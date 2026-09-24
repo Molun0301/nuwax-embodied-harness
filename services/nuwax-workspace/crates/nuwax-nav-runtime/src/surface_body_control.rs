@@ -90,7 +90,11 @@ impl SurfaceFollower {
                 (position.x-target.pose.position.x).hypot(position.y-target.pose.position.y)
             } else {position.distance(target.pose.position)};
             let passed = if rotation {
-                false
+                // 实际步态可能一次越过多个细分角度；沿同向进度消费，不倒转追旧点。
+                let step = angle_diff(target.pose.orientation.yaw(), previous.pose.orientation.yaw());
+                let actual = angle_diff(yaw, previous.pose.orientation.yaw());
+                step * actual > 0.0 && actual.abs() >= step.abs()
+                    && actual.abs() < std::f64::consts::FRAC_PI_2 && distance < tolerance * 2.0
             } else {
                 let a = previous.pose.position;
                 let b = target.pose.position;
@@ -105,6 +109,28 @@ impl SurfaceFollower {
                 self.path_index += 1;
             } else {
                 break;
+            }
+        }
+        // 搜索的原地转向点是几何路径离散，不能把每个微小角度变成机体停走门槛。
+        // 若实际机体到紧邻平移段的完整扫掠可行，直接跟随该连接；每拍速度及制动
+        // 尾段仍由下方控制器重新核验。狭窄处扫掠不通过时继续保留原地转向。
+        if self.path_index < path.poses.len() {
+            let anchor = &path.poses[self.path_index - 1];
+            let mut next = self.path_index;
+            while next < path.poses.len()
+                && path.poses[next].pose.position.distance(anchor.pose.position) < 1e-5
+            {
+                next += 1;
+            }
+            if next > self.path_index && next < path.poses.len() {
+                let target = &path.poses[next];
+                if angle_diff(target.pose.orientation.yaw(), yaw).abs() <= 0.25
+                    && position.distance(target.pose.position) <= self.config.lookahead_m
+                    && map.validate_body_motion(body(pose), body(target), &[]).is_ok()
+                {
+                    self.path_index = next;
+                    self.progress_m = self.cumulative[next - 1];
+                }
             }
         }
         if self.path_index >= path.poses.len() {

@@ -10972,6 +10972,14 @@ class PlatformGeometryProviderBundle(
             return False
         return self.runtime.unsubscribe_navigation_updates(subscription_id)
 
+    def get_navigation_control_state(self, *, deadline_monotonic: Optional[float] = None):
+        """沿原后端读取停车所需状态，避免显示附带查询阻塞归零证据。"""
+        backend = self.runtime._resolve_navigation_backend()
+        getter = getattr(backend, "get_navigation_control_state", None)
+        if not callable(getter):
+            return self.get_navigation_state(deadline_monotonic=deadline_monotonic)
+        return getter(deadline_monotonic=deadline_monotonic)
+
     def get_navigation_state(
         self,
         *,

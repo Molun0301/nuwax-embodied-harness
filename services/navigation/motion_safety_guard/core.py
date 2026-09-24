@@ -166,6 +166,9 @@ class MotionGuardCore:
         self._priority_capacity = dedup_capacity - self._ordinary_capacity
         self._ordinary_records: Dict[Tuple[object, ...], OperationRecord] = {}
         self._priority_records: Dict[Tuple[object, ...], OperationRecord] = {}
+        # 全局停车可先于原运动拥有方到达；保留被撤租者的精确归零票据供其收尾。
+        self._externally_fenced_leases: Dict[Tuple[int, str], bytes] = {}
+        self._pending_retired_lease: Optional[Tuple[int, str]] = None
         self._operation_index: Dict[str, List[OperationRecord]] = {}
 
     @property
@@ -652,6 +655,15 @@ class MotionGuardCore:
         if cached is not None:
             return cached
         envelope = request.revoke_and_zero.envelope
+        retired = self._externally_fenced_leases.get((envelope.tuple.lease_id, source))
+        if retired is not None:
+            response, outcome = self._response(request)
+            outcome.result.CopyFrom(self._result(pb.ACK_CODE_RESOURCE_FENCED))
+            outcome.result.lease = pb.LEASE_STATE_IDLE
+            outcome.zero_ack.ParseFromString(retired)
+            # 这里只交付旧租约的历史停车证明，不能归零或撤销后来者的运动。
+            self._remember(request, peer, source, response, priority=True)
+            return response
         self._begin_lease_operation(envelope, peer, source)
         return self._revoke_response(request, peer, source)
 
@@ -1163,6 +1175,9 @@ class MotionGuardCore:
     def _store_stop_confirmation(self) -> None:
         # 补充原操作账本的物理终态，不改写最初命令回执的幂等响应字节。
         encoded = self._last_zero_confirmation.SerializeToString(deterministic=True)
+        for key, saved in self._externally_fenced_leases.items():
+            if pb.ZeroAck.FromString(saved).zero_ack_id == self._last_zero_confirmation.zero_ack_id:
+                self._externally_fenced_leases[key] = encoded
         for priority, key, operation_id in self._pending_zero_records:
             target = self._priority_records if priority else self._ordinary_records
             record = target.get(key)
@@ -1238,8 +1253,19 @@ class MotionGuardCore:
         self.epoch = next_epoch
         self.lease_state = next_lease
         self._startup_zero_confirmed = next_epoch.startup_zero_confirmed
+        # 到期、主动撤租、全局停车和失败重试共用同一持久提交边界。
+        # 只保存已经实际取得且与本次持久回执匹配的停车证明。
+        if (self._pending_retired_lease is not None and next_lease == pb.LEASE_STATE_IDLE
+                and last_zero_ack_id and last_zero_ack_id == self._last_zero_confirmation.zero_ack_id
+                and self._last_zero_confirmation.applied_monotonic_ns > 0):
+            self._externally_fenced_leases[self._pending_retired_lease] = self._last_zero_confirmation.SerializeToString()
+            self._pending_retired_lease = None
+            while len(self._externally_fenced_leases) > self._priority_capacity:
+                del self._externally_fenced_leases[next(iter(self._externally_fenced_leases))]
 
     def _clear_lease(self) -> None:
+        if self._active_lease_id:
+            self._pending_retired_lease = (self._active_lease_id, self._active_source)
         self._active_lease_id = 0
         self._active_source = ""
         self._last_sequence = 0

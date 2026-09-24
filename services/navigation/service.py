@@ -1295,6 +1295,16 @@ class NavigationService:
             return bool(availability_checker())
         return True
 
+    def get_navigation_control_context(self, *, deadline_monotonic: Optional[float] = None) -> NavigationContext:
+        """停车只读取原提供器证明，不进入显示聚合锁和其它业务查询。"""
+        provider = self._find_navigation_provider()
+        if provider is None:
+            raise GatewayError("当前平台几何运行时未提供导航后端。")
+        getter = getattr(provider, "get_navigation_control_state", provider.get_navigation_state)
+        state = getter() if deadline_monotonic is None else getter(deadline_monotonic=deadline_monotonic)
+        return NavigationContext(navigation_state=state, backend_name=provider.provider_name,
+            goal_reached=bool(state.goal_reached), metadata={"provider_version":provider.provider_version})
+
     def refresh_navigation(
         self,
         *,
@@ -1347,6 +1357,38 @@ class NavigationService:
         ):
             previous_context = self._latest_navigation_context
             current_goal = self._current_goal
+            # 同步查询开始后可能已有新推送到达；旧查询不能回退新目标或抹掉停车证据。
+            if previous_context is not None:
+                previous = previous_context.navigation_state
+                def identity(state):
+                    metadata = dict(state.metadata or {})
+                    try:
+                        producer = int(metadata.get("producer_runtime_generation") or 0)
+                        generation = int(metadata.get("goal_generation") or 0)
+                    except (ValueError, TypeError):
+                        return None
+                    return (producer, generation) if producer > 0 and generation > 0 else None
+                old_identity, incoming_identity = identity(previous), identity(navigation_state)
+                if old_identity is not None and incoming_identity is not None and incoming_identity < old_identity:
+                    return previous_context
+                same_goal = bool(previous.current_goal_id and previous.current_goal_id == navigation_state.current_goal_id)
+                same_identity = same_goal and (
+                    old_identity == incoming_identity if old_identity is not None or incoming_identity is not None
+                    else current_goal is None or current_goal is previous_context.current_goal)
+                metadata = dict(previous.metadata or {})
+                try:
+                    zero_stamp = int(metadata.get("zero_applied_monotonic_ns") or 0)
+                except (TypeError, ValueError):
+                    zero_stamp = 0
+                previous_fenced = (previous.status in {NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED}
+                    and metadata.get("actuator_zeroed") is True and bool(str(metadata.get("zero_ack_id") or "").strip()) and zero_stamp > 0)
+                if same_identity:
+                    if previous_fenced and navigation_state.status not in {NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED}:
+                        return previous_context
+                    if navigation_state.updated_at < previous.updated_at:
+                        return previous_context
+                if previous_fenced and current_goal is None and navigation_state.status == NavigationStatus.IDLE:
+                    return previous_context
             if lightweight:
                 goal_reached = bool(navigation_state.goal_reached)
                 context = NavigationContext(
@@ -1371,12 +1413,14 @@ class NavigationService:
                 in {NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED}
                 and navigation_state.status == NavigationStatus.IDLE
                 and previous_context.navigation_state.current_goal_id is not None
+                and (current_goal is None or current_goal is previous_context.current_goal)
             )
 
             diagnostics = self._build_navigation_diagnostics(provider, navigation_state)
             self._last_navigation_diagnostics = diagnostics
 
-            goal_reached = bool(provider.is_goal_reached() or navigation_state.goal_reached)
+            # 到达证据属于这一帧，不能混用提供器随后收到的另一目标状态。
+            goal_reached = bool(navigation_state.goal_reached)
             if reuse_terminal_state:
                 navigation_state = previous_context.navigation_state.model_copy(deep=True)
                 current_goal = current_goal or previous_context.current_goal
@@ -1420,6 +1464,7 @@ class NavigationService:
             runtime_metadata = self._build_map_runtime_metadata(
                 map_name=current_goal.map_name if current_goal is not None else None,
                 existing_waiting_for=navigation_state.metadata.get("waiting_for"),
+                refresh_localization=False,
             )
             runtime_metadata["navigation_state_machine"] = self._state_machine.get_state_summary()
 
@@ -1599,10 +1644,11 @@ class NavigationService:
                 deadline_monotonic=deadline_monotonic,
             )
         try:
+            state_reader = getattr(provider, "get_navigation_control_state", provider.get_navigation_state)
             if deadline_monotonic is None:
-                provider_state = provider.get_navigation_state()
+                provider_state = state_reader()
             else:
-                provider_state = provider.get_navigation_state(
+                provider_state = state_reader(
                     deadline_monotonic=deadline_monotonic,
                 )
         except GeometryRuntimeRpcError:
@@ -1626,14 +1672,10 @@ class NavigationService:
             )
             or ""
         ).strip()
-        with _exploration_deadline_lock(
-            self._lock,
-            deadline_monotonic,
-            "CancelNavigation",
-        ):
-            local_goal_id = str(
-                getattr(self._current_goal, "goal_id", "") or ""
-            ).strip()
+        # 目标以完整对象替换，先捕获引用；最终取消仍由后端精确租约再次裁决。
+        # 不等待持有显示聚合锁的线程，避免停车截止被无关读取耗尽。
+        local_goal = self._current_goal
+        local_goal_id = str(getattr(local_goal, "goal_id", "") or "").strip()
         if (
             backend_goal_id != exact_goal_id
             or (observed_goal_id and observed_goal_id != exact_goal_id)
@@ -1679,9 +1721,9 @@ class NavigationService:
                 http_status=409,
             )
         if deadline_monotonic is None:
-            context = self.refresh_navigation()
+            context = self.get_navigation_control_context()
         else:
-            context = self.refresh_navigation(
+            context = self.get_navigation_control_context(
                 deadline_monotonic=deadline_monotonic,
             )
         if context.navigation_state.status == NavigationStatus.IDLE and self._current_goal is not None:
@@ -2794,10 +2836,11 @@ class NavigationService:
         memory_library_name: Optional[str] = None,
         existing_waiting_for: Optional[object] = None,
         include_waiting_for: bool = True,
+        refresh_localization: bool = True,
     ) -> dict:
         map_snapshot = self._mapping_service.get_latest_snapshot()
         localization_session = self._localization_service.get_active_session()
-        if localization_session is not None and self._should_refresh_localization():
+        if refresh_localization and localization_session is not None and self._should_refresh_localization():
             try:
                 refreshed_session = self._localization_service.refresh_current_session(
                     metadata={"source": "navigation_runtime_metadata"}

@@ -858,6 +858,7 @@ class MapWorkspaceService:
         load_memory_history: bool = True,
         reset_memory_library: bool = False,
         metadata: Optional[Dict[str, object]] = None,
+        navigation_only: bool = False,
     ) -> MapWorkspace:
         if self._read_map_activation() is not None:
             return self.activate_map(
@@ -892,6 +893,20 @@ class MapWorkspaceService:
                 if (observed.get("success") is True and observed.get("active") is True
                         and str(observed.get("phase") or "").upper() == "ACTIVE"
                         and observed.get("map_name") == resolved_name and same_source):
+                    if navigation_only:
+                        # 运动准备只消费同源地图和定位，不同步构造记忆/展示聚合视图。
+                        session = self._localization_service.get_active_session()
+                        same_session = session is not None and session.map_name == resolved_name
+                        return MapWorkspace(
+                            active_map_name=resolved_name,
+                            active_memory_library_name=resolved_name,
+                            map_asset=current_asset,
+                            map_loaded=True,
+                            mapping_runtime_enabled=True,
+                            latest_map_snapshot=snapshot,
+                            active_localization_session=session if same_session else None,
+                            localization_ready=bool(same_session and session.status == LocalizationSessionStatus.READY),
+                        )
                     workspace = self.get_active_workspace(refresh_localization=False)
                     if workspace is not None and workspace.active_map_name == resolved_name:
                         return workspace

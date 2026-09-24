@@ -5828,6 +5828,7 @@ async fn apply_typed_navigation_feedback(
     nav: &crate::nav_runtime::NavRuntimeState,
     mut update: NavigationUpdate,
 ) -> Option<NavigationUpdate> {
+    let source_terminal = matches!(update.state.status.as_str(), "SUCCEEDED" | "FAILED");
     normalize_pending_cancel_zero_ack_path_identity(nav, &mut update);
     let planner_observation = if update.feedback.runtime_generation > 0 {
         let map_frame = normalize_frame(&update.feedback.planner_map_frame);
@@ -5936,6 +5937,18 @@ async fn apply_typed_navigation_feedback(
     let complete_zero_proof = !update.feedback.zero_ack_id.trim().is_empty()
         && update.feedback.zero_applied_monotonic_ns > 0;
     let cancel_snapshot = nav.cancel_snapshot();
+    // 自然结束或全局停车的精确租约围栏可能早于定向取消被执行端接收。
+    // 同一完整租约已有终态归零证明，即可完成该取消；不重新取得运动租约。
+    // 非终态、不同目标/路径、缺证明或带错误取消代次的帧仍由原校验拒绝。
+    if complete_zero_proof && update.feedback.cancel_generation == 0
+        && update.feedback.guard_generation > 0
+        && source_terminal
+        && matches!(cancel_snapshot.phase, crate::nav_runtime::CancelPhase::Pending
+            | crate::nav_runtime::CancelPhase::Failed | crate::nav_runtime::CancelPhase::TimedOut)
+        && correlated_lease.as_ref().is_some_and(|lease| cancel_snapshot.lease.as_ref() == Some(lease))
+    {
+        update.feedback.cancel_generation = cancel_snapshot.generation;
+    }
     let correlated = complete_zero_proof
         && update.feedback.cancel_generation > 0
         && matches!(
@@ -6008,6 +6021,7 @@ async fn apply_typed_navigation_feedback(
             update.feedback.planned_path = nav.display_path_for(lease,update.state.status=="RUNNING").await;
         }
     }
+    nav.retain_terminal_receipt(&update).await;
     Some(update)
 }
 
@@ -17724,6 +17738,66 @@ mod typed_navigation_feedback_tests {
     }
 
     #[tokio::test]
+    async fn retained_terminal_survives_unsubscribed_stop_and_cancel_rpc_race() {
+        use crate::proto::geometry_runtime_server::GeometryRuntime;
+        use crate::proto::{CancelNavigationRequest,Empty};
+        use tokio_stream::StreamExt;
+        let (handle,lease)=handle_with_active_path_lease("retained-stop").await;
+        let mut update=feedback_update(&lease.session_id);
+        update.state.status="FAILED".into();
+        update.feedback.path_revision=lease.path_revision;
+        update.feedback.path_payload_sha256=lease.path_payload_sha256;
+        update.feedback.zero_ack_id="retained-zero".into();
+        update.feedback.zero_applied_monotonic_ns=42;
+        apply_typed_navigation_feedback(&handle.nav,update).await.unwrap();
+        assert!(handle.nav.inner().read().await.goal.is_none());
+        let nav=handle.nav.clone();
+        let service=crate::server::GeometryRuntimeService::new(handle);
+        let request=CancelNavigationRequest {goal_id:lease.session_id.clone(),owner_kind:lease.owner_kind,
+            parent_request_id:lease.parent_request_id.clone(),goal_generation:lease.goal_generation,
+            producer_runtime_generation:lease.producer_runtime_generation};
+        let response=service.cancel_navigation(tonic::Request::new(request.clone())).await.unwrap().into_inner();
+        assert_eq!(response.zero_ack_id,"retained-zero");
+        assert!(response.actuator_zeroed);
+        assert_eq!(response.goal_generation,lease.goal_generation);
+        let mut foreign=request;
+        foreign.goal_generation+=1;
+        let rejected=service.cancel_navigation(tonic::Request::new(foreign)).await.unwrap().into_inner();
+        assert!(rejected.zero_ack_id.is_empty(),"外国代次不得领取旧票据");
+        let mut stream=service.subscribe_navigation_state(tonic::Request::new(Empty {})).await.unwrap().into_inner();
+        let replay=tokio::time::timeout(std::time::Duration::from_secs(1),stream.next()).await.unwrap().unwrap().unwrap();
+        assert_eq!(replay.zero_ack_id,"retained-zero");
+        assert_eq!(nav.terminal_receipts().await.len(),1);
+    }
+
+    #[tokio::test]
+    async fn navigation_slow_subscriber_replays_zero_proof_after_broadcast_lag() {
+        use crate::proto::geometry_runtime_server::GeometryRuntime;
+        use crate::proto::Empty;
+        use tokio_stream::StreamExt;
+        let (handle,lease)=handle_with_active_path_lease("lagged-stop").await;
+        let sender=handle.nav_state_tx.clone();
+        let nav=handle.nav.clone();
+        let service=crate::server::GeometryRuntimeService::new(handle);
+        let mut stream=service.subscribe_navigation_state(tonic::Request::new(Empty {})).await.unwrap().into_inner();
+        for _ in 0..20 {let _=sender.send(feedback_update(""));}
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let mut update=feedback_update(&lease.session_id);
+        update.state.status="FAILED".into();
+        update.feedback.path_revision=lease.path_revision;
+        update.feedback.path_payload_sha256=lease.path_payload_sha256;
+        update.feedback.zero_ack_id="lagged-zero".into();
+        update.feedback.zero_applied_monotonic_ns=43;
+        let update=apply_typed_navigation_feedback(&nav,update).await.unwrap();
+        let _=sender.send(update);
+        for _ in 0..4096 {let _=sender.send(feedback_update(""));}
+        tokio::time::timeout(std::time::Duration::from_secs(2),async {
+            loop {let item=stream.next().await.expect("订阅不能因落后关闭").unwrap();
+                if item.zero_ack_id=="lagged-zero" {break;}}
+        }).await.expect("慢订阅必须补得真实停车终态");
+    }
+
+    #[tokio::test]
     async fn ordinary_terminal_preserves_verified_zero_without_advancing_cancel() {
         for status in ["SUCCEEDED", "FAILED"] {
             let (handle,lease)=handle_with_active_path_lease("normal-zero").await;
@@ -17743,7 +17817,7 @@ mod typed_navigation_feedback_tests {
     }
 
     #[tokio::test]
-    async fn ordinary_zero_does_not_bypass_pending_cancel_or_bad_path_identity() {
+    async fn exact_terminal_fence_settles_pending_cancel_but_rejects_bad_path_identity() {
         for pending_cancel in [false,true] {
             let (handle,lease)=handle_with_active_path_lease("normal-negative").await;
             if pending_cancel {begin_pending_cancel(&handle,&lease).await;}
@@ -17755,8 +17829,10 @@ mod typed_navigation_feedback_tests {
             update.feedback.zero_applied_monotonic_ns=42;
             let result=apply_typed_navigation_feedback(&handle.nav,update).await;
             if pending_cancel {
-                let result=result.unwrap();assert!(!result.feedback.actuator_zeroed);
-                assert_eq!(handle.nav.cancel_snapshot().phase,crate::nav_runtime::CancelPhase::Pending);
+                let result=result.unwrap();assert!(result.feedback.actuator_zeroed);
+                assert_eq!(result.state.status,"CANCELLED");
+                assert_eq!(handle.nav.cancel_snapshot().phase,crate::nav_runtime::CancelPhase::Zeroed);
+                assert!(handle.nav.inner().read().await.goal.is_none());
             }else{assert!(result.is_none());}
         }
     }

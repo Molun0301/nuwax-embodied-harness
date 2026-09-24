@@ -1029,6 +1029,9 @@ where
                         Interruptible::Completed(Ok(())) => {}
                         Interruptible::Completed(Err(error)) => {
                             let error = self.fail_closed(&status_tx, error).await;
+                            // 单个目标被外部停车撤租后，精确围栏已确认便退休目标。
+                            // 进程继续拥有输入与下一目标，不能靠重启完成业务取消。
+                            if !self.lease_active && self.session.is_none() { continue; }
                             self.status.motion_sink_ready = false;
                             self.publish_status(&status_tx);
                             if matches!(error, RuntimeError::StopUnconfirmed(_)) { continue; }
@@ -1068,6 +1071,7 @@ where
                     match await_interruptible(urgent_open, &mut urgent_rx, self.session_tick(&status_tx)).await {
                         Interruptible::Completed(Ok(())) => {}
                         Interruptible::Completed(Err(error)) => {
+                            if !self.lease_active && self.session.is_none() { continue; }
                             self.status.motion_sink_ready = false;
                             self.publish_status(&status_tx);
                             if matches!(error, RuntimeError::StopUnconfirmed(_)) { continue; }
@@ -4212,12 +4216,13 @@ mod tests {
         handle.update_odometry(map_pose()).await.expect("map pose");
         handle.submit_path(path()).await.expect("path");
 
-        let result = tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("scheduler failure timeout")
-            .expect("join");
-        assert!(result.is_err());
-        let calls = &motion_state.lock().expect("motion").calls;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.status().last_terminal != Some(TerminalOutcome::SafetyFailed) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("失败必须先确认归零终态");
+        assert!(!task.is_finished(), "已确认停车的目标失败不能结束调度拥有方");
+        let calls = motion_state.lock().expect("motion").calls.clone();
         let twist = calls
             .iter()
             .position(|call| call.starts_with("twist:"))
@@ -4230,7 +4235,7 @@ mod tests {
             fence > twist,
             "ambiguous command failure must be fenced afterwards"
         );
-        assert!(!handle.status().motion_sink_ready);
+        assert!(handle.status().motion_sink_ready);
         let terminal = handle.status();
         assert_eq!(terminal.last_terminal, Some(TerminalOutcome::SafetyFailed));
         assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
@@ -4239,6 +4244,11 @@ mod tests {
             terminal.message,
             "SafetyFailed cause=Motion: motion guard operation failed: injected APPLIED timeout"
         );
+        motion_state.lock().unwrap().fail_twist = false;
+        handle.start_session(session()).await.expect("停车后仍可接纳后续目标");
+        handle.cancel(&session().session_id).await.unwrap();
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

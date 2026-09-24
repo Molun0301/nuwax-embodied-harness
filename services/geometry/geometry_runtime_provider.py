@@ -2884,14 +2884,29 @@ def _status_means_cancel_success(status: str) -> bool:
     return str(status or "").strip().lower() in _NAV_CANCEL_SUCCESS_STATUS
 
 
-def _navigation_status_can_follow(current: str, incoming: str) -> bool:
-    """Return whether one exact lease may advance to ``incoming``."""
+def _navigation_status_can_follow(
+    current: str, incoming: str, *, current_timestamp_ns: int = 0,
+    incoming_timestamp_ns: int = 0, current_path_revision: int = 0,
+    incoming_path_revision: int = 0,
+) -> bool:
+    """同一租约按来源时间和路径修订推进；运行与重规划可以往返。"""
 
     current_status = str(current or "").strip().lower()
     incoming_status = str(incoming or "").strip().lower()
     if current_status in _NAV_TERMINAL_STATUS:
         return False
     if incoming_status in _NAV_TERMINAL_STATUS:
+        return True
+    if (current_path_revision > 0 and incoming_path_revision > 0
+            and current_timestamp_ns > 0 and incoming_timestamp_ns > 0
+            and incoming_timestamp_ns < current_timestamp_ns):
+        return False
+    if current_path_revision > 0 and incoming_path_revision < current_path_revision:
+        return False
+    if (current_status in {"running", "planning"}
+            and incoming_status in {"pending", "planning"}
+            and incoming_timestamp_ns > current_timestamp_ns > 0
+            and incoming_path_revision >= current_path_revision > 0):
         return True
     return _NAV_STATUS_PROGRESS.get(incoming_status, -1) >= (
         _NAV_STATUS_PROGRESS.get(current_status, -1)
@@ -3637,6 +3652,10 @@ class GeometryRuntimeProvider:
         if previous is not None and not _navigation_status_can_follow(
             getattr(previous, "status", ""),
             getattr(update, "status", ""),
+            current_timestamp_ns=int(getattr(previous, "timestamp_ns", 0) or 0),
+            incoming_timestamp_ns=int(getattr(update, "timestamp_ns", 0) or 0),
+            current_path_revision=int(getattr(previous, "path_revision", 0) or 0),
+            incoming_path_revision=int(getattr(update, "path_revision", 0) or 0),
         ):
             LOGGER.info(
                 "丢弃回退的 SetGoal precommit frame: goal_id=%s generation=%s status=%s->%s",
@@ -7047,6 +7066,10 @@ class GeometryRuntimeProvider:
                                 and not _navigation_status_can_follow(
                                     getattr(current_overlay, "status", ""),
                                     status,
+                                    current_timestamp_ns=int(getattr(current_overlay, "timestamp_ns", 0) or 0),
+                                    incoming_timestamp_ns=ts_ns,
+                                    current_path_revision=int(getattr(current_overlay, "path_revision", 0) or 0),
+                                    incoming_path_revision=int(getattr(update, "path_revision", 0) or 0),
                                 )
                             ):
                                 return False
@@ -7112,6 +7135,10 @@ class GeometryRuntimeProvider:
                     self._last_nav_metadata.get("reason_code")
                     == "NAVIGATION_STREAM_DISCONNECTED"
                 )
+                # 已结束目标之后的无主空闲心跳是正常现象，不能每帧写日志再挤占状态交付。
+                if (current_status in terminal_statuses and not stream_disconnected_placeholder
+                        and incoming_lease == ("", 0, "", 0, 0) and normalized_status == "idle"):
+                    return False
                 inflight_token = self._nav_inflight_command_token
                 inflight_cancel_terminal = bool(
                     inflight_token is not None
@@ -7120,7 +7147,8 @@ class GeometryRuntimeProvider:
                     and inflight_token[1] == incoming_lease
                     and inflight_token[2] == self._nav_command_generation
                     and inflight_token[3] == self._nav_connection_epoch
-                    and incoming_status == NavigationStatus.CANCELLED
+                    # 同租约已停车的自然/外部终态也能结束在途取消；新目标仍由完整身份隔离。
+                    and incoming_status in terminal_statuses
                     and _navigation_update_has_complete_zero_proof(update)
                 )
                 command_generation_is_current = bool(
@@ -7132,6 +7160,10 @@ class GeometryRuntimeProvider:
                     or _navigation_status_can_follow(
                         self._last_nav_status,
                         status,
+                        current_timestamp_ns=int(self._last_nav_timestamp_ns or 0),
+                        incoming_timestamp_ns=ts_ns,
+                        current_path_revision=int(self._last_nav_metadata.get("path_revision") or 0),
+                        incoming_path_revision=int(getattr(update, "path_revision", 0) or 0),
                     )
                 )
                 if (
@@ -7548,7 +7580,7 @@ class GeometryRuntimeProvider:
                 pose=proto_pose,
                 frame_id=target_frame_id,
                 allow_reverse=bool(getattr(goal, "allow_reverse", False)),
-                position_tolerance_m=float(getattr(goal, "tolerance_position_m", 0.3)),
+                position_tolerance_m=float(getattr(goal, "tolerance_position_m", 0.35)),
                 yaw_tolerance_rad=(float(getattr(goal, "tolerance_yaw_rad", 0.3))
                     if getattr(goal, "require_goal_orientation", True) else math.pi),
                 goal_id=request_goal_id,
@@ -7891,7 +7923,9 @@ class GeometryRuntimeProvider:
             raw_status = getattr(resp, "status", "") or ""
             terminal = _status_means_cancelled(raw_status)
             success = bool(
-                _status_means_cancel_success(raw_status)
+                (_status_means_cancel_success(raw_status)
+                 or (str(raw_status).strip().lower() in _NAV_TERMINAL_STATUS
+                     and _navigation_update_has_complete_zero_proof(resp)))
                 and (
                     not terminal
                     or _navigation_update_has_complete_zero_proof(resp)
@@ -7917,7 +7951,7 @@ class GeometryRuntimeProvider:
                             and self._nav_status_to_enum(
                                 self._last_nav_status
                             )
-                            == NavigationStatus.CANCELLED
+                            in {NavigationStatus.CANCELLED, NavigationStatus.FAILED, NavigationStatus.SUCCEEDED}
                             and self._last_nav_metadata.get(
                                 "actuator_zeroed"
                             )
@@ -8023,7 +8057,7 @@ class GeometryRuntimeProvider:
                             and self._nav_status_to_enum(
                                 self._last_nav_status
                             )
-                            == NavigationStatus.CANCELLED
+                            in {NavigationStatus.CANCELLED, NavigationStatus.FAILED, NavigationStatus.SUCCEEDED}
                             and self._last_nav_metadata.get(
                                 "actuator_zeroed"
                             )
@@ -8057,9 +8091,11 @@ class GeometryRuntimeProvider:
                                 command_generation
                             )
             _log_rpc_error("CancelNavigation", exc)
+            if terminal_already_committed:
+                return True
             if deadline_monotonic is not None:
                 raise _exploration_rpc_error("CancelNavigation", exc) from exc
-            return terminal_already_committed
+            return False
         except Exception as exc:  # pragma: no cover
             terminal_already_committed = False
             with self._nav_delivery_lock:
@@ -8078,7 +8114,7 @@ class GeometryRuntimeProvider:
                             and self._nav_status_to_enum(
                                 self._last_nav_status
                             )
-                            == NavigationStatus.CANCELLED
+                            in {NavigationStatus.CANCELLED, NavigationStatus.FAILED, NavigationStatus.SUCCEEDED}
                             and self._last_nav_metadata.get(
                                 "actuator_zeroed"
                             )
@@ -8123,6 +8159,14 @@ class GeometryRuntimeProvider:
         """
         with self._nav_state_lock:
             return _status_means_succeeded(self._last_nav_status)
+
+    def get_navigation_control_state(
+        self, *, deadline_monotonic: Optional[float] = None,
+    ) -> NavigationState:
+        """只读已核验导航流，停车对账不附带就绪或定位远程查询。"""
+        return self._build_navigation_state_snapshot(
+            include_readiness=False, deadline_monotonic=deadline_monotonic,
+        )
 
     def get_navigation_state(
         self,

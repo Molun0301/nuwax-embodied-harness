@@ -209,10 +209,13 @@ impl DynamicScene {
             e.occupied_count = 0;
             e.occupied_since = 0;
         }
-        // 同帧27邻域都被真实射线穿过，并各自至少有三次有效观测才确认空闲。
-        // 当前回波格从来不在free中；遮挡、薄墙和地面擦射不能靠单束扩大清空。
+        // 首次认定仍要求27邻格的三帧自由证据。已经明确为空闲的格，
+        // 动态物体离开后只需重新取得本格三帧穿越，不被旁边的墙面永久卡住。
+        // 当前回波格从来不在free中；持续静态占据仍按上方规则撤销known_free。
         for key in &free {
-            if neighbors(*key).all(|neighbor| {
+            let reconfirmed = self.evidence.get(key).is_some_and(|e|
+                e.known_free && e.free_count >= FREE_OBSERVATIONS);
+            if reconfirmed || neighbors(*key).all(|neighbor| {
                 free.contains(&neighbor)
                     && self
                         .evidence
@@ -305,6 +308,30 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) const ORIGIN: [f64; 3] = [0.03, 0.03, 0.65];
+
+    #[test]
+    fn known_free_person_trail_retires_after_local_visibility_returns() {
+        let mut scene=DynamicScene::with_minimum_range(0.05);
+        let target=[2.7,0.03,0.65];
+        for frame in 1..=4 {
+            let (points,_)=corridor(None,(frame%3) as f64);
+            scene.observe(&points,ORIGIN,frame*100_000_000);
+        }
+        assert!(scene.evidence.get(&cell(target).unwrap()).is_some_and(|e|e.known_free),
+            "空走廊完整观察必须先证明这个区域可用");
+        let (person,_)=corridor(Some(0.0),0.0);
+        scene.observe(&person,ORIGIN,500_000_000);
+        assert!(scene.is_dynamic(target), "人体进入原空闲区域仍作为当前动态障碍");
+        let visible=vec![Point3::new(8.0,0.03,0.65)];
+        for stamp in [600_000_000,600_000_000,700_000_000] {
+            scene.observe(&visible,ORIGIN,stamp);
+            assert!(!scene.clears(target), "重复帧或不足三帧不能确认人体离开");
+        }
+        scene.observe(&visible,ORIGIN,800_000_000);
+        assert!(scene.clears(target), "局部真实穿越恢复后不再要求整个27格同时可见");
+        let unseen=[2.7,0.63,0.65];
+        assert!(!scene.clears(unseen), "未重新观察的旁格不能跟随清除");
+    }
 
     /// 独立解析射线与地面、墙面、直立圆柱求交，返回每个回波的真实动态标签。
     pub(crate) fn corridor(person_y: Option<f64>, phase: f64) -> (Vec<Point3<f64>>, Vec<bool>) {

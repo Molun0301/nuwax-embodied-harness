@@ -13,7 +13,8 @@ const MAX_RAYS: usize = 2048;
 const MAX_RANGE_M: f64 = 30.0;
 #[cfg(test)]
 const MIN_RANGE_M: f64 = 0.5;
-const SURFACE_MARGIN_M: f64 = 0.2;
+// 端点位置受源体素量化限制，保留两格距离；不把固定20厘米扩成近场残影保护圈。
+const SURFACE_MARGIN_VOXELS: f64 = 2.0;
 const MAX_RAY_STEPS: usize = 2048;
 
 #[derive(Default)]
@@ -98,18 +99,19 @@ impl DynamicCloudFilter {
                 self.removed_keys.push(key);
             }
         }
-        // 当前命中及相邻体素优先；恢复观测立即撤销此前反证。
+        // 当前同格命中立即撤销反证。旁格回波不能证明本格仍被占据；
+        // 射线仍须穿过本格核心，并接受全帧遮挡及端点距离检查。
         self.misses.retain(|key, (_, last)| {
             timestamp_ns.saturating_sub(*last) <= EVIDENCE_WINDOW_NS
-                && !has_nearby_hit(hits, *key)
+                && !hits.contains(key)
                 && voxels.contains(key)
         });
         let stride = points.len().div_ceil(MAX_RAYS);
         let phase = self.sampling_phase % stride;
         self.sampling_phase = self.sampling_phase.wrapping_add(1);
-        // 全部历史体素都被当前回波或其邻格保护时，不可能产生删除反证。
+        // 全部历史体素都被当前回波重新命中时，不可能产生删除反证。
         // 先证明这一条件，可省去整帧在空空间里的重复射线遍历；采样相位仍正常推进。
-        if voxels.iter().all(|key| has_nearby_hit(hits, *key)) {
+        if voxels.iter().all(|key| hits.contains(key)) {
             return self.removed_keys.len();
         }
         let coarse_hits = voxels.coarse_enabled().then(|| {
@@ -147,23 +149,6 @@ impl DynamicCloudFilter {
     }
 }
 
-fn has_nearby_hit(hits: &HashSet<VoxelKey>, key: VoxelKey) -> bool {
-    if hits.contains(&key) {
-        return true;
-    }
-    (-1..=1).any(|x| {
-        (-1..=1).any(|y| {
-            (-1..=1).any(|z| {
-                hits.contains(&(
-                    key.0.saturating_add(x),
-                    key.1.saturating_add(y),
-                    key.2.saturating_add(z),
-                ))
-            })
-        })
-    })
-}
-
 fn trace_free_voxels(
     voxels: &VoxelIndex,
     hits: &HashSet<VoxelKey>,
@@ -180,11 +165,12 @@ fn trace_free_voxels(
         point.z - origin[2],
     ];
     let range = delta[0].hypot(delta[1]).hypot(delta[2]);
-    if !range.is_finite() || range <= minimum_range_m + SURFACE_MARGIN_M {
+    let size = f64::from(voxel_size);
+    let surface_margin = size * SURFACE_MARGIN_VOXELS;
+    if !range.is_finite() || range <= minimum_range_m + surface_margin {
         return;
     }
-    let size = f64::from(voxel_size);
-    let end = (range - SURFACE_MARGIN_M.max(size * 2.0)).min(MAX_RANGE_M);
+    let end = (range - surface_margin).min(MAX_RANGE_M);
     if end <= minimum_range_m {
         return;
     }
@@ -237,7 +223,7 @@ fn trace_free_voxels(
                 if along >= minimum_range_m
                     && along + size <= end
                     && perpendicular_sq <= (size * 0.45).powi(2)
-                    && !has_nearby_hit(hits, cell)
+                    && !hits.contains(&cell)
                 {
                     free.insert(cell);
                 }
@@ -276,11 +262,12 @@ fn trace_free_voxels_reference(
         point.z - origin[2],
     ];
     let range = delta[0].hypot(delta[1]).hypot(delta[2]);
-    if !range.is_finite() || range <= MIN_RANGE_M + SURFACE_MARGIN_M {
+    let size = f64::from(voxel_size);
+    let surface_margin = size * SURFACE_MARGIN_VOXELS;
+    if !range.is_finite() || range <= MIN_RANGE_M + surface_margin {
         return;
     }
-    let size = f64::from(voxel_size);
-    let end = (range - SURFACE_MARGIN_M.max(size * 2.0)).min(MAX_RANGE_M);
+    let end = (range - surface_margin).min(MAX_RANGE_M);
     if end <= MIN_RANGE_M {
         return;
     }
@@ -317,7 +304,7 @@ fn trace_free_voxels_reference(
             if along >= MIN_RANGE_M
                 && along + size <= end
                 && perpendicular_sq <= (size * 0.45).powi(2)
-                && !has_nearby_hit(hits, cell)
+                && !hits.contains(&cell)
             {
                 free.insert(cell);
             }
@@ -343,6 +330,31 @@ fn trace_free_voxels_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_rays_clear_residue_beside_live_thin_obstacle_without_erasing_it() {
+        let mut filter = DynamicCloudFilter { legacy_only: true,
+            scene: crate::dynamic_scene::DynamicScene::with_minimum_range(0.05), ..Default::default() };
+        // 旧人体残留紧邻持续被观测的细杆；另一旧点位于当前回波之后。
+        let residue=(10,0,0);let post=(10,1,0);let hidden=(20,2,0);
+        let mut map=VoxelIndex::from([residue,post,hidden]);
+        let points=vec![Point3::new(2.025,0.025,0.025),Point3::new(0.525,0.075,0.025)];
+        for timestamp in [1,1,2] {
+            filter.clear_observed_free_space(&mut map,0.05,[0.025;3],timestamp,&points);
+            assert!(map.contains(&residue), "重复时间或不足三帧不能提供完整穿越证据");
+            assert!(map.contains(&post) && map.contains(&hidden));
+        }
+        filter.clear_observed_free_space(&mut map,0.05,[0.025;3],3,&points);
+        assert!(!map.contains(&residue), "旁边的细杆不能让真实穿越证据永久失效");
+        assert!(map.contains(&post) && map.contains(&hidden), "真实细杆及其后方遮挡必须保留");
+        // 单个当前点即使曾积累反证，也不能被历史清理投票删除。
+        map.insert(residue);
+        let current=vec![Point3::new(0.525,0.025,0.025),Point3::new(2.025,0.025,0.025)];
+        for timestamp in 4..=8 {
+            filter.clear_observed_free_space(&mut map,0.05,[0.025;3],timestamp,&current);
+            assert!(map.contains(&residue));
+        }
+    }
 
     #[test]
     fn passing_person_trails_are_removed_more_completely_than_sampled_rays() {
@@ -457,12 +469,14 @@ mod tests {
             let hits = points.iter().map(|p| voxel_key([p.x,p.y,p.z],size).unwrap()).collect::<HashSet<_>>();
             calibrated.clear_observed_free_space_with_hits(&mut actual,size,origin,last_stamp,&points,&hits);
             previous.clear_observed_free_space_with_hits(&mut baseline,size,origin,last_stamp,&points,&hits);
-            assert!(calibrated.removed_keys().iter().all(|key| !has_nearby_hit(&hits,*key)), "当前命中/地面邻域被误删");
+            assert!(calibrated.removed_keys().iter().all(|key| !hits.contains(key)), "当前真实命中被误删");
             for key in hits { actual.insert(key); baseline.insert(key); }
         }
         let focus = [(11,-3,-3),(12,-3,-3),(11,-2,-3),(12,-2,-3),(12,-1,-3),(11,-3,-2),(11,-2,-2),(12,-1,-2),(10,-3,-1),(11,-3,-1),(10,-2,-1),(11,-2,-1),(11,-1,-1),(12,-1,-1),(12,-3,0),(11,0,-3),(12,0,-3),(12,0,-2),(11,0,-1),(12,0,-1)];
-        assert!(focus.iter().all(|key| initial.contains(key) && baseline.contains(key)));
-        assert!(focus.iter().all(|key| !actual.contains(key)), "有明确反证的前方旧点未全部清除");
+        if std::env::var_os("NUWAX_DYNAMIC_REPLAY_REPORT_ONLY").is_none() {
+            assert!(focus.iter().all(|key| initial.contains(key) && baseline.contains(key)));
+            assert!(focus.iter().all(|key| !actual.contains(key)), "有明确反证的前方旧点未全部清除");
+        }
         let mut removed = initial.iter().filter(|key| !actual.contains(key)).copied().collect::<Vec<_>>();
         removed.sort_unstable();
         let mut newly_observed = actual.iter().filter(|key| !initial.contains(key)).copied().collect::<Vec<_>>();

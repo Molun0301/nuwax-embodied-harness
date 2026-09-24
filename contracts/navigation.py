@@ -30,7 +30,7 @@ class NavigationGoal(TimestampedContract):
     map_name: Optional[str] = Field(default=None, description="目标所属地图名称。")
     target_pose: Optional[Pose] = Field(default=None, description="目标位姿。")
     target_name: Optional[str] = Field(default=None, description="命名目标。")
-    tolerance_position_m: float = Field(default=0.3, ge=0.0, description="位置容差。")
+    tolerance_position_m: float = Field(default=0.35, ge=0.0, description="位置容差。")
     tolerance_yaw_rad: float = Field(default=0.3, ge=0.0, description="朝向容差。")
     require_goal_orientation: bool = Field(default=True, description="是否要求最终朝向；仅位置选点为否。")
     allow_reverse: bool = Field(default=False, description="是否允许倒车。")

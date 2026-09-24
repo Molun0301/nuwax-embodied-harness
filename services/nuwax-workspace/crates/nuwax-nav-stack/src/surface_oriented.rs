@@ -3,7 +3,7 @@ use nuwax_nav_control::{integrate, PlanarPose};
 use nuwax_nav_mls_planner::SurfaceSnapshot;
 use nuwax_nav_types_messages::{GoalOptions, MotionLimits, MotionModel, Point2, Twist2};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 type BodyPose = ([f64; 3], [f64; 4]);
 // 优先较快取得可执行路线；加权启发式不承诺最短路径，碰撞/支撑检查不变。
@@ -48,20 +48,21 @@ fn action(
 ) -> Option<Vec<BodyPose>> {
     let model = map.body_envelope()?;
     let start = planar(from);
-    let n = ((velocity.linear.x.hypot(velocity.linear.y)
+    // 固定空间/角度步长让相近连接复用完全相同的旋转前缀查询。
+    // 最后一步仍精确落在终点，每段弧长和角度上限与原检查一致。
+    let rate = ((velocity.linear.x.hypot(velocity.linear.y)
         + model.radius() * velocity.angular_z.abs())
-        * duration
         / (f64::from(map.config().voxel_size) * 0.5))
-        .max(velocity.angular_z.abs() * duration / 0.08)
-        .ceil()
-        .max(1.0) as usize;
+        .max(velocity.angular_z.abs() / 0.08);
+    let step = if rate > 0.0 { 1.0 / rate } else { duration };
+    let n = (duration / step).ceil().max(1.0) as usize;
     if n > 1024 {
         return None;
     }
     let mut samples = Vec::with_capacity(n);
     let mut previous = from;
     for i in 1..=n {
-        let next = integrate(start, velocity, duration * i as f64 / n as f64);
+        let next = integrate(start, velocity, (step * i as f64).min(duration));
         let support = map
             .locate_support_from_body(previous.0, previous.1, model.body_to_support_z_m)
             .ok()?.support_xyz;
@@ -113,9 +114,15 @@ fn connect(
         if !rotate && (angle(heading - a.yaw).abs() > 1e-5 || angle(b.yaw - heading).abs() > 1e-5) {
             continue;
         }
+        let shortest = angle(heading-a.yaw);
+        let mut turns=vec![shortest];
+        // 后方目标先检查左右两种转向；非对称机体在两侧的扫掠空间不同。
+        if rotate && shortest.abs()>std::f64::consts::FRAC_PI_2 {
+            turns.push(shortest-shortest.signum()*std::f64::consts::TAU);
+        }
+        for delta in turns {
         let candidate = (|| {
             let mut out = vec![from];
-            let delta = angle(heading - a.yaw);
             if delta.abs() > 1e-6 {
                 out.extend(action(
                     map,
@@ -161,8 +168,40 @@ fn connect(
         if candidate.is_some() {
             return candidate;
         }
+        }
     }
     None
+}
+
+/// 点击高度选择支撑层，最终姿态仍由真实表面与完整机体包络决定。
+fn prepare_goal_pose(map: &SurfaceSnapshot, goal: BodyPose, require_orientation: bool) -> Result<BodyPose, String> {
+    let model=map.body_envelope().ok_or("三维完整机体标定缺失")?;
+    if map.locate_support_from_body(goal.0,goal.1,model.body_to_support_z_m).is_ok()
+        && map.validate_body_pose(goal.0,goal.1).is_ok() {return Ok(goal);}
+    let support=map.locate_goal_support_from_body(goal.0,goal.1,model.body_to_support_z_m)
+        .map_err(|error|format!("目标支撑层: {error}"))?;
+    let projected=map.body_pose_on_surface([goal.0[0],goal.0[1]],planar(goal).yaw,support.surface_xyz);
+    if require_orientation {return projected.map_err(|error|format!("目标支撑面投影: {error}"));}
+    projected.or_else(|error|(0..32).find_map(|index|map.body_pose_on_surface(
+        [goal.0[0],goal.0[1]],f64::from(index)*std::f64::consts::TAU/32.0,support.surface_xyz).ok())
+        .ok_or(error)).map_err(|error|format!("目标支撑面投影: {error}"))
+}
+fn position_distance(a:BodyPose,b:BodyPose)->f64 {
+    (a.0[0]-b.0[0]).hypot(a.0[1]-b.0[1]).hypot(a.0[2]-b.0[2])
+}
+/// 有界采样容差区域中的真实落点；不为缺测格补造地面。
+fn goal_region_samples(map:&SurfaceSnapshot,start:BodyPose,goal:BodyPose,tolerance:f64)->Vec<BodyPose> {
+    if tolerance<=0.0 {return vec![];}
+    let step=f64::from(map.config().voxel_size).max(tolerance/8.0);
+    let radius=(tolerance/step).ceil().min(8.0) as i32;
+    let mut candidates=Vec::new();
+    for x in -radius..=radius {for y in -radius..=radius {for z in -radius..=radius {
+        let candidate=([goal.0[0]+f64::from(x)*step,goal.0[1]+f64::from(y)*step,goal.0[2]+f64::from(z)*step],goal.1);
+        let offset=position_distance(candidate,goal);
+        if offset>1e-6 && offset<tolerance-1e-6 {candidates.push(candidate);}
+    }}}
+    candidates.sort_by(|a,b|position_distance(*a,start).total_cmp(&position_distance(*b,start)));
+    candidates
 }
 
 /// 复用生产机体规划查询；返回真实三维机体路径，不包含运动副作用。
@@ -184,7 +223,7 @@ pub(crate) fn plan_cancellable(
     map: &SurfaceSnapshot,
     start: BodyPose,
     mut goal: BodyPose,
-    options: GoalOptions,
+    mut options: GoalOptions,
     limits: Option<&MotionLimits>,
     boundary: &[[f64; 2]],
     budget: usize,
@@ -200,24 +239,6 @@ pub(crate) fn plan_cancellable(
     map.validate_body_pose(start.0, start.1)
         .map_err(|e| format!("起点机体包络: {e}"))?;
     let model = map.body_envelope().ok_or("三维完整机体标定缺失")?;
-    if map.locate_support_from_body(goal.0, goal.1, model.body_to_support_z_m).is_err()
-        || map.validate_body_pose(goal.0, goal.1).is_err() {
-        // 选点给出的高度用于选择支撑层；水平速度不能强制四足保持点击时
-        // 的固定高度/倾角。投影到该真实支撑面后仍执行完整碰撞和扫掠检查。
-        let support = map.locate_goal_support_from_body(goal.0, goal.1, model.body_to_support_z_m)
-            .map_err(|e| format!("目标支撑层: {e}"))?;
-        let projected=map.body_pose_on_surface([goal.0[0],goal.0[1]],planar(goal).yaw,support.surface_xyz);
-        goal = if options.requires_orientation() { projected } else {
-            projected.or_else(|error| (0..32).find_map(|index|
-                map.body_pose_on_surface([goal.0[0],goal.0[1]],f64::from(index)*std::f64::consts::TAU/32.0,support.surface_xyz).ok()
-            ).ok_or(error))
-        }.map_err(|e|format!("目标支撑面投影: {e}"))?;
-    }
-    // 起终点与沿途扫掠共用同一当前占据视图；局部补足的足迹边界仍由内核检查。
-    if options.requires_orientation() {
-        map.validate_body_pose(goal.0, goal.1)
-            .map_err(|e| format!("目标机体包络: {e}"))?;
-    }
     let rotate = limits.is_none_or(|m| m.can_rotate_in_place);
     let reverse = options.allow_reverse && limits.is_some_and(|m| m.max_reverse_mps > 0.0);
     if options.allow_reverse && !reverse {
@@ -225,16 +246,36 @@ pub(crate) fn plan_cancellable(
     }
     let omni =
         limits.is_some_and(|m| m.model == MotionModel::Omnidirectional && m.max_lateral_mps > 0.0);
-    if !options.requires_orientation() {
-        let support = map.locate_goal_support_from_body(goal.0,goal.1,model.body_to_support_z_m)
-            .map_err(|e|format!("目标支撑层: {e}"))?;
-        let feasible = (0..32).any(|index| map.body_pose_on_surface([goal.0[0],goal.0[1]],
-            f64::from(index)*std::f64::consts::TAU/32.0,support.surface_xyz).is_ok());
-        if !feasible { return Err("目标位置没有满足完整机体包络的进场方向".into()); }
+    let requested=goal;
+    let original_tolerance=options.position_tolerance_m;
+    let prepared=prepare_goal_pose(map,goal,options.requires_orientation());
+    let mut regional=false;
+    let reference=prepared.as_ref().copied().unwrap_or(requested);
+    if let Ok(centre)=prepared.as_ref() {
+        goal=*centre;
+        if let Some(path)=connect(map,start,goal,boundary,rotate,reverse,omni,options.requires_orientation()) {return Ok(path);}
     }
-    if let Some(path) = connect(map, start, goal, boundary, rotate, reverse, omni, options.requires_orientation()) {
-        return Ok(path);
+    let mut first_feasible=None;
+    let mut region_seen=HashSet::new();
+    for candidate in goal_region_samples(map,start,reference,original_tolerance) {
+        if cancelled() {return Err("三维规划已取消".into());}
+        let Ok(target)=prepare_goal_pose(map,candidate,options.requires_orientation()) else {continue;};
+        if position_distance(target,reference)>=original_tolerance-1e-6 {continue;}
+        let key=[target.0[0].to_bits(),target.0[1].to_bits(),target.0[2].to_bits(),
+            target.1[0].to_bits(),target.1[1].to_bits(),target.1[2].to_bits(),target.1[3].to_bits()];
+        if !region_seen.insert(key) {continue;}
+        first_feasible.get_or_insert(target);
+        if let Some(path)=connect(map,start,target,boundary,rotate,reverse,omni,options.requires_orientation()) {
+            if path.last().is_some_and(|end|position_distance(*end,reference)<=original_tolerance) {return Ok(path);}
+        }
     }
+    if let Err(error)=prepared {
+        let Some(target)=first_feasible else {return Err(format!("{error}；目标容差区域没有已观测的可通行机体落点"));};
+        goal=target;regional=true;
+        // 搜索仍只能落在原目标区域，不能给偏移落点再叠加一次完整容差。
+        options.position_tolerance_m=(original_tolerance-position_distance(target,reference)).max(1e-6);
+    }
+    let endpoint_allowed=|pose:BodyPose|!regional||position_distance(pose,reference)<=original_tolerance;
     // 起步盲区/近墙常使原地转向不可行。先尝试沿当前可执行方向
     // 连续驶出一个机身长度，再连接目标，避免细角度搜索反复试同一转弯。
     let probe_step = (model.radius()*0.5).max(f64::from(map.config().voxel_size)*2.0);
@@ -245,7 +286,8 @@ pub(crate) fn plan_cancellable(
             let Some(prefix)=action(map,start,Twist2 {linear:Point2::new(sign,0.0),angular_z:0.0},
                 probe_step*f64::from(step),boundary) else {break;};
             let from=*prefix.last().expect("前进基元");
-            if let Some(tail)=connect(map,from,goal,boundary,rotate,reverse,omni,options.requires_orientation()) {
+            if let Some(tail)=connect(map,from,goal,boundary,rotate,reverse,omni,options.requires_orientation())
+                .filter(|path|path.last().is_some_and(|pose|endpoint_allowed(*pose))) {
                 let mut path=vec![start];path.extend(prefix);path.extend(tail.into_iter().skip(1));return Ok(path);
             }
         }
@@ -272,7 +314,7 @@ pub(crate) fn plan_cancellable(
                     path.extend(segment.into_iter().skip(1));
                 } else { valid=false;break; }
             }
-            if valid && path.len()>1 { return Ok(path); }
+            if valid && path.len()>1 && path.last().is_some_and(|pose|endpoint_allowed(*pose)) { return Ok(path); }
         }
     }
     let resolution = f64::from(map.config().voxel_size);
@@ -338,7 +380,7 @@ pub(crate) fn plan_cancellable(
         } else {
             None
         };
-        if let Some(tail) = tail {
+        if let Some(tail) = tail.filter(|path|path.last().is_some_and(|pose|endpoint_allowed(*pose))) {
             let mut chain = vec![];
             let mut cursor = index;
             while let Some(parent) = nodes[cursor].parent {
@@ -585,6 +627,163 @@ mod tests {
         }
         assert!(inserted && reached && maximum_lateral>0.3,"必须绕行并到达原目标位置");
         eprintln!("动态障碍到达：局部接续{replans}次，最大侧移{maximum_lateral}米");
+    }
+
+    #[test]
+    fn observed_goal_region_can_arrive_when_exact_clicked_column_is_missing() {
+        let base=scene(false);
+        let points:Vec<_>=(-35..35).flat_map(|x|(-20..20).filter_map(move |y| {
+            (x!=5||y!=0).then_some(((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.025))
+        })).collect();
+        let map=Arc::new(SurfaceSnapshot::from_points(&points,base.config().clone(),0.1).unwrap()
+            .with_body_envelope(base.body_envelope().unwrap().clone()).unwrap());
+        let start=pose(-0.55,0.05,0.0);let goal=pose(0.55,0.05,2.0);
+        let options=GoalOptions {position_tolerance_m:0.35,yaw_tolerance_rad:std::f64::consts::PI,..Default::default()};
+        assert!(map.locate_goal_support_from_body(goal.0,goal.1,0.4).is_err());
+        let motion=limits();
+        let path=plan(&map,start,goal,options,Some(&motion),&[],8000).expect("容差区域有真实地面可达");
+        assert!(position_distance(*path.last().unwrap(),goal)<=options.position_tolerance_m);
+        for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+        let mut config=SurfaceFollowerConfig::new(0.4);config.motion_limits=Some(motion);
+        config.controller.speed=0.35;config.controller.control_frequency=20.0;
+        let mut follower=SurfaceFollower::new(config).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+        follower.update_odometry(stamped(start,1_000_000_000));
+        follower.configure_goal(&stamped(goal,1_000_000_000),options).unwrap();
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:path.into_iter().map(|p|stamped(p,1_000_000_000)).collect()}),None,stamped(goal,1_000_000_000)).unwrap();
+        let mut current=start;let mut reached=false;
+        for tick in 1..600 {
+            follower.update_odometry(stamped(current,1_000_000_000+tick*50_000_000));
+            match follower.step(0.3) {
+                PlannerStep::Succeeded=>{reached=true;break;},
+                PlannerStep::Command(command)=>{
+                    follower.observe_applied_command(command);
+                    let next=nuwax_nav_control::integrate(planar(current),command,0.05);
+                    let next=pose(next.x,next.y,next.yaw);
+                    map.validate_body_motion(current,next,&[]).unwrap();current=next;
+                },
+                other=>panic!("目标区域执行中断：{other:?}"),
+            }
+        }
+        assert!(reached && position_distance(current,goal)<0.35);
+    }
+
+    #[test]
+    fn goal_region_keeps_support_real_when_body_height_has_changed() {
+        let map=scene(false);
+        let start=pose(-0.55,0.05,0.0);
+        let mut goal=pose(0.55,0.05,0.0);goal.0[2]=0.18;
+        let options=GoalOptions {position_tolerance_m:0.35,yaw_tolerance_rad:std::f64::consts::PI,..Default::default()};
+        assert!(map.locate_goal_support_from_body(goal.0,goal.1,0.4).is_err());
+        let path=plan(&map,start,goal,options,Some(&limits()),&[],8000).unwrap();
+        assert!(position_distance(*path.last().unwrap(),goal)<0.35);
+        for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+        goal.0[2]=3.5;
+        assert!(plan(&map,start,goal,options,Some(&limits()),&[],8000).is_err(),"不把另一个高度层降到当前地面");
+    }
+
+    #[test]
+    fn behind_goal_tries_other_in_place_turn_when_shortest_sweep_is_blocked() {
+        let base=scene(false);
+        let mut points:Vec<_>=(-35..35).flat_map(|x|(-20..20).map(move |y|
+            ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.025))).collect();
+        points.push((0.05,-0.35,0.55));
+        let mut model=base.body_envelope().unwrap().clone();
+        model.footprint_xy_m=vec![[-0.05,-0.1],[0.55,-0.1],[0.55,0.1],[-0.05,0.1]];
+        let map=SurfaceSnapshot::from_points(&points,base.config().clone(),0.1).unwrap().with_body_envelope(model).unwrap();
+        let start=pose(0.05,0.05,0.0);let goal=pose(-1.05,0.05,std::f64::consts::PI);
+        assert!(action(&map,start,Twist2 {linear:Point2::new(0.0,0.0),angular_z:-1.0},std::f64::consts::PI,&[]).is_none());
+        let path=connect(&map,start,goal,&[],true,false,false,false).expect("另一原地转向方向有完整净空");
+        assert!(planar(path[1]).yaw>0.0,"必须使用未受阻的一侧");
+        for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+        assert!(position_distance(*path.last().unwrap(),goal)<1e-6);
+    }
+
+    #[test]
+    fn unobserved_entire_goal_region_does_not_invent_support() {
+        let base=scene(false);
+        let points:Vec<_>=(-35..0).flat_map(|x|(-20..20).map(move |y|
+            ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.025))).collect();
+        let map=SurfaceSnapshot::from_points(&points,base.config().clone(),0.1).unwrap()
+            .with_body_envelope(base.body_envelope().unwrap().clone()).unwrap();
+        let options=GoalOptions {position_tolerance_m:0.35,yaw_tolerance_rad:std::f64::consts::PI,..Default::default()};
+        assert!(plan(&map,pose(-0.55,0.05,0.0),pose(0.55,0.05,0.0),options,Some(&limits()),&[],8000)
+            .unwrap_err().contains("目标容差区域没有已观测"));
+    }
+
+    #[test]
+    fn rotation_keeps_planned_direction_after_pose_overshoots_small_samples() {
+        // 路径明确选择大于半圈的正向旋转；控制不能跳到平移段后反向走短路。
+        let map=Arc::new(scene(false));
+        let start=pose(-0.55,0.05,0.0);
+        let heading=3.6_f64;
+        let goal=pose(-0.55+heading.cos(),0.05+heading.sin(),heading);
+        let options=GoalOptions {position_tolerance_m:0.12,
+            yaw_tolerance_rad:std::f64::consts::PI,..Default::default()};
+        let mut config=SurfaceFollowerConfig::new(0.4);
+        config.controller.speed=0.35;
+        config.max_angular_speed_rps=0.8;
+        let mut follower=SurfaceFollower::new(config).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+        follower.update_odometry(stamped(start,1_000_000_000));
+        follower.configure_goal(&stamped(goal,1_000_000_000),options).unwrap();
+        let mut route=vec![start];
+        route.extend((1..=72).map(|i|pose(-0.55,0.05,f64::from(i)*0.05)));
+        route.extend((1..=20).map(|i|pose(-0.55+f64::from(i)*0.05*heading.cos(),
+            0.05+f64::from(i)*0.05*heading.sin(),heading)));
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+            poses:route.into_iter().map(|p|stamped(p,1_000_000_000)).collect()
+        }),None,stamped(goal,1_000_000_000)).unwrap();
+        // 位姿采样故意一次跨过数个离散角度，必须始终沿规划方向继续旋转。
+        for (index,yaw) in [0.0,0.19,0.41,0.73,1.1,1.6,2.2,2.8,3.15].into_iter().enumerate() {
+            follower.update_odometry(stamped(pose(-0.55,0.05,yaw),1_000_000_000+index as i64*50_000_000));
+            let PlannerStep::Command(command)=follower.step(0.3) else {panic!("可行旋转不能停走");};
+            assert!(command.angular_z>0.0,"不得反向追旧角度或改走短旋转：{command:?}");
+            assert!(command.linear.x.abs()<1e-9,"对齐前保持原地旋转");
+        }
+    }
+
+    #[test]
+    fn small_rotation_waypoint_reaches_position_with_angular_deadband() {
+        // 步态响应模型独立于控制器：小于0.15弧度/秒的转向没有实际角位移。
+        for initial_yaw in [-0.10, 0.10] {
+            let map=Arc::new(scene(false));
+            let mut current=pose(-0.55,0.05,initial_yaw);
+            let goal=pose(0.55,0.05,2.0);
+            let options=GoalOptions {position_tolerance_m:0.12,
+                yaw_tolerance_rad:std::f64::consts::PI,..Default::default()};
+            let mut config=SurfaceFollowerConfig::new(0.4);
+            config.motion_limits=Some(limits());
+            config.controller.speed=0.35;
+            config.controller.control_frequency=20.0;
+            let mut follower=SurfaceFollower::new(config).unwrap();
+            follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+            follower.update_odometry(stamped(current,1_000_000_000));
+            follower.configure_goal(&stamped(goal,1_000_000_000),options).unwrap();
+            let mut route=vec![current,pose(-0.55,0.05,0.0)];
+            route.extend((1..=22).map(|i|pose(-0.55+f64::from(i)*0.05,0.05,0.0)));
+            follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+                poses:route.into_iter().map(|p|stamped(p,1_000_000_000)).collect()
+            }),None,stamped(goal,1_000_000_000)).unwrap();
+            let mut reached=false;
+            for tick in 1..=500 {
+                follower.update_odometry(stamped(current,1_000_000_000+tick*50_000_000));
+                match follower.step(0.3) {
+                    PlannerStep::Succeeded=>{reached=true;break;},
+                    PlannerStep::Command(command)=>{
+                        follower.observe_applied_command(command);
+                        let mut actual=command;
+                        if actual.angular_z.abs()<0.15 {actual.angular_z=0.0;}
+                        let next=nuwax_nav_control::integrate(planar(current),actual,0.05);
+                        let next_pose=pose(next.x,next.y,next.yaw);
+                        map.validate_body_motion(current,next_pose,&[]).unwrap();
+                        current=next_pose;
+                    },
+                    other=>panic!("连续机体控制未能接续：{other:?}"),
+                }
+            }
+            assert!(reached,"微小转向不得永久阻止沿可行路线前进");
+        }
     }
 
     #[test]

@@ -127,7 +127,7 @@ impl SurfaceSnapshot {
             data: Arc::clone(&self.data),
             observations,
             current_body_support: self.current_body_support.clone(),
-            body_pose_cache: Default::default(),
+            body_query_cache: Default::default(),
         }
     }
 

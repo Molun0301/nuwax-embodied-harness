@@ -493,7 +493,7 @@ impl SurfaceSnapshot {
             });
         }
         let mut view=self.with_current_body_columns(&updates)?;
-        view.body_pose_cache = Default::default();
+        view.body_query_cache = Default::default();
         view.current_body_support = Some(Arc::new(CurrentBodySupport {
             source: self.clone(), body, quaternion, polygon, cells: inferred, cleared_voxels,
         }));
@@ -563,7 +563,7 @@ impl SurfaceSnapshot {
         Ok(Self {
             observations: self.observations.clone(),
             current_body_support: None,
-            body_pose_cache: Default::default(),
+            body_query_cache: Default::default(),
             data: Arc::new(SurfaceData {
                 graph: Arc::new(graph),
                 regions,
@@ -748,13 +748,13 @@ impl SurfaceSnapshot {
     ) -> Result<(), SurfaceError> {
         let key = [body[0].to_bits(),body[1].to_bits(),body[2].to_bits(),
             quaternion[0].to_bits(),quaternion[1].to_bits(),quaternion[2].to_bits(),quaternion[3].to_bits()];
-        if let Some(result)=self.body_pose_cache.lock().unwrap_or_else(|e|e.into_inner()).get(&key).cloned() {
+        if let Some(result)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).poses.get(&key).cloned() {
             return result;
         }
         let result=self.check_body_pose(body,quaternion);
-        let mut cache=self.body_pose_cache.lock().unwrap_or_else(|e|e.into_inner());
-        if cache.len()>=8192 {cache.clear();}
-        cache.insert(key,result.clone());
+        let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+        if cache.poses.len()>=8192 {cache.poses.clear();}
+        cache.poses.insert(key,result.clone());
         result
     }
 
@@ -938,6 +938,20 @@ impl SurfaceSnapshot {
         yaw: f64,
         previous_support: [f64; 3],
     ) -> Result<([f64; 3], [f64; 4]), SurfaceError> {
+        let key=[xy[0].to_bits(),xy[1].to_bits(),yaw.to_bits(),
+            previous_support[0].to_bits(),previous_support[1].to_bits(),previous_support[2].to_bits()];
+        if let Some(result)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).projections.get(&key).cloned() {
+            return result;
+        }
+        let result=self.project_body_pose(xy,yaw,previous_support);
+        let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+        if cache.projections.len()>=8192 {cache.projections.clear();}
+        cache.projections.insert(key,result.clone());
+        result
+    }
+
+    fn project_body_pose(&self,xy:[f64;2],yaw:f64,previous_support:[f64;3])
+        -> Result<([f64;3],[f64;4]),SurfaceError> {
         if !xy.into_iter().chain([yaw]).all(f64::is_finite) {
             return Err(SurfaceError::InvalidPose);
         }
@@ -959,7 +973,20 @@ impl SurfaceSnapshot {
         to: ([f64; 3], [f64; 4]),
         boundary: &[[f64; 2]],
     ) -> Result<(), SurfaceError> {
-        self.validate_body_motion_checked(from, to, boundary, |_| Ok(()))
+        // 观察年龄与外部边界不属于纯几何键，仍沿各自的完整验证路径处理。
+        if !boundary.is_empty() {
+            return self.validate_body_motion_checked(from,to,boundary,|_|Ok(()));
+        }
+        let key=[from.0[0],from.0[1],from.0[2],from.1[0],from.1[1],from.1[2],from.1[3],
+            to.0[0],to.0[1],to.0[2],to.1[0],to.1[1],to.1[2],to.1[3]].map(f64::to_bits);
+        if let Some(result)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).motions.get(&key).cloned() {
+            return result;
+        }
+        let result=self.validate_body_motion_checked(from,to,boundary,|_|Ok(()));
+        let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+        if cache.motions.len()>=8192 {cache.motions.clear();}
+        cache.motions.insert(key,result.clone());
+        result
     }
 
     /// 当前实际占据的精细支撑位置；只用于本次控制检查的足下豁免。
@@ -1497,6 +1524,34 @@ mod tests {
             .unwrap()
     }
     #[test]
+    fn exact_geometry_cache_keeps_boundary_and_new_obstacle_checks() {
+        let clear=scene(&[],false);
+        let from=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+        let to=([0.25,0.05,0.5],from.1);
+        for _ in 0..2 {
+            clear.validate_body_motion(from,to,&[]).unwrap();
+            clear.body_pose_on_surface([0.05,0.05],0.0,[0.05,0.05,0.1]).unwrap();
+        }
+        assert_eq!(clear.body_query_cache.lock().unwrap().motions.len(),1);
+        assert_eq!(clear.body_query_cache.lock().unwrap().projections.len(),1);
+        let outside=[[-1.0,-1.0],[-0.5,-1.0],[-0.5,-0.5],[-1.0,-0.5]];
+        assert!(clear.validate_body_motion(from,to,&outside).is_err());
+        let changed=scene(&[(0.55,0.05,0.55)],false);
+        assert!(changed.validate_body_motion(from,to,&[]).is_err());
+        assert!(changed.body_pose_on_surface([0.05,0.05],0.0,[0.05,0.05,0.1]).is_err());
+        // 换观察、模型或实际占据视图均使用各自缓存，不能沿用旧净空许可。
+        let observed=clear.with_observations(None);
+        assert!(!Arc::ptr_eq(&clear.body_query_cache,&observed.body_query_cache));
+        let modeled=clear.with_body_envelope(model()).unwrap();
+        assert!(!Arc::ptr_eq(&clear.body_query_cache,&modeled.body_query_cache));
+        let unchanged=clear.with_current_body_support(from.0,from.1).unwrap();
+        assert!(Arc::ptr_eq(&clear.body_query_cache,&unchanged.body_query_cache));
+        let blind=scene(&[],true);
+        let current=blind.with_current_body_support(from.0,from.1).unwrap();
+        assert!(!Arc::ptr_eq(&blind.body_query_cache,&current.body_query_cache));
+    }
+
+    #[test]
     fn body_length_ceiling_and_unknown_support_are_checked() {
         let q = [0.0, 0.0, 0.0, 1.0];
         let p = [0.05, 0.05, 0.5];
@@ -2009,4 +2064,12 @@ fn reference_prism_intersects_voxel(
             }
         }
     }
+}
+
+// 缓存只属于同一不可变表面及当前足迹视图；输入保留浮点精确位，不扩大几何容差。
+#[derive(Default)]
+pub(super) struct BodyQueryCache {
+    poses: AHashMap<[u64;7],Result<(),SurfaceError>>,
+    projections: AHashMap<[u64;6],Result<([f64;3],[f64;4]),SurfaceError>>,
+    motions: AHashMap<[u64;14],Result<(),SurfaceError>>,
 }

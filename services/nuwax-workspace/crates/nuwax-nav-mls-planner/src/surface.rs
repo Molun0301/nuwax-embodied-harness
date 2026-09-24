@@ -239,7 +239,7 @@ pub struct SurfaceSnapshot {
     observations: Option<Arc<SurfaceObservations>>,
     current_body_support: Option<Arc<body::CurrentBodySupport>>,
     /// 同一不可变快照与精确位姿的检查缓存；任何几何或观察替换均清空。
-    body_pose_cache: Arc<std::sync::Mutex<AHashMap<[u64;7], Result<(),SurfaceError>>>>,
+    body_query_cache: Arc<std::sync::Mutex<body::BodyQueryCache>>,
 }
 
 impl std::fmt::Debug for SurfaceSnapshot {
@@ -307,7 +307,7 @@ impl SurfaceSnapshot {
         let result=Self {
             observations: self.observations.clone(),
             current_body_support: None,
-            body_pose_cache: Default::default(),
+            body_query_cache: Default::default(),
             data: Arc::new(SurfaceData {
                 frontier_cache: Default::default(),
                 body_cache: Default::default(),

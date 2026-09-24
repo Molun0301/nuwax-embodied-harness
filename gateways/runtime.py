@@ -620,6 +620,21 @@ def _write_json_file_atomically(path: Path, payload: Dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _wake_runtime_activation_request(request_path: Path, request_id: str) -> bool:
+    """调用者持协议锁；只唤醒同一现存请求，不续期或创建新运动授权。"""
+    try:
+        payload = json.loads(request_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return False
+    if not isinstance(payload, dict) or payload.get("request_id") != request_id:
+        return False
+    # 旧版systemd可能漏掉原子替换；关闭可写描述符会产生IN_CLOSE_WRITE。
+    # 不写字节、不改内容、不替换文件，激活器仍须完成原ACK/commit事务。
+    descriptor = os.open(request_path, os.O_WRONLY | os.O_APPEND)
+    os.close(descriptor)
+    return True
+
+
 _SERVICE_HEALTH_SEVERITY = {
     ServiceHealthStatus.AVAILABLE.value: 0,
     ServiceHealthStatus.READY.value: 0,
@@ -3276,7 +3291,7 @@ class GatewayRuntime:
                         "y": {"type": "number"},
                         "z": {"type": "number", "default": 0.0, "description": "地图坐标中的目标机体高度（米）；三维导航须填写实际高度。"},
                         "yaw_rad": {"type": "number", "description": "可选最终朝向（弧度）；省略时仅要求到达位置。"},
-                        "tolerance_position_m": {"type": "number", "minimum": 0.0, "default": 0.3},
+                        "tolerance_position_m": {"type": "number", "minimum": 0.0, "default": 0.35},
                         "tolerance_yaw_rad": {"type": "number", "minimum": 0.0, "default": 0.3},
                         "poll_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.1},
                         "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
@@ -6722,9 +6737,6 @@ class GatewayRuntime:
             )
             RUNTIME_LOGGER.info("导航工作区已准备 map_name=%s duration_ms=%.3f", map_name, (time.monotonic()-started)*1000)
             started = time.monotonic()
-            self._refresh_workspace_snapshots()
-            RUNTIME_LOGGER.info("导航工作区状态已同步 map_name=%s duration_ms=%.3f", map_name, (time.monotonic()-started)*1000)
-            started = time.monotonic()
             self._ensure_localization_for_navigation(
                 capability_name="navigate_to_pose", map_name=map_name, workspace=workspace,
                 requested_by=requested_by, arguments=arguments,
@@ -6750,7 +6762,7 @@ class GatewayRuntime:
             goal_id=str(arguments.get("goal_id") or "").strip() or self._build_runtime_request_id("nav_pose"),
             map_name=map_name,
             target_pose=pose,
-            tolerance_position_m=self._float(arguments, "tolerance_position_m", 0.3),
+            tolerance_position_m=self._float(arguments, "tolerance_position_m", 0.35),
             tolerance_yaw_rad=self._float(arguments, "tolerance_yaw_rad", 0.3),
             require_goal_orientation="yaw_rad" in arguments,
             metadata=goal_metadata,
@@ -8685,6 +8697,7 @@ class GatewayRuntime:
                 load_memory_history=True,
                 reset_memory_library=False,
                 metadata={"requested_by": requested_by or "unknown", "source": capability_name},
+                **({"navigation_only": True} if capability_name == "navigate_to_pose" else {}),
             )
             return explicit_map_name, workspace
         workspace = self.map_workspace_service.get_active_workspace()
@@ -10797,6 +10810,9 @@ class GatewayRuntime:
                             "cancelled_at": utc_now().isoformat(),
                         },
                     )
+                    _wake_runtime_activation_request(
+                        Path(context["request_path"]), context["request_id"]
+                    )
             except OSError:
                 RUNTIME_LOGGER.exception(
                     "写入按需组件激活取消标记失败 request_id=%s path=%s",
@@ -11477,6 +11493,39 @@ class GatewayRuntime:
                     self._exploration_stop_transactions = ledger
         return lock, ledger
 
+    def _reconcile_navigation_quarantine(self) -> MetadataDict:
+        """只依据原目标的真实停车证明释放隔离资源，供停车重试和新目标准入共用。"""
+        reader = getattr(self.task_manager, "list_quarantined_tasks", None)
+        candidates = []
+        for status in reader() if callable(reader) else ():
+            error = self.task_manager.get_task_error_payload(status.task_id) or {}
+            correlation = dict((error.get("details") or {}).get("resource_quarantine_correlation") or {})
+            if correlation.get("ownership_domain") == "navigation" and correlation.get("goal_id"):
+                candidates.append((status.task_id, correlation))
+        if not candidates:
+            return {"attempted": False, "pending": False, "released_task_ids": []}
+        getter = getattr(self.navigation_service, "get_latest_navigation_context", None)
+        context = getter() if callable(getter) else None
+        allowed = {NavigationStatus.SUCCEEDED.value, NavigationStatus.FAILED.value, NavigationStatus.CANCELLED.value}
+        if not all(self._navigation_terminal_proof(context, goal_id=str(item["goal_id"]), allowed_statuses=allowed)
+                   for _, item in candidates):
+            reader = getattr(self.navigation_service, "get_navigation_control_context",
+                self.navigation_service.refresh_navigation)
+            context = reader(deadline_monotonic=time.monotonic() + _EXPLORATION_STOP_BARRIER_TIMEOUT_SEC)
+        released, pending = [], []
+        for task_id, correlation in candidates:
+            proof = self._navigation_terminal_proof(context, goal_id=str(correlation["goal_id"]),
+                allowed_statuses={NavigationStatus.SUCCEEDED.value, NavigationStatus.FAILED.value,
+                    NavigationStatus.CANCELLED.value})
+            if not proof:
+                pending.append(task_id)
+                continue
+            if self.task_manager.release_resource_quarantine(task_id,
+                    proof={**proof, "ownership_domain": "navigation"}, correlation=correlation):
+                released.append(task_id)
+        return {"attempted": True, "pending": bool(pending),
+            "released_task_ids": released, "pending_task_ids": pending}
+
     def _stop_robot_motion(
         self,
         reason: Optional[str],
@@ -11603,12 +11652,18 @@ class GatewayRuntime:
                     "phase": transaction.phase.name,
                     "error": "exploration_ownership_reconciliation_pending",
                 }
+            try:
+                navigation_reconciliation = self._reconcile_navigation_quarantine()
+            except Exception as error:
+                RUNTIME_LOGGER.exception("全局停车后导航资源对账失败 operation_id=%s", operation_id)
+                navigation_reconciliation = {"attempted": True, "pending": True, "error": str(error)}
             return {
                 "cancelled_task_ids": list(transaction.cancelled_task_ids),
                 "cancelled_task_count": len(transaction.cancelled_task_ids),
                 "motion_guard": transaction.ordinary_confirmation,
                 "exploration_ownership_reconciliation": reconciliation,
-                "reconciliation_pending": bool(reconciliation.get("pending")),
+                "navigation_ownership_reconciliation": navigation_reconciliation,
+                "reconciliation_pending": bool(reconciliation.get("pending") or navigation_reconciliation.get("pending")),
             }
 
     @staticmethod
@@ -11889,6 +11944,9 @@ class GatewayRuntime:
         ):
             expected_value = expected.get(key)
             current_value = current.get(key)
+            # 稀疏运动状态不携带规划器观测；缺测不是进程换代，保留原围栏继续比对。
+            if key == "navigation_runtime_generation" and current_value is None:
+                continue
             if expected_value is not None and current_value != expected_value:
                 rollovers[key] = {
                     "expected": expected_value,
@@ -11927,11 +11985,13 @@ class GatewayRuntime:
         cancel_confirmed = False
         stop_confirmed = False
         try:
-            self.navigation_service.cancel_goal(
-                request_id=goal_id,
-                deadline_monotonic=deadline_monotonic,
-            )
-            cancel_confirmed = True
+            terminal = self._cancel_navigation_with_safety_barrier(context,
+                goal_id=goal_id, poll_interval_sec=.05, acknowledge_interrupt=False,
+                parking_deadline_monotonic=deadline_monotonic)
+            details["navigation_terminal_proof"] = self._navigation_terminal_proof(terminal,
+                goal_id=goal_id, allowed_statuses={NavigationStatus.SUCCEEDED.value,
+                    NavigationStatus.FAILED.value, NavigationStatus.CANCELLED.value})
+            cancel_confirmed = bool(details["navigation_terminal_proof"])
         except Exception as exc:
             details["cancel_error"] = str(exc)
         try:
@@ -11973,101 +12033,135 @@ class GatewayRuntime:
         completion_callback=None,
         prepare_callback=None,
     ):
+        # 旧任务可能已结束，但真实归零回执晚于它的调用期限到达。
+        # 新请求先完成精确对账，不能永久把这类隔离误报为资源冲突。
+        try:
+            recovery = self._reconcile_navigation_quarantine()
+        except Exception as error:
+            raise GatewayError("上一个导航的停车回执暂不可读取，请稍后重试。",
+                error_code="navigation_stop_pending", http_status=409,
+                details={"recovery_pending": True, "reason": str(error)}) from error
+        if recovery.get("pending"):
+            raise GatewayError("上一个导航尚未确认停车，等待原目标回执后可继续导航。",
+                error_code="navigation_stop_pending", http_status=409, details=recovery)
         descriptor = self.capability_registry.get_descriptor(capability_name)
         if not isinstance(motion_admission, _PendingNavigationAdmission):
             goal = self._goal_with_motion_admission(goal, motion_admission)
         poll_interval_sec = max(0.02, poll_interval_sec)
 
         def runner(context, goal=goal, motion_admission=motion_admission) -> Dict[str, Any]:
-            parent_deadline = context.timeout_deadline_monotonic()
-            if isinstance(motion_admission, _PendingNavigationAdmission):
-                pending = motion_admission
-                context.ensure_active()
-                context.update(progress=0.01, stage="prepare_navigation", message="导航请求已受理，正在准备运行时。")
-                self._run_with_motion_admission(pending, lambda: None)
-                activation_started=time.monotonic()
-                motion_admission = self._admit_motion_request(capability_name,
-                    request_id=pending.request_id, deadline_monotonic=parent_deadline)
-                RUNTIME_LOGGER.info("导航组件准入已完成 goal_id=%s duration_ms=%.3f", goal.goal_id, (time.monotonic()-activation_started)*1000)
-                self._run_with_motion_admission(pending, lambda: None)
-                context.ensure_active()
-                if prepare_callback is not None:
-                    prepare_callback()
-                context.ensure_active()
-                goal = self._goal_with_motion_admission(goal, motion_admission)
-            self._ensure_motion_runtime_for_backend_call(
-                capability_name,
-                motion_admission,
-                deadline_monotonic=parent_deadline,
-            )
-            context.ensure_active()
-
-            def submit_goal():
-                last_context = self.navigation_service.set_goal(
-                    goal,
+            goal_dispatched = False
+            last_context = None
+            finalized = False
+            try:
+                parent_deadline = context.timeout_deadline_monotonic()
+                if isinstance(motion_admission, _PendingNavigationAdmission):
+                    pending = motion_admission
+                    context.ensure_active()
+                    context.update(progress=0.01, stage="prepare_navigation", message="导航请求已受理，正在准备运行时。")
+                    self._run_with_motion_admission(pending, lambda: None)
+                    activation_started=time.monotonic()
+                    motion_admission = self._admit_motion_request(capability_name,
+                        request_id=pending.request_id, deadline_monotonic=parent_deadline)
+                    RUNTIME_LOGGER.info("导航组件准入已完成 goal_id=%s duration_ms=%.3f", goal.goal_id, (time.monotonic()-activation_started)*1000)
+                    self._run_with_motion_admission(pending, lambda: None)
+                    context.ensure_active()
+                    if prepare_callback is not None:
+                        prepare_callback()
+                    context.ensure_active()
+                    goal = self._goal_with_motion_admission(goal, motion_admission)
+                self._ensure_motion_runtime_for_backend_call(
+                    capability_name,
+                    motion_admission,
                     deadline_monotonic=parent_deadline,
                 )
-                generation_snapshot = self._capture_task_generation_snapshot(
-                    navigation_context=last_context,
-                    motion_admission=motion_admission,
-                )
-                return last_context, generation_snapshot
+                context.ensure_active()
 
-            def wait_and_submit():
-                # 等待只占本任务线程；每次实际提交仍复核原全局停车代次。
-                while True:
-                    context.ensure_active()
+                def submit_goal():
+                    nonlocal goal_dispatched
+                    goal_dispatched = True
                     try:
-                        return self._run_with_motion_admission(motion_admission, submit_goal)
+                        last_context = self.navigation_service.set_goal(
+                            goal, deadline_monotonic=parent_deadline,
+                        )
                     except GatewayError as error:
-                        if error.error_code != "navigation_goal_rejected" or error.details.get("backend_code") not in {
-                            "PLANNER_NOT_READY", "PLANNER_INPUT_UNOBSERVED", "PLANNER_INPUT_STALE",
-                            "TF_UNOBSERVED", "TF_STALE", "TF_INCOMPLETE",
-                        }:
-                            raise
-                        context.update(progress=0.02, stage="waiting_navigation_inputs",
-                            message="目标已保留，等待导航输入恢复：" + error.message,
-                            payload={"goal_id": goal.goal_id, "backend_code": error.details.get("backend_code")})
-                        remaining = context.timeout_remaining_sec()
-                        if remaining is not None and remaining <= 0:
-                            context.ensure_active()
-                        time.sleep(min(.5, max(.01, remaining)) if remaining is not None else .5)
+                        if error.error_code == "navigation_goal_rejected":
+                            goal_dispatched = False
+                        raise
+                    generation_snapshot = self._capture_task_generation_snapshot(
+                        navigation_context=last_context,
+                        motion_admission=motion_admission,
+                    )
+                    return last_context, generation_snapshot
 
-            last_context, generation_snapshot = wait_and_submit()
-            self._record_task_generation_snapshot(context, generation_snapshot)
-            finalized = False
-            context.update(
-                progress=0.05,
-                stage="accepted",
-                message=f"导航目标 {goal.goal_id} 已提交。",
-                payload={"goal_id": goal.goal_id},
-            )
-            try:
+                def wait_and_submit():
+                    # 等待只占本任务线程；每次实际提交仍复核原全局停车代次。
+                    while True:
+                        context.ensure_active()
+                        try:
+                            return self._run_with_motion_admission(motion_admission, submit_goal)
+                        except GatewayError as error:
+                            if error.error_code != "navigation_goal_rejected" or error.details.get("backend_code") not in {
+                                "PLANNER_NOT_READY", "PLANNER_INPUT_UNOBSERVED", "PLANNER_INPUT_STALE",
+                                "TF_UNOBSERVED", "TF_STALE", "TF_INCOMPLETE",
+                            }:
+                                raise
+                            context.update(progress=0.02, stage="waiting_navigation_inputs",
+                                message="目标已保留，等待导航输入恢复：" + error.message,
+                                payload={"goal_id": goal.goal_id, "backend_code": error.details.get("backend_code")})
+                            remaining = context.timeout_remaining_sec()
+                            if remaining is not None and remaining <= 0:
+                                context.ensure_active()
+                            time.sleep(min(.5, max(.01, remaining)) if remaining is not None else .5)
+
+                last_context, generation_snapshot = wait_and_submit()
+                self._record_task_generation_snapshot(context, generation_snapshot)
+                finalized = False
+                context.update(
+                    progress=0.05,
+                    stage="accepted",
+                    message=f"导航目标 {goal.goal_id} 已提交。",
+                    payload={"goal_id": goal.goal_id},
+                )
                 while True:
                     context.ensure_active()
                     last_context = self.navigation_service.refresh_navigation(
                         deadline_monotonic=parent_deadline,
                     )
+                    # 阻塞读取期间到达的用户停车优先进入中断收尾，不误报成运行时更换。
+                    context.ensure_active()
                     current_generations = self._capture_task_generation_snapshot(
                         navigation_context=last_context,
                         motion_admission=motion_admission,
                     )
+                    if (generation_snapshot.get("navigation_runtime_generation") is None
+                            and current_generations.get("navigation_runtime_generation") is not None):
+                        # 准入首帧可能省略规划器观测；首次真实代次只绑定一次。
+                        generation_snapshot["navigation_runtime_generation"] = current_generations["navigation_runtime_generation"]
+                        self._record_task_generation_snapshot(context, generation_snapshot)
                     rollovers = self._task_generation_rollovers(
                         generation_snapshot,
                         current_generations,
                     )
                     if rollovers:
-                        self._handle_navigation_generation_rollover(
-                            context,
-                            goal_id=goal.goal_id,
-                            expected=generation_snapshot,
-                            current=current_generations,
-                            rollovers=rollovers,
-                            deadline_monotonic=(
-                                time.monotonic()
-                                + _EXPLORATION_STOP_BARRIER_TIMEOUT_SEC
-                            ),
-                        )
+                        try:
+                            self._handle_navigation_generation_rollover(
+                                context,
+                                goal_id=goal.goal_id,
+                                expected=generation_snapshot,
+                                current=current_generations,
+                                rollovers=rollovers,
+                                deadline_monotonic=(
+                                    time.monotonic()
+                                    + _EXPLORATION_STOP_BARRIER_TIMEOUT_SEC
+                                ),
+                            )
+                        except GatewayError as error:
+                            if error.error_code == "task_generation_rollover" and error.details.get("navigation_terminal_proof"):
+                                finalized = True
+                                if context.is_cancel_requested() or context.is_timed_out():
+                                    context.acknowledge_interrupt_barrier(error.details["navigation_terminal_proof"])
+                            raise
                     status = last_context.navigation_state.status
                     context.update(
                         progress=self._estimate_navigation_progress(last_context),
@@ -12087,12 +12181,14 @@ class GatewayRuntime:
                         }
                         if completion_callback is not None:
                             result.update(dict(completion_callback(last_context) or {}))
-                        result.update(
-                            self._finalize_workspace_assets_after_task(
-                                map_name=goal.map_name,
-                                trigger=f"{capability_name}_completed",
-                            )
-                        )
+                        # 到达与停车终态直接结束导航；地图和记忆展示由原订阅更新。
+                        proof = self._navigation_terminal_proof(last_context, goal_id=goal.goal_id,
+                            allowed_statuses={NavigationStatus.SUCCEEDED.value})
+                        if not proof:
+                            raise self._navigation_parking_error(goal_id=goal.goal_id,
+                                reason="导航成功缺少同目标执行端归零证明", navigation_context=last_context)
+                        if not context.commit_success(proof):
+                            context.ensure_active()
                         finalized = True
                         return result
                     if status == NavigationStatus.SUCCEEDED:
@@ -12128,6 +12224,12 @@ class GatewayRuntime:
                             },
                         )
                     if status == NavigationStatus.CANCELLED:
+                        proof = self._navigation_terminal_proof(last_context, goal_id=goal.goal_id,
+                            allowed_statuses={NavigationStatus.CANCELLED.value})
+                        if proof:
+                            # 公共取消能力直接到达后端时，也收敛为原任务的取消终态。
+                            self.task_manager.cancel_task(context.task_id, message="导航后端已确认取消。")
+                            context.ensure_active()
                         raise GatewayError(
                             last_context.navigation_state.message or "导航已取消。",
                             error_code="navigation_cancelled",
@@ -12146,30 +12248,23 @@ class GatewayRuntime:
                             context.ensure_active()
                         sleep_sec = min(sleep_sec, remaining_sec)
                     time.sleep(sleep_sec)
+
             finally:
+                interrupted = context.is_cancel_requested() or context.is_timed_out()
                 if not finalized:
-                    try:
-                        self._finalize_workspace_assets_after_task(
-                            map_name=goal.map_name,
-                            trigger=f"{capability_name}_finalize",
-                        )
-                    except Exception:
-                        RUNTIME_LOGGER.exception(
-                            "导航任务结束后刷新地图工作区失败 capability=%s map_name=%s",
-                            capability_name,
-                            goal.map_name,
-                        )
-                if context.is_cancel_requested() or context.is_timed_out():
-                    try:
-                        self.navigation_service.cancel_goal(
-                            request_id=goal.goal_id,
-                            deadline_monotonic=(
-                                time.monotonic()
-                                + _EXPLORATION_STOP_BARRIER_TIMEOUT_SEC
-                            ),
-                        )
-                    except Exception:
-                        pass
+                    if goal_dispatched:
+                        proof = self._navigation_terminal_proof(last_context, goal_id=goal.goal_id,
+                            allowed_statuses={NavigationStatus.SUCCEEDED.value,
+                                NavigationStatus.FAILED.value, NavigationStatus.CANCELLED.value})
+                        if proof:
+                            if interrupted:
+                                context.acknowledge_interrupt_barrier(proof)
+                        else:
+                            self._cancel_navigation_with_safety_barrier(context, goal_id=goal.goal_id,
+                                poll_interval_sec=poll_interval_sec, acknowledge_interrupt=interrupted)
+                    elif interrupted:
+                        context.acknowledge_interrupt_barrier({"goal_id": goal.goal_id,
+                            "backend_not_active": True, "parking_confirmed": True})
 
         return self._run_with_motion_admission(
             motion_admission,
@@ -12186,6 +12281,7 @@ class GatewayRuntime:
                 requested_by=requested_by,
                 required_resources=list(descriptor.required_resources),
                 timeout_sec=timeout_sec,
+                deferred_interrupt=True,
                 metadata=self._build_task_request_metadata(
                     capability_name=capability_name,
                     requested_by=requested_by,
@@ -12445,11 +12541,57 @@ class GatewayRuntime:
             message="正在等待导航后端确认执行器零速。",
             payload={"goal_id": exact_goal_id},
         )
+        def cached_terminal():
+            getter = getattr(self.navigation_service, "get_navigation_control_context", None)
+            if not callable(getter):
+                getter = getattr(self.navigation_service, "get_latest_navigation_context", None)
+            cached = getter() if callable(getter) else None
+            proof = self._navigation_terminal_proof(cached, goal_id=goal_id,
+                allowed_statuses={NavigationStatus.SUCCEEDED.value, NavigationStatus.FAILED.value,
+                    NavigationStatus.CANCELLED.value})
+            return cached if proof else None
+
+        def read_stop_context():
+            cached = cached_terminal()
+            if cached is not None:
+                return cached
+            try:
+                reader = getattr(self.navigation_service, "get_navigation_control_context",
+                    self.navigation_service.refresh_navigation)
+                return reader(deadline_monotonic=deadline)
+            except Exception:
+                # 远程读取超时与推送回执到达可并发，先消费已经核验的证据。
+                cached = cached_terminal()
+                if cached is not None:
+                    return cached
+                raise
+
         try:
-            last_context = self.navigation_service.cancel_goal(
-                request_id=exact_goal_id,
-                deadline_monotonic=deadline,
-            )
+            last_context = read_stop_context()
+            proof = self._navigation_terminal_proof(last_context, goal_id=goal_id,
+                allowed_statuses={NavigationStatus.SUCCEEDED.value,
+                    NavigationStatus.FAILED.value, NavigationStatus.CANCELLED.value})
+            if proof:
+                if acknowledge_interrupt:
+                    context.acknowledge_interrupt_barrier(proof)
+                return last_context
+            try:
+                last_context = self.navigation_service.cancel_goal(
+                    request_id=exact_goal_id, deadline_monotonic=deadline,
+                )
+            except GatewayError as error:
+                if error.error_code not in {"navigation_goal_mismatch", "navigation_cancel_rejected"}:
+                    raise
+                # 取消前检查与后端自然到达可能并发，仍只接受同一目标的停车证明。
+                last_context = read_stop_context()
+                proof = self._navigation_terminal_proof(last_context, goal_id=goal_id,
+                    allowed_statuses={NavigationStatus.SUCCEEDED.value,
+                        NavigationStatus.FAILED.value, NavigationStatus.CANCELLED.value})
+                if not proof:
+                    raise
+                if acknowledge_interrupt:
+                    context.acknowledge_interrupt_barrier(proof)
+                return last_context
         except Exception as exc:
             raise self._navigation_parking_error(
                 goal_id=goal_id,
@@ -12458,6 +12600,14 @@ class GatewayRuntime:
 
         sleep_sec = min(0.1, max(0.02, float(poll_interval_sec)))
         while True:
+            last_context = cached_terminal() or last_context
+            proof = self._navigation_terminal_proof(last_context, goal_id=goal_id,
+                allowed_statuses={NavigationStatus.SUCCEEDED.value,
+                    NavigationStatus.FAILED.value, NavigationStatus.CANCELLED.value})
+            if proof:
+                if acknowledge_interrupt:
+                    context.acknowledge_interrupt_barrier(proof)
+                return last_context
             state = getattr(last_context, "navigation_state", None)
             raw_status = getattr(state, "status", None)
             status = str(
@@ -12521,9 +12671,7 @@ class GatewayRuntime:
                 )
             time.sleep(min(sleep_sec, remaining_sec))
             try:
-                last_context = self.navigation_service.refresh_navigation(
-                    deadline_monotonic=deadline,
-                )
+                last_context = read_stop_context()
             except Exception as exc:
                 raise self._navigation_parking_error(
                     goal_id=goal_id,
@@ -13753,6 +13901,7 @@ class GatewayRuntime:
             except (FileNotFoundError, ValueError):
                 return {}
 
+        next_wakeup = time.monotonic()
         while True:
             expected_generation = context.get("motion_stop_generation")
             if expected_generation is not None and expected_generation != self.safety_guard.motion_stop_generation:
@@ -13776,6 +13925,9 @@ class GatewayRuntime:
                 pending = request_exists or state in {"activating", "prepared", "ready"}
                 if settled or not pending:
                     return
+                if previous_id and time.monotonic() >= next_wakeup:
+                    _wake_runtime_activation_request(request_path, previous_id)
+                    next_wakeup = time.monotonic() + 1.0
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise GatewayError(
@@ -13899,6 +14051,7 @@ class GatewayRuntime:
                     },
                 )
                 request_written = True
+                _wake_runtime_activation_request(request_path, request_id)
         except GatewayError:
             with state_lock:
                 current = getattr(self, "_runtime_activation_context", None)
@@ -13906,6 +14059,10 @@ class GatewayRuntime:
                     self._runtime_activation_context = None
             raise
         except OSError as exc:
+            if request_written:
+                self._cancel_runtime_activation_request(
+                    context, reason=str(exc), error_code="activation_cancelled"
+                )
             with state_lock:
                 current = getattr(self, "_runtime_activation_context", None)
                 if current is not None and current.get("request_id") == request_id:
@@ -13923,8 +14080,13 @@ class GatewayRuntime:
                 },
             ) from exc
         ack_written = False
+        next_wakeup = time.monotonic() + 1.0
         try:
             while time.monotonic() < deadline:
+                if time.monotonic() >= next_wakeup:
+                    with _runtime_activation_protocol_lock(request_path):
+                        _wake_runtime_activation_request(request_path, request_id)
+                    next_wakeup = time.monotonic() + 1.0
                 try:
                     payload = json.loads(result_path.read_text(encoding="utf-8"))
                 except FileNotFoundError:

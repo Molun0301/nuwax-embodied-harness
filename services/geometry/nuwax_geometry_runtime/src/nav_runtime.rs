@@ -52,7 +52,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::channel_registry;
-use crate::lcm_runtime::{GeometryRuntimeHandle, NavState, PoseState, SharedState};
+use crate::lcm_runtime::{GeometryRuntimeHandle, NavigationUpdate, NavState, PoseState, SharedState};
 use crate::sequence_state::{SequenceStateError, SequenceStateStore};
 use crate::typed_codec;
 
@@ -313,6 +313,8 @@ pub struct NavRuntimeSlot {
     path_candidates: VecDeque<(u64, [u8; 32])>,
     /// 最近同目标的计算路径，仅用于展示，不能替代执行回执。
     display_path: Option<(GoalLease, Vec<[f64; 3]>)>,
+    /// 已核验的停车终态独立于展示缓存，供取消重试和订阅重连读取。
+    terminal_receipts: VecDeque<NavigationUpdate>,
     /// Highest goal generation ever reserved by this runtime.
     pub last_goal_generation: u64,
     /// module graph 模块节点 ID 列表(diagnostics 暴露)。
@@ -331,6 +333,7 @@ impl NavRuntimeSlot {
             path_candidate_goal: None,
             path_candidates: VecDeque::new(),
             display_path: None,
+            terminal_receipts: VecDeque::new(),
             last_goal_generation: 0,
             module_nodes: Vec::new(),
             profile,
@@ -719,7 +722,41 @@ impl NavRuntimeState {
         self.inner.clone()
     }
 
-    /// Stable producer generation for the lifetime of this runtime instance.
+    /// 只保留已经沿执行输入校验的停车证明，不从本地错误构造终态。
+    pub(crate) async fn retain_terminal_receipt(&self, update: &NavigationUpdate) {
+        if !matches!(update.state.status.as_str(), "SUCCEEDED" | "FAILED" | "CANCELLED")
+            || update.state.goal_id.is_empty() || update.feedback.goal_generation == 0
+            || update.producer_runtime_generation == 0 || !update.feedback.actuator_zeroed
+            || update.feedback.zero_ack_id.is_empty() || update.feedback.zero_applied_monotonic_ns == 0 {
+            return;
+        }
+        let mut slot=self.inner.write().await;
+        slot.terminal_receipts.retain(|old| !(old.state.goal_id==update.state.goal_id
+            && old.feedback.owner_kind==update.feedback.owner_kind
+            && old.feedback.parent_request_id==update.feedback.parent_request_id
+            && old.feedback.goal_generation==update.feedback.goal_generation
+            && old.producer_runtime_generation==update.producer_runtime_generation));
+        slot.terminal_receipts.push_back(update.clone());
+        while slot.terminal_receipts.len()>32 {slot.terminal_receipts.pop_front();}
+    }
+
+    /// 订阅恢复只重放已验证的有界终态；客户端继续按完整目标身份消费。
+    pub(crate) async fn terminal_receipts(&self) -> Vec<NavigationUpdate> {
+        self.inner.read().await.terminal_receipts.iter().cloned().collect()
+    }
+
+    /// 旧目标的精确取消重试只读取原停车回执，不触碰活动的新目标。
+    pub(crate) async fn terminal_receipt_for(&self, input: &CancelGoalInput) -> Option<NavigationUpdate> {
+        self.inner.read().await.terminal_receipts.iter().rev().find(|update|
+            update.state.goal_id==input.goal_id
+            && update.feedback.owner_kind==input.owner_kind
+            && update.feedback.parent_request_id==input.parent_request_id
+            && update.feedback.goal_generation==input.goal_generation
+            && update.producer_runtime_generation==input.producer_runtime_generation
+        ).cloned()
+    }
+
+    /// 当前拥有方整个生命周期内保持不变的生产代次。
     pub fn producer_runtime_generation(&self) -> u64 {
         self.producer_runtime_generation
     }
@@ -2396,6 +2433,7 @@ pub struct SetGoalOutcome {
 }
 
 /// Complete CAS identity required to cancel one goal lease.
+#[derive(Clone)]
 pub struct CancelGoalInput {
     /// Public business/session identifier.
     pub goal_id: String,

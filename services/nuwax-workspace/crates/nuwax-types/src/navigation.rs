@@ -13,7 +13,7 @@ pub struct GoalOptions {
     pub yaw_tolerance_rad: f64,
 }
 impl Default for GoalOptions {
-    fn default()->Self {Self {allow_reverse:false,position_tolerance_m:0.2,yaw_tolerance_rad:0.35}}
+    fn default()->Self {Self {allow_reverse:false,position_tolerance_m:0.35,yaw_tolerance_rad:0.35}}
 }
 impl GoalOptions {
     /// 容差覆盖整个圆周时，不约束最终朝向；仍保留沿途机体方向。

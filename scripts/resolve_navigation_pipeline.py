@@ -16,27 +16,49 @@ _PIPELINE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_PIPELINE)
 
 
+def actuator_limits():
+    # 与网关共用纯配置实现，避免导入core包时初始化全部契约和运行时。
+    spec = importlib.util.spec_from_file_location(
+        "nuwax_startup_config", Path(__file__).resolve().parents[1] / "core/config_values.py"
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("无法读取共同配置解析器")
+    config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config)
+    if config.runtime_value("NUWAX_ACTIVE_ROBOT", "").strip().lower() != "go2":
+        return "", ""
+    values = []
+    for key, default in [("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", "0.35"),
+                         ("GO2_OFFICIAL_MAX_YAW_RATE_RPS", "0.8")]:
+        value = float(config.runtime_value(key, default))
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("Go2速度上限必须为有限正值")
+        values.append(str(value))
+    return tuple(values)
+
+
 def main() -> int:
     try:
-        if sys.argv[1:] == ["--max-linear-speed"]:
-            # 设备装配只提供已配置的命令上限，不伪造加速度或制动标定。
-            sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-            from core.config_values import runtime_value
-            if runtime_value("NUWAX_ACTIVE_ROBOT", "").strip().lower() == "go2":
-                value = float(runtime_value("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", "0.35"))
-                if not math.isfinite(value) or value <= 0:
-                    raise ValueError("Go2最大线速度必须为有限正值")
-                print(value)
-            else:
-                print("")
+        arguments = sys.argv[1:]
+        if arguments in (["--max-linear-speed"], ["--max-yaw-rate"]):
+            linear, angular = actuator_limits()
+            print(angular if arguments == ["--max-yaw-rate"] else linear)
             return 0
+        if arguments not in ([], ["--runtime-env"]):
+            raise ValueError("不支持的启动配置参数")
         profile = _PIPELINE.resolve_navigation_profile(
             os.environ.get("NUWAX_GEOMETRY_PIPELINE"), os.environ.get("NUWAX_NAV_PROFILE")
         )
+        if arguments == ["--runtime-env"]:
+            linear, angular = actuator_limits()
+            print("NUWAX_NAV_PROFILE=" + profile)
+            print("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS=" + linear)
+            print("_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS=" + angular)
+        else:
+            print(profile)
     except ValueError as error:
         print(f"导航执行链配置错误：{error}", file=sys.stderr)
         return 1
-    print(profile)
     return 0
 
 

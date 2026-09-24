@@ -6,10 +6,13 @@ source "${GEOMETRY_RUNTIME_REPO_ROOT}/scripts/lib/config_env.sh"
 
 load_platform_config || return 1
 
-# 导航由建图链唯一决定；显式旧覆盖错配时在创建任何算法资源前失败。
-NUWAX_NAV_PROFILE="$("${NUWAX_PYTHON_BIN:-python3}" "${GEOMETRY_RUNTIME_REPO_ROOT}/scripts/resolve_navigation_pipeline.py")" || return 1
-export NUWAX_NAV_PROFILE
-
-# 规划器与执行器使用同一设备速度上限；此值为启动装配结果，不是另一套标定。
-_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS="$("${NUWAX_PYTHON_BIN:-python3}" "${GEOMETRY_RUNTIME_REPO_ROOT}/scripts/resolve_navigation_pipeline.py" --max-linear-speed)" || return 1
-export _NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS
+# 导航链和两项设备速度上限一次解析；纯配置值按固定键导出，不执行输出文本。
+_NUWAX_NAV_STARTUP_VALUES="$("${NUWAX_PYTHON_BIN:-python3}" "${GEOMETRY_RUNTIME_REPO_ROOT}/scripts/resolve_navigation_pipeline.py" --runtime-env)" || return 1
+while IFS='=' read -r _nuwax_nav_key _nuwax_nav_value; do
+  case "${_nuwax_nav_key}" in
+    NUWAX_NAV_PROFILE|_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS|_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS)
+      export "${_nuwax_nav_key}=${_nuwax_nav_value}" ;;
+    *) return 1 ;;
+  esac
+done <<< "${_NUWAX_NAV_STARTUP_VALUES}"
+unset _NUWAX_NAV_STARTUP_VALUES _nuwax_nav_key _nuwax_nav_value

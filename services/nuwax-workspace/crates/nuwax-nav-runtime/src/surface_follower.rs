@@ -23,6 +23,8 @@ pub struct SurfaceFollowerConfig {
     pub max_observation_age_sec: Option<f64>,
     /// 已有速度、控制频率及位置/朝向容差。
     pub controller: LocalPlannerConfig,
+    /// 独立的角速度命令上限，不能拿米/秒的线速度代替弧度/秒。
+    pub max_angular_speed_rps: f64,
     /// 沿连续三维路线前进的前瞻距离，单位米。
     pub lookahead_m: f64,
     /// 机体允许偏离当前连续路径的最大距离，单位米。
@@ -38,6 +40,7 @@ impl SurfaceFollowerConfig {
             motion_limits: None,
             max_observation_age_sec: None,
             controller: LocalPlannerConfig::default_config(),
+            max_angular_speed_rps: 0.55,
             lookahead_m: 0.5,
             max_path_deviation_m: GlobalPlannerConfig::default().max_path_deviation,
         }
@@ -49,6 +52,7 @@ impl SurfaceFollowerConfig {
         for (field, value) in [
             ("body_to_support_z_m", self.body_to_support_z_m),
             ("surface.speed", self.controller.speed),
+            ("surface.max_angular_speed_rps", self.max_angular_speed_rps),
             (
                 "surface.control_frequency",
                 self.controller.control_frequency,
@@ -360,7 +364,7 @@ impl SurfaceFollower {
         }
         // 原控制器最小速度不能突破三维执行显式配置的低速上限。
         let speed = self.config.controller.speed * self.config.controller.nerf_speed.min(1.0);
-        let command = twist.clamp(speed, speed);
+        let command = twist.clamp(speed, self.config.max_angular_speed_rps);
         if self.motion_is_traversable(command) {
             return PlannerStep::Command(command);
         }
@@ -756,6 +760,31 @@ mod tests {
         assert!(view.validate_body_pose(first,q).is_err(),"旧足迹外障碍必须恢复");
         assert!(source.validate_body_pose(first,q).is_err(),"原始环境不能被改写");
         assert!(Arc::ptr_eq(follower.source_map.as_ref().unwrap(),&source));
+    }
+
+    #[test]
+    fn slow_translation_keeps_independent_in_place_turn_limit() {
+        use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
+        let map=Arc::new(test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope {
+            footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+            z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.3,max_step_up_m:0.0,
+            max_step_down_m:0.0,max_cross_slope_deg:10.0,support_uncertainty_m:0.0,
+        }).unwrap());
+        let mut config=SurfaceFollowerConfig::new(0.3);
+        config.controller.speed=0.05;config.max_angular_speed_rps=0.8;
+        let mut follower=SurfaceFollower::new(config).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+        let start=body_pose([1.55,0.55,0.4],Quaternion::IDENTITY,1);
+        let turn=body_pose([1.55,0.55,0.4],Quaternion::from_yaw(std::f64::consts::PI),2);
+        let goal=body_pose([0.55,0.55,0.4],turn.pose.orientation,3);
+        follower.update_odometry(start.clone());
+        follower.configure_goal(&goal,nuwax_nav_types_messages::GoalOptions::default()).unwrap();
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:vec![start,turn,goal.clone()]}),None,goal).unwrap();
+        assert!(matches!(follower.step(0.3),PlannerStep::Command(v)
+            if v.linear.x.abs()<1e-8 && v.angular_z.abs()>0.5 && v.angular_z.abs()<=0.8),
+            "低速前进设置不能把后方目标的原地转向压到0.05弧度/秒");
+        follower.config.max_angular_speed_rps=0.2;
+        assert!(matches!(follower.step(0.3),PlannerStep::Command(v) if v.angular_z.abs()<=0.2));
     }
 
     #[test]

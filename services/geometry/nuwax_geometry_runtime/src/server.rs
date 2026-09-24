@@ -6596,7 +6596,7 @@ impl GeometryRuntime for GeometryRuntimeService {
         )
         .map_err(Status::invalid_argument)?;
         let input = SetGoalInput {
-            options: nuwax_nav_types_messages::GoalOptions {allow_reverse:ng.allow_reverse,position_tolerance_m:ng.position_tolerance_m.unwrap_or(0.3),yaw_tolerance_rad:ng.yaw_tolerance_rad.unwrap_or(0.3)},
+            options: nuwax_nav_types_messages::GoalOptions {allow_reverse:ng.allow_reverse,position_tolerance_m:ng.position_tolerance_m.unwrap_or(0.35),yaw_tolerance_rad:ng.yaw_tolerance_rad.unwrap_or(0.3)},
             goal_id: goal_id.clone(),
             owner_kind,
             parent_request_id,
@@ -7022,23 +7022,25 @@ impl GeometryRuntime for GeometryRuntimeService {
         &self,
         req: Request<CancelNavigationRequest>,
     ) -> Result<Response<NavigationState>, Status> {
-        // Phase 4:接入 nav_runtime.cancel。流程:
-        // 1) publish /nav/cancel typed frame
-        // 2) best-effort publish zero cmd_vel
-        // 3) 返回 PENDING；只有观测到 stack /nav/state 才进入 terminal CANCELLED
         let request = req.get_ref();
+        let input = crate::nav_runtime::CancelGoalInput {
+            goal_id: request.goal_id.trim().to_string(), owner_kind: request.owner_kind,
+            parent_request_id: request.parent_request_id.trim().to_string(),
+            goal_generation: request.goal_generation,
+            producer_runtime_generation: request.producer_runtime_generation,
+        };
+        if let Some(update)=self.bridge.nav.terminal_receipt_for(&input).await {
+            return Ok(Response::new(nav_state_to_proto(update)));
+        }
         let CancelOutcome { state: nav, lease } = nav_cancel(
             &self.bridge,
             &self.bridge.nav,
-            crate::nav_runtime::CancelGoalInput {
-                goal_id: request.goal_id.trim().to_string(),
-                owner_kind: request.owner_kind,
-                parent_request_id: request.parent_request_id.trim().to_string(),
-                goal_generation: request.goal_generation,
-                producer_runtime_generation: request.producer_runtime_generation,
-            },
+            input.clone(),
         )
         .await;
+        if let Some(update)=self.bridge.nav.terminal_receipt_for(&input).await {
+            return Ok(Response::new(nav_state_to_proto(update)));
+        }
         {
             let mut s = self.bridge.state.write().await;
             s.nav_state = nav.clone();
@@ -7055,9 +7057,24 @@ impl GeometryRuntime for GeometryRuntimeService {
     ) -> Result<Response<Self::SubscribeNavigationStateStream>, Status> {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let mut broadcast_rx = self.bridge.nav_state_tx.subscribe();
+        let nav = self.bridge.nav.clone();
         let stream =
             spawn_subscription_stream(self.shutdown.as_ref(), tx.clone(), rx, async move {
-                while let Ok(update) = broadcast_rx.recv().await {
+                for update in nav.terminal_receipts().await {
+                    if tx.send(Ok(nav_state_to_proto(update))).await.is_err() {return;}
+                }
+                loop {
+                    let update = match broadcast_rx.recv().await {
+                        Ok(update)=>update,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>{
+                            // 展示消费者落后不能吞掉已归零的目标终态。
+                            for update in nav.terminal_receipts().await {
+                                if tx.send(Ok(nav_state_to_proto(update))).await.is_err() {return;}
+                            }
+                            continue;
+                        }
+                    };
                     let state = nav_state_to_proto(update);
                     if tx.send(Ok(state)).await.is_err() {
                         break;

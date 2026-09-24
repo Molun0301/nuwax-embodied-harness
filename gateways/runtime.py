@@ -8221,10 +8221,9 @@ class GatewayRuntime:
         request_context: Optional[MetadataDict] = None,
     ):
         person_follow = self._person_follow_readiness()
-        image_ready = self._has_provider(ImageProvider)
-        if not (person_follow.ready and image_ready):
+        if not person_follow.ready:
             raise GatewayError(
-                "Person-follow 可选服务或图像提供器未就绪。",
+                "Person-follow 可选服务未就绪。",
                 error_code="person_follow_unavailable",
                 http_status=503,
                 jsonrpc_code=-32010,
@@ -8233,7 +8232,6 @@ class GatewayRuntime:
                     "person_follow_ready": person_follow.ready,
                     "person_follow_reason": person_follow.reason,
                     "person_follow_ready_file": person_follow.ready_file,
-                    "image_provider_ready": image_ready,
                 },
             )
         motion_admission = self._require_motion_admission(
@@ -14723,32 +14721,35 @@ class GatewayRuntime:
                 "当前机器人入口未提供图像采集提供器。",
             ),
             "get_latest_observation": (
-                lambda: self._has_provider(ImageProvider),
-                "当前机器人入口未提供图像采集提供器。",
+                # 已有缓存独立于设备图像源当前是否在线。
+                lambda: True,
+                None,
             ),
             "perceive_current_scene": (
-                lambda: self._has_provider(ImageProvider),
-                "当前机器人入口未提供图像采集提供器。",
+                # 感知消费平台接收源，由服务报告真实帧的就绪情况。
+                lambda: True,
+                None,
             ),
             "describe_current_scene": (
-                lambda: self._has_provider(ImageProvider),
-                "当前机器人入口未提供图像采集提供器。",
+                lambda: True,
+                None,
             ),
             "get_latest_perception": (
-                lambda: self._has_provider(ImageProvider),
-                "当前机器人入口未提供图像采集提供器。",
+                lambda: True,
+                None,
             ),
             "get_perception_runtime_status": (
-                lambda: self._has_provider(ImageProvider),
-                "当前机器人入口未提供图像采集提供器。",
+                lambda: True,
+                None,
             ),
             "start_perception_runtime": (
-                lambda: self._has_provider(ImageProvider) and self.perception_video_runtime.is_enabled(),
-                "当前机器人入口未提供图像采集提供器，或持续感知功能未启用。",
+                lambda: self.perception_video_runtime.is_enabled(),
+                "持续感知功能未启用。",
             ),
             "stop_perception_runtime": (
-                lambda: self._has_provider(ImageProvider) and self.perception_video_runtime.is_enabled(),
-                "当前机器人入口未提供图像采集提供器，或持续感知功能未启用。",
+                # 输入失效或配置关闭时仍须允许清理正在运行的线程。
+                lambda: True,
+                None,
             ),
             "get_localization_snapshot": (
                 lambda: True,
@@ -14807,12 +14808,13 @@ class GatewayRuntime:
                 "平台几何运行时已禁用。",
             ),
             "stop_mapping": (
-                lambda: geometry_config_enabled,
-                "平台几何运行时已禁用。",
+                # 关闭启动配置后仍须允许原拥有方停止遗留会话。
+                lambda: True,
+                None,
             ),
             "stop_exploration": (
-                lambda: geometry_config_enabled,
-                "平台几何运行时已禁用。",
+                lambda: True,
+                None,
             ),
             "list_memory_libraries": (
                 lambda: True,
@@ -14835,8 +14837,9 @@ class GatewayRuntime:
                 None,
             ),
             "tag_location": (
-                lambda: self.localization_service.get_latest_snapshot() is not None,
-                "当前还没有可用定位快照，无法标记地点。",
+                # 记忆服务同时支持定位快照和真实实时位姿，并负责缺失检查。
+                lambda: True,
+                None,
             ),
             "query_location": (
                 lambda: True,
@@ -14863,8 +14866,9 @@ class GatewayRuntime:
                 None,
             ),
             "remember_current_scene": (
-                lambda: self._has_provider(ImageProvider),
-                "当前机器人入口未提供图像采集提供器。",
+                # 保存已有观察，由记忆服务核对上下文与库范围。
+                lambda: True,
+                None,
             ),
             "list_semantic_instances": (
                 lambda: True,
@@ -14884,8 +14888,8 @@ class GatewayRuntime:
                 "平台几何运行时已禁用，或没有可用地点记忆或语义地图。",
             ),
             "find_target": (
-                lambda: geometry_config_enabled and self._has_provider(ImageProvider),
-                "平台几何运行时已禁用，或当前机器人入口未提供图像采集提供器。",
+                lambda: geometry_config_enabled,
+                "平台几何运行时已禁用。",
             ),
             "explore_area": (
                 lambda: geometry_config_enabled,
@@ -14896,17 +14900,16 @@ class GatewayRuntime:
                 "平台几何运行时已禁用。",
             ),
             "explore_and_find_target": (
-                lambda: geometry_config_enabled and self._has_provider(ImageProvider),
-                "平台几何运行时已禁用，或当前机器人入口未提供图像采集提供器。",
+                lambda: geometry_config_enabled,
+                "平台几何运行时已禁用。",
             ),
             "inspect_target": (
-                lambda: self._has_provider(ImageProvider),
-                "当前机器人入口未提供图像采集提供器。",
+                lambda: True,
+                None,
             ),
             "follow_target": (
-                lambda: self._has_provider(ImageProvider)
-                and self._person_follow_readiness().enabled,
-                "当前机器人入口未提供图像采集，或 person-follow 已禁用。",
+                lambda: self._person_follow_readiness().enabled,
+                "Person-follow 已禁用。",
             ),
             "relative_move": (
                 lambda: True,

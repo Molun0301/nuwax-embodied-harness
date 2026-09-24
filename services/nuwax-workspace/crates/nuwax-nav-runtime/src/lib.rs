@@ -487,6 +487,8 @@ pub struct FenceProof {
 /// Mutable motion boundary owned by exactly one scheduler task.
 #[async_trait]
 pub trait NavMotionPort: Send + 'static {
+    /// 服务端截止推导出的提前续租时刻；模拟或外部实现可使用配置周期。
+    fn renewal_due_at(&self) -> Option<Instant> { None }
     /// Acquire the NAV lease directly from the request's admission proof.
     async fn acquire(
         &mut self,
@@ -514,6 +516,7 @@ pub trait NavMotionPort: Send + 'static {
 
 #[async_trait]
 impl NavMotionPort for MotionGuardClient {
+    fn renewal_due_at(&self) -> Option<Instant> { self.renewal_due_at() }
     async fn acquire(
         &mut self,
         operation_id: &str,
@@ -639,6 +642,9 @@ impl ProductionNavMotionPort {
 
 #[async_trait]
 impl NavMotionPort for ProductionNavMotionPort {
+    fn renewal_due_at(&self) -> Option<Instant> {
+        self.normal.as_ref().and_then(MotionGuardClient::renewal_due_at)
+    }
     async fn acquire(
         &mut self,
         operation_id: &str,
@@ -994,11 +1000,7 @@ where
             self.config.tick_interval,
         );
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut renew = interval_at(
-            Instant::now() + self.config.renew_interval,
-            self.config.renew_interval,
-        );
-        renew.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut fallback_renewal = Instant::now() + self.config.renew_interval;
         let mut input_open = true;
         let mut urgent_open = true;
 
@@ -1009,6 +1011,7 @@ where
                     .await;
             }
 
+            let renewal_due = self.motion.renewal_due_at().map_or(fallback_renewal, |due| due.min(fallback_renewal));
             let controlling=matches!(self.status.phase,SchedulerPhase::AwaitingPath|SchedulerPhase::Controlling);
             tokio::select! {
                 biased;
@@ -1024,9 +1027,11 @@ where
                     }
                 }
 
-                _ = renew.tick(), if self.should_renew() => {
+                _ = tokio::time::sleep_until(renewal_due), if self.should_renew() => {
                     match await_interruptible(urgent_open, &mut urgent_rx, self.renew()).await {
-                        Interruptible::Completed(Ok(())) => {}
+                        Interruptible::Completed(Ok(())) => {
+                            fallback_renewal = Instant::now() + self.config.renew_interval;
+                        }
                         Interruptible::Completed(Err(error)) => {
                             let error = self.fail_closed(&status_tx, error).await;
                             // 单个目标被外部停车撤租后，精确围栏已确认便退休目标。
@@ -1565,6 +1570,12 @@ where
     ) -> Result<(), RuntimeError> {
         if let Err(error) = validate_twist(twist) {
             return Err(self.fail_closed(status_tx, error).await);
+        }
+        // 控制步骤可能跨过续租时刻；在进入下一次有界通信前再核对一次。
+        if self.motion.renewal_due_at().is_some_and(|due| Instant::now() >= due) {
+            if let Err(error) = self.renew().await {
+                return Err(self.fail_closed(status_tx, error).await);
+            }
         }
         let operation_id = self.next_operation_id("twist")?;
         let proof = match self.motion.submit_twist(&operation_id, twist).await {
@@ -2950,6 +2961,81 @@ mod tests {
         })
         .await
         .expect("terminal status timeout")
+    }
+
+    #[tokio::test]
+    async fn server_deadline_renewal_keeps_legal_slow_commands_alive() {
+        let socket = socket_path("renew-slow-commands");
+        let listener = UnixListener::bind(&socket).expect("测试守卫套接字");
+        let planner = FakePlanner::commanding();
+        let planner_state = planner.state.clone();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("接入客户端");
+            let mut operations = Vec::new();
+            let mut fence_at = Instant::now() + Duration::from_secs(1);
+            let mut applied = 0;
+            loop {
+                let request = tokio::time::timeout_at(fence_at, read_guard_request(&mut stream))
+                    .await.expect("必须在325毫秒看门狗前续租");
+                let (operation, mut response) = scripted_guard_response(&request);
+                operations.push(operation);
+                let now = Instant::now();
+                match response.outcome.as_mut().expect("响应") {
+                    motion_guard_response::Outcome::AcquireLease(body) => {
+                        let Some(motion_guard_request::Operation::AcquireLease(request)) = request.operation.as_ref() else { unreachable!() };
+                        let issued = request.envelope.as_ref().expect("信封").issued_monotonic_ns;
+                        body.owner_deadline_monotonic_ns = issued + 750_000_000;
+                        fence_at = now + Duration::from_millis(325);
+                        // 响应传输耗时必须扣入余量，不得重新从接收时刻计算许可。
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                    }
+                    motion_guard_response::Outcome::RenewLease(body) => {
+                        let Some(motion_guard_request::Operation::RenewLease(request)) = request.operation.as_ref() else { unreachable!() };
+                        let issued = request.envelope.as_ref().expect("信封").issued_monotonic_ns;
+                        body.owner_deadline_monotonic_ns = issued + 750_000_000;
+                        fence_at = now + Duration::from_millis(325);
+                    }
+                    motion_guard_response::Outcome::SubmitMotionCommand(_) => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        assert!(Instant::now() < fence_at, "合法慢SDK不能触发失联停车");
+                        applied += 1;
+                        if applied == 3 {
+                            planner_state.lock().expect("规划器").step = PlannerStep::Succeeded;
+                        }
+                    }
+                    _ => {}
+                }
+                write_guard_response(&mut stream, response).await;
+                if operation == "fence" { break; }
+            }
+            operations
+        });
+        let fixture = GuardFixture { path: socket.clone(), task: Some(task) };
+        let client = MotionGuardClient::connect_with_config(production_client_config(socket)).await.expect("客户端");
+        let scheduler = NavScheduler::new(client, planner, SchedulerConfig {
+            tick_interval: Duration::from_millis(150), ..SchedulerConfig::default()
+        }).expect("调度器");
+        let (handle, task) = spawn_scheduler(scheduler);
+        handle.start_session(session()).await.expect("会话");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(handle.status().phase, SchedulerPhase::AwaitingPath);
+        handle.update_costmap(CostmapObservation {
+            costmap: ExecutionMap::Planar(CostMap2D::new_all_free("map", 4, 4, 0.1)),
+            source_timestamp_ns: 1_000_000_000,
+        }).await.expect("地图");
+        handle.update_odometry(map_pose()).await.expect("位姿");
+        handle.submit_path(path()).await.expect("路径");
+        let mut status = handle.subscribe_status();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while status.borrow().last_terminal != Some(TerminalOutcome::Succeeded) {
+                status.changed().await.expect("状态流");
+            }
+        }).await.expect("三次慢动作完成后真实停车");
+        handle.shutdown().await.expect("关闭");
+        task.await.expect("调度拥有方").expect("调度结果");
+        let operations = fixture.finish().await;
+        assert_eq!(operations.iter().filter(|operation| **operation == "applied").count(), 3);
+        assert!(operations.iter().filter(|operation| **operation == "renew").count() >= 4);
     }
 
     #[tokio::test]

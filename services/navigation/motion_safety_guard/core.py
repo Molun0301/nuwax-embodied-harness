@@ -14,7 +14,7 @@ from services.navigation.proto_gen import motion_guard_pb2 as pb
 from .constants import (
     API_VERSION,
     DEDUP_CAPACITY_DEFAULT,
-    LEASE_ABSOLUTE_NS,
+    LEASE_RENEWAL_WINDOW_NS,
     MAX_COMMAND_DEADLINE_NS,
     OWNER_TIMEOUT_NS,
     WATCHDOG_FENCE_LEAD_NS,
@@ -487,7 +487,7 @@ class MotionGuardCore:
             self._active_lease_id = lease_id
             self._active_source = source
             self._last_sequence = 0
-            self._lease_deadline_ns = now + LEASE_ABSOLUTE_NS
+            self._lease_deadline_ns = now + LEASE_RENEWAL_WINDOW_NS
             self._owner_deadline_ns = min(now + OWNER_TIMEOUT_NS, self._lease_deadline_ns)
             self._watchdog_deadline_ns = max(
                 now,
@@ -532,6 +532,9 @@ class MotionGuardCore:
                     self._zero()
                     self._commit_epoch(startup_zero_confirmed=True)
                     raise GuardFailure(exc.code, exc.message) from exc
+            # 持续任务按有效续租接续，不能在首次取得租约十分钟后强制结束。
+            # 身份、序列、存活和执行模式已核对；命令和重复操作不会延长此窗口。
+            self._lease_deadline_ns = now + LEASE_RENEWAL_WINDOW_NS
             self._owner_deadline_ns = min(now + OWNER_TIMEOUT_NS, self._lease_deadline_ns)
             self._watchdog_deadline_ns = max(
                 now,

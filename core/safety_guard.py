@@ -206,7 +206,9 @@ class SafetyGuard:
             cached = self._successful_stop_results.get(correlated_operation_id)
             if cached is not None:
                 self._successful_stop_results.move_to_end(correlated_operation_id)
-                return deepcopy(cached)
+                result = deepcopy(cached)
+                result["pending_reconciliation_count"] = len(self._pending_stop_reconciliations)
+                return result
 
             try:
                 pending = self._pending_stop_reconciliations.get(
@@ -214,7 +216,6 @@ class SafetyGuard:
                 )
                 replay_pending_handlers = pending is not None
                 if pending is None:
-                    self._ensure_pending_stop_capacity()
                     with self._lock:
                         handlers = tuple(self._stop_handlers.items())
                         self._motion_stop_generation += 1
@@ -278,6 +279,10 @@ class SafetyGuard:
             raise stop_error.with_traceback(stop_traceback)
 
         assert result is not None
+        # 未确认票据属于尚未结束的责任，不能挤占新停车的执行资格。
+        # 数量按当前事实报告；仅成功回执使用有界缓存。
+        with self._stop_execution_lock:
+            result["pending_reconciliation_count"] = len(self._pending_stop_reconciliations)
 
         if self._event_bus is not None and result.get("completed") is True:
             self._event_bus.publish(
@@ -302,24 +307,6 @@ class SafetyGuard:
                 )
             )
         return deepcopy(result)
-
-    def _ensure_pending_stop_capacity(self) -> None:
-        if len(self._pending_stop_reconciliations) < _STOP_RESULT_CACHE_LIMIT:
-            return
-        for operation_id, pending in tuple(
-            self._pending_stop_reconciliations.items()
-        ):
-            if pending.pending_handlers:
-                continue
-            self._reconcile_pending_stop(
-                operation_id,
-                replay_pending_handlers=False,
-            )
-            if len(self._pending_stop_reconciliations) < _STOP_RESULT_CACHE_LIMIT:
-                return
-        raise RuntimeError(
-            "pending motion stop reconciliation capacity exhausted"
-        )
 
     def _reconcile_pending_stop(
         self,

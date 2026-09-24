@@ -1,14 +1,11 @@
 //! nuwax-motion-safety-guard 时序常量 + UDS 路径常量(§P0B #10/#14/#23)
 //!
-//! 对齐 W32 Python 端 `tools/motion_safety_guard/w29_uds_constants.py` +
-//! `tools/motion_safety_guard/w6_skeleton.MotionGuard.*`。
-//!
-//! FROZEN — 任何字段变更都会破坏上下游一致性,需要走 breaking-change CI。
+//! 与 `services/navigation/motion_safety_guard/constants.py` 保持一致。
 
-/// §P0B #23 lease 绝对时长:600 秒。
+/// 有效续租后滚动延长的租约窗口；短周期拥有方失联期限独立生效。
 ///
-/// 对齐 Python `LEASE_ABSOLUTE_MS = 600_000`。
-pub const LEASE_ABSOLUTE_MS: u64 = 600_000;
+/// 对齐 Python `LEASE_RENEWAL_WINDOW_NS`。
+pub const LEASE_RENEWAL_WINDOW_MS: u64 = 600_000;
 
 /// §P0B #23 NAV owner 每 250ms Renew 一次。
 ///
@@ -56,7 +53,7 @@ mod tests {
     /// §P0B #23 时序常量 FROZEN 锁定。
     #[test]
     fn timing_constants_frozen() {
-        assert_eq!(LEASE_ABSOLUTE_MS, 600_000);
+        assert_eq!(LEASE_RENEWAL_WINDOW_MS, 600_000);
         assert_eq!(RENEW_INTERVAL_MS, 250);
         assert_eq!(OWNER_TIMEOUT_MS, 750);
         assert_eq!(COMMAND_DEADLINE_MS, 300);

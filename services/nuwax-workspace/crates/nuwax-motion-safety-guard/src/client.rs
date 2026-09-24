@@ -104,7 +104,7 @@ pub struct LeaseMetadata {
 /// Metadata returned after one correlated lease renewal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenewalMetadata {
-    /// Absolute lease deadline, which renew does not extend.
+    /// 服务端本次续租确认的租约窗口截止。
     pub lease_deadline_monotonic_ns: u64,
     /// Updated owner watchdog deadline.
     pub owner_deadline_monotonic_ns: u64,
@@ -237,6 +237,7 @@ pub struct MotionGuardClient {
     sequence: u64,
     poison_reason: Option<String>,
     require_stationary: bool,
+    renewal_due_at: Option<tokio::time::Instant>,
 }
 
 impl MotionGuardClient {
@@ -264,6 +265,7 @@ impl MotionGuardClient {
             config,
             lease_tuple: None,
             sequence: 0,
+            renewal_due_at: None,
             poison_reason: None,
             require_stationary: std::env::var("NUWAX_NAV_CAPABILITIES_JSON").ok().is_some_and(|v| !v.trim().is_empty()),
         })
@@ -400,6 +402,24 @@ impl MotionGuardClient {
     #[must_use]
     pub const fn renew_interval(&self) -> Duration {
         Duration::from_millis(RENEW_INTERVAL_MS)
+    }
+
+    /// 已验证服务端截止对应的续租时刻；普通动作不会顺延该时刻。
+    #[must_use]
+    pub fn renewal_due_at(&self) -> Option<tokio::time::Instant> {
+        self.lease_tuple.as_ref().and(self.renewal_due_at)
+    }
+
+    fn schedule_renewal(&mut self, issued_ns: u64, owner_deadline_ns: u64) -> Result<(), MotionGuardClientError> {
+        // 预留完整通信上限和守卫调度片，命令执行期间仍由同一拥有方串行续租。
+        let reserve = 425_000_000 + 25_000_000
+            + self.config.request_timeout.min(Duration::from_millis(COMMAND_DEADLINE_MS as u64)).as_nanos() as u64;
+        let due_ns = issued_ns.saturating_add(RENEW_INTERVAL_MS * NANOS_PER_MILLISECOND)
+            .min(owner_deadline_ns.saturating_sub(reserve));
+        let sampled_at = tokio::time::Instant::now();
+        let remaining = due_ns.saturating_sub(monotonic_ns()?);
+        self.renewal_due_at = Some(sampled_at + Duration::from_nanos(remaining));
+        Ok(())
     }
 
     /// Returns whether this connection was permanently poisoned.
@@ -589,6 +609,7 @@ impl MotionGuardClient {
         let mut envelope =
             self.new_envelope(epoch_tuple, GuardAction::Unspecified, &operation_id, 0)?;
         envelope.motion_stop_generation = proof.motion_stop_generation;
+        let issued_ns = envelope.issued_monotonic_ns;
         let mut request = MotionGuardRequest {
             api_version: API_VERSION,
             request_id: new_request_id(),
@@ -608,6 +629,7 @@ impl MotionGuardClient {
         let metadata = self.validate_acquire(response, proof)?;
         self.sequence = 0;
         self.lease_tuple = Some(metadata.lease_tuple.clone());
+        self.schedule_renewal(issued_ns, metadata.owner_deadline_monotonic_ns)?;
         Ok(metadata)
     }
 
@@ -618,6 +640,7 @@ impl MotionGuardClient {
     ) -> Result<RenewalMetadata, MotionGuardClientError> {
         let operation_id = validate_operation_id(operation_id)?;
         let envelope = self.next_envelope(GuardAction::Unspecified, &operation_id)?;
+        let issued_ns = envelope.issued_monotonic_ns;
         let mut request = MotionGuardRequest {
             api_version: API_VERSION,
             request_id: new_request_id(),
@@ -634,7 +657,9 @@ impl MotionGuardClient {
         let motion_guard_response::Outcome::RenewLease(response) = outcome else {
             unreachable!("exchange already correlated the outcome")
         };
-        self.validate_renewal(response)
+        let metadata = self.validate_renewal(response)?;
+        self.schedule_renewal(issued_ns, metadata.owner_deadline_monotonic_ns)?;
+        Ok(metadata)
     }
 
     /// Submits a typed twist and waits for a correlated `APPLIED` acknowledgement.

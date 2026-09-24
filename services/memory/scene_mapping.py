@@ -364,10 +364,7 @@ class SceneMappingService:
     def run_once(self, *, apply_labels: Optional[bool] = None, cancel_check=None, background=False, expected_capture=None) -> Dict[str, Any]:
         if not self.config.enabled:
             raise GatewayError("语义建图未启用。", error_code="scene_mapping_disabled", http_status=409)
-        if not self._run_lock.acquire(blocking=False):
-            raise GatewayError("已有语义处理在执行。", error_code="scene_mapping_busy", http_status=409)
         with self._lock:
-            self._active_jobs += 1
             cancellation_generation = self._cancel_generation
 
         def ensure():
@@ -375,6 +372,17 @@ class SceneMappingService:
             if cancellation_generation != self._cancel_generation:
                 raise GatewayError("语义处理已被停止，拒绝迟到结果。", error_code="scene_mapping_stopped", http_status=409)
 
+        # 已受理的显式任务沿原取消/期限等待；周期轮询和同步调用仍忙时返回。
+        # 停止代次在等待之前捕获，停止后不能把排队请求当作新一轮执行。
+        if cancel_check is not None and not background:
+            while True:
+                ensure()
+                if self._run_lock.acquire(timeout=0.05):
+                    break
+        elif not self._run_lock.acquire(blocking=False):
+            raise GatewayError("已有语义处理在执行。", error_code="scene_mapping_busy", http_status=409)
+        with self._lock:
+            self._active_jobs += 1
         try:
             ensure()
             capture, spaces = self._refresh_regions(ensure, expected_capture=expected_capture)

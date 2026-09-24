@@ -15,7 +15,7 @@
 //! - operation namespace(4 类:`operation_namespace.OperationNamespace`)
 //! - epoch.json schema(`w6_skeleton.GuardEpochRecord`)
 //! - 3 UID + 1 group(`uids_provisioning.EXPECTED_USERS` / `EXPECTED_GROUPS`)
-//! - 时序常量:`LEASE_ABSOLUTE_MS=600_000` / `RENEW_INTERVAL_MS=250` /
+//! - 时序常量:`LEASE_RENEWAL_WINDOW_MS=600_000` / `RENEW_INTERVAL_MS=250` /
 //!   `OWNER_TIMEOUT_MS=750` / `COMMAND_DEADLINE_MS=300`
 //!
 //! **模块布局**：
@@ -62,7 +62,7 @@ pub use client::{
 };
 pub use constants::{
     COMMAND_DEADLINE_MS, DEFAULT_EPOCH_PATH, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_UDS_PATH,
-    LEASE_ABSOLUTE_MS, MAX_FRAME_BYTES, OWNER_TIMEOUT_MS, RENEW_INTERVAL_MS,
+    LEASE_RENEWAL_WINDOW_MS, MAX_FRAME_BYTES, OWNER_TIMEOUT_MS, RENEW_INTERVAL_MS,
     RENEW_TO_OWNER_TIMEOUT_RATIO,
 };
 pub use epoch::{

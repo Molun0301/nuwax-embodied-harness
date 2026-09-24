@@ -8,7 +8,8 @@ DEFAULT_PROVISION_PATH = "/var/lib/nuwax/motion-guard/provisioned.json"
 DEFAULT_EPOCH_PATH = "/var/lib/nuwax/motion-guard/epoch.json"
 
 MAX_FRAME_BYTES = 16 * 1024 * 1024
-LEASE_ABSOLUTE_NS = 600 * 1_000_000_000
+# 显式续租可滚动延长窗口，拥有方失联仍由短周期看门狗处理。
+LEASE_RENEWAL_WINDOW_NS = 600 * 1_000_000_000
 RENEW_INTERVAL_NS = 250 * 1_000_000
 OWNER_TIMEOUT_NS = 750 * 1_000_000
 MAX_COMMAND_DEADLINE_NS = 300 * 1_000_000

@@ -192,7 +192,9 @@ fn position_distance(a:BodyPose,b:BodyPose)->f64 {
 /// 有界采样容差区域中的真实落点；不为缺测格补造地面。
 fn goal_region_samples(map:&SurfaceSnapshot,start:BodyPose,goal:BodyPose,tolerance:f64)->Vec<BodyPose> {
     if tolerance<=0.0 {return vec![];}
-    let step=f64::from(map.config().voxel_size).max(tolerance/8.0);
+    // 容差比规划格小时也要检查格内落点；机体边缘净空随实际坐标变化。
+    // 大容差仍限制每轴最多八步，避免把精细采样扩展到整个地图。
+    let step=f64::from(map.config().voxel_size).min(tolerance/2.0).max(tolerance/8.0);
     let radius=(tolerance/step).ceil().min(8.0) as i32;
     let mut candidates=Vec::new();
     for x in -radius..=radius {for y in -radius..=radius {for z in -radius..=radius {
@@ -223,7 +225,7 @@ pub(crate) fn plan_cancellable(
     map: &SurfaceSnapshot,
     start: BodyPose,
     mut goal: BodyPose,
-    mut options: GoalOptions,
+    options: GoalOptions,
     limits: Option<&MotionLimits>,
     boundary: &[[f64; 2]],
     budget: usize,
@@ -249,13 +251,12 @@ pub(crate) fn plan_cancellable(
     let requested=goal;
     let original_tolerance=options.position_tolerance_m;
     let prepared=prepare_goal_pose(map,goal,options.requires_orientation());
-    let mut regional=false;
     let reference=prepared.as_ref().copied().unwrap_or(requested);
     if let Ok(centre)=prepared.as_ref() {
         goal=*centre;
         if let Some(path)=connect(map,start,goal,boundary,rotate,reverse,omni,options.requires_orientation()) {return Ok(path);}
     }
-    let mut first_feasible=None;
+    let mut regional_targets: Vec<_> = prepared.as_ref().copied().into_iter().collect();
     let mut region_seen=HashSet::new();
     for candidate in goal_region_samples(map,start,reference,original_tolerance) {
         if cancelled() {return Err("三维规划已取消".into());}
@@ -264,18 +265,35 @@ pub(crate) fn plan_cancellable(
         let key=[target.0[0].to_bits(),target.0[1].to_bits(),target.0[2].to_bits(),
             target.1[0].to_bits(),target.1[1].to_bits(),target.1[2].to_bits(),target.1[3].to_bits()];
         if !region_seen.insert(key) {continue;}
-        first_feasible.get_or_insert(target);
+        regional_targets.push(target);
         if let Some(path)=connect(map,start,target,boundary,rotate,reverse,omni,options.requires_orientation()) {
             if path.last().is_some_and(|end|position_distance(*end,reference)<=original_tolerance) {return Ok(path);}
         }
     }
-    if let Err(error)=prepared {
-        let Some(target)=first_feasible else {return Err(format!("{error}；目标容差区域没有已观测的可通行机体落点"));};
-        goal=target;regional=true;
-        // 搜索仍只能落在原目标区域，不能给偏移落点再叠加一次完整容差。
-        options.position_tolerance_m=(original_tolerance-position_distance(target,reference)).max(1e-6);
+    if regional_targets.is_empty() {
+        return Err(format!("{}；目标容差区域没有已观测的可通行机体落点",prepared.unwrap_err()));
     }
-    let endpoint_allowed=|pose:BodyPose|!regional||position_distance(pose,reference)<=original_tolerance;
+    if cancelled() {return Err("三维规划已取消".into());}
+    // 直连失败后，以原目标区域内真实连通的落点引导绕行，不能只追踪孤立的中心或首样本。
+    // 一次有向支撑图查询覆盖全部落点；点可达仍须通过后续完整机体扫掠。
+    let start_support=map.locate_support_from_body(start.0,start.1,model.body_to_support_z_m)
+        .map_err(|error|format!("起点支撑层: {error}"))?;
+    let targets:Vec<_>=regional_targets.iter().map(|target| {
+        map.locate_goal_support_from_body(target.0,target.1,model.body_to_support_z_m)
+            .map(|location|location.support_xyz)
+    }).collect::<Result<_,_>>().map_err(|error|format!("目标支撑层: {error}"))?;
+    let costs=map.frontier_travel_costs(start_support.support_xyz,&targets,boundary)
+        .map_err(|error|format!("目标区域支撑连通查询: {error}"))?;
+    if cancelled() {return Err("三维规划已取消".into());}
+    // 原首选落点（有效中心或首个替代点）已连通时继续复用，只有孤立才换引导点。
+    // 支撑图只排序引导点；未找到连通样本仍交给完整机体搜索，不能新增点图硬准入。
+    let reachable=if costs[0].is_finite() {0} else {
+        costs.iter().enumerate().filter(|(_,cost)|cost.is_finite())
+            .min_by(|(_,a),(_,b)|a.total_cmp(b)).map_or(0,|(index,_)|index)
+    };
+    goal=regional_targets[reachable];
+    // 引导点可以偏移，终点验收始终使用原容差球，不叠加也不缩小位置容差。
+    let endpoint_allowed=|pose:BodyPose|position_distance(pose,reference)<=original_tolerance;
     // 起步盲区/近墙常使原地转向不可行。先尝试沿当前可执行方向
     // 连续驶出一个机身长度，再连接目标，避免细角度搜索反复试同一转弯。
     let probe_step = (model.radius()*0.5).max(f64::from(map.config().voxel_size)*2.0);
@@ -370,7 +388,7 @@ pub(crate) fn plan_cancellable(
         if expanded > budget || nodes.len() > budget * 4 {
             return Err("三维朝向搜索预算耗尽".into());
         }
-        let close = distance(here) <= options.position_tolerance_m.max(1e-6)
+        let close = endpoint_allowed(here)
             && (!options.requires_orientation() || angle(planar(here).yaw - planar(goal).yaw).abs()
                 <= options.yaw_tolerance_rad.min(yaw_step).max(1e-6));
         let tail = if close {
@@ -666,6 +684,92 @@ mod tests {
             }
         }
         assert!(reached && position_distance(current,goal)<0.35);
+    }
+
+    #[test]
+    fn reachable_centre_keeps_original_detour_endpoint() {
+        let base = scene(true);
+        let mut envelope = base.body_envelope().unwrap().clone();
+        envelope.footprint_xy_m = vec![[-0.06,-0.06],[0.06,-0.06],[0.06,0.06],[-0.06,0.06]];
+        let map = base.with_body_envelope(envelope).unwrap();
+        let start = pose(-1.55,0.05,0.0);
+        let target = pose(1.55,0.05,0.0);
+        let options = GoalOptions {position_tolerance_m:0.35,yaw_tolerance_rad:0.05,..Default::default()};
+        assert!(connect(&map,start,target,&[],true,false,false,true).is_none());
+        // 中心可达且可完整绕障，不应无理由改成较近的偏移落点。
+        let path = plan(&map,start,target,options,Some(&limits()),&[],300).unwrap();
+        assert!(position_distance(*path.last().unwrap(),target)<1e-6,
+            "保持正常中心绕行的终点，实际 {:?}",path.last().unwrap());
+        assert!(path.iter().any(|p|p.0[1].abs()>0.2));
+        for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+    }
+
+    #[test]
+    fn goal_region_detours_to_reachable_support_instead_of_isolated_first_sample() {
+        let base = scene(false);
+        let mut points: Vec<_> = (-35..35).flat_map(|x| (-20..20).filter_map(move |y| {
+            let moat = (3..21).contains(&x) && (-5..5).contains(&y);
+            let island = (5..19).contains(&x) && (-3..3).contains(&y);
+            (!moat || island).then_some(((x as f32 + 0.5)*0.1, (y as f32 + 0.5)*0.1, 0.025))
+        })).collect();
+        for x in -1..1 { for y in -10..10 {
+            points.push(((x as f32 + 0.5)*0.1, (y as f32 + 0.5)*0.1, 0.55));
+        }}
+        let mut envelope = base.body_envelope().unwrap().clone();
+        envelope.footprint_xy_m = vec![[-0.1,-0.08],[0.1,-0.08],[0.1,0.08],[-0.1,0.08]];
+        let map = SurfaceSnapshot::from_points(&points,base.config().clone(),0.1).unwrap()
+            .with_body_envelope(envelope).unwrap();
+        let start = pose(-1.55,0.05,0.0);
+        let target = pose(1.95,0.05,0.0);
+        let options = GoalOptions {position_tolerance_m:0.75,yaw_tolerance_rad:0.05,..Default::default()};
+        let mut motion = limits();
+        motion.model = MotionModel::Omnidirectional;
+        motion.max_lateral_mps = 0.5;
+        assert!(prepare_goal_pose(&map,target,true).is_err());
+        let samples: Vec<_> = goal_region_samples(&map,start,target,options.position_tolerance_m)
+            .into_iter().filter_map(|sample|prepare_goal_pose(&map,sample,true).ok())
+            .filter(|sample|position_distance(*sample,target)<options.position_tolerance_m).collect();
+        assert!(!samples.is_empty());
+        assert!(samples.iter().all(|sample|connect(&map,start,*sample,&[],true,false,true,true).is_none()));
+        let first = samples[0];
+        let first_support = map.locate_support_from_body(first.0,first.1,0.4).unwrap();
+        let start_support = map.locate_support_from_body(start.0,start.1,0.4).unwrap();
+        assert!(map.plan_in_boundary(start_support.support_xyz,first_support.support_xyz,&[]).is_err(),
+            "旧策略选中的首个可站立落点位于真实支撑孤岛");
+        // 独立指定的绕行路线逐段通过正式连接器，证明容差区域内确实可达。
+        let route = [start,pose(-1.55,1.35,0.0),pose(2.35,1.35,0.0),pose(2.35,0.05,0.0)];
+        for pair in route.windows(2) {
+            assert!(connect(&map,pair[0],pair[1],&[],true,false,true,true).is_some());
+        }
+        assert!(position_distance(*route.last().unwrap(),target)<options.position_tolerance_m);
+        let path = plan(&map,start,target,options,Some(&motion),&[],300).expect("应绕过墙体到达容差内连通落点");
+        assert!(position_distance(*path.last().unwrap(),target)<options.position_tolerance_m);
+        assert!(angle(planar(*path.last().unwrap()).yaw).abs()<options.yaw_tolerance_rad);
+        for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+        let boundary = [[-3.0,-0.8],[3.0,-0.8],[3.0,0.8],[-3.0,0.8]];
+        assert!(plan(&map,start,target,options,Some(&motion),&boundary,300).is_err(),
+            "边界截断完整机体绕行时不能把支撑点连通当作机体可达");
+    }
+
+    #[test]
+    fn sub_voxel_goal_tolerance_finds_collision_free_endpoint() {
+        let map = scene(true);
+        let start = pose(-1.05, 0.05, 0.0);
+        // 障碍左沿在 -0.2 米，机身半长 0.3 米；点击仅侵入 1 厘米。
+        let target = pose(-0.49, 0.05, 0.0);
+        let options = GoalOptions {
+            position_tolerance_m: 0.04,
+            yaw_tolerance_rad: 0.05,
+            ..Default::default()
+        };
+        assert!(map.validate_body_pose(target.0, target.1).is_err());
+        map.validate_body_pose(pose(-0.52, 0.05, 0.0).0, target.1).unwrap();
+        let path = plan(&map, start, target, options, Some(&limits()), &[], 2000)
+            .expect("小于规划格的容差内仍存在无碰撞落点");
+        assert!(position_distance(*path.last().unwrap(), target) < options.position_tolerance_m);
+        for pair in path.windows(2) {
+            map.validate_body_motion(pair[0], pair[1], &[]).unwrap();
+        }
     }
 
     #[test]

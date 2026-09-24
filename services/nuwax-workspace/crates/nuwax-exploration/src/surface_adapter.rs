@@ -407,15 +407,11 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
             }
             let base_yaw = (candidate.support_xyz[1] - robot.support_xyz[1])
                 .atan2(candidate.support_xyz[0] - robot.support_xyz[0]);
-            let turns = if self
-                .observation_model
-                .as_ref()
-                .is_some_and(|model| model.horizontal_fov_rad < std::f64::consts::TAU - 1e-6)
-            {
-                4
-            } else {
-                1
-            };
+            let directional_view = self.observation_model.as_ref().is_some_and(|model| {
+                model.horizontal_fov_rad < std::f64::consts::TAU - 1e-6
+            });
+            // 机体能否停留与传感器视场独立；直指前沿不适合时仍尝试沿边缘停留。
+            let turns = if snapshot.body_envelope().is_some() || directional_view { 4 } else { 1 };
             let mut best = None;
             for i in 0..turns {
                 let yaw = base_yaw + i as f64 * std::f64::consts::FRAC_PI_2;
@@ -470,6 +466,10 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                     )| count > *old,
                 ) {
                     best = Some((body, candidate_quaternion, view, count));
+                }
+                // 无方向性视场只需首个可行视点，避免普通候选多做三次几何与射线查询。
+                if !directional_view {
+                    break;
                 }
             }
             let Some((body, candidate_quaternion, view, _)) = best else {
@@ -789,6 +789,72 @@ mod tests {
         let q = selected.pose.pose.orientation;
         snapshot.validate_body_pose([p.x,p.y,p.z],[q.x,q.y,q.z,q.w]).unwrap();
         assert!(snapshot.validate_body_pose([1.05,1.05,0.4],[0.0,0.0,0.0,1.0]).is_err());
+    }
+
+    #[test]
+    fn long_body_uses_safe_frontier_heading_without_sensor_model() {
+        assert_long_body_frontier_heading(false);
+    }
+
+    #[test]
+    fn long_body_uses_safe_frontier_heading_with_omnidirectional_sensor() {
+        assert_long_body_frontier_heading(true);
+    }
+
+    fn assert_long_body_frontier_heading(calibrated: bool) {
+        let snapshot = Arc::new(map().as_ref().clone().with_body_envelope(
+            nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+                footprint_xy_m: vec![[-0.8, -0.12], [0.8, -0.12], [0.8, 0.12], [-0.8, 0.12]],
+                z_bounds_m: [-0.05, 0.2],
+                body_to_support_z_m: 0.3,
+                max_step_up_m: 0.2,
+                max_step_down_m: 0.2,
+                max_cross_slope_deg: 15.0,
+                support_uncertainty_m: 0.0,
+            },
+        ).unwrap());
+        let current = state(0.4, 1);
+        snapshot.validate_body_pose([1.05, 1.05, 0.4], [0.0, 0.0, 0.0, 1.0]).unwrap();
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(Arc::clone(&snapshot)).unwrap();
+        let mut adapter = source(receiver, 1);
+        adapter.configure_constraints(None, 1, 0.01).unwrap();
+        // 中部可直指到达的视点已访问，剩余边缘视点需要沿边缘停留。
+        for frontier in snapshot.reachable_frontiers([1.05, 1.05, 0.1], &[]).unwrap() {
+            let p = frontier.support_xyz;
+            let yaw = (p[1] - 1.05).atan2(p[0] - 1.05);
+            let q = snapshot.body_orientation_at(p, yaw).unwrap();
+            let body = snapshot.body_position_from_support(p, q, 0.3).unwrap();
+            if snapshot.validate_body_pose(body, q).is_ok() {
+                adapter.history.push(GoalHistory {
+                    support_xyz: p, vertical_radius_m: 0.3, reached: true, failures: 0,
+                });
+            }
+        }
+        if calibrated {
+            adapter.set_observation_model(nuwax_nav_types_messages::ObservationModel {
+                kind: nuwax_nav_types_messages::ObservationKind::Volume,
+                min_range_m: 0.05,
+                max_range_m: 2.0,
+                horizontal_fov_rad: std::f64::consts::TAU,
+                vertical_min_rad: -std::f64::consts::FRAC_PI_2,
+                vertical_max_rad: 0.0,
+                sensor_translation_body_m: [0.0; 3],
+                sensor_rotation_body_xyzw: [0.0, 0.0, 0.0, 1.0],
+                max_rays: 128,
+            }).unwrap();
+        }
+        let selected = goal(adapter.poll_goal(&current).unwrap());
+        let p = selected.pose.pose.position;
+        let q = selected.pose.pose.orientation;
+        snapshot.validate_body_pose([p.x, p.y, p.z], [q.x, q.y, q.z, q.w]).unwrap();
+        let radial_yaw = (p.y - 1.05).atan2(p.x - 1.05);
+        let radial = snapshot.body_orientation_at([p.x, p.y, p.z - 0.3], radial_yaw).unwrap();
+        assert!(snapshot.validate_body_pose([p.x, p.y, p.z], radial).is_err(),
+            "前沿直指方向必须缺少支撑，才能覆盖原单朝向误拒绝");
+        if calibrated {
+            assert!(selected.information_gain.unwrap() > 0.0);
+        }
     }
 
     #[test]

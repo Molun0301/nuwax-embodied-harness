@@ -1696,7 +1696,7 @@ def _parse_relocalize_mode1_evidence_v1(
         or aggregate_input_f64_bytes != aggregate_input_points * 24
         or post_transform_points != aggregate_input_points
         or post_transform_f64_bytes != post_transform_points * 24
-        or not 50_000 <= emitted_points <= 100_000
+        or not {1: 50_000, 2: 3}.get(source_policy_version, 100_001) <= emitted_points <= 100_000
         or emitted_points > post_transform_points
         or committed_source_length != source_length
         or source_length != 8 + emitted_points * 24

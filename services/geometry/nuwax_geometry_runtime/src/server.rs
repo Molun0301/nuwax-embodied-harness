@@ -1923,7 +1923,7 @@ fn canonical_activation_identity_preimage(
     out.extend_from_slice(&asset_manifest_sha256);
     out.extend_from_slice(&asset_bundle_sha256);
     out.extend_from_slice(
-        &crate::correction_coordinator::RELOCALIZATION_SOURCE_POLICY_VERSION_V1.to_be_bytes(),
+        &crate::correction_coordinator::RELOCALIZATION_SOURCE_POLICY_VERSION.to_be_bytes(),
     );
     out.extend_from_slice(&if backend_kind=="slam_toolbox" {crate::correction_coordinator::planar_source_policy_sha256()}else{crate::correction_coordinator::relocalization_source_policy_sha256_v1()});
     out.extend_from_slice(

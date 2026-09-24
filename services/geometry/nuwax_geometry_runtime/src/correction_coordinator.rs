@@ -101,6 +101,8 @@ mod preflight_only_contract {
     const RELOCALIZATION_ACCUMULATION_TIMEOUT: Duration = Duration::from_secs(2);
     const RELOCALIZATION_MAX_FRAMES: usize = 8;
     const RELOCALIZATION_MIN_AGGREGATE_POINTS: usize = 50_000;
+    // 原匹配算法的数学输入下限；五万点只是收集目标，不代表几何质量。
+    const RELOCALIZATION_MIN_SOURCE_POINTS: usize = 3;
     const RELOCALIZATION_MAX_AGGREGATE_POINTS: usize = 250_000;
     const RELOCALIZATION_MAX_EMITTED_POINTS: usize = 100_000;
     const RELOCALIZATION_MAX_PER_FRAME_F64_BYTES: usize = 2_400_000;
@@ -143,7 +145,7 @@ mod preflight_only_contract {
         * RELOCALIZATION_MAX_COMMAND_RECORDS
         * RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_COMMAND_RECORD;
     pub(crate) const ACTIVATION_RECEIPT_SCHEMA_VERSION_V1: u32 = 1;
-    pub(crate) const RELOCALIZATION_SOURCE_POLICY_VERSION_V1: u32 = 1;
+    pub(crate) const RELOCALIZATION_SOURCE_POLICY_VERSION: u32 = 2;
     pub(crate) const RELOCALIZATION_DEADLINE_POLICY_VERSION_V1: u32 = 1;
     pub(crate) const RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1: u32 = 1;
 
@@ -3281,12 +3283,13 @@ mod preflight_only_contract {
 
     pub(crate) fn relocalization_source_policy_preimage_v1() -> Vec<u8> {
         let mut out = b"nuwax.geometry.relocalize.source-policy.v1\0".to_vec();
-        for value in [1_u32, 1, 1, 8] {
+        for value in [RELOCALIZATION_SOURCE_POLICY_VERSION, 1, 1, 8] {
             out.extend_from_slice(&value.to_be_bytes());
         }
         for value in [
             50_000_u64, 100_000, 2_400_000, 4_096, 25_600_000, 250_000, 6_000_000, 250_000,
-            6_000_000, 50_000, 100_000, 1_200_000, 2_400_000, 2_000,
+            6_000_000, RELOCALIZATION_MIN_SOURCE_POINTS as u64, 100_000,
+            (RELOCALIZATION_MIN_SOURCE_POINTS * 24) as u64, 2_400_000, 2_000,
         ] {
             out.extend_from_slice(&value.to_be_bytes());
         }
@@ -4226,7 +4229,7 @@ mod preflight_only_contract {
         fn apply_policy_identity(&self, state: &mut crate::proto::MappingSessionState) {
             state.activation_receipt_schema_version = ACTIVATION_RECEIPT_SCHEMA_VERSION_V1;
             state.runtime_generation = self.inner.runtime_generation;
-            state.source_policy_version = RELOCALIZATION_SOURCE_POLICY_VERSION_V1;
+            state.source_policy_version = RELOCALIZATION_SOURCE_POLICY_VERSION;
             state.source_policy_sha256 = relocalization_source_policy_sha256_v1().to_vec();
             state.deadline_policy_version = RELOCALIZATION_DEADLINE_POLICY_VERSION_V1;
             state.deadline_policy_sha256 = relocalization_deadline_policy_sha256_v1().to_vec();
@@ -5914,7 +5917,7 @@ mod preflight_only_contract {
             relocalization_digest(&request.deadline_policy_sha256, "deadline policy")?;
         let algorithm_options_sha256 =
             relocalization_digest(&request.algorithm_options_sha256, "algorithm options")?;
-        if request.source_policy_version != RELOCALIZATION_SOURCE_POLICY_VERSION_V1
+        if request.source_policy_version != RELOCALIZATION_SOURCE_POLICY_VERSION
             || source_policy_sha256 != if request.target_kind=="planar_graph" {planar_source_policy_sha256()}else{relocalization_source_policy_sha256_v1()}
             || request.deadline_policy_version != RELOCALIZATION_DEADLINE_POLICY_VERSION_V1
             || deadline_policy_sha256 != relocalization_deadline_policy_sha256_v1()
@@ -8088,9 +8091,16 @@ mod preflight_only_contract {
             }
             let cutoff_reason = if maximum_reached {
                 Some(RelocalizationCutoffReasonV1::MaximumAggregateReached)
+            } else if fresh_boundary && minimum_reached {
+                Some(RelocalizationCutoffReasonV1::MinimumAggregateReached)
+            } else if fresh_boundary
+                && accumulation.accepted.len() >= RELOCALIZATION_MAX_FRAMES
+                && aggregate_input_points >= RELOCALIZATION_MIN_SOURCE_POINTS
+            {
+                // 低密度雷达的完整窗口也交给原算法评估，不能为凑点拒绝真实扫描。
+                Some(RelocalizationCutoffReasonV1::MaximumFramesReached)
             } else {
-                (minimum_reached && fresh_boundary)
-                    .then_some(RelocalizationCutoffReasonV1::MinimumAggregateReached)
+                None
             };
             if cutoff_reason.is_none() && accumulation.accepted.len() >= RELOCALIZATION_MAX_FRAMES {
                 self.settle_active(
@@ -9990,7 +10000,7 @@ mod preflight_only_contract {
     fn stable_stratified_source(
         ordered: Vec<Point3<f64>>,
     ) -> Result<StableRelocalizationSource, String> {
-        if ordered.len() < RELOCALIZATION_MIN_AGGREGATE_POINTS
+        if ordered.len() < RELOCALIZATION_MIN_SOURCE_POINTS
             || ordered.len() > RELOCALIZATION_MAX_AGGREGATE_POINTS
         {
             return Err("RELOCALIZATION_SOURCE_POINT_COUNT_INVALID".to_owned());
@@ -10014,7 +10024,7 @@ mod preflight_only_contract {
             .len()
             .checked_mul(24)
             .ok_or_else(|| "RELOCALIZATION_SOURCE_BYTES_OVERFLOW".to_owned())?;
-        if !(1_200_000..=2_400_000).contains(&canonical_bytes_len) {
+        if !(RELOCALIZATION_MIN_SOURCE_POINTS * 24..=2_400_000).contains(&canonical_bytes_len) {
             return Err("RELOCALIZATION_EMITTED_SOURCE_BYTES_INVALID".to_owned());
         }
         let mut canonical = Vec::with_capacity(8 + canonical_bytes_len);
@@ -12554,11 +12564,11 @@ mod preflight_only_contract {
             assert_eq!(source.len(), 179);
             assert_eq!(
                 exact_hex(&source),
-                "6e757761782e67656f6d657472792e72656c6f63616c697a652e736f757263652d706f6c6963792e76310000000001000000010000000100000008000000000000c35000000000000186a00000000000249f000000000000001000000000000186a000000000000003d09000000000005b8d80000000000003d09000000000005b8d80000000000000c35000000000000186a00000000000124f800000000000249f0000000000000007d00000000100000001"
+                "6e757761782e67656f6d657472792e72656c6f63616c697a652e736f757263652d706f6c6963792e76310000000002000000010000000100000008000000000000c35000000000000186a00000000000249f000000000000001000000000000186a000000000000003d09000000000005b8d80000000000003d09000000000005b8d80000000000000000300000000000186a000000000000000480000000000249f0000000000000007d00000000100000001"
             );
             assert_eq!(
                 crate::map_checksum::sha256_hex(&source),
-                "b0e3c49266e73179cee77207a64680ee719e497886db18ea2267093c94a76aa8"
+                "b07edaaea099c363d43e3eb8cc0d0e62811ea01a76a97c8b6675788cc737b828"
             );
 
             let deadline = relocalization_deadline_policy_preimage_v1();
@@ -12605,7 +12615,7 @@ mod preflight_only_contract {
                 target_cloud_sha256: vec![8; 32],
                 asset_manifest_sha256: vec![9; 32],
                 asset_bundle_sha256: vec![10; 32],
-                source_policy_version: RELOCALIZATION_SOURCE_POLICY_VERSION_V1,
+                source_policy_version: RELOCALIZATION_SOURCE_POLICY_VERSION,
                 source_policy_sha256: relocalization_source_policy_sha256_v1().to_vec(),
                 deadline_policy_version: RELOCALIZATION_DEADLINE_POLICY_VERSION_V1,
                 deadline_policy_sha256: relocalization_deadline_policy_sha256_v1().to_vec(),
@@ -14148,7 +14158,8 @@ mod preflight_only_contract {
         }
 
         #[tokio::test]
-        async fn relocalization_runtime_eight_small_frames_are_insufficient_without_staging() {
+        async fn relocalization_sparse_window_matches_and_rejects_degenerate_geometry() {
+            for degenerate in [false, true] {
             let owner_identity = CorrectionOwnerRuntimeIdentity {
                 runtime_generation: 2,
                 backend_generation: 99,
@@ -14165,12 +14176,12 @@ mod preflight_only_contract {
                 },
                 owner_identity,
                 "",
-                Arc::new(FailingStageSink),
+                Arc::new(RelocalizationAppliedSink::default()),
             )
             .await
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
-            let mut request = relocalization_command_request("req-insufficient-frames", 7);
+            let mut request = relocalization_command_request(if degenerate {"req-sparse-degenerate"} else {"req-sparse-valid"}, 7);
             request.session_id = "mapping-session-owner".to_owned();
             request.session_generation = 23;
             request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
@@ -14183,26 +14194,35 @@ mod preflight_only_contract {
                 .expect("command accumulates");
             for sequence in 1..=RELOCALIZATION_MAX_FRAMES as u64 {
                 let guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+                let mut input = active_relocalization_frame(&owner, sequence, sequence * 10, 0.0);
+                input.body_points = asymmetric_cloud();
+                input.registered_cloud.point_count = input.body_points.len() as u64;
+                if degenerate {
+                    input.body_points.fill(Point3::origin());
+                }
+                input.registered_cloud.body_points_sha256 = body_points_sha256(&input.body_points).unwrap();
                 let disposition = owner
                     .ingress()
                     .submit_with_lifecycle_guard(
-                        active_relocalization_frame(&owner, sequence, sequence * 10, 0.0),
+                        input,
                         guard,
                     )
                     .await
                     .expect("small frame is acknowledged");
                 assert_eq!(disposition, CorrectionSubmitDisposition::NoCandidate);
             }
-            let terminal = tokio::time::timeout(Duration::from_secs(1), waiter.wait())
+            let terminal = tokio::time::timeout(Duration::from_secs(20), waiter.wait())
                 .await
-                .expect("max-frame cutoff is immediate")
-                .expect("insufficient terminal is delivered");
+                .expect("稀疏窗口进入实际算法并返回终态")
+                .expect("真实匹配终态已交付");
             assert_eq!(
                 terminal.disposition,
-                crate::proto::RelocalizeDisposition::InsufficientSource as i32
+                if degenerate { crate::proto::RelocalizeDisposition::AlgorithmRejected as i32 }
+                else { crate::proto::RelocalizeDisposition::Applied as i32 }
             );
-            assert_eq!(terminal.candidate_sequence, 0);
-            owner.shutdown().await.expect("insufficient owner joins");
+            assert_eq!(terminal.candidate_sequence, if degenerate { 0 } else { 1 });
+            owner.shutdown().await.expect("稀疏输入拥有方完成关闭");
+            }
         }
 
         #[tokio::test]
@@ -19850,7 +19870,7 @@ pub(crate) use preflight_only_contract::{
     PlanarCommandWork, PlanarCommandContext, PlanarCommandOutcome, planar_source_policy_sha256, planar_algorithm_policy_sha256,
     RelocalizationCommandIngress, RelocalizationCommandWaiter, RelocalizationModeFence,
     RelocalizationTerminalSnapshot, RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1,
-    RELOCALIZATION_DEADLINE_POLICY_VERSION_V1, RELOCALIZATION_SOURCE_POLICY_VERSION_V1,
+    RELOCALIZATION_DEADLINE_POLICY_VERSION_V1, RELOCALIZATION_SOURCE_POLICY_VERSION,
 };
 
 #[cfg(test)]

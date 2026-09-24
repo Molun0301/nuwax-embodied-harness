@@ -170,9 +170,8 @@ impl SurfaceFollower {
             };
             // 容差区域内的替代终点也是路径终点。不能先按路径点容差消费它，
             // 再发现机器人仍在用户目标区域之外，陷入原地重规划循环。
-            let goal_position = self.path_index+1==path.poses.len()
-                || (target.pose.position.x-goal.pose.position.x)
-                    .hypot(target.pose.position.y-goal.pose.position.y) < 1e-5;
+            let goal_position = (target.pose.position.x-goal.pose.position.x)
+                    .hypot(target.pose.position.y-goal.pose.position.y) < self.config.controller.goal_tolerance;
             let reached_position = !goal_position || final_distance < self.config.controller.goal_tolerance;
             let reached = reached_position && (distance < tolerance && (!rotation || error.abs() < 0.05) || passed);
             let mut safe_to_skip = true;

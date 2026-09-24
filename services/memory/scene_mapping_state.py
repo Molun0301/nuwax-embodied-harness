@@ -35,7 +35,7 @@ class SceneMappingMemoryMixin:
     """由MemoryService持有锁、仓储与索引，本类不创建第二份记忆状态。"""
 
     def capture_scene_mapping_state(self) -> Dict[str, Any]:
-        snapshot = self._mapping_service.get_latest_snapshot()
+        snapshot = getattr(self._mapping_service, "get_semantic_snapshot", self._mapping_service.get_latest_snapshot)()
         if snapshot is None or snapshot.occupancy_grid is None:
             raise GatewayError("当前没有可分割的规范占据地图。", error_code="scene_map_not_ready", http_status=409)
         with self._instances_lock:
@@ -105,7 +105,7 @@ class SceneMappingMemoryMixin:
         self._assert_observation_library(capture["library_name"])
         if getattr(self, "_scene_scope_generation", 0) != capture["generation"]:
             raise GatewayError("记忆库已重新激活，旧语义任务失效。", error_code="scene_scope_changed", http_status=409)
-        latest = self._mapping_service.get_latest_snapshot()
+        latest = getattr(self._mapping_service, "get_semantic_snapshot", self._mapping_service.get_latest_snapshot)()
         if latest is None or latest.occupancy_grid is None:
             raise GatewayError("语义任务期间地图已退出。", error_code="scene_map_changed", http_status=409)
         binding = snapshot_binding(latest)

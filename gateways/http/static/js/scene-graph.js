@@ -15,7 +15,8 @@
   const bindingKey = b => JSON.stringify([b?.map_name,b?.source_name,b?.source_epoch,b?.frame_id,b?.content_sha256]);
   const current = () => {
     const b=window.__nuwaxMapBinding?.(),g=state.graph?.map_binding;
-    return b?.available && g && !state.error && ['map_name','source_name','source_epoch','frame_id','content_sha256'].every(key=>b[key]===g[key]);
+    // 同一地图的连接缓存不因一次刷新超时而消失。
+    return b?.available && g && ['map_name','source_name','source_epoch','frame_id','content_sha256'].every(key=>b[key]===g[key]);
   };
   const message = (text,error=false) => {$('sceneGraphStatus').textContent=text;$('sceneGraphStatus').dataset.error=String(error);};
   async function invoke(name,args={}){

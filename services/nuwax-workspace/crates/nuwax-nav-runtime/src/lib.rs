@@ -2050,12 +2050,16 @@ pub async fn spawn_production_surface_scheduler(
     surface_config: SurfaceFollowerConfig,
 ) -> Result<(NavSchedulerHandle, JoinHandle<Result<(), RuntimeError>>), RuntimeError> {
     validate_config(config)?;
-    let reverse_supported=surface_config.motion_limits.as_ref().is_some_and(|limits|limits.max_reverse_mps>0.0);
-    let backend = planner_worker::PlannerWorker::new(SurfaceFollower::new(surface_config)?)?.with_reverse_support(reverse_supported);
+    let backend = production_surface_backend(surface_config)?;
     let motion = ProductionNavMotionPort::connect(production_client_config(socket_path))
         .await
         .map_err(|error| RuntimeError::Motion(error.message))?;
     Ok(spawn_scheduler(NavScheduler::new(motion, backend, config)?))
+}
+
+fn production_surface_backend(config: SurfaceFollowerConfig) -> Result<planner_worker::PlannerWorker, RuntimeError> {
+    let reverse_supported = config.kinematics().is_some_and(|limits| limits.max_reverse_mps > 0.0);
+    Ok(planner_worker::PlannerWorker::new(SurfaceFollower::new(config)?)?.with_reverse_support(reverse_supported))
 }
 
 enum SchedulerEvent { Input(Option<InputCommand>), Tick }
@@ -2352,6 +2356,20 @@ mod tests {
     use tokio::sync::mpsc as tokio_mpsc;
 
     use super::*;
+
+    #[test]
+    fn production_surface_worker_accepts_declared_basic_reverse_channel() {
+        let mut config = SurfaceFollowerConfig::new(0.4);
+        config.basic_kinematics = Some(nuwax_nav_types_messages::MotionKinematics {
+            model:nuwax_nav_types_messages::MotionModel::Omnidirectional,
+            max_forward_mps:0.35,max_reverse_mps:0.35,max_lateral_mps:0.35,
+            max_angular_rps:0.8,minimum_turning_radius_m:0.0,can_rotate_in_place:true,
+        });
+        assert!(config.motion_limits.is_none());
+        let mut backend = production_surface_backend(config).unwrap();
+        let goal = PoseStamped {frame_id:NavFrameId::Map,stamp:Timestamp::from_unix(1,0),pose:Pose3::default()};
+        backend.configure_goal(&goal,nuwax_nav_types_messages::GoalOptions {allow_reverse:true,..Default::default()}).unwrap();
+    }
 
     static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
 

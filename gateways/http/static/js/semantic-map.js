@@ -23,7 +23,8 @@
   const statusName = r => r.metadata?.label_locked ? '已命名' : labels[r.review_status] || '未知';
   function matchesCurrent() {
     const current = window.__nuwaxMapBinding?.();
-    if (!current?.available || !state.data?.map_binding || state.error) return false;
+    // 请求暂时失败时保留同一地图的已读标注，错误仍在面板显示。
+    if (!current?.available || !state.data?.map_binding) return false;
     const bound = state.data.map_binding;
     return ['map_name', 'frame_id', 'source_name', 'source_epoch', 'content_sha256'].every(k => current[k] == null || current[k] === bound[k]);
   }

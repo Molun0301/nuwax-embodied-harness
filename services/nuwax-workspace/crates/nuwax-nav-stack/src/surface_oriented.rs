@@ -428,6 +428,37 @@ fn omnidirectional_connection(
     None
 }
 
+/// 全局路线暂缺时，沿已观测且完整扫掠可行的短段接近目标。
+pub(crate) fn progress_path(
+    map: &SurfaceSnapshot, start: BodyPose, goal: BodyPose, options: GoalOptions,
+    limits: Option<&MotionKinematics>, boundary: &[[f64; 2]],
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<BodyPose>, String> {
+    options.validate()?;
+    if let Some(limits) = limits { limits.validate()?; }
+    let stopped = || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+    let rotate = limits.is_none_or(|m| m.can_rotate_in_place);
+    let reverse = options.allow_reverse && limits.is_some_and(|m| m.max_reverse_mps > 0.0);
+    let omni = limits.is_some_and(|m| m.model == MotionModel::Omnidirectional && m.max_lateral_mps > 0.0);
+    let distance = (goal.0[0]-start.0[0]).hypot(goal.0[1]-start.0[1]);
+    let heading = (goal.0[1]-start.0[1]).atan2(goal.0[0]-start.0[0]);
+    for length in [2.0_f64, 1.0, 0.5, 0.25] {
+        for offset in [0.0_f64, 0.5, -0.5, 1.0, -1.0] {
+            if stopped() {return Err("三维规划已取消".into());}
+            let step = length.min(distance);
+            let candidate = ([start.0[0]+step*(heading+offset).cos(),
+                start.0[1]+step*(heading+offset).sin(),start.0[2]],start.1);
+            let remaining = (goal.0[0]-candidate.0[0]).hypot(goal.0[1]-candidate.0[1]);
+            if distance-remaining < 0.15 {continue;}
+            let Ok(target) = prepare_goal_pose(map,candidate,false) else {continue;};
+            if let Some(path) = connect(map,start,target,boundary,rotate,reverse,omni,false) {
+                return Ok(path);
+            }
+        }
+    }
+    Err("当前观测中没有可向目标推进的近端路径".into())
+}
+
 /// 复用生产机体规划查询；返回真实三维机体路径，不包含运动副作用。
 pub fn plan(
     map: &SurfaceSnapshot,
@@ -1430,6 +1461,63 @@ mod tests {
         assert!(planar(path[1]).yaw>0.0,"必须使用未受阻的一侧");
         for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
         assert!(position_distance(*path.last().unwrap(),goal)<1e-6);
+    }
+
+    #[test]
+    fn sparse_remote_goal_advances_then_replans_and_finishes_after_new_observation() {
+        let base=scene(false);
+        let points:Vec<_>=(-35..0).flat_map(|x|(-20..20).map(move |y|
+            ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.025))).collect();
+        let mut map=Arc::new(SurfaceSnapshot::from_points(&points,base.config().clone(),0.1).unwrap()
+            .with_body_envelope(base.body_envelope().unwrap().clone()).unwrap());
+        let mut current=pose(-2.05,0.05,0.0);
+        let goal=pose(2.05,0.05,0.0);
+        let options=GoalOptions {position_tolerance_m:0.12,yaw_tolerance_rad:std::f64::consts::PI,..Default::default()};
+        let motion=limits().kinematics();
+        assert!(plan_with_motion_cancellable(&map,current,goal,options,Some(&motion),&[],0,None).is_err());
+        let prefix=progress_path(&map,current,goal,options,Some(&motion),&[],None).unwrap();
+        assert!(position_distance(*prefix.last().unwrap(),goal)>options.position_tolerance_m);
+        for pair in prefix.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+        let mut config=SurfaceFollowerConfig::new(0.4);
+        config.basic_kinematics=Some(motion);
+        config.controller.control_frequency=20.0;
+        let mut follower=SurfaceFollower::new(config).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+        follower.update_odometry(stamped(current,1_000_000_000));
+        follower.configure_goal(&stamped(goal,1_000_000_000),options).unwrap();
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+            poses:prefix.into_iter().map(|p|stamped(p,1_000_000_000)).collect()
+        }),None,stamped(goal,1_000_000_000)).unwrap();
+        let mut replanned=false;
+        let mut succeeded=false;
+        for tick in 1..=1200 {
+            let nanos=1_000_000_000+tick*50_000_000;
+            follower.update_odometry(stamped(current,nanos));
+            match follower.step(0.3) {
+                PlannerStep::ReplanRequired(_) if !replanned => {
+                    assert!(current.0[0]>-1.5,"必须先推进，不能原地重规划");
+                    map=Arc::new(scene(false));
+                    let route=plan_with_motion_cancellable(&map,current,goal,options,Some(&motion),&[],1000,None).unwrap();
+                    follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+                    follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+                        poses:route.into_iter().map(|p|stamped(p,nanos)).collect()
+                    }),None,stamped(goal,nanos)).unwrap();
+                    replanned=true;
+                },
+                PlannerStep::Command(command) => {
+                    follower.observe_applied_command(command);
+                    let next=integrate(planar(current),command,0.05);
+                    let next_pose=([next.x,next.y,current.0[2]],[0.0,0.0,(next.yaw*0.5).sin(),(next.yaw*0.5).cos()]);
+                    map.validate_body_motion(current,next_pose,&[]).unwrap();
+                    current=next_pose;
+                },
+                PlannerStep::Succeeded => {assert!(replanned,"分段末端不能报到达");succeeded=true;break;},
+                other=>panic!("分段接续失败: {other:?}"),
+            }
+        }
+        assert!(succeeded && position_distance(current,goal)<options.position_tolerance_m);
+        let cancelled=std::sync::atomic::AtomicBool::new(true);
+        assert!(progress_path(&map,current,goal,options,Some(&motion),&[],Some(&cancelled)).is_err());
     }
 
     #[test]

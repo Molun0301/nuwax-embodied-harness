@@ -321,6 +321,29 @@ fn body_path(
     config: &SurfaceNavigationConfig,
 ) -> NavStackResult<Path3D> {
     body_path_with_budget(surface, start, goal, config, 30_000)
+        .or_else(|_| body_progress_path(surface, start, goal, config))
+}
+
+fn body_progress_path(surface: &SurfaceSnapshot, start: &PoseStamped,
+    goal: &schema::GoalEnvelope, config: &SurfaceNavigationConfig) -> NavStackResult<Path3D> {
+    let p=start.pose.position;
+    let q=start.pose.orientation;
+    let orientation=[q.x,q.y,q.z,q.w];
+    let surface=surface.with_current_body_support([p.x,p.y,p.z],orientation)
+        .map_err(|e|module_error("surface current body",e.to_string()))?;
+    let boundary:Vec<_>=goal.boundary_points.iter().map(|p|[p[0],p[1]]).collect();
+    let route=crate::surface_oriented::progress_path(&surface,([p.x,p.y,p.z],orientation),
+        (goal.goal.pose.position,goal.goal.pose.orientation_xyzw),goal.options,
+        config.follower.kinematics().as_ref(),&boundary,config.planning_cancelled.as_deref())
+        .map_err(|e|module_error("surface progress planning",e))?;
+    Ok(Path3D {poses:route.into_iter().map(|(p,q)|PoseStamped {frame_id:start.frame_id.clone(),
+        stamp:start.stamp,pose:Pose3 {position:Point3::new(p[0],p[1],p[2]),
+        orientation:Quaternion {x:q[0],y:q[1],z:q[2],w:q[3]}}}).collect()})
+}
+
+fn path_reaches_goal(path: &Path3D, goal: &schema::GoalEnvelope) -> bool {
+    path.poses.last().is_some_and(|p| (p.pose.position.x-goal.goal.pose.position[0])
+        .hypot(p.pose.position.y-goal.goal.pose.position[1]) < goal.options.position_tolerance_m)
 }
 
 /// 快速检查共用相同几何核验，但不展开完整朝向搜索空间。
@@ -661,7 +684,8 @@ async fn run_surface_planner_with_computer(
                     }
                     Ok(None) => { path_surface = Some(Arc::downgrade(&surface)); }
                     Err(error) => {
-                        diagnostics.reject("surface planning", &error.to_string()); last_path = None;
+                        diagnostics.reject("surface planning", &error.to_string());
+                        // 全局搜索暂缺结果时继续执行已交付的近端路线。
                         hub.planning.send_replace(Some((planned_goal.session_id.clone(),planned_goal.payload_sha256,
                             format!("等待可通行路径：{error}"))));
                     }
@@ -679,7 +703,9 @@ async fn run_surface_planner_with_computer(
                 }
                 if let Ok(path)=result {
                     // 新地图的可执行路线已经就绪，旧地图上的慢搜索立即退休。
-                    if let Some((_,_,flag))=&path_cancellation {flag.store(true,std::sync::atomic::Ordering::Relaxed);}
+                    if path_reaches_goal(&path,&planned_goal) {
+                        if let Some((_,_,flag))=&path_cancellation {flag.store(true,std::sync::atomic::Ordering::Relaxed);}
+                    }
                     path_revision=path_revision.checked_add(1).ok_or_else(||module_error("surface revision","overflow"))?;
                     publish_surface_path(&transport,&node.outputs[0],&planned_goal,generation,path_revision,&path).await?;
                     last_path=Some(path);path_surface=Some(Arc::downgrade(&surface));needs_plan=false;
@@ -761,7 +787,8 @@ async fn run_surface_planner_with_computer(
                     quick_cancellation=Some((epoch,planned_goal.payload_sha256,flag));
                     quick_checks.spawn_blocking(move || {
                         let started=Instant::now();
-                        let result=body_path_with_budget(&surface,&pose,&planned_goal,&quick_config,0);
+                        let result=body_path_with_budget(&surface,&pose,&planned_goal,&quick_config,0)
+                            .or_else(|_|body_progress_path(&surface,&pose,&planned_goal,&quick_config));
                         if result.is_ok() {tracing::info!(goal_id=%planned_goal.session_id,mode="latest_map_quick",
                             elapsed_ms=started.elapsed().as_secs_f64()*1000.0,
                             points=result.as_ref().ok().map(|path|path.poses.len()),"三维路径计算完成");}
@@ -772,7 +799,7 @@ async fn run_surface_planner_with_computer(
                 let unchanged = path_surface.as_ref().and_then(std::sync::Weak::upgrade)
                     .is_some_and(|previous| previous.same_geometry(surface));
                 if !needs_plan && last_path.is_some() && unchanged { continue; }
-                checked_surface = Some(Arc::downgrade(surface));
+                checked_surface = None;
                 let surface = Arc::clone(surface);
                 let pose = pose.clone();
                 let planned_goal = active_goal.clone();
@@ -1932,6 +1959,8 @@ mod tests {
         }).await.expect("路径计算未启动");
         tokio::time::sleep(Duration::from_millis(650)).await;
         assert!(harness.scheduler.status().planner_inputs_fresh,"长计算不能令持续输入的地图超时");
+        // 快速路线可以在慢搜索期间交付；先消费取消之前已交付的路线。
+        harness.path_for(&first).await;
         harness.cancel(&first).await;
         tokio::time::timeout(Duration::from_millis(300),harness.terminal(TerminalOutcome::Cancelled))
             .await.expect("取消被长计算阻塞");

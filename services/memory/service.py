@@ -2290,11 +2290,13 @@ class MemoryService(SceneMappingMemoryMixin):
             candidates = {self._normalize_text(item) for item in candidate_labels if self._normalize_text(item)}
             if normalized_target not in candidates:
                 continue
-            target_pose = self._scene_space_navigation_pose(scene_space)
+            # 明确请求该区域时，候选位姿交给实时规划判断通行性。
+            target_pose = next(iter([*scene_space.inspection_poses, *scene_space.entry_poses]), None)
             if target_pose is None:
                 raise GatewayError("场景空间 %s 没有可导航的巡检或入口位姿。" % target_name)
             return NavigationGoal(
                 goal_id="nav_scene_space_%s" % self._normalize_text(target_name),
+                require_goal_orientation=False,
                 target_pose=target_pose,
                 target_name=target_name,
                 metadata={
@@ -2333,6 +2335,33 @@ class MemoryService(SceneMappingMemoryMixin):
                 },
             )
         raise GatewayError("未在平台语义区域中找到命名位置：%s" % target_name)
+
+    def resolve_navigation_region(self, goal: NavigationGoal) -> Optional[SceneSpace]:
+        """为明确的语义目标或区域内选点捕获对应区域。"""
+        from services.memory.room_segmentation import pose_in_scene_space
+        snapshot = self._get_map_snapshot()
+        if snapshot is None or (goal.map_name and goal.map_name != snapshot.map_name):
+            return None
+        spaces = self.current_managed_scene_spaces(snapshot, copy_records=False)
+        identifier = goal.metadata.get("resolved_scene_space_id")
+        matches = [space for space in spaces if (
+            space.scene_space_id == identifier if identifier else
+            goal.target_pose is not None and pose_in_scene_space(goal.target_pose, space))]
+        return matches[0].model_copy(deep=True) if len(matches) == 1 else None
+
+    def navigation_region_contains(self, region: SceneSpace, pose: Optional[Pose]) -> bool:
+        """使用当前地图的真实区域轮廓确认到区，不扩大目标圆容差。"""
+        from services.memory.room_segmentation import pose_in_scene_space
+        snapshot = self._get_map_snapshot()
+        if snapshot is None or pose is None or region.map_name != snapshot.map_name:
+            return False
+        if not -1 <= (utc_now() - pose.timestamp).total_seconds() <= 2:
+            return False
+        binding = region.metadata.get("map_binding", {})
+        if any(binding.get(key) != getattr(snapshot, key) for key in (
+            "map_name", "source_name", "source_epoch", "frame_id", "content_sha256")):
+            return False
+        return pose_in_scene_space(pose, region)
 
     def verify_arrival(
         self,
@@ -7775,7 +7804,7 @@ class MemoryService(SceneMappingMemoryMixin):
         raise GatewayError("当前没有可用定位流帧。")
 
     def _get_map_snapshot(self):
-        snapshot = self._mapping_service.get_latest_snapshot()
+        snapshot = getattr(self._mapping_service, "get_semantic_snapshot", self._mapping_service.get_latest_snapshot)()
         if snapshot is not None:
             self._refresh_semantic_map_context(snapshot)
             return snapshot

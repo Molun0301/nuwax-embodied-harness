@@ -1699,6 +1699,7 @@
         const data = state.lastMapEnvelope?.data || {};
         const source = data.map_snapshot || data;
         const diagnostics = source.metadata || data.diagnostics || {};
+        const semantic = diagnostics.semantic_map_binding;
         return {
           map_name: source.map_name || activeMapName(),
           source_name: source.source_name || diagnostics.source_name || null,
@@ -1706,6 +1707,8 @@
           content_sha256: source.content_sha256 || diagnostics.content_sha256 || null,
           update_sequence: source.update_sequence || diagnostics.update_sequence || null,
           frame_id: state.mapGrid?.frame_id || source.frame_id || state.lastMapEnvelope?.frame_id || null,
+          ...(semantic && semantic.map_name === (source.map_name || activeMapName())
+            && semantic.frame_id === (state.mapGrid?.frame_id || source.frame_id || state.lastMapEnvelope?.frame_id) ? semantic : {}),
           available: Boolean(state.mapGrid),
         };
       };

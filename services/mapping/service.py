@@ -29,6 +29,7 @@ class MappingService:
         self._stream_bus = stream_bus
         self._lock = threading.RLock()
         self._latest_snapshot: Optional[MapSnapshot] = None
+        self._semantic_reference: Optional[MapSnapshot] = None
         self._service_epoch = uuid.uuid4().hex
         self._source_epoch_by_source: Dict[str, str] = {}
         self._update_sequence_by_source_epoch: Dict[Tuple[str, str], int] = {}
@@ -176,6 +177,7 @@ class MappingService:
             raise GatewayError("地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。")
 
         source_metadata = dict(metadata or {})
+        source_metadata.pop("semantic_map_binding", None)
         resolved_map_name = self._resolve_map_name(
             explicit_map_name=map_name,
             metadata=source_metadata,
@@ -344,6 +346,18 @@ class MappingService:
                 "update_sequence": update_sequence,
                 "metadata": {**snapshot_metadata, **frame_metadata},
             })
+            # 激活资产是区域几何的依据；导航观测更新不会重分割已保存的房间。
+            reference = self._semantic_reference
+            if snapshot_metadata.get("source_kind") == "map_asset_bundle" and snapshot_metadata.get("backend_mode") == "mapping_localization":
+                reference = snapshot
+            elif reference is not None and (reference.map_name != snapshot.map_name or reference.frame_id != snapshot.frame_id):
+                reference = None
+            self._semantic_reference = reference
+            if reference is not None:
+                binding = {key: getattr(reference, key) for key in (
+                    "map_name", "source_name", "source_epoch", "frame_id", "update_sequence", "content_sha256")}
+                frame_metadata["semantic_map_binding"] = binding
+                snapshot = snapshot.model_copy(update={"metadata": {**snapshot.metadata, "semantic_map_binding": binding}})
             self._latest_snapshot = snapshot
             self._state_store.write(
                 StateNamespace.MAP,
@@ -439,6 +453,11 @@ class MappingService:
         with self._lock:
             return self._latest_snapshot
 
+    def get_semantic_snapshot(self) -> Optional[MapSnapshot]:
+        """区域与连接使用已激活资产；新建图沿用实时地图。"""
+        with self._lock:
+            return self._semantic_reference or self._latest_snapshot
+
     def clear_latest_snapshot(
         self,
         *,
@@ -459,6 +478,7 @@ class MappingService:
         with self._lock:
             previous = self._latest_snapshot
             self._latest_snapshot = None
+            self._semantic_reference = None
             self._stream_occupancy_key_by_source.clear()
         # 即使之前没有 snapshot 也要发 clear 信号——前端可能在重连首帧拉到旧 cache。
         previous_source_name = (

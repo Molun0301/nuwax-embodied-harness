@@ -11988,6 +11988,8 @@ class GatewayRuntime:
                                 context.ensure_active()
                             time.sleep(min(.5, max(.01, remaining)) if remaining is not None else .5)
 
+                region_resolver = getattr(getattr(self, "memory_service", None), "resolve_navigation_region", None)
+                fallback_region = region_resolver(goal) if callable(region_resolver) else None
                 last_context, generation_snapshot = wait_and_submit()
                 self._record_task_generation_snapshot(context, generation_snapshot)
                 finalized = False
@@ -12052,6 +12054,7 @@ class GatewayRuntime:
                         result = {
                             "goal_id": goal.goal_id,
                             "navigation_context": last_context,
+                            "arrival_kind": "point",
                         }
                         if completion_callback is not None:
                             result.update(dict(completion_callback(last_context) or {}))
@@ -12065,6 +12068,39 @@ class GatewayRuntime:
                             context.ensure_active()
                         finalized = True
                         return result
+                    # 先争取到点；分段路线走完、等待接续时，已进入对应区域即可结束。
+                    path = last_context.navigation_state.metadata.get("planned_path") or []
+                    target = goal.target_pose
+                    partial = bool(path and target and
+                        math.hypot(float(path[-1]["x"])-target.position.x,
+                                   float(path[-1]["y"])-target.position.y) > goal.tolerance_position_m)
+                    pose = last_context.navigation_state.current_pose if fallback_region is not None else None
+                    prefix_end_reached = bool(partial and pose and
+                        math.hypot(float(path[-1]["x"])-pose.position.x,
+                                   float(path[-1]["y"])-pose.position.y) <= 0.15)
+                    no_route = status == NavigationStatus.PLANNING and "等待可通行路径：" in (last_context.navigation_state.message or "")
+                    if (fallback_region is not None and (prefix_end_reached or no_route)
+                            and status == NavigationStatus.PLANNING
+                            and self.memory_service.navigation_region_contains(
+                                fallback_region, last_context.navigation_state.current_pose)):
+                        stopped = self._cancel_navigation_with_safety_barrier(context,
+                            goal_id=goal.goal_id, poll_interval_sec=poll_interval_sec,
+                            acknowledge_interrupt=False)
+                        context.ensure_active()
+                        proof = self._navigation_terminal_proof(stopped, goal_id=goal.goal_id,
+                            allowed_statuses={NavigationStatus.SUCCEEDED.value, NavigationStatus.CANCELLED.value})
+                        if not proof:
+                            raise self._navigation_parking_error(goal_id=goal.goal_id,
+                                reason="到区结束缺少停车证明", navigation_context=stopped)
+                        if not self.memory_service.navigation_region_contains(fallback_region, stopped.navigation_state.current_pose):
+                            raise GatewayError("停车时未处于目标区域内。", error_code="arrival_not_confirmed", http_status=409)
+                        context.update(progress=1.0, stage="completed", message="目标点路径尚不可达，已到达对应区域并停车。")
+                        if not context.commit_success(proof):
+                            context.ensure_active()
+                        finalized = True
+                        return {"goal_id": goal.goal_id, "navigation_context": stopped,
+                                "arrival_kind": "region", "scene_space_id": fallback_region.scene_space_id,
+                                "target_point_reached": False}
                     if status == NavigationStatus.SUCCEEDED:
                         raise GatewayError(
                             last_context.navigation_state.message or "导航后端报告完成，但平台未确认已到达目标。",

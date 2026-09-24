@@ -520,6 +520,9 @@ impl SurfaceSnapshot {
 
     /// 沿真实相邻占据高度读取支撑层下界，不跨越未观测的竖直空隙。
     fn observed_support_lower_bound(&self, cell: VoxelKey) -> f64 {
+        if let Some(lower)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).lower_bounds.get(&cell).copied() {
+            return lower;
+        }
         let size = f64::from(self.config().voxel_size);
         let bounds = |z| {
             self.data
@@ -539,6 +542,9 @@ impl SurfaceSnapshot {
                 lower = b[0];
             }
         }
+        let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+        if cache.lower_bounds.len()>=8192 {cache.lower_bounds.clear();}
+        cache.lower_bounds.insert(cell,lower);
         lower
     }
 
@@ -758,6 +764,40 @@ impl SurfaceSnapshot {
         result
     }
 
+    /// 缺少任何高度支撑的列若侵入机体投影内核，所有外轮廓检查必然失败。
+    /// 此处只提前拒绝，存在支撑仍交给原来的完整机体、层与接触检查。
+    fn body_core_has_support(&self,body:[f64;3],r:[[f64;3];3],model:&SurfaceBodyEnvelope)->bool {
+        if model.z_bounds_m[0]>0.0 || model.z_bounds_m[1]<0.0 {return true;}
+        let radius=model.footprint_xy_m.iter().zip(model.footprint_xy_m.iter().cycle().skip(1))
+            .filter_map(|(a,b)| {
+                let dx=b[0]-a[0];let dy=b[1]-a[1];let length=dx.hypot(dy);
+                (length>1e-12).then(||(dy*a[0]-dx*a[1])/length)
+            }).fold(f64::INFINITY,f64::min);
+        if !radius.is_finite() || radius<=0.0 {return true;}
+        // 向下取整，内核始终包含在真实投影中；不量化或放宽完整碰撞检查。
+        let quantum=f64::from(self.source_voxel_size_m())*0.25;
+        let radius=(radius*r[2][2]/quantum).floor()*quantum;
+        if radius<=0.0 {return true;}
+        let key=(body[0].to_bits(),body[1].to_bits(),radius.to_bits());
+        if let Some(value)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).support_cores.get(&key).copied() {return value;}
+        let size=f64::from(self.config().voxel_size);
+        let x0=((body[0]-radius)/size).floor() as i32;let x1=((body[0]+radius)/size).floor() as i32;
+        let y0=((body[1]-radius)/size).floor() as i32;let y1=((body[1]+radius)/size).floor() as i32;
+        if (i64::from(x1)-i64::from(x0)+1)*(i64::from(y1)-i64::from(y0)+1)>16_384 {return true;}
+        let mut supported=true;
+        'columns: for x in x0..=x1 {for y in y0..=y1 {
+            let dx=body[0]-body[0].clamp(f64::from(x)*size,f64::from(x+1)*size);
+            let dy=body[1]-body[1].clamp(f64::from(y)*size,f64::from(y+1)*size);
+            if dx*dx+dy*dy<radius*radius-1e-12
+                && !self.data.physical_graph.surface_lookup.get(&(x,y)).is_some_and(|levels|!levels.is_empty()) {
+                supported=false;break 'columns;
+            }
+        }}
+        let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+        if cache.support_cores.len()>=8192 {cache.support_cores.clear();}
+        cache.support_cores.insert(key,supported);supported
+    }
+
     fn check_body_pose(&self,body:[f64;3],quaternion:[f64;4])->Result<(),SurfaceError> {
         let model = self
             .body_envelope()
@@ -767,6 +807,7 @@ impl SurfaceSnapshot {
         if r[2][2] <= 0.0 {
             return Err(SurfaceError::InvalidPose);
         }
+        if !self.body_core_has_support(body,r,model) {return Err(SurfaceError::MissingSupport);}
         let vertices: Vec<_> = model
             .footprint_xy_m
             .iter()
@@ -1133,9 +1174,15 @@ impl SurfaceSnapshot {
             .body_envelope()
             .ok_or_else(|| SurfaceError::InvalidConfig("body envelope is unavailable".into()))?;
         let centre = self.locate_support(support)?;
+        // 邻域由支撑格决定，法线与格内查询位置、偏航无关。
+        // 高度保留精确值，当前足迹及观测变化仍建立独立缓存。
+        let normal_key = (centre.cell, support[2].to_bits());
+        let cached = self.body_query_cache.lock().unwrap_or_else(|e| e.into_inner())
+            .slopes.get(&normal_key).copied();
+        let (a, b) = if let Some(slope) = cached { slope } else {
         let radius = model.radius() + f64::from(self.config().voxel_size);
         let patch = self.ground_patch(centre, radius);
-        let points: Vec<_> = patch
+        let mut points: Vec<_> = patch
             .values()
             .map(|&cell| {
                 let mut point = self.cell_position(cell);
@@ -1147,7 +1194,15 @@ impl SurfaceSnapshot {
                 point
             })
             .collect();
-        let (a, b, _) = fit_plane(&points, support).unwrap_or((0.0, 0.0, support[2]));
+        // 固定求和顺序和局部原点，避免哈希遍历及格内平移引入拟合抖动。
+        points.sort_by(|a,b|a[0].total_cmp(&b[0]).then_with(||a[1].total_cmp(&b[1])));
+        let origin=[centre.surface_xyz[0],centre.surface_xyz[1],support[2]];
+        let (a, b, _) = fit_plane(&points, origin).unwrap_or((0.0, 0.0, support[2]));
+        let mut cache = self.body_query_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.slopes.len() >= 8192 { cache.slopes.clear(); }
+        cache.slopes.insert(normal_key, (a, b));
+        (a, b)
+        };
         let normal = normalize([-a, -b, 1.0]);
         let forward = normalize([yaw.cos(), yaw.sin(), a * yaw.cos() + b * yaw.sin()]);
         let left = cross(normal, forward);
@@ -1644,6 +1699,16 @@ mod tests {
             .unwrap();
         s.plan([1.05, 1.05, 0.025], [4.05, 1.05, 0.175]).unwrap();
         assert!(s.plan([4.05, 1.05, 0.175], [1.05, 1.05, 0.025]).is_err());
+        let lower = [1.05,1.05,0.025];
+        let upper = [4.05,1.05,0.175];
+        let to_upper = s.goal_travel_costs(&[upper],&[]).unwrap();
+        let to_lower = s.goal_travel_costs(&[lower],&[]).unwrap();
+        let forward = s.frontier_travel_costs(lower,&[upper],&[]).unwrap()[0];
+        let a=s.locate_support(lower).unwrap();let b=s.locate_support(upper).unwrap();
+        let offset=|p:[f64;3],q:[f64;3]|(p[0]-q[0]).hypot(p[1]-q[1]).hypot(p[2]-q[2]);
+        assert!((to_upper.cost(a.cell).unwrap()+offset(lower,a.surface_xyz)+offset(upper,b.surface_xyz)-forward).abs()<1e-5);
+        assert!(to_lower.cost(s.locate_support(upper).unwrap().cell).is_none(),
+            "反向距离场不能把不允许下降的台阶变成双向边");
     }
     #[test]
     fn current_body_view_clears_only_its_occupied_cells_and_keeps_environment_immutable() {
@@ -1946,7 +2011,7 @@ mod tests {
 #[cfg(test)]
 mod projection_equivalence {
     use super::*;
-fn reference_polygon_intersects_cell(polygon: &[[f64; 2]], x: i32, y: i32, size: f64) -> bool {
+pub(super) fn reference_polygon_intersects_cell(polygon: &[[f64; 2]], x: i32, y: i32, size: f64) -> bool {
     let square = [
         [x as f64 * size, y as f64 * size],
         [(x + 1) as f64 * size, y as f64 * size],
@@ -2069,7 +2134,49 @@ fn reference_prism_intersects_voxel(
 // 缓存只属于同一不可变表面及当前足迹视图；输入保留浮点精确位，不扩大几何容差。
 #[derive(Default)]
 pub(super) struct BodyQueryCache {
+    support_cores: AHashMap<(u64,u64,u64),bool>,
+    lower_bounds: AHashMap<VoxelKey,f64>,
+    slopes: AHashMap<(VoxelKey,u64),(f64,f64)>,
     poses: AHashMap<[u64;7],Result<(),SurfaceError>>,
     projections: AHashMap<[u64;6],Result<([f64;3],[f64;4]),SurfaceError>>,
     motions: AHashMap<[u64;14],Result<(),SurfaceError>>,
+}
+
+#[cfg(test)]
+mod support_core_tests {
+    use super::*;
+
+    #[test]
+    fn support_core_never_rejects_a_fully_observed_projected_footprint() {
+        let model=SurfaceBodyEnvelope {
+            footprint_xy_m:vec![[-0.3,-0.12],[0.3,-0.12],[0.3,0.12],[-0.3,0.12]],
+            z_bounds_m:[-0.4,0.1],body_to_support_z_m:0.4,max_step_up_m:0.2,
+            max_step_down_m:0.2,max_cross_slope_deg:18.0,support_uncertainty_m:0.0,
+        };
+        for (roll,pitch) in [(-0.35_f64,0.15_f64),(0.0,0.0),(0.25,-0.3)] {
+            for index in 0..16 {
+                let yaw=f64::from(index)*std::f64::consts::TAU/16.0;
+                let (sr,cr)=(roll*0.5).sin_cos();let (sp,cp)=(pitch*0.5).sin_cos();let (sy,cy)=(yaw*0.5).sin_cos();
+                let q=[sr*cp*cy-cr*sp*sy,cr*sp*cy+sr*cp*sy,cr*cp*sy-sr*sp*cy,cr*cp*cy+sr*sp*sy];
+                let r=rotation(q).unwrap();let body=[0.03,-0.017,0.5];
+                let polygon=hull(model.footprint_xy_m.iter().flat_map(|p|model.z_bounds_m.map(|z| {
+                    let p=world(r,body,[p[0],p[1],z]);[p[0],p[1]]
+                })).collect());
+                let mut points=Vec::new();
+                for x in -10..10 {for y in -10..10 {
+                    if super::projection_equivalence::reference_polygon_intersects_cell(&polygon,x,y,0.1) {
+                        points.push(((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.025));
+                    }
+                }}
+                let config=Config {world_frame:"map".into(),voxel_size:0.1,robot_height:0.4,
+                    surface_closing_radius:0.0,node_spacing_m:0.3,wall_clearance_m:0.0,
+                    wall_buffer_m:0.0,wall_buffer_weight:0.0,step_threshold_m:0.2,
+                    max_slope_deg:25.0,min_step_tread_depth_m:0.2,goal_tolerance:0.1,
+                    step_penalty_weight:1.0,viz_publish_hz:0.0};
+                let map=SurfaceSnapshot::from_points(&points,config,0.1).unwrap()
+                    .with_body_envelope(model.clone()).unwrap();
+                assert!(map.body_core_has_support(body,r,&model),"横滚{roll}、俯仰{pitch}、偏航{yaw}的真实投影已全部有支撑");
+            }
+        }
+    }
 }

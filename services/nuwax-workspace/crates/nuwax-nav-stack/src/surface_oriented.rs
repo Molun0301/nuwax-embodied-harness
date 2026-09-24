@@ -1,7 +1,7 @@
 //! 按连续机体位姿搜索三维路径，平面运动基元在真实支撑面上逐段核验。
 use nuwax_nav_control::{integrate, PlanarPose};
 use nuwax_nav_mls_planner::SurfaceSnapshot;
-use nuwax_nav_types_messages::{GoalOptions, MotionLimits, MotionModel, Point2, Twist2};
+use nuwax_nav_types_messages::{GoalOptions, MotionKinematics, MotionLimits, MotionModel, Point2, Twist2};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -18,6 +18,15 @@ fn planar(p: BodyPose) -> PlanarPose {
         y: p.0[1],
         yaw: (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z)),
     }
+}
+fn yaw_rotated(q: [f64; 4], angle: f64) -> [f64; 4] {
+    let (s, c) = (angle * 0.5).sin_cos();
+    [
+        c * q[0] - s * q[1],
+        c * q[1] + s * q[0],
+        c * q[2] + s * q[3],
+        c * q[3] - s * q[2],
+    ]
 }
 #[derive(PartialEq)]
 struct Queue(f64, usize);
@@ -61,20 +70,32 @@ fn action(
     }
     let mut samples = Vec::with_capacity(n);
     let mut previous = from;
+    let mut previous_time=0.0;
     for i in 1..=n {
-        let next = integrate(start, velocity, (step * i as f64).min(duration));
+        let time=(step*i as f64).min(duration);
+        let next = integrate(start, velocity, time);
+        // 平面执行器可以直接保持当前站姿。厚地面或局部噪声不能强迫每一拍
+        // 抬到支撑格顶；先检查实际站姿的完整运动，只有不成立时才随地形投影。
+        let maintained=([next.x,next.y,previous.0[2]],
+            yaw_rotated(previous.1,velocity.angular_z*(time-previous_time)));
+        if map.validate_body_motion(previous,maintained,boundary).is_ok() {
+            samples.push(maintained);previous=maintained;previous_time=time;continue;
+        }
         let support = map
             .locate_support_from_body(previous.0, previous.1, model.body_to_support_z_m)
             .ok()?.support_xyz;
-        let lifted = map
+        let mut lifted = map
             .body_pose_on_surface([next.x, next.y], next.yaw, support)
             .inspect_err(|error| tracing::trace!(?error,?previous,?next,?support,"三维基元投影被拒绝"))
             .ok()?;
+        // 原地转向没有升降通道；地形姿态可以核验，但不能借转向抬高机体避障。
+        if velocity.linear.x.hypot(velocity.linear.y)<1e-9 {lifted.0[2]=previous.0[2];}
         map.validate_body_motion(previous, lifted, boundary)
             .inspect_err(|error| tracing::trace!(?error,?previous,?lifted,"三维基元扫掠被拒绝"))
             .ok()?;
         samples.push(lifted);
         previous = lifted;
+        previous_time=time;
     }
     Some(samples)
 }
@@ -96,19 +117,24 @@ fn connect(
     if reverse {
         headings.push(angle(heading + std::f64::consts::PI));
     }
-    if omni || distance < 1e-9 {
+    if distance < 1e-9 {
         headings.insert(0, a.yaw);
+    } else if omni {
+        headings.push(a.yaw);
     }
-    headings.sort_by(|x, y| {
-        (angle(*x - a.yaw).abs() + angle(b.yaw - *x).abs())
-            .total_cmp(&(angle(*y - a.yaw).abs() + angle(b.yaw - *y).abs()))
-    });
+    // 优先转向目标后前进；受阻时才利用明确支持的倒退、横移通道。
+    // 明确指定最终朝向时，比较完整转向代价，避免先掉头再转回请求朝向。
+    if require_orientation {
+        headings.sort_by(|x,y|(angle(*x-a.yaw).abs()+angle(b.yaw-*x).abs())
+            .total_cmp(&(angle(*y-a.yaw).abs()+angle(b.yaw-*y).abs())));
+    }
     for heading in headings {
         // 位置目标的终点方向沿本段运动自然生成，不强制回到占位四元数。
         let to = if require_orientation { to } else {
             let model = map.body_envelope()?;
-            let support = map.locate_goal_support_from_body(to.0, to.1, model.body_to_support_z_m).ok()?;
-            map.body_pose_on_surface([b.x, b.y], heading, support.surface_xyz).ok()?
+            let Ok(support) = map.locate_goal_support_from_body(to.0, to.1, model.body_to_support_z_m) else {continue;};
+            let Ok(pose) = map.body_pose_on_surface([b.x, b.y], heading, support.surface_xyz) else {continue;};
+            pose
         };
         let b = planar(to);
         if !rotate && (angle(heading - a.yaw).abs() > 1e-5 || angle(b.yaw - heading).abs() > 1e-5) {
@@ -206,6 +232,202 @@ fn goal_region_samples(map:&SurfaceSnapshot,start:BodyPose,goal:BodyPose,toleran
     candidates
 }
 
+/// 已声明全向通道时，平移与转向独立展开；候选边出队后才核验扫掠。
+fn omnidirectional_connection(
+    map: &SurfaceSnapshot,
+    start: BodyPose,
+    reference: BodyPose,
+    tolerance: f64,
+    boundary: &[[f64; 2]],
+    reverse: bool,
+    rotate: bool,
+    goal_costs: &nuwax_nav_mls_planner::surface::SurfaceGoalCosts,
+    cancelled: &impl Fn() -> bool,
+) -> Option<Vec<BodyPose>> {
+    let model = map.body_envelope()?;
+    let step = f64::from(map.source_voxel_size_m()) * 0.5;
+    let initial_yaw = planar(start).yaw;
+    let pose_key = |pose: BodyPose| {
+        [
+            pose.0[0], pose.0[1], pose.0[2], pose.1[0], pose.1[1], pose.1[2], pose.1[3],
+        ]
+        .map(f64::to_bits)
+    };
+    let heuristic = |pose: BodyPose| {
+        let remaining = (position_distance(pose, reference) - tolerance).max(0.0);
+        let distance = map
+            .locate_goal_support_from_body(pose.0, pose.1, model.body_to_support_z_m)
+            .ok()
+            .and_then(|location| goal_costs.cost(location.cell))
+            .unwrap_or(remaining);
+        remaining.max(distance)
+    };
+    let mut nodes = vec![Node {
+        pose: start,
+        cost: 0.0,
+        parent: None,
+        samples: vec![],
+    }];
+    let mut positions = vec![(0_i32, 0_i32, 0_i32)];
+    let mut stances = vec![start.1];
+    let mut pending_motions = vec![None];
+    let mut best = HashMap::new();
+    let mut queue = BinaryHeap::from([Queue(0.0, 0)]);
+    let mut expanded = 0;
+    while let Some(Queue(_, index)) = queue.pop() {
+        if cancelled() || expanded >= 1024 {
+            return None;
+        }
+        let mut here = nodes[index].pose;
+        let (x, y, heading) = positions[index];
+        let yaw = initial_yaw + f64::from(heading) * std::f64::consts::PI / 16.0;
+        let key = (x, y, heading, pose_key(here));
+        if best
+            .get(&key)
+            .is_some_and(|&(cost, known)| known != index && cost <= nodes[index].cost)
+        {
+            continue;
+        }
+        if let Some((velocity, duration)) = pending_motions[index] {
+            let from = nodes[nodes[index].parent?].pose;
+            let Some(mut samples) = action(map, from, velocity, duration, boundary) else {
+                continue;
+            };
+            let before = samples.iter().rev().nth(1).copied().unwrap_or(from);
+            if map.validate_body_motion(before, here, boundary).is_err() {
+                // 只有实际扫掠证明需要随地形改变站姿时，才提交对应三维终点。
+                // 未检查的平面候选不能写入可达表，更不能直接返回给执行器。
+                let projected=*samples.last()?;
+                here=([here.0[0],here.0[1],projected.0[2]],projected.1);
+                if map.validate_body_motion(before,here,boundary).is_err() {continue;}
+                nodes[index].pose=here;
+                nodes[index].cost=nodes[nodes[index].parent?].cost+position_distance(from,here)
+                    +model.radius()*velocity.angular_z.abs()*duration+0.001;
+                stances[index]=yaw_rotated(here.1,-f64::from(heading)*std::f64::consts::PI/16.0);
+            }
+            *samples.last_mut()? = here;
+            nodes[index].samples = samples;
+        }
+        let key=(x,y,heading,pose_key(here));
+        if best.get(&key).is_some_and(|&(cost,known)|known!=index && cost<=nodes[index].cost) {continue;}
+        best.insert(key,(nodes[index].cost,index));
+        if position_distance(here, reference) <= tolerance {
+            let mut chain = Vec::new();
+            let mut cursor = index;
+            while let Some(parent) = nodes[cursor].parent {
+                chain.push(cursor);
+                cursor = parent;
+            }
+            let mut path = vec![start];
+            for index in chain.into_iter().rev() {
+                path.extend_from_slice(&nodes[index].samples);
+            }
+            #[cfg(test)]
+            eprintln!(
+                "全向平移搜索：展开{expanded}个状态，生成{}个节点",
+                nodes.len()
+            );
+            return Some(path);
+        }
+        expanded += 1;
+        // 大步优先推进，半体素小步保留窄口和短距离挪动的可达性。
+        for (dx, dy) in [
+            (8, 0), (8, 8), (0, 8), (-8, 8), (-8, 0), (-8, -8), (0, -8), (8, -8),
+            (4, 0), (4, 4), (0, 4), (-4, 4), (-4, 0), (-4, -4), (0, -4), (4, -4),
+            (2, 0),
+            (2, 2),
+            (0, 2),
+            (-2, 2),
+            (-2, 0),
+            (-2, -2),
+            (0, -2),
+            (2, -2),
+            (1, 0),
+            (1, 1),
+            (0, 1),
+            (-1, 1),
+            (-1, 0),
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+        ] {
+            let nx = x + dx;
+            let ny = y + dy;
+            let xy = [
+                start.0[0] + f64::from(nx) * step,
+                start.0[1] + f64::from(ny) * step,
+            ];
+            let delta = [xy[0] - here.0[0], xy[1] - here.0[1]];
+            let velocity = Twist2 {
+                linear: Point2::new(
+                    delta[0] * yaw.cos() + delta[1] * yaw.sin(),
+                    -delta[0] * yaw.sin() + delta[1] * yaw.cos(),
+                ),
+                angular_z: 0.0,
+            };
+            if !reverse && velocity.linear.x < -1e-9 {
+                continue;
+            }
+            let target = ([xy[0], xy[1], here.0[2]], here.1);
+            let key = (nx, ny, heading, pose_key(target));
+            let cost = nodes[index].cost + position_distance(here, target) + 0.001;
+            if best.get(&key).is_some_and(|&(known, _)| known <= cost) {
+                continue;
+            }
+            let next = nodes.len();
+            nodes.push(Node {
+                pose: target,
+                cost,
+                parent: Some(index),
+                samples: vec![],
+            });
+            positions.push((nx, ny, heading));
+            stances.push(stances[index]);
+            pending_motions.push(Some((velocity, 1.0)));
+            queue.push(Queue(cost + 6.0 * heuristic(target), next));
+        }
+        for sign in [-4, -2, -1, 1, 2, 4] {
+            if !rotate {
+                break;
+            }
+            let next_heading = (heading + sign).rem_euclid(32);
+            let target = (
+                here.0,
+                yaw_rotated(
+                    stances[index],
+                    f64::from(next_heading) * std::f64::consts::PI / 16.0,
+                ),
+            );
+            let cost = nodes[index].cost
+                + model.radius() * f64::from(sign).abs() * std::f64::consts::PI / 16.0
+                + 0.001;
+            let key = (x, y, next_heading, pose_key(target));
+            if best.get(&key).is_some_and(|&(known, _)| known <= cost) {
+                continue;
+            }
+            let next = nodes.len();
+            nodes.push(Node {
+                pose: target,
+                cost,
+                parent: Some(index),
+                samples: vec![],
+            });
+            let turn = f64::from(sign) * std::f64::consts::PI / 16.0;
+            positions.push((x, y, next_heading));
+            stances.push(stances[index]);
+            pending_motions.push(Some((
+                Twist2 {
+                    linear: Point2::new(0.0, 0.0),
+                    angular_z: turn.signum(),
+                },
+                turn.abs(),
+            )));
+            queue.push(Queue(cost + 6.0 * heuristic(target), next));
+        }
+    }
+    None
+}
+
 /// 复用生产机体规划查询；返回真实三维机体路径，不包含运动副作用。
 pub fn plan(
     map: &SurfaceSnapshot,
@@ -224,14 +446,32 @@ pub fn plan(
 pub(crate) fn plan_cancellable(
     map: &SurfaceSnapshot,
     start: BodyPose,
-    mut goal: BodyPose,
+    goal: BodyPose,
     options: GoalOptions,
     limits: Option<&MotionLimits>,
     boundary: &[[f64; 2]],
     budget: usize,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<BodyPose>, String> {
+    if let Some(limits)=limits {limits.validate()?;}
+    let motion=limits.map(MotionLimits::kinematics);
+    plan_with_motion_cancellable(map,start,goal,options,motion.as_ref(),boundary,budget,cancelled)
+}
+
+/// 规划只依赖执行器运动通道，保证制动参数仍由控制器单独消费。
+#[allow(clippy::too_many_arguments)]
+pub fn plan_with_motion_cancellable(
+    map: &SurfaceSnapshot,
+    start: BodyPose,
+    mut goal: BodyPose,
+    options: GoalOptions,
+    limits: Option<&MotionKinematics>,
+    boundary: &[[f64; 2]],
+    budget: usize,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<BodyPose>, String> {
     let cancelled = || cancelled.is_some_and(|flag|flag.load(std::sync::atomic::Ordering::Relaxed));
+    #[cfg(test)] let diagnostic_started = std::time::Instant::now();
     if cancelled() { return Err("三维规划已取消".into()); }
     options.validate()?;
     if let Some(limits) = limits {
@@ -258,8 +498,15 @@ pub(crate) fn plan_cancellable(
     }
     let mut regional_targets: Vec<_> = prepared.as_ref().copied().into_iter().collect();
     let mut region_seen=HashSet::new();
+    let mut region_input_seen=HashSet::new();
     for candidate in goal_region_samples(map,start,reference,original_tolerance) {
         if cancelled() {return Err("三维规划已取消".into());}
+        // 位置目标的连接最终按同一支撑层重新投影。同一水平落点、同一层
+        // 的不同高度采样会产生相同连接，不反复进行32方向机体拟合。
+        if !options.requires_orientation() {
+            let Ok(layer)=map.locate_goal_support_from_body(candidate.0,candidate.1,model.body_to_support_z_m) else {continue;};
+            if !region_input_seen.insert((candidate.0[0].to_bits(),candidate.0[1].to_bits(),layer.cell)) {continue;}
+        }
         let Ok(target)=prepare_goal_pose(map,candidate,options.requires_orientation()) else {continue;};
         if position_distance(target,reference)>=original_tolerance-1e-6 {continue;}
         let key=[target.0[0].to_bits(),target.0[1].to_bits(),target.0[2].to_bits(),
@@ -273,6 +520,7 @@ pub(crate) fn plan_cancellable(
     if regional_targets.is_empty() {
         return Err(format!("{}；目标容差区域没有已观测的可通行机体落点",prepared.unwrap_err()));
     }
+    #[cfg(test)] eprintln!("目标区域准备 {:?}，有效落点{}", diagnostic_started.elapsed(), regional_targets.len());
     if cancelled() {return Err("三维规划已取消".into());}
     // 直连失败后，以原目标区域内真实连通的落点引导绕行，不能只追踪孤立的中心或首样本。
     // 一次有向支撑图查询覆盖全部落点；点可达仍须通过后续完整机体扫掠。
@@ -294,6 +542,13 @@ pub(crate) fn plan_cancellable(
     goal=regional_targets[reachable];
     // 引导点可以偏移，终点验收始终使用原容差球，不叠加也不缩小位置容差。
     let endpoint_allowed=|pose:BodyPose|position_distance(pose,reference)<=original_tolerance;
+    let goal_costs = map.goal_travel_costs(&targets,boundary)
+        .map_err(|error|format!("目标支撑距离场: {error}"))?;
+    if budget>0 && omni && !options.requires_orientation() {
+        if let Some(path)=omnidirectional_connection(map,start,reference,original_tolerance,boundary,reverse,rotate,&goal_costs,&cancelled) {
+            return Ok(path);
+        }
+    }
     // 起步盲区/近墙常使原地转向不可行。先尝试沿当前可执行方向
     // 连续驶出一个机身长度，再连接目标，避免细角度搜索反复试同一转弯。
     let probe_step = (model.radius()*0.5).max(f64::from(map.config().voxel_size)*2.0);
@@ -307,6 +562,31 @@ pub(crate) fn plan_cancellable(
             if let Some(tail)=connect(map,from,goal,boundary,rotate,reverse,omni,options.requires_orientation())
                 .filter(|path|path.last().is_some_and(|pose|endpoint_allowed(*pose))) {
                 let mut path=vec![start];path.extend(prefix);path.extend(tail.into_iter().skip(1));return Ok(path);
+            }
+        }
+    }
+    // 后方目标先尝试连续圆弧驶离起步足迹，避免把可行的大转弯拆成
+    // 数百次小角度状态扩展。圆弧仍沿同一投影和完整扫掠验证。
+    let turn_radius = limits.map_or(0.0, |m| m.minimum_turning_radius_m)
+        .max(model.radius()).max(0.2);
+    for radius in [turn_radius, turn_radius * 2.0] {
+        for direction in [-1.0, 1.0] {
+            for step in 1..=4 {
+                if cancelled() {return Err("三维规划已取消".into());}
+                let duration = radius * f64::from(step) * std::f64::consts::FRAC_PI_4;
+                let Some(prefix) = action(map, start, Twist2 {
+                    linear: Point2::new(1.0, 0.0), angular_z: direction / radius,
+                }, duration, boundary) else {break;};
+                let from = *prefix.last().expect("圆弧基元");
+                let tail = if endpoint_allowed(from) && (!options.requires_orientation()
+                    || angle(planar(from).yaw-planar(goal).yaw).abs() <= options.yaw_tolerance_rad) {
+                    Some(vec![from])
+                } else {
+                    connect(map,from,goal,boundary,rotate,reverse,omni,options.requires_orientation())
+                };
+                if let Some(tail) = tail.filter(|path|path.last().is_some_and(|pose|endpoint_allowed(*pose))) {
+                    let mut path=vec![start];path.extend(prefix);path.extend(tail.into_iter().skip(1));return Ok(path);
+                }
             }
         }
     }
@@ -336,6 +616,7 @@ pub(crate) fn plan_cancellable(
         }
     }
     let resolution = f64::from(map.config().voxel_size);
+    #[cfg(test)] eprintln!("进入朝向搜索 {:?}", diagnostic_started.elapsed());
     let yaw_step = std::f64::consts::TAU / 32.0;
     let radius = limits
         .map_or(0.0, |m| m.minimum_turning_radius_m)
@@ -363,7 +644,12 @@ pub(crate) fn plan_cancellable(
         let heading=(goal.0[1]-p.0[1]).atan2(goal.0[0]-p.0[0]);
         let forward=angle(heading-planar(p).yaw).abs();
         let turn=if omni {0.0} else if reverse {forward.min(angle(heading+std::f64::consts::PI-planar(p).yaw).abs())} else {forward};
-        d + 2.0*model.radius()*turn*(d/options.position_tolerance_m.max(0.1)).min(1.0)
+        // 最终朝向目标的转向代价绑定选定落点，不能混入另一个区域落点的距离。
+        let graph_distance=if options.requires_orientation() {d} else {
+            map.locate_support_from_body(p.0,p.1,model.body_to_support_z_m)
+                .ok().and_then(|location|goal_costs.cost(location.cell)).unwrap_or(d)
+        };
+        d.max(graph_distance) + 2.0*model.radius()*turn*(d/options.position_tolerance_m.max(0.1)).min(1.0)
     };
     let mut nodes = vec![Node {
         pose: start,
@@ -597,6 +883,349 @@ mod tests {
             can_rotate_in_place: true,
         }
     }
+    #[test]
+    fn short_escape_before_rotation_is_not_consumed_by_position_tolerance() {
+        let base = scene(false);
+        let mut points: Vec<_> = (-20..20)
+            .flat_map(|x| {
+                (-20..20).map(move |y| ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.025))
+            })
+            .collect();
+        points.push((-0.35, 0.05, 0.55));
+        let mut envelope = base.body_envelope().unwrap().clone();
+        envelope.footprint_xy_m = vec![[-0.29, -0.12], [0.29, -0.12], [0.29, 0.12], [-0.29, 0.12]];
+        let map = Arc::new(
+            SurfaceSnapshot::from_points(&points, base.config().clone(), 0.1)
+                .unwrap()
+                .with_body_envelope(envelope)
+                .unwrap(),
+        );
+        let mut current = pose(0.0, 0.0, 0.0);
+        let goal = pose(0.06, 0.8, std::f64::consts::FRAC_PI_2);
+        let route = vec![
+            current,
+            pose(0.06, 0.0, 0.0),
+            pose(0.06, 0.0, std::f64::consts::FRAC_PI_2),
+            goal,
+        ];
+        assert!(map
+            .validate_body_motion(current, pose(0.0, 0.0, std::f64::consts::FRAC_PI_2), &[])
+            .is_err());
+        for edge in route.windows(2) {
+            map.validate_body_motion(edge[0], edge[1], &[]).unwrap();
+        }
+        let options = GoalOptions {
+            position_tolerance_m: 0.12,
+            yaw_tolerance_rad: std::f64::consts::PI,
+            ..Default::default()
+        };
+        let mut config = SurfaceFollowerConfig::new(0.4);
+        config.controller.speed = 0.3;
+        config.controller.control_frequency = 20.0;
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        let mut now = 1_000_000_000;
+        follower
+            .configure_goal(&stamped(goal, now), options)
+            .unwrap();
+        follower
+            .update_execution_map(ExecutionMap::Surface(map.clone()))
+            .unwrap();
+        follower.update_odometry(stamped(current, now));
+        follower
+            .replace_execution_path(
+                ExecutionPath::Surface(Path3D {
+                    poses: route.into_iter().map(|p| stamped(p, now)).collect(),
+                }),
+                None,
+                stamped(goal, now),
+            )
+            .unwrap();
+        let mut reached = false;
+        for tick in 0..600 {
+            match follower.step(0.3) {
+                PlannerStep::Command(command) => {
+                    if tick == 0 {
+                        assert!(
+                            command.linear.x > 0.0,
+                            "必须先平移腾出转向净空: {command:?}"
+                        );
+                    }
+                    follower.observe_applied_command(command);
+                    let next = integrate(planar(current), command, 0.05);
+                    current = pose(next.x, next.y, next.yaw);
+                }
+                PlannerStep::Succeeded => {
+                    reached = true;
+                    break;
+                }
+                other => panic!("短距离脱离转向不能卡死: {other:?}, pose={current:?}"),
+            }
+            now += 50_000_000;
+            follower.update_odometry(stamped(current, now));
+        }
+        assert!(reached);
+    }
+
+    #[test]
+    fn declared_basic_omnidirectional_channels_back_out_when_turning_is_blocked() {
+        let base = scene(false);
+        let mut points: Vec<_> = (-25..25)
+            .flat_map(|x| {
+                (-3..3).map(move |y| ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.025))
+            })
+            .collect();
+        for x in -25..25 {
+            for y in [-0.25, 0.25] {
+                points.push(((x as f32 + 0.5) * 0.1, y, 0.55));
+            }
+        }
+        let map = Arc::new(
+            SurfaceSnapshot::from_points(&points, base.config().clone(), 0.1)
+                .unwrap()
+                .with_body_envelope(base.body_envelope().unwrap().clone())
+                .unwrap(),
+        );
+        let mut current = pose(0.5, 0.0, 0.0);
+        let goal = pose(-0.5, 0.0, 0.0);
+        assert!(map
+            .validate_body_motion(current, pose(0.5, 0.0, std::f64::consts::PI), &[])
+            .is_err());
+        let motion = MotionKinematics {
+            model: MotionModel::Omnidirectional,
+            max_forward_mps: 0.2,
+            max_reverse_mps: 0.1,
+            max_lateral_mps: 0.08,
+            max_angular_rps: 0.5,
+            minimum_turning_radius_m: 0.0,
+            can_rotate_in_place: true,
+        };
+        let options = GoalOptions {
+            allow_reverse: true,
+            position_tolerance_m: 0.12,
+            yaw_tolerance_rad: std::f64::consts::PI,
+        };
+        let route =
+            plan_with_motion_cancellable(&map, current, goal, options, Some(&motion), &[], 0, None)
+                .unwrap();
+        assert!(route.iter().all(|p| angle(planar(*p).yaw).abs() < 1e-8));
+        for edge in route.windows(2) {
+            map.validate_body_motion(edge[0], edge[1], &[]).unwrap();
+        }
+        let mut config = SurfaceFollowerConfig::new(0.4);
+        config.basic_kinematics = Some(motion);
+        config.controller.control_frequency = 20.0;
+        assert!(config.motion_limits.is_none(), "基本通道不冒充保证制动标定");
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        let mut now = 1_000_000_000;
+        follower
+            .configure_goal(&stamped(goal, now), options)
+            .unwrap();
+        follower
+            .update_execution_map(ExecutionMap::Surface(map.clone()))
+            .unwrap();
+        follower.update_odometry(stamped(current, now));
+        follower
+            .replace_execution_path(
+                ExecutionPath::Surface(Path3D {
+                    poses: route.into_iter().map(|p| stamped(p, now)).collect(),
+                }),
+                None,
+                stamped(goal, now),
+            )
+            .unwrap();
+        let mut reached = false;
+        for tick in 0..800 {
+            match follower.step(0.3) {
+                PlannerStep::Command(command) => {
+                    if tick == 0 {
+                        assert!(command.linear.x < 0.0);
+                    }
+                    assert!(
+                        command.linear.x >= -0.1 - 1e-9
+                            && command.linear.y.abs() <= 0.08 + 1e-9
+                            && command.angular_z.abs() <= 0.5 + 1e-9
+                    );
+                    follower.observe_applied_command(command);
+                    let next = integrate(planar(current), command, 0.05);
+                    current = pose(next.x, next.y, next.yaw);
+                }
+                PlannerStep::Succeeded => {
+                    reached = true;
+                    break;
+                }
+                other => panic!("基本全向通道应能沿真实窄通道倒退: {other:?}"),
+            }
+            now += 50_000_000;
+            follower.update_odometry(stamped(current, now));
+        }
+        assert!(reached);
+        let mut calibrated = SurfaceFollowerConfig::new(0.4);
+        calibrated.basic_kinematics = Some(motion);
+        let mut disabled = limits();
+        disabled.max_reverse_mps = 0.0;
+        calibrated.motion_limits = Some(disabled);
+        assert!(
+            SurfaceFollower::new(calibrated)
+                .unwrap()
+                .configure_goal(&stamped(goal, now), options)
+                .is_err(),
+            "显式完整标定关闭倒退时，基本通道不能覆盖它"
+        );
+    }
+
+    #[test]
+    fn surface_height_correction_does_not_turn_rotation_into_an_unreachable_vertical_move() {
+        let base = scene(false);
+        let make_map = |height: f32| {
+            let points: Vec<_> = (-20..20)
+                .flat_map(|x| {
+                    (-20..20).map(move |y| ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, height))
+                })
+                .collect();
+            Arc::new(
+                SurfaceSnapshot::from_points(&points, base.config().clone(), 0.05)
+                    .unwrap()
+                    .with_body_envelope(base.body_envelope().unwrap().clone())
+                    .unwrap(),
+            )
+        };
+        let original = make_map(0.125);
+        let corrected = make_map(0.075);
+        let mut current = pose(-0.5, 0.0, 0.0);
+        let goal = pose(-0.5, 0.8, std::f64::consts::FRAC_PI_2);
+        let mut turn = pose(-0.5, 0.0, std::f64::consts::FRAC_PI_2);
+        turn.0[2] = 0.6;
+        let mut endpoint = goal;
+        endpoint.0[2] = 0.6;
+        let route = vec![current, turn, endpoint];
+        for edge in route.windows(2) {
+            original
+                .validate_body_motion(edge[0], edge[1], &[])
+                .unwrap();
+        }
+        assert!(corrected
+            .locate_support_from_body(turn.0, turn.1, 0.4)
+            .is_err());
+        let mut config = SurfaceFollowerConfig::new(0.4);
+        config.controller.control_frequency = 20.0;
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        let mut now = 1_000_000_000;
+        follower
+            .configure_goal(
+                &stamped(goal, now),
+                GoalOptions {
+                    position_tolerance_m: 0.12,
+                    yaw_tolerance_rad: 0.15,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        follower
+            .update_execution_map(ExecutionMap::Surface(original))
+            .unwrap();
+        follower.update_odometry(stamped(current, now));
+        follower
+            .replace_execution_path(
+                ExecutionPath::Surface(Path3D {
+                    poses: route.into_iter().map(|p| stamped(p, now)).collect(),
+                }),
+                None,
+                stamped(goal, now),
+            )
+            .unwrap();
+        follower
+            .update_execution_map(ExecutionMap::Surface(corrected))
+            .unwrap();
+        let mut reached = false;
+        for _ in 0..800 {
+            match follower.step(0.3) {
+                PlannerStep::Command(command) => {
+                    follower.observe_applied_command(command);
+                    let next = integrate(planar(current), command, 0.05);
+                    current = pose(next.x, next.y, next.yaw);
+                }
+                PlannerStep::Succeeded => {
+                    reached = true;
+                    break;
+                }
+                other => panic!("同一平面支撑高度修正不能让平面执行器追逐竖直误差: {other:?}"),
+            }
+            now += 50_000_000;
+            follower.update_odometry(stamped(current, now));
+        }
+        assert!(reached);
+    }
+
+    #[test]
+    fn regional_path_endpoint_waits_until_actual_pose_enters_requested_goal_region() {
+        let map = Arc::new(scene(false));
+        let mut current = pose(0.0, 0.0, 0.0);
+        let goal = pose(1.0, 0.0, 0.0);
+        let endpoint = pose(0.66, 0.0, 0.0);
+        let options = GoalOptions {
+            position_tolerance_m: 0.35,
+            yaw_tolerance_rad: std::f64::consts::PI,
+            ..Default::default()
+        };
+        assert!(position_distance(endpoint, goal) < options.position_tolerance_m);
+        let mut config = SurfaceFollowerConfig::new(0.4);
+        config.controller.control_frequency = 20.0;
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        let mut now = 1_000_000_000;
+        follower
+            .configure_goal(&stamped(goal, now), options)
+            .unwrap();
+        follower
+            .update_execution_map(ExecutionMap::Surface(map))
+            .unwrap();
+        follower.update_odometry(stamped(current, now));
+        follower
+            .replace_execution_path(
+                ExecutionPath::Surface(Path3D {
+                    poses: vec![stamped(current, now), stamped(endpoint, now)],
+                }),
+                None,
+                stamped(goal, now),
+            )
+            .unwrap();
+        let mut reached = false;
+        for _ in 0..800 {
+            match follower.step(0.3) {
+                PlannerStep::Command(command) => {
+                    follower.observe_applied_command(command);
+                    let next = integrate(planar(current), command, 0.05);
+                    current = pose(next.x, next.y, next.yaw);
+                }
+                PlannerStep::Succeeded => {
+                    reached = true;
+                    break;
+                }
+                other => panic!("不能在到达区域外提前消费替代终点: {other:?}, pose={current:?}"),
+            }
+            now += 50_000_000;
+            follower.update_odometry(stamped(current, now));
+        }
+        assert!(reached && position_distance(current, goal) < options.position_tolerance_m);
+    }
+
+    #[test]
+    fn blocked_translation_replans_instead_of_emitting_aligned_tiny_rotations() {
+        let clear=Arc::new(scene(false));let blocked=Arc::new(scene(true));
+        let start=pose(-0.51,0.05,0.0);let goal=pose(0.55,0.05,0.001);
+        let motion=MotionKinematics {model:MotionModel::Omnidirectional,max_forward_mps:0.4,
+            max_reverse_mps:0.3,max_lateral_mps:0.3,max_angular_rps:0.6,
+            minimum_turning_radius_m:0.0,can_rotate_in_place:true};
+        let mut config=SurfaceFollowerConfig::new(0.4);config.basic_kinematics=Some(motion);
+        config.controller.speed=0.4;config.controller.control_frequency=20.0;
+        let mut follower=SurfaceFollower::new(config).unwrap();let now=1_000_000_000;
+        follower.configure_goal(&stamped(goal,now),GoalOptions {position_tolerance_m:0.12,yaw_tolerance_rad:std::f64::consts::PI,..Default::default()}).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(clear)).unwrap();follower.update_odometry(stamped(start,now));
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:vec![stamped(start,now),stamped(goal,now)]}),None,stamped(goal,now)).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(blocked)).unwrap();
+        assert!(matches!(follower.step(0.3),PlannerStep::ReplanRequired(_)),
+            "朝向已对齐，所有平移都被新障碍阻挡时必须重规划");
+    }
+
     #[test]
     fn inserted_obstacle_replans_around_it_and_continues_to_original_position() {
         let clear=Arc::new(scene(false));let blocked=Arc::new(scene(true));

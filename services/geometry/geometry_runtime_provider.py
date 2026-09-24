@@ -9,6 +9,7 @@ from services.geometry.checkpoint_payload import FrozenPayload, payload_chunks, 
 from core.config_values import runtime_value
 
 from contextlib import contextmanager
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -2489,6 +2490,80 @@ def _latest_pose_updates(call, stop_event):
     finally:
         # 回调线程退出前先停止真实读取；未回收时原订阅句柄仍保持存活。
         _cancel_stream_call(call, context="位姿接收")
+        reader.join()
+
+
+def _coalesced_navigation_updates(call):
+    """接收不等待订阅回调；合并同一目标的连续进度，保留终态与身份边界。"""
+    condition = threading.Condition()
+    pending = deque()
+    stopping = threading.Event()
+    finished = False
+    failure = None
+
+    def merge_key(update):
+        status = str(getattr(update, "status", "") or "").strip().lower()
+        return (
+            _navigation_lease_from_message(update),
+            bytes(getattr(update, "goal_payload_sha256", b"")),
+            int(getattr(update, "runtime_generation", 0)),
+            int(getattr(update, "guard_generation", 0)),
+            status if status in _NAV_TERMINAL_STATUS or status not in _NAV_STREAM_STATUS else "progress",
+            str(getattr(update, "cancel_phase", "")),
+            int(getattr(update, "cancel_generation", 0)),
+            bool(getattr(update, "actuator_zeroed", False)),
+            str(getattr(update, "zero_ack_id", "")),
+            int(getattr(update, "zero_applied_monotonic_ns", 0)),
+        )
+
+    def receive():
+        nonlocal finished, failure
+        try:
+            for update in call:
+                key = merge_key(update)
+                with condition:
+                    if stopping.is_set():
+                        return
+                    if pending and pending[-1][0] == key:
+                        previous = pending[-1][1]
+                        if (update.timestamp_ns >= previous.timestamp_ns
+                                and update.path_revision >= previous.path_revision):
+                            pending[-1] = (key, update)
+                            condition.notify()
+                            continue
+                    # 不丢弃其它目标或停车证据。异常高频身份变化只施加有界背压。
+                    condition.wait_for(lambda: len(pending) < 32 or stopping.is_set())
+                    if stopping.is_set():
+                        return
+                    pending.append((key, update))
+                    condition.notify()
+        except Exception as exc:
+            with condition:
+                failure = exc
+        finally:
+            with condition:
+                finished = True
+                condition.notify()
+
+    reader = threading.Thread(target=receive, name="geometry_runtime_navigation_receive", daemon=True)
+    reader.start()
+    try:
+        while True:
+            with condition:
+                condition.wait_for(lambda: pending or finished)
+                if pending:
+                    _, update = pending.popleft()
+                    condition.notify()
+                elif failure is not None:
+                    raise failure
+                else:
+                    return
+            yield update
+    finally:
+        stopping.set()
+        with condition:
+            condition.notify_all()
+        _cancel_stream_call(call, context="导航状态接收")
         reader.join()
 
 
@@ -6871,6 +6946,7 @@ class GeometryRuntimeProvider:
                     ):
                         return
                 call = None
+                updates = None
                 try:
                     call = stream_stub.SubscribeNavigationState(pb2.Empty())
                     with self._nav_command_lock:
@@ -6888,7 +6964,8 @@ class GeometryRuntimeProvider:
                             context="stale navigation",
                         )
                         return
-                    for update in call:
+                    updates = _coalesced_navigation_updates(call)
+                    for update in updates:
                         notification = None
                         with self._nav_delivery_lock:
                             committed = self._cache_navigation_update(
@@ -6967,6 +7044,8 @@ class GeometryRuntimeProvider:
                     if notification is not None:
                         self._notify_navigation_subscribers(notification)
                 finally:
+                    if updates is not None:
+                        updates.close()
                     if call is not None:
                         _cancel_stream_call(
                             call,

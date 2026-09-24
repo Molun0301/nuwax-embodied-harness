@@ -25,7 +25,7 @@
 
 pub mod diagnostics;
 pub mod navigation_capabilities;
-pub use navigation_capabilities::{MotionLimits, MotionModel, NavigationCapabilities, ObservationKind, ObservationModel, TerrainLimits};
+pub use navigation_capabilities::{MotionKinematics, MotionLimits, MotionModel, NavigationCapabilities, ObservationKind, ObservationModel, TerrainLimits};
 pub mod dimos;
 pub mod frames;
 pub mod geometry;

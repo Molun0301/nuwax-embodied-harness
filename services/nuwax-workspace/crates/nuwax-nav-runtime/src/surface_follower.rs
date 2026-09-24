@@ -19,6 +19,8 @@ pub struct SurfaceFollowerConfig {
     pub body_to_support_z_m: f64,
     /// 显式运动及保证制动标定。
     pub motion_limits: Option<nuwax_nav_types_messages::MotionLimits>,
+    /// 执行器声明的基本速度通道；完整制动标定缺失时仍使用原低速几何检查。
+    pub basic_kinematics: Option<nuwax_nav_types_messages::MotionKinematics>,
     /// 近场观察最长年龄。
     pub max_observation_age_sec: Option<f64>,
     /// 已有速度、控制频率及位置/朝向容差。
@@ -38,6 +40,7 @@ impl SurfaceFollowerConfig {
         Self {
             body_to_support_z_m,
             motion_limits: None,
+            basic_kinematics: None,
             max_observation_age_sec: None,
             controller: LocalPlannerConfig::default_config(),
             max_angular_speed_rps: 0.55,
@@ -47,6 +50,7 @@ impl SurfaceFollowerConfig {
     }
 
     fn validate(&self) -> Result<(), RuntimeError> {
+        if let Some(motion)=self.kinematics() {motion.validate().map_err(|reason|RuntimeError::InvalidInput{field:"surface.kinematics",reason})?;}
         if let Some(limits)=&self.motion_limits {limits.validate().map_err(|reason|RuntimeError::InvalidInput{field:"surface.motion_limits",reason})?;}
         if self.max_observation_age_sec.is_some_and(|v|!v.is_finite() || v<=0.0){return Err(RuntimeError::InvalidInput {field:"surface.max_observation_age_sec",reason:"观察时效必须为有限正值".into()});}
         for (field, value) in [
@@ -79,6 +83,11 @@ impl SurfaceFollowerConfig {
             });
         }
         Ok(())
+    }
+
+    /// 完整标定优先于启动装配提供的基本通道声明。
+    pub fn kinematics(&self) -> Option<nuwax_nav_types_messages::MotionKinematics> {
+        self.motion_limits.as_ref().map(|limits|limits.kinematics()).or(self.basic_kinematics)
     }
 }
 
@@ -364,7 +373,23 @@ impl SurfaceFollower {
         }
         // 原控制器最小速度不能突破三维执行显式配置的低速上限。
         let speed = self.config.controller.speed * self.config.controller.nerf_speed.min(1.0);
-        let command = twist.clamp(speed, self.config.max_angular_speed_rps);
+        let mut command = twist.clamp(speed, self.config.max_angular_speed_rps);
+        if let Some(motion)=self.config.kinematics() {
+            command.linear.x=command.linear.x.clamp(
+                if self.options.allow_reverse {-motion.max_reverse_mps} else {0.0},motion.max_forward_mps);
+            command.linear.y=command.linear.y.clamp(-motion.max_lateral_mps,motion.max_lateral_mps);
+            command.angular_z=command.angular_z.clamp(-motion.max_angular_rps,motion.max_angular_rps);
+            if motion.minimum_turning_radius_m>0.0 {
+                let maximum=command.linear.x.hypot(command.linear.y)/motion.minimum_turning_radius_m;
+                command.angular_z=command.angular_z.clamp(-maximum,maximum);
+            } else if !motion.can_rotate_in_place && command.linear.x.hypot(command.linear.y)<=1e-9 {
+                command.angular_z=0.0;
+            }
+            if command.linear.x.hypot(command.linear.y)<=1e-9 && command.angular_z.abs()<=1e-9
+                && (twist.linear.x.hypot(twist.linear.y)>1e-9 || twist.angular_z.abs()>1e-9) {
+                return PlannerStep::ReplanRequired("当前平面意图超出已声明的执行器通道，需要重新规划".into());
+            }
+        }
         if self.motion_is_traversable(command) {
             return PlannerStep::Command(command);
         }
@@ -382,7 +407,18 @@ impl SurfaceFollower {
             linear: Point2::new(0.0, 0.0),
             angular_z: command.angular_z,
         };
-        if rotation.angular_z.abs() > 1e-9 && self.motion_is_traversable(rotation) {
+        let needs_rotation=self.odometry.as_ref().zip(self.control_target).is_none_or(|(pose,target)| {
+            let yaw=pose.pose.orientation.yaw();
+            let omni=self.config.kinematics().is_some_and(|m|m.model==nuwax_nav_types_messages::MotionModel::Omnidirectional && m.max_lateral_mps>0.0);
+            let desired=if !omni && command.linear.x.hypot(command.linear.y)>1e-9 {
+                (target.y-pose.pose.position.y).atan2(target.x-pose.pose.position.x)
+                    + if command.linear.x<0.0 {std::f64::consts::PI} else {0.0}
+            } else {target.yaw};
+            angle_diff(desired,yaw).abs()>self.config.controller.orientation_tolerance.min(0.05).max(1e-6)
+        });
+        // 已按当前路径对齐却没有可行平移时，微小旋转不会恢复通行性，直接重规划。
+        if needs_rotation && self.config.kinematics().is_none_or(|m|m.can_rotate_in_place)
+            && rotation.angular_z.abs() > 1e-9 && self.motion_is_traversable(rotation) {
             return PlannerStep::Command(rotation);
         }
         PlannerStep::ReplanRequired("短时速度轨迹没有连续支撑或足够净空".into())
@@ -397,6 +433,9 @@ impl SurfaceFollower {
             .all(f64::is_finite)
         {
             return false;
+        }
+        if self.maintained_body_motion_is_traversable(command,crate::DEFAULT_CONTROL_HORIZON.as_secs_f64()) {
+            return true;
         }
         let Ok(initial_support) = Self::support(map, pose, self.config.body_to_support_z_m) else {
             return false;
@@ -466,10 +505,18 @@ impl SurfaceFollower {
             if map.body_envelope().is_some() {
                 let body_at=|support:[f64;3],yaw:f64| {
                     let q=map.body_orientation_at(support,yaw).ok()?;
-                    let p=map.body_position_from_support(support,q,self.config.body_to_support_z_m).ok()?;
+                    let p=if command.linear.x.hypot(command.linear.y)<1e-9 {
+                        // 原地转向没有升降或平移指令，不得用格顶投影凭空移开机体。
+                        xyz(pose.pose.position)
+                    } else {map.body_position_from_support(support,q,self.config.body_to_support_z_m).ok()?};
                     Some((p,q))
                 };
                 let (Some(a),Some(b),Some(c),Some(d))=(body_at(support,yaw+angle*(sample-1) as f64/sample as f64),body_at(next.support_xyz,yaw+angle),body_at(delayed_support,yaw),body_at(next_delayed.support_xyz,yaw))else{return false;};
+                if sample==1 {
+                    let q=pose.pose.orientation;
+                    let actual=(xyz(pose.pose.position),[q.x,q.y,q.z,q.w]);
+                    if map.validate_body_motion(actual,a,&[]).is_err() || map.validate_body_motion(actual,c,&[]).is_err() {return false;}
+                }
                 if map.validate_body_motion(a,b,&[]).is_err() || map.validate_body_motion(c,d,&[]).is_err() || map.validate_body_motion(b,d,&[]).is_err(){return false;}
             }
             support = next.support_xyz;
@@ -482,7 +529,7 @@ impl SurfaceFollower {
 impl NavPlanner for SurfaceFollower {
     fn configure_goal(&mut self, _goal:&PoseStamped, options:nuwax_nav_types_messages::GoalOptions)->Result<(),RuntimeError> {
         options.validate().map_err(|reason|RuntimeError::InvalidInput {field:"goal_options",reason})?;
-        if options.allow_reverse && self.config.motion_limits.as_ref().is_none_or(|m|m.max_reverse_mps<=0.0) {return Err(RuntimeError::InvalidInput {field:"allow_reverse",reason:"三维执行未提供倒车标定".into()});}
+        if options.allow_reverse && self.config.kinematics().is_none_or(|m|m.max_reverse_mps<=0.0) {return Err(RuntimeError::InvalidInput {field:"allow_reverse",reason:"三维执行器未声明倒退速度通道".into()});}
         // 新目标执行仍须取得守卫准入；旧规划器内部状态不能代替该证明。
         self.braking_deadline = None;
         self.last_command = Twist2::ZERO;

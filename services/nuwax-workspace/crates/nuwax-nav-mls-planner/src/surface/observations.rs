@@ -17,7 +17,8 @@ pub struct SurfaceObservations {
     pub(super) size_m: f32,
     source_timestamp_ns: u64,
     block_edge: i32,
-    blocks: im::OrdMap<[i32; 3], Arc<BTreeMap<[i32; 3], SurfaceObservation>>>,
+    blocks: im::HashMap<[i32; 3], Arc<AHashMap<[i32; 3], SurfaceObservation>>, ahash::RandomState>,
+    obstacle_cache: Arc<std::sync::Mutex<AHashMap<[i32; 3], bool>>>,
 }
 impl SurfaceObservations {
     /// 建立空观察索引，空索引不会证明任何支撑已观察。
@@ -30,6 +31,7 @@ impl SurfaceObservations {
             source_timestamp_ns: 0,
             block_edge,
             blocks: Default::default(),
+            obstacle_cache: Default::default(),
         })
     }
 
@@ -49,8 +51,9 @@ impl SurfaceObservations {
         if values.is_empty() {
             self.blocks.remove(&block);
         } else {
-            self.blocks.insert(block, Arc::new(values));
+            self.blocks.insert(block, Arc::new(values.into_iter().collect()));
         }
+        self.obstacle_cache = Default::default();
         Ok(())
     }
 
@@ -64,12 +67,26 @@ impl SurfaceObservations {
 
     /// 当前完整提交的源采样；零表示旧输入没有可用的帧身份。
     pub fn set_source_timestamp_ns(&mut self, timestamp_ns: u64) {
+        if self.source_timestamp_ns != timestamp_ns {
+            self.obstacle_cache = Default::default();
+        }
         self.source_timestamp_ns = timestamp_ns;
     }
 
     /// 本帧障碍立即保留；历史碰撞须有重复命中或连片空间证据。
     /// 只影响导航派生判断，不删除原始地图或把未知证据当作自由。
     pub(super) fn supports_obstacle(&self, key: [i32; 3]) -> bool {
+        if let Some(value) = self.obstacle_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied() {
+            return value;
+        }
+        let supported = self.check_obstacle_support(key);
+        let mut cache = self.obstacle_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= 8192 {cache.clear();}
+        cache.insert(key,supported);
+        supported
+    }
+
+    fn check_obstacle_support(&self, key: [i32; 3]) -> bool {
         let Some(value) = self.get(key) else { return false; };
         if self.source_timestamp_ns == 0 || value.observed_ns == 0 || value.hits == 0
             || value.observed_ns >= self.source_timestamp_ns || value.hits >= 3 {
@@ -113,6 +130,13 @@ mod tests {
         }
         assert!(!grid.supports_obstacle([10,10,10]), "历史孤立单次回波不作实体墙");
         assert!(grid.get([10,10,10]).is_some(), "原始观察保留");
+        let previous = grid.clone();
+        grid.set_source_timestamp_ns(101);
+        assert!(!grid.supports_obstacle([1,1,1]), "新采样不能沿用旧帧的即时命中许可");
+        assert!(previous.supports_obstacle([1,1,1]), "旧不可变观察仍保留自己的缓存");
+        grid.replace_block([0,0,0],BTreeMap::new()).unwrap();
+        assert!(!grid.supports_obstacle([5,5,5]));
+        assert!(previous.supports_obstacle([5,5,5]));
     }
 }
 impl SurfaceSnapshot {

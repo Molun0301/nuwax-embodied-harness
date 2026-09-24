@@ -122,3 +122,14 @@ def parse_navigation_capabilities(value: str) -> Optional[NavigationCapabilities
     if not isinstance(parsed, dict) or type(parsed.get("schema_version")) is not int:
         raise ValueError("导航能力版本必须是整数")
     return NavigationCapabilities.model_validate_json(json.dumps(parsed, allow_nan=False))
+
+
+def reverse_navigation_default(calibration_json: str, actuator_model: str) -> bool:
+    """完整标定优先；未配置制动标定时，只沿执行器明确声明的基本通道。"""
+    if calibration_json.strip():
+        try:
+            calibration = parse_navigation_capabilities(calibration_json)
+        except (TypeError, ValueError):
+            return False
+        return bool(calibration and calibration.motion.max_reverse_mps > 0)
+    return actuator_model == "omnidirectional"

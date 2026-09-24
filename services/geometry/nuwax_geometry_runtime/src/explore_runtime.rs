@@ -3639,10 +3639,19 @@ impl ExploreRuntimeHandle {
                             .await;
                     }
                 };
+                if let Some(surface)=&guard.surface_mode {
+                    intent.options.allow_reverse=surface.config.as_ref().ok()
+                        .and_then(|config|config.follower.kinematics())
+                        .is_some_and(|motion|motion.max_reverse_mps>0.0);
+                    // 无方向性视域只要求到达可观察位置，避免每个子目标再次停车对齐。
+                    if goal.metadata.get("goal_orientation_required").is_some_and(|value|value=="false") {
+                        intent.options.yaw_tolerance_rad=std::f64::consts::PI;
+                    }
+                }
                 if guard.return_goal_id.as_deref()==Some(goal.id.as_str()) {
                     intent.options=nuwax_nav_types_messages::GoalOptions {allow_reverse:false,position_tolerance_m:0.1,yaw_tolerance_rad:0.2};
-                    intent.goal_sha256=schema::goal_intent_action_sha256(&intent.goal,&intent.options).expect("原目标有效且返航选项固定");
                 }
+                intent.goal_sha256=schema::goal_intent_action_sha256(&intent.goal,&intent.options).expect("目标与执行选项已核对");
                 intent.map_frame_generation = guard.surface_mode.as_ref().and_then(|mode| mode.latest.as_ref()).map_or(guard.costmap_frame_generation, |ticket| ticket.map_frame_generation);
                 let request = ChildNavigationRequest {
                     parent_request_id: guard.last_request_id.clone(),

@@ -341,7 +341,7 @@ fn body_path_with_budget(
         let surface=&current_view;
         let boundary:Vec<_>=goal.boundary_points.iter().map(|p|[p[0],p[1]]).collect();
         let options=goal.options;
-        let route=crate::surface_oriented::plan_cancellable(surface,([p.x,p.y,p.z],start_quat),(goal.goal.pose.position,goal.goal.pose.orientation_xyzw),options,config.follower.motion_limits.as_ref(),&boundary,search_budget,config.planning_cancelled.as_deref()).map_err(|e|module_error("surface body planning",e))?;
+        let route=crate::surface_oriented::plan_with_motion_cancellable(surface,([p.x,p.y,p.z],start_quat),(goal.goal.pose.position,goal.goal.pose.orientation_xyzw),options,config.follower.kinematics().as_ref(),&boundary,search_budget,config.planning_cancelled.as_deref()).map_err(|e|module_error("surface body planning",e))?;
         return Ok(Path3D{poses:route.into_iter().map(|(p,q)|PoseStamped {frame_id:start.frame_id.clone(),stamp:start.stamp,pose:Pose3 {position:Point3::new(p[0],p[1],p[2]),orientation:Quaternion{x:q[0],y:q[1],z:q[2],w:q[3]}}}).collect()});
     }
     let start_support = surface
@@ -900,13 +900,17 @@ mod tests {
         assert!(body_path_remains_traversable(&map,&current_path,&pose,&config),
             "同一实际地图不能因复核丢失当前占据视图而反复重规划");
         let mut successful = 0;
+        let mut measurements=Vec::new();
         let radii = std::env::var("NUWAX_NAV_DIAGNOSTIC_RADII").ok()
             .map(|v|v.split(',').map(|s|s.parse::<f64>().unwrap()).collect::<Vec<_>>())
             .unwrap_or_else(||vec![0.2,0.5,0.8]);
-        let directions = if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_FORWARD").is_some() {1} else {8};
+        let directions = if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_FORWARD").is_some() {1} else {
+            std::env::var("NUWAX_NAV_DIAGNOSTIC_DIRECTIONS").ok().map(|value|value.parse::<i32>().unwrap()).unwrap_or(8)
+        };
+        assert!((1..=360).contains(&directions));
         for (index, (radius, direction)) in radii.into_iter()
             .flat_map(|radius| (0..directions).map(move |direction| (radius, direction))).enumerate() {
-            let angle = f64::from(direction) * std::f64::consts::FRAC_PI_4;
+            let angle = f64::from(direction) * std::f64::consts::TAU/f64::from(directions);
             let mut goal = goal_for(&message, (index+2) as i64,
                 [position[0]+radius*angle.cos(), position[1]+radius*angle.sin(), position[2]]);
             goal.goal.pose.orientation_xyzw = quaternion;
@@ -916,14 +920,50 @@ mod tests {
             if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_POSITION_ONLY").is_some() {
                 goal.options.yaw_tolerance_rad=std::f64::consts::PI;
             }
+            if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_REVERSE").is_some() {
+                goal.options.allow_reverse=true;
+            }
             if let Ok(tolerance)=std::env::var("NUWAX_NAV_DIAGNOSTIC_POSITION_TOLERANCE") {
                 goal.options.position_tolerance_m=tolerance.parse().unwrap();
             }
+            let timer=std::env::var("NUWAX_NAV_DIAGNOSTIC_CASE_TIMEOUT_SEC").ok().map(|value| {
+                let seconds=value.parse::<f64>().unwrap();
+                let flag=Arc::new(std::sync::atomic::AtomicBool::new(false));
+                config.planning_cancelled=Some(flag.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+                    flag.store(true,std::sync::atomic::Ordering::Relaxed);
+                })
+            });
             let before = Instant::now();
             let result = body_path(&map, &pose, &goal, &config);
-            successful += usize::from(result.is_ok());
+            let search_ms=before.elapsed().as_secs_f64()*1000.0;
+            if let Some(timer)=timer {timer.abort();let _=timer.await;}
+            let validation_started=Instant::now();
+            let validated=result.as_ref().is_ok_and(|path|body_path_remains_traversable(&map,path,&pose,&config));
+            let validation_ms=validation_started.elapsed().as_secs_f64()*1000.0;
+            successful += usize::from(validated);
+            measurements.push(serde_json::json!({"radius":radius,"direction":direction,
+                "goal":goal.goal.pose.position,"search_ms":search_ms,"validation_ms":validation_ms,
+                "total_ms":search_ms+validation_ms,"success":validated,
+                "points":result.as_ref().map(|path|path.poses.len()).unwrap_or(0),
+                "error":result.as_ref().err().map(|error|error.to_string())}));
             eprintln!("半径{radius}米方向{direction}规划 {:?}，耗时 {:?}",
                 result.as_ref().map(|path|path.poses.len()), before.elapsed());
+            if let Ok(output) = std::env::var("NUWAX_NAV_DIAGNOSTIC_OUTPUT") {
+                if let Ok(path) = &result {
+                    let points: Vec<_> = path.poses.iter().map(|p| {
+                        let b = p.pose.position;
+                        serde_json::json!([b.x,b.y,b.z,p.pose.orientation.yaw()])
+                    }).collect();
+                    std::fs::write(std::path::Path::new(&output).join(format!("路径-{radius}-{direction}.json")),
+                        serde_json::to_vec(&points).unwrap()).unwrap();
+                }
+            }
+        }
+        config.planning_cancelled=None;
+        if let Ok(output)=std::env::var("NUWAX_NAV_DIAGNOSTIC_OUTPUT") {
+            std::fs::write(std::path::Path::new(&output).join("规划统计.json"),serde_json::to_vec_pretty(&measurements).unwrap()).unwrap();
         }
         eprintln!("实录候选中，可规划{successful}个");
         if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_CONTROL").is_some() {
@@ -945,6 +985,9 @@ mod tests {
                 if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_POSITION_ONLY").is_some() {
                     goal.options.yaw_tolerance_rad=std::f64::consts::PI;
                 }
+                if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_REVERSE").is_some() {
+                    goal.options.allow_reverse=true;
+                }
                 if let Ok(value)=std::env::var("NUWAX_NAV_DIAGNOSTIC_POSITION_TOLERANCE") {
                     goal.options.position_tolerance_m=value.parse().unwrap();
                 }
@@ -956,6 +999,7 @@ mod tests {
                 follower.replace_execution_path(ExecutionPath::Surface(path),None,target.clone()).unwrap();
                 let mut completed=false;
                 let mut nonzero=0;
+                let mut replans=0;
                 for tick in 0..800 {
                     actual.stamp.nanos+=50_000_000;
                     follower.update_odometry(actual.clone());
@@ -971,7 +1015,7 @@ mod tests {
                                 }
                             }
                             if tick%100==0 {eprintln!("实录控制 tick={tick} command={twist:?} pose={actual:?}");}
-                            nonzero+=usize::from(twist!=Twist2::ZERO);
+                            nonzero+=usize::from(twist.linear.x.hypot(twist.linear.y)>1e-6 || twist.angular_z.abs()>1e-6);
                             let before=actual.pose.position;
                             let q=actual.pose.orientation;
                             let yaw=q.yaw();
@@ -984,11 +1028,21 @@ mod tests {
                             actual.pose.orientation=Quaternion{x:c*q.x-s*q.y,y:s*q.x+c*q.y,
                                 z:c*q.z+s*q.w,w:c*q.w-s*q.z};
                         }
+                        PlannerStep::ReplanRequired(reason)=>{
+                            replans+=1;assert!(replans<=8,"实录局部重规划不能无限循环: {reason}");
+                            // 独立运动学中归零立即生效；不把该模型当作实机制动证明。
+                            follower.stop();follower.configure_goal(&target,goal.options).unwrap();
+                            follower.update_odometry(actual.clone());
+                            let started=Instant::now();
+                            let replacement=body_path(&map,&actual,&goal,&config).expect("实录实际位姿可重规划");
+                            eprintln!("实录局部接续第{replans}次，耗时 {:?}，原因{reason}",started.elapsed());
+                            follower.replace_execution_path(ExecutionPath::Surface(replacement),None,target.clone()).unwrap();
+                        }
                         other=>panic!("实录闭环中断 tick={tick}, pose={actual:?}, result={other:?}"),
                     }
                 }
                 let error=(actual.pose.position.x-target.pose.position.x).hypot(actual.pose.position.y-target.pose.position.y);
-                eprintln!("实录运动学闭环：目标{distance}米，非零指令{nonzero}，最终位置{:?}，水平误差{error}",actual.pose.position);
+                eprintln!("实录运动学闭环：目标{distance}米，非零指令{nonzero}，局部接续{replans}，最终位置{:?}，水平误差{error}",actual.pose.position);
                 assert!(completed && nonzero>0 && error<goal.options.position_tolerance_m,"实录闭环不能停留在路径受理或零速循环");
                 follower.stop();
             }

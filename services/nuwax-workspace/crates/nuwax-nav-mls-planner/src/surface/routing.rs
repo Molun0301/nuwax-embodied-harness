@@ -1,7 +1,63 @@
 //! 前沿与区域代价共用同一有向支撑图和边界约束。
 use super::*;
 
+/// 同一不可变有向支撑图上的目标距离场，只引导搜索，不授予机体通行许可。
+pub struct SurfaceGoalCosts {
+    costs: AHashMap<VoxelKey, f64>,
+}
+
+impl SurfaceGoalCosts {
+    /// 返回支撑格到最近目标格的有向代价；不连通时为空。
+    pub fn cost(&self, cell: VoxelKey) -> Option<f64> {
+        self.costs.get(&cell).copied()
+    }
+}
+
 impl SurfaceSnapshot {
+    /// 从多个目标反向计算代价，保留上下阶的原有方向和边界。
+    pub fn goal_travel_costs(
+        &self,
+        targets: &[[f64; 3]],
+        boundary: &[[f64; 2]],
+    ) -> Result<SurfaceGoalCosts, SurfaceError> {
+        validate_boundary(boundary)?;
+        let cells = &self.data.graph.cells;
+        let root = cells.slot_capacity();
+        let mut incoming = vec![Vec::new(); root + 1];
+        for (id, edges) in cells.iter() {
+            let from = self.cell_position(cells.coord(id));
+            for edge in edges.iter().filter(|edge| edge.cost.is_finite()) {
+                let to = self.cell_position(cells.coord(edge.dest));
+                if segment_inside_boundary([from[0], from[1]], [to[0], to[1]], boundary) {
+                    incoming[edge.dest as usize].push((id as usize, f64::from(edge.base_cost)));
+                }
+            }
+        }
+        for &target in targets {
+            if !inside_boundary([target[0], target[1]], boundary) {
+                continue;
+            }
+            if let Ok(location) = self.locate_support(target) {
+                if let Some(id) = cells.id(location.cell) {
+                    incoming[root].push((id as usize, 0.0));
+                }
+            }
+        }
+        let distances =
+            nuwax_explore_routing::shortest_costs(root + 1, root, None, |id, output| {
+                output.extend_from_slice(&incoming[id])
+            });
+        Ok(SurfaceGoalCosts {
+            costs: cells
+                .ids()
+                .filter_map(|id| {
+                    let cost = distances[id as usize];
+                    cost.is_finite().then_some((cells.coord(id), cost))
+                })
+                .collect(),
+        })
+    }
+
     /// 在与前沿查询相同的有向安全图上，一次计算到多处支撑点的路径长度。
     /// 不可达目标返回无穷，非法输入返回错误；不能把直线距离当作绕障代价。
     pub fn frontier_travel_costs(

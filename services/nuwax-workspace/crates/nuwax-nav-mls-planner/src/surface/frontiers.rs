@@ -53,6 +53,15 @@ impl DirtyBounds {
 }
 
 impl SurfaceSnapshot {
+    /// 在环境快照上准备可复用的前沿几何；当前机体视图只重算局部变化。
+    pub fn prepare_frontier_geometry(
+        &self,
+        boundary: &[[f64; 2]],
+    ) -> Result<SurfaceFrontierCacheStats, SurfaceError> {
+        validate_boundary(boundary)?;
+        Ok(self.frontier_index(boundary).stats)
+    }
+
     /// 只读取已完成计算的统计；等待下一次查询的局部更新返回空。
     pub fn frontier_cache_stats(&self) -> Option<SurfaceFrontierCacheStats> {
         self.data

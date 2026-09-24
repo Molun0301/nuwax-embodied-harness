@@ -109,7 +109,8 @@ pub fn select(
     select_with_priority(candidates, None, None, costs)
 }
 
-fn region_key(p: [f64; 3]) -> [i64; 3] {
+/// 前沿代表筛选和区域等待账本共用的空间分组，不代表已识别房间。
+pub fn region_key(p: [f64; 3]) -> [i64; 3] {
     [
         (p[0] / 4.0).floor() as i64,
         (p[1] / 4.0).floor() as i64,

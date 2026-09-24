@@ -29,6 +29,7 @@ mod routing;
 mod regions;
 mod wall;
 use routing::frontier_point_distance;
+pub use routing::SurfaceGoalCosts;
 mod update;
 pub use update::{SurfaceBuildKind, SurfaceBuildStats, SurfaceColumnUpdate, SurfaceMapBuild, SurfaceMapBuilder};
 

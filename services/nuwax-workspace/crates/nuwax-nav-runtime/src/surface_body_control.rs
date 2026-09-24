@@ -13,7 +13,72 @@ fn planar(p: &PoseStamped) -> PlanarPose {
         yaw: p.pose.orientation.yaw(),
     }
 }
+fn horizontal_distance(a: &PoseStamped, b: &PoseStamped) -> f64 {
+    (a.pose.position.x - b.pose.position.x).hypot(a.pose.position.y - b.pose.position.y)
+}
 impl SurfaceFollower {
+    /// 先核对平面执行器保持实测站姿的短时轨迹；转向延迟的整条包络仍要通过。
+    pub(super) fn maintained_body_motion_is_traversable(
+        &self,
+        command: Twist2,
+        horizon: f64,
+    ) -> bool {
+        let (Some(map), Some(pose)) = (self.map.as_ref(), self.odometry.as_ref()) else {
+            return false;
+        };
+        let Some(model) = map.body_envelope() else {
+            return false;
+        };
+        let from = body(pose);
+        let start = planar(pose);
+        let count = ((command.linear.x.hypot(command.linear.y)
+            + model.radius() * command.angular_z.abs())
+            * horizon
+            / (f64::from(map.source_voxel_size_m()) * 0.5))
+            .ceil()
+            .max(2.0) as usize;
+        if count > 512 {
+            return false;
+        }
+        let mut previous = from;
+        let mut delayed_previous = from;
+        for index in 1..=count {
+            let time = horizon * index as f64 / count as f64;
+            let next = nuwax_nav_control::integrate(start, command, time);
+            let delayed = nuwax_nav_control::integrate(
+                start,
+                Twist2 {
+                    linear: command.linear,
+                    angular_z: 0.0,
+                },
+                time,
+            );
+            let (s, c) = (command.angular_z * time * 0.5).sin_cos();
+            let q = from.1;
+            let next = (
+                [next.x, next.y, from.0[2]],
+                [
+                    c * q[0] - s * q[1],
+                    c * q[1] + s * q[0],
+                    c * q[2] + s * q[3],
+                    c * q[3] - s * q[2],
+                ],
+            );
+            let delayed = ([delayed.x, delayed.y, from.0[2]], from.1);
+            if map.validate_body_motion(previous, next, &[]).is_err()
+                || map
+                    .validate_body_motion(delayed_previous, delayed, &[])
+                    .is_err()
+                || map.validate_body_motion(next, delayed, &[]).is_err()
+            {
+                return false;
+            }
+            previous = next;
+            delayed_previous = delayed;
+        }
+        true
+    }
+
     pub(super) fn begin_braking(&mut self) {
         // 地图位姿包含定位校正，不能差分成真实速度或另一份静止证明。
         // 仅在实际生成过非零控制时保留标定制动上界；重复零速不延长等待。
@@ -75,15 +140,17 @@ impl SurfaceFollower {
         while self.path_index < path.poses.len() {
             let target = &path.poses[self.path_index];
             let previous = &path.poses[self.path_index - 1];
-            let rotation = target.pose.position.distance(previous.pose.position) < 1e-5;
+            let rotation = horizontal_distance(target,previous) < 1e-5;
             let error = angle_diff(target.pose.orientation.yaw(), yaw);
-            let same_support = actual_support.zip(map.locate_support_from_body(
-                body(target).0, body(target).1, self.config.body_to_support_z_m,
+            let same_support = actual_support.zip(map.locate_goal_support_from_body(
+                body(target).0, body(pose).1, self.config.body_to_support_z_m,
             ).ok()).is_some_and(|(a,b)| {
                 (a.surface_xyz[2]-b.surface_xyz[2]).abs()
                     <= f64::from(map.source_voxel_size_m())+1e-6
             });
-            // 地面厚层允许实际足端参考位于层内。已通过完整机体检查且关联
+            // 路径高度用于选择地面层，接触参考按实际姿态转换；平面执行器
+            // 不控制路径拟合的横滚/俯仰。地面厚层允许实际足端参考位于层内。
+            // 已通过完整机体检查且关联
             // 同一高度层时，按水平进度消耗路径点；平面速度无法补偿层顶偏差。
             // 最终到达仍使用上方完整三维距离，不跨楼层或扩大用户容差。
             let distance = if same_support {
@@ -101,10 +168,60 @@ impl SurfaceFollower {
                 let dot = (position.x - b.x) * (b.x - a.x) + (position.y - b.y) * (b.y - a.y);
                 dot >= 0.0 && distance < tolerance * 2.0
             };
-            let goal_position = (target.pose.position.x-goal.pose.position.x)
-                .hypot(target.pose.position.y-goal.pose.position.y) < 1e-5;
+            // 容差区域内的替代终点也是路径终点。不能先按路径点容差消费它，
+            // 再发现机器人仍在用户目标区域之外，陷入原地重规划循环。
+            let goal_position = self.path_index+1==path.poses.len()
+                || (target.pose.position.x-goal.pose.position.x)
+                    .hypot(target.pose.position.y-goal.pose.position.y) < 1e-5;
             let reached_position = !goal_position || final_distance < self.config.controller.goal_tolerance;
-            if reached_position && (distance < tolerance && (!rotation || error.abs() < 0.05) || passed) {
+            let reached = reached_position && (distance < tolerance && (!rotation || error.abs() < 0.05) || passed);
+            let mut safe_to_skip = true;
+            if reached && !rotation
+                && (target.pose.position.x-previous.pose.position.x)
+                    .hypot(target.pose.position.y-previous.pose.position.y)>1e-5 {
+                // 微小平移可能是为后续转向让出净空，不能仅凭到点容差省略。
+                // 只有当前位置能完成后续同位置转向，才允许提前消费这段平移。
+                let mut turn_end = self.path_index;
+                while turn_end + 1 < path.poses.len()
+                    && horizontal_distance(&path.poses[turn_end + 1],target) < 1e-5 {
+                    turn_end += 1;
+                }
+                if turn_end > self.path_index {
+                    let turn_clear=|at:[f64;3],initial:[f64;4],keep_attitude:bool| {
+                        let initial_yaw=Quaternion {x:initial[0],y:initial[1],z:initial[2],w:initial[3]}.yaw();
+                        let mut previous=(at,initial);
+                        for waypoint in &path.poses[self.path_index+1..=turn_end] {
+                            let orientation=if keep_attitude {
+                                let (s,c)=(angle_diff(waypoint.pose.orientation.yaw(),initial_yaw)*0.5).sin_cos();
+                                [c*initial[0]-s*initial[1],c*initial[1]+s*initial[0],
+                                    c*initial[2]+s*initial[3],c*initial[3]-s*initial[2]]
+                            } else {body(waypoint).1};
+                            let next=(at,orientation);
+                            if map.validate_body_motion(previous,next,&[]).is_err() {return false;}
+                            previous=next;
+                        }
+                        true
+                    };
+                    safe_to_skip=turn_clear(body(pose).0,body(pose).1,true)
+                        || turn_clear(body(pose).0,body(pose).1,false);
+                    if !safe_to_skip {
+                        // 即使走到原转向点，实测站姿也不能执行该转向时，继续压低
+                        // 位置误差不会解决问题。按当前足迹重新规划，避免追逐竖直误差。
+                        let at=[target.pose.position.x,target.pose.position.y,position.z];
+                        let q=body(pose).1;let (s,c)=(angle_diff(target.pose.orientation.yaw(),yaw)*0.5).sin_cos();
+                        let orientation=[c*q[0]-s*q[1],c*q[1]+s*q[0],c*q[2]+s*q[3],c*q[3]-s*q[2]];
+                        let expected=body(target).1;
+                        let cosine=orientation.iter().zip(expected).map(|(a,b)|a*b).sum::<f64>().abs().min(1.0);
+                        let stance_changed=(position.z-target.pose.position.z).abs()>f64::from(map.source_voxel_size_m())*0.5
+                            || 2.0*cosine.acos()>0.05;
+                        if stance_changed && map.validate_body_pose(at,orientation).is_ok()
+                            && !turn_clear(at,orientation,true) && !turn_clear(at,orientation,false) {
+                            return PlannerStep::ReplanRequired("转向点的规划站姿与实际接触不一致，需要按当前足迹重新规划".into());
+                        }
+                    }
+                }
+            }
+            if reached && safe_to_skip {
                 self.progress_m = self.cumulative[self.path_index];
                 self.path_index += 1;
             } else {
@@ -118,7 +235,7 @@ impl SurfaceFollower {
             let anchor = &path.poses[self.path_index - 1];
             let mut next = self.path_index;
             while next < path.poses.len()
-                && path.poses[next].pose.position.distance(anchor.pose.position) < 1e-5
+                && horizontal_distance(&path.poses[next],anchor) < 1e-5
             {
                 next += 1;
             }
@@ -156,7 +273,7 @@ impl SurfaceFollower {
         {
             return PlannerStep::ReplanRequired("机体偏离连续三维路线".into());
         }
-        let rotation = target.pose.position.distance(previous.pose.position) < 1e-5;
+        let rotation = horizontal_distance(target,previous) < 1e-5;
         let mut target_index = self.path_index;
         if rotation {
             // 同方向细分转向共用前瞻，避免每个离散角度都减速；不跨越反转或平移。
@@ -166,7 +283,7 @@ impl SurfaceFollower {
                 let b = &path.poses[target_index + 1];
                 let step = angle_diff(b.pose.orientation.yaw(), a.pose.orientation.yaw());
                 let ahead = angle_diff(b.pose.orientation.yaw(), yaw);
-                if b.pose.position.distance(previous.pose.position) >= 1e-5
+                if horizontal_distance(b,previous) >= 1e-5
                     || step * direction <= 0.0
                     || ahead * direction <= 0.0
                     || ahead.abs() > std::f64::consts::FRAC_PI_2
@@ -179,7 +296,7 @@ impl SurfaceFollower {
             while target_index + 1 < path.poses.len() {
                 let a = &path.poses[target_index];
                 let b = &path.poses[target_index + 1];
-                if a.pose.position.distance(b.pose.position) < 1e-5
+                if horizontal_distance(a,b) < 1e-5
                     || angle_diff(b.pose.orientation.yaw(), target.pose.orientation.yaw()).abs()
                         > 0.25
                     || position.distance(b.pose.position) > self.config.lookahead_m
@@ -204,17 +321,15 @@ impl SurfaceFollower {
             let speed = self.config.controller.speed.min(dx.hypot(dy) * 1.5);
             let omni = self
                 .config
-                .motion_limits
-                .as_ref()
-                .is_some_and(|m| m.model == MotionModel::Omnidirectional);
+                .kinematics()
+                .is_some_and(|m| m.model == MotionModel::Omnidirectional && m.max_lateral_mps>0.0);
             let reverse = self.options.allow_reverse && forward < 0.0;
             let direction = if reverse { -1.0 } else { 1.0 };
             let travel_yaw = (dy).atan2(dx) + if reverse { std::f64::consts::PI } else { 0.0 };
             let error = angle_diff(travel_yaw, yaw);
             let rotate_allowed = self
                 .config
-                .motion_limits
-                .as_ref()
+                .kinematics()
                 .is_none_or(|m| m.can_rotate_in_place);
             if omni {
                 preferred.linear = Point2::new(forward, lateral);
@@ -228,6 +343,11 @@ impl SurfaceFollower {
             } else {
                 preferred.angular_z = error.clamp(-0.6, 0.6);
             }
+        }
+        if preferred.linear.x.hypot(preferred.linear.y)<=1e-9 && preferred.angular_z.abs()<=1e-9 {
+            return PlannerStep::ReplanRequired(format!(
+                "局部路径点{}仅剩不可执行的支撑差异（高度差{:.3}米），需要从实际位姿重新规划",
+                self.path_index,target.pose.position.z-position.z));
         }
         self.bounded_command(preferred)
     }

@@ -2,7 +2,7 @@
 
 use nuwax_nav_mls_planner::{mls_planner::Config, SurfaceBodyEnvelope};
 use nuwax_nav_runtime::SurfaceFollowerConfig;
-use nuwax_nav_types_messages::{NavigationCapabilities, RobotGeometry};
+use nuwax_nav_types_messages::{MotionKinematics, MotionModel, NavigationCapabilities, RobotGeometry};
 
 use crate::{NavStackError, NavStackResult};
 
@@ -67,6 +67,27 @@ impl SurfaceNavigationConfig {
                 if let Some(limits) = config.follower.motion_limits.as_mut() {
                     limits.max_angular_rps = limits.max_angular_rps.min(limit);
                 }
+            }
+        }
+        if let Ok(model)=std::env::var("_NUWAX_NAV_ACTUATOR_MOTION_MODEL") {
+            if !model.trim().is_empty() {
+                if config.body_envelope.is_none() {
+                    return Err(NavStackError::InvalidConfig("三维基本运动通道需要完整机器人外形".into()));
+                }
+                if model!="omnidirectional" {
+                    return Err(NavStackError::InvalidConfig("不支持的执行器基本运动形式".into()));
+                }
+                let speed=std::env::var("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS")
+                    .map_err(|_|NavStackError::InvalidConfig("基本运动通道缺少执行器线速度上限".into()))?;
+                let angular=std::env::var("_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS")
+                    .map_err(|_|NavStackError::InvalidConfig("基本运动通道缺少执行器角速度上限".into()))?;
+                let speed=parse_number("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS",&speed)?;
+                let motion=MotionKinematics {model:MotionModel::Omnidirectional,
+                    max_forward_mps:speed,max_reverse_mps:speed,max_lateral_mps:speed,
+                    max_angular_rps:parse_number("_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS",&angular)?,
+                    minimum_turning_radius_m:0.0,can_rotate_in_place:true};
+                motion.validate().map_err(NavStackError::InvalidConfig)?;
+                config.follower.basic_kinematics=Some(motion);
             }
         }
         Ok(config)

@@ -12,6 +12,44 @@ pub enum MotionModel {
     /// 有最小曲率半径的阿克曼底盘。
     Ackermann,
 }
+/// 执行器已声明的平面速度通道；不包含未经测量的响应或制动保证。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionKinematics {
+    /// 可执行的运动形式。
+    pub model: MotionModel,
+    /// 前进速度上限，米/秒。
+    pub max_forward_mps: f64,
+    /// 倒退速度上限，零表示不支持。
+    pub max_reverse_mps: f64,
+    /// 横移速度上限，零表示不支持。
+    pub max_lateral_mps: f64,
+    /// 角速度上限，弧度/秒。
+    pub max_angular_rps: f64,
+    /// 最小转弯半径，米。
+    pub minimum_turning_radius_m: f64,
+    /// 执行器是否支持原地转向。
+    pub can_rotate_in_place: bool,
+}
+
+impl MotionKinematics {
+    /// 仅验证通道与速度范围，不能据此启用保证制动控制。
+    pub fn validate(&self) -> Result<(), String> {
+        if !range(self.max_forward_mps, 0.0, 5.0, true)
+            || !range(self.max_reverse_mps, 0.0, 5.0, false)
+            || !range(self.max_lateral_mps, 0.0, 5.0, false)
+            || !range(self.max_angular_rps, 0.0, 4.0 * std::f64::consts::PI, true)
+            || !range(self.minimum_turning_radius_m, 0.0, 100.0, false)
+            || (self.model != MotionModel::Omnidirectional && self.max_lateral_mps != 0.0)
+            || (self.model == MotionModel::Ackermann
+                && (self.can_rotate_in_place || self.minimum_turning_radius_m <= 0.0))
+            || (self.can_rotate_in_place && self.minimum_turning_radius_m != 0.0)
+        {
+            return Err("执行器平面运动通道或速度上限无效".into());
+        }
+        Ok(())
+    }
+}
+
 /// 同一速度执行器的速度、响应和保证制动能力，均采用国际单位。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,6 +157,18 @@ fn range(value: f64, min: f64, max: f64, positive: bool) -> bool {
     value.is_finite() && value >= min && value <= max && (!positive || value > 0.0)
 }
 impl MotionLimits {
+    /// 从完整标定提取同一执行器的速度通道。
+    pub fn kinematics(&self) -> MotionKinematics {
+        MotionKinematics {
+            model: self.model,
+            max_forward_mps: self.max_forward_mps,
+            max_reverse_mps: self.max_reverse_mps,
+            max_lateral_mps: self.max_lateral_mps,
+            max_angular_rps: self.max_angular_rps,
+            minimum_turning_radius_m: self.minimum_turning_radius_m,
+            can_rotate_in_place: self.can_rotate_in_place,
+        }
+    }
     /// 拒绝非有限、不成立或超出支持范围的标定。
     pub fn validate(&self) -> Result<(), String> {
         if self.maximum_stopping_time_sec() > 30.0 || !range(self.max_forward_mps, 0.0, 5.0, true)

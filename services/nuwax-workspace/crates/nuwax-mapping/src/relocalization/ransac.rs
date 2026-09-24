@@ -50,11 +50,15 @@ pub struct RansacResult {
     pub converged: bool,
 }
 
+/// 已计算变换的诊断指标，由调用方决定如何呈现。
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct AlignmentScore {
-    pub(crate) inlier_count: usize,
-    pub(crate) fitness: f64,
-    pub(crate) rmse: f64,
+pub struct AlignmentScore {
+    /// 对应距离内的源点数。
+    pub inlier_count: usize,
+    /// 有对应关系的源点比例。
+    pub fitness: f64,
+    /// 对应点均方根误差。
+    pub rmse: f64,
 }
 
 /// Estimate a rigid transform from feature matches using deterministic 3-point RANSAC.
@@ -163,7 +167,8 @@ fn finite_points(points: &[Point3<f64>]) -> bool {
         .all(|point| point.coords.iter().all(|value| value.is_finite()))
 }
 
-pub(crate) fn evaluate_alignment(
+/// 计算现有变换的对应关系诊断，不负责结果提交。
+pub fn evaluate_alignment(
     source: &[Point3<f64>],
     target: &[Point3<f64>],
     transform: Isometry3<f64>,

@@ -12074,7 +12074,21 @@ class GatewayRuntime:
                     partial = bool(path and target and
                         math.hypot(float(path[-1]["x"])-target.position.x,
                                    float(path[-1]["y"])-target.position.y) > goal.tolerance_position_m)
-                    pose = last_context.navigation_state.current_pose if fallback_region is not None else None
+                    def region_pose(navigation_context):
+                        current = navigation_context.navigation_state.current_pose
+                        if current is not None:
+                            return current
+                        # 导航覆盖帧可只携带执行状态；区域归属继续使用原定位服务的真实位姿。
+                        localization = self.localization_service.get_latest_snapshot()
+                        if localization is not None and localization.current_pose is not None:
+                            return localization.current_pose
+                        # 状态聚合缓存也可暂缺，复用已激活地图的原生位姿读取。
+                        try:
+                            return self.map_workspace_service.get_relocalized_pose(goal.map_name)
+                        except (GatewayError, RuntimeError):
+                            return None
+
+                    pose = region_pose(last_context) if fallback_region is not None and status == NavigationStatus.PLANNING else None
                     prefix_end_reached = bool(partial and pose and
                         math.hypot(float(path[-1]["x"])-pose.position.x,
                                    float(path[-1]["y"])-pose.position.y) <= 0.15)
@@ -12082,7 +12096,7 @@ class GatewayRuntime:
                     if (fallback_region is not None and (prefix_end_reached or no_route)
                             and status == NavigationStatus.PLANNING
                             and self.memory_service.navigation_region_contains(
-                                fallback_region, last_context.navigation_state.current_pose)):
+                                fallback_region, pose)):
                         stopped = self._cancel_navigation_with_safety_barrier(context,
                             goal_id=goal.goal_id, poll_interval_sec=poll_interval_sec,
                             acknowledge_interrupt=False)
@@ -12092,7 +12106,7 @@ class GatewayRuntime:
                         if not proof:
                             raise self._navigation_parking_error(goal_id=goal.goal_id,
                                 reason="到区结束缺少停车证明", navigation_context=stopped)
-                        if not self.memory_service.navigation_region_contains(fallback_region, stopped.navigation_state.current_pose):
+                        if not self.memory_service.navigation_region_contains(fallback_region, region_pose(stopped)):
                             raise GatewayError("停车时未处于目标区域内。", error_code="arrival_not_confirmed", http_status=409)
                         context.update(progress=1.0, stage="completed", message="目标点路径尚不可达，已到达对应区域并停车。")
                         if not context.commit_success(proof):

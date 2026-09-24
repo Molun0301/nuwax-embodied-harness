@@ -2705,11 +2705,6 @@ pub(crate) async fn admit_goal_intent(
     intent: schema::GoalIntent,
     producer_authority: GoalProducerEpochAuthority,
 ) -> SetGoalOutcome {
-    if intent.options.allow_reverse {
-        let allowed = nuwax_nav_types_messages::NavigationCapabilities::from_env()
-            .ok().flatten().is_some_and(|profile| profile.motion.max_reverse_mps > 0.0);
-        if !allowed { return rejected_goal_intent(intent.session_id.clone(), "reverse motion requires explicit calibrated capability"); }
-    }
     let goal_id = intent.session_id.clone();
     let producer_contract_valid = matches!(
         (intent.producer.as_str(), intent.owner_kind, intent.priority,),
@@ -4529,14 +4524,14 @@ mod tests {
         assert!(!d.ready);
         assert!(!d.tf);
         assert!(!d.costmap);
-        assert_eq!(d.profile, PROFILE_SIMPLE_2D);
+        assert_eq!(d.profile, PROFILE_MLS3D);
         // Phase 7 字段:初始 backend=RealLcm(test handle),counters 全 0
         assert_eq!(d.backend, "RealLcm");
         assert_eq!(d.tf_count, 0);
         assert_eq!(d.costmap_revision, 0);
         assert!(!d.cmd_vel_sink_ready);
         assert!(!d.motion_sink_observed);
-        assert_eq!(d.active_profile, PROFILE_SIMPLE_2D);
+        assert_eq!(d.active_profile, PROFILE_MLS3D);
     }
 
     #[test]
@@ -4695,7 +4690,7 @@ mod tests {
         assert!(!d.ready);
         assert!(!d.tf);
         assert!(!d.costmap);
-        assert_eq!(d.profile, PROFILE_SIMPLE_2D);
+        assert_eq!(d.profile, PROFILE_MLS3D);
         // 仅检查列表保留尚未接通运动守卫的原生配置。
         assert!(d
             .p1_native_profiles
@@ -4902,7 +4897,7 @@ mod tests {
             assert!(outcome
                 .state
                 .message
-                .contains("committed map session, generation, revision, frame, or hash changed"));
+                .contains(if mutate_hash { "committed map revision or hash conflicts" } else { "committed map revision advanced" }));
             assert!(outcome.lease.is_none());
             assert!(state.inner.read().await.goal.is_none());
             assert_eq!(state.next_goal_generation.load(AtomicOrdering::Acquire), 0);
@@ -4991,7 +4986,7 @@ mod tests {
             &handle,
             &state,
             SetGoalInput {
-            options: Default::default(),
+            options: nuwax_nav_types_messages::GoalOptions { allow_reverse: true, ..Default::default() },
                 target: PoseState {
                     x: 1.0,
                     qw: 1.0,

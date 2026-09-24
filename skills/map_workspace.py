@@ -1478,18 +1478,15 @@ class MapWorkspaceService:
         )
 
     def get_relocalized_pose(self, map_name: str):
-        """读取当前激活地图已经提交的定位位姿，不把普通里程计当作重定位。"""
-        session = self._localization_service.get_active_session()
-        snapshot = self._localization_service.get_latest_snapshot()
-        if session is None or session.map_name != map_name or snapshot is None:
-            return None
-        receipt = session.metadata.get(_RELOCALIZATION_SESSION_METADATA_KEY)
+        """按当前激活结果读取功能拥有方位姿，不等待显示聚合刷新。"""
+        receipt = self._repository.get_last_successful_relocalization_receipt()
         activation = self._repository.get_last_successful_map_activation_receipt()
-        if not receipt or not activation:
+        if not receipt or not activation or receipt.get("map_name") != map_name:
             return None
         if receipt.get("activation_identity_sha256") != activation.get("activation_identity_sha256"):
             return None
-        return snapshot.current_pose
+        provider = self._geometry_runtime.get_geometry_runtime_provider()
+        return provider.get_current_pose() if provider is not None else None
 
     def get_active_localization_session(self) -> Optional[LocalizationSession]:
         """返回当前激活地图绑定的平台定位会话。"""

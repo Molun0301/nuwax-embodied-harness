@@ -448,7 +448,7 @@ class SceneMappingService:
 
     def get_map(self) -> Dict[str, Any]:
         capture = self.memory.capture_scene_mapping_state()
-        spaces = sorted(self.memory.current_managed_scene_spaces(capture["snapshot"], include_stale=True),
+        spaces = sorted(self.memory.current_managed_scene_spaces(capture["snapshot"], include_stale=True, copy_records=False),
                         key=lambda space: space.scene_space_id)
         return {"map_binding": capture["binding"], "regions": [_public_space(space) for space in spaces],
                 "region_count": len(spaces), "navigation_checked": False}
@@ -488,11 +488,8 @@ def _distance_to_boundary(point, polygon) -> float:
 
 
 def _public_space(space):
-    """界面使用轮廓及洞，精确格归属索引保留在服务内部。"""
-    row = space.model_dump(mode="json")
-    if row.get("boundary"):
-        row["boundary"]["metadata"].pop("room_geometry", None)
-    return row
+    """界面只序列化所需轮廓，不先展开再丢弃内部栅格索引。"""
+    return space.model_dump(mode="json", exclude={"boundary": {"metadata": {"room_geometry"}}})
 
 
 def _consistent_visual_votes(result, images, winner):

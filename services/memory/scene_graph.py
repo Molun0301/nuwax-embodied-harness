@@ -57,7 +57,7 @@ class SceneGraphService:
                                      [(s.scene_space_id, s.metadata.get("geometry_digest")) for s in spaces]])
         # 内容签名覆盖实际返回字段，不把一次查询时间当作图更新。
         index_key = graph_digest([geometry_key, binding, capture["generation"],
-                                  [s.model_dump(mode="json") for s in spaces], capture["instances"],
+                                  [s.model_dump(mode="json", exclude={"boundary": {"metadata": {"room_geometry"}}}) for s in spaces], capture["instances"],
                                   [entry.model_dump(mode="json") for entry in capture["entries"]],
                                   capture["instance_total"], capture["entry_total"], len(capture["spaces"])])
         with self._lock:

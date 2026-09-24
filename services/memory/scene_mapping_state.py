@@ -42,12 +42,13 @@ class SceneMappingMemoryMixin:
             library = self._require_memory_enabled()
             if library != snapshot.map_name:
                 raise GatewayError("当前地图与记忆库名称不一致。", error_code="scene_map_library_mismatch", http_status=409)
+            # 区域更新沿原仓储替换完整记录；捕获引用即可保留一致版本，避免锁内复制栅格。
             return {
                 "snapshot": snapshot,
                 "binding": snapshot_binding(snapshot),
                 "library_name": library,
                 "generation": getattr(self, "_scene_scope_generation", 0),
-                "spaces": tuple(space.model_copy(deep=True) for space in self._scene_spaces_by_id.values()
+                "spaces": tuple(space for space in self._scene_spaces_by_id.values()
                                 if space.metadata.get(MANAGED_KEY) and self._record_library_name(space) == library),
                 # 只截取当前库的近期证据；旧帧最终还需检查地图来源及采集时间。
                 "entries": tuple(sorted((entry for entry in self._semantic_entries_by_id.values()
@@ -174,7 +175,7 @@ class SceneMappingMemoryMixin:
                     self._persist_managed_scene_space(stale)
             return written
 
-    def current_managed_scene_spaces(self, snapshot, *, include_stale: bool = False) -> List[SceneSpace]:
+    def current_managed_scene_spaces(self, snapshot, *, include_stale: bool = False, copy_records: bool = True) -> List[SceneSpace]:
         if snapshot is None or snapshot.occupancy_grid is None or not self.is_enabled():
             return []
         binding = snapshot_binding(snapshot)
@@ -189,10 +190,11 @@ class SceneMappingMemoryMixin:
                 valid = same_scope(saved, binding) and saved.get("content_sha256") == binding["content_sha256"]
                 if not valid or space.review_status == SceneSpaceReviewStatus.STALE:
                     if include_stale:
-                        result.append(space.model_copy(update={"review_status": SceneSpaceReviewStatus.STALE}, deep=True))
+                        result.append(space.model_copy(update={"review_status": SceneSpaceReviewStatus.STALE}))
                     continue
-                result.append(space.model_copy(deep=True))
-            return result
+                result.append(space)
+        # 需要独立对象的调用方在锁外复制；公开JSON读取只序列化捕获的记录。
+        return [space.model_copy(deep=True) for space in result] if copy_records else result
 
     def update_scene_mapping_label(self, *, scene_space_id: str, map_name: str, expected_revision: int,
                                    label: str, request_id: str, requested_by: str) -> SceneSpace:

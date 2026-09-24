@@ -7460,17 +7460,6 @@ class GeometryRuntimeProvider:
         transaction_context = self._nav_set_transaction_context
         if getattr(transaction_context, "active", False):
             raise RuntimeError("reentrant_set_goal")
-        with _cooperative_deadline_lock(
-            self._nav_notification_condition,
-            deadline_monotonic,
-            "SetNavigationGoal",
-        ):
-            if (
-                self._nav_pending_notification_tickets
-                or self._nav_active_notification_count > 0
-            ):
-                raise RuntimeError("navigation_notification_in_progress")
-
         request_goal_id = str(getattr(goal, "goal_id", "") or "").strip()
         transaction_context.result = (request_goal_id, False, "")
         transaction_context.notification = None
@@ -7481,36 +7470,16 @@ class GeometryRuntimeProvider:
                 deadline_monotonic,
                 "SetNavigationGoal",
             ):
-                # A caller may have waited behind a Set that just committed a
-                # synchronous callback ticket. Do not enter a callback cycle.
-                with _cooperative_deadline_lock(
-                    self._nav_notification_condition,
-                    deadline_monotonic,
-                    "SetNavigationGoal",
-                ):
-                    if (
-                        self._nav_pending_notification_tickets
-                        or self._nav_active_notification_count > 0
-                    ):
-                        raise RuntimeError(
-                            "navigation_notification_in_progress"
-                        )
+                # 命令事务自己推进代次并退休旧通知，显示回调不参与目标准入。
                 accepted = self._set_goal_transaction(
                     goal,
                     deadline_monotonic=deadline_monotonic,
                 )
                 notification = transaction_context.notification
 
-            if notification is not None and deadline_monotonic is None:
-                try:
-                    self._notify_navigation_subscribers(notification)
-                except Exception:  # pragma: no cover - defensive fanout fence
-                    with self._nav_notification_condition:
-                        notification.cancelled = True
-                    self._retire_navigation_notification(notification)
-                    LOGGER.exception(
-                        "SetNavigationGoal 已提交，但通知投递异常。"
-                    )
+            if notification is not None:
+                # 回执已写入状态缓存，真实状态流负责通知；命令返回不等待页面消费者。
+                self._retire_navigation_notification(notification)
             if not accepted:
                 submission = getattr(transaction_context, "result", None)
                 if isinstance(submission, tuple) and len(submission) == 3 and submission[0] == request_goal_id:

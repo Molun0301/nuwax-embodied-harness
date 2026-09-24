@@ -8266,6 +8266,18 @@ mod preflight_only_contract {
             Ok(())
         }
 
+        fn schedule_staged_discard(
+            computed: &RelocalizationComputedCommand,
+            runtime: &RelocalizationRuntimeContext,
+            tasks: &mut tokio::task::JoinSet<RelocalizationTaskEvent>,
+        ) {
+            let cleanup = runtime.cleanup.clone();
+            let input = computed.source.boundary_input.clone();
+            tasks.spawn(async move {
+                RelocalizationTaskEvent::DiscardScheduled(schedule_discard(&cleanup, input).await)
+            });
+        }
+
         fn handle_task_event(
             &mut self,
             event: RelocalizationTaskEvent,

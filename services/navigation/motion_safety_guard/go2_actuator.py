@@ -449,16 +449,27 @@ class Go2Actuator:
             )
             if not all(math.isfinite(value) for value in values):
                 raise ActuatorError("INVALID_ARGUMENT", "twist values must be finite")
-            if math.hypot(values[0], values[1]) > self._max_linear_velocity_mps:
-                raise ActuatorError(
-                    "INVALID_ARGUMENT",
-                    "twist linear velocity exceeds configured limit",
-                )
+            linear_norm = math.hypot(values[0], values[1])
+            # 对角限幅跨语言重算可能多出几个浮点末位；只修正舍入误差，
+            # 实际发送值仍收回配置上限内，不把正常限幅指令变成任务失败。
+            rounding_tolerance = 8 * sys.float_info.epsilon
+            if linear_norm > self._max_linear_velocity_mps:
+                if not math.isclose(linear_norm, self._max_linear_velocity_mps,
+                                    rel_tol=rounding_tolerance, abs_tol=0.0):
+                    raise ActuatorError(
+                        "INVALID_ARGUMENT",
+                        f"twist linear velocity exceeds configured limit: {linear_norm!r} > {self._max_linear_velocity_mps!r}",
+                    )
+                scale = self._max_linear_velocity_mps * (1 - rounding_tolerance) / linear_norm
+                values = (values[0] * scale, values[1] * scale, values[2])
             if abs(values[2]) > self._max_yaw_rate_rps:
-                raise ActuatorError(
-                    "INVALID_ARGUMENT",
-                    "twist yaw rate exceeds configured limit",
-                )
+                if not math.isclose(abs(values[2]), self._max_yaw_rate_rps,
+                                    rel_tol=rounding_tolerance, abs_tol=0.0):
+                    raise ActuatorError(
+                        "INVALID_ARGUMENT",
+                        "twist yaw rate exceeds configured limit",
+                    )
+                values = (values[0], values[1], math.copysign(self._max_yaw_rate_rps, values[2]))
             move_values = (
                 values[0],
                 values[1],

@@ -346,9 +346,10 @@ class MappingService:
                 "update_sequence": update_sequence,
                 "metadata": {**snapshot_metadata, **frame_metadata},
             })
-            # 激活资产是区域几何的依据；导航观测更新不会重分割已保存的房间。
+            # 封存资产是区域几何的依据，与后端采用哪种定位或检查点恢复模式无关。
+            # 原生恢复把模式放在 geometry_activation 中，不能依赖顶层 backend_mode。
             reference = self._semantic_reference
-            if snapshot_metadata.get("source_kind") == "map_asset_bundle" and snapshot_metadata.get("backend_mode") == "mapping_localization":
+            if snapshot_metadata.get("source_kind") == "map_asset_bundle":
                 reference = snapshot
             elif reference is not None and (reference.map_name != snapshot.map_name or reference.frame_id != snapshot.frame_id):
                 reference = None

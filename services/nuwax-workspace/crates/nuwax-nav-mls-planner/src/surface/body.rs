@@ -1,8 +1,12 @@
 //! 三维机体凸柱包络、支撑接触与方向性地形约束。
 use super::*;
 use std::collections::VecDeque;
+#[path = "body_translation.rs"]
+mod translation;
+#[path = "body_contact.rs"]
+mod contact;
 pub(super) type CacheSlot =
-    std::sync::Mutex<AHashMap<(VoxelKey, u64), Arc<AHashMap<(i32, i32), VoxelKey>>>>;
+    std::sync::Mutex<AHashMap<(VoxelKey, u64, u64), Arc<AHashMap<(i32, i32), VoxelKey>>>>;
 
 /// 当前占据只证明精确足迹内的支撑，原始快照用于下一次位姿重新派生。
 pub(super) struct CurrentBodySupport {
@@ -119,10 +123,13 @@ fn normalize(v: [f64; 3]) -> [f64; 3] {
 }
 fn rotation(q: [f64; 4]) -> Result<[[f64; 3]; 3], SurfaceError> {
     rotated_support_offset(q, 1.0)?;
-    let scale = q.into_iter().map(f64::abs).fold(0.0, f64::max);
-    let q = q.map(|x| x / scale);
-    let norm = q.iter().map(|x| x * x).sum::<f64>().sqrt();
-    let [x, y, z, w] = q.map(|x| x / norm);
+    // 已是单位四元数时归一化为恒等，保留输入以免制造末位姿态变化。
+    let [x,y,z,w]=if q.iter().map(|x|x*x).sum::<f64>()==1.0 {q} else {
+        let scale = q.into_iter().map(f64::abs).fold(0.0, f64::max);
+        let q = q.map(|x| x / scale);
+        let norm = q.iter().map(|x| x * x).sum::<f64>().sqrt();
+        q.map(|x| x / norm)
+    };
     Ok([
         [
             1.0 - 2.0 * (y * y + z * z),
@@ -140,6 +147,15 @@ fn rotation(q: [f64; 4]) -> Result<[[f64; 3]; 3], SurfaceError> {
             1.0 - 2.0 * (x * x + y * y),
         ],
     ])
+}
+fn interpolated_body_pose(from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),t:f64)->([f64;3],[f64;4]) {
+    if t==0.0 {return from;}
+    if t==1.0 {return to;}
+    let norm=|q:[f64;4]| {let n=q.iter().map(|v|v*v).sum::<f64>().sqrt();q.map(|v|v/n)};
+    let a=norm(from.1);let mut b=norm(to.1);
+    if a.iter().zip(b).map(|(a,b)|a*b).sum::<f64>()<0.0 {b=b.map(|v|-v);}
+    (std::array::from_fn(|i|if from.0[i]==to.0[i] {from.0[i]}else{from.0[i]*(1.0-t)+to.0[i]*t}),
+        norm(std::array::from_fn(|i|a[i]*(1.0-t)+b[i]*t)))
 }
 fn world(r: [[f64; 3]; 3], origin: [f64; 3], v: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|i| origin[i] + r[0][i] * v[0] + r[1][i] * v[1] + r[2][i] * v[2])
@@ -179,16 +195,52 @@ fn hull(mut points: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
     lower
 }
 /// 每个位姿只投影一次凸包；同一足迹下的粗细格共用精确分离轴区间。
-struct PolygonQuery(Vec<([f64;2],f64,f64)>);
-impl PolygonQuery {
-    fn new(polygon:&[[f64;2]])->Self {
+struct PolygonQuery<'a>(Vec<([f64;2],f64,f64)>, &'a [[f64;2]]);
+impl<'a> PolygonQuery<'a> {
+    fn new(polygon:&'a [[f64;2]])->Self {
         Self(polygon.iter().zip(polygon.iter().cycle().skip(1))
             .map(|(a,b)|[b[1]-a[1],a[0]-b[0]]).chain([[1.0,0.0],[0.0,1.0]])
             .map(|axis| {
                 let (low,high)=polygon.iter().map(|p|p[0]*axis[0]+p[1]*axis[1])
                     .fold((f64::INFINITY,f64::NEG_INFINITY),|(a,b),v|(a.min(v),b.max(v)));
                 (axis,low,high)
-            }).collect())
+            }).collect(),polygon)
+    }
+    /// 支撑平面在实际足迹与占据列交叠区域内的最小值。
+    /// 整格下界已证明安全时直接复用；边缘仅检查凸多边形交集的顶点。
+    fn contact_plane(&self,body:[f64;3],normal:[f64;3],x:i32,y:i32,size:f64,
+        ground_ceiling:f64,allowance:f64)->f64 {
+        let slope=[-normal[0]/normal[2],-normal[1]/normal[2]];
+        if slope==[0.0,0.0] {return body[2];}
+        let low=[f64::from(x)*size,f64::from(y)*size];
+        let high=[f64::from(x+1)*size,f64::from(y+1)*size];
+        let value=|p:[f64;2]|body[2]+(p[0]-body[0])*slope[0]+(p[1]-body[1])*slope[1];
+        let worst=std::array::from_fn(|i|if slope[i]>=0.0 {low[i]}else{high[i]});
+        let lower=value(worst);
+        if ground_ceiling<=lower+allowance {return lower;}
+        let inside=|p:[f64;2]|self.0.iter().all(|&(axis,lo,hi)| {
+            let v=axis[0]*p[0]+axis[1]*p[1];v>=lo-1e-10 && v<=hi+1e-10
+        });
+        if inside(worst) {return lower;}
+        let in_cell=|p:[f64;2]|(0..2).all(|i|p[i]>=low[i]-1e-10 && p[i]<=high[i]+1e-10);
+        let mut minimum=f64::INFINITY;
+        for &p in self.1 {if in_cell(p) {minimum=minimum.min(value(p));}}
+        for i in 0..4 {
+            let p=std::array::from_fn(|axis|if i&(1<<axis)==0 {low[axis]}else{high[axis]});
+            if inside(p) {minimum=minimum.min(value(p));}
+        }
+        for (a,b) in self.1.iter().zip(self.1.iter().cycle().skip(1)) {
+            for axis in 0..2 {
+                let delta=b[axis]-a[axis];if delta==0.0 {continue;}
+                for bound in [low[axis],high[axis]] {
+                    let t=(bound-a[axis])/delta;
+                    if !(0.0..=1.0).contains(&t) {continue;}
+                    let mut p=std::array::from_fn(|i|a[i]*(1.0-t)+b[i]*t);p[axis]=bound;
+                    if in_cell(p) {minimum=minimum.min(value(p));}
+                }
+            }
+        }
+        if minimum.is_finite() {minimum} else {lower}
     }
     fn intersects(&self,x:i32,y:i32,size:f64)->bool {
         let centre=[(f64::from(x)+0.5)*size,(f64::from(y)+0.5)*size];
@@ -271,9 +323,16 @@ impl SurfaceSnapshot {
         body: [f64; 3],
         quaternion: [f64; 4],
     ) -> Result<Self, SurfaceError> {
+        self.current_body_support_view(body,quaternion,false)
+    }
+
+    pub(super) fn current_body_support_view(
+        &self, body:[f64;3], quaternion:[f64;4], query_only:bool,
+    ) -> Result<Self,SurfaceError> {
+        self.validate_complete_source_resolution()?;
         if let Some(current) = &self.current_body_support {
             return current.source.with_observations(self.observations.clone())
-                .with_current_body_support(body, quaternion);
+                .current_body_support_view(body, quaternion,query_only);
         }
         let Some(model) = self.body_envelope() else {
             return Ok(self.clone());
@@ -410,10 +469,9 @@ impl SurfaceSnapshot {
             let top = z + (model.body_to_support_z_m + model.z_bounds_m[1]) / r[2][2];
             // 已观测到的合法足下层顶继续保留，避免清除自体时把厚地面挖成
             // 人造凹坑，进而在当前足迹边缘制造台阶。
-            let maximum_ground = z
-                + (model.body_to_support_z_m + model.z_bounds_m[0]) / r[2][2]
-                + model.max_step_up_m.max(model.max_step_down_m)
-                + quantum;
+            // 完整机体检查以名义支撑面计算跨阶范围并计入源体素量化。
+            // 足端比名义支撑更低，不能在派生视图里再次扣减这段行程。
+            let maximum_ground = z + model.max_step_up_m + quantum;
             let z = self
                 .data
                 .physical_graph
@@ -424,7 +482,7 @@ impl SurfaceSnapshot {
                 .filter(|&&iz| self.observed_support_lower_bound((x, y, iz)) <= z + quantum)
                 .map(|&iz| self.cell_position((x, y, iz))[2])
                 .filter(|&height| {
-                    height >= z - quantum && height <= maximum_ground.min(z + model.max_step_up_m)
+                    height >= z - quantum - 1e-6 && height <= maximum_ground + 1e-6
                 })
                 .max_by(f64::total_cmp)
                 .unwrap_or(z);
@@ -492,7 +550,9 @@ impl SurfaceSnapshot {
                 cells: cells.into_iter().collect(),
             });
         }
-        let mut view=self.with_current_body_columns(&updates)?;
+        let mut view=if query_only && self.can_defer_body_query_edges() {
+            self.with_body_query_columns(&updates)?
+        } else {self.with_current_body_columns(&updates)?};
         view.body_query_cache = Default::default();
         view.current_body_support = Some(Arc::new(CurrentBodySupport {
             source: self.clone(), body, quaternion, polygon, cells: inferred, cleared_voxels,
@@ -571,6 +631,7 @@ impl SurfaceSnapshot {
             current_body_support: None,
             body_query_cache: Default::default(),
             data: Arc::new(SurfaceData {
+            body_query_only: false,
                 graph: Arc::new(graph),
                 regions,
                 physical_graph: physical,
@@ -585,12 +646,110 @@ impl SurfaceSnapshot {
                 candidate_step_cells: self.data.candidate_step_cells,
                 frontier_cache: Default::default(),
                 body_cache: Default::default(),
+                routing_cache: Default::default(),
                 body_envelope: Some(Arc::new(model)),
             }),
         })
     }
-    /// 跨阶时机体连续抬升，法向参考点可以暂在两个真实踏面高度之间。
-    /// 仅在完整投影外形下存在合法阶边、完整真实支撑且高度被两端夹住时选实际支撑。
+    /// 接触关联与包络复用实际相交精细列的地面高度；缺精细依据时仍保留粗层。
+    fn footprint_ground_height(
+        &self,
+        ground: VoxelKey,
+        polygon_query: &PolygonQuery,
+        prism_query: &PrismQuery,
+        support_plane: f64,
+        contact: f64,
+    ) -> Result<f64, SurfaceError> {
+        let (x, y, _) = ground;
+        let size = f64::from(self.config().voxel_size);
+        let mut ground_height = self.cell_position(ground)[2];
+        if let Some(observations) = self.observations.as_ref().filter(|_| {
+            !self.current_body_support.as_ref().is_some_and(|current| current.cells.contains(&ground))
+        }) {
+            let fine = f64::from(observations.size_m);
+            let mut lower = self.observed_support_lower_bound(ground);
+            if let Some(current) = &self.current_body_support {
+                if polygon_intersects_cell(&current.polygon,x,y,size) {
+                    let support=self.support_position_from_body(current.body,current.quaternion,self.body_envelope().ok_or(SurfaceError::InvalidPose)?.body_to_support_z_m)?;
+                    lower=lower.min(support[2]-fine);
+                }
+            }
+            let mut height = f64::NEG_INFINITY;
+            for ix in (f64::from(x)*size/fine).floor() as i32..(f64::from(x+1)*size/fine).ceil() as i32 {
+                for iy in (f64::from(y)*size/fine).floor() as i32..(f64::from(y+1)*size/fine).ceil() as i32 {
+                    if !polygon_query.intersects(ix,iy,fine) { continue; }
+                    for iz in (lower/fine+1e-5).floor() as i32..(ground_height/fine-1e-5).ceil() as i32 {
+                        if observations.supports_obstacle([ix,iy,iz]) && !self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&[ix,iy,iz])) {
+                            let top = f64::from(iz + 1) * fine;
+                            // 倾斜机体的二维投影包含并未被机体占据的空间。
+                            // 超过足端接触范围的侧面回波，必须实际与三维包络
+                            // 相交才会抬高本次地面检查；原始占据仍完整保留。
+                            if top <= support_plane + contact + 1e-6
+                                || prism_query.intersects(
+                                    [f64::from(ix)*fine, f64::from(iy)*fine, f64::from(iz)*fine],
+                                    [f64::from(ix+1)*fine, f64::from(iy+1)*fine, top]) {
+                                height = height.max(top);
+                            }
+                        }
+                    }
+                }
+            }
+            if height.is_finite() { ground_height = ground_height.min(height); }
+        }
+        Ok(ground_height)
+    }
+
+    /// 粗格的最高地面与最低接触平面可能来自不同半列，拒绝前按同一细列联合复核。
+    /// 缺少任何相交细列证据时不补许可；原地面选择、清除及完整三维相交规则保持。
+    fn fine_ground_contact_is_compatible(
+        &self,ground:VoxelKey,polygon:&PolygonQuery,prism:&PrismQuery,
+        body:[f64;3],normal:[f64;3],coarse_support:f64,contact:f64,uncertainty:f64,
+    )->bool {
+        let Some(observations)=self.observations.as_ref().filter(|o|o.size_m<self.config().voxel_size) else {return false;};
+        if self.current_body_support.as_ref().is_some_and(|current|current.cells.contains(&ground)) {return false;}
+        let Some(model)=self.body_envelope() else {return false;};
+        let (x,y,_)=ground;let size=f64::from(self.config().voxel_size);let fine=f64::from(observations.size_m);
+        let complete=self.complete_observations_cover_column(x,y);
+        if observations.is_complete_geometry_source() && !complete {return false;}
+        let ceiling=self.cell_position(ground)[2];
+        let mut lower=self.observed_support_lower_bound(ground);
+        if let Some(current)=&self.current_body_support {
+            if polygon_intersects_cell(&current.polygon,x,y,size) {
+                let Ok(support)=self.support_position_from_body(current.body,current.quaternion,model.body_to_support_z_m) else {return false;};
+                lower=lower.min(support[2]-fine);
+            }
+        }
+        let allowance=(model.z_bounds_m[0].max(-model.body_to_support_z_m)/normal[2]+contact+1e-6).min(uncertainty);
+        let mut checked=false;
+        for ix in (f64::from(x)*size/fine).floor() as i32..(f64::from(x+1)*size/fine).ceil() as i32 {
+            for iy in (f64::from(y)*size/fine).floor() as i32..(f64::from(y+1)*size/fine).ceil() as i32 {
+                if !polygon.intersects(ix,iy,fine) {continue;}
+                let mut height=f64::NEG_INFINITY;
+                for iz in (lower/fine+1e-5).floor() as i32..(ceiling/fine-1e-5).ceil() as i32 {
+                    let key=[ix,iy,iz];
+                    if !complete && !observations.has_complete_block(key) {return false;}
+                    if !observations.supports_obstacle(key)
+                        || self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&key)) {continue;}
+                    let top=f64::from(iz+1)*fine;
+                    // 与原整列地面计算选择完全相同的真实占据，只保留其各自XY。
+                    if top<=coarse_support+contact+1e-6 || prism.intersects(
+                        [f64::from(ix)*fine,f64::from(iy)*fine,f64::from(iz)*fine],
+                        [f64::from(ix+1)*fine,f64::from(iy+1)*fine,top]) {height=height.max(top);}
+                }
+                if !height.is_finite() {return false;}
+                height=height.min(ceiling);
+                let plane=polygon.contact_plane(body,normal,ix,iy,fine,height,allowance);
+                let lower=plane+model.z_bounds_m[0]/normal[2];
+                let support=plane-model.body_to_support_z_m/normal[2];
+                if lower.max(support)+contact+1e-6<height || plane<height-uncertainty {return false;}
+                checked=true;
+            }
+        }
+        checked
+    }
+
+    /// 真实支撑可来自合法阶边、连续厚层或完整观察包围的实际接触平面。
+    /// 中心参考不命中单个层顶时，仍须证明整足迹连通、原高度范围与完整机体许可。
     pub(super) fn locate_step_contact(&self,body:[f64;3],q:[f64;4],reference:[f64;3],distance:f64)->Result<SurfaceLocation,SurfaceError> {
         let model=self.body_envelope().ok_or(SurfaceError::MissingSupport)?;
         if (model.body_to_support_z_m-distance).abs()>1e-9 {return Err(SurfaceError::MissingSupport);}
@@ -604,12 +763,15 @@ impl SurfaceSnapshot {
             let v=world(r,body,[p[0],p[1],0.0]);[v[0],v[1]]
         }).collect();
         let polygon_query=PolygonQuery::new(&polygon);
+        let prism_query=PrismQuery::new(model,r,body);
         let radius=((polygon.iter().map(|p|(p[0]-candidate.surface_xyz[0]).hypot(p[1]-candidate.surface_xyz[1]))
             .fold(0.0,f64::max)+size*2.0)/size).ceil()*size;
         let patch=self.ground_patch(candidate,radius);
         let lower:[i32;2]=std::array::from_fn(|i|(polygon.iter().map(|p|p[i]).fold(f64::INFINITY,f64::min)/size).floor() as i32);
         let upper:[i32;2]=std::array::from_fn(|i|(polygon.iter().map(|p|p[i]).fold(f64::NEG_INFINITY,f64::max)/size).floor() as i32);
         if (i64::from(upper[0])-i64::from(lower[0])+1)*(i64::from(upper[1])-i64::from(lower[1])+1)>16_384 {return Err(SurfaceError::MissingSupport);}
+        let (patch,precise_ground)=self.refine_footprint_support(patch,&polygon_query,&prism_query,body,r,(lower,upper));
+        let mut contact_columns=AHashMap::new();
         let mut contact=std::collections::BTreeSet::new();let mut min=f64::INFINITY;let mut max=f64::NEG_INFINITY;
         for x in lower[0]..=upper[0] {for y in lower[1]..=upper[1] {
             if !polygon_query.intersects(x,y,size) {continue;}
@@ -621,7 +783,15 @@ impl SurfaceSnapshot {
             if self.data.virtual_obstacles.as_ref().is_some_and(|mask| !mask.permits_cell(cell,size,0.0)) {
                 return Err(SurfaceError::VirtualObstacle);
             }
-            let height=self.cell_position(cell)[2];min=min.min(height);max=max.max(height);contact.insert(cell);
+            let contact_limit=maximum+quantum+model.support_uncertainty_m;
+            let plane=polygon_query.contact_plane(body,r[2],x,y,size,self.cell_position(cell)[2],
+                -model.body_to_support_z_m/r[2][2]+contact_limit+1e-6);
+            let support_plane=plane-model.body_to_support_z_m/r[2][2];
+            let height=if let Some(&height)=precise_ground.get(&(x,y)) {height} else {
+                self.footprint_ground_height(cell,&polygon_query,&prism_query,support_plane,contact_limit)?
+            };
+            min=min.min(height);max=max.max(height);contact.insert(cell);
+            contact_columns.insert((x,y),(cell,height));
         }}
         let graph = &self.data.physical_graph;
         let contact_neighbors = |cell: VoxelKey| self.contact_neighbors(cell);
@@ -635,16 +805,26 @@ impl SurfaceSnapshot {
         let mut connected=std::collections::BTreeSet::from([candidate.cell]);
         let mut queue=VecDeque::from([candidate.cell]);
         while let Some(cell)=queue.pop_front() {
-            for next in contact_neighbors(cell) {
-                if contact.contains(&next)&&connected.insert(next) {queue.push_back(next);}
+            let height=contact_columns.get(&(cell.0,cell.1))
+                .map_or_else(|| self.cell_position(cell)[2], |(_,height)| *height);
+            for (dx,dy) in DIRECTIONS {
+                let Some(&(next,next_height))=contact_columns.get(&(cell.0+dx,cell.1+dy)) else {continue;};
+                let rise=next_height-height;
+                if rise<=model.max_step_up_m+quantum+1e-6
+                    && -rise<=model.max_step_down_m+quantum+1e-6
+                    && connected.insert(next) {queue.push_back(next);}
             }
         }
         // 多次观测会把地面表示成连续占据层。实测接触落在该层内部时，不把层顶
         // 当成唯一真实地面；候选仍受原有腿部跨阶范围、完整足迹及连通性约束。
 
-        if (!legal_step && !observed_contact) || !contact.is_subset(&connected)
+        let observed_plane=!legal_step && !observed_contact && contact.is_subset(&connected)
+            && reference[2]>=min-quantum && reference[2]<=max+quantum
+            && self.observed_contact_plane_covers_reference(body,q,reference);
+        if (!legal_step && !observed_contact && !observed_plane) || !contact.is_subset(&connected)
             || (!observed_contact && reference[2]<min-quantum) || reference[2]>max+quantum {
-                tracing::debug!(?body, ?reference, legal_step, observed_contact, min, max,
+                tracing::debug!(?body, ?reference, legal_step, observed_contact, observed_plane, min, max,
+                    candidate=?candidate.cell, ?contact, connected_cells=?connected,
                     connected=contact.is_subset(&connected), "机体接触证据不足");
                 return Err(SurfaceError::MissingSupport);
             }
@@ -689,7 +869,12 @@ impl SurfaceSnapshot {
         centre: SurfaceLocation,
         radius: f64,
     ) -> Arc<AHashMap<(i32, i32), VoxelKey>> {
-        let key = (centre.cell, radius.to_bits());
+        self.ground_patch_at_height(centre,radius,centre.surface_xyz[2])
+    }
+
+    fn ground_patch_at_height(&self,centre:SurfaceLocation,radius:f64,height:f64)
+        -> Arc<AHashMap<(i32,i32),VoxelKey>> {
+        let key = (centre.cell, radius.to_bits(), height.to_bits());
         if let Some(patch) = self
             .data
             .body_cache
@@ -715,8 +900,8 @@ impl SurfaceSnapshot {
             patch
                 .entry((cell.0, cell.1))
                 .and_modify(|old: &mut VoxelKey| {
-                    if (self.cell_position(*old)[2] - centre.surface_xyz[2]).abs()
-                        > (p[2] - centre.surface_xyz[2]).abs()
+                    if (self.cell_position(*old)[2] - height).abs()
+                        > (p[2] - height).abs()
                     {
                         *old = cell;
                     }
@@ -744,6 +929,135 @@ impl SurfaceSnapshot {
         }
         cache.insert(key, Arc::clone(&patch));
         patch
+    }
+
+    fn validate_complete_source_resolution(&self)->Result<(),SurfaceError> {
+        if self.observations.as_ref().is_some_and(|observations|observations.is_complete_geometry_source()
+            && observations.size_m.to_bits()!=self.source_voxel_size_m().to_bits()) {
+            return Err(SurfaceError::InvalidConfig("完整精细源与当前几何的来源分辨率不一致".into()));
+        }
+        Ok(())
+    }
+
+    /// 完整精细源仍须覆盖粗列里每一层已知占据；缺层或分辨率冲突不能解释掉粗障碍。
+    fn complete_observations_cover_column(&self,x:i32,y:i32)->bool {
+        if let Some(value)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner())
+            .complete_columns.get(&(x,y)).copied() {return value;}
+        let value=(|| {
+            let observations=self.observations.as_ref()?;
+            if !observations.is_complete_geometry_source()
+                || observations.size_m.to_bits()!=self.source_voxel_size_m().to_bits() {return None;}
+            let fine=f64::from(observations.size_m);let size=f64::from(self.config().voxel_size);
+            let source=self.current_body_support.as_ref().map_or(self,|current|&current.source);
+            let Some(levels)=source.data.occupied_columns.get(&(x,y)) else {return Some(());};
+            let first_x=(f64::from(x)*size/fine-0.5).ceil() as i32;
+            let last_x=(f64::from(x+1)*size/fine-0.5).ceil() as i32;
+            let first_y=(f64::from(y)*size/fine-0.5).ceil() as i32;
+            let last_y=(f64::from(y+1)*size/fine-0.5).ceil() as i32;
+            for &z in levels {
+                let first=(f64::from(z)*size/fine-0.5).ceil() as i32;
+                let last=(f64::from(z+1)*size/fine-0.5).ceil() as i32;
+                let found=(first_x..last_x).any(|ix|(first_y..last_y).any(|iy| {
+                    let Some(column)=observations.column_levels(ix,iy) else {return false;};
+                    column.get(column.partition_point(|&iz|iz<first)).is_some_and(|&iz|iz<last)
+                }));
+                if !found {return None;}
+            }
+            Some(())
+        })().is_some();
+        let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+        if cache.complete_columns.len()>=8192 {cache.complete_columns.clear();}
+        cache.complete_columns.insert((x,y),value);value
+    }
+
+    /// 粗列被未相交的墙半列覆盖时，仅从实际相交细列读取真实暴露地面。
+    fn fine_footprint_ground(&self,query:&PolygonQuery,body:[f64;3],normal:[f64;3],x:i32,y:i32)
+        -> Option<(VoxelKey,f64)> {
+        let observations=self.observations.as_ref()?;let model=self.body_envelope()?;
+        if observations.size_m>=self.config().voxel_size {return None;}
+        let size=f64::from(self.config().voxel_size);let fine=f64::from(observations.size_m);
+        let reach=model.max_step_up_m.max(model.max_step_down_m)+f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
+        let occupied=|key:[i32;3]|observations.supports_obstacle(key)
+            && !self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&key));
+        let coarse_levels=self.data.occupied_columns.get(&(x,y))?;
+        let complete=self.complete_observations_cover_column(x,y);
+        if observations.is_complete_geometry_source() && !complete {return None;}
+        let mut height=f64::NEG_INFINITY;let mut chosen=None;
+        for ix in (f64::from(x)*size/fine).floor() as i32..(f64::from(x+1)*size/fine).ceil() as i32 {
+            for iy in (f64::from(y)*size/fine).floor() as i32..(f64::from(y+1)*size/fine).ceil() as i32 {
+                if !query.intersects(ix,iy,fine) {continue;}
+                let lower=query.contact_plane(body,normal,ix,iy,fine,f64::INFINITY,0.0)-model.body_to_support_z_m/normal[2];
+                let upper=-query.contact_plane([body[0],body[1],-body[2]],[-normal[0],-normal[1],normal[2]],
+                    ix,iy,fine,f64::INFINITY,0.0)-model.body_to_support_z_m/normal[2];
+                let low=upper-reach;let high=lower+reach;let reference=(lower+upper)*0.5;
+                let mut best:Option<(f64,VoxelKey,f64)>=None;
+                let first=((low-1e-6)/fine).ceil() as i32-1;
+                let last=((high+1e-6)/fine).floor() as i32-1;
+                for iz in first..=last {
+                    if !occupied([ix,iy,iz]) || (!complete && !observations.has_complete_block([ix,iy,iz+1]))
+                        || occupied([ix,iy,iz+1]) {continue;}
+                    // 必须是原几何中的真实占据带顶，不能在行程上限截断高墙。
+                    let top=f64::from(iz+1)*fine;let z=(top/size).ceil() as i32-1;
+                    if coarse_levels.binary_search(&z).is_err() {continue;}
+                    let cell=(x,y,z);let top=top.min(self.cell_position(cell)[2]);
+                    if top<low-1e-6 || top>high+1e-6 || top<f64::from(iz)*fine-1e-6 {continue;}
+                    let distance=(top-reference).abs();
+                    if best.as_ref().is_none_or(|best|distance<best.0) {best=Some((distance,cell,top));}
+                }
+                let (_,cell,top)=best?;
+                if top>height {height=top;chosen=Some(cell);}
+            }
+        }
+        chosen.map(|cell|(cell,height))
+    }
+
+    /// 精细补充仅属于本次足迹查询，并须按原腿部高差连到已有支撑分量。
+    fn refine_footprint_support(&self,patch:Arc<AHashMap<(i32,i32),VoxelKey>>,query:&PolygonQuery,
+        prism:&PrismQuery,body:[f64;3],r:[[f64;3];3],bounds:([i32;2],[i32;2]))
+        -> (Arc<AHashMap<(i32,i32),VoxelKey>>,AHashMap<(i32,i32),f64>) {
+        let mut precise=AHashMap::new();
+        let Some(model)=self.body_envelope() else {return (patch,precise);};
+        if self.observations.as_ref().is_none_or(|o|o.size_m>=self.config().voxel_size) {return (patch,precise);}
+        let size=f64::from(self.config().voxel_size);let quantum=f64::from(self.source_voxel_size_m());
+        let contact=model.max_step_up_m.max(model.max_step_down_m)+quantum+model.support_uncertainty_m;
+        let mut pending=Vec::new();
+        for x in bounds.0[0]..=bounds.1[0] {for y in bounds.0[1]..=bounds.1[1] {
+            if patch.contains_key(&(x,y)) || !query.intersects(x,y,size) {continue;}
+            if let Some((cell,height))=self.fine_footprint_ground(query,body,r[2],x,y) {pending.push((cell,height));}
+        }}
+        if pending.is_empty() {return (patch,precise);}
+        let mut extended=None;let mut known_heights=AHashMap::new();
+        loop {
+            let mut progress=false;
+            pending.retain(|&(cell,height)| {
+                let mut attached=false;
+                for (dx,dy) in DIRECTIONS {
+                    let key=(cell.0+dx,cell.1+dy);
+                    let source=extended.as_ref().unwrap_or(patch.as_ref());
+                    let Some(&neighbor)=source.get(&key) else {continue;};
+                    if !query.intersects(key.0,key.1,size) {continue;}
+                    let neighbor_height=if let Some(&height)=precise.get(&key) {height}
+                        else if let Some(&height)=known_heights.get(&key) {height}
+                        else {
+                            let plane=query.contact_plane(body,r[2],key.0,key.1,size,self.cell_position(neighbor)[2],
+                                -model.body_to_support_z_m/r[2][2]+contact+1e-6);
+                            let Ok(height)=self.footprint_ground_height(neighbor,query,prism,
+                                plane-model.body_to_support_z_m/r[2][2],contact) else {continue;};
+                            known_heights.insert(key,height);height
+                        };
+                    let rise=height-neighbor_height;
+                    if rise<=model.max_step_up_m+quantum+1e-6 && -rise<=model.max_step_down_m+quantum+1e-6 {
+                        attached=true;break;
+                    }
+                }
+                if attached {
+                    extended.get_or_insert_with(||patch.as_ref().clone()).insert((cell.0,cell.1),cell);
+                    precise.insert((cell.0,cell.1),height);progress=true;false
+                } else {true}
+            });
+            if !progress {break;}
+        }
+        (extended.map(Arc::new).unwrap_or(patch),precise)
     }
 
     /// 用完整姿态检查机体凸柱与占据体素；允许已确认支撑面的接触。
@@ -799,6 +1113,7 @@ impl SurfaceSnapshot {
     }
 
     fn check_body_pose(&self,body:[f64;3],quaternion:[f64;4])->Result<(),SurfaceError> {
+        self.validate_complete_source_resolution()?;
         let model = self
             .body_envelope()
             .ok_or_else(|| SurfaceError::InvalidConfig("body envelope is unavailable".into()))?;
@@ -842,6 +1157,8 @@ impl SurfaceSnapshot {
         let radius = ((vertices.iter().map(|p|(p[0]-centre.surface_xyz[0]).hypot(p[1]-centre.surface_xyz[1]))
             .fold(0.0,f64::max)+size*2.0)/size).ceil()*size;
         let patch = self.ground_patch(centre, radius);
+        let (patch,precise_ground)=self.refine_footprint_support(patch,&polygon_query,&prism_query,body,r,([x0,y0],[x1,y1]));
+        self.check_fine_column_fringe(body,r,&polygon_query,&prism_query,&patch,min,max,([x0,y0],[x1,y1]))?;
         let uncertainty = f64::from(self.source_voxel_size_m()) + model.support_uncertainty_m;
         let mut ground_points = Vec::new();
         for x in x0..=x1 {
@@ -853,8 +1170,13 @@ impl SurfaceSnapshot {
                     tracing::debug!(?body,x,y,centre=?centre.cell,"机体包络下缺少连通地面");
                     SurfaceError::MissingSupport
                 })?;
+                if self.observations.as_ref().is_some_and(|observations|observations.is_complete_geometry_source())
+                    && !self.complete_observations_cover_column(x,y) {
+                    return Err(SurfaceError::MissingSupport);
+                }
                 if self.current_body_support.as_ref().is_some_and(|current| {
-                    current.cells.contains(&ground) && !current.permits_overlap(&polygon, x, y, size)
+                    !precise_ground.contains_key(&(x,y)) && current.cells.contains(&ground)
+                        && !current.permits_overlap(&polygon, x, y, size)
                 }) {
                     tracing::debug!(?body, x, y, "候选机体进入当前足迹外的缺测支撑");
                     return Err(SurfaceError::MissingSupport);
@@ -867,52 +1189,21 @@ impl SurfaceSnapshot {
                 {
                     return Err(SurfaceError::VirtualObstacle);
                 }
-                let mut ground_height = self.cell_position(ground)[2];
                 let px = (x as f64 + 0.5) * size;
                 let py = (y as f64 + 0.5) * size;
-                let plane = body[2]
-                    - ((px - body[0]) * r[2][0] + (py - body[1]) * r[2][1]) / r[2][2];
-                let lower = plane + model.z_bounds_m[0] / r[2][2];
                 let contact = model.max_step_up_m.max(model.max_step_down_m) + uncertainty;
+                let plane=polygon_query.contact_plane(body,r[2],x,y,size,self.cell_position(ground)[2],
+                    (-model.body_to_support_z_m/r[2][2]+contact+1e-6).min(uncertainty));
+                let lower = plane + model.z_bounds_m[0] / r[2][2];
                 let support_plane = plane - model.body_to_support_z_m / r[2][2];
-                // 粗列边缘可能只与机体相交一小部分；地面高度必须来自
-                // 实际相交的精细列，不能借用格外最高回波抬高整片支撑。
-                if let Some(observations) = self.observations.as_ref().filter(|_| {
-                    !self.current_body_support.as_ref().is_some_and(|current| current.cells.contains(&ground))
-                }) {
-                    let fine = f64::from(observations.size_m);
-                    let mut lower = self.observed_support_lower_bound(ground);
-                    if let Some(current) = &self.current_body_support {
-                        if polygon_intersects_cell(&current.polygon,x,y,size) {
-                            let support=self.support_position_from_body(current.body,current.quaternion,model.body_to_support_z_m)?;
-                            lower=lower.min(support[2]-fine);
-                        }
-                    }
-                    let mut height = f64::NEG_INFINITY;
-                    for ix in (f64::from(x)*size/fine).round() as i32..(f64::from(x+1)*size/fine).round() as i32 {
-                        for iy in (f64::from(y)*size/fine).round() as i32..(f64::from(y+1)*size/fine).round() as i32 {
-                            if !polygon_query.intersects(ix,iy,fine) { continue; }
-                            for iz in (lower/fine+1e-5).floor() as i32..(ground_height/fine-1e-5).ceil() as i32 {
-                                if observations.supports_obstacle([ix,iy,iz]) && !self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&[ix,iy,iz])) {
-                                    let top = f64::from(iz + 1) * fine;
-                                    // 倾斜机体的二维投影包含并未被机体占据的空间。
-                                    // 超过足端接触范围的侧面回波，必须实际与三维包络
-                                    // 相交才会抬高本次地面检查；原始占据仍完整保留。
-                                    if top <= support_plane + contact + 1e-6
-                                        || prism_query.intersects(
-                                            [f64::from(ix)*fine, f64::from(iy)*fine, f64::from(iz)*fine],
-                                            [f64::from(ix+1)*fine, f64::from(iy+1)*fine, top]) {
-                                        height = height.max(top);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if height.is_finite() { ground_height = ground_height.min(height); }
-                }
+                let ground_height = if let Some(&height)=precise_ground.get(&(x,y)) {height} else {
+                    self.footprint_ground_height(ground,&polygon_query,&prism_query,support_plane,contact)?
+                };
                 // 外形最低点包含足端行程，跨阶高度以标定支撑平面为基准；
                 // 否则足端低于名义支撑的部分会再次扣减可跨阶高度。
-                if lower.max(support_plane) + contact + 1e-6 < ground_height || plane < ground_height - uncertainty {
+                if (lower.max(support_plane) + contact + 1e-6 < ground_height || plane < ground_height - uncertainty)
+                    && !self.fine_ground_contact_is_compatible(ground,&polygon_query,&prism_query,
+                        body,r[2],support_plane,contact,uncertainty) {
                     tracing::debug!(?body, x, y, ground_height, support_plane, contact, "机体与地面高度不兼容");
                     return Err(SurfaceError::InsufficientClearance);
                 }
@@ -966,7 +1257,59 @@ impl SurfaceSnapshot {
             let yaw = r[0][1].atan2(r[0][0]);
             let cross_slope = (-a * yaw.sin() + b * yaw.cos()).abs().atan().to_degrees();
             if cross_slope > model.max_cross_slope_deg + 1e-5 {
+                tracing::debug!(?body, cross_slope, limit=model.max_cross_slope_deg, "实际机体支撑横坡超限");
                 return Err(SurfaceError::UntraversableSegment);
+            }
+        }
+        Ok(())
+    }
+
+    /// 细体素可能跨越粗列的浮点边界；粗列只是索引，不能截掉实际机体接触。
+    /// 只补查中心归属在粗包围框外、实际体积却与机体相交的已知细体素。
+    fn check_fine_column_fringe(&self,body:[f64;3],r:[[f64;3];3],polygon:&PolygonQuery,prism:&PrismQuery,
+        patch:&AHashMap<(i32,i32),VoxelKey>,min:[f64;3],max:[f64;3],bounds:([i32;2],[i32;2]))
+        ->Result<(),SurfaceError> {
+        let Some(observations)=self.observations.as_ref() else {return Ok(());};
+        let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        let fine=f64::from(observations.size_m);let size=f64::from(self.config().voxel_size);
+        let axis=|i:usize|->Vec<(i32,i32)> {
+            let mut low=(min[i]/fine).floor() as i32;let mut high=(max[i]/fine).floor() as i32;
+            // 与水平分离轴使用同一数值边界，只为实际可能接触的相邻细格保留闭边。
+            if f64::from(low)*fine>=min[i]-1e-10 {low=low.saturating_sub(1);}
+            if f64::from(high.saturating_add(1))*fine<=max[i]+1e-10 {high=high.saturating_add(1);}
+            (low..=high).map(|key| {
+                let point=((f64::from(key)+0.5)*fine) as f32;
+                (key,(point*(1.0/self.config().voxel_size)).floor() as i32)
+            }).collect()
+        };
+        let xs=axis(0);let ys=axis(1);
+        let outer_y:Vec<_>=ys.iter().copied().filter(|&(_,y)|y<bounds.0[1]||y>bounds.1[1]).collect();
+        let contact=model.max_step_up_m.max(model.max_step_down_m)+fine+model.support_uncertainty_m;
+        for (ix,x) in xs {
+            let row=if x<bounds.0[0] || x>bounds.1[0] {&ys}else{&outer_y};
+            for &(iy,y) in row {
+                if !polygon.intersects(ix,iy,fine) {continue;}
+                let Some(levels)=observations.column_levels(ix,iy) else {continue;};
+                if observations.is_complete_geometry_source() && !self.complete_observations_cover_column(x,y) {
+                    return Err(SurfaceError::MissingSupport);
+                }
+                let first=((min[2]/fine).floor() as i32).saturating_sub(1);let last=(max[2]/fine).floor() as i32;
+                let begin=levels.partition_point(|&iz|iz<first);
+                if levels.get(begin).is_none_or(|&iz|iz>last) {continue;}
+                let ground=if let Some(&cell)=patch.get(&(x,y)) {
+                    let plane=polygon.contact_plane(body,r[2],x,y,size,self.cell_position(cell)[2],
+                        -model.body_to_support_z_m/r[2][2]+contact+1e-6);
+                    Some(self.footprint_ground_height(cell,polygon,prism,plane-model.body_to_support_z_m/r[2][2],contact)?)
+                } else {self.fine_footprint_ground(polygon,body,r[2],x,y).map(|(_,height)|height)};
+                for &iz in levels.iter().skip(begin).take_while(|&&iz|iz<=last) {
+                    let key=[ix,iy,iz];
+                    if ground.is_some_and(|height|f64::from(iz+1)*fine<=height+1e-6)
+                        || !observations.supports_obstacle(key)
+                        || self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&key)) {continue;}
+                    if prism.intersects(key.map(|v|f64::from(v)*fine),key.map(|v|f64::from(v+1)*fine)) {
+                        return Err(SurfaceError::InsufficientClearance);
+                    }
+                }
             }
         }
         Ok(())
@@ -989,6 +1332,89 @@ impl SurfaceSnapshot {
         if cache.projections.len()>=8192 {cache.projections.clear();}
         cache.projections.insert(key,result.clone());
         result
+    }
+
+    /// 从实际机体位姿推进到目标平面位置，仅应用真实地形的相对高差和法向变化。
+    /// 保留起点的高度/倾斜偏差；返回的目标仍须与起点一起通过完整扫掠和观察检查。
+    pub fn body_pose_after_motion(
+        &self,
+        from: ([f64; 3], [f64; 4]),
+        xy: [f64; 2],
+        yaw: f64,
+    ) -> Result<([f64; 3], [f64; 4]), SurfaceError> {
+        if !from.0.into_iter().chain(xy).chain([yaw]).all(f64::is_finite) {
+            return Err(SurfaceError::InvalidPose);
+        }
+        self.validate_complete_source_resolution()?;
+        let model = self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        let actual_rotation = rotation(from.1)?;
+        let current_yaw = actual_rotation[0][1].atan2(actual_rotation[0][0]);
+        let yaw_delta = (yaw-current_yaw+std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
+            - std::f64::consts::PI;
+        if xy == [from.0[0],from.0[1]] && yaw_delta.abs() < 1e-12 {
+            self.validate_body_pose(from.0,from.1)?;
+            return Ok(from);
+        }
+        let start = self.locate_support_from_body(from.0,from.1,model.body_to_support_z_m)?;
+        if actual_rotation[2][2]<=0.0 {return Err(SurfaceError::InvalidPose);}
+        // 拟合查询在机体中心XY；名义接触平面在这里的高度是z-d/n_z，
+        // 不能把位于旋转支撑点XY的z-d*n_z直接当作中心参考。
+        let initial_height=from.0[2]-model.body_to_support_z_m/actual_rotation[2][2];
+        let normal_tolerance=f64::from(self.config().step_threshold_m+self.config().voxel_size);
+        let base_projection=self.locate_near_support(
+            [from.0[0],from.0[1],initial_height],normal_tolerance)?;
+        let projected=self.locate_near_support(
+            [xy[0],xy[1],base_projection.surface_xyz[2]],normal_tolerance)?;
+        let (base_height,base_attitude)=self.body_contact_frame(base_projection,initial_height,current_yaw)?;
+        let (next_height,next_attitude)=self.body_contact_frame(projected,initial_height,yaw)?;
+        let base_rotation=rotation(base_attitude)?;
+        let next_rotation=rotation(next_attitude)?;
+        // 同一真实接触拟合场同时给出高度和法向，前足进入高地面时即可连续适应。
+        // 原机体相对于地形的高度与倾斜偏差由差分传播保留。
+        let centre_height_delta=next_height-base_height;
+        // 同一地形帧上的恒等传播保留完整实际姿态，不进行矩阵往返舍入。
+        let q=if base_rotation==next_rotation && yaw==current_yaw {
+            from.1
+        } else {
+            // 将实际姿态在起点地面坐标中的偏差传到下一处地面，不能重置成拟合姿态。
+            let mut columns = actual_rotation.map(|axis| {
+                world(next_rotation,[0.0;3],base_rotation.map(|basis| dot(basis,axis)))
+            });
+            let correction = yaw-columns[0][1].atan2(columns[0][0]);
+            let (sine,cosine) = correction.sin_cos();
+            for column in &mut columns {
+                *column = [cosine*column[0]-sine*column[1],sine*column[0]+cosine*column[1],column[2]];
+            }
+            quaternion_from_columns(columns)
+        };
+        let offset = rotated_support_offset(q,model.body_to_support_z_m)?;
+        let previous_offset=rotated_support_offset(from.1,model.body_to_support_z_m)?;
+        // 拟合高度位于机体中心XY，真正标定参考位于旋转后的支撑点XY。
+        // 先求两个接触修正的差，再叠加原Z，保持同一平面上的浮点恒等。
+        let plane_at_offset=|r:[[f64;3];3],v:[f64;3]|-(r[2][0]*v[0]+r[2][1]*v[1])/r[2][2];
+        let before_contact=plane_at_offset(base_rotation,previous_offset)-previous_offset[2];
+        let after_contact=plane_at_offset(next_rotation,offset)-offset[2];
+        let height_delta=centre_height_delta+(after_contact-before_contact);
+        // 只改变朝向时没有地面平移，实际机体中心不应因标定偏移自行升降。
+        let body_z=if xy==[from.0[0],from.0[1]] {from.0[2]} else {from.0[2]+height_delta};
+        let _destination = match self.sample_segment_support(start.support_xyz,
+            [xy[0]+offset[0],xy[1]+offset[1],projected.surface_xyz[2]],1.0) {
+            Ok(destination)=>destination,
+            Err(error)=> {
+                let flat=([xy[0],xy[1],body_z],q);
+                tracing::debug!(?error, ?from, ?flat, start=?start.support_xyz, projected=?projected.surface_xyz,
+                    offset=?offset, "实际机体推进的支撑参考连段被拒绝");
+                if matches!(error,SurfaceError::UntraversableSegment)
+                    && self.fine_contact_support_samples(from,flat).is_some() {
+                    self.validate_body_pose(flat.0,flat.1)?;
+                    return Ok(flat);
+                }
+                return Err(error);
+            }
+        };
+        let body = [xy[0],xy[1],body_z];
+        self.validate_body_pose(body,q)?;
+        Ok((body,q))
     }
 
     fn project_body_pose(&self,xy:[f64;2],yaw:f64,previous_support:[f64;3])
@@ -1114,6 +1540,81 @@ impl SurfaceSnapshot {
         })
     }
 
+    /// 粗列中心连段失真时，仅由实际参考经过的共同真实占据带补证。
+    /// 细列露顶仍遵循原上下阶能力；完整足迹、包络及观察随后沿实际曲线核验。
+    fn fine_contact_support_samples(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]))->Option<Vec<f64>> {
+        let observations=self.observations.as_ref()?;
+        if observations.size_m>=self.config().voxel_size {return None;}
+        let size=f64::from(observations.size_m);let coarse=f64::from(self.config().voxel_size);
+        let model=self.body_envelope()?;
+        let occupied=|key:[i32;3]|observations.supports_obstacle(key)
+            && !self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&key));
+        let band=|x:i32,y:i32,height:f64|->Option<(i32,i32)> {
+            let z=(height/size).floor() as i32;
+            let seed=if occupied([x,y,z]) {z} else {let previous=z.checked_sub(1)?;
+                if occupied([x,y,previous]) {previous}else{return None;}};
+            let mut lower=seed;let mut top=seed;
+            while lower>i32::MIN && occupied([x,y,lower-1]) {lower-=1;}
+            while top<i32::MAX && occupied([x,y,top+1]) {top+=1;}
+            let above=top.checked_add(1)?;
+            // 清除自体不等于原上邻为空，不能据此制造顶面并放宽阶差。
+            if observations.supports_obstacle([x,y,above]) {return None;}
+            let key=(((f64::from(x)+0.5)*size/coarse).floor() as i32,
+                ((f64::from(y)+0.5)*size/coarse).floor() as i32);
+            let complete=self.complete_observations_cover_column(key.0,key.1);
+            if observations.is_complete_geometry_source() && !complete {return None;}
+            if !complete && !observations.has_complete_block([x,y,above]) {
+                // 部分源只能沿原已知露顶证明，不能把没有提交的块当作完整空白。
+
+                if !self.data.physical_graph.surface_lookup.get(&key).is_some_and(|levels|levels.iter().any(|&z|
+                    (self.cell_position((key.0,key.1,z))[2]-f64::from(above)*size).abs()<=1e-6)) {return None;}
+            }
+            Some((lower,top))
+        };
+        let permitted=|a:(i32,i32),b:(i32,i32)| {
+            let rise=(f64::from(b.1)-f64::from(a.1))*size;
+            if rise==0.0 {return true;}
+            let limit=if rise>0.0 {model.max_step_up_m}else{model.max_step_down_m};
+            rise.abs()+2.0*model.support_uncertainty_m<=limit+1e-6
+                && rise.abs()<=f64::from(self.config().step_threshold_m)+1e-6
+        };
+        let offset=model.body_to_support_z_m;
+        let start=self.support_position_from_body(from.0,from.1,offset).ok()?;
+        let end=self.support_position_from_body(to.0,to.1,offset).ok()?;
+        let a=band((start[0]/size).floor() as i32,(start[1]/size).floor() as i32,start[2])?;
+        let b=band((end[0]/size).floor() as i32,(end[1]/size).floor() as i32,end[2])?;
+        let mut low=a.0.max(b.0);let mut high=a.1.min(b.1);
+        let mut minimum=start[2].min(end[2]);let mut maximum=start[2].max(end[2]);
+        // 真实参考可比露顶高一个源体素，与locate_support的量化口径一致。
+        // 仍对整段的共同占据带只计一次，不能逐列累加或跨越不相交层。
+        if low>high || minimum<f64::from(low)*size-1e-6 || maximum>(f64::from(high)+2.0)*size+1e-6 {return None;}
+        let samples=self.body_support_grid_fractions(from,to,size).ok()?;
+        let mut previous:Option<(i32,i32,(i32,i32))>=None;
+        for &t in &samples {
+            let (p,q)=interpolated_body_pose(from,to,t);
+            let support=self.support_position_from_body(p,q,offset).ok()?;
+            let x=(support[0]/size).floor() as i32;let y=(support[1]/size).floor() as i32;
+            let current=band(x,y,support[2])?;
+            low=low.max(current.0);high=high.min(current.1);
+            minimum=minimum.min(support[2]);maximum=maximum.max(support[2]);
+            if let Some((px,py,previous_band))=previous {
+                if (i64::from(x)-i64::from(px)).abs()>1 || (i64::from(y)-i64::from(py)).abs()>1 {return None;}
+                if !permitted(previous_band,current) {return None;}
+                if x!=px && y!=py {
+                    for (sx,sy) in [(px,y),(x,py)] {
+                        let side=band(sx,sy,support[2])?;
+                        if !permitted(previous_band,side) || !permitted(side,current) {return None;}
+                        low=low.max(side.0);high=high.min(side.1);
+                    }
+                }
+            }
+            // 所有实际参考及对角侧列共同落在已观测带内，不能逐格换层跨空隙。
+            if low>high || minimum<f64::from(low)*size-1e-6 || maximum>(f64::from(high)+2.0)*size+1e-6 {return None;}
+            previous=Some((x,y,current));
+        }
+        Some(samples)
+    }
+
     fn validate_body_motion_checked(
         &self,
         from: ([f64; 3], [f64; 4]),
@@ -1132,7 +1633,7 @@ impl SurfaceSnapshot {
         if !segment_inside_boundary([a[0], a[1]], [b[0], b[1]], boundary) {
             return Err(SurfaceError::InvalidBoundary);
         }
-        self.validate_segment(a, b)?;
+        let support_connection=self.validate_segment(a,b);
         let norm = |q: [f64; 4]| {
             let n = q.iter().map(|x| x * x).sum::<f64>().sqrt();
             q.map(|x| x / n)
@@ -1144,8 +1645,13 @@ impl SurfaceSnapshot {
             qb = qb.map(|x| -x);
         }
         let angle = 2.0 * cosine.abs().min(1.0).acos();
-        let distance = (a[0] - b[0]).hypot(a[1] - b[1]).hypot(a[2] - b[2]);
-        let count = ((distance + model.radius() * angle)
+        // 采样密度按输入机体的真实平移和三维旋转包络确定。
+        // 支撑格只证明地形连通，不能把机体重新抬到该格的层顶。
+        let distance = (from.0[0] - to.0[0]).hypot(from.0[1] - to.0[1]).hypot(from.0[2] - to.0[2]);
+        let rotation_radius = model.radius().hypot(
+            model.z_bounds_m.into_iter().map(f64::abs).fold(model.body_to_support_z_m, f64::max),
+        );
+        let count = ((distance + rotation_radius * angle)
             / (f64::from(self.source_voxel_size_m()) * 0.5))
             .max(angle / 0.05)
             .ceil()
@@ -1153,15 +1659,33 @@ impl SurfaceSnapshot {
         if count > 4096 {
             return Err(SurfaceError::UntraversableSegment);
         }
+        if let Err(error)=support_connection {
+            let samples=if matches!(error,SurfaceError::UntraversableSegment) {
+                self.fine_contact_support_samples(from,to)
+            } else {None};
+            let Some(samples)=samples else {return Err(error);};
+            // 精细层只替代错误的粗中心连段；实际机体、禁区与观察仍逐段核验。
+            for t in samples {
+                let pose=interpolated_body_pose(from,to,t);
+                self.validate_body_pose(pose.0,pose.1)?;check_observations(pose)?;
+            }
+        }
         for i in 1..count {
             let t = i as f64 / count as f64;
             let q = norm(std::array::from_fn(|j| qa[j] * (1.0 - t) + qb[j] * t));
-            let support = self.sample_segment_support(a, b, t)?.support_xyz;
-            let p = self.body_position_from_support(support, q, model.body_to_support_z_m)?;
+            let p = std::array::from_fn(|j| from.0[j] * (1.0 - t) + to.0[j] * t);
             self.validate_body_pose(p, q)?;
             check_observations((p, q))?;
         }
-        Ok(())
+        // 按真实占据接触事件补查，并保持调用方的实际位置与姿态插值。
+        self.validate_body_contact_events(from,to,|t| {
+            let p = std::array::from_fn(|j| if from.0[j]==to.0[j] {from.0[j]} else {
+                from.0[j]*(1.0-t)+to.0[j]*t
+            });
+            let q=norm(std::array::from_fn(|j|qa[j]*(1.0-t)+qb[j]*t));
+            self.validate_body_pose(p,q)?;
+            check_observations((p,q))
+        })
     }
 
     /// 从同一可达支撑邻域估计坡面姿态，位置仍由真实支撑提供。
@@ -1170,59 +1694,298 @@ impl SurfaceSnapshot {
         support: [f64; 3],
         yaw: f64,
     ) -> Result<[f64; 4], SurfaceError> {
-        let model = self
-            .body_envelope()
-            .ok_or_else(|| SurfaceError::InvalidConfig("body envelope is unavailable".into()))?;
+        self.body_envelope().ok_or_else(|| SurfaceError::InvalidConfig("body envelope is unavailable".into()))?;
         let centre = self.locate_support(support)?;
-        // 邻域由支撑格决定，法线与格内查询位置、偏航无关。
-        // 高度保留精确值，当前足迹及观测变化仍建立独立缓存。
-        let normal_key = (centre.cell, support[2].to_bits());
-        let cached = self.body_query_cache.lock().unwrap_or_else(|e| e.into_inner())
-            .slopes.get(&normal_key).copied();
-        let (a, b) = if let Some(slope) = cached { slope } else {
-        let radius = model.radius() + f64::from(self.config().voxel_size);
-        let patch = self.ground_patch(centre, radius);
-        let mut points: Vec<_> = patch
-            .values()
-            .map(|&cell| {
-                let mut point = self.cell_position(cell);
-                // 重复观测形成的连续厚层不是台阶剖面。拟合姿态时选取层内
-                // 距当前支撑最近的高度，保留薄踏面和有实际高差的坡面。
-                let lower = (self.observed_support_lower_bound(cell)
-                    + f64::from(self.source_voxel_size_m())).min(point[2]);
-                point[2] = support[2].clamp(lower,point[2]);
-                point
-            })
-            .collect();
-        // 固定求和顺序和局部原点，避免哈希遍历及格内平移引入拟合抖动。
-        points.sort_by(|a,b|a[0].total_cmp(&b[0]).then_with(||a[1].total_cmp(&b[1])));
-        let origin=[centre.surface_xyz[0],centre.surface_xyz[1],support[2]];
-        let (a, b, _) = fit_plane(&points, origin).unwrap_or((0.0, 0.0, support[2]));
-        let mut cache = self.body_query_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.slopes.len() >= 8192 { cache.slopes.clear(); }
-        cache.slopes.insert(normal_key, (a, b));
-        (a, b)
+        self.body_orientation_on_contact(centre,support[2],yaw)
+    }
+
+    fn body_orientation_on_contact(
+        &self,
+        centre: SurfaceLocation,
+        height: f64,
+        yaw: f64,
+    ) -> Result<[f64; 4], SurfaceError> {
+        self.body_contact_frame(centre,height,yaw).map(|(_,q)|q)
+    }
+
+    /// 无精细观察时保留原粗格中心及其真实连续高度区间。
+    fn ground_contact_samples(&self,cell:VoxelKey)->Arc<Vec<([f64;3],f64)>> {
+        if let Some(points)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner())
+            .contact_samples.get(&cell).cloned() {return points;}
+        let coarse=self.cell_position(cell);
+        let low=(self.observed_support_lower_bound(cell)+f64::from(self.source_voxel_size_m())).min(coarse[2]);
+        let points=Arc::new(vec![(coarse,low)]);
+        let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+        if cache.contact_samples.len()>=8192 {cache.contact_samples.clear();}
+        cache.contact_samples.insert(cell,Arc::clone(&points));
+        points
+    }
+
+    /// 原始细列的连续占据带；私有机体遮罩不切开真实带，也不制造新露顶。
+    fn fine_contact_bands(&self,x:i32,y:i32)->Arc<Vec<[f64;2]>> {
+        if let Some(bands)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner())
+            .fine_bands.get(&(x,y)).cloned() {return bands;}
+        let mut bands=Vec::new();
+        if let Some(observations)=&self.observations {
+            let size=f64::from(observations.size_m);
+            let mut run:Option<(i32,i32)>=None;
+            for &z in observations.column_levels(x,y).unwrap_or(&[]) {
+                if !observations.supports_obstacle([x,y,z]) {continue;}
+                if let Some((bottom,top))=run {
+                    if top.checked_add(1)==Some(z) {run=Some((bottom,z));continue;}
+                    bands.push([(f64::from(bottom)+1.0)*size,(f64::from(top)+1.0)*size]);
+                }
+                run=Some((z,z));
+            }
+            if let Some((bottom,top))=run {
+                bands.push([(f64::from(bottom)+1.0)*size,(f64::from(top)+1.0)*size]);
+            }
+        }
+        let bands=Arc::new(bands);
+        let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+        if cache.fine_bands.len()>=8192 {cache.fine_bands.clear();}
+        cache.fine_bands.insert((x,y),Arc::clone(&bands));bands
+    }
+
+    fn fine_contact_domain(&self,origin:[f64;3],radius:f64)
+        ->Result<Vec<([f64;3],f64,f64)>,SurfaceError> {
+        let observations=self.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
+        let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        let size=f64::from(observations.size_m);
+        let enumeration=radius+std::f64::consts::SQRT_2*size;
+        let low:[i32;2]=std::array::from_fn(|i|((origin[i]-enumeration)/size).floor() as i32);
+        let high:[i32;2]=std::array::from_fn(|i|((origin[i]+enumeration)/size).floor() as i32);
+        let nx=i64::from(high[0])-i64::from(low[0])+1;
+        let ny=i64::from(high[1])-i64::from(low[1])+1;
+        // 仅限制局部稠密临时表的容量；特殊大域继续原稀疏算法，不改变许可或拟合域。
+        let Some(count)=nx.checked_mul(ny).filter(|n|nx>0&&ny>0&&*n<=16_384) else {
+            return self.fine_contact_domain_sparse(origin,radius);
         };
-        let normal = normalize([-a, -b, 1.0]);
-        let forward = normalize([yaw.cos(), yaw.sin(), a * yaw.cos() + b * yaw.sin()]);
-        let left = cross(normal, forward);
-        Ok(quaternion_from_columns([forward, left, normal]))
+        let stride=ny as usize;let count=count as usize;
+        let mut in_domain=vec![false;count];
+        let mut bands=vec![None;count];
+        // 同一不可变来源的带缓存一次批量读取，避免每个实测细列分别取锁。
+        {
+            let cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+            for x in low[0]..=high[0] {for y in low[1]..=high[1] {
+                let dx=(f64::from(x)+0.5)*size-origin[0];let dy=(f64::from(y)+0.5)*size-origin[1];
+                if dx*dx+dy*dy>enumeration*enumeration {continue;}
+                let index=(i64::from(x)-i64::from(low[0])) as usize*stride+(i64::from(y)-i64::from(low[1])) as usize;
+                in_domain[index]=true;bands[index]=cache.fine_bands.get(&(x,y)).cloned();
+            }}
+        }
+        let distance=|band:[f64;2]|(band[0]-origin[2]).max(origin[2]-band[1]).max(0.0);
+        let mut selected=vec![None;count];let mut seed:Option<(usize,(i32,i32),[f64;4])>=None;
+        for (index,inside) in in_domain.iter().copied().enumerate() {
+            if !inside {continue;}
+            let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
+            let values=bands[index].take().unwrap_or_else(||self.fine_contact_bands(x,y));
+            let Some(&band)=values.iter().min_by(|a,b|distance(**a).total_cmp(&distance(**b))
+                .then_with(||(a[1]-origin[2]).abs().total_cmp(&(b[1]-origin[2]).abs()))
+                .then_with(||a[1].total_cmp(&b[1]))) else {continue;};
+            selected[index]=Some(band);let rise=band[1]-origin[2];
+            if rise>model.max_step_up_m+size+1e-6 || -rise>model.max_step_down_m+size+1e-6 {continue;}
+            let dx=(f64::from(x)+0.5)*size-origin[0];let dy=(f64::from(y)+0.5)*size-origin[1];
+            let rank=[dx*dx+dy*dy,distance(band),rise.abs(),band[1]];
+            let earlier=seed.as_ref().is_none_or(|&(_,old,previous)| {
+                rank.iter().zip(previous).map(|(a,b)|a.total_cmp(&b)).find(|v|!v.is_eq())
+                    .unwrap_or_else(||(x,y).cmp(&old)).is_lt()
+            });
+            if earlier {seed=Some((index,(x,y),rank));}
+        }
+        let seed=seed.ok_or(SurfaceError::MissingSupport)?.0;
+        let mut queue=VecDeque::from([seed]);let mut visited=vec![false;count];visited[seed]=true;
+        let mut points=Vec::new();
+        while let Some(index)=queue.pop_front() {
+            let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
+            let band=selected[index].expect("只有已选真实带进入队列");
+            let point=[(f64::from(x)+0.5)*size,(f64::from(y)+0.5)*size,band[1]];
+            let distance2=(point[0]-origin[0]).powi(2)+(point[1]-origin[1]).powi(2);
+            let weight=(1.0-distance2/(radius*radius)).max(0.0).powi(2);
+            if weight>0.0 {points.push((point,band[0],weight));}
+            for dx in -1..=1 {for dy in -1..=1 {
+                if dx==0&&dy==0 {continue;}
+                let(mut nx,mut ny)=(x,y);
+                loop {
+                    let(Some(next_x),Some(next_y))=(nx.checked_add(dx),ny.checked_add(dy)) else {break;};
+                    nx=next_x;ny=next_y;
+                    if nx<low[0]||nx>high[0]||ny<low[1]||ny>high[1] {break;}
+                    let next_index=(i64::from(nx)-i64::from(low[0])) as usize*stride+(i64::from(ny)-i64::from(low[1])) as usize;
+                    if !in_domain[next_index] {break;}
+                    let Some(next)=selected[next_index] else {continue;};
+                    let rise=next[1]-band[1];
+                    if rise<=model.max_step_up_m+size+1e-6 && -rise<=model.max_step_down_m+size+1e-6
+                        && !visited[next_index] {visited[next_index]=true;queue.push_back(next_index);}
+                    break;
+                }
+            }}
+        }
+        Ok(points)
     }
+
+    /// 从真实细带独立构建接触响应域；粗图不决定拟合输入，仍核验全部实际机体许可。
+    fn fine_contact_domain_sparse(&self,origin:[f64;3],radius:f64)
+        ->Result<Vec<([f64;3],f64,f64)>,SurfaceError> {
+        let observations=self.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
+        let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        let size=f64::from(observations.size_m);
+        let enumeration=radius+std::f64::consts::SQRT_2*size;
+        let low:[i32;2]=std::array::from_fn(|i|((origin[i]-enumeration)/size).floor() as i32);
+        let high:[i32;2]=std::array::from_fn(|i|((origin[i]+enumeration)/size).floor() as i32);
+        let distance=|band:[f64;2]|(band[0]-origin[2]).max(origin[2]-band[1]).max(0.0);
+        let mut selected=AHashMap::<(i32,i32),[f64;2]>::new();
+        let mut seed:Option<((i32,i32),[f64;4])>=None;
+        for x in low[0]..=high[0] {for y in low[1]..=high[1] {
+            let dx=(f64::from(x)+0.5)*size-origin[0];let dy=(f64::from(y)+0.5)*size-origin[1];
+            let distance2=dx*dx+dy*dy;
+            if distance2>enumeration*enumeration {continue;}
+            let bands=self.fine_contact_bands(x,y);
+            // 先选完整区间最近的带，不能先删高顶厚带再退到远处薄层。
+            let Some(&band)=bands.iter().min_by(|a,b|distance(**a).total_cmp(&distance(**b))
+                .then_with(||(a[1]-origin[2]).abs().total_cmp(&(b[1]-origin[2]).abs()))
+                .then_with(||a[1].total_cmp(&b[1]))) else {continue;};
+            selected.insert((x,y),band);
+            let rise=band[1]-origin[2];
+            if rise>model.max_step_up_m+size+1e-6 || -rise>model.max_step_down_m+size+1e-6 {continue;}
+            // 先关联当前实际XY附近的接触分量，不能让足迹外的高度偶合孤岛抢走种子。
+            let rank=[distance2,distance(band),rise.abs(),band[1]];
+            let earlier=seed.as_ref().is_none_or(|&(old,previous)| {
+                rank.iter().zip(previous).map(|(a,b)|a.total_cmp(&b)).find(|v|!v.is_eq())
+                    .unwrap_or_else(||(x,y).cmp(&old)).is_lt()
+            });
+            if earlier {seed=Some(((x,y),rank));}
+        }}
+        let seed=seed.ok_or(SurfaceError::MissingSupport)?.0;
+        let mut queue=VecDeque::from([seed]);let mut visited=AHashSet::from_iter([seed]);
+        let mut points=Vec::new();
+        while let Some((x,y))=queue.pop_front() {
+            let band=selected[&(x,y)];
+            let point=[(f64::from(x)+0.5)*size,(f64::from(y)+0.5)*size,band[1]];
+            let distance2=(point[0]-origin[0]).powi(2)+(point[1]-origin[1]).powi(2);
+            let weight=(1.0-distance2/(radius*radius)).max(0.0).powi(2);
+            if weight>0.0 {points.push((point,band[0],weight));}
+            // 响应估计连接每个方向最近的真实采样列，不要求观测恰好填满细格。
+            // 第一真实列即终止探测：不能越过不相容墙带；空格仍没有支撑许可。
+            for dx in -1..=1 {for dy in -1..=1 {
+                if dx==0 && dy==0 {continue;}
+                let mut key=(x,y);
+                loop {
+                    let (Some(nx),Some(ny))=(key.0.checked_add(dx),key.1.checked_add(dy)) else {break;};
+                    key=(nx,ny);
+                    if nx<low[0] || nx>high[0] || ny<low[1] || ny>high[1] {break;}
+                    let px=(f64::from(nx)+0.5)*size-origin[0];let py=(f64::from(ny)+0.5)*size-origin[1];
+                    if px*px+py*py>enumeration*enumeration {break;}
+                    let Some(next)=selected.get(&key) else {continue;};
+                    let rise=next[1]-band[1];
+                    if rise<=model.max_step_up_m+size+1e-6 && -rise<=model.max_step_down_m+size+1e-6
+                        && visited.insert(key) {queue.push_back(key);}
+                    break;
+                }
+            }}
+        }
+        Ok(points)
+    }
+
+    /// 在连续足迹邻域上共同拟合接触高度和法向；连续厚带保留实测参考允许的区间。
+    fn body_contact_frame(&self,centre:SurfaceLocation,height:f64,yaw:f64)
+        -> Result<(f64,[f64;4]),SurfaceError> {
+        let model=self.body_envelope()
+            .ok_or_else(||SurfaceError::InvalidConfig("body envelope is unavailable".into()))?;
+        let support=[centre.support_xyz[0],centre.support_xyz[1],height];
+        let key=(centre.cell,support.map(f64::to_bits));
+        let cached=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).planes.get(&key).copied();
+        let (a,b,z)=if let Some(plane)=cached {plane} else {
+            // 足迹外包半径加实际接触样本间距；有精细观察时不随规划格改变。
+            // 缺少精细观察时只保留粗格中心，不能用已丢失的细XY缩窄量化覆盖。
+            let spacing=self.observations.as_ref().map_or(self.config().voxel_size,|o|o.size_m);
+            let radius=model.radius()+f64::from(spacing);
+            let mut points=if self.observations.is_some() {
+                self.fine_contact_domain(support,radius)?
+            } else {
+                // 无原始细观察时保留粗支撑域；只为实际候选覆盖扩大枚举半径。
+                let enumeration=radius+std::f64::consts::SQRT_2*f64::from(self.config().voxel_size);
+                let patch=self.ground_patch_at_height(centre,enumeration,height);
+                let mut points=Vec::new();
+                for &cell in patch.values() {
+                    for &(point,low) in self.ground_contact_samples(cell).iter() {
+                        let distance2=(point[0]-support[0]).powi(2)+(point[1]-support[1]).powi(2);
+                        let weight=(1.0-distance2/(radius*radius)).max(0.0).powi(2);
+                        if weight>0.0 {points.push((point,low,weight));}
+                    }
+                }
+                points
+            };
+            points.sort_by(|a,b|a.0[0].total_cmp(&b.0[0]).then_with(||a.0[1].total_cmp(&b.0[1])));
+            let plane=fit_contact_plane(&points,support).ok_or(SurfaceError::MissingSupport)?;
+            let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+            if cache.planes.len()>=8192 {cache.planes.clear();}
+            cache.planes.insert(key,plane);plane
+        };
+        let normal=normalize([-a,-b,1.0]);
+        let forward=normalize([yaw.cos(),yaw.sin(),a*yaw.cos()+b*yaw.sin()]);
+        let left=cross(normal,forward);
+        Ok((z,quaternion_from_columns([forward,left,normal])))
+    }
+
 }
-fn fit_plane(points: &[[f64; 3]], origin: [f64; 3]) -> Option<(f64, f64, f64)> {
-    if points.len() < 3 {
-        return None;
+/// 最小化平面到真实高度区间的平方距离。不能先按不断变化的参考把样本锁成点。
+/// 固定空间权重矩阵只分解一次，单层地面退化为普通最小二乘；共同可行平面保持参考。
+fn fit_contact_plane(points:&[([f64;3],f64,f64)],origin:[f64;3])->Option<(f64,f64,f64)> {
+    if points.len()<3 {return None;}
+    let rows:Vec<_>=points.iter().map(|&(p,low,w)|([p[0]-origin[0],p[1]-origin[1],1.0],low,p[2],w)).collect();
+    let mut inverse=[[0.0;6];3];
+    for &(v,_,_,w) in &rows {for i in 0..3 {for j in 0..3 {inverse[i][j]+=w*v[i]*v[j];}}}
+    for i in 0..3 {inverse[i][i+3]=1.0;}
+    for column in 0..3 {
+        let pivot=(column..3).max_by(|&a,&b|inverse[a][column].abs().total_cmp(&inverse[b][column].abs()))?;
+        if inverse[pivot][column].abs()<1e-10 {return None;}
+        inverse.swap(column,pivot);
+        let scale=inverse[column][column];for j in 0..6 {inverse[column][j]/=scale;}
+        for i in 0..3 {if i!=column {
+            let factor=inverse[i][column];for j in 0..6 {inverse[i][j]-=factor*inverse[column][j];}
+        }}
     }
+    let mut plane=[0.0,0.0,origin[2]];
+    // 这是数值求解迭代界，不改变任何地面、净空、坡度或阶差许可。
+    for _ in 0..128 {
+        let project=|v:[f64;3],low:f64,high:f64|dot(v,plane).clamp(low,high);
+        let first=rows[0];let height_origin=project(first.0,first.1,first.2);
+        let mut rhs=[0.0;3];
+        for &(v,low,high,w) in &rows {
+            let residual=project(v,low,high)-height_origin;
+            for i in 0..3 {rhs[i]+=w*v[i]*residual;}
+        }
+        let mut next=std::array::from_fn(|i|(0..3).map(|j|inverse[i][j+3]*rhs[j]).sum::<f64>());
+        next[2]+=height_origin;
+        let converged=plane.iter().zip(next).all(|(a,b)|(a-b).abs()<1e-12);
+        plane=next;
+        if converged {break;}
+    }
+    Some((plane[0],plane[1],plane[2]))
+}
+
+fn fit_plane(points: &[[f64; 3]], origin: [f64; 3]) -> Option<(f64, f64, f64)> {
+    fit_plane_weighted(points.iter().copied().map(|point|(point,1.0)),origin)
+}
+fn fit_plane_weighted(points: impl Iterator<Item=([f64;3],f64)>, origin: [f64;3]) -> Option<(f64,f64,f64)> {
+    // 用实际样本高度作数值原点，使恒定平面的右端项精确为零。
+    // 名义支撑高度与地面的常量偏差不能经消元变成伪斜率。
+    let mut height_origin=None;
+    let mut count=0;
     let mut matrix = [[0.0; 4]; 3];
-    for p in points {
+    for (p,weight) in points {
+        let height_origin=*height_origin.get_or_insert(p[2]);
+        count+=1;
         let v = [p[0] - origin[0], p[1] - origin[1], 1.0];
         for i in 0..3 {
             for j in 0..3 {
-                matrix[i][j] += v[i] * v[j];
+                matrix[i][j] += weight * v[i] * v[j];
             }
-            matrix[i][3] += v[i] * (p[2] - origin[2]);
+            matrix[i][3] += weight * v[i] * (p[2] - height_origin);
         }
     }
+    if count<3 { return None; }
+    let height_origin=height_origin?;
     for col in 0..3 {
         let pivot =
             (col..3).max_by(|&a, &b| matrix[a][col].abs().total_cmp(&matrix[b][col].abs()))?;
@@ -1247,7 +2010,7 @@ fn fit_plane(points: &[[f64; 3]], origin: [f64; 3]) -> Option<(f64, f64, f64)> {
     Some((
         matrix[0][3],
         matrix[1][3],
-        origin[2] + matrix[2][3] - matrix[0][3] * origin[0] - matrix[1][3] * origin[1],
+        height_origin + matrix[2][3] - matrix[0][3] * origin[0] - matrix[1][3] * origin[1],
     ))
 }
 fn quaternion_from_columns(r: [[f64; 3]; 3]) -> [f64; 4] {
@@ -1330,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    fn body_attitude_fits_observed_ground_band_and_preserves_real_step_tops() {
+    fn body_attitude_respects_contact_band_uncertainty_and_real_step_tops() {
         let base = scene(&[], false);
         let make = |thick: bool| {
             let mut points = vec![];
@@ -1352,12 +2115,27 @@ mod tests {
         };
         let support = [-0.05, 0.05, 0.05];
         let band = make(true).body_orientation_at(support, 0.0).unwrap();
-        assert!(
-            band[0].abs() < 1e-6 && band[1].abs() < 1e-6,
-            "连续观测厚层不应制造倾斜: {band:?}"
-        );
         let step = make(false).body_orientation_at(support, 0.0).unwrap();
         assert!(step[1].abs() > 0.01, "实际高踏面不得被压成平地");
+        assert!(band[0].abs()<1e-6 && band[1].abs()<1e-6,
+            "实际共同平面位于连续观测带内时，不能强制贴合各列不同的最高点: {band:?}");
+    }
+    #[test]
+    fn ground_attitude_changes_continuously_across_voxel_boundaries() {
+        let base=scene(&[],false);
+        let points:Vec<_>=(-20..20).flat_map(|x|(-15..15).map(move |y| {
+            ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,if x>=0 {0.125} else {0.025})
+        })).collect();
+        let map=SurfaceSnapshot::from_points(&points,base.config().clone(),0.05).unwrap()
+            .with_body_envelope(base.body_envelope().unwrap().clone()).unwrap();
+        for index in (-4..0).chain(1..4) {
+            let boundary=f64::from(index)*f64::from(map.config().voxel_size);
+            let height=if index>0 {0.15} else {0.05};
+            let a=map.body_orientation_at([boundary-1e-6,0.05,height],0.0).unwrap();
+            let b=map.body_orientation_at([boundary+1e-6,0.05,height],0.0).unwrap();
+            let difference=a.iter().zip(b).map(|(a,b)|(a-b).abs()).fold(0.0,f64::max);
+            assert!(difference<1e-4,"微米跨格不能改变有限姿态: x={boundary} a={a:?} b={b:?}");
+        }
     }
     fn observation_grid(edit: impl Fn(&mut std::collections::BTreeMap<[i32; 3], SurfaceObservation>)) -> Arc<SurfaceObservations> {
         let mut values = std::collections::BTreeMap::new();
@@ -1578,6 +2356,910 @@ mod tests {
             .with_body_envelope(model())
             .unwrap()
     }
+    fn ground_band_sweep_scene(obstacle_height: f32) -> SurfaceSnapshot {
+        let mut points: Vec<_> = (-20..20).flat_map(|x| (-6..6).flat_map(move |y| {
+            [-0.025, 0.025].into_iter().map(move |z| {
+                ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, z)
+            })
+        })).collect();
+        points.push((0.05, 0.05, obstacle_height));
+        let mut config = scene(&[], false).config().clone();
+        config.robot_height = 0.1;
+        config.wall_clearance_m = 0.0;
+        let mut envelope = model();
+        envelope.footprint_xy_m = vec![[-0.1,-0.08],[0.1,-0.08],[0.1,0.08],[-0.1,0.08]];
+        SurfaceSnapshot::from_points(&points, config, 0.05).unwrap()
+            .with_body_envelope(envelope).unwrap()
+    }
+
+    #[test]
+    fn relative_terrain_normals_do_not_require_motion_from_support_to_body_center() {
+        let points:Vec<_>=(-25..25).flat_map(|x|(-15..15).map(move|y| {
+            ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,if x==0 {0.125}else{0.025})
+        })).collect();
+        let map=SurfaceSnapshot::from_points(&points,scene(&[],false).config().clone(),0.05).unwrap()
+            .with_body_envelope(model()).unwrap();
+        let from=([0.02,0.05,0.45],[0.0,0.075_f64.sin(),0.0,0.075_f64.cos()]);
+        map.validate_body_pose(from.0,from.1).unwrap();
+        let support=map.locate_support_from_body(from.0,from.1,0.4).unwrap();
+        assert!(map.sample_segment_support(support.support_xyz,[from.0[0],from.0[1],support.surface_xyz[2]],1.0).is_err(),
+            "夹在足下的窄阶边不代表机体正沿标定偏移行走");
+        let target=([from.0[0]+1e-6,from.0[1],from.0[2]],from.1);
+        map.validate_body_motion(from,target,&[]).unwrap();
+        let projected=map.body_pose_after_motion(from,[target.0[0],target.0[1]],0.0).unwrap();
+        map.validate_body_motion(from,projected,&[]).unwrap();
+    }
+
+    #[test]
+    fn relative_terrain_motion_preserves_actual_height_tilt_and_zero_motion() {
+        let map=ground_band_sweep_scene(2.025);
+        let from=([-0.65,0.05,0.375],[0.01,0.02,0.15,1.0]);
+        map.validate_body_pose(from.0,from.1).unwrap();
+        let before=rotation(from.1).unwrap();let yaw=before[0][1].atan2(before[0][0]);
+        assert_eq!(map.body_pose_after_motion(from,[from.0[0],from.0[1]],yaw).unwrap(),from);
+        let next=map.body_pose_after_motion(from,[0.65,0.05],yaw+0.25).unwrap();
+        let after=rotation(next.1).unwrap();
+        assert!((next.0[2]-from.0[2]).abs()<1e-10,"同一厚层不能凭空抬高实际机体");
+        assert!((after[2][2]-before[2][2]).abs()<1e-10,"实际倾斜偏差必须保留");
+        assert!((after[0][1].atan2(after[0][0])-yaw-0.25).abs()<1e-10);
+        map.validate_body_motion(from,next,&[]).unwrap();
+    }
+
+    #[test]
+    fn relative_terrain_motion_cannot_gain_clearance_by_resetting_height() {
+        let map=ground_band_sweep_scene(0.275);
+        let from=([-0.65,0.05,0.375],[0.0,0.0,0.0,1.0]);
+        let next=map.body_pose_after_motion(from,[0.65,0.05],0.0).unwrap();
+        assert!((next.0[2]-from.0[2]).abs()<1e-10);
+        assert_eq!(map.validate_body_motion(from,next,&[]),Err(SurfaceError::InsufficientClearance));
+    }
+
+    #[test]
+    fn support_sampling_preserves_tiny_negative_endpoints_at_a_grid_boundary() {
+        let map=scene(&[],false);
+        let from=[-0.2,-1e-24,0.1];let to=[-0.25,-1e-73,0.1];
+        map.validate_segment(from,to).expect("两端都在零线负侧，末点不能因消减误入正侧");
+        let end=map.sample_segment_support(from,to,1.0).unwrap();
+        assert_eq!(end.support_xyz[0],to[0]);
+        assert_eq!(end.support_xyz[1],to[1],"真实端点必须保留，不能靠截断小数解决");
+        map.validate_body_motion(([-0.2,0.0,0.5],[-1e-24,0.0,0.0,1.0]),
+            ([-0.25,0.0,0.5],[-1e-73,0.0,0.0,1.0]),&[]).unwrap();
+    }
+
+    #[test]
+    fn relative_terrain_motion_keeps_flat_normals_exact_without_erasing_real_tilt() {
+        let map=scene(&[],false);
+        let mut from=([0.55,0.0,0.5],[0.0,0.0,0.0,1.0]);
+        for index in 1..=30 {
+            let next=map.body_pose_after_motion(from,[0.55-index as f64*0.05,0.0],0.0).unwrap();
+            assert_eq!(next.1,[0.0,0.0,0.0,1.0],"真实平面不能拟合出跨零格界的伪倾斜");
+            map.validate_body_motion(from,next,&[]).unwrap();
+            from=next;
+        }
+        let tiny=([0.55,0.0,0.5],[1e-18,-2e-18,0.0,1.0]);
+        let r=rotation(tiny.1).unwrap();let yaw=r[0][1].atan2(r[0][0]);
+        let moved=map.body_pose_after_motion(tiny,[0.45,0.0],yaw).unwrap();
+        assert!((moved.1[0]-tiny.1[0]).abs()<1e-30 && (moved.1[1]-tiny.1[1]).abs()<1e-30,
+            "不能靠清零真实小姿态消除数值问题");
+    }
+
+    #[test]
+    fn unchanged_terrain_frame_preserves_actual_quaternion_and_height_exactly() {
+        let map=ground_band_sweep_scene(2.025);
+        for q in [[0.00394335813731047,-0.0017848593550173339,-0.005558448676189815,0.9999751836180726],
+            [1e-18,-2e-18,0.0,1.0]] {
+            let from=([-0.65,0.05,0.375],q);
+            let r=rotation(q).unwrap();let yaw=r[0][1].atan2(r[0][0]);
+            let next=map.body_pose_after_motion(from,[0.65,0.05],yaw).unwrap();
+            assert_eq!(next.1,q,"地形帧和偏航完全相同，不能经矩阵往返制造姿态变化");
+            assert_eq!(next.0[2],from.0[2],"相同旋转偏移不能经世界高度加减制造升降");
+        }
+        let from=([-0.65,0.05,0.375],[0.0,0.0,0.0,1.0]);
+        let next=map.body_pose_after_motion(from,[0.65,0.05],1e-18).unwrap();
+        assert!(next.1[2]>0.0,"真实微小偏航仍必须保留");
+    }
+
+    #[test]
+    fn relative_terrain_motion_has_no_attitude_jump_for_a_micrometre_translation() {
+        let points:Vec<_>=(-50..50).flat_map(|x|(-30..30).map(move|y| {
+            let px=(x as f32+0.5)*0.05;(px,(y as f32+0.5)*0.05,px*0.13+0.021)
+        })).collect();
+        let map=SurfaceSnapshot::from_points(&points,scene(&[],false).config().clone(),0.05).unwrap()
+            .with_body_envelope(model()).unwrap();
+        for index in -10..10 {
+            let x=index as f64*0.1+0.035;
+            let surface=map.locate_near_support([x,0.05,x*0.13+0.021],0.1).unwrap();
+            let support=[x,0.05,surface.surface_xyz[2]];
+            let q=map.body_orientation_at(support,0.0).unwrap();
+            let from=(map.body_position_from_support(support,q,0.4).unwrap(),q);
+            map.validate_body_pose(from.0,from.1).unwrap();
+            let before=rotation(from.1).unwrap();
+            let mut differences=Vec::new();
+            for distance in [1e-6,1e-7] {
+                let next=map.body_pose_after_motion(from,[from.0[0]+distance,from.0[1]],0.0).unwrap();
+                let after=rotation(next.1).unwrap();
+                let difference=(0..3).flat_map(|row|(0..3).map(move|col|
+                    (before[row][col]-after[row][col]).abs())).fold(0.0,f64::max);
+                assert!(difference<distance,"微米平移不能突然改变倾斜：{from:?} -> {next:?}");
+                differences.push(difference);
+            }
+            assert!(differences[1]<differences[0]*0.2+1e-14,
+                "位移缩小十倍时姿态变化应连续趋零：{differences:?}");
+        }
+    }
+
+    #[test]
+    fn exposed_ground_at_sparse_block_boundary_keeps_real_flat_motion() {
+        for iz in [-33,-1,31] {
+            let fine=f64::from(0.05_f32);
+            let points:Vec<_>=(-30..30).flat_map(|x|(-20..20).map(move|y|
+                (((x as f64+0.5)*fine) as f32,((y as f64+0.5)*fine) as f32,((iz as f64+0.5)*fine) as f32))).collect();
+            let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+            for &(x,y,z) in &points {
+                let key=[x,y,z].map(|v|(f64::from(v)/fine).floor() as i32);
+                blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});
+            }
+            let mut observed=SurfaceObservations::new(0.05,32).unwrap();
+            for (key,values) in blocks {observed.replace_block(key,values).unwrap();}
+            assert!(!observed.has_complete_block([0,0,iz+1]),"稀疏索引不为全空上方保留块");
+            let map=SurfaceSnapshot::from_points(&points,scene(&[],false).config().clone(),0.05).unwrap()
+                .with_body_envelope(model()).unwrap().with_observations(Some(Arc::new(observed)));
+            let from=([-0.55,0.05,(iz as f64+1.0)*fine+0.4],[0.0,0.0,0.0,1.0]);
+            let next=map.body_pose_after_motion(from,[0.55,0.05],0.0).unwrap();
+            assert_eq!(next.0[2],from.0[2]);assert_eq!(next.1,from.1);
+            map.validate_body_motion(from,next,&[]).unwrap();
+        }
+    }
+
+    #[test]
+    fn relative_terrain_cannot_turn_a_wall_or_missing_footprint_into_ground() {
+        for missing in [false,true] {
+            let mut points=Vec::new();
+            for x in -40..40 {for y in -20..20 {
+                if missing && (0..4).contains(&x) {continue;}
+                points.push(((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,-0.025));
+                if !missing && (0..4).contains(&x) {
+                    for z in 0..20 {points.push(((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,(z as f32+0.5)*0.05));}
+                }
+            }}
+            let mut cfg=scene(&[],false).config().clone();cfg.robot_height=0.1;cfg.wall_clearance_m=0.0;
+            let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(model()).unwrap();
+            let from=([-0.65,0.025,0.4],[0.0,0.0,0.0,1.0]);
+            map.validate_body_pose(from.0,from.1).unwrap();
+            assert!(map.body_pose_after_motion(from,[-0.1,0.025],0.0).is_err(),
+                "连续拟合不能借高墙或足迹缺地面生成许可，missing={missing}");
+        }
+    }
+
+    #[test]
+    fn relative_terrain_uses_exposed_fine_surface_without_internal_or_other_floor_drift() {
+        let make=|fill:bool,upper:bool| {
+            let mut points=Vec::new();
+            for x in -40..40 {for y in -20..20 {
+                let px=(x as f32+0.5)*0.05;let py=(y as f32+0.5)*0.05;
+                points.push((px,py,0.025));
+                if fill {for z in if x<0 {vec![-0.025,-0.075,-0.125]}else{vec![-0.025]} {points.push((px,py,z));}}
+                if upper {points.push((px,py,0.825));}
+            }}
+            let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+            for &(x,y,z) in &points {
+                let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
+                blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});
+            }
+            let mut observed=SurfaceObservations::new(0.05,32).unwrap();
+            for (key,values) in blocks {observed.replace_block(key,values).unwrap();}
+            SurfaceSnapshot::from_points(&points,scene(&[],false).config().clone(),0.05).unwrap()
+                .with_body_envelope(model()).unwrap().with_observations(Some(Arc::new(observed)))
+        };
+        let from=([-0.65,0.05,0.45],[0.01,0.02,0.15,1.0]);
+        let r=rotation(from.1).unwrap();let yaw=r[0][1].atan2(r[0][0]);
+        let mut results=Vec::new();
+        for (fill,upper) in [(false,false),(true,false),(true,true)] {
+            let map=make(fill,upper);
+            let result=map.body_pose_after_motion(from,[0.65,0.05],yaw).unwrap();
+            assert_eq!(result.1,from.1,"同一平坦露顶保留原完整四元数");
+            assert_eq!(result.0[2],from.0[2],"不同内部填充与独立上层都不能产生实际机体升降");
+            map.validate_body_motion(from,result,&[]).unwrap();results.push(result);
+        }
+        assert!(results.windows(2).all(|pair|pair[0]==pair[1]));
+    }
+
+    #[test]
+    fn current_body_clearing_does_not_turn_a_flat_observed_band_into_a_terrain_pit() {
+        let mut points=Vec::new();
+        for x in -40..40 {for y in -30..30 {for z in -1..3 {
+            points.push(((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,(z as f32+0.5)*0.05));
+        }}}
+        // 当前真实机体内的回波触发私有清除；完整地面仍有相同真实露顶。
+        points.push((0.025,0.025,0.325));
+        let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for &(x,y,z) in &points {
+            let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
+            blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});
+        }
+        let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+        for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+        let mut cfg=scene(&[],false).config().clone();cfg.robot_height=0.1;cfg.wall_clearance_m=0.0;
+        let mut envelope=model();envelope.footprint_xy_m=vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]];
+        envelope.z_bounds_m=[-0.448,0.057];envelope.max_step_up_m=0.15;envelope.max_step_down_m=0.15;
+        let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap()
+            .with_observations(Some(Arc::new(observations)));
+        let from=([0.0,0.0,0.4],[0.0,0.0,0.0,1.0]);
+        assert!(map.validate_body_pose(from.0,from.1).is_err());
+        let view=map.with_current_body_support(from.0,from.1).unwrap();
+        assert!(view.current_body_support.as_ref().unwrap().cleared_voxels.contains(&[0,0,2]));
+        assert!(view.observations.as_ref().unwrap().get([0,0,2]).is_some(),"私有清除不改真实源点");
+        let next=view.body_pose_after_motion(from,[0.2,0.0],0.0).unwrap();
+        assert_eq!(next.0[2],from.0[2],"清除机体回波不能把厚带内部变成低地面");
+        assert_eq!(next.1,from.1,"原真实平面不能在当前足迹边缘变成斜坡");
+        view.validate_body_motion(from,next,&[]).unwrap();
+    }
+
+    #[test]
+    fn ground_contact_plane_selects_the_continuous_band_not_a_separate_high_echo() {
+        let mut points=Vec::new();
+        for x in -30..30 {for y in -20..20 {for z in -11..=-8 {
+            points.push(((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,(z as f32+0.5)*0.05));
+        }}}
+        // 同一粗列中-7层真实缺失；-6层高回波不能替换包含实际接触的低带。
+        points.push((-0.175,-0.075,-0.275));
+        let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for &(x,y,z) in &points {
+            let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
+            blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});
+        }
+        let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+        for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+        assert!(observations.get([-4,-2,-7]).is_none());
+        assert!(observations.get([-4,-2,-6]).is_some());
+        let mut cfg=scene(&[],false).config().clone();cfg.robot_height=0.1;cfg.wall_clearance_m=0.0;
+        let mut envelope=model();envelope.z_bounds_m=[-0.448,0.057];
+        envelope.max_step_up_m=0.15;envelope.max_step_down_m=0.15;envelope.max_cross_slope_deg=18.0;
+        let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap()
+            .with_observations(Some(Arc::new(observations)));
+        let from=([0.0,0.0,-0.044],[0.0,0.0,0.0,1.0]);
+        map.validate_body_pose(from.0,from.1).unwrap();
+        let next=map.body_pose_after_motion(from,[-0.13,0.0],0.0).unwrap();
+        assert_eq!(next.0[2],from.0[2],"低真实厚带包含当前平面，不应被分离高回波强制抬升");
+        assert_eq!(next.1,from.1,"不能因选错细带制造地形倾斜");
+        map.validate_body_motion(from,next,&[]).unwrap();
+        assert_eq!(map.validate_body_pose([from.0[0],from.0[1],from.0[2]-0.01],from.1),
+            Err(SurfaceError::InsufficientClearance),"分离高回波仍参与原完整机体碰撞/接触检查");
+    }
+
+    #[test]
+    fn relative_terrain_height_follows_the_plane_at_the_rotated_support_point() {
+        for slope in [0.25_f64,-0.25] {
+            // 网格与源分辨率相容，使真实露顶精确位于已知z=slope*(x-0.1)平面。
+            let points:Vec<_>=(-40..40).flat_map(|x|(-20..20).map(move|y| {
+                let px=(x as f64+0.5)*0.2;
+                (px as f32,((y as f64+0.5)*0.2) as f32,(slope*(px-0.1).max(0.0)-0.025) as f32)
+            })).collect();
+            let mut cfg=scene(&[],false).config().clone();cfg.voxel_size=0.2;cfg.min_step_tread_depth_m=0.4;cfg.wall_clearance_m=0.0;
+            let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(model()).unwrap();
+            let angle=slope.atan();let q=[0.0,(-angle*0.5).sin(),0.0,(-angle*0.5).cos()];
+            for bias in [0.0,0.013] {
+                let flat=([-1.5,0.05,0.4+bias],[0.0,0.0,0.0,1.0]);
+                // 已知法向距离d对应机体中心的竖直高度d/cos(theta)。
+                let height=slope*1.4+0.4*(1.0+slope*slope).sqrt()+bias;
+                let inclined=([1.5,0.05,height],q);
+                let up=map.body_pose_after_motion(flat,[1.5,0.05],0.0).unwrap();
+                assert!((up.0[2]-height).abs()<1e-5,"中心高度须使用旋转支撑点的平面高度：{up:?} / {height}");
+                let down=map.body_pose_after_motion(inclined,[-1.5,0.05],0.0).unwrap();
+                assert!((down.0[2]-flat.0[2]).abs()<1e-5,"返回平地保留实际高度偏差：{down:?}");
+                let turn=map.body_pose_after_motion(inclined,[inclined.0[0],inclined.0[1]],0.2).unwrap();
+                assert_eq!(turn.0[2],inclined.0[2],"同一位置转向不能自行改变中心高度");
+            }
+        }
+    }
+
+    #[test]
+    fn relative_terrain_motion_adapts_to_unambiguous_ground_before_the_center_crosses() {
+        let mut points=Vec::new();
+        for x in -40..40 {for y in -20..20 {
+            let z=if x<0 {-1}else{1};
+            points.push(((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,(z as f32+0.5)*0.05));
+        }}
+        let mut cfg=scene(&[],false).config().clone();cfg.robot_height=0.1;cfg.wall_clearance_m=0.0;
+        let mut envelope=model();envelope.footprint_xy_m=vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]];
+        envelope.z_bounds_m=[-0.448,0.057];envelope.max_step_up_m=0.15;envelope.max_step_down_m=0.15;
+        envelope.max_cross_slope_deg=18.0;
+        let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap();
+        let from=([-0.5,0.025,0.4],[0.0,0.0,0.0,1.0]);
+        map.validate_body_pose(from.0,from.1).unwrap();
+        assert_eq!(map.body_pose_after_motion(from,[from.0[0],from.0[1]],0.0).unwrap(),from);
+        let mut current=from;
+        for i in 1..=100 {
+            let x=-0.5+i as f64*0.01;
+            let next=map.body_pose_after_motion(current,[x,0.025],0.0).unwrap();
+            map.validate_body_motion(current,next,&[]).unwrap();
+            assert!((next.0[2]-current.0[2]).abs()<0.01,"真实露顶变化须连续适应，不能在中心跨格时突然抬升");
+            if i==35 {assert!(next.0[2]>from.0[2]+0.005,"前足已覆盖高地面时须在中心跨格前抬升");}
+            current=next;
+        }
+        assert!((current.0[2]-from.0[2]-0.1).abs()<0.01,"保持实际初始偏差，随露顶真实升高0.1米");
+    }
+
+    #[test]
+    fn contact_response_follows_declared_footprint_and_source_not_planning_resolution() {
+        let mut points=Vec::new();
+        for x in -40..40 {for y in -30..30 {
+            points.push(((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,if x<3 {-0.025}else{0.075}));
+        }}
+        let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for &(x,y,z) in &points {
+            let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
+            blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});
+        }
+        let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+        for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+        let observations=Arc::new(observations);
+        let sample=|planning:f32,half:[f64;2],xy:[f64;2]| {
+            let mut cfg=scene(&[],false).config().clone();cfg.voxel_size=planning;cfg.wall_clearance_m=0.0;cfg.robot_height=0.1;
+            let mut envelope=model();let [x,y]=half;
+            envelope.footprint_xy_m=vec![[-x,-y],[x,-y],[x,y],[-x,y]];
+            let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap()
+                .with_observations(Some(Arc::clone(&observations)));
+            let centre=map.locate_support([xy[0],xy[1],0.0]).unwrap();
+            map.body_contact_frame(centre,0.0,0.0).unwrap()
+        };
+        for xy in [[-0.05,0.025],[-0.000001,0.099999],[-0.099999,-0.000001]] {
+            let a=sample(0.05,[0.3,0.15],xy);let b=sample(0.1,[0.3,0.15],xy);
+            assert!((a.0-b.0).abs()<1e-7 && a.1.iter().zip(b.1).all(|(x,y)|(x-y).abs()<1e-7),
+                "相同足迹及源观测不能因规划格变化而采用另一响应核: {xy:?}, {a:?} / {b:?}");
+        }
+        let small=sample(0.1,[0.1,0.1],[-0.05,0.025]);
+        assert_eq!(small,(0.0,[0.0,0.0,0.0,1.0]),"小足迹的一源体素覆盖域尚未接触高台");
+        let large=sample(0.1,[0.3,0.15],[-0.05,0.025]);
+        assert!(large.0>0.0 && large.1[1]<0.0,"声明足迹已覆盖高台时应产生真实提前适应");
+    }
+
+    #[test]
+    fn contact_response_uses_retained_sample_spacing_without_fine_observations() {
+        let points:Vec<_>=(-20..20).flat_map(|x|(-15..15).map(move |y|
+            ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,if x<0 {-0.0125}else{0.0875}))).collect();
+        let make=|source| {
+            let mut cfg=scene(&[],false).config().clone();cfg.voxel_size=0.1;cfg.wall_clearance_m=0.0;cfg.robot_height=0.1;
+            SurfaceSnapshot::from_points(&points,cfg,source).unwrap().with_body_envelope(model()).unwrap()
+        };
+        let fine_source=make(0.025);let other_source=make(0.05);
+        // 未保留精细观察时，两个来源精度均只留下同一粗列中心及真实高度区间。
+        // 已不存在的精细XY不能继续缩窄地形响应核。
+        for x in -6..6 {for y in -5..5 {
+            let p=[(f64::from(x)+0.5)*0.1,(f64::from(y)+0.5)*0.1,if x<0 {0.0}else{0.1}];
+            let a=fine_source.locate_support(p).unwrap();let b=other_source.locate_support(p).unwrap();
+            assert_eq!(fine_source.ground_contact_samples(a.cell),other_source.ground_contact_samples(b.cell));
+        }}
+        for xy in [[-0.15,0.05],[-0.10,0.05],[-0.025,0.075]] {
+            let p=[xy[0],xy[1],0.0];
+            let a=fine_source.body_contact_frame(fine_source.locate_support(p).unwrap(),0.0,0.0).unwrap();
+            let b=other_source.body_contact_frame(other_source.locate_support(p).unwrap(),0.0,0.0).unwrap();
+            assert!((a.0-b.0).abs()<1e-12 && a.1.iter().zip(b.1).all(|(a,b)|(a-b).abs()<1e-12),
+                "真实拟合输入相同，源分辨率元数据不应改变已聚合后的响应: {xy:?} {a:?} {b:?}");
+        }
+    }
+
+    #[test]
+    fn fine_contact_domain_uses_selected_bands_and_directed_connected_component() {
+        let make=|levels:Vec<([i32;2],Vec<i32>)>| {
+            let mut points=Vec::new();
+            let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+            for (xy,zs) in levels {for z in zs {
+                let key=[xy[0],xy[1],z];
+                points.push(((f64::from(xy[0])+0.5) as f32*0.05,(f64::from(xy[1])+0.5) as f32*0.05,(f64::from(z)+0.5) as f32*0.05));
+                blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});
+            }}
+            let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+            for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+            let mut cfg=scene(&[],false).config().clone();cfg.wall_clearance_m=0.0;cfg.robot_height=0.1;
+            let mut envelope=model();envelope.max_step_up_m=0.15;envelope.max_step_down_m=0.1;
+            SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap()
+                .with_observations(Some(Arc::new(observations)))
+        };
+        let stairs=make((-10..10).flat_map(|x|(-10..10).map(move |y|([x,y],vec![if x<0 {-1}else{3},19]))).collect());
+        let up=stairs.fine_contact_domain([-0.075,0.025,0.0],0.3).unwrap();
+        assert!(up.iter().any(|p|p.0[0]>0.0),"真实四细格上阶仍在声明上阶加量化范围内");
+        assert!(up.iter().all(|p|p.0[2]<0.3),"独立上一层不得混入当前带");
+        let down=stairs.fine_contact_domain([0.075,0.025,0.2],0.3).unwrap();
+        assert!(down.iter().all(|p|p.0[0]>0.0),"相同高差超过声明下阶范围时不能借上阶许可连接");
+        assert!(stairs.fine_contact_domain([0.075,0.025,1.0],0.3).unwrap().iter().all(|p|p.0[2]>0.9),
+            "上层实际参考不能借近列探测混入下层地面");
+        let diagonal=make((-2..=1).map(|i|([i,i],vec![-1])).collect());
+        assert_eq!(diagonal.fine_contact_domain([0.0,0.0,0.0],0.3).unwrap().len(),4,
+            "八方向必须包括真实对角邻列，不能复用粗图的四方向常量");
+        let line=make((-10..10).map(|y|([0,y],vec![-1])).collect());
+        let line_points=line.fine_contact_domain([0.025,0.025,0.0],0.3).unwrap();
+        assert!(fit_contact_plane(&line_points,[0.025,0.025,0.0]).is_none(),
+            "没有其它真实列时仍无法拟合二维地面，不能用虚构点补秩");
+        assert!(line.validate_body_pose([0.025,0.025,0.4],[0.0,0.0,0.0,1.0]).is_err(),
+            "响应域不会把孤立单列扩成完整足迹支撑");
+        let wall=make((-10..10).flat_map(|x|(-10..10).map(move |y|
+            ([x,y],if x==0 {(-1..15).collect()}else{vec![-1]}))).collect());
+        let domain=wall.fine_contact_domain([-0.1,0.025,0.0],0.3).unwrap();
+        assert!(domain.iter().all(|p|p.0[0]<0.0),"高墙顶不能连接墙内侧种子与另一侧同高地面");
+        let high_band=make((-10..10).flat_map(|x|(-10..10).map(move |y| {
+            let mut zs=vec![-3];zs.extend(-1..8);([x,y],zs)
+        })).collect());
+        assert_eq!(high_band.fine_contact_domain([0.0,0.0,0.0],0.3),Err(SurfaceError::MissingSupport),
+            "最近厚带没有近参考暴露顶时不能退而选更远的低薄层制造种子");
+        let equal=make((-10..10).flat_map(|x|(-10..10).map(move |y|([x,y],vec![-3,1]))).collect());
+        assert!(equal.fine_contact_domain([0.0,0.0,0.0],0.3).unwrap().iter().all(|p|p.0[2]<0.0),
+            "完整区间距离和顶距相同时必须稳定选较低带");
+    }
+
+    #[test]
+    fn fine_contact_seed_cannot_jump_from_supported_body_to_a_disconnected_outer_echo() {
+        let mut keys:Vec<[i32;3]>=(-12..12).flat_map(|x|(-10..4).map(move |y|[x,y,-1])).collect();
+        // 机体脚下为完整平地；横向间隔一列后，足迹外有两个高度样本形成的小孤岛。
+        keys.extend([[4,5,-1],[4,5,0]]);
+        let points:Vec<_>=keys.iter().map(|k|((k[0] as f32+0.5)*0.05,(k[1] as f32+0.5)*0.05,(k[2] as f32+0.5)*0.05)).collect();
+        let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for key in keys {blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});}
+        let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+        for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+        let mut cfg=scene(&[],false).config().clone();cfg.robot_height=0.1;cfg.wall_clearance_m=0.0;
+        let mut envelope=model();envelope.footprint_xy_m=vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]];
+        envelope.z_bounds_m=[-0.448,0.057];envelope.max_step_up_m=0.15;envelope.max_step_down_m=0.15;
+        let coarse=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap();
+        let map=coarse.with_observations(Some(Arc::new(observations)));
+        let from=([0.0,0.0,0.41],[0.0,0.0,0.0,1.0]);
+        map.validate_body_pose(from.0,from.1).expect("当前完整真实足迹和平地接触合法");
+        coarse.body_pose_after_motion(from,[0.001,0.0],0.0).expect("原粗响应可完成真实平地微动");
+        let next=map.body_pose_after_motion(from,[0.001,0.0],0.0)
+            .expect("外部孤岛恰好包含参考高度，不应夺走当前完整地面的响应种子");
+        assert!((next.0[2]-from.0[2]).abs()<1e-10 && next.1.iter().zip(from.1).all(|(a,b)|(a-b).abs()<1e-10),
+            "同层厚带可以参与估计，但不能改变脚下已证平面的实际响应");
+    }
+
+    fn sparse_contact_scene(keys:Vec<[i32;3]>,mut envelope:SurfaceBodyEnvelope)->SurfaceSnapshot {
+        let fine=f64::from(0.05_f32);
+        let points:Vec<_>=keys.iter().map(|key|((f64::from(key[0])+0.5)*fine,(f64::from(key[1])+0.5)*fine,(f64::from(key[2])+0.5)*fine))
+            .map(|(x,y,z)|(x as f32,y as f32,z as f32)).collect();
+        let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for key in keys {blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});}
+        let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+        for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+        let mut cfg=scene(&[],false).config().clone();cfg.robot_height=0.1;cfg.wall_clearance_m=0.0;
+        cfg.step_threshold_m=envelope.max_step_up_m.max(envelope.max_step_down_m) as f32;
+        envelope.footprint_xy_m=vec![[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]];
+        envelope.z_bounds_m=[-0.15,0.15];envelope.body_to_support_z_m=0.35;
+        SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap()
+            .with_observations(Some(Arc::new(observations)))
+    }
+
+    #[test]
+    fn saved_boundary_sampled_flat_ground_keeps_legal_motion_across_empty_rows() {
+        // 原探索保存PCD原点附近真实列；保留单精度量化产生的全部空行，不移动或补采样。
+        let columns=[-12,-10,-9,-8,-7,-5,-4,-2,-1,1,2,3,4,6,8,9,11,12];
+        let keys=columns.into_iter().flat_map(|x|columns.into_iter().flat_map(move |y|[-7,12].map(|z|[x,y,z]))).collect();
+        let mut envelope=model();envelope.max_step_up_m=0.0;envelope.max_step_down_m=0.0;
+        let map=sparse_contact_scene(keys,envelope);
+        let from=([0.0,0.0,0.0],[0.0,0.0,0.0,1.0]);
+        for direction in [[1.0,0.0],[0.0,1.0],[1.0,1.0]] {for distance in [0.05,0.25,0.30,0.325,0.35,0.375,0.40] {
+            let xy=direction.map(|v|v*distance);let expected=([xy[0],xy[1],0.0],from.1);
+            map.validate_body_pose(expected.0,expected.1).unwrap();
+            map.validate_body_motion(from,expected,&[]).unwrap();
+            let actual=map.body_pose_after_motion(from,xy,0.0).expect("原合法平地不能因细拟合分量退化而被关闭");
+            assert_eq!(actual,expected,"常值地面始终保留实际高度和四元数");
+        }}
+    }
+
+    #[test]
+    fn sparse_quantized_ramp_response_remains_continuous_at_old_rank_boundary() {
+        let fine=f64::from(0.05_f32);let grade=0.25_f64;
+        let keys=(-10..12).filter(|x|![0,5,7].contains(x)).flat_map(|x|(-6..6).filter(|&y|y!=0).map(move |y| {
+            let px=(f64::from(x)+0.5)*fine;
+            let z=((-0.3+grade*px-fine*0.5)/fine).floor() as i32;[x,y,z]
+        })).collect();
+        let mut envelope=model();envelope.max_step_up_m=0.15;envelope.max_step_down_m=0.15;
+        let map=sparse_contact_scene(keys,envelope);
+        let radius=map.body_envelope().unwrap().radius()+fine;
+        let plane=|x:f64| {
+            let origin=[x,0.0,-0.3+grade*x];
+            let mut points=map.fine_contact_domain(origin,radius).unwrap();
+            points.sort_by(|a,b|a.0[0].total_cmp(&b.0[0]).then_with(||a.0[1].total_cmp(&b.0[1])));
+            fit_contact_plane(&points,origin).expect("邻近真实同层样本应保留坡面的可观测方向")
+        };
+        let angle=-grade.atan();let q=[0.0,(angle*0.5).sin(),0.0,(angle*0.5).cos()];
+        for delta in [1e-3,1e-5,1e-7] {
+            let left=5.5*fine-delta;let right=5.5*fine+delta;let a=plane(left);let b=plane(right);
+            assert!(a.0>0.1 && b.0>0.1,"不能在旧单列分量边界突然压平坡面: {a:?} {b:?}");
+            assert!((b.2-a.2).abs()<2.0*delta && (b.0-a.0).abs()+(b.1-a.1).abs()<10.0*delta,
+                "真实微动变小时高度和姿态变化须同步趋零: {delta} {a:?} {b:?}");
+            let from=([left,0.0,-0.3+grade*left+0.35*(1.0+grade*grade).sqrt()],q);
+            map.validate_body_pose(from.0,from.1).unwrap();
+            let next=map.body_pose_after_motion(from,[right,0.0],0.0).unwrap();
+            map.validate_body_motion(from,next,&[]).unwrap();
+            assert!((next.0[2]-from.0[2]).abs()<2.0*delta && next.1.iter().zip(from.1).all(|(a,b)|(a-b).abs()<10.0*delta));
+        }
+    }
+
+    #[test]
+    fn relative_terrain_motion_continuously_follows_three_observed_thin_steps() {
+        let mut points=Vec::new();
+        for x in -40..60 {for y in -20..20 {
+            let step=i32::from(x>=0)+i32::from(x>=8)+i32::from(x>=16);
+            let top=step*2;
+            let first=if [0,8,16].contains(&x) {top-2}else{top-1};
+            for z in first..top {points.push(((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,(z as f32+0.5)*0.05));}
+        }}
+        let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for &(x,y,z) in &points {
+            let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
+            blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});
+        }
+        let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+        for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+        let mut cfg=scene(&[],false).config().clone();cfg.robot_height=0.1;cfg.wall_clearance_m=0.0;
+        let mut envelope=model();envelope.footprint_xy_m=vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]];
+        envelope.z_bounds_m=[-0.448,0.057];envelope.max_step_up_m=0.15;envelope.max_step_down_m=0.15;
+        envelope.max_cross_slope_deg=18.0;
+        let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap()
+            .with_observations(Some(Arc::new(observations)));
+        let start=([-0.6,0.025,0.4],[0.0,0.0,0.0,1.0]);let mut current=start;
+        let mut checkpoints=Vec::new();
+        for round in 0..3 {
+            for i in (1..=220).chain((0..220).rev()) {
+                let x=-0.6+f64::from(i)*0.01;
+                let next=map.body_pose_after_motion(current,[x,0.025],0.0).unwrap_or_else(|e|panic!("三阶相对推进round={round}, x={x}: {e}; from={current:?}"));
+                map.validate_body_motion(current,next,&[]).unwrap_or_else(|e|panic!("三阶实际扫掠round={round}, x={x}: {e}; {current:?} -> {next:?}"));
+                assert!((next.0[2]-current.0[2]).abs()<0.02,"连续小步不能突然跨越整阶高度");
+                if i==220 || i==0 {checkpoints.push((round,i,next));}
+                current=next;
+            }
+        }
+        for (round,index,pose) in &checkpoints {
+            let expected=if *index==220 {0.7}else{0.4};
+            assert!((pose.0[2]-expected).abs()<1e-7,"立面观测区间不能造成往返高度累积：{checkpoints:?}");
+            assert!(pose.1[0].abs()<1e-7 && pose.1[1].abs()<1e-7,"真实水平两端不能累计倾斜：round={round}, {pose:?}");
+        }
+    }
+
+    #[test]
+    fn relative_terrain_motion_still_follows_a_real_ramp() {
+        let points:Vec<_>=(-50..50).flat_map(|x|(-30..30).map(move|y| {
+            let px=(x as f32+0.5)*0.05;(px,(y as f32+0.5)*0.05,px*0.13+0.021)
+        })).collect();
+        let map=SurfaceSnapshot::from_points(&points,scene(&[],false).config().clone(),0.05).unwrap()
+            .with_body_envelope(model()).unwrap();
+        let support=map.locate_support([-0.55,0.05,-0.05]).unwrap().support_xyz;
+        let q=map.body_orientation_at(support,0.0).unwrap();
+        let mut from=(map.body_position_from_support(support,q,0.4).unwrap(),q);
+        from.0[2]-=0.02;
+        map.validate_body_pose(from.0,from.1).unwrap();
+        let next=map.body_pose_after_motion(from,[0.55,0.05],0.0).unwrap();
+        assert!(next.0[2]-from.0[2]>0.07,"真实上坡仍须抬升");
+        assert!(next.0[2]-from.0[2]<0.18,"不能叠加格顶的绝对高度偏差");
+        map.validate_body_motion(from,next,&[]).unwrap();
+    }
+
+    #[test]
+    fn contact_connectivity_uses_only_the_fine_ground_inside_the_footprint() {
+        let make = |missing_inside: bool| {
+            let mut points = Vec::new();
+            for x in -20..20 { for y in -16..16 {
+                if missing_inside && (0..2).contains(&x) && y==2 { continue; }
+                for z in [-0.025,0.025,0.075] {
+                    points.push(((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,z));
+                }
+            }}
+            // 高处回波位于同一粗列的足迹外半格；外侧台阶让它进入粗图接触邻域。
+            for x in [0.025,0.075] {
+                for z in [0.125,0.175,0.225,0.325,0.375] {points.push((x,0.175,z));}
+                for y in [0.225,0.275] {for z in [0.125,0.175,0.225] {points.push((x,y,z));}}
+            }
+            let mut config = scene(&[],false).config().clone();
+            config.robot_height=0.1;config.wall_clearance_m=0.0;config.step_threshold_m=0.15;
+            let mut envelope=model();envelope.footprint_xy_m=vec![[-0.3,-0.12],[0.3,-0.12],[0.3,0.12],[-0.3,0.12]];
+            envelope.z_bounds_m=[-0.448,0.057];envelope.max_step_up_m=0.15;envelope.max_step_down_m=0.15;
+            let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+            for &(x,y,z) in &points {
+                let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
+                blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});
+            }
+            let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+            for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+            SurfaceSnapshot::from_points(&points,config,0.05).unwrap().with_body_envelope(envelope).unwrap()
+                .with_observations(Some(Arc::new(observations)))
+        };
+        let body=[0.05,0.0,0.35];let q=[0.0,0.0,0.0,1.0];
+        let map=make(false);
+        map.validate_body_pose(body,q).expect("足迹外的高表面不能替换足迹内的真实低层接触");
+        let coarse=map.with_observations(None);
+        assert!(coarse.locate_support_from_body(body,q,0.4).is_err(),"精细接触缓存不能进入缺少精细证据的视图");
+        assert!(map.locate_support_from_body(body,q,0.4).is_ok());
+        assert!(map.validate_body_pose([0.05,0.1,0.35],q).is_err(),"进入真实高处回波后仍应拒绝");
+        assert!(make(true).validate_body_pose(body,q).is_err(),"缺少足迹内精细地面时不能借足迹外的低层补足");
+    }
+
+    #[test]
+    fn current_body_view_preserves_legal_ground_band_instead_of_digging_a_pit() {
+        let mut config = scene(&[], false).config().clone();
+        config.robot_height = 0.1;
+        config.wall_clearance_m = 0.0;
+        config.step_threshold_m = 0.15;
+        let mut envelope = model();
+        envelope.z_bounds_m = [-0.448, 0.057];
+        envelope.max_step_up_m = 0.15;
+        envelope.max_step_down_m = 0.15;
+        let mut points: Vec<_> = (-20..20).flat_map(|x| (-10..10).flat_map(move |y| {
+            [-0.025,0.025,0.075,0.125,0.175].into_iter().map(move |z| {
+                ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, z)
+            })
+        })).collect();
+        // 足迹内上方回波触发原有当前占据清除；周边实际地面不能随之降低。
+        points.push((0.15,0.05,0.325));
+        let map = SurfaceSnapshot::from_points(&points, config, 0.05).unwrap()
+            .with_body_envelope(envelope).unwrap();
+        let q = [0.0,0.0,0.0,1.0];
+        let body = [0.05,0.05,0.4];
+        assert!(map.validate_body_pose(body,q).is_err());
+        let before = map.locate_support_from_body(body,q,0.4).unwrap();
+        let view = map.with_current_body_support(body,q).unwrap();
+        let after = view.locate_support_from_body(body,q,0.4).unwrap();
+        assert!((before.surface_xyz[2]-after.surface_xyz[2]).abs()<1e-6,
+            "已在完整机体接触范围内的真实厚层上界必须保留");
+        assert!((after.surface_xyz[2]-0.2).abs()<1e-6);
+        view.validate_body_motion((body,q),([-0.85,0.05,0.4],q),&[]).unwrap();
+    }
+
+    #[test]
+    fn fine_inner_ground_remains_support_when_outer_half_is_a_wall() {
+        let mut points:Vec<_>=(-20..20).flat_map(|x|(-20..20).map(move |y|
+            ((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,-0.025))).collect();
+        for x in [0,1] {for z in 0..12 {points.push(((x as f32+0.5)*0.05,-0.075,(z as f32+0.5)*0.05));}}
+        for x in [0,1] {points.push(((x as f32+0.5)*0.05,-0.025,0.625));}
+        let mut cfg=scene(&[],false).config().clone();cfg.wall_clearance_m=0.0;cfg.robot_height=0.1;
+        let envelope=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.15,-0.1],[0.15,-0.1],[0.15,0.1],[-0.15,0.1]],
+            z_bounds_m:[-0.4,0.1],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
+            max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
+        let base=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap();
+        let observed=|missing:bool| {
+            let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+            for &(x,y,z) in &points {
+                let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
+                if missing && key==[0,-1,-1] {continue;}
+                blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation {observed_ns:0,hits:0});
+            }
+            let mut grid=SurfaceObservations::new(0.05,32).unwrap();
+            for (key,values) in blocks {grid.replace_block(key,values).unwrap();}
+            base.with_observations(Some(Arc::new(grid)))
+        };
+        let p=[0.025,0.08,0.4];let q=[0.0,0.0,0.0,1.0];
+        assert!(base.validate_body_pose(p,q).is_err(),"粗图自身不能证明墙边内半格可站立");
+        let map=observed(false);
+        map.validate_body_pose(p,q).expect("真实投影只覆盖内半列的连续地面");
+        let missing=observed(true);
+        assert!(missing.observations.as_ref().unwrap().has_complete_block([0,-1,-1]));
+        assert!(missing.observations.as_ref().unwrap().get([0,-1,-1]).is_none());
+        assert!(missing.validate_body_pose(p,q).is_err(),"块存在不能替代实际细地面证据");
+        let mut grid=map.observations.as_ref().unwrap().as_ref().clone();
+        grid.replace_block([0,-1,0],std::collections::BTreeMap::new()).unwrap();
+        let unknown=base.with_observations(Some(Arc::new(grid)));
+        let polygon=vec![[p[0]-0.15,p[1]-0.1],[p[0]+0.15,p[1]-0.1],
+            [p[0]+0.15,p[1]+0.1],[p[0]-0.15,p[1]+0.1]];
+        assert!(unknown.fine_footprint_ground(&PolygonQuery::new(&polygon),p,[0.0,0.0,1.0],0,-1).is_none(),
+            "缺失上方完整块不能截断连续高墙并制造层顶");
+        assert!(map.validate_body_pose([p[0],0.049,p[2]],q).is_err(),"踏入外侧高墙时不能把墙截成地面");
+    }
+
+    #[test]
+    fn fine_ground_height_and_contact_plane_use_the_same_spatial_column() {
+        let mut points=Vec::new();
+        for x in -30..30 {for y in -20..20 {for z in [0.025,0.075] {
+            points.push(((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,z));
+        }}}
+        // 较高地面只在支撑平面较高的半列，不能与另一半列的最低支撑值配对。
+        for x in [0,1] {for z in [0.125,0.175] {points.push(((x as f32+0.5)*0.05,0.075,z));}}
+        let mut cfg=scene(&[],false).config().clone();cfg.robot_height=0.1;cfg.wall_clearance_m=0.0;
+        let mut envelope=model();envelope.footprint_xy_m=vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]];
+        envelope.z_bounds_m=[-0.448,0.057];envelope.max_step_up_m=0.15;envelope.max_step_down_m=0.15;
+        envelope.max_cross_slope_deg=18.0;
+        let base=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap();
+        let make=|missing:bool| {
+            let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+            for &(x,y,z) in &points {
+                let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
+                if missing && key[0]==0 && key[1]==0 {continue;}
+                blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});
+            }
+            let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+            for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+            base.with_observations(Some(Arc::new(observations)))
+        };
+        let angle=0.1_f64;let q=[(angle*0.5).sin(),0.0,0.0,(angle*0.5).cos()];
+        let body=[0.05,-0.06,0.4/angle.cos()-0.002-0.06*angle.tan()];
+        assert!(base.validate_body_pose(body,q).is_err(),"只有粗高度时不能假设高点位于安全半列");
+        let map=make(false);
+        map.validate_body_pose(body,q).expect("每个真实细列的地面都满足该列原接触范围");
+        assert_eq!(map.validate_body_pose([body[0],body[1],body[2]-0.004],q),Err(SurfaceError::InsufficientClearance),
+            "同一真实高细列超过接触范围仍应拒绝");
+        assert!(make(true).validate_body_pose(body,q).is_err(),"细列缺失不能用整格高度补出联合许可");
+    }
+
+    #[test]
+    fn partial_footprint_contact_uses_actual_overlap_not_outside_grid_centre() {
+        let mut points:Vec<_>=(-20..20).flat_map(|x|(-20..20).flat_map(move |y|
+            [0.025,0.075].map(|z|((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,z)))).collect();
+        points.push((0.025,-0.025,0.175));
+        let mut cfg=scene(&[],false).config().clone();cfg.wall_clearance_m=0.0;
+        let envelope=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.2,-0.1],[0.2,-0.1],[0.2,0.1],[-0.2,0.1]],
+            z_bounds_m:[-0.4,0.1],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
+            max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
+        let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap();
+        let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for &(x,y,z) in &points {
+            let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
+            blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation {observed_ns:0,hits:0});
+        }
+        let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+        for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+        let map=map.with_observations(Some(Arc::new(observations)));
+        let tilt=0.1_f64;let q=[(tilt*0.5).sin(),0.0,0.0,(tilt*0.5).cos()];
+        let height=0.2-(0.15+f64::from(0.05_f32))-0.0005+0.4/tilt.cos()-tilt.tan()*(-0.05-0.075);
+        let body=[0.025,0.075,height];
+        map.validate_body_pose(body,q).expect("粗列中心在机体投影外，实际相交区域仍在原接触行程内");
+        assert_eq!(map.validate_body_pose([body[0],body[1],body[2]-0.002],q),Err(SurfaceError::InsufficientClearance),
+            "真实交叠区域超过同一行程仍须拒绝");
+    }
+
+    #[test]
+    fn fine_contact_connection_checks_intermediate_peak_not_only_equal_end_tops() {
+        let make=|top:i32| {
+            let mut points=Vec::new();
+            for x in -30..30 {for y in -20..20 {
+                let mut levels=vec![-1];
+                if (0..2).contains(&x) {levels.extend(0..top);}
+                for z in levels {points.push(((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,(z as f32+0.5)*0.05));}
+            }}
+            let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+            for &(x,y,z) in &points {
+                let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
+                blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});
+            }
+            let mut observed=SurfaceObservations::new(0.05,32).unwrap();
+            for (key,values) in blocks {observed.replace_block(key,values).unwrap();}
+            let mut cfg=scene(&[],false).config().clone();cfg.wall_clearance_m=0.0;cfg.robot_height=0.1;
+            let mut envelope=model();envelope.max_step_up_m=0.15;envelope.max_step_down_m=0.15;
+            SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap()
+                .with_observations(Some(Arc::new(observed)))
+        };
+        let from=([-0.0001,0.025,0.4],[0.0,0.0,0.0,1.0]);let to=([0.1001,0.025,0.4],from.1);
+        make(2).validate_body_motion(from,to,&[]).expect("同一已观测厚带内的10厘米中间顶受原15厘米能力约束");
+        let high=make(4);
+        high.validate_body_pose(from.0,from.1).unwrap();high.validate_body_pose(to.0,to.1).unwrap();
+        assert!(high.validate_body_motion(from,to,&[]).is_err(),
+            "两端等高也不能跳过中间超过原15厘米能力的20厘米顶");
+    }
+
+    #[test]
+    fn fine_same_level_support_does_not_inherit_another_half_columns_step() {
+        let make=|raise_crossed_half:bool,missing_fine:u8| {
+            let mut points:Vec<_>=(-30..30).flat_map(|x|(-20..20).map(move |y|
+                ((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,-0.025))).collect();
+            for x in if raise_crossed_half {vec![0,1]}else{vec![1]} {
+                for z in [0.025,0.075,0.125] {points.push(((x as f32+0.5)*0.05,0.025,z));}
+            }
+            let mut cfg=scene(&[],false).config().clone();cfg.wall_clearance_m=0.0;
+            let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(model()).unwrap();
+            let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+            for &(x,y,z) in &points {
+                let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
+                if (missing_fine==1 && key[0]==0 && key[1]==0)
+                    || (missing_fine==2 && key[0]==-1 && key[1]==0) {continue;}
+                blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation {observed_ns:0,hits:0});
+            }
+            let mut grid=SurfaceObservations::new(0.05,32).unwrap();
+            for (key,values) in blocks {grid.replace_block(key,values).unwrap();}
+            map.with_observations(Some(Arc::new(grid)))
+        };
+        let from=([0.025,-0.0001,0.4],[0.0,0.0,0.0,1.0]);
+        let to=([0.025,0.0001,0.4],from.1);
+        let map=make(false,0);
+        map.validate_body_pose(from.0,from.1).unwrap();map.validate_body_pose(to.0,to.1).unwrap();
+        let a=map.locate_support_from_body(from.0,from.1,0.4).unwrap();
+        let b=map.locate_support_from_body(to.0,to.1,0.4).unwrap();
+        assert_eq!(map.validate_segment(a.support_xyz,b.support_xyz),Err(SurfaceError::UntraversableSegment),
+            "粗格把另一半列的高回波压到了真实经过的低平地面");
+        map.validate_body_motion(from,to,&[]).expect("同一真实精细平层上的微小运动应连续");
+        let adapted=map.body_pose_after_motion(from,[to.0[0],to.0[1]],0.0).unwrap();
+        map.validate_body_motion(from,adapted,&[]).unwrap();
+        assert!((adapted.0[2]-from.0[2]).abs()<(to.0[1]-from.0[1]).abs(),
+            "足迹内其它真实高地面允许连续适应，但不能继承中心粗格的突然台阶");
+        let smaller=map.body_pose_after_motion(from,[to.0[0],from.0[1]+(to.0[1]-from.0[1])*0.1],0.0).unwrap();
+        assert!((smaller.0[2]-from.0[2]).abs()<(adapted.0[2]-from.0[2]).abs()*0.2+1e-12,
+            "露顶高度传播须随实际位移连续趋零");
+        assert!(make(false,1).validate_body_motion(from,to,&[]).is_err(),"精细列缺测时不能生成连通证据");
+        let raised=make(true,0);
+        raised.validate_body_motion(from,to,&[]).expect("真实厚带的0.15米升高仍在原0.2米上阶能力内");
+        assert!(raised.validate_body_motion(to,from,&[]).is_err(),"同一0.15米下降超过原0.1米下阶能力");
+        let mut lower_capability=model();lower_capability.max_step_up_m=0.1;
+        assert!(raised.with_body_envelope(lower_capability).unwrap().validate_body_motion(from,to,&[]).is_err(),
+            "精细厚带证明不能越过原上下阶能力");
+        // 实际标定参考略高于真实露顶仍在原源体素量化范围内；粗半列抬高不能令微动失效。
+        for elevation in [0.006,0.049] {
+            let a=([from.0[0],from.0[1],from.0[2]+elevation],from.1);
+            let b=([to.0[0],to.0[1],to.0[2]+elevation],to.1);
+            map.validate_body_motion(a,b,&[]).expect("同一细带露顶的原量化误差须跨微动连续");
+            let adapted=map.body_pose_after_motion(a,[b.0[0],b.0[1]],0.0).unwrap();
+            map.validate_body_motion(a,adapted,&[]).unwrap();
+            assert!(make(false,1).validate_body_motion(a,b,&[]).is_err(),"量化误差不能补足缺测细列");
+        }
+        let too_high=([from.0[0],from.0[1],from.0[2]+0.051],from.1);
+        let too_high_end=([to.0[0],to.0[1],to.0[2]+0.051],to.1);
+        assert!(map.validate_body_motion(too_high,too_high_end,&[]).is_err(),
+            "高出露顶超过一个真实源体素时不能借共同细带许可");
+        let diagonal_from=([-0.0001,-0.0001,0.4],from.1);
+        let diagonal_to=([0.0001,0.0001,0.4],from.1);
+        map.validate_body_motion(diagonal_from,diagonal_to,&[]).unwrap();
+        assert!(make(false,2).validate_body_motion(diagonal_from,diagonal_to,&[]).is_err(),
+            "对角连段必须保留两侧真实精细支撑，不能从缺测角点穿过");
+    }
+
+    #[test]
+    fn translated_body_sweep_catches_a_short_corner_contact_between_regular_samples() {
+        let map=ground_band_sweep_scene(0.525);
+        let q=[0.0,0.0,0.0,1.0];
+        let from=([-0.25,0.0295,0.375],q);
+        let to=([0.06,0.3395,0.375],q);
+        map.validate_body_pose(from.0,q).unwrap();
+        map.validate_body_pose(to.0,q).unwrap();
+        let t=0.15/0.31;
+        let contact=[from.0[0]*(1.0-t)+to.0[0]*t,from.0[1]*(1.0-t)+to.0[1]*t,0.375];
+        assert_eq!(map.validate_body_pose(contact,q),Err(SurfaceError::InsufficientClearance));
+        assert_eq!(map.validate_body_motion(from,to,&[]),Err(SurfaceError::InsufficientClearance),
+            "不能漏过不到一毫米的真实角点碰撞区间");
+    }
+
+    #[test]
+    fn slightly_rotating_body_sweep_keeps_short_corner_contacts() {
+        let map=ground_band_sweep_scene(0.525);
+        for angle in [-0.0011_f64,0.0011] {
+            let from=([-0.25,0.0295,0.375],[0.0,0.0,0.0,1.0]);
+            let to=([0.06,0.3395,0.375],[0.0,0.0,(angle*0.5).sin(),(angle*0.5).cos()]);
+            map.validate_body_pose(from.0,from.1).unwrap();
+            map.validate_body_pose(to.0,to.1).unwrap();
+            // 用独立的局部细步扫描找真实见证，微旋转会移动纯平移的接触时刻。
+            let witness=(0..=300).find(|&index| {
+                let t=0.47+index as f64*0.0001;
+                let p=std::array::from_fn(|i|from.0[i]*(1.0-t)+to.0[i]*t);
+                let q=std::array::from_fn(|i|from.1[i]*(1.0-t)+to.1[i]*t);
+                map.validate_body_pose(p,q)==Err(SurfaceError::InsufficientClearance)
+            });
+            assert!(witness.is_some(),"此场景应含微旋转后的真实短碰撞");
+            assert_eq!(map.validate_body_motion(from,to,&[]),Err(SurfaceError::InsufficientClearance),
+                "真实微小姿态变化不能绕过连续接触核验");
+        }
+    }
+
+    #[test]
+    fn actual_body_sweep_cannot_raise_the_body_over_a_low_obstacle() {
+        let map = ground_band_sweep_scene(0.275);
+        let q = [0.0, 0.0, 0.0, 1.0];
+        let from = ([-0.65, 0.05, 0.375], q);
+        let to = ([0.65, 0.05, 0.375], q);
+        map.validate_body_pose(from.0, q).unwrap();
+        map.validate_body_pose(to.0, q).unwrap();
+        assert_eq!(map.validate_body_pose([0.05,0.05,0.375], q), Err(SurfaceError::InsufficientClearance));
+        assert_eq!(map.validate_body_motion(from, to, &[]), Err(SurfaceError::InsufficientClearance),
+            "不能把实际机体抬到地面厚层顶部后越过真实低障碍");
+    }
+
+    #[test]
+    fn actual_body_sweep_does_not_raise_the_body_into_a_low_ceiling() {
+        let map = ground_band_sweep_scene(0.675);
+        let q = [0.0, 0.0, 0.0, 1.0];
+        let from = ([-0.65, 0.05, 0.375], q);
+        let to = ([0.65, 0.05, 0.375], q);
+        for step in 0..=130 {
+            map.validate_body_pose([-0.65 + step as f64 * 0.01,0.05,0.375], q).unwrap();
+        }
+        map.validate_body_motion_checked(from, to, &[], |(body, _)| {
+            assert!((body[2]-0.375).abs()<1e-10, "观察检查必须使用实际机体轨迹");
+            Ok(())
+        }).unwrap();
+    }
+
     #[test]
     fn exact_geometry_cache_keeps_boundary_and_new_obstacle_checks() {
         let clear=scene(&[],false);
@@ -1706,7 +3388,16 @@ mod tests {
         let forward = s.frontier_travel_costs(lower,&[upper],&[]).unwrap()[0];
         let a=s.locate_support(lower).unwrap();let b=s.locate_support(upper).unwrap();
         let offset=|p:[f64;3],q:[f64;3]|(p[0]-q[0]).hypot(p[1]-q[1]).hypot(p[2]-q[2]);
-        assert!((to_upper.cost(a.cell).unwrap()+offset(lower,a.surface_xyz)+offset(upper,b.surface_xyz)-forward).abs()<1e-5);
+        let graph=&s.data.graph;
+        let start_id=graph.cells.id(a.cell).unwrap();let goal_id=graph.cells.id(b.cell).unwrap();
+        let costs=nuwax_explore_routing::shortest_costs(graph.cells.slot_capacity(),start_id as usize,None,
+            |id,out|out.extend(graph.cells.neighbors(id as CellId).iter().filter(|edge|edge.cost.is_finite())
+                .map(|edge|(edge.dest as usize,f64::from(edge.cost)))));
+        let weighted=to_upper.cost(a.cell).unwrap();
+        assert!((weighted-costs[goal_id as usize]).abs()<1e-7,
+            "目标场应等于正向允许边的实际加权代价");
+        assert!(weighted+offset(lower,a.surface_xyz)+offset(upper,b.surface_xyz)+1e-5>=forward,
+            "含台阶及软墙距的代价不得小于原几何距离");
         assert!(to_lower.cost(s.locate_support(upper).unwrap().cell).is_none(),
             "反向距离场不能把不允许下降的台阶变成双向边");
     }
@@ -2134,9 +3825,13 @@ fn reference_prism_intersects_voxel(
 // 缓存只属于同一不可变表面及当前足迹视图；输入保留浮点精确位，不扩大几何容差。
 #[derive(Default)]
 pub(super) struct BodyQueryCache {
+    pub(super) supports: AHashMap<[u64;8],Result<SurfaceLocation,SurfaceError>>,
     support_cores: AHashMap<(u64,u64,u64),bool>,
     lower_bounds: AHashMap<VoxelKey,f64>,
-    slopes: AHashMap<(VoxelKey,u64),(f64,f64)>,
+    planes: AHashMap<(VoxelKey,[u64;3]),(f64,f64,f64)>,
+    contact_samples: AHashMap<VoxelKey,Arc<Vec<([f64;3],f64)>>>,
+    fine_bands: AHashMap<(i32,i32),Arc<Vec<[f64;2]>>>,
+    complete_columns: AHashMap<(i32,i32),bool>,
     poses: AHashMap<[u64;7],Result<(),SurfaceError>>,
     projections: AHashMap<[u64;6],Result<([f64;3],[f64;4]),SurfaceError>>,
     motions: AHashMap<[u64;14],Result<(),SurfaceError>>,
@@ -2180,3 +3875,11 @@ mod support_core_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "body_passage_tests.rs"]
+mod passage_tests;
+
+#[cfg(test)]
+#[path = "contact_domain_tests.rs"]
+mod contact_domain_tests;

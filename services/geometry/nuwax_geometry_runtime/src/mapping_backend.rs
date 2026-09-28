@@ -2549,6 +2549,14 @@ mod tests {
             next.source_timestamp_ns += 1_000_000_000;
             next.received_at_ns += 1_000_000_000;
             next.registered_points_map = vec![Point3::new(12.05,0.05,-0.4)];
+            let slanted = compute_candidate(&mut restored,&next,config).unwrap().unwrap();
+            assert!(slanted.latest_frame_occupancy.data.contains(&0));
+            assert!(!slanted.latest_frame_occupancy.data.contains(&100));
+            // 斜射线离开高度带前不足最小观测距离时，仍没有可用二维证据。
+            next.frame_sequence = 5;
+            next.source_timestamp_ns += 1_000_000_000;
+            next.received_at_ns += 1_000_000_000;
+            next.registered_points_map = vec![Point3::new(10.15,0.05,-0.4)];
             let missing = compute_candidate(&mut restored,&next,config).unwrap().unwrap();
             assert!(missing.latest_frame_occupancy.data.iter().all(|&v|v<0));
         }

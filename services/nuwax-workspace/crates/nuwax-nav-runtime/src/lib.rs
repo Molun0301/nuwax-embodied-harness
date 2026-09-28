@@ -830,6 +830,12 @@ impl BasicInProcessLocalBackend {
         ))
     }
 
+    fn set_navigation_motion_limits(&mut self, physical: nuwax_nav_types_messages::MotionLimits) -> Result<(),RuntimeError> {
+        physical.validate().map_err(|reason|RuntimeError::InvalidInput{field:"navigation_capabilities",reason})?;
+        self.0.set_motion_limits(surface_follower::forward_navigation_limits(&physical))
+            .map_err(|reason|RuntimeError::InvalidInput{field:"navigation_capabilities",reason})
+    }
+
     #[cfg(test)]
     fn kind(&self) -> LocalExecutionBackendKind {
         LocalExecutionBackendKind::BasicInProcess
@@ -838,6 +844,7 @@ impl BasicInProcessLocalBackend {
 
 impl NavPlanner for BasicInProcessLocalBackend {
     fn configure_goal(&mut self, goal:&PoseStamped, options:nuwax_nav_types_messages::GoalOptions)->Result<(),RuntimeError> {
+        let options=nuwax_nav_types_messages::GoalOptions {allow_reverse:false,..options};
         self.0.configure_goal(goal.clone(),options).map_err(|reason| RuntimeError::InvalidInput {field:"goal_options",reason})
     }
 
@@ -890,7 +897,7 @@ fn production_local_backend(
                 backend.0.set_robot_geometry(geometry);
             }
             if let Some(capabilities)=nuwax_nav_types_messages::NavigationCapabilities::from_env().map_err(|reason| RuntimeError::InvalidInput {field:"navigation_capabilities",reason})? {
-                backend.0.set_motion_limits(capabilities.motion).map_err(|reason| RuntimeError::InvalidInput {field:"navigation_capabilities",reason})?;
+                backend.set_navigation_motion_limits(capabilities.motion)?;
             }
             Ok(backend)
         }
@@ -2058,8 +2065,7 @@ pub async fn spawn_production_surface_scheduler(
 }
 
 fn production_surface_backend(config: SurfaceFollowerConfig) -> Result<planner_worker::PlannerWorker, RuntimeError> {
-    let reverse_supported = config.kinematics().is_some_and(|limits| limits.max_reverse_mps > 0.0);
-    Ok(planner_worker::PlannerWorker::new(SurfaceFollower::new(config)?)?.with_reverse_support(reverse_supported))
+    planner_worker::PlannerWorker::new(SurfaceFollower::new(config)?)
 }
 
 enum SchedulerEvent { Input(Option<InputCommand>), Tick }
@@ -2358,7 +2364,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn production_surface_worker_accepts_declared_basic_reverse_channel() {
+    fn production_surface_worker_accepts_legacy_reverse_authorization_as_an_upper_bound() {
         let mut config = SurfaceFollowerConfig::new(0.4);
         config.basic_kinematics = Some(nuwax_nav_types_messages::MotionKinematics {
             model:nuwax_nav_types_messages::MotionModel::Omnidirectional,
@@ -2369,6 +2375,102 @@ mod tests {
         let mut backend = production_surface_backend(config).unwrap();
         let goal = PoseStamped {frame_id:NavFrameId::Map,stamp:Timestamp::from_unix(1,0),pose:Pose3::default()};
         backend.configure_goal(&goal,nuwax_nav_types_messages::GoalOptions {allow_reverse:true,..Default::default()}).unwrap();
+    }
+
+    fn physical_omni_limits() -> nuwax_nav_types_messages::MotionLimits {
+        nuwax_nav_types_messages::MotionLimits {
+            model:nuwax_nav_types_messages::MotionModel::Omnidirectional,
+            max_forward_mps:1.0,max_reverse_mps:1.0,max_lateral_mps:1.0,max_angular_rps:0.8,
+            linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,angular_acceleration_rps2:2.0,
+            guaranteed_angular_braking_rps2:2.0,reaction_time_sec:0.05,minimum_turning_radius_m:0.0,
+            can_rotate_in_place:true,
+        }
+    }
+
+    #[test]
+    fn production_basic_old_oriented_paths_cannot_emit_sideways_or_reverse() {
+        for (x,y) in [(2.0,3.0),(1.0,2.0)] {
+            let mut backend=BasicInProcessLocalBackend::production();
+            backend.set_navigation_motion_limits(physical_omni_limits()).unwrap();
+            backend.update_costmap(CostMap2D::new_all_free("map",80,80,0.1));
+            let mut pose=nuwax_nav_astar::helpers::make_pose_stamped("map",2.0,2.0,0.0);
+            let goal=nuwax_nav_astar::helpers::make_pose_stamped("map",x,y,0.0);
+            backend.configure_goal(&goal,nuwax_nav_types_messages::GoalOptions {
+                allow_reverse:true,position_tolerance_m:0.12,yaw_tolerance_rad:std::f64::consts::PI,
+            }).unwrap();
+            backend.replace_path_with_orientations(Path2D::stamped(NavFrameId::Map,Timestamp::default(),
+                vec![Point2::new(2.0,2.0),Point2::new(x,y)]),Some(vec![0.0,0.0]));
+            for tick in 0..20 {
+                pose.stamp=Timestamp::from_unix(1+tick/10,(tick%10)as u32*100_000_000);
+                backend.update_odometry(pose.clone());
+                match backend.step(0.3) {
+                    PlannerStep::Command(command)=>{
+                        assert!(command.linear.x>=0.0,"生产二维后端不能按旧授权倒退：{command:?}");
+                        assert_eq!(command.linear.y,0.0,"生产二维后端不能沿旧全向路径横移：{command:?}");
+                    },
+                    PlannerStep::ReplanRequired(_)=>break,
+                    other=>panic!("旧全向路径应保持前向或请求新路径：{other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn production_basic_forward_paths_turn_and_reach_side_and_rear_goals() {
+        for heading in [std::f64::consts::FRAC_PI_2,std::f64::consts::PI] {
+            let mut backend=BasicInProcessLocalBackend::production();
+            let physical=physical_omni_limits();
+            backend.set_navigation_motion_limits(physical.clone()).unwrap();
+            let grid=CostMap2D::new_all_free("map",80,80,0.1);
+            backend.update_costmap(grid.clone());
+            let mut pose=nuwax_nav_astar::helpers::make_pose_stamped("map",2.0,2.0,0.0);
+            let goal=nuwax_nav_astar::helpers::make_pose_stamped("map",2.0+heading.cos(),2.0+heading.sin(),heading);
+            backend.configure_goal(&goal,nuwax_nav_types_messages::GoalOptions {
+                allow_reverse:true,position_tolerance_m:0.12,yaw_tolerance_rad:std::f64::consts::PI,
+            }).unwrap();
+            backend.replace_path_with_orientations(Path2D::stamped(NavFrameId::Map,Timestamp::default(),
+                vec![Point2::new(2.0,2.0),Point2::new(2.0,2.0),goal.pose.position.to_2d()]),
+                Some(vec![0.0,heading,heading]));
+            let dt=1.0/LocalPlannerConfig::default_config().control_frequency;
+            let mut applied=Twist2::ZERO;let mut reached=false;let mut done=false;
+            let mut first_motion=None;
+            for tick in 0..500 {
+                pose.stamp=Timestamp::from_unix(1,0);pose.stamp.nanos+=(tick as f64*dt*1e9)as i64;
+                backend.update_odometry(pose.clone());
+                if tick%10==0 {backend.update_costmap(grid.clone());}
+                let command=if reached {Twist2::ZERO} else {
+                    match backend.step(0.3) {
+                        PlannerStep::Command(command)=>command,
+                        PlannerStep::Succeeded=>{reached=true;Twist2::ZERO},
+                        other=>panic!("二维前向路径必须连续闭环：方向{heading}，拍{tick}，{other:?}"),
+                    }
+                };
+                assert!(command.linear.x>=0.0,"生产二维命令不能倒退：{command:?}");
+                assert_eq!(command.linear.y,0.0,"生产二维命令不能横移：{command:?}");
+                if first_motion.is_none() && command.linear.x.hypot(command.linear.y)+command.angular_z.abs()>1e-9 {
+                    first_motion=Some(command);assert_eq!(command.linear.x,0.0,"侧后方目标必须先原地转向");
+                }
+                let next=Twist2 {
+                    linear:Point2::new(command.linear.x.clamp(applied.linear.x-physical.linear_acceleration_mps2*dt,
+                        applied.linear.x+physical.linear_acceleration_mps2*dt),0.0),
+                    angular_z:command.angular_z.clamp(applied.angular_z-physical.angular_acceleration_rps2*dt,
+                        applied.angular_z+physical.angular_acceleration_rps2*dt),
+                };
+                let v=(applied.linear.x+next.linear.x)*0.5;let w=(applied.angular_z+next.angular_z)*0.5;
+                let yaw=pose.pose.orientation.yaw();let end_yaw=yaw+w*dt;
+                if w.abs()<1e-12 {pose.pose.position.x+=v*yaw.cos()*dt;pose.pose.position.y+=v*yaw.sin()*dt;}
+                else {pose.pose.position.x+=v*(end_yaw.sin()-yaw.sin())/w;pose.pose.position.y+=v*(yaw.cos()-end_yaw.cos())/w;}
+                pose.pose.orientation=nuwax_nav_types_messages::Quaternion::from_yaw(end_yaw);
+                applied=next;backend.observe_applied_command(applied);
+                assert!(applied.linear.x>=0.0);assert_eq!(applied.linear.y,0.0);
+                if reached && applied.linear.x<1e-12 && applied.angular_z.abs()<1e-12 {
+                    done=true;eprintln!("生产二维前向闭环：方向{heading:.3}，{}秒，零横移/倒退",(tick+1)as f64*dt);break;
+                }
+            }
+            assert!(done && first_motion.is_some());
+            assert!(pose.pose.position.distance(goal.pose.position)<0.12);
+            assert_eq!(physical.max_lateral_mps,1.0,"物理手动运动声明不改写");
+        }
     }
 
     static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(1);

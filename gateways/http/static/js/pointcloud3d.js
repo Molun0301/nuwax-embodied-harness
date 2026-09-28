@@ -1685,59 +1685,91 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._requestRender();
   }
 
-  updateNavigationPath(path, goalPose) {
-    const samePath = !Array.isArray(path) || (path.length === this._navigationPath.length && path.every((p, i) => {
+  updateNavigationPath(path, goalPose, mode = this._navigationPathMode || 'executing') {
+    const samePath = path === this._navigationPath || !Array.isArray(path) || (path.length === this._navigationPath.length && path.every((p, i) => {
       const old = this._navigationPath[i]; return p.x === old.x && p.y === old.y && p.z === old.z;
     }));
     const previousGoal = this._navigationGoal;
     const sameGoal = goalPose === undefined || (!goalPose && !previousGoal)
       || (goalPose && previousGoal && ['x', 'y', 'z', 'yaw'].every(key => goalPose[key] === previousGoal[key]));
-    if (samePath && sameGoal && this._scene && (this._navPathLine || this._navigationPath.length < 2)
-      && (this._navigationGoal ? this._navGoalMesh : !this._navGoalMesh)) return;
-    if (Array.isArray(path)) this._navigationPath = path.slice();
+    const sameMode = mode === this._navigationPathMode;
+    if (Array.isArray(path) && !samePath) this._navigationPath = path;
     if (goalPose !== undefined) this._navigationGoal = goalPose || null;
+    this._navigationPathMode = mode;
     if (!this._scene) return;
-    if (this._navPathLine) {
-      this._scene.remove(this._navPathLine);
-      this._navPathLine.geometry.dispose();
-      this._navPathLine.material.dispose();
-      this._navPathLine = null;
-    }
-    if (this._navGoalMesh) {
-      this._scene.remove(this._navGoalMesh);
-      this._navGoalMesh.geometry.dispose();
-      this._navGoalMesh.material.dispose();
-      this._navGoalMesh = null;
-    }
-    if (this._navigationPath.length >= 2) {
-      const pts = this._navigationPath.map(p => new THREE.Vector3(
-        Number(p.x || 0),
-        Number(p.y || 0),
-        Number.isFinite(p.z) ? p.z : 0.08,
-      ));
-      const curve = new THREE.CurvePath();
-      for (let i = 1; i < pts.length; i++) if (pts[i].distanceToSquared(pts[i - 1]) > 1e-12) {
-        curve.add(new THREE.LineCurve3(pts[i - 1], pts[i]));
+    if (samePath && sameGoal && sameMode
+      && (this._navPathLine || this._navigationPath.length < 2)
+      && (this._navGoalMesh || !this._navigationGoal)) return;
+    if (!samePath || (!this._navPathLine && this._navigationPath.length >= 2)) {
+      if (this._navigationPath.length >= 2) {
+        if (!this._navPathLine) {
+          this._navPathLine = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({
+            color: COLORS.navPath, depthTest: false, side: THREE.DoubleSide,
+          }));
+          this._navPathLine.renderOrder = 10;
+          this._scene.add(this._navPathLine);
+        }
+        let geometry = this._navPathLine.geometry;
+        const required = (this._navigationPath.length - 1) * 12;
+        let position = geometry.getAttribute('position');
+        if (!position || position.count < required) {
+          position = new THREE.BufferAttribute(new Float32Array(Math.max(32, 2 ** Math.ceil(Math.log2(required))) * 3), 3);
+          position.setUsage(THREE.DynamicDrawUsage);
+          // 扩容释放旧缓冲，路线对象与材质继续复用。
+          geometry.dispose();
+          geometry = new THREE.BufferGeometry();
+          geometry.setAttribute('position', position);
+          this._navPathLine.geometry = geometry;
+        }
+        let count = 0;
+        const appendStrip = (a, b, az, bz, ox, oy, oz) => {
+          position.setXYZ(count++, a.x + ox, a.y + oy, az + oz);
+          position.setXYZ(count++, a.x - ox, a.y - oy, az - oz);
+          position.setXYZ(count++, b.x + ox, b.y + oy, bz + oz);
+          position.setXYZ(count++, b.x + ox, b.y + oy, bz + oz);
+          position.setXYZ(count++, a.x - ox, a.y - oy, az - oz);
+          position.setXYZ(count++, b.x - ox, b.y - oy, bz - oz);
+        };
+        // 两条正交带面沿真实端点连接，侧视仍可见；不对折线反复作曲线采样。
+        for (let i = 1; i < this._navigationPath.length; i++) {
+          const a = this._navigationPath[i - 1], b = this._navigationPath[i];
+          const dx = b.x - a.x, dy = b.y - a.y, length = Math.hypot(dx, dy);
+          const ox = length > 1e-9 ? -dy / length * 0.025 : 0.025;
+          const oy = length > 1e-9 ? dx / length * 0.025 : 0;
+          const az = Number.isFinite(a.z) ? a.z : 0.08, bz = Number.isFinite(b.z) ? b.z : 0.08;
+          appendStrip(a, b, az, bz, ox, oy, 0);
+          const dz = bz - az, spatialLength = Math.hypot(dx, dy, dz) || 1;
+          appendStrip(a, b, az, bz, -dz * oy / spatialLength, dz * ox / spatialLength, (dx * oy - dy * ox) / spatialLength);
+        }
+        position.clearUpdateRanges();
+        position.addUpdateRange(0, count * 3);
+        position.needsUpdate = true;
+        geometry.setDrawRange(0, count);
+        this._navPathLine.frustumCulled = false;
       }
-      // 实线带宽以地图米为单位；独立显示层避免被密集点云遮没。
-      const geo = curve.curves.length ? new THREE.TubeGeometry(curve, Math.min(4096, Math.max(8, pts.length * 4)), 0.025, 6, false)
-        : new THREE.BufferGeometry();
-      const mat = new THREE.MeshBasicMaterial({ color: COLORS.navPath, depthTest: false });
-      this._navPathLine = new THREE.Mesh(geo, mat);
-      this._navPathLine.renderOrder = 10;
-      this._scene.add(this._navPathLine);
     }
-    if (this._navigationGoal) {
-      const goal = this._navigationGoal;
+    if (this._navPathLine) {
+      this._navPathLine.visible = this._navigationPath.length >= 2;
+      this._navPathLine.material.color.setHex(mode === 'retained' ? 0xf59e0b : COLORS.navPath);
+    }
+    const goal = this._navigationGoal;
+    if (goal) {
       const oriented = Number.isFinite(goal.yaw);
-      const geo = oriented ? new THREE.ConeGeometry(0.25, 0.6, 8) : new THREE.SphereGeometry(0.12, 16, 12);
-      if (oriented) geo.rotateZ(-Math.PI / 2);
-      const mat = new THREE.MeshBasicMaterial({ color: COLORS.navGoal });
-      this._navGoalMesh = new THREE.Mesh(geo, mat);
-      this._navGoalMesh.position.set(Number(goal.x || 0), Number(goal.y || 0), Number(goal.z || 0.3));
-      if (goal.yaw !== undefined) this._navGoalMesh.rotation.z = Number(goal.yaw || 0);
-      this._scene.add(this._navGoalMesh);
-    }
+      if (!this._navGoalMesh) {
+        this._navGoalMesh = new THREE.Mesh(undefined, new THREE.MeshBasicMaterial({ color: COLORS.navGoal, depthTest: false }));
+        this._navGoalMesh.renderOrder = 11;
+        this._scene.add(this._navGoalMesh);
+      }
+      if (this._navGoalMesh.userData.oriented !== oriented) {
+        this._navGoalMesh.geometry.dispose();
+        this._navGoalMesh.geometry = oriented ? new THREE.ConeGeometry(0.25, 0.6, 8) : new THREE.SphereGeometry(0.12, 16, 12);
+        if (oriented) this._navGoalMesh.geometry.rotateZ(-Math.PI / 2);
+        this._navGoalMesh.userData.oriented = oriented;
+      }
+      this._navGoalMesh.position.set(goal.x, goal.y, Number.isFinite(goal.z) ? goal.z : 0.3);
+      this._navGoalMesh.rotation.z = oriented ? goal.yaw : 0;
+      this._navGoalMesh.visible = true;
+    } else if (this._navGoalMesh) this._navGoalMesh.visible = false;
     this._requestRender();
   }
 
@@ -2168,6 +2200,7 @@ function yawFromValue(value) {
 
 window.addEventListener('stream:exploration.frontier', (e) => {
   const data = e.detail;
+  if (data?.navigation_path_state !== undefined) applyNavigationDisplay(data);
   let identity = null;
   try {
     identity = parseExplorationOverlayIdentity(data);
@@ -2199,13 +2232,14 @@ window.addEventListener('stream:exploration.frontier', (e) => {
   window.pointcloud3d._explorationOverlayInactive = explorationOverlayIsInactive(data);
   if (window.pointcloud3d._explorationOverlayInactive || data?.frontier_count === 0) {
     window.pointcloud3d.updateFrontiers([]);
-    if (data?.navigation_is_public !== true) window.pointcloud3d.updateNavigationPath([], null);
+    if (data?.navigation_path_state === undefined && data?.navigation_is_public !== true) window.pointcloud3d.updateNavigationPath([], null);
     return;
   }
   const rawFrontiers = Array.isArray(data) ? data
     : data?.latest_frontiers ?? data?.frontiers ?? [];
   const frontiers = rawFrontiers.map(pointFromValue).filter(Boolean);
   window.pointcloud3d.updateFrontiers(frontiers);
+  if (data?.navigation_path_state !== undefined) return;
   const navigationCorrelated = !identity
     || navigationEventMatchesExploration(data, identity);
   const rawPath = navigationCorrelated
@@ -2229,13 +2263,14 @@ window.addEventListener('stream:exploration.frontier', (e) => {
   }
 });
 
-window.addEventListener('stream:exploration.overlay-reset', () => {
+window.addEventListener('stream:exploration.overlay-reset', (event) => {
   window.pointcloud3d._explorationOverlayWatermark = null;
   window.pointcloud3d._explorationFrontierRenderedForWatermark = false;
   window.pointcloud3d._explorationOverlayInactive = false;
   window.pointcloud3d._explorationOverlayRequiresCanonical = true;
   window.pointcloud3d.updateFrontiers([]);
-  window.pointcloud3d.updateNavigationPath([], null);
+  if (event.detail?.navigation_path_state !== undefined) applyNavigationDisplay(event.detail);
+  else window.pointcloud3d.updateNavigationPath([], null);
 });
 
 window.addEventListener('stream:localization.pose', (e) => {
@@ -2262,8 +2297,20 @@ window.addEventListener('stream:localization.trajectory', (e) => {
   if (traj) window.pointcloud3d.updateTrajectory(traj);
 });
 
+function applyNavigationDisplay(data) {
+  const rawGoal = data.current_goal;
+  const point = pointFromValue(rawGoal);
+  window.pointcloud3d.updateNavigationPath(data.planned_path,
+    point ? { ...point, yaw: yawFromValue(rawGoal) } : null, data.navigation_path_state);
+}
+
 function updateNavigationOverlayFromEvent(e) {
   const d = e.detail;
+  if (d?.navigation_path_state !== undefined) {
+    applyNavigationDisplay(d);
+    // 探索事件仍处理前沿身份，导航路径仅消费已合并显示。
+    if (e.type === 'stream:navigation.state') return;
+  }
   const publicNavigation = d?.navigation_is_public === true;
   let explorationIdentity = window.pointcloud3d._explorationOverlayWatermark;
   if (e.type === 'stream:exploration.state') {
@@ -2288,12 +2335,12 @@ function updateNavigationOverlayFromEvent(e) {
       window.pointcloud3d._explorationOverlayInactive = explorationOverlayIsInactive(d);
       if (window.pointcloud3d._explorationOverlayInactive) {
         window.pointcloud3d.updateFrontiers([]);
-        if (!publicNavigation) window.pointcloud3d.updateNavigationPath([], null);
+        if (d?.navigation_path_state === undefined && !publicNavigation) window.pointcloud3d.updateNavigationPath([], null);
         if (!publicNavigation) return;
       }
       if (d?.frontier_count === 0) {
         window.pointcloud3d.updateFrontiers([]);
-        if (!publicNavigation) window.pointcloud3d.updateNavigationPath([], null);
+        if (d?.navigation_path_state === undefined && !publicNavigation) window.pointcloud3d.updateNavigationPath([], null);
         if (!publicNavigation) return;
       }
     }
@@ -2310,6 +2357,7 @@ function updateNavigationOverlayFromEvent(e) {
       return;
     }
   }
+  if (d?.navigation_path_state !== undefined) return;
   const navigationCorrelated = publicNavigation || !explorationIdentity
     || navigationEventMatchesExploration(d, explorationIdentity);
   const rawPath = navigationCorrelated

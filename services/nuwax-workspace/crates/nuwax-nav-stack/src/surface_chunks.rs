@@ -45,6 +45,8 @@ impl FineMapReader {
             grid.replace_block(reference.key, values).map_err(|e| e.to_string())?;
         }
         grid.set_source_timestamp_ns(root.source_timestamp_ns);
+        // 同一提交根的全部块已经读取并验证，缺少占据块不等于缺少已提交的几何源。
+        grid.mark_complete_geometry_source();
         Ok(Arc::new(grid))
     }
 
@@ -334,6 +336,110 @@ mod tests {
             assert!(updates.iter().any(|u| u.cells.is_empty()));
         }
     }
+    #[test]
+    fn complete_fine_manifest_resolves_a_real_door_across_storage_blocks() {
+        use nuwax_nav_mls_planner::{SurfaceMapBuilder,SurfaceBodyEnvelope,mls_planner::Config};
+        let repository=Repository::temporary().unwrap();let mut reader=reader(repository.clone());
+        let fine=f64::from(0.01_f32);let width=32.0*fine;
+        let config=Config {world_frame:"map".into(),voxel_size:0.1,robot_height:0.1,
+            surface_closing_radius:0.0,node_spacing_m:0.3,wall_clearance_m:0.0,
+            wall_buffer_m:0.4,wall_buffer_weight:2.0,max_slope_deg:18.0,step_threshold_m:0.0,
+            min_step_tread_depth_m:0.2,step_penalty_weight:2.0,goal_tolerance:0.1,viz_publish_hz:0.0};
+        let envelope=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.3,-width/2.0],[0.3,-width/2.0],
+            [0.3,width/2.0],[-0.3,width/2.0]],z_bounds_m:[-0.15,0.15],body_to_support_z_m:0.4,
+            max_step_up_m:0.0,max_step_down_m:0.0,max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
+        let mut builder=SurfaceMapBuilder::configured(config,Some(envelope));
+        let mut previous:Option<(Manifest,Arc<nuwax_nav_mls_planner::SurfaceObservations>)>=None;
+        for (revision,gap) in [(1,33),(2,32)] {
+            let mut keys:BTreeSet<Key>=(-100..100).flat_map(|x|(-50..100).map(move|y|[x,y,-1])).collect();
+            keys.extend((0..4).flat_map(|x|(-50..100).filter(move|&y|y<0||y>=gap)
+                .flat_map(move|y|(0..80).map(move|z|[x,y,z]))));
+            let root=install(&repository,&keys,0.01,revision);
+            let observations=reader.observations(&root,previous.as_ref().map(|(root,grid)|(root,grid))).unwrap();
+            let (updates,count)=reader.columns(&root,previous.as_ref().map(|(root,_)|root),0.1).unwrap();
+            let built=builder.build_column_updates(&updates,0.01,previous.is_none(),count).unwrap();
+            let map=built.snapshot.with_observations(Some(Arc::clone(&observations)));
+            let y=gap as f64*fine/2.0;let q=[0.0,0.0,0.0,1.0];
+            let result=map.validate_body_motion(([-0.5,y,0.4],q),([0.5,y,0.4],q),&[]);
+            assert_eq!(result.is_ok(),gap==33,"门宽必须决定通行，存储块边缘不能改变它：{gap} {result:?}");
+            if gap==33 {
+                use nuwax_nav_runtime::{ExecutionMap,ExecutionPath,NavPlanner,PlannerStep,SurfaceFollower,SurfaceFollowerConfig};
+                use nuwax_nav_types_messages::{GoalOptions,MotionLimits,MotionModel,NavFrameId,Path3D,Point2,Point3,Pose3,PoseStamped,Quaternion,Timestamp,Twist2};
+                let map=Arc::new(map);
+                // 未对准门中线时，先证明完整前向参照，再验直接全局请求。
+                let point=|x,y|([x,y,0.4],[0.0,0.0,0.0,1.0]);
+                let reference=[point(-0.65,0.30),point(-0.35,y),point(0.39,y),point(0.65,0.30)];
+                let motion=MotionLimits {model:MotionModel::Omnidirectional,max_forward_mps:0.3,
+                    max_reverse_mps:0.3,max_lateral_mps:0.3,max_angular_rps:0.8,
+                    linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,
+                    angular_acceleration_rps2:2.0,guaranteed_angular_braking_rps2:2.0,
+                    reaction_time_sec:0.05,minimum_turning_radius_m:0.0,can_rotate_in_place:true};
+                let options=GoalOptions {allow_reverse:true,position_tolerance_m:0.003,yaw_tolerance_rad:0.01};
+                for pair in reference.windows(2) {
+                    let segment=crate::surface_oriented::plan(&map,pair[0],pair[1],options,Some(&motion),&[],0)
+                        .expect("非对齐窄门必须先有真实可执行的前向参照");
+                    for edge in segment.windows(2) {map.validate_body_motion(edge[0],edge[1],&[]).unwrap();}
+                }
+                let route=crate::surface_oriented::plan(&map,reference[0],reference[3],options,Some(&motion),&[],1000)
+                    .expect("未预先对准的真实可过窄门须找到完整路线");
+                for edge in route.windows(2) {map.validate_body_motion(edge[0],edge[1],&[]).unwrap();}
+                for (heading,aligned) in [(0.0_f64,true),(5.0_f64.to_radians(),true),(0.0,false)] {
+                    let body=|x:f64|([x,if aligned {y+(x-2.0*fine)*heading.tan()} else {0.30},0.4],[0.0,0.0,(heading/2.0).sin(),(heading/2.0).cos()]);
+                    let stamped=|body:([f64;3],[f64;4]),time:i64|PoseStamped {frame_id:NavFrameId::Map,
+                        stamp:Timestamp::from_unix(time/1_000_000_000,(time%1_000_000_000) as u32),
+                        pose:Pose3 {position:Point3::new(body.0[0],body.0[1],body.0[2]),
+                            orientation:Quaternion{x:body.1[0],y:body.1[1],z:body.1[2],w:body.1[3]}}};
+                    let motion=MotionLimits {model:MotionModel::Omnidirectional,max_forward_mps:0.3,
+                        max_reverse_mps:0.3,max_lateral_mps:0.3,max_angular_rps:0.8,
+                        linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,
+                        angular_acceleration_rps2:2.0,guaranteed_angular_braking_rps2:2.0,
+                        reaction_time_sec:0.05,minimum_turning_radius_m:0.0,can_rotate_in_place:true};
+                    let options=GoalOptions {allow_reverse:true,position_tolerance_m:0.03,yaw_tolerance_rad:0.05};
+                    let end_x=if aligned {0.5}else{0.65};
+                    let mut current=body(-end_x);let goal=body(end_x);let mut time=1_000_000_000;
+                    let route=crate::surface_oriented::plan(&map,current,goal,options,Some(&motion),&[],1000).unwrap();
+                    let mut config=SurfaceFollowerConfig::new(0.4);config.controller.speed=0.3;
+                    config.controller.control_frequency=20.0;config.controller.simulation=true;
+                    config.motion_limits=Some(motion);config.max_angular_speed_rps=0.8;
+                    let mut follower=SurfaceFollower::new(config).unwrap();
+                    follower.configure_goal(&stamped(goal,time),options).unwrap();
+                    follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+                    follower.update_odometry(stamped(current,time));
+                    follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+                        poses:route.into_iter().map(|p|stamped(p,time)).collect()}),None,stamped(goal,time)).unwrap();
+                    let mut applied=Twist2::ZERO;let mut reached=false;
+                    for _ in 0..240 {
+                        let mut arriving=false;
+                        let command=match follower.step(0.32) {
+                            PlannerStep::Command(command)=>command,
+                            PlannerStep::Succeeded=>{arriving=true;Twist2::ZERO},
+                            other=>panic!("真实窄门闭环不能卡住：角度{heading} {other:?} {current:?}"),
+                        };
+                        assert!(command.linear.x>=0.0 && command.linear.y==0.0,"窄门也不能横走倒退");
+                        let next_applied=Twist2 {linear:Point2::new(applied.linear.x+(command.linear.x-applied.linear.x).clamp(-0.05,0.05),0.0),
+                            angular_z:applied.angular_z+(command.angular_z-applied.angular_z).clamp(-0.1,0.1)};
+                        let mean=Twist2 {linear:Point2::new((applied.linear.x+next_applied.linear.x)*0.5,0.0),
+                            angular_z:(applied.angular_z+next_applied.angular_z)*0.5};
+                        let yaw=2.0*current.1[2].atan2(current.1[3]);
+                        let next=nuwax_nav_control::integrate(nuwax_nav_control::PlanarPose{x:current.0[0],y:current.0[1],yaw},mean,0.05);
+                        let actual=([next.x,next.y,0.4],[0.0,0.0,(next.yaw/2.0).sin(),(next.yaw/2.0).cos()]);
+                        map.validate_body_motion(current,actual,&[]).expect("实际积分机体不能碰到门框");
+                        current=actual;applied=next_applied;time+=50_000_000;
+                        follower.observe_applied_command(applied);follower.update_odometry(stamped(current,time));
+                        // 跟随器只报告规划到达，模拟执行器仍真实制动到停稳后确认。
+                        if arriving && applied.linear.x.abs()<0.005 && applied.angular_z.abs()<0.01
+                            && (current.0[0]-goal.0[0]).hypot(current.0[1]-goal.0[1])<options.position_tolerance_m {
+                            reached=true;break;
+                        }
+                    }
+                    assert!(reached && current.0[0]>0.46 && applied.linear.x.abs()<0.01,
+                        "完整机体须通过门框并停稳：角度{heading}，到达{reached}，位姿{current:?}，速度{applied:?}");
+                }
+            }
+            previous=Some((root,observations));
+        }
+    }
+
     #[test]
     fn fixed_dirty_region_reads_same_points_when_far_map_grows() {
         let repository = Repository::temporary().unwrap();

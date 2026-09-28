@@ -16,8 +16,11 @@ pub struct SurfaceObservation {
 pub struct SurfaceObservations {
     pub(super) size_m: f32,
     source_timestamp_ns: u64,
+    complete_geometry_source: bool,
     block_edge: i32,
     blocks: im::HashMap<[i32; 3], Arc<AHashMap<[i32; 3], SurfaceObservation>>, ahash::RandomState>,
+    // 按XY维护真实占据层号，局部地形查询不扫描整图或所有竖直块。
+    columns: im::HashMap<[i32; 2], Arc<Vec<i32>>, ahash::RandomState>,
     obstacle_cache: Arc<std::sync::Mutex<AHashMap<[i32; 3], bool>>>,
 }
 impl SurfaceObservations {
@@ -29,8 +32,10 @@ impl SurfaceObservations {
         Ok(Self {
             size_m,
             source_timestamp_ns: 0,
+            complete_geometry_source: false,
             block_edge,
             blocks: Default::default(),
+            columns: Default::default(),
             obstacle_cache: Default::default(),
         })
     }
@@ -48,6 +53,21 @@ impl SurfaceObservations {
         {
             return Err(SurfaceError::InvalidConfig("观察块坐标或容量无效".into()));
         }
+        // 块替换之后须由完整提交的拥有方重新确认，不把旧根的完整性带入部分更新。
+        self.complete_geometry_source=false;
+        let mut replacement=AHashMap::<[i32;2],Vec<i32>>::new();
+        for key in values.keys() {replacement.entry([key[0],key[1]]).or_default().push(key[2]);}
+        let mut affected:AHashSet<[i32;2]>=replacement.keys().copied().collect();
+        if let Some(previous)=self.blocks.get(&block) {
+            affected.extend(previous.keys().map(|key|[key[0],key[1]]));
+        }
+        for column in affected {
+            let mut levels=self.columns.get(&column).map_or_else(Vec::new,|levels|levels.as_ref().clone());
+            levels.retain(|z|z.div_euclid(self.block_edge)!=block[2]);
+            if let Some(replacement)=replacement.remove(&column) {levels.extend(replacement);}
+            levels.sort_unstable();levels.dedup();
+            if levels.is_empty() {self.columns.remove(&column);} else {self.columns.insert(column,Arc::new(levels));}
+        }
         if values.is_empty() {
             self.blocks.remove(&block);
         } else {
@@ -57,12 +77,33 @@ impl SurfaceObservations {
         Ok(())
     }
 
+    /// 确认本索引覆盖同域、同精度、同次几何提交的全部已知占据。
+    /// 只能在拥有方验证并装配完整源之后调用；不表示自由空间、观察新鲜度或命中质量。
+    /// 后续任意成功块替换都会撤销该事实。
+    pub fn mark_complete_geometry_source(&mut self) {
+        self.complete_geometry_source=true;
+    }
+
+    pub(super) fn is_complete_geometry_source(&self)->bool {
+        self.complete_geometry_source
+    }
+
     /// 查询实际位置的证据，不修改时间或命中次数。
     pub fn get(&self, key: [i32; 3]) -> Option<SurfaceObservation> {
         self.blocks
             .get(&key.map(|v| v.div_euclid(self.block_edge)))?
             .get(&key)
             .copied()
+    }
+
+    /// 同一原始细列的全部实测层号；稳定性由原占据证据判断继续核对。
+    pub(super) fn column_levels(&self,x:i32,y:i32)->Option<&[i32]> {
+        self.columns.get(&[x,y]).map(|levels|levels.as_slice())
+    }
+
+    /// 完整块存在只说明该范围已提交；具体细格是否有证据仍须查询get。
+    pub(super) fn has_complete_block(&self,key:[i32;3])->bool {
+        self.blocks.contains_key(&key.map(|v|v.div_euclid(self.block_edge)))
     }
 
     /// 当前完整提交的源采样；零表示旧输入没有可用的帧身份。
@@ -109,6 +150,43 @@ impl SurfaceObservations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_geometry_fact_is_scoped_to_the_immutable_committed_source() {
+        let mut grid=SurfaceObservations::new(0.05,32).unwrap();
+        assert!(!grid.is_complete_geometry_source());
+        let row=SurfaceObservation{observed_ns:0,hits:0};
+        grid.replace_block([0,0,0],BTreeMap::from([([0,0,0],row)])).unwrap();
+        grid.mark_complete_geometry_source();let previous=grid.clone();
+        grid.set_source_timestamp_ns(100);
+        assert!(grid.is_complete_geometry_source(),"只更新根时间不改变占据全集");
+        assert!(grid.replace_block([0,0,0],BTreeMap::from([([32,0,0],row)])).is_err());
+        assert!(grid.is_complete_geometry_source(),"失败输入不能改动已提交事实");
+        grid.replace_block([0,0,0],BTreeMap::new()).unwrap();
+        assert!(!grid.is_complete_geometry_source(),"删除或替换后必须重新验证完整根");
+        assert!(previous.is_complete_geometry_source());
+        assert!(previous.get([0,0,0]).is_some());
+    }
+
+    #[test]
+    fn local_columns_follow_block_replacement_and_preserve_immutable_snapshots() {
+        let mut observations=SurfaceObservations::new(0.05,2).unwrap();
+        let row=SurfaceObservation {observed_ns:0,hits:0};
+        observations.replace_block([0,0,-1],BTreeMap::from([([0,0,-1],row)])).unwrap();
+        observations.replace_block([0,0,0],BTreeMap::from([([0,0,0],row),([0,0,1],row)])).unwrap();
+        observations.replace_block([0,0,1],BTreeMap::from([([0,0,2],row)])).unwrap();
+        let previous=observations.clone();
+        assert_eq!(observations.column_levels(0,0),Some([-1,0,1,2].as_slice()));
+        observations.replace_block([0,0,0],BTreeMap::from([([0,0,1],row),([1,0,0],row)])).unwrap();
+        assert_eq!(observations.column_levels(0,0),Some([-1,1,2].as_slice()));
+        assert_eq!(observations.column_levels(1,0),Some([0].as_slice()));
+        observations.replace_block([0,0,0],BTreeMap::new()).unwrap();
+        assert_eq!(observations.column_levels(0,0),Some([-1,2].as_slice()));
+        assert!(observations.column_levels(1,0).is_none());
+        assert_eq!(previous.column_levels(0,0),Some([-1,0,1,2].as_slice()));
+        assert!(observations.replace_block([0,0,0],BTreeMap::from([([0,0,2],row)])).is_err());
+        assert_eq!(observations.column_levels(0,0),Some([-1,2].as_slice()));
+    }
 
     #[test]
     fn isolated_history_does_not_replace_current_or_confirmed_obstacles() {

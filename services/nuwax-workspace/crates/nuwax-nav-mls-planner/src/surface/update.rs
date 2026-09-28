@@ -357,7 +357,7 @@ pub(super) fn height_bounds(
     }
     result
 }
-fn column_supports(
+pub(super) fn column_supports(
     x: i32,
     y: i32,
     zs: &[i32],
@@ -482,8 +482,10 @@ pub(super) fn from_columns(
         current_body_support: None,
         body_query_cache: Default::default(),
         data: Arc::new(SurfaceData {
+            body_query_only: false,
             frontier_cache: Default::default(),
             body_cache: Default::default(),
+            routing_cache: Default::default(),
             body_envelope: model.cloned().map(Arc::new),
             height_bounds: Arc::new(heights),
             physical_graph: Arc::clone(&graph),
@@ -679,8 +681,10 @@ fn update_columns(
         current_body_support: None,
         body_query_cache: Default::default(),
         data: Arc::new(SurfaceData {
+            body_query_only: false,
             frontier_cache: Default::default(),
             body_cache: Default::default(),
+            routing_cache: Default::default(),
             body_envelope: previous.data.body_envelope.clone(),
             height_bounds: Arc::new(heights),
             physical_graph: Arc::clone(&graph),

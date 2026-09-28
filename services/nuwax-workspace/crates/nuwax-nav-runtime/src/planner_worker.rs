@@ -25,7 +25,6 @@ struct Inputs {
 pub(crate) struct PlannerWorker {
     shared: Arc<(Mutex<Inputs>, Condvar)>,
     thread: Option<std::thread::JoinHandle<()>>,
-    reverse_supported: bool,
 }
 impl PlannerWorker {
     pub(crate) fn new(mut planner: impl NavPlanner) -> Result<Self, RuntimeError> {
@@ -124,14 +123,7 @@ impl PlannerWorker {
         Ok(Self {
             shared,
             thread: Some(thread),
-            reverse_supported: false,
         })
-    }
-}
-impl PlannerWorker {
-    pub(crate) fn with_reverse_support(mut self, enabled: bool) -> Self {
-        self.reverse_supported = enabled;
-        self
     }
 }
 impl NavPlanner for PlannerWorker {
@@ -141,12 +133,8 @@ impl NavPlanner for PlannerWorker {
         options: nuwax_nav_types_messages::GoalOptions,
     ) -> Result<(), RuntimeError> {
         options.validate().map_err(RuntimeError::Planner)?;
-        if options.allow_reverse && !self.reverse_supported {
-            return Err(RuntimeError::InvalidInput {
-                field: "allow_reverse",
-                reason: "三维执行未提供倒车标定".into(),
-            });
-        }
+        // 自主导航授权按前向策略收窄；旧目标允许倒退不能导致误拒或恢复倒退。
+        let options=nuwax_nav_types_messages::GoalOptions {allow_reverse:false,..options};
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
@@ -275,6 +263,28 @@ mod tests {
             })
         }
         fn stop(&mut self) {}
+    }
+    #[test]
+    fn autonomous_worker_delivers_forward_only_goal_options() {
+        let entered=Arc::new(AtomicBool::new(false));
+        let mut worker=PlannerWorker::new(SlowPlanner {
+            entered:Arc::clone(&entered),release:Arc::new(AtomicBool::new(true)),
+        }).unwrap();
+        let goal=nuwax_nav_astar::helpers::make_pose_stamped("map",1.0,0.0,0.0);
+        let options=nuwax_nav_types_messages::GoalOptions {
+            allow_reverse:true,position_tolerance_m:0.23,yaw_tolerance_rad:0.7,
+        };
+        worker.configure_goal(&goal,options).unwrap();
+        worker.step(0.3);
+        let deadline=std::time::Instant::now()+Duration::from_secs(1);
+        while worker.shared.0.lock().unwrap().result.is_none() && std::time::Instant::now()<deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let input=worker.shared.0.lock().unwrap();
+        assert_eq!(input.goal.as_ref().unwrap().1,nuwax_nav_types_messages::GoalOptions {allow_reverse:false,..options});
+        assert!(matches!(input.result.as_ref().map(|r|&r.1),Some(PlannerStep::Command(v))if v.linear.x>0.0),
+            "默认不支持倒退的后端必须收到收窄后的目标，不能误拒旧授权");
+        assert!(entered.load(Ordering::SeqCst));
     }
     #[test]
     fn replacement_path_preserves_goal_and_applied_control_state() {

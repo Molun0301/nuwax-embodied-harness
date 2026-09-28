@@ -222,6 +222,11 @@
       if (['succeeded', 'failed', 'cancelled', 'timeout'].includes(status.state)) {
         stopPolling();
         state.inflightRequestId = null;
+        // 本任务已到真终态时移除其选点预览，保留用户另选的新目标。
+        if (state.pendingPose === state.submittedPose) {
+          state.pendingPose = null;
+          window.pointcloud3d?.previewNavigationPoint(null);
+        }
         if (status.state === 'succeeded') setStatus('已到达' + selected, 'success');
         else if (status.state === 'cancelled') setStatus('已取消' + selected, 'idle');
         else setStatus((status.state === 'timeout' ? '导航超时' : '导航失败') + selected, 'error');

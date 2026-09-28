@@ -59,7 +59,7 @@ pub fn project_to_occupancy<P: PointCloud2Like + ?Sized>(
     Ok(())
 }
 
-/// 按有效水平回波和同帧雷达原点确定范围，四周留一米边界。
+/// 按高度带内的有效观测和同帧雷达原点确定范围，四周留一米边界。
 /// 没有有效回波时返回一格未知，不将缺测方向推定为自由。
 pub fn build_occupancy_auto<P: PointCloud2Like + ?Sized>(
     cloud: &P,
@@ -76,9 +76,9 @@ pub fn build_occupancy_auto<P: PointCloud2Like + ?Sized>(
     let mut max_y = origin.y;
     let mut observed = false;
     for point in cloud.points() {
-        if !planar_scan::contains_return(point, &origin) {
+        let Some((point, _)) = planar_scan::observed_ray_end(point, &origin) else {
             continue;
-        }
+        };
         observed = true;
         min_x = min_x.min(point.x);
         max_x = max_x.max(point.x);

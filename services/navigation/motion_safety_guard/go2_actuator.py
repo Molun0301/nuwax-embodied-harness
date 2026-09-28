@@ -200,7 +200,7 @@ class Go2Actuator:
         actuator_symbols_sha256: str,
         dds_iface: Optional[str],
         timeout_seconds: float,
-        max_linear_velocity_mps: float = 0.35,
+        max_linear_velocity_mps: float = 1.0,
         max_yaw_rate_rps: float = 0.8,
         yaw_rate_deadband_rps: float = 0.003490658503988659,
         max_body_pose_rad: float = 0.5,
@@ -372,7 +372,7 @@ class Go2Actuator:
         try:
             timeout = float(runtime_value("GO2_OFFICIAL_CLIENT_TIMEOUT_SEC", "3.0"))
             max_linear = float(
-                runtime_value("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", "0.35")
+                runtime_value("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", "1.0")
             )
             max_yaw = float(runtime_value("GO2_OFFICIAL_MAX_YAW_RATE_RPS", "0.8"))
             yaw_deadband = float(

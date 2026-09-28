@@ -4337,7 +4337,9 @@ fn apply_simple_planner_goal(
         return module_input_error("simple_planner.goal_pose", error);
     }
     module.set_goal_yaw(pose.pose.orientation.yaw());
-    module.set_goal_options(envelope.options).map_err(|error|module_error("simple_planner.goal_options",error))?;
+    // 目标身份保留原信封，自主导航只收窄其允许的运动方向。
+    module.set_goal_options(nuwax_nav_types_messages::GoalOptions {allow_reverse:false,..envelope.options})
+        .map_err(|error|module_error("simple_planner.goal_options",error))?;
     Ok(OwnerInput::Accepted((envelope, boundary)))
 }
 
@@ -4799,8 +4801,17 @@ async fn run_simple_planner(
         .filter(|value| !value.trim().is_empty())
         .map(|value| nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value))
         .transpose().map_err(NavStackError::InvalidConfig)?;
+    let motion_limits=nuwax_nav_types_messages::NavigationCapabilities::from_env()
+        .map_err(NavStackError::InvalidConfig)?.map(|profile| {
+            let mut limits=profile.motion;
+            let navigation=nuwax_nav_runtime::surface_follower::forward_navigation_kinematics(limits.kinematics());
+            limits.model=navigation.model;
+            limits.max_reverse_mps=navigation.max_reverse_mps;
+            limits.max_lateral_mps=navigation.max_lateral_mps;
+            limits
+        });
     let mut module = SimplePlannerModule::with_config(nuwax_nav_simple_planner::SimplePlannerConfig {
-        robot_geometry, motion_limits: nuwax_nav_types_messages::NavigationCapabilities::from_env().map_err(NavStackError::InvalidConfig)?.map(|profile|profile.motion), ..nuwax_nav_simple_planner::SimplePlannerConfig::default()
+        robot_geometry, motion_limits, ..nuwax_nav_simple_planner::SimplePlannerConfig::default()
     }).map_err(|error| module_error("simple_planner.robot_geometry", error))?;
     module.enable_background_planning();
     let planner_runtime_generation = saturating_i64(runtime_generation());

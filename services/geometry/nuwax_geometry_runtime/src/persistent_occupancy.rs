@@ -343,6 +343,35 @@ mod projection_tests {
     use super::*;
 
     #[test]
+    fn slanted_free_observations_remove_the_same_residue_as_three_dimensional_rays() {
+        use nalgebra::point;
+        use nuwax_mapping::{cost_mapper::SimplePointCloud2, pointclouds::occupancy::build_occupancy_auto};
+        let observe = |timestamp, points| build_occupancy_auto(
+            &SimplePointCloud2::with_metadata(points, point![0.025, 0.025, 0.0], "map", timestamp),
+            0.05,
+        ).unwrap();
+        let first = observe(1.0, vec![point![1.025, 0.025, 0.0]]);
+        let mut persistent = PersistentOccupancyGrid::stage_observation(None, &first).unwrap();
+        persistent.merge_observation(&observe(2.0, vec![point![1.025, 0.025, 0.0]])).unwrap();
+        let at = |persistent: &PersistentOccupancyGrid| {
+            let grid = &persistent.grid;
+            let x = ((1.025 - grid.origin[0]) / grid.resolution).floor() as u32;
+            let y = ((0.025 - grid.origin[1]) / grid.resolution).floor() as u32;
+            grid.data[grid.index(y, x)]
+        };
+        assert_eq!(at(&persistent), 100);
+        // 终点不在水平切片内，但射线真实穿过旧障碍格；同帧重投不能重复投票。
+        for timestamp in [3.0, 4.0] {
+            let free = observe(timestamp, vec![point![4.025, 0.025, 0.2]]);
+            persistent.merge_observation(&free).unwrap();
+            persistent.merge_observation(&free).unwrap();
+            assert_eq!(at(&persistent), 100);
+        }
+        persistent.merge_observation(&observe(5.0, vec![point![4.025, 0.025, 0.2]])).unwrap();
+        assert_eq!(at(&persistent), 0);
+    }
+
+    #[test]
     fn planar_observations_confirm_hits_and_clears_without_reusing_timestamps() {
         let mut scan = OccupancyGrid::with_frame(3, 1, 0.05, "map");
         scan.data = vec![0, 100, -1];

@@ -28,7 +28,7 @@ def actuator_limits():
     if config.runtime_value("NUWAX_ACTIVE_ROBOT", "").strip().lower() != "go2":
         return "", ""
     values = []
-    for key, default in [("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", "0.35"),
+    for key, default in [("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", "1.0"),
                          ("GO2_OFFICIAL_MAX_YAW_RATE_RPS", "0.8")]:
         value = float(config.runtime_value(key, default))
         if not math.isfinite(value) or value <= 0:

@@ -534,7 +534,7 @@ _ZH_NAMES: Dict[str, str] = {
     'GO2_OFFICIAL_BACKEND_ENABLED': '启用 Go2 官方控制后端',
     'GO2_OFFICIAL_OBSTACLE_AVOIDANCE_DEFAULT_ENABLED': '默认启用 Go2 官方避障',
     'GO2_OFFICIAL_CLIENT_TIMEOUT_SEC': 'Go2 官方客户端超时（秒）',
-    'GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS': 'Go2 官方最大线速度（米/秒）',
+    'GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS': 'Go2 运动线速度上限（米/秒）',
     'GO2_OFFICIAL_MAX_YAW_RATE_RPS': 'Go2 官方最大偏航角速度（弧度/秒）',
     'GO2_OFFICIAL_YAW_RATE_DEADBAND_RPS': 'Go2 官方偏航角速度死区（弧度/秒）',
     'GO2_OFFICIAL_SERVICES_AUTO_START': '自动启动 Go2 官方服务',

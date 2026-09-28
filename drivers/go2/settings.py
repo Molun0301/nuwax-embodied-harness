@@ -90,7 +90,7 @@ class Go2OfficialControlConfig:
     auto_start_services: bool = False
     service_names: Tuple[str, ...] = ("obstacles_avoid",)
     client_timeout_sec: float = 3.0
-    max_linear_velocity_mps: float = 0.35
+    max_linear_velocity_mps: float = 1.0
     max_yaw_rate_rps: float = 0.8
     yaw_rate_deadband_rps: float = 0.003490658503988659
     obstacle_avoidance_default_enabled: bool = False
@@ -158,7 +158,7 @@ def load_go2_data_plane_config(
             auto_start_services=_cfg_bool("GO2_OFFICIAL_SERVICES_AUTO_START", False),
             service_names=_cfg_csv("GO2_OFFICIAL_SERVICE_NAMES", ("obstacles_avoid",)),
             client_timeout_sec=max(0.5, _cfg_float("GO2_OFFICIAL_CLIENT_TIMEOUT_SEC", 3.0)),
-            max_linear_velocity_mps=max(0.05, _cfg_float("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", 0.35)),
+            max_linear_velocity_mps=max(0.05, _cfg_float("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", 1.0)),
             max_yaw_rate_rps=max(0.1, _cfg_float("GO2_OFFICIAL_MAX_YAW_RATE_RPS", 0.8)),
             yaw_rate_deadband_rps=_require_nonnegative_finite(
                 "GO2_OFFICIAL_YAW_RATE_DEADBAND_RPS",

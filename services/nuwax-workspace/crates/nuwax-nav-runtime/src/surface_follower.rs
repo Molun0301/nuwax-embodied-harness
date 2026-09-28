@@ -8,9 +8,30 @@ use nuwax_nav_astar::controllers::{angle_diff, Controller, PController};
 use nuwax_nav_astar::global_planner::GlobalPlannerConfig;
 use nuwax_nav_astar::local_planner::LocalPlannerConfig;
 use nuwax_nav_astar::navigation_map::CostMap2D;
-use nuwax_nav_types_messages::{Path2D, Path3D, Point2, Point3, PoseStamped, Quaternion, Twist2};
+use nuwax_nav_types_messages::{MotionKinematics, MotionLimits, MotionModel, Path2D, Path3D, Point2, Point3, PoseStamped, Quaternion, Twist2};
 
 use crate::{ExecutionMap, ExecutionPath, NavPlanner, PlannerStep, RuntimeError, SurfaceSnapshot};
+
+/// 从真实执行器声明派生自主导航/探索的前进与转向通道，不改写手动运动能力。
+#[must_use]
+pub fn forward_navigation_kinematics(mut motion: MotionKinematics) -> MotionKinematics {
+    if motion.model == MotionModel::Omnidirectional {
+        motion.model = MotionModel::Differential;
+    }
+    motion.max_reverse_mps = 0.0;
+    motion.max_lateral_mps = 0.0;
+    motion
+}
+
+/// 完整标定的前向副本供两个生产执行后端共用，保留原加减速和反应参数。
+pub(crate) fn forward_navigation_limits(physical: &MotionLimits) -> MotionLimits {
+    let motion = forward_navigation_kinematics(physical.kinematics());
+    let mut limits = physical.clone();
+    limits.model = motion.model;
+    limits.max_reverse_mps = motion.max_reverse_mps;
+    limits.max_lateral_mps = motion.max_lateral_mps;
+    limits
+}
 
 /// 三维跟随必须明确标定，控制参数复用已有局部控制器配置。
 #[derive(Debug, Clone)]
@@ -50,7 +71,10 @@ impl SurfaceFollowerConfig {
     }
 
     fn validate(&self) -> Result<(), RuntimeError> {
-        if let Some(motion)=self.kinematics() {motion.validate().map_err(|reason|RuntimeError::InvalidInput{field:"surface.kinematics",reason})?;}
+        // 先验证真实声明，策略收窄不能掩盖原始标定中无效的速度通道。
+        if let Some(motion)=self.motion_limits.as_ref().map(|limits|limits.kinematics()).or(self.basic_kinematics) {
+            motion.validate().map_err(|reason|RuntimeError::InvalidInput{field:"surface.kinematics",reason})?;
+        }
         if let Some(limits)=&self.motion_limits {limits.validate().map_err(|reason|RuntimeError::InvalidInput{field:"surface.motion_limits",reason})?;}
         if self.max_observation_age_sec.is_some_and(|v|!v.is_finite() || v<=0.0){return Err(RuntimeError::InvalidInput {field:"surface.max_observation_age_sec",reason:"观察时效必须为有限正值".into()});}
         for (field, value) in [
@@ -85,9 +109,10 @@ impl SurfaceFollowerConfig {
         Ok(())
     }
 
-    /// 完整标定优先于启动装配提供的基本通道声明。
-    pub fn kinematics(&self) -> Option<nuwax_nav_types_messages::MotionKinematics> {
+    /// 完整标定优先，导航只使用从真实声明派生的前进与转向通道。
+    pub fn kinematics(&self) -> Option<MotionKinematics> {
         self.motion_limits.as_ref().map(|limits|limits.kinematics()).or(self.basic_kinematics)
+            .map(forward_navigation_kinematics)
     }
 }
 
@@ -108,6 +133,7 @@ pub struct SurfaceFollower {
     options: nuwax_nav_types_messages::GoalOptions,
     last_command: Twist2,
     braking_deadline: Option<std::time::Instant>,
+    simulation_braking_deadline_ns: Option<i64>,
     control_target: Option<nuwax_nav_control::PlanarPose>,
     body_view_dirty: bool,
 }
@@ -135,6 +161,7 @@ impl SurfaceFollower {
             options:Default::default(),
             last_command:Twist2::ZERO,
             braking_deadline:None,
+            simulation_braking_deadline_ns:None,
             control_target:None,
             body_view_dirty: true,
         })
@@ -187,26 +214,35 @@ impl SurfaceFollower {
             return Err(rejected("三维路径缺少机体位姿"));
         };
         crate::validate_map_pose(odometry, "odometry")?;
-        let current_support =
-            Self::support(map, odometry, self.config.body_to_support_z_m).map_err(rejected)?;
         // 完整规划属于后台MLS拥有方；调度器只验证当前接续与有界前向段，
         // 避免长路线的全图遍历阻塞优先取消和续租。
-        let (progress, projected) = closest_in_window(
-            &path,
-            &cumulative,
-            odometry.pose.position,
-            0.0,
-            self.config.max_path_deviation_m,
-        );
+        let (progress, projected) = if path.poses[0].pose.position == odometry.pose.position {
+            // 原始首点就是当前机体时，不让零弧长的旋转点或归一化余量改变接续站姿。
+            (0.0, path.poses[0].clone())
+        } else {
+            closest_in_window(&path, &cumulative, odometry.pose.position, 0.0,
+                self.config.max_path_deviation_m)
+        };
         if projected.pose.position.distance(odometry.pose.position)
             > self.config.max_path_deviation_m
         {
             return Err(rejected("新路径首段不能与当前三维机体位置连续接续"));
         }
-        let projected_support =
-            Self::support(map, &projected, self.config.body_to_support_z_m).map_err(rejected)?;
-        map.validate_segment(current_support, projected_support)
-            .map_err(|error| rejected(error.to_string()))?;
+        if map.body_envelope().is_some() {
+            let q = odometry.pose.orientation;
+            let from = (xyz(odometry.pose.position), [q.x, q.y, q.z, q.w]);
+            // 完整机体已沿实际地形验证；粗格中心连边不能否决精细层上的合法接续。
+            if body_control::connection_endpoint(map, from, &projected).is_none() {
+                return Err(rejected("新路径不能从实际机体站姿连续接续"));
+            }
+        } else {
+            let current_support = Self::support(map, odometry, self.config.body_to_support_z_m)
+                .map_err(rejected)?;
+            let projected_support = Self::support(map, &projected, self.config.body_to_support_z_m)
+                .map_err(rejected)?;
+            map.validate_segment(current_support, projected_support)
+                .map_err(|error| rejected(error.to_string()))?;
+        }
         self.progress_m = progress;
         self.last_tracked_pose = Some(odometry.clone());
         self.path_index=1;
@@ -367,9 +403,13 @@ impl SurfaceFollower {
     }
 
     fn bounded_command(&mut self, twist: Twist2) -> PlannerStep {
+        self.bounded_command_with_speed_limit(twist,None)
+    }
+
+    fn bounded_command_with_speed_limit(&mut self, twist: Twist2, speed_limit: Option<f64>) -> PlannerStep {
         if self.config.max_observation_age_sec.is_some()
             || self.config.motion_limits.is_some() && self.map.as_ref().is_some_and(|m|m.body_envelope().is_some()) {
-            return self.bounded_body_command(twist);
+            return self.bounded_body_command(twist,speed_limit);
         }
         // 原控制器最小速度不能突破三维执行显式配置的低速上限。
         let speed = self.config.controller.speed * self.config.controller.nerf_speed.min(1.0);
@@ -407,21 +447,49 @@ impl SurfaceFollower {
             linear: Point2::new(0.0, 0.0),
             angular_z: command.angular_z,
         };
-        let needs_rotation=self.odometry.as_ref().zip(self.control_target).is_none_or(|(pose,target)| {
+        let needs_rotation=self.rotation_can_restore_translation(command,command.angular_z);
+        // 没有转向恢复通行的依据时不反复发微小角速度；必要的小角转向仍沿真实扫掠执行。
+        if needs_rotation && self.config.kinematics().is_none_or(|m|m.can_rotate_in_place)
+            && rotation.angular_z.abs() > 1e-9 && self.motion_is_traversable(rotation) {
+            return PlannerStep::Command(rotation);
+        }
+        PlannerStep::ReplanRequired("短时速度轨迹没有连续支撑或足够净空".into())
+    }
+
+    /// 微转向只有能恢复后续平移时才属于接续动作，避免在已对齐堵点渐近旋转。
+    pub(super) fn rotation_can_restore_translation(&self, command: Twist2, candidate_angular_z:f64) -> bool {
+        self.odometry.as_ref().zip(self.control_target).is_none_or(|(pose,target)| {
             let yaw=pose.pose.orientation.yaw();
             let omni=self.config.kinematics().is_some_and(|m|m.model==nuwax_nav_types_messages::MotionModel::Omnidirectional && m.max_lateral_mps>0.0);
             let desired=if !omni && command.linear.x.hypot(command.linear.y)>1e-9 {
                 (target.y-pose.pose.position.y).atan2(target.x-pose.pose.position.x)
                     + if command.linear.x<0.0 {std::f64::consts::PI} else {0.0}
             } else {target.yaw};
-            angle_diff(desired,yaw).abs()>self.config.controller.orientation_tolerance.min(0.05).max(1e-6)
-        });
-        // 已按当前路径对齐却没有可行平移时，微小旋转不会恢复通行性，直接重规划。
-        if needs_rotation && self.config.kinematics().is_none_or(|m|m.can_rotate_in_place)
-            && rotation.angular_z.abs() > 1e-9 && self.motion_is_traversable(rotation) {
-            return PlannerStep::Command(rotation);
-        }
-        PlannerStep::ReplanRequired("短时速度轨迹没有连续支撑或足够净空".into())
+            let error=angle_diff(desired,yaw);
+            if !candidate_angular_z.is_finite() {return false;}
+            // 恢复依据属于这个候选的方向；另一个方向可能有路，不能授权反向微转。
+            // 已有实际角速度的减速仍是必要制动，后续照常核验真实速度窗口与完整停车。
+            let braking=candidate_angular_z*self.last_command.angular_z>=0.0
+                && candidate_angular_z.abs()<self.last_command.angular_z.abs();
+            if braking {return true;}
+            if candidate_angular_z*error<=0.0 {return false;}
+            if error.abs()>self.config.controller.orientation_tolerance.min(0.05).max(1e-6) {return true;}
+            if error.abs()<=1e-6 {return false;}
+            let Some(map)=self.map.as_ref() else {return false;};
+            let distance=(target.x-pose.pose.position.x).hypot(target.y-pose.pose.position.y);
+            let travel=(command.linear.x.hypot(command.linear.y)
+                *crate::DEFAULT_CONTROL_HORIZON.as_secs_f64()).min(distance);
+            if travel<=1e-9 || distance<=1e-9 {return false;}
+            let q=pose.pose.orientation;
+            let actual=(xyz(pose.pose.position),[q.x,q.y,q.z,q.w]);
+            let mut aligned_target=pose.clone();aligned_target.pose.orientation=Quaternion::from_yaw(desired);
+            let Some(aligned)=body_control::connection_endpoint(map,actual,&aligned_target) else {return false;};
+            let mut next=aligned_target;
+            next.pose.position.x=actual.0[0]+(target.x-actual.0[0])*travel/distance;
+            next.pose.position.y=actual.0[1]+(target.y-actual.0[1])*travel/distance;
+            // 必要小转向与后续平移都使用同一实际地形接续，不能借旧路径站姿取得许可。
+            body_control::translation_connects(map,aligned,&next)
+        })
     }
 
     fn motion_is_traversable(&self, command: Twist2) -> bool {
@@ -434,8 +502,8 @@ impl SurfaceFollower {
         {
             return false;
         }
-        if self.maintained_body_motion_is_traversable(command,crate::DEFAULT_CONTROL_HORIZON.as_secs_f64()) {
-            return true;
+        if map.body_envelope().is_some() {
+            return self.predicted_body_motion_is_traversable(command,crate::DEFAULT_CONTROL_HORIZON.as_secs_f64());
         }
         let Ok(initial_support) = Self::support(map, pose, self.config.body_to_support_z_m) else {
             return false;
@@ -502,23 +570,6 @@ impl SurfaceFollower {
             {
                 return false;
             }
-            if map.body_envelope().is_some() {
-                let body_at=|support:[f64;3],yaw:f64| {
-                    let q=map.body_orientation_at(support,yaw).ok()?;
-                    let p=if command.linear.x.hypot(command.linear.y)<1e-9 {
-                        // 原地转向没有升降或平移指令，不得用格顶投影凭空移开机体。
-                        xyz(pose.pose.position)
-                    } else {map.body_position_from_support(support,q,self.config.body_to_support_z_m).ok()?};
-                    Some((p,q))
-                };
-                let (Some(a),Some(b),Some(c),Some(d))=(body_at(support,yaw+angle*(sample-1) as f64/sample as f64),body_at(next.support_xyz,yaw+angle),body_at(delayed_support,yaw),body_at(next_delayed.support_xyz,yaw))else{return false;};
-                if sample==1 {
-                    let q=pose.pose.orientation;
-                    let actual=(xyz(pose.pose.position),[q.x,q.y,q.z,q.w]);
-                    if map.validate_body_motion(actual,a,&[]).is_err() || map.validate_body_motion(actual,c,&[]).is_err() {return false;}
-                }
-                if map.validate_body_motion(a,b,&[]).is_err() || map.validate_body_motion(c,d,&[]).is_err() || map.validate_body_motion(b,d,&[]).is_err(){return false;}
-            }
             support = next.support_xyz;
             delayed_support = next_delayed.support_xyz;
         }
@@ -529,11 +580,11 @@ impl SurfaceFollower {
 impl NavPlanner for SurfaceFollower {
     fn configure_goal(&mut self, _goal:&PoseStamped, options:nuwax_nav_types_messages::GoalOptions)->Result<(),RuntimeError> {
         options.validate().map_err(|reason|RuntimeError::InvalidInput {field:"goal_options",reason})?;
-        if options.allow_reverse && self.config.kinematics().is_none_or(|m|m.max_reverse_mps<=0.0) {return Err(RuntimeError::InvalidInput {field:"allow_reverse",reason:"三维执行器未声明倒退速度通道".into()});}
         // 新目标执行仍须取得守卫准入；旧规划器内部状态不能代替该证明。
         self.braking_deadline = None;
         self.last_command = Twist2::ZERO;
-        self.options=options;
+        // 目标授权是上限，旧目标允许倒车也不能恢复自主导航已禁用的运动方向。
+        self.options=nuwax_nav_types_messages::GoalOptions {allow_reverse:false,..options};
         self.config.controller.goal_tolerance=options.position_tolerance_m.max(1e-6);
         self.config.controller.orientation_tolerance=options.yaw_tolerance_rad.max(1e-6);
         Ok(())
@@ -778,7 +829,302 @@ pub(crate) fn test_snapshot(slope: f64, blocked_strip: bool) -> Arc<SurfaceSnaps
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nuwax_nav_types_messages::{NavFrameId, Pose3, Timestamp};
+    use nuwax_nav_types_messages::{GoalOptions, NavFrameId, Pose3, Timestamp};
+
+    fn omni_route_follower(poses: Vec<PoseStamped>, calibrated: bool) -> (SurfaceFollower, Arc<SurfaceSnapshot>) {
+        use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
+        use nuwax_nav_types_messages::{MotionLimits, MotionModel};
+        let map=Arc::new(test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope {
+            footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+            z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.3,max_step_up_m:0.0,
+            max_step_down_m:0.0,max_cross_slope_deg:10.0,support_uncertainty_m:0.0,
+        }).unwrap());
+        let limits=MotionLimits {
+            model:MotionModel::Omnidirectional,max_forward_mps:1.0,max_reverse_mps:1.0,
+            max_lateral_mps:1.0,max_angular_rps:0.8,linear_acceleration_mps2:1.0,
+            guaranteed_braking_mps2:1.0,angular_acceleration_rps2:2.0,
+            guaranteed_angular_braking_rps2:2.0,reaction_time_sec:0.05,
+            minimum_turning_radius_m:0.0,can_rotate_in_place:true,
+        };
+        let mut config=SurfaceFollowerConfig::new(0.3);
+        config.controller.speed=1.0;config.controller.control_frequency=20.0;
+        config.controller.simulation=true;config.max_angular_speed_rps=0.8;
+        config.basic_kinematics=Some(limits.kinematics());
+        if calibrated {config.motion_limits=Some(limits);}
+        let mut follower=SurfaceFollower::new(config).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+        follower.update_odometry(poses.first().unwrap().clone());
+        let goal=poses.last().unwrap().clone();
+        follower.configure_goal(&goal,GoalOptions {
+            allow_reverse:true,position_tolerance_m:0.12,yaw_tolerance_rad:std::f64::consts::PI,
+        }).unwrap();
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D{poses}),None,goal).unwrap();
+        (follower,map)
+    }
+
+    #[test]
+    fn forward_navigation_turns_then_reaches_rear_and_side_targets() {
+        for calibrated in [false,true] {
+            for (heading,prefix) in [(std::f64::consts::PI,true),(-2.6,true),
+                (std::f64::consts::PI,false),(std::f64::consts::FRAC_PI_2,false)] {
+                let mut current=body_pose([3.05,1.55,0.4],Quaternion::IDENTITY,0);
+                let mut poses=vec![current.clone()];
+                if prefix {
+                    for index in 1..=20 {
+                        poses.push(body_pose(xyz(current.pose.position),Quaternion::from_yaw(heading*index as f64/20.0),0));
+                    }
+                }
+                let goal=body_pose([3.05+1.2*heading.cos(),1.55+1.2*heading.sin(),0.4],Quaternion::from_yaw(heading),0);
+                poses.push(goal.clone());
+                let (mut follower,map)=omni_route_follower(poses,calibrated);
+                let mut applied=Twist2::ZERO;let mut reached=false;let mut translated=false;let mut finished=false;
+                let mut max_cross_track=0.0_f64;let mut completed_ticks=0;
+                for tick in 0..300 {
+                    current.stamp.nanos=1_000_000_000+tick*50_000_000;
+                    follower.update_odometry(current.clone());
+                    let error=angle_diff(heading,current.pose.orientation.yaw());
+                    let command=if reached {Twist2::ZERO} else {
+                        match follower.step(0.3) {
+                            PlannerStep::Command(command)=>command,
+                            PlannerStep::Succeeded=>{reached=true;Twist2::ZERO},
+                            other=>panic!("明确转向后前进不应丢失路线：完整标定{calibrated}，方向{heading}，{other:?}"),
+                        }
+                    };
+                    let alignment_range=if prefix {0.25}else{0.6};
+                    if error.abs()>alignment_range {
+                        assert!(command.linear.x.hypot(command.linear.y)<1e-10,
+                            "大转向前缀未完成时不可改成倒走或横移：{command:?}");
+                    }
+                    assert!(command.linear.x>=-1e-10,"前进路线不可被跟随器改成倒退：{command:?}");
+                    assert_eq!(command.linear.y,0.0,"自主导航必须保持机体横向速度为零");
+                    if !translated && command.linear.x.hypot(command.linear.y)>1e-8 {
+                        translated=true;
+                        assert!(command.linear.x>0.0 && error.abs()<=alignment_range,
+                            "后方路线须先对齐到现有接续范围再向前行走");
+                    }
+                    // 独立按声明矢量加速度和实际回执积分，不把命令当已瞬时达到的速度。
+                    let dx=command.linear.x-applied.linear.x;let dy=command.linear.y-applied.linear.y;
+                    let ratio=(0.05/dx.hypot(dy).max(1e-12)).min(1.0);
+                    let next_velocity=Twist2 {
+                        linear:Point2::new(applied.linear.x+dx*ratio,applied.linear.y+dy*ratio),
+                        angular_z:applied.angular_z+(command.angular_z-applied.angular_z).clamp(-0.1,0.1),
+                    };
+                    let mean=Twist2{linear:Point2::new((applied.linear.x+next_velocity.linear.x)*0.5,
+                        (applied.linear.y+next_velocity.linear.y)*0.5),angular_z:(applied.angular_z+next_velocity.angular_z)*0.5};
+                    let next=nuwax_nav_control::integrate(nuwax_nav_control::PlanarPose {
+                        x:current.pose.position.x,y:current.pose.position.y,yaw:current.pose.orientation.yaw(),
+                    },mean,0.05);
+                    let q=Quaternion::from_yaw(next.yaw);
+                    let advance=(next.x-current.pose.position.x)*heading.cos()
+                        +(next.y-current.pose.position.y)*heading.sin();
+                    assert!(advance>=-1e-9,"独立实际轨迹不能沿直线反复折返：{advance}");
+                    max_cross_track=max_cross_track.max(((next.x-3.05)*heading.sin()
+                        -(next.y-1.55)*heading.cos()).abs());
+                    let from=(xyz(current.pose.position),[current.pose.orientation.x,current.pose.orientation.y,
+                        current.pose.orientation.z,current.pose.orientation.w]);
+                    let to=([next.x,next.y,current.pose.position.z],[q.x,q.y,q.z,q.w]);
+                    map.with_current_body_support(from.0,from.1).unwrap().validate_body_motion(from,to,&[]).unwrap();
+                    current.pose.position=Point3::new(to.0[0],to.0[1],to.0[2]);current.pose.orientation=q;
+                    applied=next_velocity;follower.observe_applied_command(applied);
+                    assert!(applied.linear.x>=0.0);assert_eq!(applied.linear.y,0.0);
+                    if reached && applied.linear.x.hypot(applied.linear.y)<1e-12 && applied.angular_z.abs()<1e-12 {
+                        finished=true;completed_ticks=tick+1;break;
+                    }
+                }
+                assert!(finished && translated,"明确前进路线须闭环到达并停稳");
+                assert!(current.pose.position.distance(goal.pose.position)<0.12);
+                if prefix {assert!(max_cross_track<0.12,"明确直线前缀后不应横摆：{max_cross_track}");}
+                eprintln!("完整标定{calibrated}，明确前缀{prefix}，目标朝向{heading:.3}：{}秒，实际最大横偏{max_cross_track:.6}米，零横移/倒退/折返",completed_ticks as f64*0.05);
+            }
+        }
+    }
+
+    #[test]
+    fn large_turn_prefix_cannot_be_skipped_by_translation_endpoint_heading() {
+        for calibrated in [false,true] {
+            let start=body_pose([3.05,1.55,0.4],Quaternion::IDENTITY,0);
+            let turn=body_pose(xyz(start.pose.position),Quaternion::from_yaw(std::f64::consts::PI),0);
+            // 后续平移还包含姿态变化，不能用它的末朝向替代明确的原地转向终点。
+            let end=body_pose([2.65,1.55,0.4],Quaternion::IDENTITY,0);
+            let (mut follower,_)=omni_route_follower(vec![start,turn,end],calibrated);
+            let PlannerStep::Command(command)=follower.step(0.3) else {panic!("可行的明确转向应开始执行")};
+            assert!(command.linear.x.hypot(command.linear.y)<1e-10 && command.angular_z.abs()>0.0,
+                "后续平移末端恰好与当前朝向相同，也不能跳过大转向并直接倒走：{command:?}");
+        }
+    }
+
+    #[test]
+    fn autonomous_side_and_rear_goals_turn_without_lateral_or_reverse_motion() {
+        for calibrated in [false,true] {
+            let start=body_pose([3.05,1.55,0.4],Quaternion::IDENTITY,0);
+            for (direction,heading,prefix) in [([-1.0,0.0],0.0,false),([0.0,1.0],0.0,false),
+                ([0.12_f64.cos(),0.12_f64.sin()],0.12,true)] {
+                let mut poses=vec![start.clone()];
+                if prefix {
+                    poses.push(body_pose(xyz(start.pose.position),Quaternion::from_yaw(heading),0));
+                    // 与生产完整采样路径一致，在有限前瞻内保留紧邻平移点。
+                    poses.push(body_pose([start.pose.position.x+direction[0]*0.2,
+                        start.pose.position.y+direction[1]*0.2,0.4],Quaternion::from_yaw(heading),0));
+                }
+                poses.push(body_pose([start.pose.position.x+direction[0],start.pose.position.y+direction[1],0.4],Quaternion::from_yaw(heading),0));
+                let (mut follower,_)=omni_route_follower(poses,calibrated);
+                let PlannerStep::Command(command)=follower.step(0.3) else {panic!("明确规划的可行平移必须保留")};
+                assert!(!follower.options.allow_reverse,"旧目标倒退授权不能覆盖自主导航策略");
+                assert_eq!(command.linear.y,0.0,"自主导航不能生成横移");
+                assert!(command.linear.x>=0.0,"自主导航不能生成倒退");
+                if prefix {
+                    assert!(command.linear.x>0.0,"小转角近邻仍应连续前进：{command:?}");
+                } else {
+                    assert_eq!(command.linear.x,0.0,"侧方或后方先原地转向");
+                    assert!(command.angular_z.abs()>0.0,"必须朝新的前进方向转动");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_navigation_policy_preserves_physical_calibration_and_curvature_limits() {
+        let poses=vec![body_pose([2.05,1.05,0.4],Quaternion::IDENTITY,0),
+            body_pose([3.05,1.05,0.4],Quaternion::IDENTITY,0)];
+        let (follower,_)=omni_route_follower(poses,true);
+        let physical=follower.config.motion_limits.as_ref().unwrap();
+        assert_eq!(physical.model,MotionModel::Omnidirectional);
+        assert_eq!((physical.max_reverse_mps,physical.max_lateral_mps),(1.0,1.0));
+        let strategy=follower.config.kinematics().unwrap();
+        assert_eq!(strategy.model,MotionModel::Differential);
+        assert_eq!((strategy.max_reverse_mps,strategy.max_lateral_mps),(0.0,0.0));
+        let mut expected=physical.clone();expected.model=MotionModel::Differential;
+        expected.max_reverse_mps=0.0;expected.max_lateral_mps=0.0;
+        assert_eq!(forward_navigation_limits(physical),expected,"响应、加速和制动标定必须原样保留");
+        let car=MotionKinematics{model:MotionModel::Ackermann,can_rotate_in_place:false,
+            minimum_turning_radius_m:0.8,max_lateral_mps:0.0,..physical.kinematics()};
+        let forward_car=forward_navigation_kinematics(car);
+        assert_eq!(forward_car.model,MotionModel::Ackermann);
+        assert_eq!(forward_car.minimum_turning_radius_m,0.8);
+        assert!(!forward_car.can_rotate_in_place);
+        let mut invalid=follower.config.clone();invalid.motion_limits=None;
+        invalid.basic_kinematics=Some(MotionKinematics{model:MotionModel::Differential,
+            max_lateral_mps:1.0,..physical.kinematics()});
+        assert!(SurfaceFollower::new(invalid).is_err(),"策略收窄不能掩盖无效物理声明");
+    }
+
+    fn apply_forward_feedback(map:&SurfaceSnapshot,pose:&mut PoseStamped,applied:&mut Twist2,command:Twist2) {
+        assert!(command.linear.x>=0.0,"前向命令不能倒退：{command:?}");
+        assert_eq!(command.linear.y,0.0,"前向命令不能横移");
+        let next=Twist2{linear:Point2::new(command.linear.x.clamp(applied.linear.x-0.05,applied.linear.x+0.05),0.0),
+            angular_z:command.angular_z.clamp(applied.angular_z-0.1,applied.angular_z+0.1)};
+        let mean=Twist2{linear:Point2::new((applied.linear.x+next.linear.x)*0.5,0.0),
+            angular_z:(applied.angular_z+next.angular_z)*0.5};
+        let q=pose.pose.orientation;let yaw=q.yaw();
+        let end_yaw=yaw+mean.angular_z*0.05;
+        // 独立积分实际前进圆弧，不能用路径点直接替换实际位置。
+        let (dx,dy)=if mean.angular_z.abs()<1e-12 {
+            (mean.linear.x*yaw.cos()*0.05,mean.linear.x*yaw.sin()*0.05)
+        } else {(mean.linear.x*(end_yaw.sin()-yaw.sin())/mean.angular_z,
+            mean.linear.x*(yaw.cos()-end_yaw.cos())/mean.angular_z)};
+        let from=(xyz(pose.pose.position),[q.x,q.y,q.z,q.w]);
+        let q=Quaternion::from_yaw(end_yaw);
+        let to=([from.0[0]+dx,from.0[1]+dy,from.0[2]],[q.x,q.y,q.z,q.w]);
+        map.with_current_body_support(from.0,from.1).unwrap().validate_body_motion(from,to,&[]).unwrap();
+        pose.pose.position=Point3::new(to.0[0],to.0[1],to.0[2]);pose.pose.orientation=q;*applied=next;
+        assert!(applied.linear.x>=0.0);assert_eq!(applied.linear.y,0.0);
+    }
+
+    #[test]
+    fn forward_navigation_follows_a_continuous_arc_and_cancels_with_real_braking() {
+        for calibrated in [false,true] {
+            let poses:Vec<_>=(0..=32).map(|index| {
+                let angle=std::f64::consts::FRAC_PI_2*index as f64/32.0;
+                body_pose([2.05+angle.sin(),1.55-angle.cos(),0.4],Quaternion::from_yaw(angle),0)
+            }).collect();
+            for cancel_at in [None,Some(20)] {
+                let goal=poses.last().unwrap().clone();let mut pose=poses[0].clone();
+                let (mut follower,map)=omni_route_follower(poses.clone(),calibrated);
+                let mut applied=Twist2::ZERO;let mut completed=false;let mut stopping=false;
+                let mut curved=0;let mut moving=0;let mut zero_between=0;let mut peak=0.0_f64;
+                for tick in 0..400 {
+                    pose.stamp.nanos=1_000_000_000+tick*50_000_000;
+                    follower.update_odometry(pose.clone());
+                    if cancel_at==Some(tick) {follower.stop();stopping=true;}
+                    let command=if stopping {
+                        match follower.step(0.3) {
+                            PlannerStep::Command(command)=>{assert_eq!(command,Twist2::ZERO);command},
+                            PlannerStep::ReplanRequired(_)=>Twist2::ZERO,
+                            other=>panic!("取消后的旧路径不能恢复：{other:?}"),
+                        }
+                    } else {
+                        match follower.step(0.3) {
+                            PlannerStep::Command(command)=>command,
+                            PlannerStep::Succeeded=>{stopping=true;follower.stop();Twist2::ZERO},
+                            other=>panic!("前进圆弧应连续执行：完整标定{calibrated}，拍{tick}，{other:?}"),
+                        }
+                    };
+                    if !stopping {
+                        if command.linear.x>1e-8 {moving+=1;if command.angular_z.abs()>1e-8 {curved+=1;}}
+                        else if moving>0 {zero_between+=1;}
+                    }
+                    apply_forward_feedback(&map,&mut pose,&mut applied,command);
+                    peak=peak.max(applied.linear.x);follower.observe_applied_command(applied);
+                    if stopping && applied.linear.x<1e-12 && applied.angular_z.abs()<1e-12 {
+                        completed=true;
+                        eprintln!("前向圆弧：完整标定{calibrated}，取消{cancel_at:?}，{}秒，峰速{peak:.3}，运动拍{moving}，曲线拍{curved}，中途零平移{zero_between}",(tick+1)as f64*0.05);
+                        break;
+                    }
+                }
+                assert!(completed,"真实反馈闭环必须有限时间内停稳");
+                if cancel_at.is_none() {
+                    assert!(pose.pose.position.distance(goal.pose.position)<0.12,"圆弧终点仍按原容差验收");
+                    assert_eq!(zero_between,0,"连续可行圆弧不应每个采样点停转");
+                    assert!(curved*2>moving,"必须实际同时前进转弯，不能用平移/原地转向拼接冒充圆弧");
+                } else {
+                    assert!(follower.path.is_none(),"取消后路径不能重新出现");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_navigation_brakes_before_tight_arcs_and_keeps_driving() {
+        for radius in [0.2,0.5] {
+            let mut poses:Vec<_>=(0..=30).map(|i|
+                body_pose([1.05+i as f64*0.05,0.55,0.4],Quaternion::IDENTITY,0)).collect();
+            for i in 1..=32 {
+                let angle=std::f64::consts::FRAC_PI_2*i as f64/32.0;
+                poses.push(body_pose([2.55+radius*angle.sin(),0.55+radius*(1.0-angle.cos()),0.4],Quaternion::from_yaw(angle),0));
+            }
+            for i in 1..=20 {
+                poses.push(body_pose([2.55+radius,0.55+radius+i as f64*0.05,0.4],Quaternion::from_yaw(std::f64::consts::FRAC_PI_2),0));
+            }
+            let goal=poses.last().unwrap().clone();let mut pose=poses[0].clone();
+            let (mut follower,map)=omni_route_follower(poses,true);
+            let mut applied=Twist2::ZERO;let mut reached=false;let mut completed=false;
+            let mut entry_speed=None;let mut peak_before=0.0_f64;let mut stopped_in_arc=false;
+            for tick in 0..500 {
+                pose.stamp.nanos=1_000_000_000+tick*50_000_000;follower.update_odometry(pose.clone());
+                let command=if reached {Twist2::ZERO} else {
+                    match follower.step(0.3) {
+                        PlannerStep::Command(command)=>command,
+                        PlannerStep::Succeeded=>{reached=true;Twist2::ZERO},
+                        other=>panic!("合法前向小圆弧不能中断：半径{radius}，拍{tick}，位置{:?}，朝向{}，目标{:?}，{other:?}",xyz(pose.pose.position),pose.pose.orientation.yaw(),follower.control_target),
+                    }
+                };
+                apply_forward_feedback(&map,&mut pose,&mut applied,command);follower.observe_applied_command(applied);
+                if pose.pose.position.x<2.55 {peak_before=peak_before.max(applied.linear.x);}
+                else if entry_speed.is_none() {entry_speed=Some(applied.linear.x);}
+                let angle=(pose.pose.position.x-2.55).atan2(0.55+radius-pose.pose.position.y);
+                if angle>0.1 && angle<std::f64::consts::FRAC_PI_2-0.1 && applied.linear.x<1e-8 {stopped_in_arc=true;}
+                if reached && applied.linear.x<1e-12 && applied.angular_z.abs()<1e-12 {
+                    completed=true;
+                    eprintln!("小圆弧半径{radius}：{}秒，直段峰速{peak_before:.3}，入弯速度{:.3}，原角速对应上限{:.3}",(tick+1)as f64*0.05,entry_speed.unwrap_or(0.0),radius*0.8);
+                    break;
+                }
+            }
+            assert!(completed && pose.pose.position.distance(goal.pose.position)<0.12);
+            assert!(peak_before>0.8,"必须先真实巡航再验证提前减速，不能统一低速完成");
+            assert!(entry_speed.unwrap()<=radius*0.8+1e-6,"入弯前应按路径曲率与原角速能力减速");
+            assert!(!stopped_in_arc,"可执行相切小圆弧不能退化为中途停车转向");
+        }
+    }
 
     #[test]
     fn moving_current_body_view_does_not_accumulate_old_footprint_clearing() {
@@ -863,6 +1209,177 @@ mod tests {
         follower.update_odometry(goal);
         assert!(matches!(follower.step(0.3),PlannerStep::Succeeded),
             "到达只交给调度器发起停车，物理终态由运动守卫确认");
+    }
+
+    #[test]
+    fn path_admission_uses_fine_body_support_across_a_coarse_step() {
+        use nuwax_nav_mls_planner::{SurfaceBodyEnvelope, SurfaceObservation, SurfaceObservations};
+        let mut points: Vec<_> = (-30..30).flat_map(|x| (-20..20).map(move |y|
+            ((x as f32+0.5)*0.05, (y as f32+0.5)*0.05, -0.025))).collect();
+        for z in [0.025, 0.075, 0.125] { points.push((0.075, 0.025, z)); }
+        let mut cfg = test_snapshot(0.0, false).config().clone();
+        cfg.wall_clearance_m=0.0; cfg.robot_height=0.25; cfg.step_threshold_m=0.21;
+        cfg.min_step_tread_depth_m=0.2; cfg.max_slope_deg=25.0;
+        let mut blocks=std::collections::BTreeMap::<[i32;3], std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for &(x,y,z) in &points {
+            let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
+            blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,
+                SurfaceObservation { observed_ns:0, hits:0 });
+        }
+        let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+        for (key,values) in blocks { observations.replace_block(key,values).unwrap(); }
+        let map=Arc::new(SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap()
+            .with_body_envelope(SurfaceBodyEnvelope {
+                footprint_xy_m:vec![[-0.55,-0.14],[0.55,-0.14],[0.55,0.14],[-0.55,0.14]],
+                z_bounds_m:[-0.1,0.25],body_to_support_z_m:0.4,max_step_up_m:0.2,
+                max_step_down_m:0.1,max_cross_slope_deg:10.0,support_uncertainty_m:0.0,
+            }).unwrap().with_observations(Some(Arc::new(observations))));
+        let current=body_pose([0.025,-0.0001,0.4],Quaternion::IDENTITY,1);
+        let first=body_pose([0.025,0.0001,0.4],Quaternion::IDENTITY,1);
+        let from=(xyz(current.pose.position),[0.0,0.0,0.0,1.0]);
+        let to=(xyz(first.pose.position),from.1);
+        let a=map.locate_support_from_body(from.0,from.1,0.4).unwrap();
+        let b=map.locate_support_from_body(to.0,to.1,0.4).unwrap();
+        assert!(map.validate_segment(a.support_xyz,b.support_xyz).is_err(),
+            "粗格中心的台阶来自另一精细半列，不能否决实际经过的低平地面");
+        map.validate_body_motion(from,to,&[]).unwrap();
+        let mut follower=SurfaceFollower::new(SurfaceFollowerConfig::new(0.4)).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+        follower.update_odometry(current);
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+            poses:vec![first.clone()],
+        }),None,first).expect("路径从实际机体沿精细连续支撑接入");
+    }
+
+    #[test]
+    fn short_velocity_prediction_does_not_lift_body_over_flat_ground_obstacle() {
+        use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
+        let mut geometry=test_snapshot(0.0,false).config().clone();
+        geometry.wall_clearance_m=0.0;geometry.robot_height=0.1;
+        let mut points:Vec<_>=(0..40).flat_map(|x|(0..20).flat_map(move |y|
+            [0.025,0.075,0.125].into_iter().map(move |z|((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,z)))).collect();
+        points.push((1.65,0.55,0.45));
+        let map=Arc::new(SurfaceSnapshot::from_points(&points,geometry,0.05).unwrap().with_body_envelope(SurfaceBodyEnvelope {
+            footprint_xy_m:vec![[-0.3,-0.12],[0.3,-0.12],[0.3,0.12],[-0.3,0.12]],
+            z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,
+            max_step_up_m:0.2,max_step_down_m:0.2,max_cross_slope_deg:15.0,support_uncertainty_m:0.0,
+        }).unwrap());
+        let start=body_pose([1.29,0.55,0.46],Quaternion::IDENTITY,1);
+        let next=([1.415,0.55,0.46],[0.0,0.0,0.0,1.0]);
+        map.validate_body_pose(xyz(start.pose.position),next.1).unwrap();
+        assert!(map.validate_body_motion((xyz(start.pose.position),next.1),next,&[]).is_err(),
+            "实际恒高轨迹确实会碰到低障碍");
+        let support=map.locate_support_from_body(xyz(start.pose.position),next.1,0.4).unwrap();
+        let raised=map.body_pose_on_surface([next.0[0],next.0[1]],0.0,support.support_xyz).unwrap();
+        assert!(raised.0[2]>next.0[2]+0.05,"旧格顶投影会擅自抬高当前机体");
+        let old_waypoint=body_pose([1.31,0.55,raised.0[2]],Quaternion::IDENTITY,1);
+        assert!(map.validate_body_motion((xyz(start.pose.position),next.1),
+            (xyz(old_waypoint.pose.position),next.1),&[]).is_ok(),
+            "旧路径的抬高站姿可在几何上越过低障碍，必须独立验证实际地形接续");
+        assert!(!body_control::translation_connects(&map,(xyz(start.pose.position),next.1),&old_waypoint),
+            "局部不能提前消费逃逸点，再借旧路径末姿态抬高实际机体");
+        let mut follower=SurfaceFollower::new(SurfaceFollowerConfig::new(0.4)).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();follower.update_odometry(start);
+        follower.refresh_current_body_view();
+        assert!(!follower.motion_is_traversable(Twist2{linear:Point2::new(0.5,0.0),angular_z:0.0}),
+            "基础短时预测不能凭空抬高机体获得通过");
+    }
+
+    #[test]
+    fn calibrated_rotation_changes_direction_without_discarding_the_route() {
+        use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
+        use nuwax_nav_types_messages::{MotionLimits,MotionModel,GoalOptions};
+        let map=Arc::new(test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope {
+            footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+            z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.3,
+            max_step_up_m:0.0,max_step_down_m:0.0,max_cross_slope_deg:10.0,support_uncertainty_m:0.0,
+        }).unwrap());
+        let mut config=SurfaceFollowerConfig::new(0.3);
+        config.controller.control_frequency=20.0;
+        config.motion_limits=Some(MotionLimits {
+            model:MotionModel::Differential,max_forward_mps:0.5,max_reverse_mps:0.3,
+            max_lateral_mps:0.0,max_angular_rps:0.7,linear_acceleration_mps2:1.0,
+            guaranteed_braking_mps2:1.0,angular_acceleration_rps2:2.0,
+            guaranteed_angular_braking_rps2:2.0,reaction_time_sec:0.1,
+            minimum_turning_radius_m:0.0,can_rotate_in_place:true,
+        });
+        let mut follower=SurfaceFollower::new(config).unwrap();
+        let start=body_pose([1.0,0.55,0.4],Quaternion::IDENTITY,1);
+        let goal=body_pose([1.0,0.55,0.4],Quaternion::from_yaw(0.8),1);
+        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+        follower.update_odometry(start.clone());
+        follower.configure_goal(&goal,GoalOptions::default()).unwrap();
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:vec![start,goal.clone()]}),None,goal).unwrap();
+        follower.observe_applied_command(Twist2 {linear:Point2::new(0.0,0.0),angular_z:-0.05});
+        assert_eq!(follower.step(0.3),PlannerStep::Command(Twist2::ZERO),
+            "换向时已验证的过零不能触发完整重规划");
+        assert!(follower.path.is_some());
+        assert!(follower.braking_deadline.is_some());
+        follower.observe_applied_command(Twist2::ZERO);
+        follower.braking_deadline=Some(std::time::Instant::now()-std::time::Duration::from_millis(1));
+        assert!(matches!(follower.step(0.3),PlannerStep::Command(v) if v.angular_z>0.0),
+            "制动结束应沿原路线开始反向转动");
+    }
+
+    #[test]
+    fn simulation_braking_uses_input_time_and_current_confirmed_speed() {
+        use nuwax_nav_types_messages::{MotionLimits,MotionModel};
+        let mut config=SurfaceFollowerConfig::new(0.4);config.controller.control_frequency=20.0;
+        config.motion_limits=Some(MotionLimits {
+            model:MotionModel::Omnidirectional,max_forward_mps:1.0,max_reverse_mps:1.0,max_lateral_mps:1.0,
+            max_angular_rps:0.8,linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,
+            angular_acceleration_rps2:2.0,guaranteed_angular_braking_rps2:2.0,reaction_time_sec:0.05,
+            minimum_turning_radius_m:0.0,can_rotate_in_place:true,
+        });
+        for simulation in [false,true] {
+            config.controller.simulation=simulation;
+            let mut follower=SurfaceFollower::new(config.clone()).unwrap();
+            follower.update_odometry(body_pose([0.0,0.0,0.5],Quaternion::IDENTITY,0));
+            follower.observe_applied_command(Twist2{linear:Point2::new(0.1,0.0),angular_z:0.0});
+            follower.begin_braking();
+            if simulation {
+                assert_eq!(follower.simulation_braking_deadline_ns,Some(1_150_000_000),
+                    "0.1米/秒只按自身150毫秒停止时间等待，不能按最高速度等一秒");
+                assert!(follower.braking_deadline.is_none());
+                follower.stop();
+                assert_eq!(follower.simulation_braking_deadline_ns,Some(1_150_000_000));
+                follower.update_odometry(body_pose([0.0,0.0,0.5],Quaternion::IDENTITY,2));
+                assert_eq!(follower.follow_body_step(0.3),PlannerStep::Command(Twist2::ZERO));
+                follower.update_odometry(body_pose([0.0,0.0,0.5],Quaternion::IDENTITY,4));
+                assert!(!matches!(follower.follow_body_step(0.3),PlannerStep::Command(_)),
+                    "模拟时间到期应回到正常输入检查，不依赖墙钟等待");
+            } else {
+                assert!(follower.simulation_braking_deadline_ns.is_none());
+                follower.update_odometry(body_pose([0.0,0.0,0.5],Quaternion::IDENTITY,400));
+                assert_eq!(follower.follow_body_step(0.3),PlannerStep::Command(Twist2::ZERO),
+                    "生产制动等待不能被输入时间跳变提前结束");
+            }
+        }
+    }
+
+    #[test]
+    fn simulation_flag_does_not_boost_complete_body_rotation_commands() {
+        use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
+        use nuwax_nav_types_messages::GoalOptions;
+        let map=Arc::new(test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope {
+            footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+            z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.3,
+            max_step_up_m:0.0,max_step_down_m:0.0,max_cross_slope_deg:10.0,support_uncertainty_m:0.0,
+        }).unwrap());
+        let mut results=Vec::new();
+        for simulation in [false,true] {
+            let mut config=SurfaceFollowerConfig::new(0.3);config.controller.simulation=simulation;
+            let mut follower=SurfaceFollower::new(config).unwrap();
+            let start=body_pose([1.0,0.55,0.4],Quaternion::IDENTITY,1);
+            let goal=body_pose([1.0,0.55,0.4],Quaternion::from_yaw(0.1),1);
+            follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+            follower.update_odometry(start.clone());
+            follower.configure_goal(&goal,GoalOptions{yaw_tolerance_rad:0.01,..Default::default()}).unwrap();
+            follower.replace_execution_path(ExecutionPath::Surface(Path3D{poses:vec![start,goal.clone()]}),None,goal).unwrap();
+            results.push(follower.step(0.3));
+        }
+        assert_eq!(results[0],results[1],"完整机体模拟只换时钟，不采用旧PController的0.8弧度/秒补偿");
+        assert!(matches!(results[0],PlannerStep::Command(v)if v.angular_z.abs()<0.2));
     }
 
     #[test]

@@ -56,7 +56,9 @@ impl SurfaceNavigationConfig {
             if !value.trim().is_empty() {
                 let limit = parse_number("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS", &value)?;
                 if limit <= 0.0 {return Err(NavStackError::InvalidConfig("执行器线速度上限必须为正".into()));}
-                config.follower.controller.speed = config.follower.controller.speed.min(limit);
+                // 设备声明给出巡航上限；旧控制器默认速度不能再次隐式截断。
+                config.follower.controller.speed = config.follower.motion_limits.as_ref()
+                    .map_or(limit,|motion|limit.min(motion.max_forward_mps));
             }
         }
         if let Ok(value) = std::env::var("_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS") {
@@ -154,10 +156,13 @@ impl SurfaceNavigationConfig {
                 "surface geometry exceeds float32 domain or tread is below two voxels".into(),
             ));
         }
+        let mut follower=SurfaceFollowerConfig::new(body_to_support_z_m);
+        // 三维生产调度为20赫兹，速度窗口的加减速时间必须采用同一控制周期。
+        follower.controller.control_frequency=1.0/nuwax_nav_runtime::DEFAULT_TICK_INTERVAL.as_secs_f64();
         Ok(Self {
             geometry,
             body_envelope: None,
-            follower: SurfaceFollowerConfig::new(body_to_support_z_m),
+            follower,
             robot_width_m,
             planning_cancelled: None,
         })
@@ -172,11 +177,7 @@ impl SurfaceNavigationConfig {
         if let Some(caps) = &capabilities {
             caps.validate().map_err(NavStackError::InvalidConfig)?;
             self.follower.motion_limits = Some(caps.motion.clone());
-            self.follower.controller.speed = self
-                .follower
-                .controller
-                .speed
-                .min(caps.motion.max_forward_mps);
+            self.follower.controller.speed = caps.motion.max_forward_mps;
             if let Some(terrain) = &caps.terrain {
                 self.geometry.step_threshold_m = if terrain.stairs_supported {
                     terrain.max_step_up_m.max(terrain.max_step_down_m) as f32
@@ -226,6 +227,12 @@ impl SurfaceNavigationConfig {
             // 支撑图提取独立地面层，只要求一个体素的空隙。完整宽高由
             // 每个位姿和扫掠的机体检查承担，避免侧面/高处回波抹掉整列地面。
             self.geometry.wall_clearance_m = 0.0;
+            // 软余量从机体最远水平轮廓外开始生效；重复装配先取回原余量，避免逐次累加。
+            if self.geometry.wall_buffer_m>0.0 && self.geometry.wall_buffer_weight>0.0 {
+                let previous_radius=self.body_envelope.as_ref().map_or(0.0,SurfaceBodyEnvelope::radius);
+                let padding=(f64::from(self.geometry.wall_buffer_m)-previous_radius).max(0.0);
+                self.geometry.wall_buffer_m=(envelope.radius()+padding) as f32;
+            }
             self.geometry.robot_height = self.geometry.voxel_size;
             self.body_envelope = Some(envelope);
         }
@@ -252,6 +259,23 @@ fn parse_number(key: &str, value: &str) -> NavStackResult<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actuator_speed_is_not_capped_by_the_legacy_controller_default() {
+        const CHILD: &str = "NUWAX_TEST_SURFACE_SPEED_CHILD";
+        if let Ok(expected)=std::env::var(CHILD) {
+            let config=SurfaceNavigationConfig::from_env().unwrap();
+            assert_eq!(config.follower.controller.speed,expected.parse::<f64>().unwrap());
+            return;
+        }
+        for speed in ["1.0","0.35"] {
+            let result=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","surface_config::tests::actuator_speed_is_not_capped_by_the_legacy_controller_default","--nocapture"])
+                .env_clear().env(CHILD,speed).env("NUWAX_NAV_BODY_TO_SUPPORT_Z_M","0.4")
+                .env("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS",speed).output().unwrap();
+            assert!(result.status.success(),"生产环境解析未消费设备速度：{}",String::from_utf8_lossy(&result.stderr));
+        }
+    }
 
     #[test]
     fn geometry_and_calibration_are_validated_before_starting_either_owner() {

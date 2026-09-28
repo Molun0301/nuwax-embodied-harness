@@ -267,6 +267,17 @@ pub(super) fn sparse_path(
     size: f32,
     permits: impl Fn(CellId) -> bool,
 ) -> Result<(Vec<CellId>, usize), SurfaceError> {
+    sparse_path_edges(cells, start, goal, size, |_, to| permits(to))
+}
+
+/// 边界按实际展开的边检查，查询不复制或改写不可变地图的全图邻接。
+pub(super) fn sparse_path_edges(
+    cells: &SurfaceCells,
+    start: CellId,
+    goal: CellId,
+    size: f32,
+    permits: impl Fn(CellId, CellId) -> bool,
+) -> Result<(Vec<CellId>, usize), SurfaceError> {
     let heuristic = |id| horizontal_distance(cells.coord(id), cells.coord(goal), size);
     let mut heap = BinaryHeap::from([Queue(heuristic(start), start)]);
     let mut distance = AHashMap::from_iter([(start, 0.0)]);
@@ -289,7 +300,7 @@ pub(super) fn sparse_path(
             return Ok((result, visited));
         }
         for edge in cells.neighbors(id) {
-            if !edge.cost.is_finite() || !permits(edge.dest) {
+            if !edge.cost.is_finite() || !permits(id, edge.dest) {
                 continue;
             }
             let next = cost + edge.cost;
@@ -302,6 +313,40 @@ pub(super) fn sparse_path(
     }
     Err(SurfaceError::NoPath)
 }
+
+/// 仅覆盖排序成本；原边的硬可行性、方向性和边界仍分别检查，不改写共享图。
+pub(super) fn weighted_path_edges(
+    cells:&SurfaceCells,start:CellId,goal:CellId,size:f32,permits:impl Fn(CellId,CellId)->bool,
+    edge_cost:impl Fn(CellId,&crate::adjacency::Edge)->f64,
+)->Result<(Vec<CellId>,usize),SurfaceError> {
+    let heuristic=|id|f64::from(horizontal_distance(cells.coord(id),cells.coord(goal),size));
+    let mut heap=BinaryHeap::from([WeightedQueue(heuristic(start),start)]);
+    let mut distance=AHashMap::from_iter([(start,0.0)]);let mut pred=AHashMap::new();let mut visited=0;
+    while let Some(WeightedQueue(score,id))=heap.pop() {
+        let cost=distance[&id];if score>cost+heuristic(id) {continue;}
+        visited+=1;
+        if id==goal {
+            let mut result=vec![goal];let mut cursor=goal;
+            while cursor!=start {cursor=*pred.get(&cursor).ok_or(SurfaceError::NoPath)?;result.push(cursor);}
+            result.reverse();return Ok((result,visited));
+        }
+        for edge in cells.neighbors(id) {
+            if !edge.cost.is_finite() || !permits(id,edge.dest) {continue;}
+            let weight=edge_cost(id,edge);if !weight.is_finite() || weight<0.0 {continue;}
+            let next=cost+weight;
+            if next<*distance.get(&edge.dest).unwrap_or(&f64::INFINITY) {
+                distance.insert(edge.dest,next);pred.insert(edge.dest,id);
+                heap.push(WeightedQueue(next+heuristic(edge.dest),edge.dest));
+            }
+        }
+    }
+    Err(SurfaceError::NoPath)
+}
+struct WeightedQueue(f64,CellId);
+impl PartialEq for WeightedQueue {fn eq(&self,other:&Self)->bool {self.0.total_cmp(&other.0).is_eq() && self.1==other.1}}
+impl Eq for WeightedQueue {}
+impl PartialOrd for WeightedQueue {fn partial_cmp(&self,other:&Self)->Option<Ordering> {Some(self.cmp(other))}}
+impl Ord for WeightedQueue {fn cmp(&self,other:&Self)->Ordering {other.0.total_cmp(&self.0).then_with(||other.1.cmp(&self.1))}}
 
 fn build_tile(cells: &SurfaceCells, ids: &[CellId]) -> Tile {
     // 两次迭代遍历求强连通分量；保留单向坡阶，避免无向洪泛伪造返程。

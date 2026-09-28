@@ -23,9 +23,14 @@ mod observations;
 pub use observations::{SurfaceObservation, SurfaceObservations};
 mod body;
 pub use body::SurfaceBodyEnvelope;
+mod passage;
+pub use passage::SurfaceBodyPassageCandidate;
+mod body_query;
+pub use body_query::SurfaceBodyQueryView;
 mod frontiers;
 pub use frontiers::SurfaceFrontierCacheStats;
 mod routing;
+mod centering;
 mod regions;
 mod wall;
 use routing::frontier_point_distance;
@@ -133,10 +138,13 @@ pub struct SurfaceFrontier {
 type HeightBounds = im::HashMap<VoxelKey, [f32;2], ahash::RandomState>;
 
 struct SurfaceData {
+    // 仅由受限机体查询视图持有；邻接按请求核验，不向路由消费者公开。
+    body_query_only: bool,
     body_envelope: Option<Arc<SurfaceBodyEnvelope>>,
     height_bounds: Arc<HeightBounds>,
     frontier_cache: frontiers::CacheSlot,
     body_cache: body::CacheSlot,
+    routing_cache: std::sync::Mutex<routing::RoutingCache>,
     graph: Arc<PlannerGraph>,
     regions: Arc<regions::RegionGraph>,
     physical_graph: Arc<PlannerGraph>,
@@ -310,8 +318,10 @@ impl SurfaceSnapshot {
             current_body_support: None,
             body_query_cache: Default::default(),
             data: Arc::new(SurfaceData {
+                body_query_only: false,
                 frontier_cache: Default::default(),
                 body_cache: Default::default(),
+                routing_cache: Default::default(),
                 body_envelope: self.data.body_envelope.clone(),
                 height_bounds: Arc::clone(&self.data.height_bounds),
                 graph: Arc::new(graph),
@@ -352,12 +362,23 @@ impl SurfaceSnapshot {
         body_xyzw: [f64; 4],
         body_to_support_z_m: f64,
     ) -> Result<SurfaceLocation, SurfaceError> {
-        let support = self.support_position_from_body(body_xyz, body_xyzw, body_to_support_z_m)?;
-        match self.locate_support(support) {
-            Ok(location)=>Ok(location),
-            Err(SurfaceError::MissingSupport)=>self.locate_step_contact(body_xyz,body_xyzw,support,body_to_support_z_m),
-            Err(error)=>Err(error),
+        let key=[body_xyz[0],body_xyz[1],body_xyz[2],body_xyzw[0],body_xyzw[1],body_xyzw[2],body_xyzw[3],body_to_support_z_m]
+            .map(f64::to_bits);
+        if let Some(result)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).supports.get(&key).cloned() {
+            return result;
         }
+        let result=(|| {
+            let support = self.support_position_from_body(body_xyz, body_xyzw, body_to_support_z_m)?;
+            match self.locate_support(support) {
+                Ok(location)=>Ok(location),
+                Err(SurfaceError::MissingSupport)=>self.locate_step_contact(body_xyz,body_xyzw,support,body_to_support_z_m),
+                Err(error)=>Err(error),
+            }
+        })();
+        let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+        if cache.supports.len()>=8192 {cache.supports.clear();}
+        cache.supports.insert(key,result.clone());
+        result
     }
 
     /// 导航目标高度用于选择支撑层，不作为平面底盘的可控自由度。
@@ -465,12 +486,16 @@ impl SurfaceSnapshot {
         for sample in 1..=steps * 2 {
             let ratio = sample as f64 / (steps * 2) as f64;
             // 使用真实端点连线穿过的列，而非把两端换成中心后另画一条线。
-            let ix = ((from[0] + ratio * (to[0] - from[0])) / size).floor() as i32;
-            let iy = ((from[1] + ratio * (to[1] - from[1])) / size).floor() as i32;
+            // 最后一次直接使用真实末点，避免大数相减把靠近零线的小坐标消成零。
+            let point = if sample == steps * 2 { to } else {
+                std::array::from_fn(|i| from[i] * (1.0 - ratio) + to[i] * ratio)
+            };
+            let ix = (point[0] / size).floor() as i32;
+            let iy = (point[1] / size).floor() as i32;
             if (ix, iy) == (previous.0, previous.1) {
                 continue;
             }
-            let height = start.surface_xyz[2] + ratio * (end.surface_xyz[2] - start.surface_xyz[2]);
+            let height = start.surface_xyz[2] * (1.0 - ratio) + end.surface_xyz[2] * ratio;
             let current = self
                 .nearest_column_cell(
                     ix,
@@ -505,7 +530,9 @@ impl SurfaceSnapshot {
         {
             return Err(SurfaceError::InvalidPose);
         }
-        let desired = std::array::from_fn(|index| from[index] + ratio * (to[index] - from[index]));
+        let desired = if ratio == 0.0 { from } else if ratio == 1.0 { to } else {
+            std::array::from_fn(|index| from[index] * (1.0 - ratio) + to[index] * ratio)
+        };
         let nearest = self.locate_near_support(
             desired,
             f64::from(self.config().step_threshold_m + self.config().voxel_size),
@@ -588,10 +615,14 @@ impl SurfaceSnapshot {
         Ok(())
     }
 
-    /// 按有向区域连接选择路线，再展开沿途细图并执行原共享段校验。
+    /// 在原有向支撑图上选路；软偏好启用时按公开乘子的累计代价比较，仍执行原共享段校验。
     pub fn plan(&self, start: [f64; 3], goal: [f64; 3]) -> Result<Vec<[f64; 3]>, SurfaceError> {
         let start_location = self.locate_support(start)?;
         let goal_location = self.locate_support(goal)?;
+        if self.config().wall_buffer_m>0.0 && self.config().wall_buffer_weight>0.0 {
+            let path=self.plan_on_cells(start_location,goal_location,&[])?;
+            return self.simplify_flat_path(path,&[]);
+        }
         let cells=&self.data.graph.cells;
         let start_id=cells.id(start_location.cell).ok_or(SurfaceError::NoPath)?;
         let goal_id=cells.id(goal_location.cell).ok_or(SurfaceError::NoPath)?;
@@ -619,18 +650,7 @@ impl SurfaceSnapshot {
         }
         let start_location = self.locate_support(start)?;
         let goal_location = self.locate_support(goal)?;
-        let mut cells = self.data.graph.cells.clone();
-        let positions: Vec<_> = (0..cells.slot_capacity())
-            .map(|id| self.cell_position(cells.coord(id as CellId)))
-            .collect();
-        for (id, edges) in cells.iter_edges_mut() {
-            let from = positions[id as usize];
-            edges.retain(|edge| {
-                let to = positions[edge.dest as usize];
-                segment_inside_boundary([from[0], from[1]], [to[0], to[1]], boundary)
-            });
-        }
-        let path = self.plan_on_cells(&cells, start_location, goal_location)?;
+        let path = self.plan_on_cells(start_location, goal_location, boundary)?;
         if path.windows(2).all(|pair| {
             segment_inside_boundary([pair[0][0], pair[0][1]], [pair[1][0], pair[1][1]], boundary)
         }) {
@@ -666,6 +686,10 @@ impl SurfaceSnapshot {
                 // 无法取得原路线软代价时保留已验证路径，不放宽净空偏好。
                 return Ok(path);
             };
+        let Some(edge_costs)=path.windows(2).map(|pair|self.soft_segment_cost(pair[0],pair[1]))
+            .collect::<Option<Vec<_>>>() else {return Ok(path);};
+        let mut accumulated=Vec::with_capacity(path.len());accumulated.push(0.0);
+        for cost in edge_costs {accumulated.push(accumulated.last().copied().unwrap()+cost);}
         let permits = |from: usize, to: usize| {
             cells[from..=to].iter().all(|cell| cell.2 == cells[from].2)
                 && segment_inside_boundary(
@@ -674,7 +698,12 @@ impl SurfaceSnapshot {
                 && metrics(cells[from], cells[to]).is_some_and(|(penalty, rise)| {
                     rise <= 1e-6 && penalty <= penalties[from..to].iter().copied().fold(1.0_f32, f32::max) + 1e-3
                 })
-                // 代价采样以格中心为参考，真实端点连线还须通过原几何校验。
+                // 起终点贴墙时两条路线可以有相同峰值，但贴墙长直线的累计代价更高。
+                && self.soft_segment_cost(path[from],path[to]).is_some_and(|cost| {
+                    let original=accumulated[to]-accumulated[from];
+                    cost<=original+1e-9*original.max(1.0)
+                })
+                // 代价不授予许可，真实端点连线仍通过原完整支撑段核验。
                 && self.validate_segment(path[from], path[to]).is_ok()
         };
         if permits(0, path.len() - 1) {
@@ -693,20 +722,68 @@ impl SurfaceSnapshot {
         Ok(result)
     }
 
+    /// 按实际线段穿过各格的长度积累有限软代价，避免峰值或端点抽样抹掉居中收益。
+    fn soft_segment_cost(&self,from:[f64;3],to:[f64;3])->Option<f64> {
+        let delta: [f64;3]=std::array::from_fn(|i|to[i]-from[i]);
+        let length=delta[0].hypot(delta[1]).hypot(delta[2]);
+        if !length.is_finite() {return None;}
+        if length==0.0 || self.config().wall_buffer_m<=0.0 || self.config().wall_buffer_weight<=0.0 {
+            return Some(length);
+        }
+        let size=f64::from(self.config().voxel_size);let mut events=vec![0.0,1.0];
+        for axis in 0..2 {
+            if delta[axis]==0.0 {continue;}
+            let low=(from[axis].min(to[axis])/size).floor() as i64+1;
+            let high=(from[axis].max(to[axis])/size).floor() as i64;
+            if high-low>MAX_SEGMENT_CELLS {return None;}
+            for index in low..=high {
+                let t=(index as f64*size-from[axis])/delta[axis];
+                if t>0.0 && t<1.0 {events.push(t);}
+            }
+        }
+        events.sort_by(f64::total_cmp);events.dedup();
+        let mut cost=0.0;
+        for pair in events.windows(2) {
+            let t=(pair[0]+pair[1])*0.5;
+            let point=std::array::from_fn(|i|from[i]*(1.0-t)+to[i]*t);
+            let location=self.locate_near_support(point,
+                f64::from(self.config().step_threshold_m+self.config().voxel_size)).ok()?;
+            cost+=length*(pair[1]-pair[0])*self.soft_traversal_multiplier(location.cell);
+        }
+        cost.is_finite().then_some(cost)
+    }
+
     fn plan_on_cells(
         &self,
-        cells: &SurfaceCells,
         start_location: SurfaceLocation,
         goal_location: SurfaceLocation,
+        boundary: &[[f64; 2]],
     ) -> Result<Vec<[f64; 3]>, SurfaceError> {
         let start = start_location.support_xyz;
         let goal = goal_location.support_xyz;
         let graph = &self.data.graph;
+        let cells = &graph.cells;
         let start_id = cells.id(start_location.cell).ok_or(SurfaceError::NoPath)?;
         let goal_id = cells.id(goal_location.cell).ok_or(SurfaceError::NoPath)?;
-        let (cells,_) = regions::sparse_path(cells,start_id,goal_id,self.config().voxel_size,|_|true)?;
-        self.path_with_actual_endpoints(cells.into_iter().map(|cell|self.cell_position(graph.cells.coord(cell))).collect(),start,goal)
-
+        let permits=|from,to| {
+            let a=self.cell_position(cells.coord(from));let b=self.cell_position(cells.coord(to));
+            segment_inside_boundary([a[0],a[1]],[b[0],b[1]],boundary)
+        };
+        let (path,_)=if self.config().wall_buffer_m>0.0 && self.config().wall_buffer_weight>0.0 {
+            let weights=std::cell::RefCell::new(AHashMap::new());
+            let multiplier=|id| {
+                if let Some(value)=weights.borrow().get(&id).copied() {return value;}
+                let value=self.soft_traversal_multiplier(cells.coord(id));weights.borrow_mut().insert(id,value);value
+            };
+            regions::weighted_path_edges(cells,start_id,goal_id,self.config().voxel_size,permits,|id,edge| {
+                (f64::from(edge.base_cost)*(multiplier(id)+multiplier(edge.dest))*0.5
+                    +f64::from(self.config().step_penalty_weight)*f64::from(edge.rise)).max(f64::from(edge.cost))
+            })?
+        } else {regions::sparse_path_edges(cells,start_id,goal_id,self.config().voxel_size,permits)?};
+        self.path_with_actual_endpoints(
+            path.into_iter().map(|cell| self.cell_position(cells.coord(cell))).collect(),
+            start, goal,
+        )
     }
 
     fn path_with_actual_endpoints(&self, mut path:Vec<[f64;3]>,start:[f64;3],goal:[f64;3])->Result<Vec<[f64;3]>,SurfaceError> {
@@ -786,6 +863,8 @@ impl SurfaceSnapshot {
             .cells
             .id(cell)
             .is_some_and(|id| self.data.virtual_blocked_cells.contains(&id))
+            || (self.data.body_query_only && self.data.virtual_obstacles.as_ref().is_some_and(|mask|
+                !mask.permits_cell(cell,size,0.0)))
         {
             return Err(SurfaceError::VirtualObstacle);
         }
@@ -830,6 +909,7 @@ impl SurfaceSnapshot {
     }
 
     fn cell_is_clear(&self, cell: VoxelKey) -> bool {
+        if self.data.body_query_only {return self.body_query_cell_is_clear(cell);}
         self.data.graph.cells.id(cell).is_some_and(|id| {
             if self.data.virtual_blocked_cells.contains(&id) {
                 return false;
@@ -853,6 +933,7 @@ impl SurfaceSnapshot {
     }
 
     fn has_geometric_edge(&self, from: VoxelKey, to: VoxelKey) -> bool {
+        if self.data.body_query_only {return self.body_query_transition(from,to).is_some();}
         let (Some(from), Some(to)) = (self.data.graph.cells.id(from), self.data.graph.cells.id(to))
         else {
             return false;
@@ -866,6 +947,7 @@ impl SurfaceSnapshot {
     }
 
     fn has_edge(&self, from: VoxelKey, to: VoxelKey) -> bool {
+        if self.data.body_query_only {return self.body_query_edge_is_allowed(from,to);}
         let (Some(from), Some(to)) = (self.data.graph.cells.id(from), self.data.graph.cells.id(to))
         else {
             return false;
@@ -1247,6 +1329,28 @@ fn plane_from(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> Option<[f64; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flat_simplification_preserves_integrated_center_preference_between_wall_endpoints() {
+        let mut cfg=config();cfg.voxel_size=0.1;cfg.robot_height=0.35;cfg.wall_clearance_m=0.0;
+        cfg.wall_buffer_m=0.6;cfg.wall_buffer_weight=3.0;
+        let mut points=Vec::new();
+        for x in -22..23 {for y in -6..=5 {for z in if y==-6 || y==5 {0..10}else{0..1} {
+            points.push(((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,(z as f32+0.5)*0.1));
+        }}}
+        let map=SurfaceSnapshot::from_points(&points,cfg,0.1).unwrap();
+        let start=[-1.5,-0.3,0.1];let goal=[1.5,-0.3,0.1];
+        map.validate_segment(start,goal).unwrap();
+        let path=map.plan_in_boundary(start,goal,&[]).unwrap();
+        assert!(path.iter().any(|p|p[1].abs()<0.2),"原居中路线不能被同峰值贴墙直线覆盖: {path:?}");
+        let cost=path.windows(2).map(|p|map.soft_segment_cost(p[0],p[1]).unwrap()).sum::<f64>();
+        let direct=map.soft_segment_cost(start,goal).unwrap();
+        assert!(cost<direct,"完整软代价应保留居中收益: {cost} >= {direct}");
+        map.validate_path(&path).unwrap();
+        let boundary=[[-2.0,-0.48],[2.0,-0.48],[2.0,0.48],[-2.0,0.48]];
+        let bounded=map.plan_in_boundary(start,goal,&boundary).unwrap();
+        assert!(bounded.iter().any(|p|p[1].abs()<0.2));
+    }
 
     #[test]
     fn overlapping_ground_band_keeps_local_connection_without_bridging_a_separated_step() {

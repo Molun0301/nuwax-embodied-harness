@@ -9,10 +9,29 @@ const MIN_RANGE_M: f64 = 0.3;
 const MAX_RANGE_M: f64 = 30.0;
 const ANGULAR_BINS: usize = 1440;
 
-pub(super) fn contains_return(point: &Point3<f64>, origin: &Point3<f64>) -> bool {
-    point.coords.iter().all(|v| v.is_finite())
-        && (point.z - origin.z).abs() <= HALF_HEIGHT_M
-        && (MIN_RANGE_M..=MAX_RANGE_M).contains(&(point.x - origin.x).hypot(point.y - origin.y))
+/// 斜射线在高度带内的部分同样提供自由证据；裁剪位置不是障碍回波。
+pub(super) fn observed_ray_end(
+    point: &Point3<f64>,
+    origin: &Point3<f64>,
+) -> Option<(Point3<f64>, bool)> {
+    if !point.coords.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let dx = point.x - origin.x;
+    let dy = point.y - origin.y;
+    let range = dx.hypot(dy);
+    if !(MIN_RANGE_M..=MAX_RANGE_M).contains(&range) {
+        return None;
+    }
+    let height = (point.z - origin.z).abs();
+    if height <= HALF_HEIGHT_M {
+        return Some((*point, true));
+    }
+    let ratio = HALF_HEIGHT_M / height;
+    if range * ratio < MIN_RANGE_M {
+        return None;
+    }
+    Some((origin + (point - origin) * ratio, false))
 }
 
 #[cfg(test)]
@@ -105,6 +124,23 @@ mod tests {
     }
 
     #[test]
+    fn slanted_returns_clear_only_the_observed_height_band_and_keep_current_hits() {
+        let origin = point![0.025, 0.025, 0.0];
+        for z in [-0.2, 0.2] {
+            // 射线在两米处离开高度带，不能把四米处的地板或高处回波标为墙。
+            let grid = build(vec![point![4.025, 0.025, z]], origin);
+            assert_eq!(at(&grid, 1.025, 0.025), 0);
+            assert_eq!(at(&grid, 2.075, 0.025), -1);
+            assert!(!grid.data.contains(&100));
+            let blocked = build(
+                vec![point![4.025, 0.025, z], point![1.025, 0.025, 0.0]], origin,
+            );
+            assert_eq!(at(&blocked, 1.025, 0.025), 100);
+            assert_eq!(at(&blocked, 1.525, 0.025), -1);
+        }
+    }
+
+    #[test]
     fn planar_scan_bounds_ignore_rejected_points_and_include_sensor() {
         let grid = build(
             vec![
@@ -145,20 +181,27 @@ impl PointCloudOccupancyBuilder {
         };
         let mut nearest = [f64::INFINITY; ANGULAR_BINS];
         let mut endpoints = [None; ANGULAR_BINS];
+        let mut free_ranges = [0.0; ANGULAR_BINS];
+        let mut free_endpoints = [None; ANGULAR_BINS];
         for point in points {
-            if !contains_return(point, &self.sensor_origin) {
+            let Some((observed_end, occupied)) = observed_ray_end(point, &self.sensor_origin) else {
                 continue;
-            }
-            let dx = point.x - self.sensor_origin.x;
-            let dy = point.y - self.sensor_origin.y;
+            };
+            let dx = observed_end.x - self.sensor_origin.x;
+            let dy = observed_end.y - self.sensor_origin.y;
             let range = dx.hypot(dy);
             let angle = dy.atan2(dx).rem_euclid(std::f64::consts::TAU);
             let bin = ((angle / std::f64::consts::TAU * ANGULAR_BINS as f64) as usize)
                 .min(ANGULAR_BINS - 1);
-            if range < nearest[bin] {
-                if let Some(endpoint) = cell(point) {
+            if occupied && range < nearest[bin] {
+                if let Some(endpoint) = cell(&observed_end) {
                     nearest[bin] = range;
                     endpoints[bin] = Some(endpoint);
+                }
+            } else if !occupied && range > free_ranges[bin] {
+                if let Some(endpoint) = cell(&observed_end) {
+                    free_ranges[bin] = range;
+                    free_endpoints[bin] = Some(endpoint);
                 }
             }
         }
@@ -166,7 +209,7 @@ impl PointCloudOccupancyBuilder {
         for &(x, y) in endpoints.iter().flatten() {
             grid.data[y as usize * self.width as usize + x as usize] = 100;
         }
-        for &(end_x, end_y) in endpoints.iter().flatten() {
+        for &(end_x, end_y) in endpoints.iter().chain(free_endpoints.iter()).flatten() {
             let (mut x, mut y) = (start_x, start_y);
             let dx = (end_x - x).abs();
             let dy = -(end_y - y).abs();

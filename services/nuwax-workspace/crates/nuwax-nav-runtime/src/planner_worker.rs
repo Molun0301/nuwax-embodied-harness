@@ -5,8 +5,10 @@ use std::sync::{Condvar, Mutex};
 type Route = (ExecutionPath, Option<Vec<f64>>, PoseStamped);
 #[derive(Default)]
 struct Inputs {
+    goal_id:String,
     epoch: u64,
     goal_version: u64,
+    boundary: Vec<[f64;2]>,
     path_version: u64,
     goal: Option<(PoseStamped, nuwax_nav_types_messages::GoalOptions)>,
     path: Option<Arc<Route>>,
@@ -40,9 +42,11 @@ impl PlannerWorker {
                 loop {
                     let (
                         version,
+                        goal_id,
                         goal_seq,
                         path_seq,
                         goal,
+                        boundary,
                         path,
                         map,
                         map_seq,
@@ -60,9 +64,11 @@ impl PlannerWorker {
                         }
                         (
                             input.epoch,
+                            input.goal_id.clone(),
                             input.goal_version,
                             input.path_version,
                             input.goal.clone(),
+                            input.boundary.clone(),
                             input.path.clone(),
                             input.map.clone(),
                             input.map_version,
@@ -73,11 +79,14 @@ impl PlannerWorker {
                         )
                     };
                     let started = std::time::Instant::now();
+                    let span=tracing::info_span!("navigation.local",goal_id=%goal_id);
+                    let _entered=span.enter();
                     let computed = (|| -> Result<PlannerStep, RuntimeError> {
                         if goal_seq != goal_version {
                             planner.stop();
                             if let Some((goal, options)) = &goal {
                                 planner.configure_goal(goal, *options)?;
+                                planner.configure_boundary(&boundary);
                             }
                             goal_version = goal_seq;
                             path_version = u64::MAX;
@@ -127,6 +136,13 @@ impl PlannerWorker {
     }
 }
 impl NavPlanner for PlannerWorker {
+    fn set_goal_log_context(&mut self,goal_id:&str) {
+        self.shared.0.lock().unwrap().goal_id=goal_id.to_owned();
+    }
+    fn configure_boundary(&mut self, boundary: &[[f64;2]]) {
+        let mut input=self.shared.0.lock().unwrap();
+        input.boundary=boundary.to_vec();
+    }
     fn configure_goal(
         &mut self,
         goal: &PoseStamped,

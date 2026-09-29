@@ -111,6 +111,27 @@ pub(super) fn connection_endpoint(map: &SurfaceSnapshot, from: ([f64; 3], [f64; 
     Some(previous)
 }
 
+/// 以控制器实际前进圆弧核对接续；直弦不可行不能否定绕过墙角的曲线。
+fn forward_arc_connects(map:&SurfaceSnapshot,from:BodyPose,next:&PoseStamped)->bool {
+    let Some(model)=map.body_envelope()else{return false;};
+    let q=from.1;let yaw=Quaternion{x:q[0],y:q[1],z:q[2],w:q[3]}.yaw();
+    let dx=next.pose.position.x-from.0[0];let dy=next.pose.position.y-from.0[1];let distance=dx.hypot(dy);
+    let error=angle_diff(dy.atan2(dx),yaw);
+    if error.abs()>=std::f64::consts::FRAC_PI_2{return false;}
+    let angle=2.0*error;let length=if error.abs()<1e-9{distance}else{distance*error/error.sin()};
+    let count=((length+model.radius()*angle.abs())/(f64::from(map.source_voxel_size_m())*0.5)).max(angle.abs()/0.05).ceil().max(1.0)as usize;
+    if count>4096{return false;}
+    let start=PlanarPose{x:from.0[0],y:from.0[1],yaw};let motion=Twist2{linear:Point2::new(length,0.0),angular_z:angle};
+    let mut previous=from;
+    for index in 1..=count {
+        let planar=nuwax_nav_control::integrate(start,motion,index as f64/count as f64);
+        let Ok(projected)=map.body_pose_after_motion(previous,[planar.x,planar.y],planar.yaw)else{return false;};
+        if map.validate_body_motion(previous,projected,&[]).is_err(){return false;}
+        previous=projected;
+    }
+    true
+}
+
 pub(super) fn translation_connects(map:&SurfaceSnapshot,from:([f64;3],[f64;4]),next:&PoseStamped)->bool {
     connection_endpoint(map,from,next).is_some() || {
         // 窄门前需要先对齐，直弦上同时平移和改朝向可能真实碰框。
@@ -214,11 +235,11 @@ impl SurfaceFollower {
             };
             let Some(next)=advance(previous,next) else {return false;};
             let Some(delayed)=advance(delayed_previous,delayed) else {return false;};
-            if map.validate_body_motion(previous, next, &[]).is_err()
+            if map.validate_body_motion(previous, next, &self.boundary).is_err()
                 || map
-                    .validate_body_motion(delayed_previous, delayed, &[])
+                    .validate_body_motion(delayed_previous, delayed, &self.boundary)
                     .is_err()
-                || map.validate_body_motion(next, delayed, &[]).is_err()
+                || map.validate_body_motion(next, delayed, &self.boundary).is_err()
             {
                 return false;
             }
@@ -327,7 +348,7 @@ impl SurfaceFollower {
                 let step = angle_diff(target.pose.orientation.yaw(), previous.pose.orientation.yaw());
                 let actual = angle_diff(yaw, previous.pose.orientation.yaw());
                 step * actual > 0.0 && actual.abs() >= step.abs()
-                    && actual.abs() < std::f64::consts::FRAC_PI_2 && distance < tolerance * 2.0
+                    && actual.abs() < std::f64::consts::FRAC_PI_2
             } else {
                 let a = previous.pose.position;
                 let b = target.pose.position;
@@ -337,6 +358,19 @@ impl SurfaceFollower {
                 // 位姿可低于控制频率到达；同层沿线越过多个采样点时按横向偏差消费，不能反向追旧点。
                 dot >= 0.0 && (distance < tolerance * 2.0 || same_support && lateral < tolerance * 2.0)
             };
+            // 换线时的实际制动位移可能越过新曲线的起始采样，但仍有横差。
+            // 这些点既不能按到点容差直接跳过，也不能掉头重新追赶；从实际站姿重接局部路线。
+            // 同层、沿原段已越过且目标落在当前机体后方，三者共同确认过期的平移目标。
+            if !rotation && !passed && same_support && distance > tolerance {
+                let a = previous.pose.position;
+                let b = target.pose.position;
+                let along = (position.x - b.x) * (b.x - a.x)
+                    + (position.y - b.y) * (b.y - a.y);
+                let forward = (b.x - position.x) * yaw.cos() + (b.y - position.y) * yaw.sin();
+                if along >= 0.0 && forward < 0.0 && horizontal_distance(previous, target) > 1e-5 {
+                    return PlannerStep::ReplanRequired("实际机体已越过局部采样且存在横差，需要从当前站姿接续前方路线".into());
+                }
+            }
             // 容差区域内的替代终点也是路径终点。不能先按路径点容差消费它，
             // 再发现机器人仍在用户目标区域之外，陷入原地重规划循环。
             // 防止提前消费的是最终位置组；内部采样即使靠近原目标，也须允许沿已确认进度越过。
@@ -359,8 +393,10 @@ impl SurfaceFollower {
                 // 中点是沿路径的进度平面；末采样很短时，正常横差不能把其缩成无法到达的小圆。
                 (position.x-a.x)*dx+(position.y-a.y)*dy >= (dx*dx+dy*dy)*0.5
             };
-            let reached = reached_position && (distance < arrival_distance && (!rotation || error.abs() < 0.05)
-                || passed || midpoint_reached);
+            // 前段已允许在当前实际位置完成转向，旋转本身只消费角度进度。
+            // 再要求旧支点距离会让已完成的转向永远不能退出；最终位置仍由reached_position约束。
+            let reached = reached_position && (if rotation {error.abs()<0.05 || passed}
+                else {distance<arrival_distance || passed || midpoint_reached});
             let mut safe_to_skip = true;
             if reached && !rotation
                 && (target.pose.position.x-previous.pose.position.x)
@@ -383,10 +419,13 @@ impl SurfaceFollower {
                         let outgoing = [next.pose.position.x - target.pose.position.x,
                             next.pose.position.y - target.pose.position.y];
                         let lengths = incoming[0].hypot(incoming[1]) * outgoing[0].hypot(outgoing[1]);
+                        // 平滑曲线的采样点按沿线进度消费，实际横差不把每个采样变成折角。
+                        // 真实折角仍核对后继接续；每拍完整机体及制动检查负责实际运动许可。
                         let off_segment = ((position.x-target.pose.position.x)*outgoing[1]
                             - (position.y-target.pose.position.y)*outgoing[0]).abs();
                         if lengths > 1e-10 && (incoming[0] * outgoing[0] + incoming[1] * outgoing[1]
-                            < lengths * 0.25_f64.cos() || off_segment > outgoing[0].hypot(outgoing[1]) * 1e-5) {
+                            < lengths * 0.25_f64.cos()
+                            || !curved && off_segment > outgoing[0].hypot(outgoing[1]) * 1e-5) {
                             // 短平移可能是绕过墙角所必需，只有接续可行才提前消费折点。
                             // 从实际站姿沿地形推进，不能借路径拟合的横滚/俯仰取得接续许可。
                             safe_to_skip = translation_connects(map,body(pose),next);
@@ -422,32 +461,8 @@ impl SurfaceFollower {
                 break;
             }
         }
-        // 搜索的原地转向点是几何路径离散，不能把每个微小角度变成机体停走门槛。
-        // 若实际机体到紧邻平移段的完整扫掠可行，直接跟随该连接；每拍速度及制动
-        // 尾段仍由下方控制器重新核验。狭窄处扫掠不通过时继续保留原地转向。
-        if self.path_index < path.poses.len() {
-            let anchor = &path.poses[self.path_index - 1];
-            let mut next = self.path_index;
-            while next < path.poses.len()
-                && horizontal_distance(&path.poses[next],anchor) < 1e-5
-            {
-                next += 1;
-            }
-            if next > self.path_index && next < path.poses.len() {
-                let target = &path.poses[next];
-                // 原地转向终点和后续平移末端是两个姿态；后者可能再次转回当前
-                // 朝向，不能据此跳过明确的大转向并把前进意图改成直接倒走。
-                let turn_end = &path.poses[next - 1];
-                if angle_diff(turn_end.pose.orientation.yaw(), yaw).abs() <= 0.25
-                    && angle_diff(target.pose.orientation.yaw(), yaw).abs() <= 0.25
-                    && position.distance(target.pose.position) <= lookahead_m
-                    && translation_connects(map,body(pose),target)
-                {
-                    self.path_index = next;
-                    self.progress_m = self.cumulative[next - 1];
-                }
-            }
-        }
+        // 显式原地转向按已有角度进度完成；同方向细分角由下方前瞻连续消费。
+        // 不再按剩余角度或整段角度把尚未完成的转向改写成平移曲线。
         if self.path_index >= path.poses.len() {
             if final_distance >= self.config.controller.goal_tolerance {
                 return PlannerStep::ReplanRequired("三维安全路径结束，原目标未到达".into());
@@ -534,12 +549,16 @@ impl SurfaceFollower {
                 target_index += 1;
             }
         }
-        if !rotation {
-            // 前瞻是实际机体可连续接续的局部线段；墙角附近退回较近的路径点，
+        if self.alignment_target_index.is_some_and(|index|index<self.path_index || index>=path.poses.len()) {
+            self.alignment_target_index=None;
+        }
+        if let Some(index)=self.alignment_target_index {target_index=index;}
+        if !rotation && self.alignment_target_index.is_none() {
+            // 前瞻按实际机体可执行的前进圆弧选择；墙角附近退回较近的路径点，
             // 不能只沿受阻的长弦不断减速，否则已知可执行的短路径永远得不到跟随。
             // 不能用先转向来保留远处曲线目标，否则会过早朝远端切向旋转并离开原路线。
             while target_index > self.path_index
-                && connection_endpoint(map,body(pose),&path.poses[target_index]).is_none() {
+                && !forward_arc_connects(map,body(pose),&path.poses[target_index]) {
                 target_index -= 1;
             }
         }
@@ -551,13 +570,29 @@ impl SurfaceFollower {
             angular_z: heading_error.clamp(-0.6, 0.6),
         };
         let mut speed_limit=None;
-        let align_before_translation=!rotation && target_index==self.path_index
-            && self.config.kinematics().is_none_or(|motion|motion.can_rotate_in_place)
-            && connection_endpoint(map,body(pose),target).is_none()
-            && translation_connects(map,body(pose),target);
-        if align_before_translation {
-            // 接续许可明确需要先转正时，控制目标也采用同一转向，不能仍沿旧曲率入门。
-            self.control_target=Some(PlanarPose{x:position.x,y:position.y,yaw:target.pose.orientation.yaw()});
+        // 直弦插值可能包含机体侧移，不能用它批准前向圆弧。
+        let connects_without_turn=rotation || forward_arc_connects(map,body(pose),target);
+        let alignment = if !connects_without_turn
+            && self.config.kinematics().is_none_or(|motion|motion.can_rotate_in_place) {
+            let heading=(target.pose.position.y-position.y).atan2(target.pose.position.x-position.x);
+            let mut translated=target.clone();
+            translated.pose.orientation=Quaternion::from_yaw(heading);
+            let mut turned=translated.clone();turned.pose.position=position;
+            connection_endpoint(map,body(pose),&turned)
+                .and_then(|at_turn|connection_endpoint(map,at_turn,&translated)).map(|_|heading)
+        }else{None};
+        if !connects_without_turn && alignment.is_none() {
+            // 旧路径在实际站姿下已不可接续，继续向缺测边界逼近只会让速度趋于零。
+            // 按同一完整机体几何重新规划，不用微速或等待时长判断是否卡住。
+            return PlannerStep::ReplanRequired(format!(
+                "局部路径点{}无法从实际站姿按前进圆弧或转向接续，需要重新规划",self.path_index));
+        }
+        if let Some(heading)=alignment {
+            // 转向期间固定这次接续目标，不能随偏航在相邻前瞻点之间切换意图。
+            self.alignment_target_index=Some(target_index);
+            // 先对齐真正的平移方向；不能在路径末切向与实际前进方向之间反复切换。
+            preferred.angular_z=angle_diff(heading,yaw).clamp(-0.6,0.6);
+            self.control_target=Some(PlanarPose{x:position.x,y:position.y,yaw:heading});
         } else if !rotation {
             let dx = target.pose.position.x - position.x;
             let dy = target.pose.position.y - position.y;
@@ -660,6 +695,7 @@ impl SurfaceFollower {
         let motion_queries = std::cell::RefCell::new(std::collections::HashMap::new());
         let period_queries = std::cell::RefCell::new(std::collections::HashMap::new());
         let future_views = std::cell::RefCell::new(std::collections::HashMap::<[u64;7],Result<Arc<nuwax_nav_mls_planner::SurfaceBodyQueryView>,nuwax_nav_mls_planner::surface::SurfaceError>>::new());
+        let boundary=&self.boundary;
         let make_check = |rebase:bool| {
             let mut previous_body=body(pose);
             let mut previous_xy=[pose.pose.position.x,pose.pose.position.y];
@@ -699,13 +735,13 @@ impl SurfaceFollower {
                     if preserve_height {b.0[2]=a.0[2];}
                     // 未来足迹不能自行授予新区域许可，始终保留本拍初始视图的完整检查。
                     match observation_check {
-                        Some((occupied, now, age)) => map.validate_observed_body_motion(a,b,occupied,
-                            now.saturating_add((elapsed * 1e9) as u64),*age)?,
-                        None => map.validate_body_motion(a,b,&[])?,
+                        Some((occupied, now, age)) => map.validate_observed_body_motion_in_boundary(a,b,occupied,
+                            now.saturating_add((elapsed * 1e9) as u64),*age,boundary)?,
+                        None => map.validate_body_motion(a,b,boundary)?,
                     }
                     if let Some(view)=future {
                         // 完全同源同足迹的视图可复用刚通过的同一扫掠；其它视图独立核验。
-                        if !view.same_body_query_view(map) {view.validate_body_motion(a,b,&[])?;}
+                        if !view.same_body_query_view(map) {view.validate_body_motion(a,b,boundary)?;}
                     }
                     Ok(b)
                 }) {
@@ -822,6 +858,139 @@ mod query_reuse_tests {
         let forbidden=pose(0.03,0.1649999963119626,0.7);
         assert!(!translation_connects(&map,body(&inside),&forbidden),
             "门内没有转身空间时，两种接续都必须拒绝");
+    }
+
+    #[test]
+    fn real_forward_arc_survives_a_blocked_chord_but_a_closed_connection_replans() {
+        let pose=|x:f64,y:f64,yaw:f64|PoseStamped {frame_id:nuwax_nav_types_messages::NavFrameId::Map,
+            stamp:nuwax_nav_types_messages::Timestamp::from_unix(1,0),
+            pose:Pose3 {position:Point3::new(x,y,0.4),orientation:Quaternion::from_yaw(yaw)}};
+        let start=pose(1.05,1.05,0.0);
+        let target=pose(1.05+2.0*1.0_f64.sin(),1.05+2.0*(1.0-1.0_f64.cos()),1.0);
+        for block_arc in [false,true] {
+            let mut points:Vec<_>=(0..40).flat_map(|x|(0..40).map(move|y|
+                ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.05))).collect();
+            // 第一根柱子切断直弦，第二根柱子才真正切断前进圆弧。
+            for (x,y) in [(1.85,1.55)].into_iter().chain(block_arc.then_some((2.05,1.25))) {
+                for z in 1..8 {points.push((x,y,(z as f32+0.5)*0.1));}
+            }
+            let base=map(0.0);
+            let source=Arc::new(SurfaceSnapshot::from_points(&points,base.config().clone(),0.1).unwrap()
+                .with_body_envelope(base.body_envelope().unwrap().clone()).unwrap());
+            source.validate_body_pose(body(&start).0,body(&start).1).unwrap();
+            assert!(connection_endpoint(&source,body(&start),&target).is_none(),"真实立柱必须挡住直弦");
+            assert_eq!(forward_arc_connects(&source,body(&start),&target),!block_arc,
+                "完整圆弧扫掠必须区分能绕过的柱子和真实堵路");
+            let path=Path3D{poses:vec![start.clone(),target.clone()]};
+            let mut config=SurfaceFollowerConfig::new(0.3);config.controller.speed=0.2;
+            let mut follower=SurfaceFollower::new(config).unwrap();
+            follower.cumulative=cumulative_lengths(&path);follower.path=Some(path);follower.path_index=1;
+            follower.goal=Some(target.clone());follower.map=Some(Arc::clone(&source));follower.source_map=Some(source);
+            follower.odometry=Some(start.clone());
+            let step=follower.follow_body_step(0.2);
+            if block_arc {
+                assert!(matches!(step,PlannerStep::ReplanRequired(ref reason)if reason.contains("无法从实际站姿")),
+                    "完整连接已失效时不能用微速继续追点: {step:?}");
+            }else{
+                assert!(matches!(step,PlannerStep::Command(command)if command.linear.x>0.0 && command.linear.y==0.0),
+                    "可执行前向圆弧不能因直弦受阻被提前拒绝: {step:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn clear_chord_does_not_authorize_a_blocked_forward_arc() {
+        let pose=|x:f64,y:f64,yaw:f64|PoseStamped {frame_id:nuwax_nav_types_messages::NavFrameId::Map,
+            stamp:nuwax_nav_types_messages::Timestamp::from_unix(1,0),
+            pose:Pose3 {position:Point3::new(x,y,0.4),orientation:Quaternion::from_yaw(yaw)}};
+        let start=pose(1.05,1.05,0.0);
+        let target=pose(1.05+2.0*1.0_f64.sin(),1.05+2.0*(1.0-1.0_f64.cos()),1.0);
+        let mut points:Vec<_>=(0..40).flat_map(|x|(0..40).map(move|y|
+            ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.05))).collect();
+        for z in 1..8 {points.push((2.05,1.25,(z as f32+0.5)*0.1));}
+        let base=map(0.0);
+        let source=Arc::new(SurfaceSnapshot::from_points(&points,base.config().clone(),0.1).unwrap()
+            .with_body_envelope(base.body_envelope().unwrap().clone()).unwrap());
+        assert!(connection_endpoint(&source,body(&start),&target).is_some());
+        assert!(!forward_arc_connects(&source,body(&start),&target));
+        let path=Path3D{poses:vec![start.clone(),target.clone()]};
+        let mut config=SurfaceFollowerConfig::new(0.3);config.controller.speed=0.2;
+        let mut follower=SurfaceFollower::new(config).unwrap();
+        follower.cumulative=cumulative_lengths(&path);follower.path=Some(path);follower.path_index=1;
+        follower.goal=Some(target);follower.map=Some(Arc::clone(&source));follower.source_map=Some(source);
+        follower.odometry=Some(start);
+        let step=follower.follow_body_step(0.2);
+        assert!(matches!(step,PlannerStep::Command(command)if command.linear.x==0.0 && command.angular_z>0.0),
+            "当前前向圆弧被柱子阻挡，应先对齐可执行方向，不能凭直弦许可直接平移：{step:?}");
+    }
+
+    #[test]
+    fn explicit_turn_is_completed_before_starting_translation() {
+        let make=|x:f64,yaw:f64|PoseStamped {frame_id:nuwax_nav_types_messages::NavFrameId::Map,
+            stamp:nuwax_nav_types_messages::Timestamp::from_unix(1,0),
+            pose:Pose3 {position:Point3::new(x,1.05,0.4),orientation:Quaternion::from_yaw(yaw)}};
+        let pi=std::f64::consts::PI;
+        let source=Arc::new(map(0.0));let target=make(0.7,pi);
+        let path=Path3D{poses:vec![make(1.05,0.0),make(1.05,pi),target.clone()]};
+        let mut config=SurfaceFollowerConfig::new(0.3);config.controller.speed=0.2;
+        let mut follower=SurfaceFollower::new(config).unwrap();
+        follower.cumulative=cumulative_lengths(&path);follower.path=Some(path);follower.path_index=1;
+        follower.goal=Some(target);follower.map=Some(Arc::clone(&source));follower.source_map=Some(source);
+        follower.odometry=Some(make(1.05,pi-0.2));
+        let step=follower.follow_body_step(0.2);
+        assert!(matches!(step,PlannerStep::Command(c) if c.linear.x==0.0 && c.angular_z>0.0),
+            "明确的原地转向尚差约11度时应继续转向，不能提前切入平移：{step:?}");
+    }
+
+    #[test]
+    fn completed_turn_at_a_permitted_shifted_pivot_advances() {
+        let make=|x:f64,y:f64,yaw:f64|PoseStamped {frame_id:nuwax_nav_types_messages::NavFrameId::Map,
+            stamp:nuwax_nav_types_messages::Timestamp::from_unix(1,0),
+            pose:Pose3 {position:Point3::new(x,y,0.4),orientation:Quaternion::from_yaw(yaw)}};
+        let source=Arc::new(map(0.0));let goal=make(1.8,1.05,0.12);
+        let actual=make(1.2,1.1,0.12);
+        let mut turned=make(1.2,1.1,0.0);
+        assert!(connection_endpoint(&source,body(&turned),&actual).is_some(),"当前偏移处确实允许转向");
+        turned.pose.position=Point3::new(1.05,1.05,0.4);
+        let path=Path3D{poses:vec![turned,make(1.05,1.05,0.12),goal.clone()]};
+        let mut config=SurfaceFollowerConfig::new(0.3);config.controller.speed=0.2;
+        let mut follower=SurfaceFollower::new(config).unwrap();
+        follower.cumulative=cumulative_lengths(&path);follower.path=Some(path);follower.path_index=1;
+        follower.goal=Some(goal);follower.map=Some(Arc::clone(&source));follower.source_map=Some(source);
+        follower.odometry=Some(actual);
+        let step=follower.follow_body_step(0.2);
+        assert!(follower.path_index>1 && matches!(step,PlannerStep::Command(c) if c.linear.x>0.0),
+            "允许的偏移支点已转完，不能继续追旧支点而原地摆动：{step:?}");
+    }
+
+    #[test]
+    fn passed_local_sample_reconnects_instead_of_turning_back_across_tracking_error() {
+        let make = |x, y| PoseStamped {
+            frame_id: nuwax_nav_types_messages::NavFrameId::Map,
+            stamp: nuwax_nav_types_messages::Timestamp::from_unix(1, 0),
+            pose: Pose3 { position: Point3::new(x, y, 0.4), orientation: Quaternion::IDENTITY },
+        };
+        let source = Arc::new(map(0.0));
+        let goal = make(1.9, 1.05);
+        let path = Path3D { poses: vec![make(1.05, 1.05), make(1.1, 1.05), goal.clone()] };
+        let mut config = SurfaceFollowerConfig::new(0.3);
+        config.controller.speed = 0.2;
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        follower.cumulative = cumulative_lengths(&path);
+        follower.path = Some(path);
+        follower.path_index = 1;
+        follower.goal = Some(goal);
+        follower.map = Some(Arc::clone(&source));
+        follower.source_map = Some(source);
+        follower.odometry = Some(make(1.5, 1.3));
+        let step = follower.follow_body_step(0.2);
+        assert!(matches!(step, PlannerStep::ReplanRequired(ref reason) if reason.contains("越过局部采样")),
+            "减速位移造成越过起始点并有横差时，须请求实际位姿接续，不能转回旧点：{step:?}");
+        // 正常直线上的进度仍按原容差消费，不因采样位于后方就重规划。
+        follower.odometry = Some(make(1.5, 1.06));
+        let step = follower.follow_body_step(0.2);
+        assert!(follower.path_index > 1 && matches!(step, PlannerStep::Command(c) if c.linear.x > 0.0),
+            "同一直段的正常采样越过应继续前进：{step:?}");
     }
 
     #[test]

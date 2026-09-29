@@ -11,7 +11,7 @@
 //!
 //! ## 核心职责
 //!
-//! 1. 捕获两条固定完整链：二维使用`simple-2d`，三维使用`mls-3d`。
+//! 1. 捕获两条固定完整链：二维使用`simple-2d`，三维使用`pct-scan-3d`。
 //!    导航配置与建图链冲突时拒绝启动，不回退其它维度。
 //! 2. 用 `nuwax_nav_stack::NavStackBuilder` 构造 `ModuleGraph`,把节点列表
 //!    写入 diagnostics / nav state message 的 `message` 字段(便于 health
@@ -65,10 +65,10 @@ pub const PROFILE_CMU_NATIVE: &str = "cmu-native";
 /// `exploration-native` profile 字符串(P1:依赖 native bridge 进程,本期未实装)。
 pub const PROFILE_EXPLORATION_NATIVE: &str = "exploration-native";
 /// 已接入统一运动守卫的多层表面导航配置名。
-/// 注意:与 `NavStackProfile::Mls3D.as_str()` 一致,使用 kebab-case "mls-3d"
+/// 注意:与 `NavStackProfile::Mls3D.as_str()` 一致,使用 kebab-case "pct-scan-3d"
 /// 而非 "mls3d",否则 `build_nav_stack_handle_renders_for_all_profiles`
 /// 测试中 `text.contains(p)` 会失败。
-pub const PROFILE_MLS3D: &str = "mls-3d";
+pub const PROFILE_MLS3D: &str = "pct-scan-3d";
 
 /// 未选择执行链时使用三维完整链；非法显式配置不会回退。
 pub const DEFAULT_PROFILE: &str = PROFILE_MLS3D;

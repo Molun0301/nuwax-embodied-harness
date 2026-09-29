@@ -29,7 +29,7 @@ impl SurfaceNavigationConfig {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 NavStackError::InvalidConfig(
-                    "mls-3d requires calibrated NUWAX_NAV_BODY_TO_SUPPORT_Z_M".into(),
+                    "pct-scan-3d requires calibrated NUWAX_NAV_BODY_TO_SUPPORT_Z_M".into(),
                 )
             })?;
         let offset = parse_number("NUWAX_NAV_BODY_TO_SUPPORT_Z_M", &offset)?;
@@ -52,6 +52,14 @@ impl SurfaceNavigationConfig {
             .transpose()
             .map_err(NavStackError::InvalidConfig)?;
         config.apply_calibration(body, capabilities)?;
+        config.follower.scan.horizon_m = configured_number("NUWAX_NAV_LOCAL_HORIZON_M", 3.0)?;
+        config.follower.scan.refresh_distance_m = configured_number("NUWAX_NAV_LOCAL_REFRESH_DISTANCE_M", 1.0)?;
+        let iterations = configured_number("NUWAX_NAV_SPLINE_ITERATIONS", 12.0)?;
+        if iterations.fract() != 0.0 || !(0.0..=100.0).contains(&iterations) {
+            return Err(NavStackError::InvalidConfig("近场样条迭代次数需要0—100的整数".into()));
+        }
+        config.follower.scan.optimization_iterations = iterations as usize;
+        config.follower.scan.validate().map_err(NavStackError::InvalidConfig)?;
         if let Ok(value) = std::env::var("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS") {
             if !value.trim().is_empty() {
                 let limit = parse_number("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS", &value)?;
@@ -92,6 +100,10 @@ impl SurfaceNavigationConfig {
                 config.follower.basic_kinematics=Some(motion);
             }
         }
+        tracing::info!(target:"navigation.config",event="navigation.config.loaded",profile="pct-scan-3d",
+            voxel_m=config.geometry.voxel_size,local_horizon_m=config.follower.scan.horizon_m,
+            local_refresh_m=config.follower.scan.refresh_distance_m,spline_iterations=config.follower.scan.optimization_iterations,
+            "三维导航已读取统一配置");
         Ok(config)
     }
 

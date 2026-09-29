@@ -56,6 +56,9 @@ members = [
     "crates/nuwax-nav-bbox-tracker",
     # 多层表面规划与运动运行时
     "crates/nuwax-nav-mls-planner",
+    "crates/nuwax-nav-pct",
+    "crates/nuwax-nav-scan",
+    "crates/nuwax-nav-voxel",
     "crates/nuwax-motion-safety-guard",
     "crates/nuwax-nav-runtime",
     "crates/nuwax-nav-control",

@@ -241,6 +241,16 @@ impl VirtualObstacleMask {
     }
 }
 
+/// 来源声明决定连续占据带是测量区间还是实体体积。
+#[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
+pub enum GroundEvidence {
+    /// 点云表面测量的连续厚带。
+    #[default]
+    MeasuredSurface,
+    /// 已知实体占据，接触面只能位于暴露带顶。
+    OccupiedVolume,
+}
+
 /// 一次地图更新建立一次；克隆仅共享不可变表面和邻接图。
 #[derive(Clone)]
 pub struct SurfaceSnapshot {
@@ -249,6 +259,7 @@ pub struct SurfaceSnapshot {
     current_body_support: Option<Arc<body::CurrentBodySupport>>,
     /// 同一不可变快照与精确位姿的检查缓存；任何几何或观察替换均清空。
     body_query_cache: Arc<std::sync::Mutex<body::BodyQueryCache>>,
+    ground_evidence:GroundEvidence,
 }
 
 impl std::fmt::Debug for SurfaceSnapshot {
@@ -258,11 +269,64 @@ impl std::fmt::Debug for SurfaceSnapshot {
             .field("cells", &self.data.graph.cells.ids().count())
             .field("voxel_size", &self.data.config.voxel_size)
             .field("source_voxel_size_m", &self.data.source_voxel_size_m)
+            .field("ground_evidence",&self.ground_evidence)
             .finish()
     }
 }
 
 impl SurfaceSnapshot {
+    /// 声明来源的物理含义；改变后重新建立接触和规划缓存。
+    pub fn with_ground_evidence(mut self,evidence:GroundEvidence)->Self {
+        if self.ground_evidence==evidence {return self;}
+        if let Some(current)=self.current_body_support.take() {
+            self=current.source.with_observations(self.observations.clone());
+        }
+        self.ground_evidence=evidence;
+        self.body_query_cache=Default::default();
+        self
+    }
+    /// 原始占据是否表示实体体积，而非带厚度的表面测量。
+    pub fn ground_evidence(&self)->GroundEvidence {self.ground_evidence}
+    /// 向层析规划提供实际占据高度带；不读取旧MLS路由或填补未知列。
+    pub fn navigation_height_columns(&self) -> impl Iterator<Item = ([i32; 2], Vec<[f64; 2]>)> + '_ {
+        self.data.occupied_columns.iter().map(|(&(x, y), levels)| {
+            let size = f64::from(self.config().voxel_size);
+            let bands = levels.iter().map(|&z| {
+                self.data.height_bounds.get(&(x, y, z)).map_or(
+                    [f64::from(z) * size, f64::from(z + 1) * size],
+                    |bounds| bounds.map(f64::from),
+                )
+            }).collect();
+            ([x, y], bands)
+        })
+    }
+
+    /// 完整精细占据优先；粗规划格不能把局部侧面回波扩展成整格障碍。
+    pub fn navigation_source_columns(&self,window:Option<([f64;2],f64)>)->(f64,Box<dyn Iterator<Item=([i32;2],Vec<[f64;2]>)>+'_>) {
+        if let Some(source)=self.observations.as_ref().filter(|o|o.is_complete_geometry_source()
+            && o.size_m.to_bits()==self.source_voxel_size_m().to_bits()) {
+            let size=f64::from(source.size_m);
+            return (size,Box::new(source.navigation_columns().filter(move|(column,_)| {
+                window.is_none_or(|(center,radius)|((f64::from(column[0])+0.5)*size-center[0]).abs()<=radius
+                    && ((f64::from(column[1])+0.5)*size-center[1]).abs()<=radius)
+            }).map(move|(column,levels)| {
+                (column,levels.iter().map(|&z|[f64::from(z)*size,f64::from(z+1)*size]).collect())
+            })));
+        }
+        let size=f64::from(self.config().voxel_size);
+        (size,Box::new(self.navigation_height_columns().filter(move|(column,_)| {
+            window.is_none_or(|(center,radius)|((f64::from(column[0])+0.5)*size-center[0]).abs()<=radius
+                && ((f64::from(column[1])+0.5)*size-center[1]).abs()<=radius)
+        })))
+    }
+
+    /// 层析单元沿用当前图的虚拟障碍，不创建另一份禁区配置。
+    pub fn navigation_column_allowed(&self, column: [i32; 2], resolution:f64) -> bool {
+        self.data.virtual_obstacles.as_ref().is_none_or(|mask| {
+            mask.permits_cell((column[0], column[1], 0), resolution, 0.0)
+        })
+    }
+
     /// 使用已提交的真实点云建立表面；来源身份与清空语义由外层拥有方处理。
     pub fn from_points(
         points: &[(f32, f32, f32)],
@@ -314,6 +378,7 @@ impl SurfaceSnapshot {
         }
         let regions=Arc::new(regions::RegionGraph::full(&graph,self.config().voxel_size));
         let result=Self {
+            ground_evidence:self.ground_evidence,
             observations: self.observations.clone(),
             current_body_support: None,
             body_query_cache: Default::default(),
@@ -1253,7 +1318,8 @@ fn boundary_edges_intersect(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) 
     opposite(cross(a, b, c), cross(a, b, d)) && opposite(cross(c, d, a), cross(c, d, b))
 }
 
-fn segment_inside_boundary(from: [f64; 2], to: [f64; 2], boundary: &[[f64; 2]]) -> bool {
+/// 精确核对线段是否留在任务多边形内，供全局与近场共用。
+pub fn segment_inside_boundary(from: [f64; 2], to: [f64; 2], boundary: &[[f64; 2]]) -> bool {
     if boundary.is_empty() {
         return true;
     }
@@ -1290,7 +1356,8 @@ fn segment_inside_boundary(from: [f64; 2], to: [f64; 2], boundary: &[[f64; 2]]) 
     })
 }
 
-fn inside_boundary(point: [f64; 2], boundary: &[[f64; 2]]) -> bool {
+/// 空边界表示不限制；多边形边缘属于任务范围。
+pub fn inside_boundary(point: [f64; 2], boundary: &[[f64; 2]]) -> bool {
     if boundary.is_empty() {
         return true;
     }

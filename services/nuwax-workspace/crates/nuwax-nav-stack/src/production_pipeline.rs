@@ -27,7 +27,8 @@ impl ProductionPipeline {
             }
         };
         if let Some(profile) = profile.map(str::trim).filter(|value| !value.is_empty()) {
-            if profile != selected.navigation_profile().as_str() {
+            let legacy_3d = selected == Self::Lio3D && profile == "mls-3d";
+            if !legacy_3d && profile != selected.navigation_profile().as_str() {
                 return Err(NavStackError::invalid(format!(
                     "执行链{}固定使用{}导航，NUWAX_NAV_PROFILE={}与执行链冲突；请移除该覆盖或改为{}",
                     selected.as_str(),

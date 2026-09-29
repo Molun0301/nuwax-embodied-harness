@@ -1,9 +1,11 @@
 //! 开发机导航模拟工作进程：复用生产规划与跟随，环境运动独立积分速度命令。
+mod scenarios;
 use nuwax_nav_mls_planner::{
     SurfaceMapBuilder, SurfaceObservation, SurfaceObservations, SurfaceSnapshot,
 };
-use nuwax_nav_runtime::{ExecutionMap, ExecutionPath, NavPlanner, PlannerStep, SurfaceFollower};
-use nuwax_nav_stack::{surface_config::SurfaceNavigationConfig, surface_oriented};
+use nuwax_nav_mls_planner::surface::GroundEvidence;
+use nuwax_nav_runtime::{ExecutionMap, ExecutionPath, NavPlanner, PlannerStep, RouteFollower};
+use nuwax_nav_stack::{surface_config::SurfaceNavigationConfig};
 use nuwax_nav_types_messages::{
     GoalOptions, MotionLimits, MotionModel, NavFrameId, Path3D, Point3, Pose3, PoseStamped,
     Quaternion, Timestamp, Twist2,
@@ -168,7 +170,16 @@ fn body_after_ground_change(
     let orientation = if correction == 0.0 {
         orientation
     } else {
-        multiply(quaternion(0.0, 0.0, correction), orientation)
+        // 偏航只确定机体X轴在水平面的方向，不能绕世界Z再转走已传播的法向。
+        // 由独立环境的法向和积分偏航解出横滚/俯仰，保持相对地面的倾斜偏差。
+        let [x,y,z,w]=unit_orientation(orientation);
+        let normal=[2.0*(x*z+w*y),2.0*(y*z-w*x),1.0-2.0*(x*x+y*y)];
+        let heading=yaw(planar);
+        let nx=normal[0]*heading.cos()+normal[1]*heading.sin();
+        let ny=-normal[0]*heading.sin()+normal[1]*heading.cos();
+        let pitch=nx.atan2(normal[2]);
+        let roll=(-ny).atan2(nx.hypot(normal[2]));
+        quaternion(roll,pitch,heading)
     };
     // 地面高度在机体中心XY查询，实际支撑点还沿机体竖轴偏移。
     // 用两法向独立求该点与地平面的交高；坡面对齐时结果为d/n_z。
@@ -413,7 +424,14 @@ impl Terrain {
         // 直接最小化平面到观测区间的残差。每轮投影当前平面，不能把样本
         // 固定为每拍变化的实际参考；否则相对地形旋转会在台阶往返中累计漂移。
         // 单层等价于原加权最小二乘，共同可行的水平面无需反复求解。
-        let mut plane = [0.0, 0.0, reference];
+        // 相同观测的地面必须可重复查询；实际高度不能决定一个新的斜面解。
+        let lower=samples.iter().map(|s|s.2).fold(f64::NEG_INFINITY,f64::max);
+        let upper=samples.iter().map(|s|s.3).fold(f64::INFINITY,f64::min);
+        if lower<=upper {
+            return Ok(([xy[0],xy[1],reference.clamp(lower,upper)+offset],quaternion(0.0,0.0,heading)));
+        }
+        let centre=samples.iter().map(|s|(s.2+s.3)*0.5*s.4).sum::<f64>()/sw;
+        let mut plane = [0.0, 0.0, centre];
         for _ in 0..128 {
             let (fx, fy, low, high, _) = samples[0];
             let origin_z = (plane[0] * fx + plane[1] * fy + plane[2]).clamp(low, high);
@@ -457,6 +475,7 @@ struct Scene {
     map: Arc<SurfaceSnapshot>,
     obstacles: Vec<Value>,
     metadata: Value,
+    ground_evidence:GroundEvidence,
 }
 fn observation_index(points: &[(f32, f32, f32)]) -> Result<SurfaceObservations, String> {
     let mut blocks = BTreeMap::<[i32; 3], BTreeMap<[i32; 3], SurfaceObservation>>::new();
@@ -489,17 +508,22 @@ impl Scene {
         points: Vec<(f32, f32, f32)>,
         poses: Vec<Body>,
         config: SurfaceNavigationConfig,
+        flat:bool,
+        ground_evidence:GroundEvidence,
         data: &PathBuf,
     ) -> Result<Self, String> {
         let offset = config.follower.body_to_support_z_m;
         let body_model = config.body_envelope.as_ref().ok_or("模拟机体足迹缺失")?;
-        let terrain = Terrain::new(
+        let mut terrain = Terrain::new(
             &points,
-            id != "recorded",
+            flat,
             &body_model.footprint_xy_m,
             0.05,
             [body_model.max_step_up_m, body_model.max_step_down_m],
         );
+        if ground_evidence==GroundEvidence::OccupiedVolume {
+            for bands in terrain.columns.values_mut() {for band in bands {band.0=band.1;}}
+        }
         let mut builder =
             SurfaceMapBuilder::configured(config.geometry.clone(), config.body_envelope.clone());
         let observations = Arc::new(observation_index(&points)?);
@@ -508,7 +532,8 @@ impl Scene {
                 .build(&points, 0.05)
                 .map_err(|e| e.to_string())?
                 .snapshot
-                .with_observations(Some(observations.clone())),
+                .with_observations(Some(observations.clone()))
+                .with_ground_evidence(ground_evidence),
         );
         let mut cases = Vec::new();
         if id == "recorded" {
@@ -563,6 +588,7 @@ impl Scene {
             map,
             obstacles: Vec::new(),
             metadata,
+            ground_evidence,
         })
     }
     fn change_obstacles(&mut self, values: Vec<Value>) -> Result<(), String> {
@@ -637,7 +663,8 @@ impl Scene {
         self.map = Arc::new(
             built
                 .snapshot
-                .with_observations(Some(Arc::new(observations))),
+                .with_observations(Some(Arc::new(observations)))
+                .with_ground_evidence(self.ground_evidence),
         );
         self.obstacles = values;
         Ok(())
@@ -646,7 +673,7 @@ impl Scene {
 
 struct Simulation {
     scene: String,
-    follower: SurfaceFollower,
+    follower: RouteFollower,
     options: GoalOptions,
     current: Body,
     goal: Body,
@@ -741,7 +768,14 @@ impl Simulation {
                 }
             }
         }
-        let mut follower = SurfaceFollower::new(config).map_err(|e| e.to_string())?;
+        if let Some(values)=request["start_orientation"].as_array() {
+            if values.len()!=4 {return Err("起点完整朝向需要四元数的四个分量".into());}
+            let mut q=[0.0;4];
+            for (i,value) in values.iter().enumerate() {q[i]=value.as_f64().filter(|v|v.is_finite()).ok_or("起点朝向数值无效")?;}
+            if q.iter().map(|v|v*v).sum::<f64>()<1e-12 {return Err("起点朝向不能为零四元数".into());}
+            current.1=q;
+        }
+        let mut follower = RouteFollower::new(config).map_err(|e| e.to_string())?;
         follower
             .update_execution_map(ExecutionMap::Surface(scene.map.clone()))
             .map_err(|e| e.to_string())?;
@@ -787,20 +821,8 @@ impl Simulation {
     }
     fn plan(&mut self, scene: &Scene) -> Result<(), String> {
         let started = Instant::now();
-        let motion = self.follower_config_motion();
-        let map = scene
-            .map
-            .with_current_body_support(self.current.0, self.current.1)
-            .map_err(|e| e.to_string())?;
-        let route = surface_oriented::plan_with_motion_cancellable(
-            &map,
-            self.current,
-            self.goal,
-            self.options,
-            Some(&motion),
-            &[],
-            30_000,
-            Some(&CANCEL),
+        let route = scene.config.follower.pct.body_route(
+            &scene.map, self.current, self.goal, self.options, &[], Some(&CANCEL),
         );
         self.last_plan_ms = started.elapsed().as_secs_f64() * 1000.;
         self.plans += 1;
@@ -824,17 +846,7 @@ impl Simulation {
         self.message = "沿完整全局路线前进".into();
         Ok(())
     }
-    fn follower_config_motion(&self) -> nuwax_nav_types_messages::MotionKinematics {
-        nuwax_nav_types_messages::MotionKinematics {
-            model: MotionModel::Omnidirectional,
-            max_forward_mps: self.speed,
-            max_reverse_mps: self.speed,
-            max_lateral_mps: self.speed,
-            max_angular_rps: 0.8,
-            minimum_turning_radius_m: 0.,
-            can_rotate_in_place: true,
-        }
-    }
+
     fn tick(&mut self, scene: &Scene) -> Result<(), String> {
         let planned_this_tick = self.need_plan;
         if self.need_plan {
@@ -963,10 +975,9 @@ impl Simulation {
         Ok(())
     }
     fn state(&mut self, scene: &Scene) -> Value {
-        let local: Vec<_> = (0..=12)
-            .map(|i| integrate(self.current, self.command, i as f64 * 0.05).0)
-            .collect();
-        json!({"status":self.status,"sim_time_sec":self.time,"pose":pose4(self.current),"orientation":self.current.1,"goal":pose4(self.goal),"command":self.command,"velocity":self.applied,"global_path":self.path.iter().map(|p|p.0).collect::<Vec<_>>(),"path_revision":self.plans,"path_history":self.history,"local_path":local,"frames":std::mem::take(&mut self.pending_frames),"obstacles":scene.obstacles,"world_model":self.pose_mode,"terrain_response":scene.metadata["terrain_response"],"motion_failure":self.motion_failure,"metrics":{"speed_mps":self.applied[0].hypot(self.applied[1]),"configured_speed_mps":self.speed,"distance_remaining_m":distance(self.current,self.goal),"global_plans":self.plans,"last_plan_ms":self.last_plan_ms,"last_control_ms":self.last_control_ms,"max_rss_mb":rss_mb(),"motion_validation_failures":self.motion_failures,"reverse_travel_m":self.reverse_travel_m,"lateral_travel_m":self.lateral_travel_m,"max_reverse_command_mps":self.max_reverse_command_mps,"max_lateral_command_mps":self.max_lateral_command_mps},"motion_policy":"forward_only","message":self.message})
+        let local:Vec<_>=self.follower.local_path().map_or_else(Vec::new,|path|path.poses.iter()
+            .map(|pose|[pose.pose.position.x,pose.pose.position.y,pose.pose.position.z]).collect());
+        json!({"status":self.status,"sim_time_sec":self.time,"pose":pose4(self.current),"orientation":self.current.1,"goal":pose4(self.goal),"command":self.command,"velocity":self.applied,"global_path":self.path.iter().map(|p|p.0).collect::<Vec<_>>(),"path_revision":self.plans,"path_history":self.history,"local_path":local,"frames":std::mem::take(&mut self.pending_frames),"obstacles":scene.obstacles,"world_model":self.pose_mode,"terrain_response":scene.metadata["terrain_response"],"motion_failure":self.motion_failure,"metrics":{"speed_mps":self.applied[0].hypot(self.applied[1]),"configured_speed_mps":self.speed,"distance_remaining_m":distance(self.current,self.goal),"global_plans":self.plans,"local_plans":self.follower.local_plans(),"last_plan_ms":self.last_plan_ms,"last_control_ms":self.last_control_ms,"max_rss_mb":rss_mb(),"motion_validation_failures":self.motion_failures,"reverse_travel_m":self.reverse_travel_m,"lateral_travel_m":self.lateral_travel_m,"max_reverse_command_mps":self.max_reverse_command_mps,"max_lateral_command_mps":self.max_lateral_command_mps},"motion_policy":"forward_only","message":self.message})
     }
 }
 fn synthetic(blocked: bool) -> Vec<(f32, f32, f32)> {
@@ -992,6 +1003,7 @@ fn synthetic(blocked: bool) -> Vec<(f32, f32, f32)> {
     points
 }
 fn run() -> Result<(), String> {
+    nuwax_core::logging::init_component_logging("nuwax-navigation-simulator", "info");
     unsafe {
         libc::signal(libc::SIGUSR1, interrupt as libc::sighandler_t);
     }
@@ -1009,7 +1021,7 @@ fn run() -> Result<(), String> {
             name,
             synthetic(blocked),
             Vec::new(),
-            config.clone(),
+            config.clone(),true,GroundEvidence::MeasuredSurface,
             &data,
         )?;
         scenes.insert(id.to_owned(), scene);
@@ -1042,7 +1054,7 @@ fn run() -> Result<(), String> {
                 "9月18日最新代码遥控建图-1512",
                 points,
                 poses,
-                config.clone(),
+                config.clone(),false,GroundEvidence::MeasuredSurface,
                 &data,
             )?;
             scenes.insert("recorded".into(), scene);
@@ -1055,6 +1067,18 @@ fn run() -> Result<(), String> {
             .as_array_mut()
             .unwrap()
             .push(scene.metadata.clone());
+    }
+    for specification in scenarios::multilevel() {
+        let mut scene=Scene::make(specification.id,specification.name,specification.points,
+            Vec::new(),config.clone(),false,
+            if specification.occupied_volume {GroundEvidence::OccupiedVolume}else{GroundEvidence::MeasuredSurface},&data)?;
+        scene.cases=specification.cases;
+        scene.metadata["description"]=json!(specification.description);
+        scene.metadata["ground_evidence"]=json!(format!("{:?}",scene.ground_evidence));
+        scene.metadata["default_start"]=scene.cases[0]["start"].clone();
+        scene.metadata["default_goal"]=scene.cases[0]["goal"].clone();
+        catalog["scenes"].as_array_mut().unwrap().push(scene.metadata.clone());
+        scenes.insert(specification.id.into(),scene);
     }
     fs::write(
         data.join("scenes.json"),
@@ -1076,6 +1100,33 @@ fn run() -> Result<(), String> {
         let response = (|| -> Result<Value, String> {
             let request: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
             match request["op"].as_str().unwrap_or("") {
+                "inspect_route" => {
+                    let scene=scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
+                    let session=Simulation::new(scene,&request)?;
+                    let began=Instant::now();
+                    let route=scene.config.follower.pct.body_route(&scene.map,session.current,
+                        session.goal,session.options,&[],Some(&CANCEL));
+                    Ok(json!({"route":route,"elapsed_ms":began.elapsed().as_secs_f64()*1000.0,
+                        "world_model":session.pose_mode}))
+                }
+                "inspect_path" => {
+                    let scene=scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
+                    let path:Vec<Body>=serde_json::from_value(request["path"].clone()).map_err(|e|e.to_string())?;
+                    if path.is_empty(){return Err("检查路径为空".into());}
+                    let first=path[0];
+                    let initial=scene.map.body_query_with_current_support(first.0,first.1)
+                        .and_then(|view|view.validate_body_motion(first,first,&[]));
+                    let mut failure=initial.err().map(|error|json!({"index":0,"reason":error.to_string(),"from":first,"to":first}));
+                    let mut checked=0;
+                    for (index,pair) in path.windows(2).enumerate() {
+                        if failure.is_some(){break;}
+                        let result=scene.map.body_query_with_current_support(pair[0].0,pair[0].1)
+                            .and_then(|view|view.validate_body_motion(pair[0],pair[1],&[]));
+                        checked+=1;
+                        if let Err(error)=result {failure=Some(json!({"index":index,"reason":error.to_string(),"from":pair[0],"to":pair[1]}));break;}
+                    }
+                    Ok(json!({"accepted":failure.is_none(),"checked":checked,"failure":failure}))
+                }
                 "start" => {
                     CANCEL.store(false, Ordering::Relaxed);
                     let id = request["scene_id"].as_str().ok_or("场景缺失")?;
@@ -1089,7 +1140,15 @@ fn run() -> Result<(), String> {
                     Ok(state)
                 }
                 // 完整站姿仅按诊断请求导出，避免每拍重复传输四元数历史。
-                "body_paths" => Ok(json!({"body_path_history":simulation.as_ref().ok_or("尚未开始")?.body_history})),
+                "body_paths" => {
+                    let session=simulation.as_ref().ok_or("尚未开始")?;
+                    let local:Vec<_>=session.follower.local_path().map_or_else(Vec::new,|path|
+                        path.poses.iter().map(|pose| {
+                            let p=pose.pose.position;let q=pose.pose.orientation;
+                            ([p.x,p.y,p.z],[q.x,q.y,q.z,q.w])
+                        }).collect());
+                    Ok(json!({"body_path_history":session.body_history,"local_body_path":local}))
+                },
                 "step" => {
                     let session = simulation.as_mut().ok_or("尚未开始")?;
                     let scene = scenes.get(&session.scene).unwrap();
@@ -1121,6 +1180,42 @@ fn run() -> Result<(), String> {
                         session.status = "planning".into();
                     }
                     Ok(session.state(scene))
+                }
+                "inspect_sweep" => {
+                    let scene=scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
+                    let from:Body=serde_json::from_value(request["from"].clone()).map_err(|e|e.to_string())?;
+                    let to:Body=serde_json::from_value(request["to"].clone()).map_err(|e|e.to_string())?;
+                    let full=scene.map.with_current_body_support(from.0,from.1)
+                        .and_then(|m|m.validate_body_motion(from,to,&[])).map_err(|e|e.to_string());
+                    let query=scene.map.body_query_with_current_support(from.0,from.1)
+                        .and_then(|m|m.validate_body_motion(from,to,&[])).map_err(|e|e.to_string());
+                    Ok(json!({"full":full,"query":query}))
+                }
+                "inspect_motions" => {
+                    let scene=scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
+                    let pose:Body=serde_json::from_value(request["body"].clone()).map_err(|e|e.to_string())?;
+                    let mut samples=Vec::new();
+                    for length in [0.0,0.0025,0.005,0.01,0.025,0.05,0.1] {
+                        for turn in [-0.08,-0.04,-0.02,-0.01,-0.005,0.0,0.005,0.01,0.02,0.04,0.08] {
+                            let path=nuwax_nav_scan::probe_motion(&scene.map,pose,length,turn,&[]);
+                            samples.push(json!({"length":length,"turn":turn,"end":path.and_then(|p|p.last().copied())}));
+                        }
+                    }
+                    Ok(json!({"samples":samples}))
+                }
+                "inspect_terrain" => {
+                    let id=request["scene_id"].as_str().ok_or("场景缺失")?;
+                    let scene=scenes.get(id).ok_or("场景不存在")?;
+                    let x=request["x"].as_f64().ok_or("X缺失")?;
+                    let y=request["y"].as_f64().ok_or("Y缺失")?;
+                    let radius=request["radius"].as_f64().unwrap_or(2.0).clamp(0.1,5.0);
+                    let map=scene.config.follower.pct.map(&scene.map)?;
+                    let cells:Vec<_>=map.cells.iter().enumerate().filter_map(|(i,cell)| {
+                        let p=map.position(i);
+                        ((p[0]-x).hypot(p[1]-y)<=radius).then(||json!({"position":p,"ground_interval":cell.ground_interval,"cost":cell.cost,
+                            "clearance":cell.clearance,"ceiling":if cell.ceiling.is_finite(){Some(cell.ceiling)}else{None}}))
+                    }).collect();
+                    Ok(json!({"cells":cells,"resolution":map.resolution}))
                 }
                 "pose" => {
                     let id = request["scene_id"].as_str().ok_or("场景缺失")?;
@@ -1199,6 +1294,36 @@ mod tests {
             0.05,
             [0.15, 0.15],
         )
+    }
+
+    #[test]
+    fn ground_transport_keeps_relative_tilt_over_a_complete_turn() {
+        let normal = |q:[f64;4]| {
+            let [x,y,z,w]=unit_orientation(q);
+            [2.0*(x*z+w*y),2.0*(y*z-w*x),1.0-2.0*(x*x+y*y)]
+        };
+        let ground = |heading:f64| {
+            let (gx,gy)=(0.15_f64,-0.08_f64);
+            let pitch=-(gx*heading.cos()+gy*heading.sin()).atan();
+            let roll=((-gx*heading.sin()+gy*heading.cos())*pitch.cos()).atan();
+            ([0.0,0.0,0.4],quaternion(roll,pitch,heading))
+        };
+        let initial=([0.0,0.0,0.5],quaternion(0.08,-0.1,0.0));
+        let ground_normal=normal(ground(0.0).1);let original_normal=normal(initial.1);
+        let cosine=|a:[f64;3]|a.into_iter().zip(ground_normal).map(|(a,b)|a*b).sum::<f64>();
+        let initial_cosine=cosine(original_normal);let mut body=initial;
+        for step in 1..=360 {
+            let heading=std::f64::consts::TAU*step as f64/360.0;
+            let before=ground(yaw(body));let after=ground(heading);
+            let angles=tilt(body.1);
+            let planar=(body.0,quaternion(angles[0],angles[1],heading));
+            body=body_after_ground_change(body,planar,before,after,0.4);
+            assert!((cosine(normal(body.1))-initial_cosine).abs()<1e-10,
+                "原地转向不得改变相对同一地平面的倾角：第{step}步，初始{initial_cosine}，当前{}",cosine(normal(body.1)));
+            assert_eq!(body.0,initial.0);
+        }
+        assert!(normal(body.1).into_iter().zip(original_normal).all(|(a,b)|(a-b).abs()<1e-9),
+            "闭合转向须恢复原机体法向");
     }
 
     #[test]
@@ -1671,6 +1796,22 @@ mod tests {
             "连续三阶必须正常抬升：{actual:?}"
         );
     }
+    #[test]
+    fn reported_environment_height_keeps_the_same_ground_on_requery() {
+        let mut points=Vec::new();
+        for p in terrain_points(|x,_|0.2*x) {
+            for i in 0..3 {points.push((p.0,p.1,p.2-0.05*i as f32));}
+        }
+        let terrain=test_terrain(&points,false);
+        for reference in [-0.08,0.08] {
+            let first=terrain.body_at([0.025,0.025],reference,0.3,0.4).unwrap();
+            let next=terrain.body_at([0.025,0.025],first.0[2]-0.4,0.3,0.4).unwrap();
+            assert!((first.0[2]-next.0[2]).abs()<1e-9
+                && first.1.iter().zip(next.1).all(|(a,b)|(a-b).abs()<1e-9),
+                "原地按地面刚返回的高度查询不能改变环境法向：{first:?} -> {next:?}");
+        }
+    }
+
     #[test]
     fn uncertain_height_bands_preserve_a_common_feasible_flat_contact() {
         let mut points = terrain_points(|_, _| 0.0);

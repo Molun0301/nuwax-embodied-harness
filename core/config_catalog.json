@@ -848,18 +848,6 @@
     "apply_scope": "重启网关、人物跟随后端后生效",
     "description": ""
   },
-  "NUWAX_MLS_PLANNING_TIMEOUT_MS": {
-    "zh_name": "三维表面规划超时（毫秒）",
-    "type": "int",
-    "default": 5000,
-    "section_id": "nav_stack",
-    "target_file": "core_env",
-    "consumers": [
-      "services/nuwax-workspace/crates/nuwax-nav-mls-planner/src/lcm_worker.rs"
-    ],
-    "apply_scope": "重启相关服务后生效",
-    "description": ""
-  },
   "NUWAX_WAVEFRONT_GOAL_TIMEOUT_MS": {
     "zh_name": "波前探索单目标超时（毫秒）",
     "type": "int",
@@ -1806,7 +1794,7 @@
     "description": "支撑面至机器人最高点所需净空，与机体到支撑面标定距离不同。"
   },
   "NUWAX_NAV_SURFACE_VOXEL_SIZE_M": {
-    "zh_name": "三维支撑面体素（米）",
+    "zh_name": "三维几何索引体素（米）",
     "type": "float",
     "default": 0.1,
     "section_id": "nav_stack",
@@ -1815,7 +1803,7 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
     ],
     "apply_scope": "重启导航栈与几何运行时后生效",
-    "description": "规划支撑面分辨率；来源点云比此值更粗时明确拒绝，不能恢复不存在的细节。"
+    "description": "共享地形索引的分辨率；PCT有完整精细源时使用原始精度。来源点云不能比索引更粗。"
   },
   "NUWAX_NAV_MIN_STAIR_TREAD_M": {
     "zh_name": "楼梯最小踏面深度（米）",
@@ -1829,6 +1817,46 @@
     "apply_scope": "重启导航栈与几何运行时后生效",
     "description": "离散台阶两侧所需连续踏面深度，配合最大台阶高度和坡度使用。"
   },
+  "NUWAX_NAV_LOCAL_HORIZON_M": {
+    "zh_name": "近场轨迹视距（米）",
+    "type": "float",
+    "default": 3.0,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈后生效",
+    "description": "沿PCT全局路线选取前方参考的长度；实际窗口至少覆盖机体尺寸、控制前瞻和声明的转弯尺度。",
+    "minimum": 0.01
+  },
+  "NUWAX_NAV_LOCAL_REFRESH_DISTANCE_M": {
+    "zh_name": "近场轨迹更新距离（米）",
+    "type": "float",
+    "default": 1.0,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈后生效",
+    "description": "沿路前进此距离后更新近场轨迹，复用余下全局路线；实际更新同时受剩余窗口长度约束，无需与视距手工配对。",
+    "minimum": 0.01
+  },
+  "NUWAX_NAV_SPLINE_ITERATIONS": {
+    "zh_name": "近场样条优化次数",
+    "type": "int",
+    "default": 12,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈后生效",
+    "description": "局部三次样条的优化迭代上限，0—100；不增加全局搜索维度。",
+    "minimum": 0,
+    "maximum": 100
+  },
   "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_STEP_HEIGHT_M": {
     "zh_name": "可通行最大台阶高度（米）",
     "type": "float",
@@ -1840,7 +1868,7 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
     ],
     "apply_scope": "重启导航栈与几何运行时后生效",
-    "description": "MLS三维导航允许的最大真实台阶高度，仍需满足踏面和净空条件。"
+    "description": "三维导航允许的最大真实台阶高度，仍需满足踏面和净空条件。"
   },
   "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_SLOPE_DEG": {
     "zh_name": "可通行最大坡度（度）",

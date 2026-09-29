@@ -10,6 +10,17 @@ export function poseArray(value) {
   return [value[0], value[1], value[2], Number.isFinite(value[3]) ? value[3] : 0];
 }
 
+export function routeViewBounds(start, goal, path = []) {
+  const low = [Infinity, Infinity, Infinity], high = [-Infinity, -Infinity, -Infinity];
+  for (const value of [start, goal, ...path]) {
+    const point = poseArray(value); if (!point) continue;
+    for (let axis = 0; axis < 3; axis++) { low[axis] = Math.min(low[axis], point[axis]); high[axis] = Math.max(high[axis], point[axis]); }
+  }
+  if (!low.every(Number.isFinite)) return null;
+  const padding = Math.max(1.2, Math.hypot(high[0] - low[0], high[1] - low[1]) * 0.16);
+  return [low[0] - padding, low[1] - padding, low[2] - 0.6, high[0] + padding, high[1] + padding, high[2] + 0.6];
+}
+
 export function frameIndexAt(frames, time) {
   let low = 0, high = frames.length - 1;
   while (low <= high) {
@@ -178,6 +189,11 @@ class SimulationView {
     object.visible = Boolean(pose);
     if (pose) {
       object.position.set(pose[0], pose[1], pose[2]);
+      const marker = object === this.body ? ['robot-label', '机器人'] : object === this.goal ? ['goal-label', '目标'] : object === this.start ? ['start-label', '起点'] : null;
+      if (marker) {
+        const label = document.getElementById(marker[0]), text = `${marker[1]} · Z ${Number(pose[2]).toFixed(2)} 米`;
+        if (label && label.textContent !== text) label.textContent = text;
+      }
       if (Array.isArray(orientation) && orientation.length === 4 && orientation.every(Number.isFinite)) {
         object.quaternion.set(...orientation).normalize();
       } else object.rotation.set(0, 0, pose[3] || 0);
@@ -205,11 +221,9 @@ class SimulationView {
     this.headingMesh.position.set(Math.max(...footprint.map(point => point[0])) + 0.08, 0, height[1] + 0.03);
   }
   fit() { this.frameBounds(this.bounds); }
-  focusRoute(start, goal) {
-    const padding = Math.max(1.2, Math.hypot(goal[0] - start[0], goal[1] - start[1]) * 0.16);
-    this.frameBounds([Math.min(start[0], goal[0]) - padding, Math.min(start[1], goal[1]) - padding,
-      Math.min(start[2], goal[2]) - 0.6, Math.max(start[0], goal[0]) + padding,
-      Math.max(start[1], goal[1]) + padding, Math.max(start[2], goal[2]) + 0.6]);
+  focusRoute(start, goal, path = []) {
+    const bounds = routeViewBounds(start, goal, path);
+    if (bounds) this.frameBounds(bounds);
   }
   frameBounds(b) {
     this.framingBounds = b;
@@ -351,6 +365,7 @@ function initialize() {
     showState(); controls();
   }
   function rememberPaths(snapshot) {
+    const firstPath = !store.lastGlobal?.length;
     const history = snapshot.path_history || {};
     for (const [revision, points] of Object.entries(history)) if (Array.isArray(points) && points.length && !store.paths.get(String(revision))?.length) store.paths.set(String(revision), points);
     const revision = snapshot.path_revision ?? store.frames.at(-1)?.path_revision;
@@ -359,6 +374,13 @@ function initialize() {
         if (!store.paths.has(String(revision))) store.paths.set(String(revision), snapshot.global_path);
         store.lastGlobal = store.paths.get(String(revision));
       } else store.lastGlobal = snapshot.global_path;
+      // 同XY跨层必须绕行到楼梯或坡道；首次出线后按真实全局路线扩展画面。
+      // 后续重规划与用户主动调整镜头时保持当前视角。
+      const bounds = view.framingBounds;
+      if (firstPath && !view.userCamera && (!bounds || snapshot.global_path.some(point =>
+        point.slice(0, 3).some((value, axis) => value < bounds[axis] || value > bounds[axis + 3])))) {
+        view.focusRoute(store.start, poseArray(snapshot.goal) || store.goal, snapshot.global_path);
+      }
     }
     if (Array.isArray(snapshot.local_path)) {
       const t = snapshot.sim_time_sec ?? store.frames.at(-1)?.t;

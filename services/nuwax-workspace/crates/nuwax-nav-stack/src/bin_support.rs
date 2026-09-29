@@ -186,7 +186,7 @@ fn print_help() {
          Navigation stack orchestration.\n\n\
          USAGE:\n    nuwax-nav-stack [OPTIONS]\n\n\
          OPTIONS:\n\
-         -p, --profile <NAME>   确认执行链的导航配置（二维simple-2d，三维mls-3d）；其它图仅可dry-run\n\
+         -p, --profile <NAME>   确认执行链的导航配置（二维simple-2d，三维pct-scan-3d）；其它图仅可dry-run\n\
              --preset <NAME>    apply feature preset (none | simple | cmu | explore | mls | all)\n\
              --dry-run         render module graph and exit (no process spawn)\n\
              --list-features   list available features and exit\n\

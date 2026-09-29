@@ -478,6 +478,7 @@ pub(super) fn from_columns(
     let graph = Arc::new(graph);
     let occupied_voxels = columns.values().map(Vec::len).sum();
     Ok(SurfaceSnapshot {
+        ground_evidence:GroundEvidence::MeasuredSurface,
         observations: None,
         current_body_support: None,
         body_query_cache: Default::default(),
@@ -677,6 +678,7 @@ fn update_columns(
         Arc::new(graph)
     };
     let snapshot = SurfaceSnapshot {
+        ground_evidence:previous.ground_evidence,
         observations: None,
         current_body_support: None,
         body_query_cache: Default::default(),

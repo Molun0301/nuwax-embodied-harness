@@ -55,7 +55,7 @@ def main() -> int:
             print("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS=" + linear)
             print("_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS=" + angular)
             # Go2官方Move接口声明前后、左右及偏航通道；不推测制动参数。
-            print("_NUWAX_NAV_ACTUATOR_MOTION_MODEL=" + ("omnidirectional" if linear and profile == "mls-3d" else ""))
+            print("_NUWAX_NAV_ACTUATOR_MOTION_MODEL=" + ("omnidirectional" if linear and profile == "pct-scan-3d" else ""))
         else:
             print(profile)
     except ValueError as error:

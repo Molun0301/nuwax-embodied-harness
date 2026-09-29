@@ -66,7 +66,10 @@ impl SurfaceObservations {
             levels.retain(|z|z.div_euclid(self.block_edge)!=block[2]);
             if let Some(replacement)=replacement.remove(&column) {levels.extend(replacement);}
             levels.sort_unstable();levels.dedup();
-            if levels.is_empty() {self.columns.remove(&column);} else {self.columns.insert(column,Arc::new(levels));}
+            if levels.is_empty() {self.columns.remove(&column);}
+            else if self.columns.get(&column).is_none_or(|previous|previous.as_slice()!=levels.as_slice()) {
+                self.columns.insert(column,Arc::new(levels));
+            }
         }
         if values.is_empty() {
             self.blocks.remove(&block);
@@ -86,6 +89,16 @@ impl SurfaceObservations {
 
     pub(super) fn is_complete_geometry_source(&self)->bool {
         self.complete_geometry_source
+    }
+
+    /// 仅比较占据几何；新扫描时间和命中次数不使层析代价重建。
+    pub fn same_geometry(&self,other:&Self)->bool {
+        self.size_m.to_bits()==other.size_m.to_bits()
+            && self.complete_geometry_source==other.complete_geometry_source
+            && self.columns.ptr_eq(&other.columns)
+    }
+    pub(super) fn navigation_columns(&self)->impl Iterator<Item=([i32;2],&[i32])> {
+        self.columns.iter().map(|(&key,levels)|(key,levels.as_slice()))
     }
 
     /// 查询实际位置的证据，不修改时间或命中次数。
@@ -220,12 +233,13 @@ mod tests {
 impl SurfaceSnapshot {
     /// 几何相同即可继续复用静态路线；观察层由局部执行独立检查。
     pub fn same_geometry(&self, previous: &Self) -> bool {
-        Arc::ptr_eq(&self.data, &previous.data)
+        Arc::ptr_eq(&self.data, &previous.data) && self.ground_evidence==previous.ground_evidence
     }
 
     /// 将同一次完整提交的观察附到已有几何上。
     pub fn with_observations(&self, observations: Option<Arc<SurfaceObservations>>) -> Self {
         Self {
+            ground_evidence:self.ground_evidence,
             data: Arc::clone(&self.data),
             observations,
             current_body_support: self.current_body_support.clone(),

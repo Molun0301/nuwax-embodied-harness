@@ -12,9 +12,15 @@ impl PrismQuery {
             let radius = dot(axis.map(f64::abs), half);
             let velocity = -dot(axis, displacement);
             let allowance=padding*dot(axis,axis).sqrt();
-            let lower = low - radius - allowance - 1e-10;
-            let upper = high + radius + allowance + 1e-10;
-            if velocity == 0.0 {
+            // 候选时间区间必须覆盖后续逐姿态相交判断。近乎平行时，点积的
+            // 末位误差会被除以极小速度放大；向外包住运算误差，不改最终碰撞许可。
+            let velocity_error=32.0*f64::EPSILON*(0..3).map(|i|(axis[i]*displacement[i]).abs()).sum::<f64>();
+            let rounding=32.0*f64::EPSILON*((0..3).map(|i|axis[i].abs()
+                *(min[i].abs()+max[i].abs()+2.0*self.origin[i].abs()+displacement[i].abs())).sum::<f64>()
+                +low.abs()+high.abs()+radius+allowance);
+            let lower = low - radius - allowance - 1e-10 - rounding;
+            let upper = high + radius + allowance + 1e-10 + rounding;
+            if velocity.abs() <= velocity_error {
                 if position < lower || position > upper { return None; }
             } else {
                 let first = (lower - position) / velocity;
@@ -474,6 +480,30 @@ impl SurfaceSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn translated_interval_contains_all_grazing_pose_contacts() {
+        let model=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],
+            z_bounds_m:[-0.4,0.06],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
+            max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
+        let low=[0.025,0.025,-0.2];let high=[0.075,0.075,-0.15];
+        for n in 1..80 {
+            let angle=f64::from(n)*0.073;let r=rotation([0.0,0.0,(angle*0.5).sin(),(angle*0.5).cos()]).unwrap();
+            let gap=0.16+(r[1][0].abs()+r[1][1].abs())*0.025+1e-10/0.6;
+            for jitter in -20..=20 {
+                let from=[0.05-r[1][0]*gap+f64::from(jitter)*1e-17,0.05-r[1][1]*gap,0.0];
+                let delta=r[0].map(|v|v*0.0043);
+                let interval=PrismQuery::new(&model,r,from).expanded_translated_interval(delta,low,high,0.0);
+                for t in [0.0,0.25,0.5,0.75,1.0] {
+                    let at=std::array::from_fn(|i|from[i]+delta[i]*t);
+                    if PrismQuery::new(&model,r,at).intersects(low,high) {
+                        assert!(interval.is_some_and(|v|v[0]<=t+1e-8 && v[1]>=t-1e-8),
+                            "候选区间不能遗漏实际相交：angle={angle} jitter={jitter} t={t} interval={interval:?}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn ground_allowance_covers_all_actual_column_corners_and_attitudes() {
         let model=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]],

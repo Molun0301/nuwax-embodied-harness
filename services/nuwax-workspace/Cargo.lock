@@ -2009,6 +2009,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwax-nav-pct"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "nuwax-nav-mls-planner",
+ "nuwax-nav-types-messages",
+ "tracing",
+]
+
+[[package]]
 name = "nuwax-nav-pgo-bridge"
 version = "0.1.0"
 dependencies = [
@@ -2037,10 +2047,24 @@ dependencies = [
  "nuwax-nav-astar",
  "nuwax-nav-control",
  "nuwax-nav-mls-planner",
+ "nuwax-nav-pct",
+ "nuwax-nav-scan",
  "nuwax-nav-types-messages",
  "prost",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "nuwax-nav-scan"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-mls-planner",
+ "nuwax-nav-pct",
+ "nuwax-nav-types-messages",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -2084,6 +2108,7 @@ dependencies = [
  "nuwax-nav-native-runner",
  "nuwax-nav-path-follower-bridge",
  "nuwax-nav-patrolling",
+ "nuwax-nav-pct",
  "nuwax-nav-pgo-bridge",
  "nuwax-nav-runtime",
  "nuwax-nav-simple-planner",
@@ -2191,6 +2216,16 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "nuwax-nav-voxel"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "nalgebra 0.33.3",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

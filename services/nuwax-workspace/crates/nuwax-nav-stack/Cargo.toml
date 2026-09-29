@@ -109,6 +109,7 @@ click-goal = ["lcm-runtime", "dep:nuwax-nav-click-goal-bridge"]
 
 # ---- 3D / 探索(可选,本 crate 默认不引入 explore)----
 mls = [
+    "dep:nuwax-nav-pct",
     "guard-runtime",
     "dep:nuwax-map-chunks",
     "dep:nuwax-rpc",
@@ -158,6 +159,7 @@ full = [
 ]
 
 [dependencies]
+nuwax-nav-pct = { path = "../nuwax-nav-pct", optional = true }
 nuwax-nav-control = { path = "../nuwax-nav-control" }
 nuwax-core = { path = "../nuwax-core" }
 # ---- Foundation(协议层与基础类型):不直接使用,留给上游 crate 各自引用

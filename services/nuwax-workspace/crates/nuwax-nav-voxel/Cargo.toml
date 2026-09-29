@@ -1,0 +1,17 @@
+[package]
+name = "nuwax-nav-voxel"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "独立原始体素局部几何与候选路线对照"
+
+[dependencies]
+ahash = "0.8"
+nalgebra = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

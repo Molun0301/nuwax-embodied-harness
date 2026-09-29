@@ -1,4 +1,4 @@
-//! MLS生产拥有方：共享一次构建的表面，沿既有目标、路径与运动守卫推进。
+//! 三维导航生产拥有方：共享地图，交付PCT全局参考，并由Scan近场持续执行。
 
 use std::collections::VecDeque;
 
@@ -336,12 +336,12 @@ fn body_path_with_budget(
     ];
     if surface.body_envelope().is_some() {
         let p=start.pose.position;
-        let current_view=surface.with_current_body_support([p.x,p.y,p.z],start_quat)
-            .map_err(|e|module_error("surface current body",e.to_string()))?;
-        let surface=&current_view;
         let boundary:Vec<_>=goal.boundary_points.iter().map(|p|[p[0],p[1]]).collect();
-        let options=goal.options;
-        let route=crate::surface_oriented::plan_with_motion_cancellable(surface,([p.x,p.y,p.z],start_quat),(goal.goal.pose.position,goal.goal.pose.orientation_xyzw),options,config.follower.kinematics().as_ref(),&boundary,search_budget,config.planning_cancelled.as_deref()).map_err(|e|module_error("surface body planning",e))?;
+        let _ = search_budget;
+        let route=config.follower.pct.body_route(surface,([p.x,p.y,p.z],start_quat),
+            (goal.goal.pose.position,goal.goal.pose.orientation_xyzw),goal.options,
+            &boundary,config.planning_cancelled.as_deref())
+            .map_err(|e|module_error("pct global planning",e))?;
         return Ok(Path3D{poses:route.into_iter().map(|(p,q)|PoseStamped {frame_id:start.frame_id.clone(),stamp:start.stamp,pose:Pose3 {position:Point3::new(p[0],p[1],p[2]),orientation:Quaternion{x:q[0],y:q[1],z:q[2],w:q[3]}}}).collect()});
     }
     let start_support = surface
@@ -738,6 +738,7 @@ async fn run_surface_planner_with_computer(
                 if goal.as_ref().is_some_and(|active|active == &incoming) { continue; }
                 if newest_goal.as_ref().is_some_and(|current| validate_goal_envelope_order(&incoming, current).is_err()) { continue; }
                 if let Err(error) = navigation_boundary_from_goal(&incoming) { diagnostics.reject("surface goal boundary",&error.to_string());continue; }
+                config.follower.pct.clear_local_costs();
                 newest_goal = Some(incoming.clone()); goal = Some(incoming);
                 path_revision = 0; last_path = None; needs_plan = true; execution_admitted = false;
                 retry_after = Instant::now(); checked_surface = None; failed_input = None;
@@ -801,6 +802,9 @@ async fn run_surface_planner_with_computer(
                 let queued=Instant::now();
                 path_computations.spawn_blocking(move || {
                     let started = Instant::now();
+                    let span=tracing::info_span!("navigation.plan",goal_id=%planned_goal.session_id,
+                        goal_generation=planned_goal.goal_generation);
+                    let _entered=span.enter();
                     let result = computer(&surface,&pose,&planned_goal,&config);
                     tracing::info!(goal_id=%planned_goal.session_id, queue_ms=started.duration_since(queued).as_secs_f64()*1000.0, elapsed_ms=started.elapsed().as_secs_f64()*1000.0, points=result.as_ref().ok().map(|p|p.poses.len()), error=?result.as_ref().err(), "三维路径计算完成");
                     (epoch, planned_goal, surface, pose.pose, result)
@@ -977,8 +981,8 @@ mod tests {
         }
         eprintln!("实录候选中，可规划{successful}个");
         if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_CONTROL").is_some() {
-            use nuwax_nav_runtime::{NavPlanner,ExecutionMap,ExecutionPath,PlannerStep,SurfaceFollower};
-            let mut follower=SurfaceFollower::new(config.follower.clone()).unwrap();
+            use nuwax_nav_runtime::{NavPlanner,ExecutionMap,ExecutionPath,PlannerStep,RouteFollower};
+            let mut follower=RouteFollower::new(config.follower.clone()).unwrap();
             follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
             let mut actual=pose.clone();
             let distances = std::env::var("NUWAX_NAV_DIAGNOSTIC_CONTROL_DISTANCES").ok()
@@ -1395,7 +1399,7 @@ mod tests {
         let mut start = pose_from_schema(&goal.goal).unwrap();
         start.pose.position.x = 0.55;
         let path = body_path(&surface, &start, &goal, &configured).unwrap();
-        let mut follower = nuwax_nav_runtime::SurfaceFollower::new(configured.follower).unwrap();
+        let mut follower = nuwax_nav_runtime::RouteFollower::new(configured.follower).unwrap();
         follower
             .update_execution_map(nuwax_nav_runtime::ExecutionMap::Surface(surface))
             .unwrap();
@@ -1603,7 +1607,7 @@ mod tests {
                         shutdown,
                         ready,
                         async move {
-                            let local = nuwax_nav_runtime::SurfaceFollower::new(config().follower)?;
+                            let local = nuwax_nav_runtime::RouteFollower::new(config().follower)?;
                             let scheduler = nuwax_nav_runtime::NavScheduler::new(
                                 RecordingMotion(motion_calls),
                                 local,

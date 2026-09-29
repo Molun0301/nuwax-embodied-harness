@@ -140,6 +140,7 @@ fn identity(session_id: &str, path_revision: i64) -> PathExecutionIdentity {
 
 fn session() -> NavSession {
     NavSession {
+        boundary: Vec::new(),
             options: Default::default(),
         goal_pose: nuwax_nav_astar::helpers::make_pose_stamped("map", 2.0, 0.0, 0.0),
         session_id: "nav_scheduler_20hz_baseline-nav".to_string(),

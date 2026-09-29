@@ -30,6 +30,8 @@ mod planner_worker;
 pub mod surface_follower;
 pub use nuwax_nav_mls_planner::SurfaceSnapshot;
 pub use surface_follower::{SurfaceFollower, SurfaceFollowerConfig};
+mod route_follower;
+pub use route_follower::RouteFollower;
 
 /// 局部执行保留路径维度，三维路径不能通过默认适配静默丢弃高度。
 #[derive(Debug, Clone, PartialEq)]
@@ -184,6 +186,8 @@ impl PathExecutionIdentity {
 /// One navigation session and its request-level motion admission.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NavSession {
+    /// 原任务的平面边界，局部重规划沿用同一范围。
+    pub boundary: Vec<[f64; 2]>,
     /// 随封存目标核对的倒车授权与到达容差。
     pub options: nuwax_nav_types_messages::GoalOptions,
     /// Stable goal/session identifier.
@@ -753,6 +757,10 @@ enum LocalExecutionPayload {
 
 /// Synchronous deterministic planner boundary.
 pub trait NavPlanner: Send + 'static {
+    /// 传递既有导航会话标识用于计算线程日志，不参与运动准入。
+    fn set_goal_log_context(&mut self, _goal_id: &str) {}
+    /// 接续局部路线时保留已受理任务边界；无局部重规划的后端可沿原全局路径。
+    fn configure_boundary(&mut self, _boundary: &[[f64; 2]]) {}
     /// 在获取新目标租约前捕获执行选项；默认后端不推定支持倒车。
     fn configure_goal(&mut self, _goal: &PoseStamped, options: nuwax_nav_types_messages::GoalOptions) -> Result<(), RuntimeError> {
         options.validate().map_err(|reason| RuntimeError::InvalidInput {field:"goal_options",reason})?;
@@ -1322,7 +1330,9 @@ where
         let motion_admission = session.motion_admission;
         let guard_generation = motion_admission.guard_generation;
         self.planner.stop();
+        self.planner.set_goal_log_context(&session.session_id);
         self.planner.configure_goal(&session.goal_pose,session.options)?;
+        self.planner.configure_boundary(&session.boundary);
         self.session = Some(session);
         self.current_path_revision = 0;
         self.current_payload_hash = None;
@@ -2065,7 +2075,7 @@ pub async fn spawn_production_surface_scheduler(
 }
 
 fn production_surface_backend(config: SurfaceFollowerConfig) -> Result<planner_worker::PlannerWorker, RuntimeError> {
-    planner_worker::PlannerWorker::new(SurfaceFollower::new(config)?)
+    planner_worker::PlannerWorker::new(RouteFollower::new(config)?)
 }
 
 enum SchedulerEvent { Input(Option<InputCommand>), Tick }
@@ -2995,6 +3005,7 @@ mod tests {
 
     fn session_for(session_id: &str) -> NavSession {
         NavSession {
+            boundary: Vec::new(),
             options: Default::default(),
             session_id: session_id.into(),
             execution_identity: execution_identity_for(session_id, 0),

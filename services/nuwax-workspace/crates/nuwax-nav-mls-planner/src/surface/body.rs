@@ -627,6 +627,7 @@ impl SurfaceSnapshot {
         } else {(*physical).clone()};
         let regions=Arc::new(regions::RegionGraph::full(&graph,self.config().voxel_size));
         Ok(Self {
+            ground_evidence:self.ground_evidence,
             observations: self.observations.clone(),
             current_body_support: None,
             body_query_cache: Default::default(),
@@ -1380,11 +1381,14 @@ impl SurfaceSnapshot {
             let mut columns = actual_rotation.map(|axis| {
                 world(next_rotation,[0.0;3],base_rotation.map(|basis| dot(basis,axis)))
             });
-            let correction = yaw-columns[0][1].atan2(columns[0][0]);
-            let (sine,cosine) = correction.sin_cos();
-            for column in &mut columns {
-                *column = [cosine*column[0]-sine*column[1],sine*column[0]+cosine*column[1],column[2]];
-            }
+            // 偏航约束前向轴的水平投影；绕世界竖轴修正会再次转走已搬运的法向。
+            // 在保持机体法向的平面内重建正交基，避免转向细分积累倾斜误差。
+            let normal=columns[2];
+            let (sine,cosine)=yaw.sin_cos();
+            let forward=[cosine*normal[2],sine*normal[2],-cosine*normal[0]-sine*normal[1]];
+            let length=dot(forward,forward).sqrt();
+            columns[0]=forward.map(|v|v/length);
+            columns[1]=cross(normal,columns[0]);
             quaternion_from_columns(columns)
         };
         let offset = rotated_support_offset(q,model.body_to_support_z_m)?;
@@ -1521,9 +1525,18 @@ impl SurfaceSnapshot {
         now_ns: u64,
         max_age_ns: u64,
     ) -> Result<(), SurfaceError> {
+        self.validate_observed_body_motion_in_boundary(from,to,occupied,now_ns,max_age_ns,&[])
+    }
+
+    /// 近场轨迹同时沿用原任务边界和实测观察，一次完成相同运动的几何核对。
+    pub fn validate_observed_body_motion_in_boundary(
+        &self, from: ([f64;3],[f64;4]), to: ([f64;3],[f64;4]),
+        occupied: &std::collections::BTreeSet<[i32;3]>, now_ns:u64, max_age_ns:u64,
+        boundary:&[[f64;2]],
+    ) -> Result<(),SurfaceError> {
         let observations = self.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
         if now_ns == 0 || max_age_ns == 0 { return Err(SurfaceError::MissingSupport); }
-        self.validate_body_motion_checked(from, to, &[], |pose| {
+        self.validate_body_motion_checked(from, to, boundary, |pose| {
             for cell in self.body_observation_footprint(pose)? {
                 if occupied.contains(&cell) { continue; }
                 let evidence = observations.get(cell).unwrap_or(SurfaceObservation {observed_ns:0,hits:0});
@@ -1713,7 +1726,8 @@ impl SurfaceSnapshot {
         if let Some(points)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner())
             .contact_samples.get(&cell).cloned() {return points;}
         let coarse=self.cell_position(cell);
-        let low=(self.observed_support_lower_bound(cell)+f64::from(self.source_voxel_size_m())).min(coarse[2]);
+        let low=if self.ground_evidence==GroundEvidence::OccupiedVolume {coarse[2]}else{
+            (self.observed_support_lower_bound(cell)+f64::from(self.source_voxel_size_m())).min(coarse[2])};
         let points=Arc::new(vec![(coarse,low)]);
         let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
         if cache.contact_samples.len()>=8192 {cache.contact_samples.clear();}
@@ -1741,6 +1755,7 @@ impl SurfaceSnapshot {
                 bands.push([(f64::from(bottom)+1.0)*size,(f64::from(top)+1.0)*size]);
             }
         }
+        if self.ground_evidence==GroundEvidence::OccupiedVolume {for band in &mut bands {band[0]=band[1];}}
         let bands=Arc::new(bands);
         let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
         if cache.fine_bands.len()>=8192 {cache.fine_bands.clear();}
@@ -1945,7 +1960,14 @@ fn fit_contact_plane(points:&[([f64;3],f64,f64)],origin:[f64;3])->Option<(f64,f6
             let factor=inverse[i][column];for j in 0..6 {inverse[i][j]-=factor*inverse[column][j];}
         }}
     }
-    let mut plane=[0.0,0.0,origin[2]];
+    // 区间拟合可能有多个同样可行的斜面，不能由每拍变化的参考高度选择不同法向。
+    // 共同水平接触保留原参考；确需斜面时，从仅由固定观测决定的高度开始求解。
+    let low=rows.iter().map(|row|row.1).fold(f64::NEG_INFINITY,f64::max);
+    let high=rows.iter().map(|row|row.2).fold(f64::INFINITY,f64::min);
+    if low<=high {return Some((0.0,0.0,origin[2].clamp(low,high)));}
+    let weight=rows.iter().map(|row|row.3).sum::<f64>();
+    let height=rows.iter().map(|row|(row.1+row.2)*0.5*row.3).sum::<f64>()/weight;
+    let mut plane=[0.0,0.0,height];
     // 这是数值求解迭代界，不改变任何地面、净空、坡度或阶差许可。
     for _ in 0..128 {
         let project=|v:[f64;3],low:f64,high:f64|dot(v,plane).clamp(low,high);
@@ -2090,6 +2112,21 @@ mod tests {
             make(&[0.175]).validate_body_pose(p, q).is_err(),
             "悬空参考点不能借地面厚层规则通过"
         );
+    }
+
+    #[test]
+    fn reported_contact_height_does_not_change_the_same_observed_plane() {
+        let points:Vec<_>=(-5..=5).flat_map(|x|(-5..=5).map(move|y| {
+            let x=f64::from(x)*0.1;
+            ([x,f64::from(y)*0.1,0.2*x+0.04],0.2*x-0.04,1.0)
+        })).collect();
+        for height in [-0.08,0.08] {
+            let first=fit_contact_plane(&points,[0.0,0.0,height]).unwrap();
+            let repeated=fit_contact_plane(&points,[0.0,0.0,first.2]).unwrap();
+            assert!((first.0-repeated.0).abs()<1e-10 && (first.1-repeated.1).abs()<1e-10
+                && (first.2-repeated.2).abs()<1e-10,
+                "同一观测、同一XY按返回高度再查不能改变地面：{first:?} -> {repeated:?}");
+        }
     }
 
     #[test]
@@ -2370,6 +2407,96 @@ mod tests {
         envelope.footprint_xy_m = vec![[-0.1,-0.08],[0.1,-0.08],[0.1,0.08],[-0.1,0.08]];
         SurfaceSnapshot::from_points(&points, config, 0.05).unwrap()
             .with_body_envelope(envelope).unwrap()
+    }
+
+    // 单层真实细采样令拟合在固定XY处唯一，不用厚带参考变化解释姿态搬运误差。
+    fn biased_sloped_contact_fixture() -> (SurfaceSnapshot,([f64;3],[f64;4])) {
+        let fine=0.05_f32;
+        let points:Vec<_>=(-35..35).flat_map(|x|(-35..35).map(move|y| {
+            let px=(x as f32+0.5)*fine;let py=(y as f32+0.5)*fine;
+            (px,py,0.12*px+0.06*py)
+        })).collect();
+        let mut config=scene(&[],false).config().clone();config.wall_clearance_m=0.0;config.robot_height=0.1;
+        let mut model=model();model.footprint_xy_m=vec![[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]];
+        model.max_cross_slope_deg=25.0;
+        let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for &(x,y,z) in &points {
+            let key=[x,y,z].map(|v|(f64::from(v)/f64::from(fine)).floor() as i32);
+            blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});
+        }
+        let mut observations=SurfaceObservations::new(fine,32).unwrap();
+        for(key,values)in blocks{observations.replace_block(key,values).unwrap();}observations.mark_complete_geometry_source();
+        let map=SurfaceSnapshot::from_points(&points,config,fine).unwrap().with_body_envelope(model).unwrap()
+            .with_observations(Some(Arc::new(observations)));
+        let centre=map.locate_near_support([0.025,0.025,0.0],0.3).unwrap();
+        let(height,ground)=map.body_contact_frame(centre,0.0,0.35).unwrap();
+        let(sr,cr)=(0.10_f64*0.5).sin_cos();let(sp,cp)=(-0.07_f64*0.5).sin_cos();
+        let bias=rotation([sr*cp,cr*sp,-sr*sp,cr*cp]).unwrap();let r=rotation(ground).unwrap();
+        let actual=quaternion_from_columns(bias.map(|axis|world(r,[0.0;3],axis)));
+        let body=[0.025,0.025,height+0.4/rotation(actual).unwrap()[2][2]];
+        map.validate_body_pose(body,actual).unwrap();(map,(body,actual))
+    }
+    fn relative_up_on_ground(map:&SurfaceSnapshot,pose:([f64;3],[f64;4]))->[f64;3] {
+        let actual=rotation(pose.1).unwrap();let yaw=actual[0][1].atan2(actual[0][0]);
+        let height=pose.0[2]-map.body_envelope().unwrap().body_to_support_z_m/actual[2][2];
+        let centre=map.locate_near_support([pose.0[0],pose.0[1],height],0.3).unwrap();
+        let(_,ground)=map.body_contact_frame(centre,height,yaw).unwrap();
+        rotation(ground).unwrap().map(|axis|dot(axis,actual[2]))
+    }
+    fn follow_closed_test_arc(map:&SurfaceSnapshot,from:([f64;3],[f64;4]),angle:f64,steps:usize)
+        ->([f64;3],[f64;4]) {
+        let r=rotation(from.1).unwrap();let yaw=r[0][1].atan2(r[0][0]);let phase=yaw-std::f64::consts::FRAC_PI_2;
+        let radius=0.2;let center=[from.0[0]-radius*phase.cos(),from.0[1]-radius*phase.sin()];
+        let mut current=from;
+        for i in 1..=steps {
+            let turn=angle*i as f64/steps as f64;
+            let xy=if i==steps && angle.abs()==std::f64::consts::TAU {[from.0[0],from.0[1]]}
+                else {[center[0]+radius*(phase+turn).cos(),center[1]+radius*(phase+turn).sin()]};
+            let next=map.body_pose_after_motion(current,xy,yaw+turn).unwrap();
+            map.validate_body_motion(current,next,&[]).unwrap();current=next;
+        }
+        current
+    }
+
+    #[test]
+    fn relative_terrain_full_turn_preserves_transported_tilt_bias() {
+        let(map,from)=biased_sloped_contact_fixture();let r=rotation(from.1).unwrap();let yaw=r[0][1].atan2(r[0][0]);
+        let reference=relative_up_on_ground(&map,from);assert!(reference[2]<0.999,"测试必须具有非零真实倾斜偏差");
+        for sign in [-1.0,1.0] {
+            let mut current=from;let mut worst=0.0_f64;
+            for step in 1..=180 {
+                let target_yaw=yaw+sign*std::f64::consts::TAU*step as f64/180.0;
+                let next=map.body_pose_after_motion(current,[from.0[0],from.0[1]],target_yaw).unwrap();
+                map.validate_body_motion(current,next,&[]).unwrap();assert_eq!(next.0,from.0,"原地转向不能升降或平移");
+                let actual=relative_up_on_ground(&map,next);
+                worst=worst.max(actual.iter().zip(reference).map(|(a,b)|(a-b).abs()).fold(0.0,f64::max));
+                current=next;
+            }
+            let closure=rotation(current.1).unwrap()[2].iter().zip(r[2]).map(|(a,b)|(a-b).abs()).fold(0.0,f64::max);
+            eprintln!("斜面原地完整转向 sign={sign}, 相对法向最大偏差={worst:e}, 闭合误差={closure:e}");
+            assert!(worst<1e-10&&closure<1e-10,"只修正偏航不能额外转动已搬运法向");
+        }
+    }
+    #[test]
+    fn relative_terrain_closed_path_preserves_attitude_and_height() {
+        let(map,from)=biased_sloped_contact_fixture();
+        let end=follow_closed_test_arc(&map,from,std::f64::consts::TAU,180);
+        let a=rotation(from.1).unwrap();let b=rotation(end.1).unwrap();
+        let attitude=a.iter().flatten().zip(b.iter().flatten()).map(|(a,b)|(a-b).abs()).fold(0.0,f64::max);
+        eprintln!("斜面闭合路径 姿态误差={attitude:e}, 高度误差={:e}",end.0[2]-from.0[2]);
+        assert!(attitude<1e-9&&(end.0[2]-from.0[2]).abs()<1e-9,"闭合地形和偏航不能累积倾斜/高度偏差");
+    }
+    #[test]
+    fn relative_terrain_transport_is_independent_of_turn_segmentation() {
+        let(map,from)=biased_sloped_contact_fixture();
+        let direct=follow_closed_test_arc(&map,from,std::f64::consts::FRAC_PI_2,1);
+        for steps in [3,18,90] {
+            let divided=follow_closed_test_arc(&map,from,std::f64::consts::FRAC_PI_2,steps);
+            let a=rotation(direct.1).unwrap();let b=rotation(divided.1).unwrap();
+            let attitude=a.iter().flatten().zip(b.iter().flatten()).map(|(a,b)|(a-b).abs()).fold(0.0,f64::max);
+            eprintln!("斜面转弯分段 n={steps}, 姿态差={attitude:e}, 高度差={:e}",divided.0[2]-direct.0[2]);
+            assert!(attitude<1e-9&&(divided.0[2]-direct.0[2]).abs()<1e-9,"同一地形与完整端点不应依赖弯道细分数");
+        }
     }
 
     #[test]

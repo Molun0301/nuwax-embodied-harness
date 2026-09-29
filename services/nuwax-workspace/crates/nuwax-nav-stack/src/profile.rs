@@ -22,7 +22,7 @@
 //!   的 CMU stack,使用 native C++ bridge。
 //! - `ReplanningAStar`:基于 `nuwax-nav-astar` 的纯 Rust replanning pipeline。
 //! - `ExplorationNative`:在 CmuNative 之上叠加 TARE / Wavefront 探索目标源。
-//! - `Mls3D`:基于 `nuwax-nav-mls-planner` 的 3D MLS pipeline。
+//! - `Mls3D`:PCT全局、Scan近场与持续执行，保留Rust枚举名兼容既有装配。
 
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +42,8 @@ pub enum NavStackProfile {
     ReplanningAStar,
     /// CMU 原生 pipeline + 探索目标源(TARE / wavefront)。
     ExplorationNative,
-    /// 3D MLS planner pipeline。
+    /// PCT、Scan与持续路线执行；枚举名兼容已有编排调用。
+    #[serde(rename = "pct-scan-3d", alias = "mls3-d", alias = "mls-3d")]
     Mls3D,
 }
 
@@ -61,7 +62,7 @@ impl NavStackProfile {
     /// 从 CLI 字符串解析。
     ///
     /// 接受 `"simple-2d"` / `"cmu-native"` / `"replanning-astar"`
-    /// / `"exploration-native"` / `"mls-3d"`,也接受兼容大小写。
+    /// / `"exploration-native"` / `"pct-scan-3d"`；旧三维名称自动迁移。
     pub fn from_cli_str(s: &str) -> NavStackResult<Self> {
         let normalized = s.trim().to_ascii_lowercase().replace('_', "-");
         match normalized.as_str() {
@@ -73,10 +74,10 @@ impl NavStackProfile {
             "exploration-native" | "explorationnative" | "exploration" => {
                 Ok(NavStackProfile::ExplorationNative)
             }
-            "mls-3d" | "mls3d" | "mls" => Ok(NavStackProfile::Mls3D),
+            "pct-scan-3d" | "mls-3d" | "mls3d" | "mls" => Ok(NavStackProfile::Mls3D),
             other => Err(NavStackError::invalid(format!(
                 "unknown profile: `{other}` (allowed: simple-2d, cmu-native, \
-                 replanning-astar, exploration-native, mls-3d)"
+                 replanning-astar, exploration-native, pct-scan-3d)"
             ))),
         }
     }
@@ -88,7 +89,7 @@ impl NavStackProfile {
             NavStackProfile::CmuNative => "cmu-native",
             NavStackProfile::ReplanningAStar => "replanning-astar",
             NavStackProfile::ExplorationNative => "exploration-native",
-            NavStackProfile::Mls3D => "mls-3d",
+            NavStackProfile::Mls3D => "pct-scan-3d",
         }
     }
 
@@ -107,7 +108,7 @@ impl NavStackProfile {
             NavStackProfile::ExplorationNative => {
                 "探索目标源增强的 CMU pipeline(在 cmu-native 基础上叠加 TARE / wavefront)"
             }
-            NavStackProfile::Mls3D => "3D MLS planner pipeline(mls-planner + binding)",
+            NavStackProfile::Mls3D => "PCT层析全局路线 + Scan近场轨迹 + 3DMR式持续执行",
         }
     }
 }

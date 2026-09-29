@@ -25,11 +25,13 @@ def resolve_navigation_profile(pipeline: Optional[str], configured_profile: Opti
     selected = (pipeline or "").strip() or "lio_3d"
     if pipeline and pipeline != pipeline.strip():
         raise ValueError("NUWAX_GEOMETRY_PIPELINE不能包含首尾空白")
-    profiles = {"lio_3d": "mls-3d", "slam_2d": "simple-2d"}
+    profiles = {"lio_3d": "pct-scan-3d", "slam_2d": "simple-2d"}
     if selected not in profiles:
         raise ValueError("NUWAX_GEOMETRY_PIPELINE必须为lio_3d或slam_2d")
     expected = profiles[selected]
     configured = (configured_profile or "").strip()
+    if selected == "lio_3d" and configured == "mls-3d":
+        configured = expected  # 旧三维方案随升级迁入当前实现。
     if configured and configured != expected:
         raise ValueError(
             f"执行链{selected}固定使用{expected}导航，"

@@ -211,7 +211,7 @@ impl ExploreStartConfig {
             "" | "wavefront" | "frontier" => {}
             "surface" if surface_mode => {}
             "surface" => {
-                return Err("surface exploration requires the mls-3d navigation profile".into())
+                return Err("surface exploration requires the pct-scan-3d navigation profile".into())
             }
             "tare" | "native" | "exploration-native" => {
                 return Err(format!(

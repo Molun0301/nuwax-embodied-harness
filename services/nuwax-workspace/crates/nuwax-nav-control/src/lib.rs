@@ -501,7 +501,7 @@ pub struct TrackingScore {
 }
 
 /// 用本拍真实速度过渡及随后恒定候选的三个预览样本评价路径跟随。
-/// 为原窗口线速与边界补充曲率耦合提案，先保持可达曲率，再用预览评分择优；全部停车许可仍须通过。
+/// 为原窗口线速与边界补充曲率耦合提案，按实际预览与停车误差择优；全部停车许可仍须通过。
 /// 评分返回None时保留原位姿目标评分，不授予任何额外运动能力。
 #[allow(clippy::too_many_arguments)]
 pub fn choose_tracking_control_with_period_check(
@@ -585,6 +585,9 @@ fn choose_control_ordered(
             }
         }
     }
+    if let Some(candidate)=terminal_rotation_candidate(pose,current,preferred,target,limits,control_dt) {
+        if allowed(candidate,limits,allow_reverse) && !velocities.contains(&candidate) {velocities.push(candidate);}
+    }
     let mut braking=reachable(Twist2::ZERO,current,limits,control_dt,allow_reverse);
     if limits.minimum_turning_radius_m>0.0 {
         let limit=braking.linear.x.hypot(braking.linear.y)/limits.minimum_turning_radius_m;
@@ -630,9 +633,9 @@ fn choose_control_ordered(
             && current==Twist2::ZERO && velocity==Twist2::ZERO;
         score.is_finite().then_some((stationary_idle,curvature_error,score,velocity,stopped,tracking))
     }).collect();
-    // 停车距离和停车转角都进入目标误差，不能靠短时更接近目标而一直保持过高速度。
+    // 先比较实际预览与停车目标的总误差，同分再比较曲率，避免微小曲率优势压过实际推进。
     // 排序只用已声明的动力学；首个候选仍须完成原几何、观察和整拍物理检查。
-    ranked.sort_by(|left,right|left.0.cmp(&right.0).then_with(||left.1.total_cmp(&right.1)).then_with(||left.2.total_cmp(&right.2)));
+    ranked.sort_by(|left,right|left.0.cmp(&right.0).then_with(||left.2.total_cmp(&right.2)).then_with(||left.1.total_cmp(&right.1)));
     let mut best=None;let mut best_tracking=None;let mut current_stop=None;
     let mut tested=vec![false;ranked.len()];
     for (index,&(_,_,_,velocity,stopped,tracking)) in ranked.iter().enumerate() {
@@ -645,7 +648,7 @@ fn choose_control_ordered(
         }
         if current_stop.as_ref().is_some_and(|result|result.is_none()) {break;}
     }
-    // 曲率首选若只能微动，不得饿死路径跟随和停车接近目标同时更好的原候选。
+    // 总分因末位舍入并列时，继续选择路径跟随和停车接近目标同时更好的候选。
     // 两项必须都不劣且至少一项改善；速度更快但更偏离路径的候选不能据此替换。
     if best.is_some() && best_tracking.is_some() {
         for (index,&(stationary_idle,_,_,velocity,stopped,tracking)) in ranked.iter().enumerate() {
@@ -661,6 +664,22 @@ fn choose_control_ordered(
         }
     }
     best
+}
+
+/// 临近静止的纯转向按整拍过渡、响应等待和一拍制动求解收尾速度。
+/// 仍需多拍制动的常规转向保留原速度选择，避免收尾提案提前改变宏观转弯。
+fn terminal_rotation_candidate(pose:PlanarPose,current:Twist2,preferred:Twist2,target:PlanarPose,
+    limits:&MotionLimits,dt:f64)->Option<Twist2> {
+    let stoppable=limits.guaranteed_angular_braking_rps2*dt;
+    if !limits.can_rotate_in_place || limits.minimum_turning_radius_m>0.0
+        || current.linear.x.hypot(current.linear.y)>1e-9 || preferred.linear.x.hypot(preferred.linear.y)>1e-9
+        || current.angular_z.abs()>stoppable || target.x!=pose.x || target.y!=pose.y {return None;}
+    // Δθ = 本拍平均角速度积分 + 响应等待 + 下一拍降至零的积分。
+    let command=(angle(target.yaw-pose.yaw)-current.angular_z*dt*0.5)/(dt+limits.reaction_time_sec);
+    if command.abs()>stoppable {return None;}
+    let requested=Twist2{linear:Point2::new(0.0,0.0),angular_z:command};
+    let candidate=reachable(requested,current,limits,dt,false);
+    (candidate==requested).then_some(candidate)
 }
 
 #[cfg(test)]
@@ -1118,6 +1137,25 @@ mod tests {
         let cruise=choose_control(pose(),twist(1.0,0.0,0.0),twist(1.0,0.0,0.0),
             PlanarPose{x:0.75,y:0.0,yaw:0.0},&limits,dt,0.025,0.3,true,|_,_,_|true).unwrap();
         assert_eq!(cruise.command,twist(1.0,0.0,0.0),"前方有完整停车距离的直段继续巡航");
+    }
+    #[test]
+    fn tiny_alignment_error_can_finish_with_the_declared_response_and_braking() {
+        let mut limits=limits();limits.max_angular_rps=0.8;limits.reaction_time_sec=0.05;
+        let dt=0.05;
+        for error in [1e-3,-1e-3,1e-6,-1e-6,1e-9,-1e-9] {
+            let target=PlanarPose{x:0.0,y:0.0,yaw:error};
+            let choice=choose_control(pose(),Twist2::ZERO,twist(0.0,0.0,error),target,&limits,
+                dt,0.025,0.3,false,|_,_,_|true).unwrap();
+            // 独立积分本拍、最长响应延迟与下一拍制动，不读取规划器预测终态。
+            let mut velocity=0.0;let mut heading=0.0;
+            for tick in 0..3 {
+                let requested=if tick<2 {choice.command.angular_z}else{0.0};
+                let next=velocity+(requested-velocity).clamp(-2.0*dt,2.0*dt);
+                heading+=(velocity+next)*0.5*dt;velocity=next;
+            }
+            assert!((heading-error).abs()<1e-13,"微小转向不能仅完成固定比例：误差{error}，命令{:?}，最终{heading}",choice.command);
+            assert_eq!(velocity,0.0);
+        }
     }
 
     #[test]

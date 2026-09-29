@@ -31,7 +31,7 @@ bitflags::bitflags! {
     /// 实际生效仍需要对应的 Cargo feature 也已启用(编译期门控)。
     #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct NavFeatureFlags: u32 {
-        /// 启用 MLS 3D pipeline(必须配合 `mls` Cargo feature)。
+        /// 启用三维导航与共享地形，继续使用兼容的 `mls` 构建特性。
         const MLS             = 1 << 3;
         /// 启用探索目标源(必须配合 `explore` Cargo feature)。
         const EXPLORE         = 1 << 4;
@@ -143,7 +143,7 @@ pub enum NavStackPreset {
     Cmu,
     /// 探索模式(Cmu + explore)。
     Explore,
-    /// MLS 3D 模式。
+    /// PCT与Scan三维模式，预设名保留兼容。
     Mls,
     /// 全部启用(开发期 / 集成测试,仍受 Cargo feature gate 约束)。
     All,

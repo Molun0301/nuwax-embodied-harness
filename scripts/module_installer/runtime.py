@@ -176,7 +176,7 @@ def write_runtime(
         "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE": str(binary_dir / f"{backend}_native") if backend != "device" else "",
         "NUWAX_GEOMETRY_LIO_BACKEND": backend,
         "NUWAX_GEOMETRY_PIPELINE": "slam_2d" if "slam2d" in selected else "lio_3d",
-        "NUWAX_NAV_PROFILE": "simple-2d" if "slam2d" in selected else "mls-3d",
+        "NUWAX_NAV_PROFILE": "simple-2d" if "slam2d" in selected else "pct-scan-3d",
         "NUWAX_GEOMETRY_SLAM2D_BINARY": str(binary_dir / "nuwax-slam-2d-worker") if "slam2d" in selected else "",
         "NUWAX_GEOMETRY_RELEASE_MANIFEST": "",
         "NUWAX_GEOMETRY_RELEASE_NATIVE_PGO_EXECUTABLE": "",

@@ -36,7 +36,7 @@ impl SurfaceSnapshot {
         fn same<T>(a:&Option<Arc<T>>,b:&Option<Arc<T>>)->bool {
             match(a,b){(None,None)=>true,(Some(a),Some(b))=>Arc::ptr_eq(a,b),_=>false}
         }
-        Arc::ptr_eq(&self.data,&other.data)&&same(&self.observations,&other.observations)
+        self.ground_evidence==other.ground_evidence && Arc::ptr_eq(&self.data,&other.data)&&same(&self.observations,&other.observations)
             &&same(&self.current_body_support,&other.current_body_support)
     }
 
@@ -84,7 +84,7 @@ impl SurfaceSnapshot {
         }
         if columns.is_empty()||count>MAX_SOURCE_POINTS {return Err(SurfaceError::InvalidPointCloud);}
         let graph=Arc::new(graph);
-        Ok(Self {observations:self.observations.clone(),current_body_support:None,body_query_cache:Default::default(),
+        Ok(Self {ground_evidence:self.ground_evidence,observations:self.observations.clone(),current_body_support:None,body_query_cache:Default::default(),
             data:Arc::new(SurfaceData {body_query_only:true,body_envelope:self.data.body_envelope.clone(),
                 height_bounds:Arc::new(heights),frontier_cache:Default::default(),body_cache:Default::default(),
                 routing_cache:Default::default(),physical_graph:graph.clone(),graph,

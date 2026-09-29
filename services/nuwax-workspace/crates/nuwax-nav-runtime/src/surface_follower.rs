@@ -36,6 +36,10 @@ pub(crate) fn forward_navigation_limits(physical: &MotionLimits) -> MotionLimits
 /// 三维跟随必须明确标定，控制参数复用已有局部控制器配置。
 #[derive(Debug, Clone)]
 pub struct SurfaceFollowerConfig {
+    /// 同一导航拥有方的全局地图与局部反馈缓存。
+    pub pct: Arc<nuwax_nav_pct::PctPlanner>,
+    /// 路线引导的近场轨迹参数，生产RouteFollower消费。
+    pub scan: nuwax_nav_scan::ScanConfig,
     /// 机体局部负Z方向到支撑参考点的正距离，单位米；不提供猜测默认值。
     pub body_to_support_z_m: f64,
     /// 显式运动及保证制动标定。
@@ -59,6 +63,8 @@ impl SurfaceFollowerConfig {
     #[must_use]
     pub fn new(body_to_support_z_m: f64) -> Self {
         Self {
+            pct: Default::default(),
+            scan: nuwax_nav_scan::ScanConfig::default(),
             body_to_support_z_m,
             motion_limits: None,
             basic_kinematics: None,
@@ -118,6 +124,7 @@ impl SurfaceFollowerConfig {
 
 /// 跟随器的进度是三维累计弧长，跨地图修订不保存可复用的表面单元编号。
 pub struct SurfaceFollower {
+    boundary: Vec<[f64;2]>,
     config: SurfaceFollowerConfig,
     controller: PController,
     map: Option<Arc<SurfaceSnapshot>>,
@@ -130,6 +137,7 @@ pub struct SurfaceFollower {
     last_tracked_pose: Option<PoseStamped>,
     invalid_input: Option<String>,
     path_index: usize,
+    alignment_target_index: Option<usize>,
     options: nuwax_nav_types_messages::GoalOptions,
     last_command: Twist2,
     braking_deadline: Option<std::time::Instant>,
@@ -146,6 +154,7 @@ impl SurfaceFollower {
         let mut controller = PController::new(speed, config.controller.control_frequency);
         controller.set_simulation(config.controller.simulation);
         Ok(Self {
+            boundary: Vec::new(),
             config,
             controller,
             map: None,
@@ -158,6 +167,7 @@ impl SurfaceFollower {
             last_tracked_pose: None,
             invalid_input: None,
             path_index: 1,
+            alignment_target_index: None,
             options:Default::default(),
             last_command:Twist2::ZERO,
             braking_deadline:None,
@@ -246,6 +256,7 @@ impl SurfaceFollower {
         self.progress_m = progress;
         self.last_tracked_pose = Some(odometry.clone());
         self.path_index=1;
+        self.alignment_target_index=None;
         self.path = Some(path);
         self.goal = Some(goal);
         self.cumulative = cumulative;
@@ -578,6 +589,7 @@ impl SurfaceFollower {
 }
 
 impl NavPlanner for SurfaceFollower {
+    fn configure_boundary(&mut self,boundary:&[[f64;2]]) {self.boundary=boundary.to_vec();}
     fn configure_goal(&mut self, _goal:&PoseStamped, options:nuwax_nav_types_messages::GoalOptions)->Result<(),RuntimeError> {
         options.validate().map_err(|reason|RuntimeError::InvalidInput {field:"goal_options",reason})?;
         // 新目标执行仍须取得守卫准入；旧规划器内部状态不能代替该证明。
@@ -973,7 +985,12 @@ mod tests {
                 assert_eq!(command.linear.y,0.0,"自主导航不能生成横移");
                 assert!(command.linear.x>=0.0,"自主导航不能生成倒退");
                 if prefix {
-                    assert!(command.linear.x>0.0,"小转角近邻仍应连续前进：{command:?}");
+                    assert_eq!(command.linear.x,0.0,"显式小转向也应先完成：{command:?}");
+                    assert!(command.angular_z>0.0);
+                    follower.observe_applied_command(Twist2::ZERO);
+                    follower.update_odometry(body_pose(xyz(start.pose.position),Quaternion::from_yaw(heading),1));
+                    assert!(matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x>0.0 && c.linear.y==0.0),
+                        "实际完成转向后应立即继续前向移动");
                 } else {
                     assert_eq!(command.linear.x,0.0,"侧方或后方先原地转向");
                     assert!(command.angular_z.abs()>0.0,"必须朝新的前进方向转动");

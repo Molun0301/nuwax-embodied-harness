@@ -51,7 +51,7 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
         "NUWAX_GEOMETRY_LIO_BODY_FROM_IMU": json.dumps(
             {"translation_m": [0, 0, 0], "rotation_row_major": [1, 0, 0, 0, 1, 0, 0, 0, 1]}
         ),
-        "NUWAX_NAV_PROFILE": "mls-3d",
+        "NUWAX_NAV_PROFILE": "pct-scan-3d",
         # 数值来自下方合成场景：地面0米、机体基准0.35米，不作为实机标定。
         "NUWAX_NAV_BODY_TO_SUPPORT_Z_M": "0.35",
         "NUWAX_NAV_ROBOT_WIDTH_M": "0.3",
@@ -377,7 +377,7 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
         "surface_sampling": "五厘米细格中心" if near_field else "原五厘米网格边界",
         "drive_model": "100毫秒响应、线加减速1米每平方秒、角加减速2弧度每平方秒" if calibrated_motion else "理想速度跟随",
         "working_dir": str(working),
-        "components": ["真实MCP网关", "真实Geometry", "真实运动守卫"] + (["真实simple-2d导航", "真实slam_toolbox建图"] if pipeline == "slam_2d" else ["真实mls-3d导航", "raytracing建图"]),
+        "components": ["真实MCP网关", "真实Geometry", "真实运动守卫"] + (["真实simple-2d导航", "真实slam_toolbox建图"] if pipeline == "slam_2d" else ["真实pct-scan-3d导航", "raytracing建图"]),
         "simulation": "5米正方形房间，标准设备里程计，机体速度按真实时间积分，无物理步态仿真；" + ("2.8米量程的瞬时二维扫描" if pipeline == "slam_2d" else f"{getattr(world, 'cloud_range_m', 1.6)}米观测半径的三维点云"),
     }
     rpc_records, snapshots, processes, logs = [], [], [], []

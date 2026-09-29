@@ -726,7 +726,7 @@ fn build_exploration_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
 fn build_mls3d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
     g.push_node(map_pose_adapter(topics).with_feature("mls"));
     g.push_node(
-        ModuleNode::new("mls_planner", "多层表面持续规划", ModuleKind::RustAlgorithm)
+        ModuleNode::new("mls_planner", "PCT层析全局路线", ModuleKind::RustAlgorithm)
             .with_feature("mls")
             .add_input(topics.get_or("navigation_map3d", "/nav/map3d"))
             .add_input(topics.get_or("map_pose", "/nav/map_pose"))
@@ -738,7 +738,7 @@ fn build_mls3d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
     );
     let mut scheduler = guarded_nav_scheduler(topics, "mls_planner");
     scheduler.id = "surface_nav_scheduler".into();
-    scheduler.display_name = "三维受控路径执行".into();
+    scheduler.display_name = "Scan近场轨迹与持续执行".into();
     scheduler.inputs[3] = topics.get_or("navigation_map3d", "/nav/map3d").into();
     g.push_node(scheduler);
     g.push_edge(GraphEdge {

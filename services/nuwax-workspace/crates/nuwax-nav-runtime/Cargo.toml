@@ -8,6 +8,9 @@ authors.workspace = true
 description = "nuwax 导航运行时 Tokio 调度器与 controller 流水线(20Hz tick + cancel epoch + guard client)"
 
 [dependencies]
+nuwax-nav-pct = { path = "../nuwax-nav-pct" }
+nuwax-nav-scan = { path = "../nuwax-nav-scan" }
+tracing.workspace = true
 nuwax-nav-control = { path = "../nuwax-nav-control" }
 # Foundation 类型与安全边界
 nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }

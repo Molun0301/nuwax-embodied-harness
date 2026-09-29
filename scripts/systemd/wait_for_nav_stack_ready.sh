@@ -68,7 +68,7 @@ check_ready() {
     || return 1
   [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ "${starttime}" =~ ^[1-9][0-9]*$ ]] || return 1
-  [[ "${profile}" == "simple-2d" || "${profile}" == "replanning-astar" || "${profile}" == "mls-3d" ]] || return 1
+  [[ "${profile}" == "simple-2d" || "${profile}" == "replanning-astar" || "${profile}" == "pct-scan-3d" ]] || return 1
   [[ "${scheduler_ready}" == "1" ]] || return 1
 
   current_boot_id="$(nuwax_read_boot_id)" || return 1

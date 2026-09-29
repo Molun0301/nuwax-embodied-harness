@@ -111,7 +111,7 @@ internal_scheduler_ready() {
 }
 
 case "${PROFILE}" in
-  simple-2d|mls-3d)
+  simple-2d|pct-scan-3d)
     ;;
   *)
     fail "生产导航配置必须由二维或三维执行链确定：${PROFILE}"

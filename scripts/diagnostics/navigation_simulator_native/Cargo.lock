@@ -1236,6 +1236,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwax-nav-pct"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "nuwax-nav-mls-planner",
+ "nuwax-nav-types-messages",
+ "tracing",
+]
+
+[[package]]
 name = "nuwax-nav-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1244,9 +1254,23 @@ dependencies = [
  "nuwax-nav-astar",
  "nuwax-nav-control",
  "nuwax-nav-mls-planner",
+ "nuwax-nav-pct",
+ "nuwax-nav-scan",
  "nuwax-nav-types-messages",
  "thiserror",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "nuwax-nav-scan"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-mls-planner",
+ "nuwax-nav-pct",
+ "nuwax-nav-types-messages",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -1263,6 +1287,7 @@ dependencies = [
  "nuwax-nav-click-goal-bridge",
  "nuwax-nav-control",
  "nuwax-nav-mls-planner",
+ "nuwax-nav-pct",
  "nuwax-nav-runtime",
  "nuwax-nav-types-messages",
  "nuwax-protocol",
@@ -1297,8 +1322,10 @@ name = "nuwax-navigation-simulator"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "nuwax-core",
  "nuwax-nav-mls-planner",
  "nuwax-nav-runtime",
+ "nuwax-nav-scan",
  "nuwax-nav-stack",
  "nuwax-nav-types-messages",
  "serde_json",

@@ -443,6 +443,12 @@ impl NavPlanner for RouteFollower {
     fn observe_applied_command(&mut self, command: Twist2) {
         self.controller.observe_applied_command(command);
     }
+    fn local_path_for_display(&self) -> Vec<[f64; 3]> {
+        if self.wait_reason.is_some() { return Vec::new(); }
+        self.local_path.as_ref().map(|path| path.poses.iter().map(|p| {
+            let p = p.pose.position; [p.x, p.y, p.z]
+        }).collect()).unwrap_or_default()
+    }
     fn step(&mut self, width: f64) -> PlannerStep {
         self.wait_reason = None;
         if self

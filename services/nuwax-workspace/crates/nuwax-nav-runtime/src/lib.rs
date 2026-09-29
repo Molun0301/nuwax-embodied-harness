@@ -288,6 +288,8 @@ pub struct SchedulerStatus {
     pub last_fence_monotonic_ns: u64,
     /// Diagnostic message for operators and tests.
     pub message: String,
+    /// 当前目标的局部规划轨迹，仅用于显示。
+    pub local_path: Vec<[f64; 3]>,
 }
 
 impl Default for SchedulerStatus {
@@ -309,6 +311,7 @@ impl Default for SchedulerStatus {
             last_zero_ack_id: None,
             last_fence_monotonic_ns: 0,
             message: "idle".into(),
+            local_path: Vec::new(),
         }
     }
 }
@@ -816,6 +819,8 @@ pub trait NavPlanner: Send + 'static {
     fn observe_applied_command(&mut self, _command: Twist2) {}
     /// 计算未完成或控制许可过期时的等待原因；命令回执不能覆盖该执行阶段。
     fn execution_wait_reason(&self) -> Option<String> { None }
+    /// 只读展示当前局部规划，不改变速度或路径许可。
+    fn local_path_for_display(&self) -> Vec<[f64; 3]> { Vec::new() }
     /// Produce one controller step.
     fn step(&mut self, robot_width_m: f64) -> PlannerStep;
     /// Clear planner state after a terminal fence.
@@ -1359,6 +1364,7 @@ where
             last_zero_ack_id: None,
             last_fence_monotonic_ns: 0,
             message: "acquiring NAV lease".into(),
+            local_path: Vec::new(),
         };
         self.publish_status(status_tx);
 
@@ -1880,7 +1886,13 @@ where
     }
 
     fn publish_status(&self, status_tx: &watch::Sender<SchedulerStatus>) {
-        status_tx.send_replace(self.status.clone());
+        let mut status = self.status.clone();
+        if status.phase == SchedulerPhase::Controlling && status.last_terminal.is_none() {
+            status.local_path = self.planner.local_path_for_display();
+        } else {
+            status.local_path.clear();
+        }
+        status_tx.send_replace(status);
     }
 }
 

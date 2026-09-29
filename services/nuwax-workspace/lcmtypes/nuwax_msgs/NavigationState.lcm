@@ -30,4 +30,7 @@ struct NavigationState {
     int64_t path_revision;
     byte goal_payload_sha256[32];
     byte path_payload_sha256[32];
+    // 同一目标与路径修订的局部规划展示；终态为空。
+    int32_t local_path_count;
+    double local_path[local_path_count][3];
 }

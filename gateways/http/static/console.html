@@ -274,8 +274,9 @@
                   <span id="semanticRegionLegend" class="lg" hidden><span class="sw" style="background:var(--info)"></span>语义区域 · 编号对应列表</span>
                   <span class="lg"><span class="sw" style="background:var(--grid-free)"></span>可通行</span>
                   <span class="lg"><span class="sw" style="background:var(--grid-occ)"></span>占据</span>
-                  <span class="lg"><span class="sw" style="background:var(--traj)"></span>轨迹</span>
-                  <span class="lg"><span class="sw" style="background:var(--plan)"></span>规划</span>
+                  <span class="lg"><span class="sw" style="background:#b2a0f8"></span>轨迹</span>
+                  <span class="lg"><span class="sw" style="background:#a5e27e"></span>全局路线</span>
+                  <span class="lg"><span class="sw" style="background:#69dedc"></span>局部路线</span>
                   <span class="lg"><span class="sw" style="background:var(--robot)"></span><span id="robotGeometryLegend">机器人</span></span>
                   <span class="lg"><span class="sw" style="background:var(--frontier)"></span>前沿</span>
                   <span class="lg"><span class="sw" style="background:var(--goal)"></span>目标</span>
@@ -427,7 +428,7 @@
   <script src="/static/js/console-logs.js?v=20260908-pose-log-stream"></script>
   <script src="/static/js/console-settings.js?v=20260920-settings-style"></script>
   <script src="/static/js/map-workspace.js?v=20260923-map-subbar-overlay"></script>
-  <script src="/static/js/console.js?v=20260924-semantic-asset-binding"></script>
+  <script src="/static/js/console.js?v=20260929-navigation-display"></script>
   <script src="/static/js/semantic-map.js?v=20260924-semantic-asset-binding"></script>
   <script src="/static/js/scene-graph.js?v=20260924-semantic-asset-binding"></script>
   <script>
@@ -450,7 +451,7 @@
   </script>
   <script type="module">
     if (window.__NUWAX_GEOMETRY_PIPELINE__ !== "slam_2d") {
-      await import("/static/js/pointcloud3d.js?v=20260923-navigation-path");
+      await import("/static/js/pointcloud3d.js?v=20260929-navigation-display");
     }
   </script>
   <!-- 地图导航与禁行区面板均在地图内展示。 -->

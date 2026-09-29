@@ -8,8 +8,10 @@ import { DensePointCloudLayer } from './dense-pointcloud.js?v=20260918-dense-poi
 const COLORS = {
   robot: 0xfbbf24,
   frontier: 0xf472b6,
-  trajectory: 0x22d3ee,
-  navPath: 0x22ff66,
+  trajectory: 0xb2a0f8,
+  navPath: 0xa5e27e,
+  localPath: 0x69dedc,
+  retainedPath: 0xffba78,
   navGoal: 0xa78bfa,
   semantic: 0xf59e0b,
   semanticFallback: 0x94a3b8,
@@ -405,6 +407,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._sceneGraphData = null;
     this._trajectoryLine = null;
     this._navPathLine = null;
+    this._navLocalPathLine = null;
     this._navGoalMesh = null;
     this._resizeObserver = null;
     this._interactionActive = false;
@@ -421,6 +424,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._forbiddenZoneGeneration = 0;
     this._trajectory = [];
     this._navigationPath = [];
+    this._navigationLocalPath = [];
     this._navigationGoal = null;
     this._semanticInstances = [];
     this._semanticRenderKey = null;
@@ -675,7 +679,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
       this._navigationPickMarker = null;
     }
     if (point && this._scene && Number.isFinite(point.z)) {
-      const marker = new THREE.Mesh(new THREE.SphereGeometry(0.1, 12, 8), new THREE.MeshBasicMaterial({ color: COLORS.navGoal, depthTest: false }));
+      const marker = new THREE.Mesh(new THREE.SphereGeometry(0.1, 12, 8), new THREE.MeshBasicMaterial({ color: COLORS.navGoal, transparent: true, depthTest: false, depthWrite: false }));
       marker.position.set(point.x, point.y, point.z);
       marker.renderOrder = 10;
       this._navigationPickMarker = marker;
@@ -690,14 +694,20 @@ class PointCloud3DViewer extends PointCloudProcessor {
   }
 
   resize() {
+    // 布局观察回调只请求绘制，改画布尺寸与绘制必须在同一帧完成。
+    this._requestRender();
+  }
+
+  _resizeDrawingBuffer() {
     if (!this._container || !this._camera || !this._renderer) return;
     const w = this._container.clientWidth;
     const h = this._container.clientHeight;
     if (!w || !h) return;
+    const size = this._renderer.getSize(new THREE.Vector2());
+    if (size.x === w && size.y === h) return;
     this._camera.aspect = w / h;
     this._camera.updateProjectionMatrix();
     this._renderer.setSize(w, h);
-    this._requestRender();
   }
 
   _requestRender() {
@@ -727,6 +737,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
   _renderLoop() {
     this._rafId = null;
     if (!this._visible) return;
+    this._resizeDrawingBuffer();
     const controlsChanged = Boolean(this._controls?.update());
     this._removeLegacySceneHelpers();
     this._syncSemanticGroupVisibility();
@@ -1343,6 +1354,14 @@ class PointCloud3DViewer extends PointCloudProcessor {
       const legend = document.getElementById('robotGeometryLegend');
       if (legend) { legend.textContent = label; legend.title = description; }
     }
+    // 位姿属于地图叠加，与路线保持固定绘制顺序，避免新点云遮挡标记。
+    group.traverse(object => {
+      if (!object.material) return;
+      object.renderOrder = 33;
+      object.material.transparent = true;
+      object.material.depthTest = false;
+      object.material.depthWrite = false;
+    });
     group.visible = false;
     this._robotMesh = group;
     this._scene.add(group);
@@ -1685,79 +1704,66 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._requestRender();
   }
 
-  updateNavigationPath(path, goalPose, mode = this._navigationPathMode || 'executing') {
-    const samePath = path === this._navigationPath || !Array.isArray(path) || (path.length === this._navigationPath.length && path.every((p, i) => {
-      const old = this._navigationPath[i]; return p.x === old.x && p.y === old.y && p.z === old.z;
-    }));
+  _updateNavigationLine(object, points, color, order) {
+    if (!object && points.length < 2) return null;
+    if (!object) {
+      object = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({
+        color, transparent: true, opacity: 1, depthTest: false, depthWrite: false,
+      }));
+      object.renderOrder = order;
+      object.frustumCulled = false;
+      this._scene.add(object);
+    }
+    object.material.color.setHex(color);
+    object.visible = points.length >= 2;
+    let position = object.geometry.getAttribute('position');
+    if (points.length >= 2) {
+      if (!position || position.count < points.length) {
+        const capacity = Math.max(64, 2 ** Math.ceil(Math.log2(points.length)));
+        position = new THREE.BufferAttribute(new Float32Array(capacity * 3), 3);
+        position.setUsage(THREE.DynamicDrawUsage);
+        object.geometry.dispose();
+        object.geometry = new THREE.BufferGeometry();
+        object.geometry.setAttribute('position', position);
+      }
+      // 与实验台一致，连接真实路径点；缓冲只在容量不足时扩容。
+      points.forEach((p, i) => position.setXYZ(i, p.x, p.y, Number.isFinite(p.z) ? p.z : 0));
+      position.clearUpdateRanges();
+      position.addUpdateRange(0, points.length * 3);
+      position.needsUpdate = true;
+    }
+    object.geometry.setDrawRange(0, points.length);
+    return object;
+  }
+
+  updateNavigationPath(path, goalPose, mode = this._navigationPathMode || 'executing', localPath = []) {
+    const samePoints = (next, previous) => next === previous || !Array.isArray(next)
+      || (next.length === previous.length && next.every((p, i) => {
+        const old = previous[i]; return p.x === old.x && p.y === old.y && p.z === old.z;
+      }));
+    const samePath = samePoints(path, this._navigationPath);
+    const sameLocal = samePoints(localPath, this._navigationLocalPath);
     const previousGoal = this._navigationGoal;
     const sameGoal = goalPose === undefined || (!goalPose && !previousGoal)
       || (goalPose && previousGoal && ['x', 'y', 'z', 'yaw'].every(key => goalPose[key] === previousGoal[key]));
     const sameMode = mode === this._navigationPathMode;
     if (Array.isArray(path) && !samePath) this._navigationPath = path;
+    if (Array.isArray(localPath) && !sameLocal) this._navigationLocalPath = localPath;
     if (goalPose !== undefined) this._navigationGoal = goalPose || null;
     this._navigationPathMode = mode;
     if (!this._scene) return;
-    if (samePath && sameGoal && sameMode
-      && (this._navPathLine || this._navigationPath.length < 2)
-      && (this._navGoalMesh || !this._navigationGoal)) return;
-    if (!samePath || (!this._navPathLine && this._navigationPath.length >= 2)) {
-      if (this._navigationPath.length >= 2) {
-        if (!this._navPathLine) {
-          this._navPathLine = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({
-            color: COLORS.navPath, depthTest: false, side: THREE.DoubleSide,
-          }));
-          this._navPathLine.renderOrder = 10;
-          this._scene.add(this._navPathLine);
-        }
-        let geometry = this._navPathLine.geometry;
-        const required = (this._navigationPath.length - 1) * 12;
-        let position = geometry.getAttribute('position');
-        if (!position || position.count < required) {
-          position = new THREE.BufferAttribute(new Float32Array(Math.max(32, 2 ** Math.ceil(Math.log2(required))) * 3), 3);
-          position.setUsage(THREE.DynamicDrawUsage);
-          // 扩容释放旧缓冲，路线对象与材质继续复用。
-          geometry.dispose();
-          geometry = new THREE.BufferGeometry();
-          geometry.setAttribute('position', position);
-          this._navPathLine.geometry = geometry;
-        }
-        let count = 0;
-        const appendStrip = (a, b, az, bz, ox, oy, oz) => {
-          position.setXYZ(count++, a.x + ox, a.y + oy, az + oz);
-          position.setXYZ(count++, a.x - ox, a.y - oy, az - oz);
-          position.setXYZ(count++, b.x + ox, b.y + oy, bz + oz);
-          position.setXYZ(count++, b.x + ox, b.y + oy, bz + oz);
-          position.setXYZ(count++, a.x - ox, a.y - oy, az - oz);
-          position.setXYZ(count++, b.x - ox, b.y - oy, bz - oz);
-        };
-        // 两条正交带面沿真实端点连接，侧视仍可见；不对折线反复作曲线采样。
-        for (let i = 1; i < this._navigationPath.length; i++) {
-          const a = this._navigationPath[i - 1], b = this._navigationPath[i];
-          const dx = b.x - a.x, dy = b.y - a.y, length = Math.hypot(dx, dy);
-          const ox = length > 1e-9 ? -dy / length * 0.025 : 0.025;
-          const oy = length > 1e-9 ? dx / length * 0.025 : 0;
-          const az = Number.isFinite(a.z) ? a.z : 0.08, bz = Number.isFinite(b.z) ? b.z : 0.08;
-          appendStrip(a, b, az, bz, ox, oy, 0);
-          const dz = bz - az, spatialLength = Math.hypot(dx, dy, dz) || 1;
-          appendStrip(a, b, az, bz, -dz * oy / spatialLength, dz * ox / spatialLength, (dx * oy - dy * ox) / spatialLength);
-        }
-        position.clearUpdateRanges();
-        position.addUpdateRange(0, count * 3);
-        position.needsUpdate = true;
-        geometry.setDrawRange(0, count);
-        this._navPathLine.frustumCulled = false;
-      }
-    }
-    if (this._navPathLine) {
-      this._navPathLine.visible = this._navigationPath.length >= 2;
-      this._navPathLine.material.color.setHex(mode === 'retained' ? 0xf59e0b : COLORS.navPath);
-    }
+    const needsPath = !samePath || (!this._navPathLine && this._navigationPath.length >= 2);
+    const needsLocal = !sameLocal || (!this._navLocalPathLine && this._navigationLocalPath.length >= 2);
+    if (!needsPath && !needsLocal && sameGoal && sameMode && (this._navGoalMesh || !this._navigationGoal)) return;
+    if (needsPath) this._navPathLine = this._updateNavigationLine(this._navPathLine, this._navigationPath, COLORS.navPath, 30);
+    if (needsLocal) this._navLocalPathLine = this._updateNavigationLine(this._navLocalPathLine, this._navigationLocalPath, COLORS.localPath, 31);
+    if (this._navPathLine) this._navPathLine.material.color.setHex(mode === 'retained' ? COLORS.retainedPath : COLORS.navPath);
     const goal = this._navigationGoal;
     if (goal) {
       const oriented = Number.isFinite(goal.yaw);
       if (!this._navGoalMesh) {
-        this._navGoalMesh = new THREE.Mesh(undefined, new THREE.MeshBasicMaterial({ color: COLORS.navGoal, depthTest: false }));
-        this._navGoalMesh.renderOrder = 11;
+        this._navGoalMesh = new THREE.Mesh(undefined, new THREE.MeshBasicMaterial({ color: COLORS.navGoal, transparent: true, depthTest: false, depthWrite: false }));
+        this._navGoalMesh.renderOrder = 32;
         this._scene.add(this._navGoalMesh);
       }
       if (this._navGoalMesh.userData.oriented !== oriented) {
@@ -1985,7 +1991,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     }
     this.updateFrontiers(this._frontiers);
     this.updateTrajectory(this._trajectory);
-    this.updateNavigationPath(this._navigationPath, this._navigationGoal);
+    this.updateNavigationPath(this._navigationPath, this._navigationGoal, this._navigationPathMode, this._navigationLocalPath);
     this._rebuildForbiddenZones();
     this._rebuildSemanticInstances();
     this.setSemanticInstancesVisible(this._semanticInstancesVisible);
@@ -2118,7 +2124,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
       if (Array.isArray(object.material)) object.material.forEach((material) => material.dispose?.());
       else object.material?.dispose?.();
     });
-    for (const object of [this._trajectoryLine, this._navPathLine, this._navGoalMesh]) {
+    for (const object of [this._trajectoryLine, this._navPathLine, this._navLocalPathLine, this._navGoalMesh]) {
       object?.geometry?.dispose?.();
       if (Array.isArray(object?.material)) object.material.forEach((material) => material.dispose?.());
       else object?.material?.dispose?.();
@@ -2141,6 +2147,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._semanticGroup = null;
     this._trajectoryLine = null;
     this._navPathLine = null;
+    this._navLocalPathLine = null;
     this._navGoalMesh = null;
     this._semanticPointerDown = null;
     this._semanticPointerDownHandler = null;
@@ -2301,7 +2308,7 @@ function applyNavigationDisplay(data) {
   const rawGoal = data.current_goal;
   const point = pointFromValue(rawGoal);
   window.pointcloud3d.updateNavigationPath(data.planned_path,
-    point ? { ...point, yaw: yawFromValue(rawGoal) } : null, data.navigation_path_state);
+    point ? { ...point, yaw: yawFromValue(rawGoal) } : null, data.navigation_path_state, data.local_path || []);
 }
 
 function updateNavigationOverlayFromEvent(e) {

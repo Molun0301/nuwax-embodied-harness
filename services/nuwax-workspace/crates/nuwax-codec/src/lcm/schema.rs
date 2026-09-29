@@ -39,7 +39,7 @@ pub const TF_MESSAGE_FINGERPRINT: [u8; 8] = 0xc2b8_a1c3_3a89_23ec_u64.to_be_byte
 /// `geometry_msgs.Transform` fingerprint generated from the repository IDL.
 pub const GEOMETRY_TRANSFORM_FINGERPRINT: [u8; 8] = 0xee5f_f426_47bf_3f91_u64.to_be_bytes();
 /// `nuwax_msgs.NavigationState` generated-C fingerprint.
-pub const NAVIGATION_STATE_FINGERPRINT: [u8; 8] = 0xfabd_0ec7_0419_6a8d_u64.to_be_bytes();
+pub const NAVIGATION_STATE_FINGERPRINT: [u8; 8] = 0x9ea3_f3f5_fd5a_fbda_u64.to_be_bytes();
 /// `nuwax_msgs.CancelNavigation` generated-C fingerprint.
 pub const CANCEL_NAVIGATION_FINGERPRINT: [u8; 8] = 0x9704_4b28_e9c5_dd22_u64.to_be_bytes();
 /// `nuwax_msgs.Frontier` generated-C fingerprint.
@@ -425,6 +425,9 @@ pub struct NavigationState {
     pub goal_payload_sha256: [u8; 32],
     /// Canonical path payload digest.
     pub path_payload_sha256: [u8; 32],
+    /// 同一目标的局部规划展示点，不授予运动权限。
+    pub local_path: Vec<[f64; 3]>,
+
 }
 
 /// Repository-native navigation cancellation bridge message.
@@ -2221,6 +2224,11 @@ pub fn encode_navigation_state_body(message: &NavigationState) -> CodecResult<Ve
     out.extend_from_slice(&message.path_revision.to_be_bytes());
     out.extend_from_slice(&message.goal_payload_sha256);
     out.extend_from_slice(&message.path_payload_sha256);
+    if message.local_path.len() > 65536 || message.local_path.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(CodecError::LcmEncode("局部路线点数越界或坐标非法".into()));
+    }
+    out.extend_from_slice(&(message.local_path.len() as i32).to_be_bytes());
+    for point in &message.local_path { encode_f64_array(point, &mut out); }
     Ok(out)
 }
 
@@ -2274,6 +2282,21 @@ fn decode_navigation_state_from(cursor: &mut Cursor<'_>) -> CodecResult<Navigati
             .read_exact(32)?
             .try_into()
             .expect("32-byte path digest"),
+        local_path: {
+            let count = cursor.read_nonnegative_len("local_path_count")?;
+            if count > 65536 || count > cursor.remaining() / 24 {
+                return Err(CodecError::LcmDecode("局部路线点数超过载荷长度或容量".into()));
+            }
+            let mut points = Vec::with_capacity(count);
+            for _ in 0..count {
+                let point: [f64; 3] = cursor.read_f64_array()?;
+                if point.iter().any(|v| !v.is_finite()) {
+                    return Err(CodecError::LcmDecode("局部路线坐标非法".into()));
+                }
+                points.push(point);
+            }
+            points
+        },
     })
 }
 
@@ -3731,6 +3754,22 @@ mod tests {
     }
 
     #[test]
+    fn navigation_local_display_rejects_corrupt_sizes_and_coordinates() {
+        let mut message = NavigationState { local_path: vec![[0.0, 1.0, 0.4]], ..Default::default() };
+        let encoded = encode_navigation_state_body(&message).unwrap();
+        let count_at = encoded.len() - 28;
+        let mut bad_count = encoded.clone();
+        bad_count[count_at..count_at + 4].copy_from_slice(&65537_i32.to_be_bytes());
+        assert!(decode_navigation_state_body(&bad_count).is_err());
+        assert!(decode_navigation_state_body(&encoded[..encoded.len() - 1]).is_err());
+        let mut bad_coordinate = encoded;
+        bad_coordinate[count_at + 4..count_at + 12].copy_from_slice(&f64::NAN.to_be_bytes());
+        assert!(decode_navigation_state_body(&bad_coordinate).is_err());
+        message.local_path[0][0] = f64::INFINITY;
+        assert!(encode_navigation_state_body(&message).is_err());
+    }
+
+    #[test]
     fn native_bridge_single_messages_round_trip_with_generated_fingerprints() {
         let transform = Transform {
             translation: [1.0, 2.0, 3.0],
@@ -3770,6 +3809,7 @@ mod tests {
             path_revision: 2,
             goal_payload_sha256: [0x11; 32],
             path_payload_sha256: [0x22; 32],
+            local_path: vec![[0.5, 1.0, 0.4], [1.0, 2.0, 0.6]],
         };
         let encoded = encode_navigation_state(&navigation).unwrap();
         assert_eq!(&encoded[..8], &NAVIGATION_STATE_FINGERPRINT);

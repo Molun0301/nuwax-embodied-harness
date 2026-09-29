@@ -83,6 +83,16 @@ struct _nuwax_msgs_NavigationState
      * LCM Type: byte[32]
      */
     uint8_t    path_payload_sha256[32];
+
+    /**
+     * 同一目标与路径修订的局部规划展示；终态为空。
+     */
+    int32_t    local_path_count;
+
+    /**
+     * LCM Type: double[local_path_count][3]
+     */
+    double     **local_path;
 };
 
 /**

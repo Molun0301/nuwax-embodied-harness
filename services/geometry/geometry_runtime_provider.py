@@ -3039,6 +3039,8 @@ def _navigation_state_typed_metadata(update) -> Dict[str, Any]:
     """Project typed NavigationState fields without parsing message text."""
 
     return {
+        "local_path": [{"x": float(p.x), "y": float(p.y), "z": float(p.z)}
+                       for p in getattr(update, "local_path", ())],
         "planned_path": [{"x": float(p.x), "y": float(p.y), "z": float(p.z)}
                          for p in getattr(update, "planned_path", ())],
         "path_revision": int(getattr(update, "path_revision", 0) or 0),

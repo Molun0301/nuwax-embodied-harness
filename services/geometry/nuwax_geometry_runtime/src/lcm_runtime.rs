@@ -164,6 +164,8 @@ pub struct NavState {
 pub struct NavigationFeedback {
     /// 当前目标已经计算的地图坐标路径点。
     pub planned_path: Vec<[f64; 3]>,
+    /// 经同一状态身份核对的局部规划展示点。
+    pub local_path: Vec<[f64; 3]>,
     pub cancel_phase: String,
     pub cancel_generation: u64,
     pub actuator_zeroed: bool,
@@ -18431,6 +18433,7 @@ mod typed_navigation_feedback_tests {
         let mut state = feedback_update(&lease.session_id);
         state.feedback.path_revision = 1;
         state.feedback.path_payload_sha256 = path.path_payload_sha256;
+        state.feedback.local_path = vec![[0.0,0.0,0.4],[1.0,0.5,0.4]];
         let promoted = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if let Some(promoted) = apply_typed_navigation_feedback(&nav, state.clone()).await {
@@ -18442,6 +18445,7 @@ mod typed_navigation_feedback_tests {
         .await
         .expect("exact NavigationState must promote the observed candidate");
         assert_eq!(promoted.feedback.path_revision, 1);
+        assert_eq!(promoted.feedback.local_path, state.feedback.local_path);
         assert_eq!(
             nav.active_goal_lease().await.unwrap().path_payload_sha256,
             path.path_payload_sha256

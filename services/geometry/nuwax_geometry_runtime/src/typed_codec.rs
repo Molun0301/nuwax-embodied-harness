@@ -406,6 +406,7 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
             path_revision,
             goal_payload_sha256: message.goal_payload_sha256,
             path_payload_sha256: message.path_payload_sha256,
+            local_path: if message.state == 2 { message.local_path } else { Vec::new() },
             ..NavigationFeedback::default()
         },
         state,
@@ -600,10 +601,12 @@ mod tests {
             path_revision: 0,
             goal_payload_sha256: [7; 32],
             path_payload_sha256: [0; 32],
+            local_path: vec![[0.0,0.0,0.4],[0.5,0.0,0.4]],
         })
         .unwrap();
         let nav = decode_nav_state_payload(&nav).expect("decode navigation state");
         assert_eq!(nav.state.status, "RUNNING");
+        assert_eq!(nav.feedback.local_path, vec![[0.0,0.0,0.4],[0.5,0.0,0.4]]);
         assert_eq!(nav.state.goal_id, "goal-7");
         assert_eq!(nav.state.distance_remaining, 5.0);
         assert_eq!(nav.state.timestamp_ns, 4_000_000_005);
@@ -693,11 +696,13 @@ mod tests {
             path_revision: 1,
             goal_payload_sha256: [3; 32],
             path_payload_sha256: [4; 32],
+            local_path: vec![[0.0,0.0,0.4],[0.5,0.0,0.4]],
         })
         .expect("encode stack cancel ack");
 
         let nav = decode_nav_state_payload(&payload).expect("decode stack cancel ack");
         assert_eq!(nav.state.status, "CANCELLED");
+        assert!(nav.feedback.local_path.is_empty());
         assert_eq!(nav.state.goal_id, "goal-cancelled");
         assert_eq!(nav.feedback.cancel_generation, 3);
         assert_eq!(nav.feedback.zero_ack_id, "zero-3");

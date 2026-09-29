@@ -21,7 +21,7 @@ uint64_t __nuwax_msgs_NavigationState_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_NavigationState_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0xfd5e8763820cb546LL
+    uint64_t hash = (uint64_t)0x4f51f9fafead7dedLL
          + __string_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
@@ -51,6 +51,8 @@ uint64_t __nuwax_msgs_NavigationState_hash_recursive(const __lcm_hash_ptr *p)
          + __int64_t_hash_recursive(&cp)
          + __byte_hash_recursive(&cp)
          + __byte_hash_recursive(&cp)
+         + __int32_t_hash_recursive(&cp)
+         + __double_hash_recursive(&cp)
         ;
 
     return (hash<<1) + ((hash>>63)&1);
@@ -160,6 +162,16 @@ int __nuwax_msgs_NavigationState_encode_array(void *buf, int offset, int maxlen,
         thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].path_payload_sha256, 32);
         if (thislen < 0) return thislen; else pos += thislen;
 
+        thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].local_path_count), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        { int a;
+        for (a = 0; a < p[element].local_path_count; a++) {
+            thislen = __double_encode_array(buf, offset + pos, maxlen - pos, p[element].local_path[a], 3);
+            if (thislen < 0) return thislen; else pos += thislen;
+        }
+        }
+
     }
     return pos;
 }
@@ -240,6 +252,14 @@ int __nuwax_msgs_NavigationState_encoded_array_size(const nuwax_msgs_NavigationS
         size += __byte_encoded_array_size(p[element].goal_payload_sha256, 32);
 
         size += __byte_encoded_array_size(p[element].path_payload_sha256, 32);
+
+        size += __int32_t_encoded_array_size(&(p[element].local_path_count), 1);
+
+        { int a;
+        for (a = 0; a < p[element].local_path_count; a++) {
+            size += __double_encoded_array_size(p[element].local_path[a], 3);
+        }
+        }
 
     }
     return size;
@@ -343,6 +363,18 @@ int __nuwax_msgs_NavigationState_decode_array(const void *buf, int offset, int m
         thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].path_payload_sha256, 32);
         if (thislen < 0) return thislen; else pos += thislen;
 
+        thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].local_path_count), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        p[element].local_path = (double**) lcm_malloc(sizeof(double*) * p[element].local_path_count);
+        { int a;
+        for (a = 0; a < p[element].local_path_count; a++) {
+            p[element].local_path[a] = (double*) lcm_malloc(sizeof(double) * 3);
+            thislen = __double_decode_array(buf, offset + pos, maxlen - pos, p[element].local_path[a], 3);
+            if (thislen < 0) return thislen; else pos += thislen;
+        }
+        }
+
     }
     return pos;
 }
@@ -410,6 +442,16 @@ int __nuwax_msgs_NavigationState_decode_array_cleanup(nuwax_msgs_NavigationState
         __byte_decode_array_cleanup(p[element].goal_payload_sha256, 32);
 
         __byte_decode_array_cleanup(p[element].path_payload_sha256, 32);
+
+        __int32_t_decode_array_cleanup(&(p[element].local_path_count), 1);
+
+        { int a;
+        for (a = 0; a < p[element].local_path_count; a++) {
+            __double_decode_array_cleanup(p[element].local_path[a], 3);
+            if (p[element].local_path[a]) free(p[element].local_path[a]);
+        }
+        }
+        if (p[element].local_path) free(p[element].local_path);
 
     }
     return 0;
@@ -498,6 +540,16 @@ int __nuwax_msgs_NavigationState_clone_array(const nuwax_msgs_NavigationState *p
         __byte_clone_array(p[element].goal_payload_sha256, q[element].goal_payload_sha256, 32);
 
         __byte_clone_array(p[element].path_payload_sha256, q[element].path_payload_sha256, 32);
+
+        __int32_t_clone_array(&(p[element].local_path_count), &(q[element].local_path_count), 1);
+
+        q[element].local_path = (double**) lcm_malloc(sizeof(double*) * q[element].local_path_count);
+        { int a;
+        for (a = 0; a < p[element].local_path_count; a++) {
+            q[element].local_path[a] = (double*) lcm_malloc(sizeof(double) * 3);
+            __double_clone_array(p[element].local_path[a], q[element].local_path[a], 3);
+        }
+        }
 
     }
     return 0;

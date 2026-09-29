@@ -23,6 +23,7 @@ struct Inputs {
     result: Option<(std::time::Instant, PlannerStep)>,
     result_pose_version: u64,
     result_wait_reason: Option<String>,
+    display_path: Vec<[f64; 3]>,
     closed: bool,
 }
 
@@ -127,6 +128,9 @@ impl PlannerWorker {
                     let wait_reason = if matches!(computed, PlannerStep::Command(command) if command == Twist2::ZERO) {
                         planner.execution_wait_reason()
                     } else { None };
+                    let display_path = if matches!(computed, PlannerStep::Command(_)) {
+                        planner.local_path_for_display()
+                    } else { Vec::new() };
                     let elapsed = started.elapsed();
                     let slow_result = (elapsed > DEFAULT_CONTROL_HORIZON
                         && slow_log_at.is_none_or(|last| last.elapsed() >= Duration::from_secs(5)))
@@ -139,6 +143,7 @@ impl PlannerWorker {
                         input.result = Some((started, computed));
                         input.result_pose_version = pose_seq;
                         input.result_wait_reason = wait_reason;
+                        input.display_path = display_path;
                     }
                     drop(input);
                     // 日志不持输入锁，慢磁盘不能阻塞调度器的取消与续租。
@@ -178,6 +183,7 @@ impl NavPlanner for PlannerWorker {
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
+        input.display_path.clear();
         input.path = None;
         input.goal_version += 1;
         input.path_version += 1;
@@ -196,6 +202,7 @@ impl NavPlanner for PlannerWorker {
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
+        input.display_path.clear();
         input.path_version += 1;
         input.path = Some(Arc::new((path, yaws, goal)));
         Ok(())
@@ -277,6 +284,9 @@ impl NavPlanner for PlannerWorker {
         };
         ready.unwrap_or(PlannerStep::Command(Twist2::ZERO))
     }
+    fn local_path_for_display(&self) -> Vec<[f64; 3]> {
+        self.shared.0.lock().unwrap().display_path.clone()
+    }
     fn execution_wait_reason(&self) -> Option<String> {
         self.wait_reason.clone()
     }
@@ -285,6 +295,7 @@ impl NavPlanner for PlannerWorker {
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
+        input.display_path.clear();
         input.result_wait_reason = None;
         input.path = None;
         input.goal = None;
@@ -302,6 +313,7 @@ impl Drop for PlannerWorker {
             let mut input = self.shared.0.lock().unwrap();
             input.closed = true;
             input.result = None;
+            input.display_path.clear();
             self.shared.1.notify_one();
         }
         if let Some(thread) = self.thread.take() {
@@ -313,6 +325,42 @@ impl Drop for PlannerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_display_drops_late_worker_results_after_stop() {
+        struct DisplayPlanner { release: std::sync::mpsc::Receiver<()>, started: std::sync::mpsc::Sender<()> }
+        impl NavPlanner for DisplayPlanner {
+            fn replace_path(&mut self, _: Path2D) {}
+            fn update_odometry(&mut self, _: PoseStamped) {}
+            fn update_costmap(&mut self, _: CostMap2D) {}
+            fn step(&mut self, _: f64) -> PlannerStep {
+                self.started.send(()).unwrap();
+                self.release.recv().unwrap();
+                PlannerStep::Command(Twist2::ZERO)
+            }
+            fn local_path_for_display(&self) -> Vec<[f64; 3]> { vec![[0.0,0.0,0.4],[1.0,0.5,0.4]] }
+            fn stop(&mut self) {}
+        }
+        let (release, receive) = std::sync::mpsc::channel();
+        let (started, start) = std::sync::mpsc::channel();
+        let mut worker = PlannerWorker::new(DisplayPlanner {release:receive, started}).unwrap();
+        worker.step(0.3);
+        start.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(worker.local_path_for_display().is_empty());
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while worker.local_path_for_display().is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(worker.local_path_for_display().len(), 2);
+        worker.observe_applied_command(Twist2::ZERO);
+        start.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.stop();
+        release.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(worker.local_path_for_display().is_empty(), "取消后的旧局部轨迹不能复活");
+    }
+
     #[test]
     fn stationary_geometry_wait_reason_crosses_the_compute_thread() {
         struct WaitingPlanner;

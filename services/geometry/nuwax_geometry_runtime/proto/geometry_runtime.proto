@@ -487,6 +487,8 @@ message NavigationState {
   uint64 producer_runtime_generation = 25;
   // 当前目标已计算路径；终态为空，点采用planner_map_frame坐标。
   repeated Vec3 planned_path = 26;
+  // 同一目标与全局路径修订下的局部规划展示；缺失或终态为空。
+  repeated Vec3 local_path = 27;
 }
 message NavigationReadiness {
   reserved 10;

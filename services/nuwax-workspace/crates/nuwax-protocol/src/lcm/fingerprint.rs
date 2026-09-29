@@ -98,7 +98,7 @@ mod tests {
             ("tf2_msgs.TFMessage", 0xc2b8_a1c3_3a89_23ec),
             ("nuwax_msgs.GoalEnvelope", 0xdd19_bb81_9d6c_3e44),
             ("nuwax_msgs.PathEnvelope", 0xf11d_70cc_600f_1ab1),
-            ("nuwax_msgs.NavigationState", 0xfabd_0ec7_0419_6a8d),
+            ("nuwax_msgs.NavigationState", 0x9ea3_f3f5_fd5a_fbda),
             ("nuwax_msgs.NavigationMap3D", 0xd11d6dd10d5490b8),
             ("nuwax_msgs.NavigationMapBlock", 0xb22a311c07119b68),
             ("nuwax_msgs.PlanarNavigationMap", 0x7b8ad3f2faf4fdd4),

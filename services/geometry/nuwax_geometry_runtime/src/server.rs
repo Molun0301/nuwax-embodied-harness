@@ -4661,6 +4661,7 @@ fn nav_state_to_proto(update: NavigationUpdate) -> NavigationState {
         feedback,
         producer_runtime_generation,
     } = update;
+    let local_path = if nav.status == "RUNNING" { feedback.local_path } else { Vec::new() };
     NavigationState {
         status: nav.status,
         message: nav.message,
@@ -4686,6 +4687,7 @@ fn nav_state_to_proto(update: NavigationUpdate) -> NavigationState {
         path_payload_sha256: feedback.path_payload_sha256.to_vec(),
         producer_runtime_generation,
         planned_path: feedback.planned_path.into_iter().map(|p| Vec3 { x:p[0], y:p[1], z:p[2] }).collect(),
+        local_path: local_path.into_iter().map(|p| Vec3 { x:p[0], y:p[1], z:p[2] }).collect(),
     }
 }
 
@@ -17089,6 +17091,7 @@ mod navigation_feedback_contract_tests {
             producer_runtime_generation: 41,
             feedback: NavigationFeedback {
                 planned_path: vec![[1.0,2.0,0.4],[2.0,2.0,0.4]],
+                local_path: vec![[1.0,2.0,0.4],[1.4,2.1,0.5]],
                 cancel_phase: "ZEROED".into(),
                 cancel_generation: 3,
                 actuator_zeroed: true,
@@ -17132,6 +17135,14 @@ mod navigation_feedback_contract_tests {
         assert_eq!(proto.producer_runtime_generation, 41);
         assert_eq!(proto.planned_path.len(),2);
         assert_eq!(proto.planned_path[1].z,0.4);
+        assert!(proto.local_path.is_empty());
+        let running = nav_state_to_proto(NavigationUpdate {
+            state: crate::lcm_runtime::NavState { status: "RUNNING".into(), ..Default::default() },
+            feedback: NavigationFeedback { local_path: vec![[1.0,2.0,0.4],[1.4,2.1,0.5]], ..Default::default() },
+            producer_runtime_generation: 41,
+        });
+        assert_eq!(running.local_path.len(),2);
+        assert_eq!(running.local_path[1].z,0.5);
     }
 
     #[tokio::test]

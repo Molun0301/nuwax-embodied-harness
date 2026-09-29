@@ -3116,6 +3116,10 @@ fn build_guarded_navigation_state(
         path_revision: telemetry.path_revision,
         goal_payload_sha256: telemetry.goal_payload_sha256,
         path_payload_sha256: telemetry.path_payload_sha256,
+        local_path: if state == 2
+            && status.session_id.as_deref() == Some(telemetry.public_session_id.as_str())
+            && i64::try_from(status.path_revision).ok() == Some(telemetry.path_revision)
+        { status.local_path.clone() } else { Vec::new() },
     }
 }
 
@@ -9597,6 +9601,30 @@ mod guarded_tests {
             ..nuwax_nav_runtime::SchedulerStatus::default()
         };
         assert!(scheduler_session_is_active(&next, "goal-b"));
+    }
+
+    #[test]
+    fn guarded_local_display_survives_heartbeats_and_clears_at_terminal() {
+        let telemetry = GuardedNavTelemetry { public_session_id: "display-goal".into(), ..Default::default() };
+        let mut status = nuwax_nav_runtime::SchedulerStatus {
+            phase: SchedulerPhase::Controlling,
+            session_id: Some("display-goal".into()),
+            local_path: vec![[0.0,0.0,0.4],[1.0,0.5,0.6]],
+            ..Default::default()
+        };
+        for observation in [None, Some(false), Some(true)] {
+            let wire = build_guarded_navigation_state(&status, &telemetry, observation, Duration::from_secs(1));
+            let decoded = schema::decode_navigation_state(&schema::encode_navigation_state(&wire).unwrap()).unwrap();
+            assert_eq!(decoded.local_path, status.local_path);
+        }
+        status.last_terminal = Some(nuwax_nav_runtime::TerminalOutcome::Succeeded);
+        assert!(build_guarded_navigation_state(&status, &telemetry, None, Duration::from_secs(2)).local_path.is_empty());
+        status.last_terminal = None;
+        status.session_id = Some("old-goal".into());
+        assert!(build_guarded_navigation_state(&status, &telemetry, None, Duration::from_secs(3)).local_path.is_empty());
+        status.session_id = Some("display-goal".into());
+        status.path_revision = 1;
+        assert!(build_guarded_navigation_state(&status, &telemetry, None, Duration::from_secs(4)).local_path.is_empty());
     }
 
     #[test]

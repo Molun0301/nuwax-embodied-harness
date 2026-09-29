@@ -5,14 +5,16 @@
         mapUnknown: [51, 65, 85],
         mapFree: [219, 234, 254],
         mapOccupied: [2, 6, 23],
-        trajectory: "#22d3ee",
+        trajectory: "#b2a0f8",
         frontier: "#f472b6",
         frontierStroke: "#fbcfe8",
         robot: "#fbbf24",
         robotStroke: "#fef3c7",
         goal: "#a78bfa",
         goalStroke: "#ddd6fe",
-        navPath: "#22ff66",
+        navPath: "#a5e27e",
+        localPath: "#69dedc",
+        retainedPath: "#ffba78",
       };
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "perception_nms", "logs"].filter(name => !PLANAR_PIPELINE || !["pointcloud_map", "pointcloud"].includes(name));
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "服务状态", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", perception_nms: "感知 NMS", logs: "日志" };
@@ -71,6 +73,7 @@
         frontiers: [],
         goalPose: null,
         navigationPath: [],
+        navigationLocalPath: [],
         navigationDisplay: null,
         logCursor: 0,
         streamSocket: null,
@@ -2122,6 +2125,7 @@
         state.latestFrontierStream = null;
         state.goalPose = null;
         state.navigationPath = [];
+        state.navigationLocalPath = [];
         state.navigationDisplay = null;
         renderNavigationPathStatus();
       }
@@ -2300,7 +2304,8 @@
       }
       function drawNavigationPath(ctx, anchor, scale) {
         const retained = state.navigationDisplay?.mode !== "executing";
-        drawWorldPoints(ctx, anchor, scale, state.navigationPath, retained ? "#f59e0b" : CANVAS_THEME.navPath, 3);
+        drawWorldPoints(ctx, anchor, scale, state.navigationPath, retained ? CANVAS_THEME.retainedPath : CANVAS_THEME.navPath, 2);
+        drawWorldPoints(ctx, anchor, scale, state.navigationLocalPath, CANVAS_THEME.localPath, 2);
       }
       function drawGoal(ctx, anchor, scale) {
         const point = pointFromPose(state.goalPose);
@@ -2563,6 +2568,7 @@
           detail: {
             frontiers: state.frontiers || [],
             planned_path: state.navigationPath || [],
+            local_path: state.navigationLocalPath || [],
             navigation_path_state: state.navigationDisplay?.mode || (state.navigationPath.length ? "retained" : "none"),
             current_goal: state.goalPose || null,
             navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
@@ -2573,6 +2579,7 @@
         window.dispatchEvent(new CustomEvent("stream:exploration.state", {
           detail: {
             planned_path: state.navigationPath || [],
+            local_path: state.navigationLocalPath || [],
             navigation_path_state: state.navigationDisplay?.mode || (state.navigationPath.length ? "retained" : "none"),
             current_goal: state.goalPose || null,
             navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
@@ -2583,6 +2590,7 @@
         window.dispatchEvent(new CustomEvent("stream:navigation.state", {
           detail: {
             planned_path: state.navigationPath || [],
+            local_path: state.navigationLocalPath || [],
             navigation_path_state: state.navigationDisplay?.mode || (state.navigationPath.length ? "retained" : "none"),
             current_goal: state.goalPose || null,
             navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
@@ -3644,7 +3652,7 @@
             entry.className = "lg";
             const swatch = document.createElement("span");
             swatch.className = "sw";
-            swatch.style.background = "#f59e0b";
+            swatch.style.background = CANVAS_THEME.retainedPath;
             entry.append(swatch, "保留全局路线 · 等待执行更新");
             legend.append(entry);
             els.navigationPathLegend = entry;
@@ -3660,7 +3668,7 @@
           }
         }
         if (els.navigationPathStatus) {
-          const text = !hasPath ? "" : retained ? "保留全局路线（橙色），等待执行更新" : "当前执行路线（绿色）";
+          const text = !hasPath ? "" : retained ? "保留全局路线（橙色），等待执行更新" : "全局路线（浅绿） · 局部路线（青色）";
           if (els.navigationPathStatus.textContent !== text) els.navigationPathStatus.textContent = text;
         }
       }
@@ -3673,6 +3681,7 @@
         const producer = Number(metadata.producer_runtime_generation || 0);
         const generation = Number(metadata.goal_generation || 0);
         const revision = Number(metadata.path_revision || 0);
+        const timestamp = Date.parse(nav.updated_at || nav.timestamp || context?.timestamp || "") || 0;
         const sameGoal = previous && goalId && previous.goalId === goalId
           && (!producer || !previous.producer || producer === previous.producer)
           && (!generation || !previous.generation || generation === previous.generation);
@@ -3682,27 +3691,32 @@
           && generation && previous.generation && generation < previous.generation) return previous;
         // 空闲/缺测快照不表示原目标已结束，也不能把保留路线显示为正在执行。
         if (!goalId) return previous && !previous.terminal
-          ? { ...previous, mode: "retained" } : previous;
+          ? { ...previous, localPath: [], mode: "retained" } : previous;
         if (sameGoal && previous.terminal && !terminal) return previous;
         if (terminal) return {
-          goalId, producer, generation, revision, terminal: true, goal: null, path: [], mode: "none",
+          goalId, producer, generation, revision, terminal: true, goal: null, path: [], localPath: [], mode: "none",
           isPublic: Number(metadata.owner_kind) === 1 || (sameGoal && previous.isPublic === true),
         };
         const base = sameGoal ? previous : null;
         const olderPath = base && revision > 0 && base.revision > revision;
-        const nextPath = olderPath ? base.path : path.length ? path : (base?.path || []);
+        // 迟到状态不能把较新路线切回等待颜色，也不能替换同修订的新局部轨迹。
+        if (olderPath || (base && timestamp && base.timestamp && timestamp < base.timestamp)) return base;
+        const nextPath = path.length ? path : (base?.path || []);
         const rawGoal = context?.current_goal;
         const nextGoal = rawGoal?.goal_id && rawGoal.goal_id !== goalId ? base?.goal || null : goal || base?.goal || null;
         return {
           goalId, producer: producer || base?.producer || 0, generation: generation || base?.generation || 0,
           revision: Math.max(revision, base?.revision || 0),
-          pathRevision: !olderPath && path.length ? revision : (base?.pathRevision || 0),
+          timestamp: timestamp || base?.timestamp || 0,
+          pathRevision: path.length ? revision : (base?.pathRevision || 0),
           terminal: false,
           isPublic: Number(metadata.owner_kind) === 1 || (base?.isPublic === true && !Number(metadata.owner_kind)),
           goal: nextGoal,
           goalData: rawGoal?.goal_id === goalId ? rawGoal : base?.goalData || null,
           path: nextPath,
-          mode: nextPath.length ? (!olderPath && path.length && status === "running" ? "executing" : "retained") : "none",
+          localPath: status === "running" && Array.isArray(metadata.local_path)
+            ? metadata.local_path.map(pathPointFromValue).filter(point => point && [point.x, point.y, point.z].every(Number.isFinite)) : [],
+          mode: nextPath.length ? (path.length && status === "running" ? "executing" : "retained") : "none",
         };
       }
       function updateNavigation(envelope) {
@@ -3792,6 +3806,7 @@
         if (!navigationContextIsPublic(data.navigation_context) && canonicalInactive) {
           state.goalPose = null;
           state.navigationPath = [];
+          state.navigationLocalPath = [];
         } else if (
           !navigationContextIsPublic(data.navigation_context)
           && latestExplorationIdentity
@@ -3802,6 +3817,7 @@
         ) {
           state.goalPose = null;
           state.navigationPath = [];
+          state.navigationLocalPath = [];
         }
         const clearNavigation = !navigationContextIsPublic(data.navigation_context) && (canonicalInactive
           || (latestExplorationIdentity && !navigationGoalMatchesExploration(data.navigation_context, latestExplorationIdentity)));
@@ -3812,6 +3828,7 @@
           state.goalPose = state.navigationDisplay.goal;
           state.navigationPath = state.navigationDisplay.path;
         }
+        state.navigationLocalPath = state.navigationDisplay?.localPath || [];
         renderNavigationPathStatus();
         setKv(els.navigationMeta, [
           ["导航", summarizeContext(data.navigation_context, "navigation_state")],
@@ -3822,7 +3839,8 @@
           ["等待原因", waitingFor || "无"],
           ["前沿几何", frontiers && frontiers.length ? `${frontiers.length} 个几何` : "暂无候选"],
           ["目标点", state.goalPose ? "已设置" : "--"],
-          ["导航路径", state.navigationPath.length ? `${state.navigationPath.length} 点 · ${state.navigationDisplay?.mode === "executing" ? "当前执行路线（绿色）" : "保留全局路线，等待执行更新（橙色）"}` : "--"],
+          ["全局路线", state.navigationPath.length ? `${state.navigationPath.length} 点 · ${state.navigationDisplay?.mode === "executing" ? "浅绿色" : "保留路线，等待执行更新（橙色）"}` : "--"],
+          ["局部路线", state.navigationLocalPath.length ? `${state.navigationLocalPath.length} 点 · 青色` : "暂无局部轨迹"],
           ["数据时间", shortTime(envelope.source_timestamp)],
           ["延迟", fmt(envelope.latency_ms, " ms")],
           ["已过期", displayBool(envelope.stale === true)],
@@ -4519,6 +4537,7 @@
         if (frame.topic === "navigation.state") {
           return {
             planned_path: state.navigationPath || [],
+            local_path: state.navigationLocalPath || [],
             navigation_path_state: state.navigationDisplay?.mode || (state.navigationPath.length ? "retained" : "none"),
             current_goal: state.goalPose || null,
             navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
@@ -4533,6 +4552,7 @@
           const navigationFrame = state.latestStreamFrames["navigation.state"];
           return {
             planned_path: state.navigationPath || [],
+            local_path: state.navigationLocalPath || [],
             navigation_path_state: state.navigationDisplay?.mode || (state.navigationPath.length ? "retained" : "none"),
             current_goal: state.goalPose || null,
             navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
@@ -4548,6 +4568,7 @@
           return {
             frontiers: state.frontiers || [],
             planned_path: state.navigationPath || [],
+            local_path: state.navigationLocalPath || [],
             navigation_path_state: state.navigationDisplay?.mode || (state.navigationPath.length ? "retained" : "none"),
             current_goal: state.goalPose || null,
             navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
@@ -4832,12 +4853,14 @@
         state.frontiers = [];
         if (!preserveNavigation) {
           state.navigationPath = [];
+          state.navigationLocalPath = [];
           state.goalPose = null;
           state.navigationDisplay = null;
           state.highlightTarget = null;
         } else if (state.navigationDisplay && !state.navigationDisplay.terminal) {
-          state.navigationDisplay = { ...state.navigationDisplay, mode: "retained" };
+          state.navigationDisplay = { ...state.navigationDisplay, localPath: [], mode: "retained" };
         }
+        state.navigationLocalPath = [];
         renderNavigationPathStatus();
         for (const topic of ["exploration.state", "exploration.frontier", "navigation.state"]) {
           delete state.latestStreamFrames[topic];
@@ -4845,7 +4868,7 @@
         }
         requestMapDraw(false);
         window.dispatchEvent(new CustomEvent("stream:exploration.overlay-reset", {
-          detail: { reason, planned_path: state.navigationPath, current_goal: state.goalPose,
+          detail: { reason, planned_path: state.navigationPath, local_path: state.navigationLocalPath, current_goal: state.goalPose,
             navigation_path_state: state.navigationDisplay?.mode || (state.navigationPath.length ? "retained" : "none") },
         }));
       }

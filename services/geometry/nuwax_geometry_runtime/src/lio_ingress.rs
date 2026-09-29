@@ -4839,6 +4839,12 @@ mod tests {
         let (initial_snapshot, initial_frame_generation) =
             claim_fresh_mapping_session(&fixture, "deferred-session", "deferred-map", true).await;
         assert_eq!(initial_frame_generation, 0);
+        // 生产启动在重放前等待同代点云会话登记完成。
+        assert!(matches!(
+            fixture.handle.begin_cloud_map_session(initial_snapshot.session_generation).await,
+            crate::lcm_runtime::CloudMapSessionAdmission::Registered(_)
+        ));
+
 
         let replay = fixture.replay.clone();
         let replay_task = tokio::spawn(async move { replay.replay_claimed().await });

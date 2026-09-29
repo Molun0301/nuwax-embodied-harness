@@ -3,7 +3,7 @@ use std::io::{Error, ErrorKind};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::atomic::{fence, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use memmap2::MmapMut;
 use nalgebra::Point3;
@@ -176,6 +176,8 @@ pub struct CloudMapShmWriter {
     last_occupancy_receipt: Option<OccupancyCommitReceipt>,
     last_cloud_receipt: Option<CloudCommitReceipt>,
     typed_publish_state: Arc<TypedCloudPublishState>,
+    // 仅由本写入器提交的修订可复用；新提交和会话重置撤销本地引用。
+    committed_snapshot_cache: OnceLock<CommittedCloudMapSnapshot<Arc<[u8]>>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -263,12 +265,13 @@ impl TypedCloudPublishState {
 
 /// One successfully committed cumulative cloud-map revision and the exact
 /// canonical map-frame voxel snapshot available to typed transport sinks.
-pub(crate) struct CommittedCloudMapSnapshot {
+#[derive(Clone)]
+pub(crate) struct CommittedCloudMapSnapshot<Payload = Vec<u8>> {
     pub revision: u64,
     pub point_count: u32,
     pub voxel_size: f32,
     pub session_generation: u64,
-    pub xyz_f32_le: Vec<u8>,
+    pub xyz_f32_le: Payload,
     /// Exact SHA-256 identity of the packed XYZ payload.
     pub xyz_sha256: [u8; 32],
 }
@@ -474,6 +477,7 @@ impl CloudMapShmWriter {
             last_occupancy_receipt: None,
             last_cloud_receipt: None,
             typed_publish_state: Arc::new(TypedCloudPublishState::new()),
+            committed_snapshot_cache: OnceLock::new(),
         }
     }
 
@@ -709,12 +713,19 @@ impl CloudMapShmWriter {
         Ok((ticket, work))
     }
 
-    pub(crate) fn install_scan_work(&mut self, ticket: uuid::Uuid, mut work: Self) -> bool {
-        if self.scan_preparation != Some(ticket) || self.session_generation != work.session_generation {
-            return false;
+    pub(crate) fn install_scan_work(&mut self, ticket: uuid::Uuid, mut work: Self) -> Result<(), String> {
+        if self.scan_preparation != Some(ticket) {
+            return Err("point-cloud preparation ticket is stale".into());
+        }
+        if self.session_generation != work.session_generation {
+            return Err(format!("point-cloud preparation generation mismatch: writer={} prepared={}",
+                self.session_generation, work.session_generation));
         }
         if work.revision != self.revision {
-            if self.revision.checked_add(1) != Some(work.revision) { return false; }
+            if self.revision.checked_add(1) != Some(work.revision) {
+                return Err(format!("point-cloud preparation revision mismatch: writer={} prepared={}",
+                    self.revision, work.revision));
+            }
             let slot = cloud_map_active_slot(work.revision).unwrap() as usize;
             let (revision_offset, count_offset) = slot_metadata_offsets(slot).unwrap();
             let count = u32::from_le_bytes(work.mmap[count_offset..count_offset + 4].try_into().unwrap()) as usize;
@@ -734,6 +745,7 @@ impl CloudMapShmWriter {
             fence(Ordering::Release);
             self.mmap[CM_GLOBAL_REVISION_OFFSET..CM_GLOBAL_REVISION_OFFSET + 8].copy_from_slice(&work.revision.to_le_bytes());
             self.revision = work.revision;
+            self.committed_snapshot_cache = std::mem::take(&mut work.committed_snapshot_cache);
         }
         self.replace_accumulator(work.take_prepared_accumulator());
         self.last_occupancy_receipt = work.last_occupancy_receipt.take();
@@ -742,7 +754,7 @@ impl CloudMapShmWriter {
         self.committed_dense_cloud = work.committed_dense_cloud.take();
         self.pending_dense_readers = None;
         self.scan_preparation = None;
-        true
+        Ok(())
     }
 
     fn replace_accumulator(&mut self, prepared: PreparedCloudAccumulator) {
@@ -756,8 +768,21 @@ impl CloudMapShmWriter {
         self.dense_history_missing = prepared.dense_history_missing;
     }
 
-    /// Read the exact active SHM payload without advancing its revision.
+    /// 导出接口需要独立字节数组；实时校验使用共享快照，避免重复复制与摘要。
     pub(crate) fn committed_snapshot(&self) -> Option<CommittedCloudMapSnapshot> {
+        let snapshot = self.shared_committed_snapshot()?;
+        Some(CommittedCloudMapSnapshot {
+            revision: snapshot.revision,
+            point_count: snapshot.point_count,
+            voxel_size: snapshot.voxel_size,
+            session_generation: snapshot.session_generation,
+            xyz_f32_le: snapshot.xyz_f32_le.to_vec(),
+            xyz_sha256: snapshot.xyz_sha256,
+        })
+    }
+
+    /// 复用当前已提交修订的不可变载荷；仍逐次核对共享内存槽位元数据。
+    pub(crate) fn shared_committed_snapshot(&self) -> Option<CommittedCloudMapSnapshot<Arc<[u8]>>> {
         if self.revision == 0 || self.session_generation == 0 {
             return None;
         }
@@ -813,16 +838,27 @@ impl CloudMapShmWriter {
         }
         let start = CM_HEADER_SIZE + active_buf * CM_SINGLE_BUFFER_SIZE;
         let end = start.checked_add(data_size)?;
-        let xyz_f32_le = self.mmap.get(start..end)?.to_vec();
-        let xyz_sha256 = crate::map_checksum::sha256_bytes(&xyz_f32_le);
-        Some(CommittedCloudMapSnapshot {
-            revision: self.revision,
-            point_count,
-            voxel_size,
-            session_generation: self.session_generation,
-            xyz_f32_le,
-            xyz_sha256,
-        })
+        let payload = self.mmap.get(start..end)?;
+        let snapshot = self.committed_snapshot_cache.get_or_init(|| {
+            let xyz_f32_le: Arc<[u8]> = payload.into();
+            let xyz_sha256 = crate::map_checksum::sha256_bytes(&xyz_f32_le);
+            CommittedCloudMapSnapshot {
+                revision: self.revision,
+                point_count,
+                voxel_size,
+                session_generation: self.session_generation,
+                xyz_f32_le,
+                xyz_sha256,
+            }
+        });
+        if snapshot.revision != self.revision
+            || snapshot.session_generation != self.session_generation
+            || snapshot.point_count != point_count
+            || snapshot.voxel_size.to_bits() != voxel_size.to_bits()
+        {
+            return None;
+        }
+        Some(snapshot.clone())
     }
 
     pub(crate) fn last_cloud_receipt(&self) -> Option<CloudCommitReceipt> {
@@ -1031,12 +1067,14 @@ impl CloudMapShmWriter {
         self.mmap[CM_GLOBAL_REVISION_OFFSET..CM_GLOBAL_REVISION_OFFSET + 8]
             .copy_from_slice(&revision.to_le_bytes());
         self.revision = revision;
+        self.committed_snapshot_cache.take();
         // 这是启动时重新初始化的进程间通信映射；上方发布屏障保证可见性。
         // 地图资产有独立持久化流程，实时提交不等待整段文件同步写盘。
         Some((revision, point_count, self.voxel_size))
     }
 
     fn reset_accumulator(&mut self, session_generation: u64) {
+        self.committed_snapshot_cache.take();
         self.scan_preparation = None;
         self.pending_dense_readers = None;
         self.fine_cloud = None;
@@ -1227,6 +1265,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_snapshot_tracks_commits_and_keeps_old_payload_immutable() {
+        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        writer.begin_session(1).unwrap();
+        let cleared = writer.shared_committed_snapshot().unwrap();
+        assert!(cleared.xyz_f32_le.is_empty());
+        assert!(writer.accumulate_mapping_frame(1, &[Point3::new(1.0, 0.0, 0.0)]));
+        writer.commit_accumulated().unwrap();
+        let first = writer.shared_committed_snapshot().unwrap();
+        let again = writer.shared_committed_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&first.xyz_f32_le, &again.xyz_f32_le));
+        assert_eq!(first.xyz_sha256, crate::map_checksum::sha256_bytes(&first.xyz_f32_le));
+        let original = first.xyz_f32_le.to_vec();
+
+        // 私有准备尚未安装时，读者继续观察原提交；安装后直接接续准备端的快照。
+        let (ticket, mut work) = writer.prepare_scan_work().unwrap();
+        assert!(work.accumulate_mapping_frame(1, &[Point3::new(2.0, 0.0, 0.0)]));
+        work.commit_accumulated().unwrap();
+        let prepared = work.shared_committed_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&first.xyz_f32_le, &writer.shared_committed_snapshot().unwrap().xyz_f32_le));
+        assert!(writer.install_scan_work(uuid::Uuid::new_v4(), CloudMapShmWriter::new_private().unwrap()).is_err());
+        writer.install_scan_work(ticket, work).unwrap();
+        let installed = writer.shared_committed_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&prepared.xyz_f32_le, &installed.xyz_f32_le));
+        assert_eq!(installed.point_count, 2);
+        assert_eq!(first.xyz_f32_le.as_ref(), original.as_slice());
+
+        // 共享内存元数据损坏仍拒绝，不因已有快照绕过槽位校验。
+        let revision = writer.revision;
+        writer.mmap[CM_GLOBAL_REVISION_OFFSET..CM_GLOBAL_REVISION_OFFSET + 8].fill(0);
+        assert!(writer.shared_committed_snapshot().is_none());
+        writer.mmap[CM_GLOBAL_REVISION_OFFSET..CM_GLOBAL_REVISION_OFFSET + 8].copy_from_slice(&revision.to_le_bytes());
+        writer.begin_session(2).unwrap();
+        let reset = writer.shared_committed_snapshot().unwrap();
+        assert_eq!(reset.session_generation, 2);
+        assert!(reset.xyz_f32_le.is_empty());
+        assert_eq!(installed.point_count, 2);
+        assert_eq!(first.xyz_f32_le.as_ref(), original.as_slice());
+    }
+
+    #[test]
+    #[ignore = "大点云重复读取对照，显式运行并记录耗时"]
+    fn committed_snapshot_read_budget() {
+        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        writer.begin_session(1).unwrap();
+        // 使用真实提交入口生成接近共享槽容量的规范载荷。
+        let points: Vec<_> = (0..1_300_000).map(|i| Point3::new(
+            (i % 1000) as f64 * 0.1, (i / 1000) as f64 * 0.1, 0.0)).collect();
+        for chunk in points.chunks(POINTCLOUD_MAX_FRAME_POINTS) {
+            assert!(writer.accumulate_mapping_frame(1, chunk));
+        }
+        writer.commit_accumulated().unwrap();
+        let started = std::time::Instant::now();
+        let first = writer.shared_committed_snapshot().unwrap();
+        let cold_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = std::time::Instant::now();
+        for _ in 0..7 {
+            std::hint::black_box(writer.shared_committed_snapshot().unwrap());
+        }
+        let repeated_7_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = std::time::Instant::now();
+        for _ in 0..700 {
+            let snapshot = writer.shared_committed_snapshot().unwrap();
+            assert!(Arc::ptr_eq(&first.xyz_f32_le, &snapshot.xyz_f32_le));
+            std::hint::black_box(snapshot);
+        }
+        println!("snapshot_bytes={} cold_ms={cold_ms:.3} repeated_7_ms={repeated_7_ms:.6} repeated_700_ms={:.3}",
+            first.xyz_f32_le.len(), started.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    #[test]
     #[ignore = "需要显式提供已冻结位姿的记录，仅用于同源性能测量"]
     fn dynamic_recorded_scan_benchmark() {
         use std::io::Read;
@@ -1356,7 +1464,7 @@ mod tests {
         let reader = writer.dense_readers().unwrap();
         let pinned = reader.pin_read(old.clone(), &old.epoch, 0).unwrap();
         assert_eq!(pinned.point_count, old.point_count);
-        assert!(writer.install_scan_work(ticket, work));
+        writer.install_scan_work(ticket, work).unwrap();
         assert!(writer.committed_dense_cloud().unwrap().unwrap().point_count > old.point_count);
     }
 

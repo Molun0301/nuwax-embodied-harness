@@ -8498,7 +8498,7 @@ fn ingest_mapping_points(
 pub(crate) struct CommittedMappingCloudMap {
     pub(crate) notification: CloudMapNotification,
     pub(crate) source_timestamp_ns: u64,
-    pub(crate) xyz_f32_le: Vec<u8>,
+    pub(crate) xyz_f32_le: Arc<[u8]>,
     pub(crate) receipt: crate::mapping_commit::CloudCommitReceipt,
 }
 
@@ -8830,7 +8830,7 @@ async fn ingest_mapping_points_with_backend_owned(
                         (outcome, Some((ticket, work)), acceptance)
                     }).await.map_err(|error| format!("point-cloud preparation failed: {error}"))
                 }
-                Ok(None) => Ok((outcome, None, MappingCloudMapAcceptance { cloud_commit: None, accepted: true })),
+                Ok(None) => Ok((outcome, None, Ok(None))),
                 Err(error) => Err(error),
             };
             let _lifecycle_guard = lifecycle_lock.lock().await;
@@ -8842,25 +8842,34 @@ async fn ingest_mapping_points_with_backend_owned(
                     (Some(epoch), Some(mode)) => { let value = mode.snapshot(); !value.active && value.epoch == epoch }
                     _ => true,
                 };
-            let (outcome, acceptance, preparation_error) = match prepared {
-                Ok((outcome, work, mut acceptance)) => {
-                    acceptance.accepted &= still_current;
-                    if let Some((ticket, work)) = work {
-                        acceptance.accepted &= cloud_map_writer.lock().as_mut()
-                            .is_some_and(|writer| still_current && writer.install_scan_work(ticket, work));
-                    }
-                    (Some(outcome), acceptance, None)
+            let (outcome, acceptance) = match prepared {
+                Ok((outcome, work, acceptance)) => {
+                    let acceptance = acceptance.and_then(|cloud_commit| {
+                        if !still_current {
+                            return Err("point-cloud preparation crossed mapping session or relocalization mode".into());
+                        }
+                        if let Some((ticket, work)) = work {
+                            cloud_map_writer.lock().as_mut()
+                                .ok_or_else(|| "point-cloud writer disappeared before installation".to_owned())?
+                                .install_scan_work(ticket, work)?;
+                        }
+                        Ok(cloud_commit)
+                    });
+                    (Some(outcome), acceptance)
                 }
-                Err(error) => (None, MappingCloudMapAcceptance { cloud_commit: None, accepted: false }, Some(error)),
+                Err(error) => (None, Err(error)),
             };
-            let resolved = adapter.resolve_backend_completion(&committed_token, resolution, acceptance.accepted);
-            if acceptance.accepted && resolved.is_ok() {
-                Ok(MappingIngestCommit { outcome: outcome.unwrap(), cloud_commit: acceptance.cloud_commit })
+            let resolved = adapter.resolve_backend_completion(&committed_token, resolution, acceptance.is_ok());
+            if acceptance.is_ok() && resolved.is_ok() {
+                Ok(MappingIngestCommit { outcome: outcome.unwrap(), cloud_commit: acceptance.unwrap() })
             } else {
-                let reason = preparation_error.unwrap_or_else(|| match resolved {
-                    Err(error) => format!("mapping backend completion resolution failed: {error}"),
-                    Ok(()) => "canonical cloud-map acceptance failed".to_owned(),
-                });
+                // 点云失败与后端决议失败分别保留，不能用后者覆盖最初的拒绝原因。
+                let mut reasons = Vec::new();
+                if let Err(error) = acceptance { reasons.push(error); }
+                if let Err(error) = resolved {
+                    reasons.push(format!("mapping backend completion resolution failed: {error}"));
+                }
+                let reason = reasons.join("; ");
                 let retirement = adapter.stop_session_detached(&token.session_id).ok().and_then(|v| v.retirement);
                 Err((target_frame_id, reason, retirement))
             }
@@ -8962,12 +8971,13 @@ async fn fence_failed_mapping_backend(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn update_mapping_cloud_map_if_current(
     outcome: &MappingIngestOutcome,
     current_session: &crate::mapping_adapter::MappingSessionSnapshot,
     writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
 ) -> Option<CommittedMappingCloudMap> {
-    update_mapping_cloud_map_with_acceptance(outcome, current_session, writer).cloud_commit
+    update_mapping_cloud_map_with_acceptance(outcome, current_session, writer).ok().flatten()
 }
 
 pub(crate) fn accept_mapping_cloud_map_for_backend_candidate(
@@ -8978,7 +8988,7 @@ pub(crate) fn accept_mapping_cloud_map_for_backend_candidate(
     source_timestamp_ns: u64,
     current_session: &crate::mapping_adapter::MappingSessionSnapshot,
     writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
-) -> (bool, Option<CommittedMappingCloudMap>) {
+) -> Result<Option<CommittedMappingCloudMap>, String> {
     let outcome = MappingIngestOutcome {
         sensor_origin_map: None,
         accepted_map_points: accepted_map_points.to_vec(),
@@ -8989,32 +8999,20 @@ pub(crate) fn accept_mapping_cloud_map_for_backend_candidate(
         session_generation,
         source_timestamp_ns,
     };
-    let acceptance = update_mapping_cloud_map_with_acceptance(&outcome, current_session, writer);
-    (acceptance.accepted, acceptance.cloud_commit)
-}
-
-struct MappingCloudMapAcceptance {
-    cloud_commit: Option<CommittedMappingCloudMap>,
-    accepted: bool,
+    update_mapping_cloud_map_with_acceptance(&outcome, current_session, writer)
 }
 
 fn update_mapping_cloud_map_with_acceptance(
     outcome: &MappingIngestOutcome,
     current_session: &crate::mapping_adapter::MappingSessionSnapshot,
     writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
-) -> MappingCloudMapAcceptance {
+) -> Result<Option<CommittedMappingCloudMap>, String> {
     if !current_session.active || current_session.session_generation != outcome.session_generation {
-        return MappingCloudMapAcceptance {
-            cloud_commit: None,
-            accepted: false,
-        };
+        return Err("point-cloud candidate mapping session is inactive or stale".into());
     }
     let mut writer = writer.lock();
     let Some(writer) = writer.as_mut() else {
-        return MappingCloudMapAcceptance {
-            cloud_commit: None,
-            accepted: true,
-        };
+        return Ok(None);
     };
     let (event, receipt) = match (
         outcome.occupancy_event.as_ref(),
@@ -9028,17 +9026,13 @@ fn update_mapping_cloud_map_with_acceptance(
                     outcome.sensor_origin_map,
                     outcome.source_timestamp_ns,
                 );
-            return MappingCloudMapAcceptance {
-                cloud_commit: None,
-                accepted,
+            return if accepted { Ok(None) } else {
+                Err("point-cloud accumulation rejected pending scan".into())
             };
         }
         (Some(event), Some(receipt)) => (event, receipt),
         _ => {
-            return MappingCloudMapAcceptance {
-                cloud_commit: None,
-                accepted: false,
-            };
+            return Err("point-cloud candidate requires paired occupancy event and receipt".into());
         }
     };
     if receipt.session_generation != outcome.session_generation
@@ -9050,10 +9044,7 @@ fn update_mapping_cloud_map_with_acceptance(
         || receipt.session_id != current_session.session_id
         || event.session_id != receipt.session_id
     {
-        return MappingCloudMapAcceptance {
-            cloud_commit: None,
-            accepted: false,
-        };
+        return Err("point-cloud candidate occupancy event/receipt identity mismatch".into());
     }
     if !outcome.accepted_map_points.is_empty()
         && !writer.accumulate_mapping_scan(
@@ -9063,20 +9054,13 @@ fn update_mapping_cloud_map_with_acceptance(
             outcome.source_timestamp_ns,
         )
     {
-        return MappingCloudMapAcceptance {
-            cloud_commit: None,
-            accepted: false,
-        };
+        return Err("point-cloud accumulation rejected committed scan".into());
     }
-    let Some(committed) = writer.commit_accumulated_snapshot(receipt).ok().flatten() else {
-        return MappingCloudMapAcceptance {
-            cloud_commit: None,
-            accepted: false,
-        };
-    };
+    let committed = writer.commit_accumulated_snapshot(receipt)
+        .map_err(|error| format!("point-cloud snapshot commit failed: {error}"))?
+        .ok_or_else(|| "point-cloud snapshot commit produced no revision".to_owned())?;
     let snapshot = committed.snapshot;
-    MappingCloudMapAcceptance {
-        cloud_commit: Some(CommittedMappingCloudMap {
+    Ok(Some(CommittedMappingCloudMap {
             notification: CloudMapNotification {
                 revision: snapshot.revision,
                 point_count: snapshot.point_count,
@@ -9084,11 +9068,9 @@ fn update_mapping_cloud_map_with_acceptance(
                 session_generation: outcome.session_generation,
             },
             source_timestamp_ns: receipt.source_timestamp_ns,
-            xyz_f32_le: snapshot.xyz_f32_le,
+            xyz_f32_le: snapshot.xyz_f32_le.into(),
             receipt: committed.receipt,
-        }),
-        accepted: true,
-    }
+    }))
 }
 
 pub(crate) async fn publish_committed_global_map_in_frame(
@@ -9220,7 +9202,7 @@ async fn publish_global_map_snapshot_in_frame(
 struct CanonicalCloudPublication {
     notification: CloudMapNotification,
     source_timestamp_ns: u64,
-    xyz_f32_le: Vec<u8>,
+    xyz_f32_le: Arc<[u8]>,
     fine: Option<Arc<nuwax_map_chunks::SealedMap>>,
     /// `None` is reserved for the zero-point session-clear publication. Every
     /// non-empty canonical snapshot carries the complete commit receipt.
@@ -9431,7 +9413,7 @@ fn build_navigation_map_3d_publication_frame(
         point_step: 12,
         row_step: i32::try_from(publication.xyz_f32_le.len())
             .map_err(|_| "NavigationMap3D point payload exceeds i32".to_string())?,
-        data: publication.xyz_f32_le.clone(),
+        data: publication.xyz_f32_le.to_vec(),
         is_dense: true,
         ..schema::PointCloud2::default()
     };
@@ -9492,7 +9474,7 @@ fn canonical_cloud_payload_matches(notification: &CloudMapNotification, xyz_f32_
 
 fn canonical_cloud_receipt_matches_snapshot(
     receipt: &crate::mapping_commit::CloudCommitReceipt,
-    snapshot: &crate::pointcloud::CommittedCloudMapSnapshot,
+    snapshot: &crate::pointcloud::CommittedCloudMapSnapshot<Arc<[u8]>>,
 ) -> bool {
     receipt.session_generation == snapshot.session_generation
         && receipt.cloud_revision == snapshot.revision
@@ -9534,7 +9516,7 @@ fn canonical_committed_cloud_publication_matches_writer(
     let Some(writer) = guard.as_ref() else {
         return false;
     };
-    let Some(snapshot) = writer.committed_snapshot() else {
+    let Some(snapshot) = writer.shared_committed_snapshot() else {
         return false;
     };
     let Some(receipt) = writer.last_cloud_receipt() else {
@@ -9551,7 +9533,7 @@ fn canonical_committed_cloud_publication_matches_writer(
             session_generation: snapshot.session_generation,
         },
         source_timestamp_ns: receipt.source_timestamp_ns,
-        xyz_f32_le: snapshot.xyz_f32_le,
+        xyz_f32_le: snapshot.xyz_f32_le.into(),
         receipt: Some(receipt),
         fine: writer.committed_fine_cloud(),
     };
@@ -9636,7 +9618,7 @@ fn latest_canonical_cloud_publication(
         return Ok(None);
     };
     let publish_state = writer.typed_publish_state();
-    let Some(snapshot) = writer.committed_snapshot() else {
+    let Some(snapshot) = writer.shared_committed_snapshot() else {
         return Ok(None);
     };
     let receipt = writer.last_cloud_receipt();
@@ -9665,7 +9647,7 @@ fn latest_canonical_cloud_publication(
                 session_generation: snapshot.session_generation,
             },
             source_timestamp_ns,
-            xyz_f32_le: snapshot.xyz_f32_le,
+            xyz_f32_le: snapshot.xyz_f32_le.into(),
             receipt,
             fine: writer.committed_fine_cloud(),
         },
@@ -9728,7 +9710,7 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                         session_generation: clear.session_generation,
                     },
                     source_timestamp_ns: 0,
-                    xyz_f32_le: Vec::new(),
+                    xyz_f32_le: Arc::from([]),
                     receipt: None,
                     fine: None,
                 })
@@ -9846,7 +9828,7 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                     drop(shared);
                     continue 'acquire_sequencer;
                 }
-                let Some(current_snapshot) = current_writer.committed_snapshot() else {
+                let Some(current_snapshot) = current_writer.shared_committed_snapshot() else {
                     return Ok(None);
                 };
                 current_snapshot.session_generation == canonical_identity.0
@@ -10003,7 +9985,7 @@ async fn ensure_canonical_mapping_cloud_identity(
             .ok_or_else(|| "canonical cloud publication writer is unavailable".to_owned())?;
         (
             writer
-                .committed_snapshot()
+                .shared_committed_snapshot()
                 .ok_or_else(|| "canonical cloud publication snapshot is unavailable".to_owned())?,
             writer
                 .last_cloud_receipt()
@@ -10781,7 +10763,7 @@ async fn ensure_read_only_mapping_identity(
             .as_ref()
             .ok_or_else(|| "relocalization current cloud-map writer is unavailable".to_owned())?;
         (
-            writer.committed_snapshot().ok_or_else(|| {
+            writer.shared_committed_snapshot().ok_or_else(|| {
                 "relocalization current cloud-map snapshot is unavailable".to_owned()
             })?,
             writer.last_cloud_receipt().ok_or_else(|| {
@@ -10976,7 +10958,7 @@ async fn registered_lio_read_only_correction_frame(
             .as_ref()
             .ok_or_else(|| "relocalization requires the canonical cloud-map writer".to_owned())?;
         let snapshot = writer
-            .committed_snapshot()
+            .shared_committed_snapshot()
             .ok_or_else(|| "relocalization requires a committed cloud-map snapshot".to_owned())?;
         let receipt = writer
             .last_cloud_receipt()
@@ -12343,6 +12325,12 @@ mod mapping_feed_tests {
         Arc::new(parking_lot::Mutex::new(active_mapping_adapter()))
     }
 
+    async fn register_test_cloud_session(handle: &GeometryRuntimeHandle) {
+        let generation = handle.mapping_adapter.as_ref().unwrap().lock().snapshot().session_generation;
+        assert!(matches!(handle.begin_cloud_map_session(generation).await,
+            CloudMapSessionAdmission::Registered(_)), "测试必须完成生产点云会话登记");
+    }
+
     struct NavigationMap3DFixture {
         context: NavigationMap3DPublishContext,
         state: Arc<RwLock<SharedState>>,
@@ -12417,6 +12405,25 @@ mod mapping_feed_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+
+    #[test]
+    fn cloud_commit_preserves_duplicate_receipt_error_without_advancing_snapshot() {
+        let fixture = NavigationMap3DFixture::new();
+        let mut mapping = fixture.context.mapping.lock();
+        let outcome = ingest_mapping_points(
+            &mut mapping, &[Point3::new(0.5, 0.0, 0.0)], 12, 1_000_000_000,
+            "map", 1_000_000_000, &fixture.state, &fixture.map_tx,
+        ).unwrap();
+        let session = mapping.snapshot();
+        let first = update_mapping_cloud_map_with_acceptance(&outcome, &session, &fixture.writer)
+            .unwrap().unwrap();
+        let error = update_mapping_cloud_map_with_acceptance(&outcome, &session, &fixture.writer)
+            .err().expect("重复回执必须保留底层原因");
+        assert_eq!(error, "point-cloud snapshot commit failed: cloud-map occupancy receipt is duplicate or out of order");
+        let snapshot = fixture.writer.lock().as_ref().unwrap().shared_committed_snapshot().unwrap();
+        assert_eq!(snapshot.revision, first.notification.revision);
+        assert_eq!(snapshot.xyz_f32_le, first.xyz_f32_le);
     }
 
     #[tokio::test]
@@ -12649,7 +12656,7 @@ mod mapping_feed_tests {
         }
         let fine_xyz = keys.into_iter().flat_map(|key| key.into_iter().flat_map(|v|
             (((v as f64 + 0.5) * f64::from(root.voxel_size_m)) as f32).to_le_bytes())).collect::<Vec<_>>();
-        assert_eq!(fine_xyz, committed.xyz_f32_le);
+        assert_eq!(fine_xyz.as_slice(), committed.xyz_f32_le.as_ref());
         assert_eq!(
             frames[3].msg_type.fingerprint(),
             schema::NAVIGATION_MAP_3D_FINGERPRINT
@@ -13139,7 +13146,7 @@ mod mapping_feed_tests {
                 session_generation: receipt.session_generation,
             },
             source_timestamp_ns: receipt.source_timestamp_ns,
-            xyz_f32_le: vec![0; 12],
+            xyz_f32_le: vec![0; 12].into(),
             receipt: Some(receipt),
         };
         assert!(same_canonical_cloud_publication_identity(
@@ -13215,7 +13222,7 @@ mod mapping_feed_tests {
         ));
 
         let mut wrong_payload = publication.clone();
-        wrong_payload.xyz_f32_le[0] = 1;
+        Arc::make_mut(&mut wrong_payload.xyz_f32_le)[0] = 1;
         assert!(!same_canonical_cloud_publication_identity(
             &publication,
             &wrong_payload
@@ -13354,7 +13361,7 @@ mod mapping_feed_tests {
             .is_none());
             let writer_guard = writer.lock();
             let writer_state = writer_guard.as_ref().expect("cloud writer");
-            assert!(writer_state.committed_snapshot().is_none());
+            assert!(writer_state.shared_committed_snapshot().is_none());
             assert!(writer_state.last_cloud_receipt().is_none());
         }
         let update = update_mapping_cloud_map_if_current(&outcome, &current_session, &writer)
@@ -13572,7 +13579,7 @@ mod mapping_feed_tests {
             .cloud_map_writer
             .lock()
             .as_ref()
-            .and_then(CloudMapShmWriter::committed_snapshot)
+            .and_then(CloudMapShmWriter::shared_committed_snapshot)
             .expect("session-two SHM clear");
         assert_eq!(final_snapshot.revision, 4);
         assert_eq!(final_snapshot.session_generation, 2);
@@ -14880,6 +14887,8 @@ mod mapping_feed_tests {
                     .lock()
                     .start_session("pgo-complete", "pgo-complete-map")
                     .unwrap();
+                register_test_cloud_session(&handle).await;
+                register_test_cloud_session(&baseline).await;
                 let owner = CorrectionTransportOwner::start(
                     CorrectionOwnerSpec::None,
                     identity.clone(),
@@ -14921,6 +14930,8 @@ mod mapping_feed_tests {
                 let mut pending = None;
                 for index in [0usize, 1, 2, 3, 4, 6] {
                     let stamp = (index as u64 + 1) * 1_000_000_000;
+                    {
+                        let _lifecycle = baseline.mapping_lifecycle_lock.lock().await;
                     handoff_lio_odometry(
                         &baseline,
                         &pose_state_from_isometry(&optimized[index], "odom", stamp),
@@ -14929,6 +14940,7 @@ mod mapping_feed_tests {
                     )
                     .await
                     .unwrap();
+                    }
                     let (truth_generation, truth_frame, truth_origin) = {
                         let adapter = baseline.mapping_adapter.as_ref().unwrap().lock();
                         let transform = adapter.map_odom_transform_snapshot().unwrap();
@@ -14955,6 +14967,8 @@ mod mapping_feed_tests {
                     )
                     .await
                     .unwrap());
+                    {
+                        let _lifecycle = handle.mapping_lifecycle_lock.lock().await;
                     handoff_lio_odometry_with_correction(
                         &handle,
                         &pose_state_from_isometry(&raw[index], "odom", stamp),
@@ -14964,6 +14978,7 @@ mod mapping_feed_tests {
                     )
                     .await
                     .unwrap();
+                    }
                     let (points, binding) = {
                         let adapter = mapping.lock();
                         let transform = adapter.map_odom_transform_snapshot().unwrap();
@@ -15127,7 +15142,7 @@ mod mapping_feed_tests {
                             .lock()
                             .as_ref()
                             .unwrap()
-                            .committed_snapshot()
+                            .shared_committed_snapshot()
                             .unwrap();
                         if !background {
                             applier.rebuild_budget = Duration::ZERO;
@@ -15157,7 +15172,7 @@ mod mapping_feed_tests {
                                 .lock()
                                 .as_ref()
                                 .unwrap()
-                                .committed_snapshot()
+                                .shared_committed_snapshot()
                                 .unwrap()
                                 .xyz_f32_le,
                             cloud_before.xyz_f32_le
@@ -15319,7 +15334,7 @@ mod mapping_feed_tests {
                             .lock()
                             .as_ref()
                             .unwrap()
-                            .committed_snapshot()
+                            .shared_committed_snapshot()
                             .unwrap();
                         let actual: Vec<_> = cloud
                             .xyz_f32_le
@@ -15429,6 +15444,7 @@ mod mapping_feed_tests {
                 .lock()
                 .start_session("pgo-simulation", "pgo-simulation-map")
                 .unwrap();
+            register_test_cloud_session(&handle).await;
             let identity = CorrectionOwnerRuntimeIdentity {
                 runtime_generation: 7,
                 backend_generation: 7,
@@ -15549,7 +15565,7 @@ mod mapping_feed_tests {
                     .lock()
                     .as_ref()
                     .unwrap()
-                    .committed_snapshot()
+                    .shared_committed_snapshot()
                     .unwrap();
                 println!("生产模拟 pgo={enabled} sequence={sequence} source={source_timestamp_ns} odom_x={x:.3} public=({:.3},{:.3},{:.3}) error_m={error:.6} error_deg={:.6} points={} correction={}",
                     public.x,public.y,public.z,rotation_error.to_degrees(),cloud.point_count,
@@ -15578,6 +15594,15 @@ mod mapping_feed_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn registered_lio_commit_receipts_form_exact_correction_frame_identity() {
+        exercise_registered_lio_correction_commit(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unregistered_cloud_generation_retires_mapping_without_staging_correction() {
+        exercise_registered_lio_correction_commit(false).await;
+    }
+
+    async fn exercise_registered_lio_correction_commit(register_cloud_session: bool) {
         let handle = build_handle_for_tests()
             .await
             .expect("test Geometry handle");
@@ -15618,6 +15643,13 @@ mod mapping_feed_tests {
                 ),
             )
         };
+        // 与生产StartMapping一致，点云写入器先登记到同一建图代次。
+        if register_cloud_session {
+            assert!(matches!(
+                handle.begin_cloud_map_session(mapping_snapshot.session_generation).await,
+                CloudMapSessionAdmission::Registered(_)
+            ));
+        }
         let frozen_odom_from_body = nalgebra::Isometry3::from_parts(
             nalgebra::Translation3::new(0.5, 0.25, -0.1),
             nalgebra::UnitQuaternion::from_euler_angles(0.1, -0.2, 0.3),
@@ -15666,7 +15698,7 @@ mod mapping_feed_tests {
             Point3::new(2.7, -0.3, 0.2),
         ];
 
-        assert!(handoff_registered_lio_cloud_with_correction(
+        let result = handoff_registered_lio_cloud_with_correction(
             &handle,
             &map_points,
             12,
@@ -15677,8 +15709,20 @@ mod mapping_feed_tests {
             &binding,
             &correction,
         )
-        .await
-        .expect("registered cloud commit and correction handoff"));
+        .await;
+        if !register_cloud_session {
+            let error = result.expect_err("未登记的点云代次必须拒绝");
+            assert!(error.contains("point-cloud preparation generation mismatch: writer=0 prepared=1"), "{error}");
+            assert!(!mapping.lock().snapshot().active);
+            assert!(sink.staged.lock().await.is_empty());
+            assert!(revision_rx.try_recv().is_err());
+            assert!(handle.committed_map_authority.lock().unwrap().is_none());
+            owner.shutdown().await.unwrap();
+            drop(handle);
+            std::fs::remove_file(cloud_path).unwrap();
+            return;
+        }
+        assert!(result.expect("registered cloud commit and correction handoff"));
         let event = tokio::time::timeout(Duration::from_secs(1), revision_rx.recv())
             .await
             .expect("map revision event deadline")
@@ -16921,6 +16965,7 @@ mod mapping_feed_tests {
         handle.cloud_map_writer = Arc::new(parking_lot::Mutex::new(Some(
             CloudMapShmWriter::new(&path).expect("cloud map writer"),
         )));
+        register_test_cloud_session(&handle).await;
         let mut revision_rx = handle.map_revision_tx.subscribe();
 
         assert!(handoff_registered_lio_cloud(
@@ -16940,13 +16985,14 @@ mod mapping_feed_tests {
         let state = handle.state.read().await;
         assert_eq!(state.map.frame_id, "robot/map");
         assert_eq!(state.map.timestamp_ns, 0);
-        assert_eq!(state.cloud_map_revision, 1);
+        assert_eq!(state.cloud_map_revision, 2);
         drop(state);
         let published = backend.published.lock().expect("published frames");
-        assert_eq!(published.len(), 1);
-        let mut encoded = Vec::with_capacity(8 + published[0].payload.len());
+        let clouds: Vec<_> = published.iter().filter(|frame| frame.topic.channel() == "/global_map").collect();
+        assert_eq!(clouds.len(), 2, "同代清空与首帧点云各发布一次");
+        let mut encoded = Vec::with_capacity(8 + clouds[1].payload.len());
         encoded.extend_from_slice(&schema::POINT_CLOUD2_FINGERPRINT);
-        encoded.extend_from_slice(&published[0].payload);
+        encoded.extend_from_slice(&clouds[1].payload);
         let cloud = schema::decode_point_cloud2(&encoded).expect("global cloud payload");
         assert_eq!(cloud.header.frame_id, "robot/map");
         assert_eq!((cloud.header.stamp_sec, cloud.header.stamp_nsec), (0, 0));
@@ -17286,6 +17332,7 @@ mod mapping_feed_tests {
             CloudMapShmWriter::new(&path).expect("cloud map writer"),
         )));
 
+        register_test_cloud_session(&handle).await;
         assert!(handoff_registered_lio_cloud(
             &handle,
             &[Point3::new(0.0, 0.0, 0.0)],
@@ -17315,13 +17362,14 @@ mod mapping_feed_tests {
             )
         };
         assert_eq!(adapter_state, (1, 2, 2));
-        assert_eq!(backend.published_count(), 1);
-        assert_eq!(handle.state.read().await.cloud_map_revision, 1);
+        assert_eq!(backend.published.lock().unwrap().iter()
+            .filter(|frame| frame.topic.channel() == "/global_map").count(), 2);
+        assert_eq!(handle.state.read().await.cloud_map_revision, 2);
         {
             let writer = handle.cloud_map_writer.lock();
             let writer = writer.as_ref().expect("cloud-map writer");
-            let snapshot = writer.committed_snapshot().expect("first cloud snapshot");
-            assert_eq!(snapshot.revision, 1);
+            let snapshot = writer.shared_committed_snapshot().expect("first cloud snapshot");
+            assert_eq!(snapshot.revision, 2);
             assert_eq!(snapshot.point_count, 1);
         }
 
@@ -17337,13 +17385,13 @@ mod mapping_feed_tests {
         .expect("next cadence revision"));
         // 三维导航表面也会发布到同一传输端；本例只核对占据图节拍。
         assert_eq!(backend.published.lock().unwrap().iter()
-            .filter(|frame| frame.topic.channel() == "/global_map").count(), 2);
-        assert_eq!(handle.state.read().await.cloud_map_revision, 2);
+            .filter(|frame| frame.topic.channel() == "/global_map").count(), 3);
+        assert_eq!(handle.state.read().await.cloud_map_revision, 3);
         {
             let writer = handle.cloud_map_writer.lock();
             let writer = writer.as_ref().expect("cloud-map writer");
-            let snapshot = writer.committed_snapshot().expect("second cloud snapshot");
-            assert_eq!(snapshot.revision, 2);
+            let snapshot = writer.shared_committed_snapshot().expect("second cloud snapshot");
+            assert_eq!(snapshot.revision, 3);
             assert_eq!(snapshot.point_count, 3);
         }
         drop(handle);

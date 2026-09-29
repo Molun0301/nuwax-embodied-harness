@@ -2456,7 +2456,7 @@ async fn activate_map_r1(
                     session_generation: current.session_generation,
                 },
                 source_timestamp_ns: proof.source_timestamp_ns,
-                xyz_f32_le: target.xyz_f32_le.clone(),
+                xyz_f32_le: target.xyz_f32_le.clone().into(),
                 receipt: proof.cloud_receipt.clone(),
             };
             let replaying_retained_publication = retained_global_map.is_some();
@@ -3051,7 +3051,7 @@ async fn activate_map_r1(
             CommittedMappingCloudMap {
                 notification,
                 source_timestamp_ns,
-                xyz_f32_le: target.xyz_f32_le.clone(),
+                xyz_f32_le: target.xyz_f32_le.clone().into(),
                 receipt: correlated.receipt,
             },
             target_receipt_sha256,
@@ -5962,7 +5962,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                     ..
                 } = committed;
                 let current_session = adapter.lock().snapshot();
-                let (cloud_accepted, cloud_commit) =
+                let cloud_result =
                     accept_mapping_cloud_map_for_backend_candidate(
                         &accepted_map_points,
                         &event,
@@ -5974,16 +5974,14 @@ impl GeometryRuntime for GeometryRuntimeService {
                     );
                 let resolution_result = adapter
                     .lock()
-                    .resolve_backend_completion(&token, resolution, cloud_accepted);
-                if !cloud_accepted || resolution_result.is_err() {
-                    let mut reason = if !cloud_accepted {
-                        "mapping backend checkpoint flush cloud-map acceptance failed".to_owned()
-                    } else {
-                        format!(
-                            "mapping backend checkpoint flush resolution failed: {}",
-                            resolution_result.expect_err("resolution failure checked above")
-                        )
-                    };
+                    .resolve_backend_completion(&token, resolution, cloud_result.is_ok());
+                if cloud_result.is_err() || resolution_result.is_err() {
+                    let mut reasons = Vec::new();
+                    if let Err(error) = cloud_result { reasons.push(error); }
+                    if let Err(error) = resolution_result {
+                        reasons.push(format!("mapping backend checkpoint flush resolution failed: {error}"));
+                    }
+                    let mut reason = reasons.join("; ");
                     let retirement = adapter
                         .lock()
                         .stop_session_detached(&token.session_id)
@@ -6005,6 +6003,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                     }
                     return Err(Status::failed_precondition(reason));
                 }
+                let cloud_commit = cloud_result.expect("point-cloud commit failure already retired");
                 if let Some(event) = event {
                     let _ = bridge.map_revision_tx.send(event);
                 }
@@ -13851,7 +13850,8 @@ mod lifecycle_tests {
             .await
             .expect("seed registered ray handoff");
             assert!(committed, "每帧点必须接纳，栅格发布另行判断");
-            assert_eq!(source_handle.state.read().await.map.revision > 0, sequence == 3);
+            // 相邻输入间隔1秒，均超过当前在线构图周期，应从首帧开始有真实修订。
+            assert!(source_handle.state.read().await.map.revision > 0);
         }
         let mut source_checkpoint = GeometryRuntime::export_mapping_backend_checkpoint(
             &source_service,
@@ -13989,11 +13989,16 @@ mod lifecycle_tests {
 
         let source_map = source_handle.state.read().await.map.clone();
         let restored_map = restored_handle.state.read().await.map.clone();
-        assert_eq!(
-            occupancy_checkpoint_proto(&restored_map),
-            occupancy_checkpoint_proto(&source_map),
-            "restored and uninterrupted canonical maps must match"
-        );
+        // 恢复会话独立分配修订；比较实际几何和源时间，原点允许协议分辨率的浮点量化误差。
+        assert_eq!(restored_map.data, source_map.data);
+        assert_eq!((restored_map.width, restored_map.height), (source_map.width, source_map.height));
+        assert_eq!(restored_map.resolution, source_map.resolution);
+        assert_eq!(restored_map.frame_id, source_map.frame_id);
+        assert_eq!(restored_map.timestamp_ns, source_map.timestamp_ns);
+        for (restored, source) in [(restored_map.origin_x, source_map.origin_x), (restored_map.origin_y, source_map.origin_y)] {
+            let tolerance = f64::from(f32::EPSILON) * source.abs().max(f64::from(source_map.resolution));
+            assert!((restored - source).abs() <= tolerance, "恢复原点必须在协议浮点精度内一致");
+        }
         let source_cloud = source_handle
             .cloud_map_writer
             .lock()

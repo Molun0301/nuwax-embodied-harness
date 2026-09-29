@@ -339,7 +339,8 @@ def _verify_prefix(prefix: Path, modules: Sequence[str]) -> None:
         raise InstallError("安装产物不完整：" + ", ".join(missing))
 
 
-def apply(request: InstallRequest, hardware) -> dict:
+def check_prerequisites(request: InstallRequest, hardware) -> str:
+    """安装与只读诊断共用准入检查，返回实际可用的解释器。"""
     if sys.platform != "linux" or hardware.os_id not in ("ubuntu", "debian", "raspbian", "linuxmint"):
         raise InstallError("当前自动安装支持 Debian（操作系统）及 Ubuntu（操作系统）系列；其它系统可以查看 --dry-run 计划。")
     if request.jobs < 1:
@@ -348,6 +349,13 @@ def apply(request: InstallRequest, hardware) -> dict:
         raise InstallError("请用普通用户运行 ./install.sh；只有缺少的系统依赖由安装器自动提权安装。")
     if request.robot not in ("customrobot", "go2"):
         raise InstallError("请选择标准机器人接入 customrobot 或 Go2。")
+    if hardware.architecture not in ("x86_64", "aarch64"):
+        raise InstallError("当前自动安装面向 x86_64 与 aarch64（64位ARM架构）；请在受支持的64位主机上安装。")
+    ancestor = request.home
+    while not ancestor.exists() and ancestor != ancestor.parent:
+        ancestor = ancestor.parent
+    if not ancestor.is_dir() or not os.access(ancestor, os.W_OK | os.X_OK):
+        raise InstallError(f"安装位置不可写：{request.home}；请用 --install-dir 选择当前用户可写的目录。")
     seed = choose_python(request.python)
     models = bool(set(request.modules) & {"perception", "memory"})
     if hardware.is_jetson and models and not _probe_imports(seed, ("torch", "torchvision")):
@@ -357,6 +365,11 @@ def apply(request: InstallRequest, hardware) -> dict:
             wheels = list(request.wheel_dir.glob(name + "-*.whl")) if request.wheel_dir else []
             if len(wheels) != 1:
                 raise InstallError(f"Go2 设备软件尚未就绪：需要 {name}；请通过 --wheel-dir 提供设备安装包，或用 --robot customrobot 安装标准接入。")
+    return seed
+
+
+def apply(request: InstallRequest, hardware) -> dict:
+    seed = check_prerequisites(request, hardware)
     source_identity = source_fingerprint(request.root, request.modules, request.robot)
     fingerprint = hashlib.sha256((source_identity + seed).encode()).hexdigest()
     with installation_lock(request.home), idle_gateway(request.root):

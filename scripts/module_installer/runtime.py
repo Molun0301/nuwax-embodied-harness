@@ -147,6 +147,12 @@ def write_runtime(
         values.update(read_settings(root / "drivers/go2/data_plane.env.example"))
     values.update(read_settings(root / ".env.example"))
     values.update(existing)
+    # 新安装先供本机接入；已配置的监听地址与制品访问地址继续沿用。
+    if not existing.get("NUWAX_GATEWAY_HOST", "").strip():
+        values["NUWAX_GATEWAY_HOST"] = "127.0.0.1"
+    if not existing.get("NUWAX_GATEWAY_PUBLIC_BASE_URL", "").strip():
+        port = values.get("NUWAX_GATEWAY_PORT", "8766") or "8766"
+        values["NUWAX_GATEWAY_PUBLIC_BASE_URL"] = f"http://127.0.0.1:{port}"
     # 新配置位于安装目录，但原用户路径仍以项目目录为基准。
     for key in _ROOT_RELATIVE_PATH_KEYS:
         value = values.get(key, "").strip()

@@ -189,3 +189,13 @@ drivers/.active_robot
 drivers/.settings.lock
 drivers/*/.active_config.lock
 drivers/.active_robot.lock
+
+# NEH 产品使用与维护文档；开发记录和独立测试继续只留本地。
+!/docs/公开文档/安装前准备.md
+!/docs/公开文档/配置说明.md
+!/docs/公开文档/控制台使用指南.md
+!/docs/公开文档/升级与恢复.md
+!/docs/公开文档/常见问题与排障.md
+!/docs/公开文档/安全与数据说明.md
+!/docs/公开文档/贡献指南.md
+!/docs/公开文档/发布与兼容性.md

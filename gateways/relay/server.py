@@ -70,7 +70,7 @@ def create_relay_app(
 ) -> FastAPI:
     """创建容器内边车转发器。"""
 
-    app = FastAPI(title="nuwax_robot_bridge_relay")
+    app = FastAPI(title="Nuwax Embodied Harness（NEH）中继")
     app.state.relay_config = relay_config
     app.state.http_transport = transport
     request_log_limiter = LogRateLimiter()

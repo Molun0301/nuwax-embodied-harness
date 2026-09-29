@@ -3,15 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Nuwax 机器人控制台</title>
-  <link rel="stylesheet" href="/static/console.css?v=20260923-map-subbar-overlay">
+  <title>NEH · Nuwax Embodied Harness 机器人控制台</title>
+  <meta name="description" content="Nuwax Embodied Harness（NEH，具身运行框架）：机器人地图、感知、空间记忆与任务控制台。">
+  <link rel="icon" href="/static/neh-icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/console.css?v=20260929-neh-toolbar">
 </head>
 <body>
 <div class="app" id="app">
   <header class="vitals card">
     <div class="brand">
       <span class="dot"></span>
-      <div><div class="nm">Nuwax 机器人控制台</div><div class="md"><span id="robotName">机器人未连接</span> · <span id="robotModel">型号 --</span></div></div>
+      <div><div class="nm" title="Nuwax Embodied Harness（NEH，具身运行框架）">NEH 机器人控制台</div><div class="md"><span id="robotName">机器人未连接</span> · <span id="robotModel">型号 --</span></div></div>
     </div>
     <div class="vstats">
       <div class="vstat"><div class="v" id="connectionText">缺失</div><div class="l">网关</div></div>
@@ -425,10 +427,10 @@
 </div>
 
   <script>window.__NUWAX_GEOMETRY_PIPELINE__ = "__GEOMETRY_PIPELINE__"; window.__NUWAX_NAV_SUPPORT_DISTANCE__ = "__NAV_SUPPORT_DISTANCE__";</script>
-  <script src="/static/js/console-logs.js?v=20260908-pose-log-stream"></script>
+  <script src="/static/js/console-logs.js?v=neh-20260908-pose-log-stream"></script>
   <script src="/static/js/console-settings.js?v=20260920-settings-style"></script>
   <script src="/static/js/map-workspace.js?v=20260923-map-subbar-overlay"></script>
-  <script src="/static/js/console.js?v=20260929-navigation-display"></script>
+  <script src="/static/js/console.js?v=neh-20260929-navigation-display"></script>
   <script src="/static/js/semantic-map.js?v=20260924-semantic-asset-binding"></script>
   <script src="/static/js/scene-graph.js?v=20260924-semantic-asset-binding"></script>
   <script>

@@ -1076,7 +1076,7 @@
         const changes = Object.fromEntries(Object.entries(payload || {}).filter(([, value]) => value !== undefined));
         const health = { ...(state.latestHealth || {}), ...changes };
         state.latestHealth = health;
-        setText(els.robotName, health.robot_name || "nuwax_robot_bridge");
+        setText(els.robotName, health.robot_name || "机器人未命名");
         setText(els.robotModel, `型号：${safeText(health.robot_model)}`);
         const robot = health.latest_robot_snapshot || {};
         const status = health.assembly_status || {};

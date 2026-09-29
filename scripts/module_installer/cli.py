@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -14,19 +15,29 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from .catalog import MODULES, remove_modules, replace_lio, resolve_modules
+from .doctor import diagnose
 from .hardware import detect_hardware, recommend_modules
 from .manager import InstallError, InstallRequest, apply, existing_config, make_plan, read_current
 from .runtime import read_settings
 
+PRESETS = {
+    "basic": ("core",),
+    "map2d": ("slam2d",),
+    "map3d": ("fastlio2",),
+}
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="./install.sh", description="Nuwax · 按需安装，随时增删",
+        prog="./install.sh", description="Nuwax Embodied Harness（NEH，具身运行框架）· 安装与管理",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""常用操作：
   ./install.sh                         自动检测，进入简洁向导
   ./install.sh install --yes            接受自动推荐并安装
   ./install.sh install --modules core   只安装基础网关
+  ./install.sh install --preset map2d   二维激光建图方案
+  ./install.sh install --preset map3d   三维激光惯性建图方案
+  ./install.sh doctor                   检查安装前提及已有产物
   ./install.sh add fastlio2             增加建图，自动补齐依赖
   ./install.sh add pointlio             将 FastLIO2 替换为 PointLIO
   ./install.sh remove perception        卸载视觉及依赖它的跟随模块
@@ -39,7 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("command", nargs="?", default="manage", choices=("manage", "install", "add", "remove", "list", "doctor", "start", "stop"), help="安装管理操作")
     parser.add_argument("names", nargs="*", help="add/remove 的模块名称，可使用逗号分隔")
-    parser.add_argument("--modules", help="完整目标模块列表；默认采用已有选择或自动推荐")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--modules", help="完整目标模块列表；默认采用已有选择或自动推荐")
+    selection.add_argument("--preset", choices=tuple(PRESETS), help="完整安装方案：basic 基础接入，map2d 二维建图，map3d 三维建图；替换当前模块选择")
     parser.add_argument("--robot", choices=("auto", "customrobot", "go2"), default="auto", help="自动沿用配置，未知设备使用标准接入")
     parser.add_argument("--lio", choices=("fastlio2", "pointlio", "device"), help="切换定位算法；device 表示设备已有里程计")
     parser.add_argument("--install-dir", type=Path, help="专属安装目录，默认 runtime_data/installation")
@@ -48,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jobs", type=int, help="编译并行数，默认依据处理器和内存自动限制")
     parser.add_argument("--yes", "-y", action="store_true", help="接受显示的目标方案，不再交互确认")
     parser.add_argument("--dry-run", action="store_true", help="只查看模块、依赖和构建计划，不写入文件")
-    parser.add_argument("--json", action="store_true", help="输出结构化计划或状态；不执行安装")
+    parser.add_argument("--json", action="store_true", help="输出结构化计划、状态或诊断；不执行安装")
     parser.add_argument("--repair", action="store_true", help="重新安装相同模块，修复缺失或损坏的产物")
     return parser
 
@@ -58,7 +71,7 @@ def _names(values: Sequence[str]) -> tuple:
 
 
 def _show_hardware(hardware, recommendation, *, show_reasons: bool = True) -> None:
-    print("\nNuwax · 模块管理\n")
+    print("\nNuwax Embodied Harness（NEH，具身运行框架）· 安装与管理\n")
     print(f"{hardware.os_id} {hardware.version_id} · {hardware.architecture} · {hardware.cpu_count} 核 · {hardware.memory_bytes / 1024 ** 3:.1f} GiB（吉字节）内存 · {hardware.free_disk_bytes / 1024 ** 3:.1f} GiB 可用磁盘")
     print("图形设备：{}；编译并行：{}".format(
         "Jetson（嵌入式计算平台）" if hardware.is_jetson else "NVIDIA（英伟达）" if hardware.nvidia_gpu else "未检测到可用的 NVIDIA 图形设备",
@@ -74,6 +87,7 @@ def _show_modules(selected: Sequence[str]) -> None:
     for number, (key, spec) in enumerate(MODULES.items(), 1):
         mark = "✓" if key in selected else " "
         print(f"  {number} [{mark}] {key:<12} {spec.title}")
+        print("      " + spec.description)
 
 
 def _show_plan(plan: dict) -> None:
@@ -98,6 +112,7 @@ def _wizard(selected: tuple, recommended: tuple) -> Optional[tuple]:
     while True:
         _show_modules(selected)
         print("\n回车使用以上方案；输入编号增删（如 3 6）；r 恢复推荐；q 退出。")
+        print("输入 basic（基础接入）、map2d（二维建图）、map3d（三维建图）可替换整套选择。")
         answer = input("选择 › ").strip().lower()
         if not answer:
             return selected
@@ -106,6 +121,10 @@ def _wizard(selected: tuple, recommended: tuple) -> Optional[tuple]:
         if answer == "r":
             selected = recommended
             continue
+        if answer in PRESETS:
+            selected = resolve_modules(PRESETS[answer])
+            continue
+        original = selected
         try:
             for token in answer.replace(",", " ").split():
                 number = int(token)
@@ -119,7 +138,8 @@ def _wizard(selected: tuple, recommended: tuple) -> Optional[tuple]:
                 else:
                     selected = resolve_modules(selected + (key,))
         except ValueError as exc:
-            print("  " + str(exc))
+            selected = original
+            print("  选择未应用：" + str(exc))
 
 
 def _stop(current: dict, root: Path) -> int:
@@ -154,8 +174,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if args.names and args.command not in ("add", "remove"):
             parser.error("模块名称只能跟在 add/remove 后；完整选择请用 --modules。")
-        if args.command in ("add", "remove") and (not args.names or args.modules):
-            parser.error("add/remove 需要模块名称，且不能与 --modules 同用。")
+        if args.command in ("add", "remove") and (not args.names or args.modules is not None or args.preset):
+            parser.error("add/remove 需要模块名称，且不能与 --modules 或 --preset 同用。")
+        if args.command in ("list", "start", "stop") and (args.modules is not None or args.preset or args.lio or args.repair):
+            parser.error("list/start/stop 不修改安装选择；请先用 install/add/remove。")
         current = read_current(home)
         if args.command == "list":
             if args.json:
@@ -163,7 +185,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             elif current:
                 print("当前已安装：")
                 _show_modules(current["modules"])
-                print("\n配置文件：{}/settings.env".format(current["prefix"]))
+                print("\n初始配置：{}/settings.env".format(current["prefix"]))
+                active_config = root / "runtime_data/settings/active.env"
+                if active_config.is_file():
+                    print("当前机器人方案：" + str(active_config.resolve()))
+                print("安装目录：" + str(home))
+                print("安装时间：" + current.get("installed_at", "未知"))
             else:
                 print("尚未安装。运行 ./install.sh 自动检测并开始。")
             return 0
@@ -183,6 +210,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             existing["NUWAX_ACTIVE_ROBOT"] = args.robot
         recommendation = recommend_modules(hardware, existing, current.get("modules"))
         selected = resolve_modules(_names([args.modules])) if args.modules is not None else recommendation.modules
+        if args.preset:
+            selected = resolve_modules(PRESETS[args.preset])
         if args.command == "add":
             names = _names(args.names)
             if "fastlio2" in names and "pointlio" in names:
@@ -212,7 +241,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                  wheel_dir.expanduser().resolve() if wheel_dir else None, args.repair)
         preview = args.dry_run or args.json or args.command == "doctor"
         if not args.json:
-            _show_hardware(hardware, recommendation, show_reasons=args.modules is None and args.command in ("manage", "install", "doctor"))
+            _show_hardware(hardware, recommendation, show_reasons=args.modules is None and not args.preset and args.command in ("manage", "install", "doctor"))
         if args.command == "manage" and not preview and not args.yes:
             if not sys.stdin.isatty():
                 print("\n非交互环境只展示计划；实际安装请使用 install --yes。")
@@ -223,6 +252,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     return 0
                 request = replace(request, modules=selected)
         plan = make_plan(request, hardware, current)
+        if args.command == "doctor":
+            report = diagnose(request, hardware, current)
+            if args.json:
+                print(json.dumps({"hardware": hardware.to_dict(), "plan": plan, "diagnostics": report}, ensure_ascii=False, indent=2))
+            else:
+                _show_plan(plan)
+                print("\n安装检查：")
+                labels = {"ok": "通过", "warning": "提示", "error": "需处理"}
+                for item in report["checks"]:
+                    print("  [{}] {}".format(labels[item["status"]], item["message"]))
+                print("诊断通过。" if report["ok"] else "请处理以上缺项后重新检查。")
+            return 0 if report["ok"] else 1
         if args.json:
             print(json.dumps({"hardware": hardware.to_dict(), "recommendation": recommendation.to_dict(), "plan": plan}, ensure_ascii=False, indent=2))
         else:
@@ -243,12 +284,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         finally:
             signal.signal(signal.SIGTERM, previous_handler)
         print("\n安装完成：" + "、".join(MODULES[key].title for key in result["modules"]))
-        print("启动：./install.sh start" + (" --install-dir " + str(home) if args.install_dir else ""))
+        settings_path = Path(result["prefix"]) / "settings.env"
+        active_config = root / "runtime_data/settings/active.env"
+        print("初始配置：" + str(settings_path))
+        if active_config.is_file():
+            print("当前机器人方案：" + str(active_config.resolve()))
+        start = ["./install.sh", "start"] + (["--install-dir", str(home)] if args.install_dir else [])
+        print("启动：" + shlex.join(start))
+        print("首次使用：docs/公开文档/快速上手.md；机器人接入：docs/公开文档/架构与机器人接入.md")
+        settings = read_settings(active_config if active_config.is_file() else settings_path)
+        host = settings.get("NUWAX_GATEWAY_HOST", "127.0.0.1") or "127.0.0.1"
+        host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+        host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        port = settings.get("NUWAX_GATEWAY_PORT", "8766") or "8766"
+        print(f"启动后打开控制台：http://{host}:{port}/console（显式进程环境可覆盖配置）。")
         print("以后运行 ./install.sh 可继续增删模块。")
         return 0
     except KeyboardInterrupt:
         print("\n已取消，上一有效安装保留。", file=sys.stderr)
         return 130
+    except EOFError:
+        print("\n输入已结束，未确认的安装未执行；自动化安装请明确指定 --yes。", file=sys.stderr)
+        return 2
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         print(f"\n无法完成：{exc}", file=sys.stderr)
         return 1

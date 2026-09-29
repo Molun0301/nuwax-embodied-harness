@@ -374,7 +374,7 @@
       const url = URL.createObjectURL(blob);
       const anchor = make("a");
       anchor.href = url;
-      anchor.download = `Nuwax日志_${new Date().toISOString().slice(0, 10)}.${format === "text" ? "txt" : "jsonl"}`;
+      anchor.download = `NEH日志_${new Date().toISOString().slice(0, 10)}.${format === "text" ? "txt" : "jsonl"}`;
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();

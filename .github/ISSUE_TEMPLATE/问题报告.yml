@@ -1,0 +1,33 @@
+name: 问题报告
+description: 报告 NEH 安装、接入或运行中可复现的问题
+title: "[问题] "
+body:
+  - type: markdown
+    attributes:
+      value: "请先查阅公开文档中的常见问题与排障。不要提交密钥、完整私有配置、场地图或个人影像。"
+  - type: textarea
+    id: environment
+    attributes:
+      label: 版本与环境
+      description: 源码提交与分支、系统架构、Python版本、安装方式和模块、设备型号。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 从什么状态开始，执行了什么命令或页面操作？
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 期望与实际结果
+      description: 说明失败阶段、发生时间，以及是否在真实设备发生。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 脱敏证据
+      description: 首条错误、相关任务标识和最小日志；缺少证据时说明哪些未取得。

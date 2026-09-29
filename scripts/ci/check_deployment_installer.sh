@@ -27,11 +27,20 @@ plan = json.load(sys.stdin)["plan"]
 assert plan["modules"] == ["core", "geometry", "pointlio"]
 assert "libgoogle-glog-dev" in plan["system_packages"]
 '
-python3 install.py plan --profile go2-jetson --release-id ci-contract --go2-robot-ip 192.0.2.10 >/tmp/nuwax-install-plan.txt
+plan_file="$(mktemp -t neh-install-plan.XXXXXX)"
+trap 'rm -f "${plan_file}"' EXIT
+python3 install.py plan --profile go2-jetson --release-id ci-contract --go2-robot-ip 192.0.2.10 >"${plan_file}"
 
-grep -q 'rust_build' /tmp/nuwax-install-plan.txt
-grep -q 'nuwax-person-follow' /tmp/nuwax-install-plan.txt
-grep -q '/api/health/full' /tmp/nuwax-install-plan.txt
+grep -q 'rust_build' "${plan_file}"
+grep -q 'nuwax-person-follow' "${plan_file}"
+grep -q '/api/health/full' "${plan_file}"
+
+python3 install.py install --preset map2d --robot customrobot --json | python3 -c '
+import json, sys
+plan = json.load(sys.stdin)["plan"]
+assert plan["modules"] == ["core", "geometry", "slam2d"]
+assert plan["models"] == []
+'
 
 # 测试按项目约定仅存在于开发机；远端检查不依赖未入仓的文件。
 if [[ "${1:-}" == "--with-tests" ]]; then

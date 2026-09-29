@@ -253,7 +253,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>nuwax_robot_bridge 运维页</title>
+  <title>NEH 运维页</title>
   <style>
     :root {{
       --bg: #f6f7f9;
@@ -368,7 +368,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
   <button id="themeToggle" class="theme-toggle" title="切换主题" aria-label="切换白天/黑夜主题">☀️</button>
   <div class="app-shell">
     <div class="eyebrow">运维控制台</div>
-    <h1>nuwax_robot_bridge 运维页</h1>
+    <h1>NEH 运维页</h1>
     <p class="muted">用于快速查看宿主机运行时、目录布局和安全策略的最低可用状态页。</p>
     <div class="grid">
       <section class="card">

@@ -859,7 +859,8 @@ details.msb-pane>summary{display:none}
 #live-map .map-scene-graph-body{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,260px);gap:12px}
 .map-scene-graph-stage{min-height:160px;position:relative;background:var(--inset);border:1px solid var(--line);border-radius:var(--r-sm);overflow:hidden}
 
-@container (max-width:800px){
+/* 视图、镜头与状态已有固定宽度，功能按钮在拥挤前独立换行。 */
+@container (max-width:1200px){
   #live-map{--map-header-pad:8px}
   #live-map .map-header{flex-wrap:wrap;gap:6px 8px;padding:var(--map-header-pad) 12px}
   #live-map .map-tool-actions{order:3;flex:1 0 100%;border-left:0;border-top:1px solid var(--line-2);padding:4px 0 0;overflow-x:auto;scrollbar-width:thin}

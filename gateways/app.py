@@ -240,7 +240,7 @@ def create_gateway_app(
                 if agent_tools is not None:
                     agent_tools.close()
 
-    app = FastAPI(title="nuwax_robot_bridge_gateway", lifespan=lifespan)
+    app = FastAPI(title="Nuwax Embodied Harness（NEH）网关", lifespan=lifespan)
     app.state.runtime = runtime
     app.state.config = config
     app.state.access_manager = access_manager

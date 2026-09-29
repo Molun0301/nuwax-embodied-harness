@@ -51,7 +51,12 @@ impl SurfaceNavigationConfig {
             .map(|v| RobotGeometry::from_runtime_json(&v))
             .transpose()
             .map_err(NavStackError::InvalidConfig)?;
-        config.apply_calibration(body, capabilities)?;
+        config.apply_calibration(body, capabilities.clone())?;
+        config.apply_step_overrides(
+            optional_step("NUWAX_NAV_MAX_STEP_UP_M")?,
+            optional_step("NUWAX_NAV_MAX_STEP_DOWN_M")?,
+            capabilities.as_ref(),
+        )?;
         config.follower.scan.horizon_m = configured_number(
             "NUWAX_NAV_LOCAL_HORIZON_M", config.follower.scan.horizon_m,
         )?;
@@ -104,9 +109,47 @@ impl SurfaceNavigationConfig {
         }
         tracing::info!(target:"navigation.config",event="navigation.config.loaded",profile="pct-scan-3d",
             voxel_m=config.geometry.voxel_size,local_horizon_m=config.follower.scan.horizon_m,
+            max_step_up_m=config.body_envelope.as_ref().map(|body|body.max_step_up_m),
+            max_step_down_m=config.body_envelope.as_ref().map(|body|body.max_step_down_m),
             local_refresh_m=config.follower.scan.refresh_distance_m,spline_iterations=config.follower.scan.optimization_iterations,
             "三维导航已读取统一配置");
         Ok(config)
+    }
+
+    /// 简单设置与完整能力标定共用一份机体参数，不能在两端静默取不同限制。
+    fn apply_step_overrides(
+        &mut self,
+        up: Option<f64>,
+        down: Option<f64>,
+        capabilities: Option<&NavigationCapabilities>,
+    ) -> NavStackResult<()> {
+        if up.is_none() && down.is_none() {
+            return Ok(());
+        }
+        let fallback = f64::from(self.geometry.step_threshold_m);
+        let up = up.unwrap_or_else(|| self.body_envelope.as_ref().map_or(fallback, |body| body.max_step_up_m));
+        let down = down.unwrap_or_else(|| self.body_envelope.as_ref().map_or(fallback, |body| body.max_step_down_m));
+        if ![up, down].into_iter().all(|v| v.is_finite() && (0.0..=1.0).contains(&v)) {
+            return Err(NavStackError::InvalidConfig("上、下台阶高度必须是0—1米的有限数值".into()));
+        }
+        if let Some(caps) = capabilities {
+            let limits = caps.terrain.as_ref().filter(|terrain| terrain.stairs_supported)
+                .map_or([0.0, 0.0], |terrain| [terrain.max_step_up_m, terrain.max_step_down_m]);
+            if up > limits[0] + 1e-9 || down > limits[1] + 1e-9 {
+                return Err(NavStackError::InvalidConfig(
+                    "台阶设置超过NUWAX_NAV_CAPABILITIES_JSON中声明的地形能力，请同步机器人能力标定".into(),
+                ));
+            }
+        }
+        if let Some(body) = self.body_envelope.as_mut() {
+            body.max_step_up_m = up;
+            body.max_step_down_m = down;
+            body.validate().map_err(|e| NavStackError::InvalidConfig(e.to_string()))?;
+        } else if (up - down).abs() > 1e-9 {
+            return Err(NavStackError::InvalidConfig("分别设置上、下台阶能力需要完整机器人外形".into()));
+        }
+        self.geometry.step_threshold_m = up.max(down) as f32;
+        Ok(())
     }
 
     /// 显式构造便于部署校验和无硬件回归，不读取或修改进程环境。
@@ -261,6 +304,19 @@ fn configured_number(key: &str, default: f64) -> NavStackResult<f64> {
     }
 }
 
+fn optional_step(key: &str) -> NavStackResult<Option<f64>> {
+    match std::env::var(key) {
+        Ok(value) if !value.trim().is_empty() => {
+            let value = parse_number(key, &value)?;
+            if !(0.0..=1.0).contains(&value) {
+                return Err(NavStackError::InvalidConfig(format!("{key}需要0—1米的有限数值")));
+            }
+            Ok(Some(value))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn parse_number(key: &str, value: &str) -> NavStackResult<f64> {
     value
         .trim()
@@ -273,6 +329,66 @@ fn parse_number(key: &str, value: &str) -> NavStackResult<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directional_step_settings_reach_the_body_and_geometry_from_the_real_loader() {
+        const CHILD: &str = "NUWAX_TEST_DIRECTIONAL_STEPS";
+        if let Ok(case) = std::env::var(CHILD) {
+            let loaded = SurfaceNavigationConfig::from_env();
+            if case == "invalid" {
+                assert!(loaded.is_err());
+                return;
+            }
+            let config = loaded.unwrap();
+            let body = config.body_envelope.unwrap();
+            let expected = if case == "inherit" { [0.15, 0.15] } else { [0.2, 0.1] };
+            assert!((body.max_step_up_m - expected[0]).abs() < 1e-6);
+            assert!((body.max_step_down_m - expected[1]).abs() < 1e-6);
+            assert!((f64::from(config.geometry.step_threshold_m) - expected[0]).abs() < 1e-6);
+            return;
+        }
+        let model = r#"{"footprint_xy_m":[[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],"z_min_m":-0.05,"z_max_m":0.2,"source":"设置回归"}"#;
+        for (case, up, down) in [("configured", "0.2", "0.1"), ("inherit", "", ""),
+            ("invalid", "-0.1", "0.2"), ("invalid", "NaN", "0.2"), ("invalid", "0.2", "1.1")] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "surface_config::tests::directional_step_settings_reach_the_body_and_geometry_from_the_real_loader", "--nocapture"])
+                .env_clear().env(CHILD, case).env("NUWAX_NAV_BODY_TO_SUPPORT_Z_M", "0.4")
+                .env("NUWAX_ROBOT_GEOMETRY_JSON", model)
+                .env("NUWAX_NAV_MAX_STEP_UP_M", up).env("NUWAX_NAV_MAX_STEP_DOWN_M", down)
+                .output().unwrap();
+            assert!(result.status.success(), "台阶设置加载失败：{}", String::from_utf8_lossy(&result.stderr));
+        }
+    }
+
+    #[test]
+    fn step_settings_cannot_exceed_or_restore_undeclared_robot_ability() {
+        let caps = NavigationCapabilities::from_json(r#"{
+            "schema_version":1,"calibration_id":"台阶设置回归",
+            "motion":{"model":"omnidirectional","max_forward_mps":1.0,"max_reverse_mps":0.0,
+                "max_lateral_mps":0.0,"max_angular_rps":1.0,"linear_acceleration_mps2":1.0,
+                "guaranteed_braking_mps2":1.0,"angular_acceleration_rps2":2.0,
+                "guaranteed_angular_braking_rps2":2.0,"reaction_time_sec":0.1,
+                "minimum_turning_radius_m":0.0,"can_rotate_in_place":true},
+            "terrain":{"max_step_up_m":0.2,"max_step_down_m":0.1,"min_tread_depth_m":0.2,
+                "max_slope_deg":18.0,"max_cross_slope_deg":18.0,"support_height_uncertainty_m":0.0,
+                "max_observation_age_sec":2.0,"stairs_supported":true}}
+        "#).unwrap();
+        let robot = RobotGeometry {
+            footprint_xy_m: vec![[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],
+            z_min_m: -0.05, z_max_m: 0.2, source: "台阶设置回归".into(),
+        };
+        for (up, down, accepted) in [(0.2,0.1,true), (0.1,0.0,true), (0.21,0.1,false), (0.2,0.2,false)] {
+            let mut config = SurfaceNavigationConfig::new("map".into(),0.4,0.3,0.6,0.1,0.15,18.0,0.2).unwrap();
+            config.apply_calibration(Some(robot.clone()),Some(caps.clone())).unwrap();
+            assert_eq!(config.apply_step_overrides(Some(up),Some(down),Some(&caps)).is_ok(),accepted);
+        }
+        let mut absent = caps;
+        absent.terrain = None;
+        let mut config = SurfaceNavigationConfig::new("map".into(),0.4,0.3,0.6,0.1,0.15,18.0,0.2).unwrap();
+        config.apply_calibration(Some(robot),Some(absent.clone())).unwrap();
+        assert!(config.apply_step_overrides(Some(0.2),None,Some(&absent)).is_err());
+        assert!(config.apply_step_overrides(None,Some(0.2),Some(&absent)).is_err());
+    }
 
     #[test]
     fn actuator_speed_is_not_capped_by_the_legacy_controller_default() {

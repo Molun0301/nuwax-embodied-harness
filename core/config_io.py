@@ -632,6 +632,15 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
     """返回规范化后的值；非法返回 None（由调用方记入 rejected）。"""
 
     v = value.strip()
+    if key in {"NUWAX_NAV_MAX_STEP_UP_M", "NUWAX_NAV_MAX_STEP_DOWN_M"}:
+        # 留空继承已有能力；显式零表示该方向不允许离散台阶。
+        if not v:
+            return ""
+        try:
+            number = float(v)
+        except ValueError:
+            return None
+        return str(number) if math.isfinite(number) and 0 <= number <= 1 else None
     if not R.catalog_number_in_range(key, v):
         return None
     from core.config_effects import HOT_FIELDS

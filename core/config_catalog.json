@@ -1868,7 +1868,31 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
     ],
     "apply_scope": "重启导航栈与几何运行时后生效",
-    "description": "三维导航允许的最大真实台阶高度，仍需满足踏面和净空条件。"
+    "description": "未分别设置上、下台阶高度且未声明完整地形能力时的共同默认值；默认0.15米。不同机器人的越障能力应按实际能力配置，仍需满足踏面、坡度及机体净空。"
+  },
+  "NUWAX_NAV_MAX_STEP_UP_M": {
+    "zh_name": "机器人最大上台阶高度（米）",
+    "type": "float",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈与几何运行时后生效",
+    "description": "可自定义0—1米，0表示不允许上台阶；例如0.20表示允许20厘米内的真实上阶，仍需满足踏面和机体净空。留空继承完整地形能力或共同台阶高度；显式值不能超过完整机器人能力标定声明的上限。"
+  },
+  "NUWAX_NAV_MAX_STEP_DOWN_M": {
+    "zh_name": "机器人最大下台阶高度（米）",
+    "type": "float",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈与几何运行时后生效",
+    "description": "可自定义0—1米，0表示不允许下台阶；与上台阶独立，不能据上阶能力推断下阶能力。留空继承完整地形能力或共同台阶高度；显式值不能超过完整机器人能力标定声明的上限。"
   },
   "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_SLOPE_DEG": {
     "zh_name": "可通行最大坡度（度）",

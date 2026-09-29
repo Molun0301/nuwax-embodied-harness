@@ -22,6 +22,7 @@ struct Inputs {
     applied_version: u64,
     result: Option<(std::time::Instant, PlannerStep)>,
     result_pose_version: u64,
+    result_wait_reason: Option<String>,
     closed: bool,
 }
 
@@ -123,6 +124,9 @@ impl PlannerWorker {
                         Ok(planner.step(width))
                     })()
                     .unwrap_or_else(|error| PlannerStep::ReplanRequired(error.to_string()));
+                    let wait_reason = if matches!(computed, PlannerStep::Command(command) if command == Twist2::ZERO) {
+                        planner.execution_wait_reason()
+                    } else { None };
                     let elapsed = started.elapsed();
                     let slow_result = (elapsed > DEFAULT_CONTROL_HORIZON
                         && slow_log_at.is_none_or(|last| last.elapsed() >= Duration::from_secs(5)))
@@ -134,6 +138,7 @@ impl PlannerWorker {
                     if current {
                         input.result = Some((started, computed));
                         input.result_pose_version = pose_seq;
+                        input.result_wait_reason = wait_reason;
                     }
                     drop(input);
                     // 日志不持输入锁，慢磁盘不能阻塞调度器的取消与续租。
@@ -263,7 +268,7 @@ impl NavPlanner for PlannerWorker {
                 }
             })
             .map(|(_, step)| step.clone());
-        self.wait_reason = if ready.is_some() { None } else if arrival_changed {
+        self.wait_reason = if ready.is_some() { input.result_wait_reason.clone() } else if arrival_changed {
             Some("位姿已更新，保持零速并重新核对到达状态".into())
         } else if expired {
             Some("局部速度计算结果已过期，保持零速并重新计算".into())
@@ -280,6 +285,7 @@ impl NavPlanner for PlannerWorker {
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
+        input.result_wait_reason = None;
         input.path = None;
         input.goal = None;
         input.applied = Twist2::ZERO;
@@ -307,6 +313,29 @@ impl Drop for PlannerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stationary_geometry_wait_reason_crosses_the_compute_thread() {
+        struct WaitingPlanner;
+        impl NavPlanner for WaitingPlanner {
+            fn replace_path(&mut self, _: Path2D) {}
+            fn update_odometry(&mut self, _: PoseStamped) {}
+            fn update_costmap(&mut self, _: CostMap2D) {}
+            fn step(&mut self, _: f64) -> PlannerStep { PlannerStep::Command(Twist2::ZERO) }
+            fn execution_wait_reason(&self) -> Option<String> { Some("等待当前足下支撑恢复".into()) }
+            fn stop(&mut self) {}
+        }
+        let mut worker = PlannerWorker::new(WaitingPlanner).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+            if worker.execution_wait_reason().as_deref() == Some("等待当前足下支撑恢复") { break; }
+            assert!(std::time::Instant::now() < deadline, "计算线程必须交付实际等待原因");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        worker.stop();
+        assert!(worker.execution_wait_reason().is_none());
+        assert!(worker.shared.0.lock().unwrap().result_wait_reason.is_none());
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
     #[test]
     fn slow_planner_outcomes_are_not_lost_to_velocity_expiry() {

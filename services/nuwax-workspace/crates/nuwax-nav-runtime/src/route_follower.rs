@@ -44,6 +44,7 @@ pub struct RouteFollower {
     dirty: bool,
     local_plans: u64,
     failed_local: Vec<FailedLocalPlan>,
+    wait_reason: Option<String>,
 }
 fn error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::InvalidInput {
@@ -83,6 +84,7 @@ impl RouteFollower {
             dirty: true,
             local_plans: 0,
             failed_local: Vec::new(),
+            wait_reason: None,
         })
     }
     /// 已执行的全局路线弧长，不受近场轨迹替换重置。
@@ -442,12 +444,21 @@ impl NavPlanner for RouteFollower {
         self.controller.observe_applied_command(command);
     }
     fn step(&mut self, width: f64) -> PlannerStep {
+        self.wait_reason = None;
         if self
             .map
             .as_ref()
             .is_some_and(|map| map.body_envelope().is_none())
         {
             return self.controller.step(width);
+        }
+        if let Some(reason) = self.controller.current_body_error() {
+            // 起点缺少合法支撑或净空时，重发同一全局路线只会造成规划忙循环。
+            // 原实际速度回执、输入期限和取消仍由执行调度器处理。
+            self.wait_reason = Some(format!(
+                "当前机体支撑或净空尚不可用，保持零速等待地图或位姿恢复：{reason}"
+            ));
+            return PlannerStep::Command(Twist2::ZERO);
         }
         self.advance_progress();
         let window = (self.local_end - self.local_progress_at_plan).max(0.1);
@@ -483,7 +494,11 @@ impl NavPlanner for RouteFollower {
             step => step,
         }
     }
+    fn execution_wait_reason(&self) -> Option<String> {
+        self.wait_reason.clone()
+    }
     fn stop(&mut self) {
+        self.wait_reason = None;
         self.controller.stop();
         self.route = None;
         self.goal = None;
@@ -504,6 +519,50 @@ mod tests {
     use super::*;
     use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
     use nuwax_nav_types_messages::{MotionKinematics, MotionModel, NavFrameId, Pose3, Timestamp};
+    #[test]
+    fn invalid_current_support_waits_without_replanning_and_recovers_on_pose_update() {
+        let map = Arc::new(crate::surface_follower::test_snapshot(0.0, false)
+            .with_body_envelope(SurfaceBodyEnvelope {
+                footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+                z_bounds_m: [-0.05,0.2], body_to_support_z_m: 0.4,
+                max_step_up_m: 0.2, max_step_down_m: 0.2,
+                max_cross_slope_deg: 18.0, support_uncertainty_m: 0.0,
+            }).unwrap());
+        let make = |x,z| PoseStamped { frame_id: NavFrameId::Map, stamp: Timestamp::from_unix(1,0),
+            pose: Pose3 { position: Point3::new(x,1.0,z), orientation: Quaternion::IDENTITY } };
+        let mut config = SurfaceFollowerConfig::new(0.4);
+        config.controller.simulation = true;
+        config.basic_kinematics = Some(MotionKinematics { model: MotionModel::Differential,
+            max_forward_mps: 1.0, max_reverse_mps: 0.0, max_lateral_mps: 0.0,
+            max_angular_rps: 0.8, minimum_turning_radius_m: 0.0, can_rotate_in_place: true });
+        let mut follower = RouteFollower::new(config).unwrap();
+        let start = make(0.5,0.5);
+        let goal = make(3.0,0.5);
+        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+        follower.update_odometry(make(0.5,2.0));
+        follower.configure_goal(&goal, GoalOptions::default()).unwrap();
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D { poses: vec![start.clone(),goal.clone()] }), None, goal).unwrap();
+        for _ in 0..3 {
+            assert_eq!(follower.step(0.3), PlannerStep::Command(Twist2::ZERO));
+            assert!(follower.execution_wait_reason().unwrap().contains("支撑或净空"));
+            assert_eq!(follower.local_plans(),0);
+            assert!(follower.failed_local.is_empty());
+        }
+        follower.update_odometry(start.clone());
+        assert!(matches!(follower.step(0.3), PlannerStep::Command(command) if command != Twist2::ZERO));
+        assert!(follower.execution_wait_reason().is_none());
+        assert_eq!(follower.local_plans(),1);
+        // 中途输入再次失效时也保留同一参考，恢复后不重复生成局部路线。
+        follower.update_odometry(make(0.5,2.0));
+        assert_eq!(follower.step(0.3), PlannerStep::Command(Twist2::ZERO));
+        follower.update_odometry(start);
+        assert!(matches!(follower.step(0.3), PlannerStep::Command(command) if command != Twist2::ZERO));
+        assert_eq!(follower.local_plans(),1);
+        follower.stop();
+        assert!(follower.execution_wait_reason().is_none());
+        assert!(follower.route.is_none());
+    }
+
     #[test]
     fn straight_global_route_stays_straight_after_lateral_tracking_error() {
         let map=Arc::new(crate::surface_follower::test_snapshot(0.0,false)

@@ -60,6 +60,7 @@ scripts/ci/release_gates/*
 !/docs/公开文档/阅读指南.md
 !/docs/公开文档/快速上手.md
 !/docs/公开文档/功能列表.md
+!/docs/公开文档/项目功能与实现情况清单.md
 !/docs/公开文档/部署文档.md
 !/docs/公开文档/智能体接入.md
 !/docs/公开文档/架构与机器人接入.md

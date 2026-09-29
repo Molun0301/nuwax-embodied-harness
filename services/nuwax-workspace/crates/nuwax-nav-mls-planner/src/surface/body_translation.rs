@@ -48,6 +48,8 @@ struct RotationEvents {
     faces: Vec<([f64;3],f64,[[f64;3];4])>,
     edges: Vec<([f64;3],[f64;3],[[f64;3];4],[[f64;3];4])>,
     minimum_upward_z:f64,
+    ground_normal:[f64;3],
+    normal_delta_bound:f64,
     // 缓存只属于这一段实际运动，不跨位姿、机体模型或地图快照复用。
     root_equations:std::cell::RefCell<AHashMap<[u64;4],Vec<f64>>>,
     frames:std::cell::RefCell<AHashMap<u64,MotionFrame>>,
@@ -104,6 +106,7 @@ impl RotationEvents {
         let edges=edges.into_iter().map(|(v,e)|(v,e,samples.map(|(r,_,_)|world(r,[0.0;3],e)),
             samples.map(|(r,_,_)|world(r,[0.0;3],cross(v,e))))).collect();
         Self {samples,vertices,faces,edges,minimum_upward_z:minimum_upward_z(qa,qb),
+            ground_normal:rotation(qa).expect("已验证实际姿态")[2],normal_delta_bound:2.0*angular_bound,
             root_equations:Default::default(),frames:Default::default(),
             vertex_bounds,face_bounds,edge_bounds,from:(from.0,qa),to:(to.0,qb)}
     }
@@ -113,19 +116,17 @@ impl RotationEvents {
         contact:f64,uncertainty:f64)->f64 {
         let upward=self.minimum_upward_z;
         if upward<=0.0 {return f64::NEG_INFINITY;}
-        let normal=rotation(self.from.1).expect("已验证实际姿态")[2];
+        let normal=self.ground_normal;
         if normal[2]<=0.0 {return f64::NEG_INFINITY;}
-        let delta=2.0*self.from.1.iter().zip(self.to.1).map(|(a,b)|(a-b).powi(2)).sum::<f64>().sqrt();
         let lower=|height:f64| {
             let mut minimum=f64::INFINITY;let mut error=0.0_f64;
-            // 固定起点法向时，平面值及误差界都是端点和列角点上的线性/凸函数。
             for p in [self.from.0,self.to.0] {for ix in [x,x+1] {for iy in [y,y+1] {
                 let dx=f64::from(ix)*size-p[0];let dy=f64::from(iy)*size-p[1];
                 let numerator=height-normal[0]*dx-normal[1]*dy;
                 minimum=minimum.min(p[2]+numerator/normal[2]);
                 error=error.max(dx.hypot(dy)+numerator.abs()/normal[2]);
             }}}
-            minimum-delta*error/upward-1e-10
+            minimum-self.normal_delta_bound*error/upward-1e-10
         };
         (lower(model.z_bounds_m[0].max(-model.body_to_support_z_m))+contact+1e-6)
             .min(lower(0.0)+uncertainty)

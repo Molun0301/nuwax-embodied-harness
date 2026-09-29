@@ -3404,7 +3404,7 @@ mod tests {
         assert!(changed.validate_body_motion(from,to,&[]).is_err());
         assert!(changed.body_pose_on_surface([0.05,0.05],0.0,[0.05,0.05,0.1]).is_err());
         // 换观察、模型或实际占据视图均使用各自缓存，不能沿用旧净空许可。
-        let observed=clear.with_observations(None);
+        let observed=clear.with_observations(Some(Arc::new(super::SurfaceObservations::new(0.05,32).unwrap())));
         assert!(!Arc::ptr_eq(&clear.body_query_cache,&observed.body_query_cache));
         let modeled=clear.with_body_envelope(model()).unwrap();
         assert!(!Arc::ptr_eq(&clear.body_query_cache,&modeled.body_query_cache));

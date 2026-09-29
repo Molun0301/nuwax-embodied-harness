@@ -197,6 +197,17 @@ impl SurfaceFollower {
         }
     }
 
+    /// 当前站姿自身被拒绝时，全局改道不能恢复运动；保留目标等待实际输入恢复。
+    pub(crate) fn current_body_error(&mut self) -> Option<String> {
+        self.refresh_current_body_view();
+        let map = self.map.as_ref()?;
+        map.body_envelope()?;
+        let pose = self.odometry.as_ref()?;
+        let q = pose.pose.orientation;
+        map.validate_body_pose(xyz(pose.pose.position), [q.x, q.y, q.z, q.w])
+            .err().map(|error| error.to_string())
+    }
+
     fn support(map: &SurfaceSnapshot, pose: &PoseStamped, offset: f64) -> Result<[f64; 3], String> {
         let q = pose.pose.orientation;
         map.locate_support_from_body(xyz(pose.pose.position), [q.x, q.y, q.z, q.w], offset)

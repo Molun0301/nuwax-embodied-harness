@@ -238,6 +238,15 @@ impl SurfaceSnapshot {
 
     /// 将同一次完整提交的观察附到已有几何上。
     pub fn with_observations(&self, observations: Option<Arc<SurfaceObservations>>) -> Self {
+        // 同一不可变观察的再次挂接不是输入变化；保留已经完成的精确几何查询。
+        // 新对象（即使数值相等）仍走原失效路径，不为旧观察延长有效期。
+        if match (&self.observations, &observations) {
+            (None, None) => true,
+            (Some(previous), Some(next)) => Arc::ptr_eq(previous, next),
+            _ => false,
+        } {
+            return self.clone();
+        }
         Self {
             ground_evidence:self.ground_evidence,
             data: Arc::clone(&self.data),
@@ -250,5 +259,33 @@ impl SurfaceSnapshot {
     /// 已提交的真实观察；没有精细证据时为未知。
     pub fn observations(&self) -> Option<&Arc<SurfaceObservations>> {
         self.observations.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod snapshot_cache_tests {
+    use super::*;
+
+    #[test]
+    fn identical_observation_owner_preserves_queries_but_replacement_retires_them() {
+        let points: Vec<_> = (-10..=10).flat_map(|x|
+            (-10..=10).map(move |y| (x as f32 * 0.1, y as f32 * 0.1, 0.0))).collect();
+        let config = crate::mls_planner::Config { world_frame: "map".into(), voxel_size: 0.1,
+            robot_height: 0.55, surface_closing_radius: 0.0, node_spacing_m: 0.3,
+            wall_clearance_m: 0.0, wall_buffer_m: 0.1, wall_buffer_weight: 2.0,
+            max_slope_deg: 18.0, step_threshold_m: 0.15, min_step_tread_depth_m: 0.2,
+            step_penalty_weight: 1.0, goal_tolerance: 0.1, viz_publish_hz: 0.0 };
+        let map = SurfaceSnapshot::from_points(&points, config, 0.05).unwrap();
+        let unchanged = map.with_observations(None);
+        assert!(Arc::ptr_eq(&map.body_query_cache, &unchanged.body_query_cache));
+        let observations = Arc::new(SurfaceObservations::new(0.05, 32).unwrap());
+        let observed = map.with_observations(Some(observations.clone()));
+        assert!(!Arc::ptr_eq(&map.body_query_cache, &observed.body_query_cache));
+        let repeated = observed.with_observations(Some(observations.clone()));
+        assert!(Arc::ptr_eq(&observed.body_query_cache, &repeated.body_query_cache));
+        let replacement = observed.with_observations(Some(Arc::new((*observations).clone())));
+        assert!(!Arc::ptr_eq(&observed.body_query_cache, &replacement.body_query_cache),
+            "新提交即使数据相等也不能沿用旧观察的许可缓存");
+        assert!(!Arc::ptr_eq(&observed.body_query_cache, &observed.with_observations(None).body_query_cache));
     }
 }

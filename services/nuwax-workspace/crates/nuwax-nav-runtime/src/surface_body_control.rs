@@ -217,6 +217,7 @@ impl SurfaceFollower {
         }
         let mut previous = from;
         let mut delayed_previous = from;
+        let rotating_in_place = command.linear.x == 0.0 && command.linear.y == 0.0;
         for index in 1..=count {
             let time = horizon * index as f64 / count as f64;
             let next = nuwax_nav_control::integrate(start, command, time);
@@ -234,6 +235,15 @@ impl SurfaceFollower {
                 Some(terrain)
             };
             let Some(next)=advance(previous,next) else {return false;};
+            if rotating_in_place {
+                // 纯转向的延迟响应停在同一位置；前段逐段扫掠已经包含所有
+                // 中间转角，无需重复检查静止段和从该角度倒扫回起点。
+                if map.validate_body_motion(previous, next, &self.boundary).is_err() {
+                    return false;
+                }
+                previous = next;
+                continue;
+            }
             let Some(delayed)=advance(delayed_previous,delayed) else {return false;};
             if map.validate_body_motion(previous, next, &self.boundary).is_err()
                 || map

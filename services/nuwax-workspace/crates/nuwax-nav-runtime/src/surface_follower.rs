@@ -424,7 +424,20 @@ impl SurfaceFollower {
         }
         // 原控制器最小速度不能突破三维执行显式配置的低速上限。
         let speed = self.config.controller.speed * self.config.controller.nerf_speed.min(1.0);
-        let mut command = twist.clamp(speed, self.config.max_angular_speed_rps);
+        let mut requested = twist;
+        if twist.linear.x == 0.0 && twist.linear.y == 0.0 && twist.angular_z != 0.0
+            && self.map.as_ref().is_some_and(|map| map.body_envelope().is_some())
+        {
+            if let Some((pose, target)) = self.odometry.as_ref().zip(self.control_target) {
+                // 基础通道按已核验短时段完成剩余转角；不把角度直接当每秒速度，
+                // 也不引入未标定的最低角速度。完整制动通道仍走上方动态窗口。
+                let error = angle_diff(target.yaw, pose.pose.orientation.yaw());
+                if error * twist.angular_z > 0.0 {
+                    requested.angular_z = error / crate::DEFAULT_CONTROL_HORIZON.as_secs_f64();
+                }
+            }
+        }
+        let mut command = requested.clamp(speed, self.config.max_angular_speed_rps);
         if let Some(motion)=self.config.kinematics() {
             command.linear.x=command.linear.x.clamp(
                 if self.options.allow_reverse {-motion.max_reverse_mps} else {0.0},motion.max_forward_mps);
@@ -622,8 +635,13 @@ impl NavPlanner for SurfaceFollower {
     }
 
     fn update_odometry(&mut self, odometry: PoseStamped) {
+        // 新时间戳仍交给观察时效检查；几何完全相同的重复位姿不重建足迹。
+        if self.odometry.as_ref().is_none_or(|previous|
+            previous.pose != odometry.pose || previous.frame_id != odometry.frame_id)
+        {
+            self.body_view_dirty = true;
+        }
         self.odometry = Some(odometry);
-        self.body_view_dirty = true;
     }
 
     fn update_costmap(&mut self, _costmap: CostMap2D) {
@@ -638,9 +656,11 @@ impl NavPlanner for SurfaceFollower {
                 if map.config().world_frame != "map" {
                     return Err(rejected("三维表面快照必须使用当前机体路径的map坐标系"));
                 }
-                self.map = Some(Arc::clone(&map));
+                if self.source_map.as_ref().is_none_or(|previous| !previous.same_body_query_view(&map)) {
+                    self.map = Some(Arc::clone(&map));
+                    self.body_view_dirty = true;
+                }
                 self.source_map = Some(map);
-                self.body_view_dirty = true;
                 Ok(())
             }
             ExecutionMap::Planar(_) => Err(rejected("三维后端不能用二维占据图恢复就绪")),
@@ -1163,6 +1183,19 @@ mod tests {
         follower.update_odometry(body_pose(first,Quaternion::IDENTITY,1));
         follower.step(0.3);
         follower.map.as_ref().unwrap().validate_body_pose(first,q).unwrap();
+        let first_view = Arc::clone(follower.map.as_ref().unwrap());
+        follower.update_odometry(body_pose(first,Quaternion::IDENTITY,2));
+        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&source))).unwrap();
+        follower.step(0.3);
+        assert!(Arc::ptr_eq(&first_view, follower.map.as_ref().unwrap()),
+            "同站姿新时间戳及同源地图心跳应复用足迹，不能每拍重建");
+        let observations = Arc::new(nuwax_nav_mls_planner::SurfaceObservations::new(0.1, 32).unwrap());
+        let changed = Arc::new(source.with_observations(Some(observations)));
+        follower.update_execution_map(ExecutionMap::Surface(changed)).unwrap();
+        follower.step(0.3);
+        assert!(!Arc::ptr_eq(&first_view, follower.map.as_ref().unwrap()),
+            "新观察必须撤销旧查询视图，不能只比较粗图几何");
+        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&source))).unwrap();
         follower.update_odometry(body_pose(next,Quaternion::IDENTITY,2));
         follower.step(0.3);
         let view=follower.map.as_ref().unwrap();
@@ -1396,7 +1429,9 @@ mod tests {
             results.push(follower.step(0.3));
         }
         assert_eq!(results[0],results[1],"完整机体模拟只换时钟，不采用旧PController的0.8弧度/秒补偿");
-        assert!(matches!(results[0],PlannerStep::Command(v)if v.angular_z.abs()<0.2));
+        assert!(matches!(results[0],PlannerStep::Command(v)
+            if (v.angular_z * crate::DEFAULT_CONTROL_HORIZON.as_secs_f64() - 0.1).abs() < 1e-9),
+            "剩余转角应在已核验窗口内完成，不依赖模拟开关或固定最低角速度");
     }
 
     #[test]

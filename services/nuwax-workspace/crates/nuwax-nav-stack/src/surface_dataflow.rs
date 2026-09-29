@@ -908,6 +908,118 @@ mod tests {
             pose: Pose3 { position: Point3::new(position[0], position[1], position[2]),
                 orientation: Quaternion { x: quaternion[0], y: quaternion[1], z: quaternion[2], w: quaternion[3] } },
         };
+        if let Ok(path_file) = std::env::var("NUWAX_NAV_DIAGNOSTIC_PUBLISHED_PATH") {
+            use nuwax_nav_runtime::{NavPlanner, ExecutionMap, ExecutionPath, RouteFollower, SurfaceFollower};
+            let points: Vec<[f64; 3]> = serde_json::from_slice(&std::fs::read(path_file).unwrap()).unwrap();
+            let mut path = nuwax_nav_types_messages::Path3D { poses: points.into_iter().map(|p| {
+                let mut point = pose.clone();
+                point.pose.position = Point3::new(p[0], p[1], p[2]);
+                point
+            }).collect() };
+            let rotation = std::env::var_os("NUWAX_NAV_DIAGNOSTIC_ROTATION_CONTROL").is_some();
+            if rotation {
+                let mut target = pose.clone();
+                let (s, c) = (-0.07_f64 / 2.0).sin_cos();
+                let q = pose.pose.orientation;
+                target.pose.orientation = Quaternion { x:c*q.x-s*q.y, y:s*q.x+c*q.y, z:c*q.z+s*q.w, w:c*q.w-s*q.z };
+                path.poses = vec![pose.clone(), target];
+            }
+            let goal = path.poses.last().unwrap().clone();
+            let mut follower: Box<dyn NavPlanner> = if rotation {
+                Box::new(SurfaceFollower::new(config.follower.clone()).unwrap())
+            } else {
+                Box::new(RouteFollower::new(config.follower.clone()).unwrap())
+            };
+            follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+            follower.update_odometry(pose.clone());
+            follower.configure_goal(&goal, nuwax_nav_types_messages::GoalOptions {
+                allow_reverse: false, position_tolerance_m: 0.2,
+                yaw_tolerance_rad: if rotation {0.01} else {std::f64::consts::PI},
+            }).unwrap();
+            follower.replace_execution_path(ExecutionPath::Surface(path), None, goal.clone()).unwrap();
+            if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_PUBLISHED_CLOSED_LOOP").is_some() {
+                let mut actual = pose.clone();
+                let mut replans = 0;
+                let mut commands = 0;
+                let mut travelled = 0.0;
+                let mut frames = Vec::new();
+                let mut outcome = "控制步数耗尽".to_owned();
+                for tick in 0..1600 {
+                    actual.stamp.nanos += 50_000_000;
+                    follower.update_odometry(actual.clone());
+                    let began = Instant::now();
+                    let step = follower.step(config.robot_width_m);
+                    let elapsed_ms = began.elapsed().as_secs_f64() * 1000.0;
+                    frames.push(serde_json::json!({"tick":tick,"elapsed_ms":elapsed_ms,
+                        "position":[actual.pose.position.x,actual.pose.position.y,actual.pose.position.z],
+                        "yaw":actual.pose.orientation.yaw(),"step":format!("{step:?}")}));
+                    match step {
+                        nuwax_nav_runtime::PlannerStep::Succeeded => {outcome="到达".into(); break;}
+                        nuwax_nav_runtime::PlannerStep::Command(command) => {
+                            follower.observe_applied_command(command);
+                            commands += usize::from(command.linear.x != 0.0);
+                            let p=actual.pose.position;let q=actual.pose.orientation;let yaw=q.yaw();
+                            // 场景为现场平地，独立刚体积分保持实测高度及倾斜；不以待测地形生成运动真值。
+                            let angle=command.angular_z*0.05;
+                            let (a,b)=if command.angular_z.abs()<1e-9 {(0.05,0.0)} else {
+                                (angle.sin()/command.angular_z,(1.0-angle.cos())/command.angular_z)
+                            };
+                            let dx=a*command.linear.x-b*command.linear.y;
+                            let dy=b*command.linear.x+a*command.linear.y;
+                            actual.pose.position.x+=yaw.cos()*dx-yaw.sin()*dy;
+                            actual.pose.position.y+=yaw.sin()*dx+yaw.cos()*dy;
+                            travelled+=(actual.pose.position.x-p.x).hypot(actual.pose.position.y-p.y);
+                            let (s,c)=(angle*0.5).sin_cos();
+                            actual.pose.orientation=Quaternion{x:c*q.x-s*q.y,y:s*q.x+c*q.y,z:c*q.z+s*q.w,w:c*q.w-s*q.z};
+                        }
+                        nuwax_nav_runtime::PlannerStep::ReplanRequired(reason) => {
+                            replans+=1;
+                            eprintln!("原路径闭环重规划{replans}: {reason}");
+                            if replans>8 {outcome=format!("重规划未恢复: {reason}");break;}
+                            follower.observe_applied_command(nuwax_nav_types_messages::Twist2::ZERO);
+                            follower.stop();
+                            // 同一目标保留PCT收到的局部阻塞代价，不重新配置目标清空反馈。
+                            let p=goal.pose.position;
+                            let mut envelope=goal_for(&message,1,[p.x,p.y,p.z]);
+                            envelope.options.allow_reverse=false;
+                            envelope.options.yaw_tolerance_rad=std::f64::consts::PI;
+                            envelope.options.position_tolerance_m=0.2;
+                            let q=goal.pose.orientation;
+                            envelope.goal.pose.orientation_xyzw=[q.x,q.y,q.z,q.w];
+                            match body_path(&map,&actual,&envelope,&config) {
+                                Ok(path)=>follower.replace_execution_path(ExecutionPath::Surface(path),None,goal.clone()).unwrap(),
+                                Err(reason)=>{outcome=format!("全局重规划失败: {reason}");break;}
+                            }
+                        }
+                        other=>{outcome=format!("{other:?}");break;}
+                    }
+                }
+                let summary=serde_json::json!({"outcome":outcome,"replans":replans,"translation_commands":commands,
+                    "travelled_m":travelled,"distance_to_path_endpoint_m":actual.pose.position.distance(goal.pose.position),
+                    "frames":frames});
+                eprintln!("原路径闭环 outcome={outcome}, replans={replans}, commands={commands}, travelled={travelled}");
+                let output=std::env::var("NUWAX_NAV_DIAGNOSTIC_OUTPUT").unwrap();
+                std::fs::write(std::path::Path::new(&output).join("原路径闭环.json"),serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
+                server.stop().await.unwrap();
+                return;
+            }
+            let mut results = Vec::new();
+            for tick in 0..12 {
+                let started = Instant::now();
+                // 固定现场站姿和零速回执，量化原地重复计算及其速度候选。
+                follower.update_odometry(pose.clone());
+                follower.observe_applied_command(nuwax_nav_types_messages::Twist2::ZERO);
+                let step = follower.step(config.robot_width_m);
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("冻结已发布路径 tick={tick} elapsed_ms={elapsed_ms:.3} step={step:?}");
+                results.push(serde_json::json!({"tick":tick, "elapsed_ms":elapsed_ms, "step":format!("{step:?}")}));
+            }
+            if let Ok(output) = std::env::var("NUWAX_NAV_DIAGNOSTIC_OUTPUT") {
+                std::fs::write(std::path::Path::new(&output).join("原路径控制统计.json"), serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+            }
+            server.stop().await.unwrap();
+            return;
+        }
         let mut current = goal_for(&message, 1, position);
         current.goal.pose.orientation_xyzw = quaternion;
         let current_path = body_path(&map, &pose, &current, &config).expect("实录当前占据目标必须可以规划");

@@ -23,7 +23,7 @@ pub struct ScanConfig {
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
-            horizon_m: 3.0,
+            horizon_m: 5.0,
             refresh_distance_m: 1.0,
             optimization_iterations: 12,
             reference_corridor_m: 0.9,

@@ -52,7 +52,9 @@ impl SurfaceNavigationConfig {
             .transpose()
             .map_err(NavStackError::InvalidConfig)?;
         config.apply_calibration(body, capabilities)?;
-        config.follower.scan.horizon_m = configured_number("NUWAX_NAV_LOCAL_HORIZON_M", 3.0)?;
+        config.follower.scan.horizon_m = configured_number(
+            "NUWAX_NAV_LOCAL_HORIZON_M", config.follower.scan.horizon_m,
+        )?;
         config.follower.scan.refresh_distance_m = configured_number("NUWAX_NAV_LOCAL_REFRESH_DISTANCE_M", 1.0)?;
         let iterations = configured_number("NUWAX_NAV_SPLINE_ITERATIONS", 12.0)?;
         if iterations.fract() != 0.0 || !(0.0..=100.0).contains(&iterations) {

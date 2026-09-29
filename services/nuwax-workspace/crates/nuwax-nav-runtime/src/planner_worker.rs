@@ -15,11 +15,13 @@ struct Inputs {
     map: Option<ExecutionMap>,
     map_version: u64,
     pose: Option<PoseStamped>,
+    pose_version: u64,
     requested: Option<f64>,
     control_width: Option<f64>,
     applied: Twist2,
     applied_version: u64,
     result: Option<(std::time::Instant, PlannerStep)>,
+    result_pose_version: u64,
     closed: bool,
 }
 
@@ -27,6 +29,7 @@ struct Inputs {
 pub(crate) struct PlannerWorker {
     shared: Arc<(Mutex<Inputs>, Condvar)>,
     thread: Option<std::thread::JoinHandle<()>>,
+    wait_reason: Option<String>,
 }
 impl PlannerWorker {
     pub(crate) fn new(mut planner: impl NavPlanner) -> Result<Self, RuntimeError> {
@@ -39,6 +42,7 @@ impl PlannerWorker {
                 let mut goal_version = u64::MAX;
                 let mut path_version = u64::MAX;
                 let mut map_version = u64::MAX;
+                let mut slow_log_at: Option<std::time::Instant> = None;
                 loop {
                     let (
                         version,
@@ -51,6 +55,7 @@ impl PlannerWorker {
                         map,
                         map_seq,
                         pose,
+                        pose_seq,
                         width,
                         applied,
                         applied_seq,
@@ -73,6 +78,7 @@ impl PlannerWorker {
                             input.map.clone(),
                             input.map_version,
                             input.pose.clone(),
+                            input.pose_version,
                             input.requested.take().unwrap(),
                             input.applied,
                             input.applied_version,
@@ -117,13 +123,25 @@ impl PlannerWorker {
                         Ok(planner.step(width))
                     })()
                     .unwrap_or_else(|error| PlannerStep::ReplanRequired(error.to_string()));
+                    let elapsed = started.elapsed();
+                    let slow_result = (elapsed > DEFAULT_CONTROL_HORIZON
+                        && slow_log_at.is_none_or(|last| last.elapsed() >= Duration::from_secs(5)))
+                        .then(|| format!("{computed:?}"));
                     let mut input = lock.lock().unwrap();
+                    let current = input.epoch == version
+                        && input.applied_version == applied_seq && !input.closed;
                     // 换目标、换路径、取消或来源撤销后的迟到结果一律退休。
-                    if input.epoch == version
-                        && input.applied_version == applied_seq
-                        && !input.closed
-                    {
+                    if current {
                         input.result = Some((started, computed));
+                        input.result_pose_version = pose_seq;
+                    }
+                    drop(input);
+                    // 日志不持输入锁，慢磁盘不能阻塞调度器的取消与续租。
+                    if let Some(result) = slow_result {
+                        tracing::warn!(target: "navigation.local", event = "navigation.local.slow",
+                            elapsed_ms = elapsed.as_secs_f64() * 1000.0, current, result,
+                            "局部计算超过速度预测窗口，速度候选不延长许可，状态结论继续交付");
+                        slow_log_at = Some(std::time::Instant::now());
                     }
                 }
                 planner.stop();
@@ -132,6 +150,7 @@ impl PlannerWorker {
         Ok(Self {
             shared,
             thread: Some(thread),
+            wait_reason: None,
         })
     }
 }
@@ -177,7 +196,13 @@ impl NavPlanner for PlannerWorker {
         Ok(())
     }
     fn update_odometry(&mut self, pose: PoseStamped) {
-        self.shared.0.lock().unwrap().pose = Some(pose);
+        let mut input = self.shared.0.lock().unwrap();
+        if input.pose.as_ref().is_none_or(|previous|
+            previous.pose != pose.pose || previous.frame_id != pose.frame_id)
+        {
+            input.pose_version += 1;
+        }
+        input.pose = Some(pose);
     }
     fn update_costmap(&mut self, map: CostMap2D) {
         let _ = self.update_execution_map(ExecutionMap::Planar(map));
@@ -215,20 +240,43 @@ impl NavPlanner for PlannerWorker {
             return PlannerStep::Failed("局部计算线程已退出".into());
         }
         input.control_width = Some(width);
-        if input.result.is_none() {
+        let expired = input.result.as_ref().is_some_and(|(started, step)|
+            matches!(step, PlannerStep::Command(_)) && started.elapsed() > DEFAULT_CONTROL_HORIZON);
+        let arrival_changed = input.result.as_ref().is_some_and(|(_, step)|
+            matches!(step, PlannerStep::Succeeded) && input.result_pose_version != input.pose_version);
+        if input.result.is_none() || expired || arrival_changed {
             input.requested = Some(width);
             self.shared.1.notify_one();
         }
         // 只在已核验控制段的预测窗口内持续发送同一意图；新结果未及时
         // 完成时归零等待，不能将独立续租变成无限重放旧速度。
-        input
+        let ready = input
             .result
             .as_ref()
-            .filter(|(started, _)| started.elapsed() <= DEFAULT_CONTROL_HORIZON)
-            .map(|(_, step)| step.clone())
-            .unwrap_or(PlannerStep::Command(Twist2::ZERO))
+            .filter(|(started, step)| {
+                // 时效窗约束速度许可；失败、重规划及到达只触发原调度器归零，
+                // 不能因计算慢而把这些结论吞成永远运行中的零速度。
+                match step {
+                    PlannerStep::Command(_) => started.elapsed() <= DEFAULT_CONTROL_HORIZON,
+                    PlannerStep::Succeeded => !arrival_changed,
+                    _ => true,
+                }
+            })
+            .map(|(_, step)| step.clone());
+        self.wait_reason = if ready.is_some() { None } else if arrival_changed {
+            Some("位姿已更新，保持零速并重新核对到达状态".into())
+        } else if expired {
+            Some("局部速度计算结果已过期，保持零速并重新计算".into())
+        } else {
+            Some("局部轨迹正在计算，保持零速等待".into())
+        };
+        ready.unwrap_or(PlannerStep::Command(Twist2::ZERO))
+    }
+    fn execution_wait_reason(&self) -> Option<String> {
+        self.wait_reason.clone()
     }
     fn stop(&mut self) {
+        self.wait_reason = None;
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
@@ -260,6 +308,56 @@ impl Drop for PlannerWorker {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+    #[test]
+    fn slow_planner_outcomes_are_not_lost_to_velocity_expiry() {
+        let mut worker = PlannerWorker::new(SlowPlanner {
+            entered: Arc::new(AtomicBool::new(false)),
+            release: Arc::new(AtomicBool::new(true)),
+        }).unwrap();
+        // 重规划和终态本身不授权运动；慢查询的结论仍必须交给原调度器收尾。
+        for outcome in [
+            PlannerStep::ReplanRequired("现场近场轨迹受阻".into()),
+            PlannerStep::Failed("局部输入无效".into()),
+            PlannerStep::Succeeded,
+        ] {
+            worker.shared.0.lock().unwrap().result = Some((
+                std::time::Instant::now() - DEFAULT_CONTROL_HORIZON - Duration::from_millis(1),
+                outcome.clone(),
+            ));
+            assert_eq!(worker.step(0.3), outcome);
+        }
+        worker.shared.0.lock().unwrap().result = Some((
+            std::time::Instant::now() - DEFAULT_CONTROL_HORIZON - Duration::from_millis(1),
+            PlannerStep::Command(Twist2 { linear: nuwax_nav_types_messages::Point2::new(0.2, 0.0), angular_z: 0.0 }),
+        ));
+        assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO),
+            "传播慢查询结论不能延长速度许可");
+        assert!(worker.execution_wait_reason().unwrap().contains("过期"));
+    }
+
+    #[test]
+    fn arrival_is_rechecked_when_pose_changes_after_computation() {
+        let mut worker = PlannerWorker::new(SlowPlanner {
+            entered: Arc::new(AtomicBool::new(false)),
+            release: Arc::new(AtomicBool::new(true)),
+        }).unwrap();
+        let mut pose = nuwax_nav_astar::helpers::make_pose_stamped("map", 1.0, 0.0, 0.0);
+        worker.update_odometry(pose.clone());
+        {
+            let mut input = worker.shared.0.lock().unwrap();
+            input.result = Some((std::time::Instant::now(), PlannerStep::Succeeded));
+            input.result_pose_version = input.pose_version;
+        }
+        pose.stamp.nanos += 50_000_000;
+        worker.update_odometry(pose.clone());
+        assert_eq!(worker.step(0.3), PlannerStep::Succeeded,
+            "同位姿新时间戳不应阻断已确认的位置到达");
+        pose.pose.position.x += 0.5;
+        worker.update_odometry(pose);
+        assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO),
+            "移动后不能沿旧位置报告成功");
+        assert!(worker.execution_wait_reason().unwrap().contains("到达状态"));
+    }
     struct SlowPlanner {
         entered: Arc<AtomicBool>,
         release: Arc<AtomicBool>,

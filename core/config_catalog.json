@@ -1820,7 +1820,7 @@
   "NUWAX_NAV_LOCAL_HORIZON_M": {
     "zh_name": "近场轨迹视距（米）",
     "type": "float",
-    "default": 3.0,
+    "default": 5.0,
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [

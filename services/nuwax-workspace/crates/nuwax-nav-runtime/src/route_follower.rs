@@ -638,7 +638,8 @@ mod tests {
             },
         };
         let start = make(0.5);
-        let goal = make(5.0);
+        // 目标须在默认五米窗口之外，本例才会覆盖滚动更新而非末段跟随。
+        let goal = make(6.0);
         let mut config = SurfaceFollowerConfig::new(0.4);
         config.controller.simulation = true;
         config.scan.refresh_distance_m = 0.15;
@@ -674,6 +675,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(follower.step(0.2), PlannerStep::Command(_)));
+        assert!(follower.local_end < *follower.cumulative.last().unwrap());
         let previous_local = follower.local_plans();
         let missing = Arc::new(
             crate::surface_follower::test_snapshot(0.0, true)

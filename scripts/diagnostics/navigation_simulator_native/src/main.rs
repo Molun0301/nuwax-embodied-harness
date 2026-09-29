@@ -707,6 +707,11 @@ impl Simulation {
         let goal = body4(&request["goal"])?;
         let speed = request["speed_mps"].as_f64().unwrap_or(1.).clamp(0.1, 1.5);
         let mut config = scene.config.follower.clone();
+        // 同一原生程序逐请求对照局部视距，保持控制与物理参数一致。
+        if let Some(value) = request.get("local_horizon_m") {
+            config.scan.horizon_m = value.as_f64().filter(|v| v.is_finite() && *v > 0.0)
+                .ok_or("局部规划视距必须为正有限数值")?;
+        }
         config.controller.speed = speed;
         config.controller.control_frequency = 1. / DT;
         config.controller.simulation = true;

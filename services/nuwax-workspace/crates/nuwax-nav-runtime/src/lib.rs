@@ -814,6 +814,8 @@ pub trait NavPlanner: Send + 'static {
     }
     /// 接收唯一运动端已确认的指令；后台计算不能把未执行候选当作当前速度。
     fn observe_applied_command(&mut self, _command: Twist2) {}
+    /// 计算未完成或控制许可过期时的等待原因；命令回执不能覆盖该执行阶段。
+    fn execution_wait_reason(&self) -> Option<String> { None }
     /// Produce one controller step.
     fn step(&mut self, robot_width_m: f64) -> PlannerStep;
     /// Clear planner state after a terminal fence.
@@ -1545,7 +1547,14 @@ where
         }
         match intent.payload {
             LocalExecutionPayload::Command(twist) => {
+                let wait_reason = self.planner.execution_wait_reason();
                 self.apply_controller_twist(status_tx, twist).await?;
+                if twist == Twist2::ZERO {
+                    if let Some(reason) = wait_reason {
+                        self.status.message = reason;
+                        self.publish_status(status_tx);
+                    }
+                }
                 self.path_wait_started_at = None;
                 Ok(())
             }
@@ -2966,11 +2975,46 @@ mod tests {
         }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(520)).await;
         assert!(calls.lock().unwrap().calls.iter().filter(|call|call.starts_with("renew:")).count()>=2);
+        assert!(handle.status().message.contains("局部轨迹正在计算"),
+            "零速执行回执不能掩盖仍在等待局部计算的阶段");
         tokio::time::timeout(Duration::from_millis(100),handle.cancel("goal-1")).await
             .expect("取消不能等待700毫秒局部计算").unwrap();
         assert_eq!(handle.status().last_terminal,Some(TerminalOutcome::Cancelled));
         assert_ne!(handle.status().last_applied_twist.map(|t|t.linear.x),Some(0.2));
         handle.shutdown().await.unwrap();task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_local_blockage_reaches_scheduler_replanning_state() {
+        struct Blocked;
+        impl NavPlanner for Blocked {
+            fn replace_path(&mut self, _:Path2D) {}
+            fn update_odometry(&mut self, _:PoseStamped) {}
+            fn update_costmap(&mut self, _:CostMap2D) {}
+            fn step(&mut self, _:f64) -> PlannerStep {
+                std::thread::sleep(DEFAULT_CONTROL_HORIZON + Duration::from_millis(50));
+                PlannerStep::ReplanRequired("完整机体扫掠受阻".into())
+            }
+            fn stop(&mut self) {}
+        }
+        let motion = FakeMotion(Arc::new(Mutex::new(FakeMotionState::default())));
+        let worker = planner_worker::PlannerWorker::new(Blocked).unwrap();
+        let (handle, task) = spawn_scheduler(NavScheduler::new(motion, worker, SchedulerConfig::default()).unwrap());
+        handle.update_odometry(map_pose()).await.unwrap();
+        handle.update_costmap(costmap_at(1)).await.unwrap();
+        handle.start_session(session()).await.unwrap();
+        handle.submit_path(path()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while handle.status().phase != SchedulerPhase::AwaitingPath
+                || !handle.status().message.contains("完整机体扫掠受阻")
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("慢失败必须沿生产调度器触发停车重规划，不能无限发零速");
+        assert_eq!(handle.status().last_applied_twist, Some(Twist2::ZERO));
+        handle.cancel("goal-1").await.unwrap();
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
     }
 
     fn execution_identity_for(session_id: &str, path_revision: u64) -> PathExecutionIdentity {

@@ -468,6 +468,8 @@ class DropPatternLogFilter(logging.Filter):
             self._drop_patterns = [p for p in self._drop_patterns if p != pattern]
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "event", "") == "harness.feedback":
+            return True
         try:
             message = record.getMessage()
         except Exception:
@@ -661,6 +663,8 @@ class DeduplicatingLogFilter(logging.Filter):
         self._lock = threading.Lock()
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "event", "") == "harness.feedback":
+            return True
         if record.levelno >= logging.ERROR:
             return True
         try:

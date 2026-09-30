@@ -22,7 +22,7 @@ from core.errors import GatewayError, as_gateway_error
 from gateways.agent.feedback import (
     INPUT_MAX_BYTES, TERMINAL_STATES, build_receipt, checked_json,
 )
-from gateways.feedback import build_public_error_payload
+from gateways.feedback import build_public_error_payload, build_mcp_tool_result
 from gateways.request_context import normalize_request_id
 
 
@@ -115,7 +115,11 @@ class AgentToolService:
             "robot_identity_source": "configured_assembly_and_artifact_directory",
             "paths": {"tools": "/api/agent/tools", "invoke": "/api/agent/invoke",
                       "calls": "/api/agent/calls", "tasks": "/api/agent/tasks",
-                      "events": "/events/stream", "artifacts": "/artifacts"},
+                      "events": "/events/stream", "artifacts": "/artifacts",
+                      "feedback": "/api/feedback/stream"},
+            "feedback": {"transport": "sse", "resume_header": "Last-Event-ID",
+                         "subscribe_before_invoke": True,
+                         "agent_integration": "将反馈作为观测加入会话，attention=wake时唤醒宿主；不重复执行动作。"},
             "limits": {"invoke_max_bytes": INPUT_MAX_BYTES, "wait_max_seconds": 30},
         }
 
@@ -226,12 +230,19 @@ class AgentToolService:
                             "events": manager.get_task_events(task_id), "result": manager.get_task_result(task_id),
                             "error": manager.get_task_error(task_id),
                             "error_payload": manager.get_task_error_payload(task_id)}
+                # 真实运行时共用任务结果，保留地图保存、检查点等附加回执。
+                if callable(getattr(self.runtime, "get_task_snapshot", None)):
+                    snapshot = self.runtime.get_task_snapshot(task_id)
+                else:
+                    from gateways.feedback_messages import build_task_feedback
+                    events = snapshot["events"]
+                    snapshot["feedback"] = build_task_feedback(self.runtime, events[-1]) if events else None
         except KeyError as exc:
             raise GatewayError("当前网关实例没有此任务；旧调用记录不代表当前机器人状态。",
                                error_code="not_found", http_status=404,
                                details={"status_source": "live_task", "gateway_instance_id": self.gateway_instance_id,
                                         "historical_record_path": "/api/agent/tasks/%s/record" % quote(task_id, safe="")}) from exc
-        return checked_json(snapshot)
+        return checked_json(build_mcp_tool_result(snapshot)["structuredContent"])
 
     def get_task(self, task_id: str) -> Dict[str, Any]:
         snapshot = self._task_snapshot(task_id)

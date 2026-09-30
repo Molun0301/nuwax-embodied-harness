@@ -909,3 +909,12 @@ details.msb-pane>summary{display:none}
   #live-map .map-camera-dock{order:2;flex:1 0 100%;padding:4px 0 0;border-right:0;border-top:1px solid var(--line-2)}
   #live-map .map-tool-actions{order:3}
 }
+.task-feedback-details{margin-top:8px;font-size:12px;min-width:0}
+.task-feedback-details summary{cursor:pointer;line-height:1.7}
+.task-feedback-fields{display:grid;grid-template-columns:auto minmax(0,1fr);gap:5px 10px}
+.task-feedback-fields dt{opacity:.6}.task-feedback-fields dd{margin:0;overflow-wrap:anywhere}
+.task-feedback-data{white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto;font-size:11px;line-height:1.6}
+.task-row>div:first-child{min-width:0;flex:1}
+.task-row-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+.task-row-heading>.mono{min-width:0;overflow-wrap:anywhere}
+.task-row-heading>.pill{flex-shrink:0;white-space:nowrap}

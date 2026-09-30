@@ -305,6 +305,8 @@ def create_gateway_app(
 
     app.include_router(build_http_router(runtime, access_manager))
     app.include_router(build_agent_router(get_agent_tools))
+    from gateways.feedback_stream import build_feedback_router
+    app.include_router(build_feedback_router(runtime))
     app.include_router(build_console_router(runtime))
     app.include_router(build_logs_router(runtime, access_manager))
     app.include_router(build_mcp_router(runtime, access_manager))

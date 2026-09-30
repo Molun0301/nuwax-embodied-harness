@@ -170,7 +170,8 @@
     time.title = entry.timestamp;
     if (entry.timestamp) time.dateTime = entry.timestamp;
     const level = LEVEL_NAMES[entry.level] ? entry.level : "info";
-    const readableMessage = entry.message === "运行时事件" && entry.details.runtime_message ? entry.details.runtime_message : entry.message;
+    const feedback = entry.details.feedback;
+    const readableMessage = feedback?.message || (entry.message === "运行时事件" && entry.details.runtime_message ? entry.details.runtime_message : entry.message);
     const headline = make("span", "console-log-message", readableMessage);
     const context = [];
     if (entry.details.method || entry.details.path) context.push([entry.details.method, entry.details.path].filter(Boolean).join(" "));
@@ -180,7 +181,7 @@
     if (entry.task_id) context.push("任务 " + entry.task_id);
     else if (entry.request_id) context.push("请求 " + entry.request_id);
     if (context.length) headline.appendChild(make("span", "console-log-context", context.join(" · ")));
-    summary.append(time, make("span", `console-log-level level-${level}`, LEVEL_NAMES[entry.level] || entry.level), make("span", "console-log-component", entry.component), headline);
+    summary.append(time, make("span", `console-log-level level-${level}`, LEVEL_NAMES[entry.level] || entry.level), make("span", "console-log-component", feedback?.source?.display_name || entry.component), headline);
     summary.append(copyButton("复制文本", entry, false), copyButton("复制 JSON", entry, true));
     const body = make("div", "console-log-details");
     const fields = make("dl", "console-log-fields");
@@ -191,6 +192,7 @@
       fields.appendChild(field);
     }
     body.append(fields, make("pre", "console-log-message", entry.message));
+    if (feedback && window.nuwaxFeedback) body.append(window.nuwaxFeedback.details(feedback));
     if (Object.keys(entry.details).length) body.append(make("strong", "", "详细字段"), make("pre", "console-log-fields", JSON.stringify(entry.details, null, 2)));
     if (entry.exception) body.append(make("strong", "", "异常栈"), make("pre", "console-log-message", entry.exception));
     outer.append(summary, body);
@@ -205,10 +207,12 @@
     const time = make("time", "console-log-time", entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString("zh-CN", { hour12: false }) : "时间未知");
     time.title = entry.timestamp;
     if (entry.timestamp) time.dateTime = entry.timestamp;
-    summary.append(time, make("span", `console-log-level level-${level}`, LEVEL_NAMES[entry.level] || entry.level), make("span", "console-log-component", entry.component), make("span", "console-log-message", entry.message));
+    const feedback = entry.details.feedback;
+    summary.append(time, make("span", `console-log-level level-${level}`, LEVEL_NAMES[entry.level] || entry.level), make("span", "console-log-component", feedback?.source?.display_name || entry.component), make("span", "console-log-message", feedback?.message || entry.message));
     summary.title = "点击展开完整日志";
     const body = make("div", "console-log-details");
     body.append(make("pre", "console-log-message", asText(entry)), copyButton("复制文本", entry, false));
+    if (feedback && window.nuwaxFeedback) body.append(window.nuwaxFeedback.details(feedback));
     outer.append(summary, body);
     outer.addEventListener("toggle", () => {
       if (recentState.dirty && !outer.open) scheduleRender();

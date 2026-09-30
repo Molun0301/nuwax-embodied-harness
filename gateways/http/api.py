@@ -19,7 +19,8 @@ from contracts.navigation import NavigationGoal
 from gateways.arguments import validate_closed_schema
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError, as_gateway_error
-from gateways.feedback import build_task_summary
+from gateways.feedback import build_task_summary, build_mcp_tool_result
+from gateways.feedback_messages import build_task_feedback
 from gateways.runtime import GatewayRuntime
 from gateways.serialization import to_jsonable, to_map_json_bytes
 from gateways.ws.client_queue import ClientQueue
@@ -630,7 +631,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
                 arguments,
                 requested_by=requested_by,
                 request_context=request_context,
-                project_result=not unwrap,
+                project_result=False,
             )
         except Exception as exc:
             raise as_gateway_error(exc) from exc
@@ -639,7 +640,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             result = result["result"]
         if map_response:
             return Response(to_map_json_bytes(result), media_type="application/json")
-        response = to_jsonable(result)
+        response = build_mcp_tool_result(result)["structuredContent"]
         request_id = getattr(request.state, "request_id", None)
         if isinstance(response, dict) and request_id:
             response["request_id"] = request_id
@@ -673,11 +674,17 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
                     error_payload = runtime.task_manager.get_task_error_payload(task_id)
                 except (KeyError, AttributeError):
                     error_payload = None
-            return build_task_summary(
+            summary = build_task_summary(
                 status,
                 spec=spec,
                 error_payload=error_payload,
             )
+            if task_id:
+                events = runtime.task_manager.get_task_events(task_id)
+                if events:
+                    summary["feedback"] = build_task_feedback(runtime, events[-1])
+                    summary["summary"] = summary["feedback"]["message"]
+            return summary
 
         return {
             "active_tasks": [
@@ -694,7 +701,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     @router.get("/api/tasks/{task_id}")
     def api_task_status(task_id: str, request: Request) -> Dict[str, Any]:
         try:
-            return to_jsonable(runtime.get_task_snapshot(task_id))
+            return build_mcp_tool_result(runtime.get_task_snapshot(task_id))["structuredContent"]
         except Exception as exc:
             raise as_gateway_error(exc) from exc
 

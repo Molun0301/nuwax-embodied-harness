@@ -15,6 +15,7 @@ import re
 import socket
 import sys
 import tempfile
+import threading
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
@@ -214,6 +215,11 @@ class RobotClient:
     def cancel(self, task_id: str) -> Dict[str, Any]:
         return self._receipt(self._request("/api/agent/tasks/" + quote(task_id, safe="") + "/cancel", method="POST", body={}))
 
+    def feedback(self, *, after=None, request_id=None, task_id=None, capability_name=None):
+        """建立就绪的订阅后再调用工具；上下文退出只关闭订阅。"""
+        return FeedbackSubscription(self, after=after, request_id=request_id,
+                                    task_id=task_id, capability_name=capability_name)
+
     def download_artifact(self, artifact_id: str, output: Path, *,
                           max_bytes: int = ARTIFACT_LIMIT) -> Dict[str, Any]:
         """按同一网关制品标识下载，原子发布且不覆盖已有文件。"""
@@ -280,6 +286,150 @@ class RobotClient:
                 "next_action": "使用引擎图片读取工具读取path；下载成功尚不代表模型已经看到图像。"}
 
 
+class FeedbackSubscription:
+    """持续读取推送，断线仅续接订阅；成功处理后才推进游标。"""
+
+    def __init__(self, client, *, after=None, **filters):
+        if after and not re.fullmatch(r"[a-f0-9]{32}:[0-9]{1,20}", after):
+            raise RobotClientError("invalid_cursor", "反馈续传标识无效。")
+        self.client, self.last_event_id = client, after
+        self.path = "/api/feedback/stream?" + urlencode({k: v for k, v in filters.items() if v})
+        self._closed = threading.Event()
+        self._io_lock = threading.RLock()
+        self._response = None
+        self._frames = None
+        self._pending = []
+        self._connect()
+
+    def _connect(self):
+        headers = {"Accept": "text/event-stream"}
+        if self.client.token:
+            headers["Authorization"] = "Bearer " + self.client.token
+        if self.last_event_id:
+            headers["Last-Event-ID"] = self.last_event_id
+        try:
+            self._response = self.client._opener.open(
+                Request(self.client.base_url + self.path, headers=headers), timeout=self.client.timeout)
+            if self._response.headers.get_content_type() != "text/event-stream":
+                raise RobotClientError("invalid_response", "网关未返回反馈事件流。")
+            self._frames = self._read_frames()
+            for frame in self._frames:
+                if frame["event"] == "feedback.ready":
+                    return
+                self._pending.append(frame)
+                if len(self._pending) > 8:
+                    raise RobotClientError("invalid_response", "反馈连接未报告就绪。")
+            raise RobotClientError("transport_error", "反馈连接在就绪前关闭。")
+        except HTTPError as exc:
+            exc.close()
+            raise RobotClientError("feedback_http_error", "反馈连接被拒绝。",
+                                   details={"http_status": exc.code}) from exc
+        except (URLError, TimeoutError, OSError, HTTPException) as exc:
+            self._disconnect()
+            raise RobotClientError("transport_error", "反馈连接中断。") from exc
+        except BaseException:
+            self._disconnect()
+            raise
+
+    def _read_frames(self):
+        data, kind, identity, size = [], "message", None, 0
+        while not self._closed.is_set():
+            with self._io_lock:
+                if self._closed.is_set() or self._response is None:
+                    return
+                line = self._response.readline(65537)
+            if not line:
+                return
+            size += len(line)
+            if size > 65536:
+                raise RobotClientError("response_too_large", "单条反馈超过读取上限。")
+            text = line.decode("utf-8").rstrip("\r\n")
+            if not text:
+                if data:
+                    payload = _json_loads("\n".join(data).encode("utf-8"))
+                    if not isinstance(payload, dict):
+                        raise RobotClientError("invalid_response", "反馈须为JSON对象。")
+                    yield {"event": kind, "data": payload, "id": identity}
+                data, kind, identity, size = [], "message", None, 0
+            elif not text.startswith(":"):
+                field, _, value = text.partition(":")
+                value = value[1:] if value.startswith(" ") else value
+                if field == "data":
+                    data.append(value)
+                elif field == "event":
+                    kind = value
+                elif field == "id":
+                    if not re.fullmatch(r"[a-f0-9]{32}:[0-9]{1,20}", value):
+                        raise RobotClientError("invalid_response", "反馈事件含非法续传标识。")
+                    identity = value
+
+    def __iter__(self):
+        backoff = 0.5
+        while not self._closed.is_set():
+            try:
+                if self._frames is None:
+                    self._connect()
+                if self._closed.is_set():
+                    return
+                if self._pending:
+                    frame = self._pending.pop(0)
+                else:
+                    frame = next(self._frames)
+                if frame["event"] in {"keepalive", "feedback.ready"}:
+                    continue
+                yield frame
+                # 宿主回调抛错时不会到这里，重连可再次交付未处理消息。
+                if frame["id"]:
+                    self.last_event_id = frame["id"]
+                backoff = 0.5
+            except (StopIteration, URLError, TimeoutError, OSError, HTTPException):
+                self._disconnect()
+                if self._closed.wait(backoff):
+                    return
+                backoff = min(backoff * 2, 30)
+            except RobotClientError as exc:
+                if exc.payload["code"] != "transport_error":
+                    raise
+                self._disconnect()
+                if self._closed.wait(backoff):
+                    return
+                backoff = min(backoff * 2, 30)
+
+    def listen(self, on_message, *, on_gap=None):
+        """宿主回调可注入会话并唤醒模型；工具消息仍是观测。"""
+        for frame in self:
+            if frame["event"] == "feedback.message":
+                on_message(frame["data"])
+            elif frame["event"] == "feedback.gap":
+                if on_gap is None:
+                    raise RobotClientError("feedback_gap", frame["data"]["message"], details=frame["data"])
+                on_gap(frame["data"])
+
+    def _disconnect(self):
+        with self._io_lock:
+            response, self._response = self._response, None
+            self._frames = None
+            if response is not None:
+                response.close()
+
+    def close(self):
+        self._closed.set()
+        response = self._response
+        if response is not None:
+            # 先唤醒阻塞读取，再关闭文件对象，允许宿主从另一线程回收订阅。
+            try:
+                response.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+            except (AttributeError, OSError):
+                pass
+        self._disconnect()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+
 def receipt_exit_code(payload: Dict[str, Any]) -> int:
     """0表示本次查询/同步调用成功；3表示仍在执行；1表示错误或未确认结果。"""
     if payload.get("error") or payload.get("delivery_state") == "unknown":
@@ -305,6 +455,9 @@ def main(argv=None) -> int:
     parser.add_argument("--timeout", type=float, default=35.0, help="HTTP超时秒数。")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("info", help="检查智能体接口版本和机器人身份。")
+    watch = commands.add_parser("watch", help="持续接收主动反馈，断线续接；不轮询任务。")
+    for name in ("after", "request-id", "task-id", "capability-name"):
+        watch.add_argument("--" + name)
     tools_parser = commands.add_parser("tools", help="读取真实工具参数和结果结构。")
     tools_parser.add_argument("--name")
     tools_parser.add_argument("--full", action="store_true", help="输出所有工具完整参数结构；默认只列目录。")
@@ -334,6 +487,12 @@ def main(argv=None) -> int:
         client = RobotClient(args.url, timeout=args.timeout, token=os.environ.get("NUWAX_ROBOT_TOKEN"))
         if args.command == "info":
             payload = client.info()
+        elif args.command == "watch":
+            with client.feedback(after=args.after, request_id=args.request_id, task_id=args.task_id,
+                                 capability_name=args.capability_name) as subscription:
+                for frame in subscription:
+                    print(json.dumps(frame, ensure_ascii=False, allow_nan=False), flush=True)
+            return 0
         elif args.command == "tools":
             payload = client.tools(args.name)
             if args.name is None and not args.full:

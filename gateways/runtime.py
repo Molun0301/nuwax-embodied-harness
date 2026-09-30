@@ -269,6 +269,9 @@ class _ShmVideoFrameSource:
 
 
 RUNTIME_LOGGER = logging.getLogger("nuwax_robot_bridge.runtime")
+FEEDBACK_LOGGER = logging.getLogger("nuwax_robot_bridge.feedback")
+# 共享会话记录不随诊断日志级别丢失；复用既有文件、轮转和实时日志处理器。
+FEEDBACK_LOGGER.setLevel(logging.INFO)
 _RUNTIME_EVENT_LOG_RATE_LIMIT_SEC = 10.0
 _RUNTIME_SLOW_EVENT_THRESHOLD_MS = 1000.0
 _LOW_VALUE_RUNTIME_CAPABILITY_NAMES = frozenset(
@@ -1687,6 +1690,18 @@ class GatewayRuntime:
 
         try:
             self._publish_runtime_event_stream_frames(event)
+            from gateways.feedback_messages import build_feedback_message
+            feedback = build_feedback_message(self, event)
+            if feedback is not None:
+                # 用户可见反馈逐条落日志，不能应用普通遥测日志的限频策略。
+                feedback_level = {"warning": logging.WARNING, "error": logging.ERROR}.get(
+                    feedback["severity"], logging.INFO)
+                FEEDBACK_LOGGER.log(feedback_level, feedback["message"], extra={
+                    "event": "harness.feedback", "feedback": feedback,
+                    "request_id": feedback.get("request_id"), "task_id": feedback.get("task_id"),
+                    "capability_name": feedback["source"].get("capability_name"),
+                    "feedback_id": feedback["message_id"],
+                })
             event_type = str(event.event_type)
             level = {
                 "info": logging.INFO,
@@ -1757,8 +1772,13 @@ class GatewayRuntime:
                 payload=event,
                 sequence=getattr(event, "cursor", None),
                 status="available",
-                metadata={"task_id": getattr(event, "task_id", None), "event_type": getattr(event, "event_type", None)},
+                metadata={"task_id": getattr(event, "task_id", None), "event_type": getattr(event, "event_type", None),
+                          "feedback": self._feedback_for_event(event)},
             )
+
+    def _feedback_for_event(self, event):
+        from gateways.feedback_messages import build_feedback_message
+        return build_feedback_message(self, event)
 
     @staticmethod
     def _build_log_preview(value: Any) -> str:
@@ -4345,11 +4365,13 @@ class GatewayRuntime:
         """按技能工具名调用运行时能力。"""
 
         tool_descriptor = self.skill_registry.get_descriptor(tool_name)
+        tool_context = dict(request_context or {})
+        tool_context["tool_name"] = tool_name
         return self.invoke_capability(
             tool_descriptor.capability_name,
             arguments,
             requested_by=requested_by,
-            request_context=request_context,
+            request_context=tool_context,
             project_result=project_result,
         )
 
@@ -4436,7 +4458,10 @@ class GatewayRuntime:
                     payload={"mode": descriptor.execution_mode.value, "task_id": result.task_id},
                     message=f"异步能力 {descriptor.name} 任务已接受。",
                 )
-                status = self.task_manager.get_task_status(result.task_id)
+                from gateways.feedback_messages import build_task_feedback
+                with self.task_manager._lock:
+                    status = self.task_manager.get_task_status(result.task_id)
+                    events = self.task_manager.get_task_events(result.task_id)
                 response = {
                     "request_id": completed_context.get("request_id"),
                     "task_id": result.task_id,
@@ -4444,15 +4469,17 @@ class GatewayRuntime:
                     "mode": descriptor.execution_mode.value,
                     "task": result,
                     "status": status,
+                    "feedback": build_task_feedback(self, events[-1]) if events else None,
                 }
                 # 智能体调用账本在展示投影前保留真实受理结果。
                 return self._slim_async_capability_response(response) if project_result else response
 
-            self._publish_capability_invocation_event(
+            completed_event = self._publish_capability_invocation_event(
                 "capability.invocation.completed",
                 descriptor.name,
                 completed_context,
-                payload={"mode": descriptor.execution_mode.value},
+                payload={"mode": descriptor.execution_mode.value,
+                         "result_summary": self._feedback_result_summary(result)},
                 message=f"同步能力 {descriptor.name} 调用完成。",
             )
             slim_result = result
@@ -4474,6 +4501,7 @@ class GatewayRuntime:
                 "capability_name": descriptor.name,
                 "mode": descriptor.execution_mode.value,
                 "result": slim_result,
+                "feedback": self._feedback_for_event(completed_event),
             }
         except Exception as exc:
             duration_ms = (time.perf_counter() - started_at) * 1000.0
@@ -4502,6 +4530,13 @@ class GatewayRuntime:
             clear_correlation_context(correlation_tokens)
 
     @staticmethod
+    def _feedback_result_summary(result):
+        """事件只附有界结果摘要，完整业务结果继续由原调用交付。"""
+        from gateways.feedback import compact_public_data
+        return compact_public_data(result, max_depth=3, max_items=8, max_string_chars=400,
+                                   max_total_bytes=1800, max_nodes=48)
+
+    @staticmethod
     def _build_capability_request_context(
         request_context: Optional[Dict[str, Any]],
         *,
@@ -4523,13 +4558,13 @@ class GatewayRuntime:
         severity: RuntimeEventSeverity = RuntimeEventSeverity.INFO,
         payload: Optional[MetadataDict] = None,
         message: Optional[str] = None,
-    ) -> None:
+    ):
         metadata = {
             key: request_context[key]
             for key in _REQUEST_CONTEXT_KEYS
             if key in request_context and _has_observability_value(request_context[key])
         }
-        self.event_bus.publish(
+        return self.event_bus.publish(
             self.event_bus.build_event(
                 event_type,
                 category=RuntimeEventCategory.SYSTEM,
@@ -5602,15 +5637,20 @@ class GatewayRuntime:
     def get_task_snapshot(self, task_id: str) -> Dict[str, Any]:
         """读取任务状态快照。"""
 
-        snapshot = {
-            "task_id": task_id,
-            "status": self.task_manager.get_task_status(task_id),
-            "events": self.task_manager.get_task_events(task_id),
-            "result": self.task_manager.get_task_result(task_id),
-            "error": self.task_manager.get_task_error(task_id),
-            "error_payload": self.task_manager.get_task_error_payload(task_id),
-        }
-        metadata = self.task_manager.get_task_spec(task_id).metadata
+        from gateways.feedback_messages import build_task_feedback
+        with self.task_manager._lock:
+            spec = self.task_manager.get_task_spec(task_id)
+            events = self.task_manager.get_task_events(task_id)
+            snapshot = {
+                "task_id": task_id, "task": spec,
+                "status": self.task_manager.get_task_status(task_id),
+                "events": events,
+                "result": self.task_manager.get_task_result(task_id),
+                "error": self.task_manager.get_task_error(task_id),
+                "error_payload": self.task_manager.get_task_error_payload(task_id),
+                "feedback": build_task_feedback(self, events[-1]) if events else None,
+            }
+            metadata = dict(spec.metadata)
         checkpoint = metadata.get("exploration_checkpoint")
         if isinstance(checkpoint, dict):
             snapshot["exploration_checkpoint"] = dict(checkpoint)

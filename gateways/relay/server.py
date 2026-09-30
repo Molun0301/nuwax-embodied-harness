@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import Response
 from fastapi.responses import StreamingResponse
 import httpx
+import anyio
 import websockets
 
 from core.logging_utils import LogRateLimiter
@@ -23,6 +24,22 @@ from core.settings import RelayServerConfig
 
 
 RELAY_LOGGER = logging.getLogger("nuwax_robot_bridge.relay")
+
+
+class RelayStreamingResponse(StreamingResponse):
+    """主动监听下游断开，避免日志中间件屏蔽发送端断连后遗留上游流。"""
+
+    async def __call__(self, scope, receive, send):
+        async with anyio.create_task_group() as group:
+            async def stream():
+                await self.stream_response(send)
+                group.cancel_scope.cancel()
+
+            group.start_soon(stream)
+            await self.listen_for_disconnect(receive)
+            group.cancel_scope.cancel()
+        if self.background is not None:
+            await self.background()
 _LOW_VALUE_RELAY_PATHS = frozenset(
     (
         "/relay/health",
@@ -185,7 +202,8 @@ def create_relay_app(
 
     @app.api_route("/api/{path:path}", methods=["GET", "POST"])
     async def relay_api(path: str, request: Request) -> Response:
-        return await _forward_request(app, request, f"/api/{path}")
+        return await _forward_request(app, request, f"/api/{path}",
+                                      stream=request.method == "GET" and path == "feedback/stream")
 
     @app.get("/artifacts/{path:path}")
     async def relay_artifacts(path: str, request: Request) -> Response:
@@ -236,8 +254,10 @@ async def _forward_request(
                     content=content,
                 )
                 upstream_response = await client.send(upstream_request, stream=True)
-            except Exception:
-                await client.aclose()
+            except BaseException:
+                # 下游断开会取消当前作用域，清理必须仍能关闭真实上游连接。
+                with anyio.CancelScope(shield=True):
+                    await client.aclose()
                 raise
             _record_upstream_observation(request, upstream_response.status_code, upstream_start_at)
 
@@ -261,10 +281,13 @@ async def _forward_request(
                     )
                     raise
                 finally:
-                    await upstream_response.aclose()
-                    await client.aclose()
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            await upstream_response.aclose()
+                        finally:
+                            await client.aclose()
 
-            return StreamingResponse(
+            return RelayStreamingResponse(
                 _iter_bytes(),
                 status_code=upstream_response.status_code,
                 headers=_filter_response_headers(upstream_response.headers),

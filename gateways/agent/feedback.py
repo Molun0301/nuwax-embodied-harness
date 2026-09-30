@@ -171,4 +171,10 @@ def build_receipt(*, request_id: Optional[str], gateway_instance_id: str, tool_n
         "record_scope": scope,
         "status_source": "live_task" if scope == "task" else "recorded_call",
     }
+    feedback = response.get("feedback")
+    if not isinstance(feedback, dict) and isinstance(result, dict):
+        feedback = result.get("feedback")
+    if delivery_state == "recorded" and isinstance(feedback, dict):
+        receipt["feedback"] = feedback
+        receipt["summary"] = feedback["message"]
     return checked_json(receipt, max_bytes=RECEIPT_MAX_BYTES)

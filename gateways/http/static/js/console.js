@@ -1175,13 +1175,14 @@
         const active = Array.isArray(payload && payload.active_tasks) ? payload.active_tasks : [];
         const history = Array.isArray(payload && payload.history_tasks) ? payload.history_tasks : [];
         state.latestTasks = payload || {};
-        els.taskSummary.replaceChildren();
+        const existingRows = new Map(Array.from(els.taskSummary.querySelectorAll("article[data-task-id]"), node => [node.dataset.taskId, node]));
         setPill(els.taskStatus, active.length ? "available" : "idle", active.length ? `${active.length} 个任务` : "空闲");
         const recentFailures = history.filter((task) => ["failed", "timeout"].includes(normalizeTaskState(task.state || task.status))).slice(0, 2);
         const items = active.length
           ? [...active.slice(0, 4), ...recentFailures.filter((task) => !active.some((item) => String(item.task_id) === String(task.task_id)))]
           : history.slice(0, 4);
         if (!items.length) {
+          els.taskSummary.replaceChildren();
           const row = document.createElement("article");
           row.className = "task-row";
           row.innerHTML = '<div><div class="mono">暂无运行任务</div><div class="meta">当前没有活动任务；历史任务为空。</div></div><span class="pill stale">空闲</span>';
@@ -1189,16 +1190,21 @@
           renderServiceStatus();
           return;
         }
+        const wantedRows = [];
         for (const task of items) {
-          const row = document.createElement("article");
+          const taskKey = String(task.task_id || task.id);
+          const row = existingRows.get(taskKey) || document.createElement("article");
           row.className = "task-row";
-          const left = document.createElement("div");
-          const title = document.createElement("div");
+          row.dataset.taskId = taskKey;
+          const left = row.firstElementChild || document.createElement("div");
+          const heading = left.querySelector(".task-row-heading") || document.createElement("div");
+          heading.className = "task-row-heading";
+          const title = left.querySelector(".mono") || document.createElement("div");
           title.className = "mono";
           const taskId = safeText(task.task_id || task.id);
-          title.textContent = task.capability_name ? `${safeText(task.capability_name)} · ${taskId}` : taskId;
+          title.textContent = task.feedback?.source?.display_name || task.capability_name || taskId;
           title.title = taskId;
-          const meta = document.createElement("div");
+          const meta = left.querySelector(":scope > .meta") || document.createElement("div");
           meta.className = "meta";
           const taskState = normalizeTaskState(task.state || task.status);
           const reason = task.failure_reason || task.waiting_for || task.message || task.error || (["failed", "timeout", "cancelled"].includes(taskState) ? "未上报原因" : "");
@@ -1214,15 +1220,28 @@
             : "时间未上报";
           const nextAction = task.next_action ? ` · 下一步 ${safeText(task.next_action)}` : "";
           const retryText = task.retryable === true ? " · 可重试" : task.retryable === false && ["failed", "timeout"].includes(taskState) ? " · 不建议原样重试" : "";
-          meta.textContent = `阶段 ${safeText(task.stage || taskState)} · ${progressText} · ${timeText}${reason ? " · " + reason : ""}${retryText}${nextAction}`;
-          left.append(title, meta);
-          const pill = document.createElement("span");
+          meta.textContent = task.feedback?.message || task.summary || `阶段 ${safeText(task.stage || taskState)} · ${progressText} · ${timeText}${reason ? " · " + reason : ""}${retryText}${nextAction}`;
+          if (!heading.parentElement) left.prepend(heading);
+          if (title.parentElement !== heading) heading.append(title);
+          if (!meta.parentElement) left.append(meta);
+          if (task.feedback && window.nuwaxFeedback) {
+            const detail = left.querySelector(".task-feedback-details");
+            if (detail) detail.updateFeedback(task.feedback);
+            else left.append(window.nuwaxFeedback.details(task.feedback));
+          }
+          const pill = heading.querySelector(".pill") || row.querySelector(":scope > .pill") || document.createElement("span");
           pill.className = `pill ${taskState === "failed" || taskState === "timeout" ? "error" : taskState === "running" || taskState === "accepted" ? "available" : taskState === "succeeded" ? "available" : "stale"}`;
           pill.textContent = displayValue(taskState, "task_state");
           pill.title = taskState;
-          row.append(left, pill);
-          els.taskSummary.appendChild(row);
+          if (!left.parentElement) row.append(left);
+          if (pill.parentElement !== heading) heading.append(pill);
+          wantedRows.push(row);
         }
+        const wanted = new Set(wantedRows);
+        for (const row of Array.from(els.taskSummary.children)) if (!wanted.has(row)) row.remove();
+        wantedRows.forEach((row, index) => {
+          if (els.taskSummary.children[index] !== row) els.taskSummary.insertBefore(row, els.taskSummary.children[index] || null);
+        });
         renderServiceStatus();
       }
       async function loadInitialTasks() {
@@ -5380,6 +5399,7 @@
         const derivedStage = event.event_type ? String(event.event_type).replace(/^task\./, "") : null;
         const task = {
           ...existing,
+          feedback: frame.metadata?.feedback || payload.feedback || existing.feedback,
           task_id: taskId,
           capability_name: payload.capability_name || requestContext.capability_name || existing.capability_name,
           state: payload.state || event.state || (isTerminalTaskState(derivedStage) || ["accepted", "running"].includes(derivedStage) ? derivedStage : null) || existing.state || null,

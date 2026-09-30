@@ -4,6 +4,7 @@ import collections
 from dataclasses import dataclass
 import logging
 import threading
+from uuid import uuid4
 from typing import Any, Callable, Deque, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 from contracts.base import MetadataDict
@@ -73,6 +74,7 @@ class EventBus:
     """支持游标续播的内存事件总线。"""
 
     def __init__(self, retention_limit: int = 1000) -> None:
+        self.instance_id = uuid4().hex
         self._retention_limit = max(1, retention_limit)
         self._events: Deque[RuntimeEvent] = collections.deque(maxlen=self._retention_limit)
         self._subscriptions: Dict[str, EventSubscription] = {}
@@ -347,7 +349,7 @@ class EventBus:
             message=task_event.message,
             payload=payload,
             metadata=metadata,
-        )
+        ).model_copy(update={"timestamp": task_event.timestamp})
 
     def prepare_task_event(
         self,

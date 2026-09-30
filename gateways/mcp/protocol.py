@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import time
+from collections import OrderedDict
+from uuid import uuid4
 from typing import Dict, Optional, Any, List, Mapping, Tuple
 
 from contracts.skills import SkillDescriptor
@@ -24,6 +26,7 @@ from gateways.feedback import (
 )
 from gateways.request_context import categorize_gateway_error
 from gateways.runtime import GatewayRuntime
+from gateways.feedback_stream import feedback_cursor, feedback_events, format_feedback_sse
 
 
 MCP_LOGGER = logging.getLogger("nuwax_robot_bridge.gateway.mcp")
@@ -484,7 +487,7 @@ def _build_initialize_result(runtime: GatewayRuntime, protocol_version: str) -> 
     base_url = runtime.config.gateway.public_base_url.rstrip("/")
     return {
         "protocolVersion": protocol_version,
-        "capabilities": {"tools": {"listChanged": False}},
+        "capabilities": {"tools": {"listChanged": False}, "logging": {}},
         "serverInfo": {"name": "nuwax_robot_bridge", "version": "0.9.0"},
         "metadata": {
             "transport": {
@@ -501,6 +504,9 @@ def _build_initialize_result(runtime: GatewayRuntime, protocol_version: str) -> 
                 "sse_url": f"{base_url}/streams/sse",
             },
             "artifacts": {"base_url": f"{base_url}/artifacts"},
+            "feedback": {"sse_url": f"{base_url}/api/feedback/stream",
+                         "mcp_notification": "notifications/message",
+                         "agent_action": "将通知data作为观测加入会话；attention=wake时由宿主唤醒。"},
         },
     }
 
@@ -577,16 +583,47 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
     """构造 MCP JSON-RPC 路由。"""
 
     router = APIRouter()
+    # 只保存连接的日志级别，不拥有任务或模型会话；有界淘汰后客户端重新初始化。
+    logging_sessions = OrderedDict()
+    log_levels = ("debug", "info", "notice", "warning", "error", "critical", "alert", "emergency")
+
+    def session_for(request):
+        identity = request.headers.get("mcp-session-id")
+        if identity is None:
+            return None
+        session = logging_sessions.get(identity)
+        if session is None:
+            raise GatewayError("MCP连接已过期，请重新初始化。", error_code="mcp_session_expired", http_status=404)
+        logging_sessions.move_to_end(identity)
+        return session
 
     @router.get("/mcp")
     async def mcp_stream(request: Request) -> Response:
-        async def event_generator():
-            yield _format_sse("endpoint", {"endpoint": "/mcp", "protocol_versions": list(_SUPPORTED_PROTOCOL_VERSIONS)})
-            while not await request.is_disconnected():
-                await asyncio.sleep(runtime.config.gateway.sse_keepalive_sec)
-                yield _format_sse("keepalive", {"endpoint": "/mcp"})
+        session = session_for(request)
+        cursor, reason = feedback_cursor(runtime, request.headers.get("last-event-id"))
 
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
+        async def event_generator():
+            async for kind, payload, identity in feedback_events(
+                    runtime, request, after_cursor=cursor, reset_reason=reason):
+                if kind in {"keepalive", "feedback.ready"}:
+                    yield ": feedback connection active\n\n"
+                    continue
+                if kind == "feedback.gap":
+                    level, logger_name = "warning", "harness.feedback"
+                    payload = {"event_type": "feedback.gap", "attention": "wake", **payload}
+                else:
+                    level = payload["severity"]
+                    logger_name = payload["source"].get("capability_name") or payload["source"]["component"]
+                if kind != "feedback.gap" and log_levels.index(level) < log_levels.index(
+                        session["level"] if session else "info"):
+                    continue
+                yield format_feedback_sse("message", {
+                    "jsonrpc": "2.0", "method": "notifications/message",
+                    "params": {"level": level, "logger": logger_name, "data": payload},
+                }, identity)
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @router.post("/mcp")
     async def mcp_endpoint(request: Request) -> Response:
@@ -664,7 +701,20 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
 
             if method == "initialize":
                 protocol_version = _negotiate_protocol_version(params)
-                return JSONResponse(_jsonrpc_result(request_id, _build_initialize_result(runtime, protocol_version)))
+                session_id = uuid4().hex
+                logging_sessions[session_id] = {"level": "info"}
+                if len(logging_sessions) > 256:
+                    logging_sessions.popitem(last=False)
+                return JSONResponse(_jsonrpc_result(request_id, _build_initialize_result(runtime, protocol_version)),
+                                    headers={"Mcp-Session-Id": session_id})
+
+            if method == "logging/setLevel":
+                session = session_for(request)
+                if session is None or params.get("level") not in log_levels:
+                    raise GatewayError("设置通知级别需要初始化返回的Mcp-Session-Id及有效level。",
+                                       error_code="invalid_params", http_status=422, jsonrpc_code=-32602)
+                session["level"] = params["level"]
+                return JSONResponse(_jsonrpc_result(request_id, {}))
 
             if method == "tools/list":
                 tools = await run_in_threadpool(lambda: _build_collection_tools(runtime))
@@ -789,7 +839,7 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                 http_status=400,
                 jsonrpc_code=-32601,
                 details={
-                    "supported_methods": ["initialize", "tools/list", "tools/call"],
+                    "supported_methods": ["initialize", "tools/list", "tools/call", "logging/setLevel"],
                 },
             )
         except Exception as exc:

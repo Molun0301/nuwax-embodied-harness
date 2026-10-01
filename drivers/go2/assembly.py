@@ -70,6 +70,10 @@ class Go2RobotAssembly(RobotAssemblyBase):
     data_plane: Optional[ManagedRobotDeviceDataPlane] = None
     data_plane_runtime: Optional[Go2DataPlaneRuntime] = None
 
+    def has_motion_actuator(self) -> Optional[bool]:
+        """Physical motion hardware remains present even when disconnected."""
+        return True
+
     def __post_init__(self) -> None:
         _prepare_go2_sdk_path(self.config)
         self.factories = self.factories or _load_default_factories()

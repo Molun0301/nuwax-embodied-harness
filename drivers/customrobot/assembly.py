@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, Optional
 
 from adapters.base import AdapterConfig
 from contracts.calibration import SensorTopology
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 class CustomRobotAssembly(RobotAssemblyBase):
     """标准数据输入与可注入运动执行器的通用机器人入口。"""
 
-    config: "NuwaxRobotBridgeConfig"
+    config: NuwaxRobotBridgeConfig
     iface: Optional[str] = None
     adapter_configs: Optional[Dict[str, AdapterConfig]] = None
     motion_control: Optional[MotionControl] = None
@@ -33,6 +33,14 @@ class CustomRobotAssembly(RobotAssemblyBase):
         self.providers = CustomRobotProviderBundle(
             motion_control=self.motion_control, sensor_topology=self.sensor_topology,
         )
+
+    def has_motion_actuator(self) -> Optional[bool]:
+        """Injected motion is present; external adapters may own unknown actuators."""
+        if self.motion_control is not None:
+            return True
+        if self.list_adapters():
+            return None
+        return False
 
     def start(self) -> None:
         """启用标准输入并初始化接入方绑定的适配器。"""
@@ -71,7 +79,7 @@ class CustomRobotAssembly(RobotAssemblyBase):
 
 
 def create_customrobot_assembly(
-    config: "NuwaxRobotBridgeConfig",
+    config: NuwaxRobotBridgeConfig,
     iface: Optional[str] = None,
     adapter_configs: Optional[Dict[str, AdapterConfig]] = None,
     *,

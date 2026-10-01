@@ -23,6 +23,9 @@ def _bootstrap_path() -> None:
 def main() -> int:
     """默认进入模块向导，原有明确部署命令继续使用事务安装器。"""
     _bootstrap_path()
+    if len(sys.argv) > 1 and sys.argv[1] == "update":
+        from scripts.update_client import main as update_main
+        return int(update_main(sys.argv[2:]))
     legacy_commands = {"plan", "check", "deploy", "resume", "verify", "status", "rollback", "bundle"}
     if len(sys.argv) > 1 and sys.argv[1] in legacy_commands:
         from scripts.deploy_installer.cli import main as installer_main

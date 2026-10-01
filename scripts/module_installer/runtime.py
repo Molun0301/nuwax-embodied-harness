@@ -9,6 +9,8 @@ import shlex
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from .catalog import ROBOT_REQUIREMENTS
+
 # 按文件导入共同解析器，安装前不导入 core 包及其运行依赖。
 _PARSER_PATH = Path(__file__).resolve().parents[2] / "core" / "config_values.py"
 _SPEC = importlib.util.spec_from_file_location("nuwax_install_config_values", _PARSER_PATH)
@@ -134,7 +136,7 @@ def write_runtime(
         raise ValueError("二维与三维执行链必须互斥")
     if {"fastlio2", "pointlio"}.issubset(selected):
         raise ValueError("FastLIO2 与 PointLIO 只能安装一种")
-    if robot not in {"customrobot", "go2"}:
+    if robot not in ROBOT_REQUIREMENTS:
         raise ValueError("不支持的机器人接入类型")
     if selected & {"fastlio2", "pointlio", "slam2d", "navigation"} and "geometry" not in selected:
         raise ValueError("定位算法和导航需要几何模块")
@@ -169,6 +171,7 @@ def write_runtime(
     fixed = {key: str(settings_path) for key in _CONFIG_PATH_KEYS}
     fixed.update({
         "NUWAX_ROBOT_PROFILE_MODE": "1",
+        "NUWAX_INSTALL_HOME": str(prefix.parent.parent),
         "NUWAX_SETTINGS_LAUNCHER": str(prefix / "start.sh"),
         "NUWAX_ACTIVE_ROBOT": robot,
         "NUWAX_GATEWAY_LOCK_FILE": str(root / "runtime_data/gateway/start_gateway.lock"),
@@ -280,3 +283,18 @@ def write_runtime(
     start_path = prefix / "start.sh"
     start_path.write_text("\n".join(launcher), encoding="utf-8")
     start_path.chmod(0o755)
+
+
+def effective_settings(root: Path, prefix: Path, environment=None):
+    """Merge installed defaults, the active profile and explicit listener overrides."""
+    environment = {} if environment is None else environment
+    settings = prefix / "settings.env"
+    values = read_settings(settings)
+    active = root / "runtime_data/settings/active.env"
+    if active.is_file():
+        values.update(_VALUES.configuration_values(root=root, environment=environment))
+        settings = active.resolve()
+    for key in ("NUWAX_GATEWAY_HOST", "NUWAX_GATEWAY_PORT"):
+        if key in environment:
+            values[key] = environment[key]
+    return values, settings

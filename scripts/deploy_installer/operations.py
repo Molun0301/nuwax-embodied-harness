@@ -3,6 +3,7 @@ from __future__ import annotations
 import grp
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -15,15 +16,19 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Dict, FrozenSet, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, FrozenSet, Mapping, Optional, Sequence, Tuple
+
+from scripts.systemd.prepare_lcm_network import lcm_url_from_env_text, migrated_root_lcm_url
 
 from .config import atomic_write, fsync_directory, render_env
+from .gateway import gateway_health_url, resolve_gateway_listener
 from .profile import profile_sha256
 from .runner import resolve_build_account, source_user_command, source_user_environment
-from scripts.systemd.prepare_lcm_network import lcm_url_from_env_text, migrated_root_lcm_url
 
 if TYPE_CHECKING:
     from .engine import ExecutionContext
+
+logger = logging.getLogger(__name__)
 
 
 class DeploymentError(RuntimeError):
@@ -80,7 +85,7 @@ def _first_wheel(bundle: Path, distribution: str) -> Optional[Path]:
     return matches[0].resolve() if matches else None
 
 
-def _resolve_go2_artifacts(context: "ExecutionContext") -> None:
+def _resolve_go2_artifacts(context: ExecutionContext) -> None:
     options = context.options
     bundle = options.offline_bundle
     sdk = options.go2_sdk
@@ -259,7 +264,7 @@ def _git_source_identity(path: Path) -> str:
     return hashlib.sha256(head.stdout + b"\0" + index.stdout).hexdigest()
 
 
-def _verify_source_artifacts(context: "ExecutionContext") -> None:
+def _verify_source_artifacts(context: ExecutionContext) -> None:
     relative = context.profile.python.source_artifact_manifest
     if not relative:
         return
@@ -356,7 +361,7 @@ def _verify_source_artifacts(context: "ExecutionContext") -> None:
         context.notes[f"artifact_sha256:{distribution}"] = actual
 
 
-def _verify_python_runtime(context: "ExecutionContext") -> None:
+def _verify_python_runtime(context: ExecutionContext) -> None:
     expected = context.profile.python.version
     if not expected:
         return
@@ -393,7 +398,7 @@ def _installed_package_version(package: str) -> str:
     return version.strip() if completed.returncode == 0 and status.startswith("ii ") else ""
 
 
-def _validate_jetson_compatibility(context: "ExecutionContext") -> None:
+def _validate_jetson_compatibility(context: ExecutionContext) -> None:
     profile = context.profile
     if not profile.production or profile.robot != "go2":
         return
@@ -427,7 +432,7 @@ def _validate_jetson_compatibility(context: "ExecutionContext") -> None:
     context.notes["jetson_compatibility"] = facts
 
 
-def _verify_vendor_python_packages(context: "ExecutionContext") -> None:
+def _verify_vendor_python_packages(context: ExecutionContext) -> None:
     build_account = resolve_build_account()
     for package in context.profile.python.vendor_packages:
         if package.get("required") is not True:
@@ -810,14 +815,14 @@ def _prepare_managed_directory(path: Path, group_gid: int, mode: int, label: str
     return path
 
 
-def _prepare_build_root(context: "ExecutionContext", build_gid: int) -> Path:
+def _prepare_build_root(context: ExecutionContext, build_gid: int) -> Path:
     options = context.options
     _prepare_managed_directory(options.cache_dir, build_gid, 0o750, "deployment cache root")
     _prepare_managed_directory(options.cache_dir / "build", build_gid, 0o750, "build cache root")
     return _prepare_managed_directory(options.build_dir, build_gid, 0o750, "release build directory")
 
 
-def _prepare_release_root(context: "ExecutionContext") -> Path:
+def _prepare_release_root(context: ExecutionContext) -> Path:
     options = context.options
     public_gid = os.getegid()
     _prepare_managed_directory(options.install_root, public_gid, 0o755, "installation root")
@@ -1231,7 +1236,7 @@ def stage_source_snapshot(source_root: Path, cache_dir: Path) -> Tuple[Path, str
     return target, revision, tree_id
 
 
-def verify_input_admission(context: "ExecutionContext") -> None:
+def verify_input_admission(context: ExecutionContext) -> None:
     options = context.options
     if options.offline_bundle is not None:
         bundle = _require_dir(options.offline_bundle, "offline bundle")
@@ -1279,7 +1284,7 @@ def validate_protected_paths(options) -> None:
                 raise DeploymentError(f"{label} path is not root-managed: {current}")
 
 
-def preflight(context: "ExecutionContext") -> None:
+def preflight(context: ExecutionContext) -> None:
     profile = context.profile
     options = context.options
     if os.geteuid() != 0:
@@ -1334,20 +1339,22 @@ def preflight(context: "ExecutionContext") -> None:
     if not options.allow_unsupported_host and not profile.supports(os_id, version_id, architecture):
         raise DeploymentError(f"profile {profile.name} does not support {os_id} {version_id} {architecture}")
     _verify_python_runtime(context)
-    if profile.production and profile.python.lock_status != "hashed":
-        if not options.allow_unlocked_python:
-            raise DeploymentError(
-                f"production profile Python lock_status={profile.python.lock_status!r}; "
-                "generate the approved lock or pass --allow-unlocked-python for controlled bring-up"
-            )
-    if profile.production and profile.metadata.get("deployable") is False:
-        if not options.allow_unverified_third_party:
-            blockers = profile.metadata.get("blockers") or []
-            detail = "; ".join(str(item) for item in blockers)
-            raise DeploymentError(
-                "production profile is fail-closed because third-party artifacts are unresolved"
-                + (f": {detail}" if detail else "")
-            )
+    if profile.production and profile.python.lock_status != "hashed" and not options.allow_unlocked_python:
+        raise DeploymentError(
+            f"production profile Python lock_status={profile.python.lock_status!r}; "
+            "generate the approved lock or pass --allow-unlocked-python for controlled bring-up"
+        )
+    if (
+        profile.production
+        and profile.metadata.get("deployable") is False
+        and not options.allow_unverified_third_party
+    ):
+        blockers = profile.metadata.get("blockers") or []
+        detail = "; ".join(str(item) for item in blockers)
+        raise DeploymentError(
+            "production profile is fail-closed because third-party artifacts are unresolved"
+            + (f": {detail}" if detail else "")
+        )
     validate_protected_paths(options)
     _validate_jetson_compatibility(context)
     protected_roots = {
@@ -1448,9 +1455,12 @@ def preflight(context: "ExecutionContext") -> None:
         if not iface.is_dir():
             raise DeploymentError(f"DDS interface does not exist: {options.dds_interface}")
     required_interface = profile.metadata.get("required_dds_interface")
-    if profile.production and isinstance(required_interface, str):
-        if options.dds_interface != required_interface:
-            raise DeploymentError(f"profile {profile.name} requires --dds-interface {required_interface}")
+    if (
+        profile.production
+        and isinstance(required_interface, str)
+        and options.dds_interface != required_interface
+    ):
+        raise DeploymentError(f"profile {profile.name} requires --dds-interface {required_interface}")
     existing_manifest = options.release_dir / "release-manifest.json"
     if existing_manifest.is_file():
         try:
@@ -1487,7 +1497,7 @@ def _missing_system_packages(packages: Sequence[str]) -> Tuple[str, ...]:
     return tuple(missing)
 
 
-def _record_system_package_versions(context: "ExecutionContext") -> None:
+def _record_system_package_versions(context: ExecutionContext) -> None:
     versions = {}
     for package_spec in context.profile.system_packages:
         package = package_spec.partition("=")[0]
@@ -1498,7 +1508,7 @@ def _record_system_package_versions(context: "ExecutionContext") -> None:
     context.notes["system_package_versions"] = versions
 
 
-def install_online_system_packages(context: "ExecutionContext") -> None:
+def install_online_system_packages(context: ExecutionContext) -> None:
     missing = _missing_system_packages(context.profile.system_packages)
     if not missing:
         context.notes["system_packages_unchanged"] = True
@@ -1512,7 +1522,7 @@ def install_online_system_packages(context: "ExecutionContext") -> None:
     _record_system_package_versions(context)
 
 
-def install_offline_system_packages(context: "ExecutionContext") -> None:
+def install_offline_system_packages(context: ExecutionContext) -> None:
     missing = _missing_system_packages(context.profile.system_packages)
     if not missing:
         context.notes["system_packages_unchanged"] = True
@@ -1576,7 +1586,7 @@ def install_offline_system_packages(context: "ExecutionContext") -> None:
 
 
 def _prepare_offline_rustup_home(
-    context: "ExecutionContext",
+    context: ExecutionContext,
     build_uid: int,
     build_gid: int,
 ) -> Path:
@@ -1622,7 +1632,7 @@ def _prepare_offline_rustup_home(
 
 
 def _validate_rust_proxy(
-    context: "ExecutionContext",
+    context: ExecutionContext,
     kind: str,
     executable: Path,
     env: Mapping[str, str],
@@ -1696,7 +1706,7 @@ def _existing_rust_proxy(toolchain_bin: Path, proxy: str) -> Path:
     return candidate
 
 
-def ensure_rust_toolchain(context: "ExecutionContext") -> None:
+def ensure_rust_toolchain(context: ExecutionContext) -> None:
     toolchain = context.profile.rust.toolchain
     build_account = resolve_build_account()
     build_uid = build_account.pw_uid
@@ -1808,11 +1818,11 @@ def ensure_rust_toolchain(context: "ExecutionContext") -> None:
         )
 
 
-def _venv_python(context: "ExecutionContext") -> Path:
+def _venv_python(context: ExecutionContext) -> Path:
     return context.options.release_dir / ".venv" / "bin" / "python"
 
 
-def _build_user_env(context: "ExecutionContext") -> Mapping[str, str]:
+def _build_user_env(context: ExecutionContext) -> Mapping[str, str]:
     return {
         "HOME": str(context.options.build_home),
         "XDG_CACHE_HOME": str(context.options.build_home / ".cache"),
@@ -2114,7 +2124,7 @@ def _publish_build_snapshot(
 
 
 def _pip_install(
-    context: "ExecutionContext",
+    context: ExecutionContext,
     arguments: Sequence[str],
     *,
     timeout: int = 3600,
@@ -2130,7 +2140,7 @@ def _pip_install(
 
 
 def _python_install_artifact(
-    context: "ExecutionContext",
+    context: ExecutionContext,
     distribution: str,
     raw_artifact: object,
 ) -> Path:
@@ -2228,7 +2238,7 @@ def _normalized_distribution(line: str) -> str:
 
 
 def _filtered_requirement(
-    context: "ExecutionContext",
+    context: ExecutionContext,
     relative: str,
 ) -> Path:
     source = context.options.source_root / relative
@@ -2249,7 +2259,7 @@ def _filtered_requirement(
     return output
 
 
-def _python_requirement_paths(context: "ExecutionContext") -> Tuple[str, ...]:
+def _python_requirement_paths(context: ExecutionContext) -> Tuple[str, ...]:
     if context.profile.python.lock_status == "hashed":
         target = context.profile.metadata.get("lock_target")
         if not isinstance(target, str) or not target:
@@ -2258,7 +2268,7 @@ def _python_requirement_paths(context: "ExecutionContext") -> Tuple[str, ...]:
     return context.profile.python.requirements
 
 
-def _validate_hashed_requirement_policy(context: "ExecutionContext", path: Path) -> None:
+def _validate_hashed_requirement_policy(context: ExecutionContext, path: Path) -> None:
     if context.profile.python.lock_status != "hashed":
         return
     denied = {name.lower().replace("_", "-") for name in context.profile.python.deny_distributions}
@@ -2284,7 +2294,7 @@ def _validate_hashed_requirement_policy(context: "ExecutionContext", path: Path)
             raise DeploymentError(f"hashed Python lock contains index-forbidden distribution {distribution}: {path}")
 
 
-def install_python_environment(context: "ExecutionContext") -> None:
+def install_python_environment(context: ExecutionContext) -> None:
     options = context.options
     existing_manifest = options.release_dir / "release-manifest.json"
     if existing_manifest.is_file():
@@ -2443,8 +2453,10 @@ def install_python_environment(context: "ExecutionContext") -> None:
             (
                 str(venv_python),
                 "-c",
-                "import torch, torchvision; assert torch.cuda.is_available(), "
-                "'Jetson CUDA torch is required; generic PyPI torch is forbidden'",
+                (
+                    "import torch, torchvision; assert torch.cuda.is_available(), "
+                    "'Jetson CUDA torch is required; generic PyPI torch is forbidden'"
+                ),
             ),
             env=_build_user_env(context),
             as_build_user=True,
@@ -2554,7 +2566,7 @@ def _materialize_verified_model(
         os.close(parent_descriptor)
 
 
-def prepare_assets(context: "ExecutionContext") -> None:
+def prepare_assets(context: ExecutionContext) -> None:
     options = context.options
     if options.skip_models:
         return
@@ -2692,9 +2704,8 @@ def _copy_ignore(_directory: str, names: Sequence[str]):
         if name in ignored
         or (name == "configs" and Path(_directory).parent.name == "drivers")
         or name == ".env"
-        or name.startswith(".env.")
+        or name.startswith((".env.", "data_plane.env."))
         or name == "data_plane.env"
-        or name.startswith("data_plane.env.")
         or name.endswith((".pyc", ".log"))
     ]
 
@@ -2787,7 +2798,7 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _source_revision(context: "ExecutionContext") -> str:
+def _source_revision(context: ExecutionContext) -> str:
     if context.options.source_revision:
         return context.options.source_revision
     bundle_manifest = context.notes.get("bundle_manifest")
@@ -3006,7 +3017,7 @@ def _validate_completed_release(release_dir: Path, manifest: Mapping[str, object
 
 
 def _validate_managed_release(
-    context: "ExecutionContext",
+    context: ExecutionContext,
     release: Path,
     label: str,
 ) -> Path:
@@ -3032,7 +3043,7 @@ def _validate_managed_release(
     return release
 
 
-def _switch_current(context: "ExecutionContext", release_dir: Path) -> None:
+def _switch_current(context: ExecutionContext, release_dir: Path) -> None:
     current = context.options.current_link
     current.parent.mkdir(parents=True, exist_ok=True)
     if current.is_symlink():
@@ -3059,18 +3070,18 @@ def _switch_current(context: "ExecutionContext", release_dir: Path) -> None:
     _record_recovery(context, release_dir, activated=True)
 
 
-def _transaction_backup_dir(context: "ExecutionContext") -> Path:
+def _transaction_backup_dir(context: ExecutionContext) -> Path:
     transaction_id = context.options.transaction_id
     if not transaction_id:
         raise DeploymentError("deployment transaction_id is required for rollback state")
     return context.options.state_dir / "backups" / transaction_id
 
 
-def _systemd_backup_dir(context: "ExecutionContext") -> Path:
+def _systemd_backup_dir(context: ExecutionContext) -> Path:
     return _transaction_backup_dir(context) / "systemd"
 
 
-def _prepare_backup_root(context: "ExecutionContext") -> Path:
+def _prepare_backup_root(context: ExecutionContext) -> Path:
     root = _transaction_backup_dir(context)
     for path in (context.options.state_dir, context.options.state_dir / "backups", root):
         if path.is_symlink():
@@ -3081,7 +3092,7 @@ def _prepare_backup_root(context: "ExecutionContext") -> Path:
 
 
 def _record_recovery(
-    context: "ExecutionContext",
+    context: ExecutionContext,
     release_dir: Path,
     *,
     activated: bool,
@@ -3152,7 +3163,7 @@ def _record_recovery(
     )
 
 
-def _mark_recovery_rolling_back(context: "ExecutionContext") -> None:
+def _mark_recovery_rolling_back(context: ExecutionContext) -> None:
     recovery_path = _transaction_backup_dir(context) / "recovery.json"
     if not recovery_path.is_file():
         return
@@ -3172,7 +3183,7 @@ def _mark_recovery_rolling_back(context: "ExecutionContext") -> None:
     )
 
 
-def _install_geometry_release(context: "ExecutionContext", release_dir: Path) -> None:
+def _install_geometry_release(context: ExecutionContext, release_dir: Path) -> None:
     contract = context.profile.metadata.get("geometry_release")
     if not isinstance(contract, dict):
         return
@@ -3234,13 +3245,15 @@ def _install_geometry_release(context: "ExecutionContext", release_dir: Path) ->
     )
 
 
-def install_release(context: "ExecutionContext") -> None:
+def install_release(context: ExecutionContext) -> None:
     options = context.options
     release_dir = options.release_dir
     expected_source_identity = context.notes.get("source_identity_at_preflight")
-    if isinstance(expected_source_identity, str):
-        if _git_source_identity(options.source_root) != expected_source_identity:
-            raise DeploymentError("production source changed after preflight")
+    if (
+        isinstance(expected_source_identity, str)
+        and _git_source_identity(options.source_root) != expected_source_identity
+    ):
+        raise DeploymentError("production source changed after preflight")
     _prepare_backup_root(context)
     manifest_path = release_dir / "release-manifest.json"
     if manifest_path.is_file():
@@ -3385,7 +3398,7 @@ def install_release(context: "ExecutionContext") -> None:
     _record_recovery(context, release_dir, activated=False)
 
 
-def _backup_config(context: "ExecutionContext", path: Path) -> None:
+def _backup_config(context: ExecutionContext, path: Path) -> None:
     if path in context.config_backups:
         return
     if path.is_symlink():
@@ -3498,7 +3511,7 @@ def _copy_migration_source(source: Path, destination: Path) -> None:
         shutil.copy2(candidate, target)
 
 
-def _migrate_legacy_runtime_data(context: "ExecutionContext", source_env: str) -> None:
+def _migrate_legacy_runtime_data(context: ExecutionContext, source_env: str) -> None:
     values = _parse_env_values(source_env)
     targets = {
         "NUWAX_GATEWAY_ARTIFACT_DIR": Path("/var/lib/nuwax/gateway/artifacts"),
@@ -3527,7 +3540,7 @@ def _migrate_legacy_runtime_data(context: "ExecutionContext", source_env: str) -
         )
 
 
-def write_configuration(context: "ExecutionContext") -> None:
+def write_configuration(context: ExecutionContext) -> None:
     options = context.options
     config_dir = options.config_dir
     root_config = config_dir / "nuwax.env"
@@ -3548,6 +3561,7 @@ def write_configuration(context: "ExecutionContext") -> None:
         "NUWAX_LCM_URL": migrated_root_lcm_url(lcm_url_from_env_text(root_source)),
         "NUWAX_PYTHON_BIN": str(options.current_link / ".venv" / "bin" / "python"),
         "NUWAX_GATEWAY_HOST": options.gateway_host,
+        "NUWAX_GATEWAY_PORT": str(options.gateway_port),
         "NUWAX_NUWAX_WORKSPACE_DIR": str(options.current_link / "services" / "nuwax-workspace"),
         "NUWAX_GEOMETRY_RUNTIME_BINARY": str(options.current_link / "bin" / "nuwax-geometry-runtime"),
         "NUWAX_NAV_STACK_BINARY": str(options.current_link / "bin" / "nuwax-nav-stack"),
@@ -3605,7 +3619,7 @@ def write_configuration(context: "ExecutionContext") -> None:
 
 
 def _deployment_env(
-    context: "ExecutionContext",
+    context: ExecutionContext,
     *,
     active_release: bool = False,
 ) -> Mapping[str, str]:
@@ -3635,11 +3649,11 @@ def _deployment_env(
     }
 
 
-def _deployment_script(context: "ExecutionContext") -> Path:
+def _deployment_script(context: ExecutionContext) -> Path:
     return context.options.release_dir / "scripts" / "install_motion_guard_deployment.sh"
 
 
-def install_systemd(context: "ExecutionContext") -> None:
+def install_systemd(context: ExecutionContext) -> None:
     script = _require_file(_deployment_script(context), "release systemd installer")
     context.runner.run(("bash", str(script), "install"), env=_deployment_env(context), timeout=900)
     context.notes["systemd_unchanged"] = not (_systemd_backup_dir(context) / "sources.changed").is_file()
@@ -3653,7 +3667,7 @@ def install_systemd(context: "ExecutionContext") -> None:
             os.chmod(path, 0o640)
 
 
-def provision_safety(context: "ExecutionContext") -> None:
+def provision_safety(context: ExecutionContext) -> None:
     manifest = _require_file(context.options.actuator_manifest, "actuator symbols manifest")
     expected = context.notes.get("actuator_manifest_sha256")
     snapshot_dir = _prepare_backup_root(context) / "inputs"
@@ -3732,7 +3746,7 @@ def _unit_file_state(service: str) -> str:
     return state
 
 
-def enable_and_start(context: "ExecutionContext") -> None:
+def enable_and_start(context: ExecutionContext) -> None:
     script = _require_file(_deployment_script(context), "release systemd installer")
     env = _deployment_env(context)
     always_on_services, on_demand_services = _service_activation_contract(
@@ -3823,7 +3837,7 @@ def _migrate_robot_profiles(source: Path, destination: Path) -> None:
                 temporary.unlink()
 
 
-def activate_release(context: "ExecutionContext") -> None:
+def activate_release(context: ExecutionContext) -> None:
     release_dir = context.options.release_dir
     manifest = _require_file(release_dir / "release-manifest.json", "candidate release manifest")
     try:
@@ -3833,23 +3847,67 @@ def activate_release(context: "ExecutionContext") -> None:
     if payload.get("fingerprint") != context.plan.fingerprint:
         raise DeploymentError("candidate release fingerprint changed before activation")
     current = context.options.current_link
+    stopped_previous = False
     if current.is_symlink() and current.resolve() != release_dir.resolve():
         previous = _validate_managed_release(context, current.resolve(), "configuration migration source")
         if (previous / "drivers").is_dir():
             # 先沿原拥有方停机，再迁移最后保存的配置，避免切换窗口继续写旧目录。
             if not context.options.no_systemd:
+                if context.options.require_update_readiness:
+                    _require_update_readiness(context)
                 context.runner.run(("bash", str(previous / "scripts/install_motion_guard_deployment.sh"), "stop"),
                                    env=_deployment_env(context, active_release=True), timeout=300)
+                stopped_previous = True
             _migrate_robot_profiles(previous, release_dir)
+    if context.options.require_update_readiness and not stopped_previous:
+        _require_update_readiness(context)
     _switch_current(context, release_dir)
 
 
-def _health_ready(timeout_seconds: int = 90) -> None:
+class _NoHealthRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # A different server must not satisfy the active gateway's health gate.
+        return None
+
+
+def _require_update_readiness(context: ExecutionContext) -> None:
+    current = context.options.current_link
+    if not current.is_symlink() or current.resolve().parent != context.options.releases_dir.resolve():
+        raise DeploymentError("update readiness requires an existing managed active release")
+    try:
+        host, port = resolve_gateway_listener(
+            current.resolve(),
+            context.options.config_dir,
+            config_overrides=context.config_backups,
+        )
+        url = gateway_health_url(host, port).replace("/api/health/full", "/api/updates/readiness")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoHealthRedirect())
+        with opener.open(url, timeout=5) as response:
+            if response.status != 200:
+                raise DeploymentError(f"update readiness returned HTTP {response.status}")
+            data = response.read(1024 * 1024 + 1)
+            if len(data) > 1024 * 1024:
+                raise DeploymentError("update readiness response exceeds the safety limit")
+            payload = json.loads(data.decode("utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise DeploymentError(f"cannot verify update readiness before activation: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("ready") is not True:
+        raise DeploymentError("active gateway is not ready for a software update; activation refused")
+
+
+def _health_ready(
+    timeout_seconds: int = 90,
+    *,
+    gateway_host: str = "127.0.0.1",
+    gateway_port: int = 8766,
+) -> None:
+    url = gateway_health_url(gateway_host, gateway_port)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoHealthRedirect())
     deadline = time.monotonic() + timeout_seconds
     last_error = "health endpoint not attempted"
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen("http://127.0.0.1:8766/api/health/full", timeout=5) as response:
+            with opener.open(url, timeout=5) as response:
                 if response.status != 200:
                     last_error = f"HTTP {response.status}"
                 else:
@@ -3865,10 +3923,10 @@ def _health_ready(timeout_seconds: int = 90) -> None:
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
             last_error = str(exc)
         time.sleep(2)
-    raise DeploymentError(f"authoritative health did not become ready: {last_error}")
+    raise DeploymentError(f"authoritative health did not become ready at {url}: {last_error}")
 
 
-def verify_deployment(context: "ExecutionContext") -> None:
+def verify_deployment(context: ExecutionContext) -> None:
     current = context.options.current_link
     if not current.is_symlink():
         raise DeploymentError(f"active release link is missing or unsafe: {current}")
@@ -3948,10 +4006,14 @@ def verify_deployment(context: "ExecutionContext") -> None:
         as_build_user=True,
         timeout=30,
     )
-    _health_ready()
+    try:
+        gateway_host, gateway_port = resolve_gateway_listener(active_release, context.options.config_dir)
+    except (OSError, TypeError, ValueError) as exc:
+        raise DeploymentError(f"cannot resolve the active gateway listener: {exc}") from exc
+    _health_ready(gateway_host=gateway_host, gateway_port=gateway_port)
 
 
-def rollback(context: "ExecutionContext") -> bool:
+def rollback(context: ExecutionContext) -> bool:
     options = context.options
     env = _deployment_env(context)
     candidate_script = options.release_dir / "scripts" / "install_motion_guard_deployment.sh"
@@ -4010,7 +4072,7 @@ def rollback(context: "ExecutionContext") -> bool:
                         timeout=300,
                     )
                 except Exception:
-                    pass
+                    logger.exception("Could not disable candidate services during first-deployment rollback")
             try:
                 options.current_link.unlink()
             except FileNotFoundError:
@@ -4036,12 +4098,12 @@ def rollback(context: "ExecutionContext") -> bool:
                         timeout=300,
                     )
                 except Exception:
-                    pass
+                    logger.exception("Could not stop active services after rollback verification failed")
             raise
     return rollback_performed
 
 
-def load_persisted_recovery(context: "ExecutionContext") -> bool:
+def load_persisted_recovery(context: ExecutionContext) -> bool:
     backup_root = _transaction_backup_dir(context)
     recovery_path = backup_root / "recovery.json"
     if not recovery_path.is_file():
@@ -4135,9 +4197,10 @@ def load_persisted_recovery(context: "ExecutionContext") -> bool:
                 context.release_switched = False
             elif actual_current == candidate.resolve():
                 context.release_switched = True
-            elif start_target is None and actual_current is None:
-                context.release_switched = False
-            elif start_target is not None and actual_current == start_target.resolve():
+            elif (
+                (start_target is None and actual_current is None)
+                or (start_target is not None and actual_current == start_target.resolve())
+            ):
                 context.release_switched = False
             else:
                 raise DeploymentError("refusing stale rolling-back transaction: current no longer matches facts")
@@ -4147,9 +4210,10 @@ def load_persisted_recovery(context: "ExecutionContext") -> bool:
             context.release_switched = False
         elif actual_current == candidate.resolve():
             context.release_switched = True
-        elif start_target is None and actual_current is None:
-            context.release_switched = False
-        elif start_target is not None and actual_current == start_target.resolve():
+        elif (
+            (start_target is None and actual_current is None)
+            or (start_target is not None and actual_current == start_target.resolve())
+        ):
             context.release_switched = False
         else:
             raise DeploymentError("refusing stale prepared recovery: current no longer matches transaction facts")

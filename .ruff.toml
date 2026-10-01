@@ -27,3 +27,7 @@ docstring-quotes = "double"
 
 [lint.pydocstyle]
 convention = "google"
+
+[lint.pyupgrade]
+# Python 3.8 部署引导仍需在运行时解析注解，保留 typing 容器与 Optional。
+keep-runtime-typing = true

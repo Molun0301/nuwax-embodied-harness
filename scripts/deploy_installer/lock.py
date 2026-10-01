@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import fcntl
 import os
-from pathlib import Path
 import stat
+from pathlib import Path
 from typing import Optional, TextIO
 
 
@@ -12,7 +12,8 @@ class InstallerLock:
         self.path = path
         self._handle: Optional[TextIO] = None
 
-    def __enter__(self) -> "InstallerLock":
+    # This Python 3.8 bootstrap must not require typing_extensions to acquire its lock.
+    def __enter__(self) -> InstallerLock:  # noqa: PYI034
         self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         parent_metadata = self.path.parent.lstat()
         if (

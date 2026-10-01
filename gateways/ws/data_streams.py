@@ -16,7 +16,7 @@ from pathlib import Path
 import struct
 import threading
 import time
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 from uuid import UUID
 from urllib.parse import quote
 
@@ -1044,7 +1044,7 @@ def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
     return struct.pack("<8sBI", _MAP_BINARY_MAGIC, _MAP_BINARY_VERSION, len(header)) + header + np.asarray(data, dtype=np.int8).tobytes()
 
 
-def _encode_ws_frame(frame: StreamFrame) -> str | bytes:
+def _encode_ws_frame(frame: StreamFrame) -> Union[str, bytes]:
     """回放与实时发送使用同一编码；大载荷的降级也留在编码线程内。"""
     if frame.payload_kind == StreamPayloadKind.BINARY and isinstance(frame.payload, (bytes, bytearray)):
         if frame.topic not in _POINTCLOUD_BINARY_TOPICS:

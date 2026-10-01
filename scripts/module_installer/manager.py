@@ -21,7 +21,7 @@ from typing import Mapping, Optional, Sequence
 from scripts.deploy_installer.config import atomic_write, fsync_directory
 
 from .builds import build_modules, describe_builds, prune_build_cache
-from .catalog import module_imports, module_requirements, module_system_packages, resolve_modules
+from .catalog import ROBOT_REQUIREMENTS, module_imports, module_requirements, module_system_packages, resolve_modules
 from .runtime import read_existing, read_settings, write_runtime
 
 
@@ -39,6 +39,9 @@ class InstallRequest:
     python: str = ""
     wheel_dir: Optional[Path] = None
     repair: bool = False
+    keep_previous: bool = False
+    noninteractive: bool = False
+    service_mode: str = ""
 
 
 def read_current(home: Path) -> dict:
@@ -58,7 +61,7 @@ def read_current(home: Path) -> dict:
             raise ValueError("未完成的安装记录")
         if tuple(state["modules"]) != resolve_modules(state["modules"]):
             raise ValueError("模块依赖记录不完整")
-        if state["robot"] not in ("customrobot", "go2"):
+        if state["robot"] not in ROBOT_REQUIREMENTS:
             raise ValueError("未知机器人装配")
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise InstallError(f"安装状态损坏：{exc}；请检查 {prefix}") from exc
@@ -134,6 +137,7 @@ def make_plan(request: InstallRequest, hardware, current: Mapping) -> dict:
         "system_packages": list(module_system_packages(selected, request.robot)),
         "builds": list(describe_builds(selected)), "jobs": request.jobs,
         "install_dir": str(request.home),
+        "service_mode": request.service_mode or current.get("deployment", {}).get("lifecycle", {}).get("mode", "foreground"),
         "models": [name for name in ("perception", "memory") if name in selected],
         "jetson_vendor_python": hardware.is_jetson and bool(set(selected) & {"perception", "memory"}),
     }
@@ -210,7 +214,7 @@ def idle_gateway(root: Path):
         yield
 
 
-def _system_dependencies(packages: Sequence[str], run) -> None:
+def _system_dependencies(packages: Sequence[str], run, *, noninteractive: bool = False) -> None:
     missing = []
     for package in packages:
         status = subprocess.run(
@@ -223,6 +227,8 @@ def _system_dependencies(packages: Sequence[str], run) -> None:
             )
         if status.returncode or status.stdout.strip() != "install ok installed":
             missing.append(package)
+    if missing and noninteractive:
+        raise InstallError("自动更新缺少系统依赖，请由管理员先安装：" + ", ".join(missing))
     if missing:
         prefix = [] if os.geteuid() == 0 else ["sudo", "--"]
         if prefix:
@@ -347,8 +353,8 @@ def check_prerequisites(request: InstallRequest, hardware) -> str:
         raise InstallError("编译并行数必须大于零。")
     if os.geteuid() == 0:
         raise InstallError("请用普通用户运行 ./install.sh；只有缺少的系统依赖由安装器自动提权安装。")
-    if request.robot not in ("customrobot", "go2"):
-        raise InstallError("请选择标准机器人接入 customrobot 或 Go2。")
+    if request.robot not in ROBOT_REQUIREMENTS:
+        raise InstallError("请选择已注册机器人接入；自定义硬件使用 customrobot。")
     if hardware.architecture not in ("x86_64", "aarch64"):
         raise InstallError("当前自动安装面向 x86_64 与 aarch64（64位ARM架构）；请在受支持的64位主机上安装。")
     ancestor = request.home
@@ -370,13 +376,16 @@ def check_prerequisites(request: InstallRequest, hardware) -> str:
 
 def apply(request: InstallRequest, hardware) -> dict:
     seed = check_prerequisites(request, hardware)
+    from .lifecycle import MODES, deployment_descriptor
+    if request.service_mode and request.service_mode not in MODES:
+        raise InstallError("未知生命周期模式")
     source_identity = source_fingerprint(request.root, request.modules, request.robot)
     fingerprint = hashlib.sha256((source_identity + seed).encode()).hexdigest()
     with installation_lock(request.home), idle_gateway(request.root):
         current = read_current(request.home)
         if current and current.get("source_root") != str(request.root):
             raise InstallError("此安装目录属于另一个源码工作区，请使用独立 --install-dir。")
-        if current.get("fingerprint") == fingerprint and not request.repair:
+        if current.get("fingerprint") == fingerprint and not request.repair and (not request.service_mode or request.service_mode == current.get("deployment", {}).get("lifecycle", {}).get("mode", "foreground")):
             _verify_prefix(Path(current["prefix"]), request.modules)
             print("所选模块已经安装，无需重复处理。使用 --repair 可重新安装。")
             return current
@@ -390,7 +399,7 @@ def apply(request: InstallRequest, hardware) -> dict:
         temporary = request.home / (".current-" + identifier)
         try:
             print("[1/5] 安装所选模块的系统依赖", flush=True)
-            _system_dependencies(module_system_packages(request.modules, request.robot), run)
+            _system_dependencies(module_system_packages(request.modules, request.robot), run, noninteractive=request.noninteractive)
             print("[2/5] 创建独立 Python 环境", flush=True)
             _python_environment(request, hardware, prefix, seed, run)
             print(f"[3/5] 构建所选组件（并行 {request.jobs}）", flush=True)
@@ -403,6 +412,8 @@ def apply(request: InstallRequest, hardware) -> dict:
             state = {"schema": 1, "complete": True, "modules": list(request.modules),
                      "robot": request.robot, "source_root": str(request.root), "fingerprint": fingerprint,
                      "python": seed, "binaries": binaries, "installed_at": identifier}
+            mode = request.service_mode or current.get("deployment", {}).get("lifecycle", {}).get("mode", "foreground")
+            state["deployment"] = deployment_descriptor(request.root, request.home, prefix, request.modules, request.robot, mode)
             atomic_write(prefix / "manifest.json", json.dumps(state, ensure_ascii=False, indent=2) + "\n", mode=0o600)
             temporary.symlink_to(prefix.relative_to(request.home))
             os.replace(str(temporary), str(request.home / "current"))
@@ -414,7 +425,7 @@ def apply(request: InstallRequest, hardware) -> dict:
             if temporary.is_symlink():
                 temporary.unlink()
             raise
-        if previous:
+        if previous and not request.keep_previous:
             # 默认数据在安装目录之外；用户自行放进旧代际的数据同样不能删。
             references = []
             for key, value in read_settings(prefix / "settings.env").items():

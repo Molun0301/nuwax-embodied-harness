@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 from dataclasses import asdict, dataclass, field
@@ -13,6 +14,7 @@ from .profile import DeploymentProfile
 from .runner import Runner, resolve_build_account, source_user_command, source_user_environment
 from .state import StateStore
 
+logger = logging.getLogger(__name__)
 
 PHASE_ORDER: Tuple[str, ...] = (
     "preflight",
@@ -57,7 +59,7 @@ class Action:
         as_build_user: bool = False,
         network_isolated: bool = False,
         timeout: Optional[int] = None,
-    ) -> "Action":
+    ) -> Action:
         return cls(
             name=name,
             display=display,
@@ -70,10 +72,10 @@ class Action:
         )
 
     @classmethod
-    def callback(cls, name: str, callback_fn: Callback, display: Optional[str] = None) -> "Action":
+    def callback(cls, name: str, callback_fn: Callback, display: Optional[str] = None) -> Action:
         return cls(name=name, display=display or name, callback_fn=callback_fn)
 
-    def execute(self, context: "ExecutionContext") -> None:
+    def execute(self, context: ExecutionContext) -> None:
         if self.callback_fn is not None:
             self.callback_fn(context)
             return
@@ -176,6 +178,7 @@ class DeploymentEngine:
                 for action in phase.actions:
                     action.execute(context)
             except Exception as exc:
+                logger.exception("Deployment phase %s failed", phase.name)
                 rollback_error = ""
                 terminal_status = "failed"
                 if plan.rollback is not None:
@@ -183,6 +186,7 @@ class DeploymentEngine:
                         rollback_result = plan.rollback(context)
                         terminal_status = "failed" if rollback_result is False else "rolled_back"
                     except Exception as rollback_exc:
+                        logger.exception("Deployment rollback failed after phase %s", phase.name)
                         rollback_error = f"; rollback failed: {rollback_exc}"
                         terminal_status = "rollback_failed"
                 active_release = str(options.current_link.resolve()) if options.current_link.is_symlink() else None
@@ -330,6 +334,8 @@ def _fingerprint(profile: DeploymentProfile, options: DeploymentOptions) -> str:
         "dds_interface": options.dds_interface,
         "go2_robot_ip": options.go2_robot_ip,
         "gateway_host": options.gateway_host,
+        "gateway_port": options.gateway_port,
+        "require_update_readiness": options.require_update_readiness,
         "allow_unverified_third_party": options.allow_unverified_third_party,
         "allow_dirty_source": options.allow_dirty_source,
         "controlled_bringup_transaction": (options.transaction_id if options.allow_dirty_source else ""),
@@ -348,7 +354,7 @@ def _build_user_rust_paths() -> Tuple[Path, Path, Path]:
 
 
 def _cargo_environment(options: DeploymentOptions, target_dir: Path) -> Dict[str, str]:
-    cargo_home, rustup_home, toolchain_bin = _build_user_rust_paths()
+    cargo_home, rustup_home, _toolchain_bin = _build_user_rust_paths()
     return {
         "AR": "/usr/bin/ar",
         "CC": "/usr/bin/cc",

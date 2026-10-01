@@ -27,6 +27,15 @@ class G1RobotAssembly(RobotAssemblyBase):
         self._initialize_adapter_runtime(self.adapter_configs)
         self.providers = G1ProviderBundle()
 
+    def has_motion_actuator(self) -> Optional[bool]:
+        """Only the unchanged empty scaffold can prove it owns no actuator."""
+        if (type(self.providers) is G1ProviderBundle
+                and set(vars(self.providers)) <= {"provider_name", "provider_version"}
+                and not self.list_adapters()
+                and self.manifest.capability_matrix.metadata.get("implemented") is False):
+            return False
+        return None
+
     def start(self) -> None:
         """安全空实现：骨架入口未实现，启动为 no-op，使网关启动后如实呈现未实现态。"""
 

@@ -918,3 +918,17 @@ details.msb-pane>summary{display:none}
 .task-row-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
 .task-row-heading>.mono{min-width:0;overflow-wrap:anywhere}
 .task-row-heading>.pill{flex-shrink:0;white-space:nowrap}
+
+/* 软件更新入口：徽标位于品牌标题右上角，隐藏时不占位置。 */
+.brand .nm { position: relative; padding-right: 42px; }
+.update-new-badge { position: absolute; top: -9px; right: 0; border: 0; border-radius: 8px; padding: 2px 5px; background: #dc2626; color: white; font-size: 10px; font-weight: 800; cursor: pointer; }
+.update-new-badge[hidden] { display: none; }
+.update-panel { border: 1px solid var(--line, #dce1e8); border-radius: 12px; padding: 16px; margin-bottom: 18px; }
+.update-heading,.update-controls { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.update-heading { justify-content:space-between; }
+.update-heading h3 { margin:0; }
+.update-controls label { display:flex; align-items:center; gap:6px; font-size:12px; }
+#updateInterval { width:90px; }
+#updateMessage[data-state="failed"],#updateMessage[data-state="recovery_required"] { color:#dc2626; }
+#updateMessage[data-state="succeeded"] { color:#16834a; }
+#updateDialog { max-width: min(520px,90vw); }

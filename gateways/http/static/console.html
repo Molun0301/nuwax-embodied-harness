@@ -6,14 +6,14 @@
   <title>NEH · Nuwax Embodied Harness 机器人控制台</title>
   <meta name="description" content="Nuwax Embodied Harness（NEH，具身运行框架）：机器人地图、感知、空间记忆与任务控制台。">
   <link rel="icon" href="/static/neh-icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/console.css?v=20260930-task-heading">
+  <link rel="stylesheet" href="/static/console.css?v=20261001-updates">
 </head>
 <body>
 <div class="app" id="app">
   <header class="vitals card">
     <div class="brand">
       <span class="dot"></span>
-      <div><div class="nm" title="Nuwax Embodied Harness（NEH，具身运行框架）">NEH 机器人控制台</div><div class="md"><span id="robotName">机器人未连接</span> · <span id="robotModel">型号 --</span></div></div>
+      <div><div class="nm" title="Nuwax Embodied Harness（NEH，具身运行框架）">NEH 机器人控制台<button id="updateNewBadge" class="update-new-badge" type="button" title="发现新版本，打开更新设置" hidden>New！</button></div><div class="md"><span id="robotName">机器人未连接</span> · <span id="robotModel">型号 --</span></div></div>
     </div>
     <div class="vstats">
       <div class="vstat"><div class="v" id="connectionText">缺失</div><div class="l">网关</div></div>
@@ -392,6 +392,27 @@
             <div class="t"><div class="eyebrow">配置管理</div><h2>平台设置</h2></div>
             <span id="configStatus" class="pill missing">缺失</span>
           </div>
+          <section id="updatePanel" class="update-panel" aria-label="软件更新">
+            <div class="update-heading"><h3>软件更新</h3><span id="updateVersion" class="mono small">正在读取版本…</span></div>
+            <p id="updateMessage" role="status" aria-live="polite">正在读取更新状态…</p>
+            <p id="updateCheckedAt" class="muted small"></p>
+            <p id="updateUnavailable" class="muted small"></p>
+            <div class="update-controls">
+              <button id="updateCheck" class="btn" type="button">检查更新</button>
+              <button id="updateInstall" class="btn primary" type="button" disabled>更新并重启</button>
+              <label><input id="updateAutoCheck" type="checkbox">自动检查</label>
+              <label><input id="updateAutoInstall" type="checkbox">空闲时自动安装</label>
+              <label>间隔（分钟）<input id="updateInterval" class="field" type="number" min="15" max="1440" value="60"></label>
+              <button id="updateSave" class="btn" type="button">保存更新设置</button>
+            </div>
+            <p class="muted small">默认每小时检测当前分支的远端版本；自动安装需手动开启。更新会暂停服务，设备须停稳并停用电机。保留配置、地图、模型及恢复环境，只清理受管构建缓存。</p>
+          </section>
+          <dialog id="updateDialog" class="config-apply-dialog">
+            <h3>确认更新并重启</h3>
+            <p>将拉取版本 <span id="updateConfirmVersion" class="mono"></span>，编译已安装模块并重新部署。期间页面会暂时断开，后台任务不因关闭页面而取消。</p>
+            <p>请先完成或取消任务，停稳机器人并停用电机。构建或启动失败会尝试恢复旧版本，恢复结果可在此查看。</p>
+            <div class="update-controls"><button id="updateCancel" class="btn" type="button">取消</button><button id="updateConfirm" class="btn primary" type="button">确认更新</button></div>
+          </dialog>
           <div class="config-toolbar">
             <input id="configSearch" class="field" type="search" placeholder="搜索中文名称、键名或说明" aria-label="搜索配置">
             <label class="small muted config-option"><input id="configShowAdvanced" type="checkbox">展开高级项</label>
@@ -429,6 +450,7 @@
   <script>window.__NUWAX_GEOMETRY_PIPELINE__ = "__GEOMETRY_PIPELINE__"; window.__NUWAX_NAV_SUPPORT_DISTANCE__ = "__NAV_SUPPORT_DISTANCE__";</script>
   <script src="/static/js/task-feedback.js?v=20260930"></script>
   <script src="/static/js/console-logs.js?v=20260930-task-feedback"></script>
+  <script src="/static/js/console-updates.js?v=20261001"></script>
   <script src="/static/js/console-settings.js?v=20260920-settings-style"></script>
   <script src="/static/js/map-workspace.js?v=20260923-map-subbar-overlay"></script>
   <script src="/static/js/console.js?v=20260930-task-heading"></script>

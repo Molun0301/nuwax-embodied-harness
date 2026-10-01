@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 import hashlib
-from pathlib import Path
 import re
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Optional
 
+from .gateway import validate_gateway_listener
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,191}")
 
@@ -41,6 +42,8 @@ class DeploymentOptions:
     dds_interface: str = ""
     go2_robot_ip: str = ""
     gateway_host: str = "127.0.0.1"
+    gateway_port: int = 8766
+    require_update_readiness: bool = False
     offline_bundle: Optional[Path] = None
     bundle_public_key: Optional[Path] = None
     legacy_config: Optional[Path] = None
@@ -57,6 +60,9 @@ class DeploymentOptions:
     persist_state: bool = True
 
     def __post_init__(self) -> None:
+        validate_gateway_listener(self.gateway_host, self.gateway_port)
+        if not isinstance(self.require_update_readiness, bool):
+            raise TypeError("require_update_readiness must be a boolean")
         validate_identifier(self.release_id, "release_id")
         if self.transaction_id:
             validate_identifier(self.transaction_id, "transaction_id")
@@ -113,7 +119,7 @@ class DeploymentOptions:
         *,
         source_root: Path,
         dry_run: bool = False,
-    ) -> "DeploymentOptions":
+    ) -> DeploymentOptions:
         root = source_root.resolve()
         return cls(
             source_root=root,
@@ -132,5 +138,5 @@ class DeploymentOptions:
             persist_state=False,
         )
 
-    def with_release_id(self, release_id: str) -> "DeploymentOptions":
+    def with_release_id(self, release_id: str) -> DeploymentOptions:
         return replace(self, release_id=release_id)

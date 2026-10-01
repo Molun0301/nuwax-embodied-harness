@@ -57,6 +57,9 @@ MODULES: dict[str, ModuleSpec] = {
     ),
 }
 
+# Adapter identifiers describe installable integration packages, not hardware
+# readiness. G1 remains a scaffold; installing its dependencies does not implement
+# motion control or bypass adapter-specific provisioning and safety guards.
 ROBOT_REQUIREMENTS = {
     "customrobot": (),
     "go2": ("requirements/robot-go2.in",),

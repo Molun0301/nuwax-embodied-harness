@@ -214,6 +214,8 @@ def create_gateway_app(
     agent_tools = None
     agent_tools_lock = threading.Lock()
     request_log_limiter = LogRateLimiter()
+    from gateways.updates import UpdateService, build_update_router, UpdateMaintenanceMiddleware
+    updates = UpdateService(runtime)
 
     def get_agent_tools():
         nonlocal agent_tools
@@ -230,8 +232,10 @@ def create_gateway_app(
                 await run_in_threadpool(get_agent_tools)
                 APP_LOGGER.info("宿主机网关运行时准备启动。")
                 await run_in_threadpool(runtime.start)
+                updates.start()
             yield
         finally:
+            await updates.close()
             try:
                 if start_runtime_on_lifespan:
                     APP_LOGGER.info("宿主机网关运行时准备停止。")
@@ -245,6 +249,9 @@ def create_gateway_app(
     app.state.config = config
     app.state.access_manager = access_manager
     app.state.agent_tools = agent_tools
+    app.state.updates = updates
+    app.add_middleware(UpdateMaintenanceMiddleware, service=updates)
+    app.include_router(build_update_router(updates))
 
     app.add_middleware(RequestLoggingMiddleware, request_log_limiter=request_log_limiter)
 

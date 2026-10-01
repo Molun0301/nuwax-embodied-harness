@@ -14,7 +14,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .catalog import MODULES, remove_modules, replace_lio, resolve_modules
+from .catalog import MODULES, ROBOT_REQUIREMENTS, remove_modules, replace_lio, resolve_modules
 from .doctor import diagnose
 from .hardware import detect_hardware, recommend_modules
 from .manager import InstallError, InstallRequest, apply, existing_config, make_plan, read_current
@@ -53,11 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--modules", help="完整目标模块列表；默认采用已有选择或自动推荐")
     selection.add_argument("--preset", choices=tuple(PRESETS), help="完整安装方案：basic 基础接入，map2d 二维建图，map3d 三维建图；替换当前模块选择")
-    parser.add_argument("--robot", choices=("auto", "customrobot", "go2"), default="auto", help="自动沿用配置，未知设备使用标准接入")
+    parser.add_argument("--robot", choices=("auto", *ROBOT_REQUIREMENTS), default="auto", help="自动沿用配置，未知设备使用标准接入")
     parser.add_argument("--lio", choices=("fastlio2", "pointlio", "device"), help="切换定位算法；device 表示设备已有里程计")
     parser.add_argument("--install-dir", type=Path, help="专属安装目录，默认 runtime_data/installation")
+    parser.add_argument("--service-mode", choices=("foreground", "systemd-user"), default="", help="初次安装的运行模式；后续默认保留已存模式")
     parser.add_argument("--python", default="", help="指定 Python（编程语言）3.8—3.12 解释器")
-    parser.add_argument("--wheel-dir", type=Path, help="包含 Go2 设备安装包的目录；已有可用设备依赖时自动复用")
+    parser.add_argument("--wheel-dir", type=Path, help="包含所选机器人适配器设备安装包的目录；已有可用设备依赖时自动复用")
     parser.add_argument("--jobs", type=int, help="编译并行数，默认依据处理器和内存自动限制")
     parser.add_argument("--yes", "-y", action="store_true", help="接受显示的目标方案，不再交互确认")
     parser.add_argument("--dry-run", action="store_true", help="只查看模块、依赖和构建计划，不写入文件")
@@ -92,7 +93,7 @@ def _show_modules(selected: Sequence[str]) -> None:
 
 def _show_plan(plan: dict) -> None:
     print("\n目标模块：" + "、".join(MODULES[key].title for key in plan["modules"]))
-    print("机器人接入：%s" % ("Go2（宇树四足机器人）" if plan["robot"] == "go2" else "标准输入（设备型号和传感器待接入）"))
+    print("机器人接入：" + plan["robot"] + ("（接入骨架；不代表设备驱动已经实现）" if plan["robot"] == "g1" else ""))
     for label, key in (("新增", "add"), ("移除", "remove")):
         if plan[key]:
             print(label + "：" + "、".join(MODULES[name].title for name in plan[key]))
@@ -150,13 +151,22 @@ def _stop(current: dict, root: Path) -> int:
         pid = int(pid_file.read_text().strip())
         if pid <= 1:
             raise ValueError("无效进程编号")
+        process_path = Path("/proc") / str(pid)
+        if process_path.joinpath("stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+            return 0
         environment = (Path("/proc") / str(pid) / "environ").read_bytes().split(b"\0")
         identity = ("NUWAX_BOOTSTRAP_ENV_FILE=" + str(prefix / "settings.env")).encode()
         if identity not in environment:
             raise InstallError("进程不属于当前模块安装，未发送停止信号。")
         os.kill(pid, signal.SIGTERM)
         for _ in range(150):
-            if not (Path("/proc") / str(pid)).exists():
+            process_path = Path("/proc") / str(pid)
+            # 更新器可能是父进程；僵尸已退出且不再持有锁，随后由父进程回收。
+            try:
+                exited = process_path.joinpath("stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+            except FileNotFoundError:
+                exited = True
+            if exited:
                 print("当前安装的网关已停止。")
                 return 0
             time.sleep(0.2)
@@ -178,6 +188,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.error("add/remove 需要模块名称，且不能与 --modules 或 --preset 同用。")
         if args.command in ("list", "start", "stop") and (args.modules is not None or args.preset or args.lio or args.repair):
             parser.error("list/start/stop 不修改安装选择；请先用 install/add/remove。")
+        if args.service_mode and args.command in ("list", "start", "stop"):
+            parser.error("--service-mode 只能通过安装变更；start/stop 保留已存模式")
         current = read_current(home)
         if args.command == "list":
             if args.json:
@@ -200,10 +212,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 0
             if not current:
                 raise InstallError("尚未安装，请先运行 ./install.sh。")
+            from .lifecycle import inspect_installation, start_current, stop_current
+            descriptor = inspect_installation(home, environment=os.environ)
             if args.command == "stop":
-                return _stop(current, root)
-            script = str(Path(current["prefix"]) / "start.sh")
-            os.execv("/bin/bash", ["bash", script])
+                return stop_current(descriptor)
+            start_current(descriptor, foreground=True)
+            return 0
         hardware = detect_hardware(home)
         existing = existing_config(root, current)
         if args.robot != "auto":
@@ -226,7 +240,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.lio:
             selected = replace_lio(selected, args.lio)
         robot = args.robot if args.robot != "auto" else current.get("robot", recommendation.robot)
-        if robot not in ("customrobot", "go2"):
+        if robot not in ROBOT_REQUIREMENTS:
             robot = "customrobot"
         jobs = args.jobs if args.jobs is not None else hardware.build_jobs
         if jobs < 1:
@@ -238,7 +252,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             wheel_dir = cached if cached.is_dir() else conventional if conventional.is_dir() else None
         request = InstallRequest(root, home, tuple(selected), robot, jobs,
                                  args.python or current.get("python", ""),
-                                 wheel_dir.expanduser().resolve() if wheel_dir else None, args.repair)
+                                 wheel_dir.expanduser().resolve() if wheel_dir else None, args.repair, service_mode=args.service_mode)
         preview = args.dry_run or args.json or args.command == "doctor"
         if not args.json:
             _show_hardware(hardware, recommendation, show_reasons=args.modules is None and not args.preset and args.command in ("manage", "install", "doctor"))

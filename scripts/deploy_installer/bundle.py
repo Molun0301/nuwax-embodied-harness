@@ -3,11 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
 import shutil
-import subprocess
 import stat
+import subprocess
 import tarfile
+from pathlib import Path, PurePosixPath
 from typing import Dict, Mapping, Optional
 
 from .config import atomic_write

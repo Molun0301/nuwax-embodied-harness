@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 import json
 import os
 import platform
@@ -9,6 +8,7 @@ import secrets
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -125,6 +125,12 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-start", action="store_true")
     parser.add_argument("--no-verify", action="store_true")
     parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+    parser.add_argument("--gateway-port", type=int, default=8766, help="gateway 监听端口（1–65535）")
+    parser.add_argument(
+        "--require-update-readiness",
+        action="store_true",
+        help="切换前重新验收当前网关的软件更新安全条件；不满足时禁止停机或激活",
+    )
     exposure = parser.add_mutually_exclusive_group()
     exposure.add_argument("--gateway-host", default="127.0.0.1")
     exposure.add_argument(
@@ -233,6 +239,8 @@ def _options(args: argparse.Namespace, *, dry_run: bool) -> DeploymentOptions:
         dds_interface=args.dds_interface,
         go2_robot_ip=str(args.go2_robot_ip or "").strip(),
         gateway_host=gateway_host,
+        gateway_port=args.gateway_port,
+        require_update_readiness=args.require_update_readiness,
         offline_bundle=offline_bundle,
         bundle_public_key=(args.bundle_public_key.expanduser().resolve() if args.bundle_public_key else None),
         legacy_config=(args.legacy_config.expanduser().resolve() if args.legacy_config else None),
@@ -286,7 +294,7 @@ def _load_json(path: Path, label: str) -> dict:
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"cannot read {label} {path}: {exc}") from exc
     if not isinstance(data, dict):
-        raise RuntimeError(f"{label} must be a JSON object: {path}")
+        raise TypeError(f"{label} must be a JSON object: {path}")
     return data
 
 
@@ -310,7 +318,7 @@ def _newest_transaction_state(state_dir: Path) -> dict:
         transaction_id = record.get("transaction_id")
         started_at = record.get("started_at")
         if not isinstance(transaction_id, str) or not isinstance(started_at, (int, float)):
-            raise RuntimeError(f"deployment transaction identity is invalid: {path}")
+            raise TypeError(f"deployment transaction identity is invalid: {path}")
         if path.stem != transaction_id:
             raise RuntimeError(f"deployment transaction filename does not match its identity: {path}")
         journal_records[transaction_id] = record
@@ -345,7 +353,7 @@ def _newest_transaction_state(state_dir: Path) -> dict:
 def _save_transaction_state(state_dir: Path, state: dict) -> None:
     transaction_id = state.get("transaction_id")
     if not isinstance(transaction_id, str):
-        raise RuntimeError("deployment transaction_id is missing")
+        raise TypeError("deployment transaction_id is missing")
     validate_identifier(transaction_id, "transaction_id")
     rendered = json.dumps(state, indent=2, sort_keys=True) + "\n"
     atomic_write(
@@ -692,7 +700,7 @@ def _status(state_dir: Path, install_root: Path) -> int:
     except FileNotFoundError:
         print(f"尚无部署状态: {path}")
         return 1
-    except (OSError, json.JSONDecodeError, RuntimeError) as exc:
+    except (OSError, json.JSONDecodeError, RuntimeError, TypeError) as exc:
         print(f"无法读取部署状态: {exc}", file=sys.stderr)
         return 1
     if not data:
@@ -791,7 +799,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         parser.error(f"unknown command: {args.command}")
         return 64
-    except (ProfileError, RuntimeError, OSError, ValueError) as exc:
+    except (ProfileError, RuntimeError, OSError, TypeError, ValueError) as exc:
         print(f"installer error: {exc}", file=sys.stderr)
         return 1
 

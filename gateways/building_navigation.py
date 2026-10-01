@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 import time
-from typing import Any
+from typing import Any, Optional
 
 from contracts.building_navigation import FloorPose
 from contracts.geometry import Pose, Quaternion, Vector3
@@ -18,7 +18,7 @@ from providers.facilities import BoundedDockingProvider
 class GatewayBuildingPorts:
     """一个原平台任务持有的接线对象，不创建额外导航任务或速度写入端。"""
 
-    def __init__(self, runtime: Any, context: Any, admission: Any, *, requested_by: str | None = None) -> None:
+    def __init__(self, runtime: Any, context: Any, admission: Any, *, requested_by: Optional[str] = None) -> None:
         self.runtime = runtime
         self.context = context
         self.task_id = context.task_id

@@ -1,5 +1,18 @@
 # Local planning CPU ownership
 
+## Qualification status correction
+
+The first moving factory/measured logs did **not** enforce delivered
+`ReplanRequired`/`Failed` transitions. They are movement plus geometry/braking
+oracle evidence only, **not rejection-respecting task-completion qualification**.
+The core owner/cancellation milestone is independently tested, but no strict
+20 Hz guarantee is established. Terminal-aware replacement experiments stop on
+any delivered negative. Explicitly primed arms first acquire/install two real,
+wall-spaced source samples; the cold-first-acquisition arm remains separate.
+Neither arm implements the full NavScheduler/motion-port fencing pipeline.
+Historical failures and superseded logs are preserved below.
+
+
 `RouteFollower` keeps `SurfaceFollower` as its only motion/control owner. With
 local planning enabled it owns exactly one reusable `nav-local-planning` thread.
 OFF creates no planning thread or exchange. The existing outer `PlannerWorker`
@@ -142,3 +155,43 @@ interrupted; subsequent commands reused the established target with two jobs.
 Measured inner-control CPU, held-planning real-worker continuity and the separate
 1 cm stress experiment remain later qualification steps; initial milestone
 signoff does not assert their outcome.
+
+### Qualification corrections and residual costs
+
+The initial factory and measured moving runs above used a test consumer that
+mapped delivered `ReplanRequired`/`Failed` to zero and could continue the same
+route. That is not the real NavScheduler transition protocol. Their motion and
+independent geometry/braking checks remain observations, but they do **not**
+establish rejection-respecting full-task completion. Terminal-aware replacement
+experiments must record the exact delivered negative and stop; prior logs are
+retained without relabeling them successful qualification.
+
+The first measured ON run reached its configured region at
+(1.604614, 1.5, 0.5), yaw 1.438178 rad: position error 0.145386 m and yaw error
+0.132618 rad against a (1.75, 1.5, 0.5), pi/2 target with strict 0.15 m/0.15 rad
+tolerances. Its actual travel was 0.854614 m, not a literal 1 m traversal. Measured
+control wall time was median/p95/max 21.55/34.27/48.28 ms. The initial OFF run also
+reached its region but **failed** the 50 ms control criterion: maximum 108.37 ms
+with no planning jobs. This is a residual control/scheduling cost independent of
+the planning owner, not grounds to relax any velocity or observation deadline.
+
+The original held-second-job experiment recorded six fresh nonzero commands after
+the original lease while that job was held, three admissions and 4.418 m of
+actual progress. It passed the postrun motion/braking oracles, but **failed** its
+60 s full 7 m goal window and recorded a 57.85 ms maximum control step. A separate
+continuity-property experiment and any longer goal run must be clearly named and
+must not relabel this run a pass. The normal empty 5 Hz sensor queue is separately
+reported from actual consumer Pending/source-fence/expiry outcomes.
+
+The five existing UDS regression fixtures still could not bind sockets (`EPERM`)
+in a separately approved less-restricted invocation. Their environment blocker
+remains explicit; no passing UDS result is claimed for this environment.
+
+The steady-input harness still dequeues/installs a new map immediately before a
+consumer tick. This intentionally conservative phase coupling can produce a
+periodic source-fence Pending and an applied-command ramp reset. Its frequency is
+not a measurement of asynchronous NavScheduler input timing or sensor starvation.
+Replacement/retirement arms stop immediately too; a delivered current
+ReplanRequired after a restrictive boundary/geometry change is an expected safe
+rejection, while unexpected Failed or any stale positive remains a failure.
+Goal/continuity arms reject every delivered negative.

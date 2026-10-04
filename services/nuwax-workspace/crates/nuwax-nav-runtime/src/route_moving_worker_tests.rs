@@ -134,7 +134,7 @@ impl NavPlanner for Measured {
 }
 
 #[derive(Clone,Copy,Debug,PartialEq)]
-enum Scenario {Goal,HoldFirst,HoldSecond,ReplaceGoal,ReplacePath,ReplaceBoundary,ReplaceGeometry,Cancel}
+enum Scenario {Goal,HoldFirst,HoldSecond,HoldSecondContinuity,ReplaceGoal,ReplacePath,ReplaceBoundary,ReplaceGeometry,Cancel}
 struct RawReceipt {map:Arc<SurfaceSnapshot>,boundary:Arc<Vec<[f64;2]>>,pose:PlanarPose,before:Twist2,command:Twist2,ns:u64}
 struct RawSegment {map:Arc<SurfaceSnapshot>,boundary:Arc<Vec<[f64;2]>>,from:PlanarPose,to:PlanarPose,ns:u64,dt:f64}
 fn distribution(values:&[f64])->(f64,f64,f64) {let mut v=values.to_vec();v.sort_by(f64::total_cmp);if v.is_empty(){return (0.0,0.0,0.0);} (v[v.len()/2],v[((v.len()-1)as f64*0.95).ceil()as usize],*v.last().unwrap())}
@@ -160,8 +160,16 @@ impl ConsumerWaits {
 }
 fn cpu_snapshot()->String {format!("stat={:?} status_threads={:?}",std::fs::read_to_string("/proc/self/stat").ok(),std::fs::read_to_string("/proc/self/status").ok().and_then(|s|s.lines().find(|l|l.starts_with("Threads:")).map(str::to_owned)))}
 
+// Existing entrypoints intentionally remain the cold first-acquisition arm.
 fn run(enabled:bool,resolution:f32,scenario:Scenario,factory:bool) {
-    let (config,base,keys)=fixture(enabled,resolution,if scenario==Scenario::HoldSecond{10.0}else{6.0});
+    run_startup(enabled,resolution,scenario,factory,false);
+}
+fn run_startup(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,primed:bool) {
+    run_with_budget(enabled,resolution,scenario,factory,primed,MAX_TICKS);
+}
+fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,primed:bool,max_ticks:usize) {
+    let (config,base,keys)=fixture(enabled,resolution,if matches!(scenario,Scenario::HoldSecond|Scenario::HoldSecondContinuity){10.0}else{6.0});
+    let priming_started=Instant::now();
     let sensor=Sensor::new(base.clone(),keys);
     let probe=Arc::new(Mutex::new(Probe{control_ms:Vec::with_capacity(MAX_TICKS*2),..Default::default()}));
     let jobs=Arc::new(AtomicUsize::new(0));let held=Arc::new(AtomicBool::new(false));
@@ -170,26 +178,46 @@ fn run(enabled:bool,resolution:f32,scenario:Scenario,factory:bool) {
         let count=jobs.clone();let active=held.clone();
         let inner=RouteFollower::new_with_planning_hook(config.clone(),Box::new(move |_| {
             let job=count.fetch_add(1,Ordering::SeqCst)+1;
-            let hold=match scenario{Scenario::Goal=>false,Scenario::HoldSecond=>job==2,_=>job==1};
+            let hold=match scenario{Scenario::Goal=>false,Scenario::HoldSecond|Scenario::HoldSecondContinuity=>job==2,_=>job==1};
             if hold {active.store(true,Ordering::Release);let _=receive.recv_timeout(Duration::from_secs(10));active.store(false,Ordering::Release);}
         })).unwrap();
         planner_worker::PlannerWorker::new(Measured{inner,probe:probe.clone()}).unwrap()
     };
+    let mut map=base;let mut boundary=Arc::new(Vec::new());let mut frames=0usize;let mut sensor_no_new_frame=0usize;let mut consumer_waits=ConsumerWaits::default();
+    let mut previous_frame=None::<u64>;let mut previous_source=None::<Arc<SurfaceSnapshot>>;let mut sequence=0u16;
+    if primed {
+        // Same live 5Hz producer and one-frame queue as the cold arm. Install two
+        // separately acquired frames before any goal/path; never edit their hits
+        // or timestamps. The producer continues normally after priming.
+        for _ in 0..2 {
+            let frame=sensor.receive.recv_timeout(Duration::from_secs(5)).expect("two real priming frames");
+            assert!(frame.sample_ns<=unix_ns());
+            if let Some(previous)=previous_frame {
+                assert!(frame.sample_ns>previous);
+                let old=previous_source.as_ref().unwrap();
+                assert!(nuwax_nav_pct::same_source_geometry(old,&frame.map));
+                assert!(!old.same_body_query_view(&frame.map));
+            }
+            previous_frame=Some(frame.sample_ns);previous_source=Some(frame.map.clone());sequence=frame.sequence;frames+=1;
+            map=frame.map;worker.update_execution_map(ExecutionMap::Surface(map.clone())).unwrap();
+        }
+        assert!(sequence>=2);
+    }
+    let priming_duration=if primed {priming_started.elapsed()}else{Duration::ZERO};
+    let startup=if primed {"primed_two_real_frames"}else{"cold_first_acquisition"};
     let mut current=pose(0.75,1.5,0.0);
-    let goal=pose(if scenario==Scenario::HoldSecond{7.75}else{1.75},1.5,std::f64::consts::FRAC_PI_2);
+    let goal=pose(if matches!(scenario,Scenario::HoldSecond|Scenario::HoldSecondContinuity){7.75}else{1.75},1.5,std::f64::consts::FRAC_PI_2);
     let options=GoalOptions {position_tolerance_m:0.15,yaw_tolerance_rad:0.15,allow_reverse:false};
     worker.configure_goal(&goal,options).unwrap();worker.update_odometry(current.clone());
     worker.replace_execution_path(ExecutionPath::Surface(Path3D{poses:vec![current.clone(),goal.clone()]}),None,goal.clone()).unwrap();
-    let mut map=base;let mut boundary=Arc::new(Vec::new());let mut frames=0usize;let mut sensor_no_new_frame=0usize;let mut consumer_waits=ConsumerWaits::default();
-    let mut previous_frame=None::<u64>;let mut previous_source=None::<Arc<SurfaceSnapshot>>;let mut sequence=0u16;
     let mut receipts=Vec::with_capacity(MAX_TICKS);let mut segments=Vec::with_capacity(MAX_TICKS);
     let mut gaps=Vec::with_capacity(MAX_TICKS);let mut consume_ms=Vec::with_capacity(MAX_TICKS);
     let mut command=Twist2::ZERO;let mut command_at=Instant::now();let mut command_deadline=command_at;let mut segment_ns=unix_ns();
-    let mut nonzero_count=0;let mut accepted=0;let mut held_nonzero=0;let mut succeeded=false;
-    let mut hold_start=None;let mut hold_frame_count=0;let mut changed=false;let mut retired_deadline=None;
+    let mut nonzero_count=0;let mut accepted=0;let mut held_nonzero=0;let mut succeeded=false;let mut delivered_negative=0usize;let mut delivered_negative_reason=None::<String>;let mut expected_current_rejection=false;
+    let mut hold_start=None;let mut hold_frame_count=0;let mut hold_admitted_count=0;let mut released_at=None;let mut continuity_complete=false;let mut changed=false;let mut retired_deadline=None;
     let started=Instant::now();let mut last_tick=started;let mut deadline=started;
     let cpu_before=cpu_snapshot();
-    for tick in 0..MAX_TICKS {
+    for tick in 0..max_ticks {
         if let Some(delay)=deadline.checked_duration_since(Instant::now()){std::thread::sleep(delay);}
         let now=Instant::now();let elapsed=now.duration_since(last_tick);gaps.push(elapsed.as_secs_f64()*1e3);
         // Ideal kinematic actuator: only previously accepted commands cause
@@ -211,9 +239,9 @@ fn run(enabled:bool,resolution:f32,scenario:Scenario,factory:bool) {
             if !changed || !matches!(scenario,Scenario::ReplaceGeometry|Scenario::Cancel){map=frame.map;worker.update_execution_map(ExecutionMap::Surface(map.clone())).unwrap();}
         }else{sensor_no_new_frame+=1;}
         worker.update_odometry(current.clone());
-        if held.load(Ordering::Acquire)&&hold_start.is_none(){hold_start=Some(now);hold_frame_count=frames;}
+        if held.load(Ordering::Acquire)&&hold_start.is_none(){hold_start=Some(now);hold_frame_count=frames;hold_admitted_count=probe.lock().unwrap().admitted;}
         if let Some(hold)=hold_start {
-            if !changed && !matches!(scenario,Scenario::HoldFirst|Scenario::HoldSecond) {
+            if !changed && !matches!(scenario,Scenario::HoldFirst|Scenario::HoldSecond|Scenario::HoldSecondContinuity) {
                 changed=true;
                 match scenario {
                     Scenario::ReplaceGoal=>{let g=pose(current.pose.position.x,2.2,0.0);worker.configure_goal(&g,options).unwrap();},
@@ -224,7 +252,7 @@ fn run(enabled:bool,resolution:f32,scenario:Scenario,factory:bool) {
                 }
                 retired_deadline=Some(now+Duration::from_secs(2));
             }
-            if now.duration_since(hold)>=Duration::from_millis(650){let _=release.try_send(());}
+            if released_at.is_none()&&now.duration_since(hold)>=Duration::from_millis(650)&&release.try_send(()).is_ok(){released_at=Some(now);}
         }
         let t=Instant::now();let result=worker.step(WIDTH);consume_ms.push(t.elapsed().as_secs_f64()*1e3);
         if matches!(&result,PlannerStep::Pending(_)){consumer_waits.record(worker.execution_wait_reason());}
@@ -235,7 +263,15 @@ fn run(enabled:bool,resolution:f32,scenario:Scenario,factory:bool) {
         if matches!(&result,PlannerStep::Command(_))&&permitted_until<=receipt_at{consumer_waits.expired_at_receipt+=1;}
         let before=command;command=match result {
             PlannerStep::Command(v) if permitted_until>receipt_at=>{accepted+=1;if nonzero(v){nonzero_count+=1;if held.load(Ordering::Acquire)&&frames>hold_frame_count&&hold_start.is_some_and(|start|now.duration_since(start)>DEFAULT_CONTROL_HORIZON+PERIOD){held_nonzero+=1;}}v},
-            PlannerStep::Succeeded=>{succeeded=true;Twist2::ZERO},_=>Twist2::ZERO,
+            PlannerStep::Succeeded=>{succeeded=true;Twist2::ZERO},
+            negative @ (PlannerStep::ReplanRequired(_)|PlannerStep::Failed(_))=>{
+                expected_current_rejection=changed&&matches!(scenario,Scenario::ReplaceBoundary|Scenario::ReplaceGeometry)
+                    &&matches!(&negative,PlannerStep::ReplanRequired(_));
+                delivered_negative+=1;delivered_negative_reason=Some(format!("{negative:?}"));
+                // A real scheduler leaves this execution state on a terminal or
+                // replan outcome. Retire the route now; never keep stepping it.
+                worker.stop();Twist2::ZERO
+            },_=>Twist2::ZERO,
         };
         // First acquisition has one hit, never fabricate independent evidence.
         if nonzero(command){assert!(sequence>=2);}
@@ -243,10 +279,14 @@ fn run(enabled:bool,resolution:f32,scenario:Scenario,factory:bool) {
         command_at=receipt_at;command_deadline=permitted_until;segment_ns=unix_ns();
         if nonzero(command){receipts.push(RawReceipt{map:map.clone(),boundary:boundary.clone(),pose:planar(&current),before,command,ns:segment_ns});}
         worker.observe_applied_command(command);
-        if succeeded||retired_deadline.is_some_and(|d|Instant::now()>=d){break;}
+        if scenario==Scenario::HoldSecondContinuity&&held_nonzero>=2&&released_at.is_some()
+            &&!held.load(Ordering::Acquire)&&probe.lock().unwrap().admitted>hold_admitted_count {
+            continuity_complete=true;
+        }
+        if delivered_negative_reason.is_some()||continuity_complete||succeeded||retired_deadline.is_some_and(|d|Instant::now()>=d){break;}
         deadline+=PERIOD;
         if deadline<Instant::now(){deadline=Instant::now();} // no fake catch-up feedback
-        if tick+1==MAX_TICKS {eprintln!("TIMEOUT scenario={scenario:?} enabled={enabled} pose={current:?} wait={:?}",worker.execution_wait_reason());}
+        if tick+1==max_ticks {eprintln!("TIMEOUT scenario={scenario:?} enabled={enabled} pose={current:?} wait={:?}",worker.execution_wait_reason());}
     }
     let time_to_goal=started.elapsed();worker.stop();let _=release.try_send(());
     drop(worker); // control/planning samples settled before reading metrics
@@ -255,8 +295,9 @@ fn run(enabled:bool,resolution:f32,scenario:Scenario,factory:bool) {
     let distance_m: f64=segments.iter().map(|s|(s.to.x-s.from.x).hypot(s.to.y-s.from.y)).sum();
     let displacement_m=(current.pose.position.x-0.75).hypot(current.pose.position.y-1.5);
     let tick_gaps=&gaps[1..];
-    eprintln!("MOVING scenario={scenario:?} enabled={enabled} source_cm={} factory={factory} elapsed_s={:.3} succeeded={succeeded} accepted={accepted} nonzero={nonzero_count} held_nonzero={held_nonzero} sensor_frames={frames} sensor_no_new_frame={sensor_no_new_frame} dropped_frames={} consumer_waits={consumer_waits:?} planning_metrics=[{planning_metrics}] final_pose_xyzyaw={:?} actual_displacement_m={displacement_m:.6} actual_travel_m={distance_m:.6} tick_gap_ms_median_p95_max={} tick_gaps_over_50ms={} tick_gaps_over_75ms={} consumer_ms_median_p95_max={} control_step_ms_median_p95_max={} map_update_ms_median_p95_max={}\nCPU BEFORE {cpu_before}\nCPU AFTER {}",
-        resolution*100.0,time_to_goal.as_secs_f64(),sensor.dropped.load(Ordering::Relaxed),
+    let remaining_goal_m=current.pose.position.distance(goal.pose.position);
+    eprintln!("MOVING scenario={scenario:?} enabled={enabled} source_cm={} factory={factory} startup={startup} priming_s={:.3} elapsed_s={:.3} succeeded={succeeded} continuity_complete={continuity_complete} remaining_goal_m={remaining_goal_m:.6} max_ticks={max_ticks} delivered_negative={delivered_negative} delivered_negative_reason={delivered_negative_reason:?} expected_current_rejection={expected_current_rejection} accepted={accepted} nonzero={nonzero_count} held_nonzero={held_nonzero} sensor_frames={frames} sensor_no_new_frame={sensor_no_new_frame} dropped_frames={} consumer_waits={consumer_waits:?} planning_metrics=[{planning_metrics}] final_pose_xyzyaw={:?} actual_displacement_m={displacement_m:.6} actual_travel_m={distance_m:.6} tick_gap_ms_median_p95_max={} tick_gaps_over_50ms={} tick_gaps_over_75ms={} consumer_ms_median_p95_max={} control_step_ms_median_p95_max={} map_update_ms_median_p95_max={}\nCPU BEFORE {cpu_before}\nCPU AFTER {}",
+        resolution*100.0,priming_duration.as_secs_f64(),time_to_goal.as_secs_f64(),sensor.dropped.load(Ordering::Relaxed),
         [current.pose.position.x,current.pose.position.y,current.pose.position.z,current.pose.orientation.yaw()],
         measured_distribution(tick_gaps),tick_gaps.iter().filter(|ms|**ms>50.0).count(),tick_gaps.iter().filter(|ms|**ms>75.0).count(),
         measured_distribution(&consume_ms),measured_distribution(&p.control_ms),measured_distribution(&p.map_update_ms),cpu_snapshot());
@@ -278,9 +319,15 @@ fn run(enabled:bool,resolution:f32,scenario:Scenario,factory:bool) {
         };
         assert!(nuwax_nav_control::check_stopping_trajectory_with_period_check(r.pose,r.before,r.command,&limits(),PERIOD.as_secs_f64(),f64::from(resolution)*0.5,r.map.body_envelope().unwrap().radius(),check,check).is_some(),"receipt {i} independent full braking oracle rejected");
     }
+    assert!(delivered_negative_reason.is_none()||expected_current_rejection,"delivered_negative={delivered_negative}: {}",delivered_negative_reason.as_deref().unwrap_or("none"));
     let p=probe.lock().unwrap();
     if matches!(scenario,Scenario::Goal|Scenario::HoldFirst|Scenario::HoldSecond){assert!(succeeded,"full position plus final yaw required");assert!(nonzero_count>0);assert!(!segments.is_empty());assert!(current.pose.position.x>1.5,"actual accepted-command displacement required");assert!(current.pose.position.distance(goal.pose.position)<options.position_tolerance_m);assert!(nuwax_nav_astar::controllers::angle_diff(current.pose.orientation.yaw(),goal.pose.orientation.yaw()).abs()<options.yaw_tolerance_rad);}
-    if scenario==Scenario::HoldSecond{assert!(held_nonzero>=2,"must continue fresh guarded motion on previously accepted path while real planning owner is held");}
+    if matches!(scenario,Scenario::HoldSecond|Scenario::HoldSecondContinuity){assert!(held_nonzero>=2,"must continue fresh guarded motion on previously accepted path while real planning owner is held");}
+    if scenario==Scenario::HoldSecondContinuity {
+        assert!(continuity_complete,"held-planning continuity needs fresh held commands, 650ms release and a newer actual admission");
+        assert!(released_at.is_some()&&p.admitted>hold_admitted_count);
+        assert!(!segments.is_empty()&&distance_m>0.0,"actual motion required; this arm makes no full-goal claim");
+    }
     if scenario==Scenario::HoldFirst{assert!(frames>=4&&p.admitted>0,"metadata churn must allow a current job to finish/admit");}
     if matches!(scenario,Scenario::ReplaceGoal|Scenario::ReplaceBoundary|Scenario::ReplaceGeometry|Scenario::Cancel){assert!(changed&&hold_start.is_some());assert_eq!(p.admitted,0,"old held candidate must not become admitted");}
     if scenario==Scenario::ReplacePath {assert!(changed);assert!(p.endpoints.iter().all(|end|(end[0]-0.75).abs()<0.15&&end[1]>1.9),"old eastbound endpoint survived northbound path replacement: {:?}",p.endpoints);}
@@ -330,3 +377,35 @@ fn moving_5cm_source_positive_and_expired_negative_probe() {
 fn moving_measured_5cm_off_full_goal(){run(false,0.05,Scenario::Goal,false);}
 #[test] #[ignore="independent ON measured run; failure cannot hide OFF evidence"]
 fn moving_measured_5cm_on_full_goal(){run(true,0.05,Scenario::Goal,false);}
+
+#[test] #[ignore="independent 1cm OFF stress; failure cannot hide ON evidence"]
+fn moving_1cm_stress_off_full_goal(){run(false,0.01,Scenario::Goal,false);}
+#[test] #[ignore="independent 1cm ON stress; failure cannot hide OFF evidence"]
+fn moving_1cm_stress_on_full_goal(){run(true,0.01,Scenario::Goal,false);}
+
+
+#[test] #[ignore="primed real factory OFF; two genuine frames before goal/path"]
+fn moving_factory_5cm_primed_off_full_goal(){run_startup(false,0.05,Scenario::Goal,true,true);}
+#[test] #[ignore="primed real factory ON; two genuine frames before goal/path"]
+fn moving_factory_5cm_primed_on_full_goal(){run_startup(true,0.05,Scenario::Goal,true,true);}
+#[test] #[ignore="primed measured OFF; two genuine frames before goal/path"]
+fn moving_measured_5cm_primed_off_full_goal(){run_startup(false,0.05,Scenario::Goal,false,true);}
+#[test] #[ignore="primed measured ON; two genuine frames before goal/path"]
+fn moving_measured_5cm_primed_on_full_goal(){run_startup(true,0.05,Scenario::Goal,false,true);}
+
+
+#[test] #[ignore="continuity only: fresh held commands then actual post-release admission; not full goal"]
+fn moving_5cm_held_planning_continuity_only(){run(true,0.05,Scenario::HoldSecondContinuity,false);}
+#[test] #[ignore="separate 120s full 7m goal arm; original 60s arm remains unchanged"]
+fn moving_5cm_held_planning_7m_full_goal_120s(){run_with_budget(true,0.05,Scenario::HoldSecond,false,false,MAX_TICKS*2);}
+
+#[test] #[ignore="primed continuity only; genuine samples before goal, no full-goal claim"]
+fn moving_5cm_primed_held_planning_continuity_only(){run_startup(true,0.05,Scenario::HoldSecondContinuity,false,true);}
+#[test] #[ignore="primed metadata-churn arm; two real samples before goal"]
+fn moving_5cm_primed_metadata_churn_finishes_current_job(){run_startup(true,0.05,Scenario::HoldFirst,false,true);}
+#[test] #[ignore="primed separate 120s full 7m goal; original cold 60s arm retained"]
+fn moving_5cm_primed_held_planning_7m_full_goal_120s(){run_with_budget(true,0.05,Scenario::HoldSecond,false,true,MAX_TICKS*2);}
+#[test] #[ignore="primed 1cm OFF stress; genuine samples before goal"]
+fn moving_1cm_stress_primed_off_full_goal(){run_startup(false,0.01,Scenario::Goal,false,true);}
+#[test] #[ignore="primed 1cm ON stress; genuine samples before goal"]
+fn moving_1cm_stress_primed_on_full_goal(){run_startup(true,0.01,Scenario::Goal,false,true);}

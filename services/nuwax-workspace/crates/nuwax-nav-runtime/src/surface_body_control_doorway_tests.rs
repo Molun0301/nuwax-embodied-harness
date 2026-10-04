@@ -763,7 +763,7 @@ use super::*;
         let started = Instant::now();
         let mut follower = checkpoint();
         let step_started = Instant::now();
-        let outcome = follower.step(0.32);
+        let outcome = captured_legacy_step(&mut follower);
         let step_elapsed = step_started.elapsed();
         let observed = format!("{outcome:?}");
         eprintln!("DOOR_CHECKPOINT_RESULT step={step_elapsed:?} total={:?}\nexpected={CAPTURED_OUTCOME}\nobserved={observed}", started.elapsed());
@@ -787,7 +787,7 @@ use super::*;
 fn captured_dense_doorway_far_bearing_has_guarded_command() {
     let total = Instant::now();
     let mut follower = checkpoint();
-    let reproduced = follower.step(0.32);
+    let reproduced = captured_legacy_step(&mut follower);
     assert_eq!(format!("{reproduced:?}"), CAPTURED_OUTCOME,
         "first reproduce the exact old selected-target rejection");
 
@@ -953,7 +953,7 @@ fn exit_checkpoint() -> SurfaceFollower {
 fn captured_exit_state_reproduces_exact_rejection() {
     let mut follower=exit_checkpoint();
     let started=Instant::now();
-    let result=follower.step(0.32);
+    let result=captured_legacy_step(&mut follower);
     let expected: &str="ReplanRequired(\"局部路径点420无法从实际站姿按前进圆弧或转向接续，需要重新规划; initial_path_index=420 initial_alignment_index=Some(420) initial_progress=1.0289866811689183 selected_index=420 alignment_index=Some(420) path_len=584 target=Pose3 { position: Point3 { x: 0.341879547245133, y: 0.16500862138040892, z: 0.4 }, orientation: Quaternion { w: 0.9999894712817012, x: 0.0, y: 0.0, z: 0.0045888261836384 } } previous=Pose3 { position: Point3 { x: 0.33999998648377033, y: 0.16499999631196252, z: 0.4 }, orientation: Quaternion { w: 1.0, x: -0.0, y: 0.0, z: -2.220446049250313e-16 } } applied=Twist2 { linear: Point2 { x: 0.06383976866574535, y: 0.0 }, angular_z: 0.008656092459438654 }\")";
     eprintln!("DOOR_EXIT_CHECKPOINT result={result:?} elapsed={:?}",started.elapsed());
     assert_eq!(format!("{result:?}"),expected);
@@ -1729,4 +1729,136 @@ fn captured_translation_advice_reflected_y_from_original_start_reaches_goal() {
 #[ignore = "experimental rotated full-source doorway, unchanged dynamic guard"]
 fn captured_translation_advice_rotated_90_from_original_start_reaches_goal() {
     run_door_scene_from_original_start(DoorScene::Rotate90);
+}
+
+// Historical rejected-state comparator remains explicit when the default changes.
+fn captured_legacy_step(follower: &mut SurfaceFollower) -> PlannerStep {
+    follower.refresh_current_body_view();
+    follower.follow_body_step_policy::<true,false,false,false>(0.32)
+}
+
+
+#[test]
+fn translation_advice_approaches_blocked_future_then_replans_and_stops_safely() {
+    use nuwax_nav_mls_planner::surface::SurfaceError;
+    let source = tga_map(true, false);
+    let start = tga_pose(0.8, 0.55, 0.0);
+    let goal = tga_pose(2.0, 0.55, 0.0);
+    let initial = body(&start);
+    let mut follower = tga_follower(Arc::clone(&source), vec![start, goal.clone()], false);
+    follower.config.controller.simulation = true;
+    follower.controller.set_simulation(true);
+    assert_eq!(follower.config.motion_limits.as_ref().unwrap(), &tga_limits(false));
+    assert_eq!(follower.config.max_observation_age_sec, Some(30.0));
+    assert!(!forward_arc_connects(&source, initial, &goal),
+        "the future path must actually be blocked, beyond the initial safe stopping envelope");
+    let dt = 1.0 / follower.config.controller.control_frequency;
+    assert_eq!(dt, 0.05);
+    let limits = follower.config.motion_limits.as_ref().unwrap().clone();
+    let mut current = initial;
+    let mut applied = Twist2::ZERO;
+    let mut nonzero_commands = 0;
+    let mut rejection: Option<(usize, String)> = None;
+    let started = Instant::now();
+
+    for tick in 0..200 {
+        // Keep one fixed environmental source and its true wall-time evidence.
+        // The configured 30-second window stays on; no observation refresh or
+        // future timestamp is used. An expiry failure cannot pass the typed
+        // geometric diagnostic below and is preserved as a real test failure.
+        follower.observe_applied_command(applied);
+        follower.update_odometry(stamped(current, tick as i64 * 50_000_000));
+        follower.refresh_current_body_view();
+        assert!(follower.current_body_error().is_none(), "invalid actual body at tick {tick}");
+
+        let command = if rejection.is_some() {
+            // Once the real policy requests a replan, execute its stop rather
+            // than repeatedly asking the unchanged, blocked route to recover.
+            Twist2::ZERO
+        } else {
+            let result = follower.follow_body_step_policy::<true,true,true,true>(0.3);
+            match result {
+                PlannerStep::Command(command) => {
+                    if tick == 0 {
+                        assert!(command.linear.x > 0.0,
+                            "advice must permit genuine initial guarded advance: {command:?}");
+                    }
+                    tga_assert_model_command(command, &limits);
+                    if command != Twist2::ZERO { nonzero_commands += 1; }
+                    command
+                }
+                PlannerStep::ReplanRequired(reason) => {
+                    assert!(nonzero_commands > 0 && current.0[0] > initial.0[0] + 1e-6,
+                        "an immediate static route rejection is not the requested approach: tick={tick}, {reason}");
+                    assert!(reason.contains("三维局部控制未找到可推进速度"),
+                        "must be the current dynamic guard, not unrelated input/route rejection: {reason}");
+                    assert_eq!(follower.last_command, Twist2::ZERO);
+                    if applied != Twist2::ZERO {
+                        assert!(follower.simulation_braking_deadline_ns.is_some(),
+                            "moving rejection must retain its calibrated braking bound");
+                    }
+                    // Identify a real geometric rejection for a forward,
+                    // acceleration-reachable candidate at this actual state.
+                    // Supply the old applied velocity explicitly: issuance
+                    // just zeroed last_command and must not erase that state.
+                    let trial = Twist2 {
+                        linear: Point2::new((applied.linear.x
+                            + limits.linear_acceleration_mps2 * dt).min(limits.max_forward_mps), 0.0),
+                        angular_z: applied.angular_z + (-applied.angular_z)
+                            .clamp(-limits.angular_acceleration_rps2 * dt,
+                                limits.angular_acceleration_rps2 * dt),
+                    };
+                    let (safe, why) = tga_prove_command(&follower, applied, trial);
+                    assert!(!safe, "forward candidate unexpectedly retained its complete stopping proof");
+                    assert!(matches!(why,
+                        Some(SurfaceError::MissingSupport)
+                        | Some(SurfaceError::InsufficientClearance)
+                        | Some(SurfaceError::UntraversableSegment)),
+                        "expected geometric future-body rejection, not observation expiry: {why:?}");
+                    eprintln!("BLOCKED_APPROACH_REPLAN tick={tick} current={current:?} applied={applied:?} reason={reason}");
+                    rejection = Some((tick, reason));
+                    Twist2::ZERO
+                }
+                other => panic!("blocked goal must not succeed or fail for unrelated reasons at tick {tick}: {other:?}"),
+            }
+        };
+        assert!(command.linear.x.is_finite() && command.linear.y.is_finite()
+            && command.angular_z.is_finite());
+        let linear_step = limits.linear_acceleration_mps2 * dt;
+        let angular_step = limits.angular_acceleration_rps2 * dt;
+        let next_applied = Twist2 {
+            linear: Point2::new(applied.linear.x
+                + (command.linear.x-applied.linear.x).clamp(-linear_step,linear_step), 0.0),
+            angular_z: applied.angular_z
+                + (command.angular_z-applied.angular_z).clamp(-angular_step,angular_step),
+        };
+        let mean = Twist2 {
+            linear: Point2::new((applied.linear.x+next_applied.linear.x)*0.5,0.0),
+            angular_z: (applied.angular_z+next_applied.angular_z)*0.5,
+        };
+        let next = nuwax_nav_control::integrate(PlanarPose {
+            x: current.0[0], y: current.0[1],
+            yaw: stamped(current,0).pose.orientation.yaw(),
+        }, mean, dt);
+        let actual = ([next.x,next.y,current.0[2]],
+            [0.0,0.0,(next.yaw*0.5).sin(),(next.yaw*0.5).cos()]);
+        // Independent full-body oracle over the fixed environmental source,
+        // including every post-rejection physical braking edge.
+        source.validate_body_motion(current,actual,&[])
+            .unwrap_or_else(|error| panic!("unsafe actual edge at tick {tick}: {error}; {current:?} -> {actual:?}; applied={applied:?}, command={command:?}"));
+        current = actual;
+        applied = next_applied;
+        if let Some((rejected_tick, reason)) = &rejection {
+            if applied.linear.x.abs() < 1e-9 && applied.angular_z.abs() < 1e-9 {
+                assert!(current.0[0] > initial.0[0] + 1e-6);
+                assert!(stamped(current,0).pose.position.distance(goal.pose.position) > 0.03,
+                    "blocked route cannot be confused with reaching the goal");
+                assert!(nonzero_commands > 0);
+                eprintln!("BLOCKED_APPROACH_STOPPED tick={tick} rejected_tick={rejected_tick} nonzero_commands={nonzero_commands} displacement={} current={current:?} reason={reason} wall={:?}",
+                    current.0[0]-initial.0[0], started.elapsed());
+                return;
+            }
+        }
+    }
+    panic!("blocked approach did not produce a genuine guard rejection and safe physical stop in 200 ticks: current={current:?}, applied={applied:?}, nonzero_commands={nonzero_commands}, rejection={rejection:?}");
 }

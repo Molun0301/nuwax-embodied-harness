@@ -326,12 +326,8 @@ fn run_startup(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,primed
     run_with_budget(enabled,resolution,scenario,factory,primed,MAX_TICKS);
 }
 fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,primed:bool,max_ticks:usize) {
-    run_with_policy(enabled,resolution,scenario,factory,primed,max_ticks,false);
-}
-fn run_with_policy(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,primed:bool,max_ticks:usize,translation_advice:bool) {
-    let (mut config,base,keys)=fixture(enabled,resolution,if matches!(scenario,Scenario::HoldSecond|Scenario::HoldSecondContinuity){10.0}else{6.0});
-    config.translation_advice_for_test=translation_advice;
-    eprintln!("MOVING_POLICY combined_straight_alignment_translation_advice={translation_advice} release_policy_unchanged=true");
+    let (config,base,keys)=fixture(enabled,resolution,if matches!(scenario,Scenario::HoldSecond|Scenario::HoldSecondContinuity){10.0}else{6.0});
+    eprintln!("MOVING_POLICY compiled_default=translation_advice");
     let priming_started=Instant::now();
     let sensor=Sensor::new(base.clone(),keys);
     let probe=Arc::new(Mutex::new(Probe::with_control_sample_budget(max_ticks)));
@@ -832,8 +828,8 @@ fn selected_candidate_guard_cost_5cm_h100(){benchmark_selected_guard_prefix(2);}
 fn selected_candidate_guard_cost_5cm_h150(){benchmark_selected_guard_prefix(3);}
 
 #[test] #[ignore="experimental advice, primed actual factory OFF"]
-fn moving_advice_factory_5cm_primed_off_full_goal(){run_with_policy(false,0.05,Scenario::Goal,true,true,MAX_TICKS,true);}
+fn moving_advice_factory_5cm_primed_off_full_goal(){run_with_budget(false,0.05,Scenario::Goal,true,true,MAX_TICKS);}
 #[test] #[ignore="experimental advice, primed actual factory ON"]
-fn moving_advice_factory_5cm_primed_on_full_goal(){run_with_policy(true,0.05,Scenario::Goal,true,true,MAX_TICKS,true);}
+fn moving_advice_factory_5cm_primed_on_full_goal(){run_with_budget(true,0.05,Scenario::Goal,true,true,MAX_TICKS);}
 #[test] #[ignore="experimental advice, primed current control during held planning"]
-fn moving_advice_5cm_primed_held_planning_continuity(){run_with_policy(true,0.05,Scenario::HoldSecondContinuity,false,true,MAX_TICKS,true);}
+fn moving_advice_5cm_primed_held_planning_continuity(){run_with_budget(true,0.05,Scenario::HoldSecondContinuity,false,true,MAX_TICKS);}

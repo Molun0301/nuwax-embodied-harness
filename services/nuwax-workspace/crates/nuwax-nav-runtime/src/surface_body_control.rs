@@ -342,15 +342,11 @@ impl SurfaceFollower {
     // The false specialization is exercised only by differential tests. The
     // production specialization reuses no state beyond this one invocation.
     fn follow_body_step_inner<const REUSE_LOOKAHEAD: bool>(&mut self, robot_width: f64) -> PlannerStep {
-        #[cfg(test)]
-        if self.config.translation_advice_for_test {
-            return self.follow_body_step_policy::<REUSE_LOOKAHEAD, true, true, true>(robot_width);
-        }
-        self.follow_body_step_policy::<REUSE_LOOKAHEAD, false, false, false>(robot_width)
+        self.follow_body_step_policy::<REUSE_LOOKAHEAD, true, true, true>(robot_width)
     }
 
-    // Experimental straight-run intent policy is exercised only by tests until
-    // current-state guarding and closed-loop route behavior are qualified.
+    // Proposed default under isolated validation: route intent remains advice;
+    // the unchanged calibrated current-state guard authorizes each command.
     fn follow_body_step_policy<const REUSE_LOOKAHEAD: bool, const STRAIGHT_INTENT: bool, const ALIGN_STRAIGHT: bool, const TRANSLATION_INTENT: bool>(&mut self, robot_width: f64) -> PlannerStep {
         // Scalar provenance for a rejected connector; no additional geometry
         // query or hot-path allocation is needed to diagnose the chosen target.

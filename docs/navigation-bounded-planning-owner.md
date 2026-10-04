@@ -596,3 +596,8 @@ sampled run comparisons, not hard bounds or deployed-hardware capacity claims;
 the earlier failed deadline experiments remain recorded. Future-view construction
 was already small and was not changed. Delayed first issuance, predecessor
 activation and downstream expiry remain the independent open limitations.
+
+
+## Dense doorway intent correction
+
+The complete original downstream doorway regression now passes with the shared translation-advice default. Long future-route connector checks no longer veto calibrated nonrotation intent before the unchanged current-state body/observation/boundary/reaction/braking guard can evaluate a command. Scalar corner/reversal/rotation bounds, pivot progress, speed limits and strict arrival remain. See [the captured failure, failed trials and final qualification](navigation-dense-doorway-diagnostics.md). The final runtime suite has 146 passes (five previously documented sandbox UDS exclusions), ordinary factory ON/OFF and held-planning trials pass, and the original downstream test passes with all existing variants. This is a functional correction and removal of repeated lookahead work; dense control costs and delayed first-issuance/downstream expiry limitations remain explicitly open.

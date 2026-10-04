@@ -8,6 +8,32 @@ mod contact;
 pub(super) type CacheSlot =
     std::sync::Mutex<AHashMap<(VoxelKey, u64, u64), Arc<AHashMap<(i32, i32), VoxelKey>>>>;
 
+/// 只复用同一不可变视图的一个精确足迹；不保存观察许可或失败。
+struct ObservationFootprintCache<'a> {
+    snapshot: &'a SurfaceSnapshot,
+    entry: Option<([u64; 7], std::collections::BTreeSet<[i32; 3]>)>,
+    #[cfg(test)]
+    builds: usize,
+}
+
+impl<'a> ObservationFootprintCache<'a> {
+    fn new(snapshot: &'a SurfaceSnapshot) -> Self {
+        Self { snapshot, entry: None, #[cfg(test)] builds: 0 }
+    }
+
+    fn cells(&mut self, pose: ([f64; 3], [f64; 4]))
+        -> Result<&std::collections::BTreeSet<[i32; 3]>, SurfaceError> {
+        let key = [pose.0[0], pose.0[1], pose.0[2],
+            pose.1[0], pose.1[1], pose.1[2], pose.1[3]].map(f64::to_bits);
+        if self.entry.as_ref().is_none_or(|(cached, _)| *cached != key) {
+            #[cfg(test)] { self.builds += 1; }
+            let cells = self.snapshot.body_observation_footprint(pose)?;
+            self.entry = Some((key, cells));
+        }
+        Ok(&self.entry.as_ref().expect("successful footprint entry").1)
+    }
+}
+
 /// 当前占据只证明精确足迹内的支撑，原始快照用于下一次位姿重新派生。
 pub(super) struct CurrentBodySupport {
     pub(super) source: SurfaceSnapshot,
@@ -1567,6 +1593,40 @@ impl SurfaceSnapshot {
         })
     }
 
+    /// 本次近场检查复用一个精确足迹，仍逐次核对完整扫掠与当前检查时刻。
+    /// 缓存仅保存足迹单元几何，不保存新鲜度、观察许可或失败结果。
+    /// 返回值借用原视图、足下豁免和边界，不能跨观察源或机体视图复用许可。
+    pub fn observed_body_motion_checker<'a>(
+        &'a self,
+        occupied: &'a std::collections::BTreeSet<[i32; 3]>,
+        max_age_ns: u64,
+        boundary: &'a [[f64; 2]],
+    ) -> impl FnMut(([f64; 3], [f64; 4]), ([f64; 3], [f64; 4]), u64)
+        -> Result<(), SurfaceError> + 'a {
+        let mut footprints = ObservationFootprintCache::new(self);
+        move |from, to, checked_ns| {
+            let observations = self.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
+            if checked_ns == 0 || max_age_ns == 0 { return Err(SurfaceError::MissingSupport); }
+            self.validate_body_motion_checked(from, to, boundary, |pose| {
+                for &cell in footprints.cells(pose)? {
+                    if occupied.contains(&cell) { continue; }
+                    let evidence = observations.get(cell).unwrap_or(SurfaceObservation {observed_ns:0,hits:0});
+                    let reason = if evidence.observed_ns == 0 {Some("缺少真实观察")}
+                        else if evidence.hits < 2 {Some("独立采样命中不足")}
+                        else if evidence.observed_ns > checked_ns.saturating_add(50_000_000) {Some("采样时间在未来")}
+                        else if checked_ns.saturating_sub(evidence.observed_ns) > max_age_ns {Some("观察已过期")}
+                        else {None};
+                    if let Some(reason) = reason {
+                        return Err(SurfaceError::NearFieldObservation {
+                            cell, reason, observed_ns:evidence.observed_ns, checked_ns,
+                        });
+                    }
+                }
+                Ok(())
+            })
+        }
+    }
+
     /// 粗列中心连段失真时，仅由实际参考经过的共同真实占据带补证。
     /// 细列露顶仍遵循原上下阶能力；完整足迹、包络及观察随后沿实际曲线核验。
     fn fine_contact_support_samples(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]))->Option<Vec<f64>> {
@@ -1647,7 +1707,7 @@ impl SurfaceSnapshot {
         from: ([f64; 3], [f64; 4]),
         to: ([f64; 3], [f64; 4]),
         boundary: &[[f64; 2]],
-        check_observations: impl Fn(([f64; 3], [f64; 4])) -> Result<(), SurfaceError>,
+        mut check_observations: impl FnMut(([f64; 3], [f64; 4])) -> Result<(), SurfaceError>,
     ) -> Result<(), SurfaceError> {
         validate_boundary(boundary)?;
         let model = self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
@@ -2254,6 +2314,188 @@ mod tests {
         // 当前实际占据区域仍需通过几何检查，但可以从旧足下证据开始停稳。
         map.validate_observed_body_motion(from, from, &occupied, 12_000_000_000, 1_000_000_000).unwrap();
     }
+
+    fn assert_observation_checker_matches(
+        map: &SurfaceSnapshot,
+        occupied: &std::collections::BTreeSet<[i32; 3]>,
+        max_age_ns: u64,
+        boundary: &[[f64; 2]],
+        queries: &[(([f64; 3], [f64; 4]), ([f64; 3], [f64; 4]), u64)],
+    ) {
+        let mut cached = map.observed_body_motion_checker(occupied, max_age_ns, boundary);
+        for &(from, to, checked_ns) in queries {
+            let expected = map.validate_observed_body_motion_in_boundary(
+                from, to, occupied, checked_ns, max_age_ns, boundary);
+            assert_eq!(cached(from, to, checked_ns), expected,
+                "足迹复用必须保留完整结果、首个错误及时间字段: {from:?} -> {to:?}, {checked_ns}");
+        }
+    }
+
+    #[test]
+    fn observation_footprint_cache_is_exact_single_entry_and_borrows_hits() {
+        let map = scene(&[], false).with_observations(Some(observation_grid(|_| {})));
+        let pose = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let mut cache = ObservationFootprintCache::new(&map);
+        let first = cache.cells(pose).unwrap().first().unwrap() as *const [i32; 3];
+        assert_eq!(cache.builds, 1);
+        let repeated = cache.cells(pose).unwrap().first().unwrap() as *const [i32; 3];
+        assert_eq!(first, repeated, "命中必须借用原集合中的同一元素，不能克隆足迹");
+        assert_eq!(cache.builds, 1);
+        let words = [pose.0[0], pose.0[1], pose.0[2], pose.1[0], pose.1[1], pose.1[2], pose.1[3]];
+        for index in 0..7 {
+            let mut changed = words;
+            changed[index] = if changed[index] == 0.0 { -0.0 }
+                else { f64::from_bits(changed[index].to_bits() + 1) };
+            let other = ([changed[0], changed[1], changed[2]],
+                [changed[3], changed[4], changed[5], changed[6]]);
+            assert_eq!(cache.cells(other).unwrap(), &map.body_observation_footprint(other).unwrap());
+            assert_eq!(cache.builds, 2 + index * 2, "全部七个输入位模式均属于键");
+            cache.cells(other).unwrap();
+            assert_eq!(cache.builds, 2 + index * 2);
+            cache.cells(pose).unwrap();
+            assert_eq!(cache.builds, 3 + index * 2, "另一位姿必须淘汰唯一旧项");
+        }
+        let missing = ([100.0, 100.0, 0.5], pose.1);
+        let before = cache.builds;
+        assert!(cache.cells(missing).is_err());
+        assert!(cache.cells(missing).is_err());
+        assert_eq!(cache.builds, before + 2, "失败不能进入缓存");
+        cache.cells(pose).unwrap();
+        assert_eq!(cache.builds, before + 2, "失败不替换最后一个成功足迹");
+    }
+
+    #[test]
+    fn observation_footprint_cache_reuses_adjacent_engine_samples() {
+        let map = scene(&[], false).with_observations(Some(observation_grid(|_| {})));
+        let poses: Vec<_> = (0..8).map(|index| (
+            [0.051 + f64::from(index) * 0.005, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0],
+        )).collect();
+        let mut cache = ObservationFootprintCache::new(&map);
+        let mut queries = 0;
+        for pair in poses.windows(2) {
+            map.validate_body_motion_checked(pair[0], pair[1], &[], |pose| {
+                queries += 1;
+                assert_eq!(cache.cells(pose)?, &map.body_observation_footprint(pose)?);
+                Ok(())
+            }).unwrap();
+        }
+        // 只计原采样顺序下的几何构建量；不作为耗时或观察许可的资格证明。
+        eprintln!("observation footprint geometry work: queries={queries} builds={} hits={}",
+            cache.builds, queries - cache.builds);
+        assert!(queries >= 2 * (poses.len() - 1));
+        assert!(cache.builds < queries, "邻段共享的真实端点应复用同一个精确足迹");
+    }
+
+    #[test]
+    fn observed_motion_checker_rechecks_time_and_preserves_evidence_error_fields() {
+        let base = scene(&[], false);
+        let from = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let to = ([0.45, 0.05, 0.5], from.1);
+        let good = base.with_observations(Some(observation_grid(|_| {})));
+        let occupied = good.body_observation_footprint(from).unwrap();
+        let mut checker = good.observed_body_motion_checker(&occupied, 1_000_000_000, &[]);
+        checker(to, to, 10_100_000_000).unwrap();
+        let expired = checker(to, to, 12_000_000_000);
+        assert_eq!(expired, good.validate_observed_body_motion_in_boundary(
+            to, to, &occupied, 12_000_000_000, 1_000_000_000, &[]));
+        assert!(matches!(expired, Err(SurfaceError::NearFieldObservation {
+            reason: "观察已过期", observed_ns: 10_000_000_000, checked_ns: 12_000_000_000, ..
+        })));
+        checker(to, to, 10_100_000_000).unwrap();
+        checker(from, from, 12_000_000_000).unwrap();
+        for kind in 0..8 {
+            let map = base.with_observations(Some(observation_grid(|cells| {
+                let evidence = cells.get_mut(&[8, 0, 0]).unwrap();
+                match kind {
+                    0 => {},
+                    1 => evidence.hits = 0,
+                    2 => evidence.hits = 1,
+                    3 => evidence.observed_ns = 0,
+                    4 => evidence.observed_ns = 1,
+                    5 => evidence.observed_ns = 11_000_000_000,
+                    6 => { cells.remove(&[8, 0, 0]); },
+                    _ => {
+                        evidence.observed_ns = 1;
+                        cells.insert([8, 0, -1], SurfaceObservation { observed_ns: 10_000_000_000, hits: 3 });
+                    },
+                }
+            })));
+            assert_observation_checker_matches(&map, &occupied, 1_000_000_000, &[], &[
+                (to, to, 10_100_000_000), (to, to, 10_100_000_001),
+                (from, to, 10_100_000_000), (to, from, 12_000_000_000),
+                (from, from, 12_000_000_000), (to, to, u64::MAX),
+            ]);
+        }
+        // 未来容差和年龄边界均在同一足迹命中时重新计算。
+        let none = Default::default();
+        assert_observation_checker_matches(&good, &none, 1_000_000_000, &[], &[
+            (to, to, 9_949_999_999), (to, to, 9_950_000_000),
+            (to, to, 11_000_000_000), (to, to, 11_000_000_001),
+        ]);
+    }
+
+    #[test]
+    fn observed_motion_checker_preserves_missing_source_zero_time_and_first_error_order() {
+        let base = scene(&[], false);
+        let good = base.with_observations(Some(observation_grid(|_| {})));
+        let wrong_resolution = base.with_observations(Some(Arc::new(SurfaceObservations::new(0.05, 32).unwrap())));
+        let pose = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let invalid = (pose.0, [0.0; 4]);
+        let occupied = good.body_observation_footprint(pose).unwrap();
+        for map in [&base, &good, &wrong_resolution] {
+            for max_age in [0, 1_000_000_000] {
+                for boundary in [vec![], vec![[0.0, 0.0], [1.0, 0.0]]] {
+                    assert_observation_checker_matches(map, &occupied, max_age, &boundary, &[
+                        (pose, pose, 0), (invalid, pose, 0),
+                        (pose, pose, 10_100_000_000), (invalid, pose, 10_100_000_000),
+                        (pose, invalid, 10_100_000_000),
+                    ]);
+                }
+            }
+        }
+        let stale = base.with_observations(Some(observation_grid(|cells| {
+            cells.get_mut(&[-4, 0, 0]).unwrap().observed_ns = 1;
+            cells.get_mut(&[8, 0, 0]).unwrap().hits = 1;
+        })));
+        let none = Default::default();
+        let to = ([0.45, 0.05, 0.5], pose.1);
+        for boundary in [vec![], vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]]] {
+            assert_observation_checker_matches(&stale, &none, 1_000_000_000, &boundary, &[
+                (pose, to, 10_100_000_000), (to, pose, 10_100_000_000),
+                (pose, to, 12_000_000_000),
+            ]);
+        }
+    }
+
+    #[test]
+    fn observed_motion_checker_keeps_geometry_rotation_boundary_and_view_contexts() {
+        let from = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let to = ([0.45, 0.05, 0.5], from.1);
+        let turn = (from.0, [0.0, 0.0, std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2]);
+        let map = scene(&[], false).with_observations(Some(observation_grid(|_| {})));
+        let occupied = map.body_observation_footprint(from).unwrap();
+        let view = map.with_current_body_support(from.0, from.1).unwrap();
+        let fork = map.fork_for_planning();
+        let obstacle = scene(&[(0.85, 0.05, 0.4)], false).with_observations(Some(observation_grid(|_| {})));
+        let blocked = map.with_virtual_obstacles([-4.0, -4.0], 0.1, 80, 80, &vec![true; 6400]).unwrap();
+        for context in [&map, &view, &fork, &obstacle, &blocked] {
+            for boundary in [vec![], vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]]] {
+                assert_observation_checker_matches(context, &occupied, 1_000_000_000, &boundary, &[
+                    (from, to, 10_100_000_000), (to, to, 10_100_000_000),
+                    (from, turn, 10_100_000_000), (turn, to, 10_100_000_000),
+                    (to, from, 12_000_000_000), (from, from, 12_000_000_000),
+                ]);
+            }
+        }
+        // 相同输入位姿的不同观察源不能共享几何选择或许可。
+        let missing = scene(&[], false).with_observations(Some(observation_grid(|cells| { cells.remove(&[8,0,0]); })));
+        let mut fresh_checker = map.observed_body_motion_checker(&occupied, 1_000_000_000, &[]);
+        let mut missing_checker = missing.observed_body_motion_checker(&occupied, 1_000_000_000, &[]);
+        fresh_checker(to, to, 10_100_000_000).unwrap();
+        assert!(missing_checker(to, to, 10_100_000_000).is_err());
+        fresh_checker(to, to, 10_100_000_000).unwrap();
+    }
+
     #[test]
     fn observed_body_motion_checks_intermediate_sweep_and_new_rotation_space() {
         let map = scene(&[], false).with_observations(Some(observation_grid(|cells| {
@@ -2301,6 +2543,10 @@ mod tests {
         let occupied = map.body_observation_footprint(from).unwrap();
         map.validate_body_motion(from,to,&[]).unwrap();
         map.validate_observed_body_motion(from,to,&occupied,10_100_000_000,1_000_000_000).unwrap();
+        assert_observation_checker_matches(&map, &occupied, 1_000_000_000, &[], &[
+            (from, to, 10_100_000_000), (to, to, 10_100_000_000),
+            (to, to, 12_000_000_000), (to, from, 10_100_000_000),
+        ]);
     }
     #[test]
     fn observed_ramp_crossing_coarse_height_boundary_uses_actual_fine_support() {
@@ -2356,6 +2602,22 @@ mod tests {
             map.validate_body_motion(pair[0],pair[1],&[]).unwrap();
             map.validate_body_motion(pair[1],pair[0],&[]).unwrap();
         }
+        let mut blocks: std::collections::BTreeMap<_, std::collections::BTreeMap<_, _>> = Default::default();
+        let fine = 0.025_f32;
+        for &(x,y,z) in &points {
+            let key = [x,y,z].map(|v| (f64::from(v) / f64::from(fine)).floor() as i32);
+            blocks.entry(key.map(|v| v.div_euclid(32))).or_default().insert(key,
+                SurfaceObservation { observed_ns: 10_000_000_000, hits: 2 });
+        }
+        let mut observations = SurfaceObservations::new(fine, 32).unwrap();
+        for (key, block) in blocks { observations.replace_block(key, block).unwrap(); }
+        let observed = map.with_observations(Some(Arc::new(observations)));
+        let occupied = observed.body_observation_footprint(poses[25]).unwrap();
+        let queries: Vec<_> = poses[25..=65].windows(2).step_by(5).flat_map(|pair| [
+            (pair[0], pair[1], 10_100_000_000), (pair[1], pair[1], 10_100_000_000),
+            (pair[1], pair[0], 12_000_000_000),
+        ]).collect();
+        assert_observation_checker_matches(&observed, &occupied, 1_000_000_000, &[], &queries);
         let floating=([-0.8,0.0,0.55],[0.0,0.0,0.0,1.0]);
         assert!(map.validate_body_pose(floating.0,floating.1).is_err());
         let missing:Vec<_>=points.into_iter().filter(|p|!(p.0>0.0&&p.0<0.15)).collect();
@@ -3855,7 +4117,14 @@ mod tests {
         let occupied = view.body_observation_footprint(start).unwrap();
         view.validate_observed_body_motion(start,target,&occupied,10_100_000_000,1_000_000_000).unwrap();
         assert!(view.validate_observed_body_motion(start,target,&occupied,12_000_000_000,1_000_000_000).is_err());
+        assert_observation_checker_matches(&view, &occupied, 1_000_000_000, &[], &[
+            (start, target, 10_100_000_000), (target, target, 10_100_000_000),
+            (target, target, 12_000_000_000), (start, start, 12_000_000_000),
+        ]);
         let advanced = view.with_current_body_support(target.0,target.1).unwrap();
+        assert_observation_checker_matches(&advanced, &occupied, 1_000_000_000, &[], &[
+            (start, target, 10_100_000_000), (target, target, 10_100_000_000),
+        ]);
         assert!(advanced.validate_body_pose(start.0,start.1).is_err(), "新查询不能保留旧足迹的补足");
         assert!(base.validate_body_pose(start.0,start.1).is_err());
         assert!(observations.get([0,0,0]).is_none(), "不能伪造盲区的观察时间");

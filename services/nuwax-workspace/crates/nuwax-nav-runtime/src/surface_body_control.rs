@@ -108,11 +108,19 @@ pub(super) fn connection_endpoint(map: &SurfaceSnapshot, from: ([f64; 3], [f64; 
         #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::ConnectionSubsteps);
         #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::BodyProjectionCalls);
         let fraction=index as f64/count as f64;
-        let Ok(mut projected)=map.body_pose_after_motion(previous,
-            [from.0[0]+dx*fraction,from.0[1]+dy*fraction],initial_yaw+turn*fraction) else {return None;};
+        let projection={
+            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ConnectorProjection);
+            map.body_pose_after_motion(previous,
+                [from.0[0]+dx*fraction,from.0[1]+dy*fraction],initial_yaw+turn*fraction)
+        };
+        let Ok(mut projected)=projection else {return None;};
         if distance<1e-9 {projected.0[2]=previous.0[2];}
         #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
-        if map.validate_body_motion(previous,projected,&[]).is_err() {return None;}
+        let swept={
+            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ConnectorSweep);
+            map.validate_body_motion(previous,projected,&[])
+        };
+        if swept.is_err() {return None;}
         previous=projected;
     }
     Some(previous)
@@ -135,9 +143,17 @@ fn forward_arc_connects(map:&SurfaceSnapshot,from:BodyPose,next:&PoseStamped)->b
         #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::ForwardArcSubsteps);
         #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::BodyProjectionCalls);
         let planar=nuwax_nav_control::integrate(start,motion,index as f64/count as f64);
-        let Ok(projected)=map.body_pose_after_motion(previous,[planar.x,planar.y],planar.yaw)else{return false;};
+        let projection={
+            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ConnectorProjection);
+            map.body_pose_after_motion(previous,[planar.x,planar.y],planar.yaw)
+        };
+        let Ok(projected)=projection else{return false;};
         #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
-        if map.validate_body_motion(previous,projected,&[]).is_err(){return false;}
+        let swept={
+            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ConnectorSweep);
+            map.validate_body_motion(previous,projected,&[])
+        };
+        if swept.is_err(){return false;}
         previous=projected;
     }
     true
@@ -717,6 +733,12 @@ impl SurfaceFollower {
             let mut previous_yaw=pose.pose.orientation.yaw();
             let last_failure=&last_failure;
             let observation_check=&observation_check;
+            // One last footprint-cell set per callback, bound to this immutable
+            // view and original exemption. This footprint context stores no
+            // time/evidence outcomes; each actual checker invocation uses the
+            // existing now+elapsed. Outer exact-time motion memoization is unchanged.
+            let mut observed_motion=observation_check.as_ref().map(|(occupied,now,age)|
+                (*now,map.observed_body_motion_checker(occupied,*age,boundary)));
             // 两种回调的地形依据不同，不能共用运动许可；视图按精确站姿在本次选择内复用。
             let motion_queries=if rebase {&period_queries}else{&motion_queries};
             let future_views=&future_views;
@@ -742,26 +764,33 @@ impl SurfaceFollower {
                             None=>{
                                 #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::FutureViewBuilds);
                                 // 从同一环境源派生机体查询视图，旧足迹不会累积，也不重建全局路由。
-                                let view=source_map.body_query_with_current_support(a.0,a.1).map(Arc::new);
+                                let view={
+                                    #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::FutureViewConstruction);
+                                    source_map.body_query_with_current_support(a.0,a.1).map(Arc::new)
+                                };
                                 future_views.borrow_mut().insert(key,view.clone());view?
                             }
                         })
                     }else{None};
                     #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::BodyProjectionCalls);
-                    let mut b=match &future {
-                        Some(view)=>view.body_pose_after_motion(a,[to.x,to.y],to.yaw)?,
-                        None=>map.body_pose_after_motion(a,[to.x,to.y],to.yaw)?,
+                    let mut b={
+                        #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardProjection);
+                        match &future {
+                            Some(view)=>view.body_pose_after_motion(a,[to.x,to.y],to.yaw)?,
+                            None=>map.body_pose_after_motion(a,[to.x,to.y],to.yaw)?,
+                        }
                     };
                     if preserve_height {b.0[2]=a.0[2];}
                     // 未来足迹不能自行授予新区域许可，始终保留本拍初始视图的完整检查。
-                    match observation_check {
-                        Some((occupied, now, age)) => {
+                    match observed_motion.as_mut() {
+                        Some((now, check)) => {
                             #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::ObservedSweeps);
-                            map.validate_observed_body_motion_in_boundary(a,b,occupied,
-                                now.saturating_add((elapsed * 1e9) as u64),*age,boundary)?;
+                            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardObservedSweep);
+                            check(a,b,now.saturating_add((elapsed * 1e9) as u64))?;
                         },
                         None => {
                             #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
+                            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardGeometrySweep);
                             map.validate_body_motion(a,b,boundary)?;
                         },
                     }
@@ -769,6 +798,7 @@ impl SurfaceFollower {
                         // 完全同源同足迹的视图可复用刚通过的同一扫掠；其它视图独立核验。
                         if !view.same_body_query_view(map) {
                             #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::FutureGeometrySweeps);
+                            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardGeometrySweep);
                             view.validate_body_motion(a,b,boundary)?;
                         }
                     }
@@ -786,9 +816,12 @@ impl SurfaceFollower {
             }
         };
         #[cfg(test)] drop(profile_setup);
-        let result=run(&mut make_check(false), &mut make_check(true), &last_failure);
+        let mut geometric_check=make_check(false);
+        let mut period_check=make_check(true);
+        let result=run(&mut geometric_check, &mut period_check, &last_failure);
         #[cfg(test)] {
             let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardCleanup);
+            drop(period_check);drop(geometric_check);
             drop(future_views);drop(period_queries);drop(motion_queries);
             drop(last_failure);drop(observation_check);
         }

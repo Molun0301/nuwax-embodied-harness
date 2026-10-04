@@ -517,3 +517,82 @@ travel, position/yaw errors 0.061857 m / 0.142211 rad; ON 20.90 s, 309 commands,
 0.15 m / 0.15 rad goal region, with zero delivered negatives. This retains useful
 motion in the backend-plus-ideal-plant fixture; it does not turn the separate
 51.95 ms held-run deadline failure into a pass or establish an optimization speedup.
+
+### Query-family attribution after exact arc reuse
+
+`query-family-profile-compile.log` passed five profiler tests. Six additional
+cfg(test) scopes split connector projection/sweep, guard projection/observed
+sweep/geometry sweep, and future-view construction, without changing any query.
+`query-family-held-baseline.log` retained six fresh held commands, later admission,
+zero delivered negatives and 1.078333 m travel. Its sampled control maximum was
+46.95 ms (median/p95 26.22/40.40 ms); this successful run does not erase the prior
+51.95 ms failure or establish a hard deadline.
+
+Measured per-called-step wall median/p95/max, in milliseconds:
+
+| Query family | Median | p95 | Maximum |
+| --- | ---: | ---: | ---: |
+| First-arc/connector projection | 6.05 | 8.14 | 10.47 |
+| Connector geometry sweep | 2.99 | 3.89 | 5.89 |
+| Selected-guard projection | 4.82 | 7.42 | 9.33 |
+| Selected observed-motion sweep | 14.44 | 21.28 | 27.61 |
+| Future-view construction | 0.014 | 0.024 | 0.389 |
+
+Future-view construction is not the useful target in this fixture. The observed
+sweep includes full geometry as well as footprint/evidence work; timing this
+family alone does not attribute every millisecond to footprint construction.
+Source inspection identifies a candidate to test: adjacent motion segments visit
+identical endpoint poses, while body_observation_footprint rebuilds time-independent
+cell geometry. A one-entry exact-pose cache bound to the immutable map could reuse
+those cells while still checking every cell's current hits, future/expiry limits,
+original occupied exemption, and the complete geometry/boundary sweep. No such
+cache or relaxed guard is included in this instrumentation change.
+
+## One-entry footprint-cell geometry reuse
+
+The observed-motion checker now offers a borrowed context tied to one immutable
+surface snapshot, original occupied-cell exemption, boundary and age policy.
+It retains only the last successful footprint **cell set**, keyed by the exact
+seven floating-point bit patterns of position and quaternion. A hit returns a
+borrowed BTreeSet: no cell-set clone, new hash, lock or copied point cloud. A miss
+replaces that one entry; failed footprint construction is not cached. There is
+one context for the geometric callback and one for the period callback, hence
+**two one-entry contexts per control selection**, both dropped before returning.
+Intermediate/contact samples can evict an endpoint; sampling is never reordered
+to improve the hit rate.
+
+Only time-independent footprint geometry is reused by this new context. Whenever
+the pre-existing exact-time motion memoization invokes the observation checker,
+full geometric/boundary checks and all non-exempt cells' current `now + elapsed`,
+hit, future-tolerance and age checks still execute. This new footprint cache stores
+no permission/failure results; the existing outer motion-result memoization is
+unchanged, and the exemption never grows.
+The prior `validate_observed_body_motion_in_boundary` method remains the unchanged,
+uncached independent oracle. No input domain, dynamics, horizon or publication
+fence changes are part of this optimization.
+
+Validation and evidence:
+
+- Focused checker/cache tests: 4 passed, including exact first-error parity,
+  same-pose TTL crossing, future-time boundaries, hits, invalid inputs, rotation,
+  boundary and separate map/view contexts, bit-exact keys and one-entry eviction
+- Full MLS regression: 220 passed, 3 opt-in ignored (`footprint-mls-full.log`)
+- A subsequent test-only adjacent-engine-sample case passed: **14 footprint
+  queries, 8 builds, 6 hits**, with every returned cell set equal to uncached
+  construction (`footprint-work-count.log`). This is geometry-work evidence,
+  not a timing or permission-qualification result
+- Runtime surface tests: 42 passed
+- Held continuity: six fresh nonzero held commands plus later admission, zero
+  delivered negatives, 1.081196 m travel; all independent postrun oracles passed
+- Factory OFF/ON: both reached the unchanged 0.15 m / 0.15 rad goal region with
+  zero delivered negatives. OFF 22.05 s, 326 nonzero commands, 0.940063 m travel,
+  position/yaw errors 0.059937 m / 0.137495 rad. ON 20.90 s, 310 commands,
+  0.855063 m travel, errors 0.144937 m / 0.137515 rad
+
+In the matched unoptimized + debuginfo held experiments, observed-sweep wall
+median/p95 changed from 14.44/21.28 to 10.32/15.11 ms. Overall control
+median/p95/max changed from 26.22/40.40/46.95 to 24.81/32.06/39.65 ms. These are
+sampled run comparisons, not hard bounds or deployed-hardware capacity claims;
+the earlier failed deadline experiments remain recorded. Future-view construction
+was already small and was not changed. Delayed first issuance, predecessor
+activation and downstream expiry remain the independent open limitations.

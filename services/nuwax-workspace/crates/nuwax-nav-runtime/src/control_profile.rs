@@ -34,10 +34,16 @@ pub(crate) enum Stage {
     ConnectionEndpoint,
     TranslationConnector,
     TrackingReferenceProjection,
+    ConnectorProjection,
+    ConnectorSweep,
+    GuardProjection,
+    GuardObservedSweep,
+    GuardGeometrySweep,
+    FutureViewConstruction,
 }
 
 impl Stage {
-    pub(crate) const COUNT: usize = 18;
+    pub(crate) const COUNT: usize = 24;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::RouteCurrentBody,
         Self::CurrentViewRefresh,
@@ -57,6 +63,12 @@ impl Stage {
         Self::ConnectionEndpoint,
         Self::TranslationConnector,
         Self::TrackingReferenceProjection,
+        Self::ConnectorProjection,
+        Self::ConnectorSweep,
+        Self::GuardProjection,
+        Self::GuardObservedSweep,
+        Self::GuardGeometrySweep,
+        Self::FutureViewConstruction,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -79,6 +91,13 @@ impl Stage {
             Self::ConnectionEndpoint => "connection_endpoint",
             Self::TranslationConnector => "translation_connector",
             Self::TrackingReferenceProjection => "tracking_reference_projection",
+            Self::ConnectorProjection => "connector_projection",
+            Self::ConnectorSweep => "connector_sweep",
+            Self::GuardProjection => "guard_projection",
+            Self::GuardObservedSweep => "guard_observed_sweep",
+            Self::GuardGeometrySweep => "guard_geometry_sweep",
+            Self::FutureViewConstruction => "future_view_construction",
+
         }
     }
 }

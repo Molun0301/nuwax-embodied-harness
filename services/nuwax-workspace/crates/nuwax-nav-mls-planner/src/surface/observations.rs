@@ -58,29 +58,39 @@ impl SurfaceObservations {
         block: [i32; 3],
         values: BTreeMap<[i32; 3], SurfaceObservation>,
     ) -> Result<(), SurfaceError> {
-        if values.len() > (self.block_edge as usize).pow(3)
-            || values
-                .keys()
-                .any(|key| key.map(|v| v.div_euclid(self.block_edge)) != block)
-        {
+        if values.len() > (self.block_edge as usize).pow(3) {
             return Err(SurfaceError::InvalidConfig("观察块坐标或容量无效".into()));
+        }
+        let previous = self.blocks.get(&block);
+        let mut same_membership = previous.map_or(values.is_empty(), |previous| previous.len() == values.len());
+        // Check exact membership during the mandatory coordinate-validation walk.
+        // Stop probing after the first mismatch; no content/identity digest is needed.
+        for key in values.keys() {
+            if key.map(|v| v.div_euclid(self.block_edge)) != block {
+                return Err(SurfaceError::InvalidConfig("观察块坐标或容量无效".into()));
+            }
+            same_membership = same_membership && previous.is_some_and(|previous| previous.contains_key(key));
         }
         // 块替换之后须由完整提交的拥有方重新确认，不把旧根的完整性带入部分更新。
         self.complete_geometry_source=false;
-        let mut replacement=AHashMap::<[i32;2],Vec<i32>>::new();
-        for key in values.keys() {replacement.entry([key[0],key[1]]).or_default().push(key[2]);}
-        let mut affected:AHashSet<[i32;2]>=replacement.keys().copied().collect();
-        if let Some(previous)=self.blocks.get(&block) {
-            affected.extend(previous.keys().map(|key|[key[0],key[1]]));
-        }
-        for column in affected {
-            let mut levels=self.columns.get(&column).map_or_else(Vec::new,|levels|levels.as_ref().clone());
-            levels.retain(|z|z.div_euclid(self.block_edge)!=block[2]);
-            if let Some(replacement)=replacement.remove(&column) {levels.extend(replacement);}
-            levels.sort_unstable();levels.dedup();
-            if levels.is_empty() {self.columns.remove(&column);}
-            else if self.columns.get(&column).is_none_or(|previous|previous.as_slice()!=levels.as_slice()) {
-                self.columns.insert(column,Arc::new(levels));
+        // Evidence-only refreshes leave occupied cells unchanged, so avoid allocating
+        // per-column vectors or cloning, sorting and deduplicating column levels.
+        if !same_membership {
+            let mut replacement=AHashMap::<[i32;2],Vec<i32>>::new();
+            for key in values.keys() {replacement.entry([key[0],key[1]]).or_default().push(key[2]);}
+            let mut affected:AHashSet<[i32;2]>=replacement.keys().copied().collect();
+            if let Some(previous)=self.blocks.get(&block) {
+                affected.extend(previous.keys().map(|key|[key[0],key[1]]));
+            }
+            for column in affected {
+                let mut levels=self.columns.get(&column).map_or_else(Vec::new,|levels|levels.as_ref().clone());
+                levels.retain(|z|z.div_euclid(self.block_edge)!=block[2]);
+                if let Some(replacement)=replacement.remove(&column) {levels.extend(replacement);}
+                levels.sort_unstable();levels.dedup();
+                if levels.is_empty() {self.columns.remove(&column);}
+                else if self.columns.get(&column).is_none_or(|previous|previous.as_slice()!=levels.as_slice()) {
+                    self.columns.insert(column,Arc::new(levels));
+                }
             }
         }
         if values.is_empty() {
@@ -175,6 +185,222 @@ impl SurfaceObservations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Original rebuilding path retained only as a differential oracle and matched benchmark.
+    // Returns the number of column vectors rebuilt (including unchanged columns).
+    fn replace_block_reference(
+        grid: &mut SurfaceObservations,
+        block: [i32; 3],
+        values: BTreeMap<[i32; 3], SurfaceObservation>,
+    ) -> Result<usize, SurfaceError> {
+        if values.len() > (grid.block_edge as usize).pow(3)
+            || values.keys().any(|key| key.map(|v| v.div_euclid(grid.block_edge)) != block)
+        {
+            return Err(SurfaceError::InvalidConfig("观察块坐标或容量无效".into()));
+        }
+        grid.complete_geometry_source = false;
+        let mut replacement = AHashMap::<[i32; 2], Vec<i32>>::new();
+        for key in values.keys() {
+            replacement.entry([key[0], key[1]]).or_default().push(key[2]);
+        }
+        let mut affected: AHashSet<[i32; 2]> = replacement.keys().copied().collect();
+        if let Some(previous) = grid.blocks.get(&block) {
+            affected.extend(previous.keys().map(|key| [key[0], key[1]]));
+        }
+        let rebuilt = affected.len();
+        for column in affected {
+            let mut levels = grid.columns.get(&column).map_or_else(Vec::new, |levels| levels.as_ref().clone());
+            levels.retain(|z| z.div_euclid(grid.block_edge) != block[2]);
+            if let Some(replacement) = replacement.remove(&column) { levels.extend(replacement); }
+            levels.sort_unstable();
+            levels.dedup();
+            if levels.is_empty() { grid.columns.remove(&column); }
+            else if grid.columns.get(&column).is_none_or(|previous| previous.as_slice() != levels.as_slice()) {
+                grid.columns.insert(column, Arc::new(levels));
+            }
+        }
+        if values.is_empty() { grid.blocks.remove(&block); }
+        else { grid.blocks.insert(block, Arc::new(values.into_iter().collect())); }
+        grid.obstacle_cache = Default::default();
+        Ok(rebuilt)
+    }
+
+    #[test]
+    fn block_updates_match_rebuilding_reference_for_exact_membership() {
+        let mut actual = SurfaceObservations::new(0.05, 2).unwrap();
+        let mut reference = actual.clone();
+        // Include adjacent vertical blocks, negative coordinates, evidence refreshes,
+        // equal-size key swaps, deletions, missing empty blocks and rejected coordinates.
+        let updates = [
+            ([0,0,-1], vec![[0,0,-1]]),
+            ([0,0,1], vec![[0,0,2]]),
+            ([-1,0,0], vec![[-1,0,0],[-2,1,1]]),
+            ([0,0,0], vec![[0,0,0],[0,0,1]]),
+            ([0,0,0], vec![[0,0,1],[0,0,0],[0,0,0]]),
+            ([0,0,0], vec![[0,0,1],[1,0,0]]),
+            ([0,0,0], vec![[0,0,1]]),
+            ([0,0,0], vec![]),
+            ([0,0,0], vec![]),
+            ([0,0,0], vec![[0,0,2]]),
+            ([-1,0,0], vec![]),
+        ];
+        for (index, (block, keys)) in updates.into_iter().enumerate() {
+            actual.mark_complete_geometry_source();
+            reference.mark_complete_geometry_source();
+            actual.set_source_timestamp_ns(100 + index as u64);
+            reference.set_source_timestamp_ns(100 + index as u64);
+            let previous = actual.clone();
+            let old_blocks = previous.blocks.clone();
+            let old_columns = previous.columns.clone();
+            // Duplicate inputs retain BTreeMap's last-value-wins semantics.
+            let values: BTreeMap<_, _> = keys.into_iter().enumerate().map(|(n, key)|
+                (key, SurfaceObservation { observed_ns: index as u64 + n as u64, hits: n as u16 })).collect();
+            let result = actual.replace_block(block, values.clone());
+            let expected = replace_block_reference(&mut reference, block, values);
+            assert_eq!(result.is_ok(), expected.is_ok());
+            assert_eq!(actual.blocks, reference.blocks);
+            assert_eq!(actual.columns, reference.columns);
+            assert_eq!(actual.complete_geometry_source, reference.complete_geometry_source);
+            assert_eq!(previous.blocks, old_blocks);
+            assert_eq!(previous.columns, old_columns);
+            if result.is_err() {
+                assert!(actual.blocks.ptr_eq(&previous.blocks));
+                assert!(actual.columns.ptr_eq(&previous.columns));
+                assert!(Arc::ptr_eq(&actual.obstacle_cache, &previous.obstacle_cache));
+            } else {
+                assert!(!Arc::ptr_eq(&actual.obstacle_cache, &previous.obstacle_cache));
+            }
+            for x in -2..=2 { for y in 0..=2 { for z in -2..=3 {
+                let key = [x,y,z];
+                assert_eq!(actual.get(key), reference.get(key));
+                assert_eq!(actual.supports_obstacle(key), reference.supports_obstacle(key));
+                assert_eq!(actual.has_complete_block(key), reference.has_complete_block(key));
+            }}}
+        }
+    }
+
+    #[test]
+    fn evidence_refresh_reuses_geometry_but_retires_obstacle_permissions() {
+        let key = [1,1,1];
+        let mut grid = SurfaceObservations::new(0.05, 32).unwrap();
+        grid.set_source_timestamp_ns(100);
+        grid.replace_block([0,0,0], BTreeMap::from([
+            (key, SurfaceObservation { observed_ns: 100, hits: 1 }),
+        ])).unwrap();
+        grid.mark_complete_geometry_source();
+        assert!(grid.supports_obstacle(key));
+        let original = grid.clone();
+        // An older isolated observation must not inherit a current-frame permission.
+        let older = SurfaceObservation { observed_ns: 1, hits: 1 };
+        grid.replace_block([0,0,0], BTreeMap::from([(key, older)])).unwrap();
+        assert!(grid.columns.ptr_eq(&original.columns));
+        assert!(!grid.blocks.ptr_eq(&original.blocks));
+        assert!(!grid.is_complete_geometry_source());
+        assert!(!grid.same_geometry(&original));
+        assert_eq!(grid.get(key), Some(older));
+        assert!(!grid.supports_obstacle(key));
+        assert!(original.supports_obstacle(key));
+        assert_eq!(original.get(key).unwrap().observed_ns, 100);
+        grid.mark_complete_geometry_source();
+        assert!(grid.same_geometry(&original));
+        let confirmed = SurfaceObservation { observed_ns: 1, hits: 3 };
+        grid.replace_block([0,0,0], BTreeMap::from([(key, confirmed)])).unwrap();
+        assert_eq!(grid.get(key), Some(confirmed));
+        assert!(grid.supports_obstacle(key));
+        grid.set_source_timestamp_ns(101);
+        assert!(grid.supports_obstacle(key));
+        assert!(original.supports_obstacle(key));
+    }
+
+    #[test]
+    fn neighbor_evidence_refresh_retires_cached_cross_block_decisions() {
+        let center = [1,0,0];
+        let neighbor = [2,0,0];
+        let weak = SurfaceObservation { observed_ns: 1, hits: 1 };
+        let mut grid = SurfaceObservations::new(0.05, 2).unwrap();
+        grid.set_source_timestamp_ns(100);
+        grid.replace_block([0,0,0], BTreeMap::from([(center, weak)])).unwrap();
+        grid.replace_block([1,0,0], BTreeMap::from([(neighbor, weak)])).unwrap();
+        assert!(!grid.supports_obstacle(center));
+        let previous = grid.clone();
+        let strong = SurfaceObservation { observed_ns: 1, hits: 3 };
+        grid.replace_block([1,0,0], BTreeMap::from([(neighbor, strong)])).unwrap();
+        assert!(grid.columns.ptr_eq(&previous.columns));
+        assert!(grid.supports_obstacle(center));
+        assert!(!previous.supports_obstacle(center));
+        assert_eq!(previous.get(neighbor), Some(weak));
+    }
+
+    #[test]
+    #[ignore = "matched local observation-block microbenchmark; run explicitly with --nocapture"]
+    fn benchmark_evidence_only_block_refresh() {
+        // One fully occupied horizontal 32x32 block, not a full-map scan fixture.
+        let values: BTreeMap<_, _> = (0..32).flat_map(|x| (0..32).map(move |y|
+            ([x,y,0], SurfaceObservation { observed_ns: 1, hits: 1 }))).collect();
+        let mut seed = SurfaceObservations::new(0.05, 32).unwrap();
+        seed.replace_block([0,0,0], values.clone()).unwrap();
+        let updates: Vec<_> = (2..202).map(|observed_ns| values.keys().map(|&key|
+            (key, SurfaceObservation { observed_ns, hits: 2 })).collect::<BTreeMap<_, _>>()).collect();
+        benchmark_updates("evidence-only", &seed, &updates, true);
+        // Same cardinality, but every occupied layer changes; membership rejects on
+        // its first key before taking the unchanged baseline reconstruction path.
+        let changes: Vec<_> = (2..202).map(|observed_ns| values.keys().map(|&[x,y,_]|
+            ([x,y,1 + (observed_ns % 2) as i32], SurfaceObservation { observed_ns, hits: 2 }))
+            .collect::<BTreeMap<_, _>>()).collect();
+        benchmark_updates("changed-membership", &seed, &changes, false);
+        // A last-key-only layer toggle forces nearly the full membership scan before
+        // falling back, bounding the extra lookup work on equal-cardinality changes.
+        let late_changes: Vec<_> = (2..202).map(|observed_ns| values.keys().map(|&[x,y,z]| {
+            let z = if x == 31 && y == 31 { 1 + (observed_ns % 2) as i32 } else { z };
+            ([x,y,z], SurfaceObservation { observed_ns, hits: 2 })
+        }).collect::<BTreeMap<_, _>>()).collect();
+        benchmark_updates("late-key-changed-membership", &seed, &late_changes, false);
+    }
+
+    fn benchmark_updates(
+        label: &str,
+        seed: &SurfaceObservations,
+        updates: &[BTreeMap<[i32; 3], SurfaceObservation>],
+        unchanged_geometry: bool,
+    ) {
+        let run = |use_reference| {
+            let mut grid = seed.clone();
+            let start = std::time::Instant::now();
+            let mut rebuilt_columns = 0;
+            for update in updates {
+                if use_reference {
+                    rebuilt_columns += replace_block_reference(&mut grid, [0,0,0], update.clone()).unwrap();
+                } else {
+                    grid.replace_block([0,0,0], update.clone()).unwrap();
+                }
+            }
+            (grid, start.elapsed(), rebuilt_columns)
+        };
+        // Warm both paths and alternate measured order to reduce order bias.
+        run(true);
+        run(false);
+        let mut old_times = Vec::new();
+        let mut new_times = Vec::new();
+        for round in 0..5 {
+            let (reference, optimized) = if round % 2 == 0 {
+                (run(true), run(false))
+            } else {
+                let optimized = run(false);
+                (run(true), optimized)
+            };
+            assert_eq!(optimized.0.blocks, reference.0.blocks);
+            assert_eq!(optimized.0.columns, reference.0.columns);
+            if unchanged_geometry { assert!(optimized.0.columns.ptr_eq(&seed.columns)); }
+            assert_eq!(reference.2, updates.len() * 1024);
+            old_times.push(reference.1);
+            new_times.push(optimized.1);
+        }
+        old_times.sort();
+        new_times.sort();
+        eprintln!("{label}: {} matched block updates, five alternating rounds; median reference={:?}, optimized={:?}; reference rebuilt {} column vectors; optimized rebuilt {}",
+            updates.len(), old_times[2], new_times[2], updates.len() * 1024,
+            if unchanged_geometry { 0 } else { updates.len() * 1024 });
+    }
 
     #[test]
     fn planning_fork_shares_observation_roots_without_sharing_obstacle_cache() {

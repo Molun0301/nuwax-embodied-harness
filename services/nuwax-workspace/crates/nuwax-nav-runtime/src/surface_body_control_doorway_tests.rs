@@ -853,7 +853,7 @@ fn captured_dense_doorway_far_bearing_has_guarded_command() {
             follower.update_odometry(stamped(current,time));
             follower.refresh_current_body_view();
             let now=Instant::now();
-            let outcome=follower.follow_body_step_policy::<true,true,false>(0.32);
+            let outcome=follower.follow_body_step_policy::<true,true,false,false>(0.32);
             max_step=max_step.max(now.elapsed());
             if offset%20==0 {eprintln!("DOOR_STRAIGHT_INTENT tick={} pose={current:?} applied={applied:?} outcome={outcome:?} elapsed={:?}",71+offset,started.elapsed());}
             let command=match outcome {
@@ -894,7 +894,7 @@ fn captured_dense_doorway_far_bearing_has_guarded_command() {
             follower.update_odometry(stamped(current,time));
             follower.refresh_current_body_view();
             let now=Instant::now();
-            let outcome=follower.follow_body_step_policy::<true,true,true>(0.32);
+            let outcome=follower.follow_body_step_policy::<true,true,true,false>(0.32);
             max_step=max_step.max(now.elapsed());
             if offset%20==0 {eprintln!("DOOR_CHEAP_ALIGNMENT tick={} pose={current:?} applied={applied:?} outcome={outcome:?} elapsed={:?}",71+offset,started.elapsed());}
             let command=match outcome {
@@ -934,4 +934,799 @@ fn straight_intent_eligibility_keeps_corners_turns_and_reversals() {
     assert!(!check(vec![make(0.0,0.0,0.0),make(0.1,0.0,0.0),make(0.2,0.0,0.01)]));
     assert!(!check(vec![make(0.0,0.0,0.0),make(0.0,0.0,0.0),make(0.1,0.0,0.0)]));
     assert!(!forward_straight_run(&Path3D{poses:vec![make(0.0,0.0,0.0),make(0.1,0.0,0.0)]},1,1,Point3::new(0.1,0.0,0.4)));
+}
+// The tick-123 source/log checkpoint reproduces its complete public rejection
+// in exit-state-repro-v1.log. It does not infer earlier latch-creation history.
+fn exit_checkpoint() -> SurfaceFollower {
+    let mut follower=checkpoint();
+    let current=([4599414902756649891,4595099643829216516,4600877379321698714].map(f64::from_bits),[0,0,4569385943785422139,4607182374406345371].map(f64::from_bits));
+    follower.path_index=420; follower.alignment_target_index=Some(420);
+    follower.progress_m=f64::from_bits(4607312963206528456);
+    let a=[4589264560797156439,0,4576143519352229438].map(f64::from_bits);
+    follower.observe_applied_command(Twist2{linear:Point2::new(a[0],a[1]),angular_z:a[2]});
+    follower.update_odometry(stamped(current,7_150_000_000));
+    follower
+}
+
+#[test]
+#[ignore="diagnostic exit-state reproduction, not a passage fix"]
+fn captured_exit_state_reproduces_exact_rejection() {
+    let mut follower=exit_checkpoint();
+    let started=Instant::now();
+    let result=follower.step(0.32);
+    let expected: &str="ReplanRequired(\"局部路径点420无法从实际站姿按前进圆弧或转向接续，需要重新规划; initial_path_index=420 initial_alignment_index=Some(420) initial_progress=1.0289866811689183 selected_index=420 alignment_index=Some(420) path_len=584 target=Pose3 { position: Point3 { x: 0.341879547245133, y: 0.16500862138040892, z: 0.4 }, orientation: Quaternion { w: 0.9999894712817012, x: 0.0, y: 0.0, z: 0.0045888261836384 } } previous=Pose3 { position: Point3 { x: 0.33999998648377033, y: 0.16499999631196252, z: 0.4 }, orientation: Quaternion { w: 1.0, x: -0.0, y: 0.0, z: -2.220446049250313e-16 } } applied=Twist2 { linear: Point2 { x: 0.06383976866574535, y: 0.0 }, angular_z: 0.008656092459438654 }\")";
+    eprintln!("DOOR_EXIT_CHECKPOINT result={result:?} elapsed={:?}",started.elapsed());
+    assert_eq!(format!("{result:?}"),expected);
+}
+
+    #[test]
+    #[ignore = "experimental translation advice, unchanged current dynamic guard"]
+    fn captured_exit_translation_advice_continues_to_goal() {
+        let mut follower=exit_checkpoint();
+        let source=Arc::clone(follower.source_map.as_ref().unwrap());
+        let mut current=body(follower.odometry.as_ref().unwrap());
+        let values=[follower.last_command.linear.x,follower.last_command.linear.y,follower.last_command.angular_z];
+        let mut applied=Twist2 {linear:Point2::new(values[0],values[1]),angular_z:values[2]};
+        let started=Instant::now(); let mut nonzero=0; let mut max_step=std::time::Duration::ZERO;
+        for offset in 0..(240-123) {
+            let time=7_150_000_000+offset as i64*50_000_000;
+            follower.observe_applied_command(applied);
+            follower.update_odometry(stamped(current,time));
+            follower.refresh_current_body_view();
+            let now=Instant::now();
+            let outcome=follower.follow_body_step_policy::<true,true,true,true>(0.32);
+            max_step=max_step.max(now.elapsed());
+            if offset%20==0 {eprintln!("DOOR_EXIT_TRANSLATION tick={} pose={current:?} applied={applied:?} outcome={outcome:?} elapsed={:?}",123+offset,started.elapsed());}
+            let command=match outcome {
+                PlannerStep::Command(command)=>command,
+                PlannerStep::Succeeded=>Twist2::ZERO,
+                other=>panic!("straight intent failed at tick{}: {other:?}, actual={current:?}, applied={applied:?}",123+offset),
+            };
+            assert!(command.linear.x>=0.0 && command.linear.y==0.0);
+            if command!=Twist2::ZERO {nonzero+=1;}
+            let next_applied=Twist2 {linear:Point2::new(applied.linear.x+(command.linear.x-applied.linear.x).clamp(-0.05,0.05),0.0),angular_z:applied.angular_z+(command.angular_z-applied.angular_z).clamp(-0.1,0.1)};
+            let mean=Twist2 {linear:Point2::new((applied.linear.x+next_applied.linear.x)*0.5,0.0),angular_z:(applied.angular_z+next_applied.angular_z)*0.5};
+            let next=nuwax_nav_control::integrate(PlanarPose {x:current.0[0],y:current.0[1],yaw:2.0*current.1[2].atan2(current.1[3])},mean,0.05);
+            let actual=([next.x,next.y,0.4],[0.0,0.0,(next.yaw/2.0).sin(),(next.yaw/2.0).cos()]);
+            source.validate_body_motion(current,actual,&[]).unwrap();
+            current=actual;applied=next_applied;
+            let goal=decode(GOAL);let distance=(current.0[0]-goal.0[0]).hypot(current.0[1]-goal.0[1]);
+            let yaw_error=angle_diff(2.0*current.1[2].atan2(current.1[3]),0.0).abs();
+            if matches!(outcome,PlannerStep::Succeeded) && applied.linear.x.abs()<1e-6 && applied.angular_z.abs()<1e-6 {
+                assert!(distance<0.03 && yaw_error<0.05);assert!(nonzero>2);
+                eprintln!("DOOR_EXIT_TRANSLATION_GOAL tick={} nonzero={nonzero} distance={distance} yaw_error={yaw_error} max_step={max_step:?} wall={:?}",123+offset,started.elapsed());return;
+            }
+        }
+        panic!("straight intent did not finish within original 240 ticks: current={current:?}, applied={applied:?}, nonzero={nonzero}, max_step={max_step:?}");
+    }
+
+
+    #[test]
+    #[ignore = "experimental translation advice, unchanged current dynamic guard"]
+    fn captured_translation_advice_from_first_failure_reaches_goal() {
+        let mut follower=checkpoint();
+        let source=Arc::clone(follower.source_map.as_ref().unwrap());
+        let mut current=decode(CURRENT);
+        let values=APPLIED.map(f64::from_bits);
+        let mut applied=Twist2 {linear:Point2::new(values[0],values[1]),angular_z:values[2]};
+        let started=Instant::now(); let mut nonzero=0; let mut max_step=std::time::Duration::ZERO;
+        for offset in 0..(240-71) {
+            let time=TIME+offset as i64*50_000_000;
+            follower.observe_applied_command(applied);
+            follower.update_odometry(stamped(current,time));
+            follower.refresh_current_body_view();
+            let now=Instant::now();
+            let outcome=follower.follow_body_step_policy::<true,true,true,true>(0.32);
+            max_step=max_step.max(now.elapsed());
+            if offset%20==0 {eprintln!("DOOR_ALL_TRANSLATION tick={} pose={current:?} applied={applied:?} outcome={outcome:?} elapsed={:?}",71+offset,started.elapsed());}
+            let command=match outcome {
+                PlannerStep::Command(command)=>command,
+                PlannerStep::Succeeded=>Twist2::ZERO,
+                other=>panic!("straight intent failed at tick{}: {other:?}, actual={current:?}, applied={applied:?}",71+offset),
+            };
+            assert!(command.linear.x>=0.0 && command.linear.y==0.0);
+            if command!=Twist2::ZERO {nonzero+=1;}
+            let next_applied=Twist2 {linear:Point2::new(applied.linear.x+(command.linear.x-applied.linear.x).clamp(-0.05,0.05),0.0),angular_z:applied.angular_z+(command.angular_z-applied.angular_z).clamp(-0.1,0.1)};
+            let mean=Twist2 {linear:Point2::new((applied.linear.x+next_applied.linear.x)*0.5,0.0),angular_z:(applied.angular_z+next_applied.angular_z)*0.5};
+            let next=nuwax_nav_control::integrate(PlanarPose {x:current.0[0],y:current.0[1],yaw:2.0*current.1[2].atan2(current.1[3])},mean,0.05);
+            let actual=([next.x,next.y,0.4],[0.0,0.0,(next.yaw/2.0).sin(),(next.yaw/2.0).cos()]);
+            source.validate_body_motion(current,actual,&[]).unwrap();
+            current=actual;applied=next_applied;
+            let goal=decode(GOAL);let distance=(current.0[0]-goal.0[0]).hypot(current.0[1]-goal.0[1]);
+            let yaw_error=angle_diff(2.0*current.1[2].atan2(current.1[3]),0.0).abs();
+            if matches!(outcome,PlannerStep::Succeeded) && applied.linear.x.abs()<1e-6 && applied.angular_z.abs()<1e-6 {
+                assert!(distance<0.03 && yaw_error<0.05);assert!(nonzero>2);
+                eprintln!("DOOR_ALL_TRANSLATION_GOAL tick={} nonzero={nonzero} distance={distance} yaw_error={yaw_error} max_step={max_step:?} wall={:?}",71+offset,started.elapsed());return;
+            }
+        }
+        panic!("straight intent did not finish within original 240 ticks: current={current:?}, applied={applied:?}, nonzero={nonzero}, max_step={max_step:?}");
+    }
+
+
+    #[test]
+    #[ignore = "experimental translation advice, unchanged current dynamic guard"]
+    fn captured_translation_advice_from_original_start_reaches_goal() {
+        let mut follower=checkpoint();
+        follower.path_index=1; follower.alignment_target_index=None; follower.progress_m=0.0;
+        follower.observe_applied_command(Twist2::ZERO);
+        follower.update_odometry(stamped(decode(FIRST),FIRST_TIME));
+        let source=Arc::clone(follower.source_map.as_ref().unwrap());
+        let mut current=decode(FIRST);
+        let values=[0.0,0.0,0.0];
+        let mut applied=Twist2 {linear:Point2::new(values[0],values[1]),angular_z:values[2]};
+        let started=Instant::now(); let mut nonzero=0; let mut max_step=std::time::Duration::ZERO;
+        for offset in 0..240 {
+            let time=FIRST_TIME+offset as i64*50_000_000;
+            follower.observe_applied_command(applied);
+            follower.update_odometry(stamped(current,time));
+            follower.refresh_current_body_view();
+            let now=Instant::now();
+            let outcome=follower.follow_body_step_policy::<true,true,true,true>(0.32);
+            max_step=max_step.max(now.elapsed());
+            if offset%20==0 {eprintln!("DOOR_ORIGINAL_START tick={} pose={current:?} applied={applied:?} outcome={outcome:?} elapsed={:?}",offset,started.elapsed());}
+            let command=match outcome {
+                PlannerStep::Command(command)=>command,
+                PlannerStep::Succeeded=>Twist2::ZERO,
+                other=>panic!("straight intent failed at tick{}: {other:?}, actual={current:?}, applied={applied:?}",offset),
+            };
+            assert!(command.linear.x>=0.0 && command.linear.y==0.0);
+            if command!=Twist2::ZERO {nonzero+=1;}
+            let next_applied=Twist2 {linear:Point2::new(applied.linear.x+(command.linear.x-applied.linear.x).clamp(-0.05,0.05),0.0),angular_z:applied.angular_z+(command.angular_z-applied.angular_z).clamp(-0.1,0.1)};
+            let mean=Twist2 {linear:Point2::new((applied.linear.x+next_applied.linear.x)*0.5,0.0),angular_z:(applied.angular_z+next_applied.angular_z)*0.5};
+            let next=nuwax_nav_control::integrate(PlanarPose {x:current.0[0],y:current.0[1],yaw:2.0*current.1[2].atan2(current.1[3])},mean,0.05);
+            let actual=([next.x,next.y,0.4],[0.0,0.0,(next.yaw/2.0).sin(),(next.yaw/2.0).cos()]);
+            source.validate_body_motion(current,actual,&[]).unwrap();
+            current=actual;applied=next_applied;
+            let goal=decode(GOAL);let distance=(current.0[0]-goal.0[0]).hypot(current.0[1]-goal.0[1]);
+            let yaw_error=angle_diff(2.0*current.1[2].atan2(current.1[3]),0.0).abs();
+            if matches!(outcome,PlannerStep::Succeeded) && applied.linear.x.abs()<1e-6 && applied.angular_z.abs()<1e-6 {
+                assert!(distance<0.03 && yaw_error<0.05);assert!(nonzero>2);
+                eprintln!("DOOR_ORIGINAL_START_GOAL tick={} nonzero={nonzero} distance={distance} yaw_error={yaw_error} max_step={max_step:?} wall={:?}",offset,started.elapsed());return;
+            }
+        }
+        panic!("straight intent did not finish within original 240 ticks: current={current:?}, applied={applied:?}, nonzero={nonzero}, max_step={max_step:?}");
+    }
+
+
+fn tga_pose(x: f64, y: f64, yaw: f64) -> PoseStamped {
+    stamped(([x, y, 0.4], [0.0, 0.0, (yaw * 0.5).sin(), (yaw * 0.5).cos()]), 0)
+}
+
+fn tga_limits(car: bool) -> MotionLimits {
+    MotionLimits {
+        model: if car { MotionModel::Ackermann } else { MotionModel::Differential },
+        max_forward_mps: 0.5,
+        max_reverse_mps: 0.3,
+        max_lateral_mps: 0.0,
+        max_angular_rps: 0.7,
+        linear_acceleration_mps2: 1.0,
+        guaranteed_braking_mps2: 1.0,
+        angular_acceleration_rps2: 2.0,
+        guaranteed_angular_braking_rps2: 2.0,
+        reaction_time_sec: 0.1,
+        minimum_turning_radius_m: if car { 0.8 } else { 0.0 },
+        can_rotate_in_place: !car,
+    }
+}
+
+fn tga_map(missing_future_strip: bool, expired_future_strip: bool) -> Arc<SurfaceSnapshot> {
+    let base = super::super::test_snapshot(0.0, false);
+    let geometry = if missing_future_strip {
+        // The current footprint [0.9,1.1] and first 50-ms footprint through
+        // x=1.125 remain supported. The unavoidable stopping footprint enters
+        // the missing strip's existing clearance margin. The strip itself is
+        // [1.3,1.5); the stopping footprint need not enter it. Floor beyond remains real.
+        let points: Vec<_> = (0..65)
+            .filter(|x| !(13..=14).contains(x))
+            .flat_map(|x| (0..35).map(move |y| {
+                (((x as f64 + 0.5) * 0.1) as f32,
+                 ((y as f64 + 0.5) * 0.1) as f32, 0.05_f32)
+            })).collect();
+        SurfaceSnapshot::from_points(&points, base.config().clone(), 0.1).unwrap()
+    } else {
+        (*base).clone()
+    }.with_body_envelope(SurfaceBodyEnvelope {
+        footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+        z_bounds_m: [-0.05, 0.2],
+        body_to_support_z_m: 0.3,
+        max_step_up_m: 0.0,
+        max_step_down_m: 0.0,
+        max_cross_slope_deg: 10.0,
+        support_uncertainty_m: 0.0,
+    }).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap()
+        .as_nanos().min(u128::from(u64::MAX)) as u64;
+    let mut blocks = BTreeMap::<[i32;3], BTreeMap<[i32;3], SurfaceObservation>>::new();
+    for (x,y,z) in geometry.cell_keys() {
+        let key = [x,y,z];
+        blocks.entry(key.map(|v| v.div_euclid(32))).or_default().insert(key,
+            SurfaceObservation {
+                observed_ns: if expired_future_strip && x >= 12 { 1 } else { now },
+                hits: 2,
+            });
+    }
+    let mut observations = SurfaceObservations::new(geometry.source_voxel_size_m(), 32).unwrap();
+    for (key, block) in blocks { observations.replace_block(key, block).unwrap(); }
+    Arc::new(geometry.with_observations(Some(Arc::new(observations))))
+}
+
+fn tga_follower(map: Arc<SurfaceSnapshot>, poses: Vec<PoseStamped>, car: bool) -> SurfaceFollower {
+    let mut config = SurfaceFollowerConfig::new(0.3);
+    config.controller.speed = 0.5;
+    config.controller.nerf_speed = 1.0;
+    config.controller.control_frequency = 20.0;
+    config.controller.simulation = false;
+    config.max_angular_speed_rps = 0.7;
+    config.max_observation_age_sec = Some(30.0);
+    config.motion_limits = Some(tga_limits(car));
+    let mut follower = SurfaceFollower::new(config).unwrap();
+    let goal = poses.last().unwrap().clone();
+    follower.configure_goal(&goal, GoalOptions {
+        allow_reverse: false, position_tolerance_m: 0.03, yaw_tolerance_rad: 0.05,
+    }).unwrap();
+    follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+    follower.update_odometry(poses[0].clone());
+    follower.replace_execution_path(ExecutionPath::Surface(Path3D { poses }), None, goal).unwrap();
+    assert!(follower.current_body_error().is_none());
+    assert!(follower.invalid_input.is_none());
+    assert!(follower.braking_deadline.is_none());
+    assert!(follower.simulation_braking_deadline_ns.is_none());
+    assert_eq!(follower.path_index, 1);
+    assert_eq!(follower.progress_m, 0.0);
+    follower
+}
+
+fn tga_straight(map: Arc<SurfaceSnapshot>, car: bool) -> SurfaceFollower {
+    tga_follower(map, vec![tga_pose(1.0, 0.55, 0.0), tga_pose(2.0, 0.55, 0.0)], car)
+}
+
+fn tga_speed() -> Twist2 {
+    Twist2 { linear: Point2::new(0.5, 0.0), angular_z: 0.0 }
+}
+
+// Checks the same complete geometric and rebased-period callbacks as issuance.
+// The explicit applied argument allows rechecking a returned command against
+// the actual pre-step velocity, instead of the newly written last_command.
+fn tga_prove_command(
+    follower: &SurfaceFollower, applied: Twist2, command: Twist2,
+) -> (bool, Option<nuwax_nav_mls_planner::surface::SurfaceError>) {
+    let map = follower.map.as_ref().unwrap();
+    let pose = planar(follower.odometry.as_ref().unwrap());
+    let limits = forward_navigation_limits(follower.config.motion_limits.as_ref().unwrap());
+    follower.with_body_motion_checks(|clear, period_clear, last_failure| {
+        let choice = nuwax_nav_control::check_selected_stopping_trajectory_with_period_check(
+            pose, applied, command, &limits,
+            1.0 / follower.config.controller.control_frequency, 1,
+            f64::from(map.source_voxel_size_m()) * 0.5,
+            map.body_envelope().unwrap().radius(), clear, period_clear,
+        );
+        (choice.is_some(), last_failure.borrow().clone())
+    }).unwrap()
+}
+
+fn tga_assert_initial_period_valid(follower: &SurfaceFollower) {
+    let from = planar(follower.odometry.as_ref().unwrap());
+    let dt = 1.0 / follower.config.controller.control_frequency;
+    let to = nuwax_nav_control::integrate(from, tga_speed(), dt);
+    assert!((to.x - 1.025).abs() < 1e-12);
+    follower.with_body_motion_checks(|clear, period_clear, failure| {
+        assert!(clear(from, to, dt), "first geometric segment: {:?}", failure.borrow());
+        assert!(period_clear(from, to, dt), "first control period: {:?}", failure.borrow());
+    }).unwrap();
+}
+
+fn tga_assert_model_command(command: Twist2, physical: &MotionLimits) {
+    assert!(command.linear.x.is_finite() && command.linear.y.is_finite()
+        && command.angular_z.is_finite());
+    assert!(command.linear.x >= 0.0 && command.linear.x <= physical.max_forward_mps + 1e-9);
+    assert_eq!(command.linear.y, 0.0);
+    assert!(command.angular_z.abs() <= physical.max_angular_rps + 1e-9);
+    if !physical.can_rotate_in_place && command.linear.x == 0.0 {
+        assert_eq!(command.angular_z, 0.0, "a nonrotatable model cannot acquire a pivot channel");
+    }
+    assert!(command.angular_z.abs() * physical.minimum_turning_radius_m
+        <= command.linear.x + 1e-9, "turning radius was weakened: {command:?}");
+}
+
+#[test]
+fn translation_advice_fresh_straight_fixture_emits_guarded_nonzero_command() {
+    // Matched positive control for the three tail negatives below, including
+    // the nonrotatable model. A zero stop is deliberately not a passing result.
+    for car in [false, true] {
+        let mut follower = tga_straight(tga_map(false, false), car);
+        follower.observe_applied_command(tga_speed());
+        tga_assert_initial_period_valid(&follower);
+        let result = follower.follow_body_step_policy::<true,true,true,true>(0.3);
+        let PlannerStep::Command(command) = result else { panic!("{result:?}"); };
+        assert!(command.linear.x > 0.0, "positive control must advance: {command:?}");
+        tga_assert_model_command(command, follower.config.motion_limits.as_ref().unwrap());
+        let (safe, why) = tga_prove_command(&follower, tga_speed(), command);
+        assert!(safe, "issued candidate failed the full current-state stopping proof: {why:?}");
+        assert!(follower.braking_deadline.is_none());
+    }
+}
+
+#[test]
+fn translation_advice_rejects_expired_observation_only_in_stopping_tail() {
+    use nuwax_nav_mls_planner::surface::SurfaceError;
+    let mut follower = tga_straight(tga_map(false, true), false);
+    follower.observe_applied_command(tga_speed());
+    tga_assert_initial_period_valid(&follower);
+    let (safe, why) = tga_prove_command(&follower, tga_speed(), Twist2::ZERO);
+    assert!(!safe, "even immediate stopping must retain the old applied speed");
+    match why {
+        Some(SurfaceError::NearFieldObservation { cell, observed_ns, checked_ns, .. }) => {
+            assert!(cell[0] >= 12, "initial occupied cells must not be the failing evidence");
+            assert_eq!(observed_ns, 1);
+            assert!(checked_ns > observed_ns + 30_000_000_000);
+        }
+        other => panic!("expected typed expiry in future cells, got {other:?}"),
+    }
+    let result = follower.follow_body_step_policy::<true,true,true,true>(0.3);
+    assert!(matches!(&result, PlannerStep::ReplanRequired(reason) if reason.contains("扫掠拒绝")),
+        "the actual policy must reach and fail the final guard: {result:?}");
+    assert_eq!(follower.last_command, Twist2::ZERO);
+    assert!(follower.braking_deadline.is_some(), "rejection must retain physical stopping time");
+    assert_eq!(follower.path_index, 1);
+    assert_eq!(follower.progress_m, 0.0);
+}
+
+#[test]
+fn translation_advice_rejects_restrictive_boundary_in_stopping_tail() {
+    use nuwax_nav_mls_planner::surface::SurfaceError;
+    let mut follower = tga_straight(tga_map(false, false), false);
+    // First-period whole footprint ends at 1.125, inside 1.14. The current
+    // stopping center reaches 1.175, outside it. A 1.2 boundary is too loose:
+    // boundary segments constrain support position, not just footprint edges.
+    follower.configure_boundary(&[[0.0,0.0],[1.14,0.0],[1.14,3.5],[0.0,3.5]]);
+    follower.observe_applied_command(tga_speed());
+    tga_assert_initial_period_valid(&follower);
+    let (safe, why) = tga_prove_command(&follower, tga_speed(), Twist2::ZERO);
+    assert!(!safe);
+    assert!(matches!(why, Some(SurfaceError::InvalidBoundary)), "{why:?}");
+    let result = follower.follow_body_step_policy::<true,true,true,true>(0.3);
+    assert!(matches!(&result, PlannerStep::ReplanRequired(reason) if reason.contains("扫掠拒绝")), "{result:?}");
+    assert_eq!(follower.last_command, Twist2::ZERO);
+    assert!(follower.braking_deadline.is_some());
+    assert_eq!(follower.path_index, 1);
+    assert_eq!(follower.progress_m, 0.0);
+}
+
+#[test]
+fn translation_advice_rejects_missing_future_support_in_stopping_tail() {
+    use nuwax_nav_mls_planner::surface::SurfaceError;
+    let mut follower = tga_straight(tga_map(false, false), false);
+    // Legitimate post-admission map change: the previously admitted forward
+    // route loses future support. Keep the route and actual pose unchanged.
+    follower.update_execution_map(ExecutionMap::Surface(tga_map(true, false))).unwrap();
+    assert!(follower.current_body_error().is_none(), "the actual body must remain valid");
+    follower.observe_applied_command(tga_speed());
+    tga_assert_initial_period_valid(&follower);
+    let (safe, why) = tga_prove_command(&follower, tga_speed(), Twist2::ZERO);
+    assert!(!safe);
+    assert!(matches!(why, Some(SurfaceError::MissingSupport)
+        | Some(SurfaceError::UntraversableSegment)
+        | Some(SurfaceError::InsufficientClearance)),
+        "must be a geometric future-body failure, not expiry or bad current input: {why:?}");
+    let result = follower.follow_body_step_policy::<true,true,true,true>(0.3);
+    assert!(matches!(&result, PlannerStep::ReplanRequired(reason) if reason.contains("扫掠拒绝")), "{result:?}");
+    assert_eq!(follower.last_command, Twist2::ZERO);
+    assert!(follower.braking_deadline.is_some());
+    assert_eq!(follower.path_index, 1);
+    assert_eq!(follower.progress_m, 0.0);
+}
+
+#[test]
+fn translation_advice_nonrotatable_model_keeps_channels_and_radius() {
+    let mut follower = tga_follower(tga_map(false, false), vec![
+        tga_pose(1.0, 0.55, 0.0), tga_pose(1.0, 1.05, 0.0),
+    ], true);
+    let physical = follower.config.motion_limits.as_ref().unwrap().clone();
+    let result = follower.follow_body_step_policy::<true,true,true,true>(0.3);
+    match result {
+        PlannerStep::Command(command) => {
+            tga_assert_model_command(command, &physical);
+            assert!(command.linear.x > 0.0,
+                "at-rest target is not satisfied; a zero command is not positive evidence");
+            let (safe, why) = tga_prove_command(&follower, Twist2::ZERO, command);
+            assert!(safe, "{why:?}");
+        }
+        PlannerStep::ReplanRequired(_) => {
+            // Typed policy rejection is legitimate if no radius-respecting
+            // advancing arc is useful. It is distinct from an accepted pivot.
+            assert_eq!(follower.last_command, Twist2::ZERO);
+        }
+        other => panic!("neither completed nor silently stopped: {other:?}"),
+    }
+    assert_eq!(follower.config.motion_limits.as_ref().unwrap(), &physical);
+    assert_eq!(follower.path_index, 1);
+    assert_eq!(follower.progress_m, 0.0);
+}
+
+
+#[test]
+fn translation_advice_keeps_corner_reversal_turn_and_s_bend_target_barriers() {
+    // All start at real path progress zero and at rest. The selected advice
+    // must stop at the semantic barrier even though all future floor is clear.
+    let cases = vec![
+        ("corner", vec![
+            tga_pose(1.0,0.55,0.0), tga_pose(1.3,0.55,0.0),
+            tga_pose(1.3,0.85,0.0),
+        ], (1.3,0.55)),
+        ("reversal", vec![
+            tga_pose(1.0,0.55,0.0), tga_pose(1.3,0.55,0.0),
+            tga_pose(1.15,0.55,0.0),
+        ], (1.3,0.55)),
+        ("explicit turn ahead", vec![
+            tga_pose(1.0,0.55,0.0), tga_pose(1.3,0.55,0.0),
+            tga_pose(1.3,0.55,0.3), tga_pose(1.55,0.63,0.3),
+        ], (1.3,0.55)),
+        ("curvature sign change", vec![
+            tga_pose(1.0,0.55,0.0), tga_pose(1.15,0.565,0.2),
+            tga_pose(1.3,0.60,0.4), tga_pose(1.45,0.61,0.2),
+        ], (1.3,0.60)),
+    ];
+    for (label, poses, expected) in cases {
+        let mut follower = tga_follower(tga_map(false, false), poses, false);
+        assert_eq!(follower.last_command, Twist2::ZERO);
+        let result = follower.follow_body_step_policy::<true,true,true,true>(0.3);
+        let PlannerStep::Command(command) = result else { panic!("{label}: {result:?}"); };
+        assert!(command.linear.x > 0.0, "{label}: no all-stop positive: {command:?}");
+        let target = follower.control_target.expect("policy must record selected advice");
+        assert!((target.x-expected.0).abs() < 1e-12
+            && (target.y-expected.1).abs() < 1e-12,
+            "{label}: advice crossed its barrier: {target:?}, expected {expected:?}");
+        assert_eq!(follower.path_index, 1, "{label}: no fictitious waypoint progress");
+        assert_eq!(follower.progress_m, 0.0, "{label}: no fictitious distance progress");
+        assert!(follower.alignment_target_index.is_none());
+        tga_assert_model_command(command, follower.config.motion_limits.as_ref().unwrap());
+        let (safe, why) = tga_prove_command(&follower, Twist2::ZERO, command);
+        assert!(safe, "{label}: selected command lost full-body guard: {why:?}");
+    }
+}
+
+#[test]
+fn translation_advice_keeps_unfinished_same_position_turn_as_a_pivot() {
+    let mut follower = tga_follower(tga_map(false, false), vec![
+        tga_pose(1.0,0.55,0.0), tga_pose(1.0,0.55,0.35),
+        tga_pose(1.3,0.65,0.35),
+    ], false);
+    let result = follower.follow_body_step_policy::<true,true,true,true>(0.3);
+    let PlannerStep::Command(command) = result else { panic!("{result:?}"); };
+    assert_eq!(command.linear, Point2::new(0.0,0.0));
+    assert!(command.angular_z > 0.0, "an unfinished valid turn must actually advance");
+    let target = follower.control_target.unwrap();
+    assert!((target.x-1.0).abs() < 1e-12 && (target.y-0.55).abs() < 1e-12);
+    assert!((target.yaw-0.35).abs() < 1e-12);
+    assert_eq!(follower.path_index, 1);
+    assert_eq!(follower.progress_m, 0.0);
+    let (safe, why) = tga_prove_command(&follower, Twist2::ZERO, command);
+    assert!(safe, "{why:?}");
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DoorScene {
+    Identity,
+    ReflectY,
+    Rotate90,
+}
+
+impl DoorScene {
+    fn key(self, [x,y,z]: [i32;3]) -> [i32;3] {
+        match self {
+            Self::Identity => [x,y,z],
+            Self::ReflectY => [x,-y-1,z],
+            Self::Rotate90 => [-y-1,x,z],
+        }
+    }
+
+    fn body(self, pose: Body) -> Body {
+        if self == Self::Identity { return pose; }
+        let ([x,y,z], [qx,qy,qz,qw]) = pose;
+        match self {
+            Self::Identity => unreachable!(),
+            // S R S with S=diag(1,-1,1): mirror the world and the local
+            // lateral axis. The captured rectangular envelope is Y-symmetric,
+            // so this leaves exactly the same physical body/calibration.
+            Self::ReflectY => ([x,-y,z], [-qx,qy,-qz,qw]),
+            // World-frame +90 degrees: q' = q_z(pi/2) * q. Avoid converting
+            // captured quaternions to yaw and rebuilding their other axes.
+            Self::Rotate90 => {
+                let h = std::f64::consts::FRAC_1_SQRT_2;
+                ([-y,x,z], [h*(qx-qy), h*(qx+qy), h*(qz+qw), h*(qw-qz)])
+            }
+        }
+    }
+
+    fn twist(self, velocity: Twist2) -> Twist2 {
+        match self {
+            Self::ReflectY => Twist2 {
+                linear: Point2::new(velocity.linear.x, -velocity.linear.y),
+                angular_z: -velocity.angular_z,
+            },
+            // A rigid world rotation does not rotate body-frame velocity
+            // components. Identity returns the input bits without arithmetic.
+            Self::Identity | Self::Rotate90 => velocity,
+        }
+    }
+}
+
+#[test]
+fn doorway_scene_transforms_preserve_identity_bits_and_source_key_bijections() {
+    let source: BTreeSet<[i32;3]> = (-100..100)
+        .flat_map(|x| (-50..100).map(move |y| [x,y,-1]))
+        .chain((0..4).flat_map(|x| (-50..100).filter(|&y| y<0 || y>=33)
+            .flat_map(move |y| (0..80).map(move |z| [x,y,z]))))
+        .collect();
+    assert_eq!(source.len(), 67_440);
+    for scene in [DoorScene::Identity, DoorScene::ReflectY, DoorScene::Rotate90] {
+        let transformed: BTreeSet<_> = source.iter().copied().map(|key| scene.key(key)).collect();
+        assert_eq!(transformed.len(), source.len(), "{scene:?}");
+        let blocks: BTreeSet<_> = transformed.iter().map(|key| key.map(|v| v.div_euclid(32))).collect();
+        assert_eq!(blocks.len(), 63, "the block-grid transforms are also bijections: {scene:?}");
+        for &key in &source {
+            let inverse = match scene {
+                DoorScene::Identity => scene.key(key),
+                DoorScene::ReflectY => scene.key(scene.key(key)),
+                DoorScene::Rotate90 => scene.key(scene.key(scene.key(scene.key(key)))),
+            };
+            assert_eq!(inverse, key);
+        }
+    }
+    for captured in [FIRST, CURRENT, GOAL].into_iter().chain(ROUTE.iter().copied()) {
+        assert_eq!(bits(DoorScene::Identity.body(decode(captured))), captured,
+            "identity must preserve all original raw pose bits");
+        assert_eq!(bits(DoorScene::ReflectY.body(DoorScene::ReflectY.body(decode(captured)))), captured);
+    }
+    let values = APPLIED.map(f64::from_bits);
+    let applied = Twist2 { linear: Point2::new(values[0],values[1]), angular_z: values[2] };
+    let raw = |v: Twist2| [v.linear.x,v.linear.y,v.angular_z].map(f64::to_bits);
+    assert_eq!(raw(DoorScene::Identity.twist(applied)), APPLIED);
+    assert_eq!(raw(DoorScene::Rotate90.twist(applied)), APPLIED);
+    let mirrored = DoorScene::ReflectY.twist(applied);
+    assert_eq!(mirrored.linear.x.to_bits(), APPLIED[0]);
+    assert_eq!(mirrored.linear.y.to_bits(), (-values[1]).to_bits());
+    assert_eq!(mirrored.angular_z.to_bits(), (-values[2]).to_bits());
+    assert_eq!(raw(DoorScene::ReflectY.twist(mirrored)), APPLIED);
+    let first = decode(FIRST);
+    let turned = DoorScene::Rotate90.body(first);
+    assert_eq!(turned.0, [-first.0[1],first.0[0],first.0[2]]);
+    assert!(angle_diff(stamped(turned,FIRST_TIME).pose.orientation.yaw(),
+        stamped(first,FIRST_TIME).pose.orientation.yaw()+std::f64::consts::FRAC_PI_2).abs()<1e-12);
+}
+
+    fn door_scene_map(scene: DoorScene) -> Arc<SurfaceSnapshot> {
+        if scene == DoorScene::Identity { return original_map(); }
+        let started = Instant::now();
+        let fine = f32::from_bits(1008981770);
+        let config = Config { world_frame: "map".into(),
+            goal_tolerance: f32::from_bits(1036831949),
+            max_slope_deg: f32::from_bits(1099956224),
+            min_step_tread_depth_m: f32::from_bits(1045220557),
+            node_spacing_m: f32::from_bits(1050253722),
+            robot_height: f32::from_bits(1036831949),
+            step_penalty_weight: f32::from_bits(1073741824),
+            step_threshold_m: f32::from_bits(0),
+            surface_closing_radius: f32::from_bits(0),
+            viz_publish_hz: f32::from_bits(0),
+            voxel_size: f32::from_bits(1036831949),
+            wall_buffer_m: f32::from_bits(1053609165),
+            wall_buffer_weight: f32::from_bits(1073741824),
+            wall_clearance_m: f32::from_bits(0),
+        };
+        let footprint = [[13822447976325526323,13818304664539496448],[4599075939470750515,13818304664539496448],[4599075939470750515,4594932627684720640],[13822447976325526323,4594932627684720640]];
+        let scalar = [13817944376698155827, 4594572339843380019, 4600877379321698714, 0, 0, 4625759767262920704, 0].map(f64::from_bits);
+        assert_eq!(fine.to_bits(), 0.01_f32.to_bits());
+        let envelope = SurfaceBodyEnvelope {
+            footprint_xy_m: footprint.into_iter().map(|p| p.map(f64::from_bits)).collect(),
+            z_bounds_m: [scalar[0], scalar[1]], body_to_support_z_m: scalar[2],
+            max_step_up_m: scalar[3], max_step_down_m: scalar[4],
+            max_cross_slope_deg: scalar[5], support_uncertainty_m: scalar[6],
+        };
+        // Verify the same body is valid under local-Y reflection. Do not
+        // rotate or shrink its footprint: it stays in the robot's body frame.
+        let footprint_bits: BTreeSet<_> = envelope.footprint_xy_m.iter()
+            .map(|p| [p[0].to_bits(),p[1].to_bits()]).collect();
+        let reflected_footprint_bits: BTreeSet<_> = envelope.footprint_xy_m.iter()
+            .map(|p| [p[0].to_bits(),(-p[1]).to_bits()]).collect();
+        assert_eq!(footprint_bits, reflected_footprint_bits);
+        let mut keys: BTreeSet<[i32; 3]> = (-100..100)
+            .flat_map(|x| (-50..100).map(move |y| [x, y, -1])).collect();
+        keys.extend((0..4).flat_map(|x| (-50..100).filter(|&y| y < 0 || y >= 33)
+            .flat_map(move |y| (0..80).map(move |z| [x, y, z]))));
+        assert_eq!(keys.len(), 67_440);
+        // Transform fine occupied cells exactly, then feed the unchanged
+        // reader-equivalent f64 -> f32 -> planning-column conversion below.
+        let keys: BTreeSet<_> = keys.into_iter().map(|key| scene.key(key)).collect();
+        assert_eq!(keys.len(), 67_440);
+        let mut blocks = BTreeMap::<[i32; 3], BTreeMap<[i32; 3], SurfaceObservation>>::new();
+        for &key in &keys {
+            blocks.entry(key.map(|v| v.div_euclid(32))).or_default()
+                .insert(key, SurfaceObservation { observed_ns: 1, hits: 1 });
+        }
+        assert_eq!(blocks.len(), 63);
+        let mut observations = SurfaceObservations::new(fine, 32).unwrap();
+        let mut dirty = BTreeSet::new();
+        for (&block, values) in &blocks {
+            observations.replace_block(block, values.clone()).unwrap();
+            // Same storage-block extrema and f64->f32 center conversion as
+            // FineMapReader::planning_columns, including empty edge columns.
+            let convert = |v: i32| {
+                let point = ((f64::from(v) + 0.5) * f64::from(fine)) as f32;
+                (point / config.voxel_size).floor() as i32
+            };
+            let min = [convert(block[0] * 32), convert(block[1] * 32)];
+            let max = [convert(block[0] * 32 + 31), convert(block[1] * 32 + 31)];
+            for x in min[0]..=max[0] { for y in min[1]..=max[1] { dirty.insert([x, y]); } }
+        }
+        observations.set_source_timestamp_ns(1);
+        observations.mark_complete_geometry_source();
+        let mut columns = BTreeMap::<[i32; 2], BTreeMap<i32, [f32; 2]>>::new();
+        for key in &keys {
+            // Identical to the already-qualified reader.columns/assert_columns
+            // conversion, including the source-height quantization.
+            let xyz = key.map(|v| ((f64::from(v) + 0.5) * f64::from(fine)) as f32);
+            let cell = xyz.map(|v| (v / config.voxel_size).floor() as i32);
+            let column = [cell[0], cell[1]];
+            assert!(dirty.contains(&column));
+            let layer = (f64::from(xyz[2]) / f64::from(fine)).floor();
+            let low = (layer * f64::from(fine)) as f32;
+            let high = ((layer + 1.0) * f64::from(fine)) as f32;
+            columns.entry(column).or_default().entry(cell[2])
+                .and_modify(|b| { b[0] = b[0].min(low); b[1] = b[1].max(high); })
+                .or_insert([low, high]);
+        }
+        let updates: Vec<_> = dirty.into_iter().map(|column| SurfaceColumnUpdate {
+            column, cells: columns.remove(&column).unwrap_or_default().into_iter().collect(),
+        }).collect();
+        assert!(columns.is_empty());
+        let mut builder = SurfaceMapBuilder::configured(config, Some(envelope));
+        let built = builder.build_column_updates(&updates, fine, true, keys.len()).unwrap();
+        // Input occupancy and its calibration are exact transforms. Coarse
+        // f32 column/height quantization is rerun honestly and may produce a
+        // different graph: do not claim transformed cell counts/hashes equal
+        // to the captured identity's 300-cell graph.
+        assert_eq!(built.stats.kind, SurfaceBuildKind::Full);
+        assert_eq!(built.stats.input_points, 67_440);
+        assert!(built.stats.changed_columns > 0);
+        assert!(built.stats.changed_surface_cells > 0);
+        assert!(built.stats.checked_cells > 0);
+        assert!(built.stats.global_cost_refresh);
+        let observations = Arc::new(observations);
+        let map = Arc::new(built.snapshot.with_observations(Some(Arc::clone(&observations))));
+        assert!(Arc::ptr_eq(map.observations().unwrap(), &observations));
+        assert_eq!(map.source_voxel_size_m().to_bits(), fine.to_bits());
+        for key in keys {
+            assert_eq!(observations.get(key), Some(SurfaceObservation { observed_ns: 1, hits: 1 }));
+        }
+        eprintln!("DOOR_SCENE_MAP scene={scene:?} source_keys=67440 source_blocks=63 stats={:?} elapsed={:?}",
+            built.stats, started.elapsed());
+        map
+    }
+    fn door_scene_start(scene: DoorScene) -> SurfaceFollower {
+        let map = door_scene_map(scene);
+        let motion = MotionLimits {
+            model: MotionModel::Omnidirectional, max_forward_mps: 0.3,
+            max_reverse_mps: 0.3, max_lateral_mps: 0.3, max_angular_rps: 0.8,
+            linear_acceleration_mps2: 1.0, guaranteed_braking_mps2: 1.0,
+            angular_acceleration_rps2: 2.0, guaranteed_angular_braking_rps2: 2.0,
+            reaction_time_sec: 0.05, minimum_turning_radius_m: 0.0, can_rotate_in_place: true,
+        };
+        let options = GoalOptions { allow_reverse: true, position_tolerance_m: 0.03, yaw_tolerance_rad: 0.05 };
+        let mut config = SurfaceFollowerConfig::new(0.4);
+        config.controller.speed = 0.3;
+        config.controller.control_frequency = 20.0;
+        config.controller.simulation = true;
+        config.motion_limits = Some(motion);
+        config.max_angular_speed_rps = 0.8;
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        let goal = stamped(scene.body(decode(GOAL)), FIRST_TIME);
+        follower.configure_goal(&goal, options).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+        follower.update_odometry(stamped(scene.body(decode(FIRST)), FIRST_TIME));
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+            poses: ROUTE.iter().copied().map(|p| stamped(scene.body(decode(p)), FIRST_TIME)).collect(),
+        }), None, goal).unwrap();
+        assert_eq!(follower.path_index, 1);
+        assert_eq!(follower.progress_m, 0.0);
+        assert_eq!(follower.alignment_target_index, None);
+        assert_eq!(follower.last_command, Twist2::ZERO);
+        assert!(follower.braking_deadline.is_none());
+        assert!(follower.simulation_braking_deadline_ns.is_none());
+        assert!(follower.invalid_input.is_none());
+        assert_eq!(follower.path.as_ref().unwrap().poses.len(), 584);
+        assert_eq!(follower.cumulative.len(), 584);
+        assert_eq!(bits(body(follower.last_tracked_pose.as_ref().unwrap())),
+            bits(scene.body(decode(FIRST))));
+        assert_eq!(bits(body(follower.odometry.as_ref().unwrap())),
+            bits(scene.body(decode(FIRST))));
+        for (pose, &original) in follower.path.as_ref().unwrap().poses.iter().zip(ROUTE) {
+            assert_eq!(bits(body(pose)), bits(scene.body(decode(original))));
+        }
+        follower
+    }
+
+fn run_door_scene_from_original_start(scene: DoorScene) {
+    let mut follower = door_scene_start(scene);
+    let source = Arc::clone(follower.source_map.as_ref().unwrap());
+    let goal = scene.body(decode(GOAL));
+    let goal_yaw = stamped(goal,FIRST_TIME).pose.orientation.yaw();
+    let mut current = scene.body(decode(FIRST));
+    let mut applied = scene.twist(Twist2::ZERO);
+    let started = Instant::now();
+    let mut nonzero = 0;
+    let mut max_step = std::time::Duration::ZERO;
+    // Same original 240-tick / 50-ms allowance; no checkpoint progress jump,
+    // route regeneration, geometry repair, or increasing budget on failure.
+    for tick in 0..240 {
+        let time = FIRST_TIME + tick as i64 * 50_000_000;
+        follower.observe_applied_command(applied);
+        follower.update_odometry(stamped(current,time));
+        follower.refresh_current_body_view();
+        let step_start = Instant::now();
+        let outcome = follower.follow_body_step_policy::<true,true,true,true>(0.32);
+        max_step = max_step.max(step_start.elapsed());
+        if tick % 20 == 0 {
+            eprintln!("DOOR_SCENE_START scene={scene:?} tick={tick} pose={current:?} applied={applied:?} outcome={outcome:?} elapsed={:?}", started.elapsed());
+        }
+        let command = match outcome {
+            PlannerStep::Command(command) => command,
+            PlannerStep::Succeeded => Twist2::ZERO,
+            other => panic!("{scene:?} failed at tick {tick}: {other:?}; actual={current:?}; applied={applied:?}"),
+        };
+        assert!(command.linear.x.is_finite() && command.angular_z.is_finite());
+        assert!(command.linear.x >= 0.0 && command.linear.x <= 0.3+1e-9);
+        assert_eq!(command.linear.y, 0.0);
+        assert!(command.angular_z.abs() <= 0.8+1e-9);
+        if command != Twist2::ZERO { nonzero += 1; }
+        // Identical actuator feedback to the captured original-start loop:
+        // preserve calibrated 1 m/s^2 and 2 rad/s^2 response, not instantaneous
+        // command application. Each physically integrated edge is checked
+        // against the immutable transformed environmental source afterward.
+        let next_applied = Twist2 {
+            linear: Point2::new(applied.linear.x
+                + (command.linear.x-applied.linear.x).clamp(-0.05,0.05), 0.0),
+            angular_z: applied.angular_z
+                + (command.angular_z-applied.angular_z).clamp(-0.1,0.1),
+        };
+        let mean = Twist2 {
+            linear: Point2::new((applied.linear.x+next_applied.linear.x)*0.5,0.0),
+            angular_z: (applied.angular_z+next_applied.angular_z)*0.5,
+        };
+        let next = nuwax_nav_control::integrate(PlanarPose {
+            x: current.0[0], y: current.0[1],
+            yaw: stamped(current,time).pose.orientation.yaw(),
+        }, mean, 0.05);
+        let actual = ([next.x,next.y,current.0[2]],
+            [0.0,0.0,(next.yaw*0.5).sin(),(next.yaw*0.5).cos()]);
+        source.validate_body_motion(current,actual,&[])
+            .unwrap_or_else(|error| panic!("{scene:?} unsafe actual edge at tick {tick}: {error}; {current:?} -> {actual:?}"));
+        current = actual;
+        applied = next_applied;
+        let distance = Point3::new(current.0[0],current.0[1],current.0[2])
+            .distance(Point3::new(goal.0[0],goal.0[1],goal.0[2]));
+        let yaw_error = angle_diff(stamped(current,time).pose.orientation.yaw(),goal_yaw).abs();
+        if matches!(outcome,PlannerStep::Succeeded)
+            && applied.linear.x.abs()<1e-6 && applied.angular_z.abs()<1e-6
+        {
+            assert!(distance<0.03 && yaw_error<0.05,
+                "{scene:?} outside original strict goal: distance={distance}, yaw_error={yaw_error}");
+            assert!(nonzero>2, "{scene:?} cannot pass on zero commands alone");
+            eprintln!("DOOR_SCENE_START_GOAL scene={scene:?} tick={tick} nonzero={nonzero} distance={distance} yaw_error={yaw_error} max_step={max_step:?} wall={:?}",started.elapsed());
+            return;
+        }
+    }
+    panic!("{scene:?} did not finish within original 240 ticks: current={current:?}, applied={applied:?}, nonzero={nonzero}, max_step={max_step:?}");
+}
+
+#[test]
+#[ignore = "experimental reflected full-source doorway, unchanged dynamic guard"]
+fn captured_translation_advice_reflected_y_from_original_start_reaches_goal() {
+    run_door_scene_from_original_start(DoorScene::ReflectY);
+}
+
+#[test]
+#[ignore = "experimental rotated full-source doorway, unchanged dynamic guard"]
+fn captured_translation_advice_rotated_90_from_original_start_reaches_goal() {
+    run_door_scene_from_original_start(DoorScene::Rotate90);
 }

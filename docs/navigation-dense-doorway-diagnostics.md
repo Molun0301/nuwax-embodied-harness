@@ -1,6 +1,6 @@
 # Dense doorway: captured failure and isolated intent experiments
 
-Status: diagnostics and opt-in experiments only. The production follower keeps the original connector policy. No closed-loop correction or timing guarantee is claimed by this checkpoint.
+Status: diagnostics and opt-in experiments only. The production follower keeps the original connector policy. A later translation-advice experiment completes the captured route, but production activation, the original downstream test under that proposed default, and timing qualification remain pending.
 
 ## Reproducible baseline
 
@@ -44,3 +44,43 @@ Logs and capture are under `/workspace/shared/neh-validation/doorway/`:
 - `stack-final-compile.log`: split stack diagnostic module compiles
 
 The earlier compilation errors in `primary-capture*.log` are retained. The full original failed test remains active and unchanged in its navigation assertions. The reproduction and exploratory tests are explicitly ignored and opt-in; known failures are not silently counted as passing navigation coverage.
+
+## Follow-on translation-advice experiment (disabled production default)
+
+After exact tick-123 reproduction (0.69 s total, 74.8 ms step), a fourth const policy retains the original scalar curvature/corner/reversal-bounded target for calibrated nonrotation translation. It consistently retires the old translation-advice alignment latch. It does not replace curved targets with a virtual straight target. Explicit pivot progress, actual applied state, speed limits, reference scoring and the complete current-body/observation/boundary/reaction/braking checks remain unchanged. Straight alignment reuses the existing waypoint-rotation completion tolerance, now named `WAYPOINT_ROTATION_TOLERANCE_RAD`; this remains guidance, not a clearance certificate.
+
+Recorded strict-goal results (position tolerance 0.03 m, yaw tolerance 0.05 rad):
+
+| Start state | Goal tick | Nonzero commands | Position error m | Yaw error rad | Wall s | Maximum measured step s |
+|---|---:|---:|---:|---:|---:|---:|
+| Captured exit failure, tick 123 | 185 | 60 | 0.000467197 | 0.022929379 | 37.22 | 1.593 |
+| Captured entry failure, tick 71 | 183 | 110 | 0.000333168 | 0.016827673 | 119.65 | 2.958 |
+| Original captured route, original rest start | 183 | 181 | 0.000301570 | 0.017134889 | 153.13 | 2.898 |
+
+Every actual plant edge is independently checked against the unchanged source. Any negative result terminates a trial. The simulated loop remains bounded by the original 240 ticks; no goal tolerance or deadline was relaxed. These results concern the captured complete route, not a rerun of the original nav-stack planning/test composition. The original downstream test remains a separate required qualification.
+
+Seven matched policy tests pass: positive Differential/Ackermann movement; nonrotatable channels/radius; stale evidence confined to the stopping tail; restrictive boundary in the stopping tail; lost future support after admission; corner/reversal/S-bend target boundaries; and an unfinished explicit pivot. Negative cases first prove that the first 50 ms segment is valid, then require a typed failure of the full stopping check and rejection by the actual policy guard. The stale-evidence unit fixture uses true current timestamps with a 30-second age window to isolate the intended old tail; it is not the factory's one-second configuration. The initial missing-support test failed its first-period precondition because of the existing 0.2 m graph clearance. Moving the missing strip from cells 12–13 to 13–14 isolates that clearance failure in the braking tail; every assertion was retained. Both logs remain available.
+
+A default-false `cfg(test)` configuration field selects the combined alignment/translation policy for runtime's actual production factory and PlannerWorker harness. It introduces no release configuration, process-global switch, extra locks or environment lookup. Every existing harness entrypoint remains on the previous policy. This hook does not propagate to runtime when built as a dependency by nav-stack tests.
+
+Primed real-clock 5 cm factory + ideal-plant tests pass in both local-planning modes with zero delivered negatives. OFF: 21.90 s, 328 nonzero commands, 0.939665 m travel, final position/yaw errors 0.060335 m / 0.138346 rad. ON: 20.85 s, 309 nonzero commands, 0.853971 m travel, errors 0.146029 m / 0.142723 rad. These use the existing generic factory goal region 0.15 m / 0.15 rad, one-second observation age, two genuinely acquired priming frames, and unchanged dispatch-result deadlines. They do not exercise full NavScheduler/motion-port fencing.
+
+The held-planning continuity trial also passes: six fresh nonzero commands beyond the old lease, a later new admission, zero delivered negatives, and 1.083691 m actual travel. Its control median/p95/max is 17.19/25.00/34.73 ms in this debug sample. The held log records zero forward-arc and translation-connector calls, while connection-endpoint has two small calls across the run; this shows removal of the repeated lookahead work, not elimination of every connection check; these sampled times are not a hard 20 Hz or deployed-release guarantee. The independent source-positive/actually-expired-negative probe and all postrun motion/braking oracles pass.
+
+Additional evidence under the same doorway directory:
+- `exit-state-repro-v1.log`
+- `exit-translation-v1.log`
+- `all-translation-first-state-v1.log`
+- `all-translation-original-start-v1.log`
+- `translation-negatives-v1.log` (failed fixture precondition retained)
+- `translation-negatives-v2.log` (7 pass, 3 ignored)
+- `advice-source-probe.log`
+- `advice-factory-held-v1.log` (3 pass)
+
+The reflected-Y and +90-degree full-source original-start trials both pass at tick 183 with 181 nonzero commands. Reflected position/yaw errors are 0.000301569911 m / 0.017134888502 rad; rotated errors are 0.000301569902 m / 0.017134888530 rad. Exact integer source transforms preserve all 67,440 cells and 63 blocks; identity raw-bit/key-bijection tests pass. These two functional trials ran with two test threads; their wall times are not compared to the single-thread baseline. The default-off surface regression suite passes 50 active tests with 8 ignored experiments, and the explicitly selected legacy arc-reuse comparator passes.
+
+Remaining qualification includes the original downstream test under an isolated proposed-default build, full regressions with that proposed default actually active in cfg(test) too, and independent review before any production activation. The two earlier failed intent policies remain separate and are not retroactively passed.
+
+The earlier nonzero-result single-consumption change remains in place. This intent-policy experiment does not resolve delayed first issuance, predecessor-to-new-command activation drift, or original proof expiry through the downstream motion port; no physical stop-by guarantee is added.
+
+Final experimental evidence also includes `scene-transform-unit.log` (1 pass), `advice-transformed-scenes-v1.log` (2 passes), `advice-surface-regressions.log` (50 pass / 8 ignored), and `advice-explicit-legacy-reference.log` (1 pass). The unchanged downstream test, including all heading/alignment variants and the too-narrow negative case, must still pass under the proposed default; none of these copied fixtures substitutes for that requirement.

@@ -38,6 +38,9 @@ pub(crate) fn forward_navigation_limits(physical: &MotionLimits) -> MotionLimits
 pub struct SurfaceFollowerConfig {
     /// Startup-only route refinement switch; collision, observation and braking checks stay enabled.
     pub local_planning_enabled: bool,
+    /// Unit-test factory hook: combined straight alignment and translation advice.
+    #[cfg(test)]
+    pub(crate) translation_advice_for_test: bool,
     /// 同一导航拥有方的全局地图与局部反馈缓存。
     pub pct: Arc<nuwax_nav_pct::PctPlanner>,
     /// 路线引导的近场轨迹参数，生产RouteFollower消费。
@@ -66,6 +69,8 @@ impl SurfaceFollowerConfig {
     pub fn new(body_to_support_z_m: f64) -> Self {
         Self {
             local_planning_enabled: true,
+            #[cfg(test)]
+            translation_advice_for_test: false,
             pct: Default::default(),
             scan: nuwax_nav_scan::ScanConfig::default(),
             body_to_support_z_m,

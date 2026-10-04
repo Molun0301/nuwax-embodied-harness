@@ -2,6 +2,10 @@
 use super::*;
 use nuwax_nav_control::{choose_tracking_control_with_period_check, PlanarPose, TrackingScore};
 type BodyPose = ([f64; 3], [f64; 4]);
+// Existing waypoint rotation completion tolerance, also reused as experimental
+// alignment guidance. It is not a body-clearance or motion-permission threshold.
+const WAYPOINT_ROTATION_TOLERANCE_RAD: f64 = 0.05;
+
 type BodyMotionResult = Result<BodyPose, nuwax_nav_mls_planner::surface::SurfaceError>;
 
 /// 仅在一次控制选择内共享；地图、当前足迹和观察集合由该调用固定。
@@ -338,12 +342,16 @@ impl SurfaceFollower {
     // The false specialization is exercised only by differential tests. The
     // production specialization reuses no state beyond this one invocation.
     fn follow_body_step_inner<const REUSE_LOOKAHEAD: bool>(&mut self, robot_width: f64) -> PlannerStep {
-        self.follow_body_step_policy::<REUSE_LOOKAHEAD, false, false>(robot_width)
+        #[cfg(test)]
+        if self.config.translation_advice_for_test {
+            return self.follow_body_step_policy::<REUSE_LOOKAHEAD, true, true, true>(robot_width);
+        }
+        self.follow_body_step_policy::<REUSE_LOOKAHEAD, false, false, false>(robot_width)
     }
 
     // Experimental straight-run intent policy is exercised only by tests until
     // current-state guarding and closed-loop route behavior are qualified.
-    fn follow_body_step_policy<const REUSE_LOOKAHEAD: bool, const STRAIGHT_INTENT: bool, const ALIGN_STRAIGHT: bool>(&mut self, robot_width: f64) -> PlannerStep {
+    fn follow_body_step_policy<const REUSE_LOOKAHEAD: bool, const STRAIGHT_INTENT: bool, const ALIGN_STRAIGHT: bool, const TRANSLATION_INTENT: bool>(&mut self, robot_width: f64) -> PlannerStep {
         // Scalar provenance for a rejected connector; no additional geometry
         // query or hot-path allocation is needed to diagnose the chosen target.
         let initial_path_index=self.path_index;
@@ -478,7 +486,7 @@ impl SurfaceFollower {
             };
             // 前段已允许在当前实际位置完成转向，旋转本身只消费角度进度。
             // 再要求旧支点距离会让已完成的转向永远不能退出；最终位置仍由reached_position约束。
-            let reached = reached_position && (if rotation {error.abs()<0.05 || passed}
+            let reached = reached_position && (if rotation {error.abs()<WAYPOINT_ROTATION_TOLERANCE_RAD || passed}
                 else {distance<arrival_distance || passed || midpoint_reached});
             let mut safe_to_skip = true;
             if reached && !rotation
@@ -640,6 +648,11 @@ impl SurfaceFollower {
                 target_index += 1;
             }
         }
+        // This experimental policy retires only a legacy translation-advice
+        // latch. Explicit same-position turns keep their original progress and
+        // selection semantics; calibrated current control remains mandatory.
+        let translation_intent=TRANSLATION_INTENT && self.config.motion_limits.is_some() && !rotation;
+        if translation_intent { self.alignment_target_index=None; }
         if self.alignment_target_index.is_some_and(|index|index<self.path_index || index>=path.poses.len()) {
             self.alignment_target_index=None;
         }
@@ -647,8 +660,9 @@ impl SurfaceFollower {
         let straight_intent = STRAIGHT_INTENT && self.config.motion_limits.is_some()
             && !rotation && self.alignment_target_index.is_none()
             && forward_straight_run(path, self.path_index, target_index, position);
+        let advisory_intent=straight_intent || translation_intent;
         let mut confirmed_lookahead=false;
-        if !straight_intent && !rotation && self.alignment_target_index.is_none() {
+        if !advisory_intent && !rotation && self.alignment_target_index.is_none() {
             // 前瞻按实际机体可执行的前进圆弧选择；墙角附近退回较近的路径点，
             // 不能只沿受阻的长弦不断减速，否则已知可执行的短路径永远得不到跟随。
             // 不能用先转向来保留远处曲线目标，否则会过早朝远端切向旋转并离开原路线。
@@ -674,13 +688,13 @@ impl SurfaceFollower {
         // source stance and target are unchanged in this scope. Falling back to
         // path_index, alignment and rotation retain their original checks; this
         // is neither a cross-step permission nor a replacement for body control.
-        let connects_without_turn=straight_intent || rotation || (REUSE_LOOKAHEAD && confirmed_lookahead)
+        let track_without_alignment=advisory_intent || rotation || (REUSE_LOOKAHEAD && confirmed_lookahead)
             || forward_arc_connects(map,body(pose),target);
         let alignment = if ALIGN_STRAIGHT && straight_intent
             && self.config.kinematics().is_some_and(|motion|motion.can_rotate_in_place)
-            && angle_diff((target.pose.position.y-position.y).atan2(target.pose.position.x-position.x),yaw).abs()>=0.05 {
+            && angle_diff((target.pose.position.y-position.y).atan2(target.pose.position.x-position.x),yaw).abs()>=WAYPOINT_ROTATION_TOLERANCE_RAD {
             Some((target.pose.position.y-position.y).atan2(target.pose.position.x-position.x))
-        } else if !connects_without_turn
+        } else if !track_without_alignment
             && self.config.kinematics().is_none_or(|motion|motion.can_rotate_in_place) {
             let heading=(target.pose.position.y-position.y).atan2(target.pose.position.x-position.x);
             let mut translated=target.clone();
@@ -689,7 +703,7 @@ impl SurfaceFollower {
             connection_endpoint(map,body(pose),&turned)
                 .and_then(|at_turn|connection_endpoint(map,at_turn,&translated)).map(|_|heading)
         }else{None};
-        if !connects_without_turn && alignment.is_none() {
+        if !track_without_alignment && alignment.is_none() {
             // 旧路径在实际站姿下已不可接续，继续向缺测边界逼近只会让速度趋于零。
             // 按同一完整机体几何重新规划，不用微速或等待时长判断是否卡住。
             return PlannerStep::ReplanRequired(format!(
@@ -699,7 +713,7 @@ impl SurfaceFollower {
         }
         if let Some(heading)=alignment {
             // 转向期间固定这次接续目标，不能随偏航在相邻前瞻点之间切换意图。
-            if !straight_intent {self.alignment_target_index=Some(target_index);}
+            if !advisory_intent {self.alignment_target_index=Some(target_index);}
             // 先对齐真正的平移方向；不能在路径末切向与实际前进方向之间反复切换。
             preferred.angular_z=angle_diff(heading,yaw).clamp(-0.6,0.6);
             self.control_target=Some(PlanarPose{x:position.x,y:position.y,yaw:heading});
@@ -1487,10 +1501,12 @@ mod query_reuse_tests {
                 };
                 let mut reference=make();let mut reused=make();
                 crate::control_profile::begin();
-                let old=reference.follow_body_step_inner::<false>(0.2);
+                // Explicit legacy comparison; the proposed default must not silently
+                // turn this historical exact-arc-reuse test into a different policy.
+                let old=reference.follow_body_step_policy::<false,false,false,false>(0.2);
                 let old_profile=crate::control_profile::end();
                 crate::control_profile::begin();
-                let new=reused.follow_body_step_inner::<true>(0.2);
+                let new=reused.follow_body_step_policy::<true,false,false,false>(0.2);
                 let new_profile=crate::control_profile::end();
                 assert_eq!(old,new,"{model:?} x={x} turn={turn} aligned={aligned} restricted={restricted} blocked={blocked}");
                 assert_eq!(reference.path_index,reused.path_index);

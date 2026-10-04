@@ -312,3 +312,40 @@ not valid-positive guard throughput. This producer/fixture cannot qualify
 fresh-positive 1 cm execution; no timestamp or observation-age accommodation
 was made. The five-centimeter positive result covers three straight-line cases,
 not from-rest, turning, or rough-terrain coverage.
+
+## Fixed-period selected hold-prefix experiment
+
+The additional selected-only control API proves every allowed cutoff from one
+through N periods. Each independent branch replays from the original pose and
+absolute elapsed time, repeatedly applies the existing reachable transition at
+50 ms, then checks zero/maximum reaction and the complete discrete braking tail.
+An independent instantaneous-response hold-and-stop branch remains required for
+every cutoff. Original footprint/observation evidence and existing per-trajectory
+1024-sample/20-second limits are preserved. N=1 retains exact result and callback
+order parity. Production ranking still calls the original one-period checker;
+only opt-in runtime experiments call the extension. The final control suite
+passed 26 tests, including eight new parity, cutoff, reset, curved/rotation,
+instantaneous-response, fractional-braking and limit regressions.
+
+`selected-prefix-cost-5cm.log` tests N=2 (H100 ms) and N=3 (H150 ms), each with
+216 nonzero checks: six motion cases, three cold/warm/moved contexts, twelve
+samples per context. Cases add from-rest 0.05 m/s, steady rotation 0.2 rad/s,
+and curved 0.2 m/s plus 0.2 rad/s to the earlier three straight-line cases.
+Both horizons accepted every candidate and dropped no producer frames.
+
+- H100: capture-to-completion medians 12.35–42.74 ms; maximum 50.246 ms.
+  One strict 50 ms miss. After adding a possible 50 ms consumer phase, worst
+  headroom is already -0.246 ms before sample age or dispatch.
+- H150: medians 18.01–54.41 ms; maximum 72.866 ms. Eighteen strict 50 ms misses.
+  Worst remaining headroom after that consumer phase is 27.134 ms, before
+  measured real input age and dispatch, which this microbenchmark does not model.
+
+Both experiments therefore retain FAILED strict-50-ms test outcomes. The longer
+proof's asynchronous throughput is distinct from a nonblocking 20 Hz consumer:
+C above 50 ms does not by itself invalidate a still-live proved continuation,
+but no consumer or dispatch qualification follows from these direct checks.
+H150 is the next experimental candidate, not a production lifetime claim. Any
+moving software fixture must measure actual pose age, C, consumer/dispatch delay,
+and original-expiry retirement, rather than assuming the remaining 27 ms is a
+real transport bound. With twelve observations per context the reported
+empirical p95 equals the maximum under this test's quantile formula.

@@ -739,14 +739,19 @@ impl SurfaceFollower {
     /// not a command issuance API and does not install or renew any permission.
     #[cfg(test)]
     pub(crate) fn check_selected_candidate_for_test(&mut self, candidate: Twist2) -> bool {
+        self.check_selected_candidate_periods_for_test(candidate, 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn check_selected_candidate_periods_for_test(&mut self, candidate: Twist2, periods: usize) -> bool {
         if self.current_body_error().is_some() { return false; }
         let (Some(map),Some(pose),Some(limits))=(self.map.as_ref(),self.odometry.as_ref(),self.config.motion_limits.as_ref()) else { return false; };
         let Some(model)=map.body_envelope() else {return false;};
         let limits=forward_navigation_limits(limits);
         self.with_body_motion_checks(|clear,period_clear,_| {
-            nuwax_nav_control::check_stopping_trajectory_with_period_check(
+            nuwax_nav_control::check_selected_stopping_trajectory_with_period_check(
                 planar(pose),self.last_command,candidate,&limits,
-                1.0/self.config.controller.control_frequency,
+                1.0/self.config.controller.control_frequency,periods,
                 f64::from(map.source_voxel_size_m())*0.5,model.radius(),clear,period_clear,
             ).is_some()
         }).unwrap_or(false)

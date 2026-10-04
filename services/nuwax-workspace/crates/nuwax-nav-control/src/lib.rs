@@ -210,6 +210,41 @@ pub fn check_stopping_trajectory_with_period_check(
         body_radius_m,&mut clear,&mut period_clear,&mut current_stop)
 }
 
+/// 仅对已选命令验证多拍接续；每个允许截点均须通过完整停车检查，不重新选择候选。
+/// `hold_periods` 必须非零；可达速度和离散制动仍使用原 `control_dt`，不改成总时长。
+/// 每条独立轨迹从原位姿及零累计时间重放，回调应据此重置各自的预测站姿，
+/// 并始终保留原足迹豁免和证据时钟。仅覆盖这些离散截点，不证明任意激活延迟。
+/// 一拍时与原检查完全相同；每条完整前缀及尾段仍受原1024段、20秒限制。
+#[allow(clippy::too_many_arguments)]
+pub fn check_selected_stopping_trajectory_with_period_check(
+    pose:PlanarPose,current:Twist2,command:Twist2,limits:&MotionLimits,control_dt:f64,
+    hold_periods:usize,spatial_step_m:f64,body_radius_m:f64,
+    mut clear:impl FnMut(PlanarPose,PlanarPose,f64)->bool,
+    mut period_clear:impl FnMut(PlanarPose,PlanarPose,f64)->bool,
+)->Option<ControlChoice> {
+    // 先转浮点再相乘，避免周期数的整数乘法溢出；不引入额外周期数上限。
+    let hold=control_dt*hold_periods as f64;
+    if hold_periods==0 || !hold.is_finite() || hold>20.0 {return None;}
+    let mut choice=check_stopping_trajectory_with_period_check(pose,current,command,limits,
+        control_dt,spatial_step_m,body_radius_m,&mut clear,&mut period_clear)?;
+    for cutoff in 2..=hold_periods {
+        // 必须重放原前缀，不能从未来XY重新调用单拍检查而丢失站姿或证据年龄。
+        for delay in [0.0,limits.reaction_time_sec] {
+            choice.samples+=stopping_after_command_periods(pose,current,command,cutoff,delay,
+                limits,control_dt,spatial_step_m,body_radius_m,&mut clear,&mut period_clear)?;
+            if limits.reaction_time_sec==0.0 {break;}
+        }
+        if command!=Twist2::ZERO {
+            let instant=stopping_from_velocity(pose,command,
+                control_dt*cutoff as f64+limits.reaction_time_sec,
+                limits,spatial_step_m,body_radius_m,&mut clear)?;
+            choice.stopped_pose=instant.stopped_pose;
+            choice.samples+=instant.samples;
+        }
+    }
+    Some(choice)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_stopping_trajectory_cached(
     pose:PlanarPose,current:Twist2,command:Twist2,limits:&MotionLimits,control_dt:f64,
@@ -297,6 +332,19 @@ fn stopping_after_velocity_transition(
     clear: &mut impl FnMut(PlanarPose,PlanarPose,f64)->bool,
     period_clear: &mut impl FnMut(PlanarPose,PlanarPose,f64)->bool,
 ) -> Option<usize> {
+    stopping_after_command_periods(pose,current,command,1,delay,limits,control_dt,
+        spatial_step_m,body_radius_m,clear,period_clear)
+}
+
+/// 原实际过渡的完整多拍前缀；每拍重新计算可达速度，再从该截点完整停车。
+fn stopping_after_command_periods(
+    pose:PlanarPose,current:Twist2,command:Twist2,hold_periods:usize,delay:f64,
+    limits:&MotionLimits,control_dt:f64,spatial_step_m:f64,body_radius_m:f64,
+    clear:&mut impl FnMut(PlanarPose,PlanarPose,f64)->bool,
+    period_clear:&mut impl FnMut(PlanarPose,PlanarPose,f64)->bool,
+)->Option<usize> {
+    let hold=control_dt*hold_periods as f64;
+    if hold_periods==0 || !hold.is_finite() || hold+delay>20.0 {return None;}
     let mut velocity=reachable(command,current,limits,control_dt,true);
     let tail=(velocity.linear.x.hypot(velocity.linear.y)/limits.guaranteed_braking_mps2)
         .max(velocity.angular_z.abs()/limits.guaranteed_angular_braking_rps2);
@@ -308,6 +356,18 @@ fn stopping_after_velocity_transition(
     // 细分只用于连续几何；执行器每拍确认的端点从独立物理站姿接续。
     if !period_clear(pose,here,control_dt) {return None;}
     let mut elapsed=control_dt;
+    for _ in 1..hold_periods {
+        let next=reachable(command,velocity,limits,control_dt,true);
+        let tail=(next.linear.x.hypot(next.linear.y)/limits.guaranteed_braking_mps2)
+            .max(next.angular_z.abs()/limits.guaranteed_angular_braking_rps2);
+        if !tail.is_finite() || elapsed+control_dt+delay+tail>20.0 {return None;}
+        let origin=here;
+        here=sweep_velocity_transition(origin,velocity,next,control_dt,elapsed,
+            spatial_step_m,body_radius_m,&mut samples,clear)?;
+        elapsed+=control_dt;
+        if !period_clear(origin,here,elapsed) {return None;}
+        velocity=next;
+    }
     let mut remaining_delay=delay;
     while remaining_delay>0.0 {
         let duration=remaining_delay.min(control_dt);
@@ -771,6 +831,219 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn selected_one_period_keeps_exact_results_and_callback_order() {
+        for model in [MotionModel::Differential,MotionModel::Omnidirectional,MotionModel::Ackermann] {
+            for delay in [0.0,0.075] {
+                for mode in 0..4 {
+                    let mut limits=limits();limits.model=model;limits.reaction_time_sec=delay;
+                    if model==MotionModel::Omnidirectional {limits.max_lateral_mps=1.0;}
+                    if model==MotionModel::Ackermann {limits.minimum_turning_radius_m=0.5;limits.can_rotate_in_place=false;}
+                    let current=twist(0.4,if model==MotionModel::Omnidirectional {0.1}else{0.0},0.2);
+                    let command=if mode==1 {Twist2::ZERO}else{twist(0.45,current.linear.y,0.3)};
+                    let run=|selected| {
+                        let trace=std::cell::RefCell::new(Vec::new());
+                        let record=|basis,from:PlanarPose,to:PlanarPose,elapsed:f64| {
+                            trace.borrow_mut().push([basis,from.x.to_bits(),from.y.to_bits(),from.yaw.to_bits(),
+                                to.x.to_bits(),to.y.to_bits(),to.yaw.to_bits(),elapsed.to_bits()]);
+                        };
+                        let mut clear=|from,to,time| {record(0,from,to,time);mode!=2 || time==0.0};
+                        let mut period=|from,to,time| {record(1,from,to,time);mode!=3 || time==0.0};
+                        let result=if selected {
+                            check_selected_stopping_trajectory_with_period_check(pose(),current,command,&limits,
+                                0.05,1,0.0025,0.3,&mut clear,&mut period)
+                        }else{
+                            check_stopping_trajectory_with_period_check(pose(),current,command,&limits,
+                                0.05,0.0025,0.3,&mut clear,&mut period)
+                        };
+                        (result.map(|r|(r.command,r.stopped_pose,r.samples)),trace.into_inner())
+                    };
+                    let original=run(false);let selected=run(true);
+                    assert_eq!(original,selected,"单拍必须保留结果及回调的精确次序：{model:?}/{delay}/{mode}");
+                    assert_eq!(selected.0.is_some(),mode<2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_cutoffs_replay_original_ramp_and_steady_prefix_with_absolute_time() {
+        let mut limits=limits();limits.reaction_time_sec=0.075;
+        for current_speed in [0.05,0.1] {
+            let current=twist(current_speed,0.0,0.0);let command=twist(0.1,0.0,0.0);
+            let mut geometry_branches=0;
+            let mut previous_pose=pose();let mut previous_time=0.0;
+            let mut branches:Vec<Vec<(PlanarPose,PlanarPose,f64)>>=Vec::new();
+            let result=check_selected_stopping_trajectory_with_period_check(pose(),current,command,&limits,
+                0.05,3,0.001,0.3,|from,to,time| {
+                    if time==0.0 {
+                        assert_eq!((from,to),(pose(),pose()));
+                        geometry_branches+=1;previous_pose=pose();previous_time=0.0;
+                    }else{
+                        assert_eq!(from,previous_pose,"每个几何前缀须从原站姿完整重放");
+                        assert!(time>previous_time,"证据年龄不能在未来控制周期重新归零");
+                        previous_pose=to;previous_time=time;
+                    }
+                    true
+                },|from,to,time| {
+                    if time==0.0 {
+                        assert_eq!((from,to),(pose(),pose()));branches.push(Vec::new());
+                    }else{
+                        let branch=branches.last_mut().unwrap();
+                        assert_eq!(from,branch.last().map_or(pose(),|sample|sample.1));
+                        branch.push((from,to,time));
+                    }
+                    true
+                }).unwrap();
+            assert_eq!(result.command,command);
+            assert_eq!(geometry_branches,10,"立即停车加每个截点的两类实际分支和独立即时响应");
+            assert_eq!(branches.len(),6);
+            let first_distance=(current_speed+0.1)*0.5*0.05;
+            for (index,branch) in branches.iter().enumerate() {
+                let cutoff=index/2+1;let delay=if index%2==0 {0.0}else{0.075};
+                for period in 0..cutoff {
+                    assert!((branch[period].1.x-first_distance-period as f64*0.005).abs()<1e-12);
+                    assert!((branch[period].2-(period+1)as f64*0.05).abs()<1e-12);
+                }
+                let last=branch.last().unwrap();
+                assert!((last.1.x-(first_distance+(cutoff-1)as f64*0.005+0.1*delay+0.005)).abs()<1e-12);
+                assert!((last.2-(cutoff as f64*0.05+delay+0.1)).abs()<1e-12,
+                    "延迟及完整两拍制动必须保留原累计时间");
+                if delay>0.0 {
+                    assert!((branch[cutoff].2-(cutoff as f64*0.05+0.05)).abs()<1e-12);
+                    assert!((branch[cutoff+1].2-(cutoff as f64*0.05+0.075)).abs()<1e-12);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_curved_mixed_and_rotation_prefixes_keep_fixed_period_reachability() {
+        let mut limits=limits();limits.model=MotionModel::Omnidirectional;
+        limits.max_lateral_mps=1.0;limits.reaction_time_sec=0.0;
+        for (current,command,velocities) in [
+            (twist(0.05,0.0,0.1),twist(0.08,0.04,0.2),
+                [twist(0.08,0.04,0.2);3]),
+            (Twist2::ZERO,twist(0.0,0.0,0.4),
+                [twist(0.0,0.0,0.1),twist(0.0,0.0,0.2),twist(0.0,0.0,0.3)]),
+            (twist(0.4,0.0,0.2),twist(0.45,0.0,0.3),
+                [twist(0.45,0.0,0.3);3]),
+        ] {
+            let mut branches:Vec<Vec<(PlanarPose,f64)>>=Vec::new();
+            check_selected_stopping_trajectory_with_period_check(pose(),current,command,&limits,
+                0.05,3,0.001,0.3,|_,_,_|true,|from,to,time| {
+                    if time==0.0 {assert_eq!(from,pose());branches.push(Vec::new());}
+                    else {branches.last_mut().unwrap().push((to,time));}
+                    true
+                }).unwrap();
+            assert_eq!(branches.len(),3,"零响应延迟不重复相同分支");
+            let mut expected=pose();let mut before=current;
+            for (index,after) in velocities.into_iter().enumerate() {
+                expected=integrate(expected,twist((before.linear.x+after.linear.x)*0.5,
+                    (before.linear.y+after.linear.y)*0.5,(before.angular_z+after.angular_z)*0.5),0.05);
+                for branch in branches.iter().skip(index) {
+                    let (actual,time)=branch[index];
+                    assert!((actual.x-expected.x).abs()<1e-12);
+                    assert!((actual.y-expected.y).abs()<1e-12);
+                    assert!((actual.yaw-expected.yaw).abs()<1e-12);
+                    assert!((time-(index+1)as f64*0.05).abs()<1e-12);
+                }
+                before=after;
+            }
+        }
+    }
+
+    #[test]
+    fn selected_intermediate_cutoff_cannot_borrow_final_cutoff_evidence() {
+        let mut limits=limits();limits.reaction_time_sec=0.0;
+        let command=twist(0.1,0.0,0.0);
+        // 支撑条带在原时钟145毫秒后失效。第三拍接续早已穿过，第二拍停车却仍在条带内。
+        let clear=|from:PlanarPose,to:PlanarPose,time:f64|
+            !(from.x<0.0137 && to.x>0.012 && time>0.145);
+        assert!(check_selected_stopping_trajectory_with_period_check(pose(),command,command,&limits,
+            0.05,1,0.001,0.0,clear,|_,_,_|true).is_some());
+        assert!(stopping_after_command_periods(pose(),command,command,3,0.0,&limits,
+            0.05,0.001,0.0,&mut {clear},&mut |_,_,_|true).is_some());
+        assert!(stopping_from_velocity(pose(),command,0.15,&limits,0.001,0.0,clear).is_some());
+        for periods in [2,3] {
+            assert!(check_selected_stopping_trajectory_with_period_check(pose(),command,command,&limits,
+                0.05,periods,0.001,0.0,clear,|_,_,_|true).is_none(),
+                "最终截点通过不能代替中间截点的完整停车证据");
+        }
+    }
+
+    #[test]
+    fn selected_extended_prefix_checks_both_callbacks_and_immediate_stop() {
+        let mut limits=limits();limits.reaction_time_sec=0.0;
+        let command=twist(0.1,0.0,0.0);
+        let reject=|_:PlanarPose,to:PlanarPose,time:f64| !(time>0.19 && to.x>0.014);
+        for geometry in [true,false] {
+            assert!(check_selected_stopping_trajectory_with_period_check(pose(),command,command,&limits,
+                0.05,1,0.001,0.0,|from,to,time| !geometry || reject(from,to,time),
+                |from,to,time| geometry || reject(from,to,time)).is_some());
+            assert!(check_selected_stopping_trajectory_with_period_check(pose(),command,command,&limits,
+                0.05,3,0.001,0.0,|from,to,time| !geometry || reject(from,to,time),
+                |from,to,time| geometry || reject(from,to,time)).is_none());
+        }
+        let mut resets=0;
+        assert!(check_selected_stopping_trajectory_with_period_check(pose(),command,Twist2::ZERO,&limits,
+            0.05,3,0.001,0.0,|_,_,time| {if time==0.0 {resets+=1;}time==0.0},|_,_,_|true).is_none());
+        assert_eq!(resets,1,"立即停车不通过时不能跳去任何未来截点");
+        assert_eq!(check_selected_stopping_trajectory_with_period_check(pose(),command,Twist2::ZERO,&limits,
+            0.05,3,0.001,0.0,|_,_,_|true,|_,_,_|true).unwrap().command,Twist2::ZERO);
+    }
+
+    #[test]
+    fn selected_extended_instantaneous_branch_remains_an_independent_requirement() {
+        let mut limits=limits();limits.reaction_time_sec=0.0;
+        let current=twist(0.05,0.0,0.0);let command=twist(0.1,0.0,0.0);
+        let clear=|_:PlanarPose,to:PlanarPose,_:f64|to.x<0.0195;
+        // 三拍实际加速接续停在18.75毫米；独立即时响应却要到20毫米才能停下。
+        assert!(stopping_after_command_periods(pose(),current,command,3,0.0,&limits,
+            0.05,0.001,0.0,&mut {clear},&mut |_,_,_|true).is_some());
+        assert!(check_selected_stopping_trajectory_with_period_check(pose(),current,command,&limits,
+            0.05,2,0.001,0.0,clear,|_,_,_|true).is_some());
+        assert!(check_selected_stopping_trajectory_with_period_check(pose(),current,command,&limits,
+            0.05,3,0.001,0.0,clear,|_,_,_|true).is_none(),
+            "实际多拍接续通过后仍须检查该截点的独立即时响应边界");
+    }
+
+    #[test]
+    fn selected_cutoff_keeps_the_final_fractional_speed_braking_period() {
+        let mut limits=limits();limits.reaction_time_sec=0.0;
+        let command=twist(0.075,0.0,0.0);
+        let clear=|_:PlanarPose,to:PlanarPose,_:f64|to.x<0.0105;
+        // 两拍保持后，连续制动到10.3125毫米即停；完整离散末拍实际到10.625毫米。
+        assert!(stopping_from_velocity(pose(),command,0.1,&limits,0.001,0.0,clear).is_some());
+        assert!(check_selected_stopping_trajectory_with_period_check(pose(),command,command,&limits,
+            0.05,1,0.001,0.0,clear,|_,_,_|true).is_some());
+        assert!(check_selected_stopping_trajectory_with_period_check(pose(),command,command,&limits,
+            0.05,2,0.001,0.0,clear,|_,_,_|true).is_none(),
+            "较长保持不能把最后不足整拍的速度提前按连续制动截短");
+    }
+
+    #[test]
+    fn selected_prefix_and_tail_share_existing_sample_and_time_bounds() {
+        let mut limits=limits();limits.reaction_time_sec=0.0;
+        let command=twist(0.1,0.0,0.0);
+        assert!(check_selected_stopping_trajectory_with_period_check(pose(),command,command,&limits,
+            0.05,2,0.00002,0.0,|_,_,_|true,|_,_,_|true).is_some());
+        assert!(check_selected_stopping_trajectory_with_period_check(pose(),command,command,&limits,
+            0.05,3,0.00002,0.0,|_,_,_|true,|_,_,_|true).is_none(),
+            "不能把前缀采样从1024段预算中扣除后再检查完整制动");
+        limits.guaranteed_braking_mps2=0.1;
+        let command=twist(1.99,0.0,0.0);
+        assert!(check_selected_stopping_trajectory_with_period_check(pose(),command,command,&limits,
+            0.05,1,1.0,0.0,|_,_,_|true,|_,_,_|true).is_some());
+        assert!(check_selected_stopping_trajectory_with_period_check(pose(),command,command,&limits,
+            0.05,3,1.0,0.0,|_,_,_|true,|_,_,_|true).is_none(),
+            "完整前缀加制动超过20秒时须拒绝，不能截短尾段");
+        for periods in [0,401,usize::MAX] {
+            assert!(check_selected_stopping_trajectory_with_period_check(pose(),Twist2::ZERO,Twist2::ZERO,&limits,
+                0.05,periods,1.0,0.0,|_,_,_|panic!("无效周期须提前拒绝"),|_,_,_|true).is_none());
         }
     }
 

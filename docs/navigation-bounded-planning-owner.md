@@ -266,3 +266,49 @@ within about 12 mm clearance, whereas another 50 ms command hold plus reaction
 and stopping needs 15 mm. They do not prove that emergency braking is already
 impossible. Nor do they retrospectively identify the exact cause of every earlier
 1 cm oracle rejection, whose original computed context was not captured.
+
+## Standalone selected-candidate proof cost (2026-10-04)
+
+`selected-proof-cost-5cm.log` measures the existing one-period (50 ms) proof
+without route search, reference scoring, or candidate ranking. The production
+body-motion callback code is shared with the test entry: current-body-view
+refresh and validation, original observation footprint, projected motion,
+independent future support views, full braking checks, and per-call cache cleanup
+are included. The timing-only entry receives known reachable nonzero candidates;
+it issues no command, modifies no applied state, and creates no lease. The 41
+existing surface-follower tests passed after the shared-callback extraction.
+
+There are 12 samples for each of three cases (steady 0.1 m/s, steady 0.3 m/s,
+0.05 to 0.1 m/s acceleration) and three contexts (new observation metadata,
+identical source/pose, moved pose by 5 mm): 108 accepted nonzero checks and zero
+rejections. Real sensor acquisitions were about 200 ms apart, with zero dropped
+producer frames; priming took 0.236 s. Input observations retain the explicit
+1 s age limit. Capture-to-completion wall-cost medians ranged from 8.23 to
+26.30 ms; the maximum was 41.65 ms, in the warm 0.3 m/s context. No sample exceeded
+50 ms. These are wall costs, not thread CPU attribution or hard latency bounds.
+
+The largest measured cost leaves only 8.35 ms of a 50 ms interval for input
+sample age, consumer phase, and dispatch. A 20 Hz asynchronous consumer can add
+nearly another 50 ms before dispatch, so this run does not establish viable
+H=50 ms command issuance. Two- and three-period selected-candidate proofs are
+subsequent experiments, with the kinematic integration/braking period remaining
+50 ms and all intermediate stopping cutoffs required. No production permission
+interval has been changed on the basis of these measurements.
+
+The benchmark captures a new truthful pose timestamp immediately before each
+independent synthetic state. It is not a moving feedback or transport-age bound.
+The moved-pose case is a separate geometric fixture, not simulated motion during
+computation. Subtracting sample age from an expiry does not itself model spatial
+drift while a previous command continues; any later issuance design must state
+its sampled-state model and test software zero/retirement at the original expiry,
+including stalled dispatch. No physical stop-by guarantee follows from this test.
+
+The separate `selected-proof-cost-1cm.log` stress experiment failed: all 108
+nonzero checks rejected, with metadata-cold source ages already about
+1.06–1.15 s at guard entry against the unchanged 1 s TTL. Actual source spacing
+was about 1.26–1.35 s, not 200 ms. Sixty-one calls exceeded 50 ms and maximum
+capture-to-completion cost was 228.21 ms, but these are rejected-path costs,
+not valid-positive guard throughput. This producer/fixture cannot qualify
+fresh-positive 1 cm execution; no timestamp or observation-age accommodation
+was made. The five-centimeter positive result covers three straight-line cases,
+not from-rest, turning, or rough-terrain coverage.

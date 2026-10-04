@@ -444,3 +444,106 @@ fn moving_5cm_primed_held_planning_7m_full_goal_120s(){run_with_budget(true,0.05
 fn moving_1cm_stress_primed_off_full_goal(){run_startup(false,0.01,Scenario::Goal,false,true);}
 #[test] #[ignore="primed 1cm ON stress; genuine samples before goal"]
 fn moving_1cm_stress_primed_on_full_goal(){run_startup(true,0.01,Scenario::Goal,false,true);}
+
+// Selected-candidate microbenchmark, deliberately not a controller or movement
+// qualification. Each call is an independent synthetic pose/velocity fixture.
+// Metadata-cold means a new genuine observation object, not cold geometry roots.
+// Warm and moved calls keep that exact source; their naturally increasing source
+// age is reported and must never be refreshed away just to obtain a pass.
+#[derive(Default)]
+struct SelectedGuardSamples {
+    c_ms:Vec<f64>,guard_ms:Vec<f64>,pose_age_ms:Vec<f64>,source_entry_age_ms:Vec<f64>,
+    source_completion_age_ms:Vec<f64>,accepted:usize,rejected:usize,
+}
+fn benchmark_selected_guard(resolution:f32) {
+    const SAMPLES:usize=12;
+    let (config,base,keys)=fixture(false,resolution,6.0);
+    let sensor=Sensor::new(base,keys);
+    let priming_started=Instant::now();
+    let first=sensor.receive.recv_timeout(Duration::from_secs(5)).expect("first real source acquisition");
+    let second=sensor.receive.recv_timeout(Duration::from_secs(5)).expect("second real source acquisition");
+    assert!(first.sample_ns<second.sample_ns&&second.sample_ns<=unix_ns());
+    assert!(first.sequence>=1&&second.sequence>=2);
+    assert!(nuwax_nav_pct::same_source_geometry(&first.map,&second.map));
+    assert!(!first.map.same_body_query_view(&second.map));
+    eprintln!("SELECTED_GUARD_PRIMING source_cm={} duration_s={:.6} first_sequence={} second_sequence={} first_sample_ns={} second_sample_ns={} actual_sample_spacing_ms={:.6}",
+        resolution*100.0,priming_started.elapsed().as_secs_f64(),first.sequence,second.sequence,
+        first.sample_ns,second.sample_ns,(second.sample_ns-first.sample_ns)as f64/1e6);
+    let mut ready=Some(second);
+    let mut prior_source=None::<Arc<SurfaceSnapshot>>;
+    let mut prior_sample_ns=first.sample_ns;
+    let mut all_rejections=0;
+    let mut all_over_50ms=0;
+    for (case,before_speed,candidate_speed) in [("steady_0.1",0.1_f64,0.1_f64),("steady_0.3",0.3,0.3),("ramp_0.05_to_0.1",0.05,0.1)] {
+        let applied=Twist2{linear:nuwax_nav_types_messages::Point2::new(before_speed,0.0),angular_z:0.0};
+        let candidate=Twist2{linear:nuwax_nav_types_messages::Point2::new(candidate_speed,0.0),angular_z:0.0};
+        assert!(nonzero(applied)&&nonzero(candidate));
+        assert!(candidate_speed<=limits().max_forward_mps);
+        assert!((candidate_speed-before_speed).abs()<=limits().linear_acceleration_mps2*PERIOD.as_secs_f64()+1e-12);
+        let mut follower=SurfaceFollower::new(config.clone()).unwrap();
+        let mut samples:[SelectedGuardSamples;3]=std::array::from_fn(|_|SelectedGuardSamples::default());
+        let mut sample_spacings_ms=Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let frame=ready.take().unwrap_or_else(||sensor.receive.recv_timeout(Duration::from_secs(5)).expect("next bounded real source frame"));
+            assert!(frame.sequence>=2&&frame.sample_ns>prior_sample_ns&&frame.sample_ns<=unix_ns());
+            sample_spacings_ms.push((frame.sample_ns-prior_sample_ns)as f64/1e6);
+            if let Some(old)=&prior_source {
+                assert!(nuwax_nav_pct::same_source_geometry(old,&frame.map));
+                assert!(!old.same_body_query_view(&frame.map));
+            }
+            prior_sample_ns=frame.sample_ns;prior_source=Some(frame.map.clone());
+            // Each batch changes its baseline slightly too. These are explicitly
+            // separate geometric fixtures; they are not claimed applied motion.
+            let baseline_x=0.75+sample as f64*0.001;
+            for (phase,label) in ["metadata_cold","warm_same_pose","moved_pose_5mm"].into_iter().enumerate() {
+                let capture=Instant::now();
+                let captured=pose(baseline_x+if phase==2{0.005}else{0.0},1.5,0.0);
+                let pose_stamp_ns=captured.stamp.nanos as u64;
+                if phase==0 {follower.update_execution_map(ExecutionMap::Surface(frame.map.clone())).unwrap();}
+                follower.update_odometry(captured.clone());
+                follower.observe_applied_command(applied);
+                let guard_entry_ns=unix_ns();
+                assert!(frame.sample_ns<=guard_entry_ns&&pose_stamp_ns<=guard_entry_ns);
+                let guard_start=Instant::now();
+                let accepted=follower.check_selected_candidate_for_test(candidate);
+                // The method has returned: shared production checker setup,
+                // swept stopping checks and its local cleanup are all included.
+                let guard_elapsed=guard_start.elapsed();
+                let completion_ns=unix_ns();
+                let c=capture.elapsed();
+                let record=&mut samples[phase];
+                record.c_ms.push(c.as_secs_f64()*1e3);
+                record.guard_ms.push(guard_elapsed.as_secs_f64()*1e3);
+                record.pose_age_ms.push(completion_ns.saturating_sub(pose_stamp_ns)as f64/1e6);
+                record.source_entry_age_ms.push(guard_entry_ns.saturating_sub(frame.sample_ns)as f64/1e6);
+                record.source_completion_age_ms.push(completion_ns.saturating_sub(frame.sample_ns)as f64/1e6);
+                if accepted {record.accepted+=1;}else {
+                    record.rejected+=1;
+                    // Do not replace failed nonzero candidates with a zero or
+                    // retry against fresher metadata. The original false remains.
+                    eprintln!("SELECTED_GUARD_REJECT source_cm={} case={case} phase={label} sample={sample} source_sequence={} source_sample_ns={} pose_stamp_ns={pose_stamp_ns} guard_entry_ns={guard_entry_ns} completion_ns={completion_ns} pose={:?} applied={applied:?} candidate={candidate:?} C_ms={:.6} guard_ms={:.6} source_age_entry_ms={:.6} source_age_completion_ms={:.6} detailed_guard_reason=unavailable_from_bool_api",
+                        resolution*100.0,frame.sequence,frame.sample_ns,captured.pose,c.as_secs_f64()*1e3,guard_elapsed.as_secs_f64()*1e3,
+                        guard_entry_ns.saturating_sub(frame.sample_ns)as f64/1e6,completion_ns.saturating_sub(frame.sample_ns)as f64/1e6);
+                }
+            }
+        }
+        for (phase,label) in ["metadata_cold","warm_same_pose","moved_pose_5mm"].into_iter().enumerate() {
+            let result=&samples[phase];
+            let over_50ms=result.c_ms.iter().filter(|ms|**ms>50.0).count();
+            all_over_50ms+=over_50ms;all_rejections+=result.rejected;
+            eprintln!("SELECTED_GUARD_COST source_cm={} case={case} phase={label} samples={} accepted_nonzero={} rejected_nonzero={} C_ms_median_p95_max={} guard_ms_median_p95_max={} captured_pose_age_completion_ms_median_p95_max={} source_age_entry_ms_median_p95_max={} source_age_completion_ms_median_p95_max={} actual_source_spacing_ms_median_p95_max={} C_over_50ms={over_50ms} control_period_ms=50 observation_age_limit_ms=1000",
+                resolution*100.0,result.c_ms.len(),result.accepted,result.rejected,measured_distribution(&result.c_ms),
+                measured_distribution(&result.guard_ms),measured_distribution(&result.pose_age_ms),
+                measured_distribution(&result.source_entry_age_ms),measured_distribution(&result.source_completion_age_ms),measured_distribution(&sample_spacings_ms));
+        }
+    }
+    eprintln!("SELECTED_GUARD_TOTAL source_cm={} rejected_nonzero={all_rejections} C_over_50ms={all_over_50ms} producer_dropped_frames={}",resolution*100.0,sensor.dropped.load(Ordering::Relaxed));
+    drop(sensor);
+    assert_eq!(all_rejections,0,"original selected-candidate safety failures; see per-sample diagnostics, no zero substituted");
+    assert_eq!(all_over_50ms,0,"selected-candidate capture-to-completion cost exceeds 50ms; no deadline qualification");
+}
+
+#[test] #[ignore="run 5cm first: exact shared selected-candidate guard cost, no route/ranking"]
+fn selected_candidate_guard_cost_5cm(){benchmark_selected_guard(0.05);}
+#[test] #[ignore="separate optional 1cm stress; truthful source ages and rejections retained"]
+fn selected_candidate_guard_cost_1cm_stress(){benchmark_selected_guard(0.01);}

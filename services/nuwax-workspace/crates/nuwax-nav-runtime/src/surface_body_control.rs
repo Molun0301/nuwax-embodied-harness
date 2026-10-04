@@ -649,58 +649,18 @@ impl SurfaceFollower {
         }
         self.bounded_command_with_speed_limit(preferred,speed_limit)
     }
-    pub(super) fn bounded_body_command(&mut self, preferred: Twist2, speed_limit:Option<f64>) -> PlannerStep {
-        let (Some(map), Some(pose), Some(physical_limits)) = (
-            self.map.as_ref(),
-            self.odometry.as_ref(),
-            self.config.motion_limits.as_ref(),
-        ) else {
-            return PlannerStep::ReplanRequired("缺少机体控制标定".into());
-        };
-        let mut limits=forward_navigation_limits(physical_limits);
-        let Some(model) = map.body_envelope() else {
-            return PlannerStep::ReplanRequired("缺少机体包络".into());
-        };
-        let target = self.control_target.unwrap_or_else(|| planar(pose));
-        // 用已下发控制及标定动态界预测制动扫掠；map位姿仍用于实际
-        // 位置、障碍和偏离检查，其坐标校正不充当执行器速度。
-        let current = self.last_command;
-        if let Some(limit)=speed_limit {
-            // 曲率速度参考进入可达窗口；已有实际速度只能按原标定逐拍降低。
-            let rate=limits.guaranteed_braking_mps2.min(limits.linear_acceleration_mps2);
-            let next_minimum=(current.linear.x-rate/self.config.controller.control_frequency).max(0.0);
-            limits.max_forward_mps=limits.max_forward_mps.min(limit.max(next_minimum).max(f64::MIN_POSITIVE));
-        }
-        let dt=1.0/self.config.controller.control_frequency;
-        let tracking_horizon=crate::DEFAULT_CONTROL_HORIZON.as_secs_f64()
-            .max(dt+limits.reaction_time_sec+current.angular_z.abs()/limits.guaranteed_angular_braking_rps2)
-            .min(20.0);
-        let mut reference_segments=Vec::new();
-        if preferred.linear.x.hypot(preferred.linear.y)>1e-9 {
-            if let Some(path)=&self.path {
-                let terminal=path.poses.last().is_some_and(|last|
-                    last.pose.position.x==target.x && last.pose.position.y==target.y);
-                if !terminal {
-                    let span=self.config.lookahead_m
-                        .max(self.config.controller.speed*self.config.controller.nerf_speed.min(1.0)/1.5
-                            +f64::from(map.config().voxel_size))
-                        .max(current.linear.x.abs().max(limits.max_forward_mps)*tracking_horizon);
-                    let mut travelled=0.0;
-                    let start=self.path_index.saturating_sub(1).min(path.poses.len());
-                    for pair in path.poses[start..].windows(2) {
-                        if is_rotation(&pair[0],&pair[1]) {break;}
-                        let length=horizontal_distance(&pair[0],&pair[1]);
-                        if length<1e-5 {continue;}
-                        reference_segments.push((planar(&pair[0]),planar(&pair[1])));
-                        travelled+=length;
-                        if travelled>=span {break;}
-                    }
-                }
-            }
-        }
+    // Keep observation and projected-body callbacks identical for ranking and a
+    // standalone selected-candidate proof. Caches live only for this invocation.
+    fn with_body_motion_checks<R>(&self, run: impl FnOnce(
+        &mut dyn FnMut(PlanarPose, PlanarPose, f64) -> bool,
+        &mut dyn FnMut(PlanarPose, PlanarPose, f64) -> bool,
+        &std::cell::RefCell<Option<nuwax_nav_mls_planner::surface::SurfaceError>>,
+    ) -> R) -> Result<R, String> {
+        let map=self.map.as_ref().ok_or("缺少表面地图")?;
+        let pose=self.odometry.as_ref().ok_or("缺少实际位姿")?;
         let observation_check = if let Some(age) = self.config.max_observation_age_sec {
             let Ok(occupied) = map.body_observation_footprint(body(pose)) else {
-                return PlannerStep::ReplanRequired("三维近场实际观察缺失".into());
+                return Err("三维近场实际观察缺失".into());
             };
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos().min(u128::from(u64::MAX)) as u64).unwrap_or(0);
@@ -772,9 +732,79 @@ impl SurfaceFollower {
                 true
             }
         };
+        Ok(run(&mut make_check(false), &mut make_check(true), &last_failure))
+    }
+
+    /// Timing-only entry: callers supply a known reachable candidate. This is
+    /// not a command issuance API and does not install or renew any permission.
+    #[cfg(test)]
+    pub(crate) fn check_selected_candidate_for_test(&mut self, candidate: Twist2) -> bool {
+        if self.current_body_error().is_some() { return false; }
+        let (Some(map),Some(pose),Some(limits))=(self.map.as_ref(),self.odometry.as_ref(),self.config.motion_limits.as_ref()) else { return false; };
+        let Some(model)=map.body_envelope() else {return false;};
+        let limits=forward_navigation_limits(limits);
+        self.with_body_motion_checks(|clear,period_clear,_| {
+            nuwax_nav_control::check_stopping_trajectory_with_period_check(
+                planar(pose),self.last_command,candidate,&limits,
+                1.0/self.config.controller.control_frequency,
+                f64::from(map.source_voxel_size_m())*0.5,model.radius(),clear,period_clear,
+            ).is_some()
+        }).unwrap_or(false)
+    }
+
+    pub(super) fn bounded_body_command(&mut self, preferred: Twist2, speed_limit:Option<f64>) -> PlannerStep {
+        let (Some(map), Some(pose), Some(physical_limits)) = (
+            self.map.as_ref(),
+            self.odometry.as_ref(),
+            self.config.motion_limits.as_ref(),
+        ) else {
+            return PlannerStep::ReplanRequired("缺少机体控制标定".into());
+        };
+        let mut limits=forward_navigation_limits(physical_limits);
+        let Some(model) = map.body_envelope() else {
+            return PlannerStep::ReplanRequired("缺少机体包络".into());
+        };
+        let target = self.control_target.unwrap_or_else(|| planar(pose));
+        // 用已下发控制及标定动态界预测制动扫掠；map位姿仍用于实际
+        // 位置、障碍和偏离检查，其坐标校正不充当执行器速度。
+        let current = self.last_command;
+        if let Some(limit)=speed_limit {
+            // 曲率速度参考进入可达窗口；已有实际速度只能按原标定逐拍降低。
+            let rate=limits.guaranteed_braking_mps2.min(limits.linear_acceleration_mps2);
+            let next_minimum=(current.linear.x-rate/self.config.controller.control_frequency).max(0.0);
+            limits.max_forward_mps=limits.max_forward_mps.min(limit.max(next_minimum).max(f64::MIN_POSITIVE));
+        }
+        let dt=1.0/self.config.controller.control_frequency;
+        let tracking_horizon=crate::DEFAULT_CONTROL_HORIZON.as_secs_f64()
+            .max(dt+limits.reaction_time_sec+current.angular_z.abs()/limits.guaranteed_angular_braking_rps2)
+            .min(20.0);
+        let mut reference_segments=Vec::new();
+        if preferred.linear.x.hypot(preferred.linear.y)>1e-9 {
+            if let Some(path)=&self.path {
+                let terminal=path.poses.last().is_some_and(|last|
+                    last.pose.position.x==target.x && last.pose.position.y==target.y);
+                if !terminal {
+                    let span=self.config.lookahead_m
+                        .max(self.config.controller.speed*self.config.controller.nerf_speed.min(1.0)/1.5
+                            +f64::from(map.config().voxel_size))
+                        .max(current.linear.x.abs().max(limits.max_forward_mps)*tracking_horizon);
+                    let mut travelled=0.0;
+                    let start=self.path_index.saturating_sub(1).min(path.poses.len());
+                    for pair in path.poses[start..].windows(2) {
+                        if is_rotation(&pair[0],&pair[1]) {break;}
+                        let length=horizontal_distance(&pair[0],&pair[1]);
+                        if length<1e-5 {continue;}
+                        reference_segments.push((planar(&pair[0]),planar(&pair[1])));
+                        travelled+=length;
+                        if travelled>=span {break;}
+                    }
+                }
+            }
+        }
         let mut rotation_useful=std::collections::HashMap::<u64,bool>::new();
         let reference_curvature=reference_segments.first().map(|(a,b)|
             2.0*(angle_diff(b.yaw,a.yaw)*0.5).sin()/(b.x-a.x).hypot(b.y-a.y));
+        let checked = self.with_body_motion_checks(|clear,period_clear,last_failure| {
         let result = choose_tracking_control_with_period_check(
             planar(pose),
             current,
@@ -801,9 +831,12 @@ impl SurfaceFollower {
                         self.rotation_can_restore_translation(preferred,candidate.angular_z))
                 } else {true}
             },
-            make_check(false),
-            make_check(true),
+            clear,
+            period_clear,
         );
+        (result,last_failure.take())
+        });
+        let (result,last_failure)=match checked {Ok(value)=>value,Err(error)=>return PlannerStep::ReplanRequired(error)};
         match result {
             Some(choice) if choice.command.linear.x.hypot(choice.command.linear.y) > 1e-9
                 || choice.command.angular_z.abs() > 1e-9 => {
@@ -819,7 +852,7 @@ impl SurfaceFollower {
                 self.begin_braking();
                 PlannerStep::ReplanRequired(format!("三维局部控制未找到可推进速度，路径点{}，实际速度{:?}，参考速度{:?}，局部目标{:?}{}",
                     self.path_index,current,preferred,target,
-                    last_failure.borrow().as_ref().map(|error|format!("，扫掠拒绝: {error}")).unwrap_or_default()))
+                    last_failure.as_ref().map(|error|format!("，扫掠拒绝: {error}")).unwrap_or_default()))
             }
         }
     }

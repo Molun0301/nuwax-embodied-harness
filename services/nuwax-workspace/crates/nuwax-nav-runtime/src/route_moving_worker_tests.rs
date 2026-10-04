@@ -135,7 +135,8 @@ impl NavPlanner for Measured {
 
 #[derive(Clone,Copy,Debug,PartialEq)]
 enum Scenario {Goal,HoldFirst,HoldSecond,HoldSecondContinuity,ReplaceGoal,ReplacePath,ReplaceBoundary,ReplaceGeometry,Cancel}
-struct RawReceipt {map:Arc<SurfaceSnapshot>,boundary:Arc<Vec<[f64;2]>>,pose:PlanarPose,before:Twist2,command:Twist2,ns:u64}
+struct RawReceipt {map:Arc<SurfaceSnapshot>,boundary:Arc<Vec<[f64;2]>>,pose:PlanarPose,before:Twist2,command:Twist2,ns:u64,
+    source_sample_ns:u64,source_sequence:u16,pose_stamp_ns:i64,worker_result_age_ms:f64,worker_remaining_ms:f64}
 struct RawSegment {map:Arc<SurfaceSnapshot>,boundary:Arc<Vec<[f64;2]>>,from:PlanarPose,to:PlanarPose,ns:u64,dt:f64}
 fn distribution(values:&[f64])->(f64,f64,f64) {let mut v=values.to_vec();v.sort_by(f64::total_cmp);if v.is_empty(){return (0.0,0.0,0.0);} (v[v.len()/2],v[((v.len()-1)as f64*0.95).ceil()as usize],*v.last().unwrap())}
 fn measured_distribution(values:&[f64])->String {
@@ -184,7 +185,7 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
         planner_worker::PlannerWorker::new(Measured{inner,probe:probe.clone()}).unwrap()
     };
     let mut map=base;let mut boundary=Arc::new(Vec::new());let mut frames=0usize;let mut sensor_no_new_frame=0usize;let mut consumer_waits=ConsumerWaits::default();
-    let mut previous_frame=None::<u64>;let mut previous_source=None::<Arc<SurfaceSnapshot>>;let mut sequence=0u16;
+    let mut previous_frame=None::<u64>;let mut previous_source=None::<Arc<SurfaceSnapshot>>;let mut sequence=0u16;let mut installed_sample_ns=0u64;
     if primed {
         // Same live 5Hz producer and one-frame queue as the cold arm. Install two
         // separately acquired frames before any goal/path; never edit their hits
@@ -199,7 +200,7 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
                 assert!(!old.same_body_query_view(&frame.map));
             }
             previous_frame=Some(frame.sample_ns);previous_source=Some(frame.map.clone());sequence=frame.sequence;frames+=1;
-            map=frame.map;worker.update_execution_map(ExecutionMap::Surface(map.clone())).unwrap();
+            installed_sample_ns=frame.sample_ns;map=frame.map;worker.update_execution_map(ExecutionMap::Surface(map.clone())).unwrap();
         }
         assert!(sequence>=2);
     }
@@ -236,7 +237,7 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
             assert!(frame.sample_ns<=unix_ns());
             if let Some(previous)=previous_frame {assert!(frame.sample_ns>previous);let previous_map=previous_source.as_ref().unwrap();assert!(nuwax_nav_pct::same_source_geometry(previous_map,&frame.map));assert!(!previous_map.same_body_query_view(&frame.map));}
             previous_frame=Some(frame.sample_ns);previous_source=Some(frame.map.clone());sequence=frame.sequence;frames+=1;
-            if !changed || !matches!(scenario,Scenario::ReplaceGeometry|Scenario::Cancel){map=frame.map;worker.update_execution_map(ExecutionMap::Surface(map.clone())).unwrap();}
+            if !changed || !matches!(scenario,Scenario::ReplaceGeometry|Scenario::Cancel){installed_sample_ns=frame.sample_ns;map=frame.map;worker.update_execution_map(ExecutionMap::Surface(map.clone())).unwrap();}
         }else{sensor_no_new_frame+=1;}
         worker.update_odometry(current.clone());
         if held.load(Ordering::Acquire)&&hold_start.is_none(){hold_start=Some(now);hold_frame_count=frames;hold_admitted_count=probe.lock().unwrap().admitted;}
@@ -259,7 +260,8 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
         let receipt_at=Instant::now();
         // Original worker result expiry is captured under its selection lock.
         // Replaying the same candidate never renews its permission horizon.
-        let permitted_until=worker.delivered_command_deadline_for_test().unwrap_or(receipt_at).min(receipt_at+PERIOD);
+        let original_deadline=worker.delivered_command_deadline_for_test().unwrap_or(receipt_at);
+        let permitted_until=original_deadline.min(receipt_at+PERIOD);
         if matches!(&result,PlannerStep::Command(_))&&permitted_until<=receipt_at{consumer_waits.expired_at_receipt+=1;}
         let before=command;command=match result {
             PlannerStep::Command(v) if permitted_until>receipt_at=>{accepted+=1;if nonzero(v){nonzero_count+=1;if held.load(Ordering::Acquire)&&frames>hold_frame_count&&hold_start.is_some_and(|start|now.duration_since(start)>DEFAULT_CONTROL_HORIZON+PERIOD){held_nonzero+=1;}}v},
@@ -277,7 +279,9 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
         if nonzero(command){assert!(sequence>=2);}
         if changed&&matches!(scenario,Scenario::ReplaceGoal|Scenario::ReplaceBoundary|Scenario::ReplaceGeometry|Scenario::Cancel){assert!(!nonzero(command),"stale command after {scenario:?}");}
         command_at=receipt_at;command_deadline=permitted_until;segment_ns=unix_ns();
-        if nonzero(command){receipts.push(RawReceipt{map:map.clone(),boundary:boundary.clone(),pose:planar(&current),before,command,ns:segment_ns});}
+        if nonzero(command){receipts.push(RawReceipt{map:map.clone(),boundary:boundary.clone(),pose:planar(&current),before,command,ns:segment_ns,source_sample_ns:installed_sample_ns,source_sequence:sequence,pose_stamp_ns:current.stamp.nanos,
+            worker_result_age_ms:DEFAULT_CONTROL_HORIZON.saturating_sub(original_deadline.saturating_duration_since(receipt_at)).as_secs_f64()*1e3,
+            worker_remaining_ms:original_deadline.saturating_duration_since(receipt_at).as_secs_f64()*1e3});}
         worker.observe_applied_command(command);
         if scenario==Scenario::HoldSecondContinuity&&held_nonzero>=2&&released_at.is_some()
             &&!held.load(Ordering::Acquire)&&probe.lock().unwrap().admitted>hold_admitted_count {
@@ -313,11 +317,42 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
     }
     for (i,r) in receipts.iter().enumerate(){
         let occupied=r.map.body_observation_footprint(body(r.pose)).unwrap();
-        let check=|a:PlanarPose,b:PlanarPose,elapsed:f64| {
-            r.map.validate_observed_body_motion_in_boundary(body(a),body(b),&occupied,r.ns+(elapsed*1e9)as u64,(OBS_AGE*1e9)as u64,&r.boundary).is_ok()
-                && r.map.body_query_with_current_support(body(a).0,body(a).1).and_then(|view|view.validate_body_motion(body(a),body(b),&r.boundary)).is_ok()
+        // Diagnostic-only additions: retain the exact prior flat-body oracle,
+        // receipt clock, initial footprint exemption and unchanged age limit.
+        // In particular a production-projected alternative cannot make it pass.
+        let first_failure=std::cell::RefCell::new(None::<String>);
+        let make_check=|kind:&'static str| {
+            let first_failure=&first_failure;let occupied=&occupied;
+            move |a:PlanarPose,b:PlanarPose,elapsed:f64| {
+                let checked_ns=r.ns+(elapsed*1e9)as u64;
+                let result=r.map.validate_observed_body_motion_in_boundary(body(a),body(b),occupied,checked_ns,(OBS_AGE*1e9)as u64,&r.boundary)
+                    .map_err(|e|format!("initial-footprint observed sweep: {e:?}"))
+                    .and_then(|_|r.map.body_query_with_current_support(body(a).0,body(a).1)
+                        .and_then(|view|view.validate_body_motion(body(a),body(b),&r.boundary))
+                        .map_err(|e|format!("future-footprint geometry sweep: {e:?}")));
+                if let Err(reason)=result {
+                    if first_failure.borrow().is_none() {
+                        // Alternatives are printed only, never used as permission.
+                        let source_projection=r.map.body_pose_after_motion(body(a),[b.x,b.y],b.yaw);
+                        let view_projection=r.map.body_query_with_current_support(body(a).0,body(a).1)
+                            .and_then(|view|view.body_pose_after_motion(body(a),[b.x,b.y],b.yaw));
+                        *first_failure.borrow_mut()=Some(format!("callback={kind} elapsed_s={elapsed:.9} from={:?} to={:?} checked_ns={checked_ns} source_age_at_check_ms={:.6} reason={reason} source_projection={source_projection:?} future_view_projection={view_projection:?}",
+                            body(a),body(b),checked_ns.saturating_sub(r.source_sample_ns)as f64/1e6));
+                    }
+                    return false;
+                }
+                true
+            }
         };
-        assert!(nuwax_nav_control::check_stopping_trajectory_with_period_check(r.pose,r.before,r.command,&limits(),PERIOD.as_secs_f64(),f64::from(resolution)*0.5,r.map.body_envelope().unwrap().radius(),check,check).is_some(),"receipt {i} independent full braking oracle rejected");
+        let choice=nuwax_nav_control::check_stopping_trajectory_with_period_check(r.pose,r.before,r.command,&limits(),PERIOD.as_secs_f64(),f64::from(resolution)*0.5,r.map.body_envelope().unwrap().radius(),make_check("geometric-subdivision"),make_check("physical-period"));
+        if choice.is_none() {
+            let current_body_result=r.map.validate_body_pose(body(r.pose).0,body(r.pose).1);
+            let current_view_same=r.map.with_current_body_support(body(r.pose).0,body(r.pose).1).map(|view|view.same_body_query_view(&r.map));
+            let footprint_evidence:Vec<_>=occupied.iter().take(4).map(|key|(*key,r.map.observations().and_then(|o|o.get(*key)))).collect();
+            eprintln!("BRAKING_ORACLE_FAILURE receipt={i} source_cm={} receipt_ns={} pose_stamp_ns={} source_sample_ns={} source_sequence={} source_age_at_receipt_ms={:.6} worker_result_age_ms={:.6} worker_remaining_ms={:.6} actual_guard_entry_time=unavailable computed_pose_applied_context=unavailable pose={:?} before={:?} command={:?} initial_footprint_cells={} footprint_evidence_first4={footprint_evidence:?} current_body={current_body_result:?} current_view_same={current_view_same:?} first_failure={:?}",
+                resolution*100.0,r.ns,r.pose_stamp_ns,r.source_sample_ns,r.source_sequence,r.ns.saturating_sub(r.source_sample_ns)as f64/1e6,r.worker_result_age_ms,r.worker_remaining_ms,r.pose,r.before,r.command,occupied.len(),first_failure.borrow());
+        }
+        assert!(choice.is_some(),"receipt {i} independent full braking oracle rejected: {:?}",first_failure.into_inner());
     }
     assert!(delivered_negative_reason.is_none()||expected_current_rejection,"delivered_negative={delivered_negative}: {}",delivered_negative_reason.as_deref().unwrap_or("none"));
     let p=probe.lock().unwrap();

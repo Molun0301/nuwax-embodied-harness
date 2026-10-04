@@ -1435,4 +1435,96 @@ mod tests {
         assert!(worker.shared.0.lock().unwrap().result.is_none());
     }
 
+    /// Diagnostic falsifier: static evidence and a held next publication isolate
+    /// command replay from source construction rate and from planner CPU work.
+    fn run_replay_proof_falsifier(initial_speed:f64) {
+        use nuwax_nav_mls_planner::{SurfaceObservation,SurfaceObservations};
+        use nuwax_nav_types_messages::{MotionLimits,Point2};
+        use nuwax_nav_control::PlanarPose;
+        let unix_ns=||std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let stamped=|x:f64| {let mut p=route_pose(x,0);let ns=unix_ns();p.stamp=Timestamp::from_unix((ns/1_000_000_000)as i64,(ns%1_000_000_000)as u32);p};
+        let limits=MotionLimits{model:MotionModel::Differential,max_forward_mps:0.5,max_reverse_mps:0.0,
+            max_lateral_mps:0.0,max_angular_rps:0.8,linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,
+            angular_acceleration_rps2:2.0,guaranteed_angular_braking_rps2:2.0,reaction_time_sec:0.05,
+            minimum_turning_radius_m:0.0,can_rotate_in_place:true};
+        let source=crate::surface_follower::test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope{
+            footprint_xy_m:vec![[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],
+            z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,max_step_up_m:0.2,max_step_down_m:0.2,
+            max_cross_slope_deg:18.0,support_uncertainty_m:0.0}).unwrap();
+        let sampled=unix_ns();
+        let mut blocks=std::collections::BTreeMap::<_,std::collections::BTreeMap<_,_>>::new();
+        for (x,y,z) in source.cell_keys(){let key=[x,y,z];blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,
+            SurfaceObservation{observed_ns:if x>=7{sampled.saturating_sub(2_000_000_000)}else{sampled},hits:2});}
+        let mut observations=SurfaceObservations::new(source.source_voxel_size_m(),32).unwrap();
+        for (key,block) in blocks{observations.replace_block(key,block).unwrap();}
+        observations.set_source_timestamp_ns(sampled);observations.mark_complete_geometry_source();
+        let source=Arc::new(source.with_observations(Some(Arc::new(observations))));
+        let mut config=SurfaceFollowerConfig::new(0.4);config.local_planning_enabled=false;
+        config.controller.control_frequency=20.0;config.controller.speed=0.5;
+        config.motion_limits=Some(limits.clone());config.max_observation_age_sec=Some(1.0);
+        assert!(!config.controller.simulation);
+        let (computed,receive)=std::sync::mpsc::channel();let (release,wait)=std::sync::mpsc::channel();
+        let mut harness=RouteWorkerHarness{worker:PlannerWorker::new(GatedRouteFollower{
+            inner:RouteFollower::new(config).unwrap(),computed,release:wait,map:None,boundary:Vec::new(),
+            odometry:None,goal_updates:0,path_updates:0}).unwrap(),computed:receive,release,clear:source.clone()};
+        let start=stamped(0.533);let goal=stamped(2.0);
+        let initial_occupied=source.body_observation_footprint(([0.533,1.0,0.5],[0.0,0.0,0.0,1.0])).unwrap();
+        eprintln!("REPLAY initial_occupied_max_x={:?} source_resolution={}",initial_occupied.iter().map(|p|p[0]).max(),source.source_voxel_size_m());
+        assert!(initial_occupied.iter().all(|p|p[0]<7),"stale strip must lie outside initial footprint exemption");
+        let previous=Twist2{linear:Point2::new(initial_speed,0.0),angular_z:0.0};
+        harness.worker.update_execution_map(ExecutionMap::Surface(source.clone())).unwrap();
+        harness.worker.configure_goal(&goal,GoalOptions::default()).unwrap();
+        harness.worker.update_odometry(start.clone());
+        harness.worker.replace_execution_path(ExecutionPath::Surface(Path3D{poses:vec![start.clone(),goal.clone()]}),None,goal).unwrap();
+        harness.worker.observe_applied_command(previous);harness.worker.step(0.3);
+        let initial=harness.next_computation();
+        let PlannerStep::Command(first)=initial.outcome else{panic!("initial guarded command missing: {:?}",initial.outcome);};
+        assert!(first.linear.x>=0.09 && first.angular_z.abs()<1e-9,"fixture must establish the maximal safe initial command: {first:?}");
+        harness.release.send(()).unwrap();wait_for_source_result(&harness.worker);
+        assert_eq!(harness.worker.step(0.3),PlannerStep::Command(first));
+        let first_deadline=harness.worker.delivered_command_deadline_for_test().unwrap();
+        // Actual calibrated midpoint transition over one real wall-clock period.
+        std::thread::sleep(Duration::from_millis(50));
+        let current=stamped(start.pose.position.x+(previous.linear.x+first.linear.x)*0.5*0.05);
+        harness.worker.update_odometry(current.clone());harness.worker.observe_applied_command(first);
+        let latest=harness.next_computation(); // hold the new guard outcome before publication
+        let replay=harness.worker.step(0.3);
+        let receipt_ns=unix_ns();let remaining=first_deadline.saturating_duration_since(std::time::Instant::now());
+        eprintln!("REPLAY before={previous:?} initial={first:?} fresh_computed={:?} delivered={replay:?} x={} remaining_ms={}",latest.outcome,current.pose.position.x,remaining.as_secs_f64()*1000.0);
+        assert!(remaining>Duration::from_millis(50),"fresh 50ms oracle must fit inside the selected original remaining lease");
+        let command=match replay {
+            PlannerStep::Command(command)=>command,
+            PlannerStep::Pending(_)|PlannerStep::ReplanRequired(_)=>{
+                // Correct retirement is also a successful desired-safety outcome.
+                harness.worker.stop();harness.release.send(()).unwrap();return;
+            }
+            other=>panic!("unexpected replay diagnostic outcome: {other:?}"),
+        };
+        let pose=PlanarPose{x:current.pose.position.x,y:1.0,yaw:0.0};
+        let body=|p:PlanarPose|([p.x,p.y,0.5],[0.0,0.0,0.0,1.0]);
+        let view=source.with_current_body_support(body(pose).0,body(pose).1).unwrap();
+        assert!(view.same_body_query_view(&source),"flat source must need no different current-body permission");
+        let occupied=view.body_observation_footprint(body(pose)).unwrap();
+        let failure=std::cell::RefCell::new(None);
+        let check=|a:PlanarPose,b:PlanarPose,elapsed:f64| {
+            let projected=view.body_pose_after_motion(body(a),[b.x,b.y],b.yaw).unwrap();
+            assert!((projected.0[2]-0.5).abs()<1e-9,"oracle/source projection must agree");
+            match view.validate_observed_body_motion_in_boundary(body(a),projected,&occupied,receipt_ns+(elapsed*1e9)as u64,1_000_000_000,&[]) {
+                Ok(())=>true,Err(e)=>{if failure.borrow().is_none(){*failure.borrow_mut()=Some(e.to_string());}false}
+            }
+        };
+        let safe=nuwax_nav_control::check_stopping_trajectory_with_period_check(pose,first,command,&limits,0.05,
+            f64::from(source.source_voxel_size_m())*0.5,source.body_envelope().unwrap().radius(),check,check).is_some();
+        eprintln!("REPLAY oracle_safe={safe} reason={:?}",failure.borrow());
+        harness.worker.stop();harness.release.send(()).unwrap();
+        assert!(safe,"a retained command delivered inside its lease still needs current full braking permission");
+    }
+
+    #[test]
+    #[ignore="known-proof diagnostic; no production lease or guard changes"]
+    fn retained_command_replay_requires_current_full_braking_permission() {run_replay_proof_falsifier(0.05);}
+    #[test]
+    #[ignore="known-proof diagnostic with unchanged actual applied velocity"]
+    fn retained_steady_command_replay_requires_current_full_braking_permission() {run_replay_proof_falsifier(0.1);}
+
 }

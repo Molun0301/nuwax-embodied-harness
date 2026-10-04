@@ -2,6 +2,14 @@
 
 ## Qualification status correction
 
+**Open safety-proof composition issue:** two deterministic OFF cases replayed an
+old positive command that failed a current replayed-command hold-and-stop check, even with more than
+50 ms remaining on its original 250 ms lease. A newer, slower guarded command was
+held before publication. This issue concerns the unchanged control-result replay
+contract and is not resolved by planner ownership separation. No production fix
+or general deployment safety qualification is claimed in this milestone.
+
+
 The first moving factory/measured logs did **not** enforce delivered
 `ReplanRequired`/`Failed` transitions. They are movement plus geometry/braking
 oracle evidence only, **not rejection-respecting task-completion qualification**.
@@ -195,3 +203,66 @@ Replacement/retirement arms stop immediately too; a delivered current
 ReplanRequired after a restrictive boundary/geometry change is an expected safe
 rejection, while unexpected Failed or any stale positive remains a failure.
 Goal/continuity arms reject every delivered negative.
+
+### Terminal-aware results and isolated replay falsifier
+
+The replacement primed production-backend + ideal-plant goal trials both passed
+with **zero delivered negatives** and independent oracles:
+
+- OFF: priming 0.241 s, goal 22.25 s, 330 nonzero commands, 0.933687 m travel,
+  position/yaw errors 0.066313 m / 0.127547 rad
+- ON: priming 0.236 s, goal 21.4 s, 315 nonzero commands, 0.850753 m travel,
+  errors 0.149247 m / 0.137143 rad
+
+The configured region remains 0.15 m / 0.15 rad. These are separate experiments;
+they do not retroactively qualify the earlier consumer that ignored negatives.
+Factory inner-control CPU is uninstrumented.
+
+The corrected primed continuity experiment met its functional stopping condition:
+five fresh commands during held work beyond the old lease, a newer admission,
+1.083622 m travel and no delivered negative. It nevertheless **failed** its 50 ms
+inner-control criterion (maximum 163.69 ms). The corrected metadata experiment
+finished one job/admission and the goal with no delivered negative, but also
+**failed** that criterion (maximum 83.36 ms). Neither is a strict 20 Hz pass.
+
+Both 1 cm stress arms failed full-braking receipt oracles. The source producer
+also delivered only 47 frames in the 60 s ON trial, so the arm did not achieve its
+intended 5 Hz source rate. A diagnostic OFF rerun produced only two nonzero
+receipts, passed those oracles and timed out; it did not disprove the earlier
+failures. Receipt diagnostics retain original remaining lease, current pose,
+applied/command velocities, source ages and the first rejected sweep, without
+weakening the oracle or changing timestamps/TTLs.
+
+A small deterministic OFF test then isolated a replay issue without that producer
+load. A flat 100 mm source has a stale-observation strip at x >= 0.7 m, outside the
+initial footprint exemption (maximum cell x index 6). Body center starts at
+x=0.533 m with a 0.15 m forward extent, leaving 17 mm. The real initial guard
+allows 0.1 m/s; its instantaneous-response hold-plus-stop extent is 15 mm.
+
+- Ramp case: actual incoming 0.05 -> command 0.1 m/s, modeled midpoint motion after a real 50 ms wait advances 3.75 mm. The fresh guard computes 0.05 m/s, but
+  while its publication is held the worker delivers the old 0.1 with 118.9 ms
+  original lease remaining. The replayed-command hold-and-stop check rejects stale support [7, 8, 0]
+- Steady case: incoming/applied remains 0.1 m/s, modeled constant-speed motion after a real 50 ms wait advances 5 mm.
+  The fresh guard again computes 0.05, while the worker delivers old 0.1 with
+  83.49 ms remaining. The same replayed-command hold-and-stop assertion fails
+
+Both remaining leases exceed the oracle's 50 ms requested hold. Current-support
+view identity equals the raw source on this flat fixture and projected z remains
+0.5 m, ruling out those oracle discrepancies for these isolated cases. The
+steady case does not depend on an applied-velocity version change. Desired-safety
+tests remain explicitly ignored diagnostics pending a production contract fix;
+correct retirement (Pending/ReplanRequired) or a command passing the current
+oracle satisfies the intended property. The current production behavior fails.
+
+The final ordinary runtime suite passed 129 tests, with the five independently
+confirmed UDS-environment failures explicitly filtered and opt-in wall-clock
+experiments ignored. That ordinary-suite result does not override the separate
+failed qualification experiments or the replay-proof findings.
+
+These replay cases are backend state-transition fixtures, not continuously
+integrated motion-port executions. They prove unsupported continuation: at the
+steady replay pose, immediate current-speed stopping needs 10 mm and remains
+within about 12 mm clearance, whereas another 50 ms command hold plus reaction
+and stopping needs 15 mm. They do not prove that emergency braking is already
+impossible. Nor do they retrospectively identify the exact cause of every earlier
+1 cm oracle rejection, whose original computed context was not captured.

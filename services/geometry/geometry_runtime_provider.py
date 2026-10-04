@@ -35,9 +35,13 @@ from contracts.navigation import NavigationGoal, NavigationState, NavigationStat
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
 from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
 from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
-from services.geometry.dense_cloud import MAX_DENSE_ARCHIVE_BYTES, DENSE_CHUNK_POINTS, dense_chunk_payload
+from services.geometry.dense_cloud import MAX_DENSE_ARCHIVE_BYTES, DENSE_CHUNK_POINTS, dense_chunk_payload, validate_dense_archive
+from services.geometry.fine_map_archive import MAX_FINE_ARCHIVE_BYTES, validate_fine_archive
 from services.geometry.mapping_backend_checkpoint_store import (
     MappingBackendCheckpoint,
+    CheckpointMemberIdentity,
+    CheckpointArtifactReference,
+    validate_artifact_reference,
     MappingBackendCheckpointNotFoundError,
     MappingBackendCheckpointStore,
     StoredMappingBackendCheckpoint,
@@ -257,19 +261,23 @@ class MappingBackendCheckpointExportBundle:
     checkpoint: MappingBackendCheckpoint
     occupancy_asset: Mapping[str, object]
     cloud_asset: Optional[Mapping[str, object]]
-    canonical_occupancy_checkpoint_bytes: bytes
-    canonical_cloud_checkpoint_bytes: bytes
+    canonical_occupancy_checkpoint_bytes: bytes = b""
+    canonical_cloud_checkpoint_bytes: bytes = b""
 
     @property
     def backend_kind(self) -> str:
         return self.checkpoint.backend_kind
 
     def canonical_occupancy_checkpoint(self):
+        if self.checkpoint.schema_version == 2:
+            return _canonical_occupancy_from_stored(self.checkpoint, self.occupancy_asset)
         message = pb2.OccupancyGridData()
         message.ParseFromString(self.canonical_occupancy_checkpoint_bytes)
         return message
 
     def canonical_cloud_checkpoint(self):
+        if self.checkpoint.schema_version == 2:
+            return _canonical_cloud_from_stored(self.checkpoint, self.cloud_asset)
         if self.checkpoint.backend_kind == "slam_toolbox":
             return None
         message = pb2.CloudMapCheckpoint()
@@ -373,6 +381,10 @@ def _cloud_receipt_dict(message) -> Dict[str, object]:
 def _checkpoint_export_bundle_from_proto(
     response, payload=None, fine_payload=None, dense_payload=None,
 ) -> MappingBackendCheckpointExportBundle:
+    if int(response.schema_version) == 2:
+        return _checkpoint_export_bundle_v2(response, payload, fine_payload, dense_payload)
+    if int(response.schema_version) != 1:
+        raise ValueError("unsupported checkpoint envelope schema")
     if str(response.backend_kind) == "slam_toolbox":
         if fine_payload is not None or dense_payload is not None:
             raise ValueError("二维导出不能携带精细三维资产")
@@ -515,10 +527,15 @@ def _mapping_commit_identity_proto(value: Mapping[str, object]):
 
 def _mapping_backend_checkpoint_proto(
     stored: StoredMappingBackendCheckpoint,
-    occupancy_checkpoint,
-    cloud_checkpoint, graph_artifact=None, fine_map_artifact=None, dense_cloud_artifact=None,
+    occupancy_checkpoint=None,
+    cloud_checkpoint=None, graph_artifact=None, fine_map_artifact=None, dense_cloud_artifact=None,
 ):
     checkpoint = stored.checkpoint
+    if checkpoint.schema_version == 2:
+        if occupancy_checkpoint is not None or cloud_checkpoint is not None:
+            raise ValueError("v2 reconstruction uses exact stored canonical members")
+        return _mapping_backend_checkpoint_v2_proto(stored, graph_artifact=graph_artifact,
+            fine_map_artifact=fine_map_artifact, dense_cloud_artifact=dense_cloud_artifact)
     if checkpoint.backend_kind == "slam_toolbox":
         receipt = checkpoint.occupancy_receipt
         if graph_artifact is None or cloud_checkpoint is not None:
@@ -564,6 +581,131 @@ def _mapping_backend_checkpoint_proto(
         fine_map_artifact=fine_map_artifact,
         dense_cloud_artifact=dense_cloud_artifact,
     )
+
+_CHECKPOINT_MEMBER_ROLE_NAMES = {
+    1: "backend_state", 2: "canonical_occupancy", 3: "canonical_cloud",
+    4: "fine_map", 5: "dense_cloud", 6: "planar_graph",
+}
+
+
+def _member_identity_from_proto(message):
+    role = _CHECKPOINT_MEMBER_ROLE_NAMES.get(int(message.role))
+    if role is None:
+        raise ValueError("checkpoint member role is unspecified or unsupported")
+    return CheckpointMemberIdentity(str(message.checkpoint_id), role,
+        _occupancy_receipt_dict(_require_proto_message_field(message, "occupancy_receipt")),
+        _cloud_receipt_dict(message.cloud_receipt) if message.HasField("cloud_receipt") else None,
+        str(message.frame_id), int(message.frame_generation), int(message.producer_generation))
+
+
+def _artifact_reference_from_proto(reference, maximum_bytes=MAX_PLANAR_ARCHIVE_BYTES):
+    descriptor = _member_identity_from_proto(reference.member_identity) if reference.HasField("member_identity") else None
+    return validate_artifact_reference(CheckpointArtifactReference(str(reference.id), int(reference.size),
+        int(reference.identity_schema_version), descriptor, bytes(reference.sha256)), maximum_bytes=maximum_bytes)
+
+
+def _occupancy_receipt_proto(receipt):
+    return pb2.CanonicalOccupancyCommitReceipt(commit_id=_mapping_commit_identity_proto(receipt["commit_id"]),
+        **{key: value for key, value in receipt.items() if key != "commit_id"})
+
+
+def _cloud_receipt_proto(receipt):
+    return pb2.CanonicalCloudCommitReceipt(commit_id=_mapping_commit_identity_proto(receipt["commit_id"]),
+        **{key: value for key, value in receipt.items() if key != "commit_id"})
+
+
+def _member_identity_proto(identity):
+    return pb2.CheckpointMemberIdentity(checkpoint_id=identity.checkpoint_id,
+        role=next(number for number, name in _CHECKPOINT_MEMBER_ROLE_NAMES.items() if name == identity.role),
+        occupancy_receipt=_occupancy_receipt_proto(identity.occupancy_receipt),
+        cloud_receipt=_cloud_receipt_proto(identity.cloud_receipt) if identity.cloud_receipt is not None else None,
+        frame_id=identity.frame_id, frame_generation=identity.frame_generation, producer_generation=identity.producer_generation)
+
+
+def _artifact_reference_proto(reference):
+    return pb2.GraphArtifactRef(id=reference.id, size=reference.size, identity_schema_version=reference.identity_schema_version,
+        member_identity=_member_identity_proto(reference.member_identity) if reference.member_identity is not None else None,
+        sha256=reference.legacy_alias)
+
+
+def _canonical_occupancy_from_stored(checkpoint, asset):
+    return pb2.OccupancyGridData(meta=pb2.OccupancyGridMeta(width=asset["width"], height=asset["height"],
+        resolution=asset["resolution"], origin_x=asset["origin_x"], origin_y=asset["origin_y"], frame_id=asset["frame_id"],
+        revision=asset["source_occupancy_revision"], timestamp_ns=asset["timestamp_ns"]),
+        data=_protobuf_payload_bytes(checkpoint.canonical_occupancy_data))
+
+
+def _canonical_cloud_from_stored(checkpoint, asset):
+    return pb2.CloudMapCheckpoint(frame_id=asset["frame_id"], source_revision=asset["source_cloud_revision"],
+        point_count=asset["point_count"], voxel_size=asset["voxel_size"], payload_schema_version=2,
+        xyz_f32_le=_protobuf_payload_bytes(checkpoint.canonical_cloud_xyz), member_identity=_member_identity_proto(checkpoint.cloud_identity))
+
+
+def _protobuf_payload_bytes(value):
+    # Materialize only when a caller requests a protobuf bytes field.
+    return value if isinstance(value, bytes) else value[:]
+
+
+def _checkpoint_export_bundle_v2(response, payload, fine_payload, dense_payload):
+    if response.backend_kind == "slam_toolbox" or response.HasField("graph_artifact") or payload is not None:
+        raise ValueError("planar v2 checkpoint producer is not paired")
+    if response.target_kind != "":
+        raise ValueError("v2 cloud checkpoint target kind mismatch")
+    if response.content_sha256 or response.backend_payload_schema_version != 1:
+        raise ValueError("v2 checkpoint has mixed identity or unsupported backend bytes")
+    occupancy = _require_proto_message_field(response, "canonical_occupancy_checkpoint")
+    meta = _require_proto_message_field(occupancy, "meta")
+    cloud = _require_proto_message_field(response, "canonical_cloud_checkpoint")
+    if cloud.payload_schema_version != 2 or cloud.xyz_sha256:
+        raise ValueError("v2 cloud checkpoint requires assigned identity with empty legacy digest")
+    fine_reference = _artifact_reference_from_proto(response.fine_map_artifact, MAX_FINE_ARCHIVE_BYTES) if response.HasField("fine_map_artifact") else None
+    dense_reference = _artifact_reference_from_proto(response.dense_cloud_artifact, MAX_DENSE_ARCHIVE_BYTES) if response.HasField("dense_cloud_artifact") else None
+    checkpoint = MappingBackendCheckpoint(schema_version=2, backend_kind=response.backend_kind,
+        source_session_id=response.source_session_id, source_session_generation=response.source_session_generation,
+        content_sha256=b"", payload_size=response.payload_size, created_at_ns=response.created_at_ns,
+        payload=bytes(response.payload), occupancy_receipt=_occupancy_receipt_dict(_require_proto_message_field(response, "occupancy_receipt")),
+        cloud_receipt=_cloud_receipt_dict(_require_proto_message_field(response, "cloud_receipt")),
+        fine_archive=fine_payload, dense_archive=dense_payload, checkpoint_id=response.checkpoint_id, target_kind=response.target_kind,
+        backend_payload_schema_version=response.backend_payload_schema_version, canonical_occupancy_data=bytes(occupancy.data),
+        canonical_cloud_xyz=bytes(cloud.xyz_f32_le), fine_reference=fine_reference, dense_reference=dense_reference,
+        cloud_identity=_member_identity_from_proto(_require_proto_message_field(cloud, "member_identity")))
+    occupancy_asset = dict(raw_data_size=len(checkpoint.canonical_occupancy_data), width=int(meta.width), height=int(meta.height),
+        resolution=float(meta.resolution), origin_x=float(meta.origin_x), origin_y=float(meta.origin_y), frame_id=str(meta.frame_id),
+        source_occupancy_revision=int(meta.revision), timestamp_ns=int(meta.timestamp_ns))
+    cloud_asset = dict(xyz_size=len(checkpoint.canonical_cloud_xyz), frame_id=str(cloud.frame_id), source_cloud_revision=int(cloud.source_revision),
+        point_count=int(cloud.point_count), voxel_size=float(cloud.voxel_size), payload_schema_version=2)
+    checkpoint, occupancy_asset, cloud_asset = MappingBackendCheckpointStore.validate_checkpoint_bundle(checkpoint,
+        occupancy_asset=occupancy_asset, cloud_asset=cloud_asset)
+    return MappingBackendCheckpointExportBundle(checkpoint, occupancy_asset, cloud_asset)
+
+
+def reopen_mapping_backend_checkpoint(map_bundle_root, backend_kind, *, schema_version=2):
+    """Reopen exact v2 export bytes; legacy canonical assets were never persisted."""
+    if schema_version != 2:
+        raise ValueError("exact canonical reopen requires checkpoint schema 2")
+    stored = MappingBackendCheckpointStore(map_bundle_root).load(backend_kind, schema_version=2)
+    return MappingBackendCheckpointExportBundle(stored.checkpoint, stored.occupancy_asset, stored.cloud_asset)
+
+
+def _mapping_backend_checkpoint_v2_proto(stored, *, graph_artifact=None, fine_map_artifact=None, dense_cloud_artifact=None):
+    checkpoint = stored.checkpoint
+    if graph_artifact is not None:
+        raise ValueError("cloud checkpoint cannot carry planar graph artifact")
+    for supplied, retained, maximum in ((fine_map_artifact, checkpoint.fine_reference, MAX_FINE_ARCHIVE_BYTES),
+                                       (dense_cloud_artifact, checkpoint.dense_reference, MAX_DENSE_ARCHIVE_BYTES)):
+        if supplied is not None and _artifact_reference_from_proto(supplied, maximum) != retained:
+            raise ValueError("reupload must preserve the retained artifact identity")
+    return pb2.MappingBackendCheckpoint(schema_version=2, backend_kind=checkpoint.backend_kind,
+        source_session_id=checkpoint.source_session_id, source_session_generation=checkpoint.source_session_generation,
+        checkpoint_id=checkpoint.checkpoint_id, backend_payload_schema_version=checkpoint.backend_payload_schema_version,
+        payload_size=checkpoint.payload_size, created_at_ns=checkpoint.created_at_ns,
+        payload=_protobuf_payload_bytes(checkpoint.payload), occupancy_receipt=_occupancy_receipt_proto(checkpoint.occupancy_receipt),
+        cloud_receipt=_cloud_receipt_proto(checkpoint.cloud_receipt),
+        canonical_occupancy_checkpoint=_canonical_occupancy_from_stored(checkpoint, stored.occupancy_asset),
+        canonical_cloud_checkpoint=_canonical_cloud_from_stored(checkpoint, stored.cloud_asset),
+        fine_map_artifact=_artifact_reference_proto(checkpoint.fine_reference) if checkpoint.fine_reference else None,
+        dense_cloud_artifact=_artifact_reference_proto(checkpoint.dense_reference) if checkpoint.dense_reference else None,
+        target_kind=checkpoint.target_kind)
 
 
 def _canonical_string_bytes(value: str) -> bytes:
@@ -4749,38 +4891,87 @@ class GeometryRuntimeProvider:
             raise RuntimeError("二维图传输回执身份冲突")
         return response
 
-    def _download_graph_artifact(self, reference, maximum_bytes=MAX_PLANAR_ARCHIVE_BYTES):
-        if reference.size <= 0 or reference.size > maximum_bytes or len(reference.sha256) != 32:
-            raise ValueError("二维图传输引用非法")
+    def _download_graph_artifact(self, reference, maximum_bytes=MAX_PLANAR_ARCHIVE_BYTES, *, validate_structure=True):
+        retained = _artifact_reference_from_proto(reference, maximum_bytes)
+        if retained.identity_schema_version == 2 and retained.member_identity.role not in ("fine_map", "dense_cloud"):
+            raise ValueError("unpaired assigned artifact role")
         def chunks():
             offset = 0
             while offset < reference.size:
                 response = self._graph_transfer(4, reference, offset=offset)
                 data = bytes(response.data)
-                if not response.sealed or not data or len(data) > min(1024 * 1024, reference.size - offset):
+                if response.offset != reference.size or not response.sealed or not data or len(data) > min(1024 * 1024, reference.size - offset):
                     raise RuntimeError("二维图下载分块非法")
                 offset += len(data)
                 yield data
         try:
             payload = FrozenPayload(chunks(), maximum_bytes=maximum_bytes)
-            if len(payload) != reference.size or payload._digest != bytes(reference.sha256):
-                raise ValueError("二维图下载摘要不一致")
+            if len(payload) != reference.size:
+                raise ValueError("artifact downloaded size mismatch")
+            if retained.identity_schema_version == 2 and validate_structure:
+                identity = retained.member_identity
+                keywords = dict(session=identity.occupancy_receipt["session_id"],
+                    generation=identity.occupancy_receipt["session_generation"], cloud_revision=identity.cloud_receipt["cloud_revision"],
+                    source_timestamp_ns=identity.cloud_receipt["source_timestamp_ns"])
+                if identity.role == "fine_map":
+                    if payload[:8] != b"NUWAXAR2":
+                        raise ValueError("assigned fine artifact requires AR2")
+                    validate_fine_archive(payload, **keywords, frame_generation=identity.frame_generation,
+                        producer_generation=identity.producer_generation)
+                elif identity.role == "dense_cloud":
+                    validate_dense_archive(payload, **keywords, frame_id=identity.frame_id)
+                else:
+                    raise ValueError("unpaired assigned artifact role")
+            # Legacy aliases remain opaque on read after capture too.
             return payload
         finally:
             self._graph_transfer(5, reference)
 
-    def _upload_graph_artifact(self, checkpoint, *, payload=None):
+    def _upload_graph_artifact(self, checkpoint, *, payload=None, reference=None):
         payload = checkpoint.payload if payload is None else payload
-        reference = pb2.GraphArtifactRef(id=uuid.uuid4().hex, size=len(payload), sha256=payload_digest(payload))
+        if checkpoint.schema_version == 2:
+            if reference is None:
+                reference = checkpoint.fine_reference if payload is checkpoint.fine_archive else checkpoint.dense_reference if payload is checkpoint.dense_archive else None
+            if reference is None:
+                raise ValueError("v2 upload requires the retained artifact reference")
+            if not isinstance(reference, CheckpointArtifactReference):
+                reference = _artifact_reference_from_proto(reference, max(MAX_DENSE_ARCHIVE_BYTES, len(payload)))
+            validate_artifact_reference(reference, checkpoint=checkpoint, maximum_bytes=MAX_DENSE_ARCHIVE_BYTES)
+            if reference == checkpoint.fine_reference:
+                retained_payload = checkpoint.fine_archive
+            elif reference == checkpoint.dense_reference:
+                retained_payload = checkpoint.dense_archive
+            else:
+                raise ValueError("upload reference is not a retained checkpoint artifact")
+            if (not isinstance(payload, (bytes, FrozenPayload)) or len(payload) != reference.size
+                    or not isinstance(retained_payload, (bytes, FrozenPayload)) or len(retained_payload) != reference.size):
+                raise ValueError("artifact upload or retained owner type/size mismatch")
+            if payload is not retained_payload and any(left != right for left, right in zip(
+                    payload_chunks(payload), payload_chunks(retained_payload))):
+                raise ValueError("upload bytes differ from the retained immutable artifact")
+            reference = _artifact_reference_proto(reference)
+        else:
+            # Explicit residual legacy writer, retired with activation-v1.
+            reference = pb2.GraphArtifactRef(id=uuid.uuid4().hex, size=len(payload), sha256=payload_digest(payload))
         try:
-            self._graph_transfer(1, reference)
+            admitted = self._graph_transfer(1, reference)
+            frontier = int(admitted.offset)
+            sealed = bool(admitted.sealed)
+            if not 0 <= frontier <= reference.size or (sealed and frontier != reference.size):
+                raise RuntimeError("artifact initialization frontier is invalid")
             offset = 0
             for data in payload_chunks(payload):
                 response = self._graph_transfer(2, reference, offset=offset, data=data)
                 offset += len(data)
-                if response.offset != offset:
+                # Retained frontier can lead the current replayed chunk.
+                if (not max(frontier, offset) <= response.offset <= reference.size
+                        or (response.sealed and response.offset != reference.size)
+                        or (sealed and not response.sealed)):
                     raise RuntimeError("二维图上传位置回执不一致")
-            if not self._graph_transfer(3, reference).sealed:
+                frontier = int(response.offset)
+                sealed = bool(response.sealed)
+            complete = self._graph_transfer(3, reference)
+            if not complete.sealed or complete.offset != reference.size:
                 raise RuntimeError("二维图上传未封存")
             return reference
         except Exception:
@@ -4788,10 +4979,12 @@ class GeometryRuntimeProvider:
             raise
 
     def export_mapping_backend_checkpoint(
-        self,
+        self, *, checkpoint_schema_version: int = 1,
     ) -> MappingBackendCheckpointExportBundle:
-        """Export one barrier-consistent backend/occupancy/cloud bundle."""
+        """Export one frozen bundle; schema 2 is explicit until activation is paired."""
 
+        if type(checkpoint_schema_version) is not int or checkpoint_schema_version not in (1, 2):
+            raise ValueError("unsupported requested checkpoint envelope schema")
         self._raise_if_stopping("export_mapping_backend_checkpoint")
         if not self._connected or not self._stub:
             raise RuntimeError("Geometry runtime 未连接。")
@@ -4799,15 +4992,17 @@ class GeometryRuntimeProvider:
         if not callable(rpc):
             raise RuntimeError("Geometry runtime 不支持 backend checkpoint 导出。")
         try:
-            response = rpc(pb2.Empty(), timeout=_heavy_deadline_sec())
+            response = rpc(pb2.ExportMappingBackendCheckpointRequest(checkpoint_schema_version=checkpoint_schema_version), timeout=_heavy_deadline_sec())
         except grpc.RpcError as exc:
             raise GeometryRuntimeRpcError.from_rpc_error(
                 "ExportMappingBackendCheckpoint",
                 exc,
             ) from exc
+        if response.schema_version != checkpoint_schema_version:
+            raise ValueError("server returned a different checkpoint schema; downgrade is forbidden")
         payload = self._download_graph_artifact(_require_proto_message_field(response, "graph_artifact")) if response.backend_kind == "slam_toolbox" else None
-        fine_payload = self._download_graph_artifact(response.fine_map_artifact) if response.HasField("fine_map_artifact") else None
-        dense_payload = self._download_graph_artifact(response.dense_cloud_artifact, MAX_DENSE_ARCHIVE_BYTES) if response.HasField("dense_cloud_artifact") else None
+        fine_payload = self._download_graph_artifact(response.fine_map_artifact, MAX_FINE_ARCHIVE_BYTES, validate_structure=checkpoint_schema_version != 2) if response.HasField("fine_map_artifact") else None
+        dense_payload = self._download_graph_artifact(response.dense_cloud_artifact, MAX_DENSE_ARCHIVE_BYTES, validate_structure=checkpoint_schema_version != 2) if response.HasField("dense_cloud_artifact") else None
         return _checkpoint_export_bundle_from_proto(response, payload, fine_payload, dense_payload)
 
     def get_dense_cloud_chunk(self, *, expected_epoch="", offset_points=0, allow_delta=False):

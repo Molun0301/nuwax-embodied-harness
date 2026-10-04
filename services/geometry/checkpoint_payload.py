@@ -11,7 +11,6 @@ class FrozenPayload:
     def __init__(self, chunks, maximum_bytes=MAX_PLANAR_ARCHIVE_BYTES):
         temporary = tempfile.TemporaryFile(prefix="nuwax-planar-payload-")
         try:
-            digest = hashlib.sha256()
             size = 0
             for chunk in chunks:
                 if not isinstance(chunk, bytes) or len(chunk) > CHUNK_BYTES:
@@ -20,12 +19,10 @@ class FrozenPayload:
                 if size > maximum_bytes:
                     raise ValueError("二维图载荷超过预算")
                 temporary.write(chunk)
-                digest.update(chunk)
             if not size:
                 raise ValueError("二维图载荷为空")
             temporary.flush()
             self._data = mmap.mmap(temporary.fileno(), 0, access=mmap.ACCESS_READ)
-            self._digest = digest.digest()
             self._size = size
         finally:
             temporary.close()
@@ -48,7 +45,11 @@ class FrozenPayload:
 
 
 def payload_digest(value):
-    return value._digest if isinstance(value, FrozenPayload) else hashlib.sha256(value).digest()
+    """Explicit legacy-writer adapter; never called by assigned-identity paths."""
+    digest = hashlib.sha256()
+    for chunk in payload_chunks(value):
+        digest.update(chunk)
+    return digest.digest()
 
 
 def payload_chunks(value):

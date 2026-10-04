@@ -15,11 +15,33 @@ impl RpcHandler for BlockServer {
         std::fs::write(self.root.join("calls"),count.to_string()).unwrap();
         let mode=std::fs::read_to_string(self.root.join("mode")).unwrap_or_default();
         if mode=="delay" {std::fs::write(self.root.join("mode"),"good").unwrap();tokio::time::sleep(Duration::from_millis(650)).await;}
-        let Some(hash)=request.args.0.first().and_then(|v|v.get("sha256_hex")).and_then(|v|v.as_str()) else{return RpcResponse::error(request.id,serde_json::json!({"message":"缺少摘要"}));};
+        let Some(scope) = request.args.0.first() else {
+            return RpcResponse::error(request.id, serde_json::json!({"message":"缺少块请求"}));
+        };
+        let Some(revision) = scope.get("root").and_then(|root| root.get("revision"))
+            .and_then(serde_json::Value::as_u64) else {
+            return RpcResponse::error(request.id, serde_json::json!({"message":"缺少根修订"}));
+        };
         if mode=="missing" {return RpcResponse::error(request.id,serde_json::json!({"message":"块已回收"}));}
-        let Ok(mut bytes)=std::fs::read(self.root.join(hash)) else{return RpcResponse::error(request.id,serde_json::json!({"message":"没有此块"}));};
+        let manifest = std::fs::read(self.root.join(format!("manifest-{revision}.json")))
+            .map_err(|e| e.to_string()).and_then(|bytes| Manifest::decode(&bytes));
+        let Ok(manifest) = manifest else {
+            return RpcResponse::error(request.id, serde_json::json!({"message":"没有此根"}));
+        };
+        let Some(reference) = manifest.blocks.iter().find(|block| block_request(&manifest, block) == *scope) else {
+            return RpcResponse::error(request.id, serde_json::json!({"message":"根与精确块引用不符"}));
+        };
+        let bytes = Repository::open(&self.root).and_then(|repository|
+            repository.read_object(reference.object, MAX_BLOCK_BYTES));
+        let Ok(mut bytes) = bytes else {
+            return RpcResponse::error(request.id, serde_json::json!({"message":"没有此块"}));
+        };
         if mode=="corrupt" {bytes[0]^=1;}
-        RpcResponse::ok(request.id,serde_json::json!({"data_hex":bytes.iter().map(|v|format!("{v:02x}")).collect::<String>()}))
+        let mut response = scope.clone();
+        response["data"] = serde_json::json!(bytes);
+        if mode=="wrong-root" {response["root"]["revision"] = serde_json::json!(revision + 1);}
+        if mode=="wrong-block" {response["block"]["geometry_revision"] = serde_json::json!(revision + 1);}
+        RpcResponse::ok(request.id, response)
     }
 }
 
@@ -48,16 +70,21 @@ fn message(repository:&Repository,revision:u64,variant:u16)->schema::NavigationM
     let mut references=Vec::new();
     for x in 0..3 {
         let block=Block::from_iter((0..12000).map(|id|(id,Evidence{observed_ns:stamp,hits:variant})));
-        let bytes=encode_block(&block).unwrap();let hash=digest(&bytes);repository.put_object(hash,&bytes).unwrap();
-        references.push(BlockRef{key:[x,0,0],sha256:hash,geometry_sha256:block_geometry_digest(&block),points:block.len() as u32});
+        let bytes=encode_block(&block).unwrap();
+        let object = ObjectIdentity::Assigned(ObjectId::random().unwrap());
+        repository.put_object(object,&bytes).unwrap();
+        references.push(BlockRef{key:[x,0,0],object,block_revision:revision,
+            geometry_revision:1,points:block.len() as u32});
     }
-    let root=Manifest{version:1,domain,revision,source_timestamp_ns:stamp,voxel_size_m:0.05,blocks:references}.encode().unwrap();
+    let root=Manifest{version:2,domain,revision,geometry_revision:1,
+        source_timestamp_ns:stamp,voxel_size_m:0.05,blocks:references}.encode().unwrap();
+    std::fs::write(repository.path().join(format!("manifest-{revision}.json")), &root).unwrap();
     schema::NavigationMap3D {
-        schema_version:2,producer_runtime_generation:17,
+        schema_version:schema::NAVIGATION_MAP_3D_SCHEMA_VERSION,producer_runtime_generation:17,
         committed_map:schema::CommittedMapIdentity{session_id:"remote-fine".into(),session_generation:1,revision:revision as i64,payload_sha256:[3;32],frame_id:"map".into()},
         map_frame_generation:1,cloud_revision:revision as i64,source_timestamp_ns:stamp as i64,source_voxel_size:0.05,
         commit_boot_nonce:[4;16],commit_sequence:revision as i64,cleared:false,virtual_obstacles:None,
-        fine:Some(Transfer{root_sha256:digest(&root),root,included:BTreeMap::new()}),
+        fine:Some(Transfer{root,included:BTreeMap::new()}),
         cloud:schema::PointCloud2{header:schema::Header{seq:revision as i32,stamp_sec:(stamp/1_000_000_000) as i32,stamp_nsec:(stamp%1_000_000_000) as i32,frame_id:"map".into()},height:1,width:0,fields:["x","y","z"].iter().enumerate().map(|(i,name)|schema::PointField{name:(*name).into(),offset:(i*4) as i32,datatype:7,count:1}).collect(),is_bigendian:false,point_step:12,row_step:0,data:Vec::new(),is_dense:true},
     }
 }
@@ -82,15 +109,21 @@ async fn real_process_rpc_recovers_late_missing_and_corrupt_blocks_without_parti
     let current=reader.receiver.current().unwrap();
     std::fs::write(root.join("mode"),"corrupt").unwrap();
     let (reader,result)=receive(reader,message(&repository,2,2)).await;
-    assert!(result.unwrap_err().contains("摘要"));assert_eq!(reader.receiver.current().unwrap(),current);
+    assert!(result.unwrap_err().contains("格式"));assert_eq!(reader.receiver.current().unwrap(),current);
     std::fs::write(root.join("mode"),"missing").unwrap();
     let (reader,result)=receive(reader,message(&repository,3,3)).await;
     assert!(result.is_err());assert_eq!(reader.receiver.current().unwrap().revision,1);
+    std::fs::write(root.join("mode"),"wrong-root").unwrap();
+    let (reader,result)=receive(reader,message(&repository,4,4)).await;
+    assert!(result.unwrap_err().contains("身份"));assert_eq!(reader.receiver.current().unwrap().revision,1);
+    std::fs::write(root.join("mode"),"wrong-block").unwrap();
+    let (reader,result)=receive(reader,message(&repository,5,5)).await;
+    assert!(result.unwrap_err().contains("身份"));assert_eq!(reader.receiver.current().unwrap().revision,1);
     std::fs::write(root.join("mode"),"good").unwrap();
-    let (mut reader,result)=receive(reader,message(&repository,4,4)).await;assert_eq!(result.unwrap().revision,4);
+    let (mut reader,result)=receive(reader,message(&repository,6,6)).await;assert_eq!(result.unwrap().revision,6);
     // 慢读者持有的旧根仍可读，且读取的是消费者自己已验证的对象。
     let (old_columns,count)=reader.columns(&old,None,0.1).unwrap();assert!(!old_columns.is_empty());assert_eq!(count,36000);
-    let (reader,result)=receive(reader,first).await;assert!(result.is_err());assert_eq!(reader.receiver.current().unwrap().revision,4);
+    let (reader,result)=receive(reader,first).await;assert!(result.is_err());assert_eq!(reader.receiver.current().unwrap().revision,6);
     drop(reader);
     std::fs::write(root.join("stop"),"stop").unwrap();
     let deadline=Instant::now()+Duration::from_secs(3);

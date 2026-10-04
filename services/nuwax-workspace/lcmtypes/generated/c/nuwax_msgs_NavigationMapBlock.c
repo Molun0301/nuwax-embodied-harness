@@ -21,7 +21,9 @@ uint64_t __nuwax_msgs_NavigationMapBlock_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_NavigationMapBlock_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0x5915188e0388cdb4LL
+    uint64_t hash = (uint64_t)0xf2a24bae9546ee09LL
+         + __int8_t_hash_recursive(&cp)
+         + __byte_hash_recursive(&cp)
          + __byte_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
          + __byte_hash_recursive(&cp)
@@ -47,7 +49,13 @@ int __nuwax_msgs_NavigationMapBlock_encode_array(void *buf, int offset, int maxl
 
     for (element = 0; element < elements; element++) {
 
-        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].sha256, 32);
+        thislen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].object_kind), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].object_id, 16);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].legacy_alias, 32);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].data_length), 1);
@@ -79,7 +87,11 @@ int __nuwax_msgs_NavigationMapBlock_encoded_array_size(const nuwax_msgs_Navigati
     int size = 0, element;
     for (element = 0; element < elements; element++) {
 
-        size += __byte_encoded_array_size(p[element].sha256, 32);
+        size += __int8_t_encoded_array_size(&(p[element].object_kind), 1);
+
+        size += __byte_encoded_array_size(p[element].object_id, 16);
+
+        size += __byte_encoded_array_size(p[element].legacy_alias, 32);
 
         size += __int32_t_encoded_array_size(&(p[element].data_length), 1);
 
@@ -100,7 +112,13 @@ int __nuwax_msgs_NavigationMapBlock_decode_array(const void *buf, int offset, in
 
     for (element = 0; element < elements; element++) {
 
-        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].sha256, 32);
+        thislen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].object_kind), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].object_id, 16);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].legacy_alias, 32);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].data_length), 1);
@@ -120,7 +138,11 @@ int __nuwax_msgs_NavigationMapBlock_decode_array_cleanup(nuwax_msgs_NavigationMa
     int element;
     for (element = 0; element < elements; element++) {
 
-        __byte_decode_array_cleanup(p[element].sha256, 32);
+        __int8_t_decode_array_cleanup(&(p[element].object_kind), 1);
+
+        __byte_decode_array_cleanup(p[element].object_id, 16);
+
+        __byte_decode_array_cleanup(p[element].legacy_alias, 32);
 
         __int32_t_decode_array_cleanup(&(p[element].data_length), 1);
 
@@ -157,7 +179,11 @@ int __nuwax_msgs_NavigationMapBlock_clone_array(const nuwax_msgs_NavigationMapBl
     int element;
     for (element = 0; element < elements; element++) {
 
-        __byte_clone_array(p[element].sha256, q[element].sha256, 32);
+        __int8_t_clone_array(&(p[element].object_kind), &(q[element].object_kind), 1);
+
+        __byte_clone_array(p[element].object_id, q[element].object_id, 16);
+
+        __byte_clone_array(p[element].legacy_alias, q[element].legacy_alias, 32);
 
         __int32_t_clone_array(&(p[element].data_length), &(q[element].data_length), 1);
 

@@ -179,9 +179,12 @@ pub struct CloudMapShmWriter {
     dynamic_filter: DynamicCloudFilter,
     fine_cloud: Option<FineCloud>,
     committed_fine_cloud: Option<Arc<nuwax_map_chunks::SealedMap>>,
+    fine_owner: Option<(u64, u64)>,
+    defer_fine_retention: bool,
     dense_cloud: Option<DenseCloud>,
     committed_dense_cloud: Option<DenseSnapshot>,
     pending_dense_readers: Option<DenseCloudReaders>,
+    pending_fine_readers: Option<fine_cloud::FineCloudReaders>,
     scan_preparation: Option<uuid::Uuid>,
     dense_error: Option<String>,
     dense_history_missing: bool,
@@ -322,8 +325,8 @@ impl PreparedFineCloud {
 pub(crate) fn prepare_fine_cloud_archive(file: std::fs::File, session: &str, generation: u64,
     cloud_revision: u64, source_timestamp_ns: u64) -> Result<PreparedFineCloud, String> {
     let (cloud, root) = FineCloud::from_archive(file)?;
-    if root.domain.session != session || root.domain.generation != generation
-        || root.revision != cloud_revision || root.source_timestamp_ns != source_timestamp_ns {
+    if root.domain().session != session || root.domain().generation != generation
+        || root.revision() != cloud_revision || root.source_timestamp_ns() != source_timestamp_ns {
         return Err("精细地图资产与原占据/点云提交不一致".into());
     }
     Ok(PreparedFineCloud { cloud })
@@ -504,9 +507,12 @@ impl CloudMapShmWriter {
             last_stage_ms: [0.0; 3],
             fine_cloud: None,
             committed_fine_cloud: None,
+            fine_owner: None,
+            defer_fine_retention: false,
             dense_cloud: None,
             committed_dense_cloud: None,
             pending_dense_readers: None,
+            pending_fine_readers: None,
             scan_preparation: None,
             dense_error: None,
             dense_history_missing: false,
@@ -682,12 +688,25 @@ impl CloudMapShmWriter {
         occupancy_receipt: &OccupancyCommitReceipt,
     ) -> Result<Option<CorrelatedCloudMapCommit>, String> {
         self.validate_occupancy_receipt(occupancy_receipt)?;
-        let fine = if occupancy_receipt.source_timestamp_ns == 0 { None }
-            else { self.fine_cloud.as_mut().map(|fine| fine.seal(occupancy_receipt.source_timestamp_ns)).transpose()? };
+        let domain = if occupancy_receipt.source_timestamp_ns == 0 || self.fine_cloud.is_none() { None }
+            else {
+                let (frame_generation, producer_generation) = self.fine_owner
+                    .ok_or("fine-map publication has no bound runtime/frame owner")?;
+                Some(nuwax_map_chunks::Domain {
+                    session: occupancy_receipt.session_id.clone(),
+                    generation: occupancy_receipt.session_generation,
+                    frame_generation, producer_generation,
+                })
+            };
+        // Reserve the existing publication clock before sealing. A same-domain
+        // restart continues its persisted revision; a new domain restamps it.
+        let floor = domain.as_ref().map_or(0, |domain| self.fine_cloud.as_ref().unwrap().publication_floor(domain));
+        let revision = self.prepare_publication(false, floor).ok_or("cloud publication cannot be reserved")?;
+        let fine = domain.map(|domain| self.fine_cloud.as_mut().unwrap()
+            .seal(domain, revision, occupancy_receipt.source_timestamp_ns)).transpose()?;
         self.publication_receipt = Some(occupancy_receipt.clone());
-        if self.commit_accumulated().is_none() {
-            return Ok(None);
-        }
+        self.publish_prepared_snapshot(revision)
+            .ok_or("reserved cloud publication failed")?;
         let snapshot = self
             .committed_metadata()
             .ok_or_else(|| "committed cloud-map snapshot is inconsistent".to_owned())?;
@@ -701,6 +720,9 @@ impl CloudMapShmWriter {
         };
         self.last_occupancy_receipt = Some(occupancy_receipt.clone());
         self.last_cloud_receipt = Some(receipt.clone());
+        if !self.defer_fine_retention {
+            if let Some(root) = &fine { self.fine_cloud.as_mut().unwrap().retain_committed(root); }
+        }
         self.committed_fine_cloud = fine;
         self.committed_dense_cloud = if self.dense_error.is_none() && receipt.source_timestamp_ns > 0 {
             self.dense_cloud.as_ref().and_then(|cloud| cloud.snapshot(&receipt, &occupancy_receipt.session_id))
@@ -739,6 +761,7 @@ impl CloudMapShmWriter {
         let mut work = Self::new_private().map_err(|e| e.to_string())?;
         let ticket = uuid::Uuid::new_v4();
         self.pending_dense_readers = self.dense_cloud.as_ref().map(DenseCloud::readers);
+        self.pending_fine_readers = self.fine_cloud.as_ref().map(FineCloud::readers);
         work.replace_accumulator(self.take_prepared_accumulator());
         work.revision = self.revision;
         work.session_generation = self.session_generation;
@@ -751,6 +774,8 @@ impl CloudMapShmWriter {
         work.last_occupancy_receipt = self.last_occupancy_receipt.clone();
         work.last_cloud_receipt = self.last_cloud_receipt.clone();
         work.committed_fine_cloud = self.committed_fine_cloud.clone();
+        work.fine_owner = self.fine_owner;
+        work.defer_fine_retention = true;
         work.committed_dense_cloud = self.committed_dense_cloud.clone();
         self.scan_preparation = Some(ticket);
         Ok((ticket, work))
@@ -788,8 +813,13 @@ impl CloudMapShmWriter {
         self.last_occupancy_receipt = work.last_occupancy_receipt.take();
         self.last_cloud_receipt = work.last_cloud_receipt.take();
         self.committed_fine_cloud = work.committed_fine_cloud.take();
+        self.fine_owner = work.fine_owner;
+        if let (Some(owner), Some(root)) = (self.fine_cloud.as_mut(), self.committed_fine_cloud.as_ref()) {
+            owner.retain_committed(root);
+        }
         self.committed_dense_cloud = work.committed_dense_cloud.take();
         self.pending_dense_readers = None;
+        self.pending_fine_readers = None;
         self.scan_preparation = None;
         Ok(())
     }
@@ -859,6 +889,23 @@ impl CloudMapShmWriter {
         self.last_cloud_receipt.clone()
     }
 
+    pub(crate) fn bind_fine_map_owner(&mut self, frame_generation: u64, producer_generation: u64) -> Result<(), String> {
+        if producer_generation == 0 { return Err("fine-map producer generation must be positive".into()); }
+        self.fine_owner = Some((frame_generation, producer_generation));
+        Ok(())
+    }
+
+    pub(crate) fn bind_fine_map_frame(&mut self, frame_generation: u64) -> Result<(), String> {
+        let (_, producer) = self.fine_owner.ok_or("fine-map runtime owner is not bound")?;
+        self.bind_fine_map_owner(frame_generation, producer)
+    }
+
+    pub(crate) fn pin_fine_map_root(&self, identity: &nuwax_map_chunks::RootIdentity,
+        reference: &nuwax_map_chunks::BlockRef) -> Result<Arc<nuwax_map_chunks::SealedMap>, String> {
+        self.fine_cloud.as_ref().map(FineCloud::readers).or_else(|| self.pending_fine_readers.clone())
+            .ok_or("fine-map owner is unavailable")?.pin_root(identity, reference)
+    }
+
     pub(crate) fn committed_fine_cloud(&self) -> Option<Arc<nuwax_map_chunks::SealedMap>> {
         self.committed_fine_cloud.clone()
     }
@@ -918,6 +965,7 @@ impl CloudMapShmWriter {
         }
         self.scan_preparation = None;
         self.pending_dense_readers = None;
+        self.pending_fine_readers = None;
         self.session_generation = receipt.session_generation;
         self.voxel_size = prepared.voxel_size;
         self.voxels = prepared.voxels;
@@ -982,6 +1030,7 @@ impl CloudMapShmWriter {
         };
         self.scan_preparation = None;
         self.pending_dense_readers = None;
+        self.pending_fine_readers = None;
         self.session_generation = session_generation;
         self.voxel_size = voxel_size;
         self.voxels = voxels.into();
@@ -996,14 +1045,28 @@ impl CloudMapShmWriter {
             .ok_or_else(|| "cloud-map checkpoint publication failed".to_string())
     }
 
-    fn publish_snapshot(&mut self, allow_empty: bool) -> Option<(u64, u32, f32)> {
+    fn prepare_publication(&self, allow_empty: bool, revision_floor: u64) -> Option<u64> {
         if self.session_generation == 0 || (!allow_empty && self.voxels.is_empty()) { return None; }
-        let point_count = self.voxels.len();
-        if point_count > self.max_points || point_count > CM_MAX_POINTS { return None; }
-        let revision = self.revision.checked_add(1)?;
+        if self.voxels.len() > self.max_points || self.voxels.len() > CM_MAX_POINTS { return None; }
+        let revision = self.revision.max(revision_floor).checked_add(1)?;
         self.publication_sequence.checked_add(2)?;
-        if self.ordered_voxels.prepare(&self.voxels) {
-            self.layout_generation = self.layout_generation.checked_add(1)?;
+        if self.ordered_voxels.needs_rebuild() { self.layout_generation.checked_add(1)?; }
+        Some(revision)
+    }
+
+    fn publish_snapshot(&mut self, allow_empty: bool) -> Option<(u64, u32, f32)> {
+        let revision = self.prepare_publication(allow_empty, 0)?;
+        self.publish_prepared_snapshot(revision)
+    }
+
+    fn publish_prepared_snapshot(&mut self, revision: u64) -> Option<(u64, u32, f32)> {
+        if revision <= self.revision { return None; }
+        self.publication_sequence.checked_add(2)?;
+        let point_count = self.voxels.len();
+        if self.ordered_voxels.needs_rebuild() {
+            let next_layout = self.layout_generation.checked_add(1)?;
+            self.ordered_voxels.prepare(&self.voxels);
+            self.layout_generation = next_layout;
             self.published_pages.clear();
         }
         let count = point_count.div_ceil(CHUNK_POINTS);
@@ -1072,6 +1135,7 @@ impl CloudMapShmWriter {
         self.publication_receipt = None;
         self.scan_preparation = None;
         self.pending_dense_readers = None;
+        self.pending_fine_readers = None;
         self.fine_cloud = None;
         self.committed_fine_cloud = None;
         self.dense_cloud = None;

@@ -323,7 +323,7 @@ pub const STRUCT_SEEDS: &[(&str, u64)] = &[
         "nuwax_msgs.NavigationMap3D",
         u64::from_be_bytes(crate::lcm::schema::NAVIGATION_MAP_3D_FINGERPRINT).rotate_right(1),
     ),
-    ("nuwax_msgs.NavigationMapBlock", 0xb22a311c07119b68_u64.rotate_right(1)),
+    ("nuwax_msgs.NavigationMapBlock", u64::from_be_bytes(crate::lcm::schema::NAVIGATION_MAP_BLOCK_FINGERPRINT).rotate_right(1)),
     ("nuwax_msgs.CancelNavigation", 0x4b82_2594_74e2_ee91_u64),
     ("nuwax_msgs.Frontier", 0x0d5f_c1f5_0676_ce22_u64),
     ("nuwax_msgs.FrontierList", 0x109e_db47_dc0b_8fbb_u64),

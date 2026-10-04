@@ -21,7 +21,7 @@ uint64_t __nuwax_msgs_NavigationMap3D_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_NavigationMap3D_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0xd89976b0ef17401aLL
+    uint64_t hash = (uint64_t)0xc04f00a9b3adce1cLL
          + __int32_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
@@ -39,7 +39,6 @@ uint64_t __nuwax_msgs_NavigationMap3D_hash_recursive(const __lcm_hash_ptr *p)
          + __int8_t_hash_recursive(&cp)
          + __nav_msgs_OccupancyGrid_hash_recursive(&cp)
          + __int8_t_hash_recursive(&cp)
-         + __byte_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
          + __byte_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
@@ -118,9 +117,6 @@ int __nuwax_msgs_NavigationMap3D_encode_array(void *buf, int offset, int maxlen,
         thislen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].has_fine_map), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].fine_root_sha256, 32);
-        if (thislen < 0) return thislen; else pos += thislen;
-
         thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].fine_manifest_length), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -192,8 +188,6 @@ int __nuwax_msgs_NavigationMap3D_encoded_array_size(const nuwax_msgs_NavigationM
         size += __nav_msgs_OccupancyGrid_encoded_array_size(&(p[element].virtual_obstacles), 1);
 
         size += __int8_t_encoded_array_size(&(p[element].has_fine_map), 1);
-
-        size += __byte_encoded_array_size(p[element].fine_root_sha256, 32);
 
         size += __int32_t_encoded_array_size(&(p[element].fine_manifest_length), 1);
 
@@ -271,9 +265,6 @@ int __nuwax_msgs_NavigationMap3D_decode_array(const void *buf, int offset, int m
         thislen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].has_fine_map), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].fine_root_sha256, 32);
-        if (thislen < 0) return thislen; else pos += thislen;
-
         thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].fine_manifest_length), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -334,8 +325,6 @@ int __nuwax_msgs_NavigationMap3D_decode_array_cleanup(nuwax_msgs_NavigationMap3D
         __nav_msgs_OccupancyGrid_decode_array_cleanup(&(p[element].virtual_obstacles), 1);
 
         __int8_t_decode_array_cleanup(&(p[element].has_fine_map), 1);
-
-        __byte_decode_array_cleanup(p[element].fine_root_sha256, 32);
 
         __int32_t_decode_array_cleanup(&(p[element].fine_manifest_length), 1);
 
@@ -412,8 +401,6 @@ int __nuwax_msgs_NavigationMap3D_clone_array(const nuwax_msgs_NavigationMap3D *p
         __nav_msgs_OccupancyGrid_clone_array(&(p[element].virtual_obstacles), &(q[element].virtual_obstacles), 1);
 
         __int8_t_clone_array(&(p[element].has_fine_map), &(q[element].has_fine_map), 1);
-
-        __byte_clone_array(p[element].fine_root_sha256, q[element].fine_root_sha256, 32);
 
         __int32_t_clone_array(&(p[element].fine_manifest_length), &(q[element].fine_manifest_length), 1);
 

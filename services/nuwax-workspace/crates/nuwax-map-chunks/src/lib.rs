@@ -2,7 +2,6 @@
 #![deny(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -11,7 +10,7 @@ pub use repository::{Repository, RegionReader};
 mod writer;
 pub use writer::Writer;
 mod archive;
-pub use archive::{archive_file, ArchiveReader, MAX_ARCHIVE_BYTES};
+pub use archive::{archive_file, ArchiveReader, ArchivedRoot, LegacyRoot, MAX_ARCHIVE_BYTES};
 
 /// 每个方向32个细体素；负坐标使用欧几里得除法。
 pub const BLOCK_SIDE: i32 = 32;
@@ -19,9 +18,7 @@ pub const MAX_BLOCKS: usize = 131_072;
 pub const MAX_BLOCK_BYTES: usize = 16 + 32_768 * 12;
 pub const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 pub type Key = [i32; 3];
-pub type Hash = [u8; 32];
 
-pub fn digest(bytes: &[u8]) -> Hash { Sha256::digest(bytes).into() }
 pub fn block_key(key: Key) -> Key { key.map(|v| v.div_euclid(BLOCK_SIDE)) }
 pub fn local_key(key: Key) -> u16 {
     (key[0].rem_euclid(32) + 32 * key[1].rem_euclid(32) + 1024 * key[2].rem_euclid(32)) as u16
@@ -42,13 +39,6 @@ pub fn global_key(block: Key, local: u16) -> Result<Key, String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Evidence { pub observed_ns: u64, pub hits: u16 }
 pub type Block = BTreeMap<u16, Evidence>;
-/// 几何身份只取占据成员，观测续期不触发全图表面重建。
-pub fn block_geometry_digest(block: &Block) -> Hash {
-    let mut hash = Sha256::new();
-    for key in block.keys() { hash.update(key.to_le_bytes()); }
-    hash.finalize().into()
-}
-
 pub fn encode_block(block: &Block) -> Result<Vec<u8>, String> {
     if block.is_empty() || block.len() > 32768 { return Err("空块必须从根清单删除".into()); }
     let mut out = b"NUWAXBL1".to_vec();
@@ -81,144 +71,229 @@ pub fn decode_block(bytes: &[u8]) -> Result<Block, String> {
     Ok(out)
 }
 
-/// 直接承接原地图拥有方身份，不另建独立执行代次。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Domain {
-    pub session: String,
-    pub generation: u64,
-    pub frame_generation: u64,
-    pub producer_generation: u64,
+/// Assigned identity of immutable bytes, never derived from their content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ObjectId(pub [u8; 16]);
+impl ObjectId {
+    pub fn random() -> Result<Self, String> {
+        loop { let mut bytes = [0; 16]; getrandom::fill(&mut bytes).map_err(|e| e.to_string())?;
+            if bytes != [0; 16] { return Ok(Self(bytes)); } }
+    }
+}
+/// Historical alias retained verbatim without recomputing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LegacyAlias(pub [u8; 32]);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObjectIdentity { Assigned(ObjectId), Legacy(LegacyAlias) }
+impl From<ObjectId> for ObjectIdentity { fn from(id: ObjectId) -> Self { Self::Assigned(id) } }
+impl From<LegacyAlias> for ObjectIdentity { fn from(id: LegacyAlias) -> Self { Self::Legacy(id) } }
+impl ObjectIdentity {
+    pub fn validate(self) -> Result<(), String> {
+        let valid = match self { Self::Assigned(v) => v.0 != [0; 16], Self::Legacy(v) => v.0 != [0; 32] };
+        if valid { Ok(()) } else { Err("zero object identity".into()) }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BlockRef { pub key: Key, pub sha256: Hash, pub geometry_sha256: Hash, pub points: u32 }
+pub struct Domain { pub session: String, pub generation: u64, pub frame_generation: u64, pub producer_generation: u64 }
+impl Domain {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.session.is_empty() || self.session.len() > 1024 || self.session.trim() != self.session
+            || self.session.chars().any(char::is_control) || self.generation == 0 || self.producer_generation == 0 {
+            Err("invalid root domain".into())
+        } else { Ok(()) }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootIdentity { pub domain: Domain, pub revision: u64 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockRef { pub key: Key, pub object: ObjectIdentity, pub block_revision: u64, pub geometry_revision: u64, pub points: u32 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
-    pub version: u32,
-    pub domain: Domain,
-    pub revision: u64,
-    pub source_timestamp_ns: u64,
-    pub voxel_size_m: f32,
-    pub blocks: Vec<BlockRef>,
+    pub version: u32, pub domain: Domain, pub revision: u64, pub geometry_revision: u64,
+    pub source_timestamp_ns: u64, pub voxel_size_m: f32, pub blocks: Vec<BlockRef>,
 }
-
-/// 与占据提交共同封存的精细块集合；身份由实际发布拥有方附加。
-#[derive(Clone)]
-pub struct SealedMap {
-    pub voxel_size_m: f32,
-    pub source_timestamp_ns: u64,
-    pub blocks: Arc<Vec<BlockRef>>,
-    pub repository: Repository,
+/// The v1 spelling is a wire format only. Both aliases are opaque.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyBlockRef { pub key: Key, pub sha256: LegacyAlias, pub geometry_sha256: LegacyAlias, pub points: u32 }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyManifest {
+    pub version: u32, pub domain: Domain, pub revision: u64, pub source_timestamp_ns: u64,
+    pub voxel_size_m: f32, pub blocks: Vec<LegacyBlockRef>,
 }
-impl SealedMap {
-    pub fn manifest(&self, domain: Domain, revision: u64) -> Result<Manifest, String> {
-        let manifest = Manifest { version: 1, domain, revision, source_timestamp_ns: self.source_timestamp_ns,
-            voxel_size_m: self.voxel_size_m, blocks: (*self.blocks).clone() };
-        manifest.validate()?;
-        Ok(manifest)
+fn validate_header(domain: &Domain, revision: u64, timestamp: u64, voxel: f32, count: usize) -> Result<(), String> {
+    domain.validate()?;
+    if revision == 0 || timestamp == 0 || !voxel.is_finite() || voxel <= 0.0 || voxel > 1_048_576.0 || count > MAX_BLOCKS {
+        return Err("invalid root revision, evidence bound, resolution or capacity".into());
     }
+    Ok(())
+}
+fn validate_members<'a>(members: impl Iterator<Item = (Key, ObjectIdentity, u32)> + 'a) -> Result<(), String> {
+    let mut previous = None; let mut intrinsic = BTreeMap::new();
+    for (key, object, points) in members {
+        global_key(key, 32767)?; object.validate()?;
+        if points == 0 || points > 32768 || previous.is_some_and(|old| old >= key) { return Err("invalid, duplicate or unsorted block reference".into()); }
+        if intrinsic.insert(object, points).is_some_and(|old| old != points) { return Err("same object with inconsistent point count".into()); }
+        previous = Some(key);
+    }
+    Ok(())
 }
 impl Manifest {
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 1 || self.revision == 0 || self.source_timestamp_ns == 0
-            || self.domain.session.is_empty() || self.domain.session.len() > 1024
-            || self.domain.session.trim() != self.domain.session || self.domain.session.chars().any(char::is_control)
-            || self.domain.generation == 0 || self.domain.producer_generation == 0
-            || !self.voxel_size_m.is_finite() || self.voxel_size_m <= 0.0 || self.voxel_size_m > 1_048_576.0
-            || self.blocks.len() > MAX_BLOCKS { return Err("精细地图根身份、精度或容量无效".into()); }
-        let mut previous = None;
-        for block in &self.blocks {
-            global_key(block.key, 32767)?;
-            if block.sha256 == [0; 32] || block.geometry_sha256 == [0; 32] || block.points == 0 || block.points > 32768
-                || previous.is_some_and(|p| p >= block.key) { return Err("根清单块引用重复、无序或无效".into()); }
-            previous = Some(block.key);
+        validate_header(&self.domain, self.revision, self.source_timestamp_ns, self.voxel_size_m, self.blocks.len())?;
+        if self.version != 2 || self.geometry_revision == 0 || self.geometry_revision > self.revision { return Err("invalid current root revision".into()); }
+        validate_members(self.blocks.iter().map(|b| (b.key, b.object, b.points)))?;
+        for b in &self.blocks {
+            if b.geometry_revision == 0 || b.geometry_revision > b.block_revision || b.block_revision > self.revision || b.geometry_revision > self.geometry_revision {
+                return Err("invalid block revision ordering".into());
+            }
         }
         Ok(())
     }
+    pub fn identity(&self) -> RootIdentity { RootIdentity { domain: self.domain.clone(), revision: self.revision } }
     pub fn encode(&self) -> Result<Vec<u8>, String> {
-        self.validate()?;
-        let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
-        if bytes.len() > MAX_MANIFEST_BYTES { return Err("根清单超过编码预算".into()); }
-        Ok(bytes)
+        self.validate()?; let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_MANIFEST_BYTES { return Err("root exceeds encoding budget".into()); } Ok(bytes)
     }
-    pub fn decode(bytes: &[u8], expected: Hash) -> Result<Self, String> {
-        if bytes.len() > MAX_MANIFEST_BYTES || digest(bytes) != expected { return Err("根清单摘要或大小无效".into()); }
-        let value: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-        value.validate()?;
-        // 确定编码同时拒绝重复字段、非规范数字及不同键顺序引入的多重内容身份。
-        if value.encode()? != bytes { return Err("根清单不是规范编码".into()); }
-        Ok(value)
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_MANIFEST_BYTES { return Err("root exceeds encoding budget".into()); }
+        let value: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?; value.validate()?; Ok(value)
     }
     pub fn points(&self) -> u64 { self.blocks.iter().map(|b| u64::from(b.points)).sum() }
-    pub fn changed_from(&self, previous: &Self) -> Vec<Key> {
-        let old: BTreeMap<_, _> = previous.blocks.iter().map(|b| (b.key, b.sha256)).collect();
-        let new: BTreeMap<_, _> = self.blocks.iter().map(|b| (b.key, b.sha256)).collect();
-        old.keys().chain(new.keys()).copied().collect::<BTreeSet<_>>().into_iter()
-            .filter(|key| old.get(key) != new.get(key)).collect()
+    pub fn changed_from(&self, old: &Self) -> Vec<Key> {
+        let a: BTreeMap<_, _> = old.blocks.iter().map(|b| (b.key, b.object)).collect();
+        let b: BTreeMap<_, _> = self.blocks.iter().map(|b| (b.key, b.object)).collect();
+        let all = self.domain != old.domain || self.voxel_size_m != old.voxel_size_m;
+        a.keys().chain(b.keys()).copied().collect::<BTreeSet<_>>().into_iter().filter(|k| all || a.get(k) != b.get(k)).collect()
     }
 }
-
-/// 完整根决定成员关系；携带块只用于省去可靠补取，缺片绝不部分安装。
+impl LegacyManifest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_header(&self.domain, self.revision, self.source_timestamp_ns, self.voxel_size_m, self.blocks.len())?;
+        if self.version != 1 || self.blocks.iter().any(|b| b.geometry_sha256.0 == [0;32]) { return Err("invalid legacy root".into()); }
+        validate_members(self.blocks.iter().map(|b| (b.key, ObjectIdentity::Legacy(b.sha256), b.points)))
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_MANIFEST_BYTES { return Err("legacy root exceeds budget".into()); }
+        let root: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?; root.validate()?; Ok(root)
+    }
+    pub fn points(&self) -> u64 { self.blocks.iter().map(|b| u64::from(b.points)).sum() }
+}
+#[derive(Clone)]
+pub struct SealedMap { root: Arc<Manifest>, pub repository: Repository }
+impl SealedMap { pub fn manifest(&self) -> &Arc<Manifest> { &self.root } }
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Transfer { pub root: Vec<u8>, pub root_sha256: Hash, pub included: BTreeMap<Hash, Vec<u8>> }
+pub struct Transfer { pub root: Vec<u8>, pub included: BTreeMap<ObjectIdentity, Vec<u8>> }
+#[derive(Debug, Clone, Copy)]
+struct Intrinsic { points: u32, latest: u64 }
+fn intrinsic(block: &Block) -> Intrinsic {
+    Intrinsic { points: block.len() as u32, latest: block.values().map(|e| e.observed_ns).max().unwrap_or(0) }
+}
+fn admit_intrinsic(value: Intrinsic, points: u32, bound: u64) -> Result<(), String> {
+    if value.points != points || value.latest > bound { Err("block count or evidence exceeds root".into()) } else { Ok(()) }
+}
 pub struct Receiver {
-    current: Option<Arc<Manifest>>,
-    repository: Repository,
-    verified: BTreeMap<Hash, (u32, u64, Hash)>,
-    readers: Vec<std::sync::Weak<Manifest>>,
+    current: Option<Arc<Manifest>>, repository: Repository, reader: RegionReader,
+    verified: BTreeMap<ObjectIdentity, Intrinsic>, readers: Vec<std::sync::Weak<Manifest>>,
 }
 impl Receiver {
-    pub fn new(repository: Repository) -> Self { Self { current: None, repository, verified: BTreeMap::new(), readers: Vec::new() } }
+    pub fn new(repository: Repository) -> Self { Self { current: None, reader: RegionReader::new(repository.clone(), 4 * 1024 * 1024), repository, verified: BTreeMap::new(), readers: Vec::new() } }
     pub fn current(&self) -> Option<Arc<Manifest>> { self.current.clone() }
     pub fn clear(&mut self) { self.current = None; self.verified.clear(); }
-    /// 调用者先用原票据准入域及修订，并在返回后再次检查票据；本层只做完整性事务。
     pub fn receive(&mut self, transfer: &Transfer, expected: &Domain,
-        fetch: impl FnMut(Hash) -> Result<Vec<u8>, String>) -> Result<Arc<Manifest>, String> {
-        let candidate = Arc::new(Manifest::decode(&transfer.root, transfer.root_sha256)?);
-        if &candidate.domain != expected { return Err("精细根跨地图域".into()); }
-        let result = self.receive_inner(transfer, expected, fetch);
-        let mut live = self.readers.iter().filter_map(std::sync::Weak::upgrade).collect::<Vec<_>>();
+        mut fetch: impl FnMut(&Manifest, &BlockRef) -> Result<Vec<u8>, String>) -> Result<Arc<Manifest>, String> {
+        let candidate = Arc::new(Manifest::decode(&transfer.root)?);
+        if &candidate.domain != expected { return Err("root belongs to another domain".into()); }
+        let same = self.current.as_ref().is_some_and(|old| **old == *candidate);
+        if !same && self.current.as_ref().is_some_and(|old| old.domain == candidate.domain && old.revision >= candidate.revision) {
+            return Err("root revision did not advance".into());
+        }
+        // A true duplicate with no payload does no object IO, membership read or GC scan.
+        if same && transfer.included.is_empty() { return Ok(self.current.as_ref().unwrap().clone()); }
+        let result = (|| {
+            let required: BTreeMap<_, _> = candidate.blocks.iter().map(|b| (b.object, b.points)).collect();
+            for (&object, bytes) in &transfer.included {
+                let points = *required.get(&object).ok_or("included object is outside root")?;
+                let decoded = Arc::new(decode_block(bytes)?); let info = intrinsic(&decoded);
+                admit_intrinsic(info, points, candidate.source_timestamp_ns)?;
+                self.repository.put_object(object, bytes)?;
+                self.reader.cache_decoded(object, decoded, info);
+                self.verified.insert(object, info);
+            }
+            if same { return Ok(self.current.as_ref().unwrap().clone()); }
+            for block in &candidate.blocks {
+                if let Some(&info) = self.verified.get(&block.object) {
+                    admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?; continue;
+                }
+                let bytes = match self.repository.read_object(block.object, MAX_BLOCK_BYTES) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        // Existing unreadable/corrupt paths cannot be replaced by a fetch.
+                        if self.repository.object_exists(block.object)? { return Err(error); }
+                        let bytes = fetch(&candidate, block)?;
+                        let decoded = Arc::new(decode_block(&bytes)?); let info = intrinsic(&decoded);
+                        admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?;
+                        self.repository.put_object(block.object, &bytes)?;
+                        self.reader.cache_decoded(block.object, decoded, info);
+                        self.verified.insert(block.object, info); continue;
+                    }
+                };
+                let decoded = Arc::new(decode_block(&bytes)?); let info = intrinsic(&decoded);
+                admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?;
+                self.reader.cache_decoded(block.object, decoded, info);
+                        self.verified.insert(block.object, info);
+            }
+            if let Some(old) = self.current.clone() {
+                if old.domain == candidate.domain { self.validate_progression(&old, &candidate)?; }
+            }
+            Ok(candidate.clone())
+        })();
+        // Valid duplicate inclusions cannot create garbage outside the pinned current root.
+        if same { return result; }
+        let mut live: Vec<_> = self.readers.iter().filter_map(std::sync::Weak::upgrade).collect();
         self.readers.retain(|r| r.strong_count() > 0);
-        live.push(candidate);
-        if let Some(current) = &self.current { live.push(Arc::clone(current)); }
-        let required = live.iter().flat_map(|r| r.blocks.iter().map(|b| b.sha256)).collect::<BTreeSet<_>>();
-        self.verified.retain(|hash, _| required.contains(hash));
-        // 保留一次未完成补取的有效块及所有实际读取中的根，限制故障重试的磁盘增长。
+        live.push(candidate); if let Some(root) = &self.current { live.push(root.clone()); }
+        let objects: BTreeSet<_> = live.iter().flat_map(|r| r.blocks.iter().map(|b| b.object)).collect();
+        self.verified.retain(|id, _| objects.contains(id));
+        self.reader.retain_objects(&objects);
         let cleanup = self.repository.collect_unreferenced(&live);
-        result.and_then(|root| cleanup.map(|_| root))
+        result.and_then(|root| {
+            cleanup?;
+            // Candidate validation and collection both succeeded. A failed
+            // receive must never replace the root visible to existing readers.
+            self.current = Some(root.clone());
+            self.readers.push(Arc::downgrade(&root));
+            Ok(root)
+        })
     }
-    fn receive_inner(&mut self, transfer: &Transfer, expected: &Domain,
-        mut fetch: impl FnMut(Hash) -> Result<Vec<u8>, String>) -> Result<Arc<Manifest>, String> {
-        let manifest = Manifest::decode(&transfer.root, transfer.root_sha256)?;
-        if &manifest.domain != expected { return Err("精细根跨地图域".into()); }
-        if self.current.as_ref().is_some_and(|old| old.domain == manifest.domain && old.revision >= manifest.revision) {
-            return Err("精细根修订未前进".into());
-        }
-        let required: BTreeSet<_> = manifest.blocks.iter().map(|b| b.sha256).collect();
-        if transfer.included.keys().any(|hash| !required.contains(hash)) { return Err("携带了根清单之外的块".into()); }
-        for block in &manifest.blocks {
-            if let Some(&(points, latest, geometry)) = self.verified.get(&block.sha256) {
-                if points != block.points || latest > manifest.source_timestamp_ns || geometry != block.geometry_sha256 { return Err("已验证块与新根引用不符".into()); }
-                if !transfer.included.contains_key(&block.sha256) { continue; }
+    fn validate_progression(&mut self, old: &Manifest, new: &Manifest) -> Result<(), String> {
+        if new.geometry_revision < old.geometry_revision { return Err("root geometry revision rolled back".into()); }
+        let previous: BTreeMap<_, _> = old.blocks.iter().map(|b| (b.key, b)).collect();
+        let next: BTreeSet<_> = new.blocks.iter().map(|b| b.key).collect();
+        let mut membership_changed = previous.keys().any(|key| !next.contains(key));
+        for b in &new.blocks {
+            let Some(a) = previous.get(&b.key) else { membership_changed = true; continue; };
+            if b.block_revision < a.block_revision || b.geometry_revision < a.geometry_revision { return Err("block revision rolled back".into()); }
+            if b.object != a.object {
+                if b.block_revision <= a.block_revision { return Err("changed object needs advanced evidence revision".into()); }
+                let after = self.reader.block(b)?; let before = self.reader.block(a)?;
+                if before.keys().ne(after.keys()) {
+                    membership_changed = true;
+                    if b.geometry_revision <= a.geometry_revision { return Err("changed members need advanced geometry revision".into()); }
+                }
             }
-            let bytes = if let Some(bytes) = transfer.included.get(&block.sha256) { bytes.clone() }
-                else if let Ok(bytes) = self.repository.read_object(block.sha256, MAX_BLOCK_BYTES) { bytes }
-                else { fetch(block.sha256)? };
-            if digest(&bytes) != block.sha256 { return Err("补取块摘要不匹配".into()); }
-            let decoded = decode_block(&bytes)?;
-            if decoded.len() != block.points as usize || block_geometry_digest(&decoded) != block.geometry_sha256 || decoded.values().any(|e| e.observed_ns > manifest.source_timestamp_ns) {
-                return Err("块记录数或观察时间超出根清单".into());
-            }
-            self.repository.put_object(block.sha256, &bytes)?;
-            self.verified.insert(block.sha256, (block.points, decoded.values().map(|e| e.observed_ns).max().unwrap_or(0), block.geometry_sha256));
         }
-        self.repository.put_object(transfer.root_sha256, &transfer.root)?;
-        let manifest = Arc::new(manifest);
-        self.current = Some(Arc::clone(&manifest));
-        self.readers.push(Arc::downgrade(&manifest));
-        self.verified.retain(|hash, _| required.contains(hash));
-        Ok(manifest)
+        if membership_changed && new.geometry_revision <= old.geometry_revision { return Err("changed membership needs advanced root geometry revision".into()); }
+        Ok(())
     }
 }
+#[cfg(test)]
+mod tests;

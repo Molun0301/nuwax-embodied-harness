@@ -15,14 +15,27 @@
 extern "C" {
 #endif
 
+#define NUWAX_MSGS_NAVIGATIONMAPBLOCK_OBJECT_KIND_ASSIGNED 1
+#define NUWAX_MSGS_NAVIGATIONMAPBLOCK_OBJECT_KIND_LEGACY 2
+
 typedef struct _nuwax_msgs_NavigationMapBlock nuwax_msgs_NavigationMapBlock;
 struct _nuwax_msgs_NavigationMapBlock
 {
 
     /**
+     * Exactly one identity is nonzero; legacy aliases are opaque, never recomputed.
+     */
+    int8_t     object_kind;
+
+    /**
+     * LCM Type: byte[16]
+     */
+    uint8_t    object_id[16];
+
+    /**
      * LCM Type: byte[32]
      */
-    uint8_t    sha256[32];
+    uint8_t    legacy_alias[32];
     int32_t    data_length;
 
     /**

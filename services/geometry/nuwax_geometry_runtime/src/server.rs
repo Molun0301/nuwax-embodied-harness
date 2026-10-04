@@ -2951,14 +2951,17 @@ async fn activate_map_r1(
         let installed = {
             let mut writer = bridge.cloud_map_writer.lock();
             match writer.as_mut() {
-                Some(writer) => writer.install_checkpoint_with_sources(
+                Some(writer) => writer.bind_fine_map_owner(
+                    adapter.lock().global_frame_generation(),
+                    bridge.nav.producer_runtime_generation(),
+                ).and_then(|()| writer.install_checkpoint_with_sources(
                     &occupancy_receipt,
                     target.voxel_size,
                     target.point_count,
                     &target.xyz_f32_le,
                     prepared_fine,
                     prepared_dense,
-                ),
+                )),
                 None => Err("cloud-map SHM writer became unavailable".to_owned()),
             }
         };
@@ -3693,9 +3696,10 @@ fn cloud_checkpoint_proto(
         source_revision: snapshot.revision,
         point_count: snapshot.point_count,
         voxel_size: snapshot.voxel_size,
-        xyz_sha256: crate::map_checksum::sha256_hex(&snapshot.xyz_f32_le),
+        xyz_sha256: String::new(),
         xyz_f32_le: snapshot.xyz_f32_le,
         payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
+        member_identity: None,
     }
 }
 
@@ -3773,7 +3777,7 @@ fn cloud_commit_receipt_proto(
     }
 }
 
-fn validate_mapping_commit_identity<'a>(
+pub(crate) fn validate_mapping_commit_identity<'a>(
     identity: Option<&'a MappingCommitIdentity>,
     label: &str,
 ) -> Result<&'a MappingCommitIdentity, String> {
@@ -3789,7 +3793,7 @@ fn validate_mapping_commit_identity<'a>(
     Ok(identity)
 }
 
-fn validate_mapping_checkpoint_receipts(
+pub(crate) fn validate_mapping_checkpoint_receipts(
     source_session_id: &str,
     source_session_generation: u64,
     backend_kind: &str,
@@ -3884,28 +3888,8 @@ fn validate_planar_checkpoint(checkpoint:&MappingBackendCheckpoint)->Result<(),S
     Ok(())
 }
 
-fn validate_mapping_backend_checkpoint(
-    checkpoint: &MappingBackendCheckpoint,
-    expected_backend: crate::mapping_backend::MappingBackendKind,
-) -> Result<(), String> {
-    if let Some(dense) = &checkpoint.dense_cloud_artifact {
-        if dense.id.is_empty() || dense.id.len() > 128 || dense.size == 0 || dense.size > crate::dense_cloud::MAX_ARCHIVE_BYTES
-            || dense.sha256.len() != 32 || dense.sha256.iter().all(|b| *b == 0) { return Err("完整点云制品引用无效".into()); }
-    }
-    if let Some(fine) = &checkpoint.fine_map_artifact {
-        if fine.id.is_empty() || fine.id.len() > 128 || fine.size == 0 || fine.size > nuwax_map_chunks::MAX_ARCHIVE_BYTES
-            || fine.sha256.len() != 32 || fine.sha256.iter().all(|b| *b == 0) { return Err("精细地图制品引用无效".into()); }
-    }
-    if expected_backend==crate::mapping_backend::MappingBackendKind::SlamToolbox {return validate_planar_checkpoint(checkpoint);}
-    if checkpoint.schema_version
-        != crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION
-    {
-        return Err(format!(
-            "unsupported mapping backend checkpoint schema: expected={} actual={}",
-            crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION,
-            checkpoint.schema_version
-        ));
-    }
+fn validate_mapping_checkpoint_structure(checkpoint: &MappingBackendCheckpoint,
+    expected_backend: crate::mapping_backend::MappingBackendKind) -> Result<(), String> {
     if checkpoint.backend_kind != expected_backend.stable_name() {
         return Err(format!(
             "mapping backend checkpoint kind mismatch: checkpoint={} selected={}",
@@ -3939,6 +3923,137 @@ fn validate_mapping_backend_checkpoint(
             checkpoint.payload_size
         ));
     }
+    Ok(())
+}
+
+// The outer identity generation is independent of the NWMBCKP binary payload schema.
+const ASSIGNED_CHECKPOINT_ENVELOPE_VERSION: u32 = 2;
+fn checkpoint_envelope_version(requested: u32) -> Result<u32, String> {
+    match requested { 0 | 1 => Ok(1), 2 => Ok(2), _ => Err(format!("unsupported checkpoint envelope schema: {requested}")) }
+}
+fn checkpoint_member_identity(checkpoint_id: &str, role: CheckpointMemberRole,
+    occupancy: &CanonicalOccupancyCommitReceipt, cloud: &CanonicalCloudCommitReceipt,
+    frame_id: &str, fine_domain: Option<&nuwax_map_chunks::Domain>) -> CheckpointMemberIdentity {
+    CheckpointMemberIdentity { checkpoint_id: checkpoint_id.to_owned(), role: role as i32,
+        occupancy_receipt: Some(occupancy.clone()), cloud_receipt: Some(cloud.clone()), frame_id: frame_id.to_owned(),
+        frame_generation: fine_domain.map_or(0, |d| d.frame_generation), producer_generation: fine_domain.map_or(0, |d| d.producer_generation) }
+}
+fn validate_cloud_checkpoint_structure(checkpoint: &CloudMapCheckpoint, expected_frame: &str) -> Result<(), String> {
+    if expected_frame.is_empty() || checkpoint.frame_id != expected_frame || checkpoint.frame_id.len() > 1024
+        || checkpoint.frame_id.trim() != checkpoint.frame_id || checkpoint.frame_id.chars().any(char::is_control)
+        || checkpoint.source_revision == 0 || checkpoint.point_count == 0
+        || !checkpoint.voxel_size.is_finite() || checkpoint.voxel_size <= 0.0
+        || checkpoint.xyz_f32_le.len() != (checkpoint.point_count as usize).checked_mul(12).ok_or("cloud checkpoint size overflow")?
+        || checkpoint.xyz_f32_le.chunks_exact(4).any(|v| !f32::from_le_bytes(v.try_into().unwrap()).is_finite()) {
+        return Err("cloud checkpoint geometry, size or frame is invalid".into());
+    }
+    Ok(())
+}
+fn validate_checkpoint_canonical_structure(checkpoint: &MappingBackendCheckpoint) -> Result<(), String> {
+    let occupancy = checkpoint.canonical_occupancy_checkpoint.as_ref().ok_or("canonical occupancy required")?;
+    let meta = occupancy.meta.as_ref().ok_or("canonical occupancy metadata required")?;
+    if meta.width == 0 || meta.height == 0 || meta.revision == 0 || meta.timestamp_ns == 0
+        || !meta.resolution.is_finite() || meta.resolution <= 0.0 || !meta.origin_x.is_finite() || !meta.origin_y.is_finite()
+        || occupancy.data.len() != (meta.width as usize).checked_mul(meta.height as usize).ok_or("occupancy dimensions overflow")?
+        || occupancy.data.iter().any(|v| !(-1..=100).contains(&(*v as i8))) { return Err("canonical occupancy geometry, size or cells are invalid".into()); }
+    let cloud = checkpoint.canonical_cloud_checkpoint.as_ref().ok_or("canonical cloud required")?;
+    validate_cloud_checkpoint_structure(cloud, &meta.frame_id)?;
+    validate_mapping_checkpoint_bundle(checkpoint, occupancy, Some(cloud))
+}
+fn validate_checkpoint_member_binding(checkpoint: &MappingBackendCheckpoint, member: &CheckpointMemberIdentity, role: CheckpointMemberRole) -> Result<(), String> {
+    crate::planar_artifacts::validate_member_identity(member)?;
+    let frame = &checkpoint.canonical_cloud_checkpoint.as_ref().ok_or("canonical cloud required")?.frame_id;
+    if member.checkpoint_id != checkpoint.checkpoint_id || member.role != role as i32
+        || member.occupancy_receipt != checkpoint.occupancy_receipt || member.cloud_receipt != checkpoint.cloud_receipt || member.frame_id != *frame {
+        return Err("checkpoint member descriptor differs from its frozen parent".into());
+    }
+    Ok(())
+}
+fn validate_assigned_mapping_checkpoint(checkpoint: &MappingBackendCheckpoint, expected_backend: crate::mapping_backend::MappingBackendKind) -> Result<(), String> {
+    if checkpoint.schema_version != ASSIGNED_CHECKPOINT_ENVELOPE_VERSION
+        || !crate::planar_artifacts::assigned_id(&checkpoint.checkpoint_id) || !checkpoint.content_sha256.is_empty()
+        || checkpoint.backend_payload_schema_version != crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION
+        || checkpoint.graph_artifact.is_some() || !checkpoint.target_kind.is_empty()
+        || expected_backend == crate::mapping_backend::MappingBackendKind::SlamToolbox { return Err("unsupported or mixed assigned checkpoint envelope".into()); }
+    validate_mapping_checkpoint_structure(checkpoint, expected_backend)?;
+    validate_checkpoint_canonical_structure(checkpoint)?;
+    let payload = &checkpoint.payload;
+    let kind = if expected_backend == crate::mapping_backend::MappingBackendKind::Voxel { 0 } else { 1 };
+    if payload.len() < 16 || &payload[..8] != b"NWMBCKP\0" || payload[8..12] != 1_u32.to_le_bytes() || payload[12] != kind || payload[13..16] != [0; 3] {
+        return Err("backend payload format/schema differs from its envelope".into());
+    }
+    let cloud = checkpoint.canonical_cloud_checkpoint.as_ref().unwrap();
+    if cloud.payload_schema_version != 2 || !cloud.xyz_sha256.is_empty() { return Err("mixed canonical cloud identity generation".into()); }
+    validate_checkpoint_member_binding(checkpoint, cloud.member_identity.as_ref().ok_or("cloud member identity required")?, CheckpointMemberRole::CanonicalCloud)?;
+    if let (Some(fine), Some(dense)) = (&checkpoint.fine_map_artifact, &checkpoint.dense_cloud_artifact) {
+        if fine.id == dense.id { return Err("distinct checkpoint members cannot share one artifact ID".into()); }
+    }
+    for (reference, role) in [(&checkpoint.fine_map_artifact, CheckpointMemberRole::FineMap), (&checkpoint.dense_cloud_artifact, CheckpointMemberRole::DenseCloud)] {
+        if let Some(reference) = reference {
+            crate::planar_artifacts::Store::validate_reference(reference)?;
+            if reference.identity_schema_version != 2 { return Err("legacy artifact inside assigned checkpoint".into()); }
+            validate_checkpoint_member_binding(checkpoint, reference.member_identity.as_ref().unwrap(), role)?;
+        }
+    }
+    Ok(())
+}
+/// One assembly owner after the existing lifecycle barrier has frozen all inputs.
+fn assemble_mapping_checkpoint_export(mut checkpoint: MappingBackendCheckpoint, envelope_version: u32,
+    expected_backend: crate::mapping_backend::MappingBackendKind) -> Result<MappingBackendCheckpoint, String> {
+    checkpoint.schema_version = checkpoint_envelope_version(envelope_version)?;
+    if checkpoint.schema_version == 2 {
+        checkpoint.backend_payload_schema_version = crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION;
+        if !checkpoint.content_sha256.is_empty() { return Err("v2 assembly received an active legacy digest".into()); }
+        let occupancy = checkpoint.occupancy_receipt.as_ref().ok_or("occupancy receipt required")?;
+        let cloud_receipt = checkpoint.cloud_receipt.as_ref().ok_or("cloud receipt required")?;
+        let cloud = checkpoint.canonical_cloud_checkpoint.as_mut().ok_or("canonical cloud required")?;
+        if !cloud.xyz_sha256.is_empty() || cloud.member_identity.is_some() { return Err("cloud assembly requires unfingerprinted canonical bytes".into()); }
+        cloud.payload_schema_version = 2;
+        cloud.member_identity = Some(checkpoint_member_identity(&checkpoint.checkpoint_id, CheckpointMemberRole::CanonicalCloud, occupancy, cloud_receipt, &cloud.frame_id, None));
+        validate_assigned_mapping_checkpoint(&checkpoint, expected_backend)?;
+    } else {
+        if !checkpoint.checkpoint_id.is_empty() || checkpoint.backend_payload_schema_version != 0 { return Err("legacy assembly received assigned identity".into()); }
+        checkpoint.content_sha256 = crate::map_checksum::sha256_bytes(&checkpoint.payload).to_vec();
+        let cloud = checkpoint.canonical_cloud_checkpoint.as_mut().ok_or("canonical cloud required")?;
+        cloud.payload_schema_version = crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION;
+        cloud.xyz_sha256 = crate::map_checksum::sha256_hex(&cloud.xyz_f32_le);
+        validate_cloud_checkpoint_metadata(cloud, &cloud.frame_id)?;
+        validate_mapping_backend_checkpoint(&checkpoint, expected_backend)?;
+    }
+    validate_mapping_checkpoint_envelope_size("mapping backend checkpoint response", checkpoint.encoded_len())?;
+    Ok(checkpoint)
+}
+
+fn validate_mapping_backend_checkpoint(
+    checkpoint: &MappingBackendCheckpoint,
+    expected_backend: crate::mapping_backend::MappingBackendKind,
+) -> Result<(), String> {
+    if !checkpoint.checkpoint_id.is_empty() || checkpoint.backend_payload_schema_version != 0 {
+        return Err("assigned checkpoint requires its paired v2 consumer".into());
+    }
+    if let Some(dense) = &checkpoint.dense_cloud_artifact {
+        crate::planar_artifacts::Store::validate_reference(dense)?;
+        if dense.identity_schema_version == 2 { return Err("v2 artifact cannot enter legacy activation".into()); }
+        if dense.id.is_empty() || dense.id.len() > 128 || dense.size == 0 || dense.size > crate::dense_cloud::MAX_ARCHIVE_BYTES
+            || dense.sha256.len() != 32 || dense.sha256.iter().all(|b| *b == 0) { return Err("完整点云制品引用无效".into()); }
+    }
+    if let Some(fine) = &checkpoint.fine_map_artifact {
+        crate::planar_artifacts::Store::validate_reference(fine)?;
+        if fine.identity_schema_version == 2 { return Err("v2 artifact cannot enter legacy activation".into()); }
+        if fine.id.is_empty() || fine.id.len() > 128 || fine.size == 0 || fine.size > nuwax_map_chunks::MAX_ARCHIVE_BYTES
+            || fine.sha256.len() != 32 || fine.sha256.iter().all(|b| *b == 0) { return Err("精细地图制品引用无效".into()); }
+    }
+    if expected_backend==crate::mapping_backend::MappingBackendKind::SlamToolbox {return validate_planar_checkpoint(checkpoint);}
+    if checkpoint.schema_version
+        != crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION
+    {
+        return Err(format!(
+            "unsupported mapping backend checkpoint schema: expected={} actual={}",
+            crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION,
+            checkpoint.schema_version
+        ));
+    }
+    validate_mapping_checkpoint_structure(checkpoint, expected_backend)?;
     if checkpoint.content_sha256.len() != 32
         || checkpoint.content_sha256 != crate::map_checksum::sha256_bytes(&checkpoint.payload)
     {
@@ -5156,7 +5271,7 @@ impl GeometryRuntimeService {
                 }
                 let canonical=occupancy_checkpoint_proto(&map);
                 let store=self.graph_artifacts.clone();let size=artifact.payload_size;let sha=artifact.sha256;
-                let reference=tokio::task::spawn_blocking(move||store.lock().insert(file,size,sha)).await.map_err(|e|e.to_string())??;
+                let reference=tokio::task::spawn_blocking(move||store.lock().insert_legacy(file,size,sha)).await.map_err(|e|e.to_string())??;
                 Ok(MappingBackendCheckpoint{schema_version:1,backend_kind:"slam_toolbox".into(),source_session_generation:session.session_generation,
                     source_session_id:session.session_id.clone(),content_sha256:artifact.sha256.to_vec(),payload_size:artifact.payload_size,
                     created_at_ns:now_ns(),occupancy_receipt:Some(occupancy_commit_receipt_proto(&receipt)),canonical_occupancy_checkpoint:Some(canonical),
@@ -5858,8 +5973,9 @@ impl GeometryRuntime for GeometryRuntimeService {
     }
     async fn export_mapping_backend_checkpoint(
         &self,
-        _req: Request<Empty>,
+        req: Request<ExportMappingBackendCheckpointRequest>,
     ) -> Result<Response<MappingBackendCheckpoint>, Status> {
+        let envelope_version = checkpoint_envelope_version(req.into_inner().checkpoint_schema_version).map_err(Status::invalid_argument)?;
         let adapter = self
             .bridge
             .mapping_adapter
@@ -5867,6 +5983,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
             .clone();
         if adapter.lock().planar.is_some() {
+            if envelope_version == 2 { return Err(Status::failed_precondition("planar checkpoint v2 requires paired inner archive/protocol migration")); }
             let service=self.clone();
             let receiver=self.bridge.register_planar_operation(async move {service.export_planar_checkpoint().await}).map_err(Status::unavailable)?;
             return receiver.await.map_err(|_|Status::unavailable("二维图导出保留任务未返回"))?.map(Response::new).map_err(Status::failed_precondition);
@@ -6147,11 +6264,6 @@ impl GeometryRuntime for GeometryRuntimeService {
                 let canonical_occupancy_checkpoint = occupancy_checkpoint_proto(&raw_map);
                 let canonical_cloud_checkpoint =
                     cloud_checkpoint_proto(cloud_snapshot, raw_map.frame_id.clone());
-                validate_cloud_checkpoint_metadata(
-                    &canonical_cloud_checkpoint,
-                    raw_map.frame_id.trim(),
-                )
-                .map_err(Status::internal)?;
                 let receiver = client.export_checkpoint().map_err(|error| {
                     Status::unavailable(format!(
                         "mapping backend checkpoint submission failed: {error:?}"
@@ -6173,26 +6285,47 @@ impl GeometryRuntime for GeometryRuntimeService {
                     .as_nanos();
                 let created_at_ns = u64::try_from(created_at_ns)
                     .map_err(|_| Status::internal("checkpoint creation time exceeds u64"))?;
-                let fine_root = fine_snapshot.as_ref().map(|fine| fine.manifest(nuwax_map_chunks::Domain {
-                    session: snapshot.session_id.clone(), generation: snapshot.session_generation,
-                    frame_generation: adapter.lock().global_frame_generation(),
-                    producer_generation: bridge.nav.producer_runtime_generation(),
-                }, cloud_receipt.cloud_revision)).transpose().map_err(Status::internal)?;
+                let fine_root = fine_snapshot.as_ref().map(|fine| Arc::clone(fine.manifest()));
+                if let Some(root) = &fine_root {
+                    let domain = &root.domain;
+                    if domain.session != snapshot.session_id || domain.generation != snapshot.session_generation
+                        || domain.frame_generation != adapter.lock().global_frame_generation()
+                        || domain.producer_generation != bridge.nav.producer_runtime_generation()
+                        || root.revision != cloud_receipt.cloud_revision || root.source_timestamp_ns != cloud_receipt.source_timestamp_ns {
+                        return Err(Status::failed_precondition("fine checkpoint root differs from frozen canonical source"));
+                    }
+                }
+                // Assign once after the existing barrier froze receipts, payload and immutable byte owners.
+                let checkpoint_id = if envelope_version == 2 { uuid::Uuid::new_v4().simple().to_string() } else { String::new() };
+                if envelope_version == 1 && fine_snapshot.is_some() {
+                    return Err(Status::failed_precondition("staged AR2 fine export requires envelope v2; default finalized-map/activation remains v1 until paired consumers land"));
+                }
                 // 已拿到同一屏障内的不可变快照，归档不持生命周期锁。
                 drop(lifecycle_guard);
                 let dense_cloud_artifact = if let Some(dense) = dense_snapshot {
                     let store = owned_service.graph_artifacts.clone();
                     let frame_id = raw_map.frame_id.clone();
+                    let member = checkpoint_member_identity(&checkpoint_id, CheckpointMemberRole::DenseCloud,
+                        &occupancy_receipt, &cloud_receipt, &frame_id, None);
                     Some(tokio::task::spawn_blocking(move || {
-                        let (file, size, sha) = dense.archive(&frame_id)?;
-                        store.lock().insert(file, size, sha)
+                        let (mut file, size) = dense.archive(&frame_id)?;
+                        if envelope_version == 2 { store.lock().insert(file, size, member) }
+                        else {
+                            // Explicit legacy DC1 compatibility only; never applied to AR2.
+                            use std::io::{Seek, SeekFrom};
+                            file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+                            let (_, sha) = crate::dense_cloud::hash_reader(&mut file)?;
+                            store.lock().insert_legacy(file, size, sha)
+                        }
                     }).await.map_err(|e| Status::internal(e.to_string()))?.map_err(Status::internal)?)
                 } else { None };
                 let fine_map_artifact = if let (Some(fine), Some(root)) = (fine_snapshot, fine_root) {
                     let store = owned_service.graph_artifacts.clone();
+                    let member = checkpoint_member_identity(&checkpoint_id, CheckpointMemberRole::FineMap,
+                        &occupancy_receipt, &cloud_receipt, &raw_map.frame_id, Some(&root.domain));
                     Some(tokio::task::spawn_blocking(move || {
-                        let (file, size, sha) = nuwax_map_chunks::archive_file(&root, &fine.repository)?;
-                        store.lock().insert(file, size, sha)
+                        let (file, size) = nuwax_map_chunks::archive_file(&root, &fine.repository)?;
+                        store.lock().insert(file, size, member)
                     }).await.map_err(|e| Status::internal(e.to_string()))?.map_err(Status::internal)?)
                 } else { None };
                 let checkpoint = MappingBackendCheckpoint {
@@ -6200,7 +6333,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                         crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION,
                     backend_kind: backend_kind.stable_name().to_owned(),
                     source_session_generation: snapshot.session_generation,
-                    content_sha256: crate::map_checksum::sha256_bytes(&payload).to_vec(),
+                    content_sha256: Vec::new(),
                     payload_size: u64::try_from(payload.len()).map_err(|_| {
                         Status::internal("mapping backend checkpoint size exceeds u64")
                     })?,
@@ -6215,15 +6348,10 @@ impl GeometryRuntime for GeometryRuntimeService {
                     target_kind: String::new(),
                     fine_map_artifact,
                     dense_cloud_artifact,
+                    checkpoint_id,
+                    backend_payload_schema_version: 0,
                 };
-                validate_mapping_backend_checkpoint(&checkpoint, backend_kind)
-                    .map_err(Status::internal)?;
-                validate_mapping_checkpoint_envelope_size(
-                    "mapping backend checkpoint response",
-                    checkpoint.encoded_len(),
-                )
-                .map_err(Status::resource_exhausted)?;
-                return Ok(checkpoint);
+                return assemble_mapping_checkpoint_export(checkpoint, envelope_version, backend_kind).map_err(Status::internal);
             }
         }
         .await;
@@ -6642,12 +6770,41 @@ impl GeometryRuntime for GeometryRuntimeService {
         &self, request: Request<NavigationMapBlockRequest>,
     ) -> Result<Response<NavigationMapBlockResponse>, Status> {
         self.ensure_running_admission("GetNavigationMapBlock").await?;
-        let hash = crate::pointcloud::decode_checkpoint_sha256(&request.into_inner().sha256_hex)
-            .map_err(Status::invalid_argument)?;
-        let receiver = self.bridge.read_navigation_map_block(hash).map_err(Status::failed_precondition)?;
-        let bytes = receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::not_found)?;
+        let request = request.into_inner();
+        if request.schema_version != 2 {
+            return Err(Status::invalid_argument("unsupported fine-map block protocol version"));
+        }
+        let wire_root = request.root.as_ref().ok_or_else(|| Status::invalid_argument("missing retained root"))?;
+        let wire_domain = wire_root.domain.as_ref().ok_or_else(|| Status::invalid_argument("missing root domain"))?;
+        let root = nuwax_map_chunks::RootIdentity {
+            domain: nuwax_map_chunks::Domain {
+                session: wire_domain.session.clone(), generation: wire_domain.generation,
+                frame_generation: wire_domain.frame_generation, producer_generation: wire_domain.producer_generation,
+            }, revision: wire_root.revision,
+        };
+        root.domain.validate().map_err(Status::invalid_argument)?;
+        if root.revision == 0 { return Err(Status::invalid_argument("zero root revision")); }
+        let wire_block = request.block.as_ref().ok_or_else(|| Status::invalid_argument("missing block reference"))?;
+        let identity = wire_block.object.as_ref().ok_or_else(|| Status::invalid_argument("missing block object identity"))?;
+        let object = match identity.kind {
+            1 if identity.legacy_alias.is_empty() => nuwax_map_chunks::ObjectIdentity::Assigned(
+                nuwax_map_chunks::ObjectId(identity.object_id.as_slice().try_into()
+                    .map_err(|_| Status::invalid_argument("assigned object identity must contain 16 bytes"))?)),
+            2 if identity.object_id.is_empty() => nuwax_map_chunks::ObjectIdentity::Legacy(
+                nuwax_map_chunks::LegacyAlias(identity.legacy_alias.as_slice().try_into()
+                    .map_err(|_| Status::invalid_argument("legacy object alias must contain 32 bytes"))?)),
+            _ => return Err(Status::invalid_argument("invalid tagged object identity")),
+        };
+        object.validate().map_err(Status::invalid_argument)?;
+        let reference = nuwax_map_chunks::BlockRef {
+            key: wire_block.key.as_slice().try_into().map_err(|_| Status::invalid_argument("block key requires three coordinates"))?,
+            object, block_revision: wire_block.block_revision, geometry_revision: wire_block.geometry_revision,
+            points: wire_block.points,
+        };
+        let receiver = self.bridge.read_navigation_map_block(&root, &reference).map_err(Status::failed_precondition)?;
+        let data = receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::not_found)?;
         Ok(Response::new(NavigationMapBlockResponse {
-            data_hex: bytes.iter().map(|v| format!("{v:02x}")).collect(),
+            schema_version: 2, root: request.root, block: request.block, data,
         }))
     }
 
@@ -11175,6 +11332,7 @@ mod lifecycle_tests {
                 xyz_sha256: crate::map_checksum::sha256_hex(&xyz_f32_le),
                 xyz_f32_le,
                 payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
+                member_identity: None,
             }),
             mapping_backend_checkpoint: None,
             activation_request_id: String::new(),
@@ -11281,7 +11439,7 @@ mod lifecycle_tests {
         .await
         .expect("canonical source cloud handoff"));
         let checkpoint =
-            GeometryRuntime::export_mapping_backend_checkpoint(&service, Request::new(Empty {}))
+            GeometryRuntime::export_mapping_backend_checkpoint(&service, Request::new(ExportMappingBackendCheckpointRequest::default()))
                 .await
                 .expect("ExportMappingBackendCheckpoint")
                 .into_inner();
@@ -11319,6 +11477,7 @@ mod lifecycle_tests {
             xyz_sha256: crate::map_checksum::sha256_hex(&cloud_xyz),
             xyz_f32_le: cloud_xyz,
             payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
+            member_identity: None,
         };
         MappingBackendCheckpoint {
             fine_map_artifact: None,
@@ -11358,6 +11517,8 @@ mod lifecycle_tests {
             canonical_cloud_checkpoint: Some(canonical_cloud_checkpoint),
             graph_artifact: None,
             target_kind: String::new(),
+            checkpoint_id: String::new(),
+            backend_payload_schema_version: 0,
         }
     }
 
@@ -13888,7 +14049,7 @@ mod lifecycle_tests {
         }
         let mut source_checkpoint = GeometryRuntime::export_mapping_backend_checkpoint(
             &source_service,
-            Request::new(Empty {}),
+            Request::new(ExportMappingBackendCheckpointRequest::default()),
         )
         .await
         .expect("export source ray checkpoint")
@@ -14124,14 +14285,14 @@ mod lifecycle_tests {
 
         let source_continued_checkpoint = GeometryRuntime::export_mapping_backend_checkpoint(
             &source_service,
-            Request::new(Empty {}),
+            Request::new(ExportMappingBackendCheckpointRequest::default()),
         )
         .await
         .expect("export uninterrupted continued checkpoint")
         .into_inner();
         let restored_continued_checkpoint = GeometryRuntime::export_mapping_backend_checkpoint(
             &restored_service,
-            Request::new(Empty {}),
+            Request::new(ExportMappingBackendCheckpointRequest::default()),
         )
         .await
         .expect("export restored continued checkpoint")
@@ -14189,7 +14350,7 @@ mod lifecycle_tests {
             assert_eq!(handle.state.read().await.map.revision > 0, sequence == 3);
         }
         let seeded_checkpoint =
-            GeometryRuntime::export_mapping_backend_checkpoint(&service, Request::new(Empty {}))
+            GeometryRuntime::export_mapping_backend_checkpoint(&service, Request::new(ExportMappingBackendCheckpointRequest::default()))
                 .await
                 .expect("export seed ray checkpoint")
                 .into_inner();
@@ -14241,7 +14402,7 @@ mod lifecycle_tests {
         let export_task = {
             let service = service.clone();
             tokio::spawn(async move {
-                GeometryRuntime::export_mapping_backend_checkpoint(&service, Request::new(Empty {}))
+                GeometryRuntime::export_mapping_backend_checkpoint(&service, Request::new(ExportMappingBackendCheckpointRequest::default()))
                     .await
             })
         };
@@ -14381,7 +14542,7 @@ mod lifecycle_tests {
         let export_task = {
             let service = service.clone();
             tokio::spawn(async move {
-                GeometryRuntime::export_mapping_backend_checkpoint(&service, Request::new(Empty {}))
+                GeometryRuntime::export_mapping_backend_checkpoint(&service, Request::new(ExportMappingBackendCheckpointRequest::default()))
                     .await
             })
         };
@@ -17584,4 +17745,68 @@ mod relocalization_terminal_query_tests {
         ));
         std::fs::remove_dir_all(root).expect("remove terminal query store");
     }
+}
+
+#[cfg(test)]
+mod assigned_checkpoint_assembly_tests {
+use super::*;
+fn frozen() -> MappingBackendCheckpoint {
+    let id=MappingCommitIdentity {boot_nonce:vec![1;16],sequence:5};
+    let occupancy=CanonicalOccupancyCommitReceipt { commit_id:Some(id.clone()),session_id:"source".into(),session_generation:2,
+        occupancy_revision:7,source_timestamp_ns:100,backend_kind:"voxel".into(),backend_generation:3 };
+    let cloud=CanonicalCloudCommitReceipt {commit_id:Some(id),session_generation:2,occupancy_revision:7,cloud_revision:9,source_timestamp_ns:100,point_count:1};
+    let payload=[b"NWMBCKP\0".as_slice(), &1u32.to_le_bytes(), &[0,0,0,0], &[0;40]].concat();
+    MappingBackendCheckpoint {schema_version:0,backend_kind:"voxel".into(),source_session_generation:2,created_at_ns:101,
+        source_session_id:"source".into(),payload_size:payload.len() as u64,payload,checkpoint_id:"11111111111111111111111111111111".into(),
+        occupancy_receipt:Some(occupancy),cloud_receipt:Some(cloud),
+        canonical_occupancy_checkpoint:Some(OccupancyGridData {meta:Some(OccupancyGridMeta{width:1,height:1,resolution:0.05,
+            origin_x:0.0,origin_y:0.0,frame_id:"map".into(),revision:7,timestamp_ns:100}),data:vec![0]}),
+        canonical_cloud_checkpoint:Some(CloudMapCheckpoint{frame_id:"map".into(),source_revision:9,point_count:1,voxel_size:0.05,
+            xyz_f32_le:[1f32,2.,3.].into_iter().flat_map(f32::to_le_bytes).collect(),..Default::default()}),..Default::default()}
+}
+#[test]
+fn assigned_v2_native_wire_and_frozen_assembly_keep_exact_ids_bytes_and_payload_schema() {
+    assert_eq!(ExportMappingBackendCheckpointRequest::decode(&[][..]).unwrap().checkpoint_schema_version,0);
+    assert_eq!(checkpoint_envelope_version(0).unwrap(),1);assert_eq!(checkpoint_envelope_version(1).unwrap(),1);assert!(checkpoint_envelope_version(3).is_err());
+    let request=ExportMappingBackendCheckpointRequest{checkpoint_schema_version:2};
+    assert_eq!(ExportMappingBackendCheckpointRequest::decode(request.encode_to_vec().as_slice()).unwrap(),request);
+    let original=frozen();let checkpoint=assemble_mapping_checkpoint_export(original.clone(),2,crate::mapping_backend::MappingBackendKind::Voxel).unwrap();
+    assert_eq!(checkpoint.schema_version,2);assert_eq!(checkpoint.backend_payload_schema_version,1);
+    assert_eq!(checkpoint.checkpoint_id,original.checkpoint_id);assert_eq!(checkpoint.payload,original.payload);
+    assert!(checkpoint.content_sha256.is_empty());assert_eq!(checkpoint.canonical_occupancy_checkpoint,original.canonical_occupancy_checkpoint);
+    let cloud=checkpoint.canonical_cloud_checkpoint.as_ref().unwrap();assert!(cloud.xyz_sha256.is_empty());
+    assert_eq!(cloud.xyz_f32_le,original.canonical_cloud_checkpoint.unwrap().xyz_f32_le);assert_eq!(cloud.payload_schema_version,2);
+    let encoded=checkpoint.encode_to_vec();assert_eq!(MappingBackendCheckpoint::decode(encoded.as_slice()).unwrap(),checkpoint);
+    assert!(validate_mapping_backend_checkpoint(&checkpoint,crate::mapping_backend::MappingBackendKind::Voxel).is_err());
+}
+#[test]
+fn assigned_v2_assembly_rejects_mixed_fields_source_geometry_and_backend_format() {
+    let valid=assemble_mapping_checkpoint_export(frozen(),2,crate::mapping_backend::MappingBackendKind::Voxel).unwrap();
+    for field in 0..13 {
+        let mut bad=valid.clone();match field {
+            0=>bad.content_sha256=vec![7;32],1=>bad.checkpoint_id="A".repeat(32),2=>bad.backend_payload_schema_version=2,
+            3=>bad.payload_size+=1,4=>bad.payload[8]=2,5=>bad.payload[12]=1,
+            6=>bad.canonical_cloud_checkpoint.as_mut().unwrap().xyz_sha256="01".repeat(32),
+            7=>bad.canonical_cloud_checkpoint.as_mut().unwrap().member_identity.as_mut().unwrap().checkpoint_id="2".repeat(32),
+            8=>bad.canonical_cloud_checkpoint.as_mut().unwrap().xyz_f32_le[..4].copy_from_slice(&f32::NAN.to_le_bytes()),
+            9=>bad.canonical_occupancy_checkpoint.as_mut().unwrap().data[0]=254,
+            10=>bad.canonical_occupancy_checkpoint.as_mut().unwrap().meta.as_mut().unwrap().origin_x=f64::NAN,
+            11=>bad.cloud_receipt.as_mut().unwrap().cloud_revision+=1,_=>bad.canonical_cloud_checkpoint.as_mut().unwrap().frame_id="odom".into() }
+        assert!(validate_assigned_mapping_checkpoint(&bad,crate::mapping_backend::MappingBackendKind::Voxel).is_err(),"field {field}");
+    }
+    let mut bad=frozen();bad.content_sha256=vec![1;32];assert!(assemble_mapping_checkpoint_export(bad,2,crate::mapping_backend::MappingBackendKind::Voxel).is_err());
+}
+#[test]
+fn assigned_v2_assembly_checks_full_artifact_parent_descriptor() {
+    let mut checkpoint=assemble_mapping_checkpoint_export(frozen(),2,crate::mapping_backend::MappingBackendKind::Voxel).unwrap();
+    let member=checkpoint_member_identity(&checkpoint.checkpoint_id,CheckpointMemberRole::DenseCloud,checkpoint.occupancy_receipt.as_ref().unwrap(),checkpoint.cloud_receipt.as_ref().unwrap(),"map",None);
+    checkpoint.dense_cloud_artifact=Some(GraphArtifactRef{id:"2".repeat(32),size:100,identity_schema_version:2,member_identity:Some(member),..Default::default()});
+    validate_assigned_mapping_checkpoint(&checkpoint,crate::mapping_backend::MappingBackendKind::Voxel).unwrap();
+    let mut collision=checkpoint.clone();let mut fine=collision.dense_cloud_artifact.clone().unwrap();
+    fine.member_identity.as_mut().unwrap().role=CheckpointMemberRole::FineMap as i32;fine.member_identity.as_mut().unwrap().producer_generation=6;
+    collision.fine_map_artifact=Some(fine);
+    assert!(validate_assigned_mapping_checkpoint(&collision,crate::mapping_backend::MappingBackendKind::Voxel).unwrap_err().contains("cannot share one artifact ID"));
+    checkpoint.dense_cloud_artifact.as_mut().unwrap().member_identity.as_mut().unwrap().cloud_receipt.as_mut().unwrap().cloud_revision+=1;
+    assert!(validate_assigned_mapping_checkpoint(&checkpoint,crate::mapping_backend::MappingBackendKind::Voxel).is_err());
+}
 }

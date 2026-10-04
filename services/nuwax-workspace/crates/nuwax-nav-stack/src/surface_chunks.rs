@@ -11,7 +11,7 @@ pub(super) struct FineMapReader {
     lcm_url: String,
 }
 impl FineMapReader {
-    /// 按真实内容摘要刷新观察块；几何未变化的时间更新也必须交付。
+    /// 按块证据修订刷新观察块；几何未变化的时间更新也必须交付。
     pub(super) fn observations(
         &mut self,
         root: &Manifest,
@@ -34,7 +34,7 @@ impl FineMapReader {
             grid.replace_block(*key, BTreeMap::new()).map_err(|e| e.to_string())?;
         }
         for reference in &root.blocks {
-            if old.get(&reference.key).is_some_and(|old| old.sha256 == reference.sha256) { continue; }
+            if old.get(&reference.key).is_some_and(|old| old.block_revision == reference.block_revision) { continue; }
             let block = self.reader.block(reference)?;
             let mut values = BTreeMap::new();
             for (&local, evidence) in block.iter() {
@@ -64,18 +64,14 @@ impl FineMapReader {
         message: &schema::NavigationMap3D,
     ) -> Result<Arc<Manifest>, String> {
         let transfer = message.fine.as_ref().ok_or("消息缺少精细根")?;
-        let candidate = Manifest::decode(&transfer.root, transfer.root_sha256)?;
-        if let Some(current) = self.receiver.current() {
-            if current.as_ref() == &candidate {
-                return Ok(current);
-            }
-        }
+        // Receiver must also inspect included bytes on duplicate publications:
+        // an identical root cannot hide an immutable-object conflict.
         let expected = schema::navigation_map_3d_domain(message);
         let deadline = Instant::now() + Duration::from_secs(2);
         let client = &mut self.client;
         let url = &self.lcm_url;
         let mut fetched_blocks=0_usize;
-        let received=self.receiver.receive(transfer, &expected, |hash| {
+        let received=self.receiver.receive(transfer, &expected, |root, reference| {
             fetched_blocks+=1;
             if client.is_none() {
                 *client = Some(nuwax_rpc::RpcClient::new(
@@ -84,16 +80,14 @@ impl FineMapReader {
                 ).map_err(|e| e.to_string())?);
             }
             let runtime = tokio::runtime::Handle::try_current().map_err(|_| "可靠补取必须在原受管阻塞构建任务中执行")?;
-            let request = serde_json::json!({"sha256_hex": hash.iter().map(|v| format!("{v:02x}")).collect::<String>()});
+            let request = block_request(root, reference);
             let mut last = "精细块补取期限耗尽".to_string();
             for _ in 0..3 {
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { break; };
                 let result = runtime.block_on(client.as_ref().unwrap().call_scoped((vec![request.clone()], Default::default()), remaining.min(Duration::from_millis(350))));
                 match result {
                     Ok(value) => {
-                        let hex = value.get("data_hex").and_then(|v| v.as_str()).ok_or("精细块响应格式错误")?;
-                        if hex.len() > MAX_BLOCK_BYTES * 2 || hex.len() % 2 != 0 || !hex.is_ascii() { return Err("精细块响应长度错误".into()); }
-                        return (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| "精细块响应编码错误".into())).collect();
+                        return block_response(&request, &value);
                     }
                     Err(error) => last = error.to_string(),
                 }
@@ -125,7 +119,7 @@ impl FineMapReader {
         let new: BTreeMap<_, _> = root.blocks.iter().map(|b| (b.key, b)).collect();
         let mut dirty = BTreeSet::new();
         for key in old.keys().chain(new.keys()) {
-            if old.get(key).map(|b| b.geometry_sha256) == new.get(key).map(|b| b.geometry_sha256) {
+            if old.get(key).map(|b| b.geometry_revision) == new.get(key).map(|b| b.geometry_revision) {
                 continue;
             }
             let (min, max) = planning_columns(*key, root.voxel_size_m, planner_size)?;
@@ -191,6 +185,45 @@ impl FineMapReader {
     }
 }
 
+/// The reliable fetch is scoped to a specific root and exact immutable reference.
+/// The RPC object representation intentionally does not reuse serde's archive enum.
+fn block_request(root: &Manifest, reference: &nuwax_map_chunks::BlockRef) -> serde_json::Value {
+    use nuwax_map_chunks::ObjectIdentity;
+    let object = match reference.object {
+        ObjectIdentity::Assigned(id) => serde_json::json!({
+            "kind": 1, "object_id": id.0, "legacy_alias": [],
+        }),
+        ObjectIdentity::Legacy(alias) => serde_json::json!({
+            "kind": 2, "object_id": [], "legacy_alias": alias.0,
+        }),
+    };
+    serde_json::json!({
+        "schema_version": 2,
+        "root": root.identity(),
+        "block": {
+            "key": reference.key,
+            "object": object,
+            "block_revision": reference.block_revision,
+            "geometry_revision": reference.geometry_revision,
+            "points": reference.points,
+        },
+    })
+}
+
+fn block_response(request: &serde_json::Value, response: &serde_json::Value) -> Result<Vec<u8>, String> {
+    if response.get("schema_version") != request.get("schema_version")
+        || response.get("root") != request.get("root")
+        || response.get("block") != request.get("block")
+    {
+        return Err("精细块响应与请求的根或块身份不符".into());
+    }
+    let data = response.get("data").and_then(serde_json::Value::as_array)
+        .ok_or("精细块响应格式错误")?;
+    if data.len() > MAX_BLOCK_BYTES { return Err("精细块响应长度错误".into()); }
+    data.iter().map(|byte| byte.as_u64().and_then(|v| u8::try_from(v).ok())
+        .ok_or_else(|| "精细块响应字节无效".into())).collect()
+}
+
 fn planning_columns(
     key: [i32; 3],
     source: f32,
@@ -223,44 +256,22 @@ mod tests {
         cells: &BTreeSet<Key>,
         size: f32,
         revision: u64,
+        previous: Option<&Manifest>,
     ) -> Manifest {
-        let mut blocks = BTreeMap::<Key, Block>::new();
-        for &key in cells {
-            blocks.entry(block_key(key)).or_default().insert(
-                local_key(key),
-                Evidence {
-                    observed_ns: revision,
-                    hits: 1,
-                },
-            );
+        let mut writer = Writer::new(repository.clone(), size, 4 * 1024 * 1024).unwrap();
+        if let Some(previous) = previous {
+            writer.restore(previous).unwrap();
+            let mut reader = RegionReader::new(repository.clone(), 4 * 1024 * 1024);
+            let removed: Vec<_> = previous.blocks.iter().flat_map(|reference| {
+                reader.block(reference).unwrap().keys().map(|&local|
+                    global_key(reference.key, local).unwrap()).collect::<Vec<_>>()
+            }).filter(|key| !cells.contains(key)).collect();
+            writer.remove(removed).unwrap();
         }
-        let blocks = blocks
-            .into_iter()
-            .map(|(key, block)| {
-                let bytes = encode_block(&block).unwrap();
-                let sha256 = digest(&bytes);
-                repository.put_object(sha256, &bytes).unwrap();
-                BlockRef {
-                    key,
-                    sha256,
-                    geometry_sha256: block_geometry_digest(&block),
-                    points: block.len() as u32,
-                }
-            })
-            .collect();
-        Manifest {
-            version: 1,
-            domain: Domain {
-                session: "test".into(),
-                generation: 1,
-                frame_generation: 1,
-                producer_generation: 1,
-            },
-            revision,
-            source_timestamp_ns: revision,
-            voxel_size_m: size,
-            blocks,
-        }
+        writer.observe(cells.iter().copied(), revision).unwrap();
+        writer.snapshot(Domain {
+            session: "test".into(), generation: 1, frame_generation: 1, producer_generation: 1,
+        }, revision, revision).unwrap().as_ref().clone()
     }
     fn reader(repository: Repository) -> FineMapReader {
         FineMapReader {
@@ -315,22 +326,22 @@ mod tests {
             .flat_map(|x| (-12..12).flat_map(move |y| [[x, y, 0], [x, y, 50]]))
             .collect();
         for size in [0.1, 0.13] {
-            let first = install(&repository, &cells, 0.05, 1);
+            let first = install(&repository, &cells, 0.05, 1, None);
             let (updates, read) = reader.columns(&first, None, size).unwrap();
             assert_eq!(read, cells.len());
             assert_columns(&updates, &cells, 0.05, size);
             cells.remove(&[-32, 0, 0]);
             cells.insert([-33, 0, 8]);
-            let second = install(&repository, &cells, 0.05, 2);
+            let second = install(&repository, &cells, 0.05, 2, Some(&first));
             let (updates, read) = reader.columns(&second, Some(&first), size).unwrap();
             assert!(read < cells.len());
             assert_columns(&updates, &cells, 0.05, size);
-            let third = install(&repository, &cells, 0.05, 3);
+            let third = install(&repository, &cells, 0.05, 3, Some(&second));
             let (updates, read) = reader.columns(&third, Some(&second), size).unwrap();
             assert!(updates.is_empty());
             assert_eq!(read, 0);
             cells.retain(|key| block_key(*key) != [-2, 0, 0]);
-            let fourth = install(&repository, &cells, 0.05, 4);
+            let fourth = install(&repository, &cells, 0.05, 4, Some(&third));
             let (updates, _) = reader.columns(&fourth, Some(&third), size).unwrap();
             assert_columns(&updates, &cells, 0.05, size);
             assert!(updates.iter().any(|u| u.cells.is_empty()));
@@ -354,7 +365,7 @@ mod tests {
             let mut keys:BTreeSet<Key>=(-100..100).flat_map(|x|(-50..100).map(move|y|[x,y,-1])).collect();
             keys.extend((0..4).flat_map(|x|(-50..100).filter(move|&y|y<0||y>=gap)
                 .flat_map(move|y|(0..80).map(move|z|[x,y,z]))));
-            let root=install(&repository,&keys,0.01,revision);
+            let root=install(&repository,&keys,0.01,revision,previous.as_ref().map(|(root,_)| root));
             let observations=reader.observations(&root,previous.as_ref().map(|(root,grid)|(root,grid))).unwrap();
             let (updates,count)=reader.columns(&root,previous.as_ref().map(|(root,_)|root),0.1).unwrap();
             let built=builder.build_column_updates(&updates,0.01,previous.is_none(),count).unwrap();
@@ -449,9 +460,9 @@ mod tests {
             let mut cells: BTreeSet<_> = (0..far)
                 .flat_map(|x| (0..8).map(move |y| [x, y, 0]))
                 .collect();
-            let first = install(&repository, &cells, 0.05, 1);
+            let first = install(&repository, &cells, 0.05, 1, None);
             cells.insert([10, 2, 2]);
-            let next = install(&repository, &cells, 0.05, 2);
+            let next = install(&repository, &cells, 0.05, 2, Some(&first));
             let (_, count) = reader.columns(&next, Some(&first), 0.1).unwrap();
             reads.push(count);
         }

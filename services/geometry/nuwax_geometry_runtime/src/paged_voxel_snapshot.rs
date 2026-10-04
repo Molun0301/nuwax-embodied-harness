@@ -37,6 +37,7 @@ impl PagedVoxelSnapshot {
     }
     /// A global rewrite changes every point identity/layout; only this path scans
     /// the whole source set. Ordinary additions/deletions never re-sort it.
+    pub(super) fn needs_rebuild(&self) -> bool { self.rebuild }
     pub(super) fn prepare(&mut self, voxels: &HashSet<VoxelKey>) -> bool {
         if !self.rebuild { return false; }
         self.keys.extend(voxels.iter().copied());

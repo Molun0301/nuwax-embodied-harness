@@ -10,21 +10,22 @@ pub(super) struct FineCloud {
     writer: Writer,
     dynamic: DynamicCloudFilter,
     failure: Option<String>,
-    recent: VecDeque<Arc<SealedMap>>,
-    readers: Vec<Weak<SealedMap>>,
+    readers: FineCloudReaders,
     commits: u64,
+    baseline: Option<nuwax_map_chunks::RootIdentity>,
 }
 impl FineCloud {
-    pub(super) fn from_archive(file: std::fs::File) -> Result<(Self, nuwax_map_chunks::Manifest), String> {
+    pub(super) fn from_archive(file: std::fs::File) -> Result<(Self, nuwax_map_chunks::ArchivedRoot), String> {
         let mut archive = nuwax_map_chunks::ArchiveReader::open(file)?;
-        let mut cloud = Self::new(archive.manifest().voxel_size_m)?;
+        let mut cloud = Self::new(archive.root().voxel_size_m())?;
         let root = archive.import(cloud.writer.repository())?;
-        cloud.writer.restore(&root)?;
+        cloud.writer.restore_archived(&root)?;
+        cloud.baseline = Some(root.identity());
         Ok((cloud, root))
     }
     pub(super) fn new(size: f32) -> Result<Self, String> {
         Ok(Self { writer: Writer::new(Repository::temporary()?, size, 32 * 1024 * 1024)?,
-            dynamic: DynamicCloudFilter::default(), failure: None, recent: VecDeque::new(), readers: Vec::new(), commits: 0 })
+            dynamic: DynamicCloudFilter::default(), failure: None, readers: FineCloudReaders::default(), commits: 0, baseline: None })
     }
     pub(super) fn fresh() -> Result<Self, String> { Self::new(VOXEL_SIZE) }
     #[cfg(test)]
@@ -61,21 +62,60 @@ impl FineCloud {
             self.writer.observe(hits.into_iter().map(|key| [key.0, key.1, key.2]), timestamp_ns)
         }
     }
-    pub(super) fn seal(&mut self, timestamp_ns: u64) -> Result<Arc<SealedMap>, String> {
+    pub(super) fn publication_floor(&self, domain: &nuwax_map_chunks::Domain) -> u64 {
+        self.baseline.as_ref().filter(|root| &root.domain == domain).map_or(0, |root| root.revision)
+    }
+    pub(super) fn readers(&self) -> FineCloudReaders { self.readers.clone() }
+    pub(super) fn seal(&mut self, domain: nuwax_map_chunks::Domain, revision: u64, timestamp_ns: u64) -> Result<Arc<SealedMap>, String> {
         if let Some(error) = &self.failure { return Err(error.clone()); }
-        let sealed = Arc::new(self.writer.seal(timestamp_ns)?);
-        self.recent.push_back(Arc::clone(&sealed));
-        self.readers.push(Arc::downgrade(&sealed));
+        let sealed = Arc::new(self.writer.seal(domain, revision, timestamp_ns)?);
+        self.baseline = Some(sealed.manifest().identity());
+        Ok(sealed)
+    }
+    pub(super) fn retain_committed(&mut self, sealed: &Arc<SealedMap>) {
+        let mut readers = self.readers.0.lock();
+        readers.recent.push_back(Arc::clone(sealed));
+        readers.readers.push(Arc::downgrade(sealed));
         // 慢读者可补取近期根；更旧的接收者重新获取最新完整根。
-        while self.recent.len() > 16 || (self.recent.len() > 1 && self.recent.iter().map(|r| r.blocks.len()).sum::<usize>() > 262144) {
-            self.recent.pop_front();
+        while readers.recent.len() > 16 || (readers.recent.len() > 1 && readers.recent.iter().map(|r| r.manifest().blocks.len()).sum::<usize>() > 262144) {
+            readers.recent.pop_front();
         }
         self.commits += 1;
         if self.commits % 16 == 0 {
-            let live = self.readers.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
-            self.readers.retain(|r| r.strong_count() > 0);
-            self.writer.repository().collect_sealed(&live)?;
+            let live = readers.readers.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+            readers.readers.retain(|r| r.strong_count() > 0);
+            // Collection failure must not retroactively fail an already committed
+            // publication. Retention remains conservative until the next pass.
+            if let Err(error) = self.writer.collect_sealed(&live) {
+                tracing::warn!(%error, "fine-map object collection deferred");
+            }
         }
-        Ok(sealed)
+    }
+}
+
+#[derive(Default)]
+struct RetainedRoots {
+    recent: VecDeque<Arc<SealedMap>>,
+    readers: Vec<Weak<SealedMap>>,
+}
+/// Shared retention survives transfer of the mutable accumulator to a worker.
+#[derive(Clone, Default)]
+pub(super) struct FineCloudReaders(Arc<parking_lot::Mutex<RetainedRoots>>);
+impl FineCloudReaders {
+    /// Resolve the exact retained publication before starting asynchronous IO.
+    pub(super) fn pin_root(&self, identity: &nuwax_map_chunks::RootIdentity,
+        reference: &nuwax_map_chunks::BlockRef) -> Result<Arc<SealedMap>, String> {
+        let retained = self.0.lock();
+        let root = retained.recent.iter().find(|root| root.manifest().identity() == *identity)
+            .cloned().or_else(|| retained.readers.iter().filter_map(Weak::upgrade)
+                .find(|root| root.manifest().identity() == *identity))
+            .ok_or("requested fine-map root expired; request the latest complete root")?;
+        let manifest = root.manifest();
+        let index = manifest.blocks.binary_search_by_key(&reference.key, |block| block.key)
+            .map_err(|_| "requested block is not a member of the retained root")?;
+        if &manifest.blocks[index] != reference {
+            return Err("requested block identity/revisions differ from the retained root".into());
+        }
+        Ok(root)
     }
 }

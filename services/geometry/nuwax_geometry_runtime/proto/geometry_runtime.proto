@@ -9,9 +9,49 @@ package nuwax.geometry;
 // ============================================================================
 
 message Empty {}
-// 单个精细块的可靠补取；通过实际内容传递，不共享本地路径。
-message NavigationMapBlockRequest { string sha256_hex = 1; }
-message NavigationMapBlockResponse { string data_hex = 1; }
+// C1 reliable recovery is scoped to a retained root and an exact member reference.
+// Legacy aliases are opaque historical identifiers, never content-checked hashes.
+message NavigationMapDomain {
+  string session = 1;
+  uint64 generation = 2;
+  uint64 frame_generation = 3;
+  uint64 producer_generation = 4;
+}
+message NavigationMapRootIdentity {
+  NavigationMapDomain domain = 1;
+  uint64 revision = 2;
+}
+message NavigationMapObjectIdentity {
+  // 1 = assigned (16 bytes), 2 = legacy alias (32 bytes); inactive bytes must be empty.
+  uint32 kind = 1;
+  bytes object_id = 2;
+  bytes legacy_alias = 3;
+}
+message NavigationMapBlockRef {
+  // Exactly three coordinates in X, Y, Z order.
+  repeated sint32 key = 1;
+  NavigationMapObjectIdentity object = 2;
+  uint64 block_revision = 3;
+  uint64 geometry_revision = 4;
+  uint32 points = 5;
+}
+message NavigationMapBlockRequest {
+  reserved 1;
+  reserved "sha256_hex";
+  // Required value 2; unversioned/hash-only requests are rejected.
+  uint32 schema_version = 2;
+  NavigationMapRootIdentity root = 3;
+  NavigationMapBlockRef block = 4;
+}
+message NavigationMapBlockResponse {
+  reserved 1;
+  reserved "data_hex";
+  uint32 schema_version = 2;
+  // Echo the admitted request binding; clients compare both before consuming data.
+  NavigationMapRootIdentity root = 3;
+  NavigationMapBlockRef block = 4;
+  bytes data = 5;
+}
 message Vec3 { double x = 1; double y = 2; double z = 3; }
 message Quat { double x = 1; double y = 2; double z = 3; double w = 4; }
 message Pose {
@@ -160,6 +200,7 @@ message CloudMapCheckpoint {
   bytes xyz_f32_le = 5;
   string xyz_sha256 = 6;
   uint32 payload_schema_version = 7;
+  CheckpointMemberIdentity member_identity = 8;
 }
 
 message MappingCommitIdentity {
@@ -186,10 +227,35 @@ message CanonicalCloudCommitReceipt {
   uint32 point_count = 6;
 }
 
+// Assigned identity of one immutable member of a frozen checkpoint export.
+enum CheckpointMemberRole {
+  CHECKPOINT_MEMBER_ROLE_UNSPECIFIED = 0;
+  CHECKPOINT_MEMBER_ROLE_BACKEND_STATE = 1;
+  CHECKPOINT_MEMBER_ROLE_CANONICAL_OCCUPANCY = 2;
+  CHECKPOINT_MEMBER_ROLE_CANONICAL_CLOUD = 3;
+  CHECKPOINT_MEMBER_ROLE_FINE_MAP = 4;
+  CHECKPOINT_MEMBER_ROLE_DENSE_CLOUD = 5;
+  CHECKPOINT_MEMBER_ROLE_PLANAR_GRAPH = 6;
+}
+message CheckpointMemberIdentity {
+  string checkpoint_id = 1;
+  CheckpointMemberRole role = 2;
+  CanonicalOccupancyCommitReceipt occupancy_receipt = 3;
+  CanonicalCloudCommitReceipt cloud_receipt = 4;
+  string frame_id = 5;
+  uint64 frame_generation = 6;
+  uint64 producer_generation = 7;
+}
+message ExportMappingBackendCheckpointRequest {
+  // 0/1 retain the staged legacy envelope; 2 explicitly requests assigned identity.
+  uint32 checkpoint_schema_version = 1;
+}
 message GraphArtifactRef {
   string id = 1;
   uint64 size = 2;
-  bytes sha256 = 3;
+  bytes sha256 = 3; // Legacy-only; empty in identity schema 2.
+  uint32 identity_schema_version = 4;
+  CheckpointMemberIdentity member_identity = 5;
 }
 
 message GraphArtifactTransferRequest {
@@ -223,6 +289,8 @@ message MappingBackendCheckpoint {
   string target_kind = 14;
   GraphArtifactRef fine_map_artifact = 15;
   GraphArtifactRef dense_cloud_artifact = 16;
+  string checkpoint_id = 17;
+  uint32 backend_payload_schema_version = 18;
 }
 
 message ActivateMapRequest {
@@ -829,7 +897,7 @@ service GeometryRuntime {
   rpc StopMapping(StopMappingRequest) returns (MappingSessionState);
   rpc GetMappingState(Empty) returns (MappingSessionState);
   rpc TransferGraphArtifact(GraphArtifactTransferRequest) returns (GraphArtifactTransferResponse);
-  rpc ExportMappingBackendCheckpoint(Empty) returns (MappingBackendCheckpoint);
+  rpc ExportMappingBackendCheckpoint(ExportMappingBackendCheckpointRequest) returns (MappingBackendCheckpoint);
   rpc ActivateMap(ActivateMapRequest) returns (MappingSessionState);
   rpc Relocalize(RelocalizeRequest) returns (RelocalizeResult);
   rpc GetRelocalizationTerminal(GetRelocalizationTerminalRequest) returns (GetRelocalizationTerminalResponse);

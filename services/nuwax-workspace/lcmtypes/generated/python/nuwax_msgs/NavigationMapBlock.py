@@ -9,14 +9,25 @@ import struct
 
 class NavigationMapBlock(object):
 
-    __slots__ = ["sha256", "data_length", "data"]
+    __slots__ = ["object_kind", "object_id", "legacy_alias", "data_length", "data"]
 
-    __typenames__ = ["byte", "int32_t", "byte"]
+    __typenames__ = ["int8_t", "byte", "byte", "int32_t", "byte"]
 
-    __dimensions__ = [[32], None, ["data_length"]]
+    __dimensions__ = [None, [16], [32], None, ["data_length"]]
+
+    OBJECT_KIND_ASSIGNED = 1
+    OBJECT_KIND_LEGACY = 2
 
     def __init__(self):
-        self.sha256 = b""
+        self.object_kind = 0
+        """
+        Exactly one identity is nonzero; legacy aliases are opaque, never recomputed.
+        LCM Type: int8_t
+        """
+
+        self.object_id = b""
+        """ LCM Type: byte[16] """
+        self.legacy_alias = b""
         """ LCM Type: byte[32] """
         self.data_length = 0
         """ LCM Type: int32_t """
@@ -30,7 +41,9 @@ class NavigationMapBlock(object):
         return buf.getvalue()
 
     def _encode_one(self, buf):
-        buf.write(bytearray(self.sha256[:32]))
+        buf.write(struct.pack(">b", self.object_kind))
+        buf.write(bytearray(self.object_id[:16]))
+        buf.write(bytearray(self.legacy_alias[:32]))
         buf.write(struct.pack(">i", self.data_length))
         buf.write(bytearray(self.data[:self.data_length]))
 
@@ -47,7 +60,9 @@ class NavigationMapBlock(object):
     @staticmethod
     def _decode_one(buf):
         self = NavigationMapBlock()
-        self.sha256 = buf.read(32)
+        self.object_kind = struct.unpack(">b", buf.read(1))[0]
+        self.object_id = buf.read(16)
+        self.legacy_alias = buf.read(32)
         self.data_length = struct.unpack(">i", buf.read(4))[0]
         self.data = buf.read(self.data_length)
         return self
@@ -55,7 +70,7 @@ class NavigationMapBlock(object):
     @staticmethod
     def _get_hash_recursive(parents):
         if NavigationMapBlock in parents: return 0
-        tmphash = (0x5915188e0388cdb4) & 0xffffffffffffffff
+        tmphash = (0xf2a24bae9546ee09) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None
@@ -69,3 +84,4 @@ class NavigationMapBlock(object):
     def get_hash(self):
         """Get the LCM hash of the struct"""
         return struct.unpack(">Q", NavigationMapBlock._get_packed_fingerprint())[0]
+

@@ -490,7 +490,7 @@ impl DenseSnapshot {
         }
     }
 
-    pub fn archive(&self, frame_id: &str) -> Result<(File, u64, [u8; 32]), String> {
+    pub fn archive(&self, frame_id: &str) -> Result<(File, u64), String> {
         let header = serde_json::to_vec(&self.metadata(frame_id)).map_err(|e| e.to_string())?;
         if header.len() > MAX_HEADER_BYTES {
             return Err("完整点云资产元数据过大".into());
@@ -506,13 +506,23 @@ impl DenseSnapshot {
             offset += data.len() as u64 / 12;
             file.write_all(&data).map_err(|e| e.to_string())?;
         }
+        let size = file.stream_position().map_err(|e| e.to_string())?;
+        let expected = (12 + header.len() as u64).checked_add(self.point_count.checked_mul(12)
+            .ok_or("完整点云归档大小溢出")?).ok_or("完整点云归档大小溢出")?;
+        if size != expected || size > MAX_ARCHIVE_BYTES || file.metadata().map_err(|e| e.to_string())?.len() != size {
+            return Err("完整点云归档大小不符或超过预算".into());
+        }
         file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        let (size, sha) = hash_reader(&mut file)?;
-        Ok((file, size, sha))
+        Ok((file, size))
     }
 }
 
+#[cfg(test)]
+std::thread_local! { pub(crate) static FORBID_ARCHIVE_HASH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+/// Explicit legacy-only adapter; new archive creation returns owned bytes and size.
 pub(crate) fn hash_reader(reader: &mut impl Read) -> Result<(u64, [u8; 32]), String> {
+    #[cfg(test)] FORBID_ARCHIVE_HASH.with(|v| assert!(!v.get(), "legacy archive hash reached v2 path"));
     let mut hash = Sha256::new();
     let mut size = 0_u64;
     let mut buffer = vec![0; 1024 * 1024];
@@ -549,6 +559,7 @@ pub(crate) fn read_metadata(file: &mut File) -> Result<(Metadata, u64), String> 
     file.read_exact(&mut header).map_err(|e| e.to_string())?;
     let metadata: Metadata = serde_json::from_slice(&header).map_err(|e| e.to_string())?;
     let offset = 12 + length as u64;
+    if offset > size { return Err("完整点云资产头截断".into()); }
     if metadata.version != 1
         || metadata.point_count == 0
         || metadata.point_count > (size - offset) / 12
@@ -672,7 +683,7 @@ mod tests {
         assert!(cloud
             .pin_read(after.clone(), &before.epoch, before.point_count)
             .is_err());
-        let (mut archive, _, _) = after.archive("map").unwrap();
+        let (mut archive, _) = after.archive("map").unwrap();
         validate_archive(&mut archive).unwrap();
         let restored = DenseCloud::from_archive(archive, &after.metadata("map")).unwrap();
         assert_eq!(
@@ -737,11 +748,11 @@ mod tests {
             f32::from_le_bytes(first[..4].try_into().unwrap()),
             0.011_f32
         );
-        let (mut file, size, sha) = frozen.archive("map").unwrap();
+        let (mut file, size) = frozen.archive("map").unwrap();
         assert!(size > 12_000_000);
         validate_archive(&mut file).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
-        assert_eq!(hash_reader(&mut file).unwrap(), (size, sha));
+        assert_eq!(file.metadata().unwrap().len(), size);
         let restored = DenseCloud::from_archive(file, &frozen.metadata("map")).unwrap();
         let restored = restored.snapshot(&receipt(3), "恢复验证").unwrap();
         assert_ne!(restored.epoch, frozen.epoch);
@@ -765,14 +776,14 @@ mod tests {
         assert_eq!(snapshot.point_count, 1);
         assert!(snapshot.read(2, 1).is_err());
         assert!(snapshot.read(0, CHUNK_POINTS + 1).is_err());
-        let (file, _, _) = snapshot.archive("map").unwrap();
+        let (file, _) = snapshot.archive("map").unwrap();
         let mut wrong = snapshot.metadata("map");
         wrong.session_generation += 1;
         assert!(DenseCloud::from_archive(file, &wrong).is_err());
-        let (mut file, size, _) = snapshot.archive("map").unwrap();
+        let (mut file, size) = snapshot.archive("map").unwrap();
         file.set_len(size - 1).unwrap();
         assert!(validate_archive(&mut file).is_err());
-        let (mut file, _, _) = snapshot.archive("map").unwrap();
+        let (mut file, _) = snapshot.archive("map").unwrap();
         let (_, offset) = read_metadata(&mut file).unwrap();
         file.write_all_at(&f32::NAN.to_le_bytes(), offset).unwrap();
         assert!(validate_archive(&mut file).is_err());

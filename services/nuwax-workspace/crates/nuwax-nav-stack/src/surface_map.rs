@@ -4,15 +4,43 @@ use nuwax_codec::lcm::schema;
 use nuwax_nav_mls_planner::{
     mls_planner::Config, SurfaceBuildKind, SurfaceBuildStats, SurfaceMapBuilder, SurfaceSnapshot,
 };
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
+
+/// Publication identities are assigned by the owner, never derived from payload bytes.
+#[derive(Clone, PartialEq, Eq)]
+enum GeometryRevision {
+    Fine {
+        domain: nuwax_map_chunks::Domain,
+        resolution: u32,
+        geometry_revision: u64,
+    },
+    FullCloud {
+        domain: nuwax_map_chunks::Domain,
+        resolution: u32,
+        publication_revision: i64,
+    },
+}
+
+/// No independent virtual-mask revision exists yet. Occupancy commits invalidate it
+/// conservatively, including commits whose actual mask did not change.
+#[derive(Clone, PartialEq, Eq)]
+struct MaskRevision {
+    domain: nuwax_map_chunks::Domain,
+    occupancy_revision: i64,
+}
+
+struct DerivedSurface {
+    mask_revision: Option<MaskRevision>,
+    physical: Arc<SurfaceSnapshot>,
+    snapshot: Arc<SurfaceSnapshot>,
+}
 
 /// 仅缓存几何计算；调用者仍须核对消息来源、修订、接收时刻与更新票据。
 pub struct SurfaceMapCache {
     config: Config,
     builder: SurfaceMapBuilder,
-    physical: Option<([u8; 32], Arc<SurfaceSnapshot>)>,
-    latest: Option<([u8; 32], Arc<SurfaceSnapshot>)>,
+    physical: Option<(GeometryRevision, Arc<SurfaceSnapshot>)>,
+    latest: Option<DerivedSurface>,
     last_stats: Option<SurfaceBuildStats>,
     fine: Option<crate::surface_chunks::FineMapReader>,
     lcm_url: String,
@@ -86,7 +114,7 @@ impl SurfaceMapCache {
         }
     }
 
-    /// 适配已准入的完整消息；字段摘要相同快速复用，否则按体素列变化构建。
+    /// 适配已准入的完整消息；使用拥有方修订复用，否则按体素列变化构建。
     pub fn build(
         &mut self,
         message: &schema::NavigationMap3D,
@@ -116,33 +144,28 @@ impl SurfaceMapCache {
                 None => None,
             }
         } else { None };
-        let physical_digest = geometry_digest(message);
-        let digest =
-            constrained_geometry_digest(physical_digest, message.virtual_obstacles.as_ref());
-        if let Some((_, snapshot)) = self
-            .latest
-            .as_ref()
-            .filter(|(previous, _)| *previous == digest)
-        {
-            let snapshot = Arc::clone(snapshot);
-            self.record_reuse();
-            let same_observations = match (snapshot.observations(), observations.as_ref()) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                _ => false,
-            };
-            let snapshot = if same_observations { snapshot }
-                else { Arc::new(snapshot.with_observations(observations.clone())) };
-            self.observations = observations;
-            self.fine_observed_root = fine_root;
-            self.latest = Some((digest, Arc::clone(&snapshot)));
-            return Ok(snapshot);
-        }
+        let domain = schema::navigation_map_3d_domain(message);
+        let physical_revision = match fine_root.as_ref() {
+            Some(root) => GeometryRevision::Fine {
+                domain: root.domain.clone(),
+                resolution: root.voxel_size_m.to_bits(),
+                geometry_revision: root.geometry_revision,
+            },
+            None => GeometryRevision::FullCloud {
+                domain: domain.clone(),
+                resolution: message.source_voxel_size.to_bits(),
+                publication_revision: message.cloud_revision,
+            },
+        };
+        let mask_revision = message.virtual_obstacles.as_ref().map(|_| MaskRevision {
+            domain,
+            occupancy_revision: message.committed_map.revision,
+        });
         let mut frontier_changes = None;
         let physical = if let Some((_, snapshot)) = self
             .physical
             .as_ref()
-            .filter(|(previous, _)| *previous == physical_digest)
+            .filter(|(previous, _)| *previous == physical_revision)
         {
             let snapshot = Arc::clone(snapshot);
             self.record_reuse();
@@ -178,9 +201,29 @@ impl SurfaceMapCache {
                 frontier_changes = Some(result.changed_columns.clone());
             }
             self.last_stats = Some(result.stats);
-            self.physical = Some((physical_digest, Arc::clone(&result.snapshot)));
+            self.physical = Some((physical_revision, Arc::clone(&result.snapshot)));
             result.snapshot
         };
+        // An evidence-only fine publication advances the retained root without
+        // rebuilding geometry. Full-cloud compatibility goes through the builder's
+        // existing exact column comparison on each new publication revision.
+        self.fine_built_root = fine_root.clone();
+        if let Some(previous) = self.latest.as_ref().filter(|previous|
+            Arc::ptr_eq(&previous.physical, &physical) && previous.mask_revision == mask_revision)
+        {
+            let snapshot = &previous.snapshot;
+            let same_observations = match (snapshot.observations(), observations.as_ref()) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            let snapshot = if same_observations { Arc::clone(snapshot) }
+                else { Arc::new(snapshot.with_observations(observations.clone())) };
+            self.observations = observations;
+            self.fine_observed_root = fine_root;
+            self.latest = Some(DerivedSurface { mask_revision, physical, snapshot: Arc::clone(&snapshot) });
+            return Ok(snapshot);
+        }
         let snapshot = if let Some(mask) = message.virtual_obstacles.as_ref() {
             let blocked: Vec<_> = mask.data.iter().map(|value| *value == 100).collect();
             Arc::new(
@@ -195,79 +238,17 @@ impl SurfaceMapCache {
                     .map_err(|error| error.to_string())?,
             )
         } else {
-            physical
+            Arc::clone(&physical)
         };
-        if let (Some(changes), Some((_, previous))) = (frontier_changes, self.latest.as_ref()) {
-            snapshot.inherit_frontier_cache(previous, &changes);
+        if let (Some(changes), Some(previous)) = (frontier_changes, self.latest.as_ref()) {
+            snapshot.inherit_frontier_cache(&previous.snapshot, &changes);
         }
         let snapshot = if self.observation_enabled {
             Arc::new(snapshot.with_observations(observations.clone()))
         } else { snapshot };
         self.observations = observations;
         self.fine_observed_root = fine_root;
-        self.latest = Some((digest, Arc::clone(&snapshot)));
+        self.latest = Some(DerivedSurface { mask_revision, physical, snapshot: Arc::clone(&snapshot) });
         Ok(snapshot)
     }
-}
-
-fn geometry_digest(message: &schema::NavigationMap3D) -> [u8; 32] {
-    let cloud = &message.cloud;
-    let mut hash = Sha256::new();
-    if let Some(fine) = &message.fine {
-        if let Ok(root) = nuwax_map_chunks::Manifest::decode(&fine.root, fine.root_sha256) {
-            hash.update(root.voxel_size_m.to_le_bytes());
-            for block in &root.blocks {
-                for axis in block.key {
-                    hash.update(axis.to_le_bytes());
-                }
-                hash.update(block.geometry_sha256);
-            }
-            return hash.finalize().into();
-        }
-    }
-    hash.update(message.source_voxel_size.to_le_bytes());
-    hash.update((cloud.header.frame_id.len() as u64).to_le_bytes());
-    hash.update(cloud.header.frame_id.as_bytes());
-    for value in [cloud.width, cloud.height, cloud.point_step, cloud.row_step] {
-        hash.update(value.to_le_bytes());
-    }
-    hash.update([u8::from(cloud.is_bigendian), u8::from(cloud.is_dense)]);
-    hash.update((cloud.fields.len() as u64).to_le_bytes());
-    for field in &cloud.fields {
-        hash.update((field.name.len() as u64).to_le_bytes());
-        hash.update(field.name.as_bytes());
-        hash.update(field.offset.to_le_bytes());
-        hash.update(field.datatype.to_le_bytes());
-        hash.update(field.count.to_le_bytes());
-    }
-    hash.update((cloud.data.len() as u64).to_le_bytes());
-    hash.update(&cloud.data);
-    hash.finalize().into()
-}
-
-fn constrained_geometry_digest(
-    physical: [u8; 32],
-    mask: Option<&schema::OccupancyGrid>,
-) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(physical);
-    match mask {
-        None => hash.update([0]),
-        Some(mask) => {
-            hash.update([1]);
-            hash.update(mask.info.resolution.to_le_bytes());
-            hash.update(mask.info.width.to_le_bytes());
-            hash.update(mask.info.height.to_le_bytes());
-            for value in mask.info.origin.position {
-                hash.update(value.to_le_bytes());
-            }
-            for value in mask.info.origin.orientation_xyzw {
-                hash.update(value.to_le_bytes());
-            }
-            for value in &mask.data {
-                hash.update(value.to_le_bytes());
-            }
-        }
-    }
-    hash.finalize().into()
 }

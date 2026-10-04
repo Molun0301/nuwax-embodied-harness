@@ -3049,11 +3049,13 @@ pub struct GeometryRuntimeHandle {
 
 impl GeometryRuntimeHandle {
     /// 缺片读取保留到原根任务集合，客户端取消也等待实际文件读取结束。
-    pub(crate) fn read_navigation_map_block(&self, hash: [u8; 32]) -> Result<oneshot::Receiver<Result<Vec<u8>, String>>, String> {
-        let fine = self.cloud_map_writer.lock().as_ref().and_then(|writer| writer.committed_fine_cloud())
-            .ok_or("当前拥有方没有已提交精细源")?;
+    pub(crate) fn read_navigation_map_block(&self, root: &nuwax_map_chunks::RootIdentity,
+        reference: &nuwax_map_chunks::BlockRef) -> Result<oneshot::Receiver<Result<Vec<u8>, String>>, String> {
+        let fine = self.cloud_map_writer.lock().as_ref().ok_or("fine-map owner is unavailable")?
+            .pin_fine_map_root(root, reference)?;
+        let object = reference.object;
         self.register_navigation_map_operation(async move {
-            tokio::task::spawn_blocking(move || fine.repository.read_object(hash, nuwax_map_chunks::MAX_BLOCK_BYTES))
+            tokio::task::spawn_blocking(move || fine.repository.read_object(object, nuwax_map_chunks::MAX_BLOCK_BYTES))
                 .await.map_err(|e| e.to_string()).and_then(|v| v)
         })
     }
@@ -4793,10 +4795,9 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
         {
             let result = (|| -> Result<(), String> {
                 let mut writer = context.cloud_writer.lock();
-                let cloud = writer
-                    .as_mut()
-                    .ok_or("PGO点云写入端不可用")?
-                    .install_prepared_accumulator(&prepared.receipt, map.accumulator)?;
+                let cloud_writer = writer.as_mut().ok_or("PGO点云写入端不可用")?;
+                cloud_writer.bind_fine_map_frame(transaction.map_frame_generation)?;
+                let cloud = cloud_writer.install_prepared_accumulator(&prepared.receipt, map.accumulator)?;
                 drop(writer);
                 // 不可取消窗口内任何不确定失败都进入原有故障终态，不继续生成混合坐标的地图。
                 backend_restore
@@ -8032,7 +8033,11 @@ pub async fn spawn_geometry_runtime(
     // Subscription rollback therefore cannot leave an unowned mmap behind.
     let cm_shm_path = crate::pointcloud::cloud_map_shm_path();
     let cm_writer = if mapping_backend.kind() == crate::mapping_backend::MappingBackendKind::SlamToolbox { None } else { match CloudMapShmWriter::new(&cm_shm_path) {
-        Ok(writer) => Some(writer),
+        Ok(mut writer) => {
+            writer.bind_fine_map_owner(0, nav_runtime.producer_runtime_generation())
+                .expect("navigation runtime owns a positive producer generation");
+            Some(writer)
+        },
         Err(error) => {
             warn!("累积地图 mmap 初始化失败（降级为无 cloud_map 模式）: {error}");
             None
@@ -8830,7 +8835,10 @@ async fn ingest_mapping_points_with_backend_owned(
             let current_session = mapping.lock().snapshot();
             let preparation = {
                 let mut writer = cloud_map_writer.lock();
-                writer.as_mut().map(CloudMapShmWriter::prepare_scan_work).transpose()
+                writer.as_mut().map(|writer| {
+                    writer.bind_fine_map_frame(mapping.lock().global_frame_generation())?;
+                    writer.prepare_scan_work()
+                }).transpose()
             };
             drop(lifecycle_guard);
             let prepared = match preparation {
@@ -9450,7 +9458,7 @@ fn build_navigation_map_3d_publication_frame(
         ..schema::PointCloud2::default()
     };
     let mut message = schema::NavigationMap3D {
-        schema_version: 2,
+        schema_version: 3,
         producer_runtime_generation: metadata.producer_runtime_generation,
         committed_map: metadata.committed_map.clone(),
         map_frame_generation: metadata.map_frame_generation,
@@ -9465,23 +9473,26 @@ fn build_navigation_map_3d_publication_frame(
         cloud,
     };
     if let Some(fine) = &publication.fine {
-        if fine.source_timestamp_ns != publication.source_timestamp_ns {
+        if fine.manifest().source_timestamp_ns != publication.source_timestamp_ns {
             return Err("精细导航源与占据提交时间不一致".into());
         }
-        let root = fine.manifest(schema::navigation_map_3d_domain(&message), revision as u64)?;
+        let root = fine.manifest();
+        if root.domain != schema::navigation_map_3d_domain(&message) || root.revision != revision as u64 {
+            return Err("sealed fine-map identity differs from the committed publication owner".into());
+        }
         let root_bytes = root.encode()?;
         let mut included = std::collections::BTreeMap::new();
         let mut included_bytes = 0;
         for block in &root.blocks {
             if included_bytes + 16 + block.points as usize * 12 > 128 * 1024 { continue; }
-            let bytes = fine.repository.read_object(block.sha256, nuwax_map_chunks::MAX_BLOCK_BYTES)?;
+            let bytes = fine.repository.read_object(block.object, nuwax_map_chunks::MAX_BLOCK_BYTES)?;
             if included_bytes + bytes.len() > 128 * 1024 { continue; }
             included_bytes += bytes.len();
-            included.insert(block.sha256, bytes);
+            included.insert(block.object, bytes);
         }
         message.source_voxel_size = root.voxel_size_m;
         message.fine = Some(nuwax_map_chunks::Transfer {
-            root_sha256: nuwax_map_chunks::digest(&root_bytes), root: root_bytes, included,
+            root: root_bytes, included,
         });
     }
     let payload =
@@ -12596,6 +12607,7 @@ mod mapping_feed_tests {
                 uuid::Uuid::new_v4(),
             ));
             let mut writer = CloudMapShmWriter::new(&path).expect("三维发布测试共享内存");
+            writer.bind_fine_map_owner(mapping.lock().global_frame_generation(), 37).unwrap();
             writer.begin_session(generation).expect("会话清空");
             let writer = Arc::new(parking_lot::Mutex::new(Some(writer)));
             canonical_cloud_publication_invalidation(&writer)

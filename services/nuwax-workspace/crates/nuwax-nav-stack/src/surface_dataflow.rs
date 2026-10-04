@@ -5,7 +5,6 @@ use std::collections::VecDeque;
 use nuwax_nav_mls_planner::SurfaceSnapshot;
 use crate::surface_map::SurfaceMapCache as SurfaceGeometryCache;
 use nuwax_nav_types_messages::Path3D;
-use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::runner::StackRunner;
@@ -229,7 +228,7 @@ where
 /// 同一Geometry进程与点云修订不可变，进程代次由现有持久分配器排序。
 #[derive(Default)]
 struct SurfaceMapOrder {
-    latest: Option<(GuardedMapAuthority, [u8; 32])>,
+    latest: Option<(GuardedMapAuthority, Arc<Vec<u8>>)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -241,9 +240,8 @@ enum MapIngress {
 }
 
 impl SurfaceMapOrder {
-    fn observe(&mut self, authority: &GuardedMapAuthority, payload: &[u8]) -> MapIngress {
-        let digest: [u8; 32] = Sha256::digest(payload).into();
-        if let Some((previous, previous_digest)) = &self.latest {
+    fn observe(&mut self, authority: &GuardedMapAuthority, payload: &Arc<Vec<u8>>) -> MapIngress {
+        if let Some((previous, previous_payload)) = &self.latest {
             if authority.producer_runtime_generation < previous.producer_runtime_generation {
                 return MapIngress::Rejected("retired geometry map producer");
             }
@@ -265,7 +263,11 @@ impl SurfaceMapOrder {
                     return MapIngress::Rejected("stale surface cloud revision");
                 }
                 if authority.cloud_revision == previous.cloud_revision {
-                    return if authority == previous && digest == *previous_digest {
+                    // New publications retain immutable ownership in O(1). Only a
+                    // same-identity replay needs an exact payload comparison.
+                    return if authority == previous
+                        && (Arc::ptr_eq(payload, previous_payload) || payload == previous_payload)
+                    {
                         MapIngress::Duplicate
                     } else {
                         MapIngress::Invalidated("surface map revision payload mutation")
@@ -273,7 +275,7 @@ impl SurfaceMapOrder {
                 }
             }
         }
-        self.latest = Some((authority.clone(), digest));
+        self.latest = Some((authority.clone(), Arc::clone(payload)));
         MapIngress::New
     }
 }
@@ -290,11 +292,12 @@ fn map_authority(map: &schema::NavigationMap3D) -> GuardedMapAuthority {
 
 
 fn prepare_surface_map(
-    message: schema::NavigationMap3D,
+    message: impl Into<Arc<schema::NavigationMap3D>>,
     received_at: Instant,
     config: &SurfaceNavigationConfig,
     cache: &mut SurfaceGeometryCache,
 ) -> PreparedSurfaceMap {
+    let message = message.into();
     let authority = map_authority(&message);
     let source_timestamp_ns = message.source_timestamp_ns;
     let snapshot = if message.cleared {
@@ -560,7 +563,7 @@ async fn run_surface_planner_with_computer(
     let mut quick_cancellation: Option<(u64, [u8;32], Arc<std::sync::atomic::AtomicBool>)> = None;
     let mut checked_surface: Option<std::sync::Weak<SurfaceSnapshot>> = None;
     let mut path_cancellation: Option<(u64, [u8; 32], Arc<std::sync::atomic::AtomicBool>)> = None;
-    let mut pending_map: Option<(schema::NavigationMap3D, Instant, u64)> = None;
+    let mut pending_map: Option<(Arc<schema::NavigationMap3D>, Instant, u64)> = None;
     let mut accepted_domain: Option<GuardedMapAuthority> = None;
     let mut map_epoch = 0_u64;
     let mut latest_map: Option<PreparedSurfaceMap> = None;
@@ -693,10 +696,13 @@ async fn run_surface_planner_with_computer(
                 let frame = required_frame(frame, "surface planner map")?;
                 let received_at = Instant::now();
                 let message = match schema::decode_navigation_map_3d_body(&frame.payload) {
-                    Ok(message) => message,
+                    Ok(message) => Arc::new(message),
                     Err(error) => { diagnostics.reject("surface map", &error.to_string()); continue; }
                 };
-                match order.observe(&map_authority(&message), &frame.payload) {
+                // Move the transport allocation into immutable ownership; neither
+                // retaining a baseline nor accepting a new revision scans its bytes.
+                let payload = Arc::new(frame.payload);
+                match order.observe(&map_authority(&message), &payload) {
                     MapIngress::Rejected(reason) => { diagnostics.reject("surface map", reason); continue; }
                     MapIngress::Duplicate => continue,
                     MapIngress::Invalidated(reason) => {
@@ -1202,7 +1208,7 @@ mod tests {
             }
         }
         schema::NavigationMap3D {
-            schema_version: 2,
+            schema_version: schema::NAVIGATION_MAP_3D_SCHEMA_VERSION,
             producer_runtime_generation: 17,
             committed_map: schema::CommittedMapIdentity {
                 session_id: session.into(),
@@ -1341,18 +1347,24 @@ mod tests {
         observed_config.follower.max_observation_age_sec = Some(1.0);
         let mut observed_cache = SurfaceGeometryCache::configured(&observed_config);
         let mut cells:BTreeSet<[i32;3]>=(0..80).flat_map(|x|(0..60).map(move|y|[x,y,40])).collect();
-        let message=|cells:&BTreeSet<[i32;3]>,revision| {
+        let repository = Repository::temporary().unwrap();
+        let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
+        let mut previous_cells = BTreeSet::new();
+        let mut publications = BTreeMap::<i64, schema::NavigationMap3D>::new();
+        let mut message=|cells:&BTreeSet<[i32;3]>,revision| {
+            if let Some(message) = publications.get(&revision) { return message.clone(); }
             let mut message=map_message(revision,"fine");message.source_voxel_size=0.05;
             message.cloud.width=0;message.cloud.row_step=0;message.cloud.data.clear();
-            let mut blocks=BTreeMap::<[i32;3],Block>::new();
-            for &key in cells {blocks.entry(block_key(key)).or_default().insert(local_key(key),Evidence{observed_ns:message.source_timestamp_ns as u64,hits:1});}
-            let mut included=BTreeMap::new();
-            let refs=blocks.into_iter().map(|(key,block)| {
-                let bytes=encode_block(&block).unwrap();let hash=digest(&bytes);included.insert(hash,bytes);
-                BlockRef{key,sha256:hash,geometry_sha256:block_geometry_digest(&block),points:block.len() as u32}
-            }).collect();
-            let root=Manifest {version:1,domain:schema::navigation_map_3d_domain(&message),revision:revision as u64,source_timestamp_ns:message.source_timestamp_ns as u64,voxel_size_m:0.05,blocks:refs}.encode().unwrap();
-            message.fine=Some(Transfer{root_sha256:digest(&root),root,included});message
+            writer.remove(previous_cells.difference(cells).copied()).unwrap();
+            writer.observe(cells.iter().copied(), message.source_timestamp_ns as u64).unwrap();
+            let root = writer.snapshot(schema::navigation_map_3d_domain(&message),
+                revision as u64, message.source_timestamp_ns as u64).unwrap();
+            let included = root.blocks.iter().map(|block| (block.object,
+                repository.read_object(block.object, MAX_BLOCK_BYTES).unwrap())).collect();
+            message.fine=Some(Transfer { root: root.encode().unwrap(), included });
+            previous_cells = cells.clone();
+            publications.insert(revision, message.clone());
+            message
         };
         let first=cache.build(&message(&cells,1)).unwrap();
         let observed_first = observed_cache.build(&message(&cells,1)).unwrap();
@@ -1533,29 +1545,20 @@ mod tests {
     #[test]
     fn map_order_and_geometry_reuse_preserve_input_identity_and_receipt_age() {
         let first = map_message(1, "first-map");
-        let payload = schema::encode_navigation_map_3d_body(&first).unwrap();
+        let payload = Arc::new(schema::encode_navigation_map_3d_body(&first).unwrap());
+        let authority = map_authority(&first);
         let mut order = SurfaceMapOrder::default();
-        assert_eq!(
-            order.observe(&map_authority(&first), &payload),
-            MapIngress::New
-        );
-        assert_eq!(
-            order.observe(&map_authority(&first), &payload),
-            MapIngress::Duplicate
-        );
-        let mut old = first.clone();
+        assert_eq!(order.observe(&authority, &payload), MapIngress::New);
+        assert!(Arc::ptr_eq(&order.latest.as_ref().unwrap().1, &payload));
+        assert_eq!(order.observe(&authority, &payload), MapIngress::Duplicate);
+        let duplicate = Arc::new(payload.as_ref().clone());
+        assert_eq!(order.observe(&authority, &duplicate), MapIngress::Duplicate);
+        let mut old = authority.clone();
         old.producer_runtime_generation -= 1;
-        assert!(matches!(
-            order.observe(&map_authority(&old), &payload),
-            MapIngress::Rejected(_)
-        ));
-        let mut mutation = first.clone();
-        mutation.cloud.data[0] ^= 1;
-        let mutated = schema::encode_navigation_map_3d_body(&mutation).unwrap();
-        assert!(matches!(
-            order.observe(&map_authority(&mutation), &mutated),
-            MapIngress::Invalidated(_)
-        ));
+        assert!(matches!(order.observe(&old, &payload), MapIngress::Rejected(_)));
+        let mut mutation = payload.as_ref().clone();
+        mutation[0] ^= 1;
+        assert!(matches!(order.observe(&authority, &Arc::new(mutation)), MapIngress::Invalidated(_)));
         let mut cache = SurfaceGeometryCache::new(config().geometry);
         let received = Instant::now() - Duration::from_secs(2);
         let prepared = prepare_surface_map(first, received, &config(), &mut cache);

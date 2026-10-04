@@ -251,7 +251,13 @@ mod tests {
     use nuwax_map_chunks::*;
     use std::collections::{BTreeMap, BTreeSet};
 
-    fn install(
+    // Fresh-root compatibility for existing doorway diagnostic recipes.
+    #[allow(dead_code)]
+    fn install(repository: &Repository, cells: &BTreeSet<Key>, size: f32, revision: u64) -> Manifest {
+        install_revisioned(repository, cells, size, revision, None)
+    }
+
+    fn install_revisioned(
         repository: &Repository,
         cells: &BTreeSet<Key>,
         size: f32,
@@ -302,7 +308,7 @@ mod tests {
     #[test]
     fn duplicate_root_still_rejects_conflicting_included_body_without_installing_it() {
         let repository = Repository::temporary().unwrap();
-        let root = install(&repository, &BTreeSet::from([[0, 0, 0]]), 0.05, 1, None);
+        let root = install_revisioned(&repository, &BTreeSet::from([[0, 0, 0]]), 0.05, 1, None);
         let mut receiver = FineMapReader::new(String::new()).unwrap();
         let message = transfer_message(&repository, &root);
         let committed = receiver.receive(&message).unwrap();
@@ -322,8 +328,8 @@ mod tests {
     fn evidence_revision_refreshes_observations_without_dirtying_geometry() {
         let repository = Repository::temporary().unwrap();
         let cells = BTreeSet::from([[0, 0, 0], [35, 1, 2]]);
-        let first = install(&repository, &cells, 0.05, 1, None);
-        let second = install(&repository, &cells, 0.05, 2, Some(&first));
+        let first = install_revisioned(&repository, &cells, 0.05, 1, None);
+        let second = install_revisioned(&repository, &cells, 0.05, 2, Some(&first));
         let mut reader = reader(repository);
         let old = reader.observations(&first, None).unwrap();
         let next = reader.observations(&second, Some((&first, &old))).unwrap();
@@ -343,7 +349,7 @@ mod tests {
     #[test]
     fn reliable_block_reply_must_echo_exact_scope_and_bounded_bytes() {
         let repository = Repository::temporary().unwrap();
-        let root = install(&repository, &BTreeSet::from([[0, 0, 0]]), 0.05, 1, None);
+        let root = install_revisioned(&repository, &BTreeSet::from([[0, 0, 0]]), 0.05, 1, None);
         let reference = &root.blocks[0];
         let request = block_request(&root, reference);
         let bytes = repository.read_object(reference.object, MAX_BLOCK_BYTES).unwrap();
@@ -426,22 +432,22 @@ mod tests {
             .flat_map(|x| (-12..12).flat_map(move |y| [[x, y, 0], [x, y, 50]]))
             .collect();
         for size in [0.1, 0.13] {
-            let first = install(&repository, &cells, 0.05, 1, None);
+            let first = install_revisioned(&repository, &cells, 0.05, 1, None);
             let (updates, read) = reader.columns(&first, None, size).unwrap();
             assert_eq!(read, cells.len());
             assert_columns(&updates, &cells, 0.05, size);
             cells.remove(&[-32, 0, 0]);
             cells.insert([-33, 0, 8]);
-            let second = install(&repository, &cells, 0.05, 2, Some(&first));
+            let second = install_revisioned(&repository, &cells, 0.05, 2, Some(&first));
             let (updates, read) = reader.columns(&second, Some(&first), size).unwrap();
             assert!(read < cells.len());
             assert_columns(&updates, &cells, 0.05, size);
-            let third = install(&repository, &cells, 0.05, 3, Some(&second));
+            let third = install_revisioned(&repository, &cells, 0.05, 3, Some(&second));
             let (updates, read) = reader.columns(&third, Some(&second), size).unwrap();
             assert!(updates.is_empty());
             assert_eq!(read, 0);
             cells.retain(|key| block_key(*key) != [-2, 0, 0]);
-            let fourth = install(&repository, &cells, 0.05, 4, Some(&third));
+            let fourth = install_revisioned(&repository, &cells, 0.05, 4, Some(&third));
             let (updates, _) = reader.columns(&fourth, Some(&third), size).unwrap();
             assert_columns(&updates, &cells, 0.05, size);
             assert!(updates.iter().any(|u| u.cells.is_empty()));
@@ -465,7 +471,7 @@ mod tests {
             let mut keys:BTreeSet<Key>=(-100..100).flat_map(|x|(-50..100).map(move|y|[x,y,-1])).collect();
             keys.extend((0..4).flat_map(|x|(-50..100).filter(move|&y|y<0||y>=gap)
                 .flat_map(move|y|(0..80).map(move|z|[x,y,z]))));
-            let root=install(&repository,&keys,0.01,revision,previous.as_ref().map(|(root,_)| root));
+            let root=install_revisioned(&repository,&keys,0.01,revision,previous.as_ref().map(|(root,_)| root));
             let observations=reader.observations(&root,previous.as_ref().map(|(root,grid)|(root,grid))).unwrap();
             let (updates,count)=reader.columns(&root,previous.as_ref().map(|(root,_)|root),0.1).unwrap();
             let built=builder.build_column_updates(&updates,0.01,previous.is_none(),count).unwrap();
@@ -560,9 +566,9 @@ mod tests {
             let mut cells: BTreeSet<_> = (0..far)
                 .flat_map(|x| (0..8).map(move |y| [x, y, 0]))
                 .collect();
-            let first = install(&repository, &cells, 0.05, 1, None);
+            let first = install_revisioned(&repository, &cells, 0.05, 1, None);
             cells.insert([10, 2, 2]);
-            let next = install(&repository, &cells, 0.05, 2, Some(&first));
+            let next = install_revisioned(&repository, &cells, 0.05, 2, Some(&first));
             let (_, count) = reader.columns(&next, Some(&first), 0.1).unwrap();
             reads.push(count);
         }

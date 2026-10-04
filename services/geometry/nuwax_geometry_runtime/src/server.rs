@@ -3721,6 +3721,9 @@ fn validate_cloud_checkpoint_metadata(
     checkpoint: &CloudMapCheckpoint,
     expected_map_frame_id: &str,
 ) -> Result<(), String> {
+    if checkpoint.member_identity.is_some() {
+        return Err("assigned cloud member cannot enter legacy checkpoint validation".into());
+    }
     let frame_id = checkpoint.frame_id.trim();
     if frame_id != expected_map_frame_id {
         return Err(format!(
@@ -3983,6 +3986,8 @@ fn validate_assigned_mapping_checkpoint(checkpoint: &MappingBackendCheckpoint, e
     if payload.len() < 16 || &payload[..8] != b"NWMBCKP\0" || payload[8..12] != 1_u32.to_le_bytes() || payload[12] != kind || payload[13..16] != [0; 3] {
         return Err("backend payload format/schema differs from its envelope".into());
     }
+    validate_checkpoint_member_binding(checkpoint, checkpoint.backend_identity.as_ref().ok_or("backend member identity required")?, CheckpointMemberRole::BackendState)?;
+    validate_checkpoint_member_binding(checkpoint, checkpoint.occupancy_identity.as_ref().ok_or("occupancy member identity required")?, CheckpointMemberRole::CanonicalOccupancy)?;
     let cloud = checkpoint.canonical_cloud_checkpoint.as_ref().unwrap();
     if cloud.payload_schema_version != 2 || !cloud.xyz_sha256.is_empty() { return Err("mixed canonical cloud identity generation".into()); }
     validate_checkpoint_member_binding(checkpoint, cloud.member_identity.as_ref().ok_or("cloud member identity required")?, CheckpointMemberRole::CanonicalCloud)?;
@@ -4009,11 +4014,14 @@ fn assemble_mapping_checkpoint_export(mut checkpoint: MappingBackendCheckpoint, 
         let cloud_receipt = checkpoint.cloud_receipt.as_ref().ok_or("cloud receipt required")?;
         let cloud = checkpoint.canonical_cloud_checkpoint.as_mut().ok_or("canonical cloud required")?;
         if !cloud.xyz_sha256.is_empty() || cloud.member_identity.is_some() { return Err("cloud assembly requires unfingerprinted canonical bytes".into()); }
+        if checkpoint.backend_identity.is_some() || checkpoint.occupancy_identity.is_some() { return Err("assembly requires unassigned backend/occupancy members".into()); }
+        checkpoint.backend_identity = Some(checkpoint_member_identity(&checkpoint.checkpoint_id, CheckpointMemberRole::BackendState, occupancy, cloud_receipt, &cloud.frame_id, None));
+        checkpoint.occupancy_identity = Some(checkpoint_member_identity(&checkpoint.checkpoint_id, CheckpointMemberRole::CanonicalOccupancy, occupancy, cloud_receipt, &cloud.frame_id, None));
         cloud.payload_schema_version = 2;
         cloud.member_identity = Some(checkpoint_member_identity(&checkpoint.checkpoint_id, CheckpointMemberRole::CanonicalCloud, occupancy, cloud_receipt, &cloud.frame_id, None));
         validate_assigned_mapping_checkpoint(&checkpoint, expected_backend)?;
     } else {
-        if !checkpoint.checkpoint_id.is_empty() || checkpoint.backend_payload_schema_version != 0 { return Err("legacy assembly received assigned identity".into()); }
+        if !checkpoint.checkpoint_id.is_empty() || checkpoint.backend_payload_schema_version != 0 || checkpoint.backend_identity.is_some() || checkpoint.occupancy_identity.is_some() { return Err("legacy assembly received assigned identity".into()); }
         checkpoint.content_sha256 = crate::map_checksum::sha256_bytes(&checkpoint.payload).to_vec();
         let cloud = checkpoint.canonical_cloud_checkpoint.as_mut().ok_or("canonical cloud required")?;
         cloud.payload_schema_version = crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION;
@@ -4029,7 +4037,7 @@ fn validate_mapping_backend_checkpoint(
     checkpoint: &MappingBackendCheckpoint,
     expected_backend: crate::mapping_backend::MappingBackendKind,
 ) -> Result<(), String> {
-    if !checkpoint.checkpoint_id.is_empty() || checkpoint.backend_payload_schema_version != 0 {
+    if !checkpoint.checkpoint_id.is_empty() || checkpoint.backend_payload_schema_version != 0 || checkpoint.backend_identity.is_some() || checkpoint.occupancy_identity.is_some() {
         return Err("assigned checkpoint requires its paired v2 consumer".into());
     }
     if let Some(dense) = &checkpoint.dense_cloud_artifact {
@@ -6361,6 +6369,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                     dense_cloud_artifact,
                     checkpoint_id,
                     backend_payload_schema_version: 0,
+                    backend_identity: None, occupancy_identity: None,
                 };
                 return assemble_mapping_checkpoint_export(checkpoint, envelope_version, backend_kind).map_err(Status::internal);
             }
@@ -11530,6 +11539,7 @@ mod lifecycle_tests {
             target_kind: String::new(),
             checkpoint_id: String::new(),
             backend_payload_schema_version: 0,
+            backend_identity: None, occupancy_identity: None,
         }
     }
 
@@ -18031,6 +18041,28 @@ fn assigned_v2_native_wire_and_frozen_assembly_keep_exact_ids_bytes_and_payload_
     assert_eq!(cloud.xyz_f32_le,original.canonical_cloud_checkpoint.unwrap().xyz_f32_le);assert_eq!(cloud.payload_schema_version,2);
     let encoded=checkpoint.encode_to_vec();assert_eq!(MappingBackendCheckpoint::decode(encoded.as_slice()).unwrap(),checkpoint);
     assert!(validate_mapping_backend_checkpoint(&checkpoint,crate::mapping_backend::MappingBackendKind::Voxel).is_err());
+}
+#[test]
+fn assigned_v2_backend_and_occupancy_members_require_exact_parent_binding() {
+    let valid = assemble_mapping_checkpoint_export(frozen(), 2, crate::mapping_backend::MappingBackendKind::Voxel).unwrap();
+    for backend in [true, false] {
+        for mutation in 0..7 {
+            let mut bad = valid.clone();
+            let field = if backend { &mut bad.backend_identity } else { &mut bad.occupancy_identity };
+            if mutation == 0 { *field = None; } else {
+                let member = field.as_mut().unwrap();
+                match mutation {
+                    1 => member.role = CheckpointMemberRole::CanonicalCloud as i32,
+                    2 => member.checkpoint_id = "b".repeat(32),
+                    3 => member.frame_id = "odom".into(),
+                    4 => member.producer_generation = 8,
+                    5 => member.occupancy_receipt.as_mut().unwrap().occupancy_revision += 1,
+                    _ => member.cloud_receipt.as_mut().unwrap().cloud_revision += 1,
+                }
+            }
+            assert!(validate_assigned_mapping_checkpoint(&bad, crate::mapping_backend::MappingBackendKind::Voxel).is_err(), "backend={backend} mutation={mutation}");
+        }
+    }
 }
 #[test]
 fn assigned_v2_assembly_rejects_mixed_fields_source_geometry_and_backend_format() {

@@ -272,6 +272,9 @@ message GraphArtifactTransferResponse {
   bytes data = 4;
 }
 
+// One assigned ID owns one immutable finalized asset; replacement assigns a new ID.
+message AssetIdentityV2 { string asset_id = 1; }
+
 message MappingBackendCheckpoint {
   uint32 schema_version = 1;
   string backend_kind = 2;
@@ -291,6 +294,8 @@ message MappingBackendCheckpoint {
   GraphArtifactRef dense_cloud_artifact = 16;
   string checkpoint_id = 17;
   uint32 backend_payload_schema_version = 18;
+  CheckpointMemberIdentity backend_identity = 19;
+  CheckpointMemberIdentity occupancy_identity = 20;
 }
 
 message ActivateMapRequest {

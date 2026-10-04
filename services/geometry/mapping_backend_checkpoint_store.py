@@ -149,6 +149,8 @@ class MappingBackendCheckpoint:
     fine_reference: Optional[CheckpointArtifactReference] = None
     dense_reference: Optional[CheckpointArtifactReference] = None
     cloud_identity: Optional[CheckpointMemberIdentity] = None
+    backend_identity: Optional[CheckpointMemberIdentity] = None
+    occupancy_identity: Optional[CheckpointMemberIdentity] = None
     _admission: object = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self):
@@ -627,7 +629,7 @@ class MappingBackendCheckpointStore:
             content_sha256 = b""
             _validate_backend_payload_header(payload, backend_kind)
         else:
-            if checkpoint.checkpoint_id or checkpoint.cloud_identity is not None:
+            if checkpoint.checkpoint_id or checkpoint.cloud_identity is not None or checkpoint.backend_identity is not None or checkpoint.occupancy_identity is not None:
                 raise MappingBackendCheckpointValidationError("legacy checkpoint cannot carry assigned identity")
             content_sha256 = _require_sha256_bytes(checkpoint.content_sha256)
             if legacy_write and payload_digest(payload) != content_sha256:
@@ -1646,11 +1648,6 @@ def _validate_assigned_id(value, name):
     return value
 
 
-def _natural_identity(checkpoint, role, frame):
-    return CheckpointMemberIdentity(checkpoint.checkpoint_id, role, checkpoint.occupancy_receipt,
-        checkpoint.cloud_receipt, frame)
-
-
 def _validate_member_identity(identity, *, checkpoint=None, role=None, frame=None):
     if not isinstance(identity, CheckpointMemberIdentity):
         raise MappingBackendCheckpointValidationError("member identity is required")
@@ -1753,6 +1750,10 @@ def _validate_canonical_members(checkpoint, occupancy, cloud):
     for offset in range(0, len(xyz), 65536 * 12):
         if any(not math.isfinite(value) for point in struct.iter_unpack("<fff", xyz[offset:offset + 65536 * 12]) for value in point):
             raise MappingBackendCheckpointValidationError("canonical cloud contains non-finite XYZ")
+    _validate_member_identity(checkpoint.backend_identity, checkpoint=checkpoint,
+        role="backend_state", frame=occupancy["frame_id"])
+    _validate_member_identity(checkpoint.occupancy_identity, checkpoint=checkpoint,
+        role="canonical_occupancy", frame=occupancy["frame_id"])
     _validate_member_identity(checkpoint.cloud_identity, checkpoint=checkpoint,
         role="canonical_cloud", frame=cloud["frame_id"])
     for role, reference in (("fine_map", checkpoint.fine_reference), ("dense_cloud", checkpoint.dense_reference)):
@@ -1827,8 +1828,8 @@ def _member_maximum(role, backend_maximum):
 def _v2_manifest(checkpoint, occupancy, cloud):
     members, references = {}, {}
     for role, suffix, payload, identity, artifact in (
-        ("backend_state", "backend", checkpoint.payload, _natural_identity(checkpoint, "backend_state", occupancy["frame_id"]), None),
-        ("canonical_occupancy", "occupancy", checkpoint.canonical_occupancy_data, _natural_identity(checkpoint, "canonical_occupancy", occupancy["frame_id"]), None),
+        ("backend_state", "backend", checkpoint.payload, checkpoint.backend_identity, None),
+        ("canonical_occupancy", "occupancy", checkpoint.canonical_occupancy_data, checkpoint.occupancy_identity, None),
         ("canonical_cloud", "cloud", checkpoint.canonical_cloud_xyz, checkpoint.cloud_identity, None),
         ("fine_map", None, checkpoint.fine_archive, checkpoint.fine_reference.member_identity if checkpoint.fine_reference else None, checkpoint.fine_reference),
         ("dense_cloud", None, checkpoint.dense_archive, checkpoint.dense_reference.member_identity if checkpoint.dense_reference else None, checkpoint.dense_reference)):
@@ -1909,7 +1910,9 @@ def _v2_manifest_metadata(document, checkpoint_id, backend_kind):
             raise MappingBackendCheckpointValidationError("member path is unsafe, duplicated or noncanonical")
         paths.add(expected_path)
     checkpoint = replace(checkpoint, fine_reference=refs.get("fine_map"), dense_reference=refs.get("dense_cloud"),
-        cloud_identity=_identity_from_document(members["canonical_cloud"]["identity"]))
+        cloud_identity=_identity_from_document(members["canonical_cloud"]["identity"]),
+        backend_identity=_identity_from_document(members["backend_state"]["identity"]),
+        occupancy_identity=_identity_from_document(members["canonical_occupancy"]["identity"]))
     _validate_asset_bindings(checkpoint, occupancy, cloud)
     return checkpoint, occupancy, cloud, members
 

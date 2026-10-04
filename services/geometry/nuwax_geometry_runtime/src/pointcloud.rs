@@ -65,7 +65,7 @@ const CM_PAYLOAD_OFFSET: usize = (CM_HEADER_SIZE + CM_CAPACITY_CHUNKS * 8).div_c
 pub(crate) const CM_TOTAL_SIZE: usize = CM_PAYLOAD_OFFSET + CM_MAX_POINTS * CM_POINT_SIZE_BYTES;
 pub(crate) const CM_POINT_SIZE_BYTES: usize = 12;
 const CM_MAX_POINTS: usize = CM_SINGLE_BUFFER_SIZE / CM_POINT_SIZE_BYTES;
-const MAX_VOXEL_SIZE: f32 = 1_048_576.0;
+pub(crate) const MAX_VOXEL_SIZE: f32 = 1_048_576.0;
 
 type VoxelKey = (i32, i32, i32);
 

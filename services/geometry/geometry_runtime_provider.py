@@ -378,13 +378,31 @@ def _cloud_receipt_dict(message) -> Dict[str, object]:
     }
 
 
+def _validate_checkpoint_identity_envelope(response):
+    """Reject known wire skew before downloading any optional artifact bodies."""
+    if int(response.schema_version) == 2:
+        _require_proto_message_field(response, "backend_identity")
+        _require_proto_message_field(response, "occupancy_identity")
+        cloud = _require_proto_message_field(response, "canonical_cloud_checkpoint")
+        _require_proto_message_field(cloud, "member_identity")
+        if response.content_sha256 or cloud.xyz_sha256:
+            raise ValueError("assigned checkpoint cannot carry legacy digests")
+        return
+    if int(response.schema_version) != 1:
+        raise ValueError("unsupported checkpoint envelope schema")
+    if (response.checkpoint_id or response.backend_payload_schema_version
+            or response.HasField("backend_identity") or response.HasField("occupancy_identity")
+            or (response.HasField("canonical_cloud_checkpoint")
+                and response.canonical_cloud_checkpoint.HasField("member_identity"))):
+        raise ValueError("legacy checkpoint cannot carry assigned identity fields")
+
+
 def _checkpoint_export_bundle_from_proto(
     response, payload=None, fine_payload=None, dense_payload=None,
 ) -> MappingBackendCheckpointExportBundle:
+    _validate_checkpoint_identity_envelope(response)
     if int(response.schema_version) == 2:
         return _checkpoint_export_bundle_v2(response, payload, fine_payload, dense_payload)
-    if int(response.schema_version) != 1:
-        raise ValueError("unsupported checkpoint envelope schema")
     if str(response.backend_kind) == "slam_toolbox":
         if fine_payload is not None or dense_payload is not None:
             raise ValueError("二维导出不能携带精细三维资产")
@@ -668,7 +686,9 @@ def _checkpoint_export_bundle_v2(response, payload, fine_payload, dense_payload)
         fine_archive=fine_payload, dense_archive=dense_payload, checkpoint_id=response.checkpoint_id, target_kind=response.target_kind,
         backend_payload_schema_version=response.backend_payload_schema_version, canonical_occupancy_data=bytes(occupancy.data),
         canonical_cloud_xyz=bytes(cloud.xyz_f32_le), fine_reference=fine_reference, dense_reference=dense_reference,
-        cloud_identity=_member_identity_from_proto(_require_proto_message_field(cloud, "member_identity")))
+        cloud_identity=_member_identity_from_proto(_require_proto_message_field(cloud, "member_identity")),
+        backend_identity=_member_identity_from_proto(_require_proto_message_field(response, "backend_identity")),
+        occupancy_identity=_member_identity_from_proto(_require_proto_message_field(response, "occupancy_identity")))
     occupancy_asset = dict(raw_data_size=len(checkpoint.canonical_occupancy_data), width=int(meta.width), height=int(meta.height),
         resolution=float(meta.resolution), origin_x=float(meta.origin_x), origin_y=float(meta.origin_y), frame_id=str(meta.frame_id),
         source_occupancy_revision=int(meta.revision), timestamp_ns=int(meta.timestamp_ns))
@@ -709,7 +729,9 @@ def _mapping_backend_checkpoint_v2_proto(stored, *, graph_artifact=None, fine_ma
         canonical_cloud_checkpoint=_canonical_cloud_from_stored(checkpoint, stored.cloud_asset),
         fine_map_artifact=_artifact_reference_proto(checkpoint.fine_reference) if checkpoint.fine_reference else None,
         dense_cloud_artifact=_artifact_reference_proto(checkpoint.dense_reference) if checkpoint.dense_reference else None,
-        target_kind=checkpoint.target_kind)
+        target_kind=checkpoint.target_kind,
+        backend_identity=_member_identity_proto(checkpoint.backend_identity),
+        occupancy_identity=_member_identity_proto(checkpoint.occupancy_identity))
 
 
 def _canonical_string_bytes(value: str) -> bytes:
@@ -5004,6 +5026,7 @@ class GeometryRuntimeProvider:
             ) from exc
         if response.schema_version != checkpoint_schema_version:
             raise ValueError("server returned a different checkpoint schema; downgrade is forbidden")
+        _validate_checkpoint_identity_envelope(response)
         payload = self._download_graph_artifact(_require_proto_message_field(response, "graph_artifact")) if response.backend_kind == "slam_toolbox" else None
         fine_payload = self._download_graph_artifact(response.fine_map_artifact, MAX_FINE_ARCHIVE_BYTES, validate_structure=checkpoint_schema_version != 2) if response.HasField("fine_map_artifact") else None
         dense_payload = self._download_graph_artifact(response.dense_cloud_artifact, MAX_DENSE_ARCHIVE_BYTES, validate_structure=checkpoint_schema_version != 2) if response.HasField("dense_cloud_artifact") else None

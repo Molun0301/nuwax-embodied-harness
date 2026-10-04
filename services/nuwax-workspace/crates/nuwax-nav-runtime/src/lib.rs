@@ -734,6 +734,8 @@ impl NavMotionPort for ProductionNavMotionPort {
 pub enum PlannerStep {
     /// Continue controlling with this twist.
     Command(Twist2),
+    /// No admitted control result yet; retain route/goal and the existing wait deadline.
+    Pending(Vec<nuwax_nav_scan::LocalPlanError>),
     /// Goal arrival detected.
     Succeeded,
     /// Planner cannot safely continue.
@@ -753,6 +755,7 @@ struct LocalExecutionCommandIntent {
 #[derive(Debug, Clone, PartialEq)]
 enum LocalExecutionPayload {
     Command(Twist2),
+    Pending(Vec<nuwax_nav_scan::LocalPlanError>),
     Succeeded,
     Failed(String),
     ReplanRequired(String),
@@ -1564,6 +1567,14 @@ where
                 self.path_wait_started_at = None;
                 Ok(())
             }
+            LocalExecutionPayload::Pending(failures) => {
+                self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
+                self.path_wait_started_at.get_or_insert_with(Instant::now);
+                self.status.message = self.planner.execution_wait_reason().unwrap_or_else(||
+                    format!("局部轨迹待定，保持零速等待: {failures:?}"));
+                self.publish_status(status_tx);
+                self.check_path_wait_timeout(status_tx).await
+            }
             LocalExecutionPayload::ReplanRequired(reason) => {
                 self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
                 self.planner.stop();
@@ -1655,6 +1666,7 @@ where
             })?;
         let payload = match step {
             PlannerStep::Command(twist) => LocalExecutionPayload::Command(twist),
+            PlannerStep::Pending(failures) => LocalExecutionPayload::Pending(failures),
             PlannerStep::Succeeded => LocalExecutionPayload::Succeeded,
             PlannerStep::Failed(reason) => LocalExecutionPayload::Failed(reason),
             PlannerStep::ReplanRequired(reason) => LocalExecutionPayload::ReplanRequired(reason),
@@ -1708,6 +1720,13 @@ where
                 return Ok(());
             }
         }
+        self.check_path_wait_timeout(status_tx).await
+    }
+
+    async fn check_path_wait_timeout(
+        &mut self,
+        status_tx: &watch::Sender<SchedulerStatus>,
+    ) -> Result<(), RuntimeError> {
         let Some(started_at) = self.path_wait_started_at else {
             let error = RuntimeError::Planner("awaiting path without a deadline".into());
             return Err(self.fail_closed(status_tx, error).await);
@@ -3823,6 +3842,63 @@ mod tests {
         })
         .await
         .expect("调度阶段等待超时");
+    }
+
+    #[tokio::test]
+    async fn worker_pending_keeps_original_wait_deadline_goal_and_route_then_times_out() {
+        struct BlockedPending {
+            release: Option<std::sync::mpsc::Receiver<()>>,
+        }
+        impl NavPlanner for BlockedPending {
+            fn replace_path(&mut self, _: Path2D) {}
+            fn update_odometry(&mut self, _: PoseStamped) {}
+            fn update_costmap(&mut self, _: CostMap2D) {}
+            fn step(&mut self, _: f64) -> PlannerStep {
+                if let Some(release) = self.release.take() { release.recv().unwrap(); }
+                PlannerStep::Pending(vec![nuwax_nav_scan::LocalPlanError {
+                    kind: nuwax_nav_scan::LocalPlanFailureKind::BudgetExhausted,
+                    reason: "finite search budget".into(), closest_pose: None, blocked: None,
+                }])
+            }
+            fn execution_wait_reason(&self) -> Option<String> { Some("typed search pending".into()) }
+            fn stop(&mut self) {}
+        }
+        let (release, receive) = std::sync::mpsc::channel();
+        let worker = crate::planner_worker::PlannerWorker::new(BlockedPending { release: Some(receive) }).unwrap();
+        let mut scheduler = NavScheduler::new(
+            FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))), worker,
+            SchedulerConfig { path_wait_timeout: Duration::from_secs(2), ..SchedulerConfig::default() }).unwrap();
+        let (sender, _) = watch::channel(scheduler.status.clone());
+        scheduler.observe_odometry(&sender, map_pose(), None).unwrap();
+        scheduler.observe_costmap(&sender, costmap_at(1_000_000_000), Instant::now()).unwrap();
+        scheduler.start_session(&sender, session()).await.unwrap();
+        let original_deadline = scheduler.path_wait_started_at;
+        scheduler.submit_path(&sender, path()).await.unwrap();
+        let identity = scheduler.current_execution_identity.clone();
+        let route = scheduler.current_path.clone();
+        // Worker is still computing: this must not be Command(ZERO), which clears the timer.
+        scheduler.control_tick(&sender).await.unwrap();
+        // Release before assertions so a failed assertion cannot strand the worker on drop.
+        release.send(()).unwrap();
+        assert_eq!(scheduler.path_wait_started_at, original_deadline);
+        assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            scheduler.control_tick(&sender).await.unwrap();
+            assert_eq!(scheduler.path_wait_started_at, original_deadline);
+            assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
+            assert_eq!(scheduler.current_execution_identity, identity);
+            assert_eq!(scheduler.current_path, route);
+            assert!(scheduler.session.is_some());
+            assert_eq!(scheduler.status.phase, SchedulerPhase::Controlling);
+            if scheduler.status.message == "typed search pending" { break; }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(3));
+        scheduler.control_tick(&sender).await.unwrap();
+        assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
+        assert!(scheduler.status.last_zero_ack_id.is_some());
     }
 
     #[tokio::test]

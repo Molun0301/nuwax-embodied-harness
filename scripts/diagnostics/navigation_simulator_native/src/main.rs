@@ -873,6 +873,10 @@ impl Simulation {
         let mut arriving = false;
         match step {
             PlannerStep::Command(command) => self.command = velocity(command),
+            PlannerStep::Pending(failures) => {
+                self.command = [0.; 3];
+                self.message = format!("局部轨迹待定，保持原目标和路线: {failures:?}");
+            }
             PlannerStep::Succeeded => {
                 self.command = [0.; 3];
                 arriving = true;

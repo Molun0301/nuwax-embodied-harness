@@ -135,7 +135,8 @@ impl PlannerWorker {
                         Ok(planner.step(width))
                     })()
                     .unwrap_or_else(|error| PlannerStep::ReplanRequired(error.to_string()));
-                    let wait_reason = if matches!(computed, PlannerStep::Command(command) if command == Twist2::ZERO) {
+                    let wait_reason = if matches!(computed, PlannerStep::Pending(_))
+                        || matches!(computed, PlannerStep::Command(command) if command == Twist2::ZERO) {
                         planner.execution_wait_reason()
                     } else { None };
                     let display_path = if matches!(computed, PlannerStep::Command(_)) {
@@ -313,7 +314,7 @@ impl NavPlanner for PlannerWorker {
         } else {
             Some("局部轨迹正在计算，保持零速等待".into())
         };
-        ready.unwrap_or(PlannerStep::Command(Twist2::ZERO))
+        ready.unwrap_or(PlannerStep::Pending(Vec::new()))
     }
     fn local_path_for_display(&self) -> Vec<[f64; 3]> {
         self.shared.0.lock().unwrap().display_path.clone()
@@ -523,7 +524,7 @@ mod tests {
     }
     fn assert_blocked_route_computation(computed: &RouteComputation, harness: &RouteWorkerHarness, map_changed: bool, local_planning_enabled: bool) {
         assert!(matches!(computed.outcome, PlannerStep::Command(command) if command == Twist2::ZERO)
-            || matches!(computed.outcome, PlannerStep::ReplanRequired(_)),
+            || matches!(computed.outcome, PlannerStep::Pending(_) | PlannerStep::ReplanRequired(_)),
             "the real follower must not move through the replacement source: {:?}", computed.outcome);
         assert_eq!(computed.odometry.stamp.nanos, route_pose(0.5, 1).stamp.nanos);
         assert_eq!(Arc::ptr_eq(&computed.map, &harness.clear), !map_changed);
@@ -557,7 +558,7 @@ mod tests {
                     // source fence, not wall-clock expiry, can make this pass.
                     input.result.as_mut().unwrap().0 = std::time::Instant::now();
                 }
-                assert_eq!(harness.worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+                assert_eq!(harness.worker.step(0.3), PlannerStep::Pending(Vec::new()));
                 assert!(harness.worker.execution_wait_reason().unwrap().contains("地图或边界"));
                 assert!(harness.worker.local_path_for_display().is_empty());
             }
@@ -608,10 +609,10 @@ mod tests {
             // It cannot change the goal/path epoch and therefore cannot mask a
             // broken cancellation fence with replacement-goal invalidation.
             let cancelled_epoch = harness.worker.shared.0.lock().unwrap().epoch;
-            assert_eq!(harness.worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+            assert_eq!(harness.worker.step(0.3), PlannerStep::Pending(Vec::new()));
             harness.release.send(()).unwrap();
             let cancelled = harness.next_computation();
-            assert!(matches!(cancelled.outcome, PlannerStep::ReplanRequired(_))
+            assert!(matches!(cancelled.outcome, PlannerStep::Pending(_) | PlannerStep::ReplanRequired(_))
                 || matches!(cancelled.outcome, PlannerStep::Command(command) if command == Twist2::ZERO));
             assert_eq!(cancelled.goal_updates, 1);
             assert_eq!(cancelled.path_updates, 1);
@@ -639,7 +640,7 @@ mod tests {
                 poses: vec![start, route_pose(1.5, 1), goal.clone()],
             }), None, goal).unwrap();
             assert!(harness.worker.shared.0.lock().unwrap().epoch > old_epoch);
-            assert_eq!(harness.worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+            assert_eq!(harness.worker.step(0.3), PlannerStep::Pending(Vec::new()));
             harness.release.send(()).unwrap();
             let replacement = harness.next_computation();
             assert_positive_route_computation(&replacement, local_planning_enabled);
@@ -730,7 +731,7 @@ mod tests {
             assert!(matches!(input.result.as_ref().unwrap().1, PlannerStep::Command(t) if t.linear.x > 0.0));
             input.result.as_mut().unwrap().0 = std::time::Instant::now();
         }
-        assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
         assert!(worker.execution_wait_reason().unwrap().contains("地图或边界"));
         worker.stop();
         release.send(()).unwrap();
@@ -795,7 +796,7 @@ mod tests {
                     if map_changed { input.map_version += 1; }
                     else { input.boundary_version += 1; }
                 }
-                assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+                assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
             }
         }
         worker.stop();
@@ -848,14 +849,14 @@ mod tests {
             fn replace_path(&mut self, _: Path2D) {}
             fn update_odometry(&mut self, _: PoseStamped) {}
             fn update_costmap(&mut self, _: CostMap2D) {}
-            fn step(&mut self, _: f64) -> PlannerStep { PlannerStep::Command(Twist2::ZERO) }
+            fn step(&mut self, _: f64) -> PlannerStep { PlannerStep::Pending(Vec::new()) }
             fn execution_wait_reason(&self) -> Option<String> { Some("等待当前足下支撑恢复".into()) }
             fn stop(&mut self) {}
         }
         let mut worker = PlannerWorker::new(WaitingPlanner).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         loop {
-            assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+            assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
             if worker.execution_wait_reason().as_deref() == Some("等待当前足下支撑恢复") { break; }
             assert!(std::time::Instant::now() < deadline, "计算线程必须交付实际等待原因");
             std::thread::sleep(Duration::from_millis(1));
@@ -887,7 +888,7 @@ mod tests {
             std::time::Instant::now() - DEFAULT_CONTROL_HORIZON - Duration::from_millis(1),
             PlannerStep::Command(Twist2 { linear: nuwax_nav_types_messages::Point2::new(0.2, 0.0), angular_z: 0.0 }),
         ));
-        assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO),
+        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()),
             "传播慢查询结论不能延长速度许可");
         assert!(worker.execution_wait_reason().unwrap().contains("过期"));
     }
@@ -911,7 +912,7 @@ mod tests {
             "同位姿新时间戳不应阻断已确认的位置到达");
         pose.pose.position.x += 0.5;
         worker.update_odometry(pose);
-        assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO),
+        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()),
             "移动后不能沿旧位置报告成功");
         assert!(worker.execution_wait_reason().unwrap().contains("到达状态"));
     }
@@ -1046,7 +1047,7 @@ mod tests {
             release: release.clone(),
         })
         .unwrap();
-        assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
@@ -1089,7 +1090,7 @@ mod tests {
         release.store(true, Ordering::SeqCst);
         assert_eq!(
             stale,
-            PlannerStep::Command(Twist2::ZERO),
+            PlannerStep::Pending(Vec::new()),
             "不能无限重放旧速度"
         );
     }

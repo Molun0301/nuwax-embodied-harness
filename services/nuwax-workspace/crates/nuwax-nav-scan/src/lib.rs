@@ -45,8 +45,18 @@ impl ScanConfig {
         Ok(())
     }
 }
-#[derive(Clone, Debug)]
+/// A finite local search is not a proof of physical infeasibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalPlanFailureKind {
+    BudgetExhausted,
+    SearchExhausted,
+    Unclassified,
+}
+#[derive(Clone, Debug, PartialEq)]
 pub struct LocalPlanError {
+    pub kind: LocalPlanFailureKind,
+    /// Closest explored pose, diagnostic only; never an obstacle measurement.
+    pub closest_pose: Option<BodyPose>,
     pub reason: String,
     pub blocked: Option<[f64; 3]>,
 }
@@ -59,6 +69,8 @@ impl From<String> for LocalPlanError {
     fn from(reason: String) -> Self {
         Self {
             reason,
+            kind: LocalPlanFailureKind::Unclassified,
+            closest_pose: None,
             blocked: None,
         }
     }
@@ -574,7 +586,7 @@ pub fn plan(
                 "样条：{}；折线：{polyline}；{local}",
                 failures.first().map_or("未生成", String::as_str)
             ),
-            blocked: local.blocked.or(blocked.get()),
+            ..local
         })?
         },
     };
@@ -803,6 +815,77 @@ mod tests {
         )
         .is_err());
     }
+    fn coarse_open_floor() -> SurfaceSnapshot {
+        let points: Vec<_> = (-15..20).flat_map(|x| (-8..15).map(move |y|
+            ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,-0.05))).collect();
+        let config = Config { world_frame: "map".into(), voxel_size: 0.1, robot_height: 0.55,
+            surface_closing_radius: 0.0, node_spacing_m: 0.3, wall_clearance_m: 0.0,
+            wall_buffer_m: 0.1, wall_buffer_weight: 2.0, max_slope_deg: 18.0,
+            step_threshold_m: 0.2, min_step_tread_depth_m: 0.2, step_penalty_weight: 1.0,
+            goal_tolerance: 0.1, viz_publish_hz: 0.0 };
+        SurfaceSnapshot::from_points(&points,config,0.1).unwrap().with_body_envelope(SurfaceBodyEnvelope {
+            footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+            z_bounds_m: [-0.1,0.1], body_to_support_z_m: 0.4,
+            max_step_up_m: 0.2, max_step_down_m: 0.2, max_cross_slope_deg: 18.0,
+            support_uncertainty_m: 0.0,
+        }).unwrap()
+    }
+    #[test]
+    fn reduced_budget_open_floor_search_has_diagnostics_not_obstruction() {
+        let map = coarse_open_floor();
+        let tomo = Tomogram::from_surface(&map).unwrap();
+        let start = ([-1.0, 0.2, 0.4], [0.0, 0.0, 0.0, 1.0]);
+        let run = || local_search::plan(&map, &tomo, start,
+            &[[-1.0,0.2,0.0], [0.1,0.2,0.0]], &motion(), None, None, &[], 3.0, 0.9, true);
+        assert!(run().is_ok(), "the unbounded fixture has an open-floor connection");
+        // Force a finite attempt using the production branch with a reduced test budget.
+        // The elevated arrival ball is unconnected, but is not an obstacle measurement.
+        let failure = local_search::with_expansion_limit(0, || local_search::plan(&map, &tomo, start,
+            &[[-1.0,0.2,0.0], [0.1,0.2,0.0]], &motion(), None,
+            Some(([0.1,0.2,2.0],0.1)), &[], 3.0, 0.9, true)).unwrap_err();
+        assert_eq!(failure.kind, LocalPlanFailureKind::BudgetExhausted);
+        assert_eq!(failure.closest_pose, Some(start));
+        assert_eq!(failure.blocked, None);
+    }
+
+    #[test]
+    fn production_expansion_limit_is_budget_exhaustion_without_physical_evidence() {
+        let map = coarse_open_floor();
+        let tomo = Tomogram::from_surface(&map).unwrap();
+        let start = ([-1.0,0.2,0.4], [0.0,0.0,0.0,1.0]);
+        // A goal ball above the only floor prevents arrival without blocking the open terrain.
+        let failure = local_search::plan(&map, &tomo, start,
+            &[[-1.0,0.2,0.0],[0.1,0.2,0.0]], &motion(), None,
+            Some(([0.1,0.2,2.0],0.1)), &[], 3.0, 0.9, true).unwrap_err();
+        assert_eq!(failure.kind, LocalPlanFailureKind::BudgetExhausted);
+        assert!(failure.closest_pose.is_some());
+        assert!(failure.blocked.is_none());
+    }
+
+    #[test]
+    fn exhausted_search_is_distinct_and_outer_projection_cannot_supply_obstruction() {
+        let map = coarse_open_floor();
+        let tomo = Tomogram::from_surface(&map).unwrap();
+        let start = ([-1.0, 0.2, 0.4], [0.0, 0.0, 0.0, 1.0]);
+        // Open terrain with a boundary excluding every outgoing motion drains the frontier.
+        let boundary = [[2.0,2.0], [3.0,2.0], [3.0,3.0], [2.0,3.0]];
+        let reference = [[-1.0,0.2,0.0], [0.1,0.2,0.0]];
+        let drained = local_search::plan(&map, &tomo, start, &reference,
+            &motion(), None, None, &boundary, 3.0, 0.9, true).unwrap_err();
+        assert_eq!(drained.kind, LocalPlanFailureKind::SearchExhausted);
+        assert!(drained.blocked.is_none());
+        let wrapped = local_search::with_expansion_limit(0, || plan(&map, &tomo, start, &reference,
+            &motion(), &ScanConfig::default(), None, None, &boundary, true, false)).unwrap_err();
+        let wrapped_drained = plan(&map, &tomo, start, &reference,
+            &motion(), &ScanConfig::default(), None, None, &boundary, true, false).unwrap_err();
+        assert_eq!(wrapped_drained.kind, LocalPlanFailureKind::SearchExhausted);
+        assert!(wrapped_drained.blocked.is_none());
+        assert_eq!(wrapped.kind, LocalPlanFailureKind::BudgetExhausted);
+        assert!(wrapped.closest_pose.is_some());
+        assert!(wrapped.blocked.is_none(), "old projection rejection must not leak into a search failure");
+        assert_eq!(LocalPlanError::from("input unavailable").kind, LocalPlanFailureKind::Unclassified);
+    }
+
     #[test]
     fn local_window_connects_to_the_forward_cross_section_on_open_ground() {
         let map = scene(None);
@@ -830,7 +913,8 @@ mod tests {
             &motion(), None, None, &[], 3.0, 0.9, true,
         );
         let failure = result.expect_err("不能把墙前的可行前缀当作完整近场接续");
-        let reached = failure.blocked.expect("应反馈搜索实际到达的接续困难位置");
+        assert!(failure.blocked.is_none(), "finite search cannot report an obstacle");
+        let reached = failure.closest_pose.expect("closest pose is diagnostic").0;
         assert!(reached[0] > -0.5 && reached[0] < 0.0, "反馈应在墙前而非原起点：{reached:?}");
     }
 

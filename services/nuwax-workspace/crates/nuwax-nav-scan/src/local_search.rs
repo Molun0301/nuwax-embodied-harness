@@ -7,6 +7,16 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
 };
+// Tests can reduce the limit but execute the identical production exhaustion branch.
+#[cfg(test)]
+thread_local! { static EXPANSION_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(256) }; }
+#[cfg(test)]
+pub(super) fn with_expansion_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T {
+    struct Reset(usize);
+    impl Drop for Reset { fn drop(&mut self) { EXPANSION_LIMIT.set(self.0); } }
+    let _reset = Reset(EXPANSION_LIMIT.replace(limit));
+    f()
+}
 type ProjectedMotion=(Vec<BodyPose>,Vec<nuwax_nav_mls_planner::SurfaceBodyQueryView>);
 struct Node {
     pose: BodyPose,
@@ -216,6 +226,11 @@ pub fn plan(
     let mut best = HashMap::from([(key(start, quantum, angular), 0.0)]);
     let mut expanded = 0;
     let mut closest = start;
+    let mut budget_exhausted = false;
+    #[cfg(not(test))]
+    let expansion_limit = 256;
+    #[cfg(test)]
+    let expansion_limit = EXPANSION_LIMIT.get();
     while let Some(Entry(_, id)) = open.pop() {
         let from = nodes[id].pose;
         let cost = nodes[id].cost;
@@ -296,7 +311,8 @@ pub fn plan(
             return Ok(path);
         }
         expanded += 1;
-        if expanded > 256 {
+        if expanded > expansion_limit {
+            budget_exhausted = true;
             break;
         }
         let fine = (f64::from(map.source_voxel_size_m()) * 0.5).clamp(0.01, 0.05);
@@ -379,13 +395,15 @@ pub fn plan(
             ));
         }
     }
-    // 搜索已经绕过早期样条失败处时，反馈实际接续困难的位置。
-    // 它只影响当前目标的有限路线代价，不将搜索预算耗尽当作永久障碍。
+    // Neither a drained discretized search nor an expansion limit proves obstruction.
     Err(LocalPlanError {
         reason: format!(
             "近场前向搜索未连通（{expanded}次展开，最近{:.3}米，姿态{closest:?}）",
             distance(closest)
         ),
-        blocked: Some(closest.0),
+        kind: if budget_exhausted { super::LocalPlanFailureKind::BudgetExhausted }
+            else { super::LocalPlanFailureKind::SearchExhausted },
+        closest_pose: Some(closest),
+        blocked: None,
     })
 }

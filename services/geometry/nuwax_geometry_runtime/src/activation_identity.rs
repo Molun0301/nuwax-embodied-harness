@@ -399,7 +399,7 @@ impl CanonicalCloudTargetV2 {
 mod tests {
     use super::*;
 
-    const CHECKPOINT_ID: &str = "00112233445566778899aabbccddeeff00";
+    const CHECKPOINT_ID: &str = "00112233445566778899aabbccddeeff";
 
     fn wire_member() -> proto::CheckpointMemberIdentity {
         let commit_id = proto::MappingCommitIdentity {

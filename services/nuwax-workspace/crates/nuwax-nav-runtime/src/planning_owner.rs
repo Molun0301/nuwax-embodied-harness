@@ -1,0 +1,290 @@
+//! One reusable CPU owner. All payload destruction and computation occurs outside
+//! the exchange lock. Slots are bounded: active + latest pending + completion.
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Condvar, Mutex,
+};
+use std::thread::JoinHandle;
+
+#[derive(Clone)]
+pub(crate) struct Cancellation {
+    pub epoch: Arc<AtomicU64>,
+    pub expected: u64,
+}
+impl Cancellation {
+    pub fn cancelled(&self) -> bool {
+        self.epoch.load(Ordering::Acquire) != self.expected
+    }
+}
+pub(crate) struct Completion<R> {
+    pub id: u64,
+    pub epoch: u64,
+    pub value: R,
+}
+struct Request<T> {
+    id: u64,
+    epoch: u64,
+    value: T,
+}
+struct Exchange<T, R> {
+    pending: Option<Request<T>>,
+    completion: Option<Completion<R>>,
+    active: bool,
+    closed: bool,
+}
+struct Shared<T, R> {
+    exchange: Mutex<Exchange<T, R>>,
+    wake: Condvar,
+    epoch: Arc<AtomicU64>,
+    fault: AtomicBool,
+    alive: AtomicBool,
+}
+pub(crate) struct PlanningOwner<T: Send + 'static, R: Send + 'static> {
+    shared: Arc<Shared<T, R>>,
+    thread: Option<JoinHandle<()>>,
+}
+impl<T: Send + 'static, R: Send + 'static> PlanningOwner<T, R> {
+    pub fn new(
+        mut compute: impl FnMut(T, &Cancellation) -> R + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let shared = Arc::new(Shared {
+            exchange: Mutex::new(Exchange {
+                pending: None,
+                completion: None,
+                active: false,
+                closed: false,
+            }),
+            wake: Condvar::new(),
+            epoch: Arc::new(AtomicU64::new(1)),
+            fault: AtomicBool::new(false),
+            alive: AtomicBool::new(true),
+        });
+        let worker = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name("nav-local-planning".into())
+            .spawn(move || {
+                // Catch the entire loop, including an unexpected implementation panic.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+                    let request = {
+                        let mut slot = worker.exchange.lock().unwrap();
+                        while !slot.closed && (slot.pending.is_none() || slot.completion.is_some())
+                        {
+                            slot = worker.wake.wait(slot).unwrap();
+                        }
+                        if slot.closed {
+                            break;
+                        }
+                        slot.active = true;
+                        slot.pending.take().unwrap()
+                    };
+                    let cancel = Cancellation {
+                        epoch: worker.epoch.clone(),
+                        expected: request.epoch,
+                    };
+                    let result = if cancel.cancelled() {
+                        None
+                    } else {
+                        Some(compute(request.value, &cancel))
+                    };
+                    let mut result = result.map(|value| Completion {
+                        id: request.id,
+                        epoch: request.epoch,
+                        value,
+                    });
+                    {
+                        let mut slot = worker.exchange.lock().unwrap();
+                        slot.active = false;
+                        if !slot.closed && !cancel.cancelled() {
+                            slot.completion = result.take();
+                        }
+                    }
+                    drop(result);
+                    worker.wake.notify_all();
+                }));
+                if outcome.is_err() {
+                    worker.fault.store(true, Ordering::Release);
+                    let retired = {
+                        let mut slot = worker.exchange.lock().unwrap_or_else(|e| e.into_inner());
+                        slot.active = false;
+                        (slot.pending.take(), slot.completion.take())
+                    };
+                    drop(retired);
+                }
+                worker.alive.store(false, Ordering::Release);
+                worker.wake.notify_all();
+            })?;
+        Ok(Self {
+            shared,
+            thread: Some(thread),
+        })
+    }
+    #[cfg(test)]
+    pub fn is_idle_for_test(&self) -> bool {
+        let s = self.shared.exchange.lock().unwrap();
+        !s.active && s.pending.is_none() && s.completion.is_none()
+    }
+    #[cfg(test)]
+    pub fn completion_ready_for_test(&self) -> bool {
+        self.shared.exchange.lock().unwrap().completion.is_some()
+    }
+    pub fn epoch(&self) -> u64 {
+        self.shared.epoch.load(Ordering::Acquire)
+    }
+    pub fn faulted(&self) -> bool {
+        self.shared.fault.load(Ordering::Acquire) || !self.shared.alive.load(Ordering::Acquire)
+    }
+    pub fn submit(&self, id: u64, value: T) -> bool {
+        if self.faulted() {
+            return false;
+        }
+        let old;
+        {
+            let mut slot = self.shared.exchange.lock().unwrap_or_else(|e| {
+                self.shared.fault.store(true, Ordering::Release);
+                e.into_inner()
+            });
+            if slot.closed || self.shared.fault.load(Ordering::Acquire) {
+                return false;
+            }
+            old = slot.pending.replace(Request {
+                id,
+                epoch: self.epoch(),
+                value,
+            });
+        }
+        drop(old);
+        self.shared.wake.notify_one();
+        true
+    }
+    pub fn take(&self) -> Option<Completion<R>> {
+        let result = self
+            .shared
+            .exchange
+            .lock()
+            .unwrap_or_else(|e| {
+                self.shared.fault.store(true, Ordering::Release);
+                e.into_inner()
+            })
+            .completion
+            .take();
+        self.shared.wake.notify_one();
+        result
+    }
+    /// Hot cancellation never joins. Epoch exhaustion fails permanently closed.
+    pub fn cancel(&self) {
+        if self
+            .shared
+            .epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
+            .is_err()
+        {
+            self.shared.fault.store(true, Ordering::Release);
+        }
+        let retired = {
+            let mut slot = self.shared.exchange.lock().unwrap_or_else(|e| {
+                self.shared.fault.store(true, Ordering::Release);
+                e.into_inner()
+            });
+            (slot.pending.take(), slot.completion.take())
+        };
+        drop(retired);
+        self.shared.wake.notify_one();
+    }
+}
+impl<T: Send + 'static, R: Send + 'static> Drop for PlanningOwner<T, R> {
+    fn drop(&mut self) {
+        self.cancel();
+        self.shared
+            .exchange
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed = true;
+        self.shared.wake.notify_one();
+        // Exactly one join, outside all locks. Individual geometry/body calls can
+        // delay teardown; no detached replacement or per-request thread exists.
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    fn wait(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !condition() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    #[test]
+    fn one_active_latest_pending_and_one_completion() {
+        let (started, starts) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let owner = PlanningOwner::new(move |n, _: &Cancellation| {
+            started.send(n).unwrap();
+            blocked.recv().unwrap();
+            n
+        })
+        .unwrap();
+        owner.submit(1, 1);
+        assert_eq!(starts.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        owner.submit(2, 2);
+        owner.submit(3, 3);
+        release.send(()).unwrap();
+        wait(|| owner.shared.exchange.lock().unwrap().completion.is_some());
+        assert!(
+            starts.try_recv().is_err(),
+            "completion provides bounded backpressure"
+        );
+        assert_eq!(owner.take().unwrap().value, 1);
+        assert_eq!(starts.recv_timeout(Duration::from_secs(1)).unwrap(), 3);
+        release.send(()).unwrap();
+        wait(|| owner.shared.exchange.lock().unwrap().completion.is_some());
+        assert_eq!(owner.take().unwrap().value, 3);
+    }
+    #[test]
+    fn cancellation_retires_active_and_pending_without_joining() {
+        let (started, starts) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let owner = PlanningOwner::new(move |n, _: &Cancellation| {
+            started.send(n).unwrap();
+            blocked.recv().unwrap();
+            n
+        })
+        .unwrap();
+        owner.submit(1, 1);
+        starts.recv().unwrap();
+        owner.submit(2, 2);
+        owner.cancel();
+        owner.submit(3, 3);
+        assert!(owner.take().is_none());
+        release.send(()).unwrap();
+        assert_eq!(starts.recv_timeout(Duration::from_secs(1)).unwrap(), 3);
+        release.send(()).unwrap();
+        wait(|| owner.shared.exchange.lock().unwrap().completion.is_some());
+        assert_eq!(owner.take().unwrap().value, 3);
+    }
+    #[test]
+    fn panic_is_visible_and_no_restart_storm() {
+        let owner = PlanningOwner::<(), ()>::new(|_, _| panic!("injected planner fault")).unwrap();
+        owner.submit(1, ());
+        wait(|| owner.faulted());
+        assert!(!owner.submit(2, ()));
+        assert!(owner.take().is_none());
+    }
+    #[test]
+    fn poison_and_unexpected_exit_are_visible_without_silent_pending() {
+        let owner=PlanningOwner::<(),()>::new(|_,_|()).unwrap();
+        let shared=owner.shared.clone();
+        let _=std::thread::spawn(move|| {let _guard=shared.exchange.lock().unwrap();panic!("injected exchange poison");}).join();
+        assert!(owner.take().is_none());assert!(owner.faulted());assert!(!owner.submit(1,()));
+        drop(owner);
+        let owner=PlanningOwner::<(),()>::new(|_,_|()).unwrap();
+        owner.shared.exchange.lock().unwrap().closed=true;owner.shared.wake.notify_one();
+        wait(||owner.faulted());assert!(!owner.submit(1,()));
+    }
+
+}

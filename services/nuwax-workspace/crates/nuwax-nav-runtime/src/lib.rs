@@ -31,6 +31,10 @@ pub mod surface_follower;
 pub use nuwax_nav_mls_planner::SurfaceSnapshot;
 pub use surface_follower::{SurfaceFollower, SurfaceFollowerConfig};
 mod route_follower;
+mod planning_owner;
+mod route_planning;
+#[cfg(test)]
+mod route_moving_worker_tests;
 pub use route_follower::RouteFollower;
 
 /// 局部执行保留路径维度，三维路径不能通过默认适配静默丢弃高度。

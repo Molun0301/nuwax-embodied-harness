@@ -36,6 +36,12 @@ impl Ord for Queue {
             .then_with(|| other.order.cmp(&self.order))
     }
 }
+fn checkpoint(cancelled: Option<&AtomicBool>) -> Result<(), String> {
+    if cancelled.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
+        return Err("层析规划已取消".into());
+    }
+    crate::cancellation::checkpoint()
+}
 impl Tomogram {
     /// 起终点为支撑坐标；容差仅用于选择原目标球内的真实地面点。
     pub fn plan(
@@ -50,6 +56,30 @@ impl Tomogram {
     }
     /// 局部绕障限制在机器人附近；全局调用不设置空间范围。
     pub fn plan_bounded(
+        &self,
+        start: [f64; 3],
+        goal: [f64; 3],
+        tolerance: f64,
+        boundary: &[[f64; 2]],
+        cancelled: Option<&AtomicBool>,
+        radius: Option<f64>,
+        penalties: &[crate::RoutePenalty],
+    ) -> Result<Route, String> {
+        checkpoint(cancelled)?;
+        let result = self.plan_bounded_impl(start, goal, tolerance, boundary, cancelled, radius, penalties);
+        checkpoint(cancelled)?;
+        result
+    }
+    /// Explicit token convenience API; the legacy AtomicBool and scoped tokens both apply.
+    pub fn plan_bounded_cancellable(
+        &self, start: [f64; 3], goal: [f64; 3], tolerance: f64,
+        boundary: &[[f64; 2]], cancelled: Option<&AtomicBool>, radius: Option<f64>,
+        penalties: &[crate::RoutePenalty], cancellation: &crate::PlanningCancellation,
+    ) -> Result<Route, String> {
+        crate::with_planning_cancellation(cancellation, ||
+            self.plan_bounded(start, goal, tolerance, boundary, cancelled, radius, penalties))
+    }
+    fn plan_bounded_impl(
         &self,
         start: [f64; 3],
         goal: [f64; 3],
@@ -88,9 +118,12 @@ impl Tomogram {
         ];
         let r = (tolerance / self.resolution).ceil() as i32;
         for x in gx - r..=gx + r {
+            checkpoint(cancelled)?;
             for y in gy - r..=gy + r {
+                checkpoint(cancelled)?;
                 if let Some(ids) = self.columns.get(&[x, y]) {
                     for &id in ids {
+                        checkpoint(cancelled)?;
                         let point = self.position(id);
                         if distance(point, goal) <= tolerance + 1e-6
                             && inside_boundary([point[0], point[1]], boundary)
@@ -101,16 +134,19 @@ impl Tomogram {
                 }
             }
         }
+        checkpoint(cancelled)?;
         targets.sort_unstable_by(|a, b| {
             distance(a.1, goal)
                 .total_cmp(&distance(b.1, goal))
                 .then_with(|| a.0.cmp(&b.0))
         });
+        checkpoint(cancelled)?;
         if targets.is_empty() {
             return Err("原目标到达范围内没有层析地面".into());
         }
         let mut ends = ahash::AHashMap::new();
         for (id, p) in targets {
+            checkpoint(cancelled)?;
             ends.entry(id).or_insert(p);
         }
         let heuristic = |id| (distance(self.position(id), goal) - tolerance).max(0.0);
@@ -134,14 +170,12 @@ impl Tomogram {
             cost, id, score, ..
         }) = queue.pop()
         {
+            checkpoint(cancelled)?;
             if cost > costs[id] {
                 continue;
             }
             if best.is_some_and(|(_, _, total)| score >= total) {
                 break;
-            }
-            if expanded % 128 == 0 && cancelled.is_some_and(|c| c.load(AtomicOrdering::Relaxed)) {
-                return Err("层析规划已取消".into());
             }
             expanded += 1;
             if let Some(&endpoint) = ends.get(&id) {
@@ -153,6 +187,7 @@ impl Tomogram {
             }
             let a = self.position(id);
             for &next in &self.cells[id].neighbors {
+                checkpoint(cancelled)?;
                 let b = self.position(next);
                 if !crate::segment_inside_boundary([a[0], a[1]], [b[0], b[1]], boundary)
                     || radius.is_some_and(|r| (b[0] - start[0]).hypot(b[1] - start[1]) > r)
@@ -191,6 +226,7 @@ impl Tomogram {
         let mut ids = vec![id];
         let mut current = id;
         while current != from {
+            checkpoint(cancelled)?;
             current = parents[current];
             ids.push(current);
         }
@@ -198,6 +234,7 @@ impl Tomogram {
         let mut points = Vec::with_capacity(ids.len() + 2);
         points.push(start);
         for id in ids.into_iter().skip(1) {
+            checkpoint(cancelled)?;
             let p = self.position(id);
             if distance(*points.last().unwrap(), p) > 1e-6 {
                 points.push(p);
@@ -211,7 +248,7 @@ impl Tomogram {
             elapsed_ms: 0.0,
             cells: self.cells.len(),
         };
-        let points = self.reduce(points, boundary, penalties);
+        let points = self.reduce(points, boundary, penalties, cancelled)?;
         stats.elapsed_ms = began.elapsed().as_secs_f64() * 1000.0;
         Ok(Route { points, stats })
     }
@@ -222,9 +259,10 @@ impl Tomogram {
         b: [f64; 3],
         boundary: &[[f64; 2]],
         penalties: &[crate::RoutePenalty],
+        cancelled: Option<&AtomicBool>,
     ) -> Option<f64> {
         if !crate::segment_inside_boundary([a[0], a[1]], [b[0], b[1]], boundary)
-            || !self.segment_clear(a, b, boundary)
+            || !self.segment_clear_cancelled(a, b, boundary, cancelled)
         {
             return None;
         }
@@ -232,6 +270,7 @@ impl Tomogram {
         let n = (length / (self.resolution * 0.5)).ceil().max(1.0) as usize;
         let mut sum = 0.0;
         for i in 0..n {
+            checkpoint(cancelled).ok()?;
             let t = (i as f64 + 0.5) / n as f64;
             let point = std::array::from_fn(|j| a[j] + t * (b[j] - a[j]));
             let id = self.cell_at(point)?;
@@ -255,28 +294,34 @@ impl Tomogram {
         points: Vec<[f64; 3]>,
         boundary: &[[f64; 2]],
         penalties: &[crate::RoutePenalty],
-    ) -> Vec<[f64; 3]> {
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Vec<[f64; 3]>, String> {
+        checkpoint(cancelled)?;
         if points.len() < 3 {
-            return points;
+            return Ok(points);
         }
         let mut prefix = vec![0.0];
         for pair in points.windows(2) {
+            checkpoint(cancelled)?;
             let cost = self
-                .segment_cost(pair[0], pair[1], boundary, penalties)
+                .segment_cost(pair[0], pair[1], boundary, penalties, cancelled)
                 .unwrap_or_else(|| distance(pair[0], pair[1]));
             prefix.push(prefix.last().unwrap() + cost);
         }
         let mut output = vec![points[0]];
         let mut anchor = 0;
         while anchor + 1 < points.len() {
+            checkpoint(cancelled)?;
             let mut far = anchor + 1;
             while far + 1 < points.len() && distance(points[anchor], points[far + 1]) <= 3.0 {
+                checkpoint(cancelled)?;
                 far += 1;
             }
             let mut chosen = anchor + 1;
             for next in (anchor + 2..=far).rev() {
+                checkpoint(cancelled)?;
                 if self
-                    .segment_cost(points[anchor], points[next], boundary, penalties)
+                    .segment_cost(points[anchor], points[next], boundary, penalties, cancelled)
                     .is_some_and(|cost| cost <= (prefix[next] - prefix[anchor]) * 1.1 + 1e-6)
                 {
                     chosen = next;
@@ -286,7 +331,8 @@ impl Tomogram {
             output.push(points[chosen]);
             anchor = chosen;
         }
-        output
+        checkpoint(cancelled)?;
+        Ok(output)
     }
 }
 
@@ -304,6 +350,30 @@ mod tests {
             })
         });
         Tomogram::from_columns(0.1, columns, 0.5, 0.15, 0.2, 0.2, 20.0).unwrap()
+    }
+    #[test]
+    fn epoch_cancellation_interrupts_search_and_reduction_without_changing_the_map() {
+        let map = map(false);
+        let before: Vec<_> = map.cells.iter().map(|cell|
+            (cell.column, cell.ground, cell.cost, cell.neighbors.clone())).collect();
+        for checkpoints in [0, 20, 80] {
+            let error = crate::cancellation::after_checkpoints(checkpoints, ||
+                map.plan([0.05, 0.05, 0.0], [8.05, 0.05, 0.0], 0.01, &[], None)).unwrap_err();
+            assert!(error.contains("取消"), "{error}");
+        }
+        let points: Vec<_> = (0..80).map(|x| [f64::from(x) * 0.1 + 0.05, 0.05, 0.0]).collect();
+        let error = crate::cancellation::after_checkpoints(12, ||
+            map.reduce(points, &[], &[], None)).unwrap_err();
+        assert!(error.contains("取消"));
+        let after: Vec<_> = map.cells.iter().map(|cell|
+            (cell.column, cell.ground, cell.cost, cell.neighbors.clone())).collect();
+        assert_eq!(before, after);
+        let baseline = map.plan([0.05, 0.05, 0.0], [8.05, 0.05, 0.0], 0.01, &[], None).unwrap();
+        let token = crate::PlanningCancellation::new(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(9)), 9);
+        let scoped = map.plan_bounded_cancellable([0.05, 0.05, 0.0], [8.05, 0.05, 0.0],
+            0.01, &[], None, None, &[], &token).unwrap();
+        assert_eq!(baseline.points, scoped.points);
+        assert_eq!(baseline.stats.expanded, scoped.stats.expanded);
     }
     #[test]
     fn explicit_occupied_volume_stairs_keep_the_exposed_step_heights() {

@@ -14,6 +14,7 @@ impl PctPlanner {
         boundary: &[[f64; 2]],
         cancelled: Option<&AtomicBool>,
     ) -> Result<Vec<BodyPose>, String> {
+        crate::cancellation::checkpoint()?;
         let model = map
             .body_envelope()
             .ok_or("层析规划需要机器人外形和支撑标定")?;
@@ -39,6 +40,7 @@ impl PctPlanner {
         )?;
         let mut poses = vec![start];
         for (i, &point) in route.points.iter().enumerate().skip(1) {
+            crate::cancellation::checkpoint()?;
             let previous = route.points[i - 1];
             let next = route.points.get(i + 1).copied().unwrap_or(point);
             let dx = next[0] - previous[0];
@@ -52,6 +54,7 @@ impl PctPlanner {
         }
         tracing::info!(target:"navigation.pct",event="navigation.pct.route",expanded=route.stats.expanded,
             elapsed_ms=route.stats.elapsed_ms,points=poses.len(),"层析全局路线计算完成");
+        crate::cancellation::checkpoint()?;
         Ok(poses)
     }
 }

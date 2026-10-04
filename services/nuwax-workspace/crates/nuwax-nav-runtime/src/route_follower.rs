@@ -5,48 +5,43 @@ use crate::{
 };
 use nuwax_nav_astar::navigation_map::CostMap2D;
 use nuwax_nav_pct::PctPlanner;
-use nuwax_nav_scan::{BodyPose, LocalPlanError, ScanConfig};
+use nuwax_nav_scan::{LocalPlanError, ScanConfig};
 use nuwax_nav_types_messages::{
-    GoalOptions, Path2D, Path3D, Point3, PoseStamped, Quaternion, Twist2,
+    GoalOptions, Path2D, Path3D, Point3, PoseStamped, Twist2,
 };
 use std::sync::Arc;
 
-/// 只保存最近的失败查询；完全相同的输入不重复执行昂贵的姿态搜索。
-struct FailedLocalPlan {
-    map: Arc<SurfaceSnapshot>,
-    tomogram: Arc<nuwax_nav_pct::Tomogram>,
-    boundary: Vec<[f64; 2]>,
-    start: BodyPose,
-    reference: Vec<[f64; 3]>,
-    final_yaw: Option<f64>,
-    arrival: Option<([f64; 3], f64)>,
-    failure: nuwax_nav_scan::LocalPlanError,
-    follow_reference: bool,
-    prefer_straight: bool,
-}
+use crate::planning_owner::PlanningOwner;
+use crate::route_planning::{body, pose_bits, exact_points, PlanKernel, PlanRequest, PlanResult, ReferenceSource};
+use std::time::{Duration,Instant};
 
 pub struct RouteFollower {
     controller: SurfaceFollower,
     config: SurfaceFollowerConfig,
     scan: ScanConfig,
-    boundary: Vec<[f64; 2]>,
+    boundary: Arc<Vec<[f64; 2]>>,
     planner: Arc<PctPlanner>,
     map: Option<Arc<SurfaceSnapshot>>,
     pose: Option<PoseStamped>,
-    route: Option<Path3D>,
+    route: Option<Arc<Path3D>>,
     goal: Option<PoseStamped>,
     options: GoalOptions,
-    cumulative: Vec<f64>,
+    cumulative: Arc<Vec<f64>>,
     progress: f64,
     local_end: f64,
     local_progress_at_plan: f64,
     local_path: Option<Path3D>,
-    local_map: Option<(Arc<SurfaceSnapshot>, Point3, Arc<nuwax_nav_pct::Tomogram>)>,
     local_start: Option<Point3>,
     dirty: bool,
     local_plans: u64,
     local_planning_calls: u64,
-    failed_local: Vec<FailedLocalPlan>,
+    owner: Option<PlanningOwner<PlanRequest,PlanResult>>,
+    next_request: u64,
+    submitted: Option<(u64,Point3,bool)>,
+    retry_after: Instant,
+    preparation_fault: Option<String>,
+    permanent_fault: Option<String>,
+    qualified_failure: Option<String>,
     wait_reason: Option<String>,
     route_generation: u64,
     admitted_generation: Option<u64>,
@@ -58,45 +53,49 @@ fn error(message: impl Into<String>) -> RuntimeError {
         reason: message.into(),
     }
 }
-fn body(p: &PoseStamped) -> BodyPose {
-    let q = p.pose.orientation;
-    (
-        [p.pose.position.x, p.pose.position.y, p.pose.position.z],
-        [q.x, q.y, q.z, q.w],
-    )
-}
-fn exact_points<const N: usize>(a: &[[f64; N]], b: &[[f64; N]]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(a,b)| a.map(f64::to_bits) == b.map(f64::to_bits))
-}
-fn pose_bits(pose: BodyPose) -> ([u64; 3], [u64; 4]) {
-    (pose.0.map(f64::to_bits), pose.1.map(f64::to_bits))
-}
 impl RouteFollower {
     pub fn new(config: SurfaceFollowerConfig) -> Result<Self, RuntimeError> {
+        let kernel=PlanKernel::new(config.clone());
+        Self::with_kernel(config,kernel)
+    }
+    #[cfg(test)]
+    pub(crate) fn new_with_planning_hook(config:SurfaceFollowerConfig, hook:Box<dyn FnMut(&PlanRequest)+Send>)->Result<Self,RuntimeError> {
+        let mut kernel=PlanKernel::new(config.clone());kernel.hook=Some(hook);
+        Self::with_kernel(config,kernel)
+    }
+    fn with_kernel(config:SurfaceFollowerConfig,mut kernel:PlanKernel)->Result<Self,RuntimeError> {
         let scan = config.scan.clone();
         scan.validate().map_err(error)?;
+        let owner = if config.local_planning_enabled {
+            Some(PlanningOwner::new(move |request,cancel|kernel.compute(request,cancel)).map_err(|e|error(e.to_string()))?)
+        } else { None };
         Ok(Self {
             controller: SurfaceFollower::new(config.clone())?,
             planner: Arc::clone(&config.pct),
             config,
             scan,
-            boundary: Vec::new(),
+            boundary: Arc::new(Vec::new()),
             map: None,
             pose: None,
             route: None,
             goal: None,
             options: GoalOptions::default(),
-            cumulative: Vec::new(),
+            cumulative: Arc::new(Vec::new()),
             progress: 0.0,
             local_end: 0.0,
             local_progress_at_plan: 0.0,
             local_path: None,
-            local_map: None,
             local_start: None,
             dirty: true,
             local_plans: 0,
             local_planning_calls: 0,
-            failed_local: Vec::new(),
+            owner,
+            next_request: 0,
+            submitted: None,
+            retry_after: Instant::now(),
+            preparation_fault: None,
+            permanent_fault: None,
+            qualified_failure: None,
             wait_reason: None,
             route_generation: 0,
             admitted_generation: None,
@@ -118,11 +117,13 @@ impl RouteFollower {
     /// Typed diagnostics from the latest unsuccessful local planning attempts.
     pub fn local_failures(&self) -> &[LocalPlanError] { &self.local_failures }
     fn revoke_local_admission(&mut self) {
-        self.route_generation = self.route_generation.wrapping_add(1);
+        self.cancel_planning();
+        self.preparation_fault=None;
+        if let Some(next) = self.route_generation.checked_add(1) { self.route_generation=next; }
+        else { self.permanent_fault=Some("route generation exhausted".into()); }
         self.admitted_generation = None;
         self.local_path = None;
         self.local_start = None;
-        self.failed_local.clear();
         self.local_failures.clear();
         self.dirty = true;
     }
@@ -134,7 +135,7 @@ impl RouteFollower {
         let mut progress = self.progress;
         let window =
             (self.progress + self.scan.horizon_m).min(*self.cumulative.last().unwrap_or(&0.0));
-        for (i, pair) in route.poses.windows(2).enumerate() {
+        for (i, pair) in route.poses.windows(2).enumerate().skip(self.cumulative.partition_point(|&v|v<self.progress).saturating_sub(1)) {
             if self.cumulative[i + 1] + 1e-6 < self.progress {
                 continue;
             }
@@ -162,6 +163,7 @@ impl RouteFollower {
             self.progress = self.progress.max(progress);
         }
     }
+    #[cfg(test)]
     fn reference(&self, horizon: f64) -> Result<(Vec<[f64; 3]>, f64, bool, bool), String> {
         let route = self.route.as_ref().ok_or("缺少全局路线")?;
         let current = self.pose.as_ref().ok_or("缺少实际位姿")?;
@@ -174,7 +176,7 @@ impl RouteFollower {
         let end = (self.progress + horizon).min(*self.cumulative.last().ok_or("全局路线为空")?);
         let mut direction:Option<[f64;2]>=None;
         let mut global_straight=true;
-        for (i, pair) in route.poses.windows(2).enumerate() {
+        for (i, pair) in route.poses.windows(2).enumerate().skip(self.cumulative.partition_point(|&v|v<self.progress).saturating_sub(1)) {
             if self.cumulative[i + 1] <= self.progress + 0.02 {
                 continue;
             }
@@ -224,160 +226,85 @@ impl RouteFollower {
         }
         Ok((result, end, at_end, global_straight))
     }
-    fn regenerate(&mut self, detour: bool) -> Result<(), LocalPlanError> {
-        if !self.config.local_planning_enabled {
-            return Err("local planning is disabled".into());
-        }
-        self.local_planning_calls += 1;
-        let map = self.map.as_ref().ok_or("缺少当前地形")?;
-        let pose = self.pose.as_ref().ok_or("缺少实际位姿")?;
-        let mut scan = self.scan.clone();
-        scan.reference_corridor_m = self.config.max_path_deviation_m;
-        let footprint = map.body_envelope().map_or(0.0, |body| body.radius() * 2.0);
-        let turning = self
-            .config
-            .kinematics()
-            .map_or(0.0, |motion| motion.minimum_turning_radius_m * 2.0);
-        scan.horizon_m = scan
-            .horizon_m
-            .max(footprint)
-            .max(turning)
-            .max(self.config.lookahead_m * 2.0);
-        let tomogram = if let Some((_, _, local)) =
-            self.local_map.as_ref().filter(|(previous, center, _)| {
-                nuwax_nav_pct::same_source_geometry(previous, map)
-                    && center.distance(pose.pose.position) < 0.25
-            }) {
-            Arc::clone(local)
-        } else {
-            let local = Arc::new(nuwax_nav_pct::Tomogram::local_from_surface(
-                map,
-                [pose.pose.position.x, pose.pose.position.y],
-                scan.horizon_m + 1.5,
-            )?);
-            self.local_map = Some((Arc::clone(map), pose.pose.position, Arc::clone(&local)));
-            local
-        };
-        let kinematics = self.config.kinematics().ok_or("近场执行缺少运动能力")?;
-        let mut selected = None;
-        let mut failures = Vec::new();
-        // 局部轨迹须连到前方路线；不能以不断截短的可行前缀把机体送入无后续空间的角落。
-        for horizon in [scan.horizon_m] {
-            let (mut reference, end, at_end, global_straight) = self.reference(horizon)?;
-            let prefer_straight=global_straight && !detour;
-            let final_yaw = if at_end && self.options.requires_orientation() {
-                self.goal.as_ref().map(|g| g.pose.orientation.yaw())
-            } else {
-                None
-            };
-            let arrival = if at_end {
-                self.goal
-                    .as_ref()
-                    .map(|g| (body(g).0, self.options.position_tolerance_m))
-            } else {
-                None
-            };
-            if detour && reference.len() > 1 {
-                let target = *reference.last().unwrap();
-                if let Ok(route) = tomogram.plan_bounded(
-                    reference[0],
-                    target,
-                    tomogram.resolution,
-                    &self.boundary,
-                    None,
-                    Some(scan.horizon_m * 1.5),
-                    &self.planner.local_costs(),
-                ) {
-                    reference = route.points;
-                }
-            }
-            let start = body(pose);
-            let cached = self.failed_local.iter().find(|cached| {
-                Arc::ptr_eq(&cached.tomogram, &tomogram)
-                    && exact_points(&cached.boundary, &self.boundary)
-                    && cached.map.same_body_query_view(map)
-                    && pose_bits(cached.start) == pose_bits(start)
-                    && exact_points(&cached.reference, &reference)
-                    && cached.final_yaw.map(f64::to_bits) == final_yaw.map(f64::to_bits)
-                    && cached.arrival.map(|(p,t)| (p.map(f64::to_bits),t.to_bits()))
-                        == arrival.map(|(p,t)| (p.map(f64::to_bits),t.to_bits()))
-                    && cached.follow_reference == detour
-                    && cached.prefer_straight == prefer_straight
-            });
-            let result = if let Some(cached) = cached {
-                Err(cached.failure.clone())
-            } else {
-                let result = nuwax_nav_scan::plan(
-                    map, &tomogram, start, &reference, &kinematics, &scan,
-                    final_yaw, arrival, &self.boundary, detour, prefer_straight,
-                );
-                if let Err(failure) = &result {
-                    if self.failed_local.len() == 2 {
-                        self.failed_local.remove(0);
-                    }
-                    self.failed_local.push(FailedLocalPlan {
-                        map: Arc::clone(map), tomogram: Arc::clone(&tomogram),
-                        boundary: self.boundary.clone(), start, reference, final_yaw, arrival,
-                        failure: failure.clone(),
-                        follow_reference: detour,
-                        prefer_straight,
-                    });
-                }
-                result
-            };
-            match result {
-                Ok(trajectory) => {
-                    selected = Some((trajectory, end));
-                    break;
-                }
-                Err(reason) => failures.push(reason),
-            }
-        }
-        let (trajectory, end) = selected.ok_or_else(|| {
-            failures.pop().unwrap_or_else(|| "没有参考段".into())
-        })?;
-        let path = Path3D {
-            poses: trajectory
-                .poses
-                .iter()
-                .map(|&(p, q)| {
-                    let mut value = pose.clone();
-                    value.pose.position = Point3::new(p[0], p[1], p[2]);
-                    value.pose.orientation = Quaternion {
-                        x: q[0],
-                        y: q[1],
-                        z: q[2],
-                        w: q[3],
-                    };
-                    value
-                })
-                .collect(),
-        };
-        self.controller
-            .replace_execution_path(
-                ExecutionPath::Surface(path.clone()),
-                None,
-                self.goal.clone().ok_or("缺少用户目标")?,
-            )
-            .map_err(|e| e.to_string())?;
-        self.local_path = Some(path);
-        self.admitted_generation = Some(self.route_generation);
-        self.local_failures.clear();
-        self.local_progress_at_plan = self.progress;
-        self.local_end = end;
-        self.local_start = Some(pose.pose.position);
-        self.dirty = false;
-        self.local_plans += 1;
-        tracing::info!(target:"navigation.scan",event="navigation.scan.trajectory",progress_m=self.progress,
-            local_end_m=end,elapsed_ms=trajectory.elapsed_ms,points=trajectory.poses.len(),smoothed=trajectory.smoothed,
-            local_plans=self.local_plans,"近场轨迹已接续，继续使用全局路线");
-        Ok(())
+    fn cancel_planning(&mut self) {
+        if let Some(owner)=&self.owner {owner.cancel();}
+        self.submitted=None;
+        self.qualified_failure=None;
+        self.retry_after=Instant::now();
     }
+    fn schedule(&mut self,detour:bool) {
+        if self.owner.is_none() || self.preparation_fault.is_some() || Instant::now()<self.retry_after {return;}
+        let (Some(map),Some(pose))=(&self.map,&self.pose) else {return;};
+        if let Some((_,start,previous_detour))=self.submitted {
+            // Soft metadata alone cannot cancel or restart useful active work.
+            if pose.pose.position.distance(start)<self.scan.refresh_distance_m.max(0.25) && (!detour || previous_detour) {return;}
+        }
+        if self.config.kinematics().is_none() {self.preparation_fault=Some("近场执行缺少运动能力".into());return;}
+        let Some(route)=&self.route else {return;};
+        let Some(id)=self.next_request.checked_add(1) else {self.permanent_fault=Some("planning request IDs exhausted".into());return;};
+        let reference_source=ReferenceSource{route:route.clone(),cumulative:self.cumulative.clone(),
+            goal:self.goal.clone(),options:self.options,offset:self.config.body_to_support_z_m,progress:self.progress};
+        let request=PlanRequest{source:map.clone(),pose:pose.clone(),boundary:self.boundary.clone(),reference:Vec::new(),
+            reference_source:Some(reference_source),final_yaw:None,arrival:None,end:0.0,progress:self.progress,
+            generation:self.route_generation,straight:false,detour,scan:self.scan.clone()};
+        if self.owner.as_ref().unwrap().submit(id,request) {
+            self.next_request=id;self.submitted=Some((id,pose.pose.position,detour));
+            self.local_planning_calls+=1;
+            self.retry_after=Instant::now()+Duration::from_millis(250);
+        }
+    }
+    fn consume_plan(&mut self) {
+        let Some(owner)=&self.owner else {return;};
+        let Some(completion)=owner.take() else {return;};
+        if owner.faulted() {return;}
+        if self.submitted.is_some_and(|(id,_,_)|id==completion.id) {self.submitted=None;}
+        let result=completion.value;
+        let request=result.request;
+        if completion.epoch!=owner.epoch() || request.generation!=self.route_generation || self.route.is_none()
+            || !exact_points(&request.boundary,&self.boundary)
+            || self.map.as_ref().is_none_or(|map|!nuwax_nav_pct::same_source_geometry(map,&request.source)) {return;}
+        match result.outcome {
+            Ok(candidate)=> {
+                if request.end+1e-6<self.progress {self.dirty=true;return;}
+                let Some(goal)=self.goal.clone() else {return;};
+                // Candidate geometry is advice only. Current bounded connector admission
+                // uses the actual latest pose/evidence; current step still owns motion.
+                match self.controller.replace_execution_path(ExecutionPath::Surface(candidate.path.clone()),None,goal) {
+                    Ok(())=> {
+                        self.local_path=Some(candidate.path);
+                        self.admitted_generation=Some(self.route_generation);
+                        self.local_failures.clear();self.qualified_failure=None;self.local_progress_at_plan=request.progress;
+                        self.local_end=request.end;self.local_start=Some(request.pose.pose.position);
+                        self.dirty=false;self.local_plans+=1;
+                        tracing::info!(target:"navigation.scan",event="navigation.scan.candidate_admitted",
+                            elapsed_ms=candidate.elapsed_ms,request_id=completion.id,"geometry candidate admitted; current guard remains authoritative");
+                    }
+                    Err(e)=> {
+                        // Moved-start failure neither teleports nor destroys current admission.
+                        let fresh=self.map.as_ref().is_some_and(|map|map.same_body_query_view(&request.source))
+                            && self.pose.as_ref().is_some_and(|pose|pose.frame_id==request.pose.frame_id && pose_bits(body(pose))==pose_bits(body(&request.pose)));
+                        if fresh {self.qualified_failure=Some(e.to_string());}
+                        self.local_failures=vec![e.to_string().into()];self.dirty=true;
+                    }
+                }
+            }
+            Err(failures)=> {
+                // Even an exact search negative is not a current obstacle measurement.
+                // Keep current guarded execution and retry latest inputs at bounded cadence.
+                let fresh=self.map.as_ref().is_some_and(|map|map.same_body_query_view(&request.source))
+                    && self.pose.as_ref().is_some_and(|pose|pose.frame_id==request.pose.frame_id && pose_bits(body(pose))==pose_bits(body(&request.pose)));
+                self.qualified_failure=if fresh { failures.iter().find(|f|f.kind==nuwax_nav_scan::LocalPlanFailureKind::Unclassified).map(ToString::to_string) } else {None};
+                self.local_failures=failures;self.dirty=true;
+            }
+        }
+    }
+
 }
 impl NavPlanner for RouteFollower {
     fn configure_boundary(&mut self, boundary: &[[f64; 2]]) {
-        self.failed_local.clear();
-        self.boundary = boundary.to_vec();
+        self.preparation_fault=None;
+        if !exact_points(&self.boundary,boundary) {self.cancel_planning();self.dirty=true;}
+        self.boundary = Arc::new(boundary.to_vec());
         self.controller.configure_boundary(boundary);
     }
     fn configure_goal(
@@ -385,7 +312,6 @@ impl NavPlanner for RouteFollower {
         goal: &PoseStamped,
         options: GoalOptions,
     ) -> Result<(), RuntimeError> {
-        self.failed_local.clear();
         if self.config.local_planning_enabled { self.planner.clear_local_costs(); }
         self.controller.configure_goal(goal, options)?;
         self.revoke_local_admission();
@@ -424,23 +350,22 @@ impl NavPlanner for RouteFollower {
 
         self.revoke_local_admission();
         if direct { self.admitted_generation = Some(self.route_generation); }
-        self.cumulative = vec![0.0];
+        let mut cumulative = vec![0.0];
         for pair in route.poses.windows(2) {
-            self.cumulative.push(
-                self.cumulative.last().unwrap()
-                    + pair[0].pose.position.distance(pair[1].pose.position),
-            );
+            cumulative.push(cumulative.last().unwrap()+pair[0].pose.position.distance(pair[1].pose.position));
         }
-        self.route = Some(route);
+        self.cumulative=Arc::new(cumulative);
+        self.route = Some(Arc::new(route));
         self.goal = Some(goal);
         self.progress = 0.0;
         self.local_end = 0.0;
         self.dirty = true;
         self.advance_progress();
-        // 近场计算在原受管控制工作线程执行，路径受理不等待整条轨迹精化。
+        // Path acceptance never waits for the independent planning CPU owner.
         Ok(())
     }
     fn update_odometry(&mut self, pose: PoseStamped) {
+        if self.pose.as_ref().is_none_or(|old|old.frame_id!=pose.frame_id || pose_bits(body(old))!=pose_bits(body(&pose))) {self.qualified_failure=None;}
         self.controller.update_odometry(pose.clone());
         self.pose = Some(pose);
     }
@@ -453,7 +378,11 @@ impl NavPlanner for RouteFollower {
         let ExecutionMap::Surface(surface) = map else {
             return Err(error("三维路线执行缺少三维地图"));
         };
-        // 新图始终进入实际控制检查；远离路线的变化不强制丢弃仍可执行的近场轨迹。
+        if self.map.as_ref().is_none_or(|old|!old.same_body_query_view(&surface)) {self.qualified_failure=None;}
+        if self.map.as_ref().is_some_and(|old|!nuwax_nav_pct::same_source_geometry(old,&surface)) {
+            self.cancel_planning();self.dirty=true;
+        }
+        // New geometry cancels candidate work, but only the fresh guard revokes motion.
         if self.local_path.is_none() {
             self.dirty = true;
         }
@@ -478,6 +407,11 @@ impl NavPlanner for RouteFollower {
     }
     fn step(&mut self, width: f64) -> PlannerStep {
         self.wait_reason = None;
+        if let Some(reason)=&self.permanent_fault {return PlannerStep::Failed(reason.clone());}
+        if self.owner.as_ref().is_some_and(|owner|owner.faulted()) {
+            self.local_failures=vec!["local planning owner terminated unexpectedly".into()];
+            return PlannerStep::Failed(self.local_failures[0].to_string());
+        }
         if self.route.is_none() { return PlannerStep::Pending(Vec::new()); }
         if self
             .map
@@ -500,49 +434,34 @@ impl NavPlanner for RouteFollower {
         if !self.config.local_planning_enabled {
             return self.controller.step(width);
         }
-        let window = (self.local_end - self.local_progress_at_plan).max(0.1);
-        let moved = self
-            .pose
-            .as_ref()
-            .zip(self.local_start)
-            .is_some_and(|(p, start)| {
-                p.pose.position.distance(start) >= self.scan.refresh_distance_m.min(window * 0.6)
-            });
-        let at_global_end = self
-            .cumulative
-            .last()
-            .is_some_and(|&end| self.local_end >= end - 1e-6);
-        let near_local_end = !at_global_end
-            && self.local_end - self.progress < self.scan.refresh_distance_m.min(window * 0.35);
-        if self.dirty || moved && !at_global_end || near_local_end {
-            if let Err(reason) = self.regenerate(false) {
-                if let Err(local) = self.regenerate(true) {
-                    self.local_failures = vec![reason, local];
-                    if self.local_failures.iter().any(|f| f.kind == nuwax_nav_scan::LocalPlanFailureKind::Unclassified) {
-                        return PlannerStep::ReplanRequired(format!("{}；近场绕行：{}",
-                            self.local_failures[0], self.local_failures[1]));
-                    }
-                    if self.admitted_generation == Some(self.route_generation) {
-                        // Only a fresh controller evaluation can authorize continued motion.
-                        return self.controller.step(width);
-                    }
-                    self.wait_reason = Some("近场搜索尚未取得可执行轨迹，保持零速等待".into());
-                    return PlannerStep::Pending(self.local_failures.clone());
-                }
-            }
+        self.consume_plan();
+        if self.owner.as_ref().is_some_and(|owner|owner.faulted()) {
+            return PlannerStep::Failed("local planning owner terminated unexpectedly".into());
         }
-        match self.controller.step(width) {
-            PlannerStep::ReplanRequired(reason) => match self.regenerate(true) {
-                Ok(()) => self.controller.step(width),
-                Err(local) => {
-                    self.local_failures = vec![local];
-                    // Preserve the already fresh controller rejection unchanged.
-                    PlannerStep::ReplanRequired(reason)
-                }
-            },
-            step => step,
+        let window=(self.local_end-self.local_progress_at_plan).max(0.1);
+        let moved=self.pose.as_ref().zip(self.local_start).is_some_and(|(pose,start)|
+            pose.pose.position.distance(start)>=self.scan.refresh_distance_m.min(window*0.6));
+        let at_end=self.cumulative.last().is_some_and(|&end|self.local_end>=end-1e-6);
+        let near_end=!at_end && self.local_end-self.progress<self.scan.refresh_distance_m.min(window*0.35);
+        if self.dirty || moved && !at_end || near_end {self.schedule(false);}
+        if let Some(reason)=&self.permanent_fault {return PlannerStep::Failed(reason.clone());}
+        if let Some(reason)=&self.preparation_fault {
+            self.local_failures=vec![reason.clone().into()];
+            return PlannerStep::ReplanRequired(reason.clone());
         }
+        if self.admitted_generation!=Some(self.route_generation) {
+            if let Some(reason)=&self.qualified_failure {return PlannerStep::ReplanRequired(reason.clone());}
+            self.wait_reason=Some("近场搜索尚未取得可执行轨迹，保持零速等待".into());
+            return PlannerStep::Pending(self.local_failures.clone());
+        }
+        let step=self.controller.step(width);
+        if matches!(step,PlannerStep::ReplanRequired(_)) {self.dirty=true;self.schedule(true);}
+        // Preserve a genuine current rejection verbatim while detour work is pending.
+        if matches!(step,PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_)) {return step;}
+        if let Some(reason)=&self.qualified_failure {return PlannerStep::ReplanRequired(reason.clone());}
+        step
     }
+
     fn execution_wait_reason(&self) -> Option<String> {
         self.wait_reason.clone()
     }
@@ -552,13 +471,11 @@ impl NavPlanner for RouteFollower {
         self.controller.stop();
         self.route = None;
         self.goal = None;
-        self.cumulative.clear();
+        self.cumulative=Arc::new(Vec::new());
         self.progress = 0.0;
         self.local_end = 0.0;
         self.local_progress_at_plan = 0.0;
         self.local_path = None;
-        self.failed_local.clear();
-        self.local_map = None;
         self.local_start = None;
         self.dirty = true;
     }
@@ -568,7 +485,9 @@ impl NavPlanner for RouteFollower {
 mod tests {
     use super::*;
     use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
-    use nuwax_nav_types_messages::{MotionKinematics, MotionModel, NavFrameId, Pose3, Timestamp};
+    use nuwax_nav_types_messages::{MotionKinematics, MotionModel, NavFrameId, Pose3, Quaternion, Timestamp};
+    use crate::route_planning::Candidate;
+    use std::sync::mpsc;
     fn comparison_config(enabled: Option<bool>) -> SurfaceFollowerConfig {
         let mut config = SurfaceFollowerConfig::new(0.4);
         if let Some(enabled) = enabled { config.local_planning_enabled = enabled; }
@@ -614,38 +533,88 @@ mod tests {
         follower.configure_goal(&goal, GoalOptions::default()).unwrap();
         follower.replace_execution_path(ExecutionPath::Surface(Path3D { poses: vec![start,goal.clone()] }), None,goal).unwrap();
     }
-    // Seed exact valid requests with deterministic failures to exercise runtime provenance
-    // independently of search timing; scan tests exercise the actual interrupted search.
-    fn cache_budget_failures(follower: &mut RouteFollower) {
-        follower.advance_progress();
-        let map = follower.map.as_ref().unwrap().clone();
-        let pose = follower.pose.as_ref().unwrap().clone();
-        if follower.local_map.as_ref().is_none_or(|(previous,center,_)|
-            !nuwax_nav_pct::same_source_geometry(previous,&map) || center.distance(pose.pose.position) >= 0.25) {
-            let local = Arc::new(nuwax_nav_pct::Tomogram::local_from_surface(&map,
-                [pose.pose.position.x,pose.pose.position.y], follower.scan.horizon_m + 1.5).unwrap());
-            follower.local_map = Some((map.clone(), pose.pose.position, local));
+    // Waiting belongs only to this test module. Real deadlines keep a broken owner
+    // from silently spinning while the control path itself remains nonblocking.
+    fn wait_for(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "local planner did not settle before test deadline");
+            std::thread::sleep(Duration::from_millis(1));
         }
-        let tomogram = follower.local_map.as_ref().unwrap().2.clone();
-        follower.failed_local.clear();
-        for detour in [false,true] {
-            let (mut reference, _, at_end, straight) = follower.reference(follower.scan.horizon_m).unwrap();
-            let arrival = at_end.then(|| (body(follower.goal.as_ref().unwrap()).0, follower.options.position_tolerance_m));
-            let final_yaw = (at_end && follower.options.requires_orientation())
-                .then(|| follower.goal.as_ref().unwrap().pose.orientation.yaw());
-            if detour && reference.len() > 1 {
-                if let Ok(route) = tomogram.plan_bounded(reference[0], *reference.last().unwrap(),
-                    tomogram.resolution, &follower.boundary, None, Some(follower.scan.horizon_m*1.5),
-                    &follower.planner.local_costs()) { reference = route.points; }
+    }
+    fn ready_step(follower: &mut RouteFollower, width: f64) -> PlannerStep {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let step = follower.step(width);
+            if !matches!(step, PlannerStep::Pending(_)) { return step; }
+            assert!(Instant::now() < deadline, "local planner did not produce an executable result: {step:?}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    fn wait_for_plan(follower: &mut RouteFollower, previous: u64) {
+        wait_for(|| {
+            let step = follower.step(0.3);
+            // The previous admitted controller may legitimately reject while its
+            // replacement is still being computed. Only infrastructure failure is terminal here.
+            assert!(!matches!(step, PlannerStep::Failed(_)), "local planning owner failed: {step:?}");
+            follower.local_plans() > previous
+        });
+    }
+    fn typed_failures() -> Vec<LocalPlanError> {
+        [nuwax_nav_scan::LocalPlanFailureKind::BudgetExhausted,
+         nuwax_nav_scan::LocalPlanFailureKind::SearchExhausted]
+            .into_iter().map(|kind| LocalPlanError {
+                kind, closest_pose: None, blocked: None, reason: "test incomplete search".into(),
+            }).collect()
+    }
+    fn install_failures(follower: &mut RouteFollower, failures: Vec<LocalPlanError>) {
+        follower.cancel_planning();
+        follower.owner = Some(PlanningOwner::new(move |request, _| PlanResult {
+            request, outcome: Err(failures.clone()),
+        }).unwrap());
+        follower.dirty = true;
+    }
+    fn complete_failure(follower: &mut RouteFollower) {
+        follower.retry_after = Instant::now();
+        follower.schedule(false);
+        wait_for(|| follower.owner.as_ref().unwrap().completion_ready_for_test());
+        follower.consume_plan();
+    }
+    struct PlannerGate {
+        starts: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+    }
+    impl PlannerGate {
+        fn started(&self) {
+            self.starts.recv_timeout(Duration::from_secs(5)).expect("planner did not start");
+        }
+        fn release(&self) { self.release.send(()).unwrap(); }
+    }
+    fn install_held_candidate(follower: &mut RouteFollower) -> PlannerGate {
+        install_held_result(follower, None)
+    }
+    fn install_held_result(follower: &mut RouteFollower, failures: Option<Vec<LocalPlanError>>) -> PlannerGate {
+        let (started, starts) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let offset = follower.config.body_to_support_z_m;
+        follower.cancel_planning();
+        follower.owner = Some(PlanningOwner::new(move |mut request: PlanRequest, _| {
+            started.send(()).unwrap();
+            // Disconnection also releases the worker on an assertion's unwind.
+            let _ = released.recv_timeout(Duration::from_secs(5));
+            if let Some(failures) = &failures {
+                return PlanResult { request, outcome: Err(failures.clone()) };
             }
-            follower.failed_local.push(FailedLocalPlan {
-                map: map.clone(), tomogram: tomogram.clone(), boundary: follower.boundary.clone(),
-                start: body(&pose), reference, final_yaw, arrival,
-                failure: LocalPlanError { kind: nuwax_nav_scan::LocalPlanFailureKind::BudgetExhausted,
-                    closest_pose: Some(body(&pose)), blocked: None, reason: "test budget exhausted".into() },
-                follow_reference: detour, prefer_straight: straight && !detour,
-            });
-        }
+            request.materialize_reference().unwrap();
+            let path = Path3D { poses: request.reference.iter().map(|p| {
+                let mut pose = request.pose.clone();
+                pose.pose.position = Point3::new(p[0], p[1], p[2] + offset);
+                pose
+            }).collect() };
+            PlanResult { request, outcome: Ok(Candidate { path, elapsed_ms: 0.0 }) }
+        }).unwrap());
+        follower.dirty = true;
+        PlannerGate { starts, release }
     }
     fn open_follower() -> RouteFollower {
         let mut follower = RouteFollower::new(comparison_config(Some(true))).unwrap();
@@ -656,8 +625,8 @@ mod tests {
     #[test]
     fn incomplete_attempts_keep_goal_route_and_typed_evidence_without_penalty() {
         let mut follower = open_follower();
-        cache_budget_failures(&mut follower);
-        follower.failed_local[1].failure.kind = nuwax_nav_scan::LocalPlanFailureKind::SearchExhausted;
+        install_failures(&mut follower, typed_failures());
+        complete_failure(&mut follower);
         let goal = follower.goal.clone();
         let route = follower.route.clone();
         for _ in 0..3 {
@@ -666,7 +635,6 @@ mod tests {
             assert_eq!(failures[0].kind, nuwax_nav_scan::LocalPlanFailureKind::BudgetExhausted);
             assert_eq!(failures[1].kind, nuwax_nav_scan::LocalPlanFailureKind::SearchExhausted);
             assert!(failures.iter().all(|f| f.blocked.is_none()));
-            assert_eq!(follower.failed_local.len(), 2);
             assert_eq!(follower.goal, goal);
             assert_eq!(follower.route, route);
             assert!(follower.local_path_for_display().is_empty());
@@ -676,12 +644,14 @@ mod tests {
     #[test]
     fn unclassified_faults_do_not_become_incomplete_search_waits() {
         let mut follower = open_follower();
-        cache_budget_failures(&mut follower);
-        follower.failed_local[0].failure = "invalid local input".into();
+        let mut failures = typed_failures();
+        failures[0] = "invalid local input".into();
+        install_failures(&mut follower, failures);
+        complete_failure(&mut follower);
         assert!(matches!(follower.step(0.3), PlannerStep::ReplanRequired(reason)
             if reason.contains("invalid local input")));
         assert_eq!(follower.local_failures()[0].kind, nuwax_nav_scan::LocalPlanFailureKind::Unclassified);
-        assert_eq!(follower.local_failures()[1].kind, nuwax_nav_scan::LocalPlanFailureKind::BudgetExhausted);
+        assert_eq!(follower.local_failures()[1].kind, nuwax_nav_scan::LocalPlanFailureKind::SearchExhausted);
     }
     #[test]
     fn unavailable_kinematics_is_a_real_preparation_error_not_pending() {
@@ -690,34 +660,23 @@ mod tests {
         follower.config.basic_kinematics = None;
         assert!(matches!(follower.step(0.3), PlannerStep::ReplanRequired(reason)
             if reason.contains("缺少运动能力")));
-        assert_eq!(follower.local_failures().len(),2);
+        assert_eq!(follower.local_failures().len(),1);
         assert!(follower.local_failures().iter().all(|f|
             f.kind == nuwax_nav_scan::LocalPlanFailureKind::Unclassified));
-    }
-    #[test]
-    fn cache_key_preserves_signed_zero_and_quaternion_antipodes() {
-        let pose = ([0.0,1.0,2.0], [0.0,0.0,0.0,1.0]);
-        let mut changed = pose;
-        changed.0[0] = -0.0;
-        assert_ne!(pose_bits(pose), pose_bits(changed));
-        changed = pose;
-        changed.1 = changed.1.map(|x| -x);
-        assert_ne!(pose_bits(pose), pose_bits(changed));
-        assert!(!exact_points(&[[0.0,1.0]], &[[-0.0,1.0]]));
     }
     #[test]
     fn replacement_cannot_reuse_old_motion_arrival_or_display_on_budget_failure() {
         for at_old_goal in [false,true] {
             let mut follower = open_follower();
-            assert!(matches!(follower.step(0.3), PlannerStep::Command(_)));
+            assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(_)));
             assert!(!follower.local_path_for_display().is_empty());
             if at_old_goal { follower.update_odometry(comparison_pose(3.0,1)); }
             let new_goal = comparison_pose(4.0,1);
-            // Replacing a route directly is also a new admission generation.
             follower.replace_execution_path(ExecutionPath::Surface(Path3D {
                 poses: vec![follower.pose.clone().unwrap(),new_goal.clone()]
             }), None, new_goal.clone()).unwrap();
-            cache_budget_failures(&mut follower);
+            install_failures(&mut follower, typed_failures());
+            complete_failure(&mut follower);
             assert!(matches!(follower.step(0.3), PlannerStep::Pending(_)));
             assert_eq!(follower.goal.as_ref(), Some(&new_goal));
             assert!(follower.local_path_for_display().is_empty());
@@ -731,13 +690,13 @@ mod tests {
     fn current_admission_keeps_fresh_motion_arrival_and_boundary_rejection() {
         for outcome in 0..3 {
             let mut follower = open_follower();
-            assert!(matches!(follower.step(0.3), PlannerStep::Command(_)));
+            assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(_)));
             if outcome == 1 { follower.update_odometry(comparison_pose(3.0,1)); }
             if outcome == 2 {
                 follower.configure_boundary(&[[2.0,2.0],[3.0,2.0],[3.0,3.0],[2.0,3.0]]);
             }
-            cache_budget_failures(&mut follower);
-            follower.dirty = true;
+            install_failures(&mut follower, typed_failures());
+            complete_failure(&mut follower);
             let step = follower.step(0.3);
             match outcome {
                 0 => assert!(matches!(step,PlannerStep::Command(c) if c.linear.x > 0.0)),
@@ -752,44 +711,214 @@ mod tests {
     fn failed_reconnection_preserves_the_existing_fresh_controller_rejection_verbatim() {
         let prepare = || {
             let mut follower = open_follower();
-            follower.step(0.3);
+            assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(_)));
             follower.configure_boundary(&[[2.0,2.0],[3.0,2.0],[3.0,3.0],[2.0,3.0]]);
-            cache_budget_failures(&mut follower);
+            install_failures(&mut follower, typed_failures());
+            complete_failure(&mut follower);
             follower
         };
-        // Use an independent controller because rejection itself starts braking state.
         let mut oracle = prepare();
         let expected = oracle.controller.step(0.3);
         assert!(matches!(expected,PlannerStep::ReplanRequired(_)));
         let mut follower = prepare();
-        assert!(!follower.dirty);
         assert_eq!(follower.step(0.3), expected);
-        assert_eq!(follower.local_failures().len(),1);
+        assert_eq!(follower.local_failures().len(),2);
+    }
+
+    fn refresh_observation_metadata(source: &SurfaceSnapshot, observed_ns: u64) -> Arc<SurfaceSnapshot> {
+        use nuwax_nav_mls_planner::SurfaceObservation;
+        let mut observations = source.observations().unwrap().as_ref().clone();
+        let mut blocks = std::collections::BTreeMap::<_, std::collections::BTreeMap<_, _>>::new();
+        for (x,y,z) in source.cell_keys() {
+            let key = [x,y,z];
+            blocks.entry(key.map(|v| v.div_euclid(32))).or_default()
+                .insert(key, SurfaceObservation { observed_ns, hits: 3 });
+        }
+        for (key,block) in blocks { observations.replace_block(key,block).unwrap(); }
+        Arc::new(source.with_observations(Some(Arc::new(observations))))
     }
     #[test]
-    fn failed_attempt_cache_requires_exact_owner_pose_boundary_source_and_semantics() {
-        for change in 0..7 {
-            let mut follower = open_follower();
-            cache_budget_failures(&mut follower);
-            assert_eq!(follower.regenerate(false).unwrap_err().reason, "test budget exhausted");
-            match change {
-                0 => {
-                    let (source,center,_) = follower.local_map.take().unwrap();
-                    let owner = Arc::new(nuwax_nav_pct::Tomogram::local_from_surface(&source,
-                        [center.x,center.y], follower.scan.horizon_m+1.5).unwrap());
-                    follower.local_map = Some((source,center,owner));
-                }
-                1 => follower.update_odometry(comparison_pose(0.51,1)),
-                2 => follower.boundary = vec![[0.0,0.0],[6.0,0.0],[6.0,3.0],[0.0,3.0]],
-                3 => follower.update_execution_map(ExecutionMap::Surface(comparison_map(false,None))).unwrap(),
-                4 => follower.options.position_tolerance_m *= 0.9,
-                5 => follower.goal.as_mut().unwrap().pose.position.x += 0.1,
-                _ => { let mut pose = follower.pose.clone().unwrap();
-                    pose.pose.orientation.x = -0.0; follower.update_odometry(pose); }
-            }
-            follower.regenerate(false).expect("changed dependencies cannot reuse a cached failure");
-            assert!(follower.failed_local.len() <= 2);
+    fn first_candidate_is_pending_while_owner_is_held_then_admitted_once() {
+        let mut follower = open_follower();
+        let gate = install_held_candidate(&mut follower);
+        assert_eq!(follower.step(0.3), PlannerStep::Pending(Vec::new()));
+        gate.started();
+        let submitted = follower.local_planning_calls();
+        for _ in 0..20 {
+            assert_eq!(follower.step(0.3), PlannerStep::Pending(Vec::new()));
+            assert!(follower.local_path_for_display().is_empty());
+            assert_eq!(follower.local_plans(), 0);
         }
+        assert_eq!(follower.local_planning_calls(), submitted);
+        assert!(gate.starts.try_recv().is_err());
+        gate.release();
+        assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(c) if c.linear.x > 0.0));
+        assert_eq!(follower.local_plans(), 1);
+        assert!(!follower.local_path_for_display().is_empty());
+    }
+    #[test]
+    fn committed_route_keeps_current_control_while_replacement_is_held() {
+        let mut follower = open_follower();
+        assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(_)));
+        let previous_path = follower.local_path().cloned();
+        let previous_plans = follower.local_plans();
+        let gate = install_held_candidate(&mut follower);
+        assert!(matches!(follower.step(0.3), PlannerStep::Command(c) if c.linear.x > 0.0));
+        gate.started();
+        let submitted = follower.local_planning_calls();
+        for _ in 0..20 {
+            assert!(matches!(follower.step(0.3), PlannerStep::Command(c) if c.linear.x > 0.0));
+            assert_eq!(follower.local_path(), previous_path.as_ref());
+            assert_eq!(follower.local_plans(), previous_plans);
+        }
+        assert_eq!(follower.local_planning_calls(), submitted);
+        gate.release();
+        wait_for_plan(&mut follower, previous_plans);
+    }
+    #[test]
+    fn metadata_refresh_does_not_cancel_or_restart_a_held_candidate() {
+        let source = comparison_map(false, Some(1_000_000_000));
+        let refreshed = refresh_observation_metadata(&source, 2_000_000_000);
+        assert!(nuwax_nav_pct::same_source_geometry(&source, &refreshed));
+        assert!(!source.same_body_query_view(&refreshed));
+        let mut follower = RouteFollower::new(comparison_config(Some(true))).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(source)).unwrap();
+        comparison_route(&mut follower, comparison_pose(0.5,0), comparison_pose(3.0,0));
+        let gate = install_held_candidate(&mut follower);
+        assert!(matches!(follower.step(0.3), PlannerStep::Pending(_)));
+        gate.started();
+        let epoch = follower.owner.as_ref().unwrap().epoch();
+        let submitted = follower.local_planning_calls();
+        follower.update_execution_map(ExecutionMap::Surface(refreshed)).unwrap();
+        let mut same_pose = comparison_pose(0.5,1);
+        same_pose.stamp = Timestamp::from_unix(10,0);
+        follower.update_odometry(same_pose);
+        for _ in 0..20 { assert!(matches!(follower.step(0.3), PlannerStep::Pending(_))); }
+        assert_eq!(follower.owner.as_ref().unwrap().epoch(), epoch);
+        assert_eq!(follower.local_planning_calls(), submitted);
+        assert!(gate.starts.try_recv().is_err());
+        gate.release();
+        assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(c) if c.linear.x > 0.0));
+        assert_eq!(follower.local_plans(), 1);
+    }
+    #[test]
+    fn moved_start_candidate_is_rejected_without_teleporting_or_losing_admission() {
+        for committed in [false,true] {
+            let mut follower = open_follower();
+            if committed { assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(_))); }
+            let previous_path = follower.local_path().cloned();
+            let previous_plans = follower.local_plans();
+            let previous_admission = follower.admitted_generation;
+            let gate = install_held_candidate(&mut follower);
+            follower.step(0.3);
+            gate.started();
+            let mut moved = comparison_pose(0.5,1);
+            moved.pose.position.y = 2.5;
+            follower.update_odometry(moved.clone());
+            gate.release();
+            wait_for(|| follower.owner.as_ref().unwrap().completion_ready_for_test());
+            follower.consume_plan();
+            assert_eq!(follower.pose.as_ref(), Some(&moved));
+            assert_eq!(follower.local_path(), previous_path.as_ref());
+            assert_eq!(follower.local_plans(), previous_plans);
+            assert_eq!(follower.admitted_generation, previous_admission);
+            assert!(follower.local_failures().iter().any(|e| e.reason.contains("接续")));
+            assert!(follower.planner.local_costs().is_empty());
+        }
+    }
+    #[test]
+    fn lifecycle_invalidations_discard_held_late_completions() {
+        for failure in [false,true] { for change in 0..6 {
+            let mut follower = open_follower();
+            let gate = install_held_result(&mut follower, failure.then(|| vec!["obsolete invalid input".into()]));
+            assert!(matches!(follower.step(0.3), PlannerStep::Pending(_)));
+            gate.started();
+            let epoch = follower.owner.as_ref().unwrap().epoch();
+            match change {
+                0 => follower.stop(),
+                1 => follower.configure_goal(&comparison_pose(4.0,1), GoalOptions::default()).unwrap(),
+                2 => follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+                    poses: vec![comparison_pose(0.5,1), comparison_pose(4.0,1)],
+                }), None, comparison_pose(4.0,1)).unwrap(),
+                3 => follower.update_execution_map(ExecutionMap::Surface(comparison_map(true,None))).unwrap(),
+                4 => follower.configure_boundary(&[[0.0,0.0],[6.0,0.0],[6.0,3.0],[0.0,3.0]]),
+                _ => follower.invalidate_execution_map(),
+            }
+            assert!(follower.owner.as_ref().unwrap().epoch() > epoch, "change {change} did not cancel old work");
+            gate.release();
+            wait_for(|| follower.owner.as_ref().unwrap().is_idle_for_test());
+            follower.consume_plan();
+            assert_eq!(follower.local_plans(), 0, "change {change} accepted an obsolete completion");
+            assert!(follower.local_path().is_none());
+            assert!(follower.admitted_generation.is_none());
+            assert!(follower.local_failures().is_empty());
+            assert!(follower.planner.local_costs().is_empty());
+        } }
+    }
+    #[test]
+    fn owner_panic_is_visible_without_restart_or_motion() {
+        let mut follower = open_follower();
+        follower.owner = Some(PlanningOwner::new(|_: PlanRequest, _| -> PlanResult {
+            panic!("injected route owner panic")
+        }).unwrap());
+        assert!(matches!(follower.step(0.3), PlannerStep::Pending(_)));
+        wait_for(|| follower.owner.as_ref().unwrap().faulted());
+        let submitted = follower.local_planning_calls();
+        for _ in 0..3 {
+            assert!(matches!(follower.step(0.3), PlannerStep::Failed(reason)
+                if reason.contains("owner terminated")));
+            assert_eq!(follower.local_planning_calls(), submitted);
+            assert_eq!(follower.local_plans(), 0);
+            assert!(follower.local_path_for_display().is_empty());
+        }
+    }
+    #[test]
+    fn fresh_controller_rejection_is_returned_verbatim_while_planner_is_held() {
+        let prepare = || {
+            let mut follower = open_follower();
+            assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(_)));
+            follower.configure_boundary(&[[2.0,2.0],[3.0,2.0],[3.0,3.0],[2.0,3.0]]);
+            follower
+        };
+        let mut oracle = prepare();
+        let expected = oracle.controller.step(0.3);
+        assert!(matches!(expected, PlannerStep::ReplanRequired(_)));
+        let mut follower = prepare();
+        let gate = install_held_candidate(&mut follower);
+        assert_eq!(follower.step(0.3), expected);
+        gate.started();
+        assert!(!follower.owner.as_ref().unwrap().completion_ready_for_test());
+        assert_eq!(follower.local_plans(), 1);
+        assert!(follower.planner.local_costs().is_empty());
+        gate.release();
+    }
+    #[test]
+    fn stale_unclassified_failure_does_not_revoke_current_admission() {
+        for consume_while_current in [false,true] { for metadata_change in [false,true] {
+            let mut follower = RouteFollower::new(comparison_config(Some(true))).unwrap();
+            let source = comparison_map(false, Some(1_000_000_000));
+            follower.update_execution_map(ExecutionMap::Surface(source.clone())).unwrap();
+            comparison_route(&mut follower, comparison_pose(0.5,0), comparison_pose(3.0,0));
+            assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(_)));
+            install_failures(&mut follower, vec!["invalid old input".into()]);
+            follower.schedule(false);
+            wait_for(|| follower.owner.as_ref().unwrap().completion_ready_for_test());
+            if consume_while_current {
+                follower.consume_plan();
+                assert!(follower.qualified_failure.is_some());
+                assert!(matches!(follower.step(0.3), PlannerStep::ReplanRequired(reason)
+                    if reason.contains("invalid old input")));
+            }
+            if metadata_change {
+                follower.update_execution_map(ExecutionMap::Surface(refresh_observation_metadata(&source, 2_000_000_000))).unwrap();
+            } else {
+                follower.update_odometry(comparison_pose(0.51,1));
+            }
+            assert!(matches!(follower.step(0.3), PlannerStep::Command(c) if c.linear.x > 0.0));
+            assert!(follower.planner.local_costs().is_empty());
+            assert_eq!(follower.local_plans(), 1);
+            assert!(follower.qualified_failure.is_none());
+        } }
     }
 
     #[test]
@@ -803,7 +932,7 @@ mod tests {
             let mut commands = Vec::new();
             let mut arrived = false;
             for tick in 1..=140 {
-                let step = follower.step(0.3);
+                let step = ready_step(&mut follower, 0.3);
                 if step == PlannerStep::Succeeded { arrived = true; break; }
                 let PlannerStep::Command(command) = step else { panic!("clear route must progress: mode={enabled:?} tick={tick} pose={actual:?} step={step:?}"); };
                 assert!(command.linear.x >= 0.0);
@@ -819,8 +948,8 @@ mod tests {
             if enabled == Some(false) {
                 assert_eq!(follower.local_planning_calls(),0);
                 assert_eq!(follower.local_plans(),0);
-                assert!(follower.local_map.is_none() && follower.local_path.is_none());
-                assert!(follower.regenerate(false).is_err());
+                assert!(follower.owner.is_none() && follower.local_path.is_none());
+                follower.schedule(false);
                 assert_eq!(follower.local_planning_calls(),0);
             } else { assert!(follower.local_planning_calls() > 0); }
             traces.push(commands);
@@ -843,7 +972,7 @@ mod tests {
             let mut follower = RouteFollower::new(comparison_config(Some(enabled))).unwrap();
             follower.update_execution_map(ExecutionMap::Surface(clear)).unwrap();
             comparison_route(&mut follower,comparison_pose(0.5,0),comparison_pose(3.0,0));
-            assert!(matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x>0.0));
+            assert!(matches!(ready_step(&mut follower, 0.3),PlannerStep::Command(c) if c.linear.x>0.0));
             // The physical receipt remains authoritative even when planning is off.
             follower.observe_applied_command(Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.5,0.0),angular_z:0.0});
             follower.update_odometry(comparison_pose(0.5,1));
@@ -889,7 +1018,7 @@ mod tests {
             let mut follower = RouteFollower::new(comparison_config(Some(enabled))).unwrap();
             follower.update_execution_map(ExecutionMap::Surface(comparison_map(false,None))).unwrap();
             comparison_route(&mut follower,comparison_pose(0.95,0),comparison_pose(3.0,0));
-            assert!(matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x > 0.0));
+            assert!(matches!(ready_step(&mut follower, 0.3),PlannerStep::Command(c) if c.linear.x > 0.0));
             follower.update_execution_map(ExecutionMap::Surface(comparison_map(true,None))).unwrap();
             follower.update_odometry(comparison_pose(0.95,1));
             assert!(!matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x > 0.0),"changed support allowed motion, mode={enabled}");
@@ -899,7 +1028,7 @@ mod tests {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
             follower.update_execution_map(ExecutionMap::Surface(comparison_map(false,Some(now)))).unwrap();
             comparison_route(&mut follower,comparison_pose(0.5,0),comparison_pose(3.0,0));
-            assert!(matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x > 0.0),"fresh evidence should move, mode={enabled}");
+            assert!(matches!(ready_step(&mut follower, 0.3),PlannerStep::Command(c) if c.linear.x > 0.0),"fresh evidence should move, mode={enabled}");
             // A replacement source carries honestly older observations; no future timestamps or relaxed TTL.
             follower.update_execution_map(ExecutionMap::Surface(comparison_map(false,Some(now.saturating_sub(2_000_000_000))))).unwrap();
             follower.update_odometry(comparison_pose(0.5,1));
@@ -935,17 +1064,17 @@ mod tests {
             assert_eq!(follower.step(0.3), PlannerStep::Pending(Vec::new()));
             assert!(follower.execution_wait_reason().unwrap().contains("支撑或净空"));
             assert_eq!(follower.local_plans(),0);
-            assert!(follower.failed_local.is_empty());
+            assert!(follower.local_failures().is_empty());
         }
         follower.update_odometry(start.clone());
-        assert!(matches!(follower.step(0.3), PlannerStep::Command(command) if command != Twist2::ZERO));
+        assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(command) if command != Twist2::ZERO));
         assert!(follower.execution_wait_reason().is_none());
         assert_eq!(follower.local_plans(),1);
         // 中途输入再次失效时也保留同一参考，恢复后不重复生成局部路线。
         follower.update_odometry(make(0.5,2.0));
         assert_eq!(follower.step(0.3), PlannerStep::Pending(Vec::new()));
         follower.update_odometry(start);
-        assert!(matches!(follower.step(0.3), PlannerStep::Command(command) if command != Twist2::ZERO));
+        assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(command) if command != Twist2::ZERO));
         assert_eq!(follower.local_plans(),1);
         follower.stop();
         assert!(follower.execution_wait_reason().is_none());
@@ -968,7 +1097,8 @@ mod tests {
         follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
         follower.update_odometry(actual.clone());follower.configure_goal(&goal,GoalOptions::default()).unwrap();
         follower.replace_execution_path(ExecutionPath::Surface(Path3D{poses:vec![make(0.5,1.0),make(2.0,1.0),goal.clone()]}),None,goal).unwrap();
-        follower.regenerate(false).unwrap();
+        let previous = follower.local_plans();
+        wait_for_plan(&mut follower, previous);
         let path=follower.local_path().unwrap();let end=path.poses.last().unwrap().pose.position;
         let start=actual.pose.position;let dx=end.x-start.x;let dy=end.y-start.y;
         assert!(path.poses.iter().all(|p|((p.pose.position.x-start.x)*dy-(p.pose.position.y-start.y)*dx).abs()<1e-8),
@@ -976,7 +1106,8 @@ mod tests {
         let goal=make(2.0,2.0);
         follower.configure_goal(&goal,GoalOptions::default()).unwrap();
         follower.replace_execution_path(ExecutionPath::Surface(Path3D{poses:vec![make(0.5,1.0),make(2.0,1.0),goal.clone()]}),None,goal).unwrap();
-        follower.regenerate(false).unwrap();
+        let previous = follower.local_plans();
+        wait_for_plan(&mut follower, previous);
         let path=follower.local_path().unwrap();let end=path.poses.last().unwrap().pose.position;
         let dx=end.x-start.x;let dy=end.y-start.y;
         assert!(path.poses.iter().any(|p|((p.pose.position.x-start.x)*dy-(p.pose.position.y-start.y)*dx).abs()>0.05),
@@ -1044,7 +1175,7 @@ mod tests {
             .unwrap();
         let mut arrived = false;
         for i in 0..300 {
-            match follower.step(0.3) {
+            match ready_step(&mut follower, 0.3) {
                 PlannerStep::Command(command) => {
                     assert_eq!(command.linear.y, 0.0);
                     assert!(command.linear.x >= 0.0);
@@ -1122,7 +1253,7 @@ mod tests {
                 goal,
             )
             .unwrap();
-        assert!(matches!(follower.step(0.2), PlannerStep::Command(_)));
+        assert!(matches!(ready_step(&mut follower, 0.2), PlannerStep::Command(_)));
         assert!(follower.local_end < *follower.cumulative.last().unwrap());
         let previous_local = follower.local_plans();
         let missing = Arc::new(
@@ -1139,22 +1270,42 @@ mod tests {
         let outcome = follower.step(0.2);
         assert!(matches!(outcome, PlannerStep::Command(_) | PlannerStep::ReplanRequired(_)),
             "a current admitted route must use a fresh controller outcome: {outcome:?}");
-        assert!(!follower.local_failures().is_empty());
+        wait_for(|| {
+            follower.step(0.2);
+            !follower.local_failures().is_empty()
+        });
         assert!(follower.local_failures().iter().all(|failure| failure.blocked.is_none()));
         assert!(follower.planner.local_costs().is_empty(), "search failure must not penalize PCT");
         assert_eq!(follower.local_plans(), previous_local);
-        assert!(
-            follower.local_path().is_some(),
-            "重规划请求不清除可供显示的最后局部轨迹"
-        );
-        assert!(!follower.failed_local.is_empty());
-        let cached = follower.failed_local.len();
-        assert!(follower.regenerate(false).is_err());
-        assert_eq!(follower.failed_local.len(), cached);
+        assert!(follower.local_path().is_some(), "search failure keeps the last display trajectory");
         follower.update_execution_map(ExecutionMap::Surface(clear)).unwrap();
-        follower.regenerate(false).expect("障碍移除后同一位姿必须能重新接续");
+        wait_for_plan(&mut follower, previous_local);
         assert_eq!(follower.local_plans(), previous_local + 1);
         follower.stop();
-        assert!(follower.failed_local.is_empty());
+        assert!(follower.local_failures().is_empty());
     }
+    #[test]
+    fn owner_reference_materialization_matches_legacy_clipping_exactly() {
+        for turn in [false,true] {
+            let mut follower=open_follower();
+            let start=comparison_pose(0.5,0);
+            let mut middle=comparison_pose(1.5,0);
+            if turn {middle.pose.position.y=1.3;}
+            let end=comparison_pose(3.0,0);
+            let goal=comparison_pose(3.2,0);
+            follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:vec![start.clone(),middle.clone(),middle,end]}),None,goal).unwrap();
+            for progress in [0.0,0.1,0.98,1.01,2.1] {for horizon in [0.2,1.0,5.0] {
+                follower.progress=progress;
+                let source=ReferenceSource{route:follower.route.as_ref().unwrap().clone(),cumulative:follower.cumulative.clone(),
+                    goal:follower.goal.clone(),options:follower.options,offset:follower.config.body_to_support_z_m,progress};
+                assert!(Arc::ptr_eq(&source.route,follower.route.as_ref().unwrap()));
+                assert!(Arc::ptr_eq(&source.cumulative,&follower.cumulative));
+                let legacy=follower.reference(horizon).unwrap();
+                let owner=source.materialize(follower.pose.as_ref().unwrap(),horizon).unwrap();
+                assert!(exact_points(&legacy.0,&owner.0));
+                assert_eq!((legacy.1.to_bits(),legacy.2,legacy.3),(owner.1.to_bits(),owner.2,owner.3));
+            }}
+        }
+    }
+
 }

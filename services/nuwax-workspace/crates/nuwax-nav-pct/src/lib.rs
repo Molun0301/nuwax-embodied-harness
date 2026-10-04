@@ -7,6 +7,8 @@ mod boundary;
 mod surface_adapter;
 #[cfg(feature = "mls-adapter")]
 pub use surface_adapter::{PctPlanner, same_source_geometry};
+mod cancellation;
+pub use cancellation::{PlanningCancellation, planning_cancelled, with_planning_cancellation};
 mod search;
 mod tomogram;
 pub use search::{Route, SearchStats};

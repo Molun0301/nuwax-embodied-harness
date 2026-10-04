@@ -1,4 +1,5 @@
 use ahash::{AHashMap, AHashSet};
+use crate::cancellation::checkpoint;
 #[cfg(feature = "mls-adapter")]
 use nuwax_nav_mls_planner::SurfaceSnapshot;
 use std::collections::VecDeque;
@@ -45,11 +46,20 @@ impl Tomogram {
     ) -> Result<Self, String> {
         Self::from_surface_window(source, Some((center, radius)))
     }
+    /// Build a local derived map with an explicitly scoped request token.
+    #[cfg(feature = "mls-adapter")]
+    pub fn local_from_surface_cancellable(
+        source: &SurfaceSnapshot, center: [f64; 2], radius: f64,
+        cancellation: &crate::PlanningCancellation,
+    ) -> Result<Self, String> {
+        crate::with_planning_cancellation(cancellation, || Self::local_from_surface(source, center, radius))
+    }
     #[cfg(feature = "mls-adapter")]
     fn from_surface_window(
         source: &SurfaceSnapshot,
         window: Option<([f64; 2], f64)>,
     ) -> Result<Self, String> {
+        checkpoint()?;
         let config = source.config();
         let body = source.body_envelope();
         let required_height = body.map_or(f64::from(config.robot_height), |m| {
@@ -64,16 +74,18 @@ impl Tomogram {
                 });
             (hi - lo) * 0.5
         });
+        // The source supplies one iterator; its creation and individual next() calls
+        // remain indivisible, so check on both sides of that MLS boundary.
+        checkpoint()?;
         let (resolution, columns) = source.navigation_source_columns(window);
+        checkpoint()?;
         let mut blocked = AHashSet::new();
         let mut result = Self::from_columns_with_evidence(
             resolution,
             f64::from(source.source_voxel_size_m()),
-            columns.filter(|(column, _)| {
+            columns.take_while(|_| !crate::planning_cancelled()).filter(|(column, _)| {
                 let allowed = source.navigation_column_allowed(*column, resolution);
-                if !allowed {
-                    blocked.insert(*column);
-                }
+                if !allowed { blocked.insert(*column); }
                 allowed
             }),
             required_height,
@@ -85,9 +97,13 @@ impl Tomogram {
             source.ground_evidence()==nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume,
         )?;
         if !blocked.is_empty() {
-            result.known_columns.extend(blocked);
-            result.compute_costs();
+            for column in blocked {
+                checkpoint()?;
+                result.known_columns.insert(column);
+            }
+            result.compute_costs()?;
         }
+        checkpoint()?;
         Ok(result)
     }
 
@@ -144,6 +160,7 @@ impl Tomogram {
         clearance_radius: f64,
         occupied_volume:bool,
     ) -> Result<Self, String> {
+        checkpoint()?;
         if !resolution.is_finite()
             || resolution <= 0.0
             || !source_quantum.is_finite()
@@ -178,11 +195,13 @@ impl Tomogram {
         // 切片间隔只控制层号；相同地面/顶面的重复切片在此直接压缩。
         let spacing = body_height.max(resolution);
         for (column, mut bands) in columns {
+            checkpoint()?;
             map.known_columns.insert(column);
             bands.retain(|b| b[0].is_finite() && b[1].is_finite() && b[0] < b[1]);
             bands.sort_unstable_by(|a, b| a[0].total_cmp(&b[0]));
             let mut merged: Vec<[f64; 2]> = Vec::new();
             for band in bands {
+                checkpoint()?;
                 if let Some(last) = merged.last_mut().filter(|last| band[0] <= last[1] + 1e-6) {
                     last[1] = last[1].max(band[1]);
                 } else {
@@ -190,6 +209,7 @@ impl Tomogram {
                 }
             }
             for (i, band) in merged.iter().enumerate() {
+                checkpoint()?;
                 // 厚地面带是两种LIO都可能产生的测量厚度。只在地形能力范围内
                 // 使用带内代表高程，避免把每列最高回波都当成离散台阶；真实接触仍由近场判断。
                 let depth = band[1] - band[0];
@@ -217,11 +237,13 @@ impl Tomogram {
                 map.columns.entry(column).or_default().push(id);
             }
         }
+        checkpoint()?;
         if map.cells.is_empty() {
             return Err("层析地图没有可用地面".into());
         }
-        map.connect();
-        map.compute_costs();
+        map.connect()?;
+        map.compute_costs()?;
+        checkpoint()?;
         Ok(map)
     }
     pub fn position(&self, id: usize) -> [f64; 3] {
@@ -297,8 +319,9 @@ impl Tomogram {
                     .total_cmp(&(self.cells[a].ground - self.cells[c].ground).abs())
             })
     }
-    fn connect(&mut self) {
+    fn connect(&mut self) -> Result<(), String> {
         for id in 0..self.cells.len() {
+            checkpoint()?;
             let [x, y] = self.cells[id].column;
             let mut neighbors = Vec::with_capacity(8);
             for dx in -1..=1 {
@@ -329,11 +352,14 @@ impl Tomogram {
             }
             self.cells[id].neighbors = neighbors;
         }
+        checkpoint()?;
+        Ok(())
     }
-    fn compute_costs(&mut self) {
+    fn compute_costs(&mut self) -> Result<(), String> {
         let mut walls = VecDeque::new();
         let mut unknown = VecDeque::new();
         for id in 0..self.cells.len() {
+            checkpoint()?;
             self.cells[id].clearance = f64::INFINITY;
             self.cells[id].support_clearance = f64::INFINITY;
             let [x, y] = self.cells[id].column;
@@ -358,6 +384,7 @@ impl Tomogram {
         }
         for (mut queue, is_wall) in [(walls, true), (unknown, false)] {
             while let Some(id) = queue.pop_front() {
+                checkpoint()?;
                 let value = if is_wall {
                     self.cells[id].clearance
                 } else {
@@ -380,22 +407,19 @@ impl Tomogram {
         }
         // 高差影响机体整个足迹，不能只在中心恰好经过阶边时付出代价。
         // 沿同层可连接单元传播有限偏好，真实台阶与唯一通道仍保持连通。
-        let mut terrain: Vec<f64> = self
-            .cells
-            .iter()
-            .map(|c| {
-                c.neighbors
-                    .iter()
-                    .map(|&n| (self.cells[n].ground - c.ground).abs() / self.resolution)
-                    .fold(0.0, f64::max)
-                    .min(2.0)
-            })
-            .collect();
-        let mut queue: VecDeque<usize> = (0..self.cells.len())
-            .filter(|&id| terrain[id] > 0.0)
-            .collect();
+        let mut terrain = Vec::with_capacity(self.cells.len());
+        let mut queue = VecDeque::new();
+        for (id, cell) in self.cells.iter().enumerate() {
+            checkpoint()?;
+            let value = cell.neighbors.iter()
+                .map(|&n| (self.cells[n].ground - cell.ground).abs() / self.resolution)
+                .fold(0.0, f64::max).min(2.0);
+            terrain.push(value);
+            if value > 0.0 { queue.push_back(id); }
+        }
         let decay = 2.0 * self.resolution / self.clearance_radius.max(self.resolution);
         while let Some(id) = queue.pop_front() {
+            checkpoint()?;
             let value = terrain[id] - decay;
             if value <= 0.0 {
                 continue;
@@ -408,6 +432,7 @@ impl Tomogram {
             }
         }
         for id in 0..self.cells.len() {
+            checkpoint()?;
             let c = &self.cells[id];
             let preferred = self.clearance_radius.max(self.half_width) + self.resolution;
             let wall = preferred / (c.clearance + self.resolution * 0.5);
@@ -415,9 +440,17 @@ impl Tomogram {
             let unknown = ((preferred - c.support_clearance) / preferred).clamp(0.0, 1.0);
             self.cells[id].cost = 1.0 + wall * wall + 3.0 * unknown * unknown + terrain[id];
         }
+        checkpoint()?;
+        Ok(())
     }
     /// 层析直线可见性只验证全局参考；精细机体许可归近场轨迹。
     pub fn segment_clear(&self, a: [f64; 3], b: [f64; 3], boundary: &[[f64; 2]]) -> bool {
+        self.segment_clear_cancelled(a, b, boundary, None)
+    }
+    pub(crate) fn segment_clear_cancelled(
+        &self, a: [f64; 3], b: [f64; 3], boundary: &[[f64; 2]],
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> bool {
         if !a.into_iter().chain(b).all(f64::is_finite) {
             return false;
         }
@@ -426,6 +459,7 @@ impl Tomogram {
             .max(1.0) as usize;
         let mut previous: Option<usize> = None;
         for i in 0..=n {
+            if crate::planning_cancelled() || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) { return false; }
             let t = i as f64 / n as f64;
             let p = std::array::from_fn(|j| a[j] + t * (b[j] - a[j]));
             if !crate::inside_boundary([p[0], p[1]], boundary) {
@@ -442,5 +476,36 @@ impl Tomogram {
             previous = Some(id);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn cancellation_stops_column_input_before_collecting_the_whole_map() {
+        use std::{cell::Cell, sync::{Arc, atomic::{AtomicU64, Ordering}}};
+        let epoch = Arc::new(AtomicU64::new(4));
+        let token = crate::PlanningCancellation::new(epoch.clone(), 4);
+        let visited = Cell::new(0);
+        let columns = (0..10_000).map(|x| {
+            visited.set(visited.get() + 1);
+            if x == 7 { epoch.store(5, Ordering::Release); }
+            ([x, 0], vec![[-0.1, 0.0]])
+        });
+        let error = crate::with_planning_cancellation(&token, ||
+            Tomogram::from_columns(0.1, columns, 0.5, 0.15, 0.2, 0.2, 20.0)).unwrap_err();
+        assert!(error.contains("取消"));
+        assert_eq!(visited.get(), 8);
+    }
+    #[test]
+    fn cancellation_abandons_connect_and_cost_passes_without_returning_a_partial_map() {
+        // Each column uses three checkpoints; 302 reaches connect, 450 reaches costs.
+        for checkpoints in [302, 450] {
+            let error = crate::cancellation::after_checkpoints(checkpoints, ||
+                Tomogram::from_columns(0.1, (0..100).map(|x| ([x, 0], vec![[-0.1, 0.0]])),
+                    0.5, 0.15, 0.2, 0.2, 20.0)).unwrap_err();
+            assert!(error.contains("取消"), "{error}");
+        }
     }
 }

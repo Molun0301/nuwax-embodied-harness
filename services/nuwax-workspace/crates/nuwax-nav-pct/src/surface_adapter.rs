@@ -54,6 +54,7 @@ impl PctPlanner {
             regions=costs.len(),"局部接续反馈已加入当前目标的路线代价");
     }
     pub fn map(&self, source: &SurfaceSnapshot) -> Result<Arc<Tomogram>, String> {
+        crate::cancellation::checkpoint()?;
         {
             let cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((previous, map)) = cached
@@ -61,6 +62,7 @@ impl PctPlanner {
                 .filter(|(previous, _)| same_source_geometry(previous, source))
             {
                 let _ = previous;
+                crate::cancellation::checkpoint()?;
                 return Ok(Arc::clone(map));
             }
         }
@@ -69,6 +71,7 @@ impl PctPlanner {
         let map = Arc::new(Tomogram::from_surface(source)?);
         tracing::info!(target: "navigation.pct", event="navigation.pct.map", cells=map.cells.len(),
             elapsed_ms=began.elapsed().as_secs_f64()*1000.0, "层析地图构建完成");
+        crate::cancellation::checkpoint()?;
         let old = self
             .cached
             .lock()
@@ -78,4 +81,3 @@ impl PctPlanner {
         Ok(map)
     }
 }
-

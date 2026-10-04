@@ -29,6 +29,8 @@ struct Inputs {
     result_wait_reason: Option<String>,
     display_path: Vec<[f64; 3]>,
     closed: bool,
+    lifecycle_stop: bool,
+    lifecycle_update: bool,
 }
 
 // Only timestamps may advance without changing pose-derived authority. Preserve
@@ -65,8 +67,12 @@ pub(crate) struct PlannerWorker {
     shared: Arc<(Mutex<Inputs>, Condvar)>,
     thread: Option<std::thread::JoinHandle<()>>,
     wait_reason: Option<String>,
+    #[cfg(test)]
+    delivered_command_deadline: Option<std::time::Instant>,
 }
 impl PlannerWorker {
+    #[cfg(test)]
+    pub(crate) fn delivered_command_deadline_for_test(&self)->Option<std::time::Instant> {self.delivered_command_deadline}
     pub(crate) fn new(mut planner: impl NavPlanner) -> Result<Self, RuntimeError> {
         let shared = Arc::new((Mutex::new(Inputs::default()), Condvar::new()));
         let worker = Arc::clone(&shared);
@@ -76,7 +82,7 @@ impl PlannerWorker {
                 let (lock, wake) = &*worker;
                 let mut goal_version = u64::MAX;
                 let mut path_version = u64::MAX;
-                let mut map_version = u64::MAX;
+                let mut map_version = 0;
                 let mut boundary_version = u64::MAX;
                 let mut slow_log_at: Option<std::time::Instant> = None;
                 loop {
@@ -98,12 +104,24 @@ impl PlannerWorker {
                         applied_seq,
                     ) = {
                         let mut input = lock.lock().unwrap();
-                        while input.requested.is_none() && !input.closed {
+                        while input.requested.is_none() && !input.lifecycle_stop && !input.lifecycle_update && !input.closed {
                             input = wake.wait(input).unwrap();
                         }
                         if input.closed {
                             break;
                         }
+                        if input.lifecycle_stop {
+                            input.lifecycle_stop=false;
+                            // A newer goal/path may already have coalesced after
+                            // stop. Never mark that uninstalled state consumed.
+                            goal_version=if input.goal.is_some(){u64::MAX}else{input.goal_version};
+                            path_version=if input.path.is_some(){u64::MAX}else{input.path_version};
+                            drop(input);
+                            // Revoke inner planning even without another control tick.
+                            planner.stop();
+                            continue;
+                        }
+                        input.lifecycle_update=false;
                         (
                             input.epoch,
                             input.goal_id.clone(),
@@ -117,7 +135,7 @@ impl PlannerWorker {
                             input.map_version,
                             input.pose.clone(),
                             input.pose_version,
-                            input.requested.take().unwrap(),
+                            input.requested.take(),
                             input.applied,
                             input.applied_version,
                         )
@@ -162,9 +180,10 @@ impl PlannerWorker {
                             path_version = path_seq;
                         }
                         planner.observe_applied_command(applied);
-                        Ok(planner.step(width))
+                        Ok(width.map_or(PlannerStep::Pending(Vec::new()),|width|planner.step(width)))
                     })()
                     .unwrap_or_else(|error| PlannerStep::ReplanRequired(error.to_string()));
+                    if width.is_none() {continue;}
                     let wait_reason = if matches!(computed, PlannerStep::Pending(_))
                         || matches!(computed, PlannerStep::Command(command) if command == Twist2::ZERO) {
                         planner.execution_wait_reason()
@@ -210,6 +229,8 @@ impl PlannerWorker {
             shared,
             thread: Some(thread),
             wait_reason: None,
+            #[cfg(test)]
+            delivered_command_deadline: None,
         })
     }
 }
@@ -224,6 +245,7 @@ impl NavPlanner for PlannerWorker {
         input.display_path.clear();
         input.result_wait_reason = None;
         input.requested = input.control_width;
+        input.lifecycle_update = true;
         self.shared.1.notify_one();
     }
     fn configure_goal(
@@ -242,6 +264,8 @@ impl NavPlanner for PlannerWorker {
         input.goal_version += 1;
         input.path_version += 1;
         input.goal = Some((goal.clone(), options));
+        input.lifecycle_update = true;
+        self.shared.1.notify_one();
         Ok(())
     }
     fn replace_path(&mut self, _path: Path2D) {
@@ -259,6 +283,8 @@ impl NavPlanner for PlannerWorker {
         input.display_path.clear();
         input.path_version += 1;
         input.path = Some(Arc::new((path, yaws, goal)));
+        input.lifecycle_update = true;
+        self.shared.1.notify_one();
         Ok(())
     }
     fn update_odometry(&mut self, pose: PoseStamped) {
@@ -280,6 +306,7 @@ impl NavPlanner for PlannerWorker {
         input.display_path.clear();
         input.result_wait_reason = None;
         input.requested = input.control_width;
+        input.lifecycle_update = true;
         self.shared.1.notify_one();
         Ok(())
     }
@@ -324,7 +351,7 @@ impl NavPlanner for PlannerWorker {
         let source_changed = input.result.is_some()
             && (input.result_map_version != input.map_version
                 || input.result_boundary_version != input.boundary_version);
-        if input.result.is_none() || expired || arrival_changed || terminal_changed || source_changed {
+        if input.result.is_none() || input.result.as_ref().is_some_and(|(_,s)|matches!(s,PlannerStep::Pending(_))) || expired || arrival_changed || terminal_changed || source_changed {
             input.requested = Some(width);
             self.shared.1.notify_one();
         }
@@ -344,6 +371,10 @@ impl NavPlanner for PlannerWorker {
                 }
             })
             .map(|(_, step)| step.clone());
+        #[cfg(test)]
+        { self.delivered_command_deadline=if matches!(&ready,Some(PlannerStep::Command(_))) {
+            input.result.as_ref().map(|(started,_)|*started+DEFAULT_CONTROL_HORIZON)
+        } else {None}; }
         self.wait_reason = if ready.is_some() { input.result_wait_reason.clone() } else if arrival_changed {
             Some("位姿已更新，保持零速并重新核对到达状态".into())
         } else if terminal_changed {
@@ -365,6 +396,8 @@ impl NavPlanner for PlannerWorker {
     }
     fn stop(&mut self) {
         self.wait_reason = None;
+        #[cfg(test)]
+        {self.delivered_command_deadline=None;}
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
@@ -378,6 +411,8 @@ impl NavPlanner for PlannerWorker {
         input.path_version += 1;
         input.requested = None;
         input.control_width = None;
+        input.lifecycle_stop = true;
+        self.shared.1.notify_one();
     }
 }
 impl Drop for PlannerWorker {
@@ -465,7 +500,14 @@ mod tests {
         fn execution_wait_reason(&self) -> Option<String> { self.inner.execution_wait_reason() }
         fn local_path_for_display(&self) -> Vec<[f64; 3]> { self.inner.local_path_for_display() }
         fn step(&mut self, width: f64) -> PlannerStep {
-            let outcome = self.inner.step(width);
+            let mut outcome = self.inner.step(width);
+            // This fixture gates publication, not planning latency. Await initial
+            // asynchronous admission before applying its publication barrier.
+            let deadline=std::time::Instant::now()+Duration::from_secs(5);
+            while matches!(&outcome,PlannerStep::Pending(failures) if failures.is_empty())
+                && self.inner.local_path().is_none() && std::time::Instant::now()<deadline {
+                std::thread::sleep(Duration::from_millis(1));outcome=self.inner.step(width);
+            }
             let _ = self.computed.send(RouteComputation {
                 outcome: outcome.clone(),
                 map: self.map.as_ref().unwrap().clone(),
@@ -699,6 +741,28 @@ mod tests {
 
     // Each step announces the sources it consumed, then waits for an explicit
     // release. The timeout only bounds a failed test's Drop; ordering uses channels.
+    #[test]
+    fn stop_then_new_goal_and_path_before_old_compute_returns_installs_latest_inputs() {
+        for enabled in [false,true] {
+            let mut harness=RouteWorkerHarness::new(enabled);
+            harness.worker.step(0.3);
+            let old=harness.next_computation();assert_positive_route_computation(&old,enabled);
+            harness.worker.stop();
+            let goal=route_pose(4.0,1);
+            harness.worker.configure_goal(&goal,GoalOptions::default()).unwrap();
+            harness.worker.replace_execution_path(ExecutionPath::Surface(Path3D {
+                poses:vec![route_pose(0.5,1),goal.clone()]
+            }),None,goal).unwrap();
+            harness.worker.step(0.3);
+            harness.release.send(()).unwrap();
+            let latest=harness.next_computation();
+            assert_positive_route_computation(&latest,enabled);
+            assert_eq!(latest.goal_updates,old.goal_updates+1);
+            assert_eq!(latest.path_updates,old.path_updates+1);
+            harness.release.send(()).unwrap();
+        }
+    }
+
     struct SourceProbe {
         started: std::sync::mpsc::Sender<(bool, Vec<[f64; 2]>)>,
         release: std::sync::mpsc::Receiver<()>,
@@ -1331,4 +1395,44 @@ mod tests {
             "不能无限重放旧速度"
         );
     }
+    #[test]
+    fn lifecycle_stop_reaches_inner_owner_without_another_control_tick() {
+        use crate::planning_owner::PlanningOwner;
+        struct Probe {
+            owner: PlanningOwner<(),()>,
+            stopped: std::sync::mpsc::Sender<()>,
+            steps: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl NavPlanner for Probe {
+            fn replace_path(&mut self,_:Path2D) {}
+            fn update_odometry(&mut self,_:PoseStamped) {}
+            fn update_costmap(&mut self,_:CostMap2D) {}
+            fn step(&mut self,_:f64)->PlannerStep {
+                self.steps.fetch_add(1,Ordering::SeqCst);self.owner.submit(1,());PlannerStep::Pending(Vec::new())
+            }
+            fn stop(&mut self) {self.owner.cancel();let _=self.stopped.send(());}
+        }
+        let (started,starts)=std::sync::mpsc::channel();
+        let (cancelled,cancels)=std::sync::mpsc::channel();
+        let (stopped,stops)=std::sync::mpsc::channel();
+        let steps=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner=PlanningOwner::new(move |_,token:&crate::planning_owner::Cancellation| {
+            started.send(()).unwrap();
+            let deadline=std::time::Instant::now()+Duration::from_secs(3);
+            while !token.cancelled() && std::time::Instant::now()<deadline {std::thread::sleep(Duration::from_millis(1));}
+            assert!(token.cancelled());cancelled.send(()).unwrap();
+        }).unwrap();
+        let mut worker=PlannerWorker::new(Probe{owner,stopped,steps:steps.clone()}).unwrap();
+        worker.step(0.3);starts.recv_timeout(Duration::from_secs(1)).unwrap();
+        while stops.try_recv().is_ok() {}
+        worker.stop();
+        stops.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancels.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.update_costmap(CostMap2D::new_all_free("map",2,2,0.1));
+        worker.configure_boundary(&[[0.0,0.0],[1.0,0.0],[0.0,1.0]]);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(steps.load(Ordering::SeqCst),1,"source updates cannot restart stopped control");
+        assert!(worker.shared.0.lock().unwrap().result.is_none());
+    }
+
 }

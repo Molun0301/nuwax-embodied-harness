@@ -1,5 +1,6 @@
 //! Scan式路线引导近场规划：优化三次样条，按真实地形生成可执行机体轨迹。
 //! 全局层析路线只作参考，局部轨迹在有限视距内处理转向、机体碰撞与接触。
+mod cancellation;
 mod local_search;
 mod spline;
 #[cfg(feature="profile")]
@@ -7,6 +8,7 @@ mod profile;
 pub use local_search::probe_motion;
 use nuwax_nav_mls_planner::SurfaceSnapshot;
 use nuwax_nav_pct::Tomogram;
+pub use nuwax_nav_pct::{PlanningCancellation, planning_cancelled, with_planning_cancellation};
 use nuwax_nav_types_messages::MotionKinematics;
 pub type BodyPose = ([f64; 3], [f64; 4]);
 #[derive(Clone, Debug)]
@@ -45,9 +47,18 @@ impl ScanConfig {
         Ok(())
     }
 }
+fn admit_candidate<T>(result: Result<T, LocalPlanError>) -> Result<Option<T>, LocalPlanError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if matches!(error.kind, LocalPlanFailureKind::Cancelled) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
 /// A finite local search is not a proof of physical infeasibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalPlanFailureKind {
+    /// Superseded work is neither a search failure nor physical obstruction.
+    Cancelled,
     BudgetExhausted,
     SearchExhausted,
     Unclassified,
@@ -68,8 +79,9 @@ impl std::fmt::Display for LocalPlanError {
 impl From<String> for LocalPlanError {
     fn from(reason: String) -> Self {
         Self {
+            kind: if planning_cancelled() { LocalPlanFailureKind::Cancelled }
+                else { LocalPlanFailureKind::Unclassified },
             reason,
-            kind: LocalPlanFailureKind::Unclassified,
             closest_pose: None,
             blocked: None,
         }
@@ -101,7 +113,8 @@ fn advance(
     xy: [f64; 2],
     heading: f64,
     boundary: &[[f64; 2]],
-) -> Result<BodyPose, String> {
+) -> Result<BodyPose, LocalPlanError> {
+    cancellation::checkpoint()?;
     let (next,view)=project_endpoint(map,from,xy,heading)?;
     check_projected_motion(&view,from,next,boundary)?;
     Ok(next)
@@ -109,18 +122,21 @@ fn advance(
 /// 候选先生成完整端点站姿；中间扫掠在候选可能采用时单独核验。
 fn project_endpoint(
     map:&SurfaceSnapshot,from:BodyPose,xy:[f64;2],heading:f64,
-) -> Result<(BodyPose,nuwax_nav_mls_planner::SurfaceBodyQueryView),String> {
+) -> Result<(BodyPose,nuwax_nav_mls_planner::SurfaceBodyQueryView),LocalPlanError> {
     #[cfg(feature="profile")]
     let began=std::time::Instant::now();
+    cancellation::checkpoint()?;
     let view=map.body_query_with_current_support(from.0,from.1);
     #[cfg(feature="profile")]
     profile::record(0,began,view.is_err());
+    cancellation::checkpoint()?;
     let view=view.map_err(|e|e.to_string())?;
     #[cfg(feature="profile")]
     let began=std::time::Instant::now();
     let next=view.body_pose_after_motion(from,xy,heading);
     #[cfg(feature="profile")]
     profile::record(1,began,next.is_err());
+    cancellation::checkpoint()?;
     let mut next=next.map_err(|e|e.to_string())?;
     if (xy[0] - from.0[0]).hypot(xy[1] - from.0[1]) < 1e-9 {
         next.0[2] = from.0[2];
@@ -129,12 +145,14 @@ fn project_endpoint(
 }
 fn check_projected_motion(
     view:&nuwax_nav_mls_planner::SurfaceBodyQueryView,from:BodyPose,next:BodyPose,boundary:&[[f64;2]],
-) -> Result<(),String> {
+) -> Result<(),LocalPlanError> {
     #[cfg(feature="profile")]
     let began=std::time::Instant::now();
+    cancellation::checkpoint()?;
     let checked=view.validate_body_motion(from,next,boundary);
     #[cfg(feature="profile")]
     profile::record(2,began,checked.is_err());
+    cancellation::checkpoint()?;
     checked.map_err(|e|e.to_string())?;
     Ok(())
 }
@@ -144,7 +162,8 @@ fn rotate(
     heading: f64,
     kinematics: &MotionKinematics,
     boundary: &[[f64; 2]],
-) -> Result<(), String> {
+) -> Result<(), LocalPlanError> {
+    cancellation::checkpoint()?;
     let from = *poses.last().unwrap();
     let change = angle(heading - yaw(from.1));
     if change.abs() < 1e-4 {
@@ -156,6 +175,7 @@ fn rotate(
     let n = (change.abs() / 0.08).ceil().max(1.0) as usize;
     // 对后方目标试两个实际旋转方向，左右机体扫掠空间可能不同。
     for delta in [change, change - change.signum() * std::f64::consts::TAU] {
+        cancellation::checkpoint()?;
         let n = if delta == change {
             n
         } else {
@@ -165,6 +185,7 @@ fn rotate(
         let mut previous = from;
         let mut failed = false;
         for i in 1..=n {
+            cancellation::checkpoint()?;
             // 原地转向保持实际中心和相对地面倾斜；不能把地面法向绕世界Z轴转走。
             let result = advance(
                 map,
@@ -173,9 +194,10 @@ fn rotate(
                 yaw(from.1) + delta * i as f64 / n as f64,
                 boundary,
             );
-            let Ok(next) = result else {
-                failed = true;
-                break;
+            let next = match result {
+                Ok(next) => next,
+                Err(error) if matches!(error.kind, LocalPlanFailureKind::Cancelled) => return Err(error),
+                Err(_) => { failed = true; break; }
             };
             candidate.push(next);
             previous = next;
@@ -197,13 +219,14 @@ fn project(
     arrival: Option<([f64; 3], f64)>,
     boundary: &[[f64; 2]],
     blocked: &std::cell::Cell<Option<[f64; 3]>>,
-) -> Result<Vec<BodyPose>, String> {
+) -> Result<Vec<BodyPose>, LocalPlanError> {
+    cancellation::checkpoint()?;
     let mut poses = vec![start];
-    let valid: Vec<_> = points
-        .iter()
-        .copied()
-        .filter(|p| (p[0] - start.0[0]).hypot(p[1] - start.0[1]) > 1e-5)
-        .collect();
+    let mut valid = Vec::new();
+    for &point in points {
+        cancellation::checkpoint()?;
+        if (point[0] - start.0[0]).hypot(point[1] - start.0[1]) > 1e-5 { valid.push(point); }
+    }
     if valid.is_empty() {
         if arrival.is_some_and(|(goal, tolerance)| distance3(start.0, goal) >= tolerance) {
             return Err("近场参考尚未到达原三维目标区域".into());
@@ -222,6 +245,7 @@ fn project(
         boundary,
     )?;
     for (index, point) in valid.iter().enumerate() {
+        cancellation::checkpoint()?;
         let from = *poses.last().unwrap();
         let dx = point[0] - from.0[0];
         let dy = point[1] - from.0[1];
@@ -260,6 +284,7 @@ fn project(
                 let mut low = 0.0;
                 let mut high = 1.0;
                 for _ in 0..24 {
+                    cancellation::checkpoint()?;
                     let t = (low + high) * 0.5;
                     let distance = (previous.0[0] + delta[0] * t - goal[0])
                         .hypot(previous.0[1] + delta[1] * t - goal[1])
@@ -276,11 +301,13 @@ fn project(
                 ];
             }
         }
-        let next = advance(map, previous, xy, tangent, boundary).map_err(|e| {
-            if blocked.get().is_none() {
+        let next = advance(map, previous, xy, tangent, boundary).map_err(|mut error| {
+            if !matches!(error.kind, LocalPlanFailureKind::Cancelled)
+                && blocked.get().is_none() {
                 blocked.set(Some([xy[0], xy[1], previous.0[2]]));
             }
-            format!("轨迹点{index}({:.3},{:.3})：{e}", xy[0], xy[1])
+            error.reason = format!("轨迹点{index}({:.3},{:.3})：{}", xy[0], xy[1], error.reason);
+            error
         })?;
         // 地形投影不得跳至层析参考的另一楼层。
         let offset = map.body_envelope().unwrap().body_to_support_z_m;
@@ -308,6 +335,7 @@ fn project(
     if let Some(heading) = final_yaw {
         rotate(map, &mut poses, heading, kinematics, boundary)?;
     }
+    cancellation::checkpoint()?;
     Ok(poses)
 }
 /// 参考坐标为支撑面；起点保留实际机体完整站姿，必要时执行完整近场搜索。
@@ -324,8 +352,29 @@ pub fn plan(
     follow_reference: bool,
     prefer_straight: bool,
 ) -> Result<LocalTrajectory, LocalPlanError> {
+    cancellation::checkpoint()?;
+    let result = plan_impl(map, tomogram, start, reference, kinematics, config, final_yaw,
+        arrival, boundary, follow_reference, prefer_straight);
+    cancellation::checkpoint()?;
+    result
+}
+
+fn plan_impl(
+    map: &SurfaceSnapshot,
+    tomogram: &Tomogram,
+    start: BodyPose,
+    reference: &[[f64; 3]],
+    kinematics: &MotionKinematics,
+    config: &ScanConfig,
+    final_yaw: Option<f64>,
+    arrival: Option<([f64; 3], f64)>,
+    boundary: &[[f64; 2]],
+    follow_reference: bool,
+    prefer_straight: bool,
+) -> Result<LocalTrajectory, LocalPlanError> {
     #[cfg(feature="profile")]
     let _profile=profile::Scope::begin(start,reference,kinematics,config,final_yaw,arrival,follow_reference,prefer_straight);
+    cancellation::checkpoint()?;
     local_search::validate_caps(kinematics)?;
     let began = std::time::Instant::now();
     let blocked = std::cell::Cell::new(None);
@@ -385,9 +434,10 @@ pub fn plan(
                     along>=-1e-9 && along<=tl+1e-9 && deviation<=f64::from(map.source_voxel_size_m())
                 }));
             if straight || prefer_straight || shortcut {
-                let samples=spline::resample(&[origin,end],spacing);
+                let samples=spline::resample(&[origin,end],spacing)?;
                 for region in [interior,arrival] {
-                    if let Ok(poses)=project(map,start,&samples,kinematics,false,final_yaw,region,boundary,&blocked) {
+                    cancellation::checkpoint()?;
+                    if let Some(poses)=admit_candidate(project(map,start,&samples,kinematics,false,final_yaw,region,boundary,&blocked))? {
                         #[cfg(feature="profile")]
                         profile::success();
                         return Ok(LocalTrajectory {poses,smoothed:false,
@@ -402,6 +452,7 @@ pub fn plan(
     // 尝试从实际位置直达较远的参考折点，保留末段切向供下一窗口接续。
     // 完整候选仍核验地形、机体和转向，不能用仅中心可见或整窗直弦切掉真正转角。
     for join in (2..reference.len().saturating_sub(1)).rev() {
+        cancellation::checkpoint()?;
         let origin = reference[0];
         let heading = yaw(start.1);
         let first = reference[1];
@@ -420,11 +471,11 @@ pub fn plan(
         if !inside { continue; }
         let mut guide = vec![origin];
         guide.extend_from_slice(&reference[join..]);
-        let controls = spline::resample(&guide, 0.25_f64.max(tomogram.resolution));
-        let samples = spline::sample(&controls, spacing);
+        let controls = spline::resample(&guide, 0.25_f64.max(tomogram.resolution))?;
+        let samples = spline::sample(&controls, spacing)?;
         // 捷径受阻只否决该候选，不能把它的碰撞点当作原参考走廊受阻的证据。
         let shortcut_blocked = std::cell::Cell::new(None);
-        if let Ok(poses) = project(map, start, &samples, kinematics, true, final_yaw, interior, boundary, &shortcut_blocked) {
+        if let Some(poses) = admit_candidate(project(map, start, &samples, kinematics, true, final_yaw, interior, boundary, &shortcut_blocked))? {
             #[cfg(feature="profile")]
             profile::success();
             return Ok(LocalTrajectory { poses, smoothed: true, elapsed_ms: began.elapsed().as_secs_f64()*1000.0 });
@@ -437,6 +488,7 @@ pub fn plan(
     // 先沿参考直段生成仅在拐点圆滑的样条；碰撞距离优化只用于受阻候选。
     // 无条件推动全部控制点会把可通行的直段也推向离散墙距梯度，产生无必要的蛇形。
     for optimize_obstacles in [false, true] {
+        cancellation::checkpoint()?;
         let controls = if optimize_obstacles { spline::optimize(
             reference,
             tomogram,
@@ -444,9 +496,10 @@ pub fn plan(
             centers,
             config.optimization_iterations,
             Some(departure),
-        ) } else { spline::resample(reference, 0.25_f64.max(tomogram.resolution)) };
-        let sampled = spline::sample(&controls, spacing);
+        ) } else { spline::resample(reference, 0.25_f64.max(tomogram.resolution)) }?;
+        let sampled = spline::sample(&controls, spacing)?;
         for goal_region in [interior, arrival] {
+            cancellation::checkpoint()?;
             match project(
                 map,
                 start,
@@ -468,6 +521,7 @@ pub fn plan(
                     })
                 }
                 Err(reason) => {
+                    if matches!(reason.kind, LocalPlanFailureKind::Cancelled) { return Err(reason); }
                     tracing::debug!(target:"navigation.scan",optimize_obstacles,?reason,
                         "近场参考候选未通过机体检查");
                     failures.push(reason)
@@ -479,10 +533,10 @@ pub fn plan(
         }
     }
     // 极窄空间可能需要显式转向；原折线也经过同一真实地形及机体检查。
-    let sampled = spline::resample(reference, spacing);
-    if let Ok(poses) = project(
+    let sampled = spline::resample(reference, spacing)?;
+    if let Some(poses) = admit_candidate(project(
         map, start, &sampled, kinematics, false, final_yaw, interior, boundary, &blocked,
-    ) {
+    ))? {
         #[cfg(feature="profile")]
                         profile::success();
                         return Ok(LocalTrajectory {
@@ -494,6 +548,7 @@ pub fn plan(
     // 细门缝的中线可能落在全局粗格之间，直接使用近场真实占据给出的连续空隙。
     let mut attempted = 0;
     for pair in reference.windows(2) {
+        cancellation::checkpoint()?;
         let dx = pair[1][0] - pair[0][0];
         let dy = pair[1][1] - pair[0][1];
         let length = dx.hypot(dy);
@@ -503,6 +558,7 @@ pub fn plan(
         let heading = dy.atan2(dx);
         let count = (length / 0.3).ceil().max(1.0) as usize;
         for i in 0..count {
+            cancellation::checkpoint()?;
             if attempted >= 12 {
                 break;
             }
@@ -519,6 +575,7 @@ pub fn plan(
                 continue;
             };
             for candidate in candidates.into_iter().take(2) {
+                cancellation::checkpoint()?;
                 if candidate.clear_width_m > radius * 2.0 + 2.0 * f64::from(map.config().voxel_size)
                 {
                     continue;
@@ -533,10 +590,10 @@ pub fn plan(
                 }
                 guide.push(support(candidate.exit_xyz));
                 guide.push(*reference.last().unwrap());
-                let samples = spline::resample(&guide, spacing);
-                if let Ok(poses) = project(
+                let samples = spline::resample(&guide, spacing)?;
+                if let Some(poses) = admit_candidate(project(
                     map, start, &samples, kinematics, false, final_yaw, arrival, boundary, &blocked,
-                ) {
+                ))? {
                     #[cfg(feature="profile")]
                         profile::success();
                         return Ok(LocalTrajectory {
@@ -553,6 +610,8 @@ pub fn plan(
     ) {
         Ok(poses) => poses,
         Err(polyline) => {
+            if matches!(polyline.kind, LocalPlanFailureKind::Cancelled) { return Err(polyline); }
+            cancellation::checkpoint()?;
             // 后备搜索也遵守起步方向：可原地完成后方转向时先对齐，
             // 不能因样条失败又把尚未完成的转向混进前进动作。
             let mut prefix=vec![start];
@@ -562,7 +621,7 @@ pub fn plan(
             // 更长的段已经尝试过直线和样条；它们失败后允许搜索必要的绕障曲线。
             let search_start=if departure_distance<=model.radius()*2.0
                 && angle(departure-yaw(start.1)).abs()>std::f64::consts::FRAC_PI_2
-                && rotate(map,&mut prefix,departure,kinematics,boundary).is_ok() {
+                && admit_candidate(rotate(map,&mut prefix,departure,kinematics,boundary))?.is_some() {
                 *prefix.last().unwrap()
             }else{start};
             local_search::plan(
@@ -585,7 +644,7 @@ pub fn plan(
         .map_err(|local| LocalPlanError {
             reason: format!(
                 "样条：{}；折线：{polyline}；{local}",
-                failures.first().map_or("未生成", String::as_str)
+                failures.first().map_or("未生成", |failure| failure.reason.as_str())
             ),
             ..local
         })?
@@ -841,6 +900,40 @@ mod tests {
             "下一窗口的末段切向须保留，不能整窗拉直提前切掉出口转弯");
     }
 
+    #[test]
+    fn cancelled_scan_stages_are_typed_and_never_report_obstruction() {
+        let map = coarse_open_floor();
+        let tomo = Tomogram::from_surface(&map).unwrap();
+        let start = ([-1.0, 0.2, 0.4], [0.0, 0.0, 0.0, 1.0]);
+        let reference = [[-1.0, 0.2, 0.0], [0.1, 0.2, 0.0]];
+        let run = || plan(&map, &tomo, start, &reference, &motion(), &ScanConfig::default(),
+            None, None, &[], false, false);
+        for checkpoints in [0, 8, 80] {
+            let error = cancellation::after_checkpoints(checkpoints, run).unwrap_err();
+            assert_eq!(error.kind, LocalPlanFailureKind::Cancelled);
+            assert_eq!(error.blocked, None);
+            assert_eq!(error.closest_pose, None);
+        }
+        let baseline = run().expect("cancelled work must not poison a later valid plan");
+        let token = PlanningCancellation::new(Arc::new(std::sync::atomic::AtomicU64::new(9)), 9);
+        let scoped = with_planning_cancellation(&token, run).unwrap();
+        assert_eq!(baseline.poses, scoped.poses);
+        assert_eq!(baseline.smoothed, scoped.smoothed);
+    }
+    #[test]
+    fn cancelled_search_exits_connector_and_expansion_work_without_negative_evidence() {
+        let map = coarse_open_floor();
+        let tomo = Tomogram::from_surface(&map).unwrap();
+        let start = ([-1.0, 0.2, 0.4], [0.0, 0.0, 0.0, 1.0]);
+        for checkpoints in [3, 40, 400] {
+            let error = cancellation::after_checkpoints(checkpoints, || local_search::plan(
+                &map, &tomo, start, &[[-1.0, 0.2, 0.0], [0.1, 0.2, 0.0]], &motion(),
+                None, Some(([0.1, 0.2, 2.0], 0.1)), &[], 3.0, 0.9, true)).unwrap_err();
+            assert_eq!(error.kind, LocalPlanFailureKind::Cancelled);
+            assert_eq!(error.blocked, None);
+            assert_eq!(error.closest_pose, None);
+        }
+    }
     #[test]
     fn executable_straight_reference_does_not_bend_to_initial_yaw() {
         let map=scene(None);let tomo=Tomogram::from_surface(&map).unwrap();

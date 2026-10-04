@@ -1,21 +1,26 @@
 //! 均匀三次B样条：控制点优化与固定起终点边界，不在显示端伪造平滑。
 use nuwax_nav_pct::Tomogram;
+use crate::{cancellation::checkpoint, LocalPlanError};
 pub type Point = [f64; 3];
 fn length(a: Point, b: Point) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
 }
-pub fn resample(points: &[Point], spacing: f64) -> Vec<Point> {
+pub fn resample(points: &[Point], spacing: f64) -> Result<Vec<Point>, LocalPlanError> {
+    checkpoint()?;
     let mut result = vec![points[0]];
     for pair in points.windows(2) {
+        checkpoint()?;
         let n = (length(pair[0], pair[1]) / spacing).ceil().max(1.0) as usize;
         for i in 1..=n {
+            checkpoint()?;
             let t = i as f64 / n as f64;
             result.push(std::array::from_fn(|j| {
                 pair[0][j] * (1.0 - t) + pair[1][j] * t
             }));
         }
     }
-    result
+    checkpoint()?;
+    Ok(result)
 }
 fn clearance(map: &Tomogram, p: Point) -> f64 {
     map.cell_at(p).map_or(0.0, |id| map.cells[id].clearance)
@@ -28,10 +33,11 @@ pub fn optimize(
     centers: [f64; 2],
     iterations: usize,
     initial_heading: Option<f64>,
-) -> Vec<Point> {
-    let mut controls = resample(reference, 0.25_f64.max(map.resolution));
+) -> Result<Vec<Point>, LocalPlanError> {
+    checkpoint()?;
+    let mut controls = resample(reference, 0.25_f64.max(map.resolution))?;
     if controls.len() < 3 {
-        return controls;
+        return Ok(controls);
     }
     if let Some(heading) = initial_heading {
         let lead = length(controls[0], controls[1]).clamp(0.1, 0.3);
@@ -44,8 +50,10 @@ pub fn optimize(
     let original = controls.clone();
     let h = map.resolution;
     for _ in 0..iterations {
+        checkpoint()?;
         let previous = controls.clone();
         for i in (if initial_heading.is_some() { 2 } else { 1 })..controls.len() - 1 {
+            checkpoint()?;
             let p = previous[i];
             let heading = (previous[i + 1][1] - previous[i - 1][1])
                 .atan2(previous[i + 1][0] - previous[i - 1][0]);
@@ -89,10 +97,12 @@ pub fn optimize(
             }
         }
     }
-    controls
+    checkpoint()?;
+    Ok(controls)
 }
 /// 重复端控制点使曲线从实际起点出发、终止于局部目标。
-pub fn sample(controls: &[Point], spacing: f64) -> Vec<Point> {
+pub fn sample(controls: &[Point], spacing: f64) -> Result<Vec<Point>, LocalPlanError> {
+    checkpoint()?;
     if controls.len() < 3 {
         return resample(controls, spacing);
     }
@@ -101,6 +111,7 @@ pub fn sample(controls: &[Point], spacing: f64) -> Vec<Point> {
     p.extend_from_slice(&[*controls.last().unwrap(); 2]);
     let mut result = Vec::new();
     for window in p.windows(4) {
+        checkpoint()?;
         let n = ((length(window[0], window[1])
             + length(window[1], window[2])
             + length(window[2], window[3]))
@@ -108,6 +119,7 @@ pub fn sample(controls: &[Point], spacing: f64) -> Vec<Point> {
             .ceil()
             .max(2.0) as usize;
         for i in 0..n {
+            checkpoint()?;
             let t = i as f64 / n as f64;
             let u = 1.0 - t;
             let weights = [
@@ -127,11 +139,27 @@ pub fn sample(controls: &[Point], spacing: f64) -> Vec<Point> {
         }
     }
     result.push(*controls.last().unwrap());
-    result
+    checkpoint()?;
+    Ok(result)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancellation_aborts_spline_loops_instead_of_returning_partial_points() {
+        let points = [[0.0, 0.0, 0.0], [1.0, 0.3, 0.0], [2.0, 0.0, 0.0]];
+        let map = Tomogram::from_columns(0.1,
+            (-10..40).flat_map(|x| (-10..20).map(move |y| ([x, y], vec![[-0.1, 0.0]]))),
+            0.3, 0.15, 0.1, 0.1, 20.0).unwrap();
+        let resample_error = crate::cancellation::after_checkpoints(8, || resample(&points, 0.01)).unwrap_err();
+        let sample_error = crate::cancellation::after_checkpoints(8, || sample(&points, 0.01)).unwrap_err();
+        let optimize_error = crate::cancellation::after_checkpoints(24, ||
+            optimize(&points, &map, 0.15, [-0.15, 0.15], 12, None)).unwrap_err();
+        for error in [resample_error, sample_error, optimize_error] {
+            assert_eq!(error.kind, crate::LocalPlanFailureKind::Cancelled);
+            assert_eq!(error.blocked, None);
+        }
+    }
     #[test]
     fn open_ground_without_known_walls_keeps_finite_control_points() {
         let map = Tomogram::from_columns(
@@ -152,15 +180,15 @@ mod tests {
             [-0.15, 0.15],
             12,
             Some(0.0),
-        );
+        ).unwrap();
         assert!(controls.len() > 3);
         assert!(controls.iter().flatten().all(|value| value.is_finite()));
-        assert!(sample(&controls, 0.025).len() > 20);
+        assert!(sample(&controls, 0.025).unwrap().len() > 20);
     }
     #[test]
     fn cubic_curve_preserves_endpoints_and_rounds_corner() {
         let p = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]];
-        let points = sample(&p, 0.025);
+        let points = sample(&p, 0.025).unwrap();
         assert_eq!(points[0], p[0]);
         assert_eq!(*points.last().unwrap(), p[2]);
         assert!(points.iter().all(|v| v[0] >= -1e-12

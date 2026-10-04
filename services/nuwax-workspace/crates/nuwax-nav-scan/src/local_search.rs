@@ -84,7 +84,7 @@ pub fn probe_motion(
     turn: f64,
     boundary: &[[f64; 2]],
 ) -> Option<Vec<BodyPose>> {
-    probe_motion_until(map,from,length,turn,boundary,|_|false)
+    probe_motion_until(map,from,length,turn,boundary,|_|false).ok()
 }
 fn probe_motion_until(
     map: &SurfaceSnapshot,
@@ -93,21 +93,23 @@ fn probe_motion_until(
     turn: f64,
     boundary: &[[f64;2]],
     reached: impl Fn(BodyPose)->bool,
-) -> Option<Vec<BodyPose>> {
+) -> Result<Vec<BodyPose>, LocalPlanError> {
     let (poses,views)=project_motion_until(map,from,length,turn,reached)?;
     validate_projected(from,&poses,&views,boundary)?;
-    Some(poses)
+    Ok(poses)
 }
 fn project_motion_until(
     map:&SurfaceSnapshot,from:BodyPose,length:f64,turn:f64,reached:impl Fn(BodyPose)->bool,
-) -> Option<ProjectedMotion> {
-    let radius = map.body_envelope()?.radius();
+) -> Result<ProjectedMotion, LocalPlanError> {
+    super::cancellation::checkpoint()?;
+    let radius = map.body_envelope().ok_or("近场搜索缺少机体")?.radius();
     let n = ((length + turn.abs() * radius) / 0.025).ceil().max(1.0) as usize;
     let heading = yaw(from.1);
     let mut previous = from;
     let mut poses = Vec::with_capacity(n);
     let mut views = Vec::with_capacity(n);
     for i in 1..=n {
+        super::cancellation::checkpoint()?;
         if reached(previous) {break;}
         let t = i as f64 / n as f64;
         let theta = turn * t;
@@ -123,24 +125,25 @@ fn project_motion_until(
             from.0[0] + dx * heading.cos() - dy * heading.sin(),
             from.0[1] + dx * heading.sin() + dy * heading.cos(),
         ];
-        let (next,view)=super::project_endpoint(map,previous,xy,heading+theta).ok()?;
+        let (next,view)=super::project_endpoint(map,previous,xy,heading+theta)?;
         previous=next;
         poses.push(previous);
         views.push(view);
     }
     // 端点几何已拒绝的候选不再支付沿途扫掠；任何返回的候选仍逐段核验全部运动。
     // 保留生成端点时的同一只读查询视图，不把尚未验证的未来站姿写回地图。
-    Some((poses,views))
+    Ok((poses,views))
 }
 fn validate_projected(
     from:BodyPose,poses:&[BodyPose],views:&[nuwax_nav_mls_planner::SurfaceBodyQueryView],boundary:&[[f64;2]],
-)->Option<()> {
+)->Result<(), LocalPlanError> {
     let mut previous=from;
     for (&next,view) in poses.iter().zip(views) {
-        super::check_projected_motion(view,previous,next,boundary).ok()?;
+        super::cancellation::checkpoint()?;
+        super::check_projected_motion(view,previous,next,boundary)?;
         previous=next;
     }
-    Some(())
+    Ok(())
 }
 fn reference_distance(p: [f64; 3], reference: &[[f64; 3]]) -> f64 {
     reference
@@ -202,6 +205,7 @@ fn projected_cost(from: BodyPose, samples: &[BodyPose], offset: f64,
     let soft=|p:BodyPose|preference(tomogram,[p.0[0],p.0[1],p.0[2]-offset],reference);
     let mut previous=from; let mut cost=0.0;
     for &next in samples {
+        if super::cancellation::checkpoint().is_err() { return f64::INFINITY; }
         let distance=super::distance3(previous.0,next.0);
         let weight=if distance==0.0 {0.0} else {(soft(previous)+soft(next))*0.5};
         cost+=step_cost(distance,angle(yaw(next.1)-yaw(previous.1)),weight,motion);
@@ -221,6 +225,7 @@ fn connector_cost(from: BodyPose, heading: f64, length: f64, turn: f64,
     let mut weight=preference(tomogram,previous,reference);
     let mut cost=step_cost(0.0,angle(heading-yaw(from.1)),0.0,motion);
     for i in 1..=n {
+        if super::cancellation::checkpoint().is_err() { return f64::INFINITY; }
         let t=i as f64/n as f64; let theta=turn*t;
         let (dx,dy)=if turn.abs()<1e-8 {(length*t,0.0)}
             else {(length/turn*theta.sin(),length/turn*(1.0-theta.cos()))};
@@ -248,6 +253,7 @@ pub fn plan(
     corridor: f64,
     follow_reference: bool,
 ) -> Result<Vec<BodyPose>, LocalPlanError> {
+    super::cancellation::checkpoint()?;
     validate_caps(motion)?;
     let target = *reference.last().ok_or("近场搜索缺少目标")?;
     let support_offset = map
@@ -323,6 +329,7 @@ pub fn plan(
     #[cfg(test)]
     let expansion_limit = EXPANSION_LIMIT.get();
     while let Some(Entry(_, id)) = open.pop() {
+        super::cancellation::checkpoint()?;
         let from = nodes[id].pose;
         let cost = nodes[id].cost;
         if best
@@ -338,6 +345,7 @@ pub fn plan(
         let offsets=if arrival.is_some() {vec![0.0]}else{vec![0.0,corridor*0.5,-corridor*0.5,corridor,-corridor]};
         let mut proposals=Vec::new();
         for offset in offsets {
+            super::cancellation::checkpoint()?;
             let xy=[target[0]-tangent.sin()*offset,target[1]+tangent.cos()*offset];
             let dx=xy[0]-from.0[0];let dy=xy[1]-from.0[1];
             let distance=dx.hypot(dy);
@@ -357,12 +365,14 @@ pub fn plan(
         // 不再按固定离散转角拼出波浪，也不为省一段几何检查放弃真实净空。
         proposals.sort_by(|a,b|a.0.total_cmp(&b.0));
         for (_,heading,length,turn) in proposals {
+            super::cancellation::checkpoint()?;
             // 解析长接续先用层析中心路线排除穿墙提案；未通过仍可由原姿态动作搜索绕行。
             // 这一步不授予机体许可，入选提案随后保留完整地形、旋转和扫掠检查。
             let samples=(length/(tomogram.resolution*0.5)).ceil().max(1.0) as usize;
             let mut previous=[from.0[0],from.0[1],from.0[2]-support_offset];
             let mut visible=true;
             for i in 1..=samples {
+                super::cancellation::checkpoint()?;
                 let t=i as f64/samples as f64;
                 let theta=turn*t;
                 let (dx,dy)=if turn.abs()<1e-8 {(length*t,0.0)}
@@ -376,12 +386,12 @@ pub fn plan(
             }
             if !visible {continue;}
             let mut prefix=vec![from];
-            if super::rotate(map,&mut prefix,heading,motion,boundary).is_err() {continue;}
+            if super::admit_candidate(super::rotate(map,&mut prefix,heading,motion,boundary))?.is_none() {continue;}
             let in_goal=|pose:BodyPose|arrival.is_some_and(|(goal,tolerance)|super::distance3(pose.0,goal)<tolerance);
-            let Some(line)=probe_motion_until(map,*prefix.last().unwrap(),length,turn,boundary,in_goal)else{continue;};
+            let Some(line)=super::admit_candidate(probe_motion_until(map,*prefix.last().unwrap(),length,turn,boundary,in_goal))? else{continue;};
             prefix.extend(line);
             if let Some(heading)=final_yaw {
-                if super::rotate(map,&mut prefix,heading,motion,boundary).is_err(){continue;}
+                if super::admit_candidate(super::rotate(map,&mut prefix,heading,motion,boundary))?.is_none(){continue;}
             }
             if reach(*prefix.last().unwrap()) {
                 connection=Some(prefix);break;
@@ -391,15 +401,20 @@ pub fn plan(
             let mut chain = Vec::new();
             let mut current = id;
             while let Some(parent) = nodes[current].parent {
+                super::cancellation::checkpoint()?;
                 chain.push(current);
                 current = parent;
             }
             chain.reverse();
             let mut path = vec![start];
             for id in chain {
+                super::cancellation::checkpoint()?;
                 path.extend_from_slice(&nodes[id].samples);
             }
-            if let Some(connection)=connection {path.extend(connection.into_iter().skip(1));}
+            if let Some(connection)=connection {
+                path.extend(connection.into_iter().skip(1));
+            }
+            super::cancellation::checkpoint()?;
             return Ok(path);
         }
         expanded += 1;
@@ -435,6 +450,7 @@ pub fn plan(
         // A legal coarse edge does not prove that its continuation can escape.
         // Every existing fine primitive receives the same admission checks.
         for (length, turn) in actions {
+            super::cancellation::checkpoint()?;
             if length == 0.0 && !motion.can_rotate_in_place {
                 continue;
             }
@@ -443,7 +459,7 @@ pub fn plan(
                 continue;
             }
             work.candidates += 1;
-            let Some((samples,views)) = project_motion_until(map, from, length, turn, |_|false) else {
+            let Some((samples,views)) = super::admit_candidate(project_motion_until(map, from, length, turn, |_|false))? else {
                 continue;
             };
             let next = *samples.last().unwrap();
@@ -457,7 +473,7 @@ pub fn plan(
             }
             // 已有合法路径代价更低时不重复做扫掠；真正入队的边仍完整核验。
             work.sweeps += 1;
-            if validate_projected(from,&samples,&views,boundary).is_none() {continue;}
+            if super::admit_candidate(validate_projected(from,&samples,&views,boundary))?.is_none() {continue;}
             #[cfg(test)]
             if id == 0 { INITIAL_ADMISSIONS.with(|v|v.borrow_mut().push((length,turn,next))); }
             best.insert(k,next_cost);
@@ -477,6 +493,7 @@ pub fn plan(
             work.frontier_peak = work.frontier_peak.max(open.len());
         }
     }
+    super::cancellation::checkpoint()?;
     // Neither a drained discretized search nor an expansion limit proves obstruction.
     Err(LocalPlanError {
         reason: format!(

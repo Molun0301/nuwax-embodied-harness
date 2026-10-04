@@ -326,6 +326,7 @@ pub fn plan(
 ) -> Result<LocalTrajectory, LocalPlanError> {
     #[cfg(feature="profile")]
     let _profile=profile::Scope::begin(start,reference,kinematics,config,final_yaw,arrival,follow_reference,prefer_straight);
+    local_search::validate_caps(kinematics)?;
     let began = std::time::Instant::now();
     let blocked = std::cell::Cell::new(None);
     if reference.is_empty() {
@@ -607,7 +608,7 @@ mod tests {
     };
     use nuwax_nav_types_messages::MotionModel;
     use std::{collections::BTreeMap, sync::Arc};
-    fn motion() -> MotionKinematics {
+    pub(super) fn motion() -> MotionKinematics {
         MotionKinematics {
             model: MotionModel::Differential,
             max_forward_mps: 1.0,
@@ -726,6 +727,15 @@ mod tests {
             shift[1] as f64*0.01,0.4], [0.0,0.0,0.0,1.0]);
         (map,start)
     }
+    fn report_path_metrics(name: &str, path: &[BodyPose]) {
+        let (mut length,mut turning,mut time)=(0.0_f64,0.0_f64,0.0_f64);
+        for pair in path.windows(2) {
+            let d=distance3(pair[0].0,pair[1].0);
+            let a=angle(yaw(pair[1].1)-yaw(pair[0].1)).abs();
+            length+=d; turning+=a; time+=(d/motion().max_forward_mps).max(a/motion().max_angular_rps);
+        }
+        eprintln!("path_metrics name={name} length={length:.9} turning={turning:.9} nominal_time={time:.9}");
+    }
     fn check_fine_escape(mirror: bool, shift: [i32; 2], coarse_dead_end: bool, half_width_cells: i32) {
         let (map,start)=fine_escape_scene(mirror,shift,coarse_dead_end,half_width_cells);
         let sign=if mirror {-1.0} else {1.0};
@@ -764,6 +774,7 @@ mod tests {
         eprintln!("fine_escape mirror={mirror} shift={shift:?} coarse_dead_end={coarse_dead_end} half_width_cells={half_width_cells} result={:?} elapsed_ms={:.3}",
             result.as_ref().map(|p|p.len()),began.elapsed().as_secs_f64()*1000.0);
         let path=result.expect("the independently swept fine escape must be searchable");
+        report_path_metrics("fine_escape",&path);
         assert!(distance3(path.last().unwrap().0,goal)<0.015);
         assert!(path.iter().any(|p| (p.0[0]-depart.0[0]).abs()<1e-8 && (p.0[1]-depart.0[1]).abs()<1e-8));
         for pair in path.windows(2) { map.validate_body_motion(pair[0],pair[1],&[]).unwrap(); }
@@ -933,7 +944,7 @@ mod tests {
         )
         .is_err());
     }
-    fn coarse_open_floor() -> SurfaceSnapshot {
+    pub(super) fn coarse_open_floor() -> SurfaceSnapshot {
         let points: Vec<_> = (-15..20).flat_map(|x| (-8..15).map(move |y|
             ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,-0.05))).collect();
         let config = Config { world_frame: "map".into(), voxel_size: 0.1, robot_height: 0.55,
@@ -947,6 +958,76 @@ mod tests {
             max_step_up_m: 0.2, max_step_down_m: 0.2, max_cross_slope_deg: 18.0,
             support_uncertainty_m: 0.0,
         }).unwrap()
+    }
+    #[test]
+    fn search_objective_handles_point_references_and_invalid_speed_caps() {
+        let map=coarse_open_floor();let tomo=Tomogram::from_surface(&map).unwrap();
+        let start=([0.0,0.2,0.4],[0.0,0.0,0.0,1.0]);
+        for reference in [vec![[0.0,0.2,0.0]],vec![[0.0,0.2,0.0];3]] {
+            let path=local_search::plan(&map,&tomo,start,&reference,&motion(),Some(0.5),
+                Some((start.0,0.01)),&[],3.0,0.9,true).unwrap();
+            assert!(angle(yaw(path.last().unwrap().1)-0.5).abs()<1e-6);
+            for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+            for invalid in [0.0,-1.0,f64::NAN,f64::INFINITY,f64::NEG_INFINITY] {
+                for angular in [true,false] {
+                    let mut caps=motion();
+                    if angular {caps.max_angular_rps=invalid;}else{caps.max_forward_mps=invalid;}
+                    let failure=local_search::plan(&map,&tomo,start,&reference,&caps,None,None,&[],3.0,0.9,true).unwrap_err();
+                    assert!(failure.blocked.is_none());
+                    let failure=plan(&map,&tomo,start,&reference,&caps,&ScanConfig::default(),None,None,&[],true,true).unwrap_err();
+                    assert!(failure.blocked.is_none());
+                }
+            }
+        }
+    }
+    #[test]
+    fn objective_degenerate_reference_reach_without_arrival() {
+        let map=coarse_open_floor();let tomo=Tomogram::from_surface(&map).unwrap();
+        let start=([0.0,0.2,0.4],[0.0,0.0,0.0,1.0]);
+        for reference in [vec![[0.0,0.2,0.0]],vec![[0.0,0.2,0.0];3],
+            vec![[0.0,0.2,0.0],[0.5,0.7,0.0],[0.5,0.7,0.0]]] {
+            let path=local_search::plan(&map,&tomo,start,&reference,&motion(),None,None,&[],3.0,0.9,true).unwrap();
+            for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+            let end=path.last().unwrap();let target=reference.last().unwrap();
+            let tangent=if target[0]>0.0 {std::f64::consts::FRAC_PI_4}else{0.0};
+            let dx=end.0[0]-target[0];let dy=end.0[1]-target[1];
+            assert!((dx*tangent.cos()+dy*tangent.sin()).abs()<1e-6);
+            assert!(dx.hypot(dy)<=0.81+1e-9);
+            assert!(angle(yaw(end.1)-tangent).cos()>0.0);
+        }
+    }
+    #[test]
+    fn final_yaw_connector_ranking_uses_complete_validated_motion() {
+        let results: Vec<_>=[(1.0,[0.0,0.0]),(-1.0,[0.0,0.0]),(1.0,[0.3,0.2]),(-1.0,[0.3,0.2])]
+            .into_iter().map(|(sign,shift)| std::panic::catch_unwind(|| {
+                let map=coarse_open_floor(); let tomo=Tomogram::from_surface(&map).unwrap();
+                let start=([shift[0],shift[1],0.4],[0.0,0.0,0.0,1.0]);
+                let heading=sign*0.5_f64;
+                let goal=[shift[0]+heading.cos(),shift[1]+heading.sin(),0.4];
+                let time=|path: &[BodyPose]|path.windows(2).map(|p|
+                    (distance3(p[0].0,p[1].0)/motion().max_forward_mps)
+                    .max(angle(yaw(p[1].1)-yaw(p[0].1)).abs()/motion().max_angular_rps)).sum::<f64>();
+                let mut line=vec![start]; rotate(&map,&mut line,heading,&motion(),&[]).unwrap();
+                line.extend(probe_motion(&map,*line.last().unwrap(),1.0,0.0,&[]).unwrap());
+                let mut arc=vec![start]; arc.extend(probe_motion(&map,start,heading/heading.sin(),2.0*heading,&[]).unwrap());
+                rotate(&map,&mut arc,heading,&motion(),&[]).unwrap();
+                for path in [&line,&arc] {
+                    assert!(distance3(path.last().unwrap().0,goal)<1e-6);
+                    for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+                }
+                assert!(time(&line)+0.2<time(&arc));
+                let began=std::time::Instant::now();
+                let path=local_search::plan(&map,&tomo,start,&[[shift[0],shift[1],0.0],[goal[0],goal[1],0.0]],
+                    &motion(),Some(heading),Some((goal,0.001)),&[],3.0,0.9,false).unwrap();
+                eprintln!("final_yaw_case sign={sign} shift={shift:?} elapsed_ms={:.3} line_time={} arc_time={}",
+                    began.elapsed().as_secs_f64()*1000.0,time(&line),time(&arc));
+                report_path_metrics("final_yaw",&path);
+                for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+                assert!(distance3(path.last().unwrap().0,goal)<0.001);
+                assert!(angle(yaw(path.last().unwrap().1)-heading).abs()<1e-6);
+                assert!(time(&path)<=time(&line)+1e-6,"required final yaw must participate before ranking");
+            })).collect();
+        assert!(results.iter().all(Result::is_ok));
     }
     #[test]
     fn matched_search_workloads() {
@@ -964,7 +1045,7 @@ mod tests {
                     &reference,&motion(),None,arrival,boundary,3.0,0.9,true));
                 eprintln!("matched_workload name={name} repeat={repeat} result={:?} elapsed_ms={:.3}",
                     result.as_ref().map(|p|p.len()),began.elapsed().as_secs_f64()*1000.0);
-                if name=="open_connection" {assert!(result.is_ok());} else {
+                if name=="open_connection" {report_path_metrics(name,result.as_ref().unwrap());assert!(result.is_ok());} else {
                     let failure=result.unwrap_err();
                     assert_eq!(failure.kind,if name=="budget16" {LocalPlanFailureKind::BudgetExhausted}
                         else {LocalPlanFailureKind::SearchExhausted});

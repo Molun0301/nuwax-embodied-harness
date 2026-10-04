@@ -30,8 +30,10 @@ fn memoized_body_motion(
         observation_time_ns,
     };
     if let Some(result) = cache.borrow().get(&key) {
+        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::MotionMemoHits);
         return result.clone();
     }
+    #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::MotionMemoMisses);
     let result = check();
     cache.borrow_mut().insert(key, result.clone());
     result
@@ -56,6 +58,7 @@ fn is_rotation(a:&PoseStamped,b:&PoseStamped)->bool {
         && angle_diff(a.pose.orientation.yaw(),b.pose.orientation.yaw()).abs()>1e-6
 }
 fn tracking_error(preview:&[PlanarPose],segments:&[(PlanarPose,PlanarPose)],radius:f64)->Option<f64> {
+    #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::TrackingReferenceProjection);
     if segments.is_empty() {return None;}
     let mut total=0.0;
     for pose in preview {
@@ -90,6 +93,7 @@ fn distance_to_curve_speed(speed:f64, curve_speed:f64, rate:f64, dt:f64, delay:f
 }
 /// 接续必须从实际站姿沿同一地形模型推进，不能借旧路径的高度/倾斜跨过障碍。
 pub(super) fn connection_endpoint(map: &SurfaceSnapshot, from: ([f64; 3], [f64; 4]), next: &PoseStamped) -> Option<([f64;3],[f64;4])> {
+    #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ConnectionEndpoint);
     let model=map.body_envelope()?;
     let q=from.1;
     let initial_yaw=Quaternion{x:q[0],y:q[1],z:q[2],w:q[3]}.yaw();
@@ -101,10 +105,13 @@ pub(super) fn connection_endpoint(map: &SurfaceSnapshot, from: ([f64; 3], [f64; 
     if count>4096 {return None;}
     let mut previous=from;
     for index in 1..=count {
+        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::ConnectionSubsteps);
+        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::BodyProjectionCalls);
         let fraction=index as f64/count as f64;
         let Ok(mut projected)=map.body_pose_after_motion(previous,
             [from.0[0]+dx*fraction,from.0[1]+dy*fraction],initial_yaw+turn*fraction) else {return None;};
         if distance<1e-9 {projected.0[2]=previous.0[2];}
+        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
         if map.validate_body_motion(previous,projected,&[]).is_err() {return None;}
         previous=projected;
     }
@@ -113,6 +120,7 @@ pub(super) fn connection_endpoint(map: &SurfaceSnapshot, from: ([f64; 3], [f64; 
 
 /// 以控制器实际前进圆弧核对接续；直弦不可行不能否定绕过墙角的曲线。
 fn forward_arc_connects(map:&SurfaceSnapshot,from:BodyPose,next:&PoseStamped)->bool {
+    #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ForwardArcConnector);
     let Some(model)=map.body_envelope()else{return false;};
     let q=from.1;let yaw=Quaternion{x:q[0],y:q[1],z:q[2],w:q[3]}.yaw();
     let dx=next.pose.position.x-from.0[0];let dy=next.pose.position.y-from.0[1];let distance=dx.hypot(dy);
@@ -124,8 +132,11 @@ fn forward_arc_connects(map:&SurfaceSnapshot,from:BodyPose,next:&PoseStamped)->b
     let start=PlanarPose{x:from.0[0],y:from.0[1],yaw};let motion=Twist2{linear:Point2::new(length,0.0),angular_z:angle};
     let mut previous=from;
     for index in 1..=count {
+        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::ForwardArcSubsteps);
+        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::BodyProjectionCalls);
         let planar=nuwax_nav_control::integrate(start,motion,index as f64/count as f64);
         let Ok(projected)=map.body_pose_after_motion(previous,[planar.x,planar.y],planar.yaw)else{return false;};
+        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
         if map.validate_body_motion(previous,projected,&[]).is_err(){return false;}
         previous=projected;
     }
@@ -133,6 +144,7 @@ fn forward_arc_connects(map:&SurfaceSnapshot,from:BodyPose,next:&PoseStamped)->b
 }
 
 pub(super) fn translation_connects(map:&SurfaceSnapshot,from:([f64;3],[f64;4]),next:&PoseStamped)->bool {
+    #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::TranslationConnector);
     connection_endpoint(map,from,next).is_some() || {
         // 窄门前需要先对齐，直弦上同时平移和改朝向可能真实碰框。
         // 仅证明完整转向及后续接续；实际执行仍受前向候选和制动扫掠约束。
@@ -318,6 +330,7 @@ impl SurfaceFollower {
         if let Err(e) = body_validity {
             return PlannerStep::ReplanRequired(format!("当前三维机体包络无效: {e}"));
         }
+        #[cfg(test)] let profile_support=crate::control_profile::guard(crate::control_profile::Stage::BodySupportGoal);
         let position = pose.pose.position;
         let yaw = pose.pose.orientation.yaw();
         let cruise_speed = self.config.controller.speed*self.config.controller.nerf_speed.min(1.0);
@@ -336,6 +349,8 @@ impl SurfaceFollower {
             // 停稳证明后才发布成功，避免地图噪声形成第二道停车门槛。
             return PlannerStep::Succeeded;
         }
+        #[cfg(test)] drop(profile_support);
+        #[cfg(test)] let profile_waypoints=crate::control_profile::guard(crate::control_profile::Stage::WaypointProgress);
         // 逐点保留转向停留；曲线点只在到达或沿已确认小段越过时消耗。
         let tolerance = (f64::from(map.config().voxel_size) * 0.7).min(0.07);
         while self.path_index < path.poses.len() {
@@ -476,6 +491,7 @@ impl SurfaceFollower {
                 break;
             }
         }
+        #[cfg(test)] drop(profile_waypoints);
         // 显式原地转向按已有角度进度完成；同方向细分角由下方前瞻连续消费。
         // 不再按剩余角度或整段角度把尚未完成的转向改写成平移曲线。
         if self.path_index >= path.poses.len() {
@@ -507,6 +523,7 @@ impl SurfaceFollower {
         if deviation > self.config.max_path_deviation_m {
             return PlannerStep::ReplanRequired("机体偏离连续三维路线".into());
         }
+        #[cfg(test)] let profile_lookahead=crate::control_profile::guard(crate::control_profile::Stage::LookaheadSelection);
         let rotation = is_rotation(target,previous);
         let local_path_yaw=(target.pose.position.y-previous.pose.position.y)
             .atan2(target.pose.position.x-previous.pose.position.x);
@@ -583,6 +600,7 @@ impl SurfaceFollower {
                 target_index -= 1;
             }
         }
+        #[cfg(test)] drop(profile_lookahead);
         let target = &path.poses[target_index];
         let heading_error = angle_diff(target.pose.orientation.yaw(), yaw);
         self.control_target = Some(planar(target));
@@ -702,14 +720,19 @@ impl SurfaceFollower {
                         let key=[a.0[0],a.0[1],a.0[2],a.1[0],a.1[1],a.1[2],a.1[3]].map(f64::to_bits);
                         let cached=future_views.borrow().get(&key).cloned();
                         Some(match cached {
-                            Some(view)=>view?,
+                            Some(view)=>{
+                                #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::FutureViewHits);
+                                view?
+                            },
                             None=>{
+                                #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::FutureViewBuilds);
                                 // 从同一环境源派生机体查询视图，旧足迹不会累积，也不重建全局路由。
                                 let view=source_map.body_query_with_current_support(a.0,a.1).map(Arc::new);
                                 future_views.borrow_mut().insert(key,view.clone());view?
                             }
                         })
                     }else{None};
+                    #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::BodyProjectionCalls);
                     let mut b=match &future {
                         Some(view)=>view.body_pose_after_motion(a,[to.x,to.y],to.yaw)?,
                         None=>map.body_pose_after_motion(a,[to.x,to.y],to.yaw)?,
@@ -717,13 +740,22 @@ impl SurfaceFollower {
                     if preserve_height {b.0[2]=a.0[2];}
                     // 未来足迹不能自行授予新区域许可，始终保留本拍初始视图的完整检查。
                     match observation_check {
-                        Some((occupied, now, age)) => map.validate_observed_body_motion_in_boundary(a,b,occupied,
-                            now.saturating_add((elapsed * 1e9) as u64),*age,boundary)?,
-                        None => map.validate_body_motion(a,b,boundary)?,
+                        Some((occupied, now, age)) => {
+                            #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::ObservedSweeps);
+                            map.validate_observed_body_motion_in_boundary(a,b,occupied,
+                                now.saturating_add((elapsed * 1e9) as u64),*age,boundary)?;
+                        },
+                        None => {
+                            #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
+                            map.validate_body_motion(a,b,boundary)?;
+                        },
                     }
                     if let Some(view)=future {
                         // 完全同源同足迹的视图可复用刚通过的同一扫掠；其它视图独立核验。
-                        if !view.same_body_query_view(map) {view.validate_body_motion(a,b,boundary)?;}
+                        if !view.same_body_query_view(map) {
+                            #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::FutureGeometrySweeps);
+                            view.validate_body_motion(a,b,boundary)?;
+                        }
                     }
                     Ok(b)
                 }) {
@@ -839,11 +871,13 @@ impl SurfaceFollower {
             tracking_horizon,
             reference_curvature,
             |candidate,preview,stopped| {
+                #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::TrackingScores);
                 tracking_error(&preview,&reference_segments,model.radius()).map(|error|TrackingScore {
                     path_error_m:error,target_cost:(stopped.x-target.x).hypot(stopped.y-target.y)
                         +0.005*(candidate.angular_z-preferred.angular_z).abs()})
             },
             |candidate| {
+                #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::CandidateEligibility);
                 if current.linear.x.hypot(current.linear.y)<=1e-9
                     && preferred.linear.x.hypot(preferred.linear.y)>1e-9
                     && candidate.linear.x.hypot(candidate.linear.y)<=1e-9

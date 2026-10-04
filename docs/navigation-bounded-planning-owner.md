@@ -446,3 +446,34 @@ These samples therefore point next to route connectors/waypoint/turn/lookahead
 work and candidate sweeps, not to optimizing the small admission stage. They do
 not reproduce or explain every earlier 83/163 ms tail, and do not justify claiming
 planner separation guarantees a hard control deadline.
+
+### Finer connector/candidate attribution on the new observation baseline
+
+`stage-profile-fine-held-baseline.log` explicitly integrates the fused observation
+optimization later committed as `9688ed0`; it is a new baseline, not a matched
+before/after claim about that optimization. Five profiler isolation/reset tests
+passed. Seven finer stages and twelve fixed counters add no query changes;
+candidate eligibility calls are not mislabeled as generated-candidate counts.
+
+The held-continuity run passed its experiment assertions: six fresh held commands,
+subsequent admission, zero delivered negatives, 1.076357 m travel, control
+median/p95/max 24.97/39.78/46.34 ms and consumer maximum 0.061 ms. These remain
+single-run debug wall measurements, not a hard deadline guarantee.
+
+Across 296 controller steps, exactly 592 forward-arc probes ran. Lookahead
+selection (the first probe) had median 9.20 ms; total forward-arc time for both
+probes was 9.45 ms. Their roughly 0.25 ms difference is an estimate from aggregate
+medians (lookahead also includes scalar selection), not a directly timed duplicate.
+Paired slow-step rows independently show about 0.23–0.32 ms residual. Removing
+the identical warm second probe is a small exact-reuse opportunity, not the main
+bottleneck.
+Support/goal and waypoint progress were tiny (maxima 0.190/0.090 ms). Candidate
+ranking/sweeps had median/p95/max 19.25/28.56/33.90 ms. The slowest step counted one
+candidate eligibility check, 22 score evaluations, 27 motion-memo misses and six
+hits, six future-view constructions, and 38 forward-arc substeps. These counters
+identify query families, not internal MLS contact-plane cache misses. Next work
+should retain the objective and every guard check while identifying repeated
+projection/evidence work within the first arc and selected-candidate sweeps.
+
+`stage-profile-fine-surface-tests.log`: all 41 affected surface-follower tests passed
+after the finer instrumentation; no query/guard behavior changes are included.

@@ -18,7 +18,7 @@
 //! explicitly labeled stress. This is generic synthetic calibration, not Go2.
 
 use super::*;
-use crate::control_profile::{self, Record as StageRecord, Stage};
+use crate::control_profile::{self, Counter, Record as StageRecord, Stage};
 use nuwax_nav_control::{integrate, PlanarPose};
 use nuwax_nav_mls_planner::{mls_planner::Config, SurfaceBodyEnvelope, SurfaceObservation, SurfaceObservations};
 use nuwax_nav_types_messages::{GoalOptions, NavFrameId, MotionLimits, MotionModel, Point3, Pose3, Quaternion, Timestamp};
@@ -251,7 +251,7 @@ fn report_control_stages(p:&Probe,factory:bool,scenario:Scenario,enabled:bool,re
         return;
     }
     let sample_scope=if p.control_sample_overflow==0 {"all_recorded_steps"}else{"retained_prefix_only_incomplete"};
-    eprintln!("CONTROL_STAGE_SCOPE {context} available=true sample_scope={sample_scope} retained_steps={} record_limit={} omitted_steps={} attribution_complete={} nested_stages=inclusive_do_not_sum duration=wall_not_thread_cpu source_marker=successful_compute_owner_same_body_query_view_changes first_after_view_change=first_step_after_input_view_change metadata_cold_is_not_geometry_cold=true pose_stamp=actual_compute_owner_update_odometry_stamp planning_and_held_markers=independent_step_boundary_samples exact_transition_time=unavailable held_phase_0=not_started held_phase_1=held held_phase_2=released derived_body_view_identity=unavailable",
+    eprintln!("CONTROL_STAGE_SCOPE {context} available=true sample_scope={sample_scope} retained_steps={} record_limit={} omitted_steps={} attribution_complete={} nested_stages=inclusive_do_not_sum duration=wall_not_thread_cpu source_marker=successful_compute_owner_same_body_query_view_changes first_after_view_change=first_step_after_input_view_change metadata_cold_is_not_geometry_cold=true pose_stamp=actual_compute_owner_update_odometry_stamp planning_and_held_markers=independent_step_boundary_samples exact_transition_time=unavailable held_phase_0=not_started held_phase_1=held held_phase_2=released derived_body_view_identity=unavailable generated_candidate_count=unavailable candidate_eligibility_is_not_generated_candidate_count=true",
         p.control_samples.len(),p.control_sample_limit,p.control_sample_overflow,p.control_sample_overflow==0);
     // Reporting occurs after worker drain, outside every timed step. The scratch
     // allocation is bounded by the already bounded retained sample count.
@@ -264,6 +264,18 @@ fn report_control_stages(p:&Probe,factory:bool,scenario:Scenario,enabled:bool,re
         let calls:u64=p.control_samples.iter().map(|sample|u64::from(sample.stages.calls[index])).sum();
         eprintln!("CONTROL_STAGE {context} sample_scope={sample_scope} stage={} inclusive=true called_steps={} calls={calls} called_step_ms_median_p95_max={}",
             stage.label(),values.len(),measured_distribution(&values));
+    }
+    // These counts are actual call-site events across every retained step,
+    // including zero-event steps. Never interpret predicate calls as the number
+    // of candidates generated internally by nav-control.
+    for counter in Counter::ALL {
+        let index=counter as usize;
+        values.clear();
+        values.extend(p.control_samples.iter().map(|sample|sample.stages.counters[index]as f64));
+        let total=p.control_samples.iter().fold(0_u64,|sum,sample|sum.saturating_add(sample.stages.counters[index]));
+        let nonzero_steps=p.control_samples.iter().filter(|sample|sample.stages.counters[index]>0).count();
+        eprintln!("CONTROL_COUNTER {context} sample_scope={sample_scope} counter={} total={total} nonzero_steps={nonzero_steps} retained_steps={} retained_step_count_median_p95_max={}",
+            counter.label(),p.control_samples.len(),measured_distribution(&values));
     }
     let mut slowest:[Option<&ControlStepSample>;5]=[None;5];
     for sample in &p.control_samples {
@@ -279,7 +291,8 @@ fn report_control_stages(p:&Probe,factory:bool,scenario:Scenario,enabled:bool,re
             let index=stage as usize;
             (stage.label(),sample.stages.wall_nanos[index]as f64/1e6,sample.stages.calls[index])
         });
-        eprintln!("CONTROL_SLOW_STEP {context} sample_scope={sample_scope} rank={} step_seq={} control_wall_ms={:.6} source_view_seq={} source_present={} first_after_view_change={} pose_stamp_ns={:?} submitted_before={} submitted_after={} admitted_before={} admitted_after={} jobs_before={} jobs_after={} held_before={} held_after={} held_phase_before={} held_phase_after={} outcome={} inclusive_stage_ms_calls={stage_ms_calls:?}",
+        let counter_counts=Counter::ALL.map(|counter|(counter.label(),sample.stages.counters[counter as usize]));
+        eprintln!("CONTROL_SLOW_STEP {context} sample_scope={sample_scope} rank={} step_seq={} control_wall_ms={:.6} source_view_seq={} source_present={} first_after_view_change={} pose_stamp_ns={:?} submitted_before={} submitted_after={} admitted_before={} admitted_after={} jobs_before={} jobs_after={} held_before={} held_after={} held_phase_before={} held_phase_after={} outcome={} inclusive_stage_ms_calls={stage_ms_calls:?} counter_counts={counter_counts:?}",
             rank+1,sample.step_seq,sample.control_ms,sample.source_view_seq,sample.source_present,
             sample.first_after_view_change,sample.pose_stamp_ns,sample.submitted_before,sample.submitted_after,
             sample.admitted_before,sample.admitted_after,sample.jobs_before,sample.jobs_after,

@@ -296,6 +296,12 @@ impl SurfaceFollower {
         self.last_command = Twist2::ZERO;
     }
     pub(super) fn follow_body_step(&mut self, robot_width: f64) -> PlannerStep {
+        self.follow_body_step_inner::<true>(robot_width)
+    }
+
+    // The false specialization is exercised only by differential tests. The
+    // production specialization reuses no state beyond this one invocation.
+    fn follow_body_step_inner<const REUSE_LOOKAHEAD: bool>(&mut self, robot_width: f64) -> PlannerStep {
         #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::RouteIntent);
         if let Some(error) = &self.invalid_input {
             return PlannerStep::Failed(error.clone());
@@ -591,12 +597,16 @@ impl SurfaceFollower {
             self.alignment_target_index=None;
         }
         if let Some(index)=self.alignment_target_index {target_index=index;}
+        let mut confirmed_lookahead=false;
         if !rotation && self.alignment_target_index.is_none() {
             // 前瞻按实际机体可执行的前进圆弧选择；墙角附近退回较近的路径点，
             // 不能只沿受阻的长弦不断减速，否则已知可执行的短路径永远得不到跟随。
             // 不能用先转向来保留远处曲线目标，否则会过早朝远端切向旋转并离开原路线。
-            while target_index > self.path_index
-                && !forward_arc_connects(map,body(pose),&path.poses[target_index]) {
+            while target_index > self.path_index {
+                if forward_arc_connects(map,body(pose),&path.poses[target_index]) {
+                    confirmed_lookahead=true;
+                    break;
+                }
                 target_index -= 1;
             }
         }
@@ -610,7 +620,12 @@ impl SurfaceFollower {
         };
         let mut speed_limit=None;
         // 直弦插值可能包含机体侧移，不能用它批准前向圆弧。
-        let connects_without_turn=rotation || forward_arc_connects(map,body(pose),target);
+        // Only reuse the successful probe of this exact selected target. Map,
+        // source stance and target are unchanged in this scope. Falling back to
+        // path_index, alignment and rotation retain their original checks; this
+        // is neither a cross-step permission nor a replacement for body control.
+        let connects_without_turn=rotation || (REUSE_LOOKAHEAD && confirmed_lookahead)
+            || forward_arc_connects(map,body(pose),target);
         let alignment = if !connects_without_turn
             && self.config.kinematics().is_none_or(|motion|motion.can_rotate_in_place) {
             let heading=(target.pose.position.y-position.y).atan2(target.pose.position.x-position.x);
@@ -1359,6 +1374,77 @@ mod query_reuse_tests {
             max_step_up_m:0.2,max_step_down_m:0.2,max_cross_slope_deg:20.0,
             support_uncertainty_m:0.0,
         }).unwrap()
+    }
+
+    #[test]
+    fn successful_lookahead_reuse_preserves_control_and_only_removes_exact_duplicate() {
+        use nuwax_nav_types_messages::{MotionModel,NavFrameId,Timestamp};
+        let pose=|x:f64,y:f64,yaw:f64|PoseStamped {frame_id:NavFrameId::Map,
+            stamp:Timestamp::from_unix(1,0),pose:Pose3 {
+                position:Point3::new(x,y,0.4),orientation:Quaternion::from_yaw(yaw)}};
+        let clear_source=Arc::new(map(0.0));
+        let blocked_source=Arc::new(super::super::test_snapshot(0.0,true)
+            .with_body_envelope(clear_source.body_envelope().unwrap().clone()).unwrap());
+        let mut saved=0;
+        for model in [MotionModel::Differential,MotionModel::Omnidirectional,MotionModel::Ackermann] {
+            for (x,turn,aligned,restricted,blocked) in [(0.75,false,false,false,false),(1.04,false,false,false,false),
+                (0.75,true,false,false,false),(0.75,false,true,false,false),(0.75,false,false,true,false),
+                (0.75,false,false,false,true)] {
+                let source=if blocked {&blocked_source}else{&clear_source};
+                let path=Path3D {poses:if turn {
+                    vec![pose(0.75,1.05,0.0),pose(0.95,1.05,0.0),pose(0.95,1.05,0.3),pose(1.55,1.2,0.3)]
+                } else {vec![pose(0.75,1.05,0.0),pose(0.95,1.05,0.0),pose(1.15,1.05,0.0),pose(1.35,1.05,0.0),pose(1.55,1.05,0.0)]}};
+                let make=|| {
+                    let mut config=SurfaceFollowerConfig::new(0.3);config.controller.speed=0.3;
+                    config.controller.control_frequency=20.0;
+                    config.motion_limits=Some(MotionLimits {model,max_forward_mps:0.3,max_reverse_mps:0.0,
+                        max_lateral_mps:if model==MotionModel::Omnidirectional{0.3}else{0.0},max_angular_rps:0.6,
+                        linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,
+                        angular_acceleration_rps2:2.0,guaranteed_angular_braking_rps2:2.0,reaction_time_sec:0.05,
+                        minimum_turning_radius_m:if model==MotionModel::Ackermann{0.5}else{0.0},
+                        can_rotate_in_place:model!=MotionModel::Ackermann});
+                    let mut follower=SurfaceFollower::new(config).unwrap();
+                    follower.cumulative=cumulative_lengths(&path);follower.path=Some(path.clone());follower.path_index=1;
+                    follower.goal=path.poses.last().cloned();follower.map=Some(source.clone());follower.source_map=Some(source.clone());
+                    follower.odometry=Some(pose(x,1.05,0.0));
+                    follower.last_command=Twist2{linear:Point2::new(0.1,0.0),angular_z:0.0};
+                    if aligned {follower.alignment_target_index=Some(2);}
+                    if restricted {follower.boundary=vec![[0.5,0.7],[0.85,0.7],[0.85,1.4],[0.5,1.4]];}
+                    follower
+                };
+                let mut reference=make();let mut reused=make();
+                crate::control_profile::begin();
+                let old=reference.follow_body_step_inner::<false>(0.2);
+                let old_profile=crate::control_profile::end();
+                crate::control_profile::begin();
+                let new=reused.follow_body_step_inner::<true>(0.2);
+                let new_profile=crate::control_profile::end();
+                assert_eq!(old,new,"{model:?} x={x} turn={turn} aligned={aligned} restricted={restricted} blocked={blocked}");
+                assert_eq!(reference.path_index,reused.path_index);
+                assert_eq!(reference.progress_m,reused.progress_m);
+                assert_eq!(reference.control_target,reused.control_target);
+                assert_eq!(reference.alignment_target_index,reused.alignment_target_index);
+                assert_eq!(reference.last_command,reused.last_command);
+                let stage=crate::control_profile::Stage::ForwardArcConnector as usize;
+                let before=old_profile.calls[stage];let after=new_profile.calls[stage];
+                assert!(after<=before&&before-after<=1);
+                if aligned||turn||blocked {assert_eq!(before,after,"no successful lookahead probe to reuse");}
+                if blocked {assert!(before>0,"missing-ground case must exercise the required fallback probe");}
+                for counter in [crate::control_profile::Counter::CandidateEligibility,
+                    crate::control_profile::Counter::TrackingScores,crate::control_profile::Counter::MotionMemoHits,
+                    crate::control_profile::Counter::MotionMemoMisses] {
+                    assert_eq!(old_profile.counters[counter as usize],new_profile.counters[counter as usize],
+                        "selected-body guard work cannot be skipped");
+                }
+                if !turn&&!aligned&&!restricted&&!blocked {
+                    assert!(matches!(new,PlannerStep::Command(c)if c.linear.x>0.0));
+                    assert!(old_profile.counters[crate::control_profile::Counter::MotionMemoMisses as usize]>0,
+                        "positive case must execute physical stopping checks");
+                    assert_eq!(before-after,1);saved+=1;
+                }
+            }
+        }
+        assert!(saved>=6);
     }
 
     #[test]

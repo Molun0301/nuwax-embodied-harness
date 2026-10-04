@@ -477,3 +477,43 @@ projection/evidence work within the first arc and selected-candidate sweeps.
 
 `stage-profile-fine-surface-tests.log`: all 41 affected surface-follower tests passed
 after the finer instrumentation; no query/guard behavior changes are included.
+
+## Exact within-step lookahead-probe reuse
+
+The follower now keeps a local boolean only when the lookahead loop actually
+accepts its selected target with `forward_arc_connects`. The immediately repeated
+query has the same immutable map, source body pose and target; it can reuse that
+boolean. Falling back to the current path index or using an alignment target still
+runs the original required query, and rotation retains its original short circuit.
+No permission survives the call, and current selected-command body/braking checks
+and scoring are unchanged. The helper reads geometry and benign query caches;
+it has no observation-clock predicate.
+
+`arc-reuse-surface-tests.log` passed all 42 affected tests. The added differential
+reference retains the old repeated-probe implementation through a test-only-used
+false const specialization. Eighteen cases across differential, omnidirectional
+and Ackermann models compare exact command/status, path progress/index, target,
+applied state and selected-guard query counts. Cases include moved starts, turns,
+alignment, a restrictive boundary and failed-lookahead/missing-ground fallback.
+Clear successful lookahead removes exactly one query; the fallback cases preserve
+all required checks. This unit matrix checks calibrated geometry/stopping without
+an observation-age configuration; observed-evidence guard coverage comes from
+the unchanged moving fixture and its independent postrun oracles.
+
+`arc-reuse-held-continuity.log` confirms 295 arc calls for 295 controller steps,
+compared with 592/296 before reuse. Six fresh held commands and the later admission
+still occurred, with zero delivered negatives and 1.086228 m modeled travel. The
+run remains **FAILED** its strict 50 ms criterion: control median/p95/max was
+24.82/40.10/51.95 ms. The worst step spent 42.87 ms in selected ranking/sweeps and
+8.51 ms in its one arc probe. A prior median of 24.97 ms versus 24.82 ms here is
+not a demonstrated throughput improvement; the verified result is removal of an
+identical query and its traversal. First-arc work and selected-guard projection,
+observation sweeps and future-view construction remain the meaningful targets.
+
+The additional terminal-aware factory ON/OFF goal run also passed
+(`arc-reuse-moving-factory.log`): OFF 21.70 s, 322 nonzero commands, 0.938143 m
+travel, position/yaw errors 0.061857 m / 0.142211 rad; ON 20.90 s, 309 commands,
+0.853475 m travel, errors 0.146525 m / 0.147476 rad. Both are inside the unchanged
+0.15 m / 0.15 rad goal region, with zero delivered negatives. This retains useful
+motion in the backend-plus-ideal-plant fixture; it does not turn the separate
+51.95 ms held-run deadline failure into a pass or establish an optimization speedup.

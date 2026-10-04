@@ -2,12 +2,13 @@
 
 ## Qualification status correction
 
-**Open safety-proof composition issue:** two deterministic OFF cases replayed an
-old positive command that failed a current replayed-command hold-and-stop check, even with more than
-50 ms remaining on its original 250 ms lease. A newer, slower guarded command was
-held before publication. This issue concerns the unchanged control-result replay
-contract and is not resolved by planner ownership separation. No production fix
-or general deployment safety qualification is claimed in this milestone.
+**Current scope:** single-consumption containment now prevents reissuing a stored
+nonzero worker result. Both deterministic replay witnesses pass, and matched
+terminal-aware moving ON/OFF plus held-planning continuity tests retain useful
+motion. Their historical failures are preserved below. Delayed first issuance,
+changed-command activation while a predecessor continues, and expiry through
+the motion port remain open composition issues. This partial repair does not
+establish general deployment safety or a hard 20 Hz guarantee.
 
 
 The first moving factory/measured logs did **not** enforce delivered
@@ -250,9 +251,11 @@ Both remaining leases exceed the oracle's 50 ms requested hold. Current-support
 view identity equals the raw source on this flat fixture and projected z remains
 0.5 m, ruling out those oracle discrepancies for these isolated cases. The
 steady case does not depend on an applied-velocity version change. Desired-safety
-tests remain explicitly ignored diagnostics pending a production contract fix;
+tests remain explicitly opt-in real-clock regressions. At this diagnostic stage,
 correct retirement (Pending/ReplanRequired) or a command passing the current
-oracle satisfies the intended property. The current production behavior fails.
+oracle was the desired property, and the then-current production behavior failed.
+The later single-consumption containment below now passes both witnesses without
+claiming to resolve delayed first issuance or motion-port expiry.
 
 The final ordinary runtime suite passed 129 tests, with the five independently
 confirmed UDS-environment failures explicitly filtered and opt-in wall-clock
@@ -268,6 +271,12 @@ impossible. Nor do they retrospectively identify the exact cause of every earlie
 1 cm oracle rejection, whose original computed context was not captured.
 
 ## Standalone selected-candidate proof cost (2026-10-04)
+
+Build profile: all selected-proof, prefix, and containment comparisons here use
+Cargo `test` with `unoptimized + debuginfo`, as recorded in each build-log header.
+These are matched validation-build wall timings, not deployed release or hardware
+capacity limits. No permanent proof horizon is selected from these debug maxima,
+and no new optimized/native rebuild was performed for this phase.
 
 `selected-proof-cost-5cm.log` measures the existing one-period (50 ms) proof
 without route search, reference scoring, or candidate ranking. The production
@@ -349,3 +358,58 @@ moving software fixture must measure actual pose age, C, consumer/dispatch delay
 and original-expiry retirement, rather than assuming the remaining 27 ms is a
 real transport bound. With twelve observations per context the reported
 empirical p95 equals the maximum under this test's quantile formula.
+
+## Partial single-consumption containment
+
+The worker now atomically consumes an exact nonzero command result on its first
+qualified retrieval. Zero commands and terminal outcomes retain their prior
+behavior. A later retrieval cannot replay that publication while a new computation
+is pending; a genuinely new completed computation may deliver the same numeric
+twist once. Source, boundary, lifecycle, original-expiry and applied/publication
+gates are unchanged. Selection does not eagerly launch work with an unacknowledged
+candidate: existing APPLIED feedback and later no-result steps request computation.
+No consumer geometry, pose equality fence, new threads, or proof/port API was added.
+
+This is deliberately partial containment. It removes unsupported reuse of a
+stored result; it does not prove delayed first issuance, generic changed-command
+activation while a predecessor continues, or downstream physical stop-by. H150
+is not installed as a command permission interval. Broader lifetime plumbing is
+not part of this change.
+
+Validation uses the same unoptimized + debuginfo Cargo test profile:
+
+- `single-consumption-worker-v2.log`: 26 ordinary worker tests passed, including
+  held publication, fresh same-valued result, source/lifecycle replacement,
+  moved-pose first delivery and original expiry. Two real-clock cases remain
+  opt-in. The first run is retained in `single-consumption-worker.log`: an old
+  source-fence fixture consumed a command then assumed it was still cached,
+  causing an assertion and poisoned-lock cleanup abort. The revised fixture
+  inspects the unconsumed publication so source rejection, not consumption,
+  remains the condition tested.
+- `single-consumption-replay.log`: both real-geometry replay witnesses passed.
+  The old 0.1 m/s result returned Pending while a newer 0.05 publication was
+  held, with 119.64/73.09 ms of its original lease remaining. The original failing
+  logs remain evidence of the prior behavior.
+- `single-consumption-moving-factory.log`: corrected primed factory OFF/ON both
+  reached the configured 0.15 m / 0.15 rad goal region, zero delivered negatives.
+  OFF: 21.70 s, 324 nonzero commands, 0.934714 m travel, final position/yaw errors
+  0.065286 m / 0.142814 rad. ON: 21.30 s, 314 commands, 0.856593 m travel, errors
+  0.143407 m / 0.137546 rad. Matched earlier runs were 22.25/21.40 s; this pair
+  shows no observed liveness regression, not a demonstrated speed improvement.
+- `single-consumption-held-continuity.log`: passed the separate continuity-only
+  criterion after 14.30 s, six fresh nonzero commands during held planning beyond
+  the old lease, followed by the new route admission. Total travel 1.076565 m;
+  5.923435 m remained to the long-route goal, so no full-goal claim. Zero delivered
+  negatives, all captured segment/braking oracles passed. Inner control wall
+  median/p95/max was 28.46/41.76/47.78 ms and consumer maximum 0.082 ms. This run's
+  lower maximum is not causally attributed to the small consumption change and
+  does not erase prior deadline misses or establish a hard 20 Hz guarantee.
+
+These moving tests remain the production backend plus an ideal plant, not the
+full NavScheduler/motion-port/hardware chain. The final first-issuance/dispatch
+limitations and the independent 1 cm fixture freshness failure remain open.
+
+`single-consumption-runtime-final.log` completed the final ordinary runtime
+regression run: 130 passed, 28 opt-in experiments ignored, and only the five
+previously verified unavailable-UDS environment cases explicitly filtered out
+(122.66 s). This does not change the scope of the moving or software-safety claims.

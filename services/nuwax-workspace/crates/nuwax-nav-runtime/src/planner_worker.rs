@@ -355,8 +355,9 @@ impl NavPlanner for PlannerWorker {
             input.requested = Some(width);
             self.shared.1.notify_one();
         }
-        // 只在已核验控制段的预测窗口内持续发送同一意图；新结果未及时
-        // 完成时归零等待，不能将独立续租变成无限重放旧速度。
+        // A nonzero command result is consumed once. Its existing deadline still
+        // bounds first delivery; it is not proof for another full hold from a
+        // newer pose while the next computation is pending.
         let ready = input
             .result
             .as_ref()
@@ -386,6 +387,13 @@ impl NavPlanner for PlannerWorker {
         } else {
             Some("局部轨迹正在计算，保持零速等待".into())
         };
+        if matches!(&ready, Some(PlannerStep::Command(command)) if *command != Twist2::ZERO) {
+            // No consumer-side geometry or pose equality gate. A same-valued
+            // future command must come from another actual computation. Applied
+            // feedback (or a later step seeing no result) requests that compute;
+            // selecting this candidate is not an actuator receipt.
+            input.result = None;
+        }
         ready.unwrap_or(PlannerStep::Pending(Vec::new()))
     }
     fn local_path_for_display(&self) -> Vec<[f64; 3]> {
@@ -625,10 +633,9 @@ mod tests {
                 assert_positive_route_computation(&clear, local_planning_enabled);
                 harness.release.send(()).unwrap();
                 wait_for_source_result(&harness.worker);
-                // A gated test is not a scheduling benchmark: first prove the
-                // actual cached command is deliverable while still in its lease.
-                harness.worker.shared.0.lock().unwrap().result.as_mut().unwrap().0 = std::time::Instant::now();
-                assert_eq!(harness.worker.step(0.3), clear.outcome);
+                // Keep this positive publication unconsumed: this test isolates
+                // the source fence before first delivery, not single-use retirement.
+                assert_eq!(harness.worker.shared.0.lock().unwrap().result.as_ref().unwrap().1, clear.outcome);
                 let goal_version = harness.worker.shared.0.lock().unwrap().goal_version;
                 harness.change_source(map_changed);
                 let blocked = harness.next_computation();
@@ -1058,7 +1065,7 @@ mod tests {
         }
     }
     #[test]
-    fn pose_only_motion_preserves_inflight_and_stored_velocity_inside_original_horizon() {
+    fn pose_only_motion_preserves_first_velocity_delivery_but_cannot_replay_it() {
         let (mut worker, started, finish) = terminal_worker();
         worker.update_odometry(route_pose(0.5, 0));
         worker.step(0.3);
@@ -1071,12 +1078,8 @@ mod tests {
         wait_for_source_result(&worker);
         assert_eq!(worker.step(0.3), command, "pose movement cannot retire a computed velocity candidate");
         worker.update_odometry(route_pose(0.500002, 2));
-        assert_eq!(worker.step(0.3), command, "stored velocity keeps its original prediction horizon");
-        {
-            let mut input = worker.shared.0.lock().unwrap();
-            input.result.as_mut().unwrap().0 = std::time::Instant::now() - DEFAULT_CONTROL_HORIZON;
-        }
-        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
+        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()),
+            "a consumed velocity cannot grant another hold from the newer pose");
         worker.stop();
         let _ = finish.send(PlannerStep::Pending(Vec::new()));
     }
@@ -1435,6 +1438,29 @@ mod tests {
         assert!(worker.shared.0.lock().unwrap().result.is_none());
     }
 
+    #[test]
+    fn positive_result_is_consumed_once_and_fresh_same_value_requires_new_compute() {
+        let (mut worker, started, release)=source_worker();
+        assert_eq!(worker.step(0.3),PlannerStep::Pending(Vec::new()));
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        release.send(()).unwrap();wait_for_source_result(&worker);
+        let first=worker.step(0.3);
+        assert!(matches!(&first,PlannerStep::Command(command) if *command!=Twist2::ZERO));
+        assert!(worker.delivered_command_deadline_for_test().is_some());
+        assert!(worker.shared.0.lock().unwrap().result.is_none());
+        // A retrieval cannot rename the old publication as a new computation.
+        assert_eq!(worker.step(0.3),PlannerStep::Pending(Vec::new()));
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(worker.step(0.3),PlannerStep::Pending(Vec::new()));
+        release.send(()).unwrap();wait_for_source_result(&worker);
+        assert_eq!(worker.step(0.3),first,"same numeric command is allowed after real computation");
+        worker.stop();
+        assert!(worker.shared.0.lock().unwrap().result.is_none());
+        // A coalesced request may already have entered the gated test planner;
+        // release it after stop so its late result must retire without a long join.
+        let _=release.send(());
+    }
+
     /// Diagnostic falsifier: static evidence and a held next publication isolate
     /// command replay from source construction rate and from planner CPU work.
     fn run_replay_proof_falsifier(initial_speed:f64) {
@@ -1521,10 +1547,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore="known-proof diagnostic; no production lease or guard changes"]
+    #[ignore="real-clock geometry regression for single-consumption containment"]
     fn retained_command_replay_requires_current_full_braking_permission() {run_replay_proof_falsifier(0.05);}
     #[test]
-    #[ignore="known-proof diagnostic with unchanged actual applied velocity"]
+    #[ignore="real-clock geometry regression with unchanged actual applied velocity"]
     fn retained_steady_command_replay_requires_current_full_braking_permission() {run_replay_proof_falsifier(0.1);}
 
 }

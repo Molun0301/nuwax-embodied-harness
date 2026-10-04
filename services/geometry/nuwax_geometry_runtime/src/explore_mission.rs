@@ -1,5 +1,5 @@
 //! 探索预算复用两条生产规划算法；查询只持有不可变地图，不取得运动权。
-use super::explore_runtime::{ExploreRobotPose, ExploreStartConfig};
+use super::explore_runtime::{ExploreRobotPose, ExploreStartConfig, ExploreStopConditions};
 use nuwax_exploration::mission::MissionPose;
 use nuwax_exploration::ExplorationBoundary;
 use nuwax_nav_mls_planner::SurfaceSnapshot;
@@ -22,8 +22,15 @@ pub(crate) struct ExplorationCheckpoint {
     pub origin_session_id: String,
     pub origin_session_generation: i64,
     pub origin_frame_generation: i64,
-    pub configuration_sha256: [u8; 32],
-    pub navigation_configuration_sha256: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<ExplorationConfiguration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation_configuration: Option<NavigationConfiguration>,
+    /// V1 values are opaque read-compatible metadata, never recomputed or used as proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_sha256: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation_configuration_sha256: Option<[u8; 32]>,
     pub elapsed_ns: u64,
     pub reached_goals: u32,
     pub mission: Option<nuwax_exploration::mission::MissionProgress>,
@@ -37,7 +44,7 @@ impl ExplorationCheckpoint {
         }
         let value: Self =
             serde_json::from_str(payload).map_err(|e| format!("探索进度载荷无效：{e}"))?;
-        if value.schema_version != 1
+        if !matches!(value.schema_version, 1 | 2)
             || value.map_name.trim().is_empty()
             || value.map_name.len() > 1024
             || value.map_frame_id.trim().is_empty()
@@ -58,6 +65,16 @@ impl ExplorationCheckpoint {
         {
             return Err("探索进度版本、地图身份或容量无效".into());
         }
+        match (&value.configuration, &value.navigation_configuration) {
+            (Some(configuration), Some(navigation)) => {
+                configuration.validate()?;
+                navigation.validate()?;
+            }
+            (None, None) if value.schema_version == 1
+                && value.configuration_sha256.is_some()
+                && value.navigation_configuration_sha256.is_some() => {}
+            _ => return Err("探索进度缺少完整的实际配置".into()),
+        }
         if let Some(mission) = value.mission.as_ref() {
             mission.validate()?;
         }
@@ -72,14 +89,143 @@ impl ExplorationCheckpoint {
     }
 }
 
-/// 规范请求摘要只包含探索行为，恢复时必须与冻结请求一致。
-pub(crate) fn configuration_digest(config: &ExploreStartConfig) -> [u8; 32] {
-    let payload = serde_json::json!({"strategy":config.strategy,"arbitration":config.arbitration,
-        "boundary":config.boundary.as_ref().map(|b|b.vertices().iter().map(|p|[p.x,p.y]).collect::<Vec<_>>()),
-        "return_policy":config.return_policy,"max_navigation_retries":config.max_navigation_retries,"blacklist_radius_m":config.blacklist_radius_m,
-        "stop_conditions":{"max_coverage_pct":config.stop_conditions.max_coverage_pct,"no_frontier_timeout_ms":config.stop_conditions.no_frontier_timeout_ms,
-            "max_duration_ms":config.stop_conditions.max_duration_ms,"max_goals":config.stop_conditions.max_goals}});
-    crate::map_checksum::sha256_bytes(&serde_json::to_vec(&payload).expect("配置已验证"))
+/// Frozen behavior settings. Profile version identifies the interpretation, not the values.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExplorationConfiguration {
+    pub profile_version: u32,
+    pub source: String,
+    pub strategy: String,
+    pub arbitration: String,
+    pub boundary: Option<Vec<[f64; 2]>>,
+    pub return_policy: nuwax_exploration::mission::ReturnPolicy,
+    pub stop_conditions: ExploreStopConditions,
+    pub max_navigation_retries: u32,
+    pub blacklist_radius_m: f64,
+}
+impl ExplorationConfiguration {
+    pub fn capture(config: &ExploreStartConfig, surface: bool) -> Self {
+        Self {
+            profile_version: 1,
+            source: if surface { "surface" } else { "wavefront" }.into(),
+            strategy: config.strategy.clone(),
+            arbitration: config.arbitration.clone(),
+            boundary: config.boundary.as_ref().map(|boundary| {
+                boundary.vertices().iter().map(|point| [point.x, point.y]).collect()
+            }),
+            return_policy: config.return_policy.clone(),
+            stop_conditions: config.stop_conditions.clone(),
+            max_navigation_retries: config.max_navigation_retries,
+            blacklist_radius_m: config.blacklist_radius_m,
+        }
+    }
+    fn validate(&self) -> Result<(), String> {
+        if self.profile_version != 1 || !matches!(self.source.as_str(), "wavefront" | "surface") {
+            return Err("探索配置版本或来源无效".into());
+        }
+        let boundary = self.boundary.as_ref().map(|vertices| {
+            ExplorationBoundary::from_vertices(vertices.iter().map(|p| Point2::new(p[0], p[1])).collect())
+                .map_err(|error| error.to_string())
+        }).transpose()?;
+        ExploreStartConfig {
+            strategy: self.strategy.clone(),
+            arbitration: self.arbitration.clone(),
+            boundary,
+            return_policy: self.return_policy.clone(),
+            stop_conditions: self.stop_conditions.clone(),
+            max_navigation_retries: self.max_navigation_retries,
+            blacklist_radius_m: self.blacklist_radius_m,
+            ..Default::default()
+        }.validate_behavior(self.source == "surface")?;
+        Ok(())
+    }
+    fn changed_fields(&self, current: &Self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        macro_rules! changed {
+            ($($field:ident),+ $(,)?) => {$(if self.$field != current.$field { fields.push(concat!("configuration.", stringify!($field))); })+};
+        }
+        changed!(profile_version, source, strategy, arbitration, boundary, return_policy,
+            max_navigation_retries, blacklist_radius_m);
+        macro_rules! stop_changed {
+            ($($field:ident),+ $(,)?) => {$(if self.stop_conditions.$field != current.stop_conditions.$field { fields.push(concat!("configuration.stop_conditions.", stringify!($field))); })+};
+        }
+        stop_changed!(max_coverage_pct, no_frontier_timeout_ms, max_duration_ms, max_goals);
+        fields
+    }
+}
+
+/// Typed values previously reduced to a navigation configuration digest.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NavigationConfiguration {
+    pub profile_version: u32,
+    pub capabilities: Option<NavigationCapabilities>,
+    pub geometry: Option<RobotGeometry>,
+    pub body_to_support_z_m: Option<f64>,
+    pub base_frame: String,
+}
+impl NavigationConfiguration {
+    pub fn capture() -> Result<Self, String> {
+        let value = Self {
+            profile_version: 1,
+            capabilities: NavigationCapabilities::from_env()?,
+            geometry: std::env::var("NUWAX_ROBOT_GEOMETRY_JSON").ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| RobotGeometry::from_runtime_json(&value)).transpose()?,
+            body_to_support_z_m: std::env::var("NUWAX_NAV_BODY_TO_SUPPORT_Z_M").ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.parse::<f64>().map_err(|_| "机体支撑偏移无效".to_string())).transpose()?,
+            base_frame: std::env::var("NUWAX_BASE_FRAME").unwrap_or_default(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    fn validate(&self) -> Result<(), String> {
+        if self.profile_version != 1 {
+            return Err("导航配置版本无效".into());
+        }
+        if let Some(capabilities) = &self.capabilities { capabilities.validate()?; }
+        if let Some(geometry) = &self.geometry { geometry.validate()?; }
+        if self.body_to_support_z_m.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+            return Err("机体支撑偏移必须为正值".into());
+        }
+        Ok(())
+    }
+    fn changed_fields(&self, current: &Self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        macro_rules! changed {
+            ($($field:ident),+ $(,)?) => {$(if self.$field != current.$field { fields.push(concat!("navigation_configuration.", stringify!($field))); })+};
+        }
+        changed!(profile_version, capabilities, geometry, body_to_support_z_m, base_frame);
+        fields
+    }
+}
+
+impl ExplorationCheckpoint {
+    /// Home and measured distance are facts; the old decision to return is not.
+    pub fn prepare_history_for_replan(&mut self) {
+        if let Some(mission) = self.mission.as_mut() { mission.returning = false; }
+        self.return_reason = None;
+    }
+
+    /// True means history-only legacy resume, not proof of the original configuration.
+    pub fn resume_requires_replan(
+        &self,
+        configuration: &ExplorationConfiguration,
+        navigation: &NavigationConfiguration,
+    ) -> Result<bool, String> {
+        match (&self.configuration, &self.navigation_configuration) {
+            (Some(saved), Some(saved_navigation)) => {
+                let mut changed = saved.changed_fields(configuration);
+                changed.extend(saved_navigation.changed_fields(navigation));
+                if changed.is_empty() { Ok(false) } else {
+                    Err(format!("探索进度配置发生变化：{}", changed.join(", ")))
+                }
+            }
+            (None, None) if self.schema_version == 1 => Ok(true),
+            _ => Err("探索进度缺少完整的实际配置".into()),
+        }
+    }
 }
 
 pub(crate) fn mission_pose(pose: &ExploreRobotPose) -> MissionPose {
@@ -278,6 +424,123 @@ fn cell_in_boundary(boundary: &ExplorationBoundary, min: Point2, resolution: f64
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    fn navigation_configuration() -> NavigationConfiguration {
+        NavigationConfiguration {
+            profile_version: 1,
+            capabilities: None,
+            geometry: None,
+            body_to_support_z_m: None,
+            base_frame: String::new(),
+        }
+    }
+    fn checkpoint() -> ExplorationCheckpoint {
+        ExplorationCheckpoint {
+            schema_version: 2,
+            request_id: "checkpoint-parent".into(), map_name: "map".into(), map_frame_id: "map".into(),
+            origin_session_id: "session".into(), origin_session_generation: 1, origin_frame_generation: 1,
+            configuration: Some(ExplorationConfiguration::capture(&ExploreStartConfig::default(), false)),
+            navigation_configuration: Some(navigation_configuration()),
+            configuration_sha256: None, navigation_configuration_sha256: None,
+            elapsed_ns: 27, reached_goals: 2, mission: None, return_reason: None,
+            sources: vec![nuwax_exploration::mission::SourceCheckpoint { name: "wavefront".into(), payload: "opaque-source".into() }],
+        }
+    }
+    #[test]
+    fn checkpoint_v2_roundtrips_actual_settings_without_digest_fields() {
+        let saved = checkpoint();
+        let payload = serde_json::to_string(&saved).unwrap();
+        assert!(!payload.contains("sha256"));
+        let parsed = ExplorationCheckpoint::parse(&payload).unwrap();
+        assert_eq!(parsed.schema_version, 2);
+        assert!(!parsed.resume_requires_replan(saved.configuration.as_ref().unwrap(), saved.navigation_configuration.as_ref().unwrap()).unwrap());
+        let mut config = saved.configuration.clone().unwrap();
+        config.max_navigation_retries += 1;
+        assert!(parsed.resume_requires_replan(&config, saved.navigation_configuration.as_ref().unwrap()).unwrap_err().contains("configuration.max_navigation_retries"));
+        config = saved.configuration.clone().unwrap();
+        config.stop_conditions.max_goals = Some(5);
+        assert!(parsed.resume_requires_replan(&config, saved.navigation_configuration.as_ref().unwrap()).unwrap_err().contains("configuration.stop_conditions.max_goals"));
+        let mut navigation = saved.navigation_configuration.clone().unwrap();
+        navigation.body_to_support_z_m = Some(0.45);
+        assert!(parsed.resume_requires_replan(saved.configuration.as_ref().unwrap(), &navigation).unwrap_err().contains("navigation_configuration.body_to_support_z_m"));
+    }
+    #[test]
+    fn checkpoint_v2_compares_values_even_when_calibration_id_is_unchanged() {
+        let mut saved = checkpoint();
+        let motion = nuwax_nav_types_messages::MotionLimits {
+            model: nuwax_nav_types_messages::MotionModel::Differential,
+            max_forward_mps: 0.5, max_reverse_mps: 0.2, max_lateral_mps: 0.0, max_angular_rps: 1.0,
+            linear_acceleration_mps2: 1.0, guaranteed_braking_mps2: 1.0,
+            angular_acceleration_rps2: 1.0, guaranteed_angular_braking_rps2: 1.0,
+            reaction_time_sec: 0.1, minimum_turning_radius_m: 0.0, can_rotate_in_place: true,
+        };
+        saved.navigation_configuration.as_mut().unwrap().capabilities = Some(NavigationCapabilities {
+            schema_version: 1, calibration_id: "same-calibration".into(), motion, observation: None, terrain: None,
+        });
+        let payload = serde_json::to_string(&saved).unwrap();
+        let parsed = ExplorationCheckpoint::parse(&payload).unwrap();
+        let mut current = parsed.navigation_configuration.clone().unwrap();
+        current.capabilities.as_mut().unwrap().motion.max_forward_mps = 0.6;
+        assert!(parsed.resume_requires_replan(parsed.configuration.as_ref().unwrap(), &current).unwrap_err().contains("navigation_configuration.capabilities"));
+    }
+    #[test]
+    fn checkpoint_legacy_metadata_is_opaque_and_settings_if_present_are_compared() {
+        let mut legacy = checkpoint();
+        let configuration = legacy.configuration.take().unwrap();
+        let navigation = legacy.navigation_configuration.take().unwrap();
+        legacy.schema_version = 1;
+        legacy.configuration_sha256 = Some([0x37; 32]);
+        legacy.navigation_configuration_sha256 = Some([0x91; 32]);
+        let payload = serde_json::to_string(&legacy).unwrap();
+        let parsed = ExplorationCheckpoint::parse(&payload).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), payload);
+        assert!(parsed.resume_requires_replan(&configuration, &navigation).unwrap());
+        legacy.configuration = Some(configuration.clone());
+        legacy.navigation_configuration = Some(navigation.clone());
+        let parsed = ExplorationCheckpoint::parse(&serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert!(!parsed.resume_requires_replan(&configuration, &navigation).unwrap());
+        let mut changed = configuration;
+        changed.blacklist_radius_m += 0.5;
+        assert!(parsed.resume_requires_replan(&changed, &navigation).is_err());
+    }
+    #[test]
+    fn checkpoint_legacy_replan_retains_home_and_distance_for_current_return_budget() {
+        let mut saved = checkpoint();
+        let mut mission = nuwax_exploration::mission::MissionProgress::new(MissionPose {
+            position: [12.5, -3.25, 2.0], orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        }).unwrap();
+        mission.travelled_m = 9.0;
+        mission.returning = true;
+        saved.mission = Some(mission.clone());
+        saved.return_reason = Some(nuwax_exploration::ExplorationStopReason::DistanceBudgetReached);
+        saved.prepare_history_for_replan();
+        let restored = saved.mission.unwrap();
+        assert_eq!(restored.home, mission.home);
+        assert_eq!(restored.travelled_m, 9.0);
+        assert!(!restored.returning);
+        assert_eq!(saved.return_reason, None);
+        let current_policy = nuwax_exploration::mission::ReturnPolicy {
+            maximum_distance_m: Some(10.0), reserve_distance_m: 0.0, return_on_completion: true,
+        };
+        // The runtime checks the candidate route budget before dispatching a new goal.
+        assert!(current_policy.should_return(restored.travelled_m, 2.0).unwrap());
+        assert!(!current_policy.can_visit(restored.travelled_m, 0.5, 2.0));
+    }
+    #[test]
+    fn checkpoint_v2_rejects_incomplete_or_invalid_actual_settings() {
+        let saved = checkpoint();
+        let value = serde_json::to_value(saved).unwrap();
+        for field in ["configuration", "navigation_configuration"] {
+            let mut invalid = value.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(ExplorationCheckpoint::parse(&invalid.to_string()).is_err());
+        }
+        let mut invalid = value.clone();
+        invalid["navigation_configuration"]["body_to_support_z_m"] = serde_json::json!(-0.5);
+        assert!(ExplorationCheckpoint::parse(&invalid.to_string()).is_err());
+        let mut invalid = value;
+        invalid["configuration"]["profile_version"] = serde_json::json!(2);
+        assert!(ExplorationCheckpoint::parse(&invalid.to_string()).is_err());
+    }
     pub(crate) fn calibration() -> MissionCalibration {
         MissionCalibration {
             maximum_sample_speed_mps: 2.0,

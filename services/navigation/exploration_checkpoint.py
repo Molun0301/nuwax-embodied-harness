@@ -32,7 +32,7 @@ class ExplorationCheckpoint(BaseModel):
     @model_validator(mode="after")
     def _check_identity(self):
         value = json.loads(self.geometry_progress_json)
-        if value.get("schema_version") != 1 or value.get("map_name") != self.request.map_name or value.get("request_id") != self.request.request_id:
+        if type(value.get("schema_version")) is not int or value["schema_version"] not in (1, 2) or value.get("map_name") != self.request.map_name or value.get("request_id") != self.request.request_id:
             raise ValueError("探索进度与冻结请求的地图或原任务身份不一致")
         if self.request.resume_progress_json is not None or "motion_admission" in self.request.metadata:
             raise ValueError("持久探索请求不能携带旧运动准入或嵌套恢复载荷")

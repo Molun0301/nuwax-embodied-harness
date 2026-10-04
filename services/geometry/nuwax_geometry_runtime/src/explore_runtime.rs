@@ -46,7 +46,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::nav_runtime::MotionAdmissionProof;
 use nuwax_exploration::mission::{ReturnPolicy, MissionProgress, MissionPose};
-use crate::explore_mission::{MissionCalibration, MissionRoutes, ExplorationCheckpoint, configuration_digest, mission_pose, pose3};
+use crate::explore_mission::{MissionCalibration, MissionRoutes, ExplorationCheckpoint, ExplorationConfiguration, NavigationConfiguration, mission_pose, pose3};
 
 pub const STATUS_IDLE: &str = "IDLE";
 pub const STATUS_ACCEPTED: &str = "ACCEPTED";
@@ -168,7 +168,8 @@ pub fn pose_stamped_from_robot(x: f64, y: f64, _frame_id: &str) -> PoseStamped {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExploreStopConditions {
     pub max_coverage_pct: Option<f64>,
     pub no_frontier_timeout_ms: Option<u64>,
@@ -207,6 +208,14 @@ impl Default for ExploreStartConfig {
 
 impl ExploreStartConfig {
     fn validate(&self, surface_mode: bool) -> Result<ExplorationArbitrationPolicy, String> {
+        let policy = self.validate_behavior(surface_mode)?;
+        if !self.resume_progress_json.is_empty() { ExplorationCheckpoint::parse(&self.resume_progress_json)?; }
+        self.motion_admission.validate()
+            .map_err(|reason| format!("motion admission proof invalid: {reason}"))?;
+        Ok(policy)
+    }
+
+    pub(crate) fn validate_behavior(&self, surface_mode: bool) -> Result<ExplorationArbitrationPolicy, String> {
         match self.strategy.trim().to_ascii_lowercase().as_str() {
             "" | "wavefront" | "frontier" => {}
             "surface" if surface_mode => {}
@@ -227,7 +236,6 @@ impl ExploreStartConfig {
             );
         }
         self.return_policy.validate()?;
-        if !self.resume_progress_json.is_empty(){ExplorationCheckpoint::parse(&self.resume_progress_json)?;}
         let policy = try_parse_arbitration_policy(&self.arbitration)?;
         if policy == ExplorationArbitrationPolicy::PreferTare {
             return Err(
@@ -238,9 +246,6 @@ impl ExploreStartConfig {
         if !self.blacklist_radius_m.is_finite() || self.blacklist_radius_m < 0.0 {
             return Err("blacklist_radius_m must be finite and non-negative".to_string());
         }
-        self.motion_admission
-            .validate()
-            .map_err(|reason| format!("motion admission proof invalid: {reason}"))?;
         if self
             .stop_conditions
             .max_coverage_pct
@@ -1437,6 +1442,8 @@ pub struct ExploreRuntimeInner {
     committed_map: Option<schema::CommittedMapIdentity>,
     costmap_frame_generation: i64,
     active_config: Option<ExploreStartConfig>,
+    // Captured once at start, including errors; saving never relabels a run with later environment values.
+    navigation_configuration: Option<Result<NavigationConfiguration, String>>,
     mission: Option<MissionProgress>,
     mission_calibration: Option<MissionCalibration>,
     return_reason: Option<ExplorationStopReason>,
@@ -1496,6 +1503,7 @@ impl ExploreRuntimeInner {
             committed_map: None,
             costmap_frame_generation: 0,
             active_config: None,
+            navigation_configuration: None,
             mission: None,
             mission_calibration: None,
             return_reason: None,
@@ -2386,6 +2394,7 @@ impl ExploreRuntimeHandle {
             return snapshot;
         }
 
+        let navigation_configuration = NavigationConfiguration::capture();
         let mission_calibration = if config.return_policy.enabled() {
             let surface=guard.surface_mode.as_ref().and_then(|m|m.config.as_ref().ok());
             match MissionCalibration::capture(surface) {
@@ -2417,17 +2426,25 @@ impl ExploreRuntimeHandle {
             return self.store_snapshot(snapshot);
         }
 
+        let mut legacy_replanned = false;
         let restored=if config.resume_progress_json.is_empty(){None}else{
             let result=(|| {
-                let saved=ExplorationCheckpoint::parse(&config.resume_progress_json)?;
+                let mut saved=ExplorationCheckpoint::parse(&config.resume_progress_json)?;
                 let map_name=self.navigation_sink.read().as_ref().ok_or("导航地图来源缺失")?.current_map_name()?;
-                if saved.map_name!=map_name || saved.map_frame_id!=self.expected_map_frame.as_ref()
-                    || saved.configuration_sha256!=configuration_digest(&config)
-                    || saved.navigation_configuration_sha256!=nuwax_nav_types_messages::navigation_capabilities::configuration_digest_from_env()? {
-                    return Err("探索进度与当前地图、请求或机器人标定不匹配".into());
+                if saved.map_name!=map_name || saved.map_frame_id!=self.expected_map_frame.as_ref() {
+                    return Err("探索进度与当前地图不匹配".into());
                 }
+                legacy_replanned = saved.resume_requires_replan(
+                    &ExplorationConfiguration::capture(&config, surface_mode),
+                    navigation_configuration.as_ref().map_err(Clone::clone)?,
+                )?;
                 if config.return_policy.enabled()!=saved.mission.is_some(){return Err("探索进度缺少行程或请求未启用行程".into());}
-                controller.restore_checkpoint(&saved.sources).map_err(|e|e.to_string())?;
+                if legacy_replanned {
+                    controller.restore_checkpoint_for_replan(&saved.sources).map_err(|e|e.to_string())?;
+                    saved.prepare_history_for_replan();
+                } else {
+                    controller.restore_checkpoint(&saved.sources).map_err(|e|e.to_string())?;
+                }
                 Ok::<_,String>(saved)
             })();
             match result {Ok(saved)=>Some(saved),Err(error)=>{
@@ -2451,6 +2468,7 @@ impl ExploreRuntimeHandle {
         // 恢复载荷只在新控制器安装时使用，不随运行期配置克隆反复复制。
         active_config.resume_progress_json.clear();
         guard.active_config = Some(active_config);
+        guard.navigation_configuration = Some(navigation_configuration);
         guard.mission = None;
         guard.mission_calibration = mission_calibration;
         guard.return_reason = None;
@@ -2477,9 +2495,10 @@ impl ExploreRuntimeHandle {
         let snapshot = guard.snapshot(
             STATUS_ACCEPTED,
             format!(
-                "exploration accepted (source={}, arbitration={})",
+                "exploration accepted (source={}, arbitration={}){}",
                 if surface_mode { "surface" } else { "wavefront" },
-                arbitration_policy_str(policy)
+                arbitration_policy_str(policy),
+                if legacy_replanned { "; legacy history resumed under current settings; route and retry decisions replanned" } else { "" }
             ),
         );
         let backend_available = self.readiness_cache.lock().backend_available;
@@ -4511,9 +4530,11 @@ impl ExploreRuntimeHandle {
         let frame=guard.surface_mode.as_ref().and_then(|m|m.latest.as_ref()).map_or(guard.costmap_frame_generation,|t|t.map_frame_generation);
         let origin=guard.progress_origin.as_ref().ok_or("探索尚未消费有效坐标输入")?;
         if origin.0!=map.session_id || origin.1!=map.session_generation || origin.2!=frame{return Err("探索历史的坐标域已变化，不能保存成当前地图进度".into());}
-        let saved=ExplorationCheckpoint {schema_version:1,request_id:request_id.into(),map_name:guard.progress_map_name.clone(),map_frame_id:self.expected_map_frame.to_string(),
+        let saved=ExplorationCheckpoint {schema_version:2,request_id:request_id.into(),map_name:guard.progress_map_name.clone(),map_frame_id:self.expected_map_frame.to_string(),
             origin_session_id:origin.0.clone(),origin_session_generation:origin.1,origin_frame_generation:origin.2,
-            configuration_sha256:configuration_digest(config),navigation_configuration_sha256:nuwax_nav_types_messages::navigation_capabilities::configuration_digest_from_env()?,
+            configuration:Some(ExplorationConfiguration::capture(config, guard.surface_mode.is_some())),
+            navigation_configuration:Some(guard.navigation_configuration.as_ref().ok_or("探索启动配置不存在")?.as_ref().map_err(Clone::clone)?.clone()),
+            configuration_sha256:None,navigation_configuration_sha256:None,
             elapsed_ns:guard.progress_stopped_ns.unwrap_or_else(now_unix_nanos).saturating_sub(guard.started_at_ns),reached_goals:guard.reached_goals,mission:guard.mission.clone(),return_reason:guard.return_reason,
             sources:guard.controller.checkpoint().map_err(|e|e.to_string())?};
         let payload=serde_json::to_string(&saved).map_err(|e|e.to_string())?;
@@ -8217,6 +8238,122 @@ mod tests {
         let next = handle.tick((2.0, 2.0)).await;
         assert_eq!(next.status, STATUS_ACTIVE);
         assert_ne!(next.child_task_id, active.child_task_id);
+    }
+
+    // These fixtures never dispatch a goal or compute a legacy identity.
+    async fn hashfree_checkpoint_fixture() -> (String, ExploreStartConfig) {
+        let (handle, sink) = configured_handle();
+        let started = handle.start("settings-origin", "prefer_wavefront").await;
+        assert_eq!(started.status, STATUS_ACCEPTED, "{}", started.message);
+        let config;
+        {
+            let mut guard = handle.inner.lock().await;
+            config = guard.active_config.clone().unwrap();
+            guard.committed_map = Some(schema::CommittedMapIdentity {
+                session_id: "legacy-map-alias".into(), session_generation: 1, revision: 1,
+                payload_sha256: [0x37; 32], frame_id: "map".into(),
+            });
+            guard.costmap_frame_generation = 1;
+            guard.progress_origin = Some(("legacy-map-alias".into(), 1, 1));
+            guard.progress_map_name = "map".into();
+            guard.reached_goals = 1;
+            guard.started_at_ns = now_unix_nanos().saturating_sub(500_000_000);
+            let mut session = nuwax_explore_wavefront::session::ExplorationSession::new();
+            session.record_goal_reached(Point2::new(12.5, -3.25));
+            session.record_goal_failed(Point2::new(7.0, 9.0), 0, 1.5);
+            guard.controller.restore_checkpoint(&[nuwax_exploration::mission::SourceCheckpoint {
+                name: "wavefront".into(), payload: serde_json::to_string(&(1_u32, session)).unwrap(),
+            }]).unwrap();
+        }
+        handle.stop("settings-origin").await;
+        let payload = handle.checkpoint_progress("settings-origin").await.unwrap();
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        if let Ok(path) = std::env::var("NUWAX_TEST_EXPLORATION_CHECKPOINT_OUTPUT") {
+            std::fs::write(path, &payload).unwrap();
+        }
+        (payload, config)
+    }
+
+    #[tokio::test]
+    async fn checkpoint_v2_resumes_equal_settings_and_reports_changed_field_without_dispatch() {
+        let (payload, mut config) = hashfree_checkpoint_fixture().await;
+        let saved = ExplorationCheckpoint::parse(&payload).unwrap();
+        assert_eq!(saved.schema_version, 2);
+        assert!(!payload.contains("sha256"));
+        config.resume_progress_json = payload.clone();
+        let (resumed, sink) = configured_handle();
+        let accepted = resumed.start_with_config("equal-settings", config.clone()).await;
+        assert_eq!(accepted.status, STATUS_ACCEPTED, "{}", accepted.message);
+        assert!(!accepted.message.contains("legacy history"));
+        let guard = resumed.inner.lock().await;
+        assert_eq!(guard.reached_goals, 1);
+        assert_eq!(guard.controller.checkpoint().unwrap()[0].payload, saved.sources[0].payload);
+        assert!(guard.active_child.is_none());
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        drop(guard);
+        config.max_navigation_retries += 1;
+        let (changed, sink) = configured_handle();
+        let rejected = changed.start_with_config("changed-settings", config).await;
+        assert_eq!(rejected.status, STATUS_REJECTED);
+        assert!(rejected.message.contains("configuration.max_navigation_retries"));
+        assert!(!changed.is_active().await);
+        assert!(sink.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_legacy_changed_settings_preserve_world_history_and_replan_without_dispatch() {
+        let (payload, mut config) = hashfree_checkpoint_fixture().await;
+        let mut saved = ExplorationCheckpoint::parse(&payload).unwrap();
+        saved.schema_version = 1;
+        saved.configuration = None;
+        saved.navigation_configuration = None;
+        saved.configuration_sha256 = Some([0x22; 32]);
+        saved.navigation_configuration_sha256 = Some([0x99; 32]);
+        let legacy_payload = serde_json::to_string(&saved).unwrap();
+        config.resume_progress_json = legacy_payload.clone();
+        config.max_navigation_retries = 9;
+        config.blacklist_radius_m = 0.25;
+        let (resumed, sink) = configured_handle();
+        let accepted = resumed.start_with_config("legacy-current-settings", config).await;
+        assert_eq!(accepted.status, STATUS_ACCEPTED, "{}", accepted.message);
+        assert!(accepted.message.contains("legacy history resumed under current settings"));
+        let guard = resumed.inner.lock().await;
+        assert_eq!(guard.reached_goals, 1);
+        assert!(now_unix_nanos().saturating_sub(guard.started_at_ns) >= saved.elapsed_ns);
+        let source = guard.controller.checkpoint().unwrap();
+        let history: serde_json::Value = serde_json::from_str(&source[0].payload).unwrap();
+        assert_eq!(history[1]["explored_goals"], serde_json::json!([{ "x": 12.5, "y": -3.25 }]));
+        assert_eq!(history[1]["blacklisted_goals"], serde_json::json!([]));
+        assert_eq!(history[1]["failed_goals"], serde_json::json!([]));
+        assert_eq!(history[1]["consecutive_failures"], serde_json::json!(0));
+        assert!(guard.active_child.is_none());
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        assert_eq!(serde_json::to_string(&ExplorationCheckpoint::parse(&legacy_payload).unwrap()).unwrap(), legacy_payload);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_save_uses_start_snapshot_without_environment_recapture() {
+        let (handle, _) = configured_handle();
+        handle.start("frozen-settings", "prefer_wavefront").await;
+        let frozen;
+        {
+            let mut guard = handle.inner.lock().await;
+            // A supplied frozen value intentionally differs from this process's environment.
+            let mut navigation = guard.navigation_configuration.as_ref().unwrap().as_ref().unwrap().clone();
+            navigation.base_frame = "frozen-start-body-frame".into();
+            frozen = navigation.clone();
+            guard.navigation_configuration = Some(Ok(navigation));
+            guard.committed_map = Some(schema::CommittedMapIdentity {
+                session_id: "legacy-map-alias".into(), session_generation: 1, revision: 1,
+                payload_sha256: [0x37; 32], frame_id: "map".into(),
+            });
+            guard.costmap_frame_generation = 1;
+            guard.progress_origin = Some(("legacy-map-alias".into(), 1, 1));
+            guard.progress_map_name = "map".into();
+        }
+        handle.stop("frozen-settings").await;
+        let saved = ExplorationCheckpoint::parse(&handle.checkpoint_progress("frozen-settings").await.unwrap()).unwrap();
+        assert_eq!(saved.navigation_configuration, Some(frozen));
     }
 
     #[tokio::test]

@@ -42,8 +42,13 @@ def save_after_stop(runtime, context, request):
     if result.get("map_asset_finalize_error") or bundle is None:
         raise ValueError("探索已停稳，但本次完整地图保存未成功，不能发布检查点")
     after = json.loads(runtime.platform_geometry_runtime.get_exploration_progress(request.request_id))
-    identity = ("request_id", "map_name", "origin_session_id", "origin_session_generation", "origin_frame_generation", "configuration_sha256", "navigation_configuration_sha256")
-    if any(before[key] != after[key] for key in identity):
+    version = before.get("schema_version")
+    if type(version) is not int or version not in (1, 2) or type(after.get("schema_version")) is not int:
+        raise ValueError("探索进度版本无效，检查点未发布")
+    identity = ("schema_version", "request_id", "map_name", "map_frame_id", "origin_session_id", "origin_session_generation", "origin_frame_generation")
+    # New progress compares actual settings; v1 values remain opaque legacy metadata.
+    settings = ("configuration", "navigation_configuration") if version == 2 else ("configuration_sha256", "navigation_configuration_sha256")
+    if any(before[key] != after[key] for key in identity + settings):
         raise ValueError("完整地图保存期间探索坐标或配置改变，检查点未发布")
     frozen = request.model_copy(update={"metadata": {k: v for k, v in request.metadata.items() if k != "motion_admission"}, "resume_progress_json": None}, deep=True)
     value = ExplorationCheckpoint(checkpoint_id=checkpoint_id, pipeline=runtime.config.geometry.pipeline, request=frozen,

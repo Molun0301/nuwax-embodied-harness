@@ -264,6 +264,18 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         }
         self.history=history;self.regional_schedule=schedule;self.last_snapshot=None;self.last_notification=None;self.retry_support=None;self.last_frontiers.clear();Ok(())
     }
+    fn restore_checkpoint_for_replan(&mut self, payload: &str) -> ExploreResult<()> {
+        self.restore_checkpoint(payload)?;
+        self.history.retain(|entry| entry.reached);
+        for entry in &mut self.history {
+            entry.failures = 0;
+            // The old vertical neighborhood depended on its surface configuration.
+            // Preserve the reached world point, not an inferred band under new settings.
+            entry.vertical_radius_m = 0.0;
+        }
+        self.regional_schedule.reset();
+        Ok(())
+    }
     fn source_name(&self) -> Cow<'static, str> {
         self.name.clone()
     }
@@ -732,6 +744,29 @@ fn distance(left: [f64; 3], right: [f64; 3]) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_replan_keeps_reached_world_points_and_resets_old_neighborhoods() {
+        use super::*;
+        let mut source = SurfaceGoalSourceAdapter::new("surface", 0.5, SurfaceInputReceiver::new()).unwrap();
+        source.begin().unwrap();
+        source.record_feedback([12.5, -3.25, 2.0], 0.6, true);
+        source.record_feedback([9.0, 8.0, 2.5], 0.8, false);
+        source.regional_schedule.record_outcome([9.0, 8.0, 2.5]);
+        let payload = source.checkpoint().unwrap();
+        let mut restored = SurfaceGoalSourceAdapter::new("surface", 0.7, SurfaceInputReceiver::new()).unwrap();
+        restored.begin().unwrap();
+        restored.restore_checkpoint_for_replan(&payload).unwrap();
+        assert_eq!(restored.history.len(), 1);
+        assert_eq!(restored.history[0].support_xyz, [12.5, -3.25, 2.0]);
+        assert!(restored.history[0].reached);
+        assert_eq!(restored.history[0].failures, 0);
+        assert_eq!(restored.history[0].vertical_radius_m, 0.0);
+        assert_eq!(restored.regional_schedule.completed_rounds(), 0);
+        assert!(restored.selected.is_none());
+        assert!(restored.last_frontiers.is_empty());
+        assert_eq!(source.checkpoint().unwrap(), payload);
+    }
+
     use super::*;
     use crate::{ExplorationArbitrationPolicy, ExplorationController};
     use nuwax_nav_mls_planner::mls_planner::Config;

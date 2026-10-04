@@ -473,6 +473,10 @@ pub trait ExplorationGoalSource: Send {
     fn checkpoint(&self)->ExploreResult<String> {Err(ExploreError::SourceError("探索源不支持持久进度".into()))}
     /// 在新控制器已启动但尚未轮询前恢复历史，当前输入仍须重新核验。
     fn restore_checkpoint(&mut self,_payload:&str)->ExploreResult<()> {Err(ExploreError::SourceError("探索源不支持恢复进度".into()))}
+    /// Restore confirmed history while dropping decisions derived from unknown prior settings.
+    fn restore_checkpoint_for_replan(&mut self, _payload: &str) -> ExploreResult<()> {
+        Err(ExploreError::SourceError("探索源不支持按当前配置恢复历史".into()))
+    }
 
     /// 当前 source diagnostics(只读)
     fn diagnostics(&self) -> ExplorationSourceDiagnostics;
@@ -517,13 +521,21 @@ impl ExplorationController {
         }).collect()
     }
     /// 只安装到新建控制器；上层失败时丢弃整个候选，防止部分恢复。
-    pub fn restore_checkpoint(&mut self,states:&[mission::SourceCheckpoint])->ExploreResult<()> {
+    pub fn restore_checkpoint(&mut self, states: &[mission::SourceCheckpoint]) -> ExploreResult<()> {
+        self.restore_checkpoint_inner(states, false)
+    }
+    /// A legacy checkpoint lacks its original settings; only confirmed history may survive.
+    pub fn restore_checkpoint_for_replan(&mut self, states: &[mission::SourceCheckpoint]) -> ExploreResult<()> {
+        self.restore_checkpoint_inner(states, true)
+    }
+    fn restore_checkpoint_inner(&mut self, states: &[mission::SourceCheckpoint], replan: bool) -> ExploreResult<()> {
         if !self.active || states.len()!=self.sources.len() || states.len()>16 {return Err(ExploreError::SourceError("探索恢复源集合不匹配".into()));}
         let mut seen=std::collections::HashSet::new();
         for state in states {
             if state.payload.len()>1_048_576 || !seen.insert(&state.name){return Err(ExploreError::SourceError("探索恢复源重复或载荷过大".into()));}
             let source=self.sources.iter_mut().find(|s|s.source_name()==state.name).ok_or_else(||ExploreError::SourceError("探索恢复源名称不匹配".into()))?;
-            source.restore_checkpoint(&state.payload)?;
+            if replan { source.restore_checkpoint_for_replan(&state.payload)?; }
+            else { source.restore_checkpoint(&state.payload)?; }
         }
         Ok(())
     }

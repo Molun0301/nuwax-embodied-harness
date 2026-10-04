@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from contracts.building_navigation import BuildingTopology, FloorRecord
 from contracts.navigation import ExploreAreaRequest
+from gateways import exploration_checkpoint as checkpoint_gateway
 from gateways.exploration_checkpoint import store as checkpoint_store
 from services.mapping.catalog import MapCatalogRepository
 from services.navigation.building_catalog import BuildingCatalog
@@ -43,6 +44,34 @@ def checkpoint(identity='exploration-synthetic'):
         geometry_progress_json=json.dumps({'schema_version': 1, 'map_name': '合成地图',
             'request_id': 'source-request', 'map_frame_id': 'map',
             'configuration_sha256': [0] * 32, 'navigation_configuration_sha256': [1] * 32}))
+
+
+def native_v2_progress():
+    # The native focused test can supply its exact output for the cross-language run.
+    produced = os.environ.get('NUWAX_TEST_EXPLORATION_CHECKPOINT_OUTPUT')
+    if produced:
+        return Path(produced).read_text(encoding='utf-8')
+    return json.dumps({
+        'schema_version': 2, 'map_name': 'map', 'request_id': 'settings-origin',
+        'map_frame_id': 'map', 'origin_session_id': 'legacy-map-alias',
+        'origin_session_generation': 1, 'origin_frame_generation': 1,
+        'configuration': {'profile_version': 1, 'source': 'wavefront', 'strategy': 'wavefront',
+            'arbitration': 'prefer_wavefront', 'boundary': None,
+            'return_policy': {'maximum_distance_m': None, 'reserve_distance_m': 0.0, 'return_on_completion': False},
+            'stop_conditions': {'max_coverage_pct': None, 'no_frontier_timeout_ms': None, 'max_duration_ms': None, 'max_goals': None},
+            'max_navigation_retries': 1, 'blacklist_radius_m': 3.0},
+        'navigation_configuration': {'profile_version': 1, 'capabilities': None, 'geometry': None,
+            'body_to_support_z_m': None, 'base_frame': ''},
+        'elapsed_ns': 500000000, 'reached_goals': 1, 'mission': None, 'return_reason': None,
+        'sources': [{'name': 'wavefront', 'payload': json.dumps([1, {
+            'regional_schedule': [2, [[[1, 2, 0], 2], [[3, -1, 0], 1]]],
+            'explored_goals': [{'x': 12.5, 'y': -3.25}], 'exploration_direction': None,
+            'last_information_count': None, 'last_information_completed_goals': 0,
+            'no_gain_counter': 0, 'goals_published': 0, 'consecutive_failures': 1,
+            'failed_goals': [{'point': {'x': 7.0, 'y': 9.0}, 'failures': 1}],
+            'blacklisted_goals': [{'point': {'x': 7.0, 'y': 9.0}, 'radius_m': 1.5}],
+        }], separators=(',', ':'))}],
+    }, separators=(',', ':'))
 
 
 def discover_in_process(root, start, results):
@@ -128,6 +157,94 @@ class FileIdentityChecks(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.checkpoints.save(old.model_copy(update={'asset_manifest_sha256': 'b' * 64}))
         self.assertGreaterEqual(self.checkpoints.validate_asset.call_count, 4)
+
+    def native_checkpoint(self, progress, identity='native-v2'):
+        native = json.loads(progress)
+        return ExplorationCheckpoint(checkpoint_id=identity, pipeline='lio_3d', asset_manifest_sha256='a' * 64,
+            request=ExploreAreaRequest(request_id=native['request_id'], map_name=native['map_name']),
+            geometry_progress_json=progress)
+
+    def pause_runtime(self, before, after, identity):
+        native = json.loads(before)
+        request = ExploreAreaRequest(request_id=native['request_id'], map_name=native['map_name'])
+        runtime = SimpleNamespace(
+            config=SimpleNamespace(geometry=SimpleNamespace(pipeline='lio_3d')),
+            task_manager=SimpleNamespace(get_task_spec=Mock(return_value=SimpleNamespace(metadata={'pause_checkpoint_id': identity})),
+                update_task_metadata=Mock()),
+            platform_geometry_runtime=SimpleNamespace(get_exploration_progress=Mock(side_effect=[before, after]),
+                providers=SimpleNamespace(get_exploration_pose=Mock(return_value=None))),
+            _finalize_workspace_assets_after_task=Mock(return_value={'finalized_map_asset': SimpleNamespace(manifest_sha256='a' * 64)}),
+        )
+        return runtime, SimpleNamespace(task_id='offline-pause'), request
+
+    def test_native_v2_actual_payload_roundtrips_opaque_through_store(self):
+        progress = native_v2_progress()
+        self.assertEqual(json.loads(progress)['schema_version'], 2)
+        self.assertNotIn('configuration_sha256', json.loads(progress))
+        value = self.native_checkpoint(progress)
+        self.checkpoints.save(value)
+        reopened = ExplorationCheckpointStore(self.root).load(value.checkpoint_id, validate_asset=False)
+        self.assertEqual(reopened.geometry_progress_json, progress)
+        path = self.checkpoints._path(value.checkpoint_id)
+        before = path.read_bytes()
+        self.checkpoints.save(reopened)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(json.loads(before)['schema_version'], 2)
+        resumed = reopened.request.model_copy(update={'resume_progress_json': reopened.geometry_progress_json})
+        workspace = SimpleNamespace(active_map_name=resumed.map_name, map_asset=SimpleNamespace(asset_manifest_sha256='a' * 64))
+        runtime = SimpleNamespace(config=SimpleNamespace(geometry=SimpleNamespace(pipeline='lio_3d')),
+            map_workspace_service=SimpleNamespace(activate_map=Mock(),
+                relocalize_active_map=Mock(return_value=(SimpleNamespace(status='ready'), workspace))))
+        context = SimpleNamespace(ensure_active=Mock(), update=Mock(), timeout_remaining_sec=Mock(return_value=30.0))
+        with patch.object(checkpoint_gateway, 'store', return_value=self.checkpoints):
+            checkpoint_gateway.prepare_resume(runtime, context, resumed, reopened.checkpoint_id, 'offline-test')
+        self.assertEqual(resumed.resume_progress_json, progress)
+        self.assertEqual(path.read_bytes(), before)
+        runtime.map_workspace_service.activate_map.assert_called_once()
+        runtime.map_workspace_service.relocalize_active_map.assert_called_once()
+
+    def test_native_progress_version_requires_supported_integer_without_rewriting_payload(self):
+        native = json.loads(native_v2_progress())
+        for version in [0, 3, True, False, 2.0, '2']:
+            with self.subTest(version=version):
+                invalid = dict(native, schema_version=version)
+                with self.assertRaises(ValueError): self.native_checkpoint(json.dumps(invalid))
+
+    def test_pause_v2_compares_actual_settings_and_epoch_before_publishing(self):
+        progress = native_v2_progress()
+        runtime, context, request = self.pause_runtime(progress, progress, 'pause-native-v2')
+        with patch.object(checkpoint_gateway, 'store', return_value=self.checkpoints):
+            checkpoint_gateway.save_after_stop(runtime, context, request)
+        self.assertEqual(self.checkpoints.load('pause-native-v2').geometry_progress_json, progress)
+        self.assertEqual(runtime.task_manager.update_task_metadata.call_args.args[1]['exploration_checkpoint']['status'], 'succeeded')
+        for variation in ['configuration', 'navigation_configuration', 'origin_session_generation', 'map_frame_id']:
+            changed = json.loads(progress)
+            if variation == 'configuration': changed[variation]['max_navigation_retries'] += 1
+            elif variation == 'navigation_configuration': changed[variation]['base_frame'] = 'changed-body'
+            elif variation == 'origin_session_generation': changed[variation] += 1
+            else: changed[variation] = 'changed-map-frame'
+            identity = 'pause-changed-' + variation
+            runtime, context, request = self.pause_runtime(progress, json.dumps(changed), identity)
+            with patch.object(checkpoint_gateway, 'store', return_value=self.checkpoints), self.assertRaises(ValueError):
+                checkpoint_gateway.save_after_stop(runtime, context, request)
+            runtime.task_manager.update_task_metadata.assert_not_called()
+
+    def test_pause_v1_preserves_and_compares_only_opaque_legacy_digest_values(self):
+        native = json.loads(native_v2_progress())
+        native['schema_version'] = 1
+        del native['configuration'], native['navigation_configuration']
+        native['configuration_sha256'] = [37] * 32
+        native['navigation_configuration_sha256'] = [91] * 32
+        progress = json.dumps(native, indent=2)
+        runtime, context, request = self.pause_runtime(progress, progress, 'pause-native-v1')
+        with patch.object(checkpoint_gateway, 'store', return_value=self.checkpoints):
+            checkpoint_gateway.save_after_stop(runtime, context, request)
+        self.assertEqual(self.checkpoints.load('pause-native-v1').geometry_progress_json, progress)
+        native['navigation_configuration_sha256'] = [92] * 32
+        runtime, context, request = self.pause_runtime(progress, json.dumps(native), 'pause-changed-v1')
+        with patch.object(checkpoint_gateway, 'store', return_value=self.checkpoints), self.assertRaises(ValueError):
+            checkpoint_gateway.save_after_stop(runtime, context, request)
+        runtime.task_manager.update_task_metadata.assert_not_called()
 
     def test_warm_and_fresh_store_gets_and_misses_never_scan(self):
         self.legacy(topology('old')); self.legacy(checkpoint('old'))

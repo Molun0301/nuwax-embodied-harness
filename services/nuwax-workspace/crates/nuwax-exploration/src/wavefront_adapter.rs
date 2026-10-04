@@ -168,6 +168,11 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
         session.validate_checkpoint().map_err(ExploreError::SourceError)?;
         self.session=session;self.last_frontiers.clear();Ok(())
     }
+    fn restore_checkpoint_for_replan(&mut self, payload: &str) -> ExploreResult<()> {
+        self.restore_checkpoint(payload)?;
+        self.session.prepare_for_replan();
+        Ok(())
+    }
     fn source_name(&self) -> Cow<'static, str> {
         self.name.clone()
     }
@@ -390,6 +395,27 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_replan_selects_again_under_current_constraints() {
+        let mut previous = WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+        previous.begin().unwrap();
+        previous.session.record_goal_reached(Point2::new(12.5, -3.25));
+        previous.session.blacklist_goal(Point2::new(2.25, 2.25), 100.0);
+        previous.session.record_failure();
+        let payload = previous.checkpoint().unwrap();
+        let mut restored = WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+        restored.configure_constraints(None, 8, 0.25);
+        restored.begin().unwrap();
+        restored.restore_checkpoint_for_replan(&payload).unwrap();
+        assert_eq!(restored.session.blacklist_count(), 0);
+        let grid = frontier_grid();
+        let mut state = sample_state(Some(&grid), Timestamp::default());
+        state.robot_pose.pose.position.x = 2.25;
+        state.robot_pose.pose.position.y = 2.25;
+        assert!(matches!(restored.poll_goal(&state).unwrap(), ExplorationPoll::Goal(_)));
+        assert_eq!(previous.checkpoint().unwrap(), payload);
+    }
+
     use super::*;
     use nuwax_nav_types_messages::frames::NavFrameId;
     use nuwax_nav_types_messages::geometry::{Point3, Pose3, PoseStamped, Quaternion, Timestamp};

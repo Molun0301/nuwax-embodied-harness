@@ -299,6 +299,18 @@ impl ExplorationSession {
         stop_reason
     }
 
+    /// Keep confirmed world positions and publication counts, not old planning/retry decisions.
+    pub fn prepare_for_replan(&mut self) {
+        self.regional_schedule.reset();
+        self.exploration_direction = None;
+        self.last_information_count = None;
+        self.last_information_completed_goals = self.explored_goals.len();
+        self.no_gain_counter = 0;
+        self.consecutive_failures = 0;
+        self.failed_goals.clear();
+        self.blacklisted_goals.clear();
+    }
+
     /// 清理 no-frontier 选择历史，但保留导航失败、retry 与 blacklist 状态。
     pub fn reset_information_history(&mut self) {
         self.regional_schedule.reset();
@@ -329,6 +341,28 @@ fn point_distance(a: Point2, b: Point2) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_replan_keeps_confirmed_world_history_and_resets_derived_state() {
+        let mut session = super::ExplorationSession::new();
+        session.record_goal_reached(super::Point2::new(12.5, -3.25));
+        session.record_goal_published();
+        session.record_goal_failed(super::Point2::new(7.0, 9.0), 0, 2.0);
+        session.update_direction_from_goal(super::Point2::new(0.0, 0.0), super::Point2::new(1.0, 0.0));
+        session.last_information_count = Some(40);
+        session.no_gain_counter = 7;
+        session.prepare_for_replan();
+        session.validate_checkpoint().unwrap();
+        assert_eq!(session.explored_goals, vec![super::Point2::new(12.5, -3.25)]);
+        assert_eq!(session.goals_published(), 1);
+        assert_eq!(session.consecutive_failures(), 0);
+        assert_eq!(session.blacklist_count(), 0);
+        assert!(session.failed_goals.is_empty());
+        assert!(session.exploration_direction().is_none());
+        assert_eq!(session.no_gain_counter, 0);
+        assert_eq!(session.last_information_count, None);
+        assert_eq!(session.regional_completed_rounds(), 0);
+    }
+
     use super::*;
     use crate::config::WavefrontConfig;
     use nuwax_nav_types_messages::geometry::Point2;

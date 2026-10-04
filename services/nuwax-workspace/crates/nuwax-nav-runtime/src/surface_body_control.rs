@@ -489,11 +489,17 @@ impl SurfaceFollower {
         }
         let target = &path.poses[self.path_index];
         let previous = &path.poses[self.path_index - 1];
-        if position
-            .distance(previous.pose.position)
-            .min(position.distance(target.pose.position))
-            > self.config.max_path_deviation_m
-        {
+        let deviation = if self.config.local_planning_enabled {
+            position.distance(previous.pose.position).min(position.distance(target.pose.position))
+        } else {
+            // Global routes may have long sparse segments. Their midpoint is on
+            // the route, even when it is far from both stored endpoints. This is
+            // a distance check only; the same body/braking guards still run.
+            let (_, projected) = closest_in_window(path, &self.cumulative, position,
+                self.cumulative[self.path_index - 1], self.cumulative[self.path_index]);
+            position.distance(projected.pose.position)
+        };
+        if deviation > self.config.max_path_deviation_m {
             return PlannerStep::ReplanRequired("机体偏离连续三维路线".into());
         }
         let rotation = is_rotation(target,previous);

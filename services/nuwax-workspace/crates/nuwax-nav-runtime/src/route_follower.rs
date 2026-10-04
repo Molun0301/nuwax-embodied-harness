@@ -43,6 +43,7 @@ pub struct RouteFollower {
     local_start: Option<Point3>,
     dirty: bool,
     local_plans: u64,
+    local_planning_calls: u64,
     failed_local: Vec<FailedLocalPlan>,
     wait_reason: Option<String>,
 }
@@ -83,6 +84,7 @@ impl RouteFollower {
             local_start: None,
             dirty: true,
             local_plans: 0,
+            local_planning_calls: 0,
             failed_local: Vec::new(),
             wait_reason: None,
         })
@@ -94,6 +96,8 @@ impl RouteFollower {
     pub fn local_plans(&self) -> u64 {
         self.local_plans
     }
+    /// Number of entries into local planning, including failed attempts.
+    pub fn local_planning_calls(&self) -> u64 { self.local_planning_calls }
     pub fn local_path(&self) -> Option<&Path3D> {
         self.local_path.as_ref()
     }
@@ -196,6 +200,10 @@ impl RouteFollower {
         Ok((result, end, at_end, global_straight))
     }
     fn regenerate(&mut self, detour: bool) -> Result<(), String> {
+        if !self.config.local_planning_enabled {
+            return Err("local planning is disabled".into());
+        }
+        self.local_planning_calls += 1;
         let map = self.map.as_ref().ok_or("缺少当前地形")?;
         let pose = self.pose.as_ref().ok_or("缺少实际位姿")?;
         let mut scan = self.scan.clone();
@@ -360,7 +368,7 @@ impl NavPlanner for RouteFollower {
         options: GoalOptions,
     ) -> Result<(), RuntimeError> {
         self.failed_local.clear();
-        self.planner.clear_local_costs();
+        if self.config.local_planning_enabled { self.planner.clear_local_costs(); }
         self.controller.configure_goal(goal, options)?;
         self.options = options;
         self.goal = Some(goal.clone());
@@ -397,6 +405,12 @@ impl NavPlanner for RouteFollower {
             crate::validate_map_pose(pose, "route.payload")?;
         }
         crate::validate_map_pose(&goal, "goal_pose")?;
+        if !self.config.local_planning_enabled {
+            self.controller.replace_execution_path(
+                ExecutionPath::Surface(route.clone()), None, goal.clone(),
+            )?;
+        }
+
         self.cumulative = vec![0.0];
         for pair in route.poses.windows(2) {
             self.cumulative.push(
@@ -467,6 +481,9 @@ impl NavPlanner for RouteFollower {
             return PlannerStep::Command(Twist2::ZERO);
         }
         self.advance_progress();
+        if !self.config.local_planning_enabled {
+            return self.controller.step(width);
+        }
         let window = (self.local_end - self.local_progress_at_plan).max(0.1);
         let moved = self
             .pose
@@ -525,6 +542,167 @@ mod tests {
     use super::*;
     use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
     use nuwax_nav_types_messages::{MotionKinematics, MotionModel, NavFrameId, Pose3, Timestamp};
+    fn comparison_config(enabled: Option<bool>) -> SurfaceFollowerConfig {
+        let mut config = SurfaceFollowerConfig::new(0.4);
+        if let Some(enabled) = enabled { config.local_planning_enabled = enabled; }
+        config.controller.simulation = true;
+        config.controller.speed = 0.5;
+        config.motion_limits = Some(nuwax_nav_types_messages::MotionLimits {
+            model: MotionModel::Differential, max_forward_mps: 0.5, max_reverse_mps: 0.0,
+            max_lateral_mps: 0.0, max_angular_rps: 0.8, linear_acceleration_mps2: 1.0,
+            guaranteed_braking_mps2: 1.0, angular_acceleration_rps2: 2.0,
+            guaranteed_angular_braking_rps2: 2.0, reaction_time_sec: 0.05,
+            minimum_turning_radius_m: 0.0, can_rotate_in_place: true,
+        });
+        config
+    }
+    fn comparison_map(blocked: bool, observed_ns: Option<u64>) -> Arc<SurfaceSnapshot> {
+        let map = crate::surface_follower::test_snapshot(0.0, blocked)
+            .with_body_envelope(SurfaceBodyEnvelope {
+                footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+                z_bounds_m: [-0.05,0.2], body_to_support_z_m: 0.4,
+                max_step_up_m: 0.2, max_step_down_m: 0.2,
+                max_cross_slope_deg: 18.0, support_uncertainty_m: 0.0,
+            }).unwrap();
+        if let Some(observed_ns) = observed_ns {
+            use nuwax_nav_mls_planner::{SurfaceObservation, SurfaceObservations};
+            let mut blocks = std::collections::BTreeMap::<_, std::collections::BTreeMap<_, _>>::new();
+            for (x,y,z) in map.cell_keys() {
+                let key = [x,y,z];
+                blocks.entry(key.map(|v| v.div_euclid(32))).or_default().insert(key,
+                    SurfaceObservation { observed_ns, hits: 2 });
+            }
+            let mut observations = SurfaceObservations::new(map.source_voxel_size_m(),32).unwrap();
+            for (key,block) in blocks { observations.replace_block(key,block).unwrap(); }
+            Arc::new(map.with_observations(Some(Arc::new(observations))))
+        } else { Arc::new(map) }
+    }
+    fn comparison_pose(x: f64, tick: u32) -> PoseStamped {
+        PoseStamped { frame_id: NavFrameId::Map,
+            stamp: Timestamp::from_unix(1 + i64::from(tick / 20), tick % 20 * 50_000_000),
+            pose: Pose3 { position: Point3::new(x,1.0,0.5), orientation: Quaternion::IDENTITY } }
+    }
+    fn comparison_route(follower: &mut RouteFollower, start: PoseStamped, goal: PoseStamped) {
+        follower.update_odometry(start.clone());
+        follower.configure_goal(&goal, GoalOptions::default()).unwrap();
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D { poses: vec![start,goal.clone()] }), None,goal).unwrap();
+    }
+    #[test]
+    fn local_planning_default_and_explicit_on_match_and_off_progresses_without_planning() {
+        let mut traces = Vec::new();
+        for enabled in [None,Some(true),Some(false)] {
+            let mut follower = RouteFollower::new(comparison_config(enabled)).unwrap();
+            follower.update_execution_map(ExecutionMap::Surface(comparison_map(false,None))).unwrap();
+            let mut actual = comparison_pose(0.5,0);
+            comparison_route(&mut follower, actual.clone(),comparison_pose(3.0,0));
+            let mut commands = Vec::new();
+            let mut arrived = false;
+            for tick in 1..=140 {
+                let step = follower.step(0.3);
+                if step == PlannerStep::Succeeded { arrived = true; break; }
+                let PlannerStep::Command(command) = step else { panic!("clear route must progress: mode={enabled:?} tick={tick} pose={actual:?} step={step:?}"); };
+                assert!(command.linear.x >= 0.0);
+                commands.push(command);
+                actual.pose.position.x += command.linear.x * 0.05;
+                actual.stamp = comparison_pose(0.0,tick).stamp;
+                follower.observe_applied_command(command);
+                follower.update_odometry(actual.clone());
+            }
+            assert!(arrived, "mode {enabled:?} did not reach its goal");
+            assert!(actual.pose.position.x > 0.8, "mode {enabled:?} did not move");
+            assert!(follower.progress_m() > 0.2);
+            if enabled == Some(false) {
+                assert_eq!(follower.local_planning_calls(),0);
+                assert_eq!(follower.local_plans(),0);
+                assert!(follower.local_map.is_none() && follower.local_path.is_none());
+                assert!(follower.regenerate(false).is_err());
+                assert_eq!(follower.local_planning_calls(),0);
+            } else { assert!(follower.local_planning_calls() > 0); }
+            traces.push(commands);
+            follower.stop();
+            assert!(!matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x > 0.0));
+        }
+        assert_eq!(traces[0],traces[1],"default must preserve explicit ON behavior");
+    }
+    #[test]
+    fn both_modes_keep_obstacle_braking_and_sparse_route_deviation_checks() {
+        for enabled in [true,false] {
+            let clear = comparison_map(false,None);
+            let mut points = Vec::new();
+            for ix in 0..65 { for iy in 0..35 {
+                points.push(((ix as f32+0.5)*0.1,(iy as f32+0.5)*0.1,0.05));
+            } }
+            for iy in 0..35 { for iz in 1..8 { points.push((0.75,(iy as f32+0.5)*0.1,(iz as f32+0.5)*0.1)); } }
+            let blocked = Arc::new(SurfaceSnapshot::from_points(&points,clear.config().clone(),0.1).unwrap()
+                .with_body_envelope(clear.body_envelope().unwrap().clone()).unwrap());
+            let mut follower = RouteFollower::new(comparison_config(Some(enabled))).unwrap();
+            follower.update_execution_map(ExecutionMap::Surface(clear)).unwrap();
+            comparison_route(&mut follower,comparison_pose(0.5,0),comparison_pose(3.0,0));
+            assert!(matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x>0.0));
+            // The physical receipt remains authoritative even when planning is off.
+            follower.observe_applied_command(Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.5,0.0),angular_z:0.0});
+            follower.update_odometry(comparison_pose(0.5,1));
+            follower.update_execution_map(ExecutionMap::Surface(blocked)).unwrap();
+            let step = follower.step(0.3);
+            assert!(!matches!(step,PlannerStep::Command(c) if c.linear.x>0.0),"new wall must stop the braking envelope: mode={enabled} {step:?}");
+            if !enabled { assert_eq!(follower.local_planning_calls(),0); }
+        }
+        let mut follower = RouteFollower::new(comparison_config(Some(false))).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(comparison_map(false,None))).unwrap();
+        comparison_route(&mut follower,comparison_pose(0.5,0),comparison_pose(3.0,0));
+        let mut off_route = comparison_pose(1.5,1);
+        off_route.pose.position.y = 2.5;
+        follower.update_odometry(off_route);
+        assert!(matches!(follower.step(0.3),PlannerStep::ReplanRequired(_)));
+        assert_eq!(follower.local_planning_calls(),0);
+    }
+
+    #[test]
+    fn off_sparse_route_rejects_a_valid_body_on_a_different_floor() {
+        let clear = comparison_map(false,None);
+        let mut points = Vec::new();
+        for ix in 0..65 { for iy in 0..35 { for z in [0.05,1.55] {
+            points.push(((ix as f32+0.5)*0.1,(iy as f32+0.5)*0.1,z));
+        } } }
+        let floors = Arc::new(SurfaceSnapshot::from_points(&points,clear.config().clone(),0.1).unwrap()
+            .with_body_envelope(clear.body_envelope().unwrap().clone()).unwrap());
+        let mut follower = RouteFollower::new(comparison_config(Some(false))).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(floors)).unwrap();
+        comparison_route(&mut follower,comparison_pose(0.5,0),comparison_pose(3.0,0));
+        let mut upper_floor = comparison_pose(1.5,1);
+        upper_floor.pose.position.z = 2.0;
+        follower.update_odometry(upper_floor);
+        assert!(follower.controller.current_body_error().is_none(),"upper-floor pose must have valid support and clearance");
+        assert!(matches!(follower.step(0.3),PlannerStep::ReplanRequired(reason) if reason.contains("偏离连续三维路线")),
+            "a valid body on another floor is not on the lower route's 3D segment");
+        assert_eq!(follower.local_planning_calls(),0);
+    }
+
+    #[test]
+    fn both_modes_reject_changed_support_and_expired_observations() {
+        for enabled in [true,false] {
+            let mut follower = RouteFollower::new(comparison_config(Some(enabled))).unwrap();
+            follower.update_execution_map(ExecutionMap::Surface(comparison_map(false,None))).unwrap();
+            comparison_route(&mut follower,comparison_pose(0.95,0),comparison_pose(3.0,0));
+            assert!(matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x > 0.0));
+            follower.update_execution_map(ExecutionMap::Surface(comparison_map(true,None))).unwrap();
+            follower.update_odometry(comparison_pose(0.95,1));
+            assert!(!matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x > 0.0),"changed support allowed motion, mode={enabled}");
+            let mut config = comparison_config(Some(enabled));
+            config.max_observation_age_sec = Some(1.0);
+            let mut follower = RouteFollower::new(config).unwrap();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
+            follower.update_execution_map(ExecutionMap::Surface(comparison_map(false,Some(now)))).unwrap();
+            comparison_route(&mut follower,comparison_pose(0.5,0),comparison_pose(3.0,0));
+            assert!(matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x > 0.0),"fresh evidence should move, mode={enabled}");
+            // A replacement source carries honestly older observations; no future timestamps or relaxed TTL.
+            follower.update_execution_map(ExecutionMap::Surface(comparison_map(false,Some(now.saturating_sub(2_000_000_000))))).unwrap();
+            follower.update_odometry(comparison_pose(0.5,1));
+            assert!(!matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x > 0.0),"expired evidence allowed motion, mode={enabled}");
+            if !enabled { assert_eq!(follower.local_planning_calls(),0); }
+        }
+    }
+
     #[test]
     fn invalid_current_support_waits_without_replanning_and_recovers_on_pose_update() {
         let map = Arc::new(crate::surface_follower::test_snapshot(0.0, false)

@@ -701,12 +701,18 @@ struct Simulation {
     pose_mode: String,
     braking_for_replan: bool,
 }
+fn request_local_planning_enabled(request: &Value, startup: bool) -> Result<bool, String> {
+    request.get("local_planning_enabled").map_or(Ok(startup), |value|
+        value.as_bool().ok_or_else(|| "local_planning_enabled must be a boolean".into()))
+}
+
 impl Simulation {
     fn new(scene: &Scene, request: &Value) -> Result<Self, String> {
         let start = body4(&request["start"])?;
         let goal = body4(&request["goal"])?;
         let speed = request["speed_mps"].as_f64().unwrap_or(1.).clamp(0.1, 1.5);
         let mut config = scene.config.follower.clone();
+        config.local_planning_enabled = request_local_planning_enabled(request, config.local_planning_enabled)?;
         // 同一原生程序逐请求对照局部视距，保持控制与物理参数一致。
         if let Some(value) = request.get("local_horizon_m") {
             config.scan.horizon_m = value.as_f64().filter(|v| v.is_finite() && *v > 0.0)
@@ -1270,6 +1276,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_planning_request_inherits_startup_or_accepts_only_a_boolean() {
+        for startup in [true,false] {
+            assert_eq!(request_local_planning_enabled(&json!({}),startup).unwrap(),startup);
+            for enabled in [true,false] {
+                assert_eq!(request_local_planning_enabled(&json!({"local_planning_enabled":enabled}),startup).unwrap(),enabled);
+            }
+            for invalid in [json!("false"),json!(0),json!(null)] {
+                assert!(request_local_planning_enabled(&json!({"local_planning_enabled":invalid}),startup).is_err());
+            }
+        }
+    }
 
     #[test]
     fn quaternion_scale_does_not_change_environment_orientation_or_motion() {

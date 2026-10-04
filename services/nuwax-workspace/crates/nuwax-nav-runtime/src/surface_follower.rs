@@ -36,6 +36,8 @@ pub(crate) fn forward_navigation_limits(physical: &MotionLimits) -> MotionLimits
 /// 三维跟随必须明确标定，控制参数复用已有局部控制器配置。
 #[derive(Debug, Clone)]
 pub struct SurfaceFollowerConfig {
+    /// Startup-only route refinement switch; collision, observation and braking checks stay enabled.
+    pub local_planning_enabled: bool,
     /// 同一导航拥有方的全局地图与局部反馈缓存。
     pub pct: Arc<nuwax_nav_pct::PctPlanner>,
     /// 路线引导的近场轨迹参数，生产RouteFollower消费。
@@ -63,6 +65,7 @@ impl SurfaceFollowerConfig {
     #[must_use]
     pub fn new(body_to_support_z_m: f64) -> Self {
         Self {
+            local_planning_enabled: true,
             pct: Default::default(),
             scan: nuwax_nav_scan::ScanConfig::default(),
             body_to_support_z_m,
@@ -903,6 +906,16 @@ mod tests {
         }).unwrap();
         follower.replace_execution_path(ExecutionPath::Surface(Path3D{poses}),None,goal).unwrap();
         (follower,map)
+    }
+
+    #[test]
+    fn continuous_distance_keeps_height_and_degenerate_segment_endpoints() {
+        let pose = body_pose([1.0,1.0,0.5],Quaternion::IDENTITY,0);
+        let path = Path3D {poses:vec![pose.clone(),pose]};
+        let point = Point3::new(1.0,1.0,2.0);
+        let (progress, projected) = closest_in_window(&path,&[0.0,0.0],point,0.0,0.0);
+        assert_eq!(progress,0.0);
+        assert_eq!(projected.pose.position.distance(point),1.5);
     }
 
     #[test]

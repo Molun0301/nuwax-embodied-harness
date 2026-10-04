@@ -57,6 +57,7 @@ impl SurfaceNavigationConfig {
             optional_step("NUWAX_NAV_MAX_STEP_DOWN_M")?,
             capabilities.as_ref(),
         )?;
+        config.follower.local_planning_enabled = configured_bool("NUWAX_NAV_LOCAL_PLANNING_ENABLED", true)?;
         config.follower.scan.horizon_m = configured_number(
             "NUWAX_NAV_LOCAL_HORIZON_M", config.follower.scan.horizon_m,
         )?;
@@ -108,6 +109,7 @@ impl SurfaceNavigationConfig {
             }
         }
         tracing::info!(target:"navigation.config",event="navigation.config.loaded",profile="pct-scan-3d",
+            local_planning_enabled=config.follower.local_planning_enabled,
             voxel_m=config.geometry.voxel_size,local_horizon_m=config.follower.scan.horizon_m,
             max_step_up_m=config.body_envelope.as_ref().map(|body|body.max_step_up_m),
             max_step_down_m=config.body_envelope.as_ref().map(|body|body.max_step_down_m),
@@ -317,6 +319,19 @@ fn optional_step(key: &str) -> NavStackResult<Option<f64>> {
     }
 }
 
+fn configured_bool(key: &str, default: bool) -> NavStackResult<bool> {
+    match std::env::var(key) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(default),
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            _ => Err(NavStackError::InvalidConfig(format!("{key} must be a boolean"))),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(_) => Err(NavStackError::InvalidConfig(format!("{key} must be valid Unicode"))),
+    }
+}
+
 fn parse_number(key: &str, value: &str) -> NavStackResult<f64> {
     value
         .trim()
@@ -329,6 +344,39 @@ fn parse_number(key: &str, value: &str) -> NavStackResult<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn isolated_loader_process() -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.env_clear();
+        // Keep only the dynamic-loader search path required by relocatable SDKs;
+        // navigation settings remain isolated from the parent test environment.
+        for key in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
+            if let Some(value) = std::env::var_os(key) { command.env(key,value); }
+        }
+        command
+    }
+
+    #[test]
+    fn local_planning_boolean_uses_the_actual_environment_loader() {
+        const CHILD: &str = "NUWAX_TEST_LOCAL_PLANNING_BOOL";
+        if let Ok(expected) = std::env::var(CHILD) {
+            let result = SurfaceNavigationConfig::from_env();
+            if expected == "invalid" { assert!(result.is_err()); }
+            else { assert_eq!(result.unwrap().follower.local_planning_enabled, expected == "true"); }
+            return;
+        }
+        for (value, expected) in [(None, "true"), (Some(""), "true"), (Some("  "), "true"),
+            (Some("true"), "true"), (Some("1"), "true"), (Some(" YES "), "true"), (Some("on"), "true"),
+            (Some("false"), "false"), (Some("0"), "false"), (Some(" No "), "false"), (Some("OFF"), "false"),
+            (Some("enabled"), "invalid"), (Some("2"), "invalid")] {
+            let mut command = isolated_loader_process();
+            command.args(["--exact", "surface_config::tests::local_planning_boolean_uses_the_actual_environment_loader", "--nocapture"])
+                .env(CHILD, expected).env("NUWAX_NAV_BODY_TO_SUPPORT_Z_M", "0.4");
+            if let Some(value) = value { command.env("NUWAX_NAV_LOCAL_PLANNING_ENABLED", value); }
+            let result = command.output().unwrap();
+            assert!(result.status.success(), "{value:?}: {} {}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+        }
+    }
 
     #[test]
     fn directional_step_settings_reach_the_body_and_geometry_from_the_real_loader() {
@@ -350,9 +398,9 @@ mod tests {
         let model = r#"{"footprint_xy_m":[[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],"z_min_m":-0.05,"z_max_m":0.2,"source":"设置回归"}"#;
         for (case, up, down) in [("configured", "0.2", "0.1"), ("inherit", "", ""),
             ("invalid", "-0.1", "0.2"), ("invalid", "NaN", "0.2"), ("invalid", "0.2", "1.1")] {
-            let result = std::process::Command::new(std::env::current_exe().unwrap())
+            let result = isolated_loader_process()
                 .args(["--exact", "surface_config::tests::directional_step_settings_reach_the_body_and_geometry_from_the_real_loader", "--nocapture"])
-                .env_clear().env(CHILD, case).env("NUWAX_NAV_BODY_TO_SUPPORT_Z_M", "0.4")
+                .env(CHILD, case).env("NUWAX_NAV_BODY_TO_SUPPORT_Z_M", "0.4")
                 .env("NUWAX_ROBOT_GEOMETRY_JSON", model)
                 .env("NUWAX_NAV_MAX_STEP_UP_M", up).env("NUWAX_NAV_MAX_STEP_DOWN_M", down)
                 .output().unwrap();
@@ -399,9 +447,9 @@ mod tests {
             return;
         }
         for speed in ["1.0","0.35"] {
-            let result=std::process::Command::new(std::env::current_exe().unwrap())
+            let result=isolated_loader_process()
                 .args(["--exact","surface_config::tests::actuator_speed_is_not_capped_by_the_legacy_controller_default","--nocapture"])
-                .env_clear().env(CHILD,speed).env("NUWAX_NAV_BODY_TO_SUPPORT_Z_M","0.4")
+                .env(CHILD,speed).env("NUWAX_NAV_BODY_TO_SUPPORT_Z_M","0.4")
                 .env("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS",speed).output().unwrap();
             assert!(result.status.success(),"生产环境解析未消费设备速度：{}",String::from_utf8_lossy(&result.stderr));
         }

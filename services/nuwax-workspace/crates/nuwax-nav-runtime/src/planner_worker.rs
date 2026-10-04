@@ -281,8 +281,9 @@ impl NavPlanner for PlannerWorker {
         let arrival_changed = input.result.as_ref().is_some_and(|(_, step)|
             matches!(step, PlannerStep::Succeeded) && input.result_pose_version != input.pose_version);
         // A stored result authorizes only the exact map and boundary it consumed.
-        let source_changed = input.result_map_version != input.map_version
-            || input.result_boundary_version != input.boundary_version;
+        let source_changed = input.result.is_some()
+            && (input.result_map_version != input.map_version
+                || input.result_boundary_version != input.boundary_version);
         if input.result.is_none() || expired || arrival_changed || source_changed {
             input.requested = Some(width);
             self.shared.1.notify_one();
@@ -355,6 +356,305 @@ impl Drop for PlannerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
+    use nuwax_nav_types_messages::{
+        GoalOptions, MotionKinematics, MotionModel, NavFrameId, Path3D, Point3, Pose3,
+        Quaternion, Timestamp,
+    };
+
+    struct RouteComputation {
+        outcome: PlannerStep,
+        map: Arc<SurfaceSnapshot>,
+        boundary: Vec<[f64; 2]>,
+        odometry: PoseStamped,
+        goal_updates: u64,
+        path_updates: u64,
+        local_planning_calls: u64,
+        display_path: Vec<[f64; 3]>,
+    }
+
+    // Only publication is gated. Every input, actual geometry query, route update
+    // and command below goes through the production RouteFollower/SurfaceFollower.
+    struct GatedRouteFollower {
+        inner: crate::RouteFollower,
+        computed: std::sync::mpsc::Sender<RouteComputation>,
+        release: std::sync::mpsc::Receiver<()>,
+        map: Option<Arc<SurfaceSnapshot>>,
+        boundary: Vec<[f64; 2]>,
+        odometry: Option<PoseStamped>,
+        goal_updates: u64,
+        path_updates: u64,
+    }
+    impl NavPlanner for GatedRouteFollower {
+        fn configure_goal(&mut self, goal: &PoseStamped, options: GoalOptions) -> Result<(), RuntimeError> {
+            self.inner.configure_goal(goal, options)?;
+            self.goal_updates += 1;
+            Ok(())
+        }
+        fn configure_boundary(&mut self, boundary: &[[f64; 2]]) {
+            self.inner.configure_boundary(boundary);
+            self.boundary = boundary.to_vec();
+        }
+        fn replace_path(&mut self, path: Path2D) { self.inner.replace_path(path); }
+        fn replace_execution_path(&mut self, path: ExecutionPath, yaws: Option<Vec<f64>>, goal: PoseStamped)
+            -> Result<(), RuntimeError>
+        {
+            self.inner.replace_execution_path(path, yaws, goal)?;
+            self.path_updates += 1;
+            Ok(())
+        }
+        fn update_odometry(&mut self, pose: PoseStamped) {
+            self.inner.update_odometry(pose.clone());
+            self.odometry = Some(pose);
+        }
+        fn update_costmap(&mut self, map: CostMap2D) { self.inner.update_costmap(map); }
+        fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
+            self.inner.update_execution_map(map.clone())?;
+            self.map = match map { ExecutionMap::Surface(map) => Some(map), _ => None };
+            Ok(())
+        }
+        fn invalidate_execution_map(&mut self) {
+            self.inner.invalidate_execution_map();
+            self.map = None;
+        }
+        fn observe_applied_command(&mut self, command: Twist2) {
+            self.inner.observe_applied_command(command);
+        }
+        fn execution_wait_reason(&self) -> Option<String> { self.inner.execution_wait_reason() }
+        fn local_path_for_display(&self) -> Vec<[f64; 3]> { self.inner.local_path_for_display() }
+        fn step(&mut self, width: f64) -> PlannerStep {
+            let outcome = self.inner.step(width);
+            let _ = self.computed.send(RouteComputation {
+                outcome: outcome.clone(),
+                map: self.map.as_ref().unwrap().clone(),
+                boundary: self.boundary.clone(),
+                odometry: self.odometry.as_ref().unwrap().clone(),
+                goal_updates: self.goal_updates,
+                path_updates: self.path_updates,
+                local_planning_calls: self.inner.local_planning_calls(),
+                display_path: self.inner.local_path_for_display(),
+            });
+            // A timeout bounds cleanup after an assertion failure, not ordering.
+            let _ = self.release.recv_timeout(Duration::from_secs(15));
+            outcome
+        }
+        fn stop(&mut self) { self.inner.stop(); }
+    }
+
+    struct RouteWorkerHarness {
+        worker: PlannerWorker,
+        computed: std::sync::mpsc::Receiver<RouteComputation>,
+        release: std::sync::mpsc::Sender<()>,
+        clear: Arc<SurfaceSnapshot>,
+    }
+    impl RouteWorkerHarness {
+        fn new(local_planning_enabled: bool) -> Self {
+            let clear = Arc::new(crate::surface_follower::test_snapshot(0.0, false)
+                .with_body_envelope(SurfaceBodyEnvelope {
+                    footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+                    z_bounds_m: [-0.05, 0.2], body_to_support_z_m: 0.4,
+                    max_step_up_m: 0.2, max_step_down_m: 0.2,
+                    max_cross_slope_deg: 18.0, support_uncertainty_m: 0.0,
+                }).unwrap());
+            let mut config = crate::SurfaceFollowerConfig::new(0.4);
+            config.local_planning_enabled = local_planning_enabled;
+            config.controller.simulation = true;
+            config.basic_kinematics = Some(MotionKinematics {
+                model: MotionModel::Differential, max_forward_mps: 1.0,
+                max_reverse_mps: 0.0, max_lateral_mps: 0.0, max_angular_rps: 0.8,
+                minimum_turning_radius_m: 0.0, can_rotate_in_place: true,
+            });
+            let (computed, receive) = std::sync::mpsc::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let mut worker = PlannerWorker::new(GatedRouteFollower {
+                inner: crate::RouteFollower::new(config).unwrap(),
+                computed, release: wait, map: None, boundary: Vec::new(), odometry: None,
+                goal_updates: 0, path_updates: 0,
+            }).unwrap();
+            let start = route_pose(0.5, 0);
+            let goal = route_pose(3.0, 0);
+            worker.configure_goal(&goal, GoalOptions::default()).unwrap();
+            worker.update_execution_map(ExecutionMap::Surface(clear.clone())).unwrap();
+            worker.update_odometry(start.clone());
+            worker.replace_execution_path(ExecutionPath::Surface(Path3D {
+                poses: vec![start, goal.clone()],
+            }), None, goal).unwrap();
+            Self { worker, computed: receive, release, clear }
+        }
+        fn next_computation(&self) -> RouteComputation {
+            self.computed.recv_timeout(Duration::from_secs(15))
+                .expect("real RouteFollower did not finish its gated step")
+        }
+        fn change_source(&mut self, map_changed: bool) {
+            // No movement was applied: stationary odometry still advances by one
+            // real simulated control period, rather than replaying a frozen stamp.
+            self.worker.update_odometry(route_pose(0.5, 1));
+            if map_changed {
+                // A current-footprint virtual obstacle cannot be cleared by the
+                // controller's self-support view or bypassed by local replanning.
+                let blocked = Arc::new(self.clear.with_virtual_obstacles(
+                    [0.0, 0.0], 0.1, 65, 35, &vec![true; 65 * 35],
+                ).unwrap());
+                self.worker.update_execution_map(ExecutionMap::Surface(blocked)).unwrap();
+            } else {
+                self.worker.configure_boundary(&[[2.0,2.0],[3.0,2.0],[3.0,3.0],[2.0,3.0]]);
+            }
+        }
+    }
+    impl Drop for RouteWorkerHarness {
+        fn drop(&mut self) {
+            self.worker.stop();
+            // Release a held computation even if an assertion has unwound.
+            let _ = self.release.send(());
+        }
+    }
+    fn route_pose(x: f64, tick: i64) -> PoseStamped {
+        PoseStamped {
+            frame_id: NavFrameId::Map,
+            stamp: Timestamp { nanos: 1_000_000_000 + tick * 50_000_000, ..Timestamp::default() },
+            pose: Pose3 { position: Point3::new(x, 1.0, 0.5), orientation: Quaternion::IDENTITY },
+        }
+    }
+    fn assert_positive_route_computation(computed: &RouteComputation, local_planning_enabled: bool) {
+        assert!(matches!(computed.outcome, PlannerStep::Command(command) if command.linear.x > 0.0),
+            "clear terrain must actually produce forward motion in mode {local_planning_enabled}: {:?}", computed.outcome);
+        assert_eq!(computed.local_planning_calls > 0, local_planning_enabled);
+        assert_eq!(!computed.display_path.is_empty(), local_planning_enabled);
+    }
+    fn assert_blocked_route_computation(computed: &RouteComputation, harness: &RouteWorkerHarness, map_changed: bool, local_planning_enabled: bool) {
+        assert!(matches!(computed.outcome, PlannerStep::Command(command) if command == Twist2::ZERO)
+            || matches!(computed.outcome, PlannerStep::ReplanRequired(_)),
+            "the real follower must not move through the replacement source: {:?}", computed.outcome);
+        assert_eq!(computed.odometry.stamp.nanos, route_pose(0.5, 1).stamp.nanos);
+        assert_eq!(Arc::ptr_eq(&computed.map, &harness.clear), !map_changed);
+        assert_eq!(computed.boundary.is_empty(), map_changed);
+        if !local_planning_enabled { assert_eq!(computed.local_planning_calls, 0); }
+    }
+
+    #[test]
+    fn both_route_modes_reject_stored_positive_commands_after_map_or_boundary_changes() {
+        for local_planning_enabled in [true, false] {
+            for map_changed in [true, false] {
+                let mut harness = RouteWorkerHarness::new(local_planning_enabled);
+                harness.worker.step(0.3);
+                let clear = harness.next_computation();
+                assert_positive_route_computation(&clear, local_planning_enabled);
+                harness.release.send(()).unwrap();
+                wait_for_source_result(&harness.worker);
+                // A gated test is not a scheduling benchmark: first prove the
+                // actual cached command is deliverable while still in its lease.
+                harness.worker.shared.0.lock().unwrap().result.as_mut().unwrap().0 = std::time::Instant::now();
+                assert_eq!(harness.worker.step(0.3), clear.outcome);
+                let goal_version = harness.worker.shared.0.lock().unwrap().goal_version;
+                harness.change_source(map_changed);
+                let blocked = harness.next_computation();
+                assert_blocked_route_computation(&blocked, &harness, map_changed, local_planning_enabled);
+                {
+                    let mut input = harness.worker.shared.0.lock().unwrap();
+                    assert_eq!(input.goal_version, goal_version, "a source update must preserve the goal");
+                    assert_eq!(input.result.as_ref().unwrap().1, clear.outcome);
+                    // Keep the real computed candidate unexpired so only the
+                    // source fence, not wall-clock expiry, can make this pass.
+                    input.result.as_mut().unwrap().0 = std::time::Instant::now();
+                }
+                assert_eq!(harness.worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+                assert!(harness.worker.execution_wait_reason().unwrap().contains("地图或边界"));
+                assert!(harness.worker.local_path_for_display().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn both_route_modes_retire_inflight_results_after_map_or_boundary_changes() {
+        for local_planning_enabled in [true, false] {
+            for map_changed in [true, false] {
+                let mut harness = RouteWorkerHarness::new(local_planning_enabled);
+                harness.worker.step(0.3);
+                let clear = harness.next_computation();
+                assert_positive_route_computation(&clear, local_planning_enabled);
+                harness.change_source(map_changed);
+                harness.release.send(()).unwrap();
+                // No new step/applied-command call: source replacement itself
+                // must wake the worker and retire the already-computed command.
+                let blocked = harness.next_computation();
+                assert_blocked_route_computation(&blocked, &harness, map_changed, local_planning_enabled);
+                assert!(harness.worker.shared.0.lock().unwrap().result.is_none(),
+                    "late command from the old source was published in mode {local_planning_enabled}");
+                assert!(harness.worker.local_path_for_display().is_empty());
+                harness.release.send(()).unwrap();
+                wait_for_source_result(&harness.worker);
+                assert_eq!(harness.worker.shared.0.lock().unwrap().result.as_ref().unwrap().1, blocked.outcome);
+                assert!(!matches!(harness.worker.step(0.3), PlannerStep::Command(command) if command != Twist2::ZERO));
+            }
+        }
+    }
+
+    #[test]
+    fn both_route_modes_retire_inflight_commands_on_cancel_without_replacement() {
+        for local_planning_enabled in [true, false] {
+            let mut harness = RouteWorkerHarness::new(local_planning_enabled);
+            harness.worker.step(0.3);
+            let old = harness.next_computation();
+            assert_positive_route_computation(&old, local_planning_enabled);
+            harness.worker.stop();
+            {
+                let input = harness.worker.shared.0.lock().unwrap();
+                assert!(input.result.is_none() && input.path.is_none() && input.goal.is_none());
+                assert!(input.requested.is_none() && input.control_width.is_none());
+                assert!(input.display_path.is_empty());
+            }
+            harness.worker.update_odometry(route_pose(0.5, 1));
+            // A pathless tick is solely a completion barrier for the old step.
+            // It cannot change the goal/path epoch and therefore cannot mask a
+            // broken cancellation fence with replacement-goal invalidation.
+            let cancelled_epoch = harness.worker.shared.0.lock().unwrap().epoch;
+            assert_eq!(harness.worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+            harness.release.send(()).unwrap();
+            let cancelled = harness.next_computation();
+            assert!(matches!(cancelled.outcome, PlannerStep::ReplanRequired(_))
+                || matches!(cancelled.outcome, PlannerStep::Command(command) if command == Twist2::ZERO));
+            assert_eq!(cancelled.goal_updates, 1);
+            assert_eq!(cancelled.path_updates, 1);
+            assert!(cancelled.odometry.stamp.nanos > old.odometry.stamp.nanos);
+            if !local_planning_enabled { assert_eq!(cancelled.local_planning_calls, 0); }
+            let input = harness.worker.shared.0.lock().unwrap();
+            assert_eq!(input.epoch, cancelled_epoch);
+            assert!(input.result.is_none(), "the cancelled route's late command was published");
+            assert!(input.display_path.is_empty());
+        }
+    }
+
+    #[test]
+    fn both_route_modes_retire_inflight_commands_on_same_goal_path_replacement() {
+        for local_planning_enabled in [true, false] {
+            let mut harness = RouteWorkerHarness::new(local_planning_enabled);
+            harness.worker.step(0.3);
+            let old = harness.next_computation();
+            assert_positive_route_computation(&old, local_planning_enabled);
+            let old_epoch = harness.worker.shared.0.lock().unwrap().epoch;
+            let goal = route_pose(3.0, 1);
+            let start = route_pose(0.5, 1);
+            harness.worker.update_odometry(start.clone());
+            harness.worker.replace_execution_path(ExecutionPath::Surface(Path3D {
+                poses: vec![start, route_pose(1.5, 1), goal.clone()],
+            }), None, goal).unwrap();
+            assert!(harness.worker.shared.0.lock().unwrap().epoch > old_epoch);
+            assert_eq!(harness.worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+            harness.release.send(()).unwrap();
+            let replacement = harness.next_computation();
+            assert_positive_route_computation(&replacement, local_planning_enabled);
+            assert_eq!(replacement.goal_updates, 1);
+            assert_eq!(replacement.path_updates, 2);
+            assert!(replacement.odometry.stamp.nanos > old.odometry.stamp.nanos);
+            assert!(harness.worker.shared.0.lock().unwrap().result.is_none(),
+                "path replacement allowed the old route's late command to return");
+            harness.release.send(()).unwrap();
+            wait_for_source_result(&harness.worker);
+            assert_eq!(harness.worker.shared.0.lock().unwrap().result.as_ref().unwrap().1, replacement.outcome);
+            assert_eq!(harness.worker.local_path_for_display(), replacement.display_path);
+        }
+    }
+
     // Each step announces the sources it consumed, then waits for an explicit
     // release. The timeout only bounds a failed test's Drop; ordering uses channels.
     struct SourceProbe {

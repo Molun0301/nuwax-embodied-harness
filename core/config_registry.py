@@ -46,6 +46,7 @@ class ConfigField:
     consumers: Tuple[str, ...] = field(default_factory=tuple)
     apply_scope: str = "重启网关后生效"
     aliases: Tuple[str, ...] = field(default_factory=tuple)
+    effective_value_scope: str = "current_process"
 
 
 @dataclass(frozen=True)
@@ -617,6 +618,7 @@ def build_registry() -> Tuple[ConfigField, ...]:
             choice_labels=tuple(entry.get("choice_labels", _CHOICE_LABELS.get(key, ()))),
             consumers=tuple(consumers),
             aliases=tuple(entry.get("aliases", ())),
+            effective_value_scope=entry.get("effective_value_scope", "current_process"),
             apply_scope=entry.get("apply_scope", "重启机器人数据面及网关后生效" if rk.target_file == TARGET_GO2 else "重启网关后生效"),
         ))
     section_order = {sid: i for i, (sid, _t) in enumerate(SECTIONS)}

@@ -629,6 +629,20 @@
     "apply_scope": "重启几何运行时后生效",
     "description": ""
   },
+  "NUWAX_NAV_LOCAL_PLANNING_ENABLED": {
+    "zh_name": "启用局部规划",
+    "type": "bool",
+    "default": true,
+    "section_id": "nav_stack",
+    "advanced": false,
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "保存后重启导航后端生效",
+    "effective_value_scope": "external_process",
+    "description": "仅用于三维导航，默认开启；二维链路不使用此项。关闭后沿全局路径执行，跳过局部规划；地图、新鲜度、运动守卫及停车约束仍然有效。空值使用默认开启。此处显示启动配置，不能据此确认导航后端已经采用；修改后需重启导航后端。"
+  },
   "NUWAX_NAV_STACK_STATE_TTL_MS": {
     "zh_name": "导航状态有效时间（毫秒）",
     "type": "int",

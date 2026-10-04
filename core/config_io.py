@@ -537,14 +537,18 @@ def _build_schema(location, *, profile_snapshot=None, revision_owner=None) -> Di
         edit_value = raw_value if raw_value is not None else effective_vals.get(f.key, default_vals.get(f.key, ""))
         known = f.key in RUNTIME_VALUES
         effective_value = _format_config_value(RUNTIME_VALUES[f.key], f.type) if known else os.environ.get(f.key, edit_value)
-        pending = f.key in _SAVED_SINCE_START or (known and str(edit_value) != str(effective_value))
-        if location:
+        pending = f.key in _SAVED_SINCE_START or (known and
+            _validate(f.key, str(edit_value), f.type) != _validate(f.key, str(effective_value), f.type))
+        if location or f.effective_value_scope == "external_process":
             startup = effective_value if known else os.environ.get(f.key, settings._FILE_VALUES.get(f.key, default_vals.get(f.key, "")))
             normalized_saved = _validate(f.key, str(edit_value), f.type)
             normalized_startup = _validate(f.key, str(startup), f.type)
             pending = normalized_saved != normalized_startup
-            if apply_mode(f.key) == "hot_and_restart" and (str(location["path"]), f.key) in _SAVED_SINCE_START:
+            if location and apply_mode(f.key) == "hot_and_restart" and (str(location["path"]), f.key) in _SAVED_SINCE_START:
                 pending = True
+        # 网关读取的启动配置不是独立导航后端的采用回执。
+        if f.effective_value_scope == "external_process":
+            known, effective_value = False, None
         def masked(value):
             return _SENSITIVE_MASK if f.sensitive and value else value
         display_value = masked(edit_value)
@@ -572,6 +576,7 @@ def _build_schema(location, *, profile_snapshot=None, revision_owner=None) -> Di
             "saved_value": masked(saved),
             "effective_value": masked(effective_value),
             "effective_value_known": known,
+            "effective_value_scope": f.effective_value_scope,
             "default_value": masked(default_vals.get(f.key, "")),
             "pending_restart": pending,
             "apply_scope": apply_scope(f.key, f.apply_scope),
@@ -639,6 +644,8 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
     """返回规范化后的值；非法返回 None（由调用方记入 rejected）。"""
 
     v = value.strip()
+    if key == "NUWAX_NAV_LOCAL_PLANNING_ENABLED" and not v:
+        return "true"
     if key in {"NUWAX_NAV_MAX_STEP_UP_M", "NUWAX_NAV_MAX_STEP_DOWN_M"}:
         # 留空继承已有能力；显式零表示该方向不允许离散台阶。
         if not v:

@@ -2989,6 +2989,7 @@ mod tests {
         assert!(calls.lock().unwrap().calls.iter().filter(|call|call.starts_with("renew:")).count()>=2);
         assert!(handle.status().message.contains("局部轨迹正在计算"),
             "零速执行回执不能掩盖仍在等待局部计算的阶段");
+        assert_eq!(handle.status().last_applied_twist, Some(Twist2::ZERO));
         tokio::time::timeout(Duration::from_millis(100),handle.cancel("goal-1")).await
             .expect("取消不能等待700毫秒局部计算").unwrap();
         assert_eq!(handle.status().last_terminal,Some(TerminalOutcome::Cancelled));
@@ -3984,6 +3985,21 @@ mod tests {
             poses: vec![start.clone(), goal.clone()],
         };
         handle.update_odometry(start.clone()).await.unwrap();
+        // Fixture: continuously observe the unchanged synthetic pose
+        // with timestamps advanced by actual elapsed monotonic time; keep real TTL.
+        let observation_clock = Instant::now();
+        let observation_handle = handle.clone();
+        let observation_pose = start.clone();
+        let observation_task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let elapsed = observation_clock.elapsed();
+                let mut pose = observation_pose.clone();
+                pose.stamp = Timestamp::from_unix(1 + elapsed.as_secs() as i64, elapsed.subsec_nanos());
+                if observation_handle.update_odometry(pose).await.is_err() { break; }
+            }
+        });
+
         handle
             .update_costmap(CostmapObservation {
                 costmap: ExecutionMap::Surface(surface_follower::test_snapshot(0.0, false)),
@@ -4048,6 +4064,7 @@ mod tests {
         assert_eq!(handle.status().last_terminal, None);
         assert_eq!(handle.status().last_applied_twist, Some(Twist2::ZERO));
         handle.cancel("upper-goal").await.unwrap();
+        observation_task.abort();
         handle.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
     }

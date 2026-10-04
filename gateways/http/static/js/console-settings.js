@@ -1,7 +1,9 @@
 /* 平台设置：来源、生效状态与未保存编辑独立维护。 */
 (() => {
 "use strict";
-const configState = { loaded: false, loading: false, saving: false, dirty: new Map(), errors: new Map(), lastSchema: null, robot: null, profile: null };
+const configState = { loaded: false, loading: false, saving: false, saveAcknowledged: false, saveGeneration: 0,
+  schemaRequest: 0, schemaPromise: null, pendingUpdates: null,
+  dirty: new Map(), errors: new Map(), acknowledgedValues: new Map(), lastSchema: null, robot: null, profile: null };
 function profileIdentity() {
   const context = configState.lastSchema?.profile_context;
   return context ? { robot: context.robot, profile: context.profile, revision: context.revision } : {};
@@ -31,6 +33,17 @@ function configEscape(text) {
   return String(text == null ? "" : text).replace(/[&<>"']/g, (c) => (
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
   ));
+}
+function configBooleanValue(value, fallback) {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (!raw && fallback !== undefined) return configBooleanValue(fallback);
+  if (['true', '1', 'yes', 'on'].includes(raw)) return 'true';
+  if (['false', '0', 'no', 'off'].includes(raw)) return 'false';
+  return null;
+}
+function configFieldInputValue(field) {
+  const raw = String(field.value ?? '');
+  return field.type === 'bool' ? configBooleanValue(raw, field.default_value) ?? raw : raw;
 }
 function configHexColor(value) {
   const candidate = String(value == null ? "" : value).trim();
@@ -233,8 +246,19 @@ async function profileAction(action) {
     setConfigStatus('error', '操作失败'); document.getElementById('configDirty').textContent = error.message;
   } finally { configState.saving = false; }
 }
-async function loadConfigSchema() {
-  if (configState.loading) return;
+function loadConfigSchema(options) {
+  const pending = fetchConfigSchema(options);
+  configState.schemaPromise = pending;
+  return pending;
+}
+async function fetchConfigSchema({ afterSave = false } = {}) {
+  // 保存回执必须触发新读取；旧的并发刷新不能覆盖保存后的 schema。
+  const request = ++configState.schemaRequest;
+  // 在请求发出时固定阶段：回执后的手动刷新也可清理已保存的同值编辑，
+  // 回执前的读取则不能因为响应较晚就取得这项权限。
+  const saveGeneration = configState.saveGeneration;
+  const canReconcile = !configState.saving || afterSave || configState.saveAcknowledged;
+  const acknowledgedAtRequest = new Map(configState.acknowledgedValues);
   configState.loading = true;
   try {
     const query = new URLSearchParams();
@@ -243,12 +267,21 @@ async function loadConfigSchema() {
     const resp = await fetch("/api/config/schema?" + query);
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const schema = await resp.json();
+    if (request !== configState.schemaRequest) return false;
+    // 读取开始后若又发起保存，它就不能清理这次保存期间产生的新编辑。
+    const reconcileSaved = canReconcile && saveGeneration === configState.saveGeneration;
     // 刷新来源信息时保留尚未保存或被拒绝的输入。
     for (const section of schema.sections || []) {
       for (const field of section.fields || []) {
-        if (!field.sensitive && configState.dirty.get(field.key) === String(field.value ?? "")) {
+        if (reconcileSaved && !field.sensitive
+            && configState.dirty.get(field.key) === configFieldInputValue(field)) {
           configState.dirty.delete(field.key);
           configState.errors.delete(field.key);
+        }
+        // 只有回执后的权威读取才能替换该回执基线；读取失败时继续保留。
+        if (reconcileSaved && acknowledgedAtRequest.has(field.key)
+            && configState.acknowledgedValues.get(field.key) === acknowledgedAtRequest.get(field.key)) {
+          configState.acknowledgedValues.delete(field.key);
         }
       }
     }
@@ -263,11 +296,12 @@ async function loadConfigSchema() {
     updateConfigDirty();
     return true;
   } catch (err) {
+    if (request !== configState.schemaRequest) return false;
     setConfigStatus("error", "加载失败");
     document.getElementById("configDirty").textContent = "加载配置失败：" + err.message + "；未保存输入已保留。";
     return false;
   } finally {
-    configState.loading = false;
+    if (request === configState.schemaRequest) configState.loading = false;
   }
 }
 function renderConfigSchema(schema) {
@@ -343,6 +377,7 @@ function syncGeometryPipelineFields() {
     const key = row.dataset.key;
     const spatial = ["NUWAX_GEOMETRY_LIO_BACKEND", "NUWAX_GEOMETRY_MAPPING_BACKEND",
       "NUWAX_GEOMETRY_CORRECTION_BACKEND", "NUWAX_GEOMETRY_PGO_OPTIONS", "NUWAX_NAV_BODY_TO_SUPPORT_Z_M",
+      "NUWAX_NAV_LOCAL_PLANNING_ENABLED",
       "NUWAX_NAV_ROBOT_HEIGHT_M", "NUWAX_NAV_SURFACE_VOXEL_SIZE_M",
       "NUWAX_NAV_MIN_STAIR_TREAD_M", "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_STEP_HEIGHT_M",
       "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_SLOPE_DEG"].includes(key)
@@ -389,7 +424,14 @@ function buildConfigRow(f) {
       o.value = opt; o.textContent = opt === "true" ? "是" : "否";
       input.appendChild(o);
     }
-    input.value = String(f.value).toLowerCase() === "true" ? "true" : "false";
+    const normalized = configBooleanValue(f.value, f.default_value);
+    if (normalized === null) {
+      const invalid = document.createElement('option');
+      invalid.value = String(f.value ?? '');
+      invalid.textContent = '无效布尔值：' + (invalid.value || '（空）');
+      input.appendChild(invalid);
+    }
+    input.value = configFieldInputValue(f);
   } else if (Array.isArray(f.choices) && f.choices.length) {
     input = document.createElement("select");
     const labels = Array.isArray(f.choice_labels) ? f.choice_labels : [];
@@ -426,7 +468,10 @@ function buildConfigRow(f) {
   input.className = "field";
   if (f.readonly) { input.disabled = true; input.dataset.readonly = 'true'; }
   if (f.description) input.title = f.description;
-  input.dataset.original = (f.sensitive && f.is_set) ? "" : (f.value == null ? "" : String(f.value));
+  const baseline = configState.acknowledgedValues.has(f.key)
+    ? configState.acknowledgedValues.get(f.key) : configFieldInputValue(f);
+  if (configState.acknowledgedValues.has(f.key)) input.value = baseline;
+  input.dataset.original = (f.sensitive && f.is_set) ? "" : baseline;
   if (configState.dirty.has(f.key)) {
     input.value = configState.dirty.get(f.key);
     row.classList.add("changed");
@@ -524,7 +569,8 @@ function buildConfigRow(f) {
   }
   if (f.effective_value_known === false) {
     const unknown = document.createElement("span");
-    unknown.textContent = "当前进程值未采集";
+    unknown.textContent = f.effective_value_scope === 'external_process'
+      ? '外部进程实际采用值未核实；此处仅为启动配置' : "当前进程值未采集";
     meta.appendChild(unknown);
   } else if (f.pending_restart && !f.sensitive && f.effective_value !== undefined) {
     const effective = document.createElement("span");
@@ -546,7 +592,9 @@ function onConfigInput(key, input, row) {
   row.classList.remove("invalid");
   const error = row.querySelector(".config-err");
   if (error) error.textContent = "";
-  const changed = input.value !== input.dataset.original;
+  // 保存期间恢复旧值也是新编辑，不能被尚未到达的保存回执吞掉。
+  const baseline = configState.acknowledgedValues.has(key) ? configState.acknowledgedValues.get(key) : input.dataset.original;
+  const changed = Object.hasOwn(configState.pendingUpdates || {}, key) || input.value !== baseline;
   row.classList.toggle("changed", changed);
   if (changed) configState.dirty.set(key, input.value);
   else configState.dirty.delete(key);
@@ -571,6 +619,9 @@ async function saveConfig() {
   if (!Object.keys(updates).length) { updateConfigDirty(); return; }
   const button = document.getElementById("configSave");
   configState.saving = true;
+  configState.saveGeneration++;
+  configState.saveAcknowledged = false;
+  configState.pendingUpdates = updates;
   button.disabled = true;
   try {
     setConfigStatus("stale", "保存中");
@@ -581,15 +632,35 @@ async function saveConfig() {
     });
     const result = await resp.json();
     if (!resp.ok) throw new Error(result.error?.message || result.error || result.detail || "请求失败：" + resp.status);
+    configState.saveAcknowledged = true;
     const rejected = result.rejected || {};
+    const fields = new Map((configState.lastSchema.sections || []).flatMap(section => section.fields || []).map(field => [field.key, field]));
+    for (const [key, submitted] of Object.entries(updates)) {
+      const field = fields.get(key);
+      if (!field || field.sensitive || Object.hasOwn(rejected, key) || (result.skipped || []).includes(key)) continue;
+      // 保存回执已确认新基线，即使后续刷新失败，也不能再把旧 schema 当作编辑原值。
+      const baseline = configFieldInputValue({ ...field, value: submitted });
+      configState.acknowledgedValues.set(key, baseline);
+      const input = document.getElementById('cfg__' + key);
+      if (input) input.dataset.original = baseline;
+    }
     // 只移除本次成功保存且没有继续编辑的值，不丢失失败项或保存期间的新输入。
     for (const [key, submitted] of Object.entries(updates)) {
       if (configState.dirty.get(key) !== submitted) continue;
       if (Object.hasOwn(rejected, key)) configState.errors.set(key, rejected[key]);
       else { configState.dirty.delete(key); configState.errors.delete(key); }
     }
-    if (!await loadConfigSchema()) return;
+    let refresh = loadConfigSchema({ afterSave: true });
+    let refreshed = await refresh;
+    // 手动刷新可接管读取；等最新拥有方完成后才能解除保存期间的编辑保护。
+    while (refresh !== configState.schemaPromise) {
+      refresh = configState.schemaPromise;
+      refreshed = await refresh;
+    }
     const rejectedCount = Object.keys(rejected).length;
+    // 重启回执独立于刷新结果；网络错误或另一刷新不能吞掉已保存的事实。
+    if (result.restart_required) showRestartChoice(result);
+    if (!refreshed) return;
     if (rejectedCount) {
       setConfigStatus("error", "部分未保存");
       document.getElementById("configDirty").textContent = "有 " + rejectedCount + " 项未保存，输入及原因已保留；其余改动已保存。";
@@ -603,13 +674,14 @@ async function saveConfig() {
         setConfigStatus('error', '已保存，部分热加载失败');
         document.getElementById('configDirty').textContent = failures.map(([key, message]) => key + '：' + message).join('；');
       }
-      if (result.restart_required) showRestartChoice(result);
     }
   } catch (err) {
     setConfigStatus("error", "保存失败");
     document.getElementById("configDirty").textContent = "保存失败：" + err.message + "；输入已保留。";
   } finally {
     configState.saving = false;
+    configState.saveAcknowledged = false;
+    configState.pendingUpdates = null;
     button.disabled = false;
   }
 }

@@ -275,6 +275,43 @@ impl std::fmt::Debug for SurfaceSnapshot {
 }
 
 impl SurfaceSnapshot {
+    /// Share immutable geometry and evidence, with private disposable planning caches.
+    ///
+    /// This does not preserve snapshot-owner identity: retain the original request
+    /// source for result qualification. Ordinary `Clone` continues sharing caches.
+    /// No source cache is locked or copied, and no geometry/observation payload is
+    /// traversed. Current-body evidence is retained, with its source privately forked
+    /// so rebasing a body view cannot reach the controller's cache owners.
+    pub fn fork_for_planning(&self) -> Self {
+        Self {
+            data: Arc::new(SurfaceData {
+                body_query_only: self.data.body_query_only,
+                body_envelope: self.data.body_envelope.clone(),
+                height_bounds: self.data.height_bounds.clone(),
+                frontier_cache: Default::default(),
+                body_cache: Default::default(),
+                routing_cache: Default::default(),
+                graph: self.data.graph.clone(),
+                regions: self.data.regions.clone(),
+                physical_graph: self.data.physical_graph.clone(),
+                occupied_columns: self.data.occupied_columns.clone(),
+                occupied_voxels: self.data.occupied_voxels,
+                virtual_obstacles: self.data.virtual_obstacles.clone(),
+                virtual_blocked_cells: self.data.virtual_blocked_cells.clone(),
+                config: self.data.config.clone(),
+                source_voxel_size_m: self.data.source_voxel_size_m,
+                profile_cells: self.data.profile_cells,
+                candidate_step_cells: self.data.candidate_step_cells,
+            }),
+            observations: self.observations.as_ref().map(|source|
+                Arc::new(source.fork_for_planning())),
+            current_body_support: self.current_body_support.as_ref().map(|current|
+                Arc::new(current.fork_for_planning())),
+            body_query_cache: Default::default(),
+            ground_evidence: self.ground_evidence,
+        }
+    }
+
     /// 声明来源的物理含义；改变后重新建立接触和规划缓存。
     pub fn with_ground_evidence(mut self,evidence:GroundEvidence)->Self {
         if self.ground_evidence==evidence {return self;}

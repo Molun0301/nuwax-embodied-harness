@@ -13,12 +13,25 @@ pub(super) struct CurrentBodySupport {
     pub(super) source: SurfaceSnapshot,
     pub(super) body: [f64; 3],
     pub(super) quaternion: [f64; 4],
-    pub(super) polygon: Vec<[f64; 2]>,
-    pub(super) cells: AHashSet<VoxelKey>,
-    cleared_voxels: AHashSet<[i32; 3]>,
+    pub(super) polygon: Arc<Vec<[f64; 2]>>,
+    pub(super) cells: Arc<AHashSet<VoxelKey>>,
+    cleared_voxels: Arc<AHashSet<[i32; 3]>>,
 }
 
 impl CurrentBodySupport {
+    pub(super) fn fork_for_planning(&self) -> Self {
+        // Body-view construction always rebases to an unaugmented source; it
+        // never accumulates a chain of inferred-support snapshots.
+        Self {
+            source: self.source.fork_for_planning(),
+            body: self.body,
+            quaternion: self.quaternion,
+            polygon: self.polygon.clone(),
+            cells: self.cells.clone(),
+            cleared_voxels: self.cleared_voxels.clone(),
+        }
+    }
+
     fn permits_overlap(&self, polygon: &[[f64; 2]], x: i32, y: i32, size: f64) -> bool {
         // 将候选足迹裁到当前列，逐顶点核对其仍在原凸足迹中；相交格不能
         // 把列内未占据的半格也变成可通行支撑。
@@ -555,7 +568,8 @@ impl SurfaceSnapshot {
         } else {self.with_current_body_columns(&updates)?};
         view.body_query_cache = Default::default();
         view.current_body_support = Some(Arc::new(CurrentBodySupport {
-            source: self.clone(), body, quaternion, polygon, cells: inferred, cleared_voxels,
+            source: self.clone(), body, quaternion, polygon: Arc::new(polygon),
+            cells: Arc::new(inferred), cleared_voxels: Arc::new(cleared_voxels),
         }));
         view.validate_body_pose(body,quaternion)?;
         Ok(view)
@@ -2393,6 +2407,103 @@ mod tests {
             .with_body_envelope(model())
             .unwrap()
     }
+    #[test]
+    fn planning_fork_shares_payloads_but_isolates_every_surface_cache_and_rebase() {
+        let pose = ([0.0, 0.0, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let base = scene(&[(0.05, 0.05, 0.4)], true)
+            .with_virtual_obstacles([-4.0, -4.0], 0.1, 80, 80, &vec![false; 6400]).unwrap();
+        let view = base.with_current_body_support(pose.0, pose.1).unwrap();
+        let original = view.current_body_support.as_ref().unwrap();
+        assert!(original.source.current_body_support.is_none());
+        // Fork construction and all private cache access must work while every
+        // controller-side mutex is held, without threads, sleeps or timing claims.
+        let _query = view.body_query_cache.lock().unwrap();
+        let _body = view.data.body_cache.lock().unwrap();
+        let _routing = view.data.routing_cache.lock().unwrap();
+        let _frontier = view.data.frontier_cache.lock().unwrap();
+        let _source_query = original.source.body_query_cache.lock().unwrap();
+        let _source_body = original.source.data.body_cache.lock().unwrap();
+        let _source_routing = original.source.data.routing_cache.lock().unwrap();
+        let _source_frontier = original.source.data.frontier_cache.lock().unwrap();
+        let fork = view.fork_for_planning();
+        for (source, private) in [(&view, &fork), (&original.source, &fork.current_body_support.as_ref().unwrap().source)] {
+            assert!(!source.same_geometry(private));
+            assert!(!source.same_body_query_view(private));
+            assert!(source.same_body_query_view(&source.clone()));
+            assert!(!Arc::ptr_eq(&source.body_query_cache, &private.body_query_cache));
+            assert!(Arc::ptr_eq(&source.data.graph, &private.data.graph));
+            assert!(Arc::ptr_eq(&source.data.physical_graph, &private.data.physical_graph));
+            assert!(Arc::ptr_eq(&source.data.regions, &private.data.regions));
+            assert!(Arc::ptr_eq(&source.data.occupied_columns, &private.data.occupied_columns));
+            assert!(Arc::ptr_eq(&source.data.height_bounds, &private.data.height_bounds));
+            assert!(Arc::ptr_eq(&source.data.virtual_blocked_cells, &private.data.virtual_blocked_cells));
+            assert!(Arc::ptr_eq(source.data.virtual_obstacles.as_ref().unwrap(), private.data.virtual_obstacles.as_ref().unwrap()));
+            assert!(Arc::ptr_eq(source.data.body_envelope.as_ref().unwrap(), private.data.body_envelope.as_ref().unwrap()));
+            assert_eq!(source.data.body_query_only, private.data.body_query_only);
+            assert_eq!(source.ground_evidence, private.ground_evidence);
+            assert_eq!(source.data.occupied_voxels, private.data.occupied_voxels);
+            assert!(private.body_query_cache.try_lock().is_ok());
+            assert!(private.data.body_cache.try_lock().is_ok());
+            assert!(private.data.routing_cache.try_lock().is_ok());
+            assert!(private.data.frontier_cache.try_lock().is_ok());
+        }
+        let current = fork.current_body_support.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&original.polygon, &current.polygon));
+        assert!(Arc::ptr_eq(&original.cells, &current.cells));
+        assert!(Arc::ptr_eq(&original.cleared_voxels, &current.cleared_voxels));
+        fork.validate_body_pose(pose.0, pose.1).unwrap();
+        fork.with_current_body_support(pose.0, pose.1).unwrap();
+        super::super::centering::distances(&fork);
+    }
+
+    #[test]
+    fn planning_fork_preserves_query_only_and_occupied_volume_flags() {
+        let base = scene(&[], false).with_ground_evidence(GroundEvidence::OccupiedVolume);
+        let mut config = base.config().clone();
+        config.wall_clearance_m = 0.0;
+        let source = SurfaceSnapshot::from_points(&[(0.05,0.05,0.025)], config, 0.1).unwrap()
+            .with_ground_evidence(GroundEvidence::OccupiedVolume);
+        let query = source.with_body_query_columns(&[]).unwrap();
+        assert!(query.data.body_query_only);
+        let fork = query.fork_for_planning();
+        assert!(fork.data.body_query_only);
+        assert_eq!(fork.ground_evidence(), GroundEvidence::OccupiedVolume);
+        assert!(Arc::ptr_eq(&query.data.graph, &fork.data.graph));
+        assert_eq!(query.locate_support([0.05,0.05,0.1]), fork.locate_support([0.05,0.05,0.1]));
+    }
+
+    #[test]
+    fn planning_fork_preserves_body_observation_obstacle_and_boundary_decisions() {
+        let from = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let to = ([0.45, 0.05, 0.5], from.1);
+        for extra in [vec![], vec![(0.45, 0.05, 0.4)]] {
+            let base = scene(&extra, false);
+            for (observation_kind, observations) in [None, Some(observation_grid(|_| {})), Some(observation_grid(|cells| {cells.remove(&[8,0,0]);}))].into_iter().enumerate() {
+                let map = base.with_observations(observations);
+                let fork = map.fork_for_planning();
+                assert_eq!(map.validate_body_pose(from.0, from.1), fork.validate_body_pose(from.0, from.1));
+                assert_eq!(map.locate_support([0.05,0.05,0.1]), fork.locate_support([0.05,0.05,0.1]));
+                let occupied = base.with_observations(Some(observation_grid(|_| {})))
+                    .body_observation_footprint(from).unwrap();
+                for now in [10_100_000_000, 12_000_000_000] {
+                    for boundary in [vec![], vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]]] {
+                        let expected = map.validate_observed_body_motion_in_boundary(from,to,&occupied,now,1_000_000_000,&boundary);
+                        assert_eq!(expected, fork.validate_observed_body_motion_in_boundary(from,to,&occupied,now,1_000_000_000,&boundary));
+                        if extra.is_empty() {
+                            if observation_kind == 1 && now == 10_100_000_000 && boundary.is_empty() {
+                                assert!(expected.is_ok(), "fresh observed motion must pass");
+                            } else {
+                                assert!(expected.is_err(), "missing/expired evidence or boundary must reject");
+                            }
+                        }
+                    }
+                }
+                let blocked = map.with_virtual_obstacles([-4.0,-4.0],0.1,80,80,&vec![true;6400]).unwrap();
+                assert_eq!(blocked.validate_body_pose(from.0,from.1), blocked.fork_for_planning().validate_body_pose(from.0,from.1));
+            }
+        }
+    }
+
     fn ground_band_sweep_scene(obstacle_height: f32) -> SurfaceSnapshot {
         let mut points: Vec<_> = (-20..20).flat_map(|x| (-6..6).flat_map(move |y| {
             [-0.025, 0.025].into_iter().map(move |z| {

@@ -24,6 +24,18 @@ pub struct SurfaceObservations {
     obstacle_cache: Arc<std::sync::Mutex<AHashMap<[i32; 3], bool>>>,
 }
 impl SurfaceObservations {
+    pub(super) fn fork_for_planning(&self) -> Self {
+        Self {
+            size_m: self.size_m,
+            source_timestamp_ns: self.source_timestamp_ns,
+            complete_geometry_source: self.complete_geometry_source,
+            block_edge: self.block_edge,
+            blocks: self.blocks.clone(),
+            columns: self.columns.clone(),
+            obstacle_cache: Default::default(),
+        }
+    }
+
     /// 建立空观察索引，空索引不会证明任何支撑已观察。
     pub fn new(size_m: f32, block_edge: i32) -> Result<Self, SurfaceError> {
         if !size_m.is_finite() || size_m <= 0.0 || !(1..=128).contains(&block_edge) {
@@ -163,6 +175,33 @@ impl SurfaceObservations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planning_fork_shares_observation_roots_without_sharing_obstacle_cache() {
+        let mut source = SurfaceObservations::new(0.1, 32).unwrap();
+        source.replace_block([0,0,0], BTreeMap::from([
+            ([1,1,1], SurfaceObservation {observed_ns: 100, hits: 1}),
+            ([10,10,10], SurfaceObservation {observed_ns: 1, hits: 1}),
+        ])).unwrap();
+        source.set_source_timestamp_ns(100);
+        source.mark_complete_geometry_source();
+        let expected: Vec<_> = [[1,1,1],[10,10,10],[20,20,20]].map(|key| source.supports_obstacle(key)).into();
+        let guard = source.obstacle_cache.lock().unwrap();
+        let fork = source.fork_for_planning();
+        assert!(source.blocks.ptr_eq(&fork.blocks));
+        assert!(source.columns.ptr_eq(&fork.columns));
+        assert!(!Arc::ptr_eq(&source.obstacle_cache, &fork.obstacle_cache));
+        assert_eq!(source.source_timestamp_ns, fork.source_timestamp_ns);
+        assert_eq!(source.complete_geometry_source, fork.complete_geometry_source);
+        assert_eq!(source.block_edge, fork.block_edge);
+        assert!(fork.obstacle_cache.try_lock().unwrap().is_empty());
+        for (key, expected) in [[1,1,1],[10,10,10],[20,20,20]].into_iter().zip(expected) {
+            assert_eq!(source.get(key), fork.get(key));
+            assert_eq!(fork.supports_obstacle(key), expected);
+        }
+        fork.obstacle_cache.lock().unwrap().clear();
+        assert_eq!(guard.len(), 3);
+    }
 
     #[test]
     fn complete_geometry_fact_is_scoped_to_the_immutable_committed_source() {

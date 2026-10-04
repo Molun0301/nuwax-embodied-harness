@@ -10,4 +10,15 @@ Branches are intentionally independent:
 - recovery/python-checkpoint-overlay-20261004: v11 plus four checkpoint Python files; native protocol dependency unresolved
 - recovery/c1-core-overlay-20261004: v11 plus nine C1 crate files; native consumers not migrated
 
-No WIP native, activation fragments, reference-only relocalization material, or original dirty nav-control changes are incorporated. No remotes are configured. Archived tests document their own historical scope, not current validation. No native build or dependency installation was performed.
+No WIP native, activation fragments, reference-only relocalization material, or original dirty nav-control changes are incorporated. At the initial local-only recovery phase, no remotes were configured. The exact snapshot is now published to the independent GitHub recovery branch listed below. Archived tests document their own historical scope, not current validation. No native build or dependency installation was performed during initial snapshot recovery. This publication verifies repository durability and exact tree identity only; it does not claim full runtime or integration validation.
+
+## Publication status (2026-10-04)
+
+Published repository: https://github.com/Molun0301/nuwax-embodied-harness
+
+- Branch: recovery/v11-snapshot-20261004
+- Exact local recovery snapshot: 185410e8c89acb2eb0d1c0a51df8193c3a2c3611
+- Published exact snapshot: d95a9f6924686815dc974249478e493ad84a2f95
+- Identical snapshot Git tree: 5a4884bca9e63bdaf9bc283675f45a3848c5f96a
+
+The original refactor/map-explore-nav remains at 3be3568bbc2d9ddcbec8f32d9a592d36f8633688. This follow-up changes only publication documentation. GitHub API publication creates new commit identities; tree equality preserves source bytes, paths, and modes. These are recovered derivatives, not recovered original lost commits. NOT fully runtime/integration-revalidated. Python/native checkpoint dependencies and C1 consumer migration remain unresolved as described in the manifest.

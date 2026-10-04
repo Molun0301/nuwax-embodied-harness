@@ -2,7 +2,6 @@
   "status": "Recovered derivatives; NOT original lost commits; NOT currently integration-revalidated",
   "known_baseline": "3be3568bbc2d9ddcbec8f32d9a592d36f8633688",
   "checkout": "/workspace/scratch/71cdb9d17732/neh-recovered-local-20261004",
-  "policy": "No remote writes, new archive backups, content-hash manifests, native builds, toolchain installation, or original checkout modifications. Git commits necessarily use Git object identifiers.",
   "artifacts": {
     "v11": {
       "archive": "/workspace/scratch/71cdb9d17732/neh-recovery-inspection-20261004/archives/NEH-系统性性能优化计划.zip",
@@ -9084,5 +9083,16 @@
     "temp_docs/GO2_RTABMAP_to_GO2_RTABNAV2_migration_audit.md",
     "temp_docs/GO2_RTABNAV2_migration_checklist.md",
     "temp_docs/GO2_RTABNAV2_实机测试清单.md"
-  ]
+  ],
+  "initial_recovery_policy": "No remote writes, new archive backups, content-hash manifests, native builds, toolchain installation, or original checkout modifications. Git commits necessarily use Git object identifiers.",
+  "policy": "Initial recovery was local-only. Subsequent explicitly authorized publication uses independent recovery branches only; no force pushes, original development branch writes, deployment, new archive backups, or application content-hash code. Git object identifiers record exact tree provenance.",
+  "publication": {
+    "date": "2026-10-04",
+    "repository": "Molun0301/nuwax-embodied-harness",
+    "branch": "recovery/v11-snapshot-20261004",
+    "local_snapshot_commit": "185410e8c89acb2eb0d1c0a51df8193c3a2c3611",
+    "remote_snapshot_commit": "d95a9f6924686815dc974249478e493ad84a2f95",
+    "verified_identical_snapshot_tree": "5a4884bca9e63bdaf9bc283675f45a3848c5f96a",
+    "verification": "Remote branch ref and commit tree read back; tree equals local snapshot. Publication docs-only follow-up does not claim full runtime or integration validation."
+  }
 }

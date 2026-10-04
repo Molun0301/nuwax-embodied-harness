@@ -9,6 +9,7 @@ struct Inputs {
     epoch: u64,
     goal_version: u64,
     boundary: Vec<[f64;2]>,
+    boundary_version: u64,
     path_version: u64,
     goal: Option<(PoseStamped, nuwax_nav_types_messages::GoalOptions)>,
     path: Option<Arc<Route>>,
@@ -22,6 +23,8 @@ struct Inputs {
     applied_version: u64,
     result: Option<(std::time::Instant, PlannerStep)>,
     result_pose_version: u64,
+    result_map_version: u64,
+    result_boundary_version: u64,
     result_wait_reason: Option<String>,
     display_path: Vec<[f64; 3]>,
     closed: bool,
@@ -44,6 +47,7 @@ impl PlannerWorker {
                 let mut goal_version = u64::MAX;
                 let mut path_version = u64::MAX;
                 let mut map_version = u64::MAX;
+                let mut boundary_version = u64::MAX;
                 let mut slow_log_at: Option<std::time::Instant> = None;
                 loop {
                     let (
@@ -53,6 +57,7 @@ impl PlannerWorker {
                         path_seq,
                         goal,
                         boundary,
+                        boundary_seq,
                         path,
                         map,
                         map_seq,
@@ -76,6 +81,7 @@ impl PlannerWorker {
                             input.path_version,
                             input.goal.clone(),
                             input.boundary.clone(),
+                            input.boundary_version,
                             input.path.clone(),
                             input.map.clone(),
                             input.map_version,
@@ -94,10 +100,14 @@ impl PlannerWorker {
                             planner.stop();
                             if let Some((goal, options)) = &goal {
                                 planner.configure_goal(goal, *options)?;
-                                planner.configure_boundary(&boundary);
                             }
                             goal_version = goal_seq;
                             path_version = u64::MAX;
+                            boundary_version = u64::MAX;
+                        }
+                        if boundary_seq != boundary_version {
+                            planner.configure_boundary(&boundary);
+                            boundary_version = boundary_seq;
                         }
                         if map_seq != map_version {
                             if let Some(map) = map {
@@ -137,11 +147,16 @@ impl PlannerWorker {
                         .then(|| format!("{computed:?}"));
                     let mut input = lock.lock().unwrap();
                     let current = input.epoch == version
-                        && input.applied_version == applied_seq && !input.closed;
+                        && input.applied_version == applied_seq
+                        && input.map_version == map_seq
+                        && input.boundary_version == boundary_seq
+                        && !input.closed;
                     // 换目标、换路径、取消或来源撤销后的迟到结果一律退休。
                     if current {
                         input.result = Some((started, computed));
                         input.result_pose_version = pose_seq;
+                        input.result_map_version = map_seq;
+                        input.result_boundary_version = boundary_seq;
                         input.result_wait_reason = wait_reason;
                         input.display_path = display_path;
                     }
@@ -171,6 +186,11 @@ impl NavPlanner for PlannerWorker {
     fn configure_boundary(&mut self, boundary: &[[f64;2]]) {
         let mut input=self.shared.0.lock().unwrap();
         input.boundary=boundary.to_vec();
+        input.boundary_version += 1;
+        input.display_path.clear();
+        input.result_wait_reason = None;
+        input.requested = input.control_width;
+        self.shared.1.notify_one();
     }
     fn configure_goal(
         &mut self,
@@ -223,6 +243,10 @@ impl NavPlanner for PlannerWorker {
         let mut input = self.shared.0.lock().unwrap();
         input.map = Some(map);
         input.map_version += 1;
+        input.display_path.clear();
+        input.result_wait_reason = None;
+        input.requested = input.control_width;
+        self.shared.1.notify_one();
         Ok(())
     }
     fn invalidate_execution_map(&mut self) {
@@ -256,7 +280,10 @@ impl NavPlanner for PlannerWorker {
             matches!(step, PlannerStep::Command(_)) && started.elapsed() > DEFAULT_CONTROL_HORIZON);
         let arrival_changed = input.result.as_ref().is_some_and(|(_, step)|
             matches!(step, PlannerStep::Succeeded) && input.result_pose_version != input.pose_version);
-        if input.result.is_none() || expired || arrival_changed {
+        // A stored result authorizes only the exact map and boundary it consumed.
+        let source_changed = input.result_map_version != input.map_version
+            || input.result_boundary_version != input.boundary_version;
+        if input.result.is_none() || expired || arrival_changed || source_changed {
             input.requested = Some(width);
             self.shared.1.notify_one();
         }
@@ -265,6 +292,7 @@ impl NavPlanner for PlannerWorker {
         let ready = input
             .result
             .as_ref()
+            .filter(|_| !source_changed)
             .filter(|(started, step)| {
                 // 时效窗约束速度许可；失败、重规划及到达只触发原调度器归零，
                 // 不能因计算慢而把这些结论吞成永远运行中的零速度。
@@ -277,6 +305,8 @@ impl NavPlanner for PlannerWorker {
             .map(|(_, step)| step.clone());
         self.wait_reason = if ready.is_some() { input.result_wait_reason.clone() } else if arrival_changed {
             Some("位姿已更新，保持零速并重新核对到达状态".into())
+        } else if source_changed {
+            Some("地图或边界已更新，保持零速并重新计算".into())
         } else if expired {
             Some("局部速度计算结果已过期，保持零速并重新计算".into())
         } else {
@@ -325,6 +355,156 @@ impl Drop for PlannerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Each step announces the sources it consumed, then waits for an explicit
+    // release. The timeout only bounds a failed test's Drop; ordering uses channels.
+    struct SourceProbe {
+        started: std::sync::mpsc::Sender<(bool, Vec<[f64; 2]>)>,
+        release: std::sync::mpsc::Receiver<()>,
+        blocked: bool,
+        boundary: Vec<[f64; 2]>,
+    }
+    impl NavPlanner for SourceProbe {
+        fn replace_path(&mut self, _: Path2D) {}
+        fn update_odometry(&mut self, _: PoseStamped) {}
+        fn update_costmap(&mut self, map: CostMap2D) {
+            self.blocked = map.get(0, 0) != 0;
+        }
+        fn configure_boundary(&mut self, boundary: &[[f64; 2]]) {
+            self.boundary = boundary.to_vec();
+        }
+        fn step(&mut self, _: f64) -> PlannerStep {
+            let _ = self.started.send((self.blocked, self.boundary.clone()));
+            let _ = self.release.recv_timeout(Duration::from_secs(2));
+            PlannerStep::Command(if self.blocked || !self.boundary.is_empty() {
+                Twist2::ZERO
+            } else {
+                Twist2 { linear: nuwax_nav_types_messages::Point2::new(0.2, 0.0), angular_z: 0.0 }
+            })
+        }
+        fn stop(&mut self) { self.boundary.clear(); }
+    }
+    fn source_worker() -> (
+        PlannerWorker,
+        std::sync::mpsc::Receiver<(bool, Vec<[f64; 2]>)>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (started, start) = std::sync::mpsc::channel();
+        let (release, receive) = std::sync::mpsc::channel();
+        let worker = PlannerWorker::new(SourceProbe {
+            started, release: receive, blocked: false, boundary: Vec::new(),
+        }).unwrap();
+        (worker, start, release)
+    }
+    fn wait_for_source_result(worker: &PlannerWorker) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let input = worker.shared.0.lock().unwrap();
+            if input.result.is_some()
+                && input.result_map_version == input.map_version
+                && input.result_boundary_version == input.boundary_version {
+                return;
+            }
+            drop(input);
+            assert!(std::time::Instant::now() < deadline, "current-source result was not published");
+            std::thread::yield_now();
+        }
+    }
+    #[test]
+    fn stored_positive_command_is_rejected_after_blocking_map_update() {
+        let (mut worker, start, release) = source_worker();
+        worker.update_costmap(CostMap2D::new_all_free("map", 1, 1, 0.1));
+        worker.step(0.3);
+        assert_eq!(start.recv_timeout(Duration::from_secs(1)).unwrap(), (false, vec![]));
+        release.send(()).unwrap();
+        wait_for_source_result(&worker);
+        // Keep a stored, unexpired positive result, making retrieval (not setter
+        // clearing or command expiry) responsible for rejecting stale authority.
+        {
+            let input = worker.shared.0.lock().unwrap();
+            assert!(matches!(input.result.as_ref().unwrap().1, PlannerStep::Command(t) if t.linear.x > 0.0));
+        }
+        worker.update_costmap(CostMap2D::new_all_occupied("map", 1, 1, 0.1));
+        assert_eq!(start.recv_timeout(Duration::from_secs(1)).unwrap(), (true, vec![]));
+        {
+            let mut input = worker.shared.0.lock().unwrap();
+            assert!(matches!(input.result.as_ref().unwrap().1, PlannerStep::Command(t) if t.linear.x > 0.0));
+            input.result.as_mut().unwrap().0 = std::time::Instant::now();
+        }
+        assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+        assert!(worker.execution_wait_reason().unwrap().contains("地图或边界"));
+        worker.stop();
+        release.send(()).unwrap();
+    }
+    #[test]
+    fn map_replacement_retires_inflight_result_and_wakes_without_control_tick() {
+        let (mut worker, start, release) = source_worker();
+        worker.update_costmap(CostMap2D::new_all_free("map", 1, 1, 0.1));
+        worker.step(0.3);
+        assert_eq!(start.recv_timeout(Duration::from_secs(1)).unwrap(), (false, vec![]));
+        worker.update_costmap(CostMap2D::new_all_occupied("map", 1, 1, 0.1));
+        release.send(()).unwrap();
+        // No step or applied-command notification: map replacement must wake work.
+        assert_eq!(start.recv_timeout(Duration::from_secs(1)).unwrap(), (true, vec![]));
+        assert!(worker.shared.0.lock().unwrap().result.is_none(), "old-map result was published");
+        release.send(()).unwrap();
+        wait_for_source_result(&worker);
+        assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+    }
+    #[test]
+    fn boundary_replacement_retires_inflight_result_without_goal_change() {
+        let (mut worker, start, release) = source_worker();
+        let goal = nuwax_nav_astar::helpers::make_pose_stamped("map", 1.0, 0.0, 0.0);
+        worker.configure_goal(&goal, Default::default()).unwrap();
+        worker.step(0.3);
+        assert_eq!(start.recv_timeout(Duration::from_secs(1)).unwrap(), (false, vec![]));
+        let goal_version = worker.shared.0.lock().unwrap().goal_version;
+        let boundary = vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        worker.configure_boundary(&boundary);
+        release.send(()).unwrap();
+        assert_eq!(start.recv_timeout(Duration::from_secs(1)).unwrap(), (false, boundary.clone()));
+        assert!(worker.shared.0.lock().unwrap().result.is_none(), "old-boundary result was published");
+        assert_eq!(worker.shared.0.lock().unwrap().goal_version, goal_version);
+        release.send(()).unwrap();
+        wait_for_source_result(&worker);
+        // A new goal stops the planner; unchanged boundary still must be restored.
+        worker.configure_goal(&goal, Default::default()).unwrap();
+        worker.step(0.3);
+        assert_eq!(start.recv_timeout(Duration::from_secs(1)).unwrap(), (false, boundary));
+        worker.stop();
+        release.send(()).unwrap();
+    }
+    #[test]
+    fn stored_outcomes_require_current_map_and_boundary_at_retrieval() {
+        let (mut worker, start, release) = source_worker();
+        worker.step(0.3);
+        start.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Hold actual computation while independently exercising every cached
+        // outcome and each source fence, including destructive stale replans.
+        for map_changed in [true, false] {
+            for outcome in [
+                PlannerStep::Command(Twist2 { linear: nuwax_nav_types_messages::Point2::new(0.2, 0.0), angular_z: 0.0 }),
+                PlannerStep::Succeeded,
+                PlannerStep::ReplanRequired("old source".into()),
+                PlannerStep::Failed("old source".into()),
+            ] {
+                {
+                    let mut input = worker.shared.0.lock().unwrap();
+                    input.result = Some((std::time::Instant::now(), outcome));
+                    input.result_map_version = input.map_version;
+                    input.result_boundary_version = input.boundary_version;
+                    if map_changed { input.map_version += 1; }
+                    else { input.boundary_version += 1; }
+                }
+                assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+            }
+        }
+        worker.stop();
+        release.send(()).unwrap();
+        // Source notifications after stop must not restart control.
+        worker.update_costmap(CostMap2D::new_all_free("map", 1, 1, 0.1));
+        worker.configure_boundary(&[]);
+        assert!(worker.shared.0.lock().unwrap().requested.is_none());
+    }
     #[test]
     fn local_display_drops_late_worker_results_after_stop() {
         struct DisplayPlanner { release: std::sync::mpsc::Receiver<()>, started: std::sync::mpsc::Sender<()> }

@@ -96,3 +96,17 @@ Removing the redundant test selector did not change release dispatch: both remov
 - Blocked future path: **1 passed**. From rest, 31 nonzero guarded commands advance 0.29825 m while every actual edge remains valid. The robot settles to zero before the real current guard requests a typed clearance replan at tick 37. A forward candidate's full stopping proof independently rejects for geometry, not expiry. The already-zero state at rejection does not exercise the conditional post-rejection moving-brake branch; the earlier moving-tail tests provide that coverage.
 
 Final evidence: `proposed-default-runtime-v1.log`, `proposed-default-original-downstream-v1.log`, `proposed-default-blocked-approach-v1.log`, `proposed-default-runtime-final.log`, `proposed-default-factory-final.log`, and `proposed-default-held-final.log` under the same evidence directory. All builds remain unoptimized + debuginfo. Remaining long progress/rotation geometry checks and the dense current guard still need optimization/measurement; this correction does not establish 20 Hz capacity for all inputs.
+
+## Remaining collinear-progress cost: measured baseline
+
+The activated default was profiled at the already-qualified captured entry state using the existing fixed TLS timers/counters. One cold-for-this-checkpoint step and two exact-input warm repeats reset only recorded controller progress/pose/applied state. This is a stateless cost probe, not three steps of physical movement. Construction/admission occurs before the measured step; view refresh is included. Nested timers are inclusive and are not summed as disjoint CPU costs.
+
+| Sample | Whole step ms | Waypoint progress ms | Current candidate guard ms |
+|---|---:|---:|---:|
+| Cold checkpoint | 3006.72 | 2607.19 | 396.16 |
+| Exact-input warm 1 | 5.23 | 3.91 | 1.16 |
+| Exact-input warm 2 | 6.14 | 4.81 | 1.18 |
+
+All three return the same command `(0.11033333212307146,0,0.38829984385948857)` and consume index 270→287 with identical progress. Each records 15 translation connectors, 23 endpoint calls and 268 connector-projection substeps; the current guard retains 62 projection/sweep calls. The cold connector projection portion alone is 2024.36 ms. Warm caches reduce time but do not remove these calls, and identical-state warm results are not moving 20 Hz evidence.
+
+Evidence: `collinear-progress-baseline-v1.log`, one opt-in test passed. This checkpoint changes no algorithm. The next investigation is specifically collinear same-height progress advice; genuine corners, pivots, layer transitions and current motion guards are not candidates for blanket removal.

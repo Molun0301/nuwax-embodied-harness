@@ -1862,3 +1862,35 @@ fn translation_advice_approaches_blocked_future_then_replans_and_stops_safely() 
     }
     panic!("blocked approach did not produce a genuine guard rejection and safe physical stop in 200 ticks: current={current:?}, applied={applied:?}, nonzero_commands={nonzero_commands}, rejection={rejection:?}");
 }
+
+#[test]
+#[ignore = "wall attribution of the qualified entry checkpoint, not motion qualification"]
+fn measured_collinear_progress_at_captured_entry() {
+    use crate::control_profile::{self, Counter, Stage};
+    let mut follower=checkpoint();
+    let a=APPLIED.map(f64::from_bits);
+    let applied=Twist2 {linear:Point2::new(a[0],a[1]),angular_z:a[2]};
+    let mut reference=None;
+    for sample in 0..3 {
+        follower.path_index=INITIAL_INDEX;
+        follower.alignment_target_index=None;
+        follower.progress_m=f64::from_bits(INITIAL_PROGRESS_BITS);
+        assert!(follower.braking_deadline.is_none());
+        assert!(follower.simulation_braking_deadline_ns.is_none());
+        follower.observe_applied_command(applied);
+        follower.update_odometry(stamped(decode(CURRENT),TIME));
+        control_profile::begin();
+        let started=Instant::now();
+        let result=follower.step(0.32);
+        let wall=started.elapsed();
+        let record=control_profile::end();
+        let PlannerStep::Command(command)=result else {panic!("{result:?}")};
+        assert!(command.linear.x>0.0 && command.linear.y==0.0);
+        if let Some(previous)=reference {assert_eq!(command,previous,"query-cache warming must not change the command");}
+        reference=Some(command);
+        let stages:Vec<_>=Stage::ALL.into_iter().map(|stage|(stage.label(),record.wall_nanos[stage as usize]as f64/1e6,record.calls[stage as usize])).collect();
+        let counters:Vec<_>=Counter::ALL.into_iter().map(|counter|(counter.label(),record.counters[counter as usize])).collect();
+        eprintln!("COLLINEAR_ENTRY_PROFILE sample={sample} cache={} original_index={INITIAL_INDEX} resulting_index={} progress={} source_metadata_unchanged=true actual_state_unchanged=true wall_ms={} command={command:?} inclusive_stage_ms_calls={stages:?} counters={counters:?}",
+            if sample==0 {"cold_checkpoint"}else{"exact_input_warm"},follower.path_index,follower.progress_m,wall.as_secs_f64()*1000.0);
+    }
+}

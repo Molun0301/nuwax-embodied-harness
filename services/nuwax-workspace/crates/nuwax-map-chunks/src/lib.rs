@@ -189,7 +189,28 @@ impl LegacyManifest {
 }
 #[derive(Clone)]
 pub struct SealedMap { root: Arc<Manifest>, pub repository: Repository }
-impl SealedMap { pub fn manifest(&self) -> &Arc<Manifest> { &self.root } }
+impl SealedMap {
+    pub fn manifest(&self) -> &Arc<Manifest> { &self.root }
+
+    /// Rebind an immutable publication to the immediately following frame.
+    /// Only domain-local revision metadata changes; object bytes and the source
+    /// evidence bound are retained without reading, encoding or writing objects.
+    pub fn rehome_frame(&self, expected: &RootIdentity, new_frame: u64) -> Result<Self, String> {
+        if self.root.identity() != *expected { return Err("frame rehome root identity is stale".into()); }
+        let next_frame = self.root.domain.frame_generation.checked_add(1)
+            .ok_or("frame generation overflow")?;
+        if new_frame != next_frame { return Err("frame rehome requires the next generation".into()); }
+        self.root.validate()?;
+        let mut root = (*self.root).clone();
+        root.domain.frame_generation = new_frame;
+        root.geometry_revision = root.revision;
+        for block in &mut root.blocks {
+            block.block_revision = root.revision;
+            block.geometry_revision = root.revision;
+        }
+        Ok(Self { root: Arc::new(root), repository: self.repository.clone() })
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transfer { pub root: Vec<u8>, pub included: BTreeMap<ObjectIdentity, Vec<u8>> }
 #[derive(Debug, Clone, Copy)]
@@ -203,10 +224,12 @@ fn admit_intrinsic(value: Intrinsic, points: u32, bound: u64) -> Result<(), Stri
 pub struct Receiver {
     current: Option<Arc<Manifest>>, repository: Repository, reader: RegionReader,
     verified: BTreeMap<ObjectIdentity, Intrinsic>, readers: Vec<std::sync::Weak<Manifest>>,
+    collection_error: Option<String>,
 }
 impl Receiver {
-    pub fn new(repository: Repository) -> Self { Self { current: None, reader: RegionReader::new(repository.clone(), 4 * 1024 * 1024), repository, verified: BTreeMap::new(), readers: Vec::new() } }
+    pub fn new(repository: Repository) -> Self { Self { current: None, reader: RegionReader::new(repository.clone(), 4 * 1024 * 1024), repository, verified: BTreeMap::new(), readers: Vec::new(), collection_error: None } }
     pub fn current(&self) -> Option<Arc<Manifest>> { self.current.clone() }
+    pub fn collection_error(&self) -> Option<&str> { self.collection_error.as_deref() }
     pub fn clear(&mut self) { self.current = None; self.verified.clear(); }
     pub fn receive(&mut self, transfer: &Transfer, expected: &Domain,
         mut fetch: impl FnMut(&Manifest, &BlockRef) -> Result<Vec<u8>, String>) -> Result<Arc<Manifest>, String> {
@@ -258,21 +281,20 @@ impl Receiver {
         })();
         // Valid duplicate inclusions cannot create garbage outside the pinned current root.
         if same { return result; }
+        if let Ok(root) = &result {
+            self.current = Some(root.clone());
+            self.readers.push(Arc::downgrade(root));
+        }
         let mut live: Vec<_> = self.readers.iter().filter_map(std::sync::Weak::upgrade).collect();
         self.readers.retain(|r| r.strong_count() > 0);
         live.push(candidate); if let Some(root) = &self.current { live.push(root.clone()); }
         let objects: BTreeSet<_> = live.iter().flat_map(|r| r.blocks.iter().map(|b| b.object)).collect();
         self.verified.retain(|id, _| objects.contains(id));
         self.reader.retain_objects(&objects);
-        let cleanup = self.repository.collect_unreferenced(&live);
-        result.and_then(|root| {
-            cleanup?;
-            // Candidate validation and collection both succeeded. A failed
-            // receive must never replace the root visible to existing readers.
-            self.current = Some(root.clone());
-            self.readers.push(Arc::downgrade(&root));
-            Ok(root)
-        })
+        // Collection is maintenance after the complete candidate transaction. It
+        // must not report a failed receive after installing a successful root.
+        self.collection_error = self.repository.collect_unreferenced(&live).err();
+        result
     }
     fn validate_progression(&mut self, old: &Manifest, new: &Manifest) -> Result<(), String> {
         if new.geometry_revision < old.geometry_revision { return Err("root geometry revision rolled back".into()); }

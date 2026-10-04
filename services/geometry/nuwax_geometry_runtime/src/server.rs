@@ -2948,11 +2948,12 @@ async fn activate_map_r1(
 
     let source_timestamp_ns = map.timestamp_ns;
     let cloud_commit = if let Some(target) = immutable_target.as_ref() {
+        let fine_frame_generation = adapter.lock().global_frame_generation();
         let installed = {
             let mut writer = bridge.cloud_map_writer.lock();
             match writer.as_mut() {
                 Some(writer) => writer.bind_fine_map_owner(
-                    adapter.lock().global_frame_generation(),
+                    fine_frame_generation,
                     bridge.nav.producer_runtime_generation(),
                 ).and_then(|()| writer.install_checkpoint_with_sources(
                     &occupancy_receipt,
@@ -6091,8 +6092,18 @@ impl GeometryRuntime for GeometryRuntimeService {
                     occupancy_receipt,
                     ..
                 } = committed;
-                let current_session = adapter.lock().snapshot();
-                let cloud_result =
+                let (current_session, current_frame) = {
+                    let adapter = adapter.lock();
+                    (adapter.snapshot(), adapter.global_frame_generation())
+                };
+                let owner_bound = {
+                    let mut writer = bridge.cloud_map_writer.lock();
+                    match writer.as_mut() {
+                        Some(writer) => writer.bind_fine_map_owner(current_frame, bridge.nav.producer_runtime_generation()),
+                        None => Ok(()),
+                    }
+                };
+                let cloud_result = owner_bound.and_then(|()|
                     accept_mapping_cloud_map_for_backend_candidate(
                         &accepted_map_points,
                         &event,
@@ -6101,7 +6112,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                         source_timestamp_ns,
                         &current_session,
                         &bridge.cloud_map_writer,
-                    );
+                    ));
                 let resolution_result = adapter
                     .lock()
                     .resolve_backend_completion(&token, resolution, cloud_result.is_ok());
@@ -10638,7 +10649,7 @@ mod lifecycle_tests {
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        let writer = crate::pointcloud::CloudMapShmWriter::new(&path)
+        let writer = crate::pointcloud::CloudMapShmWriter::new_for_test(&path)
             .expect("deferred test cloud-map writer");
         let generation_rx = writer.typed_publish_state().session_generation_rx();
         *handle.cloud_map_writer.lock() = Some(writer);
@@ -11407,7 +11418,7 @@ mod lifecycle_tests {
             uuid::Uuid::new_v4()
         ));
         *handle.cloud_map_writer.lock() =
-            Some(CloudMapShmWriter::new(&cloud_path).expect("ray checkpoint cloud-map writer"));
+            Some(CloudMapShmWriter::new_for_test(&cloud_path).expect("ray checkpoint cloud-map writer"));
         let service = GeometryRuntimeService::new(handle.clone());
         (handle, service, cloud_path)
     }
@@ -11422,7 +11433,7 @@ mod lifecycle_tests {
             uuid::Uuid::new_v4()
         ));
         handle.cloud_map_writer = Arc::new(parking_lot::Mutex::new(Some(
-            CloudMapShmWriter::new(&cloud_path).expect("source cloud-map writer"),
+            CloudMapShmWriter::new_for_test(&cloud_path).expect("source cloud-map writer"),
         )));
         let service = GeometryRuntimeService::new(handle.clone());
         let started =
@@ -12988,7 +12999,7 @@ mod lifecycle_tests {
                 .as_nanos()
         ));
         handle.cloud_map_writer = Arc::new(parking_lot::Mutex::new(Some(
-            CloudMapShmWriter::new(&path).expect("cloud map writer"),
+            CloudMapShmWriter::new_for_test(&path).expect("cloud map writer"),
         )));
         let mut cloud_updates = handle.cloud_map_tx.subscribe();
         let service = GeometryRuntimeService::new(handle.clone());
@@ -13300,7 +13311,7 @@ mod lifecycle_tests {
                 .as_nanos()
         ));
         *handle.cloud_map_writer.lock() =
-            Some(CloudMapShmWriter::new(&cloud_path).expect("configured-frame cloud-map writer"));
+            Some(CloudMapShmWriter::new_for_test(&cloud_path).expect("configured-frame cloud-map writer"));
         let backend = Arc::new(CheckpointPublishBackend::default());
         handle.transport = LcmTransport::new(backend.clone());
         let service = GeometryRuntimeService::new(handle.clone());
@@ -13856,6 +13867,248 @@ mod lifecycle_tests {
         }
     }
 
+    // These server integration fixtures require liblcm (the existing isolated
+    // test URL), writable temporary storage, and no live robot or sensor.
+    async fn checkpoint_frame_test_handle() -> GeometryRuntimeHandle {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("checkpoint frame real-lcm test handle");
+        *handle.mapping_adapter.as_ref().unwrap().lock() =
+            crate::mapping_adapter::MappingAdapter::new_with_backend_for_tests(
+                crate::mapping_adapter::MappingAdapterConfig {
+                    resolution: 0.1,
+                    width_cells: 40,
+                    height_cells: 40,
+                    origin_xy: (-2.0, -2.0),
+                    voxel_size: 0.1,
+                    initial_safe_radius_meters: 0.0,
+                },
+                crate::mapping_backend::MappingBackendSpec::Voxel,
+                "map",
+                "odom",
+            );
+        handle
+    }
+
+    async fn commit_checkpoint_frame_test_pose(handle: &GeometryRuntimeHandle, timestamp_ns: u64) {
+        let _lifecycle_guard = handle.mapping_lifecycle_lock.lock().await;
+        let pose = PoseState {
+            x: 4.0,
+            y: 2.0,
+            z: 1.0,
+            qw: 1.0,
+            frame_id: "odom".to_owned(),
+            timestamp_ns,
+            ..PoseState::default()
+        };
+        let binding = (
+            LcmTopic::new("/test/geometry/checkpoint-frame-tf").unwrap(),
+            LcmMessageType::new("tf2_msgs.TFMessage").unwrap(),
+        );
+        assert!(crate::lcm_runtime::handoff_lio_odometry(handle, &pose, "base_link", &binding)
+            .await
+            .expect("commit real first-pose/anchor handoff"));
+    }
+
+    #[tokio::test]
+    async fn activation_first_real_pose_exports_v2_without_another_scan() {
+        const SOURCE_NS: u64 = 1_700_000_000_123_456_789;
+        let handle = checkpoint_frame_test_handle().await;
+        let mut owner = crate::lcm_runtime::attach_root_task_owner_for_tests(handle);
+        let handle = owner.handle.clone();
+        let service = GeometryRuntimeService::new(handle.clone());
+        let xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
+            .into_iter()
+            .flatten()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        // Activation remains on its supported legacy input contract. The v2
+        // opt-in below is an export request, not an activation-gate bypass.
+        let mut request = cloud_activation_request(xyz);
+        request.checkpoint.as_mut().unwrap().meta.as_mut().unwrap().timestamp_ns = SOURCE_NS;
+        let activated = GeometryRuntime::activate_map(&service, Request::new(request))
+            .await
+            .expect("supported cloud activation")
+            .into_inner();
+        assert!(activated.success && activated.active);
+        let (occupancy_before, raw_before, frame_before) = {
+            let adapter = handle.mapping_adapter.as_ref().unwrap().lock();
+            assert!(adapter.map_odom_transform_snapshot().is_none());
+            (
+                adapter.latest_occupancy_commit_receipt().unwrap(),
+                occupancy_checkpoint_proto(&adapter.raw_map_snapshot().unwrap()),
+                adapter.global_frame_generation(),
+            )
+        };
+        let (cloud_before, snapshot_before, old_fine) = {
+            let writer = handle.cloud_map_writer.lock();
+            let writer = writer.as_ref().unwrap();
+            (
+                writer.last_cloud_receipt().unwrap(),
+                writer.committed_snapshot().unwrap(),
+                writer.committed_fine_cloud().unwrap(),
+            )
+        };
+        assert_eq!(old_fine.manifest().domain.frame_generation, frame_before);
+        assert!(!old_fine.manifest().blocks.is_empty());
+        assert_eq!(old_fine.manifest().source_timestamp_ns, SOURCE_NS);
+        assert_eq!(occupancy_before.source_timestamp_ns, SOURCE_NS);
+        assert_eq!(cloud_before.source_timestamp_ns, SOURCE_NS);
+
+        // No cloud handoff occurs between activation and either export.
+        commit_checkpoint_frame_test_pose(&handle, SOURCE_NS + 17_000_001).await;
+        let frame_after = handle.mapping_adapter.as_ref().unwrap().lock().global_frame_generation();
+        assert_eq!(frame_after, frame_before + 1);
+        assert_eq!(handle.state.read().await.pose.timestamp_ns, SOURCE_NS + 17_000_001);
+        let anchored_fine = handle.cloud_map_writer.lock().as_ref().unwrap()
+            .committed_fine_cloud().unwrap();
+        assert!(!Arc::ptr_eq(&old_fine, &anchored_fine));
+        let mut expected_root = old_fine.manifest().as_ref().clone();
+        expected_root.domain.frame_generation = frame_after;
+        assert_eq!(anchored_fine.manifest().as_ref(), &expected_root,
+            "first pose may change only the root frame domain, never IDs, evidence or revisions");
+
+        let checkpoint = GeometryRuntime::export_mapping_backend_checkpoint(
+            &service,
+            Request::new(ExportMappingBackendCheckpointRequest { checkpoint_schema_version: 2 }),
+        ).await.expect("v2 export immediately after the first real pose").into_inner();
+        assert_eq!(checkpoint.schema_version, 2);
+        assert!(checkpoint.content_sha256.is_empty());
+        assert_eq!(checkpoint.occupancy_receipt, Some(occupancy_commit_receipt_proto(&occupancy_before)));
+        assert_eq!(checkpoint.cloud_receipt, Some(cloud_commit_receipt_proto(&cloud_before)));
+        assert_eq!(checkpoint.canonical_occupancy_checkpoint.as_ref(), Some(&raw_before));
+        let exported_cloud = checkpoint.canonical_cloud_checkpoint.as_ref().unwrap();
+        assert_eq!(exported_cloud.payload_schema_version, 2);
+        assert!(exported_cloud.xyz_sha256.is_empty());
+        assert_eq!(exported_cloud.xyz_f32_le, snapshot_before.xyz_f32_le);
+        assert_eq!(exported_cloud.source_revision, snapshot_before.revision);
+        assert_eq!(exported_cloud.point_count, snapshot_before.point_count);
+        assert_eq!(exported_cloud.voxel_size.to_bits(), snapshot_before.voxel_size.to_bits());
+        let fine_ref = checkpoint.fine_map_artifact.as_ref().expect("AR2 fine checkpoint member");
+        assert_eq!(fine_ref.identity_schema_version, 2);
+        assert!(fine_ref.sha256.is_empty());
+        let member = fine_ref.member_identity.as_ref().unwrap();
+        assert_eq!(member.frame_generation, frame_after);
+        assert_eq!(member.producer_generation, handle.nav.producer_runtime_generation());
+        let file = service.graph_artifacts.lock().open(fine_ref).expect("open exported fine member");
+        let mut archive = nuwax_map_chunks::ArchiveReader::open(file).expect("read AR2 fine member");
+        assert_eq!(archive.root(), &nuwax_map_chunks::ArchivedRoot::Current(expected_root));
+        for reference in &old_fine.manifest().blocks {
+            assert!(matches!(reference.object, nuwax_map_chunks::ObjectIdentity::Assigned(_)));
+            let bytes_before = old_fine.repository
+                .read_object(reference.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
+            assert_eq!(archive.block(reference).unwrap(), bytes_before);
+            let pinned = handle.cloud_map_writer.lock().as_ref().unwrap()
+                .pin_fine_map_root(&old_fine.manifest().identity(), reference)
+                .expect("old published root remains pinnable after frame rehome/export");
+            assert!(Arc::ptr_eq(&pinned, &old_fine));
+            let fetched = handle.read_navigation_map_block(&old_fine.manifest().identity(), reference)
+                .expect("admit fetch under retained old root")
+                .await.expect("retained fetch completion").expect("retained old object bytes");
+            assert_eq!(fetched, bytes_before);
+        }
+
+        // A later odometry observation must not reseal the already anchored root.
+        commit_checkpoint_frame_test_pose(&handle, SOURCE_NS + 34_000_002).await;
+        let repeated = GeometryRuntime::export_mapping_backend_checkpoint(
+            &service,
+            Request::new(ExportMappingBackendCheckpointRequest { checkpoint_schema_version: 2 }),
+        ).await.expect("repeat v2 export without a scan").into_inner();
+        assert_eq!(repeated.occupancy_receipt, checkpoint.occupancy_receipt);
+        assert_eq!(repeated.cloud_receipt, checkpoint.cloud_receipt);
+        assert_eq!(repeated.canonical_occupancy_checkpoint, checkpoint.canonical_occupancy_checkpoint);
+        assert_eq!(repeated.canonical_cloud_checkpoint.as_ref().unwrap().xyz_f32_le,
+            snapshot_before.xyz_f32_le);
+        {
+            let adapter = handle.mapping_adapter.as_ref().unwrap().lock();
+            assert_eq!(adapter.global_frame_generation(), frame_after);
+            assert_eq!(adapter.latest_occupancy_commit_receipt(), Some(occupancy_before));
+        }
+        {
+            let writer = handle.cloud_map_writer.lock();
+            let writer = writer.as_ref().unwrap();
+            assert_eq!(writer.last_cloud_receipt(), Some(cloud_before));
+            assert!(Arc::ptr_eq(&anchored_fine, &writer.committed_fine_cloud().unwrap()));
+            assert_eq!(writer.committed_snapshot().unwrap().xyz_f32_le, snapshot_before.xyz_f32_le);
+        }
+        assert_eq!(handle.state.read().await.cloud_map_revision, snapshot_before.revision);
+        GeometryRuntime::stop_mapping(&service, Request::new(StopMappingRequest {
+            session_id: activated.session_id,
+            reason: "first-pose checkpoint regression complete".to_owned(),
+        })).await.expect("stop activated checkpoint session");
+        assert!(owner.task_owner.shutdown().await.producers_settled());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_v2_flush_keeps_the_actual_first_pose_frame() {
+        const FIRST_RECEIVED_NS: u64 = 2_000_000_000;
+        const FIRST_SOURCE_NS: u64 = 1_700_000_000_123_456_789;
+        let handle = checkpoint_frame_test_handle().await;
+        let service = GeometryRuntimeService::new(handle.clone());
+        let session_id = "checkpoint-current-frame-flush";
+        assert!(start_mapping_session(&service, session_id, "warehouse-flush").await.active);
+        let frame_before = handle.mapping_adapter.as_ref().unwrap().lock().global_frame_generation();
+        commit_checkpoint_frame_test_pose(&handle, FIRST_SOURCE_NS - 1).await;
+        let current_frame = handle.mapping_adapter.as_ref().unwrap().lock().global_frame_generation();
+        assert_eq!(current_frame, frame_before + 1);
+
+        let points = [Point3::new(0.25, 0.0, 1.0), Point3::new(0.75, 0.5, 1.0)];
+        assert!(crate::lcm_runtime::handoff_registered_lio_cloud(
+            &handle, &points, 12, FIRST_RECEIVED_NS, FIRST_SOURCE_NS, "map",
+        ).await.expect("first source scan"));
+        let first_receipt = handle.mapping_adapter.as_ref().unwrap().lock()
+            .latest_occupancy_commit_receipt().expect("first source occupancy commit");
+        let first_cloud_receipt = handle.cloud_map_writer.lock().as_ref().unwrap()
+            .last_cloud_receipt().unwrap();
+        let first_fine = handle.cloud_map_writer.lock().as_ref().unwrap()
+            .committed_fine_cloud().unwrap();
+        assert_eq!(first_fine.manifest().domain.frame_generation, current_frame);
+
+        // This second, real source scan is the pending work the checkpoint must
+        // flush. There is no third scan or artificial frame initialization.
+        let deferred_received_ns = FIRST_RECEIVED_NS
+            + crate::mapping_backend::MAPPING_CANDIDATE_INTERVAL_NS / 2;
+        let deferred_source_ns = FIRST_SOURCE_NS + 7_000_003;
+        assert!(crate::lcm_runtime::handoff_registered_lio_cloud(
+            &handle, &points, 12, deferred_received_ns, deferred_source_ns, "map",
+        ).await.expect("cadence-deferred source scan"));
+        assert_eq!(handle.mapping_adapter.as_ref().unwrap().lock()
+            .latest_occupancy_commit_receipt(), Some(first_receipt.clone()));
+        {
+            let writer = handle.cloud_map_writer.lock();
+            let writer = writer.as_ref().unwrap();
+            assert_eq!(writer.last_cloud_receipt(), Some(first_cloud_receipt.clone()));
+            assert!(Arc::ptr_eq(&first_fine, &writer.committed_fine_cloud().unwrap()));
+        }
+
+        let checkpoint = GeometryRuntime::export_mapping_backend_checkpoint(
+            &service,
+            Request::new(ExportMappingBackendCheckpointRequest { checkpoint_schema_version: 2 }),
+        ).await.expect("explicit v2 export flushes pending source work in the current frame").into_inner();
+        let occupancy = checkpoint.occupancy_receipt.as_ref().unwrap();
+        let cloud = checkpoint.cloud_receipt.as_ref().unwrap();
+        assert!(occupancy.occupancy_revision > first_receipt.occupancy_revision);
+        assert!(cloud.cloud_revision > first_cloud_receipt.cloud_revision);
+        assert_eq!(occupancy.source_timestamp_ns, deferred_source_ns);
+        assert_eq!(cloud.source_timestamp_ns, deferred_source_ns);
+        assert_eq!(cloud.commit_id, occupancy.commit_id);
+        let fine = handle.cloud_map_writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap();
+        assert_eq!(fine.manifest().domain.frame_generation, current_frame);
+        assert_eq!(fine.manifest().domain.producer_generation, handle.nav.producer_runtime_generation());
+        assert_eq!(fine.manifest().revision, cloud.cloud_revision);
+        assert_eq!(fine.manifest().source_timestamp_ns, deferred_source_ns);
+        assert_eq!(handle.mapping_adapter.as_ref().unwrap().lock().global_frame_generation(), current_frame);
+        let fine_ref = checkpoint.fine_map_artifact.as_ref().unwrap();
+        assert_eq!(fine_ref.member_identity.as_ref().unwrap().frame_generation, current_frame);
+        let file = service.graph_artifacts.lock().open(fine_ref).unwrap();
+        let archive = nuwax_map_chunks::ArchiveReader::open(file).unwrap();
+        assert_eq!(archive.root(), &nuwax_map_chunks::ArchivedRoot::Current(fine.manifest().as_ref().clone()));
+        GeometryRuntime::stop_mapping(&service, Request::new(StopMappingRequest {
+            session_id: session_id.to_owned(),
+            reason: "current-frame checkpoint flush regression complete".to_owned(),
+        })).await.expect("stop checkpoint flush session");
+    }
+
     #[tokio::test]
     async fn backend_checkpoint_export_and_voxel_activation_round_trip() {
         let checkpoint = export_voxel_backend_checkpoint().await;
@@ -13914,7 +14167,7 @@ mod lifecycle_tests {
             uuid::Uuid::new_v4()
         ));
         handle.cloud_map_writer = Arc::new(parking_lot::Mutex::new(Some(
-            CloudMapShmWriter::new(&cloud_path).expect("target cloud-map writer"),
+            CloudMapShmWriter::new_for_test(&cloud_path).expect("target cloud-map writer"),
         )));
         let service = GeometryRuntimeService::new(handle.clone());
         let mut request = activation_request("mapload:restored", "warehouse-restored");
@@ -14007,7 +14260,7 @@ mod lifecycle_tests {
             .read(delta.offset_points, 100).unwrap();
         assert_eq!(delta.xyz_f32_le, expected);
         // 替换拥有方后不能用其前任的分块代际继续读取。
-        *handle.cloud_map_writer.lock() = Some(CloudMapShmWriter::new_private().unwrap());
+        *handle.cloud_map_writer.lock() = Some(CloudMapShmWriter::new_private_for_test().unwrap());
         assert!(GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest { allow_delta: false,
             expected_epoch: pinned.epoch, offset_points: 10, max_points: 100,
         })).await.is_err());
@@ -14737,7 +14990,7 @@ mod lifecycle_tests {
             uuid::Uuid::new_v4()
         ));
         *handle.cloud_map_writer.lock() =
-            Some(CloudMapShmWriter::new(&cloud_path).expect("checkpoint retry cloud-map writer"));
+            Some(CloudMapShmWriter::new_for_test(&cloud_path).expect("checkpoint retry cloud-map writer"));
         let service = GeometryRuntimeService::new(handle.clone());
         let session_id = "mapload:inner-schema-retry";
         let map_name = "warehouse-inner-schema-retry";
@@ -14875,7 +15128,7 @@ mod lifecycle_tests {
                 .as_nanos()
         ));
         *handle.cloud_map_writer.lock() =
-            Some(crate::pointcloud::CloudMapShmWriter::new(&cloud_path).expect("cloud writer"));
+            Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
         let service = GeometryRuntimeService::new(handle.clone());
         let epoch = service.activation_receipts.lifecycle_epoch();
         let xyz = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
@@ -14910,7 +15163,7 @@ mod lifecycle_tests {
             uuid::Uuid::new_v4()
         ));
         *handle.cloud_map_writer.lock() = Some(
-            crate::pointcloud::CloudMapShmWriter::new(&cloud_path).expect("empty cloud writer"),
+            crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("empty cloud writer"),
         );
         let service = GeometryRuntimeService::new(handle.clone());
         let request = modern_activation_request(
@@ -14965,7 +15218,7 @@ mod lifecycle_tests {
                 .as_nanos()
         ));
         *handle.cloud_map_writer.lock() =
-            Some(crate::pointcloud::CloudMapShmWriter::new(&cloud_path).expect("cloud writer"));
+            Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
         let service = GeometryRuntimeService::new(handle.clone());
         let xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
             .iter()
@@ -15076,7 +15329,7 @@ mod lifecycle_tests {
                 .as_nanos()
         ));
         *handle.cloud_map_writer.lock() =
-            Some(crate::pointcloud::CloudMapShmWriter::new(&cloud_path).expect("cloud writer"));
+            Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
         let service = GeometryRuntimeService::new(handle);
         let xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
             .iter()
@@ -15113,7 +15366,7 @@ mod lifecycle_tests {
                 .as_nanos()
         ));
         *handle.cloud_map_writer.lock() =
-            Some(crate::pointcloud::CloudMapShmWriter::new(&cloud_path).expect("cloud writer"));
+            Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
         let phase_a = crate::correction_coordinator::CorrectionPhaseAControl::for_tests();
         let (shutdown, _listener) = shutdown_channel_inner(None, Some(phase_a), None, None);
         let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
@@ -15222,7 +15475,7 @@ mod lifecycle_tests {
                     .as_nanos()
             ));
             *handle.cloud_map_writer.lock() =
-                Some(crate::pointcloud::CloudMapShmWriter::new(&cloud_path).expect("cloud writer"));
+                Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
             let service = GeometryRuntimeService::new(handle.clone());
             let xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
                 .iter()
@@ -15288,7 +15541,7 @@ mod lifecycle_tests {
                 .as_nanos()
         ));
         *handle.cloud_map_writer.lock() =
-            Some(crate::pointcloud::CloudMapShmWriter::new(&cloud_path).expect("cloud writer"));
+            Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
         let service = GeometryRuntimeService::new(handle);
         let xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
             .iter()
@@ -15343,7 +15596,7 @@ mod lifecycle_tests {
                     .as_nanos()
             ));
             *handle.cloud_map_writer.lock() =
-                Some(crate::pointcloud::CloudMapShmWriter::new(&cloud_path).expect("cloud writer"));
+                Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
             let service = GeometryRuntimeService::new(handle.clone());
             service.inject_activation_fault_after(step);
             let request = activation_request_with_backend_checkpoint(
@@ -15384,7 +15637,7 @@ mod lifecycle_tests {
                 .as_nanos()
         ));
         *handle.cloud_map_writer.lock() = Some(
-            crate::pointcloud::CloudMapShmWriter::new(&cloud_path).expect("test cloud-map writer"),
+            crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("test cloud-map writer"),
         );
         let service = GeometryRuntimeService::new(handle.clone());
         let mut revision_rx = handle.map_revision_tx.subscribe();
@@ -15522,7 +15775,7 @@ mod lifecycle_tests {
                     .as_nanos()
             ));
             *handle.cloud_map_writer.lock() = Some(
-                crate::pointcloud::CloudMapShmWriter::new(&cloud_path)
+                crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path)
                     .expect("test cloud-map writer"),
             );
             let backend = Arc::new(CheckpointPublishBackend::default());
@@ -15568,7 +15821,7 @@ mod lifecycle_tests {
                 .as_nanos()
         ));
         *handle.cloud_map_writer.lock() = Some(
-            crate::pointcloud::CloudMapShmWriter::new(&cloud_path).expect("test cloud-map writer"),
+            crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("test cloud-map writer"),
         );
         let backend = Arc::new(CheckpointPublishBackend::default());
         backend

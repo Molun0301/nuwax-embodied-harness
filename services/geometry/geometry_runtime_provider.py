@@ -679,11 +679,15 @@ def _checkpoint_export_bundle_v2(response, payload, fine_payload, dense_payload)
     return MappingBackendCheckpointExportBundle(checkpoint, occupancy_asset, cloud_asset)
 
 
-def reopen_mapping_backend_checkpoint(map_bundle_root, backend_kind, *, schema_version=2):
+def reopen_mapping_backend_checkpoint(
+    map_bundle_root, backend_kind, *, schema_version=2, expected_checkpoint_id=None,
+):
     """Reopen exact v2 export bytes; legacy canonical assets were never persisted."""
     if schema_version != 2:
         raise ValueError("exact canonical reopen requires checkpoint schema 2")
-    stored = MappingBackendCheckpointStore(map_bundle_root).load(backend_kind, schema_version=2)
+    stored = MappingBackendCheckpointStore(map_bundle_root).load(
+        backend_kind, schema_version=2, expected_checkpoint_id=expected_checkpoint_id,
+    )
     return MappingBackendCheckpointExportBundle(stored.checkpoint, stored.occupancy_asset, stored.cloud_asset)
 
 
@@ -5049,8 +5053,20 @@ class GeometryRuntimeProvider:
         expected_mapping_backend_kind: Optional[str] = None,
         expected_backend_checkpoint_manifest_sha256: Optional[str] = None,
         expected_backend_checkpoint_object_sha256: Optional[str] = None,
+        expected_backend_checkpoint_schema_version: int = 1,
+        expected_backend_checkpoint_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         self._raise_if_stopping("activate_platform_map")
+        if (type(expected_backend_checkpoint_schema_version) is not int
+                or expected_backend_checkpoint_schema_version not in (1, 2)):
+            raise ValueError("unsupported expected backend checkpoint schema")
+        if expected_backend_checkpoint_schema_version == 2:
+            raise RuntimeError(
+                "CHECKPOINT_V2_ACTIVATION_UNAVAILABLE: assigned checkpoint activation "
+                "requires the paired native activation and relocalization identity contract"
+            )
+        if expected_backend_checkpoint_id is not None:
+            raise ValueError("assigned checkpoint identity requires checkpoint schema 2")
         if not self._connected or not self._stub:
             raise RuntimeError("Geometry runtime 未连接。")
         if occupancy_grid is None:

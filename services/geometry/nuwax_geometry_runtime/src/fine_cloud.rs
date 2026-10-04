@@ -66,31 +66,39 @@ impl FineCloud {
         self.baseline.as_ref().filter(|root| &root.domain == domain).map_or(0, |root| root.revision)
     }
     pub(super) fn readers(&self) -> FineCloudReaders { self.readers.clone() }
+    pub(super) fn adopt_readers(&mut self, readers: FineCloudReaders) { self.readers = readers; }
     pub(super) fn seal(&mut self, domain: nuwax_map_chunks::Domain, revision: u64, timestamp_ns: u64) -> Result<Arc<SealedMap>, String> {
         if let Some(error) = &self.failure { return Err(error.clone()); }
         let sealed = Arc::new(self.writer.seal(domain, revision, timestamp_ns)?);
         self.baseline = Some(sealed.manifest().identity());
-        Ok(sealed)
-    }
-    pub(super) fn retain_committed(&mut self, sealed: &Arc<SealedMap>) {
-        let mut readers = self.readers.0.lock();
-        readers.recent.push_back(Arc::clone(sealed));
-        readers.readers.push(Arc::downgrade(sealed));
-        // 慢读者可补取近期根；更旧的接收者重新获取最新完整根。
-        while readers.recent.len() > 16 || (readers.recent.len() > 1 && readers.recent.iter().map(|r| r.manifest().blocks.len()).sum::<usize>() > 262144) {
-            readers.recent.pop_front();
-        }
-        self.commits += 1;
+        self.commits = self.commits.wrapping_add(1);
         if self.commits % 16 == 0 {
-            let live = readers.readers.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
-            readers.readers.retain(|r| r.strong_count() > 0);
-            // Collection failure must not retroactively fail an already committed
-            // publication. Retention remains conservative until the next pass.
+            let live = {
+                let mut readers = self.readers.0.lock();
+                let live = readers.readers.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+                readers.readers.retain(|r| r.strong_count() > 0);
+                live
+            };
+            // GC stays in private preparation, outside the short installation
+            // lock. The writer also pins this not-yet-published baseline.
             if let Err(error) = self.writer.collect_sealed(&live) {
                 tracing::warn!(%error, "fine-map object collection deferred");
             }
         }
+        Ok(sealed)
     }
+    pub(super) fn rehome_committed(&mut self, expected: &nuwax_map_chunks::RootIdentity,
+        new_frame: u64) -> Result<Arc<SealedMap>, String> {
+        if self.baseline.as_ref() != Some(expected) {
+            return Err("fine frame rehome does not name the committed baseline".into());
+        }
+        if let Some(error) = &self.failure { return Err(error.clone()); }
+        let root = Arc::new(self.writer.rehome_published_frame(expected, new_frame)?);
+        self.baseline = Some(root.manifest().identity());
+        Ok(root)
+    }
+    pub(super) fn retain_committed(&mut self, sealed: &Arc<SealedMap>) { self.readers.retain_committed(sealed); }
+
 }
 
 #[derive(Default)]
@@ -102,6 +110,14 @@ struct RetainedRoots {
 #[derive(Clone, Default)]
 pub(super) struct FineCloudReaders(Arc<parking_lot::Mutex<RetainedRoots>>);
 impl FineCloudReaders {
+    pub(super) fn retain_committed(&self, sealed: &Arc<SealedMap>) {
+        let mut readers = self.0.lock();
+        readers.recent.push_back(Arc::clone(sealed));
+        readers.readers.push(Arc::downgrade(sealed));
+        while readers.recent.len() > 16 || (readers.recent.len() > 1 && readers.recent.iter().map(|r| r.manifest().blocks.len()).sum::<usize>() > 262144) {
+            readers.recent.pop_front();
+        }
+    }
     /// Resolve the exact retained publication before starting asynchronous IO.
     pub(super) fn pin_root(&self, identity: &nuwax_map_chunks::RootIdentity,
         reference: &nuwax_map_chunks::BlockRef) -> Result<Arc<SealedMap>, String> {
@@ -117,5 +133,42 @@ impl FineCloudReaders {
             return Err("requested block identity/revisions differ from the retained root".into());
         }
         Ok(root)
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+    fn domain() -> nuwax_map_chunks::Domain {
+        nuwax_map_chunks::Domain { session: "owner".into(), generation: 3, frame_generation: 4, producer_generation: 5 }
+    }
+    #[test]
+    fn retained_lookup_requires_exact_root_and_block_and_pins_old_reader() {
+        let mut source = FineCloud::fresh().unwrap();
+        source.accumulate(&[Point3::new(-0.025, 0.025, 0.175)], None, 1).unwrap();
+        let first = source.seal(domain(), 1, 1).unwrap();
+        let readers = source.readers();
+        let identity = first.manifest().identity();
+        let reference = first.manifest().blocks[0].clone();
+        assert!(readers.pin_root(&identity, &reference).is_err());
+        source.retain_committed(&first);
+        let pinned = readers.pin_root(&identity, &reference).unwrap();
+        let mut forged = reference.clone();
+        forged.block_revision += 1;
+        assert!(readers.pin_root(&identity, &forged).is_err());
+        let mut wrong_domain = identity.clone();
+        wrong_domain.domain.frame_generation += 1;
+        assert!(readers.pin_root(&wrong_domain, &reference).is_err());
+        for revision in 2..=20 {
+            source.accumulate(&[Point3::new(-0.025, 0.025, 0.175)], None, revision).unwrap();
+            let root = source.seal(domain(), revision, revision).unwrap();
+            assert_eq!(root.manifest().geometry_revision, 1);
+            source.retain_committed(&root);
+        }
+        assert!(pinned.repository.read_object(reference.object, nuwax_map_chunks::MAX_BLOCK_BYTES).is_ok());
+        assert!(readers.pin_root(&identity, &reference).is_ok());
+        drop(first);
+        drop(pinned);
+        assert!(readers.pin_root(&identity, &reference).is_err());
     }
 }

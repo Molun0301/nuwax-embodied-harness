@@ -4042,18 +4042,49 @@ fn canonical_mapping_observation_for_odom(
     transform_cache: &parking_lot::RwLock<Option<crate::mapping_adapter::MapOdomTransformSnapshot>>,
     odom_pose: &PoseState,
     base_frame: &str,
-) -> Result<CanonicalMappingObservation, String> {
+    cloud_writer: Option<&Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>>,
+) -> Result<(CanonicalMappingObservation, bool), String> {
     let (_, yaw_radians) = normalized_quaternion_and_yaw(odom_pose)?;
+    i32::try_from(odom_pose.timestamp_ns / 1_000_000_000)
+        .map_err(|_| "odometry timestamp seconds exceed int32".to_string())?;
+    if normalize_frame(base_frame).is_empty() { return Err("canonical mapping base frame is empty".into()); }
+    let mut rehomed = false;
+    let mut prepared_observation = None;
     let transform = if let Some(mut adapter) = mapping.try_lock() {
+        if normalize_frame(&odom_pose.frame_id) != normalize_frame(adapter.configured_odom_frame_id()) {
+            return Err("odometry source frame does not match the configured frame".into());
+        }
         adapter
-            .feed_pose_in_frame(
+            .feed_pose_in_frame_with_frame_transition(
                 odom_pose.x,
                 odom_pose.y,
                 odom_pose.z,
                 yaw_radians,
                 &odom_pose.frame_id,
+                |proof| {
+                    // Validate the complete public observation before either
+                    // committed owner changes in this first-anchor transaction.
+                    let transform = proof.prepared_transform().ok_or("odom pose did not prepare T_map_odom")?;
+                    let observation = canonical_mapping_observation(transform, odom_pose, base_frame)?;
+                    if let Some(writer) = cloud_writer {
+                        rehomed = {
+                            let mut guard = writer.lock();
+                            match guard.as_mut() {
+                                Some(owner) => owner.rehome_committed_fine_frame(&proof)?,
+                                None => false,
+                            }
+                        };
+                    }
+                    prepared_observation = Some(observation);
+                    Ok(())
+                },
             )
             .map_err(|error| error.to_string())?;
+        // Both owners have committed the transition before notifying readers.
+        if rehomed {
+            if let Some(writer) = cloud_writer { latest_canonical_cloud_publication(writer)?; }
+        }
+        if let Some(observation) = prepared_observation { return Ok((observation, rehomed)); }
         adapter
             .map_odom_transform_snapshot()
             .ok_or_else(|| "odom pose did not establish T_map_odom".to_string())?
@@ -4063,7 +4094,7 @@ fn canonical_mapping_observation_for_odom(
             .clone()
             .ok_or_else(|| "mapping adapter busy before T_map_odom was established".to_string())?
     };
-    canonical_mapping_observation(&transform, odom_pose, base_frame)
+    canonical_mapping_observation(&transform, odom_pose, base_frame).map(|observation| (observation, rehomed))
 }
 
 async fn apply_canonical_mapping_observation(
@@ -8832,11 +8863,14 @@ async fn ingest_mapping_points_with_backend_owned(
                 occupancy_event: event, occupancy_receipt, session_generation,
                 source_timestamp_ns: committed_timestamp_ns,
             };
-            let current_session = mapping.lock().snapshot();
+            let (current_session, current_frame_generation) = {
+                let mapping = mapping.lock();
+                (mapping.snapshot(), mapping.global_frame_generation())
+            };
             let preparation = {
                 let mut writer = cloud_map_writer.lock();
                 writer.as_mut().map(|writer| {
-                    writer.bind_fine_map_frame(mapping.lock().global_frame_generation())?;
+                    writer.bind_fine_map_frame(current_frame_generation)?;
                     writer.prepare_scan_work()
                 }).transpose()
             };
@@ -8859,6 +8893,9 @@ async fn ingest_mapping_points_with_backend_owned(
             let current = adapter.snapshot();
             let still_current = current.active && current.session_id == current_session.session_id
                 && current.session_generation == current_session.session_generation
+                && (adapter.global_frame_generation() == current_frame_generation
+                    || cloud_map_writer.lock().as_ref().is_some_and(|writer|
+                        writer.accepts_prepared_fine_frame_transition(current_frame_generation, adapter.global_frame_generation())))
                 && match (expected_relocalization_epoch, relocalization_mode.as_ref()) {
                     (Some(epoch), Some(mode)) => { let value = mode.snapshot(); !value.active && value.epoch == epoch }
                     _ => true,
@@ -9724,9 +9761,10 @@ fn legacy_global_map_demand_future(
 /// `TypedCloudPublishState` owns ordering, but it only exposes a session watch.
 /// A newer revision in the same session must also cancel a blocked older send so
 /// the sequencer can publish the current canonical snapshot instead.
+type CanonicalPublicationIdentity = (u64, u64, [u8; 16], u64, Option<nuwax_map_chunks::RootIdentity>);
 struct CanonicalCloudPublicationInvalidation {
-    identity_tx: watch::Sender<(u64, u64, [u8; 16], u64)>,
-    canonical_metadata_published: parking_lot::Mutex<Option<CommittedCloudMapMetadata>>,
+    identity_tx: watch::Sender<CanonicalPublicationIdentity>,
+    canonical_metadata_published: parking_lot::Mutex<Option<(CommittedCloudMapMetadata, Option<nuwax_map_chunks::RootIdentity>)>>,
     // Only the owned lifecycle watcher reads the marker/environment. Hot commits
     // consult this bounded metadata, never the filesystem or cloud payload.
     legacy_full_demand: parking_lot::Mutex<Option<String>>,
@@ -9735,7 +9773,7 @@ struct CanonicalCloudPublicationInvalidation {
 
 impl CanonicalCloudPublicationInvalidation {
     fn new() -> Self {
-        let (identity_tx, _) = watch::channel((0, 0, [0; 16], 0));
+        let (identity_tx, _) = watch::channel((0, 0, [0; 16], 0, None));
         Self {
             identity_tx,
             canonical_metadata_published: parking_lot::Mutex::new(None),
@@ -9771,13 +9809,13 @@ impl CanonicalCloudPublicationInvalidation {
         }
     }
 
-    fn observe(&self, identity: (u64, u64, [u8; 16], u64)) {
+    fn observe(&self, identity: CanonicalPublicationIdentity) {
         if *self.identity_tx.borrow() != identity {
             self.identity_tx.send_replace(identity);
         }
     }
 
-    fn subscribe(&self) -> watch::Receiver<(u64, u64, [u8; 16], u64)> {
+    fn subscribe(&self) -> watch::Receiver<CanonicalPublicationIdentity> {
         self.identity_tx.subscribe()
     }
 }
@@ -9851,7 +9889,8 @@ fn latest_canonical_cloud_publication(
         .as_ref()
         .map_or(0, |receipt| receipt.source_timestamp_ns);
     publish_state.observe_session_generation(snapshot.session_generation);
-    invalidation.observe((snapshot.session_generation, snapshot.revision, snapshot.producer_epoch, snapshot.layout_generation));
+    invalidation.observe((snapshot.session_generation, snapshot.revision, snapshot.producer_epoch, snapshot.layout_generation,
+        writer.committed_fine_cloud().map(|fine| fine.manifest().identity())));
     Ok(Some((
         publish_state,
         invalidation,
@@ -9891,6 +9930,15 @@ async fn publish_latest_canonical_cloud_map(
     .await
 }
 
+fn canonical_fine_publication_pending(writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>) -> bool {
+    let invalidation = canonical_cloud_publication_invalidation(writer);
+    let root = writer.lock().as_ref().and_then(CloudMapShmWriter::committed_fine_cloud)
+        .map(|fine| fine.manifest().identity());
+    let Some(root) = root else { return false; };
+    let published = invalidation.canonical_metadata_published.lock();
+    published.as_ref().is_none_or(|(_, previous)| previous.as_ref() != Some(&root))
+}
+
 async fn publish_latest_canonical_cloud_map_with_navigation(
     transport: &LcmTransport,
     writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
@@ -9920,6 +9968,7 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                 latest_publication.notification.revision,
                 latest_publication.metadata.producer_epoch,
                 latest_publication.metadata.layout_generation,
+                latest_publication.fine.as_ref().map(|fine| fine.manifest().identity()),
             );
             let publication = pending_clear
                 .as_ref()
@@ -9950,7 +9999,8 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
             let legacy_full_demand = invalidation.legacy_full_required(&publication.metadata);
             let canonical_already_published = publish_state.published_identity() == Some(identity)
                 && invalidation.canonical_metadata_published.lock().as_ref()
-                    .is_some_and(|metadata| same_cloud_metadata(metadata, &publication.metadata));
+                    .is_some_and(|(metadata, root)| same_cloud_metadata(metadata, &publication.metadata)
+                        && *root == publication.fine.as_ref().map(|fine| fine.manifest().identity()));
             if canonical_already_published && legacy_full_demand.is_none() {
                 publish_state.mark_published(identity);
                 if pending_clear.is_some() {
@@ -10028,7 +10078,8 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                             return Ok::<bool, String>(false);
                         };
                         if (current.notification.session_generation, current.notification.revision,
-                            current.metadata.producer_epoch, current.metadata.layout_generation) != canonical_identity
+                            current.metadata.producer_epoch, current.metadata.layout_generation,
+                            current.fine.as_ref().map(|fine| fine.manifest().identity())) != canonical_identity
                             || (publication.receipt.is_some()
                                 && !same_canonical_cloud_publication_identity(&current, &publication))
                         {
@@ -10082,6 +10133,7 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                     && current_snapshot.revision == canonical_identity.1
                     && current_snapshot.producer_epoch == canonical_identity.2
                     && current_snapshot.layout_generation == canonical_identity.3
+                    && current_writer.committed_fine_cloud().map(|fine| fine.manifest().identity()) == canonical_identity.4
             };
             let committed_publication_matches = publication.receipt.as_ref().is_none_or(|_| {
                 canonical_committed_cloud_publication_matches_writer(writer, &publication)
@@ -10098,7 +10150,8 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
             if let Some(demand) = legacy_full_demand.as_ref() {
                 invalidation.mark_legacy_full_published(publication.metadata, demand);
             }
-            *invalidation.canonical_metadata_published.lock() = Some(publication.metadata);
+            *invalidation.canonical_metadata_published.lock() = Some((publication.metadata,
+                publication.fine.as_ref().map(|fine| fine.manifest().identity())));
             publish_state.mark_published(identity);
             if shared.cloud_map_revision < publication.notification.revision {
                 shared.cloud_map_revision = publication.notification.revision;
@@ -10455,11 +10508,8 @@ async fn handoff_lio_odometry_inner(
     }
 
     let transform_cache = mapping.lock().map_odom_transform_cache();
-    let base_observation = canonical_mapping_observation_for_odom(
-        mapping.as_ref(),
-        transform_cache.as_ref(),
-        pose,
-        base_frame,
+    let (base_observation, fine_rehomed) = canonical_mapping_observation_for_odom(
+        mapping.as_ref(), transform_cache.as_ref(), pose, base_frame, Some(&handle.cloud_map_writer),
     )?;
     let (mapping_snapshot, frame_generation) = {
         let mapping = mapping.lock();
@@ -10499,10 +10549,17 @@ async fn handoff_lio_odometry_inner(
         pose.timestamp_ns,
     );
     match tokio::time::timeout(MAP_FANOUT_SINK_TIMEOUT, handle.transport.publish(tf_frame)).await {
-        Ok(Ok(())) => Ok(true),
-        Ok(Err(error)) => Err(format!("canonical mapping TF publish failed: {error}")),
-        Err(_) => Err("canonical mapping TF publish timed out".to_string()),
+        Ok(Ok(())) => {},
+        Ok(Err(error)) => return Err(format!("canonical mapping TF publish failed: {error}")),
+        Err(_) => return Err("canonical mapping TF publish timed out".to_string()),
     }
+    if fine_rehomed || canonical_fine_publication_pending(&handle.cloud_map_writer) {
+        let navigation = handle.navigation_map_3d_publish_context();
+        let frame = mapping.lock().configured_map_frame_id().to_owned();
+        publish_latest_canonical_cloud_map_with_navigation(&handle.transport, &handle.cloud_map_writer,
+            &handle.state, &handle.cloud_map_tx, &frame, navigation.as_ref()).await?;
+    }
+    Ok(true)
 }
 
 /// 接纳已注册到地图坐标的实时LIO点云；返回值表示点被接纳，不表示本帧一定发布新修订。
@@ -11466,6 +11523,7 @@ fn spawn_mapping_feed_tasks(
         let transport_odom = transport.clone();
         let mapping_odom = mapping_arc.clone();
         let transform_cache = mapping_odom.lock().map_odom_transform_cache();
+        let cloud_writer_odom = cloud_map_writer.clone();
         let state_odom = state.clone();
         let mapping_lifecycle_lock_odom = mapping_lifecycle_lock.clone();
         let (tf_topic, tf_msg_type) = tf_binding;
@@ -11494,9 +11552,10 @@ fn spawn_mapping_feed_tasks(
                     transform_cache.as_ref(),
                     &pose,
                     &base_frame,
+                    Some(&cloud_writer_odom),
                 );
                 let observation = match observation {
-                    Ok(observation) => observation,
+                    Ok((observation, _)) => observation,
                     Err(error) => {
                         warn!(%error, frame = %pose.frame_id, "mapping_feed /odom rejected");
                         continue;
@@ -11785,6 +11844,8 @@ async fn build_handle_for_tests_with_cloud_writer(
             .clone(),
         mapping_lifecycle_lock.clone(),
     );
+    let nav = crate::nav_runtime::NavRuntimeState::try_from_sequence_store(sequence_store.as_ref())
+        .expect("test producer generation reservation");
     let cloud_map_writer = if with_cloud_writer {
         static CM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let cloud_map_path = std::path::PathBuf::from(format!(
@@ -11792,11 +11853,14 @@ async fn build_handle_for_tests_with_cloud_writer(
             std::process::id(),
             CM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
-        let cloud_map_writer = CloudMapShmWriter::new(&cloud_map_path).map_err(|error| {
+        let mut cloud_map_writer = CloudMapShmWriter::new(&cloud_map_path).map_err(|error| {
             RealLcmBackendUnavailable::persistence(format!(
                 "test cloud-map SHM initialization failed: {error}"
             ))
         })?;
+        cloud_map_writer.bind_fine_map_owner(
+            mapping_adapter.as_ref().unwrap().lock().global_frame_generation(), nav.producer_runtime_generation(),
+        ).expect("test fine owner");
         Arc::new(parking_lot::Mutex::new(Some(cloud_map_writer)))
     } else {
         Arc::new(parking_lot::Mutex::new(None))
@@ -11820,8 +11884,7 @@ async fn build_handle_for_tests_with_cloud_writer(
         // 配套测试用 `set_cmd_vel_sink_ready(false)` 验证 readiness 拒绝分支。
         // 生产 spawn 路径(`spawn_geometry_runtime`)默认 `false`。
         cmd_vel_sink_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        nav: crate::nav_runtime::NavRuntimeState::try_from_sequence_store(sequence_store.as_ref())
-            .expect("test producer generation reservation"),
+        nav,
         explore,
         mapping_adapter,
         mapping_lifecycle_lock,
@@ -12606,7 +12669,7 @@ mod mapping_feed_tests {
                 std::process::id(),
                 uuid::Uuid::new_v4(),
             ));
-            let mut writer = CloudMapShmWriter::new(&path).expect("三维发布测试共享内存");
+            let mut writer = CloudMapShmWriter::new_for_test(&path).expect("三维发布测试共享内存");
             writer.bind_fine_map_owner(mapping.lock().global_frame_generation(), 37).unwrap();
             writer.begin_session(generation).expect("会话清空");
             let writer = Arc::new(parking_lot::Mutex::new(Some(writer)));
@@ -12654,9 +12717,199 @@ mod mapping_feed_tests {
             let event = outcome.occupancy_event.as_ref().expect("真实占据修订");
             *self.context.committed_map_authority.lock().unwrap() =
                 Some(committed_map_identity_from_revision(event).expect("规范占据身份"));
+            // The fixture bypasses the production private-preparation owner bind.
+            // Ingestion may establish a newer frame; reserve that actual owner
+            // before sealing, just as the production commit path does.
+            self.writer.lock().as_mut().unwrap().bind_fine_map_owner(
+                mapping.global_frame_generation(), self.context.producer_runtime_generation,
+            ).unwrap();
             update_mapping_cloud_map_if_current(&outcome, &mapping.snapshot(), &self.writer)
                 .expect("真实关联点云提交")
         }
+    }
+
+    async fn activated_fine_frame_fixture() -> NavigationMap3DFixture {
+        let fixture = NavigationMap3DFixture::new();
+        let (map, event, receipt, frame) = {
+            let mut mapping = fixture.context.mapping.lock();
+            let mut grid = nuwax_mapping::OccupancyGrid::new(4, 4, 0.5);
+            grid.frame_id = "map".into();
+            grid.data.fill(0);
+            let (map, event) = mapping.install_checkpoint(grid, 100, 0).unwrap();
+            (map, event, mapping.latest_occupancy_commit_receipt().unwrap(), mapping.global_frame_generation())
+        };
+        let bytes = [0.025_f32, 0.025, 0.025, 1.025, 0.025, 0.025]
+            .into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+        {
+            let mut writer = fixture.writer.lock();
+            let writer = writer.as_mut().unwrap();
+            writer.bind_fine_map_owner(frame, fixture.context.producer_runtime_generation).unwrap();
+            writer.install_checkpoint(&receipt, 0.05, 2, &bytes).unwrap();
+        }
+        fixture.state.write().await.map = map;
+        *fixture.context.committed_map_authority.lock().unwrap() = Some(committed_map_identity_from_revision(&event).unwrap());
+        canonical_cloud_publication_invalidation(&fixture.writer).set_legacy_full_demand(None);
+        fixture
+    }
+
+    #[tokio::test]
+    async fn first_anchor_rehomes_fine_root_without_scan_and_republishes_new_domain_once() {
+        let fixture = activated_fine_frame_fixture().await;
+        let backend = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/frame-rehome").unwrap());
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        publish_latest_canonical_cloud_map_with_navigation(&transport, &fixture.writer, &fixture.state,
+            &fixture.cloud_tx, "map", Some(&fixture.context)).await.unwrap();
+        let occupancy_receipt = fixture.context.mapping.lock().latest_occupancy_commit_receipt();
+        let (old, cloud_receipt, xyz) = {
+            let writer = fixture.writer.lock(); let writer = writer.as_ref().unwrap();
+            (writer.committed_fine_cloud().unwrap(), writer.last_cloud_receipt().unwrap(),
+                writer.shared_committed_snapshot().unwrap().xyz_f32_le)
+        };
+        let before_count = backend.published.lock().unwrap().len();
+        let cache = fixture.context.mapping.lock().map_odom_transform_cache();
+        let pose = PoseState { x: 2.0, y: 3.0, qw: 1.0, frame_id: "odom".into(), timestamp_ns: 200, ..PoseState::default() };
+        let (_, rehomed) = canonical_mapping_observation_for_odom(fixture.context.mapping.as_ref(),
+            cache.as_ref(), &pose, "base_link", Some(&fixture.writer)).unwrap();
+        assert!(rehomed);
+        let next = {
+            let writer = fixture.writer.lock(); let writer = writer.as_ref().unwrap();
+            let next = writer.committed_fine_cloud().unwrap();
+            assert_eq!(writer.last_cloud_receipt().unwrap(), cloud_receipt);
+            assert!(Arc::ptr_eq(&xyz, &writer.shared_committed_snapshot().unwrap().xyz_f32_le));
+            assert!(writer.pin_fine_map_root(&old.manifest().identity(), &old.manifest().blocks[0]).is_ok());
+            next
+        };
+        assert_eq!(fixture.context.mapping.lock().latest_occupancy_commit_receipt(), occupancy_receipt);
+        assert_eq!(next.manifest().revision, old.manifest().revision);
+        assert_eq!(next.manifest().source_timestamp_ns, old.manifest().source_timestamp_ns);
+        assert_eq!(next.manifest().domain.frame_generation, fixture.context.mapping.lock().global_frame_generation());
+        assert_ne!(next.manifest().identity(), old.manifest().identity());
+        assert_eq!(next.manifest().blocks.iter().map(|block| block.object).collect::<Vec<_>>(),
+            old.manifest().blocks.iter().map(|block| block.object).collect::<Vec<_>>());
+        publish_latest_canonical_cloud_map_with_navigation(&transport, &fixture.writer, &fixture.state,
+            &fixture.cloud_tx, "map", Some(&fixture.context)).await.unwrap();
+        assert_eq!(backend.published.lock().unwrap().len(), before_count + 1);
+        let (_, again) = canonical_mapping_observation_for_odom(fixture.context.mapping.as_ref(),
+            cache.as_ref(), &pose, "base_link", Some(&fixture.writer)).unwrap();
+        assert!(!again);
+        assert!(Arc::ptr_eq(&next, &fixture.writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap()));
+        publish_latest_canonical_cloud_map_with_navigation(&transport, &fixture.writer, &fixture.state,
+            &fixture.cloud_tx, "map", Some(&fixture.context)).await.unwrap();
+        assert_eq!(backend.published.lock().unwrap().len(), before_count + 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_first_anchor_output_preserves_both_owners_and_private_ticket() {
+        for invalid in 0..3 {
+            let fixture = activated_fine_frame_fixture().await;
+            let cache = fixture.context.mapping.lock().map_odom_transform_cache();
+            let frame = fixture.context.mapping.lock().global_frame_generation();
+            let old = fixture.writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap();
+            let (ticket, work) = fixture.writer.lock().as_mut().unwrap().prepare_scan_work().unwrap();
+            let mut pose = PoseState { qw: 1.0, frame_id: "odom".into(), timestamp_ns: 200, ..PoseState::default() };
+            let mut base = "base_link";
+            match invalid {
+                0 => pose.timestamp_ns = (i32::MAX as u64 + 1) * 1_000_000_000,
+                1 => base = "",
+                _ => pose.frame_id = "map".into(),
+            }
+            assert!(canonical_mapping_observation_for_odom(fixture.context.mapping.as_ref(), cache.as_ref(),
+                &pose, base, Some(&fixture.writer)).is_err());
+            assert_eq!(fixture.context.mapping.lock().global_frame_generation(), frame);
+            assert!(cache.read().is_none());
+            assert!(Arc::ptr_eq(&old, &fixture.writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap()));
+            assert!(!fixture.writer.lock().as_ref().unwrap().accepts_prepared_fine_frame_transition(frame, frame + 1));
+            fixture.writer.lock().as_mut().unwrap().install_scan_work(ticket, work).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn same_session_backend_reset_cannot_rehome_stale_committed_geometry() {
+        let fixture = activated_fine_frame_fixture().await;
+        let old = fixture.writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap();
+        let frame = fixture.context.mapping.lock().global_frame_generation();
+        fixture.context.mapping.lock().reset_accumulator();
+        let cache = fixture.context.mapping.lock().map_odom_transform_cache();
+        let pose = PoseState { qw: 1.0, frame_id: "odom".into(), timestamp_ns: 200, ..PoseState::default() };
+        assert!(canonical_mapping_observation_for_odom(fixture.context.mapping.as_ref(), cache.as_ref(),
+            &pose, "base_link", Some(&fixture.writer)).is_err());
+        assert_eq!(fixture.context.mapping.lock().global_frame_generation(), frame);
+        assert!(cache.read().is_none());
+        assert!(Arc::ptr_eq(&old, &fixture.writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn first_anchor_preserves_dirty_and_inflight_map_work_without_a_busy_retry() {
+        for in_flight in [false, true] {
+            let fixture = activated_fine_frame_fixture().await;
+            let old = fixture.writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap();
+            let generation = old.manifest().domain.generation;
+            let points = [Point3::new(2.525, 0.025, 0.025)];
+            let (ticket, private) = if in_flight {
+                let (ticket, mut work) = fixture.writer.lock().as_mut().unwrap().prepare_scan_work().unwrap();
+                assert!(work.accumulate_mapping_scan(generation, &points, None, 1_000_000_000));
+                (Some(ticket), Arc::new(parking_lot::Mutex::new(Some(work))))
+            } else {
+                assert!(fixture.writer.lock().as_mut().unwrap().accumulate_mapping_scan(generation, &points, None, 1_000_000_000));
+                (None, fixture.writer.clone())
+            };
+            let cache = fixture.context.mapping.lock().map_odom_transform_cache();
+            let pose = PoseState { x: 4.0, qw: 1.0, frame_id: "odom".into(), timestamp_ns: 200, ..PoseState::default() };
+            let (_, rehomed) = canonical_mapping_observation_for_odom(fixture.context.mapping.as_ref(), cache.as_ref(),
+                &pose, "base_link", Some(&fixture.writer)).unwrap();
+            assert!(rehomed);
+            let current = fixture.writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap();
+            assert_eq!(current.manifest().points(), old.manifest().points(), "dirty geometry must not leak into the committed rehome");
+            assert_eq!(current.manifest().source_timestamp_ns, old.manifest().source_timestamp_ns);
+            let outcome = {
+                let mut mapping = fixture.context.mapping.lock();
+                ingest_mapping_points(&mut mapping, &points, 12, 1_000_000_000,
+                    "map", 1_000_000_000, &fixture.state, &fixture.map_tx).unwrap()
+            };
+            let session = fixture.context.mapping.lock().snapshot();
+            update_mapping_cloud_map_with_acceptance(&outcome, &session, &private).unwrap().unwrap();
+            if let Some(ticket) = ticket {
+                assert!(fixture.writer.lock().as_ref().unwrap().accepts_prepared_fine_frame_transition(
+                    old.manifest().domain.frame_generation, current.manifest().domain.frame_generation));
+                let work = private.lock().take().unwrap();
+                fixture.writer.lock().as_mut().unwrap().install_scan_work(ticket, work).unwrap();
+            }
+            let next = fixture.writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap();
+            assert_eq!(next.manifest().domain, current.manifest().domain);
+            assert!(next.manifest().points() > current.manifest().points());
+            assert_eq!(next.manifest().source_timestamp_ns, 1_000_000_000);
+        }
+    }
+
+    #[tokio::test]
+    async fn established_pose_progresses_during_dirty_private_scan_without_dropping_changes() {
+        let fixture = activated_fine_frame_fixture().await;
+        let cache = fixture.context.mapping.lock().map_odom_transform_cache();
+        let pose = PoseState { qw: 1.0, frame_id: "odom".into(), timestamp_ns: 200, ..PoseState::default() };
+        canonical_mapping_observation_for_odom(fixture.context.mapping.as_ref(), cache.as_ref(),
+            &pose, "base_link", Some(&fixture.writer)).unwrap();
+        let outcome = {
+            let mut mapping = fixture.context.mapping.lock();
+            ingest_mapping_points(&mut mapping, &[Point3::new(2.525, 0.025, 0.025)], 12,
+                1_000_000_000, "map", 1_000_000_000, &fixture.state, &fixture.map_tx).unwrap()
+        };
+        let session = fixture.context.mapping.lock().snapshot();
+        let old = fixture.writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap();
+        let (ticket, work) = fixture.writer.lock().as_mut().unwrap().prepare_scan_work().unwrap();
+        let private = Arc::new(parking_lot::Mutex::new(Some(work)));
+        update_mapping_cloud_map_with_acceptance(&outcome, &session, &private).unwrap().unwrap();
+        let moved_pose = PoseState { x: 0.25, timestamp_ns: 300, ..pose };
+        let (observation, rehomed) = canonical_mapping_observation_for_odom(fixture.context.mapping.as_ref(),
+            cache.as_ref(), &moved_pose, "base_link", Some(&fixture.writer)).unwrap();
+        assert!(!rehomed);
+        assert_eq!(observation.map_pose.x, 0.25);
+        assert!(Arc::ptr_eq(&old, &fixture.writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap()));
+        let work = private.lock().take().unwrap();
+        fixture.writer.lock().as_mut().unwrap().install_scan_work(ticket, work).unwrap();
+        let next = fixture.writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap();
+        assert!(next.manifest().points() > old.manifest().points());
+        assert_eq!(next.manifest().domain, old.manifest().domain);
+        assert!(next.manifest().revision > old.manifest().revision);
     }
 
     impl Drop for NavigationMap3DFixture {
@@ -12740,10 +12993,10 @@ mod mapping_feed_tests {
 
         let mut identity = state.subscribe();
         state.observe((metadata.session_generation, metadata.revision,
-            metadata.producer_epoch, metadata.layout_generation));
+            metadata.producer_epoch, metadata.layout_generation, None));
         identity.borrow_and_update();
         state.observe((metadata.session_generation, metadata.revision,
-            changed.producer_epoch, changed.layout_generation));
+            changed.producer_epoch, changed.layout_generation, None));
         assert!(identity.has_changed().unwrap(), "layout change must invalidate a blocked publication");
 
         state.set_legacy_full_demand(None);
@@ -13080,12 +13333,11 @@ mod mapping_feed_tests {
         );
         // 当前导航走精细块协议；核对实际块内容，不能把空的旧内联字段当作点云丢失。
         let fine = live.fine.as_ref().expect("精细导航输入");
-        let root = nuwax_map_chunks::Manifest::decode(&fine.root, fine.root_sha256).unwrap();
+        let root = nuwax_map_chunks::Manifest::decode(&fine.root).unwrap();
         assert_eq!(root.source_timestamp_ns, committed.receipt.source_timestamp_ns);
         let mut keys = std::collections::BTreeSet::new();
         for block in &root.blocks {
-            let bytes = fine.included.get(&block.sha256).expect("小场景包含全部块");
-            assert_eq!(nuwax_map_chunks::digest(bytes), block.sha256);
+            let bytes = fine.included.get(&block.object).expect("小场景包含全部块");
             for (local, _) in nuwax_map_chunks::decode_block(bytes).unwrap() {
                 keys.insert(nuwax_map_chunks::global_key(block.key, local).unwrap());
             }
@@ -13093,7 +13345,21 @@ mod mapping_feed_tests {
         let fine_xyz = keys.into_iter().flat_map(|key| key.into_iter().flat_map(|v|
             (((v as f64 + 0.5) * f64::from(root.voxel_size_m)) as f32).to_le_bytes())).collect::<Vec<_>>();
         let exported = fixture.writer.lock().as_ref().unwrap().shared_committed_snapshot().unwrap();
-        assert_eq!(fine_xyz.as_slice(), exported.xyz_f32_le.as_ref());
+        // Dense SHM slots are storage addresses, whereas this fine reconstruction
+        // is spatial-key ordered. In this uncoarsened fixture compare every
+        // coordinate bit and duplicate, not incidental cross-format ordering.
+        assert_eq!(root.voxel_size_m, exported.voxel_size);
+        assert_eq!(root.points(), u64::from(exported.point_count));
+        assert_eq!(fine_xyz.len() % 12, 0);
+        assert_eq!(exported.xyz_f32_le.len() % 12, 0);
+        let mut fine_points = fine_xyz.chunks_exact(12)
+            .map(|bytes| <[u8; 12]>::try_from(bytes).unwrap()).collect::<Vec<_>>();
+        let mut display_points = exported.xyz_f32_le.chunks_exact(12)
+            .map(|bytes| <[u8; 12]>::try_from(bytes).unwrap()).collect::<Vec<_>>();
+        assert_eq!(fine_points.len(), display_points.len());
+        fine_points.sort_unstable();
+        display_points.sort_unstable();
+        assert_eq!(fine_points, display_points);
         assert_eq!(
             frames[3].msg_type.fingerprint(),
             schema::NAVIGATION_MAP_3D_FINGERPRINT
@@ -13755,7 +14021,7 @@ mod mapping_feed_tests {
                 .as_nanos()
         ));
         let writer = Arc::new(parking_lot::Mutex::new(Some(
-            CloudMapShmWriter::new(&path).expect("cloud map writer"),
+            CloudMapShmWriter::new_for_test(&path).expect("cloud map writer"),
         )));
         let current_session = adapter.snapshot();
         let event = outcome
@@ -13837,7 +14103,7 @@ mod mapping_feed_tests {
             uuid::Uuid::new_v4()
         ));
         *handle.cloud_map_writer.lock() =
-            Some(CloudMapShmWriter::new(&path).expect("global-map race writer"));
+            Some(CloudMapShmWriter::new_for_test(&path).expect("global-map race writer"));
         {
             let mut writer = handle.cloud_map_writer.lock();
             let writer = writer.as_mut().expect("global-map race writer");
@@ -14046,7 +14312,7 @@ mod mapping_feed_tests {
             uuid::Uuid::new_v4()
         ));
         *handle.cloud_map_writer.lock() =
-            Some(CloudMapShmWriter::new(&path).expect("direct global-map checkpoint writer"));
+            Some(CloudMapShmWriter::new_for_test(&path).expect("direct global-map checkpoint writer"));
 
         let outcome = {
             let mut adapter = mapping.lock();
@@ -14134,7 +14400,7 @@ mod mapping_feed_tests {
             uuid::Uuid::new_v4()
         ));
         let writer = Arc::new(parking_lot::Mutex::new(Some(
-            CloudMapShmWriter::new(&path).expect("global-map revision race writer"),
+            CloudMapShmWriter::new_for_test(&path).expect("global-map revision race writer"),
         )));
         {
             let mut writer_guard = writer.lock();
@@ -14343,7 +14609,7 @@ mod mapping_feed_tests {
                 .as_nanos()
         ));
         let writer = Arc::new(parking_lot::Mutex::new(Some(
-            CloudMapShmWriter::new(&path).expect("cloud map writer"),
+            CloudMapShmWriter::new_for_test(&path).expect("cloud map writer"),
         )));
         let backend = MappingFeedRecordingBackend::new(
             LcmTopic::new("/unused/odom").expect("dummy odom topic"),
@@ -14542,7 +14808,7 @@ mod mapping_feed_tests {
                 .as_nanos()
         ));
         let writer = Arc::new(parking_lot::Mutex::new(Some(
-            CloudMapShmWriter::new(&path).expect("cloud map writer"),
+            CloudMapShmWriter::new_for_test(&path).expect("cloud map writer"),
         )));
         let lifecycle_lock = tokio::sync::Mutex::new(());
         let _lifecycle_guard = lifecycle_lock.lock().await;
@@ -16054,7 +16320,7 @@ mod mapping_feed_tests {
             uuid::Uuid::new_v4()
         ));
         *handle.cloud_map_writer.lock() =
-            Some(CloudMapShmWriter::new(&cloud_path).expect("real cloud-map receipt writer"));
+            Some(CloudMapShmWriter::new_for_test(&cloud_path).expect("real cloud-map receipt writer"));
         let mapping = handle
             .mapping_adapter
             .as_ref()
@@ -16421,8 +16687,9 @@ mod mapping_feed_tests {
             transform_cache.as_ref(),
             &pose,
             "base_link",
+            None,
         )
-        .expect("cached canonical observation");
+        .expect("cached canonical observation").0;
 
         assert_eq!(adapter_guard.odom_count(), 1);
         assert!((observation.map_pose.x - 1.0).abs() < 1e-9);
@@ -17405,7 +17672,7 @@ mod mapping_feed_tests {
                 .as_nanos()
         ));
         handle.cloud_map_writer = Arc::new(parking_lot::Mutex::new(Some(
-            CloudMapShmWriter::new(&path).expect("cloud map writer"),
+            CloudMapShmWriter::new_for_test(&path).expect("cloud map writer"),
         )));
         register_test_cloud_session(&handle).await;
         let mut revision_rx = handle.map_revision_tx.subscribe();
@@ -17771,7 +18038,7 @@ mod mapping_feed_tests {
                 .as_nanos()
         ));
         handle.cloud_map_writer = Arc::new(parking_lot::Mutex::new(Some(
-            CloudMapShmWriter::new(&path).expect("cloud map writer"),
+            CloudMapShmWriter::new_for_test(&path).expect("cloud map writer"),
         )));
 
         register_test_cloud_session(&handle).await;

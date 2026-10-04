@@ -25,6 +25,29 @@ impl Writer {
             published: None, legacy_baseline: None, id_source: Box::new(id_source), #[cfg(test)] encoded_blocks: 0, voxel_size_m, dirty_point_budget: cache_bytes / 128, dirty_points: 0, max_observed_ns: 0 })
     }
     pub fn repository(&self) -> &Repository { &self.repository }
+    pub fn has_unpublished_changes(&self) -> bool {
+        !self.touched.is_empty() || !self.membership_touched.is_empty() || !self.pending.is_empty()
+    }
+    /// Move only the published baseline into the next frame. Dirty evidence,
+    /// pressure-flushed references and partially installed frozen IDs stay pending.
+    pub fn rehome_published_frame(&mut self, expected: &RootIdentity, new_frame: u64) -> Result<SealedMap, String> {
+        let previous = self.published.clone().ok_or("frame rehome requires a published root")?;
+        let published = SealedMap { root: previous.clone(), repository: self.repository.clone() };
+        // All fallible validation precedes changes to either baseline or working state.
+        let rehomed = published.rehome_frame(expected, new_frame)?;
+        for reference in &previous.blocks {
+            if let Some(working) = self.blocks.get_mut(&reference.key) {
+                if working.object == reference.object {
+                    working.block_revision = rehomed.root.revision;
+                    working.geometry_revision = rehomed.root.revision;
+                }
+            }
+        }
+        // The reader cache is keyed by immutable object identity, not the frame.
+        // Keep it and all unpublished state, including the future evidence bound.
+        self.published = Some(rehomed.root.clone());
+        Ok(rehomed)
+    }
     pub fn voxel_size_m(&self) -> f32 { self.voxel_size_m }
     pub fn resident_bytes(&self) -> usize { self.dirty_points * 64 + self.reader.cached_bytes() + self.pending.values().map(|p| p.bytes.len()).sum::<usize>() }
     pub fn block_count(&self) -> usize {

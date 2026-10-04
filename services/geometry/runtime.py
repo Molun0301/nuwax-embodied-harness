@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Protocol, Set, Tuple, TYPE_CHECKING, runtime_checkable
 from urllib.parse import quote
 
@@ -63,6 +64,7 @@ from services.geometry.geometry_runtime_provider import (
     _exploration_child_lease_fingerprint,
 )
 from services.geometry.loop_closure_state import read_loop_closure_from_db
+from services.geometry.checkpoint_payload import payload_chunks
 
 from contracts.naming import build_safe_dir_segment
 from services.localization.frame_tree_ops import resolve_frame_transform
@@ -4785,18 +4787,30 @@ class PlatformGeometryRuntime:
     ) -> MapAssetBundle:
         """Install the exported canonical occupancy into the candidate bundle."""
 
-        checkpoint = checkpoint_bundle.canonical_occupancy_checkpoint()
-        meta = checkpoint.meta
+        if checkpoint_bundle.checkpoint.schema_version == 2:
+            descriptor = checkpoint_bundle.occupancy_asset
+            meta = SimpleNamespace(
+                width=descriptor["width"], height=descriptor["height"],
+                resolution=descriptor["resolution"], origin_x=descriptor["origin_x"],
+                origin_y=descriptor["origin_y"], frame_id=descriptor["frame_id"],
+                revision=descriptor["source_occupancy_revision"],
+                timestamp_ns=descriptor["timestamp_ns"],
+            )
+            raw_data = checkpoint_bundle.checkpoint.canonical_occupancy_data
+        else:
+            checkpoint = checkpoint_bundle.canonical_occupancy_checkpoint()
+            meta = checkpoint.meta
+            raw_data = bytes(checkpoint.data)
         frame_id = str(meta.frame_id or "").strip().lstrip("/")
         if not frame_id:
             raise RuntimeError("canonical mapping checkpoint frame_id is empty")
-        raw_data = bytes(checkpoint.data)
         expected_size = int(meta.width) * int(meta.height)
         if expected_size <= 0 or len(raw_data) != expected_size:
             raise RuntimeError(
                 "canonical mapping checkpoint occupancy dimensions do not match payload"
             )
-        values = [value if value <= 100 else value - 256 for value in raw_data]
+        values = [value if value <= 100 else value - 256
+                  for chunk in payload_chunks(raw_data) for value in chunk]
         if any(value < -1 or value > 100 for value in values):
             raise RuntimeError(
                 "canonical mapping checkpoint occupancy contains invalid values"
@@ -4826,9 +4840,13 @@ class PlatformGeometryRuntime:
                 checkpoint_bundle.cloud_asset["source_cloud_revision"]
             ) if checkpoint_bundle.cloud_asset is not None else None,
             "source_timestamp_ns": timestamp_ns,
-            "content_sha256": checkpoint_bundle.checkpoint.content_sha256.hex(),
+            "schema_version": checkpoint_bundle.checkpoint.schema_version,
             "payload_size": checkpoint_bundle.checkpoint.payload_size,
         }
+        if checkpoint_bundle.checkpoint.schema_version == 2:
+            checkpoint_metadata["checkpoint_id"] = checkpoint_bundle.checkpoint.checkpoint_id
+        else:
+            checkpoint_metadata["content_sha256"] = checkpoint_bundle.checkpoint.content_sha256.hex()
         snapshot = map_bundle.snapshot.model_copy(
             update={
                 "frame_id": frame_id,
@@ -4928,10 +4946,13 @@ class PlatformGeometryRuntime:
         bundle_root: Path,
         skip_pcd_export: bool = False,
         export_backend_checkpoint: bool = True,
+        checkpoint_schema_version: int = 1,
     ) -> MapAssetBundle:
         """在受控 staging 根目录生成一个 finalized 地图的几何资产。"""
 
         resolved_bundle_root = self._require_bundle_root(bundle_root)
+        if type(checkpoint_schema_version) is not int or checkpoint_schema_version not in (1, 2):
+            raise ValueError("unsupported finalized checkpoint schema")
         if export_backend_checkpoint:
             if skip_pcd_export:
                 raise RuntimeError(
@@ -4956,7 +4977,12 @@ class PlatformGeometryRuntime:
                 raise RuntimeError(
                     "active native mapping backend does not support checkpoint export"
                 )
-            checkpoint_bundle = exporter()
+            # Keep the default envelope paired with activation-v1. Explicit v2
+            # prepares hash-free immutable members; its activation is gated below.
+            checkpoint_bundle = (
+                exporter() if checkpoint_schema_version == 1
+                else exporter(checkpoint_schema_version=checkpoint_schema_version)
+            )
             if not isinstance(
                 checkpoint_bundle,
                 MappingBackendCheckpointExportBundle,
@@ -4964,6 +4990,8 @@ class PlatformGeometryRuntime:
                 raise RuntimeError(
                     "mapping backend checkpoint export returned an invalid bundle"
                 )
+            if checkpoint_bundle.checkpoint.schema_version != checkpoint_schema_version:
+                raise RuntimeError("mapping backend checkpoint export changed the requested schema")
             mapping_context_after = self.get_mapping_session_context()
             if (
                 _mapping_context_snapshot_token(mapping_context_before)
@@ -5074,13 +5102,9 @@ class PlatformGeometryRuntime:
                 "present": True,
                 "schema_version": stored_backend_checkpoint.checkpoint.schema_version,
                 "backend_kind": stored_backend_checkpoint.checkpoint.backend_kind,
-                "manifest_sha256": stored_backend_checkpoint.manifest_sha256,
                 "manifest_path": self._bundle_relative_path(
                     resolved_bundle_root,
                     stored_backend_checkpoint.manifest_path,
-                ),
-                "object_sha256": (
-                    stored_backend_checkpoint.checkpoint.content_sha256.hex()
                 ),
                 "object_path": self._bundle_relative_path(
                     resolved_bundle_root,
@@ -5095,6 +5119,17 @@ class PlatformGeometryRuntime:
                 ),
                 "legacy_checkpoint_reconstructed": False,
             }
+            if stored_backend_checkpoint.checkpoint.schema_version == 2:
+                backend_checkpoint_metadata["checkpoint_id"] = stored_backend_checkpoint.checkpoint.checkpoint_id
+                backend_checkpoint_metadata["member_paths"] = {
+                    role: self._bundle_relative_path(resolved_bundle_root, path)
+                    for role, path in stored_backend_checkpoint.member_paths.items()
+                }
+            else:
+                backend_checkpoint_metadata.update(
+                    manifest_sha256=stored_backend_checkpoint.manifest_sha256,
+                    object_sha256=stored_backend_checkpoint.checkpoint.content_sha256.hex(),
+                )
         quality_metrics = self._build_geometry_quality_metrics(
             database_metadata=database_metadata,
             pcd_metadata=pcd_metadata,
@@ -6639,8 +6674,10 @@ class PlatformGeometryRuntime:
             ".%s.%s.tmp" % (resolved_target.name, uuid.uuid4().hex)
         )
         checkpoint = checkpoint_bundle.checkpoint
+        assigned_identity = checkpoint.schema_version == 2
+        identity_column = "backend_checkpoint_id" if assigned_identity else "backend_checkpoint_content_sha256"
         identity = {
-            "schema_version": 3,
+            "schema_version": 4 if assigned_identity else 3,
             "map_name": bundle.map_name,
             "source_epoch": bundle.snapshot.source_epoch,
             "update_sequence": int(bundle.snapshot.update_sequence),
@@ -6649,7 +6686,7 @@ class PlatformGeometryRuntime:
             "mapping_session_id": str(mapping_context.get("session_id") or ""),
             "session_generation": int(mapping_context.get("session_generation") or 0),
             "backend_kind": checkpoint_bundle.backend_kind,
-            "backend_checkpoint_content_sha256": checkpoint.content_sha256.hex(),
+            identity_column: checkpoint.checkpoint_id if assigned_identity else checkpoint.content_sha256.hex(),
             "created_at": bundle.timestamp.isoformat(),
         }
         connection = None
@@ -6657,9 +6694,9 @@ class PlatformGeometryRuntime:
             connection = sqlite3.connect(str(temporary))
             connection.execute("PRAGMA journal_mode=DELETE")
             connection.execute("PRAGMA synchronous=FULL")
-            connection.execute("PRAGMA user_version=3")
+            connection.execute("PRAGMA user_version=%d" % identity["schema_version"])
             connection.execute(
-                """
+                f"""
                 CREATE TABLE map_asset_identity (
                     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
                     schema_version INTEGER NOT NULL,
@@ -6671,13 +6708,13 @@ class PlatformGeometryRuntime:
                     mapping_session_id TEXT NOT NULL,
                     session_generation INTEGER NOT NULL,
                     backend_kind TEXT NOT NULL,
-                    backend_checkpoint_content_sha256 TEXT NOT NULL,
+                    {identity_column} TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
                 """
             )
             connection.execute(
-                """
+                f"""
                 INSERT INTO map_asset_identity (
                     singleton_id,
                     schema_version,
@@ -6689,7 +6726,7 @@ class PlatformGeometryRuntime:
                     mapping_session_id,
                     session_generation,
                     backend_kind,
-                    backend_checkpoint_content_sha256,
+                    {identity_column},
                     created_at
                 ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -6703,7 +6740,7 @@ class PlatformGeometryRuntime:
                     identity["mapping_session_id"],
                     identity["session_generation"],
                     identity["backend_kind"],
-                    identity["backend_checkpoint_content_sha256"],
+                    identity[identity_column],
                     identity["created_at"],
                 ),
             )
@@ -6922,6 +6959,9 @@ class PlatformGeometryRuntime:
     ) -> Dict[str, object]:
         """Write PCD only from the cloud bytes correlated with one export bundle."""
 
+        if bundle.checkpoint.schema_version == 2:
+            return self._materialize_assigned_checkpoint_pcd_asset(target_path, bundle)
+
         from services.geometry.pointcloud_map import write_pcd_binary_xyz
         import numpy as np
 
@@ -6986,6 +7026,54 @@ class PlatformGeometryRuntime:
                     temporary_path,
                     exc_info=True,
                 )
+
+    def _materialize_assigned_checkpoint_pcd_asset(
+        self,
+        target_path: Path,
+        bundle: MappingBackendCheckpointExportBundle,
+    ) -> Dict[str, object]:
+        """Stream an admitted immutable cloud member without protobuf/array copies."""
+        from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore
+
+        checkpoint, _occupancy, descriptor = MappingBackendCheckpointStore.validate_checkpoint_bundle(
+            bundle.checkpoint, occupancy_asset=bundle.occupancy_asset, cloud_asset=bundle.cloud_asset,
+        )
+        point_count = int(descriptor["point_count"])
+        if point_count < self._pcd_min_points():
+            raise RuntimeError(
+                "canonical cloud-map 点数不足：%d < %d" % (point_count, self._pcd_min_points())
+            )
+        header = (
+            "# .PCD v0.7 - Point Cloud Data file format\n"
+            "VERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n"
+            "WIDTH %d\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS %d\nDATA binary\n"
+        ) % (point_count, point_count)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_target = target_path.expanduser().resolve()
+        temporary = resolved_target.with_name(".%s.%s.tmp" % (resolved_target.name, uuid.uuid4().hex))
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(header.encode("ascii"))
+                for chunk in payload_chunks(checkpoint.canonical_cloud_xyz):
+                    stream.write(chunk)
+            os.replace(temporary, resolved_target)
+            if not self._is_usable_pcd_file(resolved_target):
+                raise RuntimeError("canonical cloud-map PCD 未通过点数或文件完整性校验。")
+            return {
+                "pcd_present": True,
+                "pcd_source_kind": "mapping_backend_checkpoint_export",
+                "pcd_source_path": "grpc:ExportMappingBackendCheckpoint",
+                "pcd_target_path": str(resolved_target),
+                "pcd_target": self._file_metadata(resolved_target),
+                "checkpoint_schema_version": 2,
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "member_role": "canonical_cloud",
+                "cloud_revision": int(descriptor["source_cloud_revision"]),
+                "point_count": point_count,
+                "voxel_size": float(descriptor["voxel_size"]),
+            }
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _materialize_pcd_asset(
         self,
@@ -7347,9 +7435,10 @@ class PlatformGeometryRuntime:
         started_at = process.started_at_iso if process is not None else None
         pid = process.process.pid if process is not None and process.process is not None and process.is_running() else None
         source = str(db_path.resolve()) if db_path is not None else None
-        seed = "|".join(str(part or "") for part in (source, started_at, pid))
-        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16] if seed.strip("|") else ""
-        run_id = "nuwax_geometry_runtime_%s" % digest if digest else None
+        run_id = (
+            "nuwax_geometry_runtime:" + json.dumps([source, started_at, pid], separators=(",", ":"))
+            if any(value is not None for value in (source, started_at, pid)) else None
+        )
         return {
             "session_id": run_id,
             "run_id": run_id,
@@ -7694,6 +7783,11 @@ class PlatformGeometryRuntime:
                 expected_checkpoint_manifest_sha256 = None
                 expected_checkpoint_object_sha256 = None
                 if isinstance(checkpoint_identity, dict) and checkpoint_identity.get("present") is True:
+                    if checkpoint_identity.get("schema_version") == 2:
+                        raise RuntimeError(
+                            "CHECKPOINT_V2_ACTIVATION_UNAVAILABLE: assigned checkpoint activation "
+                            "requires the paired native activation and relocalization identity contract"
+                        )
                     expected_backend_kind = str(checkpoint_identity.get("backend_kind") or "").strip()
                     expected_checkpoint_manifest_sha256 = str(checkpoint_identity.get("manifest_sha256") or "").strip()
                     expected_checkpoint_object_sha256 = str(checkpoint_identity.get("object_sha256") or "").strip()

@@ -128,7 +128,7 @@ class GeometryRuntimeStub(object):
                 _registered_method=True)
         self.ExportMappingBackendCheckpoint = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/ExportMappingBackendCheckpoint',
-                request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
+                request_serializer=geometry__runtime__pb2.ExportMappingBackendCheckpointRequest.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.MappingBackendCheckpoint.FromString,
                 _registered_method=True)
         self.ActivateMap = channel.unary_unary(
@@ -665,7 +665,7 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
             ),
             'ExportMappingBackendCheckpoint': grpc.unary_unary_rpc_method_handler(
                     servicer.ExportMappingBackendCheckpoint,
-                    request_deserializer=geometry__runtime__pb2.Empty.FromString,
+                    request_deserializer=geometry__runtime__pb2.ExportMappingBackendCheckpointRequest.FromString,
                     response_serializer=geometry__runtime__pb2.MappingBackendCheckpoint.SerializeToString,
             ),
             'ActivateMap': grpc.unary_unary_rpc_method_handler(
@@ -1318,7 +1318,7 @@ class GeometryRuntime(object):
             request,
             target,
             '/nuwax.geometry.GeometryRuntime/ExportMappingBackendCheckpoint',
-            geometry__runtime__pb2.Empty.SerializeToString,
+            geometry__runtime__pb2.ExportMappingBackendCheckpointRequest.SerializeToString,
             geometry__runtime__pb2.MappingBackendCheckpoint.FromString,
             options,
             channel_credentials,

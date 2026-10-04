@@ -504,11 +504,18 @@ class MappingBackendCheckpointStore:
         backend_kind: str,
         *,
         schema_version: int = MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION,
+        expected_checkpoint_id: Optional[str] = None,
     ) -> StoredMappingBackendCheckpoint:
         """Load only through the backend's stable selector."""
 
         kind = _validate_backend_kind(backend_kind)
         schema = _validate_schema_version(schema_version)
+        if expected_checkpoint_id is not None:
+            if schema != ASSIGNED_CHECKPOINT_SCHEMA_VERSION:
+                raise MappingBackendCheckpointValidationError(
+                    "assigned checkpoint expectation requires schema 2"
+                )
+            _validate_assigned_id(expected_checkpoint_id, "expected checkpoint id")
         access = self._existing_layout(kind, schema, exclusive=False)
         try:
             stored = self._load_optional(kind, schema, access=access)
@@ -516,6 +523,11 @@ class MappingBackendCheckpointStore:
                 raise MappingBackendCheckpointNotFoundError(
                     "mapping backend checkpoint selector does not exist: "
                     f"{access.paths.selector}"
+                )
+            if (expected_checkpoint_id is not None
+                    and stored.checkpoint.checkpoint_id != expected_checkpoint_id):
+                raise MappingBackendCheckpointValidationError(
+                    "checkpoint selector does not match the expected assigned identity"
                 )
             return stored
         finally:

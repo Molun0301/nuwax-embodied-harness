@@ -262,7 +262,11 @@ impl SurfaceMapOrder {
                 if authority.cloud_revision < previous.cloud_revision {
                     return MapIngress::Rejected("stale surface cloud revision");
                 }
-                if authority.cloud_revision == previous.cloud_revision {
+                let frame_rehome = authority.map_frame_generation > previous.map_frame_generation
+                    && authority.committed_map == previous.committed_map;
+                if authority.cloud_revision == previous.cloud_revision && !frame_rehome {
+                    // A real newer frame is a distinct root domain, even when
+                    // unchanged committed coordinates retain their cloud clock.
                     // New publications retain immutable ownership in O(1). Only a
                     // same-identity replay needs an exact payload comparison.
                     return if authority == previous
@@ -851,23 +855,42 @@ mod tests {
     #[ignore = "需要本轮冻结的实机规范地图、机体位姿及实机配置"]
     async fn recorded_live_surface_navigation_diagnostic() {
         nuwax_core::logging::init_component_logging("navigation-diagnostic", "nuwax_nav_mls_planner=debug");
-        struct Blocks(std::path::PathBuf);
+        struct Blocks {
+            root: nuwax_map_chunks::Manifest,
+            repository: nuwax_map_chunks::Repository,
+        }
         #[async_trait::async_trait]
         impl nuwax_rpc::RpcHandler for Blocks {
             async fn handle(&self, request: nuwax_rpc::RpcRequest) -> nuwax_rpc::RpcResponse {
-                let hash = request.args.0[0]["sha256_hex"].as_str().unwrap();
-                let bytes = std::fs::read(self.0.join(hash)).unwrap();
-                nuwax_rpc::RpcResponse::ok(request.id, serde_json::json!({"data_hex": bytes.iter().map(|v|format!("{v:02x}")).collect::<String>()}))
+                let Some(scope) = request.args.0.first() else {
+                    return nuwax_rpc::RpcResponse::error(request.id, serde_json::json!({"message":"missing block scope"}));
+                };
+                let Some(block) = self.root.blocks.iter().find(|block|
+                    crate::surface_chunks::block_request(&self.root, block) == *scope) else {
+                    return nuwax_rpc::RpcResponse::error(request.id, serde_json::json!({"message":"root or block reference mismatch"}));
+                };
+                match self.repository.read_object(block.object, nuwax_map_chunks::MAX_BLOCK_BYTES) {
+                    Ok(bytes) => {
+                        let mut response = scope.clone();
+                        response["data"] = serde_json::json!(bytes);
+                        nuwax_rpc::RpcResponse::ok(request.id, response)
+                    }
+                    Err(error) => nuwax_rpc::RpcResponse::error(request.id, serde_json::json!({"message":error})),
+                }
             }
         }
         let directory = std::path::PathBuf::from(std::env::var("NUWAX_NAV_DIAGNOSTIC_INPUT").unwrap());
-        let broker = nuwax_rpc::RpcBroker::new();
-        let method = "GeometryRuntimeService/get_navigation_map_block";
-        broker.register(method, Box::new(Blocks(directory.join("blocks")))).await.unwrap();
-        let transport = Arc::new(nuwax_rpc::LcmRpcTransport::from_provider(&std::env::var("NUWAX_LCM_URL").unwrap()).unwrap());
-        let server = broker.serve(transport, method).await.unwrap();
         let bytes = std::fs::read(directory.join("navigation-map.lcm")).unwrap();
         let message = schema::decode_navigation_map_3d_body(&bytes[8..]).unwrap();
+        let broker = nuwax_rpc::RpcBroker::new();
+        let method = "GeometryRuntimeService/get_navigation_map_block";
+        let blocks = Blocks {
+            root: nuwax_map_chunks::Manifest::decode(&message.fine.as_ref().unwrap().root).unwrap(),
+            repository: nuwax_map_chunks::Repository::open(directory.join("blocks")).unwrap(),
+        };
+        broker.register(method, Box::new(blocks)).await.unwrap();
+        let transport = Arc::new(nuwax_rpc::LcmRpcTransport::from_provider(&std::env::var("NUWAX_LCM_URL").unwrap()).unwrap());
+        let server = broker.serve(transport, method).await.unwrap();
         let pose_file = std::env::var("NUWAX_NAV_DIAGNOSTIC_POSE_FILE").map(std::path::PathBuf::from).unwrap_or_else(|_|directory.join("pose.json"));
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(pose_file).unwrap()).unwrap();
         let position: [f64; 3] = serde_json::from_value(value["position"].clone()).unwrap();
@@ -1394,6 +1417,28 @@ mod tests {
         }
         assert!(cache.last_build_stats().unwrap().input_points<cells.len());
         assert!(!Arc::ptr_eq(&first,&next));
+        // Geometry revision numbers are scoped by domain and source resolution.
+        let mut switched = message(&cells, 5);
+        switched.committed_map.session_generation += 1;
+        let mut root = Manifest::decode(&switched.fine.as_ref().unwrap().root).unwrap();
+        root.domain = schema::navigation_map_3d_domain(&switched);
+        switched.fine.as_mut().unwrap().root = root.encode().unwrap();
+        let new_domain = cache.build(&switched).unwrap();
+        assert_eq!(cache.last_build_stats().unwrap().kind, nuwax_nav_mls_planner::SurfaceBuildKind::Full);
+        assert!(!Arc::ptr_eq(&next, &new_domain));
+        let mut resized = switched.clone();
+        resized.cloud_revision += 1;
+        resized.commit_sequence += 1;
+        resized.cloud.header.seq += 1;
+        resized.source_voxel_size = 0.025;
+        root.revision += 1;
+        root.voxel_size_m = resized.source_voxel_size;
+        resized.fine.as_mut().unwrap().root = root.encode().unwrap();
+        let new_resolution = cache.build(&resized).unwrap();
+        assert_eq!(cache.last_build_stats().unwrap().kind, nuwax_nav_mls_planner::SurfaceBuildKind::Full);
+        assert_eq!(new_resolution.source_voxel_size_m(), 0.025);
+        assert!(!Arc::ptr_eq(&new_domain, &new_resolution));
+
     }
 
     #[test]
@@ -1512,6 +1557,42 @@ mod tests {
     }
 
     #[test]
+    fn committed_occupancy_revision_conservatively_invalidates_virtual_mask_cache() {
+        let mut cache = SurfaceGeometryCache::new(config().geometry);
+        let mut first = map_message(1, "mask-revision");
+        first.virtual_obstacles = Some(virtual_mask(&first, true));
+        let old = cache.build(&first).unwrap();
+        let physical = cache.physical_snapshot().unwrap();
+        let mut second = map_message(2, "mask-revision");
+        second.committed_map.revision = 2;
+        second.virtual_obstacles = Some(virtual_mask(&second, true));
+        let repeated_mask = cache.build(&second).unwrap();
+        assert!(Arc::ptr_eq(&physical, &cache.physical_snapshot().unwrap()));
+        assert!(!Arc::ptr_eq(&old, &repeated_mask));
+        assert!(Arc::ptr_eq(&repeated_mask, &cache.build(&second).unwrap()));
+        let mut third = map_message(3, "mask-revision");
+        third.committed_map.revision = 3;
+        third.virtual_obstacles = Some(virtual_mask(&third, false));
+        let cleared_mask = cache.build(&third).unwrap();
+        assert!(repeated_mask.plan([0.55, 1.55, 2.1], [3.05, 1.55, 2.1]).is_err());
+        assert!(cleared_mask.plan([0.55, 1.55, 2.1], [3.05, 1.55, 2.1]).is_ok());
+    }
+
+    #[test]
+    fn fullcloud_publication_reuses_only_after_exact_builder_change_detection() {
+        let mut cache = SurfaceGeometryCache::new(config().geometry);
+        let first = map_message(1, "legacy-fullcloud");
+        let old = cache.build(&first).unwrap();
+        assert!(Arc::ptr_eq(&old, &cache.build(&first).unwrap()));
+        assert_eq!(cache.last_build_stats().unwrap().input_points, 0);
+        let second = map_message(2, "legacy-fullcloud");
+        let next = cache.build(&second).unwrap();
+        assert!(Arc::ptr_eq(&old, &next));
+        assert_eq!(cache.last_build_stats().unwrap().kind, nuwax_nav_mls_planner::SurfaceBuildKind::Reused);
+        assert_eq!(cache.last_build_stats().unwrap().input_points, 40 * 30);
+    }
+
+    #[test]
     fn generated_body_path_does_not_turn_quantization_duplicates_into_vertical_motion() {
         use nuwax_nav_runtime::NavPlanner;
         let message = map_message(1, "map");
@@ -1574,6 +1655,83 @@ mod tests {
         ));
         assert_eq!(next.received_at, received);
         assert_eq!(next.authority.committed_map.session_id, "second-map");
+    }
+
+    #[test]
+    fn publication_order_retains_nonce_retired_and_stale_guards_without_hashes() {
+        let mut message = map_message(2, "order");
+        message.committed_map.revision = 2;
+        let authority = map_authority(&message);
+        let payload = Arc::new(schema::encode_navigation_map_3d_body(&message).unwrap());
+        let mut order = SurfaceMapOrder::default();
+        assert_eq!(order.observe(&authority, &payload), MapIngress::New);
+        let mut retired_producer = authority.clone();
+        retired_producer.producer_runtime_generation -= 1;
+        let mut retired_frame = authority.clone();
+        retired_frame.map_frame_generation -= 1;
+        let mut stale_commit = authority.clone();
+        stale_commit.committed_map.revision -= 1;
+        let mut stale_cloud = authority.clone();
+        stale_cloud.cloud_revision -= 1;
+        for stale in [retired_producer, retired_frame, stale_commit, stale_cloud] {
+            assert!(matches!(order.observe(&stale, &payload), MapIngress::Rejected(_)));
+            assert!(Arc::ptr_eq(&order.latest.as_ref().unwrap().1, &payload));
+        }
+        let mut changed_nonce = authority.clone();
+        changed_nonce.commit_boot_nonce[0] ^= 1;
+        assert!(matches!(order.observe(&changed_nonce, &payload), MapIngress::Invalidated(_)));
+        let mut conflicting_authority = authority.clone();
+        conflicting_authority.committed_map.revision += 1;
+        assert!(matches!(order.observe(&conflicting_authority, &payload), MapIngress::Invalidated(_)));
+        let mut next = authority.clone();
+        next.cloud_revision += 1;
+        let next_payload = Arc::new(vec![1, 2, 3]);
+        assert_eq!(order.observe(&next, &next_payload), MapIngress::New);
+        assert!(Arc::ptr_eq(&order.latest.as_ref().unwrap().1, &next_payload));
+        let mut replacement = changed_nonce;
+        replacement.producer_runtime_generation += 1;
+        replacement.cloud_revision = 1;
+        assert_eq!(order.observe(&replacement, &payload), MapIngress::New);
+    }
+
+    #[test]
+    fn newer_frame_domain_accepts_unchanged_cloud_revision_but_not_same_identity_mutation() {
+        let message = map_message(2, "frame-rehome");
+        let old = map_authority(&message);
+        let old_bytes = Arc::new(schema::encode_navigation_map_3d_body(&message).unwrap());
+        let mut order = SurfaceMapOrder::default();
+        assert_eq!(order.observe(&old, &old_bytes), MapIngress::New);
+        let mut moved = message.clone();
+        moved.map_frame_generation += 1;
+        let next = map_authority(&moved);
+        let bytes = Arc::new(schema::encode_navigation_map_3d_body(&moved).unwrap());
+        assert_eq!(order.observe(&next, &bytes), MapIngress::New);
+        assert_eq!(order.observe(&next, &bytes), MapIngress::Duplicate);
+        assert!(matches!(order.observe(&old, &old_bytes), MapIngress::Rejected(_)));
+        let mut mutated = (*bytes).clone();
+        mutated.push(0);
+        assert!(matches!(order.observe(&next, &Arc::new(mutated)), MapIngress::Invalidated(_)));
+        let mut mixed = next.clone();
+        mixed.map_frame_generation += 1;
+        mixed.committed_map.revision += 1;
+        assert!(matches!(order.observe(&mixed, &bytes), MapIngress::Invalidated(_)));
+    }
+
+    #[test]
+    fn replay_is_byte_exact_even_when_decoded_signed_zero_values_compare_equal() {
+        let mut message = map_message(1, "exact-replay");
+        message.virtual_obstacles = Some(virtual_mask(&message, false));
+        let mut same_values = message.clone();
+        same_values.virtual_obstacles.as_mut().unwrap().info.origin.position[0] = -0.0;
+        assert_eq!(message, same_values);
+        let payload = Arc::new(schema::encode_navigation_map_3d_body(&message).unwrap());
+        let changed_payload = Arc::new(schema::encode_navigation_map_3d_body(&same_values).unwrap());
+        assert_ne!(payload, changed_payload);
+        let mut order = SurfaceMapOrder::default();
+        let authority = map_authority(&message);
+        assert_eq!(order.observe(&authority, &payload), MapIngress::New);
+        assert!(matches!(order.observe(&authority, &changed_payload), MapIngress::Invalidated(_)));
+        assert!(Arc::ptr_eq(&order.latest.as_ref().unwrap().1, &payload));
     }
 
     #[tokio::test]

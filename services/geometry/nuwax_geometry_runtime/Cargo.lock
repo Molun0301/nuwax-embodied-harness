@@ -1589,9 +1589,10 @@ dependencies = [
 name = "nuwax-map-chunks"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.3.4",
+ "libc",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
 ]
 

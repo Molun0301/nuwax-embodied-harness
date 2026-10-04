@@ -159,6 +159,13 @@ pub(crate) fn cloud_map_active_slot(revision: u64) -> Option<u32> {
     revision.checked_sub(1).map(|_| 0)
 }
 
+#[derive(Clone)]
+struct PendingFineFrameRehome {
+    ticket: uuid::Uuid,
+    proof: crate::mapping_adapter::InitialFrameEstablishment,
+    baseline: Option<OccupancyCommitReceipt>,
+}
+
 pub struct CloudMapShmWriter {
     #[cfg(test)]
     last_stage_ms: [f64; 3],
@@ -181,6 +188,7 @@ pub struct CloudMapShmWriter {
     committed_fine_cloud: Option<Arc<nuwax_map_chunks::SealedMap>>,
     fine_owner: Option<(u64, u64)>,
     defer_fine_retention: bool,
+    pending_fine_frame_rehome: Option<PendingFineFrameRehome>,
     dense_cloud: Option<DenseCloud>,
     committed_dense_cloud: Option<DenseSnapshot>,
     pending_dense_readers: Option<DenseCloudReaders>,
@@ -470,6 +478,19 @@ impl CloudMapShmWriter {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(path: &std::path::Path) -> std::io::Result<Self> {
+        let mut writer = Self::new(path)?;
+        writer.bind_fine_map_owner(0, 1).unwrap();
+        Ok(writer)
+    }
+    #[cfg(test)]
+    pub(crate) fn new_private_for_test() -> std::io::Result<Self> {
+        let mut writer = Self::new_private()?;
+        writer.bind_fine_map_owner(0, 1).unwrap();
+        Ok(writer)
+    }
+
     fn from_mapping(
         mut mmap: MmapMut,
         shm_path: std::path::PathBuf,
@@ -509,6 +530,7 @@ impl CloudMapShmWriter {
             committed_fine_cloud: None,
             fine_owner: None,
             defer_fine_retention: false,
+            pending_fine_frame_rehome: None,
             dense_cloud: None,
             committed_dense_cloud: None,
             pending_dense_readers: None,
@@ -688,6 +710,7 @@ impl CloudMapShmWriter {
         occupancy_receipt: &OccupancyCommitReceipt,
     ) -> Result<Option<CorrelatedCloudMapCommit>, String> {
         self.validate_occupancy_receipt(occupancy_receipt)?;
+        if self.voxels.is_empty() { return Ok(None); }
         let domain = if occupancy_receipt.source_timestamp_ns == 0 || self.fine_cloud.is_none() { None }
             else {
                 let (frame_generation, producer_generation) = self.fine_owner
@@ -789,6 +812,23 @@ impl CloudMapShmWriter {
             return Err(format!("point-cloud preparation generation mismatch: writer={} prepared={}",
                 self.session_generation, work.session_generation));
         }
+        if let Some(handoff) = &self.pending_fine_frame_rehome {
+            if handoff.ticket != ticket { return Err("fine frame handoff belongs to another scan ticket".into()); }
+            if let Some(receipt) = &work.last_occupancy_receipt {
+                handoff.proof.validate_writer_lineage(receipt)?;
+                if let Some(base) = &handoff.baseline {
+                    if receipt.commit_id.sequence < base.commit_id.sequence || receipt.occupancy_revision < base.occupancy_revision
+                        || ((receipt.commit_id.sequence == base.commit_id.sequence || receipt.occupancy_revision == base.occupancy_revision)
+                            && receipt != base) {
+                        return Err("prepared frame handoff changed or rolled back its captured source receipt".into());
+                    }
+                }
+            } else if handoff.baseline.is_some() { return Err("prepared frame handoff lost its source receipt".into()); }
+            work.apply_initial_fine_frame_rehome(&handoff.proof)?;
+        }
+        if self.fine_owner != work.fine_owner {
+            return Err("prepared cloud owner changed outside the admitted frame handoff".into());
+        }
         if work.revision != self.revision {
             if self.revision.checked_add(1) != Some(work.revision) {
                 return Err(format!("point-cloud preparation revision mismatch: writer={} prepared={}",
@@ -820,6 +860,7 @@ impl CloudMapShmWriter {
         self.committed_dense_cloud = work.committed_dense_cloud.take();
         self.pending_dense_readers = None;
         self.pending_fine_readers = None;
+        self.pending_fine_frame_rehome = None;
         self.scan_preparation = None;
         Ok(())
     }
@@ -829,7 +870,7 @@ impl CloudMapShmWriter {
         self.voxel_size = prepared.voxel_size;
         self.dynamic_filter = prepared.dynamic_filter;
         self.ordered_voxels = prepared.ordered_voxels;
-        self.fine_cloud = prepared.fine_cloud;
+        self.replace_fine_cloud(prepared.fine_cloud);
         self.dense_cloud = prepared.dense_cloud;
         self.dense_error = prepared.dense_error;
         self.dense_history_missing = prepared.dense_history_missing;
@@ -889,6 +930,15 @@ impl CloudMapShmWriter {
         self.last_cloud_receipt.clone()
     }
 
+    fn replace_fine_cloud(&mut self, mut fine: Option<FineCloud>) {
+        // A complete rebuild/checkpoint replaces mutable storage, not the
+        // retained-root lookup authority used by already-published readers.
+        let retained = self.fine_cloud.as_ref().map(FineCloud::readers)
+            .or_else(|| self.pending_fine_readers.clone());
+        if let (Some(owner), Some(readers)) = (fine.as_mut(), retained) { owner.adopt_readers(readers); }
+        self.fine_cloud = fine;
+    }
+
     pub(crate) fn bind_fine_map_owner(&mut self, frame_generation: u64, producer_generation: u64) -> Result<(), String> {
         if producer_generation == 0 { return Err("fine-map producer generation must be positive".into()); }
         self.fine_owner = Some((frame_generation, producer_generation));
@@ -898,6 +948,72 @@ impl CloudMapShmWriter {
     pub(crate) fn bind_fine_map_frame(&mut self, frame_generation: u64) -> Result<(), String> {
         let (_, producer) = self.fine_owner.ok_or("fine-map runtime owner is not bound")?;
         self.bind_fine_map_owner(frame_generation, producer)
+    }
+
+    /// Rehome unchanged committed map-frame coordinates when the first real
+    /// odometry anchor establishes the session's frame domain. This is not a
+    /// scan or occupancy commit and never advances either publication clock.
+    pub(crate) fn rehome_committed_fine_frame(&mut self,
+        proof: &crate::mapping_adapter::InitialFrameEstablishment) -> Result<bool, String> {
+        if let Some(baseline) = &self.last_occupancy_receipt { proof.validate_writer_baseline(baseline)?; }
+        let baseline = self.last_occupancy_receipt.clone();
+        let changed = self.apply_initial_fine_frame_rehome(proof)?;
+        if let Some(ticket) = self.scan_preparation {
+            self.pending_fine_frame_rehome = Some(PendingFineFrameRehome { ticket, proof: proof.clone(), baseline });
+        }
+        Ok(changed)
+    }
+
+    fn apply_initial_fine_frame_rehome(&mut self,
+        proof: &crate::mapping_adapter::InitialFrameEstablishment) -> Result<bool, String> {
+        let (old_frame, new_frame) = (proof.old_frame(), proof.new_frame());
+        let (session, generation) = (proof.session_id(), proof.session_generation());
+        if old_frame.checked_add(1) != Some(new_frame) {
+            return Err("fine frame transition is stale or exhausted".into());
+        }
+        let (_, producer) = self.fine_owner.ok_or("fine runtime owner is not bound")?;
+        if self.fine_owner != Some((old_frame, producer)) {
+            return Err("fine frame transition does not name its current owner".into());
+        }
+        let Some(previous) = self.committed_fine_cloud.clone() else {
+            if self.revision != 0 && self.session_generation != generation {
+                return Err("empty fine frame transition crossed the writer session".into());
+            }
+            self.bind_fine_map_owner(new_frame, producer)?;
+            return Ok(false);
+        };
+        let root = previous.manifest();
+        let metadata = self.committed_metadata().ok_or("fine frame transition lacks committed metadata")?;
+        let cloud = self.last_cloud_receipt.as_ref().ok_or("fine frame transition lacks cloud receipt")?;
+        let occupancy = self.last_occupancy_receipt.as_ref().ok_or("fine frame transition lacks occupancy receipt")?;
+        if root.domain.session != session || root.domain.generation != generation
+            || root.domain.frame_generation != old_frame || root.domain.producer_generation != producer
+            || occupancy.session_id != session || occupancy.session_generation != generation
+            || cloud.session_generation != generation || cloud.cloud_revision != root.revision
+            || metadata.revision != root.revision || metadata.session_generation != generation
+            || cloud.commit_id != occupancy.commit_id || cloud.occupancy_revision != occupancy.occupancy_revision
+            || cloud.source_timestamp_ns != root.source_timestamp_ns {
+            return Err("fine frame transition differs from immutable committed ownership".into());
+        }
+        let retained = if self.defer_fine_retention { None } else {
+            Some(self.fine_cloud.as_ref().map(FineCloud::readers).or_else(|| self.pending_fine_readers.clone())
+                .ok_or("fine frame transition lost retained readers")?)
+        };
+        let next = if let Some(fine) = self.fine_cloud.as_mut() {
+            fine.rehome_committed(&root.identity(), new_frame)?
+        } else if self.scan_preparation.is_some() {
+            Arc::new(previous.rehome_frame(&root.identity(), new_frame)?)
+        } else { return Err("fine frame transition has no source owner".into()); };
+        if let Some(readers) = retained { readers.retain_committed(&next); }
+        self.committed_fine_cloud = Some(next);
+        self.fine_owner = Some((new_frame, producer));
+        Ok(true)
+    }
+
+    pub(crate) fn accepts_prepared_fine_frame_transition(&self, old_frame: u64, new_frame: u64) -> bool {
+        self.pending_fine_frame_rehome.as_ref().is_some_and(|handoff|
+            self.scan_preparation == Some(handoff.ticket) && handoff.proof.old_frame() == old_frame
+                && handoff.proof.new_frame() == new_frame)
     }
 
     pub(crate) fn pin_fine_map_root(&self, identity: &nuwax_map_chunks::RootIdentity,
@@ -966,13 +1082,14 @@ impl CloudMapShmWriter {
         self.scan_preparation = None;
         self.pending_dense_readers = None;
         self.pending_fine_readers = None;
+        self.pending_fine_frame_rehome = None;
         self.session_generation = receipt.session_generation;
         self.voxel_size = prepared.voxel_size;
         self.voxels = prepared.voxels;
         self.dynamic_filter = prepared.dynamic_filter;
         self.ordered_voxels = prepared.ordered_voxels;
         self.ordered_voxels.invalidate();
-        self.fine_cloud = prepared.fine_cloud;
+        self.replace_fine_cloud(prepared.fine_cloud);
         self.dense_cloud = prepared.dense_cloud;
         self.dense_error = prepared.dense_error;
         self.dense_history_missing = prepared.dense_history_missing;
@@ -1031,12 +1148,13 @@ impl CloudMapShmWriter {
         self.scan_preparation = None;
         self.pending_dense_readers = None;
         self.pending_fine_readers = None;
+        self.pending_fine_frame_rehome = None;
         self.session_generation = session_generation;
         self.voxel_size = voxel_size;
         self.voxels = voxels.into();
         self.ordered_voxels.invalidate();
         self.dynamic_filter = DynamicCloudFilter::default();
-        self.fine_cloud = Some(fine);
+        self.replace_fine_cloud(Some(fine));
         self.dense_history_missing = dense.is_none();
         self.dense_cloud = dense;
         self.dense_error = None;
@@ -1136,6 +1254,7 @@ impl CloudMapShmWriter {
         self.scan_preparation = None;
         self.pending_dense_readers = None;
         self.pending_fine_readers = None;
+        self.pending_fine_frame_rehome = None;
         self.fine_cloud = None;
         self.committed_fine_cloud = None;
         self.dense_cloud = None;
@@ -1319,6 +1438,93 @@ mod tests {
     /// The Python peer acknowledges each committed phase after reading real SHM.
     /// No transport, legacy full export, content digest or robot is involved.
     #[test]
+    fn same_domain_archive_restore_reserves_existing_cloud_clock_then_private_work_advances_once() {
+        let receipt = |sequence, timestamp| OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 81, sequence },
+            session_id: "restored-owner".into(), session_generation: 1, occupancy_revision: sequence,
+            source_timestamp_ns: timestamp, backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+            backend_generation: 1,
+        };
+        let mut source = CloudMapShmWriter::new_private_for_test().unwrap();
+        source.revision = 69;
+        assert!(source.accumulate_mapping_scan(1, &[Point3::new(0.125, 0.125, 0.125)], None, 100));
+        source.commit_accumulated_snapshot(&receipt(1, 100)).unwrap().unwrap();
+        let sealed = source.committed_fine_cloud().unwrap();
+        let snapshot = source.committed_snapshot().unwrap();
+        let (file, _) = nuwax_map_chunks::archive_file(sealed.manifest(), &sealed.repository).unwrap();
+        let fine = prepare_fine_cloud_archive(file, "restored-owner", 1, 70, 100).unwrap();
+        let mut restored = CloudMapShmWriter::new_private_for_test().unwrap();
+        let committed = restored.install_checkpoint_with_fine(&receipt(2, 100), snapshot.voxel_size,
+            snapshot.point_count, &snapshot.xyz_f32_le, Some(fine)).unwrap();
+        assert_eq!(committed.receipt.cloud_revision, 71);
+        assert_eq!(restored.committed_fine_cloud().unwrap().manifest().geometry_revision, 70);
+        let (ticket, mut work) = restored.prepare_scan_work().unwrap();
+        assert!(work.accumulate_mapping_scan(1, &[Point3::new(0.125, 0.125, 0.125)], None, 101));
+        work.commit_accumulated_snapshot(&receipt(3, 101)).unwrap().unwrap();
+        restored.install_scan_work(ticket, work).unwrap();
+        assert_eq!(restored.last_cloud_receipt().unwrap().cloud_revision, 72);
+    }
+
+    #[test]
+    fn coordinate_rebuild_does_not_admit_an_old_private_scan_as_frame_rehome() {
+        let receipt = |sequence| OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 91, sequence },
+            session_id: "coordinate-owner".into(), session_generation: 1, occupancy_revision: sequence,
+            source_timestamp_ns: sequence, backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+            backend_generation: 1,
+        };
+        let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
+        writer.accumulate_mapping_scan(1, &[Point3::new(0.025, 0.025, 0.025)], None, 1);
+        writer.commit_accumulated_snapshot(&receipt(1)).unwrap().unwrap();
+        let (ticket, mut old_work) = writer.prepare_scan_work().unwrap();
+        old_work.accumulate_mapping_scan(1, &[Point3::new(1.025, 0.025, 0.025)], None, 2);
+        old_work.commit_accumulated_snapshot(&receipt(2)).unwrap().unwrap();
+        let mut rebuilt = CloudMapShmWriter::new_private_for_test().unwrap();
+        rebuilt.accumulate_mapping_scan(1, &[Point3::new(10.025, 0.025, 0.025)], None, 3);
+        writer.bind_fine_map_frame(1).unwrap();
+        assert!(!writer.accepts_prepared_fine_frame_transition(0, 1));
+        writer.install_prepared_accumulator(&receipt(3), rebuilt.take_prepared_accumulator()).unwrap();
+        let current = writer.committed_fine_cloud().unwrap();
+        assert!(writer.install_scan_work(ticket, old_work).is_err());
+        assert!(Arc::ptr_eq(&current, &writer.committed_fine_cloud().unwrap()));
+        assert_eq!(current.manifest().domain.frame_generation, 1);
+    }
+
+    #[test]
+    fn private_fine_candidate_is_not_fetchable_until_installed() {
+        let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
+        let receipt = |sequence, timestamp| OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 55, sequence },
+            session_id: "retained".into(), session_generation: 1, occupancy_revision: sequence,
+            source_timestamp_ns: timestamp, backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+            backend_generation: 1,
+        };
+        assert!(writer.accumulate_mapping_scan(1, &[Point3::new(0.1, 0.1, 0.1)], None, 1));
+        writer.commit_accumulated_snapshot(&receipt(1, 1)).unwrap().unwrap();
+        let old = writer.committed_fine_cloud().unwrap();
+        let old_id = old.manifest().identity();
+        let old_ref = old.manifest().blocks[0].clone();
+        let (ticket, mut work) = writer.prepare_scan_work().unwrap();
+        assert!(writer.pin_fine_map_root(&old_id, &old_ref).is_ok());
+        assert!(work.accumulate_mapping_scan(1, &[Point3::new(0.1, 0.1, 0.1)], None, 2));
+        work.commit_accumulated_snapshot(&receipt(2, 2)).unwrap().unwrap();
+        let next = work.committed_fine_cloud().unwrap();
+        let next_id = next.manifest().identity();
+        let next_ref = next.manifest().blocks[0].clone();
+        assert!(writer.pin_fine_map_root(&next_id, &next_ref).is_err());
+        assert_eq!(writer.last_cloud_receipt().unwrap().cloud_revision, old_id.revision);
+        writer.install_scan_work(ticket, work).unwrap();
+        assert!(writer.pin_fine_map_root(&next_id, &next_ref).is_ok());
+        assert_eq!(next.manifest().geometry_revision, old.manifest().geometry_revision);
+        assert!(next_ref.block_revision > old_ref.block_revision);
+        let mut rebuild = CloudMapShmWriter::new_private_for_test().unwrap();
+        assert!(rebuild.accumulate_mapping_scan(1, &[Point3::new(2.1, 0.1, 0.1)], None, 3));
+        writer.install_prepared_accumulator(&receipt(3, 3), rebuild.take_prepared_accumulator()).unwrap();
+        assert!(writer.pin_fine_map_root(&old_id, &old_ref).is_ok());
+        assert!(writer.pin_fine_map_root(&next_id, &next_ref).is_ok());
+    }
+
+    #[test]
     #[ignore = "run through scripts/check_pointcloud_native_interop.py with a Python mmap peer"]
     fn native_paged_writer_python_reader_interop() {
         use std::io::{self, Write};
@@ -1331,7 +1537,7 @@ mod tests {
         }
         let path = std::path::PathBuf::from(std::env::var_os("NUWAX_CLOUD_PAGE_INTEROP_PATH")
             .expect("Python peer supplies isolated fixture path"));
-        let mut writer = CloudMapShmWriter::new(&path).unwrap();
+        let mut writer = CloudMapShmWriter::new_for_test(&path).unwrap();
         writer.reset_accumulator(1);
         // Binary-exact centers make cross-language byte assertions unambiguous.
         writer.voxel_size = 0.5;
@@ -1364,7 +1570,7 @@ mod tests {
 
     #[test]
     fn paged_commit_and_private_install_reuse_unchanged_bytes() {
-        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
         let points = (0..10000).map(|i| Point3::new(i as f64 * 0.1, 0.0, 0.0)).collect::<Vec<_>>();
         assert!(writer.accumulate_mapping_frame(1, &points));
         writer.commit_accumulated().unwrap();
@@ -1391,7 +1597,7 @@ mod tests {
 
     #[test]
     fn receipt_session_identity_is_never_truncated_or_split() {
-        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
         assert!(writer.accumulate_mapping_frame(1, &[Point3::new(1.0, 0.0, 0.0)]));
         let mut receipt = OccupancyCommitReceipt {
             commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 7, sequence: 1 },
@@ -1410,7 +1616,7 @@ mod tests {
 
     #[test]
     fn shared_snapshot_tracks_commits_and_keeps_old_payload_immutable() {
-        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
         writer.begin_session(1).unwrap();
         let cleared = writer.shared_committed_snapshot().unwrap();
         assert!(cleared.xyz_f32_le.is_empty());
@@ -1445,7 +1651,7 @@ mod tests {
         work.commit_accumulated().unwrap();
         let prepared = work.shared_committed_snapshot().unwrap();
         assert!(Arc::ptr_eq(&first.xyz_f32_le, &writer.shared_committed_snapshot().unwrap().xyz_f32_le));
-        assert!(writer.install_scan_work(uuid::Uuid::new_v4(), CloudMapShmWriter::new_private().unwrap()).is_err());
+        assert!(writer.install_scan_work(uuid::Uuid::new_v4(), CloudMapShmWriter::new_private_for_test().unwrap()).is_err());
         writer.install_scan_work(ticket, work).unwrap();
         let installed = writer.shared_committed_snapshot().unwrap();
         assert!(Arc::ptr_eq(&prepared.xyz_f32_le, &installed.xyz_f32_le));
@@ -1468,7 +1674,7 @@ mod tests {
     #[test]
     #[ignore = "大点云重复读取对照，显式运行并记录耗时"]
     fn committed_snapshot_read_budget() {
-        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
         writer.begin_session(1).unwrap();
         // 使用真实提交入口生成接近共享槽容量的规范载荷。
         let points: Vec<_> = (0..1_300_000).map(|i| Point3::new(
@@ -1503,7 +1709,7 @@ mod tests {
         let limit = std::env::var("NUWAX_DYNAMIC_BENCHMARK_FRAMES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(300);
         let origin: [f64; 3] = serde_json::from_str(&std::env::var("NUWAX_DYNAMIC_SENSOR_ORIGIN_BODY").expect("指定真实雷达机体原点")).unwrap();
         let mut file = std::io::BufReader::new(std::fs::File::open(path).unwrap());
-        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
         let legacy = std::env::var_os("NUWAX_DYNAMIC_BENCHMARK_LEGACY").is_some();
         if legacy {
             writer.reset_accumulator(1);
@@ -1552,7 +1758,7 @@ mod tests {
     #[test]
     fn passing_person_is_live_obstacle_but_not_dense_history_and_survives_save_restore() {
         use crate::dynamic_scene::tests::{corridor, ORIGIN};
-        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
         let mut static_total = 0_u64;
         let mut people_total = 0_u64;
         let mut last_receipt = None;
@@ -1591,14 +1797,14 @@ mod tests {
         eprintln!("完整扫描人体原始={people_total} 剩余={remaining_person} 静态原始={static_total} 保留={remaining_static}");
         assert!(remaining_person * 5 < people_total);
         assert_eq!(remaining_static, static_total);
-        let (mut archive, _, _) = snapshot.archive("map").unwrap();
+        let (mut archive, _) = snapshot.archive("map").unwrap();
         crate::dense_cloud::validate_archive(&mut archive).unwrap();
         let restored = DenseCloud::from_archive(archive, &snapshot.metadata("map")).unwrap();
         let restored = restored.snapshot(&snapshot.receipt, "人员经过").unwrap();
         assert_eq!(restored.point_count, snapshot.point_count);
         assert_eq!(restored.read(0, crate::dense_cloud::CHUNK_POINTS).unwrap(), snapshot.read(0, crate::dense_cloud::CHUNK_POINTS).unwrap());
         let receipt = last_receipt.unwrap();
-        let mut next = CloudMapShmWriter::new_private().unwrap();
+        let mut next = CloudMapShmWriter::new_private_for_test().unwrap();
         next.install_prepared_accumulator(&receipt, writer.take_prepared_accumulator()).unwrap();
         assert_eq!(next.committed_dense_cloud().unwrap().unwrap().point_count, snapshot.point_count);
         assert!(next.accumulate_mapping_scan(2, &corridor(Some(0.0), 0.0).0, Some(ORIGIN), 1));
@@ -1607,7 +1813,7 @@ mod tests {
 
     #[test]
     fn prepared_scan_keeps_previous_dense_reader_until_install() {
-        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
         let first = vec![Point3::new(1.0, 0.0, 0.5), Point3::new(1.2, 0.0, 0.5)];
         assert!(writer.accumulate_mapping_scan(1, &first, None, 100));
         let receipt = |sequence, timestamp| OccupancyCommitReceipt {
@@ -1631,7 +1837,7 @@ mod tests {
 
     #[test]
     fn dense_cloud_follows_commits_rebuilds_and_checkpoint_availability() {
-        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
         let points = vec![Point3::new(0.011, 0.012, 0.013), Point3::new(0.014, 0.012, 0.013)];
         let receipt = OccupancyCommitReceipt {
             commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 17, sequence: 1 },
@@ -1650,7 +1856,7 @@ mod tests {
         assert!(writer.accumulate_mapping_scan(1, &points, None, 200));
         assert_eq!(writer.committed_dense_cloud().unwrap().unwrap().point_count, 2);
 
-        let mut rebuilt = CloudMapShmWriter::new_private().unwrap();
+        let mut rebuilt = CloudMapShmWriter::new_private_for_test().unwrap();
         let corrected = points.iter().map(|p| p + nalgebra::Vector3::new(1., 0., 0.)).collect::<Vec<_>>();
         assert!(rebuilt.accumulate_mapping_scan(1, &corrected, None, 200));
         let receipt2 = OccupancyCommitReceipt { commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 17, sequence: 2 },
@@ -1662,7 +1868,7 @@ mod tests {
         assert_eq!(f32::from_le_bytes(current.read(0, 2).unwrap()[..4].try_into().unwrap()), 1.011_f32);
         assert_eq!(f32::from_le_bytes(dense.read(0, 2).unwrap()[..4].try_into().unwrap()), 0.011_f32);
 
-        let mut legacy = CloudMapShmWriter::new_private().unwrap();
+        let mut legacy = CloudMapShmWriter::new_private_for_test().unwrap();
         legacy.install_checkpoint(&receipt, commit.snapshot.voxel_size, commit.snapshot.point_count, &explicit_checkpoint.xyz_f32_le).unwrap();
         assert!(legacy.accumulate_mapping_scan(1, &points, None, 200));
         legacy.commit_accumulated_snapshot(&receipt2).unwrap().unwrap();
@@ -1675,7 +1881,7 @@ mod tests {
     #[test]
     fn fine_cloud_survives_display_coarsening_and_seals_the_exact_commit() {
         let path = test_path("fine-cloud-coarsening");
-        let mut writer = CloudMapShmWriter::new(&path).unwrap();
+        let mut writer = CloudMapShmWriter::new_for_test(&path).unwrap();
         writer.max_points = 4;
         let points = (0..30).map(|x| Point3::new(f64::from(x) * 0.051, 0.025, 0.175)).collect::<Vec<_>>();
         assert!(writer.accumulate_mapping_scan(1, &points, None, 100));
@@ -1690,7 +1896,8 @@ mod tests {
         assert!(display.snapshot.point_count <= 4);
         let fine = writer.committed_fine_cloud().unwrap();
         let domain = nuwax_map_chunks::Domain { session: "精细源验证".into(), generation: 1, frame_generation: 0, producer_generation: 1 };
-        let root = fine.manifest(domain.clone(), 1).unwrap();
+        let root = fine.manifest();
+        assert_eq!(root.domain, domain);
         assert_eq!(root.voxel_size_m, VOXEL_SIZE);
         assert_eq!(root.points(), 30);
         let mut reader = nuwax_map_chunks::RegionReader::new(fine.repository.clone(), 4 * 1024 * 1024);
@@ -1703,14 +1910,14 @@ mod tests {
             occupancy_revision: 2, source_timestamp_ns: 200, ..first_receipt };
         writer.commit_accumulated_snapshot(&receipt).unwrap().unwrap();
         let next = writer.committed_fine_cloud().unwrap();
-        assert_eq!(next.manifest(domain, 2).unwrap().points(), 31);
+        assert_eq!(next.manifest().points(), 31);
         writer.cleanup_product_owned_file().unwrap();
     }
 
     #[test]
     fn pgo_accumulator_install_preserves_pending_dynamic_evidence() {
-        let mut source = CloudMapShmWriter::new(&test_path("pgo-private-dynamic")).unwrap();
-        let mut target = CloudMapShmWriter::new(&test_path("pgo-installed-dynamic")).unwrap();
+        let mut source = CloudMapShmWriter::new_for_test(&test_path("pgo-private-dynamic")).unwrap();
+        let mut target = CloudMapShmWriter::new_for_test(&test_path("pgo-installed-dynamic")).unwrap();
         let origin = Some([0.025; 3]);
         let person = [Point3::new(2.025, 0.025, 0.025)];
         let background = [Point3::new(4.025, 0.025, 0.025)];
@@ -1744,7 +1951,7 @@ mod tests {
     #[test]
     fn dynamic_cloud_checkpoint_and_session_reset_keep_only_committed_geometry() {
         let path = test_path("dynamic-checkpoint");
-        let mut writer = CloudMapShmWriter::new(&path).unwrap();
+        let mut writer = CloudMapShmWriter::new_for_test(&path).unwrap();
         let origin = Some([0.025; 3]);
         let person = [Point3::new(2.025, 0.025, 0.025)];
         let background = [Point3::new(4.025, 0.025, 0.025)];
@@ -1828,7 +2035,7 @@ mod tests {
     fn product_cleanup_unlinks_owned_cloud_mmap() {
         let path = test_path("owned-cleanup");
         let _ = std::fs::remove_file(&path);
-        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let mut writer = CloudMapShmWriter::new_for_test(&path).expect("cloud map writer");
 
         writer
             .cleanup_product_owned_file()
@@ -1841,7 +2048,7 @@ mod tests {
     fn product_cleanup_rejects_replaced_cloud_mmap() {
         let path = test_path("replaced-cleanup");
         let _ = std::fs::remove_file(&path);
-        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let mut writer = CloudMapShmWriter::new_for_test(&path).expect("cloud map writer");
         std::fs::remove_file(&path).expect("remove owned name");
         std::fs::write(&path, b"foreign replacement").expect("install replacement");
 
@@ -1863,7 +2070,7 @@ mod tests {
     fn product_cleanup_is_idempotent_when_cloud_mmap_is_missing() {
         let path = test_path("missing-cleanup");
         let _ = std::fs::remove_file(&path);
-        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let mut writer = CloudMapShmWriter::new_for_test(&path).expect("cloud map writer");
         std::fs::remove_file(&path).expect("remove owned name");
 
         writer
@@ -1947,7 +2154,7 @@ mod tests {
     #[test]
     fn incremental_frames_advance_the_shared_memory_revision() {
         let path = test_path("mapping-session");
-        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let mut writer = CloudMapShmWriter::new_for_test(&path).expect("cloud map writer");
         let first_frame = [Point3::new(0.0, 0.0, 0.0), Point3::new(0.01, 0.01, 0.01)];
         let second_frame = [Point3::new(1.0, 2.0, 3.0)];
 
@@ -1979,7 +2186,7 @@ mod tests {
     #[test]
     fn begin_session_publishes_one_zero_frame_per_generation() {
         let path = test_path("session-clear");
-        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let mut writer = CloudMapShmWriter::new_for_test(&path).expect("cloud map writer");
 
         let first_clear = writer.begin_session(1).expect("first session clear");
         assert_eq!(first_clear, (1, 0, VOXEL_SIZE));
@@ -2007,7 +2214,7 @@ mod tests {
     #[test]
     fn restored_checkpoint_accepts_later_live_frames() {
         let path = test_path("checkpoint-restore");
-        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let mut writer = CloudMapShmWriter::new_for_test(&path).expect("cloud map writer");
         let occupancy_receipt = OccupancyCommitReceipt {
             commit_id: crate::mapping_commit::MappingCommitId {
                 boot_nonce: 1,
@@ -2044,10 +2251,9 @@ mod tests {
 
         // 激活回执有时间，但没有精细资产的旧点必须保留未知观察时间。
         let fine = writer.committed_fine_cloud().unwrap();
-        let root = fine.manifest(nuwax_map_chunks::Domain {
-            session: occupancy_receipt.session_id.clone(), generation: 7,
-            frame_generation: 0, producer_generation: 1,
-        }, 1).unwrap();
+        let root = fine.manifest();
+        assert_eq!(root.domain.session, occupancy_receipt.session_id);
+        assert_eq!(root.domain.generation, 7);
         let mut reader = nuwax_map_chunks::RegionReader::new(fine.repository.clone(), 1024 * 1024);
         let evidence = reader.region(&root, [-100; 3], [100; 3], 10).unwrap();
         assert_eq!(evidence.len(), 2);
@@ -2066,7 +2272,7 @@ mod tests {
     #[test]
     fn rejected_checkpoint_receipt_does_not_mutate_writer_state() {
         let path = test_path("checkpoint-invalid-receipt");
-        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let mut writer = CloudMapShmWriter::new_for_test(&path).expect("cloud map writer");
         assert!(writer.accumulate_mapping_frame(3, &[Point3::new(0.0, 0.0, 0.0)]));
         let before_revision = writer.revision;
         let before_generation = writer.session_generation;
@@ -2115,7 +2321,7 @@ mod tests {
     #[test]
     fn correlated_cloud_commit_rejects_duplicate_receipts() {
         let path = test_path("receipt-order");
-        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let mut writer = CloudMapShmWriter::new_for_test(&path).expect("cloud map writer");
         assert!(writer.accumulate_mapping_frame(7, &[Point3::new(0.0, 0.0, 0.0)]));
         let first_receipt = OccupancyCommitReceipt {
             commit_id: crate::mapping_commit::MappingCommitId {
@@ -2171,7 +2377,7 @@ mod tests {
     #[test]
     fn session_switch_clears_voxels_without_resetting_revision() {
         let path = test_path("session-switch");
-        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let mut writer = CloudMapShmWriter::new_for_test(&path).expect("cloud map writer");
         assert!(writer.accumulate_mapping_frame(1, &[Point3::new(0.0, 0.0, 0.0)]));
         assert_eq!(writer.commit_accumulated().unwrap().0, 1);
 
@@ -2189,7 +2395,7 @@ mod tests {
     #[test]
     fn snapshots_coarsen_past_two_meters_instead_of_overrunning_the_buffer() {
         let path = test_path("capacity");
-        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let mut writer = CloudMapShmWriter::new_for_test(&path).expect("cloud map writer");
         writer.max_points = 1;
         let points = [
             Point3::new(0.0, 0.0, 0.0),
@@ -2211,7 +2417,7 @@ mod tests {
     #[test]
     fn v3_point_count_and_layout_shrink_with_the_committed_revision() {
         let path = test_path("v2-slot-metadata");
-        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let mut writer = CloudMapShmWriter::new_for_test(&path).expect("cloud map writer");
         let first_session = [
             Point3::new(0.0, 0.0, 0.0),
             Point3::new(1.0, 0.0, 0.0),
@@ -2241,7 +2447,7 @@ mod tests {
     #[test]
     fn oversized_single_frame_does_not_change_writer_state() {
         let path = test_path("single-frame-cap");
-        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let mut writer = CloudMapShmWriter::new_for_test(&path).expect("cloud map writer");
         assert!(writer.accumulate_mapping_frame(1, &[Point3::new(0.0, 0.0, 0.0)]));
         assert_eq!(writer.commit_accumulated().unwrap().0, 1);
         let voxels_before = writer.voxels.clone();

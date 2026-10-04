@@ -187,7 +187,7 @@ impl FineMapReader {
 
 /// The reliable fetch is scoped to a specific root and exact immutable reference.
 /// The RPC object representation intentionally does not reuse serde's archive enum.
-fn block_request(root: &Manifest, reference: &nuwax_map_chunks::BlockRef) -> serde_json::Value {
+pub(super) fn block_request(root: &Manifest, reference: &nuwax_map_chunks::BlockRef) -> serde_json::Value {
     use nuwax_map_chunks::ObjectIdentity;
     let object = match reference.object {
         ObjectIdentity::Assigned(id) => serde_json::json!({
@@ -281,6 +281,106 @@ mod tests {
             lcm_url: String::new(),
         }
     }
+    fn transfer_message(repository: &Repository, root: &Manifest) -> schema::NavigationMap3D {
+        schema::NavigationMap3D {
+            producer_runtime_generation: root.domain.producer_generation as i64,
+            map_frame_generation: root.domain.frame_generation as i64,
+            committed_map: schema::CommittedMapIdentity {
+                session_id: root.domain.session.clone(),
+                session_generation: root.domain.generation as i64,
+                ..Default::default()
+            },
+            fine: Some(Transfer {
+                root: root.encode().unwrap(),
+                included: root.blocks.iter().map(|block| (block.object,
+                    repository.read_object(block.object, MAX_BLOCK_BYTES).unwrap())).collect(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn duplicate_root_still_rejects_conflicting_included_body_without_installing_it() {
+        let repository = Repository::temporary().unwrap();
+        let root = install(&repository, &BTreeSet::from([[0, 0, 0]]), 0.05, 1, None);
+        let mut receiver = FineMapReader::new(String::new()).unwrap();
+        let message = transfer_message(&repository, &root);
+        let committed = receiver.receive(&message).unwrap();
+        assert!(Arc::ptr_eq(&receiver.receive(&message).unwrap(), &committed));
+        let mut conflicting = message.clone();
+        let bytes = conflicting.fine.as_mut().unwrap().included.values_mut().next().unwrap();
+        let mut block = decode_block(bytes).unwrap();
+        block.values_mut().next().unwrap().hits += 1;
+        *bytes = encode_block(&block).unwrap();
+        assert!(receiver.receive(&conflicting).unwrap_err().contains("identity conflicts"));
+        assert!(Arc::ptr_eq(&receiver.receiver.current().unwrap(), &committed));
+        let observations = receiver.observations(&committed, None).unwrap();
+        assert_eq!(observations.get([0, 0, 0]).unwrap().hits, 1);
+    }
+
+    #[test]
+    fn evidence_revision_refreshes_observations_without_dirtying_geometry() {
+        let repository = Repository::temporary().unwrap();
+        let cells = BTreeSet::from([[0, 0, 0], [35, 1, 2]]);
+        let first = install(&repository, &cells, 0.05, 1, None);
+        let second = install(&repository, &cells, 0.05, 2, Some(&first));
+        let mut reader = reader(repository);
+        let old = reader.observations(&first, None).unwrap();
+        let next = reader.observations(&second, Some((&first, &old))).unwrap();
+        assert_eq!(first.geometry_revision, second.geometry_revision);
+        assert!(first.blocks.iter().zip(&second.blocks).all(|(a, b)|
+            a.block_revision < b.block_revision && a.geometry_revision == b.geometry_revision));
+        let (updates, count) = reader.columns(&second, Some(&first), 0.1).unwrap();
+        assert!(updates.is_empty());
+        assert_eq!(count, 0);
+        assert_eq!(old.get([0, 0, 0]).unwrap().observed_ns, 1);
+        assert_eq!(next.get([0, 0, 0]).unwrap().observed_ns, 2);
+        assert_eq!(next.get([0, 0, 0]).unwrap().hits, 2);
+        assert!(!Arc::ptr_eq(&old, &next));
+        assert!(Arc::ptr_eq(&next, &reader.observations(&second, Some((&second, &next))).unwrap()));
+    }
+
+    #[test]
+    fn reliable_block_reply_must_echo_exact_scope_and_bounded_bytes() {
+        let repository = Repository::temporary().unwrap();
+        let root = install(&repository, &BTreeSet::from([[0, 0, 0]]), 0.05, 1, None);
+        let reference = &root.blocks[0];
+        let request = block_request(&root, reference);
+        let bytes = repository.read_object(reference.object, MAX_BLOCK_BYTES).unwrap();
+        let mut response = request.clone();
+        response["data"] = serde_json::json!(bytes);
+        assert_eq!(block_response(&request, &response).unwrap(), bytes);
+        for path in [vec!["root", "revision"], vec!["block", "block_revision"],
+            vec!["block", "geometry_revision"], vec!["block", "points"]]
+        {
+            let mut wrong = response.clone();
+            wrong[path[0]][path[1]] = serde_json::json!(99);
+            assert!(block_response(&request, &wrong).is_err());
+        }
+        let mut wrong = response.clone();
+        wrong["block"]["key"] = serde_json::json!([1, 0, 0]);
+        assert!(block_response(&request, &wrong).is_err());
+        wrong = response.clone();
+        wrong["root"]["domain"]["producer_generation"] = serde_json::json!(99);
+        assert!(block_response(&request, &wrong).is_err());
+        wrong = response.clone();
+        wrong["block"]["object"]["object_id"][0] = serde_json::json!(256);
+        assert!(block_response(&request, &wrong).is_err());
+        for data in [serde_json::json!([-1]), serde_json::json!([256]),
+            serde_json::json!([1.5]), serde_json::json!(["1"]), serde_json::json!("00"),
+            serde_json::json!(vec![0_u8; MAX_BLOCK_BYTES + 1])]
+        {
+            let mut wrong = response.clone();
+            wrong["data"] = data;
+            assert!(block_response(&request, &wrong).is_err());
+        }
+        let legacy = BlockRef { object: ObjectIdentity::Legacy(LegacyAlias([7; 32])), ..reference.clone() };
+        let legacy_request = block_request(&root, &legacy);
+        assert_eq!(legacy_request["block"]["object"]["kind"], 2);
+        assert_eq!(legacy_request["block"]["object"]["object_id"], serde_json::json!([]));
+        assert_eq!(legacy_request["block"]["object"]["legacy_alias"], serde_json::to_value([7_u8; 32]).unwrap());
+    }
+
     fn assert_columns(
         updates: &[nuwax_nav_mls_planner::SurfaceColumnUpdate],
         cells: &BTreeSet<Key>,

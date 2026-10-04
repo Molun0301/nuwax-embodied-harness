@@ -111,6 +111,95 @@ pub struct PlanarPoseSnapshot {
     pub yaw_radians: f64,
 }
 
+/// 仅由首个位姿的预提交路径签发，证明 frame 元数据建立时的真实拥有方。
+/// 私有字段禁止其它模块用任意代次构造跨坐标重置的迁移许可。
+#[derive(Clone, Debug)]
+pub(crate) struct InitialFrameEstablishment {
+    old_frame: u64,
+    new_frame: u64,
+    session_id: String,
+    session_generation: u64,
+    backend_kind: MappingBackendKind,
+    backend_generation: u64,
+    boot_nonce: u128,
+    map_frame_id: String,
+    current_occupancy_receipt: Option<OccupancyCommitReceipt>,
+    prepared_transform: Option<MapOdomTransformSnapshot>,
+}
+
+impl InitialFrameEstablishment {
+    pub(crate) fn old_frame(&self) -> u64 {
+        self.old_frame
+    }
+
+    pub(crate) fn new_frame(&self) -> u64 {
+        self.new_frame
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn session_generation(&self) -> u64 {
+        self.session_generation
+    }
+
+    pub(crate) fn map_frame_id(&self) -> &str {
+        &self.map_frame_id
+    }
+
+    pub(crate) fn current_occupancy_receipt(&self) -> Option<&OccupancyCommitReceipt> {
+        self.current_occupancy_receipt.as_ref()
+    }
+
+    pub(crate) fn prepared_transform(&self) -> Option<&MapOdomTransformSnapshot> {
+        self.prepared_transform.as_ref()
+    }
+
+    /// 私有扫描可在证明签发后取得新提交，但仍须属于同一会话、后端和提交时钟。
+    pub(crate) fn validate_writer_lineage(
+        &self,
+        receipt: &OccupancyCommitReceipt,
+    ) -> Result<(), String> {
+        if receipt.session_id != self.session_id
+            || receipt.session_generation != self.session_generation
+            || receipt.backend_kind != self.backend_kind
+            || receipt.backend_generation != self.backend_generation
+            || receipt.commit_id.boot_nonce != self.boot_nonce
+            || receipt.commit_id.sequence == 0
+            || receipt.occupancy_revision == 0
+        {
+            return Err("initial frame establishment occupancy owner mismatch".to_string());
+        }
+        Ok(())
+    }
+
+    /// 允许同拥有方占据提交领先私有三维扫描，但禁止清空或后端重置后复用旧根。
+    pub(crate) fn validate_writer_baseline(
+        &self,
+        baseline: &OccupancyCommitReceipt,
+    ) -> Result<(), String> {
+        let current = self
+            .current_occupancy_receipt()
+            .ok_or("initial frame establishment has no current occupancy receipt")?;
+        for receipt in [current, baseline] {
+            self.validate_writer_lineage(receipt)?;
+        }
+        if current.commit_id.sequence < baseline.commit_id.sequence
+            || current.occupancy_revision < baseline.occupancy_revision
+        {
+            return Err("initial frame establishment occupancy receipt is stale".to_string());
+        }
+        if (current.commit_id.sequence == baseline.commit_id.sequence
+            || current.occupancy_revision == baseline.occupancy_revision)
+            && current != baseline
+        {
+            return Err("initial frame establishment occupancy identity conflicts".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// mapping session 固定的 `map <- odom` 刚体变换与最新 map 位姿。
 ///
 /// 首个有效 odom pose `T_odom_base(0)` 建立
@@ -3307,6 +3396,23 @@ impl MappingAdapter {
         yaw_radians: f64,
         frame_id: &str,
     ) -> Result<PlanarPoseSnapshot, nuwax_mapping::SessionError> {
+        self.feed_pose_in_frame_with_frame_transition(x, y, z, yaw_radians, frame_id, |_| Ok(()))
+    }
+
+    /// 先完整准备位姿与锚点，再让调用方原子迁移真实 frame 拥有方。
+    ///
+    /// 回调仅在 frame 代次前进时执行，且早于 adapter、session 与变换缓存写入。
+    /// 回调失败时保留所有原状态；成功后仅提交已准备的值，不再执行可失败步骤。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn feed_pose_in_frame_with_frame_transition(
+        &mut self,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw_radians: f64,
+        frame_id: &str,
+        before_transition: impl FnOnce(InitialFrameEstablishment) -> Result<(), String>,
+    ) -> Result<PlanarPoseSnapshot, nuwax_mapping::SessionError> {
         let source_frame_id = normalize_frame_id(frame_id);
         if !self.is_active() {
             return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
@@ -3326,50 +3432,111 @@ impl MappingAdapter {
             position: [x, y, z],
             yaw_radians: normalize_yaw(yaw_radians),
         };
-        let map_pose = if source_frame_id == self.map_frame_id {
-            if !self.global_frame_established {
-                self.frame_generation = self.frame_generation.saturating_add(1).max(1);
-                self.global_frame_established = true;
-            }
-            source_pose
-        } else if source_frame_id == self.odom_frame_id {
-            if self.map_odom_transform.is_none() {
-                if self.global_frame_established {
-                    return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
-                        source_frame_id,
-                        target_frame_id: self.map_frame_id.clone(),
-                        reason: "session already uses direct map input; reset before establishing an odom anchor"
-                            .to_string(),
-                    });
-                }
-                self.frame_generation = self.frame_generation.saturating_add(1).max(1);
-                self.global_frame_established = true;
-                self.map_odom_transform = Some(MapOdomTransformSnapshot::from_anchor(
-                    &self.map_frame_id,
-                    &self.odom_frame_id,
-                    source_pose,
-                    self.frame_generation,
-                ));
-            }
-            let transform = self
-                .map_odom_transform
-                .as_ref()
-                .expect("odom anchor was initialized above");
-            transform.transform_pose(source_pose)
-        } else {
+        let is_map_frame = source_frame_id == self.map_frame_id;
+        let is_odom_frame = source_frame_id == self.odom_frame_id;
+        if !is_map_frame && !is_odom_frame {
             return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
                 source_frame_id,
                 target_frame_id: self.map_frame_id.clone(),
                 reason: "pose frame is neither configured map nor odom".to_string(),
             });
+        }
+        let needs_anchor = !is_map_frame && self.map_odom_transform.is_none();
+        if needs_anchor && self.global_frame_established {
+            return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id,
+                target_frame_id: self.map_frame_id.clone(),
+                reason: "session already uses direct map input; reset before establishing an odom anchor"
+                    .to_string(),
+            });
+        }
+        let frame_transition = (is_map_frame && !self.global_frame_established) || needs_anchor;
+        let next_frame_generation = if frame_transition {
+            self.frame_generation.checked_add(1).ok_or_else(|| {
+                nuwax_mapping::SessionError::FrameTransformUnavailable {
+                    source_frame_id: source_frame_id.clone(),
+                    target_frame_id: self.map_frame_id.clone(),
+                    reason: "map frame generation exhausted".to_string(),
+                }
+            })?
+        } else {
+            self.frame_generation
         };
-        if let Some(transform) = self.map_odom_transform.as_mut() {
+        let mut next_transform = if needs_anchor {
+            Some(MapOdomTransformSnapshot::from_anchor(
+                &self.map_frame_id,
+                &self.odom_frame_id,
+                source_pose,
+                next_frame_generation,
+            ))
+        } else {
+            self.map_odom_transform.clone()
+        };
+        if next_transform.as_ref().is_some_and(|transform| {
+            !transform.translation.iter().all(|value| value.is_finite())
+                || !transform.yaw_radians.is_finite()
+                || !transform
+                    .effective_isometry()
+                    .to_homogeneous()
+                    .iter()
+                    .all(|value| value.is_finite())
+        }) {
+            return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id,
+                target_frame_id: self.map_frame_id.clone(),
+                reason: "pose requires a non-finite map/odom transform".to_string(),
+            });
+        }
+        let map_pose = if is_map_frame {
+            source_pose
+        } else {
+            next_transform
+                .as_ref()
+                .expect("odom anchor was prepared above")
+                .transform_pose(source_pose)
+        };
+        if !map_pose.position.iter().all(|value| value.is_finite())
+            || !map_pose.yaw_radians.is_finite()
+        {
+            return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id,
+                target_frame_id: self.map_frame_id.clone(),
+                reason: "transformed pose contains a non-finite position or yaw".to_string(),
+            });
+        }
+        if let Some(transform) = next_transform.as_mut() {
             transform.latest_map_pose = map_pose;
-            if source_frame_id == self.odom_frame_id {
+            if is_odom_frame {
                 transform.latest_odom_pose = source_pose;
             }
         }
-        *self.map_odom_transform_cache.write() = self.map_odom_transform.clone();
+        let next_cached_transform = next_transform.clone();
+        if frame_transition {
+            let establishment = InitialFrameEstablishment {
+                old_frame: self.frame_generation,
+                new_frame: next_frame_generation,
+                session_id: self.lifecycle.session_id.clone(),
+                session_generation: self.lifecycle.session_generation,
+                backend_kind: self.mapping_backend.kind(),
+                backend_generation: self.backend_generation,
+                boot_nonce: self.commit_clock.boot_nonce(),
+                map_frame_id: self.map_frame_id.clone(),
+                current_occupancy_receipt: self.last_occupancy_commit_receipt.clone(),
+                prepared_transform: next_transform.clone(),
+            };
+            before_transition(establishment).map_err(|reason| {
+                nuwax_mapping::SessionError::FrameTransformUnavailable {
+                    source_frame_id,
+                    target_frame_id: self.map_frame_id.clone(),
+                    reason,
+                }
+            })?;
+        }
+
+        self.frame_generation = next_frame_generation;
+        self.global_frame_established |= frame_transition;
+        self.map_odom_transform = next_transform;
+        *self.map_odom_transform_cache.write() = next_cached_transform;
         self.last_sensor_origin = map_pose.position;
         self.session.feed_pose(
             map_pose.position[0],
@@ -3404,6 +3571,10 @@ impl MappingAdapter {
     /// Canonical map frame fixed by the runtime's validated startup bindings.
     pub(crate) fn configured_map_frame_id(&self) -> &str {
         &self.map_frame_id
+    }
+
+    pub(crate) fn configured_odom_frame_id(&self) -> &str {
+        &self.odom_frame_id
     }
 
     /// Move out the most recent accepted frame after it has been transformed
@@ -4148,6 +4319,9 @@ mod tests {
         cached_transform: Option<MapOdomTransformSnapshot>,
         frame_generation: u64,
         global_frame_established: bool,
+        last_sensor_origin: [f64; 3],
+        backend_generation: u64,
+        occupancy_receipt: Option<OccupancyCommitReceipt>,
         has_data: bool,
         odom_count: u64,
         pointcloud_count: u64,
@@ -4164,6 +4338,9 @@ mod tests {
             cached_transform: adapter.map_odom_transform_cache.read().clone(),
             frame_generation: adapter.frame_generation,
             global_frame_established: adapter.global_frame_established,
+            last_sensor_origin: adapter.last_sensor_origin,
+            backend_generation: adapter.backend_generation,
+            occupancy_receipt: adapter.latest_occupancy_commit_receipt(),
             has_data: adapter.has_data,
             odom_count: adapter.odom_count,
             pointcloud_count: adapter.pointcloud_count,
@@ -4186,6 +4363,21 @@ mod tests {
             nuwax_mapping::SessionError::FrameTransformUnavailable { reason, .. } => reason,
             other => panic!("unexpected registration error: {other}"),
         }
+    }
+
+    fn capture_initial_frame_establishment(
+        adapter: &mut MappingAdapter,
+    ) -> InitialFrameEstablishment {
+        let before = registration_state(adapter);
+        let mut captured = None;
+        adapter
+            .feed_pose_in_frame_with_frame_transition(4.0, 2.0, 1.0, 0.0, "odom", |proof| {
+                captured = Some(proof);
+                Err("capture proof without committing frame transition".to_string())
+            })
+            .expect_err("proof capture rejects the transition");
+        assert_eq!(registration_state(adapter), before);
+        captured.expect("first validated pose mints an establishment proof")
     }
 
     fn grid_cell_at_world(grid: &OccupancyGrid, x: f64, y: f64) -> i8 {
@@ -4279,6 +4471,309 @@ mod tests {
             .expect("first odom pose establishes an anchor");
         assert_eq!(transform.translation, [-1.0, -2.0, 0.0]);
         assert_eq!(transform.latest_map_pose.position, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn first_pose_frame_transition_runs_once_before_transform_cache_publication() {
+        for frame_id in ["odom", "map"] {
+            let mut adapter = active_adapter(sample_config());
+            let cache = adapter.map_odom_transform_cache();
+            let old_frame = adapter.global_frame_generation();
+            let session = adapter.snapshot();
+            let mut transitions = Vec::new();
+            let mut prepared_transform = None;
+            let pose = adapter
+                .feed_pose_in_frame_with_frame_transition(
+                    4.0,
+                    2.0,
+                    1.0,
+                    0.0,
+                    frame_id,
+                    |establishment| {
+                        assert!(cache.read().is_none());
+                        assert_eq!(establishment.session_id(), session.session_id);
+                        assert_eq!(
+                            establishment.session_generation(),
+                            session.session_generation
+                        );
+                        assert_eq!(establishment.map_frame_id(), "map");
+                        assert!(establishment.current_occupancy_receipt().is_none());
+                        prepared_transform = establishment.prepared_transform().cloned();
+                        transitions.push((establishment.old_frame(), establishment.new_frame()));
+                        Ok(())
+                    },
+                )
+                .expect("first pose commits after owner transition");
+
+            assert_eq!(transitions, vec![(old_frame, old_frame + 1)]);
+            assert_eq!(adapter.global_frame_generation(), old_frame + 1);
+            assert!(adapter.global_frame_established);
+            assert_eq!(adapter.odom_count(), 1);
+            assert_eq!(adapter.last_sensor_origin, pose.position);
+            assert_eq!(adapter.session.last_pose(), pose.position);
+            assert_eq!(*cache.read(), adapter.map_odom_transform_snapshot());
+            assert_eq!(prepared_transform, adapter.map_odom_transform_snapshot());
+            if frame_id == "odom" {
+                assert_eq!(pose.position, [0.0, 0.0, 0.0]);
+                let transform = cache.read().clone().expect("real odom anchor");
+                assert_eq!(transform.generation, old_frame + 1);
+                assert_eq!(transform.anchor_odom_pose.position, [4.0, 2.0, 1.0]);
+            } else {
+                assert_eq!(pose.position, [4.0, 2.0, 1.0]);
+                assert!(cache.read().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn pose_frame_transition_failure_preserves_adapter_session_and_cache() {
+        for frame_id in ["odom", "map"] {
+            let mut adapter = active_adapter(sample_config());
+            let before = registration_state(&adapter);
+            let mut calls = 0;
+            let error = adapter
+                .feed_pose_in_frame_with_frame_transition(
+                    4.0,
+                    2.0,
+                    1.0,
+                    0.25,
+                    frame_id,
+                    |establishment| {
+                        calls += 1;
+                        assert_eq!(
+                            (establishment.old_frame(), establishment.new_frame()),
+                            (before.frame_generation, before.frame_generation + 1)
+                        );
+                        Err("fine-map owner transition rejected".to_string())
+                    },
+                )
+                .expect_err("owner rejection must abort the pose");
+
+            assert_eq!(calls, 1);
+            assert_eq!(registration_state(&adapter), before);
+            assert!(matches!(
+                error,
+                nuwax_mapping::SessionError::FrameTransformUnavailable { reason, .. }
+                    if reason == "fine-map owner transition rejected"
+            ));
+            adapter
+                .feed_pose_in_frame(4.0, 2.0, 1.0, 0.25, frame_id)
+                .expect("rejected transition does not consume its frame generation");
+            assert_eq!(adapter.global_frame_generation(), before.frame_generation + 1);
+            assert_eq!(adapter.odom_count(), 1);
+        }
+    }
+
+    #[test]
+    fn invalid_pose_never_invokes_frame_transition_or_mutates_state() {
+        let mut adapter = active_adapter(sample_config());
+        for (x, y, z, yaw, frame_id) in [
+            (f64::NAN, 0.0, 0.0, 0.0, "odom"),
+            (0.0, f64::INFINITY, 0.0, 0.0, "map"),
+            (0.0, 0.0, f64::NEG_INFINITY, 0.0, "odom"),
+            (0.0, 0.0, 0.0, f64::NAN, "map"),
+            (0.0, 0.0, 0.0, 0.0, "lidar_link"),
+            (
+                f64::MAX,
+                f64::MAX,
+                0.0,
+                std::f64::consts::FRAC_PI_4,
+                "odom",
+            ),
+        ] {
+            let before = registration_state(&adapter);
+            adapter
+                .feed_pose_in_frame_with_frame_transition(x, y, z, yaw, frame_id, |_| {
+                    panic!("invalid pose must not transition its owner")
+                })
+                .expect_err("invalid source or overflowing anchor must fail closed");
+            assert_eq!(registration_state(&adapter), before);
+        }
+    }
+
+    #[test]
+    fn inactive_or_conflicting_pose_never_invokes_frame_transition() {
+        let mut adapter = MappingAdapter::new(sample_config());
+        let before = registration_state(&adapter);
+        adapter
+            .feed_pose_in_frame_with_frame_transition(1.0, 2.0, 3.0, 0.0, "odom", |_| {
+                panic!("inactive pose must not transition its owner")
+            })
+            .expect_err("inactive session");
+        assert_eq!(registration_state(&adapter), before);
+
+        adapter.start_session("test-session", "test-map").unwrap();
+        adapter
+            .feed_pose_in_frame(1.0, 2.0, 3.0, 0.0, "map")
+            .unwrap();
+        let before = registration_state(&adapter);
+        adapter
+            .feed_pose_in_frame_with_frame_transition(1.0, 2.0, 3.0, 0.0, "odom", |_| {
+                panic!("conflicting anchor must not transition its owner")
+            })
+            .expect_err("direct map input cannot acquire a later odom anchor");
+        assert_eq!(registration_state(&adapter), before);
+    }
+
+    #[test]
+    fn repeated_pose_updates_session_and_cache_without_frame_transition() {
+        for frame_id in ["odom", "map"] {
+            let mut adapter = active_adapter(sample_config());
+            adapter
+                .feed_pose_in_frame(4.0, 2.0, 1.0, 0.0, frame_id)
+                .unwrap();
+            let frame_generation = adapter.global_frame_generation();
+            let pose = adapter
+                .feed_pose_in_frame_with_frame_transition(5.0, 3.0, 2.0, 0.25, frame_id, |_| {
+                    panic!("established frame must not transition its owner again")
+                })
+                .expect("subsequent pose in established frame");
+
+            assert_eq!(adapter.global_frame_generation(), frame_generation);
+            assert_eq!(adapter.odom_count(), 2);
+            assert_eq!(adapter.last_sensor_origin, pose.position);
+            assert_eq!(adapter.session.last_pose(), pose.position);
+            assert_eq!(
+                *adapter.map_odom_transform_cache.read(),
+                adapter.map_odom_transform_snapshot()
+            );
+            if frame_id == "odom" {
+                assert_eq!(pose.position, [1.0, 1.0, 1.0]);
+                let transform = adapter.map_odom_transform_snapshot().unwrap();
+                assert_eq!(transform.latest_map_pose, pose);
+                assert_eq!(transform.latest_odom_pose.position, [5.0, 3.0, 2.0]);
+                assert_eq!(transform.anchor_odom_pose.position, [4.0, 2.0, 1.0]);
+            } else {
+                assert_eq!(pose.position, [5.0, 3.0, 2.0]);
+            }
+        }
+    }
+
+    #[test]
+    fn transformed_pose_overflow_preserves_existing_anchor_and_session() {
+        let mut adapter = active_adapter(sample_config());
+        adapter
+            .feed_pose_in_frame(-f64::MAX, 0.0, 0.0, 0.0, "odom")
+            .unwrap();
+        let before = registration_state(&adapter);
+        adapter
+            .feed_pose_in_frame_with_frame_transition(f64::MAX, 0.0, 0.0, 0.0, "odom", |_| {
+                panic!("overflowing pose must not transition its owner")
+            })
+            .expect_err("transformed position must remain finite");
+        assert_eq!(registration_state(&adapter), before);
+    }
+
+    #[test]
+    fn exhausted_frame_generation_rejects_pose_without_callback_or_mutation() {
+        for frame_id in ["odom", "map"] {
+            let mut adapter = active_adapter(sample_config());
+            adapter.frame_generation = u64::MAX;
+            let before = registration_state(&adapter);
+            let error = adapter
+                .feed_pose_in_frame_with_frame_transition(4.0, 2.0, 1.0, 0.0, frame_id, |_| {
+                    panic!("exhausted frame clock must not transition its owner")
+                })
+                .expect_err("frame generation must not be reused after exhaustion");
+            assert!(matches!(
+                error,
+                nuwax_mapping::SessionError::FrameTransformUnavailable { reason, .. }
+                    if reason == "map frame generation exhausted"
+            ));
+            assert_eq!(registration_state(&adapter), before);
+        }
+    }
+
+    #[test]
+    fn initial_frame_proof_accepts_exact_and_ahead_same_owner_occupancy() {
+        let mut adapter = active_adapter(sample_config());
+        let empty = capture_initial_frame_establishment(&mut adapter);
+        assert!(empty.current_occupancy_receipt().is_none());
+        let checkpoint = OccupancyGrid::with_frame(2, 2, 0.1, "map");
+        adapter.install_checkpoint(checkpoint.clone(), 10, 0).unwrap();
+        let baseline = adapter.latest_occupancy_commit_receipt().unwrap();
+        empty.validate_writer_lineage(&baseline).unwrap();
+        assert!(empty.validate_writer_baseline(&baseline).is_err());
+        let exact = capture_initial_frame_establishment(&mut adapter);
+        exact.validate_writer_baseline(&baseline).unwrap();
+        assert_eq!(exact.current_occupancy_receipt(), Some(&baseline));
+
+        adapter.install_checkpoint(checkpoint, 11, 0).unwrap();
+        let current = adapter.latest_occupancy_commit_receipt().unwrap();
+        assert!(current.commit_id.sequence > baseline.commit_id.sequence);
+        assert!(current.occupancy_revision > baseline.occupancy_revision);
+        let ahead = capture_initial_frame_establishment(&mut adapter);
+        ahead.validate_writer_baseline(&baseline).unwrap();
+        ahead.validate_writer_baseline(&current).unwrap();
+        assert_eq!(ahead.current_occupancy_receipt(), Some(&current));
+        assert!(exact.validate_writer_baseline(&current).is_err());
+        exact.validate_writer_lineage(&current).unwrap();
+    }
+
+    #[test]
+    fn initial_frame_proof_rejects_foreign_or_conflicting_receipt_identity() {
+        let mut adapter = active_adapter(sample_config());
+        adapter
+            .install_checkpoint(OccupancyGrid::with_frame(2, 2, 0.1, "map"), 10, 0)
+            .unwrap();
+        let baseline = adapter.latest_occupancy_commit_receipt().unwrap();
+        let proof = capture_initial_frame_establishment(&mut adapter);
+        for field in 0..8 {
+            let mut foreign = baseline.clone();
+            match field {
+                0 => foreign.session_id.push_str("-foreign"),
+                1 => foreign.session_generation += 1,
+                2 => foreign.backend_generation += 1,
+                3 => foreign.commit_id.boot_nonce ^= 1,
+                4 => foreign.commit_id.sequence = 0,
+                5 => foreign.occupancy_revision = 0,
+                6 => foreign.source_timestamp_ns += 1,
+                7 => {
+                    foreign.backend_kind = if baseline.backend_kind == MappingBackendKind::Voxel {
+                        MappingBackendKind::Raytracing
+                    } else {
+                        MappingBackendKind::Voxel
+                    };
+                }
+                _ => unreachable!(),
+            }
+            assert!(proof.validate_writer_baseline(&foreign).is_err());
+            if field != 6 {
+                assert!(proof.validate_writer_lineage(&foreign).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn same_session_reset_proof_cannot_rehome_old_writer_baseline() {
+        let mut adapter = active_adapter(sample_config());
+        let checkpoint = OccupancyGrid::with_frame(2, 2, 0.1, "map");
+        adapter.install_checkpoint(checkpoint.clone(), 10, 0).unwrap();
+        let baseline = adapter.latest_occupancy_commit_receipt().unwrap();
+        adapter
+            .feed_pose_in_frame(4.0, 2.0, 1.0, 0.0, "odom")
+            .unwrap();
+        let session = adapter.snapshot();
+        adapter.reset_accumulator();
+        assert_eq!(adapter.snapshot().session_id, session.session_id);
+        assert_eq!(
+            adapter.snapshot().session_generation,
+            session.session_generation
+        );
+
+        let cleared = capture_initial_frame_establishment(&mut adapter);
+        assert!(cleared.current_occupancy_receipt().is_none());
+        assert!(cleared.validate_writer_baseline(&baseline).is_err());
+        assert!(cleared.validate_writer_lineage(&baseline).is_err());
+
+        adapter.install_checkpoint(checkpoint, 11, 0).unwrap();
+        let replacement = adapter.latest_occupancy_commit_receipt().unwrap();
+        assert!(replacement.backend_generation > baseline.backend_generation);
+        assert!(replacement.commit_id.sequence > baseline.commit_id.sequence);
+        let reset = capture_initial_frame_establishment(&mut adapter);
+        assert!(reset.validate_writer_baseline(&baseline).is_err());
+        assert!(reset.validate_writer_lineage(&baseline).is_err());
+        reset.validate_writer_baseline(&replacement).unwrap();
     }
 
     #[test]

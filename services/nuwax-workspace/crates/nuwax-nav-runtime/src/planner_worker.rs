@@ -23,11 +23,41 @@ struct Inputs {
     applied_version: u64,
     result: Option<(std::time::Instant, PlannerStep)>,
     result_pose_version: u64,
+    result_applied_version: u64,
     result_map_version: u64,
     result_boundary_version: u64,
     result_wait_reason: Option<String>,
     display_path: Vec<[f64; 3]>,
     closed: bool,
+}
+
+// Only timestamps may advance without changing pose-derived authority. Preserve
+// signed-zero distinctions too: geometric projections can branch on their bits.
+fn same_pose(a: &PoseStamped, b: &PoseStamped) -> bool {
+    fn bits(pose: &PoseStamped) -> [u64; 7] {
+        let p = pose.pose.position;
+        let q = pose.pose.orientation;
+        [p.x, p.y, p.z, q.x, q.y, q.z, q.w].map(f64::to_bits)
+    }
+    a.frame_id == b.frame_id && bits(a) == bits(b)
+}
+
+// An already computed success records a guard-valid arrival event. Requalifying
+// that event within the original strict goal region does NOT validate the latest
+// body footprint and never grants motion. Source/path/goal/applied fences still
+// apply; Pending and negative outcomes cannot become success through this check.
+fn arrival_event_still_in_goal(input: &Inputs) -> bool {
+    let (Some(pose), Some((goal, options)), Some(path)) =
+        (&input.pose, &input.goal, &input.path) else { return false; };
+    if input.map.is_none() || validate_map_pose(pose, "odometry").is_err()
+        || validate_map_pose(goal, "goal_pose").is_err()
+        || !same_pose(goal, &path.2) {
+        return false;
+    }
+    let yaw = nuwax_nav_astar::controllers::angle_diff(
+        goal.pose.orientation.yaw(), pose.pose.orientation.yaw()).abs();
+    pose.pose.position.distance(goal.pose.position) < options.position_tolerance_m
+        && (!options.requires_orientation() || yaw < options.yaw_tolerance_rad)
 }
 
 /// 计算线程没有运动端，结果须经原调度器核对目标身份再执行。
@@ -151,11 +181,14 @@ impl PlannerWorker {
                         && input.applied_version == applied_seq
                         && input.map_version == map_seq
                         && input.boundary_version == boundary_seq
+                        && (!matches!(computed, PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
+                            || input.pose_version == pose_seq)
                         && !input.closed;
                     // 换目标、换路径、取消或来源撤销后的迟到结果一律退休。
                     if current {
                         input.result = Some((started, computed));
                         input.result_pose_version = pose_seq;
+                        input.result_applied_version = applied_seq;
                         input.result_map_version = map_seq;
                         input.result_boundary_version = boundary_seq;
                         input.result_wait_reason = wait_reason;
@@ -231,7 +264,7 @@ impl NavPlanner for PlannerWorker {
     fn update_odometry(&mut self, pose: PoseStamped) {
         let mut input = self.shared.0.lock().unwrap();
         if input.pose.as_ref().is_none_or(|previous|
-            previous.pose != pose.pose || previous.frame_id != pose.frame_id)
+            !same_pose(previous, &pose))
         {
             input.pose_version += 1;
         }
@@ -280,12 +313,18 @@ impl NavPlanner for PlannerWorker {
         let expired = input.result.as_ref().is_some_and(|(started, step)|
             matches!(step, PlannerStep::Command(_)) && started.elapsed() > DEFAULT_CONTROL_HORIZON);
         let arrival_changed = input.result.as_ref().is_some_and(|(_, step)|
-            matches!(step, PlannerStep::Succeeded) && input.result_pose_version != input.pose_version);
+            matches!(step, PlannerStep::Succeeded) && input.result_pose_version != input.pose_version
+                && !arrival_event_still_in_goal(&input));
+        let terminal_changed = input.result.as_ref().is_some_and(|(_, step)|
+            (matches!(step, PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
+                && input.result_pose_version != input.pose_version)
+            || (matches!(step, PlannerStep::Succeeded | PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
+                && input.result_applied_version != input.applied_version));
         // A stored result authorizes only the exact map and boundary it consumed.
         let source_changed = input.result.is_some()
             && (input.result_map_version != input.map_version
                 || input.result_boundary_version != input.boundary_version);
-        if input.result.is_none() || expired || arrival_changed || source_changed {
+        if input.result.is_none() || expired || arrival_changed || terminal_changed || source_changed {
             input.requested = Some(width);
             self.shared.1.notify_one();
         }
@@ -294,7 +333,7 @@ impl NavPlanner for PlannerWorker {
         let ready = input
             .result
             .as_ref()
-            .filter(|_| !source_changed)
+            .filter(|_| !source_changed && !terminal_changed)
             .filter(|(started, step)| {
                 // 时效窗约束速度许可；失败、重规划及到达只触发原调度器归零，
                 // 不能因计算慢而把这些结论吞成永远运行中的零速度。
@@ -307,6 +346,8 @@ impl NavPlanner for PlannerWorker {
             .map(|(_, step)| step.clone());
         self.wait_reason = if ready.is_some() { input.result_wait_reason.clone() } else if arrival_changed {
             Some("位姿已更新，保持零速并重新核对到达状态".into())
+        } else if terminal_changed {
+            Some("位姿或执行回执已更新，保持零速并重新计算".into())
         } else if source_changed {
             Some("地图或边界已更新，保持零速并重新计算".into())
         } else if expired {
@@ -891,6 +932,202 @@ mod tests {
         assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()),
             "传播慢查询结论不能延长速度许可");
         assert!(worker.execution_wait_reason().unwrap().contains("过期"));
+    }
+
+    // Both entry and completion are channel-controlled; no sleeps determine races.
+    struct TerminalPlanner {
+        started: std::sync::mpsc::Sender<()>,
+        outcome: std::sync::mpsc::Receiver<PlannerStep>,
+    }
+    impl NavPlanner for TerminalPlanner {
+        fn replace_path(&mut self, _: Path2D) {}
+        fn update_odometry(&mut self, _: PoseStamped) {}
+        fn update_costmap(&mut self, _: CostMap2D) {}
+        fn step(&mut self, _: f64) -> PlannerStep {
+            let _ = self.started.send(());
+            self.outcome.recv_timeout(Duration::from_secs(5))
+                .unwrap_or(PlannerStep::Pending(Vec::new()))
+        }
+        fn stop(&mut self) {}
+    }
+    fn terminal_worker() -> (PlannerWorker, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<PlannerStep>) {
+        let (started, receive) = std::sync::mpsc::channel();
+        let (send, outcome) = std::sync::mpsc::channel();
+        (PlannerWorker::new(TerminalPlanner { started, outcome }).unwrap(), receive, send)
+    }
+    #[test]
+    fn pose_only_update_retires_inflight_negative_and_accepts_current_failure() {
+        for negative in [PlannerStep::ReplanRequired("old pose".into()), PlannerStep::Failed("old pose".into())] {
+            let (mut worker, started, finish) = terminal_worker();
+            worker.update_odometry(route_pose(0.5, 0));
+            worker.step(0.3);
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            worker.update_odometry(route_pose(0.500001, 1));
+            worker.step(0.3); // Queue a current-pose computation before releasing the old one.
+            finish.send(negative.clone()).unwrap();
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(worker.shared.0.lock().unwrap().result.is_none(), "old-pose terminal was published");
+            finish.send(negative.clone()).unwrap();
+            wait_for_source_result(&worker);
+            assert_eq!(worker.step(0.3), negative, "a genuine current failure must stay authoritative");
+            worker.stop();
+        }
+    }
+    #[test]
+    fn stored_negative_requires_exact_pose_but_not_same_timestamp() {
+        for negative in [PlannerStep::ReplanRequired("pose".into()), PlannerStep::Failed("pose".into())] {
+            let (mut worker, started, finish) = terminal_worker();
+            let mut pose = route_pose(0.0, 0);
+            worker.update_odometry(pose.clone());
+            worker.step(0.3);
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            finish.send(negative.clone()).unwrap();
+            wait_for_source_result(&worker);
+            pose.stamp.nanos += 1;
+            worker.update_odometry(pose.clone());
+            assert_eq!(worker.step(0.3), negative);
+            pose.pose.position.x = -0.0;
+            worker.update_odometry(pose);
+            assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
+            worker.stop();
+            let _ = finish.send(PlannerStep::Pending(Vec::new()));
+        }
+    }
+    #[test]
+    fn pose_only_motion_preserves_inflight_and_stored_velocity_inside_original_horizon() {
+        let (mut worker, started, finish) = terminal_worker();
+        worker.update_odometry(route_pose(0.5, 0));
+        worker.step(0.3);
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.update_odometry(route_pose(0.500001, 1));
+        let command = PlannerStep::Command(Twist2 {
+            linear: nuwax_nav_types_messages::Point2::new(0.1, 0.0), angular_z: 0.0,
+        });
+        finish.send(command.clone()).unwrap();
+        wait_for_source_result(&worker);
+        assert_eq!(worker.step(0.3), command, "pose movement cannot retire a computed velocity candidate");
+        worker.update_odometry(route_pose(0.500002, 2));
+        assert_eq!(worker.step(0.3), command, "stored velocity keeps its original prediction horizon");
+        {
+            let mut input = worker.shared.0.lock().unwrap();
+            input.result.as_mut().unwrap().0 = std::time::Instant::now() - DEFAULT_CONTROL_HORIZON;
+        }
+        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
+        worker.stop();
+        let _ = finish.send(PlannerStep::Pending(Vec::new()));
+    }
+
+    #[test]
+    fn repeated_identical_invalid_pose_preserves_current_failure() {
+        let (mut worker, started, finish) = terminal_worker();
+        let mut invalid = route_pose(0.0, 0);
+        invalid.pose.position.x = f64::NAN;
+        worker.update_odometry(invalid.clone());
+        worker.step(0.3);
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let failed = PlannerStep::Failed("invalid pose".into());
+        worker.update_odometry(invalid);
+        finish.send(failed.clone()).unwrap();
+        wait_for_source_result(&worker);
+        assert_eq!(worker.step(0.3), failed);
+    }
+    #[test]
+    fn stored_terminal_results_require_current_applied_state_but_commands_do_not() {
+        let (mut worker, started, finish) = terminal_worker();
+        worker.step(0.3);
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        for outcome in [PlannerStep::Succeeded, PlannerStep::Failed("old applied".into()),
+            PlannerStep::ReplanRequired("old applied".into()), PlannerStep::Command(Twist2::ZERO)] {
+            {
+                let mut input = worker.shared.0.lock().unwrap();
+                input.result = Some((std::time::Instant::now(), outcome.clone()));
+                input.result_applied_version = input.applied_version;
+                input.applied_version += 1;
+            }
+            if matches!(outcome, PlannerStep::Command(_)) {
+                worker.update_odometry(route_pose(0.500001, 1));
+            }
+            assert_eq!(worker.step(0.3), if matches!(outcome, PlannerStep::Command(_)) {
+                outcome
+            } else { PlannerStep::Pending(Vec::new()) });
+        }
+        worker.stop();
+        finish.send(PlannerStep::Pending(Vec::new())).unwrap();
+    }
+
+    #[test]
+    fn arrival_event_requalification_preserves_strict_region_and_lifecycle_fences() {
+        // Keep the real compute thread gated while independently testing retrieval.
+        let (mut worker, started, finish) = terminal_worker();
+        worker.step(0.3);
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let goal = route_pose(0.0, 0);
+        let options = GoalOptions { position_tolerance_m: 0.25, yaw_tolerance_rad: 0.25, ..Default::default() };
+        let path = ExecutionPath::Surface(Path3D { poses: vec![goal.clone(), goal.clone()] });
+        for case in ["inside", "optional_yaw", "outside", "z_edge", "yaw_edge", "frame", "nan", "quaternion", "goal", "path", "path_goal", "map", "boundary", "applied", "pending"] {
+            let options = GoalOptions { yaw_tolerance_rad: if case == "optional_yaw" {
+                std::f64::consts::PI
+            } else {
+                nuwax_nav_astar::controllers::angle_diff(0.0, Quaternion::from_yaw(0.25).yaw()).abs()
+            }, ..options };
+            worker.configure_goal(&goal, options).unwrap();
+            worker.replace_execution_path(path.clone(), None, if case == "path_goal" {route_pose(1.0, 0)} else {goal.clone()}).unwrap();
+            worker.update_costmap(CostMap2D::new_all_free("map", 1, 1, 0.1));
+            worker.update_odometry(goal.clone());
+            {
+                let mut input = worker.shared.0.lock().unwrap();
+                input.result = Some((std::time::Instant::now(), if case == "pending" {PlannerStep::Pending(Vec::new())} else {PlannerStep::Succeeded}));
+                input.result_pose_version = input.pose_version;
+                input.result_applied_version = input.applied_version;
+                input.result_map_version = input.map_version;
+                input.result_boundary_version = input.boundary_version;
+            }
+            let mut latest = goal.clone();
+            latest.pose.position.x += 0.000001;
+            match case {
+                "optional_yaw" => latest.pose.orientation = Quaternion::from_yaw(2.0),
+                "outside" => latest.pose.position.x = 0.3,
+                "z_edge" => { latest.pose.position.x = 0.0; latest.pose.position.z += 0.25; }
+                "yaw_edge" => latest.pose.orientation = Quaternion::from_yaw(0.25),
+                "frame" => latest.frame_id = NavFrameId::Odom,
+                "nan" => latest.pose.position.y = f64::NAN,
+                "quaternion" => latest.pose.orientation = Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 0.0 },
+                "goal" => worker.configure_goal(&goal, options).unwrap(),
+                "path" => worker.replace_execution_path(path.clone(), None, goal.clone()).unwrap(),
+                "map" => worker.update_costmap(CostMap2D::new_all_free("map", 1, 1, 0.1)),
+                "boundary" => worker.configure_boundary(&[]),
+                "applied" => worker.observe_applied_command(Twist2 { linear: nuwax_nav_types_messages::Point2::new(0.1, 0.0), angular_z: 0.0 }),
+                _ => {}
+            }
+            worker.update_odometry(latest);
+            let result = worker.step(0.3);
+            assert_eq!(result, if matches!(case, "inside" | "optional_yaw") { PlannerStep::Succeeded } else { PlannerStep::Pending(Vec::new()) }, "case {case}");
+        }
+        worker.stop();
+        finish.send(PlannerStep::Pending(Vec::new())).unwrap();
+    }
+
+    #[test]
+    fn real_computed_arrival_survives_in_tolerance_pose_jitter() {
+        let mut harness = RouteWorkerHarness::new(false);
+        harness.worker.step(0.3);
+        harness.next_computation();
+        harness.release.send(()).unwrap();
+        wait_for_source_result(&harness.worker);
+        harness.worker.update_odometry(route_pose(3.0, 1));
+        harness.worker.observe_applied_command(Twist2::ZERO);
+        let computed = harness.next_computation();
+        assert_eq!(computed.outcome, PlannerStep::Succeeded);
+        harness.worker.update_odometry(route_pose(3.000001, 2));
+        harness.release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !harness.worker.shared.0.lock().unwrap().result.as_ref()
+            .is_some_and(|(_, step)| matches!(step, PlannerStep::Succeeded)) {
+            assert!(std::time::Instant::now() < deadline, "computed success was not published");
+            std::thread::yield_now();
+        }
+        assert_eq!(harness.worker.step(0.3), PlannerStep::Succeeded,
+            "an already computed arrival must survive tiny in-tolerance stationary jitter");
     }
 
     #[test]

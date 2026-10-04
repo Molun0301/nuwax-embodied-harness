@@ -12,11 +12,13 @@
   const element = (tag,text,cls) => {const n=document.createElement(tag);if(text!==undefined)n.textContent=String(text);if(cls)n.className=cls;return n;};
   const svgElement = (tag,attrs={}) => {const n=document.createElementNS(NS,tag);for(const [key,value] of Object.entries(attrs))n.setAttribute(key,String(value));return n;};
   const interested = () => !panel.hidden || $('showSceneConnections').checked;
-  const bindingKey = b => JSON.stringify([b?.map_name,b?.source_name,b?.source_epoch,b?.frame_id,b?.content_sha256]);
+  const bindingKey = b => JSON.stringify([b?.map_name,b?.source_name,b?.source_epoch,b?.frame_id,window.__nuwaxMapRevision?.(b?.update_sequence)]);
   const current = () => {
     const b=window.__nuwaxMapBinding?.(),g=state.graph?.map_binding;
     // 同一地图的连接缓存不因一次刷新超时而消失。
-    return b?.available && g && ['map_name','source_name','source_epoch','frame_id','content_sha256'].every(key=>b[key]===g[key]);
+    return b?.available && g && ['map_name','source_name','source_epoch','frame_id'].every(key=>b[key]!=null&&b[key]===g[key])
+      && window.__nuwaxMapRevision?.(b.update_sequence) != null
+      && window.__nuwaxMapRevision?.(b.update_sequence) === window.__nuwaxMapRevision?.(g.update_sequence);
   };
   const message = (text,error=false) => {$('sceneGraphStatus').textContent=text;$('sceneGraphStatus').dataset.error=String(error);};
   async function invoke(name,args={}){

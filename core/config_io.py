@@ -44,6 +44,7 @@ _GO2_ENV = _REPO_ROOT / "drivers" / "go2" / "data_plane.env"
 _USER_SETTINGS_TARGET = "user_settings_env"
 _ROBOT_PROFILE_TARGET = "robot_profile_env"
 _PROFILE_LOCATION = ContextVar("settings_profile_location", default=None)
+_PROFILE_VALUES = ContextVar("settings_profile_values", default=None)
 _POINTCLOUD3D_KEY_PREFIX = "NUWAX_GATEWAY_POINTCLOUD3D_"
 _POINTCLOUD3D_TARGET = "gateway_pointcloud3d_env"
 _POINTCLOUD3D_ENV_FILENAME = "pointcloud3d.env"
@@ -340,6 +341,9 @@ def _current_value(key: str) -> str:
 
     location = _PROFILE_LOCATION.get()
     if location:
+        captured_values = _PROFILE_VALUES.get()
+        if captured_values is not None:
+            return captured_values.get(key, "")
         values = {}
         for path in configuration_sources(root=_CORE_ENV.parent, robot=location["robot"], profile=location["profile"]):
             values.update(configuration_file_values(path, reader=_read_env_values))
@@ -444,19 +448,24 @@ def _robot_geometry_preview(file_values: Dict[str, str]) -> Dict[str, object]:
 
 
 @_schema_file_snapshot()
-def build_schema(robot=None, profile=None) -> Dict[str, object]:
+def build_schema(robot=None, profile=None, *, revision_owner=None) -> Dict[str, object]:
     location = configuration_location(root=_CORE_ENV.parent, robot=robot, profile=profile)
     token = _PROFILE_LOCATION.set(location)
     try:
         if location:
-            with _target_lock(_CORE_ENV.parent / "runtime_data" / "settings" / "transaction"):
-                return _build_schema(location)
+            from core.config_profiles import CapturedProfile
+            with _target_lock(_CORE_ENV.parent / "runtime_data" / "settings" / "transaction"), CapturedProfile(location, _CORE_ENV.parent) as captured:
+                values_token = _PROFILE_VALUES.set(captured.values())
+                try:
+                    return _build_schema(location, profile_snapshot=captured, revision_owner=revision_owner)
+                finally:
+                    _PROFILE_VALUES.reset(values_token)
         return _build_schema(location)
     finally:
         _PROFILE_LOCATION.reset(token)
 
 
-def _build_schema(location) -> Dict[str, object]:
+def _build_schema(location, *, profile_snapshot=None, revision_owner=None) -> Dict[str, object]:
     """构建前端 schema：按板块分组，含当前值（敏感脱敏）、默认值、常规/高级标记。"""
 
     from core import settings
@@ -468,12 +477,9 @@ def _build_schema(location) -> Dict[str, object]:
     geometry_owner_vals = {} if location else _read_env_values(_geometry_owner_env_path())
     pointcloud3d_vals = {} if location else _read_env_values(_pointcloud3d_env_path())
     user_path = os.environ.get("NUWAX_USER_CONFIG_ENV_FILE", "").strip()
-    user_vals = _read_env_values(Path(user_path).expanduser()) if user_path else {}
+    user_vals = _read_env_values(Path(user_path).expanduser()) if user_path and not location else {}
     if location:
-        user_vals = {}
-        for path in configuration_sources(root=_CORE_ENV.parent, robot=location["robot"], profile=location["profile"]):
-            user_vals.update(configuration_file_values(path, reader=_read_env_values))
-        user_vals["NUWAX_ACTIVE_ROBOT"] = location["robot"]
+        user_vals = _PROFILE_VALUES.get()
         user_path = str(location["path"])
     effective_core_vals = dict(core_vals)
     effective_core_vals.update(geometry_owner_vals)
@@ -589,7 +595,8 @@ def _build_schema(location) -> Dict[str, object]:
         "geometry_backend_matrix": [status.as_dict() for status in geometry_statuses if status.enabled],
         "robot_geometry_preview": robot_geometry_preview,
         "profile_context": profile_catalog(
-            root=_CORE_ENV.parent, robot=location["robot"], profile=location["profile"]) if location else None,
+            root=_CORE_ENV.parent, robot=location["robot"], profile=location["profile"],
+            revision_owner=revision_owner, snapshot=profile_snapshot) if location else None,
     }
 
 
@@ -824,21 +831,21 @@ def _atomic_write(path: Path, content: str) -> str:
     return backup
 
 
-def save_values(updates: Dict[str, str], *, robot=None, profile=None, expected_revision=None) -> SaveResult:
+def save_values(updates: Dict[str, str], *, robot=None, profile=None, expected_revision=None, revision_owner=None) -> SaveResult:
     location = configuration_location(root=_CORE_ENV.parent, robot=robot, profile=profile)
     token = _PROFILE_LOCATION.set(location)
     try:
         if location:
-            from core.config_profiles import check_revision
-            with _target_lock(_CORE_ENV.parent / "runtime_data" / "settings" / "transaction"):
-                check_revision(location, expected_revision, root=_CORE_ENV.parent)
-                return _save_values(updates)
+            from core.config_profiles import checked_profile
+            with _target_lock(_CORE_ENV.parent / "runtime_data" / "settings" / "transaction"), checked_profile(
+                    location, expected_revision, root=_CORE_ENV.parent, revision_owner=revision_owner) as captured:
+                return _save_values(updates, profile_snapshot=captured)
         return _save_values(updates)
     finally:
         _PROFILE_LOCATION.reset(token)
 
 
-def _save_values(updates: Dict[str, str]) -> SaveResult:
+def _save_values(updates: Dict[str, str], *, profile_snapshot=None) -> SaveResult:
     """校验并写回一批配置项。
 
     规则：
@@ -894,10 +901,18 @@ def _save_values(updates: Dict[str, str]) -> SaveResult:
         path = _target_path(target_file)
         with _target_lock(path):
             existed = path.exists()
-            original = path.read_text(encoding="utf-8") if path.exists() else ""
-            if not path.exists() and target_file == _ROBOT_PROFILE_TARGET:
-                from core.config_profiles import read_profile, render_values
-                original = render_values(read_profile(_PROFILE_LOCATION.get(), root=_CORE_ENV.parent))
+            if target_file == _ROBOT_PROFILE_TARGET and profile_snapshot is not None:
+                from core.config_profiles import ConfigurationConflict, render_values
+                captured_raw = profile_snapshot.raw(path)
+                current_raw = path.read_bytes() if existed else None
+                if current_raw != captured_raw:
+                    raise ConfigurationConflict("配置在本次保存期间改变，请刷新后重新提交。")
+                original = captured_raw.decode("utf-8") if captured_raw is not None else render_values(profile_snapshot.values())
+            else:
+                original = path.read_text(encoding="utf-8") if existed else ""
+                if not existed and target_file == _ROBOT_PROFILE_TARGET:
+                    from core.config_profiles import read_profile, render_values
+                    original = render_values(read_profile(_PROFILE_LOCATION.get(), root=_CORE_ENV.parent))
             new_text = _apply_updates_to_text(original, kv)
             if new_text == original and path.exists():
                 backups[target_file] = ""

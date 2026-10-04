@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime, timezone
-import hashlib
-import json
 import math
 import threading
 import time
@@ -32,14 +30,6 @@ CATEGORIES = {
 LABELS = {"office": "办公室", "meeting_room": "会议室", "corridor": "走廊", "kitchen": "茶水间",
           "storage": "储物间", "other": "其他空间", "unknown": "未知空间"}
 LOCKED_STATUSES = {SceneSpaceReviewStatus.REVIEWED, SceneSpaceReviewStatus.CORRECTED, SceneSpaceReviewStatus.REJECTED}
-
-
-def _geometry_signature(space) -> str:
-    boundary = space.boundary
-    value = {"frame": space.frame_id,
-             "polygon": [point.model_dump() for point in boundary.polygon_points] if boundary else [],
-             "holes": boundary.metadata.get("holes", []) if boundary else []}
-    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
 def _yaw(pose) -> float:
@@ -171,14 +161,16 @@ class SceneMappingService:
         bound = []
         for region in regions:
             old = previous.get(region.scene_space_id)
-            unchanged = old is not None and _geometry_signature(old) == _geometry_signature(region)
+            unchanged = old is not None and getattr(region, "_geometry_unchanged", False)
             keep_label = old is not None and (unchanged or old.metadata.get("label_locked") or old.review_status in LOCKED_STATUSES)
             metadata = {**(old.metadata if old else {}), **region.metadata,
                         MANAGED_KEY: True, "map_binding": capture["binding"],
                         "scene_revision": int(old.metadata.get("scene_revision", 0)) if old else 0,
                         "navigable": False, "non_navigable_reason": "semantic_region_requires_navigation_validation"}
+            metadata.pop("geometry_digest", None)
+            metadata.pop("decision_evidence_key", None)
             if not unchanged:
-                metadata.pop("decision_evidence_key", None)
+                metadata.pop("decision_inputs_v2", None)
                 metadata.pop("last_decision", None)
             updates = {"metadata": metadata}
             if old is not None:
@@ -188,7 +180,9 @@ class SceneMappingService:
                                 "primary_label": old.primary_label if keep_label else None,
                                 "candidate_labels": old.candidate_labels if unchanged else [],
                                 "review_status": old.review_status if keep_label and old.review_status != SceneSpaceReviewStatus.STALE else SceneSpaceReviewStatus.CANDIDATE})
-            bound.append(region.model_copy(update=updates, deep=True))
+            prepared = region.model_copy(update=updates, deep=True)
+            object.__setattr__(prepared, "_scene_graph_source_revision", getattr(old, "_scene_graph_source_revision", None) if old is not None else None)
+            bound.append(prepared)
         return bound
 
     def _refresh_regions(self, ensure_active, expected_capture=None):
@@ -211,8 +205,8 @@ class SceneMappingService:
                 unchanged = len(old_by_id) == len(regions) and all(
                     region.scene_space_id in old_by_id
                     and old_by_id[region.scene_space_id].review_status != SceneSpaceReviewStatus.STALE
-                    and _geometry_signature(region) == _geometry_signature(old_by_id[region.scene_space_id])
-                    and old_by_id[region.scene_space_id].metadata.get("map_binding", {}).get("content_sha256") == capture["binding"]["content_sha256"]
+                    and old_by_id[region.scene_space_id].metadata.get("geometry_revision") == region.metadata.get("geometry_revision")
+                    and str(old_by_id[region.scene_space_id].metadata.get("map_binding", {}).get("update_sequence", "")) == capture["binding"]["update_sequence"]
                     for region in regions
                 )
                 with self._lock:
@@ -282,25 +276,25 @@ class SceneMappingService:
                     continue
                 seen.add(artifact_id)
                 try:
-                    ref = store.get_ref(artifact_id)
-                    if not ref.metadata.get("camera_id") or ref.metadata.get("camera_id") != entry.metadata.get("camera_id"):
-                        continue
-                    frame_time = ref.metadata.get("frame_timestamp")
-                    entry_time = entry.metadata.get("frame_timestamp")
-                    if not frame_time or not entry_time:
-                        continue
-                    try:
-                        image_time = datetime.fromisoformat(str(frame_time).replace("Z", "+00:00"))
-                        evidence_time = datetime.fromisoformat(str(entry_time).replace("Z", "+00:00"))
-                        if image_time.tzinfo is None or evidence_time.tzinfo is None or abs((image_time - evidence_time).total_seconds()) > .001:
+                    with store.read_artifact(artifact_id) as (ref, stream):
+                        if not ref.metadata.get("camera_id") or ref.metadata.get("camera_id") != entry.metadata.get("camera_id"):
                             continue
-                    except (TypeError, ValueError):
-                        continue
-                    if ref.mime_type not in ("image/jpeg", "image/png", "image/webp") or ref.size_bytes > 2 * 1024 ** 2:
-                        continue
-                    data = store.get_file_path(artifact_id).read_bytes()
-                    if len(data) != ref.size_bytes:
-                        continue
+                        frame_time = ref.metadata.get("frame_timestamp")
+                        entry_time = entry.metadata.get("frame_timestamp")
+                        if not frame_time or not entry_time:
+                            continue
+                        try:
+                            image_time = datetime.fromisoformat(str(frame_time).replace("Z", "+00:00"))
+                            evidence_time = datetime.fromisoformat(str(entry_time).replace("Z", "+00:00"))
+                            if image_time.tzinfo is None or evidence_time.tzinfo is None or abs((image_time - evidence_time).total_seconds()) > .001:
+                                continue
+                        except (TypeError, ValueError):
+                            continue
+                        if ref.mime_type not in ("image/jpeg", "image/png", "image/webp") or ref.size_bytes > 2 * 1024 ** 2:
+                            continue
+                        data = stream.read(2 * 1024 ** 2 + 1)
+                        if len(data) > 2 * 1024 ** 2 or len(data) != ref.size_bytes:
+                            continue
                     images.append("data:%s;base64,%s" % (ref.mime_type, base64.b64encode(data).decode("ascii")))
                 except (OSError, KeyError, GatewayError):
                     continue
@@ -339,7 +333,7 @@ class SceneMappingService:
                    vision_tags=list(entry.metadata.get("vision_tags", [])),
                    metadata={"memory_id": entry.memory_id, "frame_timestamp": entry.metadata["frame_timestamp"]})
                    for entry in entries]
-        evidence_key = _evidence_key(entries, self.config.model)
+        evidence_key = _evidence_inputs(entries, self.config.model)
         raw = result.model_dump(mode="json")
         raw.pop("raw", None)
         raw["raw_scores"] = result.raw
@@ -357,7 +351,7 @@ class SceneMappingService:
                 confidence=value, source_model=result.model_id,
                 evidence_observation_sample_ids=[sample.sample_id for sample in samples],
                 metadata={"score_kind": result.score_kind, "calibrated": False}) for key, value in ranked],
-            "metadata": {**space.metadata, "last_decision": raw, "decision_evidence_key": evidence_key,
+            "metadata": {**space.metadata, "last_decision": raw, "decision_inputs_v2": evidence_key,
                          "category": winner, "label_source": "model" if adopted else "model_candidate"},
         }, deep=True)
 
@@ -397,7 +391,8 @@ class SceneMappingService:
                 if not entries:
                     skipped.append({"id": space.scene_space_id, "reason": "no_valid_observation_evidence"})
                     continue
-                if background and space.metadata.get("decision_evidence_key") == _evidence_key(entries, self.config.model):
+                if background and all(getattr(entry, "_scene_decision_source_revision", None) is not None
+                                      or (getattr(entry, "_memory_business_token", None) or (None,))[0] == "business" for entry in entries) and space.metadata.get("decision_inputs_v2") == _evidence_inputs(entries, self.config.model):
                     skipped.append({"id": space.scene_space_id, "reason": "evidence_unchanged"})
                     continue
                 if len(processed) + len(failures) >= self.config.max_regions_per_cycle:
@@ -411,11 +406,11 @@ class SceneMappingService:
                     current_capture = self.memory.capture_scene_mapping_state()
                     if not same_scope(current_capture["binding"], capture["binding"]) or current_capture["generation"] != capture["generation"]:
                         raise GatewayError("模型返回时地图作用域已改变。", error_code="scene_scope_changed", http_status=409)
-                    if current_capture["binding"]["content_sha256"] != capture["binding"]["content_sha256"]:
+                    if current_capture["binding"]["update_sequence"] != capture["binding"]["update_sequence"]:
                         candidates = self._segmenter.segment(current_capture["snapshot"], map_name=current_capture["library_name"],
                                                               existing_spaces=current_capture["spaces"])
                         matching = next((candidate for candidate in candidates if candidate.scene_space_id == space.scene_space_id), None)
-                        if matching is None or _geometry_signature(matching) != _geometry_signature(space):
+                        if matching is None or not getattr(matching, "_geometry_unchanged", False):
                             raise GatewayError("模型返回时区域边界已变化。", error_code="scene_geometry_changed", http_status=409)
                     updated = self._decision_space(space, result, entries, request, apply_labels=adopting)
                     updated.metadata["map_binding"] = current_capture["binding"]
@@ -473,9 +468,15 @@ class SceneMappingService:
                 "status": "located" if len(matches) == 1 else "ambiguous" if matches else "unknown"}
 
 
-def _evidence_key(entries, model):
-    return hashlib.sha256(json.dumps({"model": model, "entries": [entry.memory_id for entry in entries]},
-                                    sort_keys=True).encode()).hexdigest()
+def _evidence_inputs(entries, model):
+    # A small declared input list, not a digest or a whole-library comparison.
+    values = []
+    for entry in entries:
+        token = getattr(entry, "_memory_business_token", None)
+        owned_revision = getattr(entry, "_scene_decision_source_revision", None)
+        revision = list(owned_revision) if owned_revision is not None else list(token) if token and token[0] == "business" else None
+        values.append({"memory_id": entry.memory_id, "source_revision": revision})
+    return {"version": 2, "model": model, "entries": values}
 
 
 def _distance_to_boundary(point, polygon) -> float:

@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Dict, Iterable, Optional, Tuple
-from datetime import datetime
 from contextlib import nullcontext
+from datetime import datetime
+from typing import Dict, Iterable, Optional, Tuple
 
 from contracts.base import utc_now
 from contracts.geometry import Pose
@@ -14,7 +14,6 @@ from core import EventBus, StateNamespace, StateStore
 from core.errors import GatewayError
 from services.perception.keyframe import PerceptionKeyframeSelector
 from services.perception.service import PerceptionService
-
 
 PERCEPTION_RUNTIME_LOGGER = logging.getLogger("nuwax_robot_bridge.perception.runtime")
 
@@ -78,6 +77,11 @@ class PerceptionVideoRuntime:
             yaw_threshold_deg=keyframe_yaw_threshold_deg,
         )
         self._lock = threading.RLock()
+        self._activity_condition = threading.Condition(self._lock)
+        self._active_runs = 0
+        self._active_schedules = 0
+        self._closing = False
+        self._closed = False
         # P1-2：串行 run_once 的三个入口（background 后台线程 / burst 复核 / manual 能力调用），
         # 避免并发触发感知管线与共享运行时状态竞态。与 _lock（护状态字段）分开，
         # 因为 run_once 全程持有此锁、内部还会取 _lock 更新状态。
@@ -104,6 +108,7 @@ class PerceptionVideoRuntime:
         self._memory_write_lock = threading.Lock()
         self._memory_write_in_flight = False
         self._memory_write_pending = None
+        self._memory_write_current = None
         self._memory_write_scheduled_count = 0
         self._memory_write_completed_count = 0
         self._memory_write_failed_count = 0
@@ -226,6 +231,7 @@ class PerceptionVideoRuntime:
                 metadata={
                     **dict(self._last_status_metadata),
                     "prewarm_status": dict(self._prewarm_status),
+                    "lifecycle": self.get_lifecycle_status(),
                     "stopping": self._stop_event.is_set() and self.is_running(),
                     "memory_write_in_flight": self._memory_write_in_flight,
                     "memory_write_completed_count": self._memory_write_completed_count,
@@ -241,7 +247,13 @@ class PerceptionVideoRuntime:
         if not self._enabled:
             return self.get_status()
         with self._lock:
-            if self.is_running():
+            if self._closing:
+                raise GatewayError("持续感知运行时已关闭。", error_code="perception_runtime_closed", http_status=409)
+            with self._memory_write_lock:
+                memory_busy = self._memory_write_in_flight or bool(
+                    self._memory_write_thread is not None and self._memory_write_thread.is_alive()
+                )
+            if self.is_running() or memory_busy or self._active_runs or self._active_schedules:
                 return self.get_status()
             self._stop_event.clear()
             self._thread = threading.Thread(
@@ -260,29 +272,71 @@ class PerceptionVideoRuntime:
         self._write_status(running=True)
         return status
 
-    def stop(self) -> PerceptionRuntimeStatus:
-        """有界等待工作退出；超时仍保留线程引用，防止启动第二条感知循环。"""
+    def get_lifecycle_status(self):
+        """只读取有界运行态；不查文件、模型或记忆仓储。"""
+        with self._lock, self._memory_write_lock:
+            memory_thread = self._memory_write_thread
+            return {"closing": self._closing, "closed": self._closed,
+                    "active_operations": self._active_runs + self._active_schedules,
+                    "running": self.is_running(),
+                    "memory_write_pending": self._memory_write_pending is not None,
+                    "memory_write_in_flight": self._memory_write_in_flight,
+                    "memory_worker_alive": bool(memory_thread is not None and memory_thread.is_alive()),
+                    "pending_artifact_count": self._job_artifact_count(self._memory_write_pending),
+                    "inflight_artifact_count": self._job_artifact_count(self._memory_write_current)}
 
-        deadline = time.monotonic() + max(1.0, self._interval_sec + self._failure_backoff_sec + 0.5)
+    @staticmethod
+    def _job_artifact_count(job):
+        hold = job.get("artifact_hold") if job is not None else None
+        return len(hold.artifact_ids) if hold is not None else 0
+
+    @staticmethod
+    def _release_job(job):
+        if job is not None:
+            hold = job.pop("artifact_hold", None)
+            if hold is not None:
+                hold.release()
+
+    def stop(self, timeout=None) -> PerceptionRuntimeStatus:
+        """可复用停止；有界超时保留线程和正在写入的拥有方。"""
+        duration = max(1.0, self._interval_sec + self._failure_backoff_sec + 0.5) if timeout is None else max(0.0, float(timeout))
+        deadline = time.monotonic() + duration
         with self._lock:
             thread = self._thread
             self._stop_event.set()
         with self._memory_write_lock:
+            pending = self._memory_write_pending
             self._memory_write_pending = None
             memory_thread = self._memory_write_thread
+        self._release_job(pending)
         for worker in (thread, memory_thread):
             if worker is not None and worker is not threading.current_thread() and worker.is_alive():
                 worker.join(timeout=max(0.0, deadline - time.monotonic()))
-        with self._lock:
+        with self._activity_condition:
+            while self._active_runs or self._active_schedules:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._activity_condition.wait(remaining)
             if thread is not None and not thread.is_alive() and self._thread is thread:
                 self._thread = None
             status = self.get_status()
         self._write_status(running=status.running)
-        PERCEPTION_RUNTIME_LOGGER.info(
-            "持续感知停止等待结束 camera=%s running=%s memory_in_flight=%s",
-            status.camera_id, status.running, self._memory_write_in_flight,
-        )
         return status
+
+    def close(self, timeout=5.0):
+        """终止新准入；调用方仅在返回 True 后才能关闭记忆等依赖。"""
+        with self._lock:
+            self._closing = True
+        self.stop(timeout=timeout)
+        with self._lock, self._memory_write_lock:
+            memory_thread = self._memory_write_thread
+            self._closed = not (
+                self._active_runs or self._active_schedules or self.is_running()
+                or self._memory_write_in_flight or self._memory_write_pending is not None
+                or (memory_thread is not None and memory_thread.is_alive())
+            )
+            return self._closed
 
     def run_once(
         self,
@@ -299,14 +353,27 @@ class PerceptionVideoRuntime:
         感知管线与运行时状态竞态。
         """
 
-        with self._run_lock:
-            return self._run_once_locked(
-                force_keyframe=force_keyframe,
-                reason=reason,
-                allow_memory_write=allow_memory_write,
-                detection_metadata=detection_metadata,
-                open_vocabulary_classes=open_vocabulary_classes,
-            )
+        with self._activity_condition:
+            if self._closing:
+                raise GatewayError("持续感知运行时已关闭。", error_code="perception_runtime_closed", http_status=409)
+            self._active_runs += 1
+        try:
+            with self._run_lock:
+                with self._lock:
+                    if self._closing:
+                        raise GatewayError("持续感知运行时已关闭。", error_code="perception_runtime_closed", http_status=409)
+                return self._run_once_locked(
+                    force_keyframe=force_keyframe,
+                    reason=reason,
+                    allow_memory_write=allow_memory_write,
+                    detection_metadata=detection_metadata,
+                    open_vocabulary_classes=open_vocabulary_classes,
+                )
+
+        finally:
+            with self._activity_condition:
+                self._active_runs -= 1
+                self._activity_condition.notify_all()
 
     def _run_once_locked(
         self,
@@ -547,6 +614,25 @@ class PerceptionVideoRuntime:
     ) -> bool:
         """关键帧与连续观察共用后台工作线程，检测线程只提交最新候选。"""
 
+        with self._activity_condition:
+            if self._closing or self._stop_event.is_set():
+                return False
+            self._active_schedules += 1
+        try:
+            return self._schedule_memory_write_owned(
+                context=context, current_pose=current_pose, reason=reason, now=now, force=force,
+                allow_memory_write=allow_memory_write, map_snapshot=map_snapshot,
+                localization_snapshot=localization_snapshot, expected_library_name=expected_library_name,
+                continuous=continuous,
+            )
+        finally:
+            with self._activity_condition:
+                self._active_schedules -= 1
+                self._activity_condition.notify_all()
+
+    def _schedule_memory_write_owned(self, *, context, current_pose, reason, now, force,
+                                     allow_memory_write, map_snapshot, localization_snapshot,
+                                     expected_library_name, continuous):
         if not allow_memory_write or self._stop_event.is_set():
             return False
         memory_service = self._memory_service
@@ -566,8 +652,14 @@ class PerceptionVideoRuntime:
         current_library = library_getter() if callable(library_getter) else None
         if expected_library_name is not None and current_library != expected_library_name:
             return False
+        # 空快速帧不访问制品服务；非空引用必须先取得独立队列拥有方。
+        ids = PerceptionService._context_artifact_ids(context)
+        hold = self._perception_service.acquire_context_artifacts(
+            context, owner="perception.video_queue",
+        ) if ids else None
         job = {
             "continuous": continuous,
+            "artifact_hold": hold,
             "library_name": expected_library_name if expected_library_name is not None else current_library,
             "context": context,
             "current_pose": current_pose,
@@ -578,83 +670,101 @@ class PerceptionVideoRuntime:
             "force": force,
             "allow_memory_write": allow_memory_write,
         }
-        with self._memory_write_lock:
-            if self._stop_event.is_set():
-                return False
-            if self._memory_write_in_flight:
-                # 保留已经选中的待写关键帧，普通连续观察不挤掉它。
-                if continuous and self._memory_write_pending is not None and not self._memory_write_pending["continuous"]:
-                    return False
-                self._memory_write_scheduled_count += 1
-                self._memory_write_pending = job
-                return True
-            self._memory_write_scheduled_count += 1
-            self._memory_write_in_flight = True
-        thread = threading.Thread(
-            target=self._memory_write_worker,
-            args=(job,),
-            name="nuwax_perception_memory_write",
-            daemon=True,
-        )
-        with self._memory_write_lock:
-            self._memory_write_thread = thread
+        installed = False
         try:
-            thread.start()
-        except Exception:
             with self._memory_write_lock:
-                self._memory_write_in_flight = False
-                self._memory_write_thread = None
-            raise
-        return True
+                if self._stop_event.is_set():
+                    return False
+                if self._memory_write_in_flight:
+                    # 已排队关键帧不被连续快速观察挤掉。
+                    if continuous and self._memory_write_pending is not None and not self._memory_write_pending["continuous"]:
+                        return False
+                    old = self._memory_write_pending
+                    self._memory_write_pending = job
+                    installed = True
+                    self._memory_write_scheduled_count += 1
+                    self._release_job(old)
+                    return True
+                thread = threading.Thread(
+                    target=self._memory_write_worker, args=(job,),
+                    name="nuwax_perception_memory_write", daemon=True,
+                )
+                self._memory_write_in_flight = True
+                self._memory_write_current = job
+                self._memory_write_thread = thread
+                try:
+                    # 注册和启动共享队列锁，stop 不会错过尚未启动的工作。
+                    thread.start()
+                except BaseException:
+                    self._memory_write_in_flight = False
+                    self._memory_write_current = None
+                    self._memory_write_thread = None
+                    raise
+                installed = True
+                self._memory_write_scheduled_count += 1
+            return True
+        finally:
+            if not installed:
+                self._release_job(job)
 
     def _memory_write_worker(self, initial_job) -> None:
         job = initial_job
-        while job is not None:
-            ok = False
-            error = None
-            try:
-                parameters = dict(job)
-                continuous = parameters.pop("continuous", False)
-                expected_library = parameters.pop("library_name", None)
-                parameters["expected_library_name"] = expected_library
-                library_getter = getattr(self._memory_service, "get_active_library_name", None)
-                if self._stop_event.is_set():
-                    error = "memory_write_cancelled"
-                elif expected_library is not None and callable(library_getter) and library_getter() != expected_library:
-                    error = "memory_library_changed"
-                else:
-                    if continuous:
-                        for key in ("reason", "force", "allow_memory_write"):
-                            parameters.pop(key)
-                        ok = self._ingest_continuous_observation(**parameters)
-                    else:
-                        ok = self._remember_from_keyframe(**parameters)
-            except Exception as exc:  # 防御性兜底；_remember_from_keyframe 自身通常吞异常。
+        worker_owned = True
+        try:
+            while job is not None:
                 ok = False
-                error = str(exc)
-                PERCEPTION_RUNTIME_LOGGER.debug(
-                    "关键帧记忆后台写入失败 camera=%s reason=%s error=%s",
-                    self._camera_id,
-                    job.get("reason"),
-                    exc,
-                    exc_info=True,
-                )
-            with self._lock:
-                if ok:
-                    if job.get("continuous"):
-                        self._continuous_ingest_count += 1
-                    self._memory_write_completed_count += 1
-                    self._last_memory_write_error = None
-                else:
-                    self._memory_write_failed_count += 1
-                    self._last_memory_write_error = error or "memory_write_skipped_or_failed"
-            with self._memory_write_lock:
-                job = None if self._stop_event.is_set() else self._memory_write_pending
-                self._memory_write_pending = None
-                if job is None:
+                error = None
+                try:
+                    parameters = dict(job)
+                    parameters.pop("artifact_hold", None)
+                    continuous = parameters.pop("continuous", False)
+                    expected_library = parameters.pop("library_name", None)
+                    parameters["expected_library_name"] = expected_library
+                    library_getter = getattr(self._memory_service, "get_active_library_name", None)
+                    if self._stop_event.is_set():
+                        error = "memory_write_cancelled"
+                    elif expected_library is not None and callable(library_getter) and library_getter() != expected_library:
+                        error = "memory_library_changed"
+                    else:
+                        if continuous:
+                            for key in ("reason", "force", "allow_memory_write"):
+                                parameters.pop(key)
+                            ok = self._ingest_continuous_observation(**parameters)
+                        else:
+                            ok = self._remember_from_keyframe(**parameters)
+                except Exception as exc:
+                    error = str(exc)
+                    PERCEPTION_RUNTIME_LOGGER.debug("记忆后台写入失败 camera=%s error=%s", self._camera_id, exc, exc_info=True)
+                finally:
+                    self._release_job(job)
+                with self._lock:
+                    if ok:
+                        if job.get("continuous"):
+                            self._continuous_ingest_count += 1
+                        self._memory_write_completed_count += 1
+                        self._last_memory_write_error = None
+                    else:
+                        self._memory_write_failed_count += 1
+                        self._last_memory_write_error = error or "memory_write_skipped_or_failed"
+                with self._memory_write_lock:
+                    pending = self._memory_write_pending
+                    self._memory_write_pending = None
+                    job = None if self._stop_event.is_set() else pending
+                    self._memory_write_current = job
+                    if job is None:
+                        self._release_job(pending)
+                        self._memory_write_in_flight = False
+                        worker_owned = False
+                        return
+        finally:
+            if worker_owned:
+                with self._memory_write_lock:
+                    self._release_job(job)
+                    self._release_job(self._memory_write_pending)
+                    self._memory_write_pending = None
+                    self._memory_write_current = None
                     self._memory_write_in_flight = False
-                    self._memory_write_thread = None
-                    return
+            # 保留最后线程句柄；stop/status 可精确观察其最终退出。
 
     @staticmethod
     def _coerce_optional_float(value) -> Optional[float]:
@@ -713,6 +823,8 @@ class PerceptionVideoRuntime:
         messages = []
         try:
             for _ in range(effective_count):
+                if self._stop_event.is_set():
+                    break
                 message = self.run_once(
                     force_keyframe=True,
                     reason=requested_reason,
@@ -722,8 +834,8 @@ class PerceptionVideoRuntime:
                 )
                 if message:
                     messages.append(message)
-                if effective_interval_sec > 0:
-                    time.sleep(effective_interval_sec)
+                if effective_interval_sec > 0 and self._stop_event.wait(effective_interval_sec):
+                    break
         finally:
             self._store_artifact = original_store_artifact
         return tuple(messages)

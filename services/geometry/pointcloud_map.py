@@ -5,6 +5,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
+import ctypes
+from functools import lru_cache
 import math
 import mmap
 import os
@@ -67,6 +69,66 @@ class PointCloudMapSourceError(PointCloudMapError):
         self.terminal = bool(terminal)
 
 
+@lru_cache(maxsize=1)
+def _cloud_map_atomic_reader():
+    """Resolve the platform atomic ABI once; never install software at runtime."""
+    try:
+        library = ctypes.PyDLL("libatomic.so.1")
+        load = getattr(library, "__atomic_load_8")
+        load.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        load.restype = ctypes.c_uint64
+        fence = library.atomic_thread_fence
+        fence.argtypes = (ctypes.c_int,)
+        fence.restype = None
+        lock_free = getattr(library, "__atomic_is_lock_free")
+        lock_free.argtypes = (ctypes.c_size_t, ctypes.c_void_p)
+        lock_free.restype = ctypes.c_bool
+        if not lock_free(8, None):
+            return None, "cloud-map v3 requires lock-free platform u64 atomics"
+        return (library, load, fence, lock_free), None
+    except (OSError, AttributeError) as exc:
+        return None, f"cloud-map v3 requires platform libatomic.so.1: {exc}"
+
+
+def _cloud_map_acquire_sequence(mm: mmap.mmap) -> int:
+    functions, error = _cloud_map_atomic_reader()
+    if functions is None:
+        raise PointCloudMapSourceError("live_atomic_unavailable", error, source="live", terminal=True)
+    # Only a temporary zero-copy view obtains the address of a read-only mmap.
+    # It is released before returning: close/reopen never retains exported views.
+    view = np.frombuffer(mm, dtype="<u8", count=1, offset=16)
+    try:
+        address = ctypes.c_void_p(view.ctypes.data)
+        if address.value % 8:
+            raise PointCloudMapSourceError("live_atomic_unsupported", "cloud-map v3 needs lock-free aligned u64 loads", source="live", terminal=True)
+        return int(functions[1](address, 2))  # __ATOMIC_ACQUIRE
+    finally:
+        del view
+
+
+def _cloud_map_read_fence() -> None:
+    functions, error = _cloud_map_atomic_reader()
+    if functions is None:
+        raise PointCloudMapSourceError("live_atomic_unavailable", error, source="live", terminal=True)
+    functions[2](5)  # __ATOMIC_SEQ_CST: finish payload loads before final sequence
+
+
+@dataclass(frozen=True)
+class PointCloudMapChunk:
+    """Owned immutable XYZ for one producer-addressed page; unchanged pages are shared."""
+
+    chunk_index: int
+    revision_ordinal: int
+    point_count: int
+    xyz_bytes: bytes
+
+    def __post_init__(self) -> None:
+        if self.chunk_index < 0 or self.revision_ordinal <= 0 or self.point_count <= 0:
+            raise ValueError("invalid pointcloud chunk identity")
+        if len(self.xyz_bytes) != self.point_count * 12:
+            raise ValueError("pointcloud chunk XYZ size mismatch")
+
+
 @dataclass(frozen=True)
 class PointCloudMapSnapshot:
     """Batch03 规范点云在只读观察边界上的统一快照。"""
@@ -83,6 +145,16 @@ class PointCloudMapSnapshot:
     stream_generation: int
     provenance: Dict[str, object]
 
+    chunks: Tuple[PointCloudMapChunk, ...] = ()
+    layout_generation: int = 0
+    chunk_size_points: int = 0
+    base_revision_ordinal: int = 0
+    reset: bool = False
+
+    @property
+    def chunked(self) -> bool:
+        return self.chunk_size_points > 0
+
     def __post_init__(self) -> None:
         if self.source not in {"live", "saved"}:
             raise ValueError("pointcloud source 必须是 live 或 saved。")
@@ -90,7 +162,19 @@ class PointCloudMapSnapshot:
             raise ValueError("pointcloud snapshot 身份字段不能为空。")
         if self.revision_ordinal < 0 or self.source_timestamp_ns < 0 or self.stream_generation < 0:
             raise ValueError("pointcloud snapshot 序号与时间必须非负。")
-        if self.point_count < 0 or len(self.xyz_bytes) != self.point_count * 12:
+        if self.point_count < 0:
+            raise ValueError("pointcloud snapshot point_count must be nonnegative")
+        if self.chunked:
+            if self.xyz_bytes or self.layout_generation <= 0:
+                raise ValueError("chunked pointcloud must carry pages and layout identity")
+            expected = (self.point_count + self.chunk_size_points - 1) // self.chunk_size_points
+            if len(self.chunks) != expected:
+                raise ValueError("pointcloud snapshot chunk count mismatch")
+            for index, chunk in enumerate(self.chunks):
+                count = min(self.chunk_size_points, self.point_count - index * self.chunk_size_points)
+                if chunk.chunk_index != index or chunk.point_count != count or chunk.revision_ordinal > self.revision_ordinal:
+                    raise ValueError("pointcloud snapshot page metadata mismatch")
+        elif len(self.xyz_bytes) != self.point_count * 12:
             raise ValueError("pointcloud snapshot 点数与 XYZ 字节长度不一致。")
         if self.format != "float32-xyz-le":
             raise ValueError("pointcloud snapshot 仅支持 float32-xyz-le。")
@@ -130,6 +214,19 @@ class CloudMapMmapSnapshot:
     timestamp_ns: int
     voxel_size: float
     xyz_bytes: bytes
+    mapping_session_id: str = ""
+    session_generation: int = 0
+    occupancy_revision: int = 0
+    chunks: Tuple[PointCloudMapChunk, ...] = ()
+    layout_generation: int = 0
+    chunk_size_points: int = 0
+    base_revision_ordinal: int = 0
+    reset: bool = False
+
+    @property
+    def chunked(self) -> bool:
+        return self.chunk_size_points > 0
+
 
 
 @dataclass(frozen=True)
@@ -616,17 +713,29 @@ class CloudMapMmapReader:
     SLOT_METADATA_SIZE = struct.calcsize(SLOT_METADATA_FMT)  # 12 bytes
     SLOT_METADATA_OFFSET = HEADER_STRUCT_SIZE
     SLOT_METADATA_VERSION = 2
+    PAGED_VERSION = 3
+    PAGED_HEADER_FMT = "<QIIQQQQ16sIIIIfIQQQQQ"
+    PAGED_CORE_HEADER_SIZE = struct.calcsize(PAGED_HEADER_FMT)
+    PAGED_HEADER_SIZE = 512
+    CHUNK_SIZE_POINTS = 1024
 
     def __init__(self, shm_path: str = "/tmp/nuwax_cloudmap.mmap"):
         self._path = Path(shm_path)
         self._mm: Optional[mmap.mmap] = None
         self._fd = None
         self._opened_identity: Optional[_FileIdentity] = None
+        self._observed_file_identity: Optional[_FileIdentity] = None
         self._open_generation = 0
         self._source_epoch: Optional[str] = None
+        self._snapshot_cache: Optional[Tuple[Tuple[object, ...], CloudMapMmapSnapshot]] = None
+        self._paged_snapshot: Optional[CloudMapMmapSnapshot] = None
+        self._last_read_busy = False
+        self._sampled_snapshot_cache = None
 
     @property
     def source_epoch(self) -> Optional[str]:
+        if self._paged_snapshot is not None:
+            return self._paged_snapshot.source_epoch
         return self._source_epoch
 
     def is_available(self) -> bool:
@@ -643,11 +752,25 @@ class CloudMapMmapReader:
                 except (OSError, ValueError):
                     self.close()
                 else:
+                    descriptor_identity = _FileIdentity(
+                        device=int(descriptor_stat.st_dev),
+                        inode=int(descriptor_stat.st_ino),
+                        ctime_ns=int(descriptor_stat.st_ctime_ns),
+                        size=int(descriptor_stat.st_size),
+                    )
                     if (
-                        int(descriptor_stat.st_dev) != current_identity.device
-                        or int(descriptor_stat.st_ino) != current_identity.inode
+                        descriptor_identity.device != current_identity.device
+                        or descriptor_identity.inode != current_identity.inode
+                        or descriptor_identity.size != current_identity.size
+                        or self._opened_identity is None
+                        or self._opened_identity.size != current_identity.size
                     ):
                         self.close()
+                    else:
+                        # 正常写入新页也可能改变 ctime；只撤销字节复用，不改来源 epoch。
+                        if self._observed_file_identity != descriptor_identity:
+                            self._snapshot_cache = None
+                        self._observed_file_identity = descriptor_identity
         if self._mm is None:
             try:
                 self._open()
@@ -672,6 +795,7 @@ class CloudMapMmapReader:
                 named_identity is None
                 or named_identity.device != descriptor_identity.device
                 or named_identity.inode != descriptor_identity.inode
+                or named_identity.size != descriptor_identity.size
             ):
                 raise PointCloudMapError("cloud-map mmap 在打开期间被替换。")
             mm = mmap.mmap(fd.fileno(), 0, access=mmap.ACCESS_READ)
@@ -682,6 +806,7 @@ class CloudMapMmapReader:
         self._fd = fd
         self._mm = mm
         self._opened_identity = descriptor_identity
+        self._observed_file_identity = descriptor_identity
         self._source_epoch = "dev:%d:ino:%d:opened:%d:generation:%d" % (
             descriptor_identity.device,
             descriptor_identity.inode,
@@ -690,6 +815,10 @@ class CloudMapMmapReader:
         )
 
     def close(self) -> None:
+        self._snapshot_cache = None
+        self._paged_snapshot = None
+        self._sampled_snapshot_cache = None
+        self._last_read_busy = False
         if self._mm is not None:
             self._mm.close()
             self._mm = None
@@ -697,12 +826,23 @@ class CloudMapMmapReader:
             self._fd.close()
             self._fd = None
         self._opened_identity = None
+        self._observed_file_identity = None
         self._source_epoch = None
 
     def read_header(self) -> Optional[Tuple]:
         if not self.is_available():
             return None
         assert self._mm is not None
+        if len(self._mm) < self.HEADER_STRUCT_SIZE:
+            return None
+        if struct.unpack_from("<I", self._mm, 8)[0] == self.PAGED_VERSION:
+            raw = self._mm[:self.PAGED_HEADER_SIZE]
+            if len(raw) != self.PAGED_HEADER_SIZE:
+                return None
+            vals = struct.unpack(self.PAGED_HEADER_FMT, raw[:self.PAGED_CORE_HEADER_SIZE])
+            if vals[0] != self.MAGIC or vals[3] & 1:
+                return None
+            return (vals[0], vals[1], 0, vals[8], vals[5], vals[4], vals[12])
         raw = self._mm[0:self.HEADER_STRUCT_SIZE]
         vals = struct.unpack(self.HEADER_FMT, raw)
         if vals[0] != self.MAGIC:
@@ -725,12 +865,22 @@ class CloudMapMmapReader:
     ) -> Optional[CloudMapMmapSnapshot]:
         """读取包含完整 v2 身份与时间字段的稳定点云快照。"""
 
+        self._last_read_busy = False
+        if (self.is_available() and self._mm is not None and len(self._mm) >= 12
+                and struct.unpack_from("<I", self._mm, 8)[0] == self.PAGED_VERSION):
+            snapshot = self._read_paged_snapshot()
+            return self._limit_paged_snapshot(snapshot, max_points)
+        cached = self._snapshot_cache
+        self._snapshot_cache = None
         for _ in range(3):
+            # 不稳定、不可用或异常读取撤销复用；重试重新取得自有字节。
+            previous_cache, cached = cached, None
             if not self.is_available():
                 return None
             source_epoch = self.source_epoch
+            file_identity = self._observed_file_identity
             mm = self._mm
-            if source_epoch is None or mm is None:
+            if source_epoch is None or file_identity is None or mm is None:
                 return None
             header_raw = bytes(mm[0:self.HEADER_STRUCT_SIZE])
             if len(header_raw) != self.HEADER_STRUCT_SIZE:
@@ -763,8 +913,19 @@ class CloudMapMmapReader:
             if point_count > max_buffer_points:
                 return None
             selected_max_points = max_buffer_points if max_points is None else min(max(1, int(max_points)), max_buffer_points)
+            identity = (source_epoch, file_identity, header_raw, slot_metadata, selected_max_points)
+            cached_snapshot = (
+                previous_cache[1]
+                if version >= self.SLOT_METADATA_VERSION
+                and previous_cache is not None
+                and previous_cache[0] == identity
+                else None
+            )
             buf_offset = self.HEADER_SIZE + read_buf * self.SINGLE_BUFFER_SIZE
-            if point_count == 0:
+            if cached_snapshot is not None:
+                actual_count = cached_snapshot.point_count
+                xyz_bytes = cached_snapshot.xyz_bytes
+            elif point_count == 0:
                 actual_count = 0
                 xyz_bytes = b""
             elif point_count > selected_max_points:
@@ -802,7 +963,11 @@ class CloudMapMmapReader:
                 slot_metadata_after = self._read_slot_metadata(read_buf)
                 if slot_metadata_after != slot_metadata:
                     continue
-            return CloudMapMmapSnapshot(
+            file_identity_stable = self._observed_file_identity == file_identity
+            if cached_snapshot is not None and not file_identity_stable:
+                # 同 inode 原地重建不能借用旧字节；下一轮按原有槽校验重新复制。
+                continue
+            snapshot = cached_snapshot or CloudMapMmapSnapshot(
                 source_epoch=source_epoch,
                 version=int(version),
                 active_buffer=active_buffer,
@@ -812,6 +977,133 @@ class CloudMapMmapReader:
                 voxel_size=float(voxel_size),
                 xyz_bytes=xyz_bytes,
             )
+            if version >= self.SLOT_METADATA_VERSION and file_identity_stable:
+                # 仅保留一次已验证的 owned bytes；不保留 mmap 视图或跨读者缓存。
+                self._snapshot_cache = (identity, snapshot)
+            return snapshot
+        return None
+
+    def _limit_paged_snapshot(self, snapshot, max_points):
+        # Explicit legacy sampling request. The normal live path has no limit
+        # and never materializes contiguous XYZ. Gather only selected points.
+        if snapshot is None or max_points is None or snapshot.point_count <= max(1, int(max_points)):
+            return snapshot
+        limit = max(1, int(max_points))
+        key = (snapshot.source_epoch, snapshot.layout_generation, snapshot.revision, limit)
+        if self._sampled_snapshot_cache is not None and self._sampled_snapshot_cache[0] == key:
+            return self._sampled_snapshot_cache[1]
+        indices = np.linspace(0, snapshot.point_count - 1, num=limit, dtype=np.intp)
+        selected = np.empty((limit, 3), dtype="<f4")
+        for chunk in snapshot.chunks:
+            offset = chunk.chunk_index * snapshot.chunk_size_points
+            begin, end = np.searchsorted(indices, [offset, offset + chunk.point_count])
+            if begin != end:
+                points = np.frombuffer(chunk.xyz_bytes, dtype="<f4").reshape(-1, 3)
+                selected[begin:end] = points[indices[begin:end] - offset]
+        sampled = replace(snapshot, point_count=limit, xyz_bytes=selected.tobytes(),
+                          chunks=(), chunk_size_points=0, base_revision_ordinal=0, reset=True)
+        self._sampled_snapshot_cache = (key, sampled)
+        return sampled
+
+    def _read_paged_snapshot(self) -> Optional[CloudMapMmapSnapshot]:
+        """Read only producer-dirty page bytes, retaining immutable unchanged pages.
+
+        The bounded version table is metadata, never a coordinate comparison. A
+        complete bootstrap is needed only on first observation or layout reset.
+        """
+        self._last_read_busy = False
+        for _ in range(3):
+            if not self.is_available() or self._mm is None:
+                return None
+            mm = self._mm
+            if len(mm) < self.PAGED_HEADER_SIZE:
+                return None
+            sequence_before = _cloud_map_acquire_sequence(mm)
+            if sequence_before & 1:
+                self._last_read_busy = True
+                continue
+            raw = mm[:self.PAGED_HEADER_SIZE]
+            values = struct.unpack(self.PAGED_HEADER_FMT, raw[:self.PAGED_CORE_HEADER_SIZE])
+            (magic, version, header_size, sequence, revision, timestamp_ns,
+             layout_generation, producer_epoch, point_count, capacity, chunk_size,
+             capacity_chunks, voxel_size, _reserved, _session, table_offset,
+             payload_offset, total_size, _reserved2) = values
+            if magic != self.MAGIC or version != self.PAGED_VERSION:
+                return None
+            if sequence != sequence_before:
+                self._last_read_busy = True
+                continue
+            if revision == 0 or layout_generation == 0 or not any(producer_epoch):
+                return None
+            if (header_size != self.PAGED_HEADER_SIZE or chunk_size != self.CHUNK_SIZE_POINTS
+                    or capacity <= 0 or point_count > capacity
+                    or capacity_chunks != (capacity + chunk_size - 1) // chunk_size
+                    or table_offset < header_size
+                    or payload_offset < table_offset + capacity_chunks * 8
+                    or total_size != payload_offset + capacity * 12 or total_size > len(mm)):
+                return None
+            source_epoch = "producer:" + producer_epoch.hex()
+            session_id_length = struct.unpack_from("<I", raw, 160)[0]
+            if session_id_length > 256:
+                return None
+            try:
+                mapping_session_id = raw[164:164 + session_id_length].decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+            occupancy_revision = struct.unpack_from("<Q", raw, 152)[0]
+            previous = self._paged_snapshot
+            reset = (previous is None or previous.source_epoch != source_epoch
+                     or previous.layout_generation != layout_generation
+                     or revision < previous.revision)
+            if previous is not None and not reset and previous.revision == revision:
+                _cloud_map_read_fence()
+                if sequence_before == _cloud_map_acquire_sequence(mm) and self.is_available() and self._mm is mm:
+                    return previous
+                self._last_read_busy = True
+                continue
+            count = (point_count + chunk_size - 1) // chunk_size
+            page_raw = mm[table_offset:table_offset + count * 8]
+            versions = struct.unpack(f"<{count}Q", page_raw) if count else ()
+            chunks = []
+            valid = True
+            for index, page_revision in enumerate(versions):
+                if page_revision == 0 or page_revision > revision:
+                    valid = False
+                    break
+                count_in_page = min(chunk_size, point_count - index * chunk_size)
+                old = (previous.chunks[index] if not reset and previous is not None
+                       and index < len(previous.chunks) else None)
+                if old is not None and old.revision_ordinal == page_revision and old.point_count == count_in_page:
+                    chunks.append(old)
+                else:
+                    start = payload_offset + index * chunk_size * 12
+                    payload = mm[start:start + count_in_page * 12]
+                    if len(payload) != count_in_page * 12:
+                        valid = False
+                        break
+                    chunks.append(PointCloudMapChunk(index, int(page_revision), count_in_page, payload))
+            _cloud_map_read_fence()
+            if sequence_before != _cloud_map_acquire_sequence(mm):
+                self._last_read_busy = True
+                continue
+            if not valid:
+                return None
+            if not self.is_available() or self._mm is not mm:
+                continue
+            # File metadata is not a producer epoch; the UUID is independent of
+            # inode, timestamp, observer reopening and map revision.
+            snapshot = CloudMapMmapSnapshot(
+                source_epoch=source_epoch, version=version, active_buffer=0,
+                revision=int(revision), point_count=int(point_count),
+                timestamp_ns=int(timestamp_ns), voxel_size=float(voxel_size),
+                xyz_bytes=b"", chunks=tuple(chunks),
+                mapping_session_id=mapping_session_id, session_generation=int(_session),
+                occupancy_revision=int(occupancy_revision),
+                layout_generation=int(layout_generation), chunk_size_points=chunk_size,
+                base_revision_ordinal=0 if reset else previous.revision, reset=reset,
+            )
+            self._paged_snapshot = snapshot
+            return snapshot
         return None
 
     def read_stable(
@@ -823,6 +1115,18 @@ class CloudMapMmapReader:
         snapshot = self.read_stable_snapshot(max_points=max_points)
         if snapshot is None:
             return None
+        if snapshot.chunked:
+            # Explicit compatibility/export API. Live streaming never calls it.
+            if max_points is not None and snapshot.point_count > max(1, int(max_points)):
+                limit = max(1, int(max_points))
+                indices = np.linspace(0, snapshot.point_count - 1, num=limit, dtype=np.intp)
+                points = np.empty((limit, 3), dtype="<f4")
+                for index, slot in enumerate(indices):
+                    page = snapshot.chunks[int(slot) // snapshot.chunk_size_points]
+                    offset = (int(slot) % snapshot.chunk_size_points) * 12
+                    points[index] = np.frombuffer(page.xyz_bytes, dtype="<f4", count=3, offset=offset)
+                return snapshot.revision, limit, points.tobytes()
+            return snapshot.revision, snapshot.point_count, b"".join(chunk.xyz_bytes for chunk in snapshot.chunks)
         return snapshot.revision, snapshot.point_count, snapshot.xyz_bytes
 
     def build_binary_frame(
@@ -881,6 +1185,12 @@ class LivePointCloudMapSource(PointCloudMapSource):
             )
         try:
             snapshot = self._reader.read_stable_snapshot(max_points=self._max_points)
+        except PointCloudMapSourceError as exc:
+            if exc.terminal:
+                # A missing native atomic ABI is a lifecycle capability error,
+                # not a per-frame retry loop. Recreating the source retries setup.
+                self._cancelled = True
+            raise
         except Exception as exc:
             self._last_revision = None
             raise PointCloudMapSourceError(
@@ -890,6 +1200,8 @@ class LivePointCloudMapSource(PointCloudMapSource):
                 retryable=True,
             ) from exc
         if snapshot is None:
+            if getattr(self._reader, "_last_read_busy", False):
+                return None
             try:
                 header = self._reader.read_header()
             except Exception as exc:
@@ -936,6 +1248,11 @@ class LivePointCloudMapSource(PointCloudMapSource):
             point_count=snapshot.point_count,
             format="float32-xyz-le",
             xyz_bytes=snapshot.xyz_bytes,
+            chunks=snapshot.chunks,
+            layout_generation=snapshot.layout_generation,
+            chunk_size_points=snapshot.chunk_size_points,
+            base_revision_ordinal=snapshot.base_revision_ordinal,
+            reset=snapshot.reset,
             stream_generation=0,
             provenance={
                 "canonical_owner": "nuwax_geometry_runtime",
@@ -945,7 +1262,12 @@ class LivePointCloudMapSource(PointCloudMapSource):
                 "voxel_size": snapshot.voxel_size,
                 "shm_path": str(self._reader._path),
                 "observer_restart_generation": self._restart_generation,
-                "writer_session_id_available": False,
+                "writer_session_id_available": bool(snapshot.mapping_session_id),
+                "mapping_session_id": snapshot.mapping_session_id,
+                "session_generation": snapshot.session_generation,
+                "occupancy_revision": snapshot.occupancy_revision,
+                "mapping_source_epoch": (f"{snapshot.mapping_session_id}:{snapshot.session_generation}"
+                                         if snapshot.mapping_session_id else None),
             },
         )
         self._last_revision = snapshot.revision

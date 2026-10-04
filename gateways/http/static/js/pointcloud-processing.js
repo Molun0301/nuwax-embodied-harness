@@ -242,10 +242,27 @@ export class PointCloudProcessor {
     return colors;
   }
 
-  _spatiallySamplePointCloud(positions, spacingM) {
+  _spatiallySamplePointCloud(positions, spacingM, measurement = null) {
     const spacing = Number(spacingM);
     if (!positions.length || !Number.isFinite(spacing) || spacing <= 0) return positions;
     const inverseSpacing = 1 / spacing;
+    // 在已有边界能精确表示时使用可逆三维数组下标，其余保留完整坐标串。
+    let minX, minY, minZ, maxX, maxY, maxZ, sizeZ, rowStride = 0;
+    if (measurement) {
+      minX = Math.floor(measurement.xMin * inverseSpacing);
+      minY = Math.floor(measurement.yMin * inverseSpacing);
+      minZ = Math.floor(measurement.zMin * inverseSpacing);
+      maxX = Math.floor(measurement.xMax * inverseSpacing);
+      maxY = Math.floor(measurement.yMax * inverseSpacing);
+      maxZ = Math.floor(measurement.zMax * inverseSpacing);
+      const sizeX = maxX - minX + 1;
+      const sizeY = maxY - minY + 1;
+      sizeZ = maxZ - minZ + 1;
+      const stride = sizeY * sizeZ;
+      const volume = sizeX * stride;
+      if ([minX, minY, minZ, maxX, maxY, maxZ, sizeX, sizeY, sizeZ, stride, volume].every(Number.isSafeInteger)
+        && sizeX > 0 && sizeY > 0 && sizeZ > 0) rowStride = stride;
+    }
     const occupied = new Set();
     const sampled = new Float32Array(positions.length);
     let writeOffset = 0;
@@ -257,11 +274,10 @@ export class PointCloudProcessor {
       const gridX = Math.floor(x * inverseSpacing);
       const gridY = Math.floor(y * inverseSpacing);
       const gridZ = Math.floor(z * inverseSpacing);
-      const key = (
-        Math.imul(gridX, 73856093)
-        ^ Math.imul(gridY, 19349663)
-        ^ Math.imul(gridZ, 83492791)
-      ) >>> 0;
+      const key = rowStride && gridX >= minX && gridX <= maxX
+        && gridY >= minY && gridY <= maxY && gridZ >= minZ && gridZ <= maxZ
+        ? (gridX - minX) * rowStride + (gridY - minY) * sizeZ + (gridZ - minZ)
+        : `${gridX},${gridY},${gridZ}`;
       if (occupied.has(key)) continue;
       occupied.add(key);
       sampled[writeOffset] = (gridX + 0.5) * spacing;
@@ -299,7 +315,7 @@ export class PointCloudProcessor {
     }
     if (this._isLiveCloudMapSnapshot) {
       const positions = preset.liveSpacingM
-        ? this._spatiallySamplePointCloud(visibleSource, preset.liveSpacingM)
+        ? this._spatiallySamplePointCloud(visibleSource, preset.liveSpacingM, measurement)
         : visibleSource;
       return this._preparedResult(positions, measurement, floorContext);
     }

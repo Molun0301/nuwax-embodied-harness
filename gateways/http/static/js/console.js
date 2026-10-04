@@ -158,10 +158,11 @@
         bootstrapComplete: { health: false, tasks: false, governance: false },
         bootstrapQueue: { health: [], tasks: [], governance: [] },
         lastRobotStateRevision: null,
-        lastRobotStateHash: null,
+        lastRobotStateChangeKey: null,
         mapDrawFrame: null,
         mapBaseCache: null,
         mapGridContentKey: "",
+        mapLegacyFrameSequence: 0,
         lastMapEnvelope: null,
         lastLocalizationEnvelope: null,
         lastMapHeartbeatEnvelope: null,
@@ -177,6 +178,16 @@
         semanticFetchedAt: 0,
         semanticError: "",
         semanticMeta: {},
+        semanticIndexMeta: null,
+        semanticIndexFetchedAt: 0,
+        semanticIndexSourceKey: "",
+        semanticIndexError: "",
+        semanticIndexScope: "",
+        semanticIndexEpoch: 0,
+        semanticIndexRequest: null,
+        semanticIndexNeedsRefresh: false,
+        semanticIndexReloadPending: false,
+        semanticIndexStopped: false,
         semanticSelectedId: null,
         semanticOverlayReturnFocus: null,
         showSemanticInstances: true,
@@ -1716,6 +1727,10 @@
         );
       }
       window.__nuwaxActiveMapName = activeMapName;
+      window.__nuwaxMapRevision = function (value) {
+        const revision = normalizedStreamCursor(value);
+        return revision && revision !== "0" ? revision : null;
+      };
       window.__nuwaxMapBinding = function () {
         const data = state.lastMapEnvelope?.data || {};
         const source = data.map_snapshot || data;
@@ -1725,8 +1740,8 @@
           map_name: source.map_name || activeMapName(),
           source_name: source.source_name || diagnostics.source_name || null,
           source_epoch: source.source_epoch || diagnostics.source_epoch || null,
-          content_sha256: source.content_sha256 || diagnostics.content_sha256 || null,
-          update_sequence: source.update_sequence || diagnostics.update_sequence || null,
+          schema_version: source.schema_version || 2,
+          update_sequence: window.__nuwaxMapRevision(source.update_sequence ?? diagnostics.update_sequence),
           frame_id: state.mapGrid?.frame_id || source.frame_id || state.lastMapEnvelope?.frame_id || null,
           ...(semantic && semantic.map_name === (source.map_name || activeMapName())
             && semantic.frame_id === (state.mapGrid?.frame_id || source.frame_id || state.lastMapEnvelope?.frame_id) ? semantic : {}),
@@ -1914,21 +1929,26 @@
           if (state.mapViewMode !== "3d") drawMap();
         });
       }
-      function mapGridDataSignature(grid) {
-        const data = grid && (Array.isArray(grid.data) || grid.data instanceof Int8Array) ? grid.data : [];
-        if (!data.length) return "empty";
-        let hash = 2166136261;
-        for (let index = 0; index < data.length; index += 1) {
-          hash ^= (Number(data[index]) + 129) & 255;
-          hash = Math.imul(hash, 16777619) >>> 0;
-        }
-        return `${data.length}:${hash.toString(16)}`;
-      }
       function mapGridContentKey(grid, envelope, diagnostics) {
         if (!grid) return "missing";
+        const data = envelope.data || {};
+        const source = data.map_snapshot || data;
+        const metadata = grid.metadata || {};
+        diagnostics = diagnostics || {};
         const origin = originPosition(grid);
-        const revision = (diagnostics && (diagnostics.occupancy_content_hash || diagnostics.content_hash || diagnostics.grid_hash || diagnostics.occupancy_content_revision || diagnostics.content_revision || diagnostics.revision)) || (grid.metadata && (grid.metadata.occupancy_content_hash || grid.metadata.content_hash || grid.metadata.grid_hash || grid.metadata.occupancy_content_revision || grid.metadata.content_revision || grid.metadata.revision)) || envelope.revision || grid.revision || mapGridDataSignature(grid);
-        return [grid.frame_id || envelope.frame_id || "", grid.width, grid.height, gridResolution(grid), Number(origin.x || 0), Number(origin.y || 0), originYaw(grid), revision].join("|");
+        const sourceName = source.source_name || diagnostics.source_name || metadata.source_name || envelope.source;
+        const sourceEpoch = source.source_epoch || diagnostics.source_epoch || metadata.source_epoch;
+        const revision = diagnostics.occupancy_content_revision ?? metadata.occupancy_content_revision
+          ?? diagnostics.content_revision ?? metadata.content_revision ?? source.update_sequence
+          ?? diagnostics.update_sequence ?? metadata.update_sequence ?? diagnostics.revision
+          ?? metadata.revision ?? envelope.revision ?? grid.revision;
+        // 只复用同一拥有者生命周期内的修订；旧消息缺少身份时，每次应用都重绘。
+        const identity = sourceName && sourceEpoch && revision !== undefined && revision !== null && revision !== ""
+          ? [sourceName, sourceEpoch, revision]
+          : ["legacy-message", ++state.mapLegacyFrameSequence];
+        return JSON.stringify([source.map_name || diagnostics.map_name || grid.map_id || "",
+          grid.frame_id || source.frame_id || envelope.frame_id || "", grid.width, grid.height,
+          gridResolution(grid), Number(origin.x || 0), Number(origin.y || 0), originYaw(grid), identity]);
       }
       function normalizeStatusValue(value) {
         const raw = value && typeof value === "object" && "value" in value ? value.value : value;
@@ -2427,6 +2447,8 @@
             }
             renderSemanticMemoryStatus();
             if (requestedMap && requestedMap !== activeMapName() && !document.hidden) window.setTimeout(loadSemanticInstances, 0);
+            // 摘要会检查索引来源，独立读取，不能延迟源记录或地图标记。
+            if (requestedMap === activeMapName() && !state.semanticError) void loadSemanticIndexSummary();
           });
         renderSemanticMemoryStatus();
         return state.semanticLoadPromise;
@@ -2461,6 +2483,139 @@
           renderSemanticMemoryList();
         }
         renderSemanticMemoryStatus();
+        syncSemanticIndexScope();
+        if (state.semanticIndexNeedsRefresh && !state.semanticLoadPromise) void loadSemanticIndexSummary();
+      }
+      function semanticIndexLibrary() {
+        return state.semanticMeta.library_name || state.semanticMeta.active_library_name || "";
+      }
+      function semanticIndexScope() {
+        return JSON.stringify([activeMapName(), semanticIndexLibrary()]);
+      }
+      function syncSemanticIndexScope() {
+        const scope = semanticIndexScope();
+        if (scope === state.semanticIndexScope) return;
+        state.semanticIndexScope = scope;
+        state.semanticIndexEpoch += 1;
+        state.semanticIndexMeta = null;
+        state.semanticIndexFetchedAt = 0;
+        state.semanticIndexSourceKey = "";
+        state.semanticIndexError = "";
+        state.semanticIndexNeedsRefresh = true;
+        state.semanticIndexReloadPending = false;
+        state.semanticIndexRequest?.controller.abort();
+      }
+      function loadSemanticIndexSummary() {
+        syncSemanticIndexScope();
+        const library = semanticIndexLibrary();
+        if (!library || state.semanticIndexStopped) return Promise.resolve();
+        const previous = state.semanticIndexRequest;
+        if (previous) {
+          if (previous.epoch !== state.semanticIndexEpoch || previous.sourceKey !== state.semanticSnapshotKey) {
+            state.semanticIndexReloadPending = true;
+          }
+          return previous.promise;
+        }
+        const request = { controller: new AbortController(), epoch: state.semanticIndexEpoch,
+          scope: state.semanticIndexScope, sourceKey: state.semanticSnapshotKey };
+        const isCurrent = () => state.semanticIndexRequest === request
+          && request.epoch === state.semanticIndexEpoch && request.scope === semanticIndexScope();
+        const timeout = window.setTimeout(() => request.controller.abort(), 8000);
+        state.semanticIndexNeedsRefresh = false;
+        state.semanticIndexError = "";
+        state.semanticIndexRequest = request;
+        request.promise = fetch("/api/memory/summary", { signal: request.controller.signal })
+          .then(async (response) => {
+            if (!response.ok) throw new Error(`服务返回 ${response.status}`);
+            const body = await response.json();
+            if (!isCurrent()) return;
+            if (request.controller.signal.aborted) throw new Error("读取超时");
+            const meta = body?.memory_summary?.metadata;
+            if (meta && (typeof meta !== "object" || Array.isArray(meta))) throw new Error("索引摘要格式异常");
+            if (meta && (meta.active_library_name !== library
+              || (meta.indexing?.active_library != null && meta.indexing.active_library !== library))) {
+              throw new Error("索引摘要记忆库范围不匹配，请刷新");
+            }
+            state.semanticIndexMeta = meta || null;
+            state.semanticIndexFetchedAt = Date.now();
+            state.semanticIndexSourceKey = request.sourceKey;
+          })
+          .catch((error) => {
+            if (!isCurrent()) return;
+            state.semanticIndexError = error.name === "AbortError" ? "读取超时" : String(error.message || error);
+          })
+          .finally(() => {
+            window.clearTimeout(timeout);
+            if (state.semanticIndexRequest !== request) return;
+            state.semanticIndexRequest = null;
+            renderSemanticMemoryStatus();
+            if (state.semanticIndexReloadPending) {
+              state.semanticIndexReloadPending = false;
+              void loadSemanticIndexSummary();
+            }
+          });
+        renderSemanticMemoryStatus();
+        return request.promise;
+      }
+      function semanticIndexCount(value) {
+        return Number.isSafeInteger(value) && value >= 0 ? String(value) : "—";
+      }
+      function renderSemanticIndexStatus() {
+        if (!els.semanticMemorySummary) return;
+        if (!els.semanticMemoryIndexStatus) {
+          const status = document.createElement("span");
+          status.id = "semanticMemoryIndexStatus";
+          status.className = "msb-meta semantic-memory-status";
+          status.setAttribute("role", "status");
+          els.semanticMemorySummary.insertAdjacentElement("afterend", status);
+          els.semanticMemoryIndexStatus = status;
+        }
+        const el = els.semanticMemoryIndexStatus;
+        if (!semanticIndexLibrary()) {
+          el.textContent = "";
+          el.dataset.state = "unknown";
+          return;
+        }
+        const sameScope = state.semanticIndexScope === semanticIndexScope();
+        const meta = sameScope ? state.semanticIndexMeta : null;
+        const loading = state.semanticIndexRequest?.epoch === state.semanticIndexEpoch && sameScope;
+        const error = sameScope ? state.semanticIndexError : "";
+        const stale = Boolean(meta && (state.semanticIndexSourceKey !== state.semanticSnapshotKey || state.semanticError));
+        const parts = [error ? `索引摘要读取失败：${error}` : loading ? "索引摘要读取中…" : "索引摘要"];
+        if (sameScope && state.semanticIndexFetchedAt) parts.push(`查询于 ${new Date(state.semanticIndexFetchedAt).toLocaleTimeString()}`);
+        if (meta && (stale || loading || error)) parts.push(stale ? "源记录已更新或不可用，以下为上次摘要" : "以下为上次摘要");
+        const counts = meta?.vector_provenance_counts;
+        const indexing = meta?.indexing;
+        let warning = false;
+        if (!counts && !indexing) parts.push("索引状态未知（未提供就绪信息）");
+        else {
+          const count = (key) => semanticIndexCount(counts?.[key]);
+          parts.push(`向量：已验证 ${count("validated_current")}，历史未验证 ${count("legacy_unverified")}，已排除过时/不兼容 ${count("known_stale_or_incompatible")}`);
+          parts.push(`模态：待处理 ${count("pending")}，失败 ${count("failed")}，不可用 ${count("unavailable")}，禁用 ${count("disabled")}，不适用 ${count("not_applicable")}`);
+          parts.push(`无可用向量的记录 ${count("missing")}`);
+          const work = Array.isArray(indexing?.work) ? indexing.work : null;
+          const completeWork = work && work.every((row) => row && typeof row.status === "string"
+            && semanticIndexCount(row.count) !== "—");
+          const workCount = (status) => {
+            if (!completeWork) return "—";
+            const rows = work.filter((row) => row?.status === status);
+            return semanticIndexCount(rows.reduce((total, row) => total + row.count, 0));
+          };
+          parts.push(`后台任务（记录）：待处理 ${workCount("pending")}，退避 ${workCount("backoff")}，计算中 ${workCount("in_flight")}，完成 ${workCount("completed_fresh")}，复用 ${workCount("completed_reused")}，终止失败 ${workCount("failed_terminal")}`);
+          const errors = [...new Set((work || []).filter((row) => row?.error_category && Number.isSafeInteger(row.count) && row.count > 0).map((row) => String(row.error_category)))];
+          if (errors.length) parts.push(`任务错误：${errors.join("、")}`);
+          const reconciliation = semanticIndexCount(indexing?.reconciliation_pending);
+          parts.push(reconciliation === "—" ? "索引核对状态未知" : reconciliation === "0" ? "索引核对已完成" : "索引核对尚未完成");
+          parts.push(`全部记忆库缓存清理待办 ${semanticIndexCount(indexing?.cache_cleanup_pending)}`);
+          if (counts?.legacy_unverified > 0) parts.push("历史向量可兼容读取，尚未验证来源");
+          if (counts?.known_stale_or_incompatible > 0 || counts?.failed > 0 || counts?.unavailable > 0) parts.push("仅影响相应向量；记录仍可查看");
+          warning = ["legacy_unverified", "known_stale_or_incompatible", "pending", "failed", "unavailable"]
+            .some((key) => count(key) !== "—" && counts[key] > 0)
+            || Number(workCount("failed_terminal")) > 0 || Number(workCount("backoff")) > 0;
+        }
+        el.textContent = parts.join(" · ");
+        el.dataset.state = error ? "error" : stale ? "stale" : loading ? "busy" : counts || indexing ? "snapshot" : "unknown";
+        el.dataset.level = warning ? "warn" : "";
       }
       function semanticObservationOnly(inst) {
         return inst.observation_only === true || inst.projection_method === "current_pose_fallback";
@@ -2519,6 +2674,7 @@
         const observations = state.semanticInstances.filter(semanticObservationOnly).length;
         setText(els.semanticMemorySummary, `${count} 条记录 · ${located} 个有位置 · ${observations} 条仅观察${meta.truncated ? ` · 已载入 ${count}/${meta.total} 条` : ""}`);
         if (els.semanticInstancesRefresh) els.semanticInstancesRefresh.title = status;
+        renderSemanticIndexStatus();
       }
       function semanticListRow(inst) {
         const row = document.createElement("button");
@@ -2573,6 +2729,7 @@
       }
       function syncPointcloud3dState() {
         if (PLANAR_PIPELINE) return;
+        window.pointcloud3d?.setMapContext(state.latestStreamFrames["map.frame"]?.payload);
         const navigationFrame = state.latestStreamFrames["navigation.state"];
         const navigationContext = navigationFrame && navigationFrame.payload;
         const navigationExplorationValidated = navigationGoalMatchesExploration(
@@ -4624,9 +4781,12 @@
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const url = new URL(`${protocol}//${window.location.host}/streams/ws`);
         // 状态/地图、位姿及日志独立排队与续传，日志洪峰不能挤掉地图帧。
-        const topics = stream.topics || STREAM_TOPICS;
+        const topics = (stream.topics || STREAM_TOPICS).filter(topic =>
+          !window.__NUWAX_INCREMENTAL_POINTCLOUD_READY__ || topic !== "pointcloud_map.snapshot");
         url.searchParams.set("topics", topics.join(","));
         if (stream.mapPayload) url.searchParams.set("map_payload", stream.mapPayload);
+        url.searchParams.set("map_binary_version", "3");
+        if (stream === state && !PLANAR_PIPELINE) url.searchParams.set("pointcloud_transport", "pages");
         if (stream.latestStreamCursor) url.searchParams.set("after_cursor", String(stream.latestStreamCursor));
         return url.toString();
       }
@@ -4796,7 +4956,7 @@
       function decodeMapBinaryFrame(buffer) {
         const bytes = new Uint8Array(buffer);
         const magic = [0x4e, 0x55, 0x57, 0x41, 0x58, 0x4d, 0x41, 0x50];
-        if (bytes.byteLength < 13 || !magic.every((value, index) => bytes[index] === value) || bytes[8] !== 2) return null;
+        if (bytes.byteLength < 13 || !magic.every((value, index) => bytes[index] === value) || ![2, 3].includes(bytes[8])) return null;
         const headerLength = new DataView(buffer, 9, 4).getUint32(0, true);
         if (headerLength <= 0 || headerLength > 64 * 1024 || 13 + headerLength > bytes.byteLength) return null;
         try {
@@ -4805,6 +4965,14 @@
           const payload = frame?.payload;
           const grid = payload?.occupancy_grid;
           if (message.type !== "stream.frame" || frame?.topic !== "map.frame" || !grid || typeof payload.map_name !== "string" || !payload.map_name) return null;
+          const revision = window.__nuwaxMapRevision(payload.update_sequence);
+          if (!revision || ![payload.source_name, payload.source_epoch, payload.frame_id].every(value => typeof value === "string" && value.length > 0)) return null;
+          if (payload.map_name !== grid.map_id || payload.frame_id !== grid.frame_id) return null;
+          if (bytes[8] === 3 && payload.schema_version !== 2) return null;
+          // 版本2只作为旧格式读取，不重新计算或传播其旧摘要。
+          delete payload.content_sha256;
+          payload.schema_version = 2;
+          payload.update_sequence = revision;
           const cells = grid.width * grid.height;
           // 与服务器二进制地图的16MiB载荷预算一致；不得套用JSON展示的200万格限制。
           if (![grid.width, grid.height, cells].every(Number.isSafeInteger) || grid.width < 1 || grid.height < 1 || cells > 16 * 1024 * 1024) return null;
@@ -4891,6 +5059,13 @@
             navigation_path_state: state.navigationDisplay?.mode || (state.navigationPath.length ? "retained" : "none") },
         }));
       }
+      window.addEventListener("stream:pointcloud_map.incremental-ready", () => {
+        window.__NUWAX_INCREMENTAL_POINTCLOUD_READY__ = true;
+        // 能力握手成功后撤下旧全量通道；不重连任务/地图/导航套接字。
+        if (state.streamSocket?.readyState === WebSocket.OPEN) {
+          state.streamSocket.send(JSON.stringify({ type: "pointcloud.detach" }));
+        }
+      });
       window.addEventListener("stream:pointcloud_map.cursor-accepted", (event) => {
         updateLatestStreamCursor(event.detail?.cursor);
       });
@@ -4921,6 +5096,9 @@
           if (stream.streamReconnectTimer) {
             window.clearTimeout(stream.streamReconnectTimer);
             stream.streamReconnectTimer = null;
+          }
+          if (stream === state && window.__NUWAX_INCREMENTAL_POINTCLOUD_READY__) {
+            socket.send(JSON.stringify({ type: "pointcloud.detach" }));
           }
           if (wasReconnect && stream === state) loadInitialTasks();
           if (stream === state) {
@@ -5254,15 +5432,18 @@
       }
       function robotStateChangeKey(frame) {
         const metadata = frame.metadata || {};
-        return metadata.content_hash || metadata.signature || frame.revision || null;
+        const revision = metadata.revision ?? frame.revision;
+        if (!metadata.source_epoch || revision === undefined || revision === null || revision === "") return null;
+        return JSON.stringify([frame.source || "", metadata.robot_name || frame.payload?.robot_name || "",
+          metadata.source_epoch, revision]);
       }
       function updateRobotStateFrame(frame) {
         const payload = frame.payload;
         if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
         const changeKey = robotStateChangeKey(frame);
-        if (changeKey && changeKey === state.lastRobotStateHash) return false;
-        state.lastRobotStateHash = changeKey;
-        state.lastRobotStateRevision = frame.revision || (frame.metadata && frame.metadata.revision) || state.lastRobotStateRevision;
+        if (changeKey && changeKey === state.lastRobotStateChangeKey) return false;
+        state.lastRobotStateChangeKey = changeKey;
+        state.lastRobotStateRevision = frame.metadata?.revision ?? frame.revision ?? state.lastRobotStateRevision;
         updateHealth({
           runtime_started: true,
           robot_name: payload.robot_name,
@@ -5893,11 +6074,19 @@
         const mapName = activeMapName();
         if (state.semanticLastMapName !== mapName) {
           state.semanticLastMapName = mapName;
+          syncSemanticIndexScope();
           reconcileSemanticOverlay(state.semanticMeta.library_name);
         }
         publishSemanticMapInstances();
         renderSemanticMemoryStatus();
       });
+      window.addEventListener("pagehide", () => {
+        state.semanticIndexStopped = true;
+        state.semanticIndexEpoch += 1;
+        state.semanticIndexReloadPending = false;
+        state.semanticIndexRequest?.controller.abort();
+      });
+      window.addEventListener("pageshow", () => { state.semanticIndexStopped = false; });
       loadSemanticInstances();
       connectStreams();
       connectStreams(state.poseStream);

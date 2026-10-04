@@ -41,7 +41,7 @@ def run(output_dir: Path) -> dict:
     config.runtime_data.map_active_restore_on_start = False
     config.runtime_data.map_catalog_root = str(output_dir / "maps")
     config.runtime_data.memory_db_path = str(output_dir / "memory.db")
-    config.runtime_data.memory_embedding_model = "hashing-v1"
+    config.runtime_data.memory_embedding_model = "lexical-only"
     config.runtime_data.memory_embedding_dimension = 128
     config.runtime_data.memory_image_embedding_model = "disabled"
     config.gateway.artifact_dir = str(output_dir / "artifacts")

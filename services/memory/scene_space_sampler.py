@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
-import hashlib
-from typing import Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple
 
 from contracts.geometry import Pose
 from contracts.spatial_memory import ObservationEvent, SceneObservationSample, SceneSpace, SemanticInstance
+
+SampleIdentityResolver = Callable[[str, str], str]
 
 
 @dataclass(frozen=True)
@@ -32,16 +34,32 @@ class SceneSpaceSampler:
         observation_events: Iterable[ObservationEvent] = (),
         semantic_instances: Iterable[SemanticInstance] = (),
         max_samples: int = 8,
+        identity_resolver: Optional[SampleIdentityResolver] = None,
     ) -> SceneSpaceSamplingResult:
+        existing_ids = {}
+        for existing in scene_space.observation_samples:
+            key = self._sample_source_key(existing)
+            if key is not None:
+                existing_ids.setdefault(key, set()).add(existing.sample_id)
+        # Keep only unique evidence-based identities. Conflicting historical
+        # samples stay untouched; no arbitrary alias is selected for new input.
+        identities = {key: next(iter(values)) for key, values in existing_ids.items() if len(values) == 1}
+        def resolve_identity(source_kind, source_key):
+            key = (source_kind, source_key)
+            if key not in identities:
+                identities[key] = (identity_resolver(*key) if identity_resolver is not None
+                                   else "sample_" + uuid.uuid4().hex)
+            return identities[key]
+
         scored_samples: List[Tuple[float, SceneObservationSample]] = []
         for sample in scene_space.observation_samples:
             scored_samples.append((float(sample.confidence or 0.5), sample))
         for event in observation_events:
-            sample = self._sample_from_observation_event(scene_space, event)
+            sample = self._sample_from_observation_event(scene_space, event, identity_resolver=resolve_identity)
             if sample is not None:
                 scored_samples.append((float(sample.confidence), sample))
         for instance in semantic_instances:
-            sample = self._sample_from_semantic_instance(scene_space, instance)
+            sample = self._sample_from_semantic_instance(scene_space, instance, identity_resolver=resolve_identity)
             if sample is not None:
                 scored_samples.append((float(sample.confidence), sample))
 
@@ -82,6 +100,8 @@ class SceneSpaceSampler:
         self,
         scene_space: SceneSpace,
         event: ObservationEvent,
+        *,
+        identity_resolver: SampleIdentityResolver,
     ) -> Optional[SceneObservationSample]:
         coverage_summary = self._coverage_summary(
             scene_space,
@@ -95,7 +115,7 @@ class SceneSpaceSampler:
         if score <= 0.0:
             return None
         return SceneObservationSample(
-            sample_id=self._stable_sample_id(scene_space.scene_space_id, event.event_id),
+            sample_id=identity_resolver("observation_event", event.event_id),
             source_observation_id=event.source_observation_id,
             observation_event_id=event.event_id,
             camera_id=event.camera_id,
@@ -119,6 +139,8 @@ class SceneSpaceSampler:
         self,
         scene_space: SceneSpace,
         instance: SemanticInstance,
+        *,
+        identity_resolver: SampleIdentityResolver,
     ) -> Optional[SceneObservationSample]:
         coverage_summary = self._coverage_summary(
             scene_space,
@@ -132,7 +154,7 @@ class SceneSpaceSampler:
         if score <= 0.0:
             return None
         return SceneObservationSample(
-            sample_id=self._stable_sample_id(scene_space.scene_space_id, instance.instance_id),
+            sample_id=identity_resolver("semantic_instance", instance.instance_id),
             observation_event_id=instance.last_observation_event_id,
             camera_id=self._coerce_optional_string(instance.metadata.get("camera_id")),
             pose=instance.pose,
@@ -177,7 +199,7 @@ class SceneSpaceSampler:
             ),
             "linked_anchor": bool(anchor_id and anchor_id in scene_space.linked_anchor_ids),
             "linked_object_instance": bool(
-                set(str(item) for item in linked_instance_ids) & set(scene_space.linked_object_instance_ids)
+                {str(item) for item in linked_instance_ids} & set(scene_space.linked_object_instance_ids)
             ),
         }
 
@@ -221,12 +243,16 @@ class SceneSpaceSampler:
         scored_samples.sort(key=lambda item: (-item[0], -self._timestamp_score(item[1].timestamp), item[1].sample_id))
         selected: List[SceneObservationSample] = []
         seen_keys = set()
+        seen_ids = set()
         for _, sample in scored_samples:
+            # Evidence selection deliberately retains its historical event-first
+            # suppression policy, independently of typed durable sample identity.
             key = sample.observation_event_id or sample.metadata.get("source_instance_id") or sample.sample_id
-            if key in seen_keys:
+            if key in seen_keys or sample.sample_id in seen_ids:
                 continue
             selected.append(sample)
             seen_keys.add(key)
+            seen_ids.add(sample.sample_id)
             if len(selected) >= limit:
                 break
         return selected
@@ -255,9 +281,15 @@ class SceneSpaceSampler:
         delta_z = float(left.position.z) - float(right.position.z)
         return float((delta_x * delta_x + delta_y * delta_y + delta_z * delta_z) ** 0.5)
 
-    def _stable_sample_id(self, scene_space_id: str, source_key: str) -> str:
-        digest = hashlib.blake2b(f"{scene_space_id}:{source_key}".encode("utf-8"), digest_size=4).hexdigest()
-        return f"sample_{digest}"
+    def _sample_source_key(self, sample: SceneObservationSample) -> Optional[Tuple[str, str]]:
+        source_kind = sample.metadata.get("source_record_kind")
+        instance_id = self._coerce_optional_string(sample.metadata.get("source_instance_id"))
+        # A semantic instance's last event is evidence, never its identity.
+        if source_kind == "semantic_instance" or (source_kind is None and instance_id):
+            return ("semantic_instance", instance_id) if instance_id else None
+        if source_kind in (None, "observation_event") and sample.observation_event_id:
+            return ("observation_event", sample.observation_event_id)
+        return None
 
     def _merge_strings(self, values: Iterable[Optional[str]]) -> List[str]:
         result: List[str] = []

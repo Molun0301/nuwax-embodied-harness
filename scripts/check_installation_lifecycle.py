@@ -37,7 +37,8 @@ class LifecycleChecks(unittest.TestCase):
         (self.prefix / "manifest.json").write_text(json.dumps(self.state))
 
     def descriptor(self, mode="foreground"):
-        result = lifecycle.deployment_descriptor(self.root, self.home, self.prefix, ["core"], "customrobot", mode)
+        result = lifecycle.deployment_descriptor(self.root, self.home, self.prefix, ["core"], "customrobot", mode,
+                                                 service_name="neh-0123456789abcdef.service")
         self.state["deployment"] = result
         self.save()
         return result
@@ -50,6 +51,7 @@ class LifecycleChecks(unittest.TestCase):
     def test_legacy_schema_infers_foreground(self):
         result = lifecycle.inspect_installation(self.home)
         self.assertEqual(result["lifecycle"]["mode"], "foreground")
+        self.assertIsNone(result["lifecycle"]["service_name"])
         self.assertEqual(result["listener"]["port"], 9876)
         self.assertEqual(result["prefix"], str(self.prefix))
 

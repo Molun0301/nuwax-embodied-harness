@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import json
 import sqlite3
-import threading
-from typing import Dict, Iterable, List, Optional, Sequence
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence
 
 from contracts.base import utc_now
 from contracts.memory import MemoryPayloadFilter, SemanticMemoryEntry, TaggedLocation
@@ -17,7 +17,8 @@ from contracts.spatial_memory import (
     SemanticInstance,
     SemanticSummaryNode,
 )
-
+from services.memory.sqlite_storage import SQLiteStorage, SQLiteTransaction
+from services.memory.scene_revisions import geometry_value, graph_geometry_value
 
 TAGGED_LOCATION_VECTOR_NAMESPACE = "tagged_location"
 SEMANTIC_MEMORY_VECTOR_NAMESPACE = "semantic_memory"
@@ -46,43 +47,123 @@ class MemoryLibraryRecord:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class _PreparedSceneWrite:
+    origin: SceneSpace
+    record: SceneSpace
+    payload_json: str
+    values: tuple
+    source_preparation: object
+    has_expected_revision: bool
+    expected_revision: Optional[str]
+
+
 class MemoryRepository:
     """记忆库的轻量 SQLite 仓储。"""
 
-    def __init__(self, db_path: str) -> None:
-        self._db_path = db_path.strip() or ":memory:"
-        self._lock = threading.RLock()
-        if self._db_path != ":memory:":
-            db_file = Path(self._db_path)
-            db_file.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        with self._lock:
-            if self._db_path != ":memory:":
-                self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._init_schema()
+    def __init__(self, db_path: str = ":memory:", *, storage: Optional[SQLiteStorage] = None) -> None:
+        self._closed = False
+        self._index = None
+        self._artifact_references = None
+        self._owns_storage = storage is None
+        self._storage = SQLiteStorage(db_path) if storage is None else storage
+        self._db_path = self._storage.db_path
+        try:
+            self._init_schema()
+        except BaseException:
+            self.close()
+            raise
+
+    def attach_index(self, index) -> None:
+        """Attach the service coordinator; standalone repositories stay unchanged."""
+        if index.storage is not self._storage:
+            raise ValueError("Index and repository must share a storage owner")
+        self._index = index
+
+    def prepare_scene_identities(self, library_name, *, snapshot=None, scene=None):
+        from services.memory.scene_identity import SceneIdentityPlan
+        self._check_open()
+        return SceneIdentityPlan(self, library_name, snapshot=snapshot, scene=scene)
+
+    def attach_artifact_references(self, adapter) -> None:
+        """可选引用桥与仓储共享事务拥有方，不改变独立仓储的默认行为。"""
+        if adapter.storage is not self._storage:
+            raise ValueError("Artifact references and repository must share a storage owner")
+        if self._artifact_references is not None and self._artifact_references is not adapter:
+            raise ValueError("Artifact reference adapter is already attached")
+        self._artifact_references = adapter
+
+    @contextmanager
+    def _source_mutation(self, kind, record, *, payload_json=None, origin=None, source_preparation=None):
+        self._check_open()
+        context = self._index.mutation(kind, record, origin=origin, prepared=source_preparation) if self._index is not None else self._transaction()
+        if self._artifact_references is not None:
+            context = self._artifact_references.mutation(kind, record, context, payload_json=payload_json)
+        with context as transaction:
+            yield transaction
+
+    @contextmanager
+    def _source_deletion(self, kind, ids, expected_tokens=None):
+        self._check_open()
+        context = self._index.deletion(kind, ids, expected_tokens=expected_tokens) if self._index is not None else self._transaction()
+        if self._artifact_references is not None:
+            context = self._artifact_references.deletion(kind, ids, context)
+        with context as transaction:
+            yield transaction
 
     @property
     def db_path(self) -> str:
         return self._db_path
 
+    @property
+    def storage(self) -> SQLiteStorage:
+        """Shared transaction owner; borrowed owners outlive this wrapper."""
+        return self._storage
+
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        if self._closed:
+            return
+        if self._owns_storage:
+            self._storage.close()
+        self._closed = True
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("Memory repository is closed")
+
+    @contextmanager
+    def _transaction(self) -> Iterator[SQLiteTransaction]:
+        self._check_open()
+        with self._storage.transaction() as transaction:
+            self._check_open()
+            yield transaction
+
+    @contextmanager
+    def _read_snapshot(self) -> Iterator[SQLiteTransaction]:
+        self._check_open()
+        with self._storage.read_snapshot() as transaction:
+            self._check_open()
+            yield transaction
 
     def _load_library_records(self, table_name, model_type, order_by, library_name):
         """先按库索引筛选，再解析记录；表名和排序仅由内部固定调用提供。"""
 
-        query = f"SELECT payload_json, map_name, library_name FROM {table_name}"
+        index_columns = {"tagged_locations": "location_id", "semantic_memories": "memory_id",
+                         "semantic_instances": "instance_id", "observation_events": "event_id", "scene_spaces": "scene_space_id"}
+        column = index_columns.get(table_name)
+        extra = f", {column} AS index_record_id" if column and self._index is not None else ""
+        if table_name in ("semantic_instances", "scene_spaces"):
+            extra += ",graph_source_revision"
+        query = f"SELECT payload_json, map_name, library_name{extra} FROM {table_name}"
         params = ()
         if library_name is not None:
             query += " WHERE library_name = ?"
             params = (str(library_name).strip(),)
         query += f" ORDER BY {order_by}"
-        with self._lock:
-            rows = self._conn.execute(query, params).fetchall()
-        return [self._load_record(model_type, row) for row in rows]
+        with self._read_snapshot() as transaction:
+            rows = transaction.execute(query, params).fetchall()
+            tokens = [self._capture_loaded_token(transaction, model_type, row) for row in rows]
+        return [self._tag_loaded(self._load_record(model_type, row), token) for row, token in zip(rows, tokens)]
 
     def load_tagged_locations(self, *, library_name: Optional[str] = None) -> List[TaggedLocation]:
         return self._load_library_records(
@@ -128,18 +209,19 @@ class MemoryRepository:
         resolved_id = str(scene_space_id or "").strip()
         if not resolved_id:
             return None
-        with self._lock:
-            row = self._conn.execute(
+        with self._read_snapshot() as transaction:
+            row = transaction.execute(
                 """
-                SELECT payload_json, map_name, library_name
+                SELECT payload_json, map_name, library_name, graph_source_revision, scene_space_id AS index_record_id
                 FROM scene_spaces
                 WHERE scene_space_id = ?
                 """,
                 (resolved_id,),
             ).fetchone()
+            token = self._capture_loaded_token(transaction, SceneSpace, row) if row is not None else None
         if row is None:
             return None
-        return self._load_record(SceneSpace, row)
+        return self._tag_loaded(self._load_record(SceneSpace, row), token)
 
     def list_scene_spaces(
         self,
@@ -172,16 +254,17 @@ class MemoryRepository:
             placeholders = ", ".join("?" for _ in resolved_statuses)
             where_clauses.append(f"review_status IN ({placeholders})")
             params.extend(resolved_statuses)
-        query = "SELECT payload_json, map_name, library_name FROM scene_spaces"
+        query = "SELECT payload_json, map_name, library_name, graph_source_revision, scene_space_id AS index_record_id FROM scene_spaces"
         if where_clauses:
             query = f"{query} WHERE {' AND '.join(where_clauses)}"
         query = f"{query} ORDER BY updated_at DESC, scene_space_id ASC"
         if limit is not None and limit > 0:
             query = f"{query} LIMIT ?"
             params.append(int(limit))
-        with self._lock:
-            rows = self._conn.execute(query, tuple(params)).fetchall()
-        return [self._load_record(SceneSpace, row) for row in rows]
+        with self._read_snapshot() as transaction:
+            rows = transaction.execute(query, tuple(params)).fetchall()
+            tokens = [self._capture_loaded_token(transaction, SceneSpace, row) for row in rows]
+        return [self._tag_loaded(self._load_record(SceneSpace, row), token) for row, token in zip(rows, tokens)]
 
     def query_scene_spaces(
         self,
@@ -222,8 +305,8 @@ class MemoryRepository:
                 WHERE namespace = ?
             """
             params = (namespace,)
-        with self._lock:
-            rows = self._conn.execute(query, tuple(params)).fetchall()
+        with self._read_snapshot() as transaction:
+            rows = transaction.execute(query, tuple(params)).fetchall()
         return {
             str(row["record_id"]): VectorRecord(
                 namespace=str(row["namespace"]),
@@ -238,8 +321,8 @@ class MemoryRepository:
         }
 
     def load_memory_libraries(self) -> List[MemoryLibraryRecord]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_snapshot() as transaction:
+            rows = transaction.execute(
                 """
                 SELECT library_name, created_at, updated_at
                 FROM memory_libraries
@@ -260,8 +343,8 @@ class MemoryRepository:
         if not resolved_name:
             return
         timestamp = utc_now().isoformat()
-        with self._lock:
-            self._conn.execute(
+        with self._transaction() as transaction:
+            transaction.execute(
                 """
                 INSERT INTO memory_libraries (
                     library_name,
@@ -278,26 +361,30 @@ class MemoryRepository:
                     timestamp,
                 ),
             )
-            self._conn.commit()
 
     def delete_memory_library(self, library_name: str) -> bool:
         resolved_name = str(library_name or "").strip()
         if not resolved_name:
             return False
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._transaction() as transaction:
+            cursor = transaction.execute(
                 "DELETE FROM memory_libraries WHERE library_name = ?",
                 (resolved_name,),
             )
-            self._conn.commit()
         return int(cursor.rowcount or 0) > 0
 
     def upsert_tagged_location(self, location: TaggedLocation) -> None:
-        payload_json = location.model_dump_json()
+        origin = location
+        expected = getattr(origin, "_memory_business_token", None)
+        payload_json = origin.model_dump_json()
+        # SQL 标量、索引输入、制品引用和回调共用同一个已序列化快照。
+        location = type(origin).model_validate_json(payload_json)
+        if expected is not None:
+            object.__setattr__(location, "_memory_business_token", expected)
         created_at = location.timestamp.isoformat()
         library_name = self._resolve_record_library_name(location)
-        with self._lock:
-            self._conn.execute(
+        with self._source_mutation("location", location, payload_json=payload_json, origin=origin) as transaction:
+            transaction.execute(
                 """
                 INSERT INTO tagged_locations (
                     location_id,
@@ -326,14 +413,19 @@ class MemoryRepository:
                     library_name,
                 ),
             )
-            self._conn.commit()
 
     def upsert_semantic_memory(self, entry: SemanticMemoryEntry) -> None:
-        payload_json = entry.model_dump_json()
+        origin = entry
+        expected = getattr(origin, "_memory_business_token", None)
+        payload_json = origin.model_dump_json()
+        # SQL 标量、索引输入、制品引用和回调共用同一个已序列化快照。
+        entry = type(origin).model_validate_json(payload_json)
+        if expected is not None:
+            object.__setattr__(entry, "_memory_business_token", expected)
         created_at = entry.timestamp.isoformat()
         library_name = self._resolve_record_library_name(entry)
-        with self._lock:
-            self._conn.execute(
+        with self._source_mutation("memory", entry, payload_json=payload_json, origin=origin) as transaction:
+            transaction.execute(
                 """
                 INSERT INTO semantic_memories (
                     memory_id,
@@ -368,15 +460,22 @@ class MemoryRepository:
                     library_name,
                 ),
             )
-            self._conn.commit()
 
     def upsert_semantic_instance(self, entry: SemanticInstance) -> None:
-        payload_json = entry.model_dump_json()
+        origin = entry
+        expected = getattr(origin, "_memory_business_token", None)
+        payload_json = origin.model_dump_json()
+        # SQL 标量、索引输入、制品引用和回调共用同一个已序列化快照。
+        entry = type(origin).model_validate_json(payload_json)
+        if expected is not None:
+            object.__setattr__(entry, "_memory_business_token", expected)
+        source_revision = uuid.uuid4().hex
+        object.__setattr__(entry, "_scene_graph_source_revision", source_revision)
         created_at = entry.first_seen_ts.isoformat()
         updated_at = entry.last_seen_ts.isoformat()
         library_name = self._resolve_record_library_name(entry)
-        with self._lock:
-            self._conn.execute(
+        with self._source_mutation("instance", entry, payload_json=payload_json, origin=origin) as transaction:
+            transaction.execute(
                 """
                 INSERT INTO semantic_instances (
                     instance_id,
@@ -387,9 +486,10 @@ class MemoryRepository:
                     payload_json,
                     created_at,
                     updated_at,
-                    library_name
+                    library_name,
+                    graph_source_revision
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(instance_id) DO UPDATE SET
                     label = excluded.label,
                     lifecycle_state = excluded.lifecycle_state,
@@ -397,7 +497,8 @@ class MemoryRepository:
                     localization_session_id = excluded.localization_session_id,
                     payload_json = excluded.payload_json,
                     updated_at = excluded.updated_at,
-                    library_name = excluded.library_name
+                    library_name = excluded.library_name,
+                    graph_source_revision = excluded.graph_source_revision
                 """,
                 (
                     entry.instance_id,
@@ -409,16 +510,22 @@ class MemoryRepository:
                     created_at,
                     updated_at,
                     library_name,
+                    source_revision,
                 ),
             )
-            self._conn.commit()
 
     def upsert_observation_event(self, entry: ObservationEvent) -> None:
-        payload_json = entry.model_dump_json()
+        origin = entry
+        expected = getattr(origin, "_memory_business_token", None)
+        payload_json = origin.model_dump_json()
+        # SQL 标量、索引输入、制品引用和回调共用同一个已序列化快照。
+        entry = type(origin).model_validate_json(payload_json)
+        if expected is not None:
+            object.__setattr__(entry, "_memory_business_token", expected)
         created_at = entry.timestamp.isoformat()
         library_name = self._resolve_record_library_name(entry)
-        with self._lock:
-            self._conn.execute(
+        with self._source_mutation("event", entry, payload_json=payload_json, origin=origin) as transaction:
+            transaction.execute(
                 """
                 INSERT INTO observation_events (
                     event_id,
@@ -450,17 +557,166 @@ class MemoryRepository:
                     library_name,
                 ),
             )
-            self._conn.commit()
 
-    def upsert_scene_space(self, entry: SceneSpace) -> None:
+    def scene_graph_generations(self, library_name, *, transaction=None):
+        if transaction is None:
+            with self._read_snapshot() as snapshot:
+                return self.scene_graph_generations(library_name, transaction=snapshot)
+        row = transaction.execute("SELECT source_generation,geometry_generation FROM memory_scene_graph_inputs WHERE library_name=?", (library_name,)).fetchone()
+        return tuple(row) if row is not None else (0, 0)
+
+    def capture_scene_decision_entries(self, library_name, *, visible_ids=None, include_spaces=False, visible_space_ids=None):
+        with self._read_snapshot() as transaction:
+            row = transaction.execute("SELECT memory_generation FROM memory_scene_graph_inputs WHERE library_name=?", (library_name,)).fetchone()
+            generation = row[0] if row is not None else 0
+            identity = transaction.execute("""SELECT l.incarnation FROM memory_index_aliases a
+                JOIN memory_vectorization_libraries l ON l.name=a.internal_key
+                WHERE a.alias_kind='lib' AND a.namespace='' AND a.external_key=?""", (library_name,)).fetchone()
+            incarnation = identity[0] if identity is not None else None
+            where, params = "library_name=?", [library_name]
+            if visible_ids is not None:
+                where += " AND memory_id IN (SELECT value FROM json_each(?))"
+                params.append(json.dumps(tuple(visible_ids)))
+            rows = transaction.execute(f"""SELECT payload_json,map_name,library_name,memory_id AS index_record_id
+                FROM semantic_memories WHERE {where}
+                ORDER BY CAST(json_extract(payload_json,'$.timestamp') AS TEXT) COLLATE NEH_SCENE_TIMESTAMP DESC,memory_id
+                LIMIT 2000""", tuple(params)).fetchall()
+            tokens = [self._capture_loaded_token(transaction, SemanticMemoryEntry, row) for row in rows]
+            scene_rows, scene_tokens = [], []
+            if include_spaces:
+                scene_where = "library_name=? AND json_extract(payload_json,'$.metadata.scene_mapping_managed')=1"
+                scene_params = [library_name]
+                if visible_space_ids is not None:
+                    scene_where += " AND scene_space_id IN (SELECT value FROM json_each(?))"
+                    scene_params.append(json.dumps(tuple(visible_space_ids)))
+                scene_rows = transaction.execute(f"SELECT payload_json,map_name,library_name,graph_source_revision,scene_space_id AS index_record_id FROM scene_spaces WHERE {scene_where} ORDER BY scene_space_id", tuple(scene_params)).fetchall()
+                scene_tokens = [self._capture_loaded_token(transaction, SceneSpace, row) for row in scene_rows]
+        records = []
+        for row, token in zip(rows, tokens):
+            entry = self._tag_loaded(self._load_record(SemanticMemoryEntry,row),token)
+            object.__setattr__(entry, "_scene_decision_source_revision", ("memory_source", incarnation, generation))
+            records.append(entry)
+        if include_spaces:
+            scenes = tuple(self._tag_loaded(self._load_record(SceneSpace,row),token) for row,token in zip(scene_rows,scene_tokens))
+            return scenes, tuple(records)
+        return tuple(records)
+
+    def capture_scene_graph_sources(self, library_name, *, binding=None, visible_ids=None, live_records=None):
+        """Capture bounded source rows/counters together; decode outside reader ownership."""
+        specs = (("scene_spaces", SceneSpace, "scene_space_id", "updated_at DESC,scene_space_id", 513),
+                 ("semantic_memories", SemanticMemoryEntry, "memory_id", "CAST(json_extract(payload_json,'$.timestamp') AS TEXT) COLLATE NEH_SCENE_TIMESTAMP DESC,memory_id", 2000),
+                 ("semantic_instances", SemanticInstance, "instance_id", "CAST(json_extract(payload_json,'$.last_seen_ts') AS TEXT) COLLATE NEH_SCENE_TIMESTAMP DESC,instance_id DESC", 1000))
+        captured = []
+        with self._read_snapshot() as transaction:
+            generations = self.scene_graph_generations(library_name, transaction=transaction)
+            valid_live_ids, extra_live = [], 0
+            for point_id, record in (live_records or {}).items():
+                version = transaction.execute("SELECT graph_source_revision,library_name FROM semantic_instances WHERE instance_id=?", (point_id,)).fetchone()
+                if version is None:
+                    valid_live_ids.append(point_id)
+                    extra_live += 1
+                    continue
+                if version["library_name"] != library_name:
+                    continue
+                current_revision = version["graph_source_revision"] or None
+                expected_revision = getattr(record, "_scene_graph_source_revision", None) or None
+                if current_revision is not None or expected_revision is not None:
+                    valid = current_revision == expected_revision
+                else:
+                    state = self._index._state(transaction, 'instance', point_id) if self._index is not None else None
+                    raw = self._index._raw(transaction, 'instance', point_id) if self._index is not None else None
+                    token = self._index.business_token(state) if state is not None else self._index.raw_token(raw) if self._index is not None else None
+                    valid = token == getattr(record, "_memory_business_token", None)
+                if valid:
+                    valid_live_ids.append(point_id)
+            for table, model, column, order, limit in specs:
+                where = "library_name=?"
+                params = [library_name]
+                if visible_ids is not None:
+                    ids = tuple(visible_ids.get(table, ()))
+                    where += f" AND {column} IN (SELECT value FROM json_each(?))"
+                    params.append(json.dumps(ids))
+                if table == "scene_spaces":
+                    where += " AND json_extract(payload_json,'$.metadata.scene_mapping_managed')=1"
+                total = transaction.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", tuple(params)).fetchone()[0]
+                selected_total = total
+                if table == "scene_spaces" and binding is not None:
+                    where += " AND review_status NOT IN ('stale','rejected')"
+                    for field in ("map_name", "source_name", "source_epoch", "frame_id", "update_sequence"):
+                        where += f" AND CAST(json_extract(payload_json,'$.metadata.map_binding.{field}') AS TEXT)=?"
+                        params.append(str(binding[field]))
+                    selected_total = transaction.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", tuple(params)).fetchone()[0]
+                if table == "semantic_instances" and valid_live_ids:
+                    # Overlay before LIMIT: demoted live records must not crowd
+                    # newer durable candidates out of the bounded source page.
+                    where += " AND instance_id NOT IN (SELECT value FROM json_each(?))"
+                    params.append(json.dumps(valid_live_ids))
+                extra = ",graph_source_revision" if table in ("semantic_instances", "scene_spaces") else ""
+                rows = transaction.execute(f"SELECT payload_json,map_name,library_name,{column} AS index_record_id{extra} FROM {table} WHERE {where} ORDER BY {order} LIMIT ?", (*params,limit)).fetchall()
+                tokens = [self._capture_loaded_token(transaction,model,row) for row in rows]
+                captured.append((model,rows,tokens,total,selected_total))
+        result = {"generations": generations, "valid_live_ids": valid_live_ids, "extra_live": extra_live}
+        for name, (model, rows, tokens, total, selected_total) in zip(("spaces","entries","instances"),captured):
+            result[name] = [self._tag_loaded(self._load_record(model,row),token) for row,token in zip(rows,tokens)]
+            result[name+"_total"] = total
+            result[name+"_selected_total"] = selected_total
+        return result
+
+    def upsert_scene_space(self, entry: SceneSpace) -> SceneSpace:
+        prepared = self._prepare_scene_space_write(entry)
+        return self._commit_prepared_scene_space(prepared).model_copy(deep=True)
+
+    def _prepare_scene_space_write(self, entry: SceneSpace) -> _PreparedSceneWrite:
+        """Serialize/decode/project before entering a batch writer transaction."""
+        self._check_open()
+        origin = entry
+        expected = getattr(origin, "_memory_business_token", None)
+        payload_json = origin.model_dump_json()
+        # SQL 标量、索引输入、制品引用和回调共用同一个已序列化快照。
+        entry = type(origin).model_validate_json(payload_json)
+        if expected is not None:
+            object.__setattr__(entry, "_memory_business_token", expected)
+        with self._read_snapshot() as snapshot:
+            row = snapshot.execute("SELECT payload_json,map_name,library_name,graph_geometry_revision FROM scene_spaces WHERE scene_space_id=?", (entry.scene_space_id,)).fetchone()
+        previous = self._load_record(SceneSpace, row) if row is not None else None
+        previous_revision = previous.metadata.get("geometry_revision") if previous is not None else None
+        revision = (previous_revision if previous_revision and geometry_value(previous) == geometry_value(entry) else uuid.uuid4().hex)
+        if entry.metadata.get("scene_mapping_managed"):
+            entry.metadata = {**entry.metadata, "geometry_revision": revision}
+        graph_value = graph_geometry_value(entry)
+        graph_revision = ((row["graph_geometry_revision"] if row is not None and row["graph_geometry_revision"]
+            and graph_geometry_value(previous) == graph_value else uuid.uuid4().hex) if graph_value is not None else "")
         payload_json = entry.model_dump_json()
+        source_revision = uuid.uuid4().hex
+        object.__setattr__(entry, "_scene_graph_source_revision", source_revision)
         created_at = entry.timestamp.isoformat()
         semantic_updated_at = entry.semantic_updated_at.isoformat() if entry.semantic_updated_at else None
         updated_at = semantic_updated_at or created_at
         library_name = self._resolve_record_library_name(entry)
-        with self._lock:
-            self._conn.execute(
-                """
+        source_preparation = None
+        if self._index is not None:
+            source = self._index.prepare("scene", entry)
+            dependents = self._index._dependents("scene", source.point_id, entry)
+            source_preparation = (source, dependents)
+        return _PreparedSceneWrite(origin, entry, payload_json,
+            (entry.scene_space_id, entry.map_name, entry.localization_session_id, entry.frame_id,
+             entry.primary_label, entry.review_status.value, payload_json, created_at, updated_at,
+             semantic_updated_at, library_name, graph_revision, source_revision),
+            source_preparation, hasattr(origin, "_scene_expected_source_revision"),
+            getattr(origin, "_scene_expected_source_revision", None))
+
+    def _commit_prepared_scene_space(self, prepared: _PreparedSceneWrite) -> SceneSpace:
+        """Commit an owned scene plan; outer batch rollback discards all callbacks."""
+        entry = prepared.record
+        with self._source_mutation("scene", entry, payload_json=prepared.payload_json,
+                origin=prepared.origin, source_preparation=prepared.source_preparation) as transaction:
+            if prepared.has_expected_revision:
+                current = transaction.execute("SELECT graph_source_revision FROM scene_spaces WHERE scene_space_id=?", (entry.scene_space_id,)).fetchone()
+                current_revision = current[0] if current is not None else None
+                if current_revision != prepared.expected_revision:
+                    from services.memory.vectorization_outbox import OutboxConflict
+                    raise OutboxConflict("Scene source changed during geometry preparation")
+            transaction.execute("""
                 INSERT INTO scene_spaces (
                     scene_space_id,
                     map_name,
@@ -472,9 +728,11 @@ class MemoryRepository:
                     created_at,
                     updated_at,
                     semantic_updated_at,
-                    library_name
+                    library_name,
+                    graph_geometry_revision,
+                    graph_source_revision
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(scene_space_id) DO UPDATE SET
                     map_name = excluded.map_name,
                     localization_session_id = excluded.localization_session_id,
@@ -484,30 +742,20 @@ class MemoryRepository:
                     payload_json = excluded.payload_json,
                     updated_at = excluded.updated_at,
                     semantic_updated_at = excluded.semantic_updated_at,
-                    library_name = excluded.library_name
-                """,
-                (
-                    entry.scene_space_id,
-                    entry.map_name,
-                    entry.localization_session_id,
-                    entry.frame_id,
-                    entry.primary_label,
-                    entry.review_status.value,
-                    payload_json,
-                    created_at,
-                    updated_at,
-                    semantic_updated_at,
-                    library_name,
-                ),
-            )
-            self._conn.commit()
+                    library_name = excluded.library_name,
+                    graph_geometry_revision = excluded.graph_geometry_revision,
+                    graph_source_revision = excluded.graph_source_revision
+                """, prepared.values)
+        return entry
 
-    def upsert_navigation_trajectory_event(self, entry: NavigationTrajectoryEvent) -> None:
+    def upsert_navigation_trajectory_event(self, entry: NavigationTrajectoryEvent) -> NavigationTrajectoryEvent:
+        entry = NavigationTrajectoryEvent.model_validate_json(entry.model_dump_json())
         payload_json = entry.model_dump_json()
         created_at = entry.timestamp.isoformat()
         library_name = self._resolve_record_library_name(entry)
-        with self._lock:
-            self._conn.execute(
+        publication_revision = uuid.uuid4().hex
+        with self._transaction() as transaction:
+            transaction.execute(
                 """
                 INSERT INTO navigation_trajectory_events (
                     trajectory_event_id,
@@ -518,9 +766,10 @@ class MemoryRepository:
                     payload_json,
                     created_at,
                     updated_at,
-                    library_name
+                    library_name,
+                    publication_revision
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trajectory_event_id) DO UPDATE SET
                     event_kind = excluded.event_kind,
                     map_name = excluded.map_name,
@@ -528,7 +777,8 @@ class MemoryRepository:
                     source_record_id = excluded.source_record_id,
                     payload_json = excluded.payload_json,
                     updated_at = excluded.updated_at,
-                    library_name = excluded.library_name
+                    library_name = excluded.library_name,
+                    publication_revision = excluded.publication_revision
                 """,
                 (
                     entry.trajectory_event_id,
@@ -540,16 +790,76 @@ class MemoryRepository:
                     created_at,
                     created_at,
                     library_name,
+                    publication_revision,
                 ),
             )
-            self._conn.commit()
+        object.__setattr__(entry, "_memory_publication_revision", publication_revision)
+        return entry
 
-    def upsert_semantic_graph_relation(self, entry: SemanticGraphRelation) -> None:
-        payload_json = entry.model_dump_json()
-        created_at = entry.timestamp.isoformat()
-        library_name = self._resolve_record_library_name(entry)
-        with self._lock:
-            self._conn.execute(
+    def auxiliary_record_current(self, kind, record_id, publication_revision, library_name):
+        table, column = {
+            "trajectory": ("navigation_trajectory_events", "trajectory_event_id"),
+            "relation": ("semantic_graph_relations", "relation_id"),
+            "summary": ("semantic_summary_nodes", "summary_id"),
+        }[kind]
+        with self._read_snapshot() as transaction:
+            return transaction.execute(
+                f"SELECT 1 FROM {table} WHERE {column}=? AND publication_revision=? AND library_name=?",
+                (record_id, publication_revision, library_name),
+            ).fetchone() is not None
+
+    def _natural_record_identity(self, transaction, entry, identity_scope, *, kind, table, column, fields):
+        """Resolve one library-owned natural key; existing duplicates stay intact."""
+        library = self._resolve_record_library_name(entry)
+        key = json.dumps([value for _, value in fields], ensure_ascii=False, separators=(",", ":"))
+        clauses = " AND ".join(("COALESCE(r.%s, '') = ?" if name in ("label", "scene_space_id", "semantic_region_id") else "r.%s = ?") % name for name, _ in fields)
+        values = tuple(value for _, value in fields)
+        row = transaction.execute(
+            f"""SELECT r.{column} FROM memory_record_natural_ids n
+                JOIN {table} r ON r.{column}=n.record_id
+                WHERE n.library_incarnation=? AND n.record_kind=? AND n.natural_key=?
+                AND r.library_name=? AND {clauses}""",
+            (identity_scope, kind, key, library, *values),
+        ).fetchone()
+        if row is None:
+            # Adopt only matching candidates, without rewriting existing identities.
+            row = transaction.execute(
+                f"SELECT r.{column} FROM {table} r WHERE r.library_name=? AND {clauses} ORDER BY r.created_at,r.{column} LIMIT 1",
+                (library, *values),
+            ).fetchone()
+        record_id = row[0] if row else ("sgr_" if kind == "relation" else "ssn_") + uuid.uuid4().hex
+        transaction.execute(
+            """INSERT INTO memory_record_natural_ids VALUES (?,?,?,?)
+               ON CONFLICT(library_incarnation,record_kind,natural_key) DO UPDATE SET record_id=excluded.record_id""",
+            (identity_scope, kind, key, record_id),
+        )
+        return entry.model_copy(update={column: record_id}, deep=True)
+
+    @staticmethod
+    def _summary_identity_fields(entry):
+        kind = entry.summary_kind.value
+        fields = [("summary_kind", kind), ("label", entry.label or "")]
+        if kind != "target_category_cluster":
+            fields.append(("scene_space_id", entry.scene_space_id or ""))
+        if kind == "region":
+            fields.append(("semantic_region_id", entry.semantic_region_id or ""))
+        return tuple(fields)
+
+    def upsert_semantic_graph_relation(self, entry: SemanticGraphRelation, *, natural_identity: Optional[str] = None) -> SemanticGraphRelation:
+        entry = SemanticGraphRelation.model_validate_json(entry.model_dump_json())
+        publication_revision = uuid.uuid4().hex
+        with self._transaction() as transaction:
+            if natural_identity is not None:
+                entry = self._natural_record_identity(transaction, entry, natural_identity,
+                    kind="relation", table="semantic_graph_relations", column="relation_id", fields=(("relation_kind", entry.relation_kind.value), ("source_node_kind", entry.source_node_kind),
+                    ("source_node_id", entry.source_node_id), ("target_node_kind", entry.target_node_kind),
+                    ("target_node_id", entry.target_node_id)))
+            # Explicit-ID updates retain valid aliases. The mapped-row join
+            # checks changed ownership/key only when that identity is requested.
+            payload_json = entry.model_dump_json()
+            created_at = entry.timestamp.isoformat()
+            library_name = self._resolve_record_library_name(entry)
+            transaction.execute(
                 """
                 INSERT INTO semantic_graph_relations (
                     relation_id,
@@ -563,9 +873,10 @@ class MemoryRepository:
                     payload_json,
                     created_at,
                     updated_at,
-                    library_name
+                    library_name,
+                    publication_revision
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(relation_id) DO UPDATE SET
                     relation_kind = excluded.relation_kind,
                     source_node_kind = excluded.source_node_kind,
@@ -576,7 +887,8 @@ class MemoryRepository:
                     localization_session_id = excluded.localization_session_id,
                     payload_json = excluded.payload_json,
                     updated_at = excluded.updated_at,
-                    library_name = excluded.library_name
+                    library_name = excluded.library_name,
+                    publication_revision = excluded.publication_revision
                 """,
                 (
                     entry.relation_id,
@@ -591,16 +903,25 @@ class MemoryRepository:
                     created_at,
                     created_at,
                     library_name,
+                    publication_revision,
                 ),
             )
-            self._conn.commit()
+        object.__setattr__(entry, "_memory_publication_revision", publication_revision)
+        return entry
 
-    def upsert_semantic_summary_node(self, entry: SemanticSummaryNode) -> None:
-        payload_json = entry.model_dump_json()
-        created_at = entry.timestamp.isoformat()
-        library_name = self._resolve_record_library_name(entry)
-        with self._lock:
-            self._conn.execute(
+    def upsert_semantic_summary_node(self, entry: SemanticSummaryNode, *, natural_identity: Optional[str] = None) -> SemanticSummaryNode:
+        entry = SemanticSummaryNode.model_validate_json(entry.model_dump_json())
+        publication_revision = uuid.uuid4().hex
+        with self._transaction() as transaction:
+            if natural_identity is not None:
+                entry = self._natural_record_identity(transaction, entry, natural_identity,
+                    kind="summary", table="semantic_summary_nodes", column="summary_id", fields=self._summary_identity_fields(entry))
+            # Explicit-ID updates retain valid aliases. The mapped-row join
+            # checks changed ownership/key only when that identity is requested.
+            payload_json = entry.model_dump_json()
+            created_at = entry.timestamp.isoformat()
+            library_name = self._resolve_record_library_name(entry)
+            transaction.execute(
                 """
                 INSERT INTO semantic_summary_nodes (
                     summary_id,
@@ -613,9 +934,10 @@ class MemoryRepository:
                     payload_json,
                     created_at,
                     updated_at,
-                    library_name
+                    library_name,
+                    publication_revision
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(summary_id) DO UPDATE SET
                     summary_kind = excluded.summary_kind,
                     map_name = excluded.map_name,
@@ -625,7 +947,8 @@ class MemoryRepository:
                     label = excluded.label,
                     payload_json = excluded.payload_json,
                     updated_at = excluded.updated_at,
-                    library_name = excluded.library_name
+                    library_name = excluded.library_name,
+                    publication_revision = excluded.publication_revision
                 """,
                 (
                     entry.summary_id,
@@ -639,138 +962,147 @@ class MemoryRepository:
                     created_at,
                     created_at,
                     library_name,
+                    publication_revision,
                 ),
             )
-            self._conn.commit()
+        object.__setattr__(entry, "_memory_publication_revision", publication_revision)
+        return entry
 
-    def delete_tagged_locations(self, location_ids: Sequence[str]) -> int:
+    def delete_tagged_locations(self, location_ids: Sequence[str], *, expected_tokens=None) -> int:
         normalized_ids = [str(item).strip() for item in location_ids if str(item).strip()]
         if not normalized_ids:
             return 0
-        with self._lock:
-            self._conn.executemany(
+        with self._source_deletion("location", normalized_ids, expected_tokens) as transaction:
+            transaction.executemany(
                 "DELETE FROM tagged_locations WHERE location_id = ?",
                 [(location_id,) for location_id in normalized_ids],
             )
-            self._conn.executemany(
+            transaction.executemany(
                 "DELETE FROM memory_vectors WHERE record_id = ?",
                 [(location_id,) for location_id in normalized_ids],
             )
-            self._conn.commit()
         return len(normalized_ids)
 
-    def delete_semantic_memories(self, memory_ids: Sequence[str]) -> int:
+    def delete_semantic_memories(self, memory_ids: Sequence[str], *, expected_tokens=None) -> int:
         normalized_ids = [str(item).strip() for item in memory_ids if str(item).strip()]
         if not normalized_ids:
             return 0
-        with self._lock:
-            self._conn.executemany(
+        with self._source_deletion("memory", normalized_ids, expected_tokens) as transaction:
+            transaction.executemany(
                 "DELETE FROM semantic_memories WHERE memory_id = ?",
                 [(memory_id,) for memory_id in normalized_ids],
             )
-            self._conn.executemany(
+            transaction.executemany(
                 "DELETE FROM memory_vectors WHERE record_id = ?",
                 [(memory_id,) for memory_id in normalized_ids],
             )
-            self._conn.commit()
         return len(normalized_ids)
 
-    def delete_semantic_instances(self, instance_ids: Sequence[str]) -> int:
+    def delete_semantic_instances(self, instance_ids: Sequence[str], *, expected_tokens=None) -> int:
         normalized_ids = [str(item).strip() for item in instance_ids if str(item).strip()]
         if not normalized_ids:
             return 0
-        with self._lock:
-            self._conn.executemany(
+        with self._source_deletion("instance", normalized_ids, expected_tokens) as transaction:
+            transaction.executemany(
                 "DELETE FROM semantic_instances WHERE instance_id = ?",
                 [(instance_id,) for instance_id in normalized_ids],
             )
-            self._conn.executemany(
+            transaction.executemany(
                 "DELETE FROM memory_vectors WHERE record_id = ?",
                 [(instance_id,) for instance_id in normalized_ids],
             )
-            self._conn.commit()
         return len(normalized_ids)
 
-    def delete_observation_events(self, event_ids: Sequence[str]) -> int:
+    def delete_observation_events(self, event_ids: Sequence[str], *, expected_tokens=None) -> int:
         normalized_ids = [str(item).strip() for item in event_ids if str(item).strip()]
         if not normalized_ids:
             return 0
-        with self._lock:
-            self._conn.executemany(
+        with self._source_deletion("event", normalized_ids, expected_tokens) as transaction:
+            transaction.executemany(
                 "DELETE FROM observation_events WHERE event_id = ?",
                 [(event_id,) for event_id in normalized_ids],
             )
-            self._conn.executemany(
+            transaction.executemany(
                 "DELETE FROM memory_vectors WHERE record_id = ?",
                 [(event_id,) for event_id in normalized_ids],
             )
-            self._conn.commit()
         return len(normalized_ids)
 
-    def delete_scene_spaces(self, scene_space_ids: Sequence[str]) -> int:
+    def delete_scene_spaces(self, scene_space_ids: Sequence[str], *, expected_tokens=None) -> int:
         normalized_ids = [str(item).strip() for item in scene_space_ids if str(item).strip()]
         if not normalized_ids:
             return 0
-        with self._lock:
-            self._conn.executemany(
+        with self._source_deletion("scene", normalized_ids, expected_tokens) as transaction:
+            transaction.executemany(
                 "DELETE FROM scene_spaces WHERE scene_space_id = ?",
                 [(scene_space_id,) for scene_space_id in normalized_ids],
             )
-            self._conn.executemany(
+            transaction.executemany(
                 "DELETE FROM memory_vectors WHERE record_id = ?",
                 [(scene_space_id,) for scene_space_id in normalized_ids],
             )
-            self._conn.commit()
         return len(normalized_ids)
 
     def delete_navigation_trajectory_events(self, trajectory_event_ids: Sequence[str]) -> int:
         normalized_ids = [str(item).strip() for item in trajectory_event_ids if str(item).strip()]
         if not normalized_ids:
             return 0
-        with self._lock:
-            self._conn.executemany(
+        with self._transaction() as transaction:
+            transaction.executemany(
                 "DELETE FROM navigation_trajectory_events WHERE trajectory_event_id = ?",
                 [(trajectory_event_id,) for trajectory_event_id in normalized_ids],
             )
-            self._conn.commit()
         return len(normalized_ids)
 
     def delete_semantic_graph_relations(self, relation_ids: Sequence[str]) -> int:
         normalized_ids = [str(item).strip() for item in relation_ids if str(item).strip()]
         if not normalized_ids:
             return 0
-        with self._lock:
-            self._conn.executemany(
+        with self._transaction() as transaction:
+            transaction.executemany("DELETE FROM memory_record_natural_ids WHERE record_kind=? AND record_id=?",
+                                    [("relation", item) for item in normalized_ids])
+            transaction.executemany(
                 "DELETE FROM semantic_graph_relations WHERE relation_id = ?",
                 [(relation_id,) for relation_id in normalized_ids],
             )
-            self._conn.commit()
         return len(normalized_ids)
 
     def delete_semantic_summary_nodes(self, summary_ids: Sequence[str]) -> int:
         normalized_ids = [str(item).strip() for item in summary_ids if str(item).strip()]
         if not normalized_ids:
             return 0
-        with self._lock:
-            self._conn.executemany(
+        with self._transaction() as transaction:
+            transaction.executemany("DELETE FROM memory_record_natural_ids WHERE record_kind=? AND record_id=?",
+                                    [("summary", item) for item in normalized_ids])
+            transaction.executemany(
                 "DELETE FROM semantic_summary_nodes WHERE summary_id = ?",
                 [(summary_id,) for summary_id in normalized_ids],
             )
-            self._conn.commit()
         return len(normalized_ids)
 
     def clear_all(self) -> None:
-        with self._lock:
-            self._conn.execute("DELETE FROM tagged_locations")
-            self._conn.execute("DELETE FROM semantic_memories")
-            self._conn.execute("DELETE FROM semantic_instances")
-            self._conn.execute("DELETE FROM observation_events")
-            self._conn.execute("DELETE FROM scene_spaces")
-            self._conn.execute("DELETE FROM navigation_trajectory_events")
-            self._conn.execute("DELETE FROM semantic_graph_relations")
-            self._conn.execute("DELETE FROM semantic_summary_nodes")
-            self._conn.execute("DELETE FROM memory_vectors")
-            self._conn.commit()
+        with self._transaction() as transaction:
+            from services.memory.scene_identity import clear_all as clear_scene_identities
+            clear_scene_identities(transaction)
+            if self._index is not None or self._artifact_references is not None:
+                for table, column, method in (
+                    ("tagged_locations", "location_id", self.delete_tagged_locations),
+                    ("semantic_memories", "memory_id", self.delete_semantic_memories),
+                    ("semantic_instances", "instance_id", self.delete_semantic_instances),
+                    ("observation_events", "event_id", self.delete_observation_events),
+                    ("scene_spaces", "scene_space_id", self.delete_scene_spaces),
+                ):
+                    method([row[0] for row in transaction.execute(f"SELECT {column} FROM {table}")])
+            transaction.execute("DELETE FROM tagged_locations")
+            transaction.execute("DELETE FROM semantic_memories")
+            transaction.execute("DELETE FROM semantic_instances")
+            transaction.execute("DELETE FROM observation_events")
+            transaction.execute("DELETE FROM scene_spaces")
+            transaction.execute("DELETE FROM navigation_trajectory_events")
+            transaction.execute("DELETE FROM semantic_graph_relations")
+            transaction.execute("DELETE FROM semantic_summary_nodes")
+            transaction.execute("DELETE FROM memory_vectors")
+            transaction.execute("DELETE FROM memory_record_natural_ids")
 
     def upsert_vector_record(
         self,
@@ -783,8 +1115,8 @@ class MemoryRepository:
         vector_payload: str,
         updated_at: str,
     ) -> None:
-        with self._lock:
-            self._conn.execute(
+        with self._transaction() as transaction:
+            transaction.execute(
                 """
                 INSERT INTO memory_vectors (
                     namespace,
@@ -813,7 +1145,22 @@ class MemoryRepository:
                     updated_at,
                 ),
             )
-            self._conn.commit()
+
+    def _capture_loaded_token(self, transaction, model_type, row):
+        if self._index is None or "index_record_id" not in row.keys():
+            return None
+        from services.memory.durable_index import SOURCES
+        kind = next((key for key, value in SOURCES.items() if value[2] is model_type), None)
+        if kind is None:
+            return None
+        state = self._index._state(transaction, kind, row["index_record_id"])
+        return self._index.business_token(state) if state else self._index.raw_token(row)
+
+    def _tag_loaded(self, record, token=None):
+        if token is not None:
+            from services.memory.durable_index import TOKEN
+            object.__setattr__(record, TOKEN, token)
+        return record
 
     @staticmethod
     def _load_record(model_type, row):
@@ -831,7 +1178,10 @@ class MemoryRepository:
             if library_name and library_name != "legacy_default":
                 resolved_map_name = library_name
         payload["map_name"] = resolved_map_name or None
-        return model_type.model_validate(payload)
+        record = model_type.model_validate(payload)
+        if model_type in (SemanticInstance, SceneSpace) and "graph_source_revision" in row.keys():
+            object.__setattr__(record, "_scene_graph_source_revision", row["graph_source_revision"])
+        return record
 
     @staticmethod
     def _enum_values(values: Sequence[object]) -> List[str]:
@@ -901,8 +1251,8 @@ class MemoryRepository:
 
     @staticmethod
     def _pose_distance_m(first: object, second: object) -> float:
-        first_position = getattr(first, "position")
-        second_position = getattr(second, "position")
+        first_position = first.position
+        second_position = second.position
         dx = float(first_position.x) - float(second_position.x)
         dy = float(first_position.y) - float(second_position.y)
         dz = float(first_position.z) - float(second_position.z)
@@ -966,10 +1316,11 @@ class MemoryRepository:
         return True
 
     def _ensure_columns(self, table_name: str, columns: Dict[str, str]) -> None:
-        existing = {str(row["name"]) for row in self._conn.execute("PRAGMA table_info(%s)" % table_name).fetchall()}
-        for column_name, column_type in columns.items():
-            if column_name not in existing:
-                self._conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table_name, column_name, column_type))
+        with self._transaction() as transaction:
+            existing = {str(row["name"]) for row in transaction.execute(f"PRAGMA table_info({table_name})").fetchall()}
+            for column_name, column_type in columns.items():
+                if column_name not in existing:
+                    transaction.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
     # —— speed-up-list-maps-summary ——
     # 8 张记忆表与 library_name 列 / 索引的常量映射；供 _ensure_library_name_columns /
@@ -988,25 +1339,28 @@ class MemoryRepository:
     def _ensure_library_name_columns(self) -> None:
         """确保 8 张记忆表都有 library_name 列（不存在则 ALTER）。"""
 
-        for table_name in self._LIBRARY_NAME_TABLES:
-            self._ensure_columns(table_name, {"library_name": "TEXT"})
+        with self._transaction():
+            for table_name in self._LIBRARY_NAME_TABLES:
+                self._ensure_columns(table_name, {"library_name": "TEXT"})
 
     def _ensure_map_name_columns(self) -> None:
-        for table_name in self._LIBRARY_NAME_TABLES:
-            self._ensure_columns(table_name, {"map_name": "TEXT"})
+        with self._transaction():
+            for table_name in self._LIBRARY_NAME_TABLES:
+                self._ensure_columns(table_name, {"map_name": "TEXT"})
 
     def _backfill_map_names_from_library_names(self) -> None:
-        for table_name in self._LIBRARY_NAME_TABLES:
-            self._conn.execute(
-                """
-                UPDATE %s
-                SET map_name = TRIM(library_name)
-                WHERE (map_name IS NULL OR TRIM(map_name) = '')
-                  AND library_name IS NOT NULL
-                  AND TRIM(library_name) != ''
-                  AND TRIM(library_name) != 'legacy_default'
-                """ % table_name
-            )
+        with self._transaction() as transaction:
+            for table_name in self._LIBRARY_NAME_TABLES:
+                transaction.execute(
+                    f"""
+                    UPDATE {table_name}
+                    SET map_name = TRIM(library_name)
+                    WHERE (map_name IS NULL OR TRIM(map_name) = '')
+                      AND library_name IS NOT NULL
+                      AND TRIM(library_name) != ''
+                      AND TRIM(library_name) != 'legacy_default'
+                    """
+                )
 
     @staticmethod
     def _resolve_record_library_name(record: object) -> str:
@@ -1029,20 +1383,21 @@ class MemoryRepository:
     def _ensure_library_name_indexes(self) -> None:
         """为每张记忆表的 library_name 列加索引（按库聚合 O(logN)）。"""
 
-        for table_name in self._LIBRARY_NAME_TABLES:
-            index_name = "idx_%s_library_name" % table_name
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS %s ON %s(library_name)" % (index_name, table_name)
-            )
+        with self._transaction() as transaction:
+            for table_name in self._LIBRARY_NAME_TABLES:
+                index_name = f"idx_{table_name}_library_name"
+                transaction.execute(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name}(library_name)"
+                )
 
     def has_library_name_columns(self) -> bool:
         """检测所有记忆表是否都已具备 library_name 列（用于轻量快路径就绪判定）。"""
 
-        with self._lock:
+        with self._read_snapshot() as transaction:
             for table_name in self._LIBRARY_NAME_TABLES:
                 columns = {
                     str(row["name"])
-                    for row in self._conn.execute("PRAGMA table_info(%s)" % table_name).fetchall()
+                    for row in transaction.execute(f"PRAGMA table_info({table_name})").fetchall()
                 }
                 if "library_name" not in columns:
                     return False
@@ -1068,14 +1423,14 @@ class MemoryRepository:
             ("semantic_summary_nodes", "semantic_summary"),
         )
         result: Dict[str, Dict[str, int]] = {}
-        with self._lock:
+        with self._read_snapshot() as transaction:
             for table_name, record_kind in table_to_kind:
-                rows = self._conn.execute(
-                    """
+                rows = transaction.execute(
+                    f"""
                     SELECT COALESCE(library_name, '') AS library_name, COUNT(*) AS cnt
-                    FROM %s
+                    FROM {table_name}
                     GROUP BY library_name
-                    """ % table_name
+                    """
                 ).fetchall()
                 for row in rows:
                     name = str(row["library_name"] or "").strip()
@@ -1102,14 +1457,14 @@ class MemoryRepository:
             ("semantic_summary_nodes", "updated_at"),
         )
         merged: Dict[str, str] = {}
-        with self._lock:
+        with self._read_snapshot() as transaction:
             for table_name, updated_col in table_to_updated:
-                rows = self._conn.execute(
-                    """
-                    SELECT COALESCE(library_name, '') AS library_name, MAX(%s) AS last_ts
-                    FROM %s
+                rows = transaction.execute(
+                    f"""
+                    SELECT COALESCE(library_name, '') AS library_name, MAX({updated_col}) AS last_ts
+                    FROM {table_name}
                     GROUP BY library_name
-                    """ % (updated_col, table_name)
+                    """
                 ).fetchall()
                 for row in rows:
                     name = str(row["library_name"] or "").strip() or "legacy_default"
@@ -1122,16 +1477,14 @@ class MemoryRepository:
         return merged
 
     def backfill_library_names(self, *, batch_size: int = 500) -> Dict[str, int]:
-        """从 payload_json 元数据回填 library_name 列；幂等可重入。
+        """Resume NULL library-name migration in independently committed batches.
 
-        - 仅处理 library_name IS NULL 的行；
-        - 从 payload_json 提取 MEMORY_LIBRARY_METADATA_KEY（'memory_library_name'）作为库名；
-        - 缺失则写入 LEGACY_DEFAULT('legacy_default')；
-        - 按 batch_size 分批提交；返回 {table_name: updated_rows}。
+        When called inside an owner transaction (including schema setup), every
+        batch instead nests a savepoint and remains provisional until its caller
+        commits. Standalone decoding runs outside the writer lock; guarded SQL
+        leaves a concurrently changed payload/ownership for a later batch.
         """
-
-        MEMORY_LIBRARY_METADATA_KEY = "memory_library_name"
-        LEGACY_DEFAULT = "legacy_default"
+        self._check_open()
         table_to_pk = (
             ("tagged_locations", "location_id"),
             ("semantic_memories", "memory_id"),
@@ -1143,50 +1496,64 @@ class MemoryRepository:
             ("semantic_summary_nodes", "summary_id"),
         )
         updated_totals: Dict[str, int] = {}
-        with self._lock:
-            for table_name, pk_col in table_to_pk:
-                updated = 0
-                while True:
-                    rows = self._conn.execute(
-                        """
-                        SELECT %s AS pk, payload_json AS payload_json
-                        FROM %s
+        for table_name, pk_col in table_to_pk:
+            updated = 0
+            while True:
+                with self._read_snapshot() as transaction:
+                    rows = transaction.execute(
+                        f"""
+                        SELECT {pk_col} AS pk, payload_json AS payload_json
+                        FROM {table_name}
                         WHERE library_name IS NULL
                         LIMIT ?
-                        """ % (pk_col, table_name),
+                        """,
                         (batch_size,),
                     ).fetchall()
-                    if not rows:
-                        break
-                    updates: List[tuple] = []
-                    for row in rows:
-                        payload_str = str(row["payload_json"] or "")
-                        library_name = LEGACY_DEFAULT
-                        if payload_str:
-                            try:
-                                metadata = json.loads(payload_str).get("metadata") or {}
-                                value = (metadata or {}).get(MEMORY_LIBRARY_METADATA_KEY) if isinstance(metadata, dict) else None
-                                if isinstance(value, str) and value.strip():
-                                    library_name = value.strip()
-                            except (ValueError, TypeError):
-                                # payload 损坏时按 legacy_default 处理，保持与 _record_library_name 兜底一致。
-                                library_name = LEGACY_DEFAULT
-                        updates.append((library_name, str(row["pk"])))
-                    self._conn.executemany(
-                        "UPDATE %s SET library_name = ? WHERE %s = ?" % (table_name, pk_col),
-                        updates,
-                    )
-                    self._conn.commit()
-                    updated += len(updates)
-                    if len(rows) < batch_size:
-                        break
-                if updated:
-                    updated_totals[table_name] = updated
+                if not rows:
+                    break
+                updates = self._prepare_library_name_backfill(rows)
+                with self._transaction() as transaction:
+                    updated += self._backfill_library_names_batch_tx(transaction, table_name, pk_col, updates)
+            if updated:
+                updated_totals[table_name] = updated
         return updated_totals
 
+    @staticmethod
+    def _prepare_library_name_backfill(rows: Sequence[sqlite3.Row]) -> List[tuple]:
+        updates: List[tuple] = []
+        for row in rows:
+            payload_str = str(row["payload_json"] or "")
+            library_name = "legacy_default"
+            if payload_str:
+                try:
+                    payload = json.loads(payload_str)
+                    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+                    value = metadata.get("memory_library_name") if isinstance(metadata, dict) else None
+                    if isinstance(value, str) and value.strip():
+                        library_name = value.strip()
+                except (ValueError, TypeError):
+                    # Preserve the legacy fallback for damaged payloads.
+                    library_name = "legacy_default"
+            updates.append((library_name, str(row["pk"]), row["payload_json"]))
+        return updates
+
+    @staticmethod
+    def _backfill_library_names_batch_tx(
+        transaction: SQLiteTransaction,
+        table_name: str,
+        pk_col: str,
+        updates: Sequence[tuple],
+    ) -> int:
+        """Apply one prepared batch without controlling the caller's boundary."""
+        cursor = transaction.executemany(
+            f"UPDATE {table_name} SET library_name = ? WHERE {pk_col} = ? AND library_name IS NULL AND payload_json IS ?",
+            updates,
+        )
+        return int(cursor.rowcount or 0)
+
     def _init_schema(self) -> None:
-        with self._lock:
-            self._conn.execute(
+        with self._transaction() as transaction:
+            transaction.execute(
                 """
                 CREATE TABLE IF NOT EXISTS tagged_locations (
                     location_id TEXT PRIMARY KEY,
@@ -1198,10 +1565,10 @@ class MemoryRepository:
                 )
                 """
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tagged_locations_normalized_name ON tagged_locations(normalized_name)"
             )
-            self._conn.execute(
+            transaction.execute(
                 """
                 CREATE TABLE IF NOT EXISTS semantic_memories (
                     memory_id TEXT PRIMARY KEY,
@@ -1215,10 +1582,10 @@ class MemoryRepository:
                 )
                 """
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_memories_kind ON semantic_memories(kind)"
             )
-            self._conn.execute(
+            transaction.execute(
                 """
                 CREATE TABLE IF NOT EXISTS memory_libraries (
                     library_name TEXT PRIMARY KEY,
@@ -1227,10 +1594,10 @@ class MemoryRepository:
                 )
                 """
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_libraries_updated_at ON memory_libraries(updated_at)"
             )
-            self._conn.execute(
+            transaction.execute(
                 """
                 CREATE TABLE IF NOT EXISTS memory_vectors (
                     namespace TEXT NOT NULL,
@@ -1244,10 +1611,10 @@ class MemoryRepository:
                 )
                 """
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_vectors_namespace ON memory_vectors(namespace)"
             )
-            self._conn.execute(
+            transaction.execute(
                 """
                 CREATE TABLE IF NOT EXISTS scene_spaces (
                     scene_space_id TEXT PRIMARY KEY,
@@ -1270,25 +1637,25 @@ class MemoryRepository:
                     "localization_session_id": "TEXT",
                 },
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_scene_spaces_map_name ON scene_spaces(map_name)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_scene_spaces_localization_session_id ON scene_spaces(localization_session_id)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_scene_spaces_frame_id ON scene_spaces(frame_id)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_scene_spaces_primary_label ON scene_spaces(primary_label)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_scene_spaces_review_status ON scene_spaces(review_status)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_scene_spaces_updated_at ON scene_spaces(updated_at)"
             )
-            self._conn.execute(
+            transaction.execute(
                 """
                 CREATE TABLE IF NOT EXISTS semantic_instances (
                     instance_id TEXT PRIMARY KEY,
@@ -1309,19 +1676,19 @@ class MemoryRepository:
                     "localization_session_id": "TEXT",
                 },
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_instances_label ON semantic_instances(label)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_instances_lifecycle_state ON semantic_instances(lifecycle_state)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_instances_map_name ON semantic_instances(map_name)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_instances_localization_session_id ON semantic_instances(localization_session_id)"
             )
-            self._conn.execute(
+            transaction.execute(
                 """
                 CREATE TABLE IF NOT EXISTS observation_events (
                     event_id TEXT PRIMARY KEY,
@@ -1341,19 +1708,19 @@ class MemoryRepository:
                     "localization_session_id": "TEXT",
                 },
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_observation_events_anchor_id ON observation_events(anchor_id)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_observation_events_created_at ON observation_events(created_at)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_observation_events_map_name ON observation_events(map_name)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_observation_events_localization_session_id ON observation_events(localization_session_id)"
             )
-            self._conn.execute(
+            transaction.execute(
                 """
                 CREATE TABLE IF NOT EXISTS navigation_trajectory_events (
                     trajectory_event_id TEXT PRIMARY KEY,
@@ -1375,19 +1742,19 @@ class MemoryRepository:
                     "source_record_id": "TEXT",
                 },
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_navigation_trajectory_events_kind ON navigation_trajectory_events(event_kind)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_navigation_trajectory_events_map_name ON navigation_trajectory_events(map_name)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_navigation_trajectory_events_localization_session_id ON navigation_trajectory_events(localization_session_id)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_navigation_trajectory_events_source_record_id ON navigation_trajectory_events(source_record_id)"
             )
-            self._conn.execute(
+            transaction.execute(
                 """
                 CREATE TABLE IF NOT EXISTS semantic_graph_relations (
                     relation_id TEXT PRIMARY KEY,
@@ -1411,22 +1778,22 @@ class MemoryRepository:
                     "localization_session_id": "TEXT",
                 },
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_graph_relations_kind ON semantic_graph_relations(relation_kind)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_graph_relations_source ON semantic_graph_relations(source_node_kind, source_node_id)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_graph_relations_target ON semantic_graph_relations(target_node_kind, target_node_id)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_graph_relations_map_name ON semantic_graph_relations(map_name)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_graph_relations_localization_session_id ON semantic_graph_relations(localization_session_id)"
             )
-            self._conn.execute(
+            transaction.execute(
                 """
                 CREATE TABLE IF NOT EXISTS semantic_summary_nodes (
                     summary_id TEXT PRIMARY KEY,
@@ -1452,38 +1819,78 @@ class MemoryRepository:
                     "label": "TEXT",
                 },
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_kind ON semantic_summary_nodes(summary_kind)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_map_name ON semantic_summary_nodes(map_name)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_localization_session_id ON semantic_summary_nodes(localization_session_id)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_scene_space_id ON semantic_summary_nodes(scene_space_id)"
             )
-            self._conn.execute(
+            transaction.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_label ON semantic_summary_nodes(label)"
             )
             # —— speed-up-list-maps-summary ——
             # 给 8 张记忆表补齐库归属与稳定地图主键。旧 map_version_id 列可能仍在
             # 旧数据库中，但不再参与新写入、过滤或归属推导。
             self._ensure_library_name_columns()
+            self._ensure_columns("scene_spaces", {"graph_geometry_revision": "TEXT NOT NULL DEFAULT ''", "graph_source_revision": "TEXT NOT NULL DEFAULT ''"})
+            from services.memory.scene_identity import install_schema as install_scene_identity_schema
+            install_scene_identity_schema(transaction)
+            self._ensure_columns("semantic_instances", {"graph_source_revision": "TEXT NOT NULL DEFAULT ''"})
+            transaction.execute("""CREATE TABLE IF NOT EXISTS memory_scene_graph_inputs (
+                library_name TEXT PRIMARY KEY, source_generation INTEGER NOT NULL DEFAULT 0,
+                geometry_generation INTEGER NOT NULL DEFAULT 0, memory_generation INTEGER NOT NULL DEFAULT 0)""")
+            self._ensure_columns("memory_scene_graph_inputs", {"memory_generation": "INTEGER NOT NULL DEFAULT 0"})
+            for table in ("semantic_memories", "semantic_instances", "scene_spaces"):
+                memory_change = 1 if table == "semantic_memories" else 0
+                def eligible(row):
+                    return (f"CASE WHEN json_valid({row}.payload_json) THEN CASE WHEN "
+                            f"json_extract({row}.payload_json,'$.metadata.scene_mapping_managed')=1 "
+                            f"AND {row}.review_status NOT IN ('stale','rejected') THEN 1 ELSE 0 END ELSE 0 END")
+                geometry = eligible("OLD") if table == "scene_spaces" else "0"
+                changed = (f"CASE WHEN COALESCE(OLD.library_name,'legacy_default') != COALESCE(NEW.library_name,'legacy_default') "
+                           f"THEN {eligible('NEW')} WHEN ({eligible('OLD')}) != ({eligible('NEW')}) THEN 1 "
+                           f"WHEN ({eligible('NEW')})=1 AND OLD.graph_geometry_revision != NEW.graph_geometry_revision THEN 1 ELSE 0 END") if table == "scene_spaces" else "0"
+                for operation, row, amount in (("insert", "NEW", geometry.replace("OLD.", "NEW.")), ("delete", "OLD", geometry)):
+                    transaction.execute(f"""CREATE TRIGGER IF NOT EXISTS scene_graph_{table}_{operation}
+                        AFTER {operation.upper()} ON {table} BEGIN
+                        INSERT INTO memory_scene_graph_inputs VALUES(COALESCE({row}.library_name,'legacy_default'),1,{amount},{memory_change})
+                        ON CONFLICT(library_name) DO UPDATE SET source_generation=source_generation+1,
+                            geometry_generation=geometry_generation+{amount},memory_generation=memory_generation+{memory_change}; END""")
+                transaction.execute(f"""CREATE TRIGGER IF NOT EXISTS scene_graph_{table}_update
+                    AFTER UPDATE ON {table} BEGIN
+                    INSERT INTO memory_scene_graph_inputs VALUES(COALESCE(NEW.library_name,'legacy_default'),1,{changed},{memory_change})
+                    ON CONFLICT(library_name) DO UPDATE SET source_generation=source_generation+1,
+                        geometry_generation=geometry_generation+{changed},memory_generation=memory_generation+{memory_change};
+                    INSERT INTO memory_scene_graph_inputs SELECT COALESCE(OLD.library_name,'legacy_default'),1,{geometry},{memory_change}
+                        WHERE COALESCE(OLD.library_name,'legacy_default') != COALESCE(NEW.library_name,'legacy_default')
+                    ON CONFLICT(library_name) DO UPDATE SET source_generation=source_generation+1,
+                        geometry_generation=geometry_generation+{geometry},memory_generation=memory_generation+{memory_change}; END""")
+            for table in ("navigation_trajectory_events", "semantic_graph_relations", "semantic_summary_nodes"):
+                self._ensure_columns(table, {"publication_revision": "TEXT NOT NULL DEFAULT ''"})
+            transaction.execute("""CREATE TABLE IF NOT EXISTS memory_record_natural_ids (
+                library_incarnation TEXT NOT NULL, record_kind TEXT NOT NULL,
+                natural_key TEXT NOT NULL, record_id TEXT NOT NULL,
+                PRIMARY KEY(library_incarnation,record_kind,natural_key))""")
+            transaction.execute("CREATE INDEX IF NOT EXISTS idx_memory_record_natural_ids_record ON memory_record_natural_ids(record_kind,record_id)")
+            transaction.execute("CREATE INDEX IF NOT EXISTS idx_semantic_graph_relations_natural ON semantic_graph_relations(library_name,relation_kind,source_node_kind,source_node_id,target_node_kind,target_node_id)")
+            transaction.execute("CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_natural ON semantic_summary_nodes(library_name,summary_kind,COALESCE(label,''),COALESCE(scene_space_id,''),COALESCE(semantic_region_id,''))")
             self._ensure_map_name_columns()
             self.backfill_library_names()
             self._backfill_map_names_from_library_names()
             self._ensure_library_name_indexes()
             for table_name in self._LIBRARY_NAME_TABLES:
-                self._conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_%s_map_name ON %s(map_name)"
-                    % (table_name, table_name)
+                transaction.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table_name}_map_name ON {table_name}(map_name)"
                 )
-            self._conn.commit()
 
     def __del__(self) -> None:
         try:
             self.close()
-        except Exception:
+        except Exception:  # noqa: BLE001 - 析构时尽力清理，包括未完成的初始化
             return

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -12,8 +14,11 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence
+
+from scripts.deploy_installer.config import atomic_write
 
 RUST_VERSION = "1.88.0"
 _NATIVE_ROOT = Path("services/nuwax-workspace/crates/nuwax-lio-backends/native")
@@ -38,6 +43,159 @@ _LIVOX_SOURCE = (
     "https://github.com/Livox-SDK/Livox-SDK2.git",
     "6a940156dd7151c3ab6a52442d86bc83613bd11b",
 )
+_SOURCE_ROLES = frozenset(("fastlio2-algorithm", "pointlio-algorithm", "dimos-lcm", "livox-sdk2"))
+_TARGET_ROLES = {_WORKSPACE: "nuwax-workspace", _RUST_BUILDS["geometry"][0]: "geometry-runtime"}
+_LEGACY_SOURCE = re.compile(r"[0-9a-f]{12}-([0-9a-f]{40})")
+_ASSIGNED_SOURCE = re.compile(r"(?:" + "|".join(sorted(_SOURCE_ROLES)) + r")-[0-9a-f]{32}")
+
+
+def _cache_parent(cache: Path, relative: str) -> Path:
+    # build_modules resolves the configured base once. Linked cache placement
+    # and linked intermediate directories remain ordinary supported paths.
+    parent = cache / relative
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent
+
+
+def _read_slots(path: Path, roles: Iterable[str], fields: tuple) -> dict:
+    if path.is_symlink():
+        raise RuntimeError(f"缓存路径记录不能是符号链接：{path}")
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        slots = payload["slots"]
+        if type(payload.get("version")) is not int or payload["version"] != 1 or not isinstance(slots, dict) or not set(slots).issubset(roles):
+            raise ValueError("不支持的缓存路径记录")
+        for entry in slots.values():
+            if not isinstance(entry, dict) or set(entry) != set(fields):
+                raise ValueError("缓存路径记录字段错误")
+            if any(not isinstance(value, str) or not value or "\x00" in value for value in entry.values()):
+                raise ValueError("缓存路径记录值错误")
+            name = entry["path"]
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+                raise ValueError("缓存路径必须是单一受管目录名")
+        return slots
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"缓存路径记录损坏，拒绝重新分配：{path}") from exc
+
+
+def _save_slots(path: Path, slots: Mapping) -> None:
+    # build_modules is serialized by manager.installation_lock. Persist the name
+    # before invoking a builder so a failed build retries the same assigned path.
+    atomic_write(path, json.dumps({"version": 1, "slots": slots}, ensure_ascii=False, indent=2) + "\n", mode=0o600)
+
+
+def _cache_destination(parent: Path, name: str) -> Path:
+    destination = parent / name
+    if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
+        raise RuntimeError(f"缓存目标不是受管普通目录：{destination}")
+    return destination
+
+
+def _publish_source_directory(temporary: Path, destination: Path) -> None:
+    # Same Linux no-clobber publication used by the release/asset publishers.
+    # A destination arriving during a clone must remain untouched, even empty.
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOTSUP, "源码缓存原子发布需要 Linux renameat2")
+    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    renameat2.restype = ctypes.c_int
+    if renameat2(-100, os.fsencode(temporary), -100, os.fsencode(destination), 1) != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number), str(destination))
+
+
+def _clean_source(destination: Path, revision: str) -> bool:
+    actual = _capture(("git", "-C", str(destination), "rev-parse", "HEAD"))
+    if actual != revision:
+        return False
+    dirty = _capture(("git", "-C", str(destination), "status", "--porcelain", "--untracked-files=all"))
+    return not dirty
+
+
+def _legacy_source(parent: Path, revision: str) -> Optional[Path]:
+    selected = None
+    # This is source admission, only on a missing/changed recipe binding. Keep
+    # memory bounded and never interpret an old URL digest as an owner proof.
+    with os.scandir(parent) as entries:
+        for entry in entries:
+            old = _LEGACY_SOURCE.fullmatch(entry.name)
+            assigned = _ASSIGNED_SOURCE.fullmatch(entry.name)
+            if not ((old and old.group(1) == revision) or assigned):
+                continue
+            candidate = parent / entry.name
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                actual = _capture(("git", "-C", str(candidate), "rev-parse", "HEAD"))
+                if actual != revision:
+                    continue
+                dirty = _capture(("git", "-C", str(candidate), "status", "--porcelain", "--untracked-files=all"))
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if dirty:
+                continue
+            if selected is None or candidate.name < selected.name:
+                selected = candidate
+    return selected
+
+
+def _source_destination(cache: Path, role: str, source: tuple) -> tuple:
+    if role not in _SOURCE_ROLES:
+        raise ValueError("未知源码缓存配方")
+    url, revision = source
+    if not isinstance(url, str) or not url or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("源码缓存需要明确地址和完整固定版本")
+    parent = _cache_parent(cache, "sources")
+    record = parent / "source-paths-v1.json"
+    slots = _read_slots(record, _SOURCE_ROLES, ("url", "revision", "path"))
+    saved = slots.get(role)
+    if saved and (saved["url"], saved["revision"]) == source:
+        destination = _cache_destination(parent, saved["path"])
+        if destination.exists() and not _clean_source(destination, revision):
+            raise RuntimeError(f"源码缓存被修改，请检查该专属缓存：{destination}")
+        return destination, destination.exists()
+    destination = _legacy_source(parent, revision)
+    admitted = destination is not None
+    if destination is None:
+        destination = parent / (role + "-" + uuid.uuid4().hex)
+        if destination.exists() or destination.is_symlink():
+            raise RuntimeError(f"新分配的源码缓存名称已存在：{destination}")
+    # url is requested provenance, never a claim about a legacy fetch origin.
+    slots[role] = {"url": url, "revision": revision, "path": destination.name}
+    _save_slots(record, slots)
+    return destination, admitted
+
+
+def _rust_target(cache: Path, root: Path, manifest: str) -> Path:
+    role = _TARGET_ROLES[manifest]
+    parent = _cache_parent(cache, "build/rust")
+    record = parent / "target-paths-v1.json"
+    slots = _read_slots(record, _TARGET_ROLES.values(), ("manifest", "path"))
+    identity = str((root / manifest).resolve())
+    expected = {"version": 1, "manifest": identity}
+    saved = slots.get(role)
+    if saved and saved["manifest"] == identity:
+        target = _cache_destination(parent, saved["path"])
+        if target.exists():
+            owner = target / "neh-target-owner.json"
+            try:
+                if owner.is_symlink() or json.loads(owner.read_text(encoding="utf-8")) != expected:
+                    raise ValueError("构建缓存所有者不符")
+            except (OSError, ValueError, TypeError) as exc:
+                raise RuntimeError(f"构建缓存缺少匹配的所有者记录：{target}") from exc
+            return target
+    # The slot is the visibility boundary. Prepare the exclusively created
+    # directory and owner first; only then expose it to a builder. A crash
+    # before slot publication leaves an unbound directory, never a broken slot.
+    target = parent / (role + "-" + uuid.uuid4().hex)
+    target.mkdir()
+    atomic_write(target / "neh-target-owner.json", json.dumps(expected, ensure_ascii=False) + "\n", mode=0o600)
+    slots[role] = {"manifest": identity, "path": target.name}
+    _save_slots(record, slots)
+    return target
 
 
 def describe_builds(modules: Iterable[str]) -> tuple[str, ...]:
@@ -77,19 +235,11 @@ def _locked_source(path: Path, name: str) -> tuple[str, str]:
     return f"https://github.com/{owner}/{repository}.git", revision
 
 
-def _checkout(cache: Path, source: tuple[str, str], run: Callable) -> Path:
+def _checkout(cache: Path, source: tuple[str, str], run: Callable, *, role: str) -> Path:
     url, revision = source
-    source_key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
-    parent = cache / "sources"
-    parent.mkdir(parents=True, exist_ok=True)
-    destination = parent / (source_key + "-" + revision)
-    if destination.is_symlink():
-        raise RuntimeError(f"源码缓存不能是符号链接：{destination}")
-    if destination.exists():
-        actual = _capture(("git", "-C", str(destination), "rev-parse", "HEAD"))
-        dirty = _capture(("git", "-C", str(destination), "status", "--porcelain", "--untracked-files=all"))
-        if actual != revision or dirty:
-            raise RuntimeError(f"源码缓存被修改，请移除该专属缓存后重试：{destination}")
+    destination, admitted = _source_destination(cache, role, source)
+    parent = destination.parent
+    if admitted:
         return destination
     # 只有提交完整检出并核对后才发布缓存；下载中断不会留下可复用的半成品。
     temporary = Path(tempfile.mkdtemp(prefix=".download-", dir=str(parent)))
@@ -112,7 +262,7 @@ def _checkout(cache: Path, source: tuple[str, str], run: Callable) -> Path:
         ))
         if _capture(("git", "-C", str(temporary), "rev-parse", "HEAD")) != revision:
             raise RuntimeError(f"原生依赖检出提交与锁文件不符：{url}")
-        temporary.rename(destination)
+        _publish_source_directory(temporary, destination)
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
@@ -239,9 +389,9 @@ def _build_native(root: Path, prefix: Path, cache: Path, name: str, jobs: int,
     livox_recipe = (root / _NATIVE_ROOT / "livox/cpp/flake.nix").read_text(encoding="utf-8")
     if not re.search(r'version\s*=\s*"1\.2\.5"\s*;', livox_recipe):
         raise RuntimeError("Livox 开发库版本已变化，须同步固定提交的构建配方。")
-    algorithm = _checkout(cache, _locked_source(lock, "fast-lio"), run)
-    messages = _checkout(cache, _locked_source(lock, "dimos-lcm"), run)
-    livox = _checkout(cache, _LIVOX_SOURCE, run)
+    algorithm = _checkout(cache, _locked_source(lock, "fast-lio"), run, role=name + "-algorithm")
+    messages = _checkout(cache, _locked_source(lock, "dimos-lcm"), run, role="dimos-lcm")
+    livox = _checkout(cache, _LIVOX_SOURCE, run, role="livox-sdk2")
     native_cache = cache / "build" / "native"
     livox_copy = native_cache / "livox-source"
     _prepare_livox(livox, livox_copy)
@@ -308,8 +458,7 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
         for manifest, package, binary_name, features in recipes:
             if not (root / manifest).with_name("Cargo.lock").is_file():
                 raise RuntimeError(f"构建清单缺少依赖锁文件：{manifest}")
-            target_key = hashlib.sha256(str(root / manifest).encode("utf-8")).hexdigest()[:12]
-            target = cache / "build" / "rust" / target_key
+            target = _rust_target(cache, root, manifest)
             command = [
                 str(cargo), "build", "--locked", "--release", "--jobs", str(jobs),
                 "--manifest-path", str(root / manifest), "--target-dir", str(target),

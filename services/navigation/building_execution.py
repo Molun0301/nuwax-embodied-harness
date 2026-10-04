@@ -4,9 +4,9 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
-import hashlib
 from pathlib import Path
 import time
+import uuid
 from typing import Callable, Iterator, Mapping, Protocol
 
 from contracts.building_navigation import (
@@ -144,14 +144,12 @@ class BuildingNavigationService:
         session_id = state.facility_session_id
         if not session_id:
             raise RuntimeError("设施操作缺少已冻结预约会话。")
-        key = f"{state.request.request_id}:{state.attempt}:{state.connection_index}:{state.stage}:{action}:{target_floor_id}"
-        operation_id = hashlib.sha256(key.encode("utf-8")).hexdigest()
         operation = state.pending_operation
         if operation is not None and (operation.session_id != session_id or operation.action != action or operation.target_floor_id != target_floor_id):
             raise FacilityOutcomeUnknown("先前设施操作尚未对账，不能开始另一个动作。")
         provider = self._provider(connection)
         if operation is None:
-            operation = FacilityOperation(operation_id=operation_id, session_id=session_id, action=action, target_floor_id=target_floor_id, state="unknown")
+            operation = FacilityOperation(operation_id="facility-operation-" + uuid.uuid4().hex, session_id=session_id, action=action, target_floor_id=target_floor_id, state="unknown")
             state.pending_operation = operation
             self._save(state, ports, message="设施操作意图已保存，准备提交。")
             ports.ensure_active()
@@ -279,7 +277,7 @@ class BuildingNavigationService:
                 self._navigate(state, source, connection.waiting_pose, ports)
             elif stage == "reserving":
                 if state.facility_session_id is None:
-                    state.facility_session_id = hashlib.sha256(f"{state.request.request_id}:{state.connection_index}".encode()).hexdigest()
+                    state.facility_session_id = "facility-session-" + uuid.uuid4().hex
                     self._save(state, ports)
                 self._operation(state, connection, "reserve", None, ports)
             elif stage == "calling":

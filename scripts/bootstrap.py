@@ -423,12 +423,16 @@ class BootstrapPlanner:
         else:
             values.update(
                 {
-                    "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL": "hashing-v1",
+                    "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL": "lexical-only",
                     "NUWAX_MEMORY_TEXT_EMBEDDING_DIM": "256",
                     "NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL": "disabled",
                     "NUWAX_MEMORY_IMAGE_EMBEDDING_DIM": "512",
                 }
             )
+
+        # 旧键继续可读，但不得保留与新键不一致的历史模型选择。
+        values["NUWAX_MEMORY_EMBEDDING_MODEL"] = values["NUWAX_MEMORY_TEXT_EMBEDDING_MODEL"]
+        values["NUWAX_MEMORY_EMBEDDING_DIM"] = values["NUWAX_MEMORY_TEXT_EMBEDDING_DIM"]
 
         # 模型路径后缀即推理链路：导出引擎时指向 .engine(TensorRT)，否则 .pt(PyTorch 开放词汇)。
         yolo_world_model = DEFAULT_YOLO_WORLD_ENGINE if self.export_yolo_engine else DEFAULT_YOLO_WORLD_MODEL

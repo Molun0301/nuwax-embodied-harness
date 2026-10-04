@@ -12,11 +12,28 @@ ctx.serialize(obj) 即可，无需反向依赖 gateways。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Protocol
 
 from core import CapabilityRegistry, EventBus, StateStore
 
-__all__ = ["SkillContext"]
+__all__ = ["SkillContext", "TaskExecutionControl"]
+
+
+class TaskExecutionControl(Protocol):
+    """只在进程内传递的任务准备预算，不写入工具参数或结果。"""
+
+    def ensure_active(self) -> None: ...
+
+    def timeout_deadline_monotonic(self) -> Optional[float]: ...
+
+
+class RuntimePreparation(Protocol):
+    """兼容无任务上下文的直接调用，并可传递任务的协作取消检查。"""
+
+    def __call__(
+        self, capability_name: str, *, deadline_monotonic: Optional[float] = None,
+        check_active: Optional[Callable[[], None]] = None,
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -50,8 +67,8 @@ class SkillContext:
     # P2-4 批3：编排型 handler（relocalize/activate/delete）依赖网关
     # 运行时内部状态的私有方法（几何运行时启动锁/事件、流帧发布等），无法下沉到 skills，
     # 按设计文档 §2.5「作为 ctx 上的可调用句柄注入」下传（与 serialize 同范式，守 R4b）。
-    ensure_geometry_runtime_for_capability: Callable[[str], None]
-    ensure_geometry_runtime_started: Callable[[str], None]
+    ensure_geometry_runtime_for_capability: RuntimePreparation
+    ensure_geometry_runtime_started: RuntimePreparation
     refresh_workspace_snapshots: Callable[..., None]
     publish_pointcloud_map_stream_frame: Callable[..., None]
     publish_runtime_governance_stream_frame: Callable[[], None]

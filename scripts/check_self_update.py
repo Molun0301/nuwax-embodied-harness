@@ -477,7 +477,8 @@ class DescriptorTransactionTests(unittest.TestCase):
             (prefix / "settings.env").write_text("NUWAX_GATEWAY_HOST=127.0.0.1\nNUWAX_GATEWAY_PORT=8766\n")
             (prefix / "start.sh").write_text("#!/bin/sh\nexit 0\n")
             descriptor = lifecycle.deployment_descriptor(
-                self.root, self.home, prefix, ["core"], "g1", "systemd-user", environment={}
+                self.root, self.home, prefix, ["core"], "g1", "systemd-user", environment={},
+                service_name="neh-0123456789abcdef.service",
             )
             u.write_json(prefix / "manifest.json", {
                 "schema": 1, "complete": True, "modules": ["core"], "robot": "g1",

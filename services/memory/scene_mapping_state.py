@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import copy
-import queue
+
+from services.memory.scene_revisions import binding_value
 from typing import Any, Dict, List, Optional
 
 from contracts.base import utc_now
@@ -14,14 +15,14 @@ MANAGED_KEY = "scene_mapping_managed"
 
 
 def snapshot_binding(snapshot) -> Dict[str, Any]:
-    """复用规范来源身份；内容摘要仅表示所依据的几何版本。"""
+    """复用来源拥有者代际与修订，十进制文本确保网页传输不丢失整数精度。"""
     return {
         "map_name": snapshot.map_name,
         "source_name": snapshot.source_name,
         "source_epoch": snapshot.source_epoch,
         "frame_id": snapshot.frame_id or snapshot.occupancy_grid.frame_id,
-        "update_sequence": snapshot.update_sequence,
-        "content_sha256": snapshot.content_sha256,
+        "update_sequence": str(snapshot.update_sequence),
+        "schema_version": snapshot.schema_version,
     }
 
 
@@ -39,67 +40,109 @@ class SceneMappingMemoryMixin:
         if snapshot is None or snapshot.occupancy_grid is None:
             raise GatewayError("当前没有可分割的规范占据地图。", error_code="scene_map_not_ready", http_status=409)
         with self._instances_lock:
-            library = self._require_memory_enabled()
+            library = self._require_memory_enabled(initialize_embedders=False)
             if library != snapshot.map_name:
                 raise GatewayError("当前地图与记忆库名称不一致。", error_code="scene_map_library_mismatch", http_status=409)
-            # 区域更新沿原仓储替换完整记录；捕获引用即可保留一致版本，避免锁内复制栅格。
-            return {
-                "snapshot": snapshot,
-                "binding": snapshot_binding(snapshot),
-                "library_name": library,
+            capture = {
+                "snapshot": snapshot, "binding": snapshot_binding(snapshot), "library_name": library,
                 "generation": getattr(self, "_scene_scope_generation", 0),
-                "spaces": tuple(space for space in self._scene_spaces_by_id.values()
-                                if space.metadata.get(MANAGED_KEY) and self._record_library_name(space) == library),
-                # 只截取当前库的近期证据；旧帧最终还需检查地图来源及采集时间。
-                "entries": tuple(sorted((entry for entry in self._semantic_entries_by_id.values()
-                                          if self._record_library_name(entry) == library),
-                                         key=lambda entry: entry.timestamp, reverse=True)[:2000]),
             }
-
-    def capture_scene_graph_state(self) -> Dict[str, Any]:
-        """同一次库范围捕获区域、实例与观察，关系图只持有轻量字段。"""
+            visible = None if self._durable_index.load_history else tuple(self._semantic_entries_by_id)
+            visible_spaces = None if self._durable_index.load_history else tuple(self._scene_spaces_by_id)
+        # Decode selected evidence outside the memory/SQL writer locks. The
+        # captured memory-only generation also versions pre-index legacy rows.
+        capture["spaces"], capture["entries"] = self._repository.capture_scene_decision_entries(
+            library, visible_ids=visible, include_spaces=True, visible_space_ids=visible_spaces)
         with self._instances_lock:
-            capture = self.capture_scene_mapping_state()
-            library = capture["library_name"]
-            instances = sorted((item for item in self._semantic_instances_by_id.values()
-                                if self._record_library_name(item) == library),
-                               key=self._instance_view_order, reverse=True)
-            selected = instances[:1000]
-            rows = self._semantic_instance_rows(selected, library, utc_now())
-            records = {item.instance_id: item for item in selected}
-            capture["instances"] = []
-            for row in rows:
-                instance = records[row["instance_id"]]
-                capture["instances"].append({
-                    **row, "artifact_ids": list(instance.artifact_ids),
-                    "aliases": list(dict.fromkeys([instance.label, *instance.semantic_labels, *instance.visual_labels])),
-                    "map_source_name": instance.metadata.get("map_source_name"),
-                    "map_source_epoch": instance.metadata.get("map_source_epoch"),
-                    "map_content_sha256": instance.metadata.get("map_content_sha256"),
-                    "attributes": copy.deepcopy(instance.attributes),
-                })
-            capture["instance_total"] = len(instances)
-            capture["instance_truncated"] = len(instances) > len(selected)
-            capture["entry_total"] = sum(self._record_library_name(entry) == library
-                                         for entry in self._semantic_entries_by_id.values())
-            capture["graph_record_refs"] = records
-            capture["entries"] = tuple(entry.model_copy(deep=True) for entry in capture["entries"])
             self._assert_scene_mapping_capture(capture)
-            return capture
+        return capture
+
+    def capture_scene_graph_stamp(self) -> Dict[str, Any]:
+        """Warm graph validation captures owner scalars, never source collections."""
+        snapshot = getattr(self._mapping_service, "get_semantic_snapshot", self._mapping_service.get_latest_snapshot)()
+        if snapshot is None or snapshot.occupancy_grid is None:
+            raise GatewayError("当前没有可分割的规范占据地图。", error_code="scene_map_not_ready", http_status=409)
+        with self._instances_lock:
+            library = self._require_memory_enabled(initialize_embedders=False)
+            if library != snapshot.map_name:
+                raise GatewayError("当前地图与记忆库名称不一致。", error_code="scene_map_library_mismatch", http_status=409)
+            generation = getattr(self, "_scene_scope_generation", 0)
+            live_generation = self._scene_graph_live_generation
+            geometry_visibility = self._scene_graph_geometry_visibility_generation
+            transactional = self._repository.storage.in_transaction
+            history = self._durable_index.load_history
+            with self._repository.storage.read_snapshot() as transaction:
+                source_generation, geometry_generation = self._repository.scene_graph_generations(library, transaction=transaction)
+                row = transaction.execute("""SELECT l.incarnation FROM memory_index_aliases a
+                    JOIN memory_vectorization_libraries l ON l.name=a.internal_key
+                    WHERE a.alias_kind='lib' AND a.namespace='' AND a.external_key=?""", (library,)).fetchone()
+                incarnation = row[0] if row is not None else None
+        binding = snapshot_binding(snapshot)
+        stamp = {"snapshot": snapshot, "binding": binding, "library_name": library,
+                 "library_incarnation": incarnation, "generation": generation,
+                 "source_generation": source_generation, "geometry_generation": geometry_generation,
+                 "live_generation": live_generation, "load_history": history,
+                 "geometry_visibility_generation": geometry_visibility, "transactional": transactional}
+        stamp["stamp_key"] = (library, incarnation, generation, source_generation, geometry_generation,
+                              live_generation, history, geometry_visibility, transactional, *binding_value(binding))
+        return stamp
+
+    def capture_scene_graph_state(self, stamp=None) -> Dict[str, Any]:
+        """On a cache miss capture owned source rows; project outside SQL ownership."""
+        capture = dict(stamp or self.capture_scene_graph_stamp())
+        library = capture["library_name"]
+        with self._instances_lock:
+            if self._scene_graph_live_generation != capture["live_generation"]:
+                raise GatewayError("物品在图捕获期间已更新。", error_code="scene_graph_changed", http_status=409)
+            live = {identifier: record for identifier, record in self._semantic_instances_by_id.items()
+                    if self._record_library_name(record) == library and getattr(record, "_memory_live_only", False)}
+            visible = None if capture["load_history"] else {
+                "scene_spaces": tuple(self._scene_spaces_by_id),
+                "semantic_memories": tuple(self._semantic_entries_by_id),
+                "semantic_instances": tuple(self._semantic_instances_by_id)}
+        sources = self._repository.capture_scene_graph_sources(library, binding=capture["binding"], visible_ids=visible, live_records=live)
+        if sources["generations"] != (capture["source_generation"], capture["geometry_generation"]):
+            raise GatewayError("源记录在图捕获期间已更新。", error_code="scene_graph_changed", http_status=409)
+        if sources["spaces_selected_total"] > 512:
+            raise GatewayError("当前区域超过关系图512个区域预算。", error_code="scene_graph_budget_exceeded", http_status=422)
+        instances = {item.instance_id: item for item in sources["instances"]}
+        extra_live = sources["extra_live"]
+        for identifier in sources["valid_live_ids"]:
+            instances[identifier] = live[identifier]
+        # Only the final bounded live candidates need private model copies.
+        selected = sorted(instances.values(), key=self._instance_view_order, reverse=True)[:1000]
+        selected = [item.model_copy(deep=True) if item.instance_id in live and item is live[item.instance_id] else item
+                    for item in selected]
+        now = utc_now()
+        rows = self._semantic_instance_rows(selected, library, now)
+        records = {item.instance_id: item for item in selected}
+        capture["instances"] = []
+        for row in rows:
+            instance = records[row["instance_id"]]
+            capture["instances"].append({**row, "artifact_ids": list(instance.artifact_ids),
+                "aliases": list(dict.fromkeys([instance.label, *instance.semantic_labels, *instance.visual_labels])),
+                "map_source_name": instance.metadata.get("map_source_name"),
+                "map_source_epoch": instance.metadata.get("map_source_epoch"),
+                "map_update_sequence": instance.metadata.get("map_update_sequence"),
+                "attributes": copy.deepcopy(instance.attributes)})
+        deadlines = []
+        policy = self._instance_association_service
+        for item in selected:
+            seen = self._instance_view_order(item)[0].timestamp()
+            for durations in (policy._UNCERTAIN_AFTER_SEC, policy._STALE_AFTER_SEC, policy._REMOVED_AFTER_SEC):
+                deadline = seen + durations[item.movability]
+                if deadline > now.timestamp():
+                    deadlines.append(deadline)
+        capture.update(spaces=tuple(sources["spaces"]), space_total=sources["spaces_total"], entries=tuple(sources["entries"]),
+            instance_total=sources["instances_total"] + extra_live,
+            instance_truncated=sources["instances_total"] + extra_live > len(selected),
+            entry_total=sources["entries_total"], valid_until=min(deadlines) if deadlines else None)
+        self.assert_scene_graph_capture(capture)
+        return capture
 
     def assert_scene_graph_capture(self, capture: Dict[str, Any]) -> None:
-        """构建和查询后核对来源与已读记录，拒绝跨图或迟到的混合结果。"""
-        with self._instances_lock:
-            self._assert_scene_mapping_capture(capture)
-            revisions = {space.scene_space_id: space.metadata.get("scene_revision") for space in capture["spaces"]}
-            current = {space.scene_space_id: space.metadata.get("scene_revision")
-                       for space in self._scene_spaces_by_id.values()
-                       if space.metadata.get(MANAGED_KEY) and self._record_library_name(space) == capture["library_name"]}
-            if revisions != current:
-                raise GatewayError("区域在图查询期间已更新，请重新读取。", error_code="scene_graph_changed", http_status=409)
-            for identifier, record in capture["graph_record_refs"].items():
-                if self._semantic_instances_by_id.get(identifier) is not record:
-                    raise GatewayError("物品在图查询期间已更新，请重新读取。", error_code="scene_graph_changed", http_status=409)
+        if self.capture_scene_graph_stamp()["stamp_key"] != capture["stamp_key"]:
+            raise GatewayError("关系图来源在处理期间已更新，请重新读取。", error_code="scene_graph_changed", http_status=409)
 
     def _assert_scene_mapping_capture(self, capture: Dict[str, Any], *, require_content: bool = True) -> None:
         self._assert_observation_library(capture["library_name"])
@@ -110,14 +153,13 @@ class SceneMappingMemoryMixin:
             raise GatewayError("语义任务期间地图已退出。", error_code="scene_map_changed", http_status=409)
         binding = snapshot_binding(latest)
         if not same_scope(binding, capture["binding"]) or (
-            require_content and binding["content_sha256"] != capture["binding"]["content_sha256"]
+            require_content and binding["update_sequence"] != capture["binding"]["update_sequence"]
         ):
             raise GatewayError("语义任务依据的地图已改变，请重新读取。", error_code="scene_map_changed", http_status=409)
 
-    def _persist_managed_scene_space(self, space: SceneSpace, *, expected_revision: Optional[int] = None) -> SceneSpace:
-        """调用方持实例锁；结构先持久化，向量沿已有后台队列生成。"""
-        library = self._require_memory_enabled()
-        current = self._scene_spaces_by_id.get(space.scene_space_id)
+    def _prepare_managed_scene_space(self, space: SceneSpace, *, expected_revision=None):
+        library = self._require_memory_enabled(initialize_embedders=False)
+        current = self._repository.load_scene_space(space.scene_space_id)
         if current is not None and self._record_library_name(current) != library:
             raise GatewayError("区域标识属于其他记忆库。", error_code="scene_scope_changed", http_status=409)
         revision = int(current.metadata.get("scene_revision", 0)) if current is not None else 0
@@ -129,51 +171,56 @@ class SceneMappingMemoryMixin:
                          "memory_library_name": library},
             "semantic_updated_at": utc_now(),
         }, deep=True)
-        self._repository.upsert_scene_space(updated)
-        self._cache_scene_space(updated)
-        self._write_scene_space_state(updated)
-        # 复用现有延后向量机制，避免结构锁内进行远端模型调用。
-        previous = self._observation_write_scope()
-        jobs: List[Dict[str, Any]] = []
-        self._observation_write_state.scope = {"library_name": library, "vector_tasks": jobs}
+        object.__setattr__(updated, "_scene_expected_source_revision", getattr(space, "_scene_graph_source_revision", None))
+        if current is not None:
+            object.__setattr__(updated, "_memory_business_token", getattr(current, "_memory_business_token", None))
+        return self._repository._prepare_scene_space_write(updated)
+
+    def _persist_managed_scene_space(self, space: SceneSpace, *, expected_revision: Optional[int] = None) -> SceneSpace:
+        prepared = self._prepare_managed_scene_space(space, expected_revision=expected_revision)
+        from services.memory.vectorization_outbox import OutboxConflict
         try:
-            self._upsert_vector_point_for_scene_space(updated)
-        finally:
-            self._observation_write_state.scope = previous
-        for job in jobs:
-            job["scene_scope_generation"] = getattr(self, "_scene_scope_generation", 0)
-            job["scene_revision"] = revision + 1
-            try:
-                self._vectorization_queue.put_nowait(job)
-            except queue.Full:
-                self._mark_pending_vectorization(str(job["point_id"]), job)
+            updated = self._repository._commit_prepared_scene_space(prepared)
+        except OutboxConflict as exc:
+            raise GatewayError("区域在处理期间已更新，请重新读取。", error_code="scene_revision_conflict", http_status=409) from exc
         self._latest_semantic_map_context_identity = None
-        return updated
+        return updated.model_copy(deep=True)
 
     def commit_scene_mapping_spaces(self, capture: Dict[str, Any], spaces: List[SceneSpace],
                                     *, expected_revisions: Dict[str, int], retire_missing: bool = False) -> List[SceneSpace]:
+        from services.memory.vectorization_outbox import OutboxConflict
         with self._instances_lock:
             self._assert_scene_mapping_capture(capture)
-            for space in spaces:
-                current = self._scene_spaces_by_id.get(space.scene_space_id)
-                revision = int(current.metadata.get("scene_revision", 0)) if current else 0
-                if revision != expected_revisions.get(space.scene_space_id, 0):
-                    raise GatewayError("区域在处理期间已修改，拒绝覆盖。", error_code="scene_revision_conflict", http_status=409)
-                if space.map_name != capture["library_name"]:
-                    raise GatewayError("候选区域地图不匹配。", error_code="scene_scope_changed", http_status=409)
-            written = [self._persist_managed_scene_space(space, expected_revision=expected_revisions.get(space.scene_space_id, 0))
-                       for space in spaces]
-            if retire_missing:
-                active_ids = {space.scene_space_id for space in spaces}
-                for old in list(self._scene_spaces_by_id.values()):
-                    if not old.metadata.get(MANAGED_KEY) or old.scene_space_id in active_ids:
-                        continue
-                    if self._record_library_name(old) != capture["library_name"] or old.review_status == SceneSpaceReviewStatus.STALE:
-                        continue
-                    stale = old.model_copy(update={"review_status": SceneSpaceReviewStatus.STALE,
-                                                  "metadata": {**old.metadata, "stale_reason": "geometry_region_replaced"}})
-                    self._persist_managed_scene_space(stale)
-            return written
+        # Capture/geometry/index projection is pure preparation outside both
+        # structural publication and the SQLite writer; admission checks it again.
+        plans = []
+        for space in spaces:
+            if space.map_name != capture["library_name"]:
+                raise GatewayError("候选区域地图不匹配。", error_code="scene_scope_changed", http_status=409)
+            plans.append(self._prepare_managed_scene_space(space, expected_revision=expected_revisions.get(space.scene_space_id,0)))
+        active_ids = {space.scene_space_id for space in spaces}
+        if retire_missing:
+            for old in capture["spaces"]:
+                if old.scene_space_id in active_ids or old.review_status == SceneSpaceReviewStatus.STALE:
+                    continue
+                if self._record_library_name(old) != capture["library_name"]:
+                    continue
+                stale = old.model_copy(update={"review_status": SceneSpaceReviewStatus.STALE,
+                    "metadata": {**old.metadata, "stale_reason": "geometry_region_replaced"}}, deep=True)
+                plans.append(self._prepare_managed_scene_space(stale,
+                    expected_revision=int(old.metadata.get("scene_revision",0))))
+        written = []
+        try:
+            with self._instances_lock:
+                # One writer scope owns candidate admission and predecessor retirement.
+                with self._repository.storage.transaction():
+                    self._assert_scene_mapping_capture(capture)
+                    for plan in plans:
+                        written.append(self._repository._commit_prepared_scene_space(plan))
+                self._latest_semantic_map_context_identity = None
+        except OutboxConflict as exc:
+            raise GatewayError("区域在处理期间已更新，请重新读取。", error_code="scene_revision_conflict", http_status=409) from exc
+        return [record.model_copy(deep=True) for record in written[:len(spaces)]]
 
     def current_managed_scene_spaces(self, snapshot, *, include_stale: bool = False, copy_records: bool = True) -> List[SceneSpace]:
         if snapshot is None or snapshot.occupancy_grid is None or not self.is_enabled():
@@ -187,7 +234,7 @@ class SceneMappingMemoryMixin:
                 if space.map_name != snapshot.map_name:
                     continue
                 saved = space.metadata.get("map_binding", {})
-                valid = same_scope(saved, binding) and saved.get("content_sha256") == binding["content_sha256"]
+                valid = same_scope(saved, binding) and str(saved.get("update_sequence", "")) == binding["update_sequence"]
                 if not valid or space.review_status == SceneSpaceReviewStatus.STALE:
                     if include_stale:
                         result.append(space.model_copy(update={"review_status": SceneSpaceReviewStatus.STALE}))

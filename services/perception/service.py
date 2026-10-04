@@ -1,11 +1,26 @@
 from __future__ import annotations
 
-import threading
 import json
+import threading
+import time
 from collections import deque
+from contextlib import contextmanager, nullcontext
 from datetime import timezone
-from urllib.parse import urlencode
 from time import perf_counter
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    runtime_checkable,
+)
+from urllib.parse import urlencode
 
 from contracts.events import RuntimeEventCategory
 from contracts.naming import build_observation_id
@@ -27,7 +42,6 @@ from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.trackers import Basic2DTrackerBackend
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING, runtime_checkable
 
 if TYPE_CHECKING:
     from contracts.image import ImageFrame
@@ -94,6 +108,13 @@ class PerceptionService:
         self._pipeline_lock = threading.Lock()
         self._full_pipeline_lock = threading.Lock()
         self._latest_frame_timestamp_by_camera = {}
+        self._context_condition = threading.Condition(threading.RLock())
+        self._latest_holds = {}
+        self._full_holds = {}
+        self._history_holds = deque()
+        self._active_operations = 0
+        self._closing = False
+        self._closed = False
 
     def set_video_frame_sink(self, video_frame_sink: Optional[VideoFrameSink]) -> None:
         self._video_frame_sink = video_frame_sink
@@ -147,20 +168,36 @@ class PerceptionService:
         慢阶段运行时允许后续快速检测继续更新。
         """
 
-        # vis-three-fixes AC2.4a：在加锁前后各打点，计算 pipeline_lock_wait_ms。
+        from contracts.artifacts import ArtifactRef
+
+        if image_artifact is not None and not isinstance(image_artifact, ArtifactRef):
+            raise TypeError("PerceptionService.process_image 的 image_artifact 必须是 ArtifactRef。")
+        with self._operation():
+            # 已存在引用的文件查验在两个推理锁之外；等待锁和慢推理期间拥有方不失效。
+            hold = self._artifact_service.acquire_artifacts(
+                [image_artifact.artifact_id], owner="perception.process",
+            ) if image_artifact is not None else None
+            try:
+                if hold is not None:
+                    hold.validate_introduced()
+                return self._run_full_pipeline(
+                    image_frame, camera_info, image_artifact=image_artifact,
+                    requested_by=requested_by, detector_backend_name=detector_backend_name,
+                    source_name=source_name, detection_metadata=detection_metadata,
+                    open_vocabulary_classes=open_vocabulary_classes, artifact_hold=hold,
+                )
+            finally:
+                if hold is not None:
+                    hold.release()
+
+    def _run_full_pipeline(self, image_frame, camera_info=None, **kwargs):
         requested_at = perf_counter()
         with self._full_pipeline_lock:
+            with self._context_condition:
+                self._ensure_open()
             acquired_at = perf_counter()
             return self._process_image_locked(
-                image_frame,
-                camera_info,
-                image_artifact=image_artifact,
-                requested_by=requested_by,
-                detector_backend_name=detector_backend_name,
-                source_name=source_name,
-                detection_metadata=detection_metadata,
-                open_vocabulary_classes=open_vocabulary_classes,
-                lock_wait_ms=(acquired_at - requested_at) * 1000.0,
+                image_frame, camera_info, lock_wait_ms=(acquired_at - requested_at) * 1000.0, **kwargs,
             )
 
     def _process_image_locked(
@@ -175,6 +212,7 @@ class PerceptionService:
         detection_metadata: Optional[Dict[str, object]] = None,
         open_vocabulary_classes: Optional[Iterable[str]] = None,
         lock_wait_ms: Optional[float] = None,
+        artifact_hold=None,
     ) -> PerceptionContext:
         """完整分析的实现；调用方持有完整分析锁，检测/跟踪独立加锁。"""
 
@@ -201,6 +239,8 @@ class PerceptionService:
 
         detector_lock_requested_at = perf_counter()
         with self._pipeline_lock:
+            with self._context_condition:
+                self._ensure_open()
             lock_wait_ms = (lock_wait_ms or 0.0) + self._elapsed_ms(detector_lock_requested_at)
             stage_started_at = perf_counter()
             detection_bundle, detector_spec = self._detector_pipeline.detect(
@@ -354,20 +394,10 @@ class PerceptionService:
                 **source_timestamp_metadata,
             },
         )
-        with self._pipeline_lock:
-            self._latest_full_by_camera[context.camera_id] = context
-            self._history.append(context)
-            latest_frame_time = self._latest_frame_timestamp_by_camera.get(context.camera_id)
-            if latest_frame_time is None or image_frame.timestamp >= latest_frame_time:
-                self._latest_frame_timestamp_by_camera[context.camera_id] = image_frame.timestamp
-                self._latest_by_camera[context.camera_id] = context
-                self._state_store.write(
-                    StateNamespace.PERCEPTION,
-                    context.camera_id,
-                    context,
-                    source=source_name or detector_spec.name,
-                    metadata={"kind": "latest_perception", "pipeline_name": self._pipeline_name},
-                )
+        self._publish_context(
+            context, image_frame=image_frame, source=source_name or detector_spec.name,
+            kind="latest_perception", hold=artifact_hold, full=True,
+        )
         if self._event_bus is not None:
             self._event_bus.publish(
                 self._event_bus.build_event(
@@ -402,7 +432,7 @@ class PerceptionService:
                 )
             )
         with self._pipeline_lock:
-            if self._latest_by_camera.get(context.camera_id) is context:
+            if self.get_latest_perception(context.camera_id) is context:
                 self._publish_detection_overlay_frame(context)
         return context
 
@@ -418,6 +448,18 @@ class PerceptionService:
     ) -> PerceptionContext:
         """从平台已接收的端侧推流抽取最新帧并完成完整感知。"""
 
+        with self._operation():
+            scope = self._artifact_service.publication_scope(owner="perception.capture") if store_artifact else nullcontext(None)
+            with scope as hold:
+                return self._perceive_current_scene(
+                    camera_id=camera_id, requested_by=requested_by,
+                    detector_backend_name=detector_backend_name, store_artifact=store_artifact,
+                    detection_metadata=detection_metadata, open_vocabulary_classes=open_vocabulary_classes,
+                    artifact_hold=hold,
+                )
+
+    def _perceive_current_scene(self, *, camera_id, requested_by, detector_backend_name,
+                                store_artifact, detection_metadata, open_vocabulary_classes, artifact_hold):
         image_frame = self._read_latest_pushed_image(camera_id)
         if image_frame is None:
             ingest_status = self._video_frame_source_status()
@@ -445,10 +487,11 @@ class PerceptionService:
                 image_frame,
                 metadata={"requested_by": requested_by or "unknown", "service": "perception_service"},
             )
-        return self.process_image(
+        return self._run_full_pipeline(
             image_frame,
             camera_info,
             image_artifact=image_artifact,
+            artifact_hold=artifact_hold,
             requested_by=requested_by,
             detector_backend_name=detector_backend_name,
             source_name=source_name,
@@ -473,6 +516,15 @@ class PerceptionService:
         三角测量观测跟随 YOLO 节奏。
         """
 
+        with self._operation():
+            return self._detect_current_frame_fast(
+                camera_id=camera_id, requested_by=requested_by,
+                detector_backend_name=detector_backend_name, detection_metadata=detection_metadata,
+                open_vocabulary_classes=open_vocabulary_classes,
+            )
+
+    def _detect_current_frame_fast(self, *, camera_id, requested_by, detector_backend_name,
+                                   detection_metadata, open_vocabulary_classes):
         image_frame = self._read_latest_pushed_image(camera_id)
         if image_frame is None:
             ingest_status = self._video_frame_source_status()
@@ -517,20 +569,23 @@ class PerceptionService:
     ) -> PerceptionContext:
         """消费标准图像并产出 detector/tracker 级快速观测结果。"""
 
-        # vis-three-fixes AC2.4a：同上 process_image，记录 pipeline_lock_wait_ms。
-        requested_at = perf_counter()
-        with self._pipeline_lock:
-            acquired_at = perf_counter()
-            return self._process_image_fast_locked(
-                image_frame,
-                camera_info,
-                requested_by=requested_by,
-                detector_backend_name=detector_backend_name,
-                source_name=source_name,
-                detection_metadata=detection_metadata,
-                open_vocabulary_classes=open_vocabulary_classes,
-                lock_wait_ms=(acquired_at - requested_at) * 1000.0,
-            )
+        with self._operation():
+            # vis-three-fixes AC2.4a：同上 process_image，记录 pipeline_lock_wait_ms。
+            requested_at = perf_counter()
+            with self._pipeline_lock:
+                with self._context_condition:
+                    self._ensure_open()
+                acquired_at = perf_counter()
+                return self._process_image_fast_locked(
+                    image_frame,
+                    camera_info,
+                    requested_by=requested_by,
+                    detector_backend_name=detector_backend_name,
+                    source_name=source_name,
+                    detection_metadata=detection_metadata,
+                    open_vocabulary_classes=open_vocabulary_classes,
+                    lock_wait_ms=(acquired_at - requested_at) * 1000.0,
+                )
 
     def _process_image_fast_locked(
         self,
@@ -688,15 +743,9 @@ class PerceptionService:
                 **source_timestamp_metadata,
             },
         )
-        self._latest_frame_timestamp_by_camera[context.camera_id] = image_frame.timestamp
-        self._latest_by_camera[context.camera_id] = context
-        self._history.append(context)
-        self._state_store.write(
-            StateNamespace.PERCEPTION,
-            context.camera_id,
-            context,
-            source=source_name or detector_spec.name,
-            metadata={"kind": "latest_perception_fast", "pipeline_name": self._pipeline_name},
+        self._publish_context(
+            context, image_frame=image_frame, source=source_name or detector_spec.name,
+            kind="latest_perception_fast", hold=None, full=False,
         )
         if cacheable and stage_status["detector"] in {"completed", "fallback"}:
             self._fast_frame_cache[context.camera_id] = (source_frame, input_signature, cache_key, context)
@@ -751,14 +800,15 @@ class PerceptionService:
         camera_id: Optional[str] = None,
         requested_by: Optional[str] = None,
     ) -> None:
-        del requested_by
-        image_frame = self._read_latest_pushed_image(camera_id)
-        if image_frame is None:
-            return
-        self._publish_video_frame(
-            image_frame,
-            source_name=str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver"),
-        )
+        with self._operation():
+            del requested_by
+            image_frame = self._read_latest_pushed_image(camera_id)
+            if image_frame is None:
+                return
+            self._publish_video_frame(
+                image_frame,
+                source_name=str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver"),
+            )
 
     def _read_latest_pushed_image(
         self,
@@ -788,20 +838,31 @@ class PerceptionService:
     def get_latest_perception(self, camera_id: Optional[str] = None) -> Optional[PerceptionContext]:
         """返回最新感知结果。"""
 
+        with self._context_condition:
+            return self._select_latest(self._latest_by_camera, camera_id)
+
+    @staticmethod
+    def _select_latest(contexts, camera_id):
         if camera_id is not None:
-            return self._latest_by_camera.get(camera_id)
-        if not self._latest_by_camera:
-            return None
-        return max(self._latest_by_camera.values(), key=lambda item: item.timestamp)
+            return contexts.get(camera_id)
+        return max(contexts.values(), key=lambda item: item.timestamp, default=None)
 
     def get_latest_full_perception(self, camera_id: Optional[str] = None) -> Optional[PerceptionContext]:
-        """返回最近一次完整感知结果；fast path 结果不会覆盖该缓存。"""
+        """返回最近一次完整感知结果；快速帧不会覆盖此独立拥有方。"""
+        with self._context_condition:
+            return self._select_latest(self._latest_full_by_camera, camera_id)
 
-        if camera_id is not None:
-            return self._latest_full_by_camera.get(camera_id)
-        if not self._latest_full_by_camera:
-            return None
-        return max(self._latest_full_by_camera.values(), key=lambda item: item.timestamp)
+    def acquire_latest_perception(self, camera_id=None, *, owner, full=False):
+        """在短槽位锁内选择上下文并取得独立读取拥有方。"""
+        with self._context_condition:
+            self._ensure_open()
+            contexts = self._latest_full_by_camera if full else self._latest_by_camera
+            holds = self._full_holds if full else self._latest_holds
+            context = self._select_latest(contexts, camera_id)
+            hold = holds.get(context.camera_id) if context is not None else None
+            if hold is not None:
+                hold.validate_introduced()
+            return context, hold.retain(owner=owner) if hold is not None else None
 
     def list_history(
         self,
@@ -811,7 +872,8 @@ class PerceptionService:
     ) -> Tuple[PerceptionContext, ...]:
         """返回感知历史。"""
 
-        items = list(self._history)
+        with self._context_condition:
+            items = list(self._history)
         if camera_id is not None:
             items = [item for item in items if item.camera_id == camera_id]
         if limit is not None:
@@ -869,8 +931,134 @@ class PerceptionService:
     def list_latest_contexts(self) -> Tuple[PerceptionContext, ...]:
         """返回各相机当前最新感知结果。"""
 
-        items = sorted(self._latest_by_camera.values(), key=lambda item: (item.camera_id, item.timestamp))
+        with self._context_condition:
+            items = sorted(self._latest_by_camera.values(), key=lambda item: (item.camera_id, item.timestamp))
         return tuple(items)
+
+    @staticmethod
+    def _context_artifact_ids(context):
+        observation = getattr(context, "observation", None)
+        ids = set(getattr(observation, "artifact_ids", ()) or ())
+        image_artifact = getattr(context, "image_artifact", None)
+        if image_artifact is not None:
+            ids.add(image_artifact.artifact_id)
+        return ids
+
+    def acquire_context_artifacts(self, context, *, owner):
+        ids = self._context_artifact_ids(context)
+        if not ids:
+            return None
+        with self._operation():
+            with self._context_condition:
+                candidates = list(zip(self._history, self._history_holds)) + [
+                    (self._latest_by_camera.get(context.camera_id), self._latest_holds.get(context.camera_id)),
+                    (self._latest_full_by_camera.get(context.camera_id), self._full_holds.get(context.camera_id)),
+                ]
+                for item, hold in candidates:
+                    if item is context and hold is not None and hold.artifact_ids == ids:
+                        hold.validate_introduced()
+                        return hold.retain(owner=owner)
+            hold = self._artifact_service.acquire_artifacts(ids, owner=owner)
+            try:
+                hold.validate_introduced()
+                return hold
+            except BaseException:
+                hold.release()
+                raise
+
+    def _publish_context(self, context, *, image_frame, source, kind, hold, full):
+        with self._context_condition:
+            self._ensure_open()
+            if hold is not None:
+                hold.validate_introduced()
+            latest_time = self._latest_frame_timestamp_by_camera.get(context.camera_id)
+            publish_latest = not full or latest_time is None or image_frame.timestamp >= latest_time
+            new_holds = []
+            try:
+                for slot in ("history", "latest" if publish_latest else None, "full" if full else None):
+                    new_holds.append(hold.retain(owner="perception." + slot) if hold is not None and slot else None)
+                if publish_latest:
+                    self._state_store.write(
+                        StateNamespace.PERCEPTION, context.camera_id, context, source=source,
+                        metadata={"kind": kind, "pipeline_name": self._pipeline_name},
+                    )
+            except BaseException:
+                for new_hold in new_holds:
+                    if new_hold is not None:
+                        new_hold.release()
+                raise
+            old_holds = []
+            if len(self._history) == self._history.maxlen:
+                old_holds.append(self._history_holds.popleft())
+            self._history.append(context)
+            self._history_holds.append(new_holds[0])
+            if publish_latest:
+                old_holds.append(self._latest_holds.pop(context.camera_id, None))
+                self._latest_by_camera[context.camera_id] = context
+                self._latest_frame_timestamp_by_camera[context.camera_id] = image_frame.timestamp
+                if new_holds[1] is not None:
+                    self._latest_holds[context.camera_id] = new_holds[1]
+            if full:
+                old_holds.append(self._full_holds.pop(context.camera_id, None))
+                self._latest_full_by_camera[context.camera_id] = context
+                if new_holds[2] is not None:
+                    self._full_holds[context.camera_id] = new_holds[2]
+            for old_hold in old_holds:
+                if old_hold is not None:
+                    old_hold.release()
+
+    def _ensure_open(self):
+        if self._closing:
+            raise GatewayError("感知服务正在关闭。", error_code="perception_closed", http_status=409)
+
+    @contextmanager
+    def _operation(self):
+        with self._context_condition:
+            self._ensure_open()
+            self._active_operations += 1
+        try:
+            yield
+        finally:
+            with self._context_condition:
+                self._active_operations -= 1
+                self._context_condition.notify_all()
+
+    def get_lifecycle_status(self):
+        with self._context_condition:
+            return {"closing": self._closing, "closed": self._closed,
+                    "active_operations": self._active_operations,
+                    "latest_holders": len(self._latest_holds), "full_holders": len(self._full_holds),
+                    "history_holders": sum(hold is not None for hold in self._history_holds)}
+
+    def close(self, timeout=5.0):
+        """终止准入；慢推理超时仍保留其操作拥有方，禁止晚发布。"""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._context_condition:
+            self._closing = True
+            while self._active_operations:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._context_condition.wait(remaining)
+            if self._closed:
+                return True
+            for camera_id in self._latest_by_camera:
+                self._state_store.write(StateNamespace.PERCEPTION, camera_id, None,
+                                        source="perception_service", metadata={"kind": "closed"})
+            holds = tuple(self._latest_holds.values()) + tuple(self._full_holds.values()) + tuple(self._history_holds)
+            self._latest_by_camera.clear()
+            self._latest_full_by_camera.clear()
+            self._latest_frame_timestamp_by_camera.clear()
+            self._history.clear()
+            self._fast_frame_cache.clear()
+            self._latest_holds.clear()
+            self._full_holds.clear()
+            self._history_holds.clear()
+            for hold in holds:
+                if hold is not None:
+                    hold.release()
+            self._closed = True
+            return True
 
     def _attach_segmentation_results(
         self,

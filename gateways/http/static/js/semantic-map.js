@@ -16,7 +16,7 @@
   const visible = () => mode() === 'semantic' || state.overlays[mode()] === true || !panel.hidden;
   const interested = () => visible() || !panel.hidden;
   const node = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = String(text); if (cls) n.className = cls; return n; };
-  const bindingKey = b => JSON.stringify([b?.map_name, b?.source_name, b?.source_epoch, b?.frame_id, b?.content_sha256]);
+  const bindingKey = b => JSON.stringify([b?.map_name, b?.source_name, b?.source_epoch, b?.frame_id, window.__nuwaxMapRevision?.(b?.update_sequence)]);
   const scopeKey = b => JSON.stringify([b?.map_name, b?.source_epoch, b?.frame_id]);
   const regions = () => Array.isArray(state.data?.regions) ? state.data.regions : [];
   const name = (r, index) => r.primary_label || '区域 ' + (index + 1);
@@ -26,7 +26,9 @@
     // 请求暂时失败时保留同一地图的已读标注，错误仍在面板显示。
     if (!current?.available || !state.data?.map_binding) return false;
     const bound = state.data.map_binding;
-    return ['map_name', 'frame_id', 'source_name', 'source_epoch', 'content_sha256'].every(k => current[k] == null || current[k] === bound[k]);
+    return ['map_name', 'frame_id', 'source_name', 'source_epoch'].every(k => current[k] != null && current[k] === bound[k])
+      && window.__nuwaxMapRevision?.(current.update_sequence) != null
+      && window.__nuwaxMapRevision?.(current.update_sequence) === window.__nuwaxMapRevision?.(bound.update_sequence);
   }
   function drawable() { return matchesCurrent() ? regions().filter(r => r.review_status !== 'stale' && r.review_status !== 'rejected' && r.frame_id === state.data.map_binding.frame_id && r.boundary?.frame_id === r.frame_id) : []; }
   function color(region) {

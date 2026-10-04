@@ -13,6 +13,7 @@
   const NAV_API = '/api/capabilities/navigate_to_pose/invoke';
   const CANCEL_API = '/api/capabilities/cancel_navigation/invoke';
   const POLL_INTERVAL_MS = 500; // 2Hz
+  const POLL_TIMEOUT_MS = 10000;
   const WS_STREAM_NAME = 'navigation.state';
 
   const state = {
@@ -27,6 +28,12 @@
     submittedPose: null,
     submitting: false,
     pollTimer: null,
+    pollRequest: null,
+    pollEpoch: 0,
+    pollEnabled: false,
+    active: false,
+    pageSuspended: false,
+    detailRevision: 0,
     wsToken: null,
     mapClickHandler: null,
   };
@@ -200,26 +207,60 @@
       : invokeCapability(CANCEL_API, {});
     cancellation
       .then(function (resp) {
+        if (state.inflightRequestId !== taskId) return;
         const result = taskId ? resp : resp.result;
         if (!result) throw new Error('网关响应缺少取消结果');
         if (taskId && result.cancelled !== true) setStatus('该任务未接受取消请求，正在读取当前状态', 'warn');
         else setStatus(result.completed === true ? '导航已结束' : '取消请求已发送，等待导航结束', 'pending');
         if (taskId) startPolling();
       })
-      .catch(function (err) { setStatus('取消失败：' + err.message, 'error'); });
+      .catch(function (err) {
+        if (state.inflightRequestId === taskId) setStatus('取消失败：' + err.message, 'error');
+      });
+  }
+
+  function canPoll() {
+    return state.pollEnabled && state.active && !state.pageSuspended
+      && document.visibilityState !== 'hidden' && state.inflightRequestId;
+  }
+
+  function schedulePoll(delay) {
+    if (!canPoll() || state.pollTimer !== null || state.pollRequest) return;
+    state.pollTimer = setTimeout(function () {
+      state.pollTimer = null;
+      pollOnce();
+    }, delay);
   }
 
   function pollOnce() {
+    if (!canPoll() || state.pollRequest) return;
     const taskId = state.inflightRequestId;
-    if (!taskId) return;
-    requestJson('/api/tasks/' + encodeURIComponent(taskId)).then(function (snapshot) {
-      if (state.inflightRequestId !== taskId) return;
+    const request = {
+      controller: new AbortController(), epoch: state.pollEpoch,
+      startedAt: performance.now(), timedOut: false, detailRevision: state.detailRevision,
+    };
+    state.pollRequest = request;
+    const isCurrent = function () {
+      return canPoll() && state.pollRequest === request && state.pollEpoch === request.epoch
+        && state.inflightRequestId === taskId;
+    };
+    // 截止时间同时覆盖 fetch 与 JSON body；仅取消状态读取，不取消机器人任务。
+    request.timeout = setTimeout(function () {
+      request.timedOut = true;
+      request.controller.abort();
+    }, POLL_TIMEOUT_MS);
+    requestJson('/api/tasks/' + encodeURIComponent(taskId), { signal: request.controller.signal }).then(function (snapshot) {
+      if (!isCurrent() || request.controller.signal.aborted) return;
       const status = snapshot.status || {};
       const result = snapshot.result || {};
       const nav = result.navigation_context && result.navigation_context.navigation_state;
-      renderDetail(nav || { status: status.state, message: status.message || snapshot.error });
+      const terminal = ['succeeded', 'failed', 'cancelled', 'timeout'].includes(status.state);
+      // 读取期间收到的流详情更新更近；任务真终态仍以任务快照为准。
+      if (terminal || state.detailRevision === request.detailRevision) {
+        renderDetail(nav || { status: status.state, message: status.message || snapshot.error });
+      }
       const selected = state.submittedPose ? ' · ' + selectedPoseLabel(state.submittedPose) : '';
-      if (['succeeded', 'failed', 'cancelled', 'timeout'].includes(status.state)) {
+      if (terminal) {
         stopPolling();
         state.inflightRequestId = null;
         // 本任务已到真终态时移除其选点预览，保留用户另选的新目标。
@@ -233,26 +274,45 @@
       } else {
         setStatus((status.message || '导航执行中') + selected, 'active');
       }
-    }).catch(function (err) { setStatus('导航状态读取失败：' + err.message, 'warn'); });
+    }).catch(function (err) {
+      if (!isCurrent()) return;
+      if (request.timedOut) setStatus('导航状态读取超时，正在重试', 'warn');
+      else if (err.name !== 'AbortError') setStatus('导航状态读取失败：' + err.message, 'warn');
+    }).finally(function () {
+      clearTimeout(request.timeout);
+      if (state.pollRequest !== request) return;
+      state.pollRequest = null;
+      // 快响应保持 2Hz；慢响应完成即读最新状态，不补发积压 tick。
+      // 旧读取实际结束后也要唤醒已重新打开的面板，不能永久停在 busy 状态。
+      const delay = request.epoch === state.pollEpoch
+        ? Math.max(0, POLL_INTERVAL_MS - (performance.now() - request.startedAt)) : 0;
+      schedulePoll(delay);
+    });
   }
 
   function startPolling() {
-    stopPolling();
-    state.pollTimer = setInterval(pollOnce, POLL_INTERVAL_MS);
+    state.pollEnabled = true;
+    schedulePoll(0);
   }
 
   function stopPolling() {
-    if (state.pollTimer) {
-      clearInterval(state.pollTimer);
-      state.pollTimer = null;
+    state.pollEnabled = false;
+    state.pollEpoch++;
+    clearTimeout(state.pollTimer);
+    state.pollTimer = null;
+    if (state.pollRequest) {
+      clearTimeout(state.pollRequest.timeout);
+      state.pollRequest.controller.abort();
+      // 保留槽位直至 fetch/body 真正结束，反复切页也不会积累并行读取。
     }
   }
 
   function subscribeWs() {
     if (typeof window.__nuwaxWsSubscribe === 'function') {
       state.wsToken = window.__nuwaxWsSubscribe(WS_STREAM_NAME, function (msg) {
-        if (!msg) return;
+        if (!msg || !state.active || state.pageSuspended || document.visibilityState === 'hidden') return;
         if (msg.data && msg.data.state) {
+          state.detailRevision++;
           renderDetail(msg.data.state);
         }
       });
@@ -279,6 +339,17 @@
     if (state.btnCancel) state.btnCancel.addEventListener('click', cancelNavigation);
     captureClickFromMap();
     subscribeWs();
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') stopPolling(); else startPolling();
+    });
+    window.addEventListener('pagehide', function () {
+      state.pageSuspended = true;
+      stopPolling();
+    });
+    window.addEventListener('pageshow', function () {
+      state.pageSuspended = false;
+      startPolling();
+    });
     setStatus('未选点', 'idle');
   }
 
@@ -290,6 +361,8 @@
 
   window.__nuwaxNavigationModule = {
     setActive: function (active) {
+      state.active = Boolean(active);
+      if (state.active) startPolling(); else stopPolling();
       state.pendingPose = null;
       window.pointcloud3d?.previewNavigationPoint(null);
       if (state.heightInput) state.heightInput.placeholder = window.__nuwaxMapViewMode?.() === '3d'

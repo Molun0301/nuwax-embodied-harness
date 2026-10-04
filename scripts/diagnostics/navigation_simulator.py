@@ -5,7 +5,6 @@ import argparse
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
-import hashlib
 import json
 import mimetypes
 import os
@@ -44,10 +43,23 @@ def worker_environment() -> dict[str, str]:
     }
 
 
+def binary_provenance(binary: Path, cloud: Path, poses: Path) -> dict:
+    """只记录文件元数据，不读取二进制内容，也不为取得版本启动原生程序。"""
+    observed = binary.stat()
+    return {
+        "binary": str(binary), "source_cloud": str(cloud), "source_poses": str(poses),
+        "binary_stat": {"size_bytes": observed.st_size, "mtime_ns": observed.st_mtime_ns,
+                        "ctime_ns": observed.st_ctime_ns, "dev": observed.st_dev, "inode": observed.st_ino},
+        "binary_version": None,
+        "binary_version_status": "not_reported",
+        "provenance_scope": "Filesystem metadata observation only; not binary content verification. No native version probe was run",
+    }
+
+
 class NativeWorker:
     def __init__(self, binary: Path, data: Path, cloud: Path, poses: Path):
         self.data = data
-        self.provenance = {"binary": str(binary), "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(), "source_cloud": str(cloud), "source_poses": str(poses)}
+        self.provenance = binary_provenance(binary, cloud, poses)
         self.lock = threading.Lock()
         self.error_log = (data / "原生模拟.log").open("a", encoding="utf-8")
         args = [str(binary), str(data)]

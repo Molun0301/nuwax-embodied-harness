@@ -497,6 +497,14 @@ class MapAssetBundle(TimestampedContract):
             raise ValueError("地图资产包与运行态快照的 frame_id 不一致。")
         return self
 
+    @property
+    def snapshot_identity(self) -> Dict[str, object]:
+        """只复制来源身份标量，不为读取修订而复制完整已封存图层。"""
+        snapshot = super().__getattribute__("snapshot")
+        return {"schema_version": snapshot.schema_version, "map_name": snapshot.map_name,
+                "source_name": snapshot.source_name, "source_epoch": snapshot.source_epoch,
+                "frame_id": snapshot.frame_id, "update_sequence": str(snapshot.update_sequence)}
+
     def __getattribute__(self, name: str):
         value = super().__getattribute__(name)
         if name not in {"snapshot", "geometry_asset", "metadata"}:

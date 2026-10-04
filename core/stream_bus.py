@@ -15,6 +15,7 @@ _logger = logging.getLogger(__name__)
 _DIAGNOSTIC_LOG_LIMITER = LogRateLimiter()
 _DIAGNOSTIC_LOG_INTERVAL_SEC = 5.0
 _ASYNC_DISPATCH_QUEUE_MAXSIZE = 10000
+_PREPARED_DISPATCH_QUEUE_MAXSIZE = 10000
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,15 @@ class _StreamDispatchItem:
     frame: StreamFrame
     subscriptions: Tuple[StreamSubscription, ...]
     completion: threading.Event
+
+
+@dataclass(frozen=True)
+class PreparedStreamPublication:
+    """已分配游标并入队；订阅回调只由 dispatch_prepared 在拥有方锁外运行。"""
+
+    owner: object
+    frame: StreamFrame
+    dispatch_item: Optional[_StreamDispatchItem]
 
 
 class StreamBus:
@@ -131,10 +141,15 @@ class StreamBus:
         return self.publish_frame(frame)
 
     def publish_frame(self, frame: StreamFrame) -> StreamFrame:
-        publisher_thread_id = threading.get_ident()
+        return self.dispatch_prepared(self.prepare_publication(frame))
+
+    def prepare_publication(self, frame: StreamFrame) -> PreparedStreamPublication:
+        """只记录与入队，不运行同步订阅；未派发项由后续派发或关闭接管。"""
         with self._lock:
             if self._shutdown:
                 raise RuntimeError("实时流总线已关闭，拒绝新的发布。")
+            if len(self._dispatch_queue) >= _PREPARED_DISPATCH_QUEUE_MAXSIZE:
+                raise RuntimeError("实时流同步派发队列已满，拒绝新的发布。")
             stored_frame = frame.model_copy(update={"cursor": self._next_cursor})
             self._next_cursor += 1
             if stored_frame.payload_kind != StreamPayloadKind.BINARY:
@@ -160,24 +175,35 @@ class StreamBus:
             if async_enqueued:
                 self._async_event.set()
             if not subscriptions:
-                return stored_frame
+                return PreparedStreamPublication(self, stored_frame, None)
             dispatch_item = _StreamDispatchItem(
                 frame=stored_frame,
                 subscriptions=tuple(subscriptions),
                 completion=threading.Event(),
             )
             self._dispatch_queue.append(dispatch_item)
+            return PreparedStreamPublication(self, stored_frame, dispatch_item)
+
+    def dispatch_prepared(self, publication: PreparedStreamPublication) -> StreamFrame:
+        if publication.owner is not self:
+            raise ValueError("流发布记录不属于当前总线。")
+        dispatch_item = publication.dispatch_item
+        if dispatch_item is None or dispatch_item.completion.is_set():
+            return publication.frame
+        publisher_thread_id = threading.get_ident()
+        with self._lock:
+            if dispatch_item.completion.is_set():
+                return publication.frame
             should_drain = not self._dispatch_draining
             if should_drain:
                 self._dispatch_draining = True
                 self._dispatch_owner_thread_id = publisher_thread_id
             dispatch_owner_thread_id = self._dispatch_owner_thread_id
-
         if should_drain:
             self._drain_dispatch_queue()
         elif dispatch_owner_thread_id != publisher_thread_id:
             dispatch_item.completion.wait()
-        return stored_frame
+        return publication.frame
 
     @staticmethod
     def _map_identity_key(frame: StreamFrame):

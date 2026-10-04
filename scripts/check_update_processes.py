@@ -6,6 +6,7 @@ import ast
 import asyncio
 import fcntl
 import inspect
+import json
 import os
 import signal
 import subprocess
@@ -55,6 +56,11 @@ class ProcessTests(unittest.TestCase):
         self.lock_file = self.pid_file.parent / "start_gateway.lock"
         self.pid_file.parent.mkdir(parents=True)
         (self.prefix / "settings.env").write_text("NUWAX_GATEWAY_PID_FILE=" + str(self.pid_file) + "\n")
+        (self.prefix / "manifest.json").write_text(json.dumps({
+            "schema": 1, "complete": True, "modules": ["core"], "robot": "customrobot",
+            "source_root": str(self.root),
+        }))
+        (self.prefix.parent.parent / "current").symlink_to("generations/test")
         self.processes = []
 
     def tearDown(self):

@@ -1,7 +1,6 @@
 """依附现有地图仓储的楼层目录、请求冻结和有向连接路由。"""
 from __future__ import annotations
 
-import hashlib
 import heapq
 import math
 from pathlib import Path
@@ -10,6 +9,7 @@ from typing import Callable, Iterable, Optional
 from contracts.building_navigation import BuildingTopology, FloorNavigationRequest, FloorPose, FloorRecord
 from services.mapping.asset_store import MapAssetBundleRepository
 from services.mapping.catalog import MapCatalogRepository, _atomic_write_text
+from services.navigation.file_identity import LegacyFileIndex, read_record_text
 
 
 class BuildingCatalog:
@@ -19,28 +19,30 @@ class BuildingCatalog:
         self.maps = maps
         self.assets = assets or MapAssetBundleRepository(str(maps.root_dir))
         self.root = maps.root_dir / "buildings"
-        self.root.mkdir(parents=True, exist_ok=True)
+        self._files = LegacyFileIndex(self.root, lambda path: self._read(path).building_id,
+            discovery_forbidden=lambda: bool(getattr(self.maps._activation_guard_state.local, "depth", 0)))
 
     def _path(self, building_id: str) -> Path:
-        return self.root / (hashlib.sha256(building_id.encode("utf-8")).hexdigest() + ".json")
+        return self._files.resolve(building_id)
+
+    @staticmethod
+    def _read(path: Path) -> BuildingTopology:
+        return BuildingTopology.model_validate_json(read_record_text(path))
 
     def get(self, building_id: str) -> Optional[BuildingTopology]:
         path = self._path(building_id)
         if not path.exists():
             return None
-        if path.stat().st_size > 4 * 1024 * 1024:
-            raise ValueError("建筑目录超过四兆字节预算。")
-        value = BuildingTopology.model_validate_json(path.read_text(encoding="utf-8"))
+        value = self._read(path)
         if value.building_id != building_id:
             raise ValueError("建筑目录身份与文件索引不符。")
         return value
 
     def list(self) -> tuple[BuildingTopology, ...]:
+        self._files.refresh()
         values = []
-        for path in sorted(self.root.glob("*.json")):
-            if path.stat().st_size > 4 * 1024 * 1024:
-                raise ValueError("建筑目录超过四兆字节预算。")
-            value = BuildingTopology.model_validate_json(path.read_text(encoding="utf-8"))
+        for path in self._files.iter_paths():
+            value = self._read(path)
             if path != self._path(value.building_id):
                 raise ValueError("建筑目录文件名与身份不一致。")
             values.append(value)
@@ -61,14 +63,16 @@ class BuildingCatalog:
             raise ValueError(f"楼层 {floor.display_name} 需要可恢复和定位的二维完整图。")
 
     def save(self, topology: BuildingTopology, *, expected_revision: int = 0) -> BuildingTopology:
-        with self.maps.map_activation_guard():
+        with self._files.write_guard(), self.maps.map_activation_guard():
             current = self.get(topology.building_id)
             revision = current.revision if current else 0
             if expected_revision != revision or topology.revision != revision + 1:
                 raise ValueError("建筑目录已变化，请基于当前修订重新提交。")
             for floor in topology.floors:
                 self.validate_floor_asset(floor, require_finalized=False)
-            _atomic_write_text(self._path(topology.building_id), topology.model_dump_json(indent=2))
+            path = self._path(topology.building_id)
+            self._files.prepare_parent(path)
+            _atomic_write_text(path, topology.model_dump_json(indent=2))
         return topology
 
     def freeze_navigation(
@@ -76,6 +80,7 @@ class BuildingCatalog:
         supported_connections: Iterable[str], target_floor_id: Optional[str] = None,
         timeout_sec: float = 600.0, allow_unmapped_target: bool = False,
     ) -> FloorNavigationRequest:
+        self._files.prepare()
         with self.maps.map_activation_guard():
             topology = self.get(building_id)
             if topology is None:

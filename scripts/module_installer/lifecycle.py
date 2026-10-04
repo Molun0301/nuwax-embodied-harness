@@ -5,14 +5,14 @@ are created only by an explicit start; privileged system services are untouched.
 """
 from __future__ import annotations
 
-import hashlib
 import os
+import re
 import signal
 import subprocess
 import time
 import uuid
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Optional
 
 from scripts.deploy_installer.config import atomic_write
 
@@ -21,14 +21,26 @@ from .runtime import effective_settings
 MODES = ("foreground", "systemd-user")
 
 
-def service_identifier(home: Path) -> str:
-    return "neh-" + hashlib.sha256(str(home.resolve()).encode()).hexdigest()[:16] + ".service"
+def _service_name(name, mode):
+    if mode not in MODES:
+        raise ValueError("Unsupported lifecycle mode: " + str(mode))
+    if name is None and mode == "foreground":
+        return None
+    if (not isinstance(name, str) or len(name) > 255 or ".." in name
+            or not re.fullmatch(r"neh-[A-Za-z0-9][A-Za-z0-9_.:@-]*\.service", name)
+            or name.endswith("@.service") or name.count("@") > 1):
+        raise ValueError("Invalid lifecycle service name")
+    return name
+
+
+def service_identifier(home: Path) -> Optional[str]:
+    """Read the completed installation's opaque registration without allocating."""
+    return inspect_installation(home)["lifecycle"]["service_name"]
 
 
 def deployment_descriptor(root: Path, home: Path, prefix: Path, modules, robot: str,
-                          mode: str = "foreground", environment=None) -> dict:
-    if mode not in MODES:
-        raise ValueError("Unsupported lifecycle mode: " + str(mode))
+                          mode: str = "foreground", environment=None, *, service_name=None) -> dict:
+    service_name = _service_name(service_name, mode)
     root, home, prefix = root.resolve(), home.resolve(), prefix.resolve()
     values, settings_path = effective_settings(root, prefix, environment=environment)
     host = values.get("NUWAX_GATEWAY_HOST", "127.0.0.1") or "127.0.0.1"
@@ -37,7 +49,7 @@ def deployment_descriptor(root: Path, home: Path, prefix: Path, modules, robot: 
         raise ValueError("Invalid gateway listener port")
     return {"version": 1, "source_root": str(root), "install_home": str(home),
             "robot_adapter": robot, "modules": list(modules), "prefix": str(prefix),
-            "lifecycle": {"mode": mode, "service_name": service_identifier(home)},
+            "lifecycle": {"mode": mode, "service_name": service_name},
             "listener": {"host": host, "port": port, "settings_path": str(settings_path)},
             "pid_file": str(root / "runtime_data/gateway/gateway.pid")}
 
@@ -48,25 +60,39 @@ def inspect_installation(home: Path, environment=None) -> dict:
     current = read_current(home)
     if not current:
         raise ValueError("No completed managed installation")
-    saved = current.get("deployment", {})
-    if saved and saved.get("version") != 1:
-        raise ValueError("Unsupported deployment descriptor version")
-    mode = saved.get("lifecycle", {}).get("mode", "foreground")
+    saved = current.get("deployment")
+    mode, name = "foreground", None
+    if "deployment" in current:
+        if not isinstance(saved, Mapping) or type(saved.get("version")) is not int or saved["version"] != 1:
+            raise ValueError("Unsupported deployment descriptor version")
+        registration = saved.get("lifecycle")
+        if not isinstance(registration, Mapping) or "service_name" not in registration:
+            raise ValueError("Invalid deployment lifecycle registration")
+        mode = registration.get("mode")
+        name = _service_name(registration["service_name"], mode)
     descriptor = deployment_descriptor(Path(current["source_root"]), home, Path(current["prefix"]),
-                                       current["modules"], current["robot"], mode, environment)
-    if saved:
-        for key in ("source_root", "install_home", "robot_adapter", "modules"):
+                                       current["modules"], current["robot"], mode, environment,
+                                       service_name=name)
+    if "deployment" in current:
+        for key in ("source_root", "install_home", "robot_adapter", "modules", "prefix"):
             if saved.get(key) != descriptor[key]:
                 raise ValueError("Deployment metadata mismatch: " + key)
-        if saved.get("lifecycle", {}).get("service_name") != descriptor["lifecycle"]["service_name"]:
-            raise ValueError("Deployment service identity mismatch")
     return descriptor
 
 
 def _check(descriptor):
+    if type(descriptor.get("version")) is not int or descriptor["version"] != 1:
+        raise ValueError("Unsupported deployment descriptor version")
     mode = descriptor["lifecycle"]["mode"]
-    name = descriptor["lifecycle"]["service_name"]
-    if mode not in MODES or name != service_identifier(Path(descriptor["install_home"])):
+    name = _service_name(descriptor["lifecycle"]["service_name"], mode)
+    current = inspect_installation(Path(descriptor["install_home"]))
+    # Queued updater descriptors retain their old generation prefix/modules.
+    # Ownership is the current manifest's home, source root and registration.
+    if any(descriptor.get(key) != current[key] for key in ("install_home", "source_root")):
+        raise ValueError("Invalid lifecycle installation owner")
+    registered = current["lifecycle"]
+    if mode != registered["mode"] or (name != registered["service_name"]
+                                      and not (mode == "foreground" and name is None)):
         raise ValueError("Invalid lifecycle identity")
     return mode, name
 
@@ -83,7 +109,9 @@ def _unit_quote(value, *, executable=False):
 
 
 def render_user_service(descriptor: Mapping) -> str:
-    _check(descriptor)
+    _, name = _check(descriptor)
+    if name is None:
+        raise ValueError("No registered lifecycle service name")
     home = Path(descriptor["install_home"])
     return ("[Unit]\nDescription=NEH installed gateway\n\n[Service]\nType=simple\n"
             + "WorkingDirectory=" + _unit_quote(descriptor["source_root"]) + "\n"
@@ -134,6 +162,8 @@ def start_current(descriptor: Mapping, *, foreground=False, log=None):
     # Resolve at invocation time, so rollback starts the restored current link.
     home = Path(descriptor["install_home"])
     current = inspect_installation(home)
+    if current["lifecycle"] != {"mode": mode, "service_name": name}:
+        raise ValueError("Lifecycle registration changed before start")
     # Preserve the effective endpoint that accepted the update, including any
     # explicit process overrides; generation-specific paths still come from current.
     current["listener"] = dict(descriptor["listener"])

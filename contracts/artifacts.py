@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contracts.compat import StrEnum
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from contracts.base import ContractModel, MetadataDict, TimestampedContract
 from contracts.naming import validate_artifact_id
@@ -29,8 +29,16 @@ class ArtifactRef(TimestampedContract):
     mime_type: str = Field(description="MIME 类型。")
     size_bytes: Optional[int] = Field(default=None, ge=0, description="制品大小。")
     uri: Optional[str] = Field(default=None, description="制品访问地址。")
-    sha256: Optional[str] = Field(default=None, description="文件摘要。")
     metadata: MetadataDict = Field(default_factory=dict, description="制品元数据。")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _read_legacy_reference(cls, value):
+        if isinstance(value, dict) and "sha256" in value:
+            # 旧侧车和回执继续可读；摘要字段不再计算、验证或写入新引用。
+            value = dict(value)
+            value.pop("sha256")
+        return value
 
     @field_validator("artifact_id")
     @classmethod

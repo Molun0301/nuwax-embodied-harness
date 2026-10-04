@@ -576,6 +576,8 @@ start_geometry_runtime() {
     set +u
     # shellcheck disable=SC1091
     source "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
+    # Geometry observes the same live follower marker after lazy activation.
+    export NUWAX_PERSON_FOLLOW_READY_FILE="${NUWAX_PERSON_FOLLOW_READY_FILE:-${REPO_ROOT}/runtime_data/person-follow/nuwax_person_follow.ready}"
     export NUWAX_GEOMETRY_RUNTIME_PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
     export NUWAX_GEOMETRY_RUNTIME_READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
     export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}"

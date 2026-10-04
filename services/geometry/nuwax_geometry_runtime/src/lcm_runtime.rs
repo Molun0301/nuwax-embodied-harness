@@ -49,7 +49,7 @@ use crate::mapping_adapter::{
 };
 use crate::mapping_backend::MappingBackendSpec;
 use crate::occupancy_shm::OccupancyGridShmWriter;
-use crate::pointcloud::CloudMapShmWriter;
+use crate::pointcloud::{CloudMapShmWriter, CommittedCloudMapMetadata};
 use crate::sequence_state::{sequence_state_path_from_env, SequenceStateStore};
 
 const MAP_FANOUT_SINK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2124,10 +2124,11 @@ impl ProductionTopologyStartupFailureFixture {
 }
 
 #[cfg(test)]
-const PRODUCTION_TOPOLOGY_PERSISTENT_SLOTS: [&str; 10] = [
+const PRODUCTION_TOPOLOGY_PERSISTENT_SLOTS: [&str; 11] = [
     "navigation-state-consumer",
     "path-envelope-consumer",
     "public-tf-observer",
+    "legacy-global-map-demand",
     "cancel-timeout-maintenance",
     "frontier-fanout",
     "exploration-scheduler",
@@ -8212,6 +8213,16 @@ pub async fn spawn_geometry_runtime(
         .await?;
     }
 
+    let compatibility_shutdown_rx = task_control.shutdown_receiver();
+    register_geometry_startup_persistent(
+        &task_control, &mut task_owner, &handle, &mut owned_subscriptions,
+        &mut pending_children, "legacy-global-map-demand",
+        run_persistent_future_until_stop(
+            compatibility_shutdown_rx,
+            legacy_global_map_demand_future(handle.clone(), LegacyGlobalMapDemandConfig::from_env()),
+        ),
+    ).await?;
+
     let cancel_shutdown_rx = task_control.shutdown_receiver();
     register_geometry_startup_persistent(
         &task_control,
@@ -8500,7 +8511,7 @@ fn ingest_mapping_points(
 pub(crate) struct CommittedMappingCloudMap {
     pub(crate) notification: CloudMapNotification,
     pub(crate) source_timestamp_ns: u64,
-    pub(crate) xyz_f32_le: Arc<[u8]>,
+    pub(crate) metadata: CommittedCloudMapMetadata,
     pub(crate) receipt: crate::mapping_commit::CloudCommitReceipt,
 }
 
@@ -9070,7 +9081,7 @@ fn update_mapping_cloud_map_with_acceptance(
                 session_generation: outcome.session_generation,
             },
             source_timestamp_ns: receipt.source_timestamp_ns,
-            xyz_f32_le: snapshot.xyz_f32_le.into(),
+            metadata: snapshot,
             receipt: committed.receipt,
     }))
 }
@@ -9107,7 +9118,7 @@ pub(crate) async fn publish_committed_global_map_in_frame(
         cloud_commit: Some(CommittedMappingCloudMap {
             notification: committed.notification.clone(),
             source_timestamp_ns: committed.source_timestamp_ns,
-            xyz_f32_le: committed.xyz_f32_le.clone(),
+            metadata: committed.metadata,
             receipt: committed.receipt.clone(),
         }),
     };
@@ -9134,10 +9145,14 @@ pub(crate) async fn publish_committed_global_map_in_frame(
 
 pub(crate) fn build_committed_global_map_frame_in_frame(
     committed: &CommittedMappingCloudMap,
+    xyz_f32_le: &[u8],
     frame_id: &str,
 ) -> Result<RawLcmFrame, String> {
+    if !canonical_cloud_payload_matches(&committed.notification, xyz_f32_le) {
+        return Err("explicit global-map export payload length does not match metadata".into());
+    }
     build_global_map_snapshot_frame_in_frame(
-        &committed.xyz_f32_le,
+        xyz_f32_le,
         committed.notification.revision,
         committed.source_timestamp_ns,
         frame_id,
@@ -9181,6 +9196,11 @@ pub(crate) async fn publish_retained_global_map_frame(
     handle: &GeometryRuntimeHandle,
     frame: &RawLcmFrame,
 ) -> Result<(), String> {
+    if canonical_cloud_publication_invalidation(&handle.cloud_map_writer)
+        .legacy_full_demand.lock().is_none()
+    {
+        return Ok(());
+    }
     publish_raw_lcm_frame(&handle.transport, frame.clone()).await
 }
 
@@ -9204,7 +9224,7 @@ async fn publish_global_map_snapshot_in_frame(
 struct CanonicalCloudPublication {
     notification: CloudMapNotification,
     source_timestamp_ns: u64,
-    xyz_f32_le: Arc<[u8]>,
+    metadata: CommittedCloudMapMetadata,
     fine: Option<Arc<nuwax_map_chunks::SealedMap>>,
     /// `None` is reserved for the zero-point session-clear publication. Every
     /// non-empty canonical snapshot carries the complete commit receipt.
@@ -9280,7 +9300,7 @@ async fn navigation_map_3d_publication_metadata(
         virtual_obstacles: None,
     };
     let Some(cloud_receipt) = publication.receipt.as_ref() else {
-        if publication.notification.point_count != 0 || !publication.xyz_f32_le.is_empty() {
+        if publication.notification.point_count != 0 {
             return Err("NavigationMap3D clear must have an empty canonical cloud".into());
         }
         if metadata.committed_map.session_id.is_empty() {
@@ -9385,11 +9405,21 @@ async fn navigation_map_3d_publication_metadata(
 fn build_navigation_map_3d_publication_frame(
     publication: &CanonicalCloudPublication,
     metadata: &NavigationMap3DPublicationMetadata,
+    legacy_xyz_f32_le: Option<&[u8]>,
 ) -> Result<RawLcmFrame, String> {
     let source_timestamp_ns = i64::try_from(publication.source_timestamp_ns)
         .map_err(|_| "NavigationMap3D source time exceeds i64".to_string())?;
     let revision = i64::try_from(publication.notification.revision)
         .map_err(|_| "NavigationMap3D cloud revision exceeds i64".to_string())?;
+    let legacy_xyz = if publication.fine.is_some() || publication.receipt.is_none() {
+        &[][..]
+    } else {
+        let bytes = legacy_xyz_f32_le.ok_or("NavigationMap3D legacy export is unavailable")?;
+        if !canonical_cloud_payload_matches(&publication.notification, bytes) {
+            return Err("NavigationMap3D legacy export length does not match metadata".into());
+        }
+        bytes
+    };
     let cloud = schema::PointCloud2 {
         header: schema::Header {
             seq: i32::try_from(revision)
@@ -9400,7 +9430,7 @@ fn build_navigation_map_3d_publication_frame(
             frame_id: metadata.committed_map.frame_id.clone(),
         },
         height: 1,
-        width: i32::try_from(publication.notification.point_count)
+        width: i32::try_from(legacy_xyz.len() / 12)
             .map_err(|_| "NavigationMap3D point count exceeds i32".to_string())?,
         fields: ["x", "y", "z"]
             .iter()
@@ -9413,9 +9443,9 @@ fn build_navigation_map_3d_publication_frame(
             })
             .collect(),
         point_step: 12,
-        row_step: i32::try_from(publication.xyz_f32_le.len())
+        row_step: i32::try_from(legacy_xyz.len())
             .map_err(|_| "NavigationMap3D point payload exceeds i32".to_string())?,
-        data: publication.xyz_f32_le.to_vec(),
+        data: legacy_xyz.to_vec(),
         is_dense: true,
         ..schema::PointCloud2::default()
     };
@@ -9450,9 +9480,6 @@ fn build_navigation_map_3d_publication_frame(
             included.insert(block.sha256, bytes);
         }
         message.source_voxel_size = root.voxel_size_m;
-        message.cloud.width = 0;
-        message.cloud.row_step = 0;
-        message.cloud.data.clear();
         message.fine = Some(nuwax_map_chunks::Transfer {
             root_sha256: nuwax_map_chunks::digest(&root_bytes), root: root_bytes, included,
         });
@@ -9467,6 +9494,51 @@ fn build_navigation_map_3d_publication_frame(
     ))
 }
 
+fn cloud_metadata_matches_notification(metadata: &CommittedCloudMapMetadata, notification: &CloudMapNotification) -> bool {
+    metadata.revision == notification.revision
+        && metadata.point_count == notification.point_count
+        && metadata.voxel_size.to_bits() == notification.voxel_size.to_bits()
+        && metadata.session_generation == notification.session_generation
+}
+
+pub(crate) fn same_cloud_metadata(left: &CommittedCloudMapMetadata, right: &CommittedCloudMapMetadata) -> bool {
+    left.revision == right.revision
+        && left.point_count == right.point_count
+        && left.voxel_size.to_bits() == right.voxel_size.to_bits()
+        && left.session_generation == right.session_generation
+        && left.producer_epoch == right.producer_epoch
+        && left.layout_generation == right.layout_generation
+}
+
+/// Only a demanded legacy full consumer may flatten the cumulative cloud.
+/// Validate metadata and the complete receipt under the writer lock first.
+fn export_canonical_cloud_payload(
+    writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+    publication: &CanonicalCloudPublication,
+) -> Result<Arc<[u8]>, String> {
+    if publication.receipt.is_none() {
+        return Ok(Arc::from([]));
+    }
+    let guard = writer.lock();
+    let writer = guard.as_ref().ok_or("legacy cloud export writer is unavailable")?;
+    let metadata = writer.committed_metadata().ok_or("legacy cloud export metadata is unavailable")?;
+    if !same_cloud_metadata(&metadata, &publication.metadata)
+        || writer.last_cloud_receipt() != publication.receipt
+    {
+        return Err("legacy cloud export identity changed before materialization".into());
+    }
+    let snapshot = writer.shared_committed_snapshot().ok_or("legacy cloud export is unavailable")?;
+    if snapshot.producer_epoch != metadata.producer_epoch
+        || snapshot.layout_generation != metadata.layout_generation
+        || snapshot.revision != metadata.revision
+        || snapshot.session_generation != metadata.session_generation
+        || !canonical_cloud_payload_matches(&publication.notification, &snapshot.xyz_f32_le)
+    {
+        return Err("legacy cloud export does not match validated metadata".into());
+    }
+    Ok(snapshot.xyz_f32_le)
+}
+
 fn canonical_cloud_payload_matches(notification: &CloudMapNotification, xyz_f32_le: &[u8]) -> bool {
     usize::try_from(notification.point_count)
         .ok()
@@ -9476,20 +9548,12 @@ fn canonical_cloud_payload_matches(notification: &CloudMapNotification, xyz_f32_
 
 fn canonical_cloud_receipt_matches_snapshot(
     receipt: &crate::mapping_commit::CloudCommitReceipt,
-    snapshot: &crate::pointcloud::CommittedCloudMapSnapshot<Arc<[u8]>>,
+    snapshot: &CommittedCloudMapMetadata,
 ) -> bool {
     receipt.session_generation == snapshot.session_generation
         && receipt.cloud_revision == snapshot.revision
         && receipt.point_count == snapshot.point_count
-        && canonical_cloud_payload_matches(
-            &CloudMapNotification {
-                revision: snapshot.revision,
-                point_count: snapshot.point_count,
-                voxel_size: snapshot.voxel_size,
-                session_generation: snapshot.session_generation,
-            },
-            &snapshot.xyz_f32_le,
-        )
+
 }
 
 fn same_canonical_cloud_publication_identity(
@@ -9498,7 +9562,7 @@ fn same_canonical_cloud_publication_identity(
 ) -> bool {
     same_cloud_map_notification(&left.notification, &right.notification)
         && left.source_timestamp_ns == right.source_timestamp_ns
-        && left.xyz_f32_le == right.xyz_f32_le
+        && same_cloud_metadata(&left.metadata, &right.metadata)
         && left.receipt == right.receipt
         && match (&left.fine, &right.fine) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -9518,7 +9582,7 @@ fn canonical_committed_cloud_publication_matches_writer(
     let Some(writer) = guard.as_ref() else {
         return false;
     };
-    let Some(snapshot) = writer.shared_committed_snapshot() else {
+    let Some(snapshot) = writer.committed_metadata() else {
         return false;
     };
     let Some(receipt) = writer.last_cloud_receipt() else {
@@ -9535,11 +9599,113 @@ fn canonical_committed_cloud_publication_matches_writer(
             session_generation: snapshot.session_generation,
         },
         source_timestamp_ns: receipt.source_timestamp_ns,
-        xyz_f32_le: snapshot.xyz_f32_le.into(),
+        metadata: snapshot,
         receipt: Some(receipt),
         fine: writer.committed_fine_cloud(),
     };
     same_canonical_cloud_publication_identity(&current, expected)
+}
+
+/// Compatibility is demanded by a live follower, not by AUTOSTART configuration.
+/// External full-frame consumers must explicitly opt in. Marker I/O belongs to
+/// the owned 500 ms watcher, never to the scan/commit publication hot path.
+struct LegacyGlobalMapDemandConfig {
+    explicit_full: bool,
+    person_follow_ready_file: std::path::PathBuf,
+    proc_root: std::path::PathBuf,
+}
+
+impl LegacyGlobalMapDemandConfig {
+    fn from_env() -> Self {
+        let truthy = |name| std::env::var(name).ok().is_some_and(|value|
+            matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+        let person_follow_ready_file = std::env::var_os("NUWAX_PERSON_FOLLOW_READY_FILE")
+            .filter(|path| !path.is_empty()).map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                if truthy("NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD") {
+                    "/run/nuwax/person-follow/nuwax_person_follow.ready".into()
+                } else {
+                    "runtime_data/person-follow/nuwax_person_follow.ready".into()
+                }
+            });
+        Self {
+            explicit_full: truthy("NUWAX_GEOMETRY_LEGACY_GLOBAL_MAP_FULL"),
+            person_follow_ready_file,
+            proc_root: "/proc".into(),
+        }
+    }
+
+    fn demand(&self) -> Option<String> {
+        // A false explicit flag never disables the actual native follower.
+        self.active_follower_identity().or_else(|| self.explicit_full.then(|| "explicit-full-consumer".into()))
+    }
+
+    fn active_follower_identity(&self) -> Option<String> {
+        use std::io::Read;
+        let metadata = std::fs::symlink_metadata(&self.person_follow_ready_file).ok()?;
+        if !metadata.is_file() || metadata.len() > 1024 { return None; }
+        let mut marker = String::new();
+        std::fs::File::open(&self.person_follow_ready_file).ok()?.take(1025)
+            .read_to_string(&mut marker).ok()?;
+        if marker.len() > 1024 { return None; }
+        let mut fields = HashMap::new();
+        for line in marker.lines() {
+            let (key, value) = line.split_once('=')?;
+            if !matches!(key, "pid" | "boot_id" | "starttime" | "subscriptions_ready")
+                || fields.insert(key, value).is_some() { return None; }
+        }
+        if fields.len() != 4 || *fields.get("subscriptions_ready")? != "1" { return None; }
+        let pid = fields.get("pid")?.parse::<u32>().ok()?;
+        let starttime = fields.get("starttime")?.parse::<u64>().ok()?;
+        if pid == 0 || starttime == 0 { return None; }
+        let boot = std::fs::read_to_string(self.proc_root.join("sys/kernel/random/boot_id")).ok()?;
+        if !boot.trim().eq_ignore_ascii_case(fields.get("boot_id")?) { return None; }
+        let stat = std::fs::read_to_string(self.proc_root.join(pid.to_string()).join("stat")).ok()?;
+        let (_, rest) = stat.rsplit_once(") ")?;
+        let process: Vec<_> = rest.split_whitespace().collect();
+        if matches!(process.first().copied(), Some("Z" | "X"))
+            || process.get(19)?.parse::<u64>().ok()? != starttime { return None; }
+        Some(format!("person-follow:{}:{pid}:{starttime}", boot.trim()))
+    }
+}
+
+fn legacy_global_map_demand_future(
+    handle: GeometryRuntimeHandle,
+    config: LegacyGlobalMapDemandConfig,
+) -> GeometryTaskFuture {
+    Box::pin(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let invalidation = canonical_cloud_publication_invalidation(&handle.cloud_map_writer);
+        let mut previous_error = None;
+        loop {
+            interval.tick().await;
+            let demand = config.demand();
+            invalidation.set_legacy_full_demand(demand.clone());
+            if demand.is_none() { continue; }
+            // This also replays an unchanged committed revision once when a
+            // follower starts after mapping, including a newly restarted PID.
+            let _lifecycle = handle.mapping_lifecycle_lock.lock().await;
+            let frame = handle.mapping_adapter.as_ref()
+                .map(|mapping| mapping.lock().configured_map_frame_id().to_owned());
+            let Some(frame) = frame else { continue; };
+            let navigation = handle.navigation_map_3d_publish_context();
+            match publish_latest_canonical_cloud_map_with_navigation(
+                &handle.transport, &handle.cloud_map_writer, &handle.state,
+                &handle.cloud_map_tx, &frame, navigation.as_ref(),
+            ).await {
+                Ok(_) => previous_error = None,
+                Err(error) => {
+                    if previous_error.as_ref() != Some(&error) {
+                        warn!(%error, "demanded legacy global-map publication failed; will retry");
+                    }
+                    previous_error = Some(error);
+                }
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok(())
+    })
 }
 
 /// Per-writer invalidation signal for the canonical `/global_map` sequencer.
@@ -9548,22 +9714,59 @@ fn canonical_committed_cloud_publication_matches_writer(
 /// A newer revision in the same session must also cancel a blocked older send so
 /// the sequencer can publish the current canonical snapshot instead.
 struct CanonicalCloudPublicationInvalidation {
-    identity_tx: watch::Sender<(u64, u64)>,
+    identity_tx: watch::Sender<(u64, u64, [u8; 16], u64)>,
+    canonical_metadata_published: parking_lot::Mutex<Option<CommittedCloudMapMetadata>>,
+    // Only the owned lifecycle watcher reads the marker/environment. Hot commits
+    // consult this bounded metadata, never the filesystem or cloud payload.
+    legacy_full_demand: parking_lot::Mutex<Option<String>>,
+    legacy_full_published: parking_lot::Mutex<Option<(CommittedCloudMapMetadata, String)>>,
 }
 
 impl CanonicalCloudPublicationInvalidation {
     fn new() -> Self {
-        let (identity_tx, _) = watch::channel((0, 0));
-        Self { identity_tx }
+        let (identity_tx, _) = watch::channel((0, 0, [0; 16], 0));
+        Self {
+            identity_tx,
+            canonical_metadata_published: parking_lot::Mutex::new(None),
+            legacy_full_demand: parking_lot::Mutex::new(None),
+            legacy_full_published: parking_lot::Mutex::new(None),
+        }
     }
 
-    fn observe(&self, identity: (u64, u64)) {
+    fn set_legacy_full_demand(&self, demand: Option<String>) {
+        let mut current = self.legacy_full_demand.lock();
+        if *current != demand {
+            *self.legacy_full_published.lock() = None;
+            *current = demand;
+        }
+    }
+
+    fn legacy_full_required(&self, metadata: &CommittedCloudMapMetadata) -> Option<String> {
+        let demand = self.legacy_full_demand.lock().clone()?;
+        let published = self.legacy_full_published.lock();
+        if published.as_ref().is_some_and(|(previous, token)|
+            same_cloud_metadata(previous, metadata) && *token == demand)
+        {
+            None
+        } else {
+            Some(demand)
+        }
+    }
+
+    fn mark_legacy_full_published(&self, metadata: CommittedCloudMapMetadata, demand: &str) {
+        let current = self.legacy_full_demand.lock();
+        if current.as_deref() == Some(demand) {
+            *self.legacy_full_published.lock() = Some((metadata, demand.to_owned()));
+        }
+    }
+
+    fn observe(&self, identity: (u64, u64, [u8; 16], u64)) {
         if *self.identity_tx.borrow() != identity {
             self.identity_tx.send_replace(identity);
         }
     }
 
-    fn subscribe(&self) -> watch::Receiver<(u64, u64)> {
+    fn subscribe(&self) -> watch::Receiver<(u64, u64, [u8; 16], u64)> {
         self.identity_tx.subscribe()
     }
 }
@@ -9620,7 +9823,7 @@ fn latest_canonical_cloud_publication(
         return Ok(None);
     };
     let publish_state = writer.typed_publish_state();
-    let Some(snapshot) = writer.shared_committed_snapshot() else {
+    let Some(snapshot) = writer.committed_metadata() else {
         return Ok(None);
     };
     let receipt = writer.last_cloud_receipt();
@@ -9630,14 +9833,14 @@ fn latest_canonical_cloud_publication(
                 "canonical cloud publication receipt does not match the SHM snapshot".to_owned(),
             );
         }
-    } else if snapshot.point_count != 0 || !snapshot.xyz_f32_le.is_empty() {
+    } else if snapshot.point_count != 0 {
         return Err("non-empty canonical cloud snapshot is missing its commit receipt".to_owned());
     }
     let source_timestamp_ns = receipt
         .as_ref()
         .map_or(0, |receipt| receipt.source_timestamp_ns);
     publish_state.observe_session_generation(snapshot.session_generation);
-    invalidation.observe((snapshot.session_generation, snapshot.revision));
+    invalidation.observe((snapshot.session_generation, snapshot.revision, snapshot.producer_epoch, snapshot.layout_generation));
     Ok(Some((
         publish_state,
         invalidation,
@@ -9649,7 +9852,7 @@ fn latest_canonical_cloud_publication(
                 session_generation: snapshot.session_generation,
             },
             source_timestamp_ns,
-            xyz_f32_le: snapshot.xyz_f32_le.into(),
+            metadata: snapshot,
             receipt,
             fine: writer.committed_fine_cloud(),
         },
@@ -9663,6 +9866,9 @@ async fn publish_latest_canonical_cloud_map(
     cloud_map_tx: &broadcast::Sender<CloudMapNotification>,
     frame_id: &str,
 ) -> Result<Option<CloudMapNotification>, String> {
+    #[cfg(test)]
+    canonical_cloud_publication_invalidation(writer)
+        .set_legacy_full_demand(Some("explicit-test-legacy-consumer".into()));
     publish_latest_canonical_cloud_map_with_navigation(
         transport,
         writer,
@@ -9701,6 +9907,8 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
             let canonical_identity = (
                 latest_publication.notification.session_generation,
                 latest_publication.notification.revision,
+                latest_publication.metadata.producer_epoch,
+                latest_publication.metadata.layout_generation,
             );
             let publication = pending_clear
                 .as_ref()
@@ -9712,7 +9920,14 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                         session_generation: clear.session_generation,
                     },
                     source_timestamp_ns: 0,
-                    xyz_f32_le: Arc::from([]),
+                    metadata: CommittedCloudMapMetadata {
+                        revision: clear.revision,
+                        point_count: clear.point_count,
+                        voxel_size: clear.voxel_size,
+                        session_generation: clear.session_generation,
+                        producer_epoch: latest_publication.metadata.producer_epoch,
+                        layout_generation: latest_publication.metadata.layout_generation,
+                    },
                     receipt: None,
                     fine: None,
                 })
@@ -9721,7 +9936,11 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                 publication.notification.session_generation,
                 publication.notification.revision,
             );
-            if publish_state.published_identity() == Some(identity) {
+            let legacy_full_demand = invalidation.legacy_full_required(&publication.metadata);
+            let canonical_already_published = publish_state.published_identity() == Some(identity)
+                && invalidation.canonical_metadata_published.lock().as_ref()
+                    .is_some_and(|metadata| same_cloud_metadata(metadata, &publication.metadata));
+            if canonical_already_published && legacy_full_demand.is_none() {
                 publish_state.mark_published(identity);
                 if pending_clear.is_some() {
                     continue;
@@ -9736,7 +9955,7 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
             }
 
             let navigation_metadata = if let Some(context) =
-                navigation_context.filter(|context| context.enabled && (publication.receipt.is_none() || publication.source_timestamp_ns > 0))
+                navigation_context.filter(|context| !canonical_already_published && context.enabled && (publication.receipt.is_none() || publication.source_timestamp_ns > 0))
             {
                 Some(
                     navigation_map_3d_publication_metadata(context, &publication, state, frame_id)
@@ -9745,9 +9964,18 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
             } else {
                 None
             };
-            let navigation_frame = navigation_metadata
-                .as_ref()
-                .map(|metadata| build_navigation_map_3d_publication_frame(&publication, metadata))
+            // Fine chunks never flatten the full cloud, even transiently. A
+            // legacy full export is shared only by consumers that demanded it.
+            let legacy_navigation = navigation_metadata.is_some()
+                && publication.fine.is_none() && publication.receipt.is_some();
+            let exported_xyz = if legacy_full_demand.is_some() || legacy_navigation {
+                Some(export_canonical_cloud_payload(writer, &publication)?)
+            } else {
+                None
+            };
+            let navigation_frame = navigation_metadata.as_ref()
+                .map(|metadata| build_navigation_map_3d_publication_frame(
+                    &publication, metadata, exported_xyz.as_deref()))
                 .transpose()?;
 
             let mut canonical_identity_rx = invalidation.subscribe();
@@ -9775,15 +10003,21 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                     }
                 }
                 result = async {
-                    publish_global_map_snapshot_in_frame(
-                        transport, &publication.xyz_f32_le, publication.notification.revision,
-                        publication.source_timestamp_ns, frame_id,
-                    ).await?;
+                    if let Some(demand) = legacy_full_demand.as_ref() {
+                        if invalidation.legacy_full_demand.lock().as_ref() != Some(demand) {
+                            return Ok::<bool, String>(false);
+                        }
+                        publish_global_map_snapshot_in_frame(
+                            transport, exported_xyz.as_deref().unwrap_or(&[]), publication.notification.revision,
+                            publication.source_timestamp_ns, frame_id,
+                        ).await?;
+                    }
                     if let Some(frame) = navigation_frame {
                         let Some((_, _, current)) = latest_canonical_cloud_publication(writer)? else {
                             return Ok::<bool, String>(false);
                         };
-                        if (current.notification.session_generation, current.notification.revision) != canonical_identity
+                        if (current.notification.session_generation, current.notification.revision,
+                            current.metadata.producer_epoch, current.metadata.layout_generation) != canonical_identity
                             || (publication.receipt.is_some()
                                 && !same_canonical_cloud_publication_identity(&current, &publication))
                         {
@@ -9830,11 +10064,13 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                     drop(shared);
                     continue 'acquire_sequencer;
                 }
-                let Some(current_snapshot) = current_writer.shared_committed_snapshot() else {
+                let Some(current_snapshot) = current_writer.committed_metadata() else {
                     return Ok(None);
                 };
                 current_snapshot.session_generation == canonical_identity.0
                     && current_snapshot.revision == canonical_identity.1
+                    && current_snapshot.producer_epoch == canonical_identity.2
+                    && current_snapshot.layout_generation == canonical_identity.3
             };
             let committed_publication_matches = publication.receipt.as_ref().is_none_or(|_| {
                 canonical_committed_cloud_publication_matches_writer(writer, &publication)
@@ -9848,6 +10084,10 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                 continue;
             }
 
+            if let Some(demand) = legacy_full_demand.as_ref() {
+                invalidation.mark_legacy_full_published(publication.metadata, demand);
+            }
+            *invalidation.canonical_metadata_published.lock() = Some(publication.metadata);
             publish_state.mark_published(identity);
             if shared.cloud_map_revision < publication.notification.revision {
                 shared.cloud_map_revision = publication.notification.revision;
@@ -9924,9 +10164,6 @@ fn canonical_mapping_cloud_identity_from_commit<'a>(
                 mapping.global_frame_generation(),
             )
         };
-    let expected_payload_len = usize::try_from(cloud.notification.point_count)
-        .ok()
-        .and_then(|point_count| point_count.checked_mul(12));
     if occupancy_receipt.session_id != mapping_session_id
         || occupancy_receipt.session_generation != mapping_session_generation
         || cloud.receipt.commit_id != occupancy_receipt.commit_id
@@ -9937,7 +10174,7 @@ fn canonical_mapping_cloud_identity_from_commit<'a>(
         || cloud.notification.point_count != cloud.receipt.point_count
         || cloud.notification.session_generation != mapping_session_generation
         || cloud.source_timestamp_ns != cloud.receipt.source_timestamp_ns
-        || expected_payload_len != Some(cloud.xyz_f32_le.len())
+        || !cloud_metadata_matches_notification(&cloud.metadata, &cloud.notification)
     {
         return Err("canonical cloud publication commit identity mismatch".to_owned());
     }
@@ -9987,7 +10224,7 @@ async fn ensure_canonical_mapping_cloud_identity(
             .ok_or_else(|| "canonical cloud publication writer is unavailable".to_owned())?;
         (
             writer
-                .shared_committed_snapshot()
+                .committed_metadata()
                 .ok_or_else(|| "canonical cloud publication snapshot is unavailable".to_owned())?,
             writer
                 .last_cloud_receipt()
@@ -10012,7 +10249,7 @@ async fn ensure_canonical_mapping_cloud_identity(
         || cloud_snapshot.point_count != expected.cloud.notification.point_count
         || cloud_snapshot.voxel_size.to_bits() != expected.cloud.notification.voxel_size.to_bits()
         || cloud_snapshot.session_generation != expected.cloud.notification.session_generation
-        || cloud_snapshot.xyz_f32_le != expected.cloud.xyz_f32_le
+        || !same_cloud_metadata(&cloud_snapshot, &expected.cloud.metadata)
         || shared.map.revision != expected.occupancy_receipt.occupancy_revision
         || shared.map.timestamp_ns != expected.occupancy_receipt.source_timestamp_ns
         || normalize_frame(&shared.map.frame_id) != expected.map_frame_id
@@ -10765,7 +11002,7 @@ async fn ensure_read_only_mapping_identity(
             .as_ref()
             .ok_or_else(|| "relocalization current cloud-map writer is unavailable".to_owned())?;
         (
-            writer.shared_committed_snapshot().ok_or_else(|| {
+            writer.committed_metadata().ok_or_else(|| {
                 "relocalization current cloud-map snapshot is unavailable".to_owned()
             })?,
             writer.last_cloud_receipt().ok_or_else(|| {
@@ -10794,7 +11031,7 @@ async fn ensure_read_only_mapping_identity(
         || cloud_snapshot.point_count != expected_cloud.notification.point_count
         || cloud_snapshot.voxel_size.to_bits() != expected_cloud.notification.voxel_size.to_bits()
         || cloud_snapshot.session_generation != expected_cloud.notification.session_generation
-        || cloud_snapshot.xyz_f32_le != expected_cloud.xyz_f32_le
+        || !same_cloud_metadata(&cloud_snapshot, &expected_cloud.metadata)
         || shared.map.revision != expected_cloud.receipt.occupancy_revision
         || shared.map.timestamp_ns != expected_cloud.receipt.source_timestamp_ns
         || normalize_frame(&shared.map.frame_id) != configured_map_frame
@@ -10960,7 +11197,7 @@ async fn registered_lio_read_only_correction_frame(
             .as_ref()
             .ok_or_else(|| "relocalization requires the canonical cloud-map writer".to_owned())?;
         let snapshot = writer
-            .shared_committed_snapshot()
+            .committed_metadata()
             .ok_or_else(|| "relocalization requires a committed cloud-map snapshot".to_owned())?;
         let receipt = writer
             .last_cloud_receipt()
@@ -11066,7 +11303,7 @@ async fn registered_lio_read_only_correction_frame(
                 session_generation: cloud_snapshot.session_generation,
             },
             source_timestamp_ns: cloud_receipt.source_timestamp_ns,
-            xyz_f32_le: cloud_snapshot.xyz_f32_le,
+            metadata: cloud_snapshot,
             receipt: cloud_receipt,
         },
     })
@@ -11553,6 +11790,8 @@ async fn build_handle_for_tests_with_cloud_writer(
     } else {
         Arc::new(parking_lot::Mutex::new(None))
     };
+    canonical_cloud_publication_invalidation(&cloud_map_writer)
+        .set_legacy_full_demand(Some("explicit-test-legacy-consumer".into()));
     Ok(GeometryRuntimeHandle {
         state,
         cloud_map_tx,
@@ -12328,6 +12567,8 @@ mod mapping_feed_tests {
     }
 
     async fn register_test_cloud_session(handle: &GeometryRuntimeHandle) {
+        canonical_cloud_publication_invalidation(&handle.cloud_map_writer)
+            .set_legacy_full_demand(Some("explicit-test-legacy-consumer".into()));
         let generation = handle.mapping_adapter.as_ref().unwrap().lock().snapshot().session_generation;
         assert!(matches!(handle.begin_cloud_map_session(generation).await,
             CloudMapSessionAdmission::Registered(_)), "测试必须完成生产点云会话登记");
@@ -12356,6 +12597,9 @@ mod mapping_feed_tests {
             ));
             let mut writer = CloudMapShmWriter::new(&path).expect("三维发布测试共享内存");
             writer.begin_session(generation).expect("会话清空");
+            let writer = Arc::new(parking_lot::Mutex::new(Some(writer)));
+            canonical_cloud_publication_invalidation(&writer)
+                .set_legacy_full_demand(Some("explicit-test-legacy-consumer".into()));
             Self {
                 context: NavigationMap3DPublishContext {
                     enabled: true,
@@ -12364,7 +12608,7 @@ mod mapping_feed_tests {
                     committed_map_authority: Arc::new(std::sync::Mutex::new(None)),
                 },
                 state: Arc::new(RwLock::new(SharedState::default())),
-                writer: Arc::new(parking_lot::Mutex::new(Some(writer))),
+                writer,
                 cloud_tx: broadcast::channel(4).0,
                 map_tx: broadcast::channel(4).0,
                 path,
@@ -12409,6 +12653,183 @@ mod mapping_feed_tests {
         }
     }
 
+    #[tokio::test]
+    async fn fine_navigation_without_full_demand_never_materializes_cumulative_xyz() {
+        let fixture = NavigationMap3DFixture::new();
+        canonical_cloud_publication_invalidation(&fixture.writer).set_legacy_full_demand(None);
+        let backend = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/incremental").unwrap());
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        for stamp in [1_000_000_000, 4_000_000_000] {
+            fixture.commit(stamp);
+            assert!(!fixture.writer.lock().as_ref().unwrap().full_snapshot_materialized());
+            publish_latest_canonical_cloud_map_with_navigation(
+                &transport, &fixture.writer, &fixture.state, &fixture.cloud_tx,
+                "map", Some(&fixture.context),
+            ).await.unwrap();
+            assert!(!fixture.writer.lock().as_ref().unwrap().full_snapshot_materialized());
+        }
+        let frames = backend.published.lock().unwrap();
+        assert!(!frames.is_empty());
+        assert!(frames.iter().all(|frame| frame.topic.channel() == "/nav/map3d"));
+        for frame in frames.iter() {
+            let message = schema::decode_navigation_map_3d_body(&frame.payload).unwrap();
+            assert!(message.cloud.data.is_empty());
+            if !message.cleared { assert!(message.fine.is_some()); }
+        }
+    }
+
+    fn follower_demand_test_config(root: &std::path::Path) -> LegacyGlobalMapDemandConfig {
+        LegacyGlobalMapDemandConfig {
+            explicit_full: false,
+            person_follow_ready_file: root.join("follower.ready"),
+            proc_root: root.join("proc"),
+        }
+    }
+
+    fn write_follower_test_identity(config: &LegacyGlobalMapDemandConfig, starttime: u64) {
+        std::fs::create_dir_all(config.proc_root.join("sys/kernel/random")).unwrap();
+        std::fs::create_dir_all(config.proc_root.join("7")).unwrap();
+        std::fs::write(config.proc_root.join("sys/kernel/random/boot_id"), "test-boot\n").unwrap();
+        // /proc/stat fields after comm: state at index 0, starttime at index 19.
+        let mut fields = vec!["0".to_owned(); 20];
+        fields[0] = "S".into();
+        fields[19] = starttime.to_string();
+        std::fs::write(config.proc_root.join("7/stat"), format!("7 (person follow) {}", fields.join(" "))).unwrap();
+        std::fs::write(&config.person_follow_ready_file,
+            format!("pid=7\nboot_id=test-boot\nstarttime={starttime}\nsubscriptions_ready=1\n")).unwrap();
+    }
+
+    #[test]
+    fn legacy_full_delivery_tracks_demand_epoch_layout_and_revision_without_payload() {
+        let state = CanonicalCloudPublicationInvalidation::new();
+        let metadata = CommittedCloudMapMetadata {
+            revision: 9,
+            point_count: 10,
+            voxel_size: crate::pointcloud::VOXEL_SIZE,
+            session_generation: 3,
+            producer_epoch: [5; 16],
+            layout_generation: 2,
+        };
+        assert!(state.legacy_full_required(&metadata).is_none());
+        state.set_legacy_full_demand(Some("follower:first-process".into()));
+        assert_eq!(state.legacy_full_required(&metadata).as_deref(), Some("follower:first-process"));
+        state.mark_legacy_full_published(metadata, "follower:first-process");
+        assert!(state.legacy_full_required(&metadata).is_none());
+
+        let mut changed = metadata;
+        changed.revision += 1;
+        assert!(state.legacy_full_required(&changed).is_some());
+        changed = metadata;
+        changed.producer_epoch[0] ^= 1;
+        assert!(state.legacy_full_required(&changed).is_some());
+        changed = metadata;
+        changed.layout_generation += 1;
+        assert!(state.legacy_full_required(&changed).is_some());
+
+        let mut identity = state.subscribe();
+        state.observe((metadata.session_generation, metadata.revision,
+            metadata.producer_epoch, metadata.layout_generation));
+        identity.borrow_and_update();
+        state.observe((metadata.session_generation, metadata.revision,
+            changed.producer_epoch, changed.layout_generation));
+        assert!(identity.has_changed().unwrap(), "layout change must invalidate a blocked publication");
+
+        state.set_legacy_full_demand(None);
+        assert!(state.legacy_full_required(&metadata).is_none());
+        state.set_legacy_full_demand(Some("follower:restarted-process".into()));
+        // An old in-flight send cannot satisfy a newly activated follower.
+        state.mark_legacy_full_published(metadata, "follower:first-process");
+        assert_eq!(state.legacy_full_required(&metadata).as_deref(), Some("follower:restarted-process"));
+        state.mark_legacy_full_published(metadata, "follower:restarted-process");
+        assert!(state.legacy_full_required(&metadata).is_none());
+    }
+
+    #[test]
+    fn legacy_full_demand_requires_explicit_opt_in_or_live_follower_identity() {
+        let root = std::env::temp_dir().join(format!("nuwax-cloud-demand-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = follower_demand_test_config(&root);
+        assert!(config.demand().is_none());
+        config.explicit_full = true;
+        assert_eq!(config.demand().as_deref(), Some("explicit-full-consumer"));
+        config.explicit_full = false;
+        write_follower_test_identity(&config, 123);
+        assert_eq!(config.demand().as_deref(), Some("person-follow:test-boot:7:123"));
+        // PID reuse, stale boot, duplicate fields, missing readiness all fail closed.
+        std::fs::write(config.proc_root.join("7/stat"), "7 (person follow) S 0").unwrap();
+        assert!(config.demand().is_none());
+        write_follower_test_identity(&config, 124);
+        assert_eq!(config.demand().as_deref(), Some("person-follow:test-boot:7:124"));
+        std::fs::write(config.proc_root.join("sys/kernel/random/boot_id"), "different-boot").unwrap();
+        assert!(config.demand().is_none());
+        write_follower_test_identity(&config, 124);
+        std::fs::write(&config.person_follow_ready_file,
+            "pid=7\npid=7\nboot_id=test-boot\nstarttime=124\nsubscriptions_ready=1\n").unwrap();
+        assert!(config.demand().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn follower_demand_watcher_replays_static_map_once_and_stops_full_updates() {
+        let fixture = NavigationMap3DFixture::new();
+        let invalidation = canonical_cloud_publication_invalidation(&fixture.writer);
+        invalidation.set_legacy_full_demand(None);
+        let backend = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/follower-demand").unwrap());
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        fixture.commit(1_000_000_000);
+        publish_latest_canonical_cloud_map_with_navigation(
+            &transport, &fixture.writer, &fixture.state, &fixture.cloud_tx,
+            "map", Some(&fixture.context),
+        ).await.unwrap();
+        assert!(!fixture.writer.lock().as_ref().unwrap().full_snapshot_materialized());
+        let root = std::env::temp_dir().join(format!("nuwax-cloud-watcher-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = follower_demand_test_config(&root);
+        let marker = config.person_follow_ready_file.clone();
+        write_follower_test_identity(&config, 123);
+        let mut handle = build_handle_for_tests_without_cloud_writer().await.unwrap();
+        handle.cloud_map_writer = fixture.writer.clone();
+        handle.mapping_adapter = Some(fixture.context.mapping.clone());
+        handle.state = fixture.state.clone();
+        handle.cloud_map_tx = fixture.cloud_tx.clone();
+        handle.transport = transport.clone();
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let watcher = tokio::spawn(run_persistent_future_until_stop(shutdown_rx,
+            legacy_global_map_demand_future(handle, config)));
+        let full_count = || backend.published.lock().unwrap().iter()
+            .filter(|frame| frame.topic.channel() == GLOBAL_MAP_CHANNEL).count();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while full_count() != 1 { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.expect("live follower must receive unchanged committed map");
+        assert!(fixture.writer.lock().as_ref().unwrap().full_snapshot_materialized());
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(full_count(), 1, "same demand/revision must not resend every tick");
+        std::fs::remove_file(&marker).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while invalidation.legacy_full_demand.lock().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("stopped follower must revoke full demand");
+        fixture.commit(4_000_000_000);
+        publish_latest_canonical_cloud_map_with_navigation(
+            &transport, &fixture.writer, &fixture.state, &fixture.cloud_tx,
+            "map", Some(&fixture.context),
+        ).await.unwrap();
+        assert_eq!(full_count(), 1);
+        assert!(!fixture.writer.lock().as_ref().unwrap().full_snapshot_materialized());
+        shutdown.send_replace(true);
+        watcher.await.unwrap().unwrap();
+        // Explicit legacy consumers use the same lazy export, even without a follower.
+        invalidation.set_legacy_full_demand(Some("explicit-full-consumer".into()));
+        publish_latest_canonical_cloud_map_with_navigation(
+            &transport, &fixture.writer, &fixture.state, &fixture.cloud_tx,
+            "map", Some(&fixture.context),
+        ).await.unwrap();
+        assert_eq!(full_count(), 2);
+        assert!(fixture.writer.lock().as_ref().unwrap().full_snapshot_materialized());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn cloud_commit_preserves_duplicate_receipt_error_without_advancing_snapshot() {
         let fixture = NavigationMap3DFixture::new();
@@ -12425,7 +12846,8 @@ mod mapping_feed_tests {
         assert_eq!(error, "point-cloud snapshot commit failed: cloud-map occupancy receipt is duplicate or out of order");
         let snapshot = fixture.writer.lock().as_ref().unwrap().shared_committed_snapshot().unwrap();
         assert_eq!(snapshot.revision, first.notification.revision);
-        assert_eq!(snapshot.xyz_f32_le, first.xyz_f32_le);
+        assert_eq!(snapshot.producer_epoch, first.metadata.producer_epoch);
+        assert_eq!(snapshot.layout_generation, first.metadata.layout_generation);
     }
 
     #[tokio::test]
@@ -12480,7 +12902,7 @@ mod mapping_feed_tests {
         )
         .await
         .unwrap();
-        let frame = build_navigation_map_3d_publication_frame(&publication, &metadata).unwrap();
+        let frame = build_navigation_map_3d_publication_frame(&publication, &metadata, None).unwrap();
         let message = schema::decode_navigation_map_3d_body(&frame.payload).unwrap();
         let mask = message.virtual_obstacles.as_ref().unwrap();
         assert_eq!(i64::from(mask.header.seq), message.committed_map.revision);
@@ -12557,7 +12979,7 @@ mod mapping_feed_tests {
         )
         .await
         .unwrap();
-        let frame = build_navigation_map_3d_publication_frame(&publication, &metadata).unwrap();
+        let frame = build_navigation_map_3d_publication_frame(&publication, &metadata, None).unwrap();
         let blocked = schema::decode_navigation_map_3d_body(&frame.payload).unwrap();
         assert!(blocked
             .virtual_obstacles
@@ -12658,7 +13080,8 @@ mod mapping_feed_tests {
         }
         let fine_xyz = keys.into_iter().flat_map(|key| key.into_iter().flat_map(|v|
             (((v as f64 + 0.5) * f64::from(root.voxel_size_m)) as f32).to_le_bytes())).collect::<Vec<_>>();
-        assert_eq!(fine_xyz.as_slice(), committed.xyz_f32_le.as_ref());
+        let exported = fixture.writer.lock().as_ref().unwrap().shared_committed_snapshot().unwrap();
+        assert_eq!(fine_xyz.as_slice(), exported.xyz_f32_le.as_ref());
         assert_eq!(
             frames[3].msg_type.fingerprint(),
             schema::NAVIGATION_MAP_3D_FINGERPRINT
@@ -12860,7 +13283,7 @@ mod mapping_feed_tests {
         )
         .await
         .unwrap();
-        let frame = build_navigation_map_3d_publication_frame(&publication, &metadata).unwrap();
+        let frame = build_navigation_map_3d_publication_frame(&publication, &metadata, None).unwrap();
         let message = schema::decode_navigation_map_3d_body(&frame.payload).unwrap();
         let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
         let config = nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new(
@@ -13127,7 +13550,7 @@ mod mapping_feed_tests {
     }
 
     #[test]
-    fn canonical_cloud_publication_identity_includes_full_receipt_and_payload() {
+    fn canonical_cloud_publication_identity_includes_receipt_epoch_and_layout() {
         let receipt = crate::mapping_commit::CloudCommitReceipt {
             commit_id: crate::mapping_commit::MappingCommitId {
                 boot_nonce: 7,
@@ -13148,7 +13571,12 @@ mod mapping_feed_tests {
                 session_generation: receipt.session_generation,
             },
             source_timestamp_ns: receipt.source_timestamp_ns,
-            xyz_f32_le: vec![0; 12].into(),
+            metadata: CommittedCloudMapMetadata {
+                revision: receipt.cloud_revision, point_count: receipt.point_count,
+                voxel_size: crate::pointcloud::VOXEL_SIZE,
+                session_generation: receipt.session_generation,
+                producer_epoch: [3; 16], layout_generation: 5,
+            },
             receipt: Some(receipt),
         };
         assert!(same_canonical_cloud_publication_identity(
@@ -13223,12 +13651,12 @@ mod mapping_feed_tests {
             &wrong_point_count
         ));
 
-        let mut wrong_payload = publication.clone();
-        Arc::make_mut(&mut wrong_payload.xyz_f32_le)[0] = 1;
-        assert!(!same_canonical_cloud_publication_identity(
-            &publication,
-            &wrong_payload
-        ));
+        let mut wrong_epoch = publication.clone();
+        wrong_epoch.metadata.producer_epoch[0] ^= 1;
+        assert!(!same_canonical_cloud_publication_identity(&publication, &wrong_epoch));
+        let mut wrong_layout = publication.clone();
+        wrong_layout.metadata.layout_generation += 1;
+        assert!(!same_canonical_cloud_publication_identity(&publication, &wrong_layout));
     }
 
     fn map_revision_event(map: MapState) -> MapRevisionEvent {
@@ -13371,7 +13799,7 @@ mod mapping_feed_tests {
         assert_eq!(update.notification.revision, 1);
         assert_eq!(update.notification.point_count, 2);
         assert_eq!(update.source_timestamp_ns, 1_234_567_890_123_456_789);
-        assert_eq!(update.xyz_f32_le.len(), 24);
+        assert_eq!(update.metadata.point_count, 2);
         assert_eq!(update.receipt.commit_id, receipt.commit_id);
         assert_eq!(update.receipt.occupancy_revision, event.revision);
         assert_eq!(update.receipt.cloud_revision, update.notification.revision);

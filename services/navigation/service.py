@@ -1835,10 +1835,12 @@ class NavigationService:
                 "resolved_region_id": region.region_id,
                 "map_name": map_snapshot.map_name,
                 "map_snapshot_identity": {
+                    "schema_version": map_snapshot.schema_version,
+                    "map_name": map_snapshot.map_name,
                     "source_name": map_snapshot.source_name,
                     "source_epoch": map_snapshot.source_epoch,
-                    "update_sequence": map_snapshot.update_sequence,
-                    "content_sha256": map_snapshot.content_sha256,
+                    "frame_id": map_snapshot.frame_id,
+                    "update_sequence": str(map_snapshot.update_sequence),
                 },
             }
             return NavigationGoal(
@@ -2896,10 +2898,12 @@ class NavigationService:
             "map_status": map_status,
             "map_snapshot_identity": (
                 {
+                    "schema_version": map_snapshot.schema_version,
+                    "map_name": map_snapshot.map_name,
                     "source_name": map_snapshot.source_name,
                     "source_epoch": map_snapshot.source_epoch,
-                    "update_sequence": map_snapshot.update_sequence,
-                    "content_sha256": map_snapshot.content_sha256,
+                    "frame_id": map_snapshot.frame_id,
+                    "update_sequence": str(map_snapshot.update_sequence),
                 }
                 if map_snapshot is not None
                 else None

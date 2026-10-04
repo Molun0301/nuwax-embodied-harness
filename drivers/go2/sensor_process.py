@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
+from functools import partial
 import multiprocessing as mp
 import os
 import sys
@@ -20,9 +21,9 @@ def _sample_size(sample):
     ))
 
 
-def _default_source(config):
+def _default_source(config, *, calibration_profile=None):
     from drivers.go2.data_plane import Go2DirectDdsBridge
-    return Go2DirectDdsBridge(config)
+    return Go2DirectDdsBridge(config, calibration_profile=calibration_profile)
 
 
 def _sensor_process_main(config, data, status, commands, stop, source_factory, forward_samples):
@@ -220,10 +221,13 @@ def _sensor_process_main(config, data, status, commands, stop, source_factory, f
 class Go2SensorProcess:
     """父进程拥有子进程及交付线程，停止时撤销代际并回收真实进程。"""
 
-    def __init__(self, config, *, on_sample, on_snapshot, on_error, source_factory=_default_source, forward_samples=True):
+    def __init__(self, config, *, on_sample, on_snapshot, on_error, source_factory=_default_source,
+                 forward_samples=True, calibration_profile=None):
         self.config = config
         self.on_sample, self.on_snapshot, self.on_error = on_sample, on_snapshot, on_error
-        self.source_factory = source_factory
+        # 不注入标定时保持既有自定义工厂的单config参数合同。
+        self.source_factory = (partial(source_factory, calibration_profile=calibration_profile)
+                               if calibration_profile is not None else source_factory)
         self.forward_samples = forward_samples
         self._context = mp.get_context("spawn")
         self._stop = self._context.Event()

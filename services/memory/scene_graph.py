@@ -1,17 +1,19 @@
 """空间语义图与有界索引，复用原持久记录；不拥有运动执行。"""
 from __future__ import annotations
 
+import threading
+import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
-import threading
 from typing import Any, Dict, List, Optional
 
+from contracts.base import utc_now
 from contracts.scene_graph import SceneGraphEdge, SceneGraphNode, SceneGraphSnapshot
 from core.errors import GatewayError
-from services.memory.scene_graph_geometry import build_scene_graph_geometry, graph_digest
+from services.memory.scene_graph_geometry import build_scene_graph_geometry
 from services.memory.scene_mapping_state import same_scope
-
+from services.memory.scene_revisions import binding_value
 
 _LIMITATIONS = ["连接依据当前二维已知自由格；门状态、真实净高和机体通行尚未检查。",
                 "高度范围沿现有地图切片归属，不表示已建立多楼层连接。",
@@ -26,6 +28,7 @@ class SceneGraphIndex:
     adjacency: Dict[str, List[SceneGraphEdge]]
     region_neighbors: Dict[str, List[Any]]
     search_text: Dict[str, str]
+    valid_until: Optional[float] = None
 
 
 class SceneGraphService:
@@ -39,6 +42,8 @@ class SceneGraphService:
         self._geometry = None
         self._index_key = None
         self._index = None
+        self._graph_epoch = uuid.uuid4().hex
+        self._publication_sequence = 0
 
     def close(self):
         with self._lock:
@@ -46,31 +51,59 @@ class SceneGraphService:
             self._geometry_key = self._index_key = None
 
     def _capture(self):
-        capture = self.memory.capture_scene_graph_state()
-        binding = capture["binding"]
-        spaces = sorted((space for space in capture["spaces"]
-                         if same_scope(space.metadata.get("map_binding", {}), binding)
-                         and space.metadata["map_binding"].get("content_sha256") == binding["content_sha256"]
-                         and str(space.review_status.value) not in ("stale", "rejected")),
-                        key=lambda space: space.scene_space_id)
-        geometry_key = graph_digest([{k: binding[k] for k in binding if k != "update_sequence"},
-                                     [(s.scene_space_id, s.metadata.get("geometry_digest")) for s in spaces]])
-        # 内容签名覆盖实际返回字段，不把一次查询时间当作图更新。
-        index_key = graph_digest([geometry_key, binding, capture["generation"],
-                                  [s.model_dump(mode="json", exclude={"boundary": {"metadata": {"room_geometry"}}}) for s in spaces], capture["instances"],
-                                  [entry.model_dump(mode="json") for entry in capture["entries"]],
-                                  capture["instance_total"], capture["entry_total"], len(capture["spaces"])])
+        # Serialize graph publication only. The memory APIs own their short
+        # capture transactions; geometry/index construction runs after release.
         with self._lock:
-            if geometry_key != self._geometry_key:
+            stamp = self.memory.capture_scene_graph_stamp()
+            transactional = stamp.get("transactional", False)
+            if (not transactional and self._index is not None and stamp["stamp_key"] == self._index_key
+                    and self._within_deadline(self._index.valid_until)):
+                stamp["valid_until"] = self._index.valid_until
+                self._assert_capture(stamp)
+                return stamp, self._index
+            capture = self.memory.capture_scene_graph_state(stamp=stamp)
+            binding = capture["binding"]
+            spaces = sorted((space for space in capture["spaces"]
+                             if same_scope(space.metadata.get("map_binding", {}), binding)
+                             and str(space.metadata["map_binding"].get("update_sequence", "")) == binding["update_sequence"]
+                             and str(space.review_status.value) not in ("stale", "rejected")),
+                            key=lambda space: space.scene_space_id)
+            geometry_key = (capture["library_incarnation"], capture["generation"],
+                            capture.get("load_history", True),
+                            capture.get("geometry_visibility_generation", 0) if not capture.get("load_history", True) else 0,
+                            capture["geometry_generation"], *binding_value(binding))
+            geometry = self._geometry
+            if transactional or geometry is None or geometry_key != self._geometry_key:
                 geometry = build_scene_graph_geometry(capture["snapshot"], spaces, max_cells=self.max_cells)
+            sequence = self._publication_sequence + 1
+            revision = (f"graph_v2_{self._graph_epoch}_tx_{uuid.uuid4().hex}" if transactional
+                        else f"graph_v2_{self._graph_epoch}_{sequence}")
+            index = self._build(capture, spaces, geometry, graph_revision=revision)
+            # A failed or obsolete build changes neither cached state nor the
+            # public sequence, including lifecycle expiry during construction.
+            self._assert_capture(capture)
+            if not transactional:
                 self._geometry, self._geometry_key = geometry, geometry_key
-                self._index_key = None
-            if index_key != self._index_key:
-                self._index = self._build(capture, spaces, self._geometry)
-                self._index_key = index_key
-            index = self._index
+                self._index, self._index_key = index, capture["stamp_key"]
+                self._publication_sequence = sequence
+            stamp["valid_until"] = index.valid_until
+            return stamp, index
+
+    @staticmethod
+    def _within_deadline(valid_until):
+        return valid_until is None or utc_now().timestamp() < valid_until
+
+    def _assert_capture(self, capture):
         self.memory.assert_scene_graph_capture(capture)
-        return capture, index
+        if not self._within_deadline(capture.get("valid_until")):
+            raise GatewayError("物品状态在图查询期间已过期，请重新读取。", error_code="scene_graph_changed", http_status=409)
+
+    @staticmethod
+    def _public_identity(index):
+        snapshot = index.snapshot
+        return {"schema_version": getattr(snapshot, "schema_version", 1),
+                "graph_epoch": getattr(snapshot, "graph_epoch", None),
+                "map_binding": snapshot.map_binding, "graph_revision": snapshot.graph_revision}
 
     @staticmethod
     def _same_source(row, binding):
@@ -78,21 +111,21 @@ class SceneGraphService:
                 and row.get("map_source_name") == binding["source_name"]
                 and row.get("map_source_epoch") == binding["source_epoch"])
 
-    def _build(self, capture, spaces, geometry):
+    def _build(self, capture, spaces, geometry, *, graph_revision):
         binding = capture["binding"]
         nodes, edges = {}, []
 
         def edge(kind, source, target, evidence, directed=False):
-            edges.append(SceneGraphEdge(edge_id="edge_" + graph_digest([kind, source, target])[:24],
+            edges.append(SceneGraphEdge(edge_id="edge_" + uuid.uuid4().hex,
                          kind=kind, source=source, target=target, directed=directed, evidence=evidence))
 
         for ordinal, space in enumerate(spaces, 1):
             boundary = space.boundary.model_dump(mode="json")
             boundary["metadata"].pop("room_geometry", None)
             nodes[space.scene_space_id] = SceneGraphNode(node_id=space.scene_space_id, kind="region",
-                record_id=space.scene_space_id, name=space.primary_label or "区域 %d" % ordinal,
+                record_id=space.scene_space_id, name=space.primary_label or f"区域 {ordinal}",
                 position=space.boundary.centroid.position, aliases=space.human_aliases,
-                properties={"display_code": "R%d" % ordinal, "boundary": boundary,
+                properties={"display_code": f"R{ordinal}", "boundary": boundary,
                             "review_status": space.review_status.value,
                             "scene_revision": space.metadata.get("scene_revision"),
                             "has_label": bool(space.primary_label),
@@ -101,8 +134,8 @@ class SceneGraphService:
                             "geometry_source": "current_free_cell_region", "navigation_state": "unchecked"})
         for ordinal, passage in enumerate(geometry.passages, 1):
             identifier = passage["node_id"]
-            nodes[identifier] = SceneGraphNode(node_id=identifier, kind="passage", name="连接口 %d" % ordinal,
-                                              position=passage["position"], properties={**passage, "display_code": "P%d" % ordinal})
+            nodes[identifier] = SceneGraphNode(node_id=identifier, kind="passage", name=f"连接口 {ordinal}",
+                                              position=passage["position"], properties={**passage, "display_code": f"P{ordinal}"})
             for region_id in passage["region_ids"]:
                 edge("access", region_id, identifier, {"source": "shared_free_cell_edges",
                      "geometry_status": "free_space_connected", "navigation_state": "unchecked"})
@@ -113,7 +146,7 @@ class SceneGraphService:
             row = {**entry.metadata, "map_name": entry.map_name}
             if not self._same_source(row, binding) or entry.pose is None or entry.pose.frame_id != binding["frame_id"]:
                 continue
-            if entry.metadata.get("map_content_sha256") != binding["content_sha256"]:
+            if str(entry.metadata.get("map_update_sequence", "")) != binding["update_sequence"]:
                 continue
             try:
                 observed_at = datetime.fromisoformat(str(entry.metadata.get("frame_timestamp", "")).replace("Z", "+00:00"))
@@ -146,7 +179,7 @@ class SceneGraphService:
                 continue
             position_valid = (not row["is_fallback"] and not row["observation_only"]
                               and row["frame_id"] == binding["frame_id"]
-                              and row["map_content_sha256"] == binding["content_sha256"]
+                              and str(row["map_update_sequence"]) == binding["update_sequence"]
                               and row["lifecycle_state"] in ("active", "uncertain"))
             position = row["pose"] if position_valid else None
             region_id = geometry.region_at(position) if position else None
@@ -154,7 +187,7 @@ class SceneGraphService:
             object_ordinal += 1
             nodes[identifier] = SceneGraphNode(node_id=identifier, kind="object", record_id=identifier,
                 name=row["display_name"], position=position, aliases=row["aliases"], artifact_ids=row["artifact_ids"],
-                properties={"region_id": region_id, "display_code": "O%d" % object_ordinal,
+                properties={"region_id": region_id, "display_code": f"O{object_ordinal}",
                             "label": row["label"], "lifecycle_state": row["lifecycle_state"],
                             "dynamic_state": row["dynamic_state"], "last_seen_ts": row["last_seen_ts"],
                             "projection_method": row["projection_method"], "observation_count": row["observation_count"],
@@ -167,7 +200,8 @@ class SceneGraphService:
         ordered_nodes = sorted(nodes.values(), key=lambda node: (node.kind, node.node_id))
         edges.sort(key=lambda item: item.edge_id)
         assigned_cells = int((geometry.labels != 0).sum())
-        coverage = {"region_count": len(spaces), "excluded_region_count": len(capture["spaces"]) - len(spaces),
+        coverage = {"region_count": len(spaces),
+                    "excluded_region_count": capture.get("space_total", len(capture["spaces"])) - len(spaces),
                     "passage_count": len(geometry.passages), "object_count": sum(node.kind == "object" for node in ordered_nodes),
                     "observation_count": sum(node.kind == "observation" for node in ordered_nodes),
                     "omitted_observation_count": omitted_observations,
@@ -178,9 +212,8 @@ class SceneGraphService:
                     "observation_records_truncated": capture["entry_total"] > len(capture["entries"]),
                     "known_free_cells": geometry.known_free_cells, "assigned_free_cells": assigned_cells,
                     "geometry_connectivity_complete": assigned_cells == geometry.known_free_cells}
-        content = [binding, capture["generation"], [n.model_dump(mode="json") for n in ordered_nodes],
-                   [e.model_dump(mode="json") for e in edges], coverage]
-        graph = SceneGraphSnapshot(map_binding=binding, graph_revision=graph_digest(content), nodes=ordered_nodes,
+        graph = SceneGraphSnapshot(schema_version=2, graph_epoch=self._graph_epoch,
+                                   map_binding=binding, graph_revision=graph_revision, nodes=ordered_nodes,
                                    edges=edges, coverage=coverage, limitations=_LIMITATIONS)
         adjacency, neighbors = defaultdict(list), defaultdict(list)
         for relation in edges:
@@ -197,7 +230,7 @@ class SceneGraphService:
         for relation in edges:
             if relation.kind == "contains":
                 search[relation.source] += " " + search[relation.target]
-        return SceneGraphIndex(graph, geometry, nodes, adjacency, neighbors, search)
+        return SceneGraphIndex(graph, geometry, nodes, adjacency, neighbors, search, capture.get("valid_until"))
 
     @staticmethod
     def _check_revision(index, expected):
@@ -238,12 +271,12 @@ class SceneGraphService:
         priority = {"region": 0, "passage": 1, "object": 2, "observation": 3}
         matched.sort(key=lambda identifier: (identifier != node_id, priority[index.nodes[identifier].kind], identifier))
         chosen = set(matched[:limit])
-        result = {"map_binding": index.snapshot.map_binding, "graph_revision": index.snapshot.graph_revision,
+        result = {**self._public_identity(index),
                   "nodes": [self._public_node(index.nodes[identifier]) for identifier in matched[:limit]],
                   "edges": [edge.model_dump(mode="json") for edge in index.snapshot.edges if edge.source in chosen and edge.target in chosen],
                   "total_matches": len(matched), "limit": limit, "truncated": len(matched) > limit,
                   "coverage": index.snapshot.coverage, "navigation_checked": False, "limitations": _LIMITATIONS}
-        self.memory.assert_scene_graph_capture(capture)
+        self._assert_capture(capture)
         return result
 
     def node(self, *, node_id: str, expected_graph_revision: Optional[str] = None):
@@ -263,8 +296,8 @@ class SceneGraphService:
                                    "metadata": {key: ref.metadata.get(key) for key in ("camera_id", "frame_timestamp")}})
             except (OSError, KeyError, GatewayError):
                 images.append({"artifact_id": artifact_id, "available": False})
-        self.memory.assert_scene_graph_capture(capture)
-        return {"map_binding": index.snapshot.map_binding, "graph_revision": index.snapshot.graph_revision,
+        self._assert_capture(capture)
+        return {**self._public_identity(index),
                 "node": self._public_node(node, include_geometry=True), "images": images,
                 "edges": [edge.model_dump(mode="json") for edge in index.adjacency[node_id]],
                 "neighbors": [self._public_node(index.nodes[identifier]) for identifier in sorted({
@@ -295,7 +328,7 @@ class SceneGraphService:
                 if neighbor not in previous:
                     previous[neighbor] = (current, passage)
                     queue.append(neighbor)
-        result = {"map_binding": index.snapshot.map_binding, "graph_revision": index.snapshot.graph_revision,
+        result = {**self._public_identity(index),
                   "from_node_id": from_node_id, "to_node_id": to_node_id, "metric": "fewest_passages",
                   "navigation_checked": False, "executable": False, "requires_navigation_validation": True,
                   "coverage": index.snapshot.coverage, "limitations": _LIMITATIONS,
@@ -315,7 +348,7 @@ class SceneGraphService:
             result.update({"region_ids": list(reversed(regions)), "passages": list(reversed(passages)),
                            "passage_count": len(passages),
                            "region_names": [index.nodes[identifier].name for identifier in reversed(regions)]})
-        self.memory.assert_scene_graph_capture(capture)
+        self._assert_capture(capture)
         return result
 
     def image(self, *, node_id: Optional[str] = None, expected_graph_revision: Optional[str] = None, width: int = 1280):
@@ -328,12 +361,13 @@ class SceneGraphService:
         if store is None:
             raise GatewayError("制品存储不可用。", error_code="artifact_store_unavailable", http_status=409)
         rendered = render_scene_graph_image(index, capture["snapshot"], node_id=node_id, width=width)
-        self.memory.assert_scene_graph_capture(capture)
+        self._assert_capture(capture)
         from contracts.artifacts import ArtifactKind
-        artifact = store.save_bytes(kind=ArtifactKind.IMAGE, mime_type="image/png", data=rendered.pop("png"), extension=".png",
-            metadata={"source": "semantic_scene_graph", "map_binding": index.snapshot.map_binding,
-                      "graph_revision": index.snapshot.graph_revision, "node_id": node_id, **rendered})
-        self.memory.assert_scene_graph_capture(capture)
-        return {"map_binding": index.snapshot.map_binding, "graph_revision": index.snapshot.graph_revision,
-                "artifact": artifact.model_dump(mode="json"), **rendered,
-                "navigation_checked": False, "image_is_new_observation": False}
+        with store.publication_scope(owner="memory.scene_graph.image"):
+            artifact = store.save_bytes(kind=ArtifactKind.IMAGE, mime_type="image/png", data=rendered.pop("png"), extension=".png",
+                metadata={"source": "semantic_scene_graph", **self._public_identity(index),
+                          "node_id": node_id, **rendered})
+            self._assert_capture(capture)
+            return {**self._public_identity(index),
+                    "artifact": artifact.model_dump(mode="json"), **rendered,
+                    "navigation_checked": False, "image_is_new_observation": False}

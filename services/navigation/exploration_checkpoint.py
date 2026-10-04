@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import hashlib
+import heapq
 import json
 from pathlib import Path
 from typing import Literal, Optional
@@ -13,6 +13,7 @@ from contracts.geometry import Pose
 from contracts.navigation import ExploreAreaRequest
 from services.mapping.asset_store import MapAssetBundleRepository
 from services.mapping.catalog import MapCatalogRepository, _atomic_write_text
+from services.navigation.file_identity import LegacyFileIndex, read_record_text
 
 
 class ExplorationCheckpoint(BaseModel):
@@ -41,17 +42,30 @@ class ExplorationCheckpoint(BaseModel):
 
 
 class ExplorationCheckpointStore:
-    """文件名使用业务标识摘要；外部调用不提供文件路径。"""
+    """业务标识直接寻址；旧文件通过有界内存的派生索引读取。"""
 
     def __init__(self, root: str | Path):
         self.maps = MapCatalogRepository(str(root))
         self.assets = MapAssetBundleRepository(str(root))
         self.root = Path(root) / "exploration_progress"
+        self._files = LegacyFileIndex(self.root, lambda path: self._read(path).checkpoint_id,
+            discovery_forbidden=lambda: bool(getattr(self.maps._activation_guard_state.local, "depth", 0)))
 
     def _path(self, checkpoint_id: str) -> Path:
-        if not checkpoint_id or len(checkpoint_id) > 128:
-            raise ValueError("探索检查点标识无效")
-        return self.root / (hashlib.sha256(checkpoint_id.encode()).hexdigest() + ".json")
+        return self._files.resolve(checkpoint_id)
+
+    @staticmethod
+    def _read(path: Path) -> ExplorationCheckpoint:
+        envelope = json.loads(read_record_text(path))
+        if not isinstance(envelope, dict) or not isinstance(envelope.get("payload"), str):
+            raise ValueError("探索检查点封装无效")
+        legacy = set(envelope) == {"payload", "sha256"}
+        current = (set(envelope) == {"schema_version", "payload"}
+                   and type(envelope["schema_version"]) is int and envelope["schema_version"] == 2)
+        if not legacy and not current:
+            raise ValueError("探索检查点封装版本无效")
+        # 旧本地摘要仅作为输入兼容字段忽略；原生进度及地图资产绑定保持原样。
+        return ExplorationCheckpoint.model_validate_json(envelope["payload"])
 
     def validate_asset(self, value: ExplorationCheckpoint) -> None:
         asset = self.maps.get_map_asset(value.request.map_name)
@@ -65,7 +79,7 @@ class ExplorationCheckpointStore:
             raise ValueError("检查点地图资产与二维/三维链路不一致")
 
     def save(self, value: ExplorationCheckpoint) -> None:
-        with self.maps.map_activation_guard():
+        with self._files.write_guard(), self.maps.map_activation_guard():
             self.validate_asset(value)
             self.root.mkdir(parents=True, exist_ok=True)
             path = self._path(value.checkpoint_id)
@@ -75,19 +89,13 @@ class ExplorationCheckpointStore:
                     raise ValueError("探索检查点已存在且内容不同")
                 return
             payload = value.model_dump_json()
-            envelope = {"payload": payload, "sha256": hashlib.sha256(payload.encode()).hexdigest()}
+            envelope = {"schema_version": 2, "payload": payload}
+            self._files.prepare_parent(path)
             _atomic_write_text(path, json.dumps(envelope, ensure_ascii=False))
 
     def load(self, checkpoint_id: str, *, validate_asset: bool = True) -> ExplorationCheckpoint:
         path = self._path(checkpoint_id)
-        if path.stat().st_size > 4_194_304:
-            raise ValueError("探索检查点超过四兆字节")
-        envelope = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(envelope, dict) or set(envelope) != {"payload", "sha256"} or not isinstance(envelope["payload"], str):
-            raise ValueError("探索检查点封装无效")
-        if hashlib.sha256(envelope["payload"].encode()).hexdigest() != envelope["sha256"]:
-            raise ValueError("探索检查点摘要不匹配")
-        value = ExplorationCheckpoint.model_validate_json(envelope["payload"])
+        value = self._read(path)
         if value.checkpoint_id != checkpoint_id:
             raise ValueError("探索检查点身份与索引不符")
         if validate_asset:
@@ -95,15 +103,13 @@ class ExplorationCheckpointStore:
         return value
 
     def list(self, limit: int = 50) -> list[dict]:
+        self._files.refresh()
         records = []
-        for path in sorted(self.root.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:max(1, min(limit, 100))]:
-            if path.stat().st_size > 4_194_304:
-                raise ValueError("探索检查点超过四兆字节")
-            envelope = json.loads(path.read_text(encoding="utf-8"))
-            value = ExplorationCheckpoint.model_validate_json(envelope["payload"])
+        paths = heapq.nlargest(max(1, min(limit, 100)), self._files.iter_paths(), key=lambda path: (path.stat().st_mtime_ns, str(path)))
+        for path in paths:
+            value = self._read(path)
             if path != self._path(value.checkpoint_id):
                 raise ValueError("探索检查点文件名与身份不符")
-            value = self.load(value.checkpoint_id, validate_asset=False)
             available, reason = True, None
             try:
                 self.validate_asset(value)

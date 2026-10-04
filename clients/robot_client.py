@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import hashlib
 from http.client import HTTPException
 import json
 import math
@@ -231,6 +230,8 @@ class RobotClient:
         artifact = meta.get("artifact", meta)
         if not isinstance(artifact, dict) or artifact.get("artifact_id") != artifact_id:
             raise RobotClientError("invalid_artifact", "制品元数据标识与请求不一致。")
+        # 兼容旧网关元数据，不再把旧摘要作为内容身份或下载证明。
+        artifact = {key: value for key, value in artifact.items() if key != "sha256"}
         output = Path(output).expanduser().absolute()
         if output.exists() or output.is_symlink():
             raise RobotClientError("output_exists", "目标文件已存在，请选择新路径：" + str(output))
@@ -240,7 +241,6 @@ class RobotClient:
             headers["Authorization"] = "Bearer " + self.token
         request = Request(self.base_url + artifact_path, headers=headers)
         temp_path = None
-        digest = hashlib.sha256()
         total = 0
         try:
             with self._opener.open(request, timeout=self.timeout) as response:
@@ -256,15 +256,11 @@ class RobotClient:
                         total += len(chunk)
                         if total > max_bytes:
                             raise RobotClientError("artifact_too_large", "制品超过下载上限，未发布本地文件。")
-                        digest.update(chunk)
                         stream.write(chunk)
                     stream.flush()
                     os.fsync(stream.fileno())
             if expected_length is not None and total != expected_length:
                 raise RobotClientError("artifact_unavailable", "制品传输被截断，未发布本地文件。")
-            expected = artifact.get("sha256")
-            if expected and digest.hexdigest() != expected:
-                raise RobotClientError("artifact_digest_mismatch", "制品摘要校验失败，未发布本地文件。")
             if artifact.get("size_bytes") is not None and total != artifact["size_bytes"]:
                 raise RobotClientError("artifact_size_mismatch", "制品大小与元数据不一致，未发布本地文件。")
             # 硬链接以排他方式发布同目录临时文件，避免覆盖竞争中的用户文件。
@@ -280,7 +276,7 @@ class RobotClient:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
         return {"artifact_id": artifact_id, "path": str(output), "mime_type": media_type,
-                "size_bytes": total, "sha256": digest.hexdigest(), "source": artifact,
+                "size_bytes": total, "source": artifact,
                 "downloaded_at": datetime.now(timezone.utc).isoformat(),
                 "visual_input_required": media_type.startswith("image/"),
                 "next_action": "使用引擎图片读取工具读取path；下载成功尚不代表模型已经看到图像。"}

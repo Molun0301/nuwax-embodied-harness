@@ -56,6 +56,15 @@ _SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?=\s+[A-Za-z_][A-Za-z0-9_.-]*\s*[:=]|[\r\n,;&}\]]|$)"
 )
 _TERMINAL_TASK_STATES = frozenset({"succeeded", "failed", "cancelled", "timeout"})
+_RECEIPT_ERROR_CODES = frozenset({
+    "task_receipt_unsupported", "task_receipt_unavailable", "agent_call_result_unsupported",
+    "agent_call_outcome_unknown",
+    "agent_scope_binding_required", "agent_scope_binding_conflict", "agent_scope_identity_conflict",
+    "agent_terminal_version_required", "agent_terminal_pair_conflict",
+    "agent_terminal_cutover_required", "agent_terminal_store_unavailable",
+    "agent_terminal_identity_conflict", "agent_terminal_scope_conflict", "agent_terminal_legacy_conflict",
+    "agent_terminal_source_conflict", "agent_terminal_revision_conflict",
+})
 _RETRYABLE_ERROR_CODES = frozenset(
     {
         "resource_conflict",
@@ -494,7 +503,7 @@ def compact_public_data(
 
 def _error_is_retryable(error_code: str) -> bool:
     code = str(error_code or "").strip().lower()
-    if code in _NON_RETRYABLE_ERROR_CODES:
+    if code in _NON_RETRYABLE_ERROR_CODES or code in _RECEIPT_ERROR_CODES:
         return False
     if code in _RETRYABLE_ERROR_CODES:
         return True
@@ -521,6 +530,8 @@ def _is_internal_error(error_code: str, error_category: str) -> bool:
 
 
 def _public_error_message(error_code: str, error_category: str, message: Any) -> str:
+    if error_code in _RECEIPT_ERROR_CODES:
+        return _public_text(message, PUBLIC_MESSAGE_MAX_CHARS)
     if error_code in {"mcp_result_unavailable", "mcp_response_too_large"}:
         return "无法完整返回MCP数据；工具可能已经执行，请勿自动重复执行操作。"
     if _is_internal_error(error_code, error_category):
@@ -530,6 +541,15 @@ def _public_error_message(error_code: str, error_category: str, message: Any) ->
 
 def _next_action_for_error(error_code: str, *, retryable: bool) -> str:
     code = str(error_code or "").strip().lower()
+    if code in {"agent_scope_binding_required", "agent_scope_binding_conflict", "agent_scope_identity_conflict"}:
+        return ("由已授权维护方核对原作用域与机器人身份，明确绑定后只读查询原 request_id/task_id。"
+                "不要更换请求标识重发动作，也不要取消原任务来修复记录。")
+    if code == "agent_call_outcome_unknown":
+        return ("先用原 request_id 查询调用记录；若已有 task_id，再只读核对原任务与设备状态。"
+                "回执未知不代表动作未执行，不要重发动作或以新请求标识重试。")
+    if code in _RECEIPT_ERROR_CODES:
+        return ("只读核对原 task_id 的当前状态和历史回执。修复回执格式、版本或存储后，只重试读取或回执写入；"
+                "不要重发动作，也不要取消原任务来修复记录。")
     if code in {"mcp_result_unavailable", "mcp_response_too_large"}:
         return "先核对任务/操作状态；只读查询可缩小范围，已有完整结果或制品地址可单独读取。不要自动重复执行操作。"
     if code in {"authentication_required", "invalid_token"}:
@@ -567,7 +587,7 @@ def build_public_error_payload(
     code = _public_text(raw.get("code") or error.error_code or "gateway_error", 120)
     retryable = _error_is_retryable(code)
     public_category = _public_text(
-        error_category or categorize_gateway_error(code, error.http_status),
+        "receipt" if code in _RECEIPT_ERROR_CODES else error_category or categorize_gateway_error(code, error.http_status),
         80,
     )
     payload: Dict[str, Any] = {

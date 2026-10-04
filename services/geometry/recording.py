@@ -177,7 +177,7 @@ class MappingRecorder:
             self.record_event("mapping.state", {
                 "status": frame.status, "cursor": str(frame.cursor),
                 **{key: _field(payload, key) for key in (
-                    "map_name", "source_name", "source_epoch", "update_sequence", "content_sha256", "frame_id",
+                    "map_name", "source_name", "source_epoch", "update_sequence", "schema_version", "frame_id",
                 )},
             })
         elif frame.topic == "runtime.governance":

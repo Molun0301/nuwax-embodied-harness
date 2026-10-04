@@ -1,8 +1,7 @@
 """从已知自由栅格提取几何空间候选；不推断场景语义或运动可达性。"""
 from __future__ import annotations
 
-import hashlib
-import json
+import uuid
 import math
 from collections import defaultdict
 from typing import List, Sequence
@@ -12,6 +11,7 @@ import numpy as np
 
 from contracts.geometry import Pose, Vector3
 from contracts.naming import build_scene_space_id
+from services.memory.scene_revisions import geometry_value, semantic_geometry_value
 from contracts.occupancy_cells import PackedOccupancyCells
 from contracts.runtime_views import MapSnapshot
 from contracts.spatial_memory import SceneSpace, SceneSpaceBoundary, SceneSpaceReviewStatus
@@ -251,7 +251,6 @@ class RoomSegmentationService:
         order = np.argsort(flat, kind="stable")
         values, starts, sizes = np.unique(flat[order], return_index=True, return_counts=True)
         scope = {"map_name": snapshot.map_name, "frame_id": snapshot.frame_id, "source_epoch": snapshot.source_epoch, "source_name": snapshot.source_name}
-        namespace = hashlib.sha256(json.dumps(scope, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
         spaces = []
         label_to_space = {}
         boundary_work_cells = 0
@@ -276,9 +275,8 @@ class RoomSegmentationService:
             runs = _row_runs(mask, left, bottom)
             geometry = {"version": 1, "origin": origin, "resolution_m": resolution,
                         "row_runs": runs, "height_range_m": [origin[2] - 0.5, origin[2] + 0.5]}
-            digest = hashlib.sha256(json.dumps([origin, resolution, runs], separators=(",", ":")).encode()).hexdigest()
             space = SceneSpace(
-                scene_space_id=build_scene_space_id("geometry_" + namespace, timestamp=snapshot.timestamp, suffix=digest[:8]),
+                scene_space_id=build_scene_space_id("geometry", timestamp=snapshot.timestamp, suffix=uuid.uuid4().hex),
                 map_name=snapshot.map_name, frame_id=snapshot.frame_id,
                 boundary=SceneSpaceBoundary(frame_id=snapshot.frame_id, centroid=representative, polygon_points=polygon,
                     min_corner=Vector3(x=min(p.x for p in polygon), y=min(p.y for p in polygon), z=origin[2] - 0.5),
@@ -288,13 +286,19 @@ class RoomSegmentationService:
                               "centroid_kind": "free_cell_representative", "height_range_source": "slice_association_tolerance"}),
                 inspection_poses=[representative], primary_label=None, review_status=SceneSpaceReviewStatus.CANDIDATE,
                 metadata={**scope, "source": "room_segmentation", "source_name": snapshot.source_name, "update_sequence": snapshot.update_sequence,
-                          "geometry_update_sequence": snapshot.update_sequence, "geometry_content_sha256": snapshot.content_sha256,
-                          "content_sha256": snapshot.content_sha256, "geometry_digest": digest, "geometry_only": True,
+                          "geometry_update_sequence": snapshot.update_sequence,
+                          "geometry_only": True,
                           "navigation_reachability": "unverified", "inspection_pose_kind": "geometric_candidate",
                           "semantic_reidentification_required": True, "segmentation_method": "clearance_seeds_free_space_growth"})
             label_to_space[int(value)] = len(spaces)
             spaces.append(space)
         self._match_existing(spaces, labels, label_to_space, resolution, origin, scope, existing_spaces)
+        previous = {space.scene_space_id: space for space in existing_spaces}
+        for space in spaces:
+            old = previous.get(space.scene_space_id)
+            unchanged = old is not None and geometry_value(old) == geometry_value(space)
+            space.metadata["geometry_revision"] = (old.metadata.get("geometry_revision") if unchanged else None) or uuid.uuid4().hex
+            object.__setattr__(space, "_geometry_unchanged", old is not None and semantic_geometry_value(old) == semantic_geometry_value(space))
         return spaces
 
     def _match_existing(self, spaces, labels, label_to_space, resolution, origin, scope, existing_spaces):

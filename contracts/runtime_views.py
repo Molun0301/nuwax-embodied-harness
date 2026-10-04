@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import hashlib
-import json
-
 from contracts.compat import StrEnum
 from datetime import datetime
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from contracts.artifacts import ArtifactRef
 from contracts.base import ContractModel, MetadataDict, TimestampedContract, utc_now
@@ -21,7 +18,7 @@ from contracts.spatial_memory import (
     SemanticRegion as SpatialSemanticRegion,
     SpatialAnchor,
 )
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 
 class DiagnosticLevel(StrEnum):
@@ -238,67 +235,6 @@ def _validate_optional_map_asset_name(value: object) -> Optional[str]:
     return _validate_map_asset_name(value)
 
 
-def map_content_sha256(
-    *,
-    map_name: str,
-    frame_id: Optional[str],
-    occupancy_grid=None,
-    cost_map=None,
-    semantic_map=None,
-) -> str:
-    """计算排除动态时间戳的确定性地图内容摘要。"""
-
-    from contracts.occupancy_cells import PackedOccupancyCells
-
-    def normalize(value):
-        if type(value) in (OccupancyGrid, CostMap):
-            # 栅格已通过合同解析，数据直接复用；只递归处理小型几何和元数据字段。
-            fields = value.model_dump(mode="json", exclude={"data", "timestamp"})
-            return {**{key: normalize(inner) for key, inner in fields.items()}, "data": value.data}
-        if hasattr(value, "model_dump"):
-            value = value.model_dump(mode="json")
-        if isinstance(value, dict):
-            return {
-                str(key): normalize(inner)
-                for key, inner in value.items()
-                if key != "timestamp"
-            }
-        if type(value) is list:
-            # 先捕获副本；普通整数无需逐格重复模型/容器检查，其它元素继续原递归。
-            copied = value.copy()
-            if all(type(item) is int for item in copied):
-                return copied
-        if isinstance(value, (list, tuple)):
-            return [normalize(item) for item in value]
-        return value
-
-    payload = {
-        "map_name": str(map_name or "").strip(),
-        "frame_id": str(frame_id or "").strip() or None,
-        "occupancy_grid": normalize(occupancy_grid),
-        "cost_map": normalize(cost_map),
-        "semantic_map": normalize(semantic_map),
-    }
-    def encode(value):
-        if type(value) is PackedOccupancyCells:
-            yield value.canonical_json
-        elif isinstance(value, dict):
-            yield b"{"
-            for index, key in enumerate(sorted(value)):
-                if index:
-                    yield b","
-                yield json.dumps(key, ensure_ascii=False).encode("utf-8") + b":"
-                yield from encode(value[key])
-            yield b"}"
-        else:
-            yield json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-    digest = hashlib.sha256()
-    for chunk in encode(payload):
-        digest.update(chunk)
-    return digest.hexdigest()
-
-
 class LocalizationSnapshot(TimestampedContract):
     """定位服务快照。"""
 
@@ -317,7 +253,8 @@ class MapSnapshot(TimestampedContract):
     source_name: str = Field(description="地图来源名称。")
     source_epoch: str = Field(description="来源生命周期内稳定、跨生命周期变化的作用域标识。")
     update_sequence: int = Field(ge=1, description="source_epoch 作用域内递增的更新序号。")
-    content_sha256: str = Field(default="", description="快照规范内容摘要；构造时未提供则计算一次。")
+    schema_version: Literal[2] = Field(default=2, description="显式来源代际与修订身份，不包含内容摘要。")
+    _source_owner_id: Optional[int] = PrivateAttr(default=None)
     frame_id: Optional[str] = Field(default=None, description="地图快照统一消费坐标系。")
     occupancy_grid: Optional[OccupancyGrid] = Field(default=None, description="占据栅格地图。")
     cost_map: Optional[CostMap] = Field(default=None, description="代价地图。")
@@ -332,13 +269,20 @@ class MapSnapshot(TimestampedContract):
             raise ValueError("地图快照身份字段不能为空。")
         return resolved
 
-    @field_validator("content_sha256")
+    @model_validator(mode="before")
     @classmethod
-    def _validate_content_sha256(cls, value: str) -> str:
-        resolved = str(value or "").strip().lower()
-        if len(resolved) != 64 or any(char not in "0123456789abcdef" for char in resolved):
-            raise ValueError("content_sha256 必须为 64 位十六进制字符串。")
-        return resolved
+    def _read_legacy_snapshot(cls, value):
+        if isinstance(value, dict) and type(value.get("schema_version", 1)) is not int:
+            raise ValueError("地图快照 schema_version 必须为整数。")
+        if isinstance(value, dict) and value.get("schema_version", 1) == 1:
+            # 旧摘要只是旧格式字段，不能重新计算或当作新修订凭据。
+            value = dict(value)
+            value.pop("content_sha256", None)
+            value["schema_version"] = 2
+            if isinstance(value.get("metadata"), dict):
+                value["metadata"] = dict(value["metadata"])
+                value["metadata"].pop("content_sha256", None)
+        return value
 
     @model_validator(mode="after")
     def _validate_snapshot_identity(self) -> "MapSnapshot":
@@ -366,17 +310,6 @@ class MapSnapshot(TimestampedContract):
                 raise ValueError("地图快照图层 map_id 必须等于 map_name。")
             if frame_id and layer.frame_id != frame_id:
                 raise ValueError("地图快照图层 frame_id 不一致。")
-        expected_content_sha256 = map_content_sha256(
-            map_name=map_name,
-            frame_id=frame_id,
-            occupancy_grid=occupancy_grid,
-            cost_map=cost_map,
-            semantic_map=semantic_map,
-        )
-        if not self.content_sha256:
-            object.__setattr__(self, "content_sha256", expected_content_sha256)
-        elif self.content_sha256 != expected_content_sha256:
-            raise ValueError("地图快照 content_sha256 与规范内容不一致。")
         return self
 
 

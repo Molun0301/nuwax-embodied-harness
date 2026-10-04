@@ -3,9 +3,8 @@ from __future__ import annotations
 from core.config_values import runtime_value
 from contracts.navigation_capabilities import reverse_navigation_default
 
-import base64
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
 from enum import IntEnum
@@ -17,7 +16,6 @@ import logging
 import math
 import os
 from pathlib import Path
-import struct
 import threading
 import time
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
@@ -140,6 +138,7 @@ from skills.handlers import audio_skills
 from skills.handlers import perception_skills
 from core.logging_utils import LogRateLimiter, format_log_preview, is_low_value_runtime_event, set_correlation_context, clear_correlation_context, StreamBusLogHandler, DropPatternLogFilter
 from core.settings import NuwaxRobotBridgeConfig
+from gateways.runtime_event_log import RuntimeEventLog
 
 
 class _ShmVideoFrameSource:
@@ -1229,6 +1228,12 @@ class GatewayRuntime:
         # TODO: 若出现第 3 个生命周期源（如定时任务），升级为 owner-enum。
         self._perception_exploration_coupled = False
         self._runtime_event_log_limiter = LogRateLimiter()
+        self._runtime_event_log = RuntimeEventLog(
+            self._write_runtime_event_log, gap_writer=self._write_runtime_event_log_gap)
+        self._event_bridge_context = threading.local()
+        self._closing_event_log_subscription_id = None
+        self._dispatch_shutdown_complete = False
+        self._dispatch_shutdown_blocker = None
         self._event_log_subscription_id = self.event_bus.subscribe(self._log_runtime_event)
         self._geometry_runtime_lock = threading.RLock()
         self._geometry_runtime_start_event: Optional[threading.Event] = None
@@ -1300,6 +1305,9 @@ class GatewayRuntime:
             self.mapping_recorder.record_stream_frame,
             topics=("localization.pose", "map.frame", "runtime.governance"),
         )
+        # 仓储引用桥已由 MemoryService 装配；构造完成后才启用专属维护拥有方。
+        # 启动不扫描、不主动推进过期时间；首个正常保存才提交维护触发。
+        self.artifact_service.start_maintenance()
 
     def _attach_geometry_runtime_on_start(self) -> bool:
         """Attach and probe the systemd-owned geometry sidecar at startup.
@@ -1505,11 +1513,16 @@ class GatewayRuntime:
             if not self._started:
                 recorder = getattr(self, "mapping_recorder", None)
                 recording_pending = recorder is not None and not recorder.status()["closed"]
-                if not self._closed or recording_pending:
+                dispatch_complete = True
+                if not self._closed or recording_pending or not getattr(self, "_dispatch_shutdown_complete", False):
+                    # stop 是终止意图；清理未完成也不能重新启动半关闭的拥有者。
+                    self._closed = True
                     self.task_manager.shutdown(wait=True)
                     self._join_exploration_finalizers()
-                    self._close_dispatch_resources()
-                    self._closed = True
+                    dispatch_complete = self._close_dispatch_resources()
+                self._close_memory_service()
+                if dispatch_complete is False:
+                    raise RuntimeError("事件分发或日志输出尚未关闭，相关依赖已保留；请稍后重试停止。")
                 return
             RUNTIME_LOGGER.info("宿主机运行时开始停止。")
             self._stop_safety_watchdog_loop()
@@ -1567,10 +1580,10 @@ class GatewayRuntime:
                 ("audio service", self.audio_service.stop),
                 ("data frame streams", self._stop_data_frame_stream_sources),
                 ("geometry recording", self._close_mapping_recording),
+                ("artifact maintenance fence", self._begin_artifact_shutdown),
                 ("perception video runtime", self.perception_video_runtime.stop),
                 ("semantic mapping", self.scene_mapping_service.close),
-                ("memory background workers", self.memory_service.disable_memory_library),
-                ("memory instance stream", self.memory_service.stop_instance_stream),
+                ("memory service", self._close_memory_service),
                 ("robot", self.robot.stop),
             )
             for component_name, cleanup in cleanup_steps:
@@ -1605,6 +1618,7 @@ class GatewayRuntime:
             owner_settled = relocalization_stop_error is None
             event_payload: Dict[str, object] = {
                 "success": stop_error is None and owner_settled,
+                "memory_shutdown_complete": getattr(self, "_memory_shutdown_complete", False),
                 "relocalization_owner_settled": owner_settled,
                 "stop_error_code": (
                     relocalization_stop_error.error_code
@@ -1627,11 +1641,45 @@ class GatewayRuntime:
                     payload=event_payload,
                 )
             )
-            self._close_dispatch_resources()
+            dispatch_complete = self._close_dispatch_resources()
             if relocalization_stop_error is not None:
                 raise relocalization_stop_error
             if stop_error is not None:
                 raise stop_error
+            if dispatch_complete is False:
+                raise RuntimeError("事件分发或日志输出尚未关闭，相关依赖已保留；请稍后重试停止。")
+
+    def _close_memory_service(self) -> None:
+        """Terminal memory cleanup; reusable map disable cannot close ownership."""
+        if not self._close_artifact_dependencies():
+            self._memory_shutdown_complete = False
+            raise RuntimeError("Artifact shutdown incomplete: active publisher or maintenance callback; memory retained")
+        memory = getattr(self, "memory_service", None)
+        complete = memory is None or memory.close()
+        self._memory_shutdown_complete = complete is not False
+        if not self._memory_shutdown_complete:
+            raise RuntimeError("Memory shutdown incomplete: provider still running; storage retained")
+
+    def _close_artifact_dependencies(self, timeout_sec: float = 2.0) -> bool:
+        """先停止删除，再封闭生产者；有活动拥有方时不关闭其记忆依赖。"""
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        complete = True
+        pending = []
+        for name in ("artifact_service", "perception_video_runtime", "observation_service", "perception_service"):
+            component = getattr(self, name, None)
+            close = getattr(component, "close", None)
+            if close is not None and close(timeout=max(0.0, deadline - time.monotonic())) is False:
+                complete = False
+                pending.append(name)
+        self._artifact_shutdown_complete = complete
+        self._artifact_shutdown_pending = pending
+        return complete
+
+    def _begin_artifact_shutdown(self) -> None:
+        """生产者开始拆除前先禁止晚删除；后续关闭阶段负责有界等待及报告。"""
+        service = getattr(self, "artifact_service", None)
+        if service is not None:
+            self._artifact_shutdown_complete = service.close(timeout=0.0)
 
     def _close_mapping_recording(self) -> None:
         """所有输入与定位生产者停止后，撤销记录订阅并排空磁盘写入者。"""
@@ -1643,8 +1691,38 @@ class GatewayRuntime:
                 self._recording_subscription_id = None
             recorder.close()
 
-    def _close_dispatch_resources(self) -> None:
+    def _close_runtime_event_bridge(self, timeout_sec: float) -> bool:
+        """撤销注册并等待已认领回调；共享事件总线仍由调用方拥有。"""
+        subscription = getattr(self, "_event_log_subscription_id", None)
+        if subscription is not None:
+            self._closing_event_log_subscription_id = subscription
+            self.event_bus.unsubscribe(subscription)
+            self._event_log_subscription_id = None
+        pending = getattr(self, "_closing_event_log_subscription_id", None)
+        if pending is None:
+            return True
+        if getattr(getattr(self, "_event_bridge_context", None), "active", False):
+            return False
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        wake = threading.Event()
+        while True:
+            # 总线计数覆盖“认领但尚未进入本方法”的窗口，不能只数本地回调。
+            if not self.event_bus.status()["in_flight_callbacks"].get(pending, 0):
+                self._closing_event_log_subscription_id = None
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            # 关闭低频等待不持有事件、流或日志锁，也不占用额外工作线程。
+            wake.wait(min(0.01, remaining))
+
+    def _close_dispatch_resources(self, timeout_sec: float = 2.0) -> bool:
         """释放构造期资源；未调用 start 的实例也需要关闭自己的后台线程。"""
+
+        if not self._close_artifact_dependencies(timeout_sec):
+            self._dispatch_shutdown_complete = False
+            self._dispatch_shutdown_blocker = "artifact_owner_in_flight"
+            return False
 
         scene_mapping = getattr(self, "scene_mapping_service", None)
         if scene_mapping is not None:
@@ -1662,16 +1740,32 @@ class GatewayRuntime:
             for provider in building_service.providers.values():
                 provider.close()
             self._building_navigation_service = None
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        if not self._close_runtime_event_bridge(max(0.0, deadline - time.monotonic())):
+            self._dispatch_shutdown_complete = False
+            self._dispatch_shutdown_blocker = "event_bridge_in_flight"
+            return False
+        event_log = getattr(self, "_runtime_event_log", None)
+        if event_log is not None and not event_log.close(max(0.0, deadline - time.monotonic())):
+            self._dispatch_shutdown_complete = False
+            self._dispatch_shutdown_blocker = "event_log_in_flight"
+            return False
+        if (getattr(self, "_owns_event_bus", False)
+                and self.event_bus.shutdown(max(0.0, deadline - time.monotonic())) is False):
+            self._dispatch_shutdown_complete = False
+            self._dispatch_shutdown_blocker = "event_bus_in_flight"
+            return False
         log_handler = getattr(self, "_log_stream_handler", None)
         if log_handler is not None:
             logging.getLogger().removeHandler(log_handler)
             log_handler.close()
-        if getattr(self, "_owns_event_bus", False):
-            self.event_bus.shutdown()
         if getattr(self, "_owns_stream_bus", False):
             self.stream_bus.shutdown()
         if recording_error is not None:
             raise recording_error
+        self._dispatch_shutdown_complete = True
+        self._dispatch_shutdown_blocker = None
+        return True
 
     def get_live_map_stream_status(self) -> Dict[str, object]:
         return {
@@ -1679,91 +1773,124 @@ class GatewayRuntime:
             "running": True,
             "mode": "stream_bus",
             "stream_bus": self.stream_bus.status(),
+            "event_log": self.get_event_log_status(),
             "stream_endpoints": {
                 "sse": "/streams/sse?topics=map.frame,localization.pose,navigation.state,exploration.state,pointcloud_map.meta",
                 "websocket": "/streams/ws?topics=map.frame,localization.pose,navigation.state,exploration.state,pointcloud_map.meta",
             },
         }
 
-    def _log_runtime_event(self, event) -> None:
-        """把运行时事件同步写入标准日志。"""
+    def get_event_log_status(self) -> Dict[str, object]:
+        """只读有界计数与缺口，不读取载荷、不等待日志处理器。"""
+        event_log = getattr(self, "_runtime_event_log", None)
+        if event_log is None:
+            return {"state": "not_started", "accepting": False, "closed": False}
+        status = event_log.status()
+        complete = getattr(self, "_dispatch_shutdown_complete", False)
+        closing = (getattr(self, "_closed", False) or not status["accepting"]
+                   or getattr(self, "_closing_event_log_subscription_id", None) is not None)
+        return {**status,
+                "dispatch_state": "stopped" if complete else "stopping" if closing else "accepting",
+                "bridge_close_pending": getattr(self, "_closing_event_log_subscription_id", None) is not None,
+                "dispatch_pending_reason": getattr(self, "_dispatch_shutdown_blocker", None),
+                "dispatch_shutdown_complete": complete}
 
+    def _log_runtime_event(self, event) -> None:
+        """先同步提交任务展示状态，再将有界日志副本交给独立输出拥有者。"""
+        context = getattr(self, "_event_bridge_context", None)
+        if context is None:
+            context = self._event_bridge_context = threading.local()
+        context.active = True
         try:
-            self._publish_runtime_event_stream_frames(event)
-            from gateways.feedback_messages import build_feedback_message
-            feedback = build_feedback_message(self, event)
-            if feedback is not None:
-                # 用户可见反馈逐条落日志，不能应用普通遥测日志的限频策略。
-                feedback_level = {"warning": logging.WARNING, "error": logging.ERROR}.get(
-                    feedback["severity"], logging.INFO)
-                FEEDBACK_LOGGER.log(feedback_level, feedback["message"], extra={
-                    "event": "harness.feedback", "feedback": feedback,
-                    "request_id": feedback.get("request_id"), "task_id": feedback.get("task_id"),
-                    "capability_name": feedback["source"].get("capability_name"),
-                    "feedback_id": feedback["message_id"],
-                })
-            event_type = str(event.event_type)
-            level = {
-                "info": logging.INFO,
-                "warning": logging.WARNING,
-                "error": logging.ERROR,
-            }.get(str(event.severity), logging.INFO)
-            if level <= logging.INFO and is_low_value_runtime_event(event_type):
-                level = logging.DEBUG
-            if level <= logging.INFO and _is_low_value_runtime_capability_event(event_type, event):
-                level = logging.DEBUG
-            if not RUNTIME_LOGGER.isEnabledFor(level):
-                return
-            payload_preview = self._build_log_preview(event.payload)
-            metadata_preview = self._build_log_preview(event.metadata)
-            extra = {
-                "event": "runtime.event",
-                "cursor": event.cursor or "-",
-                "category": str(event.category),
-                "runtime_event_type": event_type,
-                "source": event.source,
-                "task_id": event.task_id or "-",
-                "subject_id": event.subject_id or "-",
-                "severity": str(event.severity),
-            }
-            metadata = event.metadata or {}
-            for key in _RUNTIME_METADATA_LOG_KEYS:
-                value = metadata.get(key)
-                if _has_observability_value(value):
-                    extra[key] = value
-            if event.message:
-                extra["runtime_message"] = event.message
-            if payload_preview != "-":
-                extra["payload_preview"] = payload_preview
-            if metadata_preview != "-":
-                extra["metadata_preview"] = metadata_preview
-            if _is_low_value_runtime_capability_event(event_type, event):
-                extra["low_value_runtime_event"] = True
-                extra["slow_runtime_event_threshold_ms"] = _RUNTIME_SLOW_EVENT_THRESHOLD_MS
-            if level > logging.INFO:
-                RUNTIME_LOGGER.log(level, "运行时事件", extra=extra)
-                return
-            self._runtime_event_log_limiter.log(
-                RUNTIME_LOGGER,
-                level,
-                "运行时事件",
-                key=(
-                    "runtime_event",
-                    logging.getLevelName(level),
-                    str(event.category),
-                    event_type,
-                ),
-                interval_sec=_RUNTIME_EVENT_LOG_RATE_LIMIT_SEC,
-                extra=extra,
-            )
-        except Exception:
-            RUNTIME_LOGGER.exception("写入运行时事件日志失败。")
+            feedback = self._feedback_for_event(event)
+            self._publish_runtime_event_stream_frames(event, feedback=feedback)
+            self._runtime_event_log.submit(event, feedback)
+        except Exception as error:
+            self._runtime_event_log.note_projection_failure(event.cursor, type(error).__name__)
+            raise
+        finally:
+            context.active = False
+
+    def _write_runtime_event_log_gap(self, gap) -> None:
+        """只在日志输出线程报告聚合缺口，不重新发布到事件总线。"""
+        RUNTIME_LOGGER.error(
+            "运行时事件日志存在缺口，请核对当前任务状态，不要重发动作。",
+            extra={"event": "runtime.event_log_gap", "event_log_gap": gap})
+
+    def _write_runtime_event_log(self, event, feedback) -> None:
+        """日志线程执行预览、限频和外部处理器；异常由拥有者记录。"""
+        if feedback is not None:
+            # 用户可见反馈逐条落日志，不能应用普通遥测日志的限频策略。
+            feedback_level = {"warning": logging.WARNING, "error": logging.ERROR}.get(
+                feedback["severity"], logging.INFO)
+            FEEDBACK_LOGGER.log(feedback_level, feedback["message"], extra={
+                "event": "harness.feedback", "feedback": feedback,
+                "request_id": feedback.get("request_id"), "task_id": feedback.get("task_id"),
+                "capability_name": feedback["source"].get("capability_name"),
+                "feedback_id": feedback["message_id"],
+            })
+        event_type = str(event.event_type)
+        level = {
+            "info": logging.INFO,
+            "warning": logging.WARNING,
+            "error": logging.ERROR,
+        }.get(str(event.severity), logging.INFO)
+        if level <= logging.INFO and is_low_value_runtime_event(event_type):
+            level = logging.DEBUG
+        if level <= logging.INFO and _is_low_value_runtime_capability_event(event_type, event):
+            level = logging.DEBUG
+        if not RUNTIME_LOGGER.isEnabledFor(level):
+            return
+        payload_preview = self._build_log_preview(event.payload)
+        metadata_preview = self._build_log_preview(event.metadata)
+        extra = {
+            "event": "runtime.event",
+            "event_id": event.event_id,
+            "event_timestamp": event.timestamp,
+            "cursor": event.cursor or "-",
+            "category": str(event.category),
+            "runtime_event_type": event_type,
+            "source": event.source,
+            "task_id": event.task_id or "-",
+            "subject_id": event.subject_id or "-",
+            "severity": str(event.severity),
+        }
+        metadata = event.metadata or {}
+        for key in _RUNTIME_METADATA_LOG_KEYS:
+            value = metadata.get(key)
+            if _has_observability_value(value):
+                extra[key] = value
+        if event.message:
+            extra["runtime_message"] = event.message
+        if payload_preview != "-":
+            extra["payload_preview"] = payload_preview
+        if metadata_preview != "-":
+            extra["metadata_preview"] = metadata_preview
+        if _is_low_value_runtime_capability_event(event_type, event):
+            extra["low_value_runtime_event"] = True
+            extra["slow_runtime_event_threshold_ms"] = _RUNTIME_SLOW_EVENT_THRESHOLD_MS
+        if level > logging.INFO:
+            RUNTIME_LOGGER.log(level, "运行时事件", extra=extra)
+            return
+        self._runtime_event_log_limiter.log(
+            RUNTIME_LOGGER,
+            level,
+            "运行时事件",
+            key=(
+                "runtime_event",
+                logging.getLevelName(level),
+                str(event.category),
+                event_type,
+            ),
+            interval_sec=_RUNTIME_EVENT_LOG_RATE_LIMIT_SEC,
+            extra=extra,
+        )
 
     @staticmethod
     def _stream_enum_value(value: Any) -> str:
         return str(getattr(value, "value", value))
 
-    def _publish_runtime_event_stream_frames(self, event) -> None:
+    def _publish_runtime_event_stream_frames(self, event, *, feedback=None) -> None:
         category = self._stream_enum_value(getattr(event, "category", ""))
         if category == "task" or getattr(event, "task_id", None):
             self.stream_bus.publish(
@@ -1773,7 +1900,7 @@ class GatewayRuntime:
                 sequence=getattr(event, "cursor", None),
                 status="available",
                 metadata={"task_id": getattr(event, "task_id", None), "event_type": getattr(event, "event_type", None),
-                          "feedback": self._feedback_for_event(event)},
+                          "feedback": feedback},
             )
 
     def _feedback_for_event(self, event):
@@ -2268,6 +2395,11 @@ class GatewayRuntime:
             self._pointcloud_map_last_error_key = error_key
         return True
 
+    def get_pointcloud_map_snapshot(self) -> Optional[PointCloudMapSnapshot]:
+        """领取已经发布来源的不可变页面引用，不读取 SHM 或拼装 XYZ。"""
+        with self._lock:
+            return self._pointcloud_map_current_snapshot
+
     def _publish_pointcloud_map_snapshot(
         self,
         snapshot: PointCloudMapSnapshot,
@@ -2290,14 +2422,18 @@ class GatewayRuntime:
             "refresh_reason": reason,
             "not_sensor_scan": True,
             "not_fallback_to_sensor_scan": True,
+            "chunked": bool(getattr(snapshot, "chunked", False)),
+            "layout_generation": getattr(snapshot, "layout_generation", 0),
+            "chunk_size_points": getattr(snapshot, "chunk_size_points", 0),
         }
         if self._pointcloud_map_stream_stop.is_set():
             return
+        chunked = bool(getattr(snapshot, "chunked", False))
         self.stream_bus.publish(
             "pointcloud_map.snapshot",
             source="pointcloud_map_source_switch",
-            payload_kind=StreamPayloadKind.BINARY,
-            payload=snapshot.xyz_bytes,
+            payload_kind=StreamPayloadKind.JSON if chunked else StreamPayloadKind.BINARY,
+            payload={"chunked": True, "point_count": snapshot.point_count} if chunked else snapshot.xyz_bytes,
             frame_id=snapshot.frame_id,
             sequence=snapshot.revision_ordinal,
             revision=snapshot.revision,
@@ -2315,75 +2451,29 @@ class GatewayRuntime:
         snapshot: PointCloudMapSnapshot,
         identity_metadata: Dict[str, object],
     ) -> None:
-        if snapshot.source == "live":
-            payload = struct.pack(
-                "<II",
-                snapshot.revision_ordinal & 0xFFFFFFFF,
-                snapshot.point_count,
-            ) + snapshot.xyz_bytes
+        # 历史主题只发布轻量通知。完整前缀/base64 在实际旧 WS 消费者发送时才生成。
+        metadata = {**identity_metadata, "legacy_pointcloud_topic": True}
+        if snapshot.source == "saved":
             self.stream_bus.publish(
-                "pointcloud_map.live_chunk",
-                source="pointcloud_map_source_switch",
-                payload_kind=StreamPayloadKind.BINARY,
-                payload=payload,
-                frame_id=snapshot.frame_id,
-                sequence=snapshot.revision_ordinal,
-                revision=snapshot.revision,
-                status="available",
-                metadata=dict(identity_metadata),
+                "pointcloud_map.meta", source="pointcloud_map_source_switch",
+                payload={"map_name": snapshot.provenance.get("map_name"),
+                         "revision": snapshot.revision, "frame_id": snapshot.frame_id,
+                         "source": snapshot.source, "source_epoch": snapshot.source_epoch,
+                         "source_kind": snapshot.provenance.get("source_kind"),
+                         "pcd_path": snapshot.provenance.get("asset_path"),
+                         "point_count": snapshot.point_count, "format": "float32-xyz",
+                         "payload_bytes": snapshot.point_count * 12,
+                         "stream_generation": snapshot.stream_generation,
+                         "stream_topics": ["pointcloud_map.meta", "pointcloud_map.chunk"],
+                         "metadata": dict(identity_metadata)},
+                frame_id=snapshot.frame_id, sequence=snapshot.revision_ordinal,
+                revision=snapshot.revision, status="available", metadata=dict(identity_metadata),
             )
-            return
-
-        payload_bytes = len(snapshot.xyz_bytes)
-        meta_payload = {
-            "map_name": snapshot.provenance.get("map_name"),
-            "revision": snapshot.revision,
-            "frame_id": snapshot.frame_id,
-            "source": snapshot.source,
-            "source_epoch": snapshot.source_epoch,
-            "source_kind": snapshot.provenance.get("source_kind"),
-            "pcd_path": snapshot.provenance.get("asset_path"),
-            "point_count": snapshot.point_count,
-            "format": "float32-xyz",
-            "payload_bytes": payload_bytes,
-            "stream_generation": snapshot.stream_generation,
-            "stream_topics": ["pointcloud_map.meta", "pointcloud_map.chunk"],
-            "metadata": dict(identity_metadata),
-        }
         self.stream_bus.publish(
-            "pointcloud_map.meta",
-            source="pointcloud_map_source_switch",
-            payload=meta_payload,
-            frame_id=snapshot.frame_id,
-            sequence=snapshot.revision_ordinal,
-            revision=snapshot.revision,
-            status="available",
-            metadata=dict(identity_metadata),
-        )
-        if self._pointcloud_map_stream_stop.is_set():
-            return
-        self.stream_bus.publish(
-            "pointcloud_map.chunk",
-            source="pointcloud_map_source_switch",
-            payload_kind=StreamPayloadKind.BINARY,
-            payload={
-                "revision": snapshot.revision,
-                "frame_id": snapshot.frame_id,
-                "lod": "preview",
-                "chunk_index": 0,
-                "chunk_count": 1,
-                "format": "float32-xyz",
-                "encoding": "base64",
-                "data": base64.b64encode(snapshot.xyz_bytes).decode("ascii"),
-                "point_count": snapshot.point_count,
-                "source_kind": snapshot.provenance.get("source_kind"),
-                "metadata": dict(identity_metadata),
-            },
-            frame_id=snapshot.frame_id,
-            sequence=snapshot.revision_ordinal,
-            revision=snapshot.revision,
-            status="available",
-            metadata=dict(identity_metadata),
+            "pointcloud_map.live_chunk" if snapshot.source == "live" else "pointcloud_map.chunk",
+            source="pointcloud_map_source_switch", payload={"legacy_pointcloud_topic": True},
+            frame_id=snapshot.frame_id, sequence=snapshot.revision_ordinal,
+            revision=snapshot.revision, status="available", metadata=metadata,
         )
 
     def _stop_data_frame_stream_sources(self) -> None:
@@ -4459,9 +4549,13 @@ class GatewayRuntime:
                     message=f"异步能力 {descriptor.name} 任务已接受。",
                 )
                 from gateways.feedback_messages import build_task_feedback
-                with self.task_manager._lock:
-                    status = self.task_manager.get_task_status(result.task_id)
-                    events = self.task_manager.get_task_events(result.task_id)
+                status, last_event = self.task_manager.capture_task_status_event(result.task_id)
+                try:
+                    feedback = build_task_feedback(self, last_event) if last_event is not None else None
+                except Exception:
+                    # 任务已受理；附加反馈不能把已知任务标识改成执行失败。
+                    RUNTIME_LOGGER.exception("任务已受理，但反馈投影不可用 task_id=%s", result.task_id)
+                    feedback = None
                 response = {
                     "request_id": completed_context.get("request_id"),
                     "task_id": result.task_id,
@@ -4469,7 +4563,7 @@ class GatewayRuntime:
                     "mode": descriptor.execution_mode.value,
                     "task": result,
                     "status": status,
-                    "feedback": build_task_feedback(self, events[-1]) if events else None,
+                    "feedback": feedback,
                 }
                 # 智能体调用账本在展示投影前保留真实受理结果。
                 return self._slim_async_capability_response(response) if project_result else response
@@ -4620,7 +4714,7 @@ class GatewayRuntime:
         exploration_context = self.navigation_service.get_latest_exploration_context()
         perception_runtime = self.perception_video_runtime.get_status()
         active_workspace = self.map_workspace_service.get_active_workspace()
-        artifact_summary = self.artifact_service.get_summary()
+        artifact_summary = self.artifact_service.get_cached_summary()
         profile = self._runtime_mapping_profile_summary(map_snapshot)
         geometry_asset = self._runtime_geometry_asset_summary(map_snapshot, localization_session)
         last_relocalization = self._runtime_last_relocalization_summary(localization_session, localization_snapshot)
@@ -4652,6 +4746,9 @@ class GatewayRuntime:
                 "map_name": getattr(active_workspace, "active_map_name", None),
                 "localization_session_id": getattr(localization_session, "session_id", None),
                 "geometry_runtime": geometry_runtime_status,
+                "artifact_summary_scope": "last_completed_scan" if artifact_summary is not None else "unknown",
+                "artifact_snapshot_time": getattr(artifact_summary, "timestamp", None),
+                "artifact_snapshot_freshness": "unverified_since_snapshot" if artifact_summary is not None else "unknown",
                 "live_mapping_diagnostics": self.platform_geometry_runtime.get_live_mapping_diagnostics(),
             },
         )
@@ -4670,7 +4767,7 @@ class GatewayRuntime:
         exploration_context = self.navigation_service.get_latest_exploration_context()
         perception_runtime = self.perception_video_runtime.get_status()
         active_workspace = self.map_workspace_service.get_active_workspace_identity()
-        artifact_summary = self.artifact_service.get_summary()
+        artifact_summary = self.artifact_service.get_cached_summary()
         localization_session = self.localization_service.get_active_session()
         geometry_asset = self._runtime_geometry_asset_summary(map_snapshot, localization_session)
         service_health = self._build_service_health_summary(
@@ -4712,7 +4809,11 @@ class GatewayRuntime:
             "artifact_summary": {
                 "artifact_count": getattr(artifact_summary, "artifact_count", None),
                 "total_size_bytes": getattr(artifact_summary, "total_size_bytes", None),
+                "scope": "last_completed_scan" if artifact_summary is not None else "unknown",
+                "snapshot_time": getattr(artifact_summary, "timestamp", None),
+                "freshness": "unverified_since_snapshot" if artifact_summary is not None else "unknown",
             },
+            "artifact_maintenance": self.artifact_service.get_maintenance_status(),
             "resource_leases": [
                 {
                     "resource": getattr(lease, "resource", None),
@@ -4723,6 +4824,7 @@ class GatewayRuntime:
             ],
             "payload_contract": "lightweight_health_summary",
             "stream_bus": self.stream_bus.status(),
+            "event_log": self.get_event_log_status(),
             "service_health": service_health.model_dump(mode="json"),
         }
 
@@ -4757,7 +4859,7 @@ class GatewayRuntime:
             "source_name": getattr(snapshot, "source_name", None),
             "source_epoch": getattr(snapshot, "source_epoch", None),
             "update_sequence": getattr(snapshot, "update_sequence", None),
-            "content_sha256": getattr(snapshot, "content_sha256", None),
+            "schema_version": getattr(snapshot, "schema_version", 2),
             "frame_id": getattr(snapshot, "frame_id", None),
             "occupancy_grid": {
                 "timestamp": getattr(occupancy_grid, "timestamp", None),
@@ -5359,18 +5461,31 @@ class GatewayRuntime:
 
         artifact_count = getattr(artifact_summary, "artifact_count", None)
         total_size = getattr(artifact_summary, "total_size_bytes", None)
+        artifact_service = getattr(self, "artifact_service", None)
+        artifact_status = artifact_service.get_maintenance_status() if artifact_service is not None else {}
+        artifact_worker = artifact_status.get("worker") or {}
+        artifact_debt = any(artifact_status.get(key, 0) for key in
+                            ("pending_count", "pending_bytes", "pending_expired", "unserviced_saves"))
+        artifact_failed = artifact_status.get("status") == "failed" or artifact_worker.get("phase") in {"failed", "start_failed", "owner_busy"}
+        artifact_closing = artifact_status.get("closing", False)
         entries.append(
             self._make_service_health_entry(
                 service_id="artifacts",
                 display_name="记忆/制品服务",
                 group="机器人数据",
-                status=ServiceHealthStatus.AVAILABLE,
-                summary="制品存储可访问",
-                evidence=f"制品 {artifact_count if artifact_count is not None else '--'} 个，总量 {total_size if total_size is not None else '--'} bytes",
+                status=(ServiceHealthStatus.DEGRADED if artifact_failed or artifact_debt or artifact_closing
+                        else ServiceHealthStatus.AVAILABLE if artifact_summary is not None else ServiceHealthStatus.IDLE),
+                summary=("制品维护存在未完成项" if artifact_failed or artifact_debt or artifact_closing
+                         else "制品维护处理中" if artifact_status.get("maintenance_pending")
+                         else "制品维护等待触发" if artifact_summary is None else "制品最近维护快照可用"),
+                evidence=f"最近快照：制品 {artifact_count if artifact_count is not None else '--'} 个，总量 {total_size if total_size is not None else '--'} bytes",
                 source="artifact_service",
                 advice="制品异常时检查 runtime_data 目录权限和磁盘空间",
                 order=80,
                 updated_at=utc_now(),
+                metadata={"maintenance": artifact_status, "summary_scope": "last_completed_scan" if artifact_summary is not None else "unknown",
+                          "snapshot_time": getattr(artifact_summary, "timestamp", None),
+                          "freshness": "unverified_since_snapshot" if artifact_summary is not None else "unknown"},
             )
         )
 
@@ -5634,23 +5749,29 @@ class GatewayRuntime:
     def _runtime_jsonable(self, value: Any) -> Any:
         return self._serialize(value)
 
-    def get_task_snapshot(self, task_id: str) -> Dict[str, Any]:
-        """读取任务状态快照。"""
-
+    def get_task_snapshot(self, task_id: str, *, captured_task=None) -> Dict[str, Any]:
+        """读取独立快照；投影与回调均在任务协调锁外运行。"""
+        from core.task_manager import TaskReceiptCapture, TaskReceiptUnavailableError
         from gateways.feedback_messages import build_task_feedback
-        with self.task_manager._lock:
-            spec = self.task_manager.get_task_spec(task_id)
-            events = self.task_manager.get_task_events(task_id)
-            snapshot = {
-                "task_id": task_id, "task": spec,
-                "status": self.task_manager.get_task_status(task_id),
-                "events": events,
-                "result": self.task_manager.get_task_result(task_id),
-                "error": self.task_manager.get_task_error(task_id),
-                "error_payload": self.task_manager.get_task_error_payload(task_id),
-                "feedback": build_task_feedback(self, events[-1]) if events else None,
-            }
-            metadata = dict(spec.metadata)
+
+        try:
+            capture = captured_task or self.task_manager.capture_task_receipt(task_id)
+            if (not isinstance(capture, TaskReceiptCapture) or capture.task_id != task_id
+                    or capture.source_id != self.task_manager.receipt_source_id):
+                raise ValueError("任务回执封套不属于当前管理器与请求任务。")
+            snapshot = capture.snapshot()
+        except TaskReceiptUnavailableError as error:
+            raise GatewayError(str(error), error_code="task_receipt_unsupported", http_status=500,
+                               details={"status_source": "live_task", "receipt_capture": "unsupported",
+                                        "task_outcome_unchanged": True, "action_replay_allowed": False}) from error
+        spec = snapshot["task"]
+        if (snapshot.get("task_id") != task_id or spec.task_id != task_id
+                or snapshot["status"].task_id != task_id):
+            raise ValueError("任务回执内容身份与封套不一致。")
+        events = snapshot["events"]
+        snapshot["feedback"] = capture.feedback(
+            lambda: build_task_feedback(self, events[-1]) if events else None)
+        metadata = dict(spec.metadata)
         checkpoint = metadata.get("exploration_checkpoint")
         if isinstance(checkpoint, dict):
             snapshot["exploration_checkpoint"] = dict(checkpoint)
@@ -5667,11 +5788,11 @@ class GatewayRuntime:
         return dict(guidance) if isinstance(guidance, dict) else None
 
     def _attach_async_task_polling_advisory(self, task_id: str, snapshot: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            spec = self.task_manager.get_task_spec(task_id)
-        except KeyError:
+        spec = snapshot.get("task")
+        if spec is None:
             return snapshot
-        guidance = self._async_task_polling_guidance(spec.capability_name)
+        capability_name = spec.get("capability_name") if isinstance(spec, dict) else spec.capability_name
+        guidance = self._async_task_polling_guidance(capability_name)
         if guidance is None:
             return snapshot
 
@@ -5687,7 +5808,7 @@ class GatewayRuntime:
         if state in terminal_states:
             if state == "succeeded" and isinstance(snapshot.get("result"), dict):
                 result = dict(snapshot["result"])
-                if not result.get("next_step_hint") and spec.capability_name == "activate_map":
+                if not result.get("next_step_hint") and capability_name == "activate_map":
                     workspace = result.get("active_workspace")
                     if hasattr(workspace, "model_dump"):
                         workspace = workspace.model_dump(mode="json")
@@ -5800,7 +5921,7 @@ class GatewayRuntime:
                 "source_name",
                 "source_epoch",
                 "update_sequence",
-                "content_sha256",
+                "schema_version",
                 "frame_id",
             )
             if key in data
@@ -5985,11 +6106,17 @@ class GatewayRuntime:
 
     @staticmethod
     def _slim_task_acceptance(task: Any, status: Any) -> Dict[str, Any]:
+        # 先选择受理响应真正使用的字段，未展示的不透明元数据不参与 JSON 编码。
+        input_keys = {"request_id", "map_name", "strategy", "max_duration_sec", "target_name", "radius_m"}
+        metadata_keys = {"exploration_launch_mode", "exploration_script", "exploration_command",
+                         "exploration_database_path", "polling_guidance"}
+        projection = {"task_id": True, "capability_name": True,
+                      "input_payload": input_keys, "metadata": metadata_keys}
         task_data: Dict[str, Any] = {}
         if hasattr(task, "model_dump"):
-            task_data = task.model_dump(mode="json")
+            task_data = task.model_dump(mode="json", include={**projection, "spec": projection})
         elif isinstance(task, dict):
-            task_data = dict(task)
+            task_data = task
         spec = task_data.get("spec") if isinstance(task_data.get("spec"), dict) else task_data
         input_payload = spec.get("input_payload") if isinstance(spec.get("input_payload"), dict) else {}
         metadata = spec.get("metadata") if isinstance(spec.get("metadata"), dict) else {}
@@ -8163,7 +8290,7 @@ class GatewayRuntime:
         timeout_sec = self._resolve_async_timeout("inspect_target", arguments, minimum_sec=0.1)
         descriptor = self.capability_registry.get_descriptor("inspect_target")
 
-        def runner(context) -> Dict[str, Any]:
+        def run_owned(context, artifact_owners) -> Dict[str, Any]:
             context.update(progress=0.05, stage="inspect_observe", message="开始检查目标。")
             perception_context = self.perception_service.describe_current_scene(
                 camera_id=camera_id,
@@ -8207,7 +8334,10 @@ class GatewayRuntime:
                     requested_reason="inspect_target_verify",
                     store_artifact=False,
                 )
-                perception_context = self.perception_service.get_latest_perception(camera_id)
+                perception_context, artifact_hold = self.perception_service.acquire_latest_perception(
+                    camera_id, owner="runtime.inspect.latest")
+                if artifact_hold is not None:
+                    artifact_owners.callback(artifact_hold.release)
                 if perception_context is None:
                     perception_context = self.perception_service.describe_current_scene(
                         camera_id=camera_id,
@@ -8223,6 +8353,7 @@ class GatewayRuntime:
             memory_entry = self.memory_service.remember_current_scene(
                 title=f"检查结果：{query}",
                 camera_id=camera_id,
+                perception_context=perception_context,
                 summary_override=perception_context.scene_summary.headline,
                 tags=[query, matched_object.label],
                 metadata={"requested_by": requested_by or "unknown", "source": "inspect_target"},
@@ -8234,6 +8365,11 @@ class GatewayRuntime:
                 "perception_context": perception_context,
                 "semantic_memory": memory_entry,
             }
+
+        def runner(context):
+            with ExitStack() as artifact_owners:
+                artifact_owners.enter_context(self.artifact_service.publication_scope(owner="runtime.inspect"))
+                return run_owned(context, artifact_owners)
 
         return self._run_with_motion_admission(
             motion_admission,
@@ -9058,6 +9194,16 @@ class GatewayRuntime:
         remember_result: bool,
         frame_count: int,
     ) -> Dict[str, Any]:
+        with ExitStack() as artifact_owners:
+            artifact_owners.enter_context(self.artifact_service.publication_scope(owner="runtime.target_search"))
+            return self._refresh_target_search_observation_owned(
+                query=query, camera_id=camera_id, requested_by=requested_by, reason=reason,
+                remember_result=remember_result, frame_count=frame_count, artifact_owners=artifact_owners,
+            )
+
+    def _refresh_target_search_observation_owned(
+        self, *, query, camera_id, requested_by, reason, remember_result, frame_count, artifact_owners,
+    ):
         target_classes = [query]
         detection_metadata = {
             "query": query,
@@ -9079,7 +9225,10 @@ class GatewayRuntime:
                 detection_metadata=detection_metadata,
                 open_vocabulary_classes=target_classes,
             )
-            perception_context = self.perception_service.get_latest_perception(camera_id)
+            perception_context, artifact_hold = self.perception_service.acquire_latest_perception(
+                camera_id, owner="runtime.target_search.latest")
+            if artifact_hold is not None:
+                artifact_owners.callback(artifact_hold.release)
         else:
             perception_context = self.perception_service.describe_current_scene(
                 camera_id=camera_id,
@@ -9101,6 +9250,7 @@ class GatewayRuntime:
                 self.memory_service.remember_current_scene(
                     title="目标识别：%s" % query[:48],
                     camera_id=perception_context.camera_id,
+                    perception_context=perception_context,
                     summary_override=perception_context.scene_summary.headline,
                     tags=[query, *detection_evidence["matched_labels"]],
                     metadata={
@@ -10407,7 +10557,8 @@ class GatewayRuntime:
                 message=f"准备执行 {capability_name}（含按需启动几何运行时）。",
             )
             context.ensure_active()
-            result = skill_handler(payload, requested_by=requested_by)
+            result = skill_handler(payload, requested_by=requested_by, execution_context=context)
+            # handler 已返回实际操作结果；迟到的取消不能在这里丢弃已知回执。
             context.update(progress=1.0, stage="completed", message=f"{capability_name} 已完成。")
             return result
 
@@ -10480,13 +10631,21 @@ class GatewayRuntime:
             StreamingPointCloudProvider,
         ))
 
-    def _runtime_input_bridge_ready(self) -> bool:
+    def _runtime_input_bridge_ready(
+        self, *, deadline_monotonic: Optional[float] = None,
+        check_active: Optional[Callable[[], None]] = None,
+    ) -> bool:
         """仅当前提供器对应且完整启动成功的输入桥可供能力复用。"""
 
         bridge = getattr(self, "_input_bridge", None)
         if bridge is None or not getattr(self, "_input_bridge_started", False):
             return False
-        provider = self.platform_geometry_runtime.get_geometry_runtime_provider()
+        control = {}
+        if deadline_monotonic is not None:
+            control["deadline_monotonic"] = deadline_monotonic
+        if check_active is not None:
+            control["check_active"] = check_active
+        provider = self.platform_geometry_runtime.get_geometry_runtime_provider(**control)
         return bool(
             provider is not None
             and bridge.runtime_provider is provider
@@ -11611,6 +11770,7 @@ class GatewayRuntime:
         *,
         request_id: str,
         deadline_monotonic: Optional[float] = None,
+        check_active: Optional[Callable[[], None]] = None,
     ) -> MotionAdmission:
         # 在启动导航进程前报告缺失标定，避免服务反复退出后才返回启动超时。
         geometry = getattr(getattr(self, "config", None), "geometry", None)
@@ -11626,6 +11786,7 @@ class GatewayRuntime:
         self._ensure_geometry_runtime_started(
             capability_name,
             **({"deadline_monotonic": deadline_monotonic} if deadline_monotonic is not None else {}),
+            **({"check_active": check_active} if check_active is not None else {}),
         )
         try:
             self._ensure_motion_guard_connected(capability_name)
@@ -11743,6 +11904,7 @@ class GatewayRuntime:
         admission: MotionAdmission,
         *,
         deadline_monotonic: Optional[float] = None,
+        check_active: Optional[Callable[[], None]] = None,
     ) -> None:
         """按需激活运动栈，仅校验请求级 stop generation。"""
 
@@ -11752,6 +11914,7 @@ class GatewayRuntime:
         self._ensure_geometry_runtime_for_capability(
             capability_name,
             deadline_monotonic=deadline_monotonic,
+            **({"check_active": check_active} if check_active is not None else {}),
         )
 
     def _get_provider(self, provider_type: type, provider_label: str):
@@ -11976,7 +12139,8 @@ class GatewayRuntime:
                     self._run_with_motion_admission(pending, lambda: None)
                     activation_started=time.monotonic()
                     motion_admission = self._admit_motion_request(capability_name,
-                        request_id=pending.request_id, deadline_monotonic=parent_deadline)
+                        request_id=pending.request_id, deadline_monotonic=parent_deadline,
+                        check_active=context.ensure_active)
                     RUNTIME_LOGGER.info("导航组件准入已完成 goal_id=%s duration_ms=%.3f", goal.goal_id, (time.monotonic()-activation_started)*1000)
                     self._run_with_motion_admission(pending, lambda: None)
                     context.ensure_active()
@@ -11988,6 +12152,7 @@ class GatewayRuntime:
                     capability_name,
                     motion_admission,
                     deadline_monotonic=parent_deadline,
+                    check_active=context.ensure_active,
                 )
                 context.ensure_active()
 
@@ -13817,13 +13982,20 @@ class GatewayRuntime:
         self,
         *,
         deadline_monotonic: Optional[float] = None,
+        check_active: Optional[Callable[[], None]] = None,
     ) -> Tuple[bool, str]:
         getter = getattr(
             self.platform_geometry_runtime,
             "get_geometry_runtime_provider",
             None,
         )
-        provider = getter() if callable(getter) else None
+        control = {}
+        if deadline_monotonic is not None:
+            control["deadline_monotonic"] = deadline_monotonic
+        if check_active is not None:
+            control["check_active"] = check_active
+            check_active()
+        provider = getter(**control) if callable(getter) else None
         if provider is None:
             return False, "GeometryRuntimeProvider 未连接"
         probe = getattr(
@@ -13834,11 +14006,13 @@ class GatewayRuntime:
         if not callable(probe):
             return False, "GeometryRuntimeProvider 缺少 live GetStatus 探测"
         try:
-            if deadline_monotonic is None:
-                ok, message = probe()
-            else:
-                ok, message = probe(deadline_monotonic=deadline_monotonic)
+            ok, message = probe(**control)
+        except TypeError:
+            # 注入接口不支持预算参数是合同错误，不能伪装成设备不可用后重试激活。
+            raise
         except Exception as exc:
+            if check_active is not None:
+                check_active()
             if (
                 isinstance(exc, GeometryRuntimeRpcError)
                 and str(getattr(getattr(exc, "grpc_code", None), "name", ""))
@@ -13846,6 +14020,8 @@ class GatewayRuntime:
             ):
                 raise
             return False, "GeometryRuntimeProvider live GetStatus 失败：%s" % exc
+        if check_active is not None:
+            check_active()
         return bool(ok), str(message or "ready")
 
     def _wait_for_previous_runtime_activation(
@@ -14189,8 +14365,13 @@ class GatewayRuntime:
         capability_name: str,
         *,
         deadline_monotonic: Optional[float] = None,
+        check_active: Optional[Callable[[], None]] = None,
     ) -> None:
-        """同步等待平台几何运行时就绪；多个并发调用共享同一个启动事件。"""
+        """共享启动结果；跟随者可取消，拥有方收尾后再响应本任务取消。
+
+        拥有方一旦提交共享事务，不因单个调用方取消而破坏其他等待者。
+        文件协议和生命周期操作仍使用原有预算；本方法不创建后台协调线程。
+        """
 
         activation_level = _runtime_activation_level(capability_name) or "geometry"
         requires_geometry = activation_level in {
@@ -14200,7 +14381,12 @@ class GatewayRuntime:
         }
         requires_input_bridge = requires_geometry and self._requires_runtime_input_bridge(capability_name)
 
+        owns_activation = False
+
         def ensure_activation_deadline() -> None:
+            # 拥有方完成共享启动后再交还本调用的取消，不能污染其他等待者。
+            if check_active is not None and not owns_activation:
+                check_active()
             if (
                 deadline_monotonic is not None
                 and time.monotonic() >= deadline_monotonic
@@ -14218,35 +14404,55 @@ class GatewayRuntime:
                     jsonrpc_code=-32010,
                 )
 
+        def input_bridge_ready() -> bool:
+            control = {}
+            if deadline_monotonic is not None:
+                control["deadline_monotonic"] = deadline_monotonic
+            if check_active is not None and not owns_activation:
+                control["check_active"] = check_active
+            return self._runtime_input_bridge_ready(**control)
+
         while True:
             ensure_activation_deadline()
             provider_ready = False
             if requires_geometry:
                 provider_ready, _ = self._geometry_runtime_provider_ready(
                     deadline_monotonic=deadline_monotonic,
+                    **({"check_active": check_active} if check_active is not None else {}),
                 )
-            input_bridge_ready = not requires_input_bridge or (
-                provider_ready and self._runtime_input_bridge_ready()
+            bridge_ready = not requires_input_bridge or (
+                provider_ready and input_bridge_ready()
             )
             ensure_activation_deadline()
             if activation_level == "guard" and self.motion_guard.started:
                 return
-            with self._geometry_runtime_lock:
+            # 不在协调锁内调用任务检查，避免反向获取 TaskManager 锁。
+            while True:
+                ensure_activation_deadline()
+                lock_timeout = 0.05
+                if deadline_monotonic is not None:
+                    lock_timeout = min(lock_timeout, max(0.0, deadline_monotonic - time.monotonic()))
+                if self._geometry_runtime_lock.acquire(timeout=lock_timeout):
+                    break
+            try:
                 event = self._geometry_runtime_start_event
-                if event is None and activation_level == "geometry" and provider_ready and input_bridge_ready:
+                if event is None and activation_level == "geometry" and provider_ready and bridge_ready:
                     return
                 should_start = event is None
                 if should_start:
                     event = _RuntimeActivationEvent(activation_level)
                     self._geometry_runtime_start_event = event
+            finally:
+                self._geometry_runtime_lock.release()
             if should_start:
+                owns_activation = True
                 break
-            wait_timeout = None
-            if deadline_monotonic is not None:
-                wait_timeout = max(0.0, deadline_monotonic - time.monotonic())
-                if wait_timeout <= 0.0:
-                    ensure_activation_deadline()
-            event.wait(timeout=wait_timeout)
+            while not event.is_set():
+                ensure_activation_deadline()
+                wait_timeout = 0.05
+                if deadline_monotonic is not None:
+                    wait_timeout = min(wait_timeout, max(0.0, deadline_monotonic - time.monotonic()))
+                event.wait(timeout=wait_timeout)
             ensure_activation_deadline()
             # 共享同一级别在途请求的结果；较低级别的完成不能代替导航/跟随依赖。
             if isinstance(event, _RuntimeActivationEvent) and event.activation_level == activation_level:
@@ -14256,9 +14462,10 @@ class GatewayRuntime:
                     return
                 provider_ready, _ = self._geometry_runtime_provider_ready(
                     deadline_monotonic=deadline_monotonic,
+                    **({"check_active": check_active} if check_active is not None else {}),
                 )
                 if provider_ready and (
-                    not requires_input_bridge or self._runtime_input_bridge_ready()
+                    not requires_input_bridge or input_bridge_ready()
                 ):
                     if activation_level != "person_follow":
                         ensure_activation_deadline()
@@ -14346,7 +14553,7 @@ class GatewayRuntime:
                             if lifecycle_lock is not None:
                                 lifecycle_lock.release()
                         ensure_activation_deadline()
-                        if not self._runtime_input_bridge_ready():
+                        if not input_bridge_ready():
                             raise GatewayError(
                                 "Geometry 提供器已连接，但当前传感器输入桥未就绪。",
                                 error_code="geometry_input_bridge_unavailable",
@@ -14375,7 +14582,7 @@ class GatewayRuntime:
                     provider_ready, provider_message = self._geometry_runtime_provider_ready(
                         deadline_monotonic=deadline_monotonic,
                     )
-                    if not provider_ready or (requires_input_bridge and not self._runtime_input_bridge_ready()):
+                    if not provider_ready or (requires_input_bridge and not input_bridge_ready()):
                         runtime_status = self.platform_geometry_runtime.get_runtime_status()
                         raise GatewayError(
                             (provider_message if not provider_ready else "Geometry 输入桥未绑定当前提供器。")
@@ -14411,12 +14618,16 @@ class GatewayRuntime:
                     if self._geometry_runtime_start_event is event:
                         self._geometry_runtime_start_event = None
                     event.set()
+            # 共享成功已发布；本调用取消只在返回边界抛出，不写入 event.error。
+            if check_active is not None:
+                check_active()
 
     def _ensure_geometry_runtime_for_capability(
         self,
         capability_name: str,
         *,
         deadline_monotonic: Optional[float] = None,
+        check_active: Optional[Callable[[], None]] = None,
     ) -> None:
         """runner 内部的几何运行时启动入口（保留原语义，被 _submit_*_task 复用）。"""
 
@@ -14438,6 +14649,7 @@ class GatewayRuntime:
         self._ensure_geometry_runtime_started(
             capability_name,
             deadline_monotonic=deadline_monotonic,
+            **({"check_active": check_active} if check_active is not None else {}),
         )
 
     def _record_exploration_finalize_failure(self, *, map_name, exploration_request_id, task_id, status, reason):

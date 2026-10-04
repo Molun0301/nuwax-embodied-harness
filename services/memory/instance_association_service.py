@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from collections import OrderedDict
 import copy
+import inspect
 import math
 import re
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -84,6 +85,13 @@ class InstanceAssociationService:
     _ID_KIND_MAX_LENGTH = 24
     _TRACK_CONTINUITY_SEC = 30.0
     _SIMILARITY_CACHE_LIMIT = 512
+    # Only cheap declared scalar metadata belongs here, never model/config objects.
+    # Optional revision declarations must be stored values, not descriptors/hooks.
+    # Providers changing weights, normalization or config in place must advance
+    # cache_revision (or explicitly refresh); model_name/dimension are always checked.
+    _EMBEDDER_CACHE_IDENTITY_FIELDS = (
+        "model_name", "dimension", "model_revision", "revision", "version", "cache_revision",
+    )
     _SEMANTIC_ATTRIBUTE_KEYS = (
         "color", "colour", "material", "shape", "category", "object_type",
         "brand", "model", "pattern", "text", "ocr_text", "description", "display_name_zh",
@@ -108,15 +116,52 @@ class InstanceAssociationService:
         inspection_pose_planner: Optional[InspectionPosePlanner] = None,
     ) -> None:
         self._text_embedder = text_embedder
+        self._text_embedder_cache_identity = self._embedder_cache_identity(text_embedder)
         self._inspection_pose_planner = inspection_pose_planner or InspectionPosePlanner()
         self._label_similarity_cache: OrderedDict[frozenset[str], float] = OrderedDict()
         self._embedding_cache: OrderedDict[str, object] = OrderedDict()
 
-    def set_text_embedder(self, text_embedder: TextEmbedder) -> None:
-        """在运行期注入文本向量器。"""
+    @classmethod
+    def _embedder_cache_identity(cls, text_embedder: Optional[TextEmbedder]) -> Optional[tuple]:
+        """Snapshot bounded scalar declarations; unknown mutable metadata is uncacheable."""
 
+        # Public model_name/dimension are part of the existing embedder contract.
+        # Inspect optional declarations without running provider properties or
+        # __getattr__ hooks while the caller owns the association lock. Descriptors
+        # remain non-scalar and conservatively disable cache preservation.
+        identity = tuple(
+            getattr(text_embedder, field, None) if field in ("model_name", "dimension")
+            else inspect.getattr_static(text_embedder, field, None)
+            for field in cls._EMBEDDER_CACHE_IDENTITY_FIELDS
+        )
+        if not all(value is None or type(value) in (str, bytes, int, float, bool) for value in identity):
+            return None
+        return identity
+
+    def set_text_embedder(
+        self, text_embedder: Optional[TextEmbedder], *, force_refresh: bool = True,
+    ) -> None:
+        """Bind under the caller's association lock; explicit calls still refresh.
+
+        Readiness checks may pass force_refresh=False to preserve unchanged caches.
+        Replacement providers always invalidate, even with identical declarations.
+        In-place configuration/normalization/weight changes must update the scalar
+        cache_revision token or call this method with its default explicit refresh.
+        Optional revision/version tokens must be stored scalar attributes; dynamic
+        descriptors are unsupported and conservatively force refresh on binding.
+        No inference, model I/O or arbitrary provider-state traversal happens here.
+        """
+
+        identity = self._embedder_cache_identity(text_embedder)
+        if (
+            not force_refresh
+            and self._text_embedder is text_embedder
+            and identity is not None
+            and identity == self._text_embedder_cache_identity
+        ):
+            return
         self._text_embedder = text_embedder
-        # 切换 embedder 后清空缓存，避免使用旧模型的结果
+        self._text_embedder_cache_identity = identity
         self._label_similarity_cache.clear()
         self._embedding_cache.clear()
 

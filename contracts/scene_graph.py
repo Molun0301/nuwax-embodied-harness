@@ -30,6 +30,9 @@ class SceneGraphEdge(ContractModel):
 
 
 class SceneGraphSnapshot(ContractModel):
+    # Old archived payloads retain their legacy interpretation when read.
+    schema_version: Literal[1, 2] = 1
+    graph_epoch: Optional[str] = None
     map_binding: Dict[str, Any]
     graph_revision: str
     nodes: List[SceneGraphNode] = Field(default_factory=list)

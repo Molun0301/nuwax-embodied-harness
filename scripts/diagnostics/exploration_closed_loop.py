@@ -340,7 +340,7 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
     config.runtime_data.map_active_restore_on_start = False
     config.runtime_data.map_catalog_root = str(output / "地图")
     config.runtime_data.memory_db_path = str(output / "memory.db")
-    config.runtime_data.memory_embedding_model = "hashing-v1"
+    config.runtime_data.memory_embedding_model = "lexical-only"
     config.runtime_data.memory_embedding_dimension = 128
     config.runtime_data.memory_image_embedding_model = "disabled"
     config.gateway.artifact_dir = str(output / "制品")

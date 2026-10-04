@@ -7,7 +7,7 @@ import os
 import re
 import shlex
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence
 
 from .catalog import ROBOT_REQUIREMENTS
 
@@ -81,20 +81,41 @@ def read_existing(root: Path) -> dict[str, str]:
     return values
 
 
-def _memory_settings(root: Path, values: dict[str, str], enabled: bool) -> dict[str, str]:
+def _memory_settings(
+    root: Path,
+    values: dict[str, str],
+    enabled: bool,
+    *,
+    configured: Optional[Mapping[str, str]] = None,
+) -> dict[str, str]:
     """停用本地模型时记住自定义模型，重新加入模块后可恢复。"""
+    # 模板的新键不能遮蔽用户仍在使用的旧文本模型键。
+    current = dict(values if configured is None else configured)
+    for suffix in ("MODEL", "DIM"):
+        key = f"NUWAX_MEMORY_TEXT_EMBEDDING_{suffix}"
+        if not current.get(key, "").strip():
+            current[key] = current.get(f"NUWAX_MEMORY_EMBEDDING_{suffix}", "")
+
+    def uses_default_model(model: str) -> bool:
+        lowered = model.lower()
+        return lowered in {"", "lexical-only", "lexical_only", "disabled"} or lowered.startswith("hashing")
+
     disabled = {
-        "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL": "hashing-v1",
+        "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL": "lexical-only",
         "NUWAX_MEMORY_TEXT_EMBEDDING_DIM": "256",
         "NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL": "disabled",
         "NUWAX_MEMORY_IMAGE_EMBEDDING_DIM": "512",
-        "NUWAX_MEMORY_EMBEDDING_MODEL": "hashing-v1",
+        "NUWAX_MEMORY_EMBEDDING_MODEL": "lexical-only",
         "NUWAX_MEMORY_EMBEDDING_DIM": "256",
     }
     if not enabled:
         for key in _MEMORY_KEYS:
-            if key in values and values.get(key) != disabled[key]:
-                values[_MEMORY_SAVED_PREFIX + key] = values[key]
+            if key in current and current.get(key, "").strip():
+                # 模型与维度一起保存；无模型占位符不能破坏先前保存的真实模型配置。
+                model_key = key.rsplit("_", 1)[0] + "_MODEL"
+                if uses_default_model(current.get(model_key, "").strip()):
+                    continue
+                values[_MEMORY_SAVED_PREFIX + key] = current[key]
         return disabled
 
     result: dict[str, str] = {}
@@ -105,12 +126,12 @@ def _memory_settings(root: Path, values: dict[str, str], enabled: bool) -> dict[
     for kind, directory, dimension in defaults:
         model_key = f"NUWAX_MEMORY_{kind}_EMBEDDING_MODEL"
         dim_key = f"NUWAX_MEMORY_{kind}_EMBEDDING_DIM"
-        model = values.get(model_key, "").strip()
-        current_dim = values.get(dim_key, "").strip()
-        if model in {"", "hashing-v1", "disabled"}:
-            model = values.get(_MEMORY_SAVED_PREFIX + model_key, model).strip()
-            current_dim = values.get(_MEMORY_SAVED_PREFIX + dim_key, current_dim).strip()
-        if model in {"", "hashing-v1", "disabled", "tongyi-embedding-vision-flash-2026-03-06"}:
+        model = current.get(model_key, "").strip()
+        current_dim = current.get(dim_key, "").strip()
+        if uses_default_model(model):
+            model = current.get(_MEMORY_SAVED_PREFIX + model_key, model).strip()
+            current_dim = current.get(_MEMORY_SAVED_PREFIX + dim_key, current_dim).strip()
+        if uses_default_model(model):
             model = str(root / "runtime_data/models" / directory)
             current_dim = dimension
         result[model_key] = model
@@ -126,8 +147,11 @@ def write_runtime(
     modules: Sequence[str],
     robot: str,
     existing: Mapping[str, str],
+    *, fresh_layout: str = "combined",
 ) -> None:
     """写入永久安装代际；选中模块可调配置，未安装模块保持禁用。"""
+    if fresh_layout not in ("combined", "split"):
+        raise ValueError("Unknown terminal storage creation policy")
     root, prefix = root.resolve(), prefix.resolve()
     selected = set(modules)
     if selected - _MODULES:
@@ -149,6 +173,8 @@ def write_runtime(
         values.update(read_settings(root / "drivers/go2/data_plane.env.example"))
     values.update(read_settings(root / ".env.example"))
     values.update(existing)
+    # 该安装能力/回滚策略只来自 manager；旧配置或调用环境不能将 combined 升成 split。
+    values.pop("NUWAX_AGENT_TERMINAL_FRESH_LAYOUT", None)
     # 新安装先供本机接入；已配置的监听地址与制品访问地址继续沿用。
     if not existing.get("NUWAX_GATEWAY_HOST", "").strip():
         values["NUWAX_GATEWAY_HOST"] = "127.0.0.1"
@@ -172,6 +198,7 @@ def write_runtime(
     fixed.update({
         "NUWAX_ROBOT_PROFILE_MODE": "1",
         "NUWAX_INSTALL_HOME": str(prefix.parent.parent),
+        "NUWAX_AGENT_TERMINAL_FRESH_LAYOUT": fresh_layout,
         "NUWAX_SETTINGS_LAUNCHER": str(prefix / "start.sh"),
         "NUWAX_ACTIVE_ROBOT": robot,
         "NUWAX_GATEWAY_LOCK_FILE": str(root / "runtime_data/gateway/start_gateway.lock"),
@@ -243,7 +270,7 @@ def write_runtime(
         fixed.update(local_only)
     if perception:
         values["NUWAX_PERCEPTION_YOLO_WORLD_MODEL"] = values.get("NUWAX_PERCEPTION_YOLO_WORLD_MODEL", "").strip() or str(root / "runtime_data/models/yolov8s-worldv2.pt")
-    memory_settings = _memory_settings(root, values, memory)
+    memory_settings = _memory_settings(root, values, memory, configured=existing)
     values.update(memory_settings)
     if not memory:
         fixed.update(memory_settings)
@@ -273,6 +300,16 @@ def write_runtime(
         f"export VIRTUAL_ENV={shlex.quote(str(prefix / 'venv'))}",
         f'export PATH={shlex.quote(str(prefix / "venv/bin") + ":" + str(binary_dir))}:"${{PATH}}"',
         "export PYTHONNOUSERSITE=1",
+        "# 此固定策略不能因继承的文件来源标记而被活动方案重新覆盖。",
+        '_neh_policy_file_keys=""',
+        'IFS=":" read -ra _neh_policy_keys <<< "${_NUWAX_CONFIG_FILE_KEYS:-}"',
+        'for _neh_policy_key in "${_neh_policy_keys[@]}"; do',
+        '  if [[ -n "${_neh_policy_key}" && "${_neh_policy_key}" != "NUWAX_AGENT_TERMINAL_FRESH_LAYOUT" ]]; then',
+        '    _neh_policy_file_keys+="${_neh_policy_key}:"',
+        '  fi',
+        'done',
+        'export _NUWAX_CONFIG_FILE_KEYS="${_neh_policy_file_keys}"',
+        'unset _neh_policy_file_keys _neh_policy_keys _neh_policy_key',
     ]
     launcher.extend(f"export {key}={shlex.quote(value)}" for key, value in sorted(fixed.items()))
     launcher.extend([

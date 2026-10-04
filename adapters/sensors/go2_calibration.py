@@ -13,11 +13,14 @@ registration frame 使用与 Geometry 配置一致的 ``go2_base_link``。profil
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, replace
-import hashlib
 import json
 import math
+import struct
+from threading import RLock
 from typing import Iterable, Optional, Tuple
+import uuid
 
 import numpy as np
 
@@ -109,6 +112,55 @@ GO2_CALIBRATION_PROFILE = Go2CalibrationProfile(
 )
 
 
+# 此编码版本固定非变换语义；改变这些约定必须显式升级版本，不能复用旧前缀。
+_REFERENCE_PREFIX = "g2cal2:"
+_REFERENCE_CONTEXT = (
+    "go2-urdf-base-v1", "go2_base_link", "utlidar_lidar", ("world/go2/imu",),
+    "parent_from_child",
+)
+
+
+def _profile_identity(profile: Go2CalibrationProfile):
+    context = (profile.calibration_ref, profile.registration_frame,
+               profile.lidar_source_frame, tuple(sorted(profile.imu_source_frames)), "parent_from_child")
+    values = (*profile.lidar_translation_m, *profile.lidar_rotation.ravel(),
+              *profile.imu_translation_m, *profile.imu_rotation.ravel())
+    return context, tuple(0.0 if value == 0 else float(value) for value in values)
+
+
+class Go2CalibrationProfileOwner:
+    """单个输入拥有方的当前标定快照；不建立跨机器人或全历史缓存。"""
+
+    def __init__(self) -> None:
+        self._epoch = uuid.uuid4().hex
+        self._revision = 0
+        self._identity = None
+        self._profile = None
+        self._lock = RLock()
+
+    def capture(self, profile: Go2CalibrationProfile, *, configured: bool) -> Go2CalibrationProfile:
+        identity = (configured, *_profile_identity(profile))
+        with self._lock:
+            if identity != self._identity:
+                self._revision += 1
+                reference = ("g2cal-owner:%s:%d" % (self._epoch, self._revision)
+                             if configured else profile.calibration_ref)
+                self._identity = identity
+                self._profile = replace(profile, calibration_ref=reference)
+            elif self._profile.source_ref != profile.source_ref:
+                self._profile = replace(profile, calibration_ref=self._profile.calibration_ref)
+            return self._profile
+
+
+def _standalone_reference(profile: Go2CalibrationProfile) -> str:
+    """兼容独立调用：可逆编码完整24个float64，不作内容校验或摘要。"""
+    context, values = _profile_identity(profile)
+    if context != _REFERENCE_CONTEXT:
+        raise ValueError("独立标定编码的坐标或默认版本已变化，必须升级编码版本")
+    # 192字节→240个ASCII字符，加版本前缀后247字节，符合既有NWS1限制。
+    return _REFERENCE_PREFIX + base64.b85encode(struct.pack("<24d", *values)).decode("ascii")
+
+
 def _parse_body_transform(raw: str, setting_name: str) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
     """按原生边界相同的完整字段和正交容差验证配置，不修正非法矩阵。"""
 
@@ -160,8 +212,10 @@ def _rotation_rpy_for_metadata(rotation: Tuple[float, ...]) -> Tuple[float, floa
 def go2_calibration_profile_from_config(
     body_from_sensor: str = "",
     body_from_imu: str = "",
+    *,
+    owner: Optional[Go2CalibrationProfileOwner] = None,
 ) -> Go2CalibrationProfile:
-    """捕获现有完整外参覆盖；空项保留模型默认，实际参数共同决定引用。"""
+    """捕获完整外参；输入实例用owner修订，独立调用用可逆变换编码。"""
     profile = GO2_CALIBRATION_PROFILE
     overrides = {}
     sources = []
@@ -179,21 +233,14 @@ def go2_calibration_profile_from_config(
         overrides[prefix + "_rpy_rad"] = _rotation_rpy_for_metadata(rotation)
         sources.append(setting_name)
     if not overrides:
-        return profile
+        return owner.capture(profile, configured=False) if owner is not None else profile
     configured = replace(profile, **overrides)
-    identity = {
-        "lidar_translation_m": configured.lidar_translation_m,
-        "lidar_rotation_row_major": configured.lidar_rotation.ravel().tolist(),
-        "imu_translation_m": configured.imu_translation_m,
-        "imu_rotation_row_major": configured.imu_rotation.ravel().tolist(),
-        "default_profile": profile.calibration_ref,
-    }
-    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-    return replace(
+    configured = replace(
         configured,
-        calibration_ref="go2-configured-v1-" + digest,
         source_ref="config:%s;default:%s" % (",".join(sources), profile.source_ref),
     )
+    return (owner.capture(configured, configured=True) if owner is not None
+            else replace(configured, calibration_ref=_standalone_reference(configured)))
 
 
 __all__ = [
@@ -203,5 +250,6 @@ __all__ = [
     "GO2_LIDAR_FRAME",
     "GO2_REGISTRATION_FRAME",
     "Go2CalibrationProfile",
+    "Go2CalibrationProfileOwner",
     "go2_calibration_profile_from_config",
 ]

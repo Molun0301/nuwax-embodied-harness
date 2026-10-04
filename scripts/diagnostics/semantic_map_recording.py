@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""核对实录同源资产并运行只读语义区域提取，产出几何验证与地图图示。"""
+"""记录导入资产来源并检查轨迹配对和几何区域，产出离线图示。"""
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
-import hashlib
 import json
 import math
-from pathlib import Path
 import sqlite3
 import struct
 import sys
 import tarfile
 import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -21,18 +21,38 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from contracts.artifacts import ArtifactKind
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.maps import OccupancyGrid
 from contracts.runtime_views import MapSnapshot
+from scripts.diagnostics.recording_inputs import recording_artifact
+from services.artifact_store import LocalArtifactStore
 from services.memory.room_segmentation import RoomSegmentationService, pose_in_scene_space
 
 
-def digest(path):
-    result = hashlib.sha256()
-    with path.open('rb') as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b''):
-            result.update(block)
-    return result.hexdigest()
+@contextmanager
+def capture_recording_inputs(args, cloud_path):
+    """Capture once, then retain the exact inputs through geometry and output."""
+    cloud_bytes = cloud_path.read_bytes()
+    occupancy_bytes = args.occupancy.read_bytes()
+    raw = json.loads(occupancy_bytes)
+    source_path = ROOT / 'services/memory/room_segmentation.py'
+    source_bytes = source_path.read_bytes()
+    store = LocalArtifactStore(str(args.artifact_dir or args.output / 'input-artifacts'), '')
+    with store.publication_scope(owner='diagnostic.recording.import') as owner:
+        refs = {}
+        for name, path, data, kind, mime, extension in (
+            ('pointcloud', cloud_path, cloud_bytes, ArtifactKind.POINTCLOUD, 'application/octet-stream', '.xyzt'),
+            ('occupancy', args.occupancy, occupancy_bytes, ArtifactKind.MAP_SNAPSHOT, 'application/json', '.json'),
+            ('segmentation_source', source_path, source_bytes, ArtifactKind.OTHER, 'text/x-python', '.py'),
+        ):
+            refs[name] = recording_artifact(store, source_path=path, kind=kind, mime_type=mime,
+                data=data, extension=extension, map_name=args.version, frame_id=raw['frame_id'], owner=owner)
+        # Transfer existing/new references before publication/read leases end;
+        # later report saves must not become part of this input owner.
+        hold = owner.retain(owner='diagnostic.recording.inputs')
+    with hold:
+        yield store, refs, cloud_bytes, raw
 
 
 def read_trajectory(path):
@@ -205,7 +225,7 @@ def render_map(grid, regions, assignment, trajectory, output, metrics):
         canvas.paste(part, (0, 112))
         heading = ImageDraw.Draw(canvas)
         heading.text((24, 16), name, font=font(28), fill='white')
-        heading.text((24, 57), '真实录制 → 同源生产水平投影 → 几何候选；编号不代表房间用途', font=font(18), fill='#aec4d8')
+        heading.text((24, 57), '导入录制输入 → 占据图几何候选；编号不代表房间用途', font=font(18), fill='#aec4d8')
         heading.text((24, 83), '彩色：候选区域  黑色：占据  深灰：未知  黄色：原始估计轨迹', font=font(16), fill='#d6e2ed')
         heading.text((24, part.height + 121), f'X {xmin:.1f}～{xmax:.1f} m · Y {ymin:.1f}～{ymax:.1f} m · 不保证运动可达 · 无图像分类真值', font=font(16), fill='#d6e2ed')
         canvas.save(output / (name + '.png'))
@@ -225,77 +245,82 @@ def main():
     parser.add_argument('--source-archive', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--max-cells', type=int, default=3000000)
+    parser.add_argument('--artifact-dir', type=Path, help='持久输入制品目录；默认 output/input-artifacts，可跨输出目录复用')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     manifest = json.loads(args.manifest.read_text())
     variant = next(item for item in manifest['variants'] if item['id'] == args.version)
     cloud_path = args.manifest.parent / variant['point_file']
-    cloud = np.fromfile(cloud_path, dtype='<f4').reshape(-1, 4)
-    cloud_hash = digest(cloud_path)
-    if cloud_hash != variant['point_sha256']:
-        raise ValueError('页面点云摘要与清单不符')
-    trajectory = read_trajectory(args.trajectory)
-    pairing = audit_paired_scans(args.paired_scans, trajectory)
-    if pairing['trajectory_timestamp_matches'] != len(trajectory) or pairing['max_position_difference_m'] > 1e-8:
-        raise ValueError('占据图配对扫描与完整链路轨迹不能确认为同坐标来源')
-    raw = json.loads(args.occupancy.read_text())
-    if raw['origin_orientation'] != [0.0, 0.0, 0.0, 1.0]:
-        raise ValueError('本诊断绘图要求轴对齐占据图，不隐式旋转源资产。')
-    timestamp = datetime.fromtimestamp(raw['ts'], timezone.utc)
-    grid = OccupancyGrid(map_id=args.version, frame_id=raw['frame_id'], width=raw['width'], height=raw['height'],
-        resolution_m=raw['resolution'], origin=Pose(frame_id=raw['frame_id'],
-        position=Vector3(x=raw['origin'][0], y=raw['origin'][1], z=raw['origin'][2]),
-        orientation=Quaternion(**dict(zip(('x', 'y', 'z', 'w'), raw['origin_orientation'])))), data=raw['data'], timestamp=timestamp)
-    snapshot = MapSnapshot(map_name=args.version, source_name='offline_recording_production_horizontal',
-        source_epoch='offline-' + digest(args.occupancy)[:24], update_sequence=pairing['frames'],
-        occupancy_grid=grid, timestamp=timestamp,
-        metadata={'offline_validation': True, 'source_occupancy': str(args.occupancy.resolve())})
-    budget_error = None
-    try:
-        RoomSegmentationService().segment(snapshot, map_name=snapshot.map_name)
-    except ValueError as error:
-        budget_error = str(error)
-    started = time.perf_counter()
-    regions = RoomSegmentationService(max_cells=args.max_cells).segment(snapshot, map_name=snapshot.map_name)
-    segmentation_sec = time.perf_counter() - started
-    started = time.perf_counter()
-    summaries, geometry_checks, assignment = verify_regions(regions, grid, trajectory)
-    verification_sec = time.perf_counter() - started
-    with sqlite3.connect(args.source_recording.resolve().as_uri() + '?mode=ro', uri=True) as connection:
-        kinds = {kind: count for kind, count in connection.execute('SELECT kind,COUNT(*) FROM records GROUP BY kind')}
-    with tarfile.open(args.source_archive) as archive:
-        image_members = [member.name for member in archive if member.name.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.mp4', '.mkv'))]
-    path_points = np.asarray([record['p'] for record in trajectory])
-    report = {'page_version': args.version, 'selected_variant': variant,
-        'segmentation_source_sha256': digest(ROOT / 'services/memory/room_segmentation.py'),
-        'segmentation_parameters': {'min_area_m2': 2.0, 'doorway_width_m': 1.2, 'max_cells': args.max_cells},
-        'input_kind': 'same_recording_production_projection_replayed_offline',
-        'pointcloud_path': str(cloud_path.resolve()), 'pointcloud_sha256': cloud_hash,
-        'pointcloud_count': len(cloud), 'finite_point_count': int(np.isfinite(cloud[:, :3]).all(axis=1).sum()),
-        'pointcloud_xyz_min': cloud[:, :3].min(axis=0).tolist(), 'pointcloud_xyz_max': cloud[:, :3].max(axis=0).tolist(),
-        'pointcloud_time_column_all_zero': bool(np.all(cloud[:, 3] == 0)),
-        'page_trajectory_count': len(read_trajectory(args.manifest.parent / variant['trajectory_file'])),
-        'trajectory_path': str(args.trajectory.resolve()), 'paired_scans_path': str(args.paired_scans.resolve()), 'pairing': pairing,
-        'occupancy_path': str(args.occupancy.resolve()), 'occupancy_sha256': digest(args.occupancy),
-        'grid_width': grid.width, 'grid_height': grid.height, 'grid_cells': grid.width * grid.height,
-        'resolution_m': grid.resolution_m, 'grid_origin': grid.origin.model_dump(mode='json'),
-        'source_last_timestamp_utc': timestamp.isoformat(),
-        'trajectory_z_range': [float(path_points[:, 2].min()), float(path_points[:, 2].max())],
-        'default_max_cells': 2000000, 'default_budget_error': budget_error,
-        'validation_max_cells': args.max_cells, 'segmentation_sec': segmentation_sec,
-        'verification_sec': verification_sec, 'region_count': len(regions), 'geometry_checks': geometry_checks,
-        'recording_kind_counts': kinds, 'source_archive_camera_images': image_members,
-        'semantic_labels_generated': False, 'classification_accuracy_verified': False,
-        'limitations': ['二维投影是同记录现行生产内核的离线输出，不是网页点云直接提供的占据资产。',
-                       '展示点云时间列被置零，不能用于图像采集时间对齐。',
-                       '记录没有相机图像或房间用途真值，只验几何和运行规模。',
-                       '切片高度容差沿当前生产函数，原轨迹高度漂移会导致二维命中而三维归属未知。']}
-    (args.output / '验证结果.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
-    (args.output / '几何候选.json').write_text(json.dumps(summaries, ensure_ascii=False, separators=(',', ':')))
-    (args.output / '同源轨迹.json').write_text(json.dumps(trajectory, separators=(',', ':')))
-    render_map(grid, regions, assignment, trajectory, args.output, geometry_checks)
-    print(json.dumps({key: report[key] for key in ('pointcloud_count', 'grid_cells', 'default_budget_error',
-        'segmentation_sec', 'verification_sec', 'region_count', 'geometry_checks')}, ensure_ascii=False, indent=2))
+    with capture_recording_inputs(args, cloud_path) as (store, refs, cloud_bytes, raw):
+        cloud = np.frombuffer(cloud_bytes, dtype='<f4').reshape(-1, 4)
+        trajectory = read_trajectory(args.trajectory)
+        pairing = audit_paired_scans(args.paired_scans, trajectory)
+        if pairing['trajectory_timestamp_matches'] != len(trajectory) or pairing['max_position_difference_m'] > 1e-8:
+            raise ValueError('占据图配对扫描与完整链路轨迹不能确认为同坐标来源')
+        if raw['origin_orientation'] != [0.0, 0.0, 0.0, 1.0]:
+            raise ValueError('本诊断绘图要求轴对齐占据图，不隐式旋转源资产。')
+        timestamp = datetime.fromtimestamp(raw['ts'], timezone.utc)
+        grid = OccupancyGrid(map_id=args.version, frame_id=raw['frame_id'], width=raw['width'], height=raw['height'],
+            resolution_m=raw['resolution'], origin=Pose(frame_id=raw['frame_id'],
+            position=Vector3(x=raw['origin'][0], y=raw['origin'][1], z=raw['origin'][2]),
+            orientation=Quaternion(**dict(zip(('x', 'y', 'z', 'w'), raw['origin_orientation'])))), data=raw['data'], timestamp=timestamp)
+        snapshot = MapSnapshot(map_name=args.version, source_name='offline_recording_production_horizontal',
+            source_epoch='offline-recording:' + refs['occupancy'].artifact_id, update_sequence=pairing['frames'],
+            frame_id=grid.frame_id,
+            occupancy_grid=grid, timestamp=timestamp,
+            metadata={'offline_validation': True, 'source_occupancy': str(args.occupancy.resolve())})
+        budget_error = None
+        try:
+            RoomSegmentationService().segment(snapshot, map_name=snapshot.map_name)
+        except ValueError as error:
+            budget_error = str(error)
+        started = time.perf_counter()
+        regions = RoomSegmentationService(max_cells=args.max_cells).segment(snapshot, map_name=snapshot.map_name)
+        segmentation_sec = time.perf_counter() - started
+        started = time.perf_counter()
+        summaries, geometry_checks, assignment = verify_regions(regions, grid, trajectory)
+        verification_sec = time.perf_counter() - started
+        with sqlite3.connect(args.source_recording.resolve().as_uri() + '?mode=ro', uri=True) as connection:
+            kinds = {kind: count for kind, count in connection.execute('SELECT kind,COUNT(*) FROM records GROUP BY kind')}
+        with tarfile.open(args.source_archive) as archive:
+            image_members = [member.name for member in archive if member.name.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.mp4', '.mkv'))]
+        path_points = np.asarray([record['p'] for record in trajectory])
+        report = {'schema_version': 2, 'page_version': args.version,
+            'selected_variant': {key: value for key, value in variant.items() if not key.endswith('_sha256')},
+            'manifest_content_binding': 'not_verified_path_selection_only',
+            'artifact_root': str(store.base_dir.resolve()),
+            'input_artifact_ids': {name: ref.artifact_id for name, ref in refs.items()},
+            'source_epoch': snapshot.source_epoch,
+            'segmentation_source_evidence': 'disk_source_bytes_at_capture_not_loaded_module_proof',
+            'segmentation_parameters': {'min_area_m2': 2.0, 'doorway_width_m': 1.2, 'max_cells': args.max_cells},
+            'input_kind': 'captured_offline_recording_inputs',
+            'pointcloud_path': str(cloud_path.resolve()), 'pointcloud_artifact_id': refs['pointcloud'].artifact_id,
+            'pointcloud_count': len(cloud), 'finite_point_count': int(np.isfinite(cloud[:, :3]).all(axis=1).sum()),
+            'pointcloud_xyz_min': cloud[:, :3].min(axis=0).tolist(), 'pointcloud_xyz_max': cloud[:, :3].max(axis=0).tolist(),
+            'pointcloud_time_column_all_zero': bool(np.all(cloud[:, 3] == 0)),
+            'page_trajectory_count': len(read_trajectory(args.manifest.parent / variant['trajectory_file'])),
+            'trajectory_path': str(args.trajectory.resolve()), 'paired_scans_path': str(args.paired_scans.resolve()), 'pairing': pairing,
+            'occupancy_path': str(args.occupancy.resolve()), 'occupancy_artifact_id': refs['occupancy'].artifact_id,
+            'grid_width': grid.width, 'grid_height': grid.height, 'grid_cells': grid.width * grid.height,
+            'resolution_m': grid.resolution_m, 'grid_origin': grid.origin.model_dump(mode='json'),
+            'source_last_timestamp_utc': timestamp.isoformat(),
+            'trajectory_z_range': [float(path_points[:, 2].min()), float(path_points[:, 2].max())],
+            'default_max_cells': 2000000, 'default_budget_error': budget_error,
+            'validation_max_cells': args.max_cells, 'segmentation_sec': segmentation_sec,
+            'verification_sec': verification_sec, 'region_count': len(regions), 'geometry_checks': geometry_checks,
+            'recording_kind_counts': kinds, 'source_archive_camera_images': image_members,
+            'semantic_labels_generated': False, 'classification_accuracy_verified': False,
+            'limitations': ['配对检查覆盖轨迹时间戳与位姿，未证明点云、占据图与源归档的内容来源。',
+                           '清单只用于选取路径；旧摘要字段不参与验证。',
+                           '展示点云时间列被置零，不能用于图像采集时间对齐。',
+                           '记录没有相机图像或房间用途真值，只验几何和运行规模。',
+                           '切片高度容差沿当前生产函数，原轨迹高度漂移会导致二维命中而三维归属未知。']}
+        (args.output / '验证结果.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
+        (args.output / '几何候选.json').write_text(json.dumps(summaries, ensure_ascii=False, separators=(',', ':')))
+        (args.output / '同源轨迹.json').write_text(json.dumps(trajectory, separators=(',', ':')))
+        render_map(grid, regions, assignment, trajectory, args.output, geometry_checks)
+        print(json.dumps({key: report[key] for key in ('pointcloud_count', 'grid_cells', 'default_budget_error',
+            'segmentation_sec', 'verification_sec', 'region_count', 'geometry_checks')}, ensure_ascii=False, indent=2))
 
 
 if __name__ == '__main__':

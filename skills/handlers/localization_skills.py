@@ -19,11 +19,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from contracts.map_workspace import MapGeoreferenceV1
 from contracts.forbidden_zones import ReplaceForbiddenZonesRequest
+from contracts.map_workspace import MapGeoreferenceV1
 from core.errors import GatewayError
 from skills.common import params
-from skills.common.context import SkillContext
+from skills.common.context import SkillContext, TaskExecutionControl
 
 _LOGGER = logging.getLogger("nuwax_robot_bridge.skills.localization")
 _FINALIZE_ACTIVE_MAP_ARGUMENTS = frozenset({"map_name", "reason", "georeference"})
@@ -109,8 +109,19 @@ def handle_relocalize_active_map(
     payload: Dict[str, Any],
     *,
     requested_by: Optional[str] = None,
+    execution_context: Optional[TaskExecutionControl] = None,
 ) -> Dict[str, Any]:
-    ctx.ensure_geometry_runtime_for_capability("relocalize_active_map")
+    if execution_context is None:
+        ctx.ensure_geometry_runtime_for_capability("relocalize_active_map")
+    else:
+        execution_context.ensure_active()
+        ctx.ensure_geometry_runtime_for_capability(
+            "relocalize_active_map",
+            deadline_monotonic=execution_context.timeout_deadline_monotonic(),
+            check_active=execution_context.ensure_active,
+        )
+        # 共享启动完成并不代表这个调用方仍有权提交地图操作。
+        execution_context.ensure_active()
     session, workspace = ctx.map_workspace_service.relocalize_active_map(
         map_name=params.optional_str(payload, "map_name"),
         metadata={
@@ -246,9 +257,20 @@ def handle_activate_map(
     payload: Dict[str, Any],
     *,
     requested_by: Optional[str] = None,
+    execution_context: Optional[TaskExecutionControl] = None,
 ) -> Dict[str, Any]:
     map_name = params.require_str(payload, "map_name")
-    ctx.ensure_geometry_runtime_started("activate_map")
+    if execution_context is None:
+        ctx.ensure_geometry_runtime_started("activate_map")
+    else:
+        execution_context.ensure_active()
+        ctx.ensure_geometry_runtime_started(
+            "activate_map",
+            deadline_monotonic=execution_context.timeout_deadline_monotonic(),
+            check_active=execution_context.ensure_active,
+        )
+        # 共享启动完成并不代表这个调用方仍有权提交地图操作。
+        execution_context.ensure_active()
     active_workspace = ctx.map_workspace_service.activate_map(
         map_name=map_name,
         create_if_missing=False,

@@ -27,12 +27,33 @@ class SettingsApplication:
     def __init__(self, runtime):
         self.runtime = runtime
         self._lock = threading.RLock()
+        self._pid = os.getpid()
         self._apply_errors = {}
+        self.revision_owner = config_profiles.ProfileRevisionOwner()
         self._root = config_io._CORE_ENV.parent
         self.started_location = configuration_location(root=self._root)
         self.started_robot = getattr(getattr(getattr(runtime, "config", None), "robot", None), "active_robot", "")
         self._startup_files = configuration_values(root=self._root)
         self._startup_files.update({key: value for key, value in os.environ.items() if config_registry.get_field(key)})
+
+    def close(self):
+        self.revision_owner.close()
+
+    def start(self):
+        """同一应用再次进入生命周期时建立新拥有方，旧编辑令牌不复活。"""
+        if self._pid != os.getpid():
+            # 子进程不能等待父进程其它线程持有的设置锁。
+            self._lock = threading.RLock()
+            self.revision_owner = config_profiles.ProfileRevisionOwner()
+            self._pid = os.getpid()
+        with self._lock:
+            if self.revision_owner.closed:
+                self.revision_owner = config_profiles.ProfileRevisionOwner()
+
+    def __del__(self):
+        owner = getattr(self, "revision_owner", None)
+        if owner is not None:
+            owner.close()
 
     def _active_location(self):
         # 活动选择属于持久配置；已经物化到本进程环境的旧机器人名不覆盖页面选择。
@@ -53,7 +74,7 @@ class SettingsApplication:
         if robot is None and self.started_robot:
             active = self._active_location()
             robot = active["robot"] if active else self.started_robot
-        schema = config_io.build_schema(robot, profile)
+        schema = config_io.build_schema(robot, profile, revision_owner=self.revision_owner)
         context = schema.get("profile_context")
         if context:
             active = self._active_location()
@@ -73,12 +94,14 @@ class SettingsApplication:
     def save(self, updates, *, robot=None, profile=None, expected_revision=None):
         with self._lock:
             location = configuration_location(root=self._root, robot=robot, profile=profile)
-            result = config_io.save_values(updates, robot=robot, profile=profile, expected_revision=expected_revision)
+            result = config_io.save_values(updates, robot=robot, profile=profile, expected_revision=expected_revision,
+                                           revision_owner=self.revision_owner)
             written = {key for keys in result.written.values() for key in keys}
             values = read_env_values(location["path"]) if location else {key: config_io._current_value(key) for key in written}
             active = self._is_active(location)
             if active and location and written and not (self._root / "runtime_data/settings/active.env").is_symlink():
-                config_profiles.activate_profile(root=self._root, robot=location["robot"], profile=location["profile"])
+                config_profiles.activate_profile(root=self._root, robot=location["robot"], profile=location["profile"],
+                                                 revision_owner=self.revision_owner)
             applied = self._apply_hot(values, written) if active and (location is None or location["robot"] == self.started_robot) else []
             restart_keys = sorted(key for key in written if key not in applied or apply_mode(key) == "hot_and_restart")
             return {"written": result.written, "skipped": result.skipped, "rejected": result.rejected,
@@ -89,7 +112,7 @@ class SettingsApplication:
     def activate(self, *, robot, profile, expected_revision=None):
         with self._lock:
             context = config_profiles.activate_profile(root=self._root, robot=robot, profile=profile,
-                                                      expected_revision=expected_revision)
+                                                      expected_revision=expected_revision, revision_owner=self.revision_owner)
             location = configuration_location(root=self._root, robot=robot, profile=profile)
             values = read_env_values(location["path"])
             # 方案中缺省的键也必须恢复默认，不能保留上一方案的热加载值。

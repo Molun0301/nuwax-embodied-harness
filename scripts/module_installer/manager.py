@@ -374,9 +374,19 @@ def check_prerequisites(request: InstallRequest, hardware) -> str:
     return seed
 
 
+def _agent_terminal_storage_policy(current: Mapping) -> dict:
+    """新代际只根据已读安装记录选择布局，绝不继承进程/配置中的能力声明。"""
+    # read_current 仅在确实没有受管代际时返回空 dict；损坏指针/清单保持其原错误。
+    fresh = type(current) is dict and not current
+    capability = current.get("agent_terminal_storage") if isinstance(current, Mapping) else None
+    reader = capability.get("reader_version") if type(capability) is dict else None
+    compatible = type(reader) is int and reader == 1
+    return {"reader_version": 1, "fresh_layout": "split" if fresh or compatible else "combined"}
+
+
 def apply(request: InstallRequest, hardware) -> dict:
     seed = check_prerequisites(request, hardware)
-    from .lifecycle import MODES, deployment_descriptor
+    from .lifecycle import MODES, deployment_descriptor, inspect_installation
     if request.service_mode and request.service_mode not in MODES:
         raise InstallError("未知生命周期模式")
     source_identity = source_fingerprint(request.root, request.modules, request.robot)
@@ -385,11 +395,16 @@ def apply(request: InstallRequest, hardware) -> dict:
         current = read_current(request.home)
         if current and current.get("source_root") != str(request.root):
             raise InstallError("此安装目录属于另一个源码工作区，请使用独立 --install-dir。")
-        if current.get("fingerprint") == fingerprint and not request.repair and (not request.service_mode or request.service_mode == current.get("deployment", {}).get("lifecycle", {}).get("mode", "foreground")):
+        registration = inspect_installation(request.home)["lifecycle"] if current else None
+        mode = request.service_mode or (registration["mode"] if registration else "foreground")
+        service_name = registration["service_name"] if registration else None
+        migrate_lifecycle = bool(request.service_mode and service_name is None)
+        if current.get("fingerprint") == fingerprint and not request.repair and not migrate_lifecycle and (not request.service_mode or request.service_mode == registration["mode"]):
             _verify_prefix(Path(current["prefix"]), request.modules)
             print("所选模块已经安装，无需重复处理。使用 --repair 可重新安装。")
             return current
         previous = Path(current["prefix"]) if current else None
+        terminal_policy = _agent_terminal_storage_policy(current)
         identifier = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
         prefix = request.home / "generations" / identifier
         prefix.mkdir(parents=True)
@@ -405,15 +420,22 @@ def apply(request: InstallRequest, hardware) -> dict:
             print(f"[3/5] 构建所选组件（并行 {request.jobs}）", flush=True)
             binaries = build_modules(request.root, prefix, request.home / "cache", request.modules, request.jobs, run)
             print("[4/5] 准备所选模型和启动配置", flush=True)
-            write_runtime(request.root, prefix, request.modules, request.robot, existing_config(request.root, current))
+            write_runtime(request.root, prefix, request.modules, request.robot, existing_config(request.root, current),
+                          fresh_layout=terminal_policy["fresh_layout"])
             _prepare_models(request, prefix, run)
             _verify_prefix(prefix, request.modules)
             print("[5/5] 校验完成，切换当前安装", flush=True)
             state = {"schema": 1, "complete": True, "modules": list(request.modules),
                      "robot": request.robot, "source_root": str(request.root), "fingerprint": fingerprint,
-                     "python": seed, "binaries": binaries, "installed_at": identifier}
-            mode = request.service_mode or current.get("deployment", {}).get("lifecycle", {}).get("mode", "foreground")
-            state["deployment"] = deployment_descriptor(request.root, request.home, prefix, request.modules, request.robot, mode)
+                     "python": seed, "binaries": binaries, "installed_at": identifier,
+                     "agent_terminal_storage": terminal_policy}
+            # Preserve descriptor-free foreground installs for old pinned readers.
+            # A real fresh install or explicit lifecycle migration assigns once.
+            if not current or "deployment" in current or request.service_mode:
+                if service_name is None and (not current or migrate_lifecycle):
+                    service_name = "neh-install-" + str(uuid.uuid4()) + ".service"
+                state["deployment"] = deployment_descriptor(request.root, request.home, prefix, request.modules,
+                                                            request.robot, mode, service_name=service_name)
             atomic_write(prefix / "manifest.json", json.dumps(state, ensure_ascii=False, indent=2) + "\n", mode=0o600)
             temporary.symlink_to(prefix.relative_to(request.home))
             os.replace(str(temporary), str(request.home / "current"))

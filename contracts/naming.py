@@ -17,12 +17,12 @@ ARTIFACT_ID_PATTERN = re.compile(r"^art_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8
 OBSERVATION_ID_PATTERN = re.compile(r"^obs_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
 MEMORY_ID_PATTERN = re.compile(r"^mem_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
 LOCATION_ID_PATTERN = re.compile(r"^loc_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
-ANCHOR_ID_PATTERN = re.compile(r"^anc_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
+ANCHOR_ID_PATTERN = re.compile(r"^anc_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_(?:[a-f0-9]{8}|[a-f0-9]{32})$")
 INSTANCE_ID_PATTERN = re.compile(r"^ins_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
 OBSERVATION_EVENT_ID_PATTERN = re.compile(r"^oev_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
 NAVIGATION_CANDIDATE_ID_PATTERN = re.compile(r"^navc_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
-SCENE_SPACE_ID_PATTERN = re.compile(r"^ssp_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
-NAVIGATION_TRAJECTORY_EVENT_ID_PATTERN = re.compile(r"^nte_[a-z0-9_]+_[a-f0-9]{12}$")
+SCENE_SPACE_ID_PATTERN = re.compile(r"^ssp_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_(?:[a-f0-9]{8}|[a-f0-9]{32})$")
+NAVIGATION_TRAJECTORY_EVENT_ID_PATTERN = re.compile(r"^nte_[a-z0-9_]+_(?:[a-f0-9]{12}|[a-f0-9]{32})$")
 
 
 def _ensure_match(value: str, pattern: re.Pattern[str], field_name: str) -> str:

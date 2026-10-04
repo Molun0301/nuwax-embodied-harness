@@ -23,7 +23,6 @@ from contracts.map_workspace import (
 from contracts.runtime_views import (
     LocalizationSession,
     LocalizationSessionStatus,
-    map_content_sha256,
 )
 from core import EventBus, StateNamespace, StateStore
 from core.errors import GatewayError
@@ -1711,13 +1710,8 @@ class MapWorkspaceService:
             snapshot = snapshot.model_copy(
                 update={
                     "occupancy_grid": raw_occupancy,
-                    "content_sha256": map_content_sha256(
-                        map_name=snapshot.map_name,
-                        frame_id=snapshot.frame_id,
-                        occupancy_grid=raw_occupancy,
-                        cost_map=snapshot.cost_map,
-                        semantic_map=snapshot.semantic_map,
-                    ),
+                    "source_epoch": json.dumps(["saved-physical-raw-v2", snapshot.source_epoch],
+                                               ensure_ascii=False, separators=(",", ":")),
                 },
                 deep=True,
             )
@@ -3156,6 +3150,7 @@ class MapWorkspaceService:
             **self._sanitize_map_metadata(runtime_metadata),
             "map_snapshot_kind": "offline_checkpoint",
             "source_kind": "map_asset_bundle",
+            "semantic_reference_identity": bundle.snapshot_identity,
             "asset_manifest_sha256": bundle.manifest_sha256,
             "checkpoint_ready": True,
             "geometry_ready": True,
@@ -3175,7 +3170,6 @@ class MapWorkspaceService:
             semantic_map=semantic_map,
             metadata=checkpoint_metadata,
             update_sequence_override=bundle_snapshot.update_sequence,
-            content_sha256=bundle_snapshot.content_sha256,
         )
 
     def _checkpoint_map_displayable(self, latest_map_snapshot) -> bool:
@@ -3277,7 +3271,6 @@ class MapWorkspaceService:
                     semantic_map=runtime_snapshot.semantic_map,
                     metadata=runtime_metadata,
                     update_sequence_override=runtime_snapshot.update_sequence,
-                    content_sha256=runtime_snapshot.content_sha256,
                 )
             self._localization_service.clear_latest_snapshot()
         except Exception as exc:

@@ -1,11 +1,10 @@
 """从持久区域的精确自由格归属派生连接口，不把邻近或未知空间作为连接。"""
 from __future__ import annotations
 
+import math
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
-import hashlib
-import json
-import math
 from typing import Any, Dict, List
 
 import cv2
@@ -14,11 +13,6 @@ import numpy as np
 from contracts.occupancy_cells import PackedOccupancyCells
 from core.errors import GatewayError
 from services.memory.room_segmentation import _local, _planar_origin, _world
-
-
-def graph_digest(value) -> str:
-    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
-                                     separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
 @dataclass
@@ -126,8 +120,9 @@ def build_scene_graph_geometry(snapshot, spaces, *, max_cells: int) -> SceneGrap
             mx, my = (start[0] + end[0]) / 2, (start[1] + end[1]) / 2
             x, y = _world(mx, my, origin, grid.resolution_m)
             region_ids = [ids[a - 1], ids[b - 1]]
-            identity = [region_ids, sorted([segments[i][0], segments[i][1]] for i in component)]
-            identifier = "passage_" + graph_digest(identity)[:24]
+            # A passage is an ephemeral handle owned by this geometry build.
+            # Reusing cached geometry retains it; a new build gets new handles.
+            identifier = "passage_" + uuid.uuid4().hex
             entrances = []
             for region_id, (row, col) in zip(region_ids, cells):
                 ex, ey = _world(col + .5, row + .5, origin, grid.resolution_m)

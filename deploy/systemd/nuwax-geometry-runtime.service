@@ -45,6 +45,8 @@ Environment=NUWAX_FORBIDDEN_ZONES_PATH=/var/lib/nuwax_robot_bridge/forbidden_zon
 Environment=NUWAX_GEOMETRY_SEQUENCE_STATE_PATH=/var/lib/nuwax_robot_bridge/geometry/sequence_state.json
 Environment=NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH=/var/lib/nuwax/geometry-runtime/exploration_ownership_journal.json
 Environment=NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready
+# Match the lazily activated person-follow owner; AUTOSTART alone is not demand.
+Environment=NUWAX_PERSON_FOLLOW_READY_FILE=/run/nuwax/person-follow/nuwax_person_follow.ready
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
 # Web 保存的 Geometry owner 选择后置覆盖基础配置，文件由共享组以只读方式提供。
 EnvironmentFile=-/var/lib/nuwax_robot_bridge/geometry-owner.env

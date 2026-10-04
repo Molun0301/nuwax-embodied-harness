@@ -93,13 +93,23 @@ class ModelProviderSpec:
 def resolve_text_embedding_provider_spec(model_name: str) -> ModelProviderSpec:
     normalized = str(model_name or "").strip()
     lowered = normalized.lower()
-    if not normalized or lowered.startswith("hashing"):
+    legacy_hashing = lowered.startswith("hashing")
+    if not normalized or lowered in {"lexical-only", "lexical_only", "disabled", "none", "off"} or legacy_hashing:
         return ModelProviderSpec(
             capability="text_embedding",
-            provider_kind="local",
-            provider_name="hashing",
-            model_name=normalized or "hashing-v1",
-            metadata={"capabilities": _capabilities(embedText=True)},
+            provider_kind="disabled",
+            provider_name="lexical_only",
+            model_name="lexical-only",
+            metadata={
+                "availability": "disabled",
+                "requested_model_name": normalized,
+                "resolved_model_name": "lexical-only",
+                "requested_provider_name": "hashing" if legacy_hashing else "lexical_only",
+                "resolved_provider_name": "lexical_only",
+                "fallback_used": legacy_hashing,
+                "fallback_reason": "legacy_hashing_removed" if legacy_hashing else "",
+                "capabilities": _capabilities(),
+            },
         )
     if _is_dashscope_multimodal_model(normalized):
         return ModelProviderSpec(

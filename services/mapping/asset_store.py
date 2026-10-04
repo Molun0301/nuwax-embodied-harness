@@ -23,7 +23,6 @@ from contracts.map_workspace import (
     MapGeoreferenceV1,
 )
 from contracts.naming import build_safe_dir_segment
-from contracts.runtime_views import map_content_sha256
 
 _BUNDLE_FILE_NAME = "bundle.json"
 _MANIFEST_FILE_NAME = "manifest.json"
@@ -1041,15 +1040,14 @@ class MapAssetBundleRepository:
             or snapshot_payload.get("version_id")
             or ""
         ).strip()
-        legacy_epoch_preimage = "%s\0%s\0%s" % (
-            map_name,
-            legacy_source_name,
-            legacy_snapshot_token,
+        legacy_source_epoch = snapshot_payload.get("source_epoch") or json.dumps(
+            ["legacy-map-snapshot-v2", map_name, legacy_source_name,
+             legacy_snapshot_token or source_dir.name], ensure_ascii=False, separators=(",", ":")
         )
         try:
             legacy_update_sequence = max(
                 1,
-                int(snapshot_payload.get("revision") or 1),
+                int(snapshot_payload.get("update_sequence") or snapshot_payload.get("revision") or 1),
             )
         except (TypeError, ValueError) as exc:
             raise MapAssetMigrationError(
@@ -1066,28 +1064,14 @@ class MapAssetBundleRepository:
         snapshot_payload.pop("source_snapshot_id", None)
         snapshot_payload["map_name"] = map_name
         snapshot_payload["source_name"] = legacy_source_name
-        snapshot_payload["source_epoch"] = "legacy:%s" % hashlib.sha256(
-            legacy_epoch_preimage.encode("utf-8")
-        ).hexdigest()
+        snapshot_payload["source_epoch"] = legacy_source_epoch
         snapshot_payload["update_sequence"] = legacy_update_sequence
         snapshot_payload["metadata"] = self._normalize_legacy_metadata(
             source_dir,
             snapshot_payload.get("metadata") or {},
         )
-        canonical_frame_id = snapshot_payload.get("frame_id")
-        if not canonical_frame_id:
-            for layer_key in ("occupancy_grid", "cost_map", "semantic_map"):
-                layer_payload = snapshot_payload.get(layer_key)
-                if isinstance(layer_payload, dict) and layer_payload.get("frame_id"):
-                    canonical_frame_id = layer_payload.get("frame_id")
-                    break
-        snapshot_payload["content_sha256"] = map_content_sha256(
-            map_name=map_name,
-            frame_id=canonical_frame_id,
-            occupancy_grid=snapshot_payload.get("occupancy_grid"),
-            cost_map=snapshot_payload.get("cost_map"),
-            semantic_map=snapshot_payload.get("semantic_map"),
-        )
+        snapshot_payload.pop("content_sha256", None)
+        snapshot_payload["schema_version"] = 2
         bundle_payload = {
             "map_name": map_name,
             "source_name": legacy_source_name,

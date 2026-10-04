@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, is_dataclass
-import hashlib
 import json
+from uuid import uuid4
 
 from contracts.runtime_views import DiagnosticItem, DiagnosticLevel, DiagnosticSnapshot, RobotStatusSnapshot
 from contracts.events import RuntimeEventCategory
@@ -35,6 +35,7 @@ class RobotStateService:
         self._diagnostic_history: Deque[DiagnosticSnapshot] = deque(maxlen=max(1, diagnostic_history_limit))
         self._latest_snapshot: Optional[RobotStatusSnapshot] = None
         self._last_web_state_signature: Optional[str] = None
+        self._web_state_source_epoch = uuid4().hex
         self._web_state_revision = 0
 
     def refresh(self) -> RobotStatusSnapshot:
@@ -114,14 +115,12 @@ class RobotStateService:
             return snapshot
         self._last_web_state_signature = web_state_signature
         self._web_state_revision += 1
-        content_hash = hashlib.sha256(web_state_signature.encode("utf-8")).hexdigest()
         web_state_metadata = {
             "robot_name": self._robot.manifest.robot_name,
             "mode": getattr(getattr(robot_state, "mode", None), "value", None),
             "diagnostic_count": len(diagnostics),
             "revision": self._web_state_revision,
-            "content_hash": content_hash,
-            "signature": content_hash,
+            "source_epoch": self._web_state_source_epoch,
             "change_policy": "web_semantic_fields",
         }
 
@@ -137,7 +136,7 @@ class RobotStateService:
                         "mode": robot_state.mode.value,
                         "diagnostic_count": len(diagnostics),
                         "revision": self._web_state_revision,
-                        "content_hash": content_hash,
+                        "source_epoch": self._web_state_source_epoch,
                     },
                 )
             )
@@ -147,7 +146,8 @@ class RobotStateService:
                 source="robot_state_service",
                 payload=snapshot,
                 frame_id=getattr(robot_state, "frame_id", None),
-                revision=str(self._web_state_revision),
+                # 旧控制台只读取信封 revision，也必须识别服务重启后的新生命周期。
+                revision=f"robot-state:{self._web_state_source_epoch}:{self._web_state_revision}",
                 status="available",
                 metadata=web_state_metadata,
             )

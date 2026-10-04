@@ -24,6 +24,7 @@ import numpy as np
 from adapters.sensors.go2_calibration import (
     GO2_CALIBRATION_PROFILE,
     Go2CalibrationProfile,
+    Go2CalibrationProfileOwner,
     go2_calibration_profile_from_config,
 )
 from adapters.sensors.go2_l2 import (
@@ -413,18 +414,24 @@ def _load_go2_official_sdk_modules(
 class Go2DirectDdsBridge:
     """Go2 官方 DDS 原始输入桥（直连 unitree_sdk2py，绕开 ROS2 中间层）。"""
 
-    def __init__(self, config: "Go2DataPlaneConfig", *, isolate_native_input: bool = False) -> None:
+    def __init__(self, config: "Go2DataPlaneConfig", *, isolate_native_input: bool = False,
+                 calibration_profile: Optional[Go2CalibrationProfile] = None) -> None:
         self.config = config
         self._isolate_native_input = isolate_native_input
         self._sensor_process = None
         self._sensor_process_status = {}
         self._sensor_process_failure = None
         # 原生定位两类样本共用创建时标定；设备自带模式不消费或验证定位覆盖。
-        self._calibration_profile = (
-            go2_calibration_profile_from_config(config.lio_body_from_sensor, config.lio_body_from_imu)
-            if config.lio_backend in {"fastlio2", "pointlio"}
-            else GO2_CALIBRATION_PROFILE
-        )
+        self._calibration_owner = None
+        if calibration_profile is not None:
+            # 子采集实例直接使用父拥有方已捕获的不可变标定，不重新生成身份。
+            self._calibration_profile = calibration_profile
+        elif config.lio_backend in {"fastlio2", "pointlio"}:
+            self._calibration_owner = Go2CalibrationProfileOwner()
+            self._calibration_profile = go2_calibration_profile_from_config(
+                config.lio_body_from_sensor, config.lio_body_from_imu, owner=self._calibration_owner)
+        else:
+            self._calibration_profile = GO2_CALIBRATION_PROFILE
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._lifecycle_generation = 0
@@ -911,6 +918,7 @@ class Go2DirectDdsBridge:
         if self._isolate_native_input and self.config.lio_backend in {"fastlio2", "pointlio"}:
             from drivers.go2.sensor_process import Go2SensorProcess
             worker = Go2SensorProcess(self.config,
+                calibration_profile=self._calibration_profile,
                 forward_samples=False,
                 on_sample=lambda sample: self._publish_sensor_sample(sample, generation),
                 on_snapshot=lambda snapshot: self._install_process_snapshot(snapshot, generation),

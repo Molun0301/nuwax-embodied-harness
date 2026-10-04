@@ -3,6 +3,8 @@ import { SemanticRegionLayer } from './semantic-regions3d.js?v=20260922-semantic
 import { SceneGraphLayer } from './scene-graph3d.js?v=20260922-scene-graph';
 import { OrbitControls } from './OrbitControls.js';
 import { PointCloudProcessor } from './pointcloud-processing.js?v=20260918-dense-pointcloud';
+import { IncrementalPointCloudConnection, mappingEpochFromMap } from './pointcloud-incremental.js?v=20261002-pages';
+import { IncrementalPointCloudLayer } from './pointcloud-pages.js?v=20261002-pages';
 import { DensePointCloudLayer } from './dense-pointcloud.js?v=20260918-dense-pointcloud';
 
 const COLORS = {
@@ -396,6 +398,11 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._controls = null;
     this._pointsMesh = null;
     this._denseCloud = null;
+    this._incrementalCloud = null;
+    this._incrementalConnection = null;
+    this._incrementalReady = false;
+    this._incrementalActive = false;
+    this._cloudPagesApplying = false;
     this._robotMesh = null;
     this._robotGeometryCenter = null;
     this._frontierGroup = null;
@@ -464,8 +471,131 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._assetCloudLoadingUrl = null;
   }
 
+  setMapContext(snapshot) {
+    this._incrementalConnection?.setMapEpoch(mappingEpochFromMap(snapshot));
+  }
+
+  _startIncrementalCloud() {
+    if (this._incrementalConnection || this._cloudDisposed) return;
+    this._incrementalConnection = new IncrementalPointCloudConnection({
+      onBatch: batch => this._acceptCloudPageBatch(batch),
+      onState: state => {
+        if (state === 'ready') {
+          this._incrementalReady = true;
+          window.dispatchEvent(new CustomEvent('stream:pointcloud_map.incremental-ready'));
+        }
+        window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', {detail: {pointcloudPageConnection: state}}));
+      },
+      onError: error => this._pointCloudComputeError(String(error?.message || error)),
+      onInvalidate: () => {
+        this._invalidatePointCloudWork(); this._cloudLoadToken++;
+        if (this._pointsMesh) this._pointsMesh.visible = false;
+        if (this._allPositions.length) this._allPositions = new Float32Array(0);
+        this._renderedPointCloudSourcePoints = 0;
+        this._pointCloudSourcePoints = 0;
+        this._lastCloudMapRevision = null;
+        this._cloudSourceKey = null;
+        this._incrementalCloud?.setVisible(false);
+        this._incrementalActive = false;
+        this._hasPointCloudSnapshot = false;
+        this._pointCloudMapWatermark = null;
+        this._pointCloudBounds = null;
+        this._displayedPointCount = 0;
+        this._denseCloud?.reset();
+        this._emitPointCount(); this._requestRender();
+      },
+    });
+    this._incrementalConnection.connect();
+  }
+
+  _acceptCloudPageBatch(batch) {
+    if (this._cloudDisposed) return;
+    if (batch.header.source === 'saved') {
+      // 保存资产为明确的不可变全快照来源；保留原有 LOD/楼层样式语义。
+      // 只有来源修订变化时组装一次，不进入实时 v3 增量路径。
+      const positions = new Float32Array(batch.header.point_count * 3);
+      for (const chunk of batch.chunks) positions.set(chunk.xyz, chunk.chunk_index * batch.header.chunk_size_points * 3);
+      this._incrementalActive = false;
+      this._incrementalCloud?.setVisible(false);
+      const header = batch.header;
+      const identity = {header, streamGeneration: BigInt(header.stream_generation),
+        revisionOrdinal: BigInt(header.revision_ordinal), sourceTimestampNs: BigInt(header.source_timestamp_ns)};
+      this._replaceCloudMapBuffer(positions, identity);
+      window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', {detail: {
+        pointcloudDecision: 'saved_snapshot', pointcloudSourceIncremental: false,
+        pointcloudSnapshotMaterializedBytes: positions.byteLength,
+      }}));
+      window.dispatchEvent(new CustomEvent('pointcloud3d:map-frame', {detail: {
+        source: 'saved', sourceTime: null,
+        frameKey: `${header.stream_generation}:${header.revision_ordinal}:${header.revision}`,
+        sourceKey: this._cloudSourceKey,
+      }}));
+      return;
+    }
+    if (!this._incrementalCloud) {
+      this._incrementalCloud = new IncrementalPointCloudLayer({config: this._processingConfig,
+        onChange: state => { if (!this._cloudPagesApplying) this._applyCloudPageState(state); }});
+      this._scene?.add(this._incrementalCloud.group);
+    }
+    this._cloudPagesApplying = true;
+    try {
+      this._incrementalCloud.setStyle(this._pointStyle);
+      this._incrementalCloud.setRobotPose(this._robotPose);
+      this._incrementalCloud.apply(batch);
+    } finally { this._cloudPagesApplying = false; }
+    const header = batch.header;
+    const previous = this._pointCloudMapWatermark?.header;
+    if (!previous || ['source', 'source_epoch', 'frame_id', 'stream_generation'].some(key => previous[key] !== header[key]) || header.point_count === 0) this._denseCloud?.reset();
+    this._invalidatePointCloudWork(); this._cloudLoadToken++;
+    this._assetCloudUrl = null;
+    this._incrementalActive = true;
+    this._cloudSourceKey = JSON.stringify([header.source, header.source_epoch, header.frame_id,
+      header.stream_generation, header.layout_generation]);
+    this._lastCloudMapRevision = header.revision;
+    this._pointCloudMapWatermark = {header, streamGeneration: BigInt(header.stream_generation),
+      revisionOrdinal: BigInt(header.revision_ordinal), sourceTimestampNs: BigInt(header.source_timestamp_ns)};
+    this._hasPointCloudSnapshot = true;
+    this._isLiveCloudMapSnapshot = header.source === 'live';
+    this._pointCloudSourcePoints = header.point_count;
+    // 旧完整缓冲只属于明确的旧协议/资产路径，新页面不重新拼装它。
+    if (this._allPositions.length) this._allPositions = new Float32Array(0);
+    if (this._pointsMesh) this._pointsMesh.visible = false;
+    this._incrementalCloud.setVisible(this._visible && this._pointStyle !== 'full');
+    this._applyCloudPageState();
+    window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', {detail: {
+      pointcloudDecision: 'accepted_pages', pointcloudAcceptedPoints: header.point_count,
+      pointcloudAcceptedRevision: header.revision, pointcloudAcceptedGeneration: header.stream_generation,
+      pointcloudAcceptedSourceEpoch: header.source_epoch, pointcloudSourceIncremental: header.source_incremental,
+      pointcloudChangedPages: header.changed_chunk_count,
+    }}));
+    window.dispatchEvent(new CustomEvent('pointcloud3d:map-frame', {detail: {
+      source: header.source, sourceTime: Number(BigInt(header.source_timestamp_ns) / 1000000n),
+      frameKey: `${header.stream_generation}:${header.revision_ordinal}:${header.revision}`,
+      sourceKey: this._cloudSourceKey,
+    }}));
+  }
+
+  _applyCloudPageState(state = null) {
+    if (!this._incrementalActive || !this._incrementalCloud || this._pointStyle === 'full') return;
+    const layer = this._incrementalCloud;
+    this._displayedPointCount = layer.displayedPointCount;
+    this._renderedPointCloudSourcePoints = layer.pointCount;
+    this._pointCloudBounds = layer.bounds?.clone() || null;
+    this._activeFloorZ = layer.floorContext?.floorZ ?? null;
+    this._renderedCloudMapRevision = this._lastCloudMapRevision;
+    this._renderedCloudSourceKey = this._cloudSourceKey;
+    this._emitPointCount();
+    if (!this._hasFramedPointCloud && !this._hasUserCameraInput && this._cameraMode === 'free') this._framePointCloud();
+    if (this._forbiddenZones.length) this._rebuildForbiddenZones();
+    window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', {detail: {
+      pointcloudComputeMode: 'incremental_pages', pointcloudPageStats: JSON.stringify(layer.stats),
+    }}));
+    this._requestRender();
+  }
+
   init(container) {
     this._cloudDisposed = false;
+    this._startIncrementalCloud();
     this._cloudWorkerFailed = false;
     if (this._initialized) {
       this.resize();
@@ -598,7 +728,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
   }
 
   pickNavigationPoint(clientX, clientY) {
-    const mesh = this._pointStyle === 'full' ? this._denseCloud?.group : this._pointsMesh;
+    const mesh = this._pointStyle === 'full' ? this._denseCloud?.group
+      : this._incrementalActive ? this._incrementalCloud?.group : this._pointsMesh;
     const identity = this._pointCloudMapWatermark;
     if (!this._visible || !mesh?.visible || !identity || this._renderedCloudSourceKey !== this._cloudSourceKey
         || (this._pointStyle === 'full' && !this._denseCloud?.metadata)) return null;
@@ -613,6 +744,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     let selected = null;
     let nearestPixels = Infinity;
     for (const hit of ray.intersectObject(mesh, true)) {
+      if (this._incrementalActive && this._pointStyle !== 'full' && !this._incrementalCloud.filterIntersection(hit)) continue;
       // 点云交点是射线上的近似位置；目标必须取命中索引对应的真实地图点。
       const position = hit.object.geometry.getAttribute('position');
       const point = new THREE.Vector3().fromBufferAttribute(position, hit.index).applyMatrix4(hit.object.matrixWorld);
@@ -770,6 +902,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   setVisible(visible) {
     this._visible = Boolean(visible);
+    this._incrementalCloud?.setVisible(this._visible && this._pointStyle !== 'full' && this._incrementalActive);
     if (!this._visible) {
       this._denseCloud?.stop();
       this._lastPoseDrawnSource = null;
@@ -946,7 +1079,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   _emitPointCount() {
     this._pointCloudDrawDiagnosticPending = true;
-    const bufferedPoints = Math.floor(this._allPositions.length / 3);
+    const bufferedPoints = this._incrementalActive ? this._incrementalCloud?.pointCount || 0 : Math.floor(this._allPositions.length / 3);
     const sourcePoints = this._renderedPointCloudSourcePoints ?? (Number.isFinite(this._pointCloudSourcePoints)
       ? Math.max(bufferedPoints, Math.floor(this._pointCloudSourcePoints))
       : bufferedPoints);
@@ -1145,6 +1278,16 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   _rebuildPointCloud() {
     if (this._cloudDisposed) return;
+    if (this._incrementalCloud) {
+      if (this._scene && this._incrementalCloud.group.parent !== this._scene) this._scene.add(this._incrementalCloud.group);
+      this._incrementalCloud.setVisible(this._visible && this._pointStyle !== 'full' && this._incrementalActive);
+    }
+    if (this._incrementalActive && this._pointStyle !== 'full') {
+      this._incrementalCloud.setStyle(this._pointStyle);
+      this._incrementalCloud.setRobotPose(this._robotPose);
+      this._applyCloudPageState();
+      return;
+    }
     if (this._pointStyle === 'full') {
       this._invalidatePointCloudWork();
       if (this._pointsMesh) this._pointsMesh.visible = false;
@@ -1387,6 +1530,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
       : new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), pose.yaw);
     const previousFollowTarget = this._lastFollowTarget?.clone() || null;
     this._robotPose = pose;
+    this._incrementalCloud?.setRobotPose(pose);
 
     const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
     if (preset.floorFilter && this._floorLevelSource === this._allPositions) {
@@ -1421,6 +1565,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   clearRobotPose() {
     this._robotPose = null;
+    this._incrementalCloud?.setRobotPose(null);
     this._robotPoseSource = null;
     this._lastPoseDrawnSource = null;
     this._lastFollowTarget = null;
@@ -2052,6 +2197,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     };
     this._displayConfig = POINTCLOUD3D_CONFIG;
     this._processingConfig = { stylePresets: POINT_STYLE_PRESETS, heightColorStops: HEIGHT_COLOR_STOPS, floorColors: FLOOR_COLORS };
+    this._incrementalCloud?.configure(this._processingConfig);
     // 旧工作线程结果不能覆盖新样式，保留点云和相机，只重新计算显示数据。
     this._invalidatePointCloudWork();
     this._cloudContextKey = null;
@@ -2086,6 +2232,9 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._assetCloudSourceKey = null;
     this._assetCloudLoadingUrl = null;
     this._cloudDisposed = true;
+    this._incrementalConnection?.dispose(); this._incrementalConnection = null;
+    this._incrementalCloud?.dispose(); this._incrementalCloud = null;
+    this._incrementalActive = false;
     this._denseCloud?.dispose();
     this._denseCloud = null;
     this.previewNavigationPoint(null);
@@ -2169,6 +2318,14 @@ class PointCloud3DViewer extends PointCloudProcessor {
 }
 
 window.pointcloud3d = new PointCloud3DViewer();
+window.pointcloud3d._startIncrementalCloud();
+
+window.addEventListener('stream:map.frame', event => {
+  window.pointcloud3d?.setMapContext(event.detail);
+});
+window.addEventListener('pagehide', event => {
+  if (!event.persisted) window.pointcloud3d?._incrementalConnection?.dispose();
+});
 
 function pointFromValue(value) {
   const pose = value?.target_pose ?? value?.pose ?? value?.geometry?.centroid ?? value?.centroid ?? value;
@@ -2424,6 +2581,7 @@ window.addEventListener('stream:pointcloud_map.meta', (e) => {
 // 统一实时/保存点云 binary 信封接收
 window.addEventListener('stream:pointcloud_map.binary', (e) => {
   if (!window.pointcloud3d || window.pointcloud3d._cloudDisposed) return;
+  if (window.pointcloud3d._incrementalReady) return;
   const buffer = e.detail?.buffer;
   let envelope;
   try {
@@ -2474,7 +2632,7 @@ window.addEventListener('stream:pointcloud_map.binary', (e) => {
 });
 
 window.addEventListener('stream:pointcloud_map.reset', () => {
-  if (!window.pointcloud3d) return;
+  if (!window.pointcloud3d || window.pointcloud3d._incrementalReady) return;
   window.pointcloud3d._invalidatePointCloudWork();
   window.pointcloud3d._cloudLoadToken += 1;
   window.pointcloud3d._pointCloudMapWatermark = null;

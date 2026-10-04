@@ -122,7 +122,7 @@ class GatewayMappingSession:
         config.runtime_data.map_active_restore_on_start = False
         config.runtime_data.map_catalog_root = str(working / "maps")
         config.runtime_data.memory_db_path = str(working / "memory.db")
-        config.runtime_data.memory_embedding_model = "hashing-v1"
+        config.runtime_data.memory_embedding_model = "lexical-only"
         config.runtime_data.memory_embedding_dimension = 128
         config.runtime_data.memory_image_embedding_model = "disabled"
         config.gateway.artifact_dir = str(working / "artifacts")

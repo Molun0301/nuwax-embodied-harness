@@ -2,12 +2,12 @@ use ahash::AHashSet as HashSet;
 use std::io::{Error, ErrorKind};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::atomic::{fence, Ordering};
+use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use memmap2::MmapMut;
 use nalgebra::Point3;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::mapping_commit::{CloudCommitReceipt, OccupancyCommitReceipt};
 use crate::dense_cloud::{DenseCloud, DenseCloudReaders, DenseSnapshot};
@@ -24,9 +24,9 @@ use dynamic_cloud::DynamicCloudFilter;
 mod fine_cloud;
 use fine_cloud::FineCloud;
 
-#[path = "ordered_voxel_snapshot.rs"]
-mod ordered_voxel_snapshot;
-use ordered_voxel_snapshot::OrderedVoxelSnapshot;
+#[path = "paged_voxel_snapshot.rs"]
+mod paged_voxel_snapshot;
+use paged_voxel_snapshot::{PagedVoxelSnapshot, CHUNK_POINTS};
 
 pub const VOXEL_SIZE: f32 = 0.05;
 
@@ -54,12 +54,15 @@ pub const POINTCLOUD_MAX_POINT_STEP_BYTES: u32 = 256;
 // ─── 累积地图双缓冲共享内存写入器 ───
 
 const CM_SHM_MAGIC: u64 = 0x4E55_5741_584D_4150; // "NUWAXMAP"
-pub(crate) const CM_SHM_VERSION: u32 = 2;
+pub(crate) const CM_SHM_VERSION: u32 = 3;
 /// Tightly packed little-endian XYZ, three f32 values per point.
 pub(crate) const CM_PAYLOAD_SCHEMA_VERSION: u32 = 1;
-const CM_HEADER_SIZE: usize = 64;
+const CM_HEADER_SIZE: usize = 512;
 pub(crate) const CM_SINGLE_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB per buffer
-pub(crate) const CM_TOTAL_SIZE: usize = CM_HEADER_SIZE + CM_SINGLE_BUFFER_SIZE * 2;
+const CM_CAPACITY_CHUNKS: usize = CM_MAX_POINTS.div_ceil(CHUNK_POINTS);
+const CM_PAGE_TABLE_OFFSET: usize = CM_HEADER_SIZE;
+const CM_PAYLOAD_OFFSET: usize = (CM_HEADER_SIZE + CM_CAPACITY_CHUNKS * 8).div_ceil(4096) * 4096;
+pub(crate) const CM_TOTAL_SIZE: usize = CM_PAYLOAD_OFFSET + CM_MAX_POINTS * CM_POINT_SIZE_BYTES;
 pub(crate) const CM_POINT_SIZE_BYTES: usize = 12;
 const CM_MAX_POINTS: usize = CM_SINGLE_BUFFER_SIZE / CM_POINT_SIZE_BYTES;
 const MAX_VOXEL_SIZE: f32 = 1_048_576.0;
@@ -131,15 +134,19 @@ pub(crate) fn unlink_product_owned_mmap(
     }
 }
 
-const CM_ACTIVE_BUFFER_OFFSET: usize = 12;
-const CM_GLOBAL_POINT_COUNT_OFFSET: usize = 16;
-const CM_TIMESTAMP_NS_OFFSET: usize = 20;
-const CM_GLOBAL_REVISION_OFFSET: usize = 28;
-const CM_VOXEL_SIZE_OFFSET: usize = 36;
-const CM_SLOT0_REVISION_OFFSET: usize = 40;
-const CM_SLOT0_POINT_COUNT_OFFSET: usize = 48;
-const CM_SLOT1_REVISION_OFFSET: usize = 52;
-const CM_SLOT1_POINT_COUNT_OFFSET: usize = 60;
+const CM_SEQUENCE_OFFSET: usize = 16;
+const CM_GLOBAL_REVISION_OFFSET: usize = 24;
+const CM_TIMESTAMP_NS_OFFSET: usize = 32;
+const CM_LAYOUT_GENERATION_OFFSET: usize = 40;
+const CM_PRODUCER_EPOCH_OFFSET: usize = 48;
+const CM_GLOBAL_POINT_COUNT_OFFSET: usize = 64;
+const CM_VOXEL_SIZE_OFFSET: usize = 80;
+
+fn sequence_atomic(mapping: &[u8]) -> &AtomicU64 {
+    // mmap bases are page-aligned and this offset is a multiple of eight.
+    // The only access to this word after initialization is atomic.
+    unsafe { &*(mapping.as_ptr().add(CM_SEQUENCE_OFFSET).cast::<AtomicU64>()) }
+}
 
 pub(crate) fn cloud_map_shm_path() -> std::path::PathBuf {
     std::path::PathBuf::from(
@@ -149,7 +156,7 @@ pub(crate) fn cloud_map_shm_path() -> std::path::PathBuf {
 }
 
 pub(crate) fn cloud_map_active_slot(revision: u64) -> Option<u32> {
-    revision.checked_sub(1).map(|value| (value % 2) as u32)
+    revision.checked_sub(1).map(|_| 0)
 }
 
 pub struct CloudMapShmWriter {
@@ -161,8 +168,14 @@ pub struct CloudMapShmWriter {
     revision: u64,
     voxel_size: f32,
     session_generation: u64,
+    producer_epoch: [u8; 16],
+    layout_generation: u64,
+    publication_sequence: u64,
+    published_pages: Vec<Arc<[u8]>>,
+    published_dirty_pages: Vec<usize>,
+    publication_receipt: Option<OccupancyCommitReceipt>,
     voxels: VoxelIndex,
-    ordered_voxels: OrderedVoxelSnapshot,
+    ordered_voxels: PagedVoxelSnapshot,
     dynamic_filter: DynamicCloudFilter,
     fine_cloud: Option<FineCloud>,
     committed_fine_cloud: Option<Arc<nuwax_map_chunks::SealedMap>>,
@@ -263,17 +276,28 @@ impl TypedCloudPublishState {
     }
 }
 
+/// Content-free producer-owned identity of one committed map.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CommittedCloudMapMetadata {
+    pub revision: u64,
+    pub point_count: u32,
+    pub voxel_size: f32,
+    pub session_generation: u64,
+    pub producer_epoch: [u8; 16],
+    pub layout_generation: u64,
+}
+
 /// One successfully committed cumulative cloud-map revision and the exact
 /// canonical map-frame voxel snapshot available to typed transport sinks.
 #[derive(Clone)]
 pub(crate) struct CommittedCloudMapSnapshot<Payload = Vec<u8>> {
+    pub producer_epoch: [u8; 16],
+    pub layout_generation: u64,
     pub revision: u64,
     pub point_count: u32,
     pub voxel_size: f32,
     pub session_generation: u64,
     pub xyz_f32_le: Payload,
-    /// Exact SHA-256 identity of the packed XYZ payload.
-    pub xyz_sha256: [u8; 32],
 }
 
 /// 私有重建得到的完整累积状态，包含尚未达到删除门限的动态反证。
@@ -281,7 +305,7 @@ pub(crate) struct PreparedCloudAccumulator {
     voxels: VoxelIndex,
     voxel_size: f32,
     dynamic_filter: DynamicCloudFilter,
-    ordered_voxels: OrderedVoxelSnapshot,
+    ordered_voxels: PagedVoxelSnapshot,
     fine_cloud: Option<FineCloud>,
     dense_cloud: Option<DenseCloud>,
     dense_error: Option<String>,
@@ -306,7 +330,7 @@ pub(crate) fn prepare_fine_cloud_archive(file: std::fs::File, session: &str, gen
 }
 
 pub(crate) struct CorrelatedCloudMapCommit {
-    pub(crate) snapshot: CommittedCloudMapSnapshot,
+    pub(crate) snapshot: CommittedCloudMapMetadata,
     pub(crate) receipt: CloudCommitReceipt,
 }
 
@@ -416,24 +440,22 @@ pub(crate) fn decode_checkpoint_sha256(value: &str) -> Result<[u8; 32], String> 
 
 impl CloudMapShmWriter {
     pub fn new(shm_path: &std::path::Path) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(shm_path)?;
-        let shm_identity = capture_product_owned_mmap(shm_path, &file)?;
-        file.set_len(CM_TOTAL_SIZE as u64)?;
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-        info!(
-            "累积地图双缓冲 mmap 已创建: {:?} ({} bytes)",
-            shm_path, CM_TOTAL_SIZE
-        );
-        Ok(Self::from_mapping(
-            mmap,
-            shm_path.to_path_buf(),
-            Some(shm_identity),
-        ))
+        // Publish a new inode atomically: never truncate a file still mapped by
+        // a reader. The independent producer UUID also fences same-inode ABA.
+        let temporary = shm_path.with_file_name(format!(".{}.{}",
+            shm_path.file_name().unwrap_or_default().to_string_lossy(), uuid::Uuid::new_v4()));
+        let file = std::fs::OpenOptions::new().read(true).write(true)
+            .create_new(true).open(&temporary)?;
+        let prepared = (|| {
+            file.set_len(CM_TOTAL_SIZE as u64)?;
+            let mmap = unsafe { MmapMut::map_mut(&file)? };
+            let mut writer = Self::from_mapping(mmap, shm_path.to_path_buf(), None);
+            std::fs::rename(&temporary, shm_path)?;
+            writer.shm_identity = Some(capture_product_owned_mmap(shm_path, &file)?);
+            Ok(writer)
+        })();
+        if prepared.is_err() { let _ = std::fs::remove_file(&temporary); }
+        prepared
     }
 
     /// 私有重建不对外发布，使用匿名内存，避免每次纠偏创建和删除临时映射文件。
@@ -450,9 +472,18 @@ impl CloudMapShmWriter {
         shm_path: std::path::PathBuf,
         shm_identity: Option<ProductOwnedMmapIdentity>,
     ) -> Self {
+        let producer_epoch = *uuid::Uuid::new_v4().as_bytes();
+        mmap[..CM_HEADER_SIZE].fill(0);
         mmap[0..8].copy_from_slice(&CM_SHM_MAGIC.to_le_bytes());
         mmap[8..12].copy_from_slice(&CM_SHM_VERSION.to_le_bytes());
-        mmap[12..CM_HEADER_SIZE].fill(0);
+        mmap[12..16].copy_from_slice(&(CM_HEADER_SIZE as u32).to_le_bytes());
+        mmap[CM_PRODUCER_EPOCH_OFFSET..CM_PRODUCER_EPOCH_OFFSET + 16].copy_from_slice(&producer_epoch);
+        mmap[68..72].copy_from_slice(&(CM_MAX_POINTS as u32).to_le_bytes());
+        mmap[72..76].copy_from_slice(&(CHUNK_POINTS as u32).to_le_bytes());
+        mmap[76..80].copy_from_slice(&(CM_CAPACITY_CHUNKS as u32).to_le_bytes());
+        mmap[96..104].copy_from_slice(&(CM_PAGE_TABLE_OFFSET as u64).to_le_bytes());
+        mmap[104..112].copy_from_slice(&(CM_PAYLOAD_OFFSET as u64).to_le_bytes());
+        mmap[112..120].copy_from_slice(&(CM_TOTAL_SIZE as u64).to_le_bytes());
         Self {
             mmap,
             shm_path,
@@ -460,8 +491,14 @@ impl CloudMapShmWriter {
             revision: 0,
             voxel_size: VOXEL_SIZE,
             session_generation: 0,
+            producer_epoch,
+            layout_generation: 1,
+            publication_sequence: 0,
+            published_pages: Vec::new(),
+            published_dirty_pages: Vec::new(),
+            publication_receipt: None,
             voxels: VoxelIndex::new(),
-            ordered_voxels: OrderedVoxelSnapshot::default(),
+            ordered_voxels: PagedVoxelSnapshot::default(),
             dynamic_filter: DynamicCloudFilter::default(),
             #[cfg(test)]
             last_stage_ms: [0.0; 3],
@@ -647,11 +684,12 @@ impl CloudMapShmWriter {
         self.validate_occupancy_receipt(occupancy_receipt)?;
         let fine = if occupancy_receipt.source_timestamp_ns == 0 { None }
             else { self.fine_cloud.as_mut().map(|fine| fine.seal(occupancy_receipt.source_timestamp_ns)).transpose()? };
+        self.publication_receipt = Some(occupancy_receipt.clone());
         if self.commit_accumulated().is_none() {
             return Ok(None);
         }
         let snapshot = self
-            .committed_snapshot()
+            .committed_metadata()
             .ok_or_else(|| "committed cloud-map snapshot is inconsistent".to_owned())?;
         let receipt = CloudCommitReceipt {
             commit_id: occupancy_receipt.commit_id,
@@ -704,6 +742,11 @@ impl CloudMapShmWriter {
         work.replace_accumulator(self.take_prepared_accumulator());
         work.revision = self.revision;
         work.session_generation = self.session_generation;
+        work.producer_epoch = self.producer_epoch;
+        work.layout_generation = self.layout_generation;
+        work.publication_sequence = self.publication_sequence;
+        work.published_pages = self.published_pages.clone();
+        work.publication_receipt = self.publication_receipt.clone();
         work.max_points = self.max_points;
         work.last_occupancy_receipt = self.last_occupancy_receipt.clone();
         work.last_cloud_receipt = self.last_cloud_receipt.clone();
@@ -726,24 +769,18 @@ impl CloudMapShmWriter {
                 return Err(format!("point-cloud preparation revision mismatch: writer={} prepared={}",
                     self.revision, work.revision));
             }
-            let slot = cloud_map_active_slot(work.revision).unwrap() as usize;
-            let (revision_offset, count_offset) = slot_metadata_offsets(slot).unwrap();
-            let count = u32::from_le_bytes(work.mmap[count_offset..count_offset + 4].try_into().unwrap()) as usize;
-            let start = CM_HEADER_SIZE + slot * CM_SINGLE_BUFFER_SIZE;
-            let end = start + count * CM_POINT_SIZE_BYTES;
-            self.mmap[revision_offset..revision_offset + 8].fill(0);
-            fence(Ordering::SeqCst);
-            self.mmap[start..end].copy_from_slice(&work.mmap[start..end]);
-            self.mmap[count_offset..count_offset + 4].copy_from_slice(&work.mmap[count_offset..count_offset + 4]);
-            fence(Ordering::Release);
-            self.mmap[revision_offset..revision_offset + 8].copy_from_slice(&work.revision.to_le_bytes());
-            // 全局修订最后发布，不能让读者把旧身份与新字节配对。
-            self.mmap[CM_ACTIVE_BUFFER_OFFSET..CM_GLOBAL_REVISION_OFFSET]
-                .copy_from_slice(&work.mmap[CM_ACTIVE_BUFFER_OFFSET..CM_GLOBAL_REVISION_OFFSET]);
-            self.mmap[CM_GLOBAL_REVISION_OFFSET + 8..CM_SLOT0_REVISION_OFFSET]
-                .copy_from_slice(&work.mmap[CM_GLOBAL_REVISION_OFFSET + 8..CM_SLOT0_REVISION_OFFSET]);
-            fence(Ordering::Release);
-            self.mmap[CM_GLOBAL_REVISION_OFFSET..CM_GLOBAL_REVISION_OFFSET + 8].copy_from_slice(&work.revision.to_le_bytes());
+            // Carry immutable current pages across private preparation. Only
+            // pages written by this accepted work item reach public SHM.
+            self.producer_epoch = work.producer_epoch;
+            self.layout_generation = work.layout_generation;
+            self.voxel_size = work.voxel_size;
+            self.published_pages = std::mem::take(&mut work.published_pages);
+            self.published_dirty_pages = std::mem::take(&mut work.published_dirty_pages);
+            self.publication_receipt = work.publication_receipt.clone();
+            let count = work.voxels.len() as u32;
+            let timestamp = u64::from_le_bytes(work.mmap[CM_TIMESTAMP_NS_OFFSET..CM_TIMESTAMP_NS_OFFSET + 8].try_into().unwrap());
+            self.write_paged_publication(work.revision, count, timestamp)
+                .ok_or("cloud-map publication sequence exhausted")?;
             self.revision = work.revision;
             self.committed_snapshot_cache = std::mem::take(&mut work.committed_snapshot_cache);
         }
@@ -768,96 +805,53 @@ impl CloudMapShmWriter {
         self.dense_history_missing = prepared.dense_history_missing;
     }
 
-    /// 导出接口需要独立字节数组；实时校验使用共享快照，避免重复复制与摘要。
+    pub(crate) fn committed_metadata(&self) -> Option<CommittedCloudMapMetadata> {
+        if self.revision == 0 || self.session_generation == 0 { return None; }
+        let sequence = sequence_atomic(&self.mmap).load(Ordering::Acquire);
+        if sequence & 1 != 0 { return None; }
+        let revision = u64::from_le_bytes(self.mmap[CM_GLOBAL_REVISION_OFFSET..CM_GLOBAL_REVISION_OFFSET + 8].try_into().ok()?);
+        let point_count = u32::from_le_bytes(self.mmap[CM_GLOBAL_POINT_COUNT_OFFSET..CM_GLOBAL_POINT_COUNT_OFFSET + 4].try_into().ok()?);
+        let layout = u64::from_le_bytes(self.mmap[CM_LAYOUT_GENERATION_OFFSET..CM_LAYOUT_GENERATION_OFFSET + 8].try_into().ok()?);
+        if revision != self.revision || layout != self.layout_generation
+            || self.mmap[CM_PRODUCER_EPOCH_OFFSET..CM_PRODUCER_EPOCH_OFFSET + 16] != self.producer_epoch
+            || sequence_atomic(&self.mmap).load(Ordering::Acquire) != sequence { return None; }
+        let voxel_size = f32::from_le_bytes(self.mmap[CM_VOXEL_SIZE_OFFSET..CM_VOXEL_SIZE_OFFSET + 4].try_into().ok()?);
+        let session_generation = u64::from_le_bytes(self.mmap[88..96].try_into().ok()?);
+        Some(CommittedCloudMapMetadata { revision, point_count, voxel_size,
+            session_generation, producer_epoch: self.producer_epoch,
+            layout_generation: self.layout_generation })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_snapshot_materialized(&self) -> bool {
+        self.committed_snapshot_cache.get().is_some()
+    }
+
+    /// Explicit full export only. Ordinary commits and publication guards use
+    /// committed_metadata; unchanged page bytes remain shared between commits.
     pub(crate) fn committed_snapshot(&self) -> Option<CommittedCloudMapSnapshot> {
         let snapshot = self.shared_committed_snapshot()?;
         Some(CommittedCloudMapSnapshot {
-            revision: snapshot.revision,
-            point_count: snapshot.point_count,
-            voxel_size: snapshot.voxel_size,
-            session_generation: snapshot.session_generation,
+            producer_epoch: snapshot.producer_epoch, layout_generation: snapshot.layout_generation,
+            revision: snapshot.revision, point_count: snapshot.point_count,
+            voxel_size: snapshot.voxel_size, session_generation: snapshot.session_generation,
             xyz_f32_le: snapshot.xyz_f32_le.to_vec(),
-            xyz_sha256: snapshot.xyz_sha256,
         })
     }
 
-    /// 复用当前已提交修订的不可变载荷；仍逐次核对共享内存槽位元数据。
     pub(crate) fn shared_committed_snapshot(&self) -> Option<CommittedCloudMapSnapshot<Arc<[u8]>>> {
-        if self.revision == 0 || self.session_generation == 0 {
-            return None;
-        }
-        let active_buf = u32::from_le_bytes(
-            self.mmap[CM_ACTIVE_BUFFER_OFFSET..CM_ACTIVE_BUFFER_OFFSET + 4]
-                .try_into()
-                .ok()?,
-        );
-        if Some(active_buf) != cloud_map_active_slot(self.revision) {
-            return None;
-        }
-        let active_buf = usize::try_from(active_buf).ok()?;
-        let (slot_revision_offset, slot_point_count_offset) = slot_metadata_offsets(active_buf)?;
-        let global_revision = u64::from_le_bytes(
-            self.mmap[CM_GLOBAL_REVISION_OFFSET..CM_GLOBAL_REVISION_OFFSET + 8]
-                .try_into()
-                .ok()?,
-        );
-        let slot_revision = u64::from_le_bytes(
-            self.mmap[slot_revision_offset..slot_revision_offset + 8]
-                .try_into()
-                .ok()?,
-        );
-        if global_revision != self.revision || slot_revision != self.revision {
-            return None;
-        }
-        let point_count = u32::from_le_bytes(
-            self.mmap[slot_point_count_offset..slot_point_count_offset + 4]
-                .try_into()
-                .ok()?,
-        );
-        let global_point_count = u32::from_le_bytes(
-            self.mmap[CM_GLOBAL_POINT_COUNT_OFFSET..CM_GLOBAL_POINT_COUNT_OFFSET + 4]
-                .try_into()
-                .ok()?,
-        );
-        if global_point_count != point_count {
-            return None;
-        }
-        let voxel_size = f32::from_le_bytes(
-            self.mmap[CM_VOXEL_SIZE_OFFSET..CM_VOXEL_SIZE_OFFSET + 4]
-                .try_into()
-                .ok()?,
-        );
-        if voxel_size.to_bits() != self.voxel_size.to_bits() {
-            return None;
-        }
-        let data_size = usize::try_from(point_count)
-            .ok()?
-            .checked_mul(CM_POINT_SIZE_BYTES)?;
-        if data_size > CM_SINGLE_BUFFER_SIZE {
-            return None;
-        }
-        let start = CM_HEADER_SIZE + active_buf * CM_SINGLE_BUFFER_SIZE;
-        let end = start.checked_add(data_size)?;
-        let payload = self.mmap.get(start..end)?;
+        let metadata = self.committed_metadata()?;
         let snapshot = self.committed_snapshot_cache.get_or_init(|| {
-            let xyz_f32_le: Arc<[u8]> = payload.into();
-            let xyz_sha256 = crate::map_checksum::sha256_bytes(&xyz_f32_le);
+            let mut bytes = Vec::with_capacity(metadata.point_count as usize * CM_POINT_SIZE_BYTES);
+            for page in &self.published_pages { bytes.extend_from_slice(page); }
+            let xyz_f32_le: Arc<[u8]> = bytes.into();
             CommittedCloudMapSnapshot {
-                revision: self.revision,
-                point_count,
-                voxel_size,
-                session_generation: self.session_generation,
+                producer_epoch: metadata.producer_epoch, layout_generation: metadata.layout_generation,
+                revision: metadata.revision, point_count: metadata.point_count,
+                voxel_size: metadata.voxel_size, session_generation: metadata.session_generation,
                 xyz_f32_le,
-                xyz_sha256,
             }
         });
-        if snapshot.revision != self.revision
-            || snapshot.session_generation != self.session_generation
-            || snapshot.point_count != point_count
-            || snapshot.voxel_size.to_bits() != voxel_size.to_bits()
-        {
-            return None;
-        }
         Some(snapshot.clone())
     }
 
@@ -929,6 +923,7 @@ impl CloudMapShmWriter {
         self.voxels = prepared.voxels;
         self.dynamic_filter = prepared.dynamic_filter;
         self.ordered_voxels = prepared.ordered_voxels;
+        self.ordered_voxels.invalidate();
         self.fine_cloud = prepared.fine_cloud;
         self.dense_cloud = prepared.dense_cloud;
         self.dense_error = prepared.dense_error;
@@ -1002,79 +997,79 @@ impl CloudMapShmWriter {
     }
 
     fn publish_snapshot(&mut self, allow_empty: bool) -> Option<(u64, u32, f32)> {
-        if self.session_generation == 0 || (!allow_empty && self.voxels.is_empty()) {
-            return None;
-        }
+        if self.session_generation == 0 || (!allow_empty && self.voxels.is_empty()) { return None; }
         let point_count = self.voxels.len();
-        let data_size = point_count.checked_mul(CM_POINT_SIZE_BYTES)?;
-        if point_count > self.max_points || data_size > CM_SINGLE_BUFFER_SIZE {
-            warn!(
-                "cloud_map voxel snapshot exceeds SHM capacity: points={} bytes={} max_points={} max_bytes={}",
-                point_count,
-                data_size,
-                self.max_points,
-                CM_SINGLE_BUFFER_SIZE
-            );
-            return None;
-        }
-        let point_count = u32::try_from(point_count).ok()?;
+        if point_count > self.max_points || point_count > CM_MAX_POINTS { return None; }
         let revision = self.revision.checked_add(1)?;
-        let active_buf = usize::try_from(cloud_map_active_slot(revision)?).ok()?;
-        let buf_offset = CM_HEADER_SIZE + active_buf * CM_SINGLE_BUFFER_SIZE;
-        let (slot_revision_offset, slot_point_count_offset) = slot_metadata_offsets(active_buf)?;
-
-        // Invalidate the selected slot before overwriting either its data or count.
-        // Readers only accept a slot whose revision matches the final global revision.
-        self.mmap[slot_revision_offset..slot_revision_offset + 8]
-            .copy_from_slice(&0_u64.to_le_bytes());
-        self.mmap[slot_point_count_offset..slot_point_count_offset + 4]
-            .copy_from_slice(&0_u32.to_le_bytes());
-        // The invalid marker must become globally ordered before any payload
-        // bytes in this slot are overwritten by the new snapshot.
-        fence(Ordering::SeqCst);
-        let keys = self.ordered_voxels.ordered(&self.voxels);
-        for (index, &key) in keys.iter().enumerate() {
-            let point = voxel_center_f32(key, self.voxel_size);
-            let offset = buf_offset + index * CM_POINT_SIZE_BYTES;
-            self.mmap[offset..offset + 4].copy_from_slice(&point[0].to_le_bytes());
-            self.mmap[offset + 4..offset + 8].copy_from_slice(&point[1].to_le_bytes());
-            self.mmap[offset + 8..offset + 12].copy_from_slice(&point[2].to_le_bytes());
+        self.publication_sequence.checked_add(2)?;
+        if self.ordered_voxels.prepare(&self.voxels) {
+            self.layout_generation = self.layout_generation.checked_add(1)?;
+            self.published_pages.clear();
         }
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        self.mmap[slot_point_count_offset..slot_point_count_offset + 4]
-            .copy_from_slice(&point_count.to_le_bytes());
-        // Publish the slot-local tuple only after its XYZ payload and count are visible.
-        fence(Ordering::Release);
-        self.mmap[slot_revision_offset..slot_revision_offset + 8]
-            .copy_from_slice(&revision.to_le_bytes());
-
-        // Global metadata is diagnostic/compatibility state. Global revision is
-        // the final publication field and therefore cannot pair an old revision
-        // with a newly overwritten slot count.
-        fence(Ordering::Release);
-        self.mmap[CM_ACTIVE_BUFFER_OFFSET..CM_ACTIVE_BUFFER_OFFSET + 4]
-            .copy_from_slice(&(active_buf as u32).to_le_bytes());
-        self.mmap[CM_GLOBAL_POINT_COUNT_OFFSET..CM_GLOBAL_POINT_COUNT_OFFSET + 4]
-            .copy_from_slice(&point_count.to_le_bytes());
-        self.mmap[CM_TIMESTAMP_NS_OFFSET..CM_TIMESTAMP_NS_OFFSET + 8]
-            .copy_from_slice(&now_ns.to_le_bytes());
-        self.mmap[CM_VOXEL_SIZE_OFFSET..CM_VOXEL_SIZE_OFFSET + 4]
-            .copy_from_slice(&self.voxel_size.to_le_bytes());
-        fence(Ordering::Release);
-        self.mmap[CM_GLOBAL_REVISION_OFFSET..CM_GLOBAL_REVISION_OFFSET + 8]
-            .copy_from_slice(&revision.to_le_bytes());
+        let count = point_count.div_ceil(CHUNK_POINTS);
+        self.published_pages.resize_with(count, || Arc::from([]));
+        let dirty = self.ordered_voxels.dirty_pages().filter(|page| *page < count).collect::<Vec<_>>();
+        for &page in &dirty {
+            let start = page * CHUNK_POINTS;
+            let end = (start + CHUNK_POINTS).min(point_count);
+            let mut bytes = Vec::with_capacity((end - start) * CM_POINT_SIZE_BYTES);
+            for &key in &self.ordered_voxels.keys()[start..end] {
+                for coordinate in voxel_center_f32(key, self.voxel_size) {
+                    bytes.extend_from_slice(&coordinate.to_le_bytes());
+                }
+            }
+            self.published_pages[page] = bytes.into();
+        }
+        self.published_dirty_pages = dirty;
+        let timestamp = self.publication_receipt.as_ref().map(|r| r.source_timestamp_ns)
+            .unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_nanos() as u64);
+        self.write_paged_publication(revision, point_count as u32, timestamp)?;
         self.revision = revision;
+        self.ordered_voxels.committed();
         self.committed_snapshot_cache.take();
-        // 这是启动时重新初始化的进程间通信映射；上方发布屏障保证可见性。
-        // 地图资产有独立持久化流程，实时提交不等待整段文件同步写盘。
-        Some((revision, point_count, self.voxel_size))
+        Some((revision, point_count as u32, self.voxel_size))
+    }
+
+    fn write_paged_publication(&mut self, revision: u64, point_count: u32, timestamp: u64) -> Option<()> {
+        let sequence = self.publication_sequence.checked_add(2)?;
+        // Begin must be globally ordered BEFORE any ordinary payload stores.
+        sequence_atomic(&self.mmap).store(sequence - 1, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        for &page in &self.published_dirty_pages {
+            let start = CM_PAYLOAD_OFFSET + page * CHUNK_POINTS * CM_POINT_SIZE_BYTES;
+            let bytes = &self.published_pages[page];
+            self.mmap[start..start + bytes.len()].copy_from_slice(bytes);
+            let version_offset = CM_PAGE_TABLE_OFFSET + page * 8;
+            self.mmap[version_offset..version_offset + 8].copy_from_slice(&revision.to_le_bytes());
+        }
+        self.mmap[CM_GLOBAL_REVISION_OFFSET..CM_GLOBAL_REVISION_OFFSET + 8].copy_from_slice(&revision.to_le_bytes());
+        self.mmap[CM_TIMESTAMP_NS_OFFSET..CM_TIMESTAMP_NS_OFFSET + 8].copy_from_slice(&timestamp.to_le_bytes());
+        self.mmap[CM_LAYOUT_GENERATION_OFFSET..CM_LAYOUT_GENERATION_OFFSET + 8].copy_from_slice(&self.layout_generation.to_le_bytes());
+        self.mmap[CM_PRODUCER_EPOCH_OFFSET..CM_PRODUCER_EPOCH_OFFSET + 16].copy_from_slice(&self.producer_epoch);
+        self.mmap[CM_GLOBAL_POINT_COUNT_OFFSET..CM_GLOBAL_POINT_COUNT_OFFSET + 4].copy_from_slice(&point_count.to_le_bytes());
+        self.mmap[CM_VOXEL_SIZE_OFFSET..CM_VOXEL_SIZE_OFFSET + 4].copy_from_slice(&self.voxel_size.to_le_bytes());
+        self.mmap[88..96].copy_from_slice(&self.session_generation.to_le_bytes());
+        self.mmap[128..420].fill(0);
+        if let Some(receipt) = &self.publication_receipt {
+            self.mmap[128..144].copy_from_slice(&receipt.commit_id.boot_nonce.to_le_bytes());
+            self.mmap[144..152].copy_from_slice(&receipt.commit_id.sequence.to_le_bytes());
+            self.mmap[152..160].copy_from_slice(&receipt.occupancy_revision.to_le_bytes());
+            let id = receipt.session_id.as_bytes();
+            // The receipt boundary validates the complete UTF-8 identity before
+            // any publication mutation; never truncate or split an identifier.
+            let length = id.len();
+            self.mmap[160..164].copy_from_slice(&(length as u32).to_le_bytes());
+            self.mmap[164..164 + length].copy_from_slice(&id[..length]);
+        }
+        sequence_atomic(&self.mmap).store(sequence, Ordering::Release);
+        self.publication_sequence = sequence;
+        Some(())
     }
 
     fn reset_accumulator(&mut self, session_generation: u64) {
         self.committed_snapshot_cache.take();
+        self.publication_receipt = None;
         self.scan_preparation = None;
         self.pending_dense_readers = None;
         self.fine_cloud = None;
@@ -1104,6 +1099,7 @@ impl CloudMapShmWriter {
         if receipt.commit_id.boot_nonce == 0
             || receipt.commit_id.sequence == 0
             || receipt.session_id.trim().is_empty()
+            || receipt.session_id.len() > 256
             || receipt.session_generation == 0
             || receipt.occupancy_revision == 0
             || receipt.backend_generation == 0
@@ -1221,14 +1217,6 @@ fn decode_checkpoint_voxels(
     Ok(voxels)
 }
 
-fn slot_metadata_offsets(slot: usize) -> Option<(usize, usize)> {
-    match slot {
-        0 => Some((CM_SLOT0_REVISION_OFFSET, CM_SLOT0_POINT_COUNT_OFFSET)),
-        1 => Some((CM_SLOT1_REVISION_OFFSET, CM_SLOT1_POINT_COUNT_OFFSET)),
-        _ => None,
-    }
-}
-
 fn voxel_center_f64(key: VoxelKey, voxel_size: f32) -> [f64; 3] {
     let voxel_size = f64::from(voxel_size);
     [
@@ -1264,6 +1252,98 @@ pub(crate) fn voxel_key(point: [f64; 3], voxel_size: f32) -> Option<VoxelKey> {
 mod tests {
     use super::*;
 
+    /// The Python peer acknowledges each committed phase after reading real SHM.
+    /// No transport, legacy full export, content digest or robot is involved.
+    #[test]
+    #[ignore = "run through scripts/check_pointcloud_native_interop.py with a Python mmap peer"]
+    fn native_paged_writer_python_reader_interop() {
+        use std::io::{self, Write};
+        fn phase(number: u32) {
+            println!("NUWAX_CLOUD_PAGE_PHASE:{number}");
+            io::stdout().flush().unwrap();
+            let mut line = String::new();
+            assert!(io::stdin().read_line(&mut line).unwrap() > 0, "Python peer closed");
+            assert_eq!(line.trim(), number.to_string());
+        }
+        let path = std::path::PathBuf::from(std::env::var_os("NUWAX_CLOUD_PAGE_INTEROP_PATH")
+            .expect("Python peer supplies isolated fixture path"));
+        let mut writer = CloudMapShmWriter::new(&path).unwrap();
+        writer.reset_accumulator(1);
+        // Binary-exact centers make cross-language byte assertions unambiguous.
+        writer.voxel_size = 0.5;
+        let points = (0..4096).map(|i| Point3::new(i as f64, 0.0, 0.0)).collect::<Vec<_>>();
+        assert!(writer.accumulate_mapping_frame(1, &points));
+        writer.commit_accumulated().unwrap();
+        phase(1);
+        assert!(writer.accumulate_mapping_frame(1, &[Point3::new(5000.0, 0.0, 0.0)]));
+        writer.commit_accumulated().unwrap();
+        phase(2);
+        // Actual edit semantics: remove an old voxel, then add its replacement.
+        let key = voxel_key([0.0, 0.0, 0.0], writer.voxel_size).unwrap();
+        assert!(writer.voxels.remove(&key));
+        writer.ordered_voxels.removed(key, writer.max_points);
+        assert!(writer.accumulate_mapping_frame(1, &[Point3::new(6000.0, 0.0, 0.0)]));
+        writer.commit_accumulated().unwrap();
+        phase(3);
+        let key = voxel_key([2048.0, 0.0, 0.0], writer.voxel_size).unwrap();
+        assert!(writer.voxels.remove(&key));
+        writer.ordered_voxels.removed(key, writer.max_points);
+        writer.commit_accumulated().unwrap();
+        phase(4);
+        writer.begin_session(2).unwrap();
+        phase(5);
+        assert!(writer.accumulate_mapping_frame(2, &[Point3::new(0.0, 0.0, 0.0)]));
+        writer.commit_accumulated().unwrap();
+        phase(6);
+        assert!(!writer.full_snapshot_materialized());
+    }
+
+    #[test]
+    fn paged_commit_and_private_install_reuse_unchanged_bytes() {
+        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        let points = (0..10000).map(|i| Point3::new(i as f64 * 0.1, 0.0, 0.0)).collect::<Vec<_>>();
+        assert!(writer.accumulate_mapping_frame(1, &points));
+        writer.commit_accumulated().unwrap();
+        assert!(!writer.full_snapshot_materialized());
+        let first_page = writer.published_pages[0].clone();
+        let first_metadata = writer.committed_metadata().unwrap();
+        let first_version = read_u64(&writer.mmap, CM_PAGE_TABLE_OFFSET);
+        let (ticket, mut work) = writer.prepare_scan_work().unwrap();
+        assert!(work.accumulate_mapping_frame(1, &[Point3::new(2000.0, 0.0, 0.0)]));
+        work.commit_accumulated().unwrap();
+        assert_eq!(work.published_dirty_pages, vec![9]);
+        assert!(Arc::ptr_eq(&first_page, &work.published_pages[0]));
+        assert_eq!(writer.committed_metadata().unwrap(), first_metadata);
+        writer.install_scan_work(ticket, work).unwrap();
+        assert!(!writer.full_snapshot_materialized());
+        assert_eq!(writer.committed_metadata().unwrap().producer_epoch, first_metadata.producer_epoch);
+        assert_eq!(writer.committed_metadata().unwrap().point_count, 10001);
+        assert_eq!(read_u64(&writer.mmap, CM_PAGE_TABLE_OFFSET), first_version);
+        assert_eq!(read_u64(&writer.mmap, CM_PAGE_TABLE_OFFSET + 9 * 8), first_metadata.revision + 1);
+        assert!(Arc::ptr_eq(&first_page, &writer.published_pages[0]));
+        assert_eq!(writer.published_pages.iter().map(|page| page.len()).sum::<usize>(), 10001 * 12);
+        assert!(!writer.full_snapshot_materialized());
+    }
+
+    #[test]
+    fn receipt_session_identity_is_never_truncated_or_split() {
+        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        assert!(writer.accumulate_mapping_frame(1, &[Point3::new(1.0, 0.0, 0.0)]));
+        let mut receipt = OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 7, sequence: 1 },
+            session_id: format!("{}é", "a".repeat(255)), session_generation: 1,
+            occupancy_revision: 1, source_timestamp_ns: 10,
+            backend_kind: crate::mapping_backend::MappingBackendKind::Voxel, backend_generation: 1,
+        };
+        assert!(writer.commit_accumulated_snapshot(&receipt).is_err());
+        assert_eq!(writer.revision, 0);
+        receipt.session_id = format!("{}é", "a".repeat(254));
+        writer.commit_accumulated_snapshot(&receipt).unwrap().unwrap();
+        assert_eq!(read_u32(&writer.mmap, 160), 256);
+        assert_eq!(&writer.mmap[164..420], receipt.session_id.as_bytes());
+        assert!(!writer.full_snapshot_materialized());
+    }
+
     #[test]
     fn shared_snapshot_tracks_commits_and_keeps_old_payload_immutable() {
         let mut writer = CloudMapShmWriter::new_private().unwrap();
@@ -1275,7 +1355,24 @@ mod tests {
         let first = writer.shared_committed_snapshot().unwrap();
         let again = writer.shared_committed_snapshot().unwrap();
         assert!(Arc::ptr_eq(&first.xyz_f32_le, &again.xyz_f32_le));
-        assert_eq!(first.xyz_sha256, crate::map_checksum::sha256_bytes(&first.xyz_f32_le));
+        let metadata = writer.committed_metadata().unwrap();
+        assert_eq!(first.producer_epoch, metadata.producer_epoch);
+        assert_eq!(first.layout_generation, metadata.layout_generation);
+        assert_eq!(first.session_generation, metadata.session_generation);
+        assert_eq!(first.revision, metadata.revision);
+        assert_eq!(first.point_count, metadata.point_count);
+        assert_eq!(first.voxel_size, metadata.voxel_size);
+        let expected_xyz: Vec<u8> = voxel_center_f32(voxel_key([1.0, 0.0, 0.0], first.voxel_size).unwrap(), first.voxel_size)
+            .into_iter().flat_map(f32::to_le_bytes).collect();
+        assert_eq!(first.xyz_f32_le.as_ref(), expected_xyz.as_slice());
+        let owned = writer.committed_snapshot().unwrap();
+        assert_eq!(owned.xyz_f32_le.as_slice(), first.xyz_f32_le.as_ref());
+        assert_eq!(owned.producer_epoch, first.producer_epoch);
+        assert_eq!(owned.layout_generation, first.layout_generation);
+        assert_eq!(owned.session_generation, first.session_generation);
+        assert_eq!(owned.revision, first.revision);
+        assert_eq!(owned.point_count, first.point_count);
+        assert_eq!(owned.voxel_size, first.voxel_size);
         let original = first.xyz_f32_le.to_vec();
 
         // 私有准备尚未安装时，读者继续观察原提交；安装后直接接续准备端的快照。
@@ -1481,6 +1578,8 @@ mod tests {
         assert!(writer.accumulate_mapping_scan(1, &points, None, 100));
         assert!(writer.committed_dense_cloud().unwrap().is_none());
         let commit = writer.commit_accumulated_snapshot(&receipt).unwrap().unwrap();
+        assert!(!writer.full_snapshot_materialized());
+        let explicit_checkpoint = writer.committed_snapshot().unwrap();
         assert_eq!(commit.snapshot.point_count, 1);
         let dense = writer.committed_dense_cloud().unwrap().unwrap();
         assert_eq!(dense.point_count, 2);
@@ -1500,7 +1599,7 @@ mod tests {
         assert_eq!(f32::from_le_bytes(dense.read(0, 2).unwrap()[..4].try_into().unwrap()), 0.011_f32);
 
         let mut legacy = CloudMapShmWriter::new_private().unwrap();
-        legacy.install_checkpoint(&receipt, commit.snapshot.voxel_size, commit.snapshot.point_count, &commit.snapshot.xyz_f32_le).unwrap();
+        legacy.install_checkpoint(&receipt, commit.snapshot.voxel_size, commit.snapshot.point_count, &explicit_checkpoint.xyz_f32_le).unwrap();
         assert!(legacy.accumulate_mapping_scan(1, &points, None, 200));
         legacy.commit_accumulated_snapshot(&receipt2).unwrap().unwrap();
         assert!(legacy.committed_dense_cloud().unwrap().is_none(), "旧资产不能以新扫描后缀冒充完整历史");
@@ -1796,10 +1895,8 @@ mod tests {
         assert_eq!(first.1, 1, "nearby points share the 5 cm voxel");
         assert_eq!(read_u64(&writer.mmap, CM_GLOBAL_REVISION_OFFSET), 1);
         assert_eq!(read_u32(&writer.mmap, 8), CM_SHM_VERSION);
-        assert_eq!(read_u64(&writer.mmap, CM_SLOT0_REVISION_OFFSET), 1);
-        assert_eq!(read_u32(&writer.mmap, CM_SLOT0_POINT_COUNT_OFFSET), 1);
-        assert_eq!(read_u64(&writer.mmap, CM_SLOT1_REVISION_OFFSET), 0);
-        assert_eq!(read_u32(&writer.mmap, CM_SLOT1_POINT_COUNT_OFFSET), 0);
+        assert_eq!(read_u64(&writer.mmap, CM_PAGE_TABLE_OFFSET), 1);
+        assert_eq!(read_u32(&writer.mmap, CM_GLOBAL_POINT_COUNT_OFFSET), 1);
 
         assert!(writer.accumulate_mapping_frame(1, &second_frame));
         let second = writer
@@ -1808,9 +1905,8 @@ mod tests {
         assert_eq!(second.0, 2);
         assert_eq!(second.1, 2);
         assert_eq!(read_u64(&writer.mmap, CM_GLOBAL_REVISION_OFFSET), 2);
-        assert_eq!(read_u32(&writer.mmap, CM_ACTIVE_BUFFER_OFFSET), 1);
-        assert_eq!(read_u64(&writer.mmap, CM_SLOT1_REVISION_OFFSET), 2);
-        assert_eq!(read_u32(&writer.mmap, CM_SLOT1_POINT_COUNT_OFFSET), 2);
+        assert_eq!(read_u64(&writer.mmap, CM_PAGE_TABLE_OFFSET), 2);
+        assert_eq!(read_u32(&writer.mmap, CM_GLOBAL_POINT_COUNT_OFFSET), 2);
 
         drop(writer);
         let _ = std::fs::remove_file(path);
@@ -1825,8 +1921,8 @@ mod tests {
         assert_eq!(first_clear, (1, 0, VOXEL_SIZE));
         assert_eq!(read_u64(&writer.mmap, CM_GLOBAL_REVISION_OFFSET), 1);
         assert_eq!(read_u32(&writer.mmap, CM_GLOBAL_POINT_COUNT_OFFSET), 0);
-        assert_eq!(read_u64(&writer.mmap, CM_SLOT0_REVISION_OFFSET), 1);
-        assert_eq!(read_u32(&writer.mmap, CM_SLOT0_POINT_COUNT_OFFSET), 0);
+        assert_eq!(writer.published_pages.len(), 0);
+        assert_eq!(sequence_atomic(&writer.mmap).load(Ordering::Acquire) & 1, 0);
         assert!(writer.begin_session(1).is_none());
         assert_eq!(writer.revision, 1, "same generation must be idempotent");
 
@@ -1837,8 +1933,8 @@ mod tests {
         assert!(writer.voxels.is_empty());
         assert_eq!(read_u64(&writer.mmap, CM_GLOBAL_REVISION_OFFSET), 3);
         assert_eq!(read_u32(&writer.mmap, CM_GLOBAL_POINT_COUNT_OFFSET), 0);
-        assert_eq!(read_u64(&writer.mmap, CM_SLOT0_REVISION_OFFSET), 3);
-        assert_eq!(read_u32(&writer.mmap, CM_SLOT0_POINT_COUNT_OFFSET), 0);
+        assert_eq!(writer.published_pages.len(), 0);
+        assert_eq!(sequence_atomic(&writer.mmap).load(Ordering::Acquire) & 1, 0);
 
         drop(writer);
         let _ = std::fs::remove_file(path);
@@ -1873,10 +1969,9 @@ mod tests {
         assert_eq!(restored.snapshot.revision, 1);
         assert_eq!(restored.snapshot.point_count, 2);
         assert_eq!(restored.snapshot.voxel_size, VOXEL_SIZE);
-        assert_eq!(
-            restored.snapshot.xyz_sha256,
-            crate::map_checksum::sha256_bytes(&restored.snapshot.xyz_f32_le)
-        );
+        assert!(!writer.full_snapshot_materialized());
+        let explicit = writer.committed_snapshot().unwrap();
+        assert_eq!(explicit.xyz_f32_le, xyz_f32_le);
         assert_eq!(restored.receipt.commit_id, occupancy_receipt.commit_id);
         assert_eq!(restored.receipt.occupancy_revision, 11);
         assert_eq!(restored.receipt.cloud_revision, 1);
@@ -2050,7 +2145,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_slot_count_shrinks_with_the_revision_that_publishes_it() {
+    fn v3_point_count_and_layout_shrink_with_the_committed_revision() {
         let path = test_path("v2-slot-metadata");
         let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
         let first_session = [
@@ -2063,20 +2158,17 @@ mod tests {
 
         assert!(writer.accumulate_mapping_frame(1, &[Point3::new(3.0, 0.0, 0.0)]));
         assert_eq!(writer.commit_accumulated().unwrap(), (2, 4, VOXEL_SIZE));
-        assert_eq!(read_u64(&writer.mmap, CM_SLOT0_REVISION_OFFSET), 1);
-        assert_eq!(read_u32(&writer.mmap, CM_SLOT0_POINT_COUNT_OFFSET), 3);
-        assert_eq!(read_u64(&writer.mmap, CM_SLOT1_REVISION_OFFSET), 2);
-        assert_eq!(read_u32(&writer.mmap, CM_SLOT1_POINT_COUNT_OFFSET), 4);
+        assert_eq!(read_u64(&writer.mmap, CM_PAGE_TABLE_OFFSET), 2);
+        assert_eq!(read_u32(&writer.mmap, CM_GLOBAL_POINT_COUNT_OFFSET), 4);
+        let layout = writer.layout_generation;
 
         assert!(writer.accumulate_mapping_frame(2, &[Point3::new(10.0, 0.0, 0.0)]));
         assert_eq!(writer.commit_accumulated().unwrap(), (3, 1, VOXEL_SIZE));
-        assert_eq!(read_u32(&writer.mmap, CM_ACTIVE_BUFFER_OFFSET), 0);
+        assert!(writer.layout_generation > layout);
         assert_eq!(read_u64(&writer.mmap, CM_GLOBAL_REVISION_OFFSET), 3);
         assert_eq!(read_u32(&writer.mmap, CM_GLOBAL_POINT_COUNT_OFFSET), 1);
-        assert_eq!(read_u64(&writer.mmap, CM_SLOT0_REVISION_OFFSET), 3);
-        assert_eq!(read_u32(&writer.mmap, CM_SLOT0_POINT_COUNT_OFFSET), 1);
-        assert_eq!(read_u64(&writer.mmap, CM_SLOT1_REVISION_OFFSET), 2);
-        assert_eq!(read_u32(&writer.mmap, CM_SLOT1_POINT_COUNT_OFFSET), 4);
+        assert_eq!(read_u64(&writer.mmap, CM_PAGE_TABLE_OFFSET), 3);
+        assert_eq!(writer.published_pages[0].len(), 12);
 
         drop(writer);
         let _ = std::fs::remove_file(path);

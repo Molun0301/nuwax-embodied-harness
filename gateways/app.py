@@ -235,14 +235,33 @@ def create_gateway_app(
                 updates.start()
             yield
         finally:
-            await updates.close()
+            source_fenced = False
+            prior_error = sys.exc_info()[0] is not None
             try:
+                await updates.close()
                 if start_runtime_on_lifespan:
                     APP_LOGGER.info("宿主机网关运行时准备停止。")
-                    await run_in_threadpool(runtime.stop)
+                    stop_result = await run_in_threadpool(runtime.stop)
+                    source_fenced = stop_result is not False
+            except BaseException:
+                prior_error = True
+                raise
             finally:
                 if agent_tools is not None:
-                    agent_tools.close()
+                    try:
+                        result = await run_in_threadpool(agent_tools.close, source_fenced=source_fenced)
+                        app.state.agent_terminal_persistence_close = result
+                        if not result["complete"]:
+                            APP_LOGGER.error("智能体终态回执关闭未完成", extra={"terminal_persistence": result})
+                            if not prior_error:
+                                raise RuntimeError("智能体终态回执仍未完成关闭或缺少源静止证明；原任务不会重执行。")
+                    except BaseException:
+                        if not hasattr(app.state, "agent_terminal_persistence_close"):
+                            app.state.agent_terminal_persistence_close = {
+                                "complete": False, "owner_closed": None, "last_error_code": "receipt_close_failed"}
+                        if not prior_error:
+                            raise
+                        APP_LOGGER.exception("回执关闭未完成；保留原始运行时关闭异常。")
 
     app = FastAPI(title="Nuwax Embodied Harness（NEH）网关", lifespan=lifespan)
     app.state.runtime = runtime

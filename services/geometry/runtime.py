@@ -39,7 +39,7 @@ from contracts.navigation import (
     NavigationGoal,
     NavigationStatus,
 )
-from contracts.runtime_views import MapSnapshot, map_content_sha256
+from contracts.runtime_views import MapSnapshot
 from providers.data_plane import (
     ExplorationDataPlane,
     LocalizationDataPlane,
@@ -87,7 +87,19 @@ def _exploration_deadline_remaining(
 
 
 @contextmanager
-def _exploration_deadline_lock(lock, deadline_monotonic, rpc_name):
+def _exploration_deadline_lock(lock, deadline_monotonic, rpc_name, *, check_active=None):
+    # 检查任务会读取 TaskManager 锁；不能在已持有服务状态锁时调用。
+    if check_active is not None:
+        while True:
+            check_active()
+            remaining = _exploration_deadline_remaining(deadline_monotonic, rpc_name)
+            if lock.acquire(timeout=min(0.05, remaining) if remaining is not None else 0.05):
+                break
+        try:
+            yield
+        finally:
+            lock.release()
+        return
     remaining = _exploration_deadline_remaining(deadline_monotonic, rpc_name)
     if remaining is None:
         with lock:
@@ -205,6 +217,7 @@ class _MapActivationSnapshot:
 @dataclass(frozen=True)
 class _ValidatedLiveMapCache:
     backend: object
+    activation_generation: int
     mapping_identity: Tuple[object, ...]
     live_occupancy: object
     live_cost_map: object
@@ -1314,15 +1327,23 @@ class PlatformGeometryRuntime:
             return providers
         return None
 
-    def get_geometry_runtime_provider(self) -> Optional["GeometryRuntimeProvider"]:
+    def get_geometry_runtime_provider(
+        self, *, deadline_monotonic: Optional[float] = None,
+        check_active: Optional[Callable[[], None]] = None,
+    ) -> Optional[GeometryRuntimeProvider]:
         """返回当前 Rust gRPC 远程 provider，未连/未启时返回 None。
 
         生命周期说明：仅当 ``start()`` 成功完成 ``_start_geometry_runtime_subprocess`` 后
         才会有非 None 实例；调用方（gateway runtime）必须按 §13.3.5 顺序在
         ``PlatformGeometryRuntime.start()`` 之后再使用。
         """
-        with self._runtime_state_lock:
+        with _exploration_deadline_lock(
+            self._runtime_state_lock, deadline_monotonic, "GetStatus", check_active=check_active,
+        ):
             provider = self._remote_provider
+        if check_active is not None:
+            check_active()
+        _exploration_deadline_remaining(deadline_monotonic, "GetStatus")
         if provider is None:
             return None
         connected = getattr(provider, "is_connected", None)
@@ -1336,31 +1357,31 @@ class PlatformGeometryRuntime:
         self,
         *,
         deadline_monotonic: Optional[float] = None,
+        check_active: Optional[Callable[[], None]] = None,
     ) -> Tuple[bool, str]:
         """Run a live, side-effect-free GetStatus probe against the provider."""
 
-        if deadline_monotonic is None:
-            if self.get_geometry_runtime_provider() is None:
-                return False, "GeometryRuntimeProvider 未连接"
-        else:
-            with _exploration_deadline_lock(
-                self._runtime_state_lock,
-                deadline_monotonic,
-                "GetStatus",
-            ):
-                provider = self._remote_provider
-            connected = getattr(provider, "is_connected", False)
-            if callable(connected):
-                connected = connected()
-            if provider is None or not bool(connected):
+        control = {}
+        if deadline_monotonic is not None:
+            control["deadline_monotonic"] = deadline_monotonic
+        if check_active is not None:
+            control["check_active"] = check_active
+        provider = self.get_geometry_runtime_provider(**control)
+        if provider is None:
+            if deadline_monotonic is not None:
                 raise GeometryRuntimeRpcError(
-                    rpc_name="GetStatus",
-                    grpc_code=grpc.StatusCode.UNAVAILABLE,
+                    rpc_name="GetStatus", grpc_code=grpc.StatusCode.UNAVAILABLE,
                     grpc_details="GeometryRuntimeProvider is disconnected",
                 )
-        return self._probe_geometry_runtime_health(
-            deadline_monotonic=deadline_monotonic,
+            return False, "GeometryRuntimeProvider 未连接"
+        result = self._probe_geometry_runtime_health(
+            deadline_monotonic=deadline_monotonic, provider=provider,
         )
+        # RPC 的成功仅属于探测时捕获的提供器，不能借给更换后的连接。
+        current = self.get_geometry_runtime_provider(**control)
+        if current is not provider:
+            return False, "GeometryRuntimeProvider 在健康探测期间已更换"
+        return result
 
     def notify_cmd_vel_sink_ready(
         self,
@@ -1714,18 +1735,24 @@ class PlatformGeometryRuntime:
         """沿已有工作区、会话和代次验证来源，不重写外部快照身份。"""
 
         selected_name = getattr(self, "_workspace_map_name", None)
-        if not selected_name:
+        source = metadata if isinstance(metadata, dict) else {}
+        source_activation_generation = source.get("map_activation_generation")
+        if not selected_name and source_activation_generation is None:
             return True
         # 只捕获标量身份，逐帧检查不能深复制整份资产包。
         with self._runtime_state_lock:
-            bundle = self._map_activation_snapshot_locked().bundle
+            activation = self._map_activation_snapshot_locked()
+            if source_activation_generation is not None and source_activation_generation != activation.generation:
+                return False
+            if not selected_name:
+                return True
+            bundle = activation.bundle
             expected_name = bundle.map_name if bundle is not None else selected_name
             current_identity = _mapping_context_snapshot_token(
                 getattr(self, "_mapping_session_context", None)
             )[:3]
         if str(map_name or "").strip() != expected_name:
             return False
-        source = metadata if isinstance(metadata, dict) else {}
         if source.get("map_snapshot_kind") == "offline_checkpoint" or source.get("source_kind") == "map_asset_bundle":
             return True
         if not all(current_identity):
@@ -2807,6 +2834,7 @@ class PlatformGeometryRuntime:
         self,
         *,
         deadline_monotonic: Optional[float] = None,
+        provider: Optional[GeometryRuntimeProvider] = None,
     ) -> Tuple[bool, str]:
         """探测 nuwax-geometry-runtime gRPC HealthCheck.healthy 与 GetStatus 状态。
 
@@ -2814,7 +2842,7 @@ class PlatformGeometryRuntime:
         - ok=True: bridge 可用，message 为附加诊断（可能为空）
         - ok=False: bridge 不可用，message 给出原因
         """
-        provider = self._remote_provider
+        provider = self._remote_provider if provider is None else provider
         if provider is None:
             return False, "GeometryRuntimeProvider 未连接"
         try:
@@ -4805,13 +4833,10 @@ class PlatformGeometryRuntime:
             update={
                 "frame_id": frame_id,
                 "occupancy_grid": occupancy_grid,
-                "content_sha256": map_content_sha256(
-                    map_name=map_bundle.map_name,
-                    frame_id=frame_id,
-                    occupancy_grid=occupancy_grid,
-                    cost_map=map_bundle.snapshot.cost_map,
-                    semantic_map=map_bundle.snapshot.semantic_map,
-                ),
+                "source_epoch": json.dumps(["checkpoint-v2", map_bundle.snapshot_identity, checkpoint_bundle.backend_kind,
+                    checkpoint_bundle.checkpoint.source_session_id,
+                    checkpoint_bundle.checkpoint.source_session_generation], separators=(",", ":")),
+                "update_sequence": max(1, int(meta.revision)),
                 "metadata": {
                     **dict(map_bundle.snapshot.metadata),
                     "mapping_backend_checkpoint": checkpoint_metadata,
@@ -5354,8 +5379,10 @@ class PlatformGeometryRuntime:
                     bundle_root=resolved_bundle_root,
                     activation_result=activation_result,
                 )
+                installed_generation = self._map_activation_snapshot_locked().generation
             if ready_snapshot is not None:
-                return ready_snapshot
+                return ready_snapshot.model_copy(update={"metadata": {**ready_snapshot.metadata,
+                    "map_activation_generation": installed_generation}})
             offline_geometry_metadata = self._build_map_snapshot_geometry_metadata(
                 bundle=bundle,
                 geometry_asset=geometry_asset,
@@ -5369,6 +5396,7 @@ class PlatformGeometryRuntime:
                     "metadata": {
                         **dict(bundle.snapshot.metadata),
                         **offline_geometry_metadata,
+                        "map_activation_generation": installed_generation,
                         "asset_manifest_sha256": bundle.manifest_sha256,
                         "source_kind": "map_asset_bundle",
                         "map_snapshot_kind": "offline_checkpoint",
@@ -5629,6 +5657,9 @@ class PlatformGeometryRuntime:
             activation_fence = self._map_asset_activation_fence_snapshot()
             if activation_fence is not None:
                 return activation_fence_payload(activation_fence)
+            if isinstance(candidate, dict):
+                candidate = {**candidate, "metadata": {**dict(candidate.get("metadata") or {}),
+                    "map_activation_generation": activation_snapshot.generation}}
             return candidate
 
         activation_fence = self._map_asset_activation_fence_snapshot()
@@ -5650,7 +5681,7 @@ class PlatformGeometryRuntime:
                 "suppressed_live_map_reason": "workspace_map_source_mismatch",
             }}
         if bundle is None:
-            return finalize(payload)
+            return finalize({**payload, "metadata": {**source_metadata, "semantic_reference_identity": None}})
         metadata = self._clone_metadata(payload.get("metadata") or {})
         activation_result = self._activation_result_from_snapshot(
             activation_snapshot
@@ -5922,6 +5953,7 @@ class PlatformGeometryRuntime:
                 if mapping_identity_complete:
                     validated_cache = _ValidatedLiveMapCache(
                         backend=backend,
+                        activation_generation=activation_snapshot.generation,
                         mapping_identity=mapping_cache_identity,
                         live_occupancy=live_occupancy,
                         live_cost_map=live_cost_map,
@@ -5937,10 +5969,13 @@ class PlatformGeometryRuntime:
                     else:
                         with cache_lock:
                             self._last_validated_live_map_cache = validated_cache
+                snapshot = snapshot.model_copy(update={"metadata": {**snapshot.metadata,
+                    "map_activation_generation": activation_snapshot.generation}})
                 if self._map_asset_activation_snapshot_read_blocked() or not self.is_map_snapshot_source_current(
                     map_name=snapshot.map_name, metadata=snapshot.metadata,
                 ):
                     return None
+                snapshot._source_owner_id = id(self)
                 return snapshot
             break
         current_mapping_identity = _mapping_context_snapshot_token(
@@ -5963,6 +5998,7 @@ class PlatformGeometryRuntime:
                 )
         if (
             isinstance(validated_cache, _ValidatedLiveMapCache)
+            and validated_cache.activation_generation == activation_snapshot.generation
             and current_mapping_identity[0]
             and current_mapping_identity[1]
             and current_mapping_identity[2] > 0
@@ -5979,10 +6015,13 @@ class PlatformGeometryRuntime:
                 seed_bundle=validated_cache.seed_bundle,
                 activation_result=activation_result,
             )
+            cached_snapshot = cached_snapshot.model_copy(update={"metadata": {**cached_snapshot.metadata,
+                "map_activation_generation": activation_snapshot.generation}})
             if self._map_asset_activation_snapshot_read_blocked() or not self.is_map_snapshot_source_current(
                 map_name=cached_snapshot.map_name, metadata=cached_snapshot.metadata,
             ):
                 return None
+            cached_snapshot._source_owner_id = id(self)
             return cached_snapshot
         if bundle is None:
             return None
@@ -6005,7 +6044,6 @@ class PlatformGeometryRuntime:
             source_name=bundle.snapshot.source_name,
             source_epoch=bundle.snapshot.source_epoch,
             update_sequence=bundle.snapshot.update_sequence,
-            content_sha256=bundle.snapshot.content_sha256,
             frame_id=bundle.snapshot.frame_id,
             occupancy_grid=occupancy_grid,
             cost_map=cost_map,
@@ -6015,8 +6053,12 @@ class PlatformGeometryRuntime:
                 **geometry_metadata,
             },
         )
-        if self._map_asset_activation_snapshot_read_blocked():
+        snapshot = snapshot.model_copy(update={"metadata": {**snapshot.metadata,
+            "map_activation_generation": activation_snapshot.generation}})
+        if self._map_asset_activation_snapshot_read_blocked() or not self.is_map_snapshot_source_current(
+            map_name=snapshot.map_name, metadata=snapshot.metadata):
             return None
+        snapshot._source_owner_id = id(self)
         return snapshot
 
     def get_raw_occupancy_grid(self):
@@ -6100,6 +6142,7 @@ class PlatformGeometryRuntime:
             "cost_map_metrics": cost_map_metrics,
         })
         metadata = {
+            "semantic_reference_identity": None,
             "event_type": "content_update",
             "source_kind": "platform_live_map_provider",
             "map_snapshot_kind": "live_streaming",
@@ -6230,6 +6273,7 @@ class PlatformGeometryRuntime:
         activation_result: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         bundle_metadata = {
+            "semantic_reference_identity": bundle.snapshot_identity,
             "asset_manifest_sha256": bundle.manifest_sha256,
         }
         metadata = {
@@ -6596,11 +6640,11 @@ class PlatformGeometryRuntime:
         )
         checkpoint = checkpoint_bundle.checkpoint
         identity = {
-            "schema_version": 2,
+            "schema_version": 3,
             "map_name": bundle.map_name,
             "source_epoch": bundle.snapshot.source_epoch,
             "update_sequence": int(bundle.snapshot.update_sequence),
-            "content_sha256": bundle.snapshot.content_sha256,
+            "source_name": bundle.snapshot.source_name,
             "frame_id": str(bundle.frame_id or bundle.snapshot.frame_id or ""),
             "mapping_session_id": str(mapping_context.get("session_id") or ""),
             "session_generation": int(mapping_context.get("session_generation") or 0),
@@ -6613,7 +6657,7 @@ class PlatformGeometryRuntime:
             connection = sqlite3.connect(str(temporary))
             connection.execute("PRAGMA journal_mode=DELETE")
             connection.execute("PRAGMA synchronous=FULL")
-            connection.execute("PRAGMA user_version=2")
+            connection.execute("PRAGMA user_version=3")
             connection.execute(
                 """
                 CREATE TABLE map_asset_identity (
@@ -6622,7 +6666,7 @@ class PlatformGeometryRuntime:
                     map_name TEXT NOT NULL,
                     source_epoch TEXT NOT NULL,
                     update_sequence INTEGER NOT NULL,
-                    content_sha256 TEXT NOT NULL,
+                    source_name TEXT NOT NULL,
                     frame_id TEXT NOT NULL,
                     mapping_session_id TEXT NOT NULL,
                     session_generation INTEGER NOT NULL,
@@ -6640,7 +6684,7 @@ class PlatformGeometryRuntime:
                     map_name,
                     source_epoch,
                     update_sequence,
-                    content_sha256,
+                    source_name,
                     frame_id,
                     mapping_session_id,
                     session_generation,
@@ -6654,7 +6698,7 @@ class PlatformGeometryRuntime:
                     identity["map_name"],
                     identity["source_epoch"],
                     identity["update_sequence"],
-                    identity["content_sha256"],
+                    identity["source_name"],
                     identity["frame_id"],
                     identity["mapping_session_id"],
                     identity["session_generation"],

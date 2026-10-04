@@ -4,6 +4,7 @@ import asyncio
 import base64
 import collections
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import fields as dataclass_fields, is_dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -38,6 +39,8 @@ from gateways.errors import GatewayError
 from gateways.feedback import build_public_runtime_event
 from gateways.runtime import GatewayRuntime
 from gateways.ws.console_projection import console_payload, field_value, selected_fields
+from gateways.ws.pointcloud_encoding import CanonicalPointCloudEncoder
+from gateways.ws.pointcloud_stream import install_pointcloud_stream
 
 try:
     from services.geometry.video_shm_reader import VideoShmReader
@@ -207,6 +210,10 @@ def _stream_frame_values(frame: StreamFrame) -> Dict[str, object]:
         if frame.topic == "tasks.state"
         else console_payload(frame.topic, frame.payload)
     )
+    if frame.topic == "map.frame" and type(values["payload"]) is MapSnapshot:
+        snapshot = values["payload"]
+        values["payload"] = selected_fields(snapshot, MapSnapshot.model_fields)
+        values["payload"]["update_sequence"] = _pointcloud_identity_integer(snapshot.update_sequence, "update_sequence")
     values["metadata"] = frame.metadata
     return values
 
@@ -321,6 +328,7 @@ def _project_json_value(
                 if type(payload) is MapSnapshot:
                     # 保留合同的防御读取，每个图层仅取一份，编码和完整性校验共用。
                     frame_values["payload"] = selected_fields(payload, MapSnapshot.model_fields)
+                    frame_values["payload"]["update_sequence"] = _pointcloud_identity_integer(payload.update_sequence, "update_sequence")
             projected_frame = _project_json_value(
                 frame_values,
                 budget,
@@ -979,7 +987,7 @@ def _encode_pointcloud_binary_frame(frame: StreamFrame) -> bytes:
 
 
 _MAP_BINARY_MAGIC = b"NUWAXMAP"
-_MAP_BINARY_VERSION = 2
+_MAP_BINARY_VERSION = 3
 _MAP_BINARY_MAX_CELLS = 16 * 1024 * 1024
 _MAP_ENCODE_CACHE_BYTES = 32 * 1024 * 1024
 _MAP_ENCODE_CACHE = collections.OrderedDict()
@@ -1009,7 +1017,7 @@ def _pack_map_envelope(header: bytes, raw: bytes) -> bytes:
 
 
 def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
-    """版本2：有界身份/绘制帧头与有符号栅格字节；缺少身份的版本1退出使用。"""
+    """版本3：明确来源代际与修订，不再要求或输出地图内容摘要。"""
     import numpy as np
 
     # 已发布快照按只读共享；帧头与栅格共享同一份输入。
@@ -1020,7 +1028,7 @@ def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
     if len(data) > _MAP_BINARY_MAX_CELLS:
         raise ValueError("二进制地图超过16MiB栅格容量")
     payload = selected_fields(frame.payload, (
-        "map_name", "source_name", "source_epoch", "update_sequence", "content_sha256",
+        "map_name", "source_name", "source_epoch", "update_sequence", "schema_version",
         "frame_id", "timestamp", "metadata",
     ))
     grid = selected_fields(occupancy_grid, (
@@ -1028,9 +1036,15 @@ def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
     ))
     if not payload.get("map_name") or not grid.get("origin") or not grid.get("frame_id"):
         raise ValueError("二进制地图缺少地图身份、坐标系或原点")
-    if not payload.get("source_name") or not payload.get("source_epoch") or not payload.get("content_sha256"):
-        raise ValueError("二进制地图缺少来源代际或内容身份")
+    if not payload.get("source_name") or not payload.get("source_epoch"):
+        raise ValueError("二进制地图缺少来源代际")
+    if payload.get("schema_version") != 2:
+        raise ValueError("二进制地图只接受显式修订快照版本2")
+    if grid.get("map_id") != payload["map_name"] or grid.get("frame_id") != payload.get("frame_id"):
+        raise ValueError("二进制地图图层与来源作用域不一致")
     payload["update_sequence"] = _pointcloud_identity_integer(payload.get("update_sequence"), "update_sequence")
+    if payload["update_sequence"] == "0":
+        raise ValueError("地图更新修订必须为正数")
     # 栅格先于可变诊断，保持头部字段和显示坐标不被诊断耗尽预算。
     metadata = payload.pop("metadata", {})
     payload["occupancy_grid"] = grid
@@ -1044,7 +1058,7 @@ def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
     return struct.pack("<8sBI", _MAP_BINARY_MAGIC, _MAP_BINARY_VERSION, len(header)) + header + np.asarray(data, dtype=np.int8).tobytes()
 
 
-def _encode_ws_frame(frame: StreamFrame) -> Union[str, bytes]:
+def _encode_ws_frame(frame: StreamFrame, *, map_binary_version=3) -> Union[str, bytes]:
     """回放与实时发送使用同一编码；大载荷的降级也留在编码线程内。"""
     if frame.payload_kind == StreamPayloadKind.BINARY and isinstance(frame.payload, (bytes, bytearray)):
         if frame.topic not in _POINTCLOUD_BINARY_TOPICS:
@@ -1057,7 +1071,7 @@ def _encode_ws_frame(frame: StreamFrame) -> Union[str, bytes]:
                 "cursor": _pointcloud_identity_integer(frame.cursor, "cursor"),
                 "reason": str(exc),
             }, compact=True)
-    if frame.topic == "map.frame" and frame.payload is not None:
+    if frame.topic == "map.frame" and frame.payload is not None and map_binary_version == 3:
         try:
             return _encode_map_binary_frame(frame)
         except (TypeError, ValueError, AttributeError):
@@ -1079,10 +1093,44 @@ def _encode_ws_frame(frame: StreamFrame) -> Union[str, bytes]:
     return _stream_json_dumps({"type": "stream.frame", "frame": frame})
 
 
-async def _send_ws_frame(websocket: WebSocket, frame: StreamFrame) -> None:
+def _legacy_pointcloud_frame(frame, snapshot):
+    """只有明确订阅旧快照通道的连接要求完整兼容载荷。"""
+    metadata = {**frame.metadata, "source": snapshot.source, "source_epoch": snapshot.source_epoch,
+                "revision": snapshot.revision, "revision_ordinal": snapshot.revision_ordinal,
+                "frame_id": snapshot.frame_id, "source_timestamp_ns": snapshot.source_timestamp_ns,
+                "point_count": snapshot.point_count, "format": snapshot.format,
+                "stream_generation": snapshot.stream_generation}
+    raw = b"".join(chunk.xyz_bytes for chunk in snapshot.chunks) if getattr(snapshot, "chunked", False) else snapshot.xyz_bytes
+    if frame.topic == "pointcloud_map.live_chunk":
+        raw = struct.pack("<II", snapshot.revision_ordinal & 0xffffffff, snapshot.point_count) + raw
+    elif frame.topic == "pointcloud_map.chunk":
+        raw = {"revision": snapshot.revision, "frame_id": snapshot.frame_id, "lod": "preview",
+               "chunk_index": 0, "chunk_count": 1, "format": "float32-xyz", "encoding": "base64",
+               "data": base64.b64encode(raw).decode("ascii"), "point_count": snapshot.point_count,
+               "source_kind": snapshot.provenance.get("source_kind"), "metadata": dict(metadata)}
+    return frame.model_copy(update={"payload_kind": StreamPayloadKind.BINARY, "payload": raw,
+                                    "metadata": metadata, "frame_id": snapshot.frame_id,
+                                    "revision": snapshot.revision})
+
+
+async def _send_ws_frame(websocket: WebSocket, frame: StreamFrame, *, pointcloud_encoder=None, map_binary_version=None, runtime=None) -> None:
+    if ((frame.topic == "pointcloud_map.snapshot" and frame.metadata.get("chunked"))
+            or frame.metadata.get("legacy_pointcloud_topic")):
+        snapshot = runtime.get_pointcloud_map_snapshot() if runtime is not None else None
+        if snapshot is None:
+            return
+        if ((frame.topic == "pointcloud_map.live_chunk" and snapshot.source != "live")
+                or (frame.topic == "pointcloud_map.chunk" and snapshot.source != "saved")):
+            return
+        frame = await _run_blocking(_legacy_pointcloud_frame, frame, snapshot)
     # 地图复制、完整栅格校验和点云编码不能占用所有连接共享的事件循环。
     # 轻量位姿直接编码，避免在工作线程繁忙时跟随地图排队。
-    if frame.topic == "map.frame" or frame.payload_kind == StreamPayloadKind.BINARY:
+    if (pointcloud_encoder is not None and frame.topic == "pointcloud_map.snapshot"
+            and frame.payload_kind == StreamPayloadKind.BINARY):
+        payload = await pointcloud_encoder.encode(frame)
+    elif frame.topic == "map.frame":
+        payload = await _run_blocking(_encode_ws_frame, frame, map_binary_version=map_binary_version)
+    elif frame.payload_kind == StreamPayloadKind.BINARY:
         payload = await _run_blocking(_encode_ws_frame, frame)
     else:
         payload = _encode_ws_frame(frame)
@@ -1092,8 +1140,13 @@ async def _send_ws_frame(websocket: WebSocket, frame: StreamFrame) -> None:
         await websocket.send_text(payload)
 
 
-async def _format_sse_frame(frame: StreamFrame) -> str:
-    if frame.topic == "map.frame":
+async def _format_sse_frame(frame: StreamFrame, *, runtime=None) -> str:
+    if runtime is not None and ((frame.topic == "pointcloud_map.snapshot" and frame.metadata.get("chunked"))
+            or frame.metadata.get("legacy_pointcloud_topic")):
+        snapshot = runtime.get_pointcloud_map_snapshot()
+        if snapshot is not None:
+            frame = await _run_blocking(_legacy_pointcloud_frame, frame, snapshot)
+    if frame.topic == "map.frame" or frame.payload_kind == StreamPayloadKind.BINARY:
         return await _run_blocking(_format_sse_payload, frame)
     return _format_sse_payload(frame)
 
@@ -1120,7 +1173,21 @@ def _map_identity_message(frame: Optional[StreamFrame], *, empty_cursor: int = 0
 def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAccessManager) -> APIRouter:
     """构造实时数据流路由。"""
 
-    router = APIRouter()
+    pointcloud_encoder = None
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        nonlocal pointcloud_encoder
+        owner = CanonicalPointCloudEncoder(_encode_ws_frame, _run_blocking)
+        pointcloud_encoder = owner
+        try:
+            yield
+        finally:
+            pointcloud_encoder = None
+            await owner.close()
+
+    router = APIRouter(lifespan=lifespan)
+    install_pointcloud_stream(router, runtime)
 
     @router.get("/streams/sse")
     async def sse_streams(
@@ -1155,7 +1222,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 )
                 replay_latest_cursor = replay_status["latest_cursor"]
                 for frame in replay_frames:
-                    yield await _format_sse_frame(frame)
+                    yield await _format_sse_frame(frame, runtime=runtime)
                     emitted += 1
                     if max_frames is not None and emitted >= max_frames:
                         return
@@ -1176,7 +1243,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                                 "stream.gap",
                                 _external_cursor_status(gap_notice),
                             )
-                        yield await _format_sse_frame(frame)
+                        yield await _format_sse_frame(frame, runtime=runtime)
                         emitted += 1
                         if max_frames is not None and emitted >= max_frames:
                             return
@@ -1268,6 +1335,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             topic_filter = _parse_topics(websocket.query_params.get("topics"))
             after_cursor = int(websocket.query_params.get("after_cursor", "0"))
             map_identity_only = websocket.query_params.get("map_payload") == "identity"
+            map_binary_version = 3 if websocket.query_params.get("map_binary_version") == "3" else None
             if map_identity_only and set(topic_filter or ()) != {"localization.pose", "map.frame"}:
                 raise ValueError("地图身份模式须仅订阅 localization.pose 与 map.frame。")
         except Exception as exc:
@@ -1284,6 +1352,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         subscription_id: Optional[str] = None
         receive_task = None
         frame_task = None
+        pointcloud_detached = websocket.query_params.get("pointcloud_transport") == "pages"
 
         try:
             subscription_id, replay_snapshot = runtime.stream_bus.subscribe_with_replay(
@@ -1316,9 +1385,11 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 replay_status["frame_count"] = len(replay_frames)
                 await _send_ws_json(websocket, _map_identity_message(map_frame, empty_cursor=barrier_cursor, start_cursor=barrier_cursor))
             for frame in replay_frames:
+                if pointcloud_detached and frame.topic == "pointcloud_map.snapshot":
+                    continue
                 if getattr(frame, 'payload_kind', None) == StreamPayloadKind.BINARY:
                     continue  # binary 帧不回放
-                await _send_ws_frame(websocket, frame)
+                await _send_ws_frame(websocket, frame, pointcloud_encoder=pointcloud_encoder, map_binary_version=map_binary_version, runtime=runtime)
             await _send_ws_json(
                 websocket,
                 {"type": "stream.replay", **_external_cursor_status(replay_status)},
@@ -1346,6 +1417,8 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                                 probe = json.loads(raw)
                             except (ValueError, TypeError):
                                 probe = None
+                            if isinstance(probe, dict) and probe.get("type") == "pointcloud.detach":
+                                pointcloud_detached = True
                             if isinstance(probe, dict) and probe.get("type") == "stream.ping":
                                 request_id = probe.get("request_id")
                                 if isinstance(request_id, str) and 0 < len(request_id) <= 64:
@@ -1367,10 +1440,12 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                             websocket,
                             {"type": "stream.gap", **_external_cursor_status(gap_notice)},
                         )
+                    if pointcloud_detached and frame.topic == "pointcloud_map.snapshot":
+                        continue
                     if map_identity_only and frame.topic == "map.frame":
                         await _send_ws_json(websocket, _map_identity_message(frame))
                     else:
-                        await _send_ws_frame(websocket, frame)
+                        await _send_ws_frame(websocket, frame, pointcloud_encoder=pointcloud_encoder, map_binary_version=map_binary_version, runtime=runtime)
                 except _ClientStreamGap:
                     gap_notice = _take_queue_gap_notice(queue, runtime)
                     if gap_notice is not None:

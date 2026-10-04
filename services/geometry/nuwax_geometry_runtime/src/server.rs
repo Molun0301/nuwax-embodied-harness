@@ -126,6 +126,7 @@ struct RetainedActivationGlobalMap {
     activation_request_identity_sha256: [u8; 32],
     map_frame_id: String,
     installed_cloud_revision: u64,
+    cloud_metadata: crate::pointcloud::CommittedCloudMapMetadata,
     cloud_receipt: crate::mapping_commit::CloudCommitReceipt,
     frame: RawLcmFrame,
 }
@@ -135,13 +136,15 @@ impl RetainedActivationGlobalMap {
         activation_request_identity_sha256: [u8; 32],
         map_frame_id: &str,
         committed: &CommittedMappingCloudMap,
+        xyz_f32_le: &[u8],
     ) -> Result<Self, String> {
         Ok(Self {
             activation_request_identity_sha256,
             map_frame_id: map_frame_id.to_owned(),
             installed_cloud_revision: committed.notification.revision,
+            cloud_metadata: committed.metadata,
             cloud_receipt: committed.receipt.clone(),
-            frame: build_committed_global_map_frame_in_frame(committed, map_frame_id)?,
+            frame: build_committed_global_map_frame_in_frame(committed, xyz_f32_le, map_frame_id)?,
         })
     }
 
@@ -151,13 +154,11 @@ impl RetainedActivationGlobalMap {
         map_frame_id: &str,
         committed: &CommittedMappingCloudMap,
     ) -> Result<(), String> {
-        let expected =
-            Self::from_committed(activation_request_identity_sha256, map_frame_id, committed)?;
         if self.activation_request_identity_sha256 != activation_request_identity_sha256
             || self.map_frame_id != map_frame_id
             || self.installed_cloud_revision != committed.notification.revision
             || self.cloud_receipt != committed.receipt
-            || self.frame != expected.frame
+            || !crate::lcm_runtime::same_cloud_metadata(&self.cloud_metadata, &committed.metadata)
         {
             return Err(
                 "retained activation global-map publication identity does not match replay"
@@ -2448,6 +2449,14 @@ async fn activate_map_r1(
             &token,
             crate::correction_coordinator::ActivationJournalStep::TypedGlobalMap,
         ) {
+            let cloud_metadata = bridge.cloud_map_writer.lock().as_ref()
+                .and_then(crate::pointcloud::CloudMapShmWriter::committed_metadata);
+            let Some(cloud_metadata) = cloud_metadata else {
+                settle_current_failure!(
+                    ActivationReceiptDisposition::OutcomeUnknown,
+                    "ACTIVATE_MAP_STAGED_CLOUD_METADATA_UNAVAILABLE".to_owned()
+                );
+            };
             let committed = CommittedMappingCloudMap {
                 notification: CloudMapNotification {
                     revision: proof.cloud_revision,
@@ -2456,7 +2465,7 @@ async fn activate_map_r1(
                     session_generation: current.session_generation,
                 },
                 source_timestamp_ns: proof.source_timestamp_ns,
-                xyz_f32_le: target.xyz_f32_le.clone().into(),
+                metadata: cloud_metadata,
                 receipt: proof.cloud_receipt.clone(),
             };
             let replaying_retained_publication = retained_global_map.is_some();
@@ -2494,6 +2503,7 @@ async fn activate_map_r1(
                     activation_request_identity_sha256,
                     &expected_map_frame_id,
                     &committed,
+                    &target.xyz_f32_le,
                 ) {
                     Ok(retained) => retained,
                     Err(error) => {
@@ -3051,7 +3061,7 @@ async fn activate_map_r1(
             CommittedMappingCloudMap {
                 notification,
                 source_timestamp_ns,
-                xyz_f32_le: target.xyz_f32_le.clone().into(),
+                metadata: correlated.snapshot,
                 receipt: correlated.receipt,
             },
             target_receipt_sha256,
@@ -3243,6 +3253,7 @@ async fn activate_map_r1(
                 activation_request_identity_sha256,
                 &expected_map_frame_id,
                 &committed,
+                &immutable_target.as_ref().expect("cloud commit requires immutable activation target").xyz_f32_le,
             ) {
                 Ok(retained) => retained,
                 Err(error) => {
@@ -4358,7 +4369,7 @@ fn occupancy_shm_ref(
 fn cloud_map_shm_ref(notification: &CloudMapNotification) -> Result<ShmRef, Box<Status>> {
     if notification.revision == 0 || notification.session_generation == 0 {
         return Err(Box::new(Status::failed_precondition(format!(
-            "invalid cloud-map SHM v2 reference: revision={} generation={}",
+            "invalid cloud-map SHM v3 reference: revision={} generation={}",
             notification.revision, notification.session_generation
         ))));
     }
@@ -9414,7 +9425,7 @@ mod cloud_map_update_tests {
             .expect("cloud-map update")
     }
 
-    fn assert_common_v2_reference(reference: &ShmRef, revision: u64, generation: u64) {
+    fn assert_common_v3_reference(reference: &ShmRef, revision: u64, generation: u64) {
         assert_eq!(
             reference.key,
             crate::pointcloud::cloud_map_shm_path()
@@ -9438,8 +9449,24 @@ mod cloud_map_update_tests {
         );
     }
 
+    #[test]
+    fn cloud_map_v3_metadata_reference_uses_slot_zero_and_u64_payload_size() {
+        let reference = cloud_map_shm_ref(&CloudMapNotification {
+            revision: 2,
+            point_count: 3,
+            voxel_size: 0.10,
+            session_generation: 8,
+        })
+        .expect("content-free v3 cloud reference");
+        assert_common_v3_reference(&reference, 2, 8);
+        assert_eq!(reference.layout_version, 3);
+        assert_eq!(reference.active_slot, 0);
+        let payload_size: u64 = reference.payload_size;
+        assert_eq!(payload_size, 36_u64);
+    }
+
     #[tokio::test]
-    async fn cloud_map_clear_update_carries_complete_v2_shm_reference() {
+    async fn cloud_map_clear_update_carries_complete_v3_shm_reference() {
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("real-lcm test handle");
@@ -9458,8 +9485,8 @@ mod cloud_map_update_tests {
 
         assert_eq!(update.point_count, 0);
         assert_eq!(update.voxel_size, 0.05);
-        let reference = update.shm_ref.expect("v2 SHM reference");
-        assert_common_v2_reference(&reference, 1, 7);
+        let reference = update.shm_ref.expect("v3 SHM reference");
+        assert_common_v3_reference(&reference, 1, 7);
         assert_eq!(reference.active_slot, 0);
         assert_eq!(reference.payload_size, 0);
     }
@@ -9484,9 +9511,9 @@ mod cloud_map_update_tests {
 
         assert_eq!(update.point_count, 3);
         assert_eq!(update.voxel_size, 0.10);
-        let reference = update.shm_ref.expect("v2 SHM reference");
-        assert_common_v2_reference(&reference, 2, 8);
-        assert_eq!(reference.active_slot, 1);
+        let reference = update.shm_ref.expect("v3 SHM reference");
+        assert_common_v3_reference(&reference, 2, 8);
+        assert_eq!(reference.active_slot, 0);
         assert_eq!(reference.payload_size, 36);
     }
 }
@@ -10910,6 +10937,10 @@ mod lifecycle_tests {
             activation_request_identity_sha256: identity,
             map_frame_id: "map".to_string(),
             installed_cloud_revision: 7,
+            cloud_metadata: crate::pointcloud::CommittedCloudMapMetadata {
+                revision: 7, point_count: 1, voxel_size: crate::pointcloud::VOXEL_SIZE,
+                session_generation: 1, producer_epoch: [1; 16], layout_generation: 1,
+            },
             cloud_receipt: crate::mapping_commit::CloudCommitReceipt {
                 commit_id: crate::mapping_commit::MappingCommitId {
                     boot_nonce: u128::from_be_bytes(identity[..16].try_into().unwrap()),

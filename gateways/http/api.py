@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import weakref
+from contextlib import asynccontextmanager
 from typing import Dict, Optional, Any
 
 from fastapi import APIRouter, Query, BackgroundTasks
@@ -25,6 +27,35 @@ from gateways.runtime import GatewayRuntime
 from gateways.serialization import to_jsonable, to_map_json_bytes
 from gateways.ws.client_queue import ClientQueue
 from core import config_io
+
+
+class ArtifactFileResponse(FileResponse):
+    """响应拥有读取保护；直到真正 ASGI 发送完成/取消才释放。
+
+    保留 FileResponse 的 range/条件请求行为。响应在执行前被丢弃时由
+    finalizer 释放备用句柄；正常路径均使用显式 finally，不依赖垃圾回收。
+    """
+
+    def __init__(self, store, artifact_id: str) -> None:
+        hold = store.acquire_artifacts((artifact_id,), owner="artifact.http_response")
+        try:
+            ref = store.get_ref(artifact_id)
+            path = store.get_file_path(artifact_id)
+            super().__init__(path, media_type=ref.mime_type, filename=path.name)
+        except BaseException:
+            hold.release()
+            raise
+        self._release_artifact = weakref.finalize(self, hold.release)
+
+    async def __call__(self, scope, receive, send):
+        try:
+            # pathsend 把路径交给服务器后就返回，服务器可能尚未真正打开文件。
+            # 本响应使用标准分块/range 发送，确保保护覆盖实际文件消费。
+            extensions = dict(scope.get("extensions", {}))
+            extensions.pop("http.response.pathsend", None)
+            await super().__call__({**scope, "extensions": extensions}, receive, send)
+        finally:
+            self._release_artifact()
 
 
 class CapabilityInvokeRequest(BaseModel):
@@ -212,6 +243,25 @@ def _full_health_payload(summary: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+def _settings_lifespan(original_lifespan, settings_application):
+    """合成原路由生命周期；清理设置快照不掩盖更早的启停异常。"""
+    @asynccontextmanager
+    async def lifespan(app):
+        settings_application.start()
+        try:
+            async with original_lifespan(app) as state:
+                yield state
+        except BaseException:
+            try:
+                settings_application.close()
+            except BaseException:
+                pass
+            raise
+        else:
+            settings_application.close()
+    return lifespan
+
+
 def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessManager) -> APIRouter:
     """构造 HTTP（超文本传输协议）业务与管理接口。"""
 
@@ -219,6 +269,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     from gateways.settings import SettingsApplication
     from core.config_profiles import ConfigurationConflict
     settings_application = SettingsApplication(runtime)
+    router.lifespan_context = _settings_lifespan(router.lifespan_context, settings_application)
 
     async def call_settings(function, *args, **kwargs):
         try:
@@ -532,7 +583,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         if not isinstance(payload, dict) or not all(isinstance(payload.get(key), str) for key in ("robot", "profile", "name")):
             raise GatewayError("请指定机器人、来源方案和新方案名称", error_code="invalid_configuration", http_status=400)
         return await call_settings(create_profile, root=config_io._CORE_ENV.parent, robot=payload["robot"],
-                                   source=payload["profile"], name=payload["name"], expected_revision=payload.get("revision"))
+                                   source=payload["profile"], name=payload["name"], expected_revision=payload.get("revision"),
+                                   revision_owner=settings_application.revision_owner)
 
     @router.post("/api/config/activate")
     async def api_config_activate_profile(request: Request) -> Dict[str, Any]:
@@ -555,7 +607,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         if location:
             if not settings_application._is_active(location):
                 raise GatewayError("请先应用所选配置方案", error_code="configuration_not_active", http_status=409)
-            await call_settings(check_revision, location, payload.get("revision"), root=root)
+            await call_settings(check_revision, location, payload.get("revision"), root=root,
+                                revision_owner=settings_application.revision_owner)
         result = await call_settings(queue_restart, root)
         background.add_task(dispatch_restart, root, result)
         return result
@@ -1036,10 +1089,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     @router.get("/artifacts/{artifact_id}")
     def api_artifact_raw(artifact_id: str, request: Request) -> FileResponse:
         try:
-            ref = runtime.artifact_store.get_ref(artifact_id)
-            path = runtime.artifact_store.get_file_path(artifact_id)
+            return ArtifactFileResponse(runtime.artifact_store, artifact_id)
         except Exception as exc:
             raise as_gateway_error(exc) from exc
-        return FileResponse(path, media_type=ref.mime_type, filename=path.name)
 
     return router

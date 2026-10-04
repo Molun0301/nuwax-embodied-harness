@@ -233,6 +233,7 @@ impl RouteFollower {
         self.retry_after=Instant::now();
     }
     fn schedule(&mut self,detour:bool) {
+        #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::PlanSchedule);
         if self.owner.is_none() || self.preparation_fault.is_some() || Instant::now()<self.retry_after {return;}
         let (Some(map),Some(pose))=(&self.map,&self.pose) else {return;};
         if let Some((_,start,previous_detour))=self.submitted {
@@ -254,6 +255,7 @@ impl RouteFollower {
         }
     }
     fn consume_plan(&mut self) {
+        #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::PlanConsumeAdmission);
         let Some(owner)=&self.owner else {return;};
         let Some(completion)=owner.take() else {return;};
         if owner.faulted() {return;}
@@ -419,10 +421,15 @@ impl NavPlanner for RouteFollower {
             .is_some_and(|map| map.body_envelope().is_none())
         {
             return if self.admitted_generation == Some(self.route_generation) {
+                #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ControllerStep);
                 self.controller.step(width)
             } else { PlannerStep::Pending(Vec::new()) };
         }
-        if let Some(reason) = self.controller.current_body_error() {
+        let body_error={
+            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::RouteCurrentBody);
+            self.controller.current_body_error()
+        };
+        if let Some(reason) = body_error {
             // 起点缺少合法支撑或净空时，重发同一全局路线只会造成规划忙循环。
             // 原实际速度回执、输入期限和取消仍由执行调度器处理。
             self.wait_reason = Some(format!(
@@ -430,9 +437,15 @@ impl NavPlanner for RouteFollower {
             ));
             return PlannerStep::Pending(Vec::new());
         }
-        self.advance_progress();
+        {
+            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::RouteProgress);
+            self.advance_progress();
+        }
         if !self.config.local_planning_enabled {
-            return self.controller.step(width);
+            return {
+                #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ControllerStep);
+                self.controller.step(width)
+            };
         }
         self.consume_plan();
         if self.owner.as_ref().is_some_and(|owner|owner.faulted()) {
@@ -454,7 +467,10 @@ impl NavPlanner for RouteFollower {
             self.wait_reason=Some("近场搜索尚未取得可执行轨迹，保持零速等待".into());
             return PlannerStep::Pending(self.local_failures.clone());
         }
-        let step=self.controller.step(width);
+        let step={
+            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ControllerStep);
+            self.controller.step(width)
+        };
         if matches!(step,PlannerStep::ReplanRequired(_)) {self.dirty=true;self.schedule(true);}
         // Preserve a genuine current rejection verbatim while detour work is pending.
         if matches!(step,PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_)) {return step;}

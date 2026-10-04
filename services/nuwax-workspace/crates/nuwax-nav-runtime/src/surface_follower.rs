@@ -187,6 +187,7 @@ impl SurfaceFollower {
     }
 
     fn refresh_current_body_view(&mut self) {
+        #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::CurrentViewRefresh);
         if !self.body_view_dirty { return; }
         self.body_view_dirty = false;
         self.map = self.source_map.clone();
@@ -203,6 +204,7 @@ impl SurfaceFollower {
     /// 当前站姿自身被拒绝时，全局改道不能恢复运动；保留目标等待实际输入恢复。
     pub(crate) fn current_body_error(&mut self) -> Option<String> {
         self.refresh_current_body_view();
+        #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::CurrentBodyValidation);
         let map = self.map.as_ref()?;
         map.body_envelope()?;
         let pose = self.odometry.as_ref()?;

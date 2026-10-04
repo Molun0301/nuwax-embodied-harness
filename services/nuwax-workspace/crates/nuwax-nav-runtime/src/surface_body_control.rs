@@ -284,6 +284,7 @@ impl SurfaceFollower {
         self.last_command = Twist2::ZERO;
     }
     pub(super) fn follow_body_step(&mut self, robot_width: f64) -> PlannerStep {
+        #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::RouteIntent);
         if let Some(error) = &self.invalid_input {
             return PlannerStep::Failed(error.clone());
         }
@@ -310,7 +311,11 @@ impl SurfaceFollower {
         if !robot_width.is_finite() || robot_width <= 0.0 {
             return PlannerStep::Failed("机器人宽度无效".into());
         }
-        if let Err(e) = map.validate_body_pose(body(pose).0, body(pose).1) {
+        let body_validity={
+            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::CurrentBodyValidation);
+            map.validate_body_pose(body(pose).0, body(pose).1)
+        };
+        if let Err(e) = body_validity {
             return PlannerStep::ReplanRequired(format!("当前三维机体包络无效: {e}"));
         }
         let position = pose.pose.position;
@@ -656,6 +661,7 @@ impl SurfaceFollower {
         &mut dyn FnMut(PlanarPose, PlanarPose, f64) -> bool,
         &std::cell::RefCell<Option<nuwax_nav_mls_planner::surface::SurfaceError>>,
     ) -> R) -> Result<R, String> {
+        #[cfg(test)] let profile_setup=crate::control_profile::guard(crate::control_profile::Stage::GuardSetup);
         let map=self.map.as_ref().ok_or("缺少表面地图")?;
         let pose=self.odometry.as_ref().ok_or("缺少实际位姿")?;
         let observation_check = if let Some(age) = self.config.max_observation_age_sec {
@@ -732,7 +738,14 @@ impl SurfaceFollower {
                 true
             }
         };
-        Ok(run(&mut make_check(false), &mut make_check(true), &last_failure))
+        #[cfg(test)] drop(profile_setup);
+        let result=run(&mut make_check(false), &mut make_check(true), &last_failure);
+        #[cfg(test)] {
+            let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardCleanup);
+            drop(future_views);drop(period_queries);drop(motion_queries);
+            drop(last_failure);drop(observation_check);
+        }
+        Ok(result)
     }
 
     /// Timing-only entry: callers supply a known reachable candidate. This is
@@ -758,6 +771,7 @@ impl SurfaceFollower {
     }
 
     pub(super) fn bounded_body_command(&mut self, preferred: Twist2, speed_limit:Option<f64>) -> PlannerStep {
+        #[cfg(test)] let profile_setup=crate::control_profile::guard(crate::control_profile::Stage::GuardSetup);
         let (Some(map), Some(pose), Some(physical_limits)) = (
             self.map.as_ref(),
             self.odometry.as_ref(),
@@ -809,7 +823,9 @@ impl SurfaceFollower {
         let mut rotation_useful=std::collections::HashMap::<u64,bool>::new();
         let reference_curvature=reference_segments.first().map(|(a,b)|
             2.0*(angle_diff(b.yaw,a.yaw)*0.5).sin()/(b.x-a.x).hypot(b.y-a.y));
+        #[cfg(test)] drop(profile_setup);
         let checked = self.with_body_motion_checks(|clear,period_clear,last_failure| {
+        #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::CandidateRankingSweeps);
         let result = choose_tracking_control_with_period_check(
             planar(pose),
             current,
@@ -841,6 +857,10 @@ impl SurfaceFollower {
         );
         (result,last_failure.take())
         });
+        #[cfg(test)] {
+            let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardCleanup);
+            drop(rotation_useful);drop(reference_segments);
+        }
         let (result,last_failure)=match checked {Ok(value)=>value,Err(error)=>return PlannerStep::ReplanRequired(error)};
         match result {
             Some(choice) if choice.command.linear.x.hypot(choice.command.linear.y) > 1e-9

@@ -413,3 +413,36 @@ limitations and the independent 1 cm fixture freshness failure remain open.
 regression run: 130 passed, 28 opt-in experiments ignored, and only the five
 previously verified unavailable-UDS environment cases explicitly filtered out
 (122.66 s). This does not change the scope of the moving or software-safety claims.
+
+## First control-stage wall attribution
+
+`stage-profile-held-baseline.log` runs the unchanged primed 5 cm held-planning
+continuity scenario on a frozen binary built before the independent observation
+update optimization. `stage-profile-final-compile.log` records the unoptimized +
+debuginfo build; three instrumentation unit tests passed in
+`stage-profile-compile.log`. New instrumentation is cfg(test), disabled unless
+the measured wrapper starts a record, with eleven fixed thread-local stage slots
+and a bounded preallocated per-step buffer. Weak source-view markers do not retain
+old cache/payload roots. Formatting is after worker drain, no new production
+locks/hashes/caches or per-stage allocations. Nested timings are inclusive and
+must not be summed. Wall time includes scheduling and instrumentation overhead;
+it is not thread CPU. Tiny outer control containers are explicitly dropped inside
+the test-only cleanup scope; normal production destruction order is unchanged.
+
+All 297 step records were retained, with no omissions. Functional continuity
+passed (five fresh held commands, subsequent admission, zero delivered negatives,
+1.079237 m modeled travel), but the run remains FAILED the strict 50 ms criterion:
+control median/p95/max 22.68/42.73/58.95 ms. Consumer maximum was 0.034 ms.
+
+The candidate ranking plus swept checks stage had median/p95/max
+19.03/28.91/36.89 ms. Current-view refresh maximum was 1.01 ms, plan consumption
+and current admission maximum 0.210 ms, and guard cleanup maximum 0.209 ms.
+At the worst step, first admission and changed metadata coincided with 58.95 ms
+control time, but admission itself was only 0.114 ms. Controller time was
+58.38 ms, containing 22.37 ms ranking/sweeps, 4.09 ms setup and 0.012 ms cleanup;
+about 31.9 ms remained in current route-intent work outside those guard stages.
+The second-slowest step similarly had about 12.7 ms outside the guard stages.
+These samples therefore point next to route connectors/waypoint/turn/lookahead
+work and candidate sweeps, not to optimizing the small admission stage. They do
+not reproduce or explain every earlier 83/163 ms tail, and do not justify claiming
+planner separation guarantees a hard control deadline.

@@ -18,11 +18,12 @@
 //! explicitly labeled stress. This is generic synthetic calibration, not Go2.
 
 use super::*;
+use crate::control_profile::{self, Record as StageRecord, Stage};
 use nuwax_nav_control::{integrate, PlanarPose};
 use nuwax_nav_mls_planner::{mls_planner::Config, SurfaceBodyEnvelope, SurfaceObservation, SurfaceObservations};
 use nuwax_nav_types_messages::{GoalOptions, NavFrameId, MotionLimits, MotionModel, Point3, Pose3, Quaternion, Timestamp};
 use std::collections::BTreeMap;
-use std::sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, mpsc, Mutex};
+use std::sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, mpsc, Mutex, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const PERIOD: Duration = Duration::from_millis(50);
@@ -30,6 +31,10 @@ const SENSOR_PERIOD: Duration = Duration::from_millis(200);
 const WIDTH: f64 = 0.3;
 const OBS_AGE: f64 = 1.0; // explicit synthetic terrain capability, never extended
 const MAX_TICKS: usize = 1_200;
+// The compute owner can finish a little more work than consumer tick count.
+// Standard runs retain MAX_TICKS + 16 samples; existing 120s runs retain
+// 2 * MAX_TICKS + 16. Further samples are counted, never grow this new buffer.
+const PROFILE_DRAIN_ALLOWANCE: usize = 16;
 
 type Body = ([f64; 3], [f64; 4]);
 fn unix_ns() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos().try_into().unwrap() }
@@ -107,26 +112,122 @@ impl Sensor {
 }
 impl Drop for Sensor {fn drop(&mut self){self.stop.store(true,Ordering::Release);if let Some(t)=self.join.take(){t.join().unwrap();}}}
 
+struct ControlStepSample {
+    step_seq: u64,
+    control_ms: f64,
+    stages: StageRecord,
+    source_view_seq: u64,
+    source_present: bool,
+    first_after_view_change: bool,
+    pose_stamp_ns: Option<i64>,
+    submitted_before: u64,
+    submitted_after: u64,
+    admitted_before: u64,
+    admitted_after: u64,
+    jobs_before: usize,
+    jobs_after: usize,
+    held_before: bool,
+    held_after: bool,
+    held_phase_before: usize,
+    held_phase_after: usize,
+    outcome: &'static str,
+}
+
 #[derive(Default)]
-struct Probe {control_ms:Vec<f64>,map_update_ms:Vec<f64>,submitted:u64,admitted:u64,negative:usize,pending:usize,endpoints:Vec<[f64;3]>}
-struct Measured {inner:RouteFollower,probe:Arc<Mutex<Probe>>}
+struct Probe {
+    control_ms:Vec<f64>,map_update_ms:Vec<f64>,submitted:u64,admitted:u64,
+    negative:usize,pending:usize,endpoints:Vec<[f64;3]>,
+    control_samples:Vec<ControlStepSample>,control_sample_limit:usize,control_sample_overflow:usize,
+}
+impl Probe {
+    fn with_control_sample_budget(max_ticks: usize) -> Self {
+        let limit = max_ticks.min(MAX_TICKS * 2) + PROFILE_DRAIN_ALLOWANCE;
+        Self {
+            control_ms: Vec::with_capacity(MAX_TICKS * 2),
+            control_samples: Vec::with_capacity(limit),
+            control_sample_limit: limit,
+            ..Self::default()
+        }
+    }
+}
+
+struct Measured {
+    inner:RouteFollower,probe:Arc<Mutex<Probe>>,
+    source:Option<Weak<SurfaceSnapshot>>,source_view_seq:u64,first_after_view_change:bool,
+    pose_stamp_ns:Option<i64>,step_seq:u64,
+    jobs:Arc<AtomicUsize>,held:Arc<AtomicBool>,held_phase:Arc<AtomicUsize>,
+}
+impl Measured {
+    fn new(inner:RouteFollower,probe:Arc<Mutex<Probe>>,jobs:Arc<AtomicUsize>,held:Arc<AtomicBool>,held_phase:Arc<AtomicUsize>)->Self {
+        Self {inner,probe,source:None,source_view_seq:0,first_after_view_change:false,
+            pose_stamp_ns:None,step_seq:0,jobs,held,held_phase}
+    }
+    fn clear_source_marker(&mut self) {
+        if self.source.take().is_some() {
+            self.source_view_seq=self.source_view_seq.saturating_add(1);
+            self.first_after_view_change=true;
+        }
+    }
+}
 impl NavPlanner for Measured {
     fn configure_goal(&mut self,g:&PoseStamped,o:GoalOptions)->Result<(),RuntimeError>{self.inner.configure_goal(g,o)}
     fn configure_boundary(&mut self,b:&[[f64;2]]){self.inner.configure_boundary(b)}
     fn replace_path(&mut self,p:Path2D){self.inner.replace_path(p)}
     fn replace_execution_path(&mut self,p:ExecutionPath,y:Option<Vec<f64>>,g:PoseStamped)->Result<(),RuntimeError>{self.inner.replace_execution_path(p,y,g)}
-    fn update_odometry(&mut self,p:PoseStamped){self.inner.update_odometry(p)}
-    fn update_costmap(&mut self,m:CostMap2D){self.inner.update_costmap(m)}
-    fn update_execution_map(&mut self,m:ExecutionMap)->Result<(),RuntimeError>{let t=Instant::now();let result=self.inner.update_execution_map(m);self.probe.lock().unwrap().map_update_ms.push(t.elapsed().as_secs_f64()*1e3);result}
-    fn invalidate_execution_map(&mut self){self.inner.invalidate_execution_map()}
+    fn update_odometry(&mut self,p:PoseStamped){self.pose_stamp_ns=Some(p.stamp.nanos);self.inner.update_odometry(p)}
+    fn update_costmap(&mut self,m:CostMap2D){self.inner.update_costmap(m);self.clear_source_marker();}
+    fn update_execution_map(&mut self,m:ExecutionMap)->Result<(),RuntimeError>{
+        // The marker follows the actual source view delivered to this compute
+        // owner. Identity comes from the existing comparison, never a new hash,
+        // an Arc address, the consumer's newer map, or a fabricated timestamp.
+        // A weak marker does not pin prior source payloads or their query
+        // caches. Its temporary upgrade is dropped before the inner update;
+        // if the source is already gone, conservatively mark a new view.
+        let (source,changed)=match &m {
+            ExecutionMap::Surface(next)=>{
+                let changed=self.source.as_ref().and_then(Weak::upgrade)
+                    .is_none_or(|old|!old.same_body_query_view(next));
+                (Some(Arc::downgrade(next)),changed)
+            },
+            ExecutionMap::Planar(_)=>(None,false),
+        };
+        let t=Instant::now();let result=self.inner.update_execution_map(m);let ms=t.elapsed().as_secs_f64()*1e3;
+        if result.is_ok() {
+            if changed {self.source_view_seq=self.source_view_seq.saturating_add(1);self.first_after_view_change=true;}
+            self.source=source;
+        }
+        self.probe.lock().unwrap().map_update_ms.push(ms);result
+    }
+    fn invalidate_execution_map(&mut self){self.inner.invalidate_execution_map();self.clear_source_marker();}
     fn observe_applied_command(&mut self,c:Twist2){self.inner.observe_applied_command(c)}
     fn execution_wait_reason(&self)->Option<String>{self.inner.execution_wait_reason()}
     fn local_path_for_display(&self)->Vec<[f64;3]>{self.inner.local_path_for_display()}
     fn step(&mut self,w:f64)->PlannerStep {
+        self.step_seq=self.step_seq.saturating_add(1);
+        let submitted_before=self.inner.local_planning_calls();let admitted_before=self.inner.local_plans();
+        let jobs_before=self.jobs.load(Ordering::Acquire);let held_phase_before=self.held_phase.load(Ordering::Acquire);
+        let held_before=self.held.load(Ordering::Acquire);
+        control_profile::begin();
         let t=Instant::now();let result=self.inner.step(w);let ms=t.elapsed().as_secs_f64()*1e3;
-        let mut p=self.probe.lock().unwrap();p.control_ms.push(ms);p.submitted=self.inner.local_planning_calls();
-        if self.inner.local_plans()>p.admitted {if let Some(end)=self.inner.local_path().and_then(|path|path.poses.last()){let v=end.pose.position;p.endpoints.push([v.x,v.y,v.z]);}}
-        p.admitted=self.inner.local_plans();
+        let stages=control_profile::end();
+        let submitted_after=self.inner.local_planning_calls();let admitted_after=self.inner.local_plans();
+        let jobs_after=self.jobs.load(Ordering::Acquire);let held_phase_after=self.held_phase.load(Ordering::Acquire);
+        let held_after=self.held.load(Ordering::Acquire);
+        let sample=ControlStepSample {step_seq:self.step_seq,control_ms:ms,stages,
+            source_view_seq:self.source_view_seq,source_present:self.source.is_some(),
+            first_after_view_change:std::mem::take(&mut self.first_after_view_change),pose_stamp_ns:self.pose_stamp_ns,
+            submitted_before,submitted_after,admitted_before,admitted_after,jobs_before,jobs_after,
+            held_before,held_after,held_phase_before,held_phase_after,
+            outcome:match &result {PlannerStep::Command(v)=>if nonzero(*v){"command_nonzero"}else{"command_zero"},
+                PlannerStep::Pending(_)=>"pending",PlannerStep::Succeeded=>"succeeded",
+                PlannerStep::ReplanRequired(_)=>"replan_required",PlannerStep::Failed(_)=>"failed"}};
+        // One existing stats lock after the measured step. New records never
+        // reallocate; overflow is visible and cannot silently qualify a run.
+        let mut p=self.probe.lock().unwrap();p.control_ms.push(ms);p.submitted=submitted_after;
+        if p.control_samples.len()<p.control_sample_limit {p.control_samples.push(sample);}
+        else {p.control_sample_overflow=p.control_sample_overflow.saturating_add(1);}
+        if admitted_after>p.admitted {if let Some(end)=self.inner.local_path().and_then(|path|path.poses.last()){let v=end.pose.position;p.endpoints.push([v.x,v.y,v.z]);}}
+        p.admitted=admitted_after;
         p.negative+=usize::from(matches!(result,PlannerStep::Failed(_)|PlannerStep::ReplanRequired(_)));
         p.pending+=usize::from(matches!(result,PlannerStep::Pending(_)));result
     }
@@ -141,6 +242,49 @@ struct RawSegment {map:Arc<SurfaceSnapshot>,boundary:Arc<Vec<[f64;2]>>,from:Plan
 fn distribution(values:&[f64])->(f64,f64,f64) {let mut v=values.to_vec();v.sort_by(f64::total_cmp);if v.is_empty(){return (0.0,0.0,0.0);} (v[v.len()/2],v[((v.len()-1)as f64*0.95).ceil()as usize],*v.last().unwrap())}
 fn measured_distribution(values:&[f64])->String {
     if values.is_empty(){"unavailable".into()}else{format!("{:?}",distribution(values))}
+}
+
+fn report_control_stages(p:&Probe,factory:bool,scenario:Scenario,enabled:bool,resolution:f32,startup:&str) {
+    let context=format!("scenario={scenario:?} enabled={enabled} source_cm={} startup={startup}",resolution*100.0);
+    if factory {
+        eprintln!("CONTROL_STAGE_SCOPE {context} available=false reason=unprobed_factory wall_not_thread_cpu=true");
+        return;
+    }
+    let sample_scope=if p.control_sample_overflow==0 {"all_recorded_steps"}else{"retained_prefix_only_incomplete"};
+    eprintln!("CONTROL_STAGE_SCOPE {context} available=true sample_scope={sample_scope} retained_steps={} record_limit={} omitted_steps={} attribution_complete={} nested_stages=inclusive_do_not_sum duration=wall_not_thread_cpu source_marker=successful_compute_owner_same_body_query_view_changes first_after_view_change=first_step_after_input_view_change metadata_cold_is_not_geometry_cold=true pose_stamp=actual_compute_owner_update_odometry_stamp planning_and_held_markers=independent_step_boundary_samples exact_transition_time=unavailable held_phase_0=not_started held_phase_1=held held_phase_2=released derived_body_view_identity=unavailable",
+        p.control_samples.len(),p.control_sample_limit,p.control_sample_overflow,p.control_sample_overflow==0);
+    // Reporting occurs after worker drain, outside every timed step. The scratch
+    // allocation is bounded by the already bounded retained sample count.
+    let mut values=Vec::with_capacity(p.control_samples.len());
+    for stage in Stage::ALL {
+        let index=stage as usize;
+        values.clear();
+        values.extend(p.control_samples.iter().filter(|sample|sample.stages.calls[index]>0)
+            .map(|sample|sample.stages.wall_nanos[index]as f64/1e6));
+        let calls:u64=p.control_samples.iter().map(|sample|u64::from(sample.stages.calls[index])).sum();
+        eprintln!("CONTROL_STAGE {context} sample_scope={sample_scope} stage={} inclusive=true called_steps={} calls={calls} called_step_ms_median_p95_max={}",
+            stage.label(),values.len(),measured_distribution(&values));
+    }
+    let mut slowest:[Option<&ControlStepSample>;5]=[None;5];
+    for sample in &p.control_samples {
+        if let Some(index)=slowest.iter().position(|old|old.is_none_or(|old|sample.control_ms>old.control_ms)) {
+            for destination in ((index+1)..slowest.len()).rev() {slowest[destination]=slowest[destination-1];}
+            slowest[index]=Some(sample);
+        }
+    }
+    for (rank,sample) in slowest.into_iter().flatten().enumerate() {
+        // All fields join on this compute-owner step, not on an asynchronously
+        // newer consumer receipt. Absent stages retain calls=0 for that step.
+        let stage_ms_calls=Stage::ALL.map(|stage|{
+            let index=stage as usize;
+            (stage.label(),sample.stages.wall_nanos[index]as f64/1e6,sample.stages.calls[index])
+        });
+        eprintln!("CONTROL_SLOW_STEP {context} sample_scope={sample_scope} rank={} step_seq={} control_wall_ms={:.6} source_view_seq={} source_present={} first_after_view_change={} pose_stamp_ns={:?} submitted_before={} submitted_after={} admitted_before={} admitted_after={} jobs_before={} jobs_after={} held_before={} held_after={} held_phase_before={} held_phase_after={} outcome={} inclusive_stage_ms_calls={stage_ms_calls:?}",
+            rank+1,sample.step_seq,sample.control_ms,sample.source_view_seq,sample.source_present,
+            sample.first_after_view_change,sample.pose_stamp_ns,sample.submitted_before,sample.submitted_after,
+            sample.admitted_before,sample.admitted_after,sample.jobs_before,sample.jobs_after,
+            sample.held_before,sample.held_after,sample.held_phase_before,sample.held_phase_after,sample.outcome);
+    }
 }
 // Fixed scalar categories describe the consumer's actual Pending reasons; an
 // empty 5Hz sensor queue during a 20Hz tick is expected and counted separately.
@@ -172,17 +316,21 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
     let (config,base,keys)=fixture(enabled,resolution,if matches!(scenario,Scenario::HoldSecond|Scenario::HoldSecondContinuity){10.0}else{6.0});
     let priming_started=Instant::now();
     let sensor=Sensor::new(base.clone(),keys);
-    let probe=Arc::new(Mutex::new(Probe{control_ms:Vec::with_capacity(MAX_TICKS*2),..Default::default()}));
+    let probe=Arc::new(Mutex::new(Probe::with_control_sample_budget(max_ticks)));
     let jobs=Arc::new(AtomicUsize::new(0));let held=Arc::new(AtomicBool::new(false));
+    // Test-hook phase only: one selected job is held in each existing scenario.
+    // This records a completed hold even if it begins/ends between step samples.
+    // It is diagnostic; the existing held flag still drives the same assertions.
+    let held_phase=Arc::new(AtomicUsize::new(0));
     let (release,receive)=mpsc::sync_channel(1);
     let mut worker=if factory {assert_eq!(scenario,Scenario::Goal);production_surface_backend(config.clone()).unwrap()} else {
-        let count=jobs.clone();let active=held.clone();
+        let count=jobs.clone();let active=held.clone();let phase=held_phase.clone();
         let inner=RouteFollower::new_with_planning_hook(config.clone(),Box::new(move |_| {
             let job=count.fetch_add(1,Ordering::SeqCst)+1;
             let hold=match scenario{Scenario::Goal=>false,Scenario::HoldSecond|Scenario::HoldSecondContinuity=>job==2,_=>job==1};
-            if hold {active.store(true,Ordering::Release);let _=receive.recv_timeout(Duration::from_secs(10));active.store(false,Ordering::Release);}
+            if hold {active.store(true,Ordering::Release);phase.store(1,Ordering::Release);let _=receive.recv_timeout(Duration::from_secs(10));active.store(false,Ordering::Release);phase.store(2,Ordering::Release);}
         })).unwrap();
-        planner_worker::PlannerWorker::new(Measured{inner,probe:probe.clone()}).unwrap()
+        planner_worker::PlannerWorker::new(Measured::new(inner,probe.clone(),jobs.clone(),held.clone(),held_phase.clone())).unwrap()
     };
     let mut map=base;let mut boundary=Arc::new(Vec::new());let mut frames=0usize;let mut sensor_no_new_frame=0usize;let mut consumer_waits=ConsumerWaits::default();
     let mut previous_frame=None::<u64>;let mut previous_source=None::<Arc<SurfaceSnapshot>>;let mut sequence=0u16;let mut installed_sample_ns=0u64;
@@ -305,6 +453,7 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
         [current.pose.position.x,current.pose.position.y,current.pose.position.z,current.pose.orientation.yaw()],
         measured_distribution(tick_gaps),tick_gaps.iter().filter(|ms|**ms>50.0).count(),tick_gaps.iter().filter(|ms|**ms>75.0).count(),
         measured_distribution(&consume_ms),measured_distribution(&p.control_ms),measured_distribution(&p.map_update_ms),cpu_snapshot());
+    report_control_stages(&p,factory,scenario,enabled,resolution,startup);
     // Report CPU raw /proc values; no false per-thread CPU attribution. Factory
     // runs deliberately have no inner probe: consumer latency is NOT control CPU.
     drop(p);drop(sensor);

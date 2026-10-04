@@ -17,6 +17,39 @@ pub(super) fn with_expansion_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T 
     let _reset = Reset(EXPANSION_LIMIT.replace(limit));
     f()
 }
+
+#[derive(Default, Debug)]
+struct SearchWork {
+    expanded: usize,
+    candidates: usize,
+    // Admission sweeps only; analytic connectors and rotations are not counted.
+    sweeps: usize,
+    nodes: usize,
+    frontier_peak: usize,
+}
+impl Drop for SearchWork {
+    fn drop(&mut self) {
+        tracing::debug!(target: "navigation.scan.search", expanded=self.expanded,
+            candidates=self.candidates, sweeps=self.sweeps, nodes=self.nodes,
+            frontier_peak=self.frontier_peak, "bounded local search work");
+        #[cfg(test)]
+        {
+            eprintln!("search_work {self:?}");
+            LAST_WORK.set((self.expanded,self.nodes,self.frontier_peak));
+        }
+    }
+}
+#[cfg(test)]
+thread_local! { static LAST_WORK: std::cell::Cell<(usize,usize,usize)> = const { std::cell::Cell::new((0,0,0)) }; }
+#[cfg(test)]
+pub(super) fn last_work() -> (usize,usize,usize) { LAST_WORK.get() }
+#[cfg(test)]
+thread_local! { static INITIAL_ADMISSIONS: std::cell::RefCell<Vec<(f64,f64,BodyPose)>> = const { std::cell::RefCell::new(Vec::new()) }; }
+#[cfg(test)]
+pub(super) fn initial_admissions() -> Vec<(f64,f64,BodyPose)> {
+    INITIAL_ADMISSIONS.with(|v| v.borrow().clone())
+}
+
 type ProjectedMotion=(Vec<BodyPose>,Vec<nuwax_nav_mls_planner::SurfaceBodyQueryView>);
 struct Node {
     pose: BodyPose,
@@ -37,13 +70,11 @@ impl Ord for Entry {
         b.0.total_cmp(&self.0).then_with(|| b.1.cmp(&self.1))
     }
 }
-fn key(p: BodyPose, quantum: f64, angular: f64) -> (i32, i32, i32, i32) {
-    (
-        (p.0[0] / quantum).floor() as i32,
-        (p.0[1] / quantum).floor() as i32,
-        (p.0[2] / quantum).floor() as i32,
-        (yaw(p.1).rem_euclid(std::f64::consts::TAU) / angular).floor() as i32,
-    )
+// Identity is the complete input pose, not a voxel/yaw equivalence class.
+// Keep signed zeros and quaternion antipodes distinct; do not canonicalize inputs.
+fn key(p: BodyPose) -> [u64; 7] {
+    [p.0[0].to_bits(), p.0[1].to_bits(), p.0[2].to_bits(),
+     p.1[0].to_bits(), p.1[1].to_bits(), p.1[2].to_bits(), p.1[3].to_bits()]
 }
 
 pub fn probe_motion(
@@ -213,9 +244,8 @@ pub fn plan(
             reference_progress([p.0[0], p.0[1], p.0[2] - offset], reference);
         (reference_length - progress).max(0.0) + deviation
     };
-    // 搜索状态按源精度合并，实际候选仍保留完整站姿并逐段核对，不量化机体或障碍。
-    let quantum = f64::from(map.source_voxel_size_m()).clamp(0.025, 0.1);
-    let angular = 0.1;
+    // Exact identity retains legal centimetre departures and small rotations.
+    // More distinct states compete within the same finite expansion budget.
     let mut nodes = vec![Node {
         pose: start,
         cost: 0.0,
@@ -223,7 +253,12 @@ pub fn plan(
         samples: Vec::new(),
     }];
     let mut open = BinaryHeap::from([Entry(remaining(start) * 4.0, 0)]);
-    let mut best = HashMap::from([(key(start, quantum, angular), 0.0)]);
+    let mut best = HashMap::from([(key(start), 0.0)]);
+    let mut work = SearchWork::default();
+    work.nodes = 1;
+    work.frontier_peak = 1;
+    #[cfg(test)]
+    INITIAL_ADMISSIONS.with(|v|v.borrow_mut().clear());
     let mut expanded = 0;
     let mut closest = start;
     let mut budget_exhausted = false;
@@ -235,7 +270,7 @@ pub fn plan(
         let from = nodes[id].pose;
         let cost = nodes[id].cost;
         if best
-            .get(&key(from, quantum, angular))
+            .get(&key(from))
             .is_some_and(|&v| cost > v + 1e-9)
         {
             continue;
@@ -315,6 +350,7 @@ pub fn plan(
             budget_exhausted = true;
             break;
         }
+        work.expanded += 1;
         let fine = (f64::from(map.source_voxel_size_m()) * 0.5).clamp(0.01, 0.05);
         let body_radius = map
             .body_envelope()
@@ -339,16 +375,9 @@ pub fn plan(
             (0.0, 0.08),
             (0.0, -0.08),
         ];
-        let mut forward_available=false;
-        let mut dominated_coarse:Vec<ProjectedMotion>=Vec::new();
-        for (index,(length, turn)) in actions.into_iter().enumerate() {
-            if index==9 && !forward_available {
-                // 被搜索代价淘汰的粗动作，只在决定是否需要细动作时核验一条可行前进边。
-                // 保持原粗细动作选择语义，避免延后检查改变路径与转弯形状。
-                forward_available=dominated_coarse.iter().any(|(poses,views)|
-                    validate_projected(from,poses,views,boundary).is_some());
-            }
-            if index>=9 && forward_available {break;}
+        // A legal coarse edge does not prove that its continuation can escape.
+        // Every existing fine primitive receives the same admission checks.
+        for (length, turn) in actions {
             if length == 0.0 && !motion.can_rotate_in_place {
                 continue;
             }
@@ -356,12 +385,12 @@ pub fn plan(
             {
                 continue;
             }
+            work.candidates += 1;
             let Some((samples,views)) = project_motion_until(map, from, length, turn, |_|false) else {
                 continue;
             };
             let next = *samples.last().unwrap();
             if (next.0[0] - start.0[0]).hypot(next.0[1] - start.0[1]) > distance(start) + 1.0 {
-                if index<9 && length>0.0 && !forward_available {dominated_coarse.push((samples,views));}
                 continue;
             }
             let support = [next.0[0], next.0[1], next.0[2] - offset];
@@ -372,14 +401,15 @@ pub fn plan(
                 + length.max(0.04) * (1.0 + 0.15 * terrain_cost)
                 + turn.abs() * 0.12
                 + reference_distance(next.0, reference) * 0.1;
-            let k = key(next, quantum, angular);
+            let k = key(next);
             if best.get(&k).is_some_and(|&old| next_cost >= old) {
-                if index<9 && length>0.0 && !forward_available {dominated_coarse.push((samples,views));}
                 continue;
             }
             // 已有合法路径代价更低时不重复做扫掠；真正入队的边仍完整核验。
+            work.sweeps += 1;
             if validate_projected(from,&samples,&views,boundary).is_none() {continue;}
-            if index<9 && length>0.0 {forward_available=true;}
+            #[cfg(test)]
+            if id == 0 { INITIAL_ADMISSIONS.with(|v|v.borrow_mut().push((length,turn,next))); }
             best.insert(k,next_cost);
             let next_id = nodes.len();
             nodes.push(Node {
@@ -393,17 +423,47 @@ pub fn plan(
                 next_cost + 4.0 * remaining(next) + heading_cost,
                 next_id,
             ));
+            work.nodes = nodes.len();
+            work.frontier_peak = work.frontier_peak.max(open.len());
         }
     }
     // Neither a drained discretized search nor an expansion limit proves obstruction.
     Err(LocalPlanError {
         reason: format!(
-            "近场前向搜索未连通（{expanded}次展开，最近{:.3}米，姿态{closest:?}）",
-            distance(closest)
+            "近场前向搜索未连通（{expanded}次访问，{}个状态，{}个待选，最近{:.3}米，姿态{closest:?}）",
+            nodes.len(), open.len(), distance(closest)
         ),
         kind: if budget_exhausted { super::LocalPlanFailureKind::BudgetExhausted }
             else { super::LocalPlanFailureKind::SearchExhausted },
         closest_pose: Some(closest),
         blocked: None,
     })
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn raw_pose_key_preserves_all_seven_components_and_antipodes() {
+        let pose=([0.0,0.0,0.4],[0.0,0.0,0.0,1.0]);
+        let original=key(pose);
+        let mut admitted=HashMap::from([(original,0)]);
+        for index in 0..7 {
+            let mut changed=pose;
+            let component=if index<3 {&mut changed.0[index]} else {&mut changed.1[index-3]};
+            *component=f64::from_bits(component.to_bits()+1);
+            assert_ne!(original,key(changed),"component {index}");
+            assert!(admitted.insert(key(changed),index+1).is_none());
+        }
+        let zeros=([0.0;3],[0.0;4]);
+        for index in 0..7 {
+            let mut changed=zeros;
+            if index<3 {changed.0[index]=-0.0;} else {changed.1[index-3]=-0.0;}
+            assert_ne!(key(zeros),key(changed),"signed zero component {index}");
+        }
+        let antipode=(pose.0,pose.1.map(|v|-v));
+        assert_ne!(original,key(antipode));
+        assert!(admitted.insert(key(antipode),8).is_none());
+        assert_eq!(admitted.insert(original,9),Some(0));
+    }
 }

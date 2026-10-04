@@ -622,6 +622,9 @@ mod tests {
         scene_with_slope(door, 0.0)
     }
     fn scene_with_slope(door: Option<i32>, slope: f64) -> SurfaceSnapshot {
+        scene_with_extra_cells(door, slope, &[])
+    }
+    fn scene_with_extra_cells(door: Option<i32>, slope: f64, extra: &[[i32; 3]]) -> SurfaceSnapshot {
         let size = 0.01_f32;
         let max_step = if slope == 0.0 { 0.0 } else { 0.15 };
         let mut cells: Vec<[i32; 3]> = (-130..131)
@@ -636,6 +639,7 @@ mod tests {
                     .flat_map(move |y| (0..65).map(move |z| [x, y, z]))
             }));
         }
+        cells.extend_from_slice(extra);
         let points: Vec<_> = cells
             .iter()
             .map(|p| {
@@ -694,6 +698,120 @@ mod tests {
             .unwrap()
             .with_observations(Some(Arc::new(observations)))
     }
+    fn fine_escape_scene(mirror: bool, shift: [i32; 2], coarse_dead_end: bool, half_width_cells: i32) -> (SurfaceSnapshot, BodyPose) {
+        let mut obstacles = vec![];
+        for z in 25..55 {
+            obstacles.push([-29, half_width_cells, z]);
+            obstacles.push([-29, -half_width_cells-1, z]);
+            if coarse_dead_end {
+                for x in 34..61 { for y in [-half_width_cells-1,half_width_cells+1] { obstacles.push([x,y,z]); } }
+                for y in -half_width_cells-1..half_width_cells+2 { obstacles.push([60,y,z]); }
+            } else {
+                for y in -50..20 { obstacles.push([37,y,z]); }
+            }
+        }
+        for p in &mut obstacles {
+            p[0] += shift[0];
+            p[1] = (if mirror { -p[1]-1 } else { p[1] }) + shift[1];
+        }
+        // Extend the independent flat support for the mirrored swept body.
+        obstacles.extend((-130..131).flat_map(|x|(-100..-70).map(move |y|[x,y,-1])));
+        let half_width=half_width_cells as f64*0.01-0.0001;
+        let map = scene_with_extra_cells(None, 0.0, &obstacles).with_body_envelope(SurfaceBodyEnvelope {
+            footprint_xy_m: vec![[-0.3,-half_width],[0.3,-half_width],[0.3,half_width],[-0.3,half_width]],
+            z_bounds_m: [-0.15,0.15], body_to_support_z_m: 0.4, max_step_up_m: 0.0, max_step_down_m: 0.0,
+            max_cross_slope_deg: 18.0, support_uncertainty_m: 0.0,
+        }).unwrap();
+        let start = ([0.011+shift[0] as f64*0.01,
+            shift[1] as f64*0.01,0.4], [0.0,0.0,0.0,1.0]);
+        (map,start)
+    }
+    fn check_fine_escape(mirror: bool, shift: [i32; 2], coarse_dead_end: bool, half_width_cells: i32) {
+        let (map,start)=fine_escape_scene(mirror,shift,coarse_dead_end,half_width_cells);
+        let sign=if mirror {-1.0} else {1.0};
+        map.validate_body_pose(start.0,start.1).unwrap();
+        for turn in [0.08,-0.08,0.3,-0.3] {
+            assert!(probe_motion(&map,start,0.0,turn,&[]).is_none(), "premature turn {turn}");
+        }
+        for turn in [0.1,-0.1] {
+            assert!(probe_motion(&map,start,0.01,turn,&[]).is_none(), "curved fine departure must collide before clearing rear pins");
+        }
+        assert_eq!(probe_motion(&map,start,0.25,0.0,&[]).is_some(),coarse_dead_end);
+        for (length,turn) in [(0.2,0.25),(0.2,-0.25),(0.12,0.45),(0.12,-0.45)] {
+            assert!(probe_motion(&map,start,length,turn,&[]).is_none(), "coarse arc must collide");
+        }
+        // This witness is constructed before invoking search. Every segment goes through
+        // the full map body-motion validator, not just endpoint or planner assertions.
+        let mut witness=vec![start];
+        witness.extend(probe_motion(&map,start,0.01,0.0,&[]).expect("one centimetre departure"));
+        let depart=*witness.last().unwrap();
+        witness.extend(probe_motion(&map,depart,0.0,sign*std::f64::consts::FRAC_PI_2,&[]).expect("turn after departure"));
+        let turned=*witness.last().unwrap();
+        witness.extend(probe_motion(&map,turned,0.5,0.0,&[]).expect("escape"));
+        for pair in witness.windows(2) { map.validate_body_motion(pair[0],pair[1],&[]).unwrap(); }
+        if coarse_dead_end {
+            let coarse=*probe_motion(&map,start,0.25,0.0,&[]).unwrap().last().unwrap();
+            assert!(probe_motion(&map,coarse,0.25,0.0,&[]).is_none(),"coarse forward terminates at the cap");
+            for turn in [0.3,-0.3,sign*std::f64::consts::FRAC_PI_2] {
+                assert!(probe_motion(&map,coarse,0.0,turn,&[]).is_none(),"coarse endpoint cannot turn out");
+            }
+        }
+        let goal=witness.last().unwrap().0;
+        let tomo=Tomogram::from_surface(&map).unwrap();
+        let began=std::time::Instant::now();
+        let result=local_search::plan(&map,&tomo,start,&[[start.0[0],start.0[1],0.0],[goal[0],goal[1],0.0]],
+            &motion(),None,Some((goal,0.015)),&[],3.0,0.9,false);
+        eprintln!("fine_escape mirror={mirror} shift={shift:?} coarse_dead_end={coarse_dead_end} half_width_cells={half_width_cells} result={:?} elapsed_ms={:.3}",
+            result.as_ref().map(|p|p.len()),began.elapsed().as_secs_f64()*1000.0);
+        let path=result.expect("the independently swept fine escape must be searchable");
+        assert!(distance3(path.last().unwrap().0,goal)<0.015);
+        assert!(path.iter().any(|p| (p.0[0]-depart.0[0]).abs()<1e-8 && (p.0[1]-depart.0[1]).abs()<1e-8));
+        for pair in path.windows(2) { map.validate_body_motion(pair[0],pair[1],&[]).unwrap(); }
+    }
+    #[test]
+    fn fine_actions_admit_both_small_turns_even_with_legal_coarse_forward() {
+        let map=scene(None);
+        let start=([0.0101,0.005,0.4],[0.0,0.0,0.0,1.0]);
+        let tomo=Tomogram::from_surface(&map).unwrap();
+        let failure=local_search::with_expansion_limit(1,||local_search::plan(&map,&tomo,start,
+            &[[0.0101,0.005,0.0],[0.3,0.005,0.0]],&motion(),None,
+            Some(([0.3,0.005,2.0],0.01)),&[],3.0,0.9,false)).unwrap_err();
+        assert_eq!(failure.kind,LocalPlanFailureKind::BudgetExhausted);
+        assert!(failure.blocked.is_none());
+        let admitted=local_search::initial_admissions();
+        assert_eq!(admitted.len(),14,"all legal existing actions, including both fine turn signs");
+        for (length,turn) in [(0.01,0.0),(0.01,0.1),(0.01,-0.1),(0.0,0.08),(0.0,-0.08)] {
+            let pose=admitted.iter().find(|(l,t,_)|*l==length && *t==turn).expect("fine action admitted").2;
+            assert_eq!(pose,*probe_motion(&map,start,length,turn,&[]).unwrap().last().unwrap());
+        }
+    }
+
+    #[test]
+    fn fine_escape_one_centimetre_then_turn_with_mirrors_and_translations() {
+        let results:Vec<_>=[(false,[0,0]),(true,[0,0]),(false,[5,10]),(true,[-5,10])].into_iter()
+            .map(|(mirror,shift)|std::panic::catch_unwind(||check_fine_escape(mirror,shift,false,2))).collect();
+        assert!(results.iter().all(Result::is_ok),"every transformed witness must pass");
+    }
+    #[test]
+    fn matched_existing_search_success_across_old_quantization_boundary() {
+        // Same swept geometry, shifted so the old 2.5 cm key admitted its 1 cm departure.
+        // This is an actual nonzero-search baseline success, not an analytic fast path.
+        check_fine_escape(false,[1,0],false,2);
+        assert_eq!(local_search::last_work().0,1);
+    }
+    #[test]
+    fn fine_escape_wide_body_geometry() {
+        let results:Vec<_>=[false,true].into_iter().map(|mirror|
+            std::panic::catch_unwind(||check_fine_escape(mirror,[0,0],false,16))).collect();
+        assert!(results.iter().all(Result::is_ok),"both wide-body witnesses must pass");
+    }
+    #[test]
+    fn fine_escape_when_legal_coarse_forward_enters_a_dead_end() {
+        let results:Vec<_>=[false,true].into_iter().map(|mirror|
+            std::panic::catch_unwind(||check_fine_escape(mirror,[0,0],true,2))).collect();
+        assert!(results.iter().all(Result::is_ok),"both coarse-dead-end witnesses must pass");
+    }
+
     #[test]
     fn nearby_reference_behind_departure_rejoins_forward_without_erasing_exit_tangent() {
         let map = scene(None);
@@ -831,6 +949,32 @@ mod tests {
         }).unwrap()
     }
     #[test]
+    fn matched_search_workloads() {
+        let map=coarse_open_floor();
+        let tomo=Tomogram::from_surface(&map).unwrap();
+        let start=([-1.0,0.2,0.4],[0.0,0.0,0.0,1.0]);
+        let reference=[[-1.0,0.2,0.0],[0.1,0.2,0.0]];
+        let excluded=[[2.0,2.0],[3.0,2.0],[3.0,3.0],[2.0,3.0]];
+        for repeat in 0..3 {
+            for name in ["open_connection","budget16","drained_boundary"] {
+                let boundary=if name=="drained_boundary" {&excluded[..]} else {&[]};
+                let arrival=if name=="budget16" {Some(([0.1,0.2,2.0],0.1))} else {None};
+                let began=std::time::Instant::now();
+                let result=local_search::with_expansion_limit(16,||local_search::plan(&map,&tomo,start,
+                    &reference,&motion(),None,arrival,boundary,3.0,0.9,true));
+                eprintln!("matched_workload name={name} repeat={repeat} result={:?} elapsed_ms={:.3}",
+                    result.as_ref().map(|p|p.len()),began.elapsed().as_secs_f64()*1000.0);
+                if name=="open_connection" {assert!(result.is_ok());} else {
+                    let failure=result.unwrap_err();
+                    assert_eq!(failure.kind,if name=="budget16" {LocalPlanFailureKind::BudgetExhausted}
+                        else {LocalPlanFailureKind::SearchExhausted});
+                    assert!(failure.blocked.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn reduced_budget_open_floor_search_has_diagnostics_not_obstruction() {
         let map = coarse_open_floor();
         let tomo = Tomogram::from_surface(&map).unwrap();
@@ -859,6 +1003,9 @@ mod tests {
             Some(([0.1,0.2,2.0],0.1)), &[], 3.0, 0.9, true).unwrap_err();
         assert_eq!(failure.kind, LocalPlanFailureKind::BudgetExhausted);
         assert!(failure.closest_pose.is_some());
+        let (expanded,nodes,frontier)=local_search::last_work();
+        assert_eq!(expanded,256);
+        assert!(nodes<=1+14*256 && frontier<=14*256);
         assert!(failure.blocked.is_none());
     }
 
@@ -958,8 +1105,7 @@ mod tests {
             );
         }
     }
-    #[test]
-    fn actual_thirty_three_centimeter_passage_survives_coarse_reference() {
+    fn assert_thirty_three_centimeter_passage() -> (BodyPose, [[f64;3];4]) {
         let map = scene(Some(33));
         let tomo = Tomogram::from_surface(&map).unwrap();
         let start = ([-0.8, 0.165, 0.4], [0.0, 0.0, 0.0, 1.0]);
@@ -990,6 +1136,15 @@ mod tests {
                 .validate_body_motion(pair[0], pair[1], &[])
                 .unwrap();
         }
+        (start,reference)
+    }
+    #[test]
+    fn matched_narrow_passage_success() {
+        assert_thirty_three_centimeter_passage();
+    }
+    #[test]
+    fn actual_thirty_three_centimeter_passage_survives_coarse_reference() {
+        let (start,reference)=assert_thirty_three_centimeter_passage();
         let blocked = scene(Some(30));
         let tomo = Tomogram::from_surface(&blocked).unwrap();
         assert!(plan(

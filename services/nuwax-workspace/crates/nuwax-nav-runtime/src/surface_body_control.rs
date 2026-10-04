@@ -57,6 +57,26 @@ fn is_rotation(a:&PoseStamped,b:&PoseStamped)->bool {
     horizontal_distance(a,b)<1e-5
         && angle_diff(a.pose.orientation.yaw(),b.pose.orientation.yaw()).abs()>1e-6
 }
+// Route-intent eligibility only. This grants no body-motion permission.
+// Duplicate points are harmless only when they carry no explicit yaw change.
+fn forward_straight_run(path: &Path3D, first: usize, last: usize, actual: Point3) -> bool {
+    if first == 0 || last < first || last >= path.poses.len() { return false; }
+    let a=&path.poses[first-1]; let b=&path.poses[first];
+    let dx=b.pose.position.x-a.pose.position.x; let dy=b.pose.position.y-a.pose.position.y;
+    if dx.hypot(dy)<=1e-5 { return false; }
+    let direction=dy.atan2(dx);
+    for pair in path.poses[first-1..=last].windows(2) {
+        let x=pair[1].pose.position.x-pair[0].pose.position.x;
+        let y=pair[1].pose.position.y-pair[0].pose.position.y;
+        if angle_diff(pair[1].pose.orientation.yaw(),pair[0].pose.orientation.yaw()).abs()>1e-6 {
+            return false;
+        }
+        if x.hypot(y)>1e-5 && angle_diff(y.atan2(x),direction).abs()>1e-6 { return false; }
+    }
+    let target=&path.poses[last].pose.position;
+    (target.x-actual.x)*direction.cos()+(target.y-actual.y)*direction.sin()>0.0
+}
+
 fn tracking_error(preview:&[PlanarPose],segments:&[(PlanarPose,PlanarPose)],radius:f64)->Option<f64> {
     #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::TrackingReferenceProjection);
     if segments.is_empty() {return None;}
@@ -318,6 +338,17 @@ impl SurfaceFollower {
     // The false specialization is exercised only by differential tests. The
     // production specialization reuses no state beyond this one invocation.
     fn follow_body_step_inner<const REUSE_LOOKAHEAD: bool>(&mut self, robot_width: f64) -> PlannerStep {
+        self.follow_body_step_policy::<REUSE_LOOKAHEAD, false, false>(robot_width)
+    }
+
+    // Experimental straight-run intent policy is exercised only by tests until
+    // current-state guarding and closed-loop route behavior are qualified.
+    fn follow_body_step_policy<const REUSE_LOOKAHEAD: bool, const STRAIGHT_INTENT: bool, const ALIGN_STRAIGHT: bool>(&mut self, robot_width: f64) -> PlannerStep {
+        // Scalar provenance for a rejected connector; no additional geometry
+        // query or hot-path allocation is needed to diagnose the chosen target.
+        let initial_path_index=self.path_index;
+        let initial_alignment_index=self.alignment_target_index;
+        let initial_progress=self.progress_m;
         #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::RouteIntent);
         if let Some(error) = &self.invalid_input {
             return PlannerStep::Failed(error.clone());
@@ -613,8 +644,11 @@ impl SurfaceFollower {
             self.alignment_target_index=None;
         }
         if let Some(index)=self.alignment_target_index {target_index=index;}
+        let straight_intent = STRAIGHT_INTENT && self.config.motion_limits.is_some()
+            && !rotation && self.alignment_target_index.is_none()
+            && forward_straight_run(path, self.path_index, target_index, position);
         let mut confirmed_lookahead=false;
-        if !rotation && self.alignment_target_index.is_none() {
+        if !straight_intent && !rotation && self.alignment_target_index.is_none() {
             // 前瞻按实际机体可执行的前进圆弧选择；墙角附近退回较近的路径点，
             // 不能只沿受阻的长弦不断减速，否则已知可执行的短路径永远得不到跟随。
             // 不能用先转向来保留远处曲线目标，否则会过早朝远端切向旋转并离开原路线。
@@ -640,9 +674,13 @@ impl SurfaceFollower {
         // source stance and target are unchanged in this scope. Falling back to
         // path_index, alignment and rotation retain their original checks; this
         // is neither a cross-step permission nor a replacement for body control.
-        let connects_without_turn=rotation || (REUSE_LOOKAHEAD && confirmed_lookahead)
+        let connects_without_turn=straight_intent || rotation || (REUSE_LOOKAHEAD && confirmed_lookahead)
             || forward_arc_connects(map,body(pose),target);
-        let alignment = if !connects_without_turn
+        let alignment = if ALIGN_STRAIGHT && straight_intent
+            && self.config.kinematics().is_some_and(|motion|motion.can_rotate_in_place)
+            && angle_diff((target.pose.position.y-position.y).atan2(target.pose.position.x-position.x),yaw).abs()>=0.05 {
+            Some((target.pose.position.y-position.y).atan2(target.pose.position.x-position.x))
+        } else if !connects_without_turn
             && self.config.kinematics().is_none_or(|motion|motion.can_rotate_in_place) {
             let heading=(target.pose.position.y-position.y).atan2(target.pose.position.x-position.x);
             let mut translated=target.clone();
@@ -655,11 +693,13 @@ impl SurfaceFollower {
             // 旧路径在实际站姿下已不可接续，继续向缺测边界逼近只会让速度趋于零。
             // 按同一完整机体几何重新规划，不用微速或等待时长判断是否卡住。
             return PlannerStep::ReplanRequired(format!(
-                "局部路径点{}无法从实际站姿按前进圆弧或转向接续，需要重新规划",self.path_index));
+                "局部路径点{}无法从实际站姿按前进圆弧或转向接续，需要重新规划; initial_path_index={} initial_alignment_index={:?} initial_progress={:?} selected_index={} alignment_index={:?} path_len={} target={:?} previous={:?} applied={:?}",
+                self.path_index,initial_path_index,initial_alignment_index,initial_progress,
+                target_index,self.alignment_target_index,path.poses.len(),target.pose,previous.pose,self.last_command));
         }
         if let Some(heading)=alignment {
             // 转向期间固定这次接续目标，不能随偏航在相邻前瞻点之间切换意图。
-            self.alignment_target_index=Some(target_index);
+            if !straight_intent {self.alignment_target_index=Some(target_index);}
             // 先对齐真正的平移方向；不能在路径末切向与实际前进方向之间反复切换。
             preferred.angular_z=angle_diff(heading,yaw).clamp(-0.6,0.6);
             self.control_target=Some(PlanarPose{x:position.x,y:position.y,yaw:heading});
@@ -1566,3 +1606,7 @@ mod query_reuse_tests {
         assert_eq!(query(from,10_100_000_000).unwrap(),fresh,"过期拒绝也不能污染原时刻结果");
     }
 }
+
+#[cfg(test)]
+#[path = "surface_body_control_doorway_tests.rs"]
+mod dense_doorway_checkpoint_diagnostic;

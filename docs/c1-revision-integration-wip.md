@@ -280,3 +280,16 @@ Independent source review found no component blocker. Static golden decoding con
 - Exact primary branch/HEAD/tree restored clean at `2026-10-04T20:15:24Z`; lane returned. The native CMake cache was not modified.
 
 A subsequent source-reviewed build correction adds an explicit `LCM_GEN_EXECUTABLE` environment override, requires actual lcm-gen1.5.2 during native CMake configure, and writes headers to a version-specific directory with the generator itself as a dependency. This prevents a warmed cache from silently reusing old 1.3.1 headers without cleaning/deleting artifacts. That configure/build guard and the socket-free native-owner fixture remain unexecuted; the codec results above apply to the exact recorded component tree. Geometry/assigned actor/terminal integration remains incomplete and nondeployable.
+
+### V3 socket-free C++ owner qualification (2026-10-04 20:39 UTC)
+
+- Frozen component source: `8df918ed9c6fd65d2bb17a45868f5a70b8d0c50a`.
+- Original-path primary base/restore: `e3676d324a9cb6a0d1ace640df5ca604707899e6`, tree `9954eef11a2793e1d743704eea93102ed6612fd2`.
+- Temporary validation merge: `df0d0e73604a253613b896cdbac24cb65677f26f`, tree `0d394d915740e6fddf4fc8134b52fc278362d4d2`.
+- Used the existing warmed native-pgo-build with explicit lcm-gen1.5.2, disconnected dependencies and only `NUWAX_BUILD_PGO_OWNER_TESTS=ON`. The generator guard passed. Captured all 641 prior cache entries, including option absence, before configure.
+- The dry-run initially tripped an overbroad inspection-script substring check on GTSAM include paths. No build ran on that failed check. Parsing actual compiler `-c` operands then confirmed exactly `online_owner_tests.cpp`, `simple_pgo.cpp`, and `commons.cpp`; no SDK/GTSAM source rebuild.
+- `cmake --build <warmed-build> --target pgo_online_owner_tests --parallel 2` passed first try. `ctest --test-dir <warmed-build> -R '^pgo_online_owner_contract$' --output-on-failure` passed 1/1 in 0.04s. This is a socket-free owner component fixture, not real transport integration or a complete Geometry build.
+- Retained binary: `/workspace/shared/neh-validation/c1-native-v3-owner-tests-df0d0e73`. Configure/dry-run/audit/build/test/restore evidence uses `c1-native-v3-owner-*20261004.log`; prior cache snapshot is `c1-native-v3-owner-cache-before-20261004.json`.
+- Restored the original primary branch, exact HEAD/tree and clean tracked state at `2026-10-04T20:39:01Z`. Reconfigured its prior cache settings, including absent test option, and compared all 641 key/type/value entries: no changes. Explicit native-lane handback followed.
+
+The V3 codec and native owner components are now qualified on their recorded merged trees. Geometry's paired source/candidate/actor/terminal integration remains incomplete and uncompiled. Default activation/finalization, assigned terminal persistence and legacy-read closure remain release gates.

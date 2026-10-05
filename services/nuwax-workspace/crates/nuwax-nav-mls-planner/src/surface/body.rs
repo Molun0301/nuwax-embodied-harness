@@ -1891,6 +1891,11 @@ impl SurfaceSnapshot {
         let stride=ny as usize;let count=count as usize;
         let mut in_domain=vec![false;count];
         let mut bands=vec![None;count];
+        // 子阶段不移动生产临时值：表/队列初始化及保留缓冲清理仍只计入外层收集。
+        #[cfg(feature = "body-query-profile")]
+        let (mut cache_present_columns,mut cache_absent_columns)=(0_u64,0_u64);
+        #[cfg(feature = "body-query-profile")]
+        let cache_profile=query_profile::guard(QueryStage::DenseBandCacheRead);
         // 同一不可变来源的带缓存一次批量读取，避免每个实测细列分别取锁。
         {
             let cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
@@ -1899,10 +1904,23 @@ impl SurfaceSnapshot {
                 if dx*dx+dy*dy>enumeration*enumeration {continue;}
                 let index=(i64::from(x)-i64::from(low[0])) as usize*stride+(i64::from(y)-i64::from(low[1])) as usize;
                 in_domain[index]=true;bands[index]=cache.fine_bands.get(&(x,y)).cloned();
+                #[cfg(feature = "body-query-profile")]
+                if bands[index].is_some() {cache_present_columns+=1;}else{cache_absent_columns+=1;}
             }}
+        }
+        #[cfg(feature = "body-query-profile")]
+        {
+            drop(cache_profile);
+            query_profile::add(QueryCounter::DenseAllocatedSlots,count as u64);
+            query_profile::add(QueryCounter::DenseCachePresentColumns,cache_present_columns);
+            query_profile::add(QueryCounter::DenseCacheAbsentColumns,cache_absent_columns);
         }
         let distance=|band:[f64;2]|(band[0]-origin[2]).max(origin[2]-band[1]).max(0.0);
         let mut selected=vec![None;count];let mut seed:Option<(usize,(i32,i32),[f64;4])>=None;
+        #[cfg(feature = "body-query-profile")]
+        let mut selected_columns=0_u64;
+        #[cfg(feature = "body-query-profile")]
+        let selection_profile=query_profile::guard(QueryStage::DenseBandSelectionSeed);
         for (index,inside) in in_domain.iter().copied().enumerate() {
             if !inside {continue;}
             let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
@@ -1911,6 +1929,8 @@ impl SurfaceSnapshot {
                 .then_with(||(a[1]-origin[2]).abs().total_cmp(&(b[1]-origin[2]).abs()))
                 .then_with(||a[1].total_cmp(&b[1]))) else {continue;};
             selected[index]=Some(band);let rise=band[1]-origin[2];
+            #[cfg(feature = "body-query-profile")]
+            {selected_columns+=1;}
             if rise>model.max_step_up_m+size+1e-6 || -rise>model.max_step_down_m+size+1e-6 {continue;}
             let dx=(f64::from(x)+0.5)*size-origin[0];let dy=(f64::from(y)+0.5)*size-origin[1];
             let rank=[dx*dx+dy*dy,distance(band),rise.abs(),band[1]];
@@ -1920,9 +1940,20 @@ impl SurfaceSnapshot {
             });
             if earlier {seed=Some((index,(x,y),rank));}
         }
+        #[cfg(feature = "body-query-profile")]
+        {
+            drop(selection_profile);
+            query_profile::add(QueryCounter::DenseSelectedColumns,selected_columns);
+        }
         let seed=seed.ok_or(SurfaceError::MissingSupport)?.0;
         let mut queue=VecDeque::from([seed]);let mut visited=vec![false;count];visited[seed]=true;
+        #[cfg(feature = "body-query-profile")]
+        let mut visited_columns=0_u64;
+        #[cfg(feature = "body-query-profile")]
+        let connectivity_profile=query_profile::guard(QueryStage::DenseConnectivityBfs);
         while let Some(index)=queue.pop_front() {
+            #[cfg(feature = "body-query-profile")]
+            {visited_columns+=1;}
             let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
             let band=selected[index].expect("只有已选真实带进入队列");
             for dx in -1..=1 {for dy in -1..=1 {
@@ -1942,8 +1973,15 @@ impl SurfaceSnapshot {
                 }
             }}
         }
+        #[cfg(feature = "body-query-profile")]
+        {
+            drop(connectivity_profile);
+            query_profile::add(QueryCounter::DenseVisitedColumns,visited_columns);
+        }
         // 只改变私有输出顺序：仍仅发出原 BFS 访问过的真实列，点与权重算式不变。
         // 网格按 X 再 Y 排列，让 body_contact_frame 保留的排序直接接收有序输入。
+        #[cfg(feature = "body-query-profile")]
+        let emission_profile=query_profile::guard(QueryStage::DenseOrderedEmission);
         let mut points=Vec::new();
         for (index,seen) in visited.into_iter().enumerate() {
             if !seen {continue;}
@@ -1954,6 +1992,8 @@ impl SurfaceSnapshot {
             let weight=(1.0-distance2/(radius*radius)).max(0.0).powi(2);
             if weight>0.0 {points.push((point,band[0],weight));}
         }
+        #[cfg(feature = "body-query-profile")]
+        drop(emission_profile);
         Ok(points)
     }
 

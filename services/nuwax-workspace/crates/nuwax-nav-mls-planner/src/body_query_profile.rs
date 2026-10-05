@@ -34,6 +34,8 @@ pub enum Stage {
     /// Contact-plane cache lookup, including the existing lock scope.
     PlaneCacheLookup,
     /// Collect contact points, including domain setup and temporary cleanup.
+    /// Dense substages are partial: table/queue setup, the seed-presence check,
+    /// and retained-buffer cleanup remain here outside those substages.
     ContactDomainCollection,
     /// Sort the collected contact points in the original order.
     ContactPointSort,
@@ -41,11 +43,21 @@ pub enum Stage {
     ContactPlaneFit,
     /// Construct the final contact frame from its plane and requested yaw.
     ContactFrameAlgebra,
+    /// Dense batch band-cache read, including the existing lock and its release.
+    DenseBandCacheRead,
+    /// Dense band-selection and seed-ranking loop, including cache-miss queries
+    /// and per-column Arc cleanup, but excluding selected-table allocation.
+    DenseBandSelectionSeed,
+    /// Dense BFS connectivity loop, excluding queue and visited-table setup.
+    DenseConnectivityBfs,
+    /// Dense ordered point emission, including output growth and consumed
+    /// visited-table cleanup, but excluding other retained-buffer cleanup.
+    DenseOrderedEmission,
 }
 
 impl Stage {
     /// Number of fixed timing categories.
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 16;
     /// Every timing category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::MotionTotal,
@@ -60,6 +72,10 @@ impl Stage {
         Self::ContactPointSort,
         Self::ContactPlaneFit,
         Self::ContactFrameAlgebra,
+        Self::DenseBandCacheRead,
+        Self::DenseBandSelectionSeed,
+        Self::DenseConnectivityBfs,
+        Self::DenseOrderedEmission,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -77,6 +93,10 @@ impl Stage {
             Self::ContactPointSort => "contact_point_sort",
             Self::ContactPlaneFit => "contact_plane_fit",
             Self::ContactFrameAlgebra => "contact_frame_algebra",
+            Self::DenseBandCacheRead => "dense_band_cache_read",
+            Self::DenseBandSelectionSeed => "dense_band_selection_seed",
+            Self::DenseConnectivityBfs => "dense_connectivity_bfs",
+            Self::DenseOrderedEmission => "dense_ordered_emission",
         }
     }
 }
@@ -95,11 +115,24 @@ pub enum Counter {
     DenseDomainCalls,
     /// Invocations of the sparse fine-domain implementation.
     SparseDomainCalls,
+    /// Rectangular grid positions allocated per dense call, counted once rather
+    /// than summed across temporary tables; this is not a byte count.
+    DenseAllocatedSlots,
+    /// Eligible dense columns with a band-cache entry in the batch read,
+    /// including cached empty bands.
+    DenseCachePresentColumns,
+    /// Eligible dense columns without a band-cache entry in the batch read.
+    DenseCacheAbsentColumns,
+    /// Dense columns with a selected real band, before seed step-height checks.
+    DenseSelectedColumns,
+    /// Unique dense columns visited by BFS, including the seed and columns
+    /// whose final point weight is zero.
+    DenseVisitedColumns,
 }
 
 impl Counter {
     /// Number of fixed counter categories.
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 10;
     /// Every counter category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::PlaneCacheHits,
@@ -107,6 +140,11 @@ impl Counter {
         Self::ContactPoints,
         Self::DenseDomainCalls,
         Self::SparseDomainCalls,
+        Self::DenseAllocatedSlots,
+        Self::DenseCachePresentColumns,
+        Self::DenseCacheAbsentColumns,
+        Self::DenseSelectedColumns,
+        Self::DenseVisitedColumns,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -117,6 +155,11 @@ impl Counter {
             Self::ContactPoints => "contact_points",
             Self::DenseDomainCalls => "dense_domain_calls",
             Self::SparseDomainCalls => "sparse_domain_calls",
+            Self::DenseAllocatedSlots => "dense_allocated_slots",
+            Self::DenseCachePresentColumns => "dense_cache_present_columns",
+            Self::DenseCacheAbsentColumns => "dense_cache_absent_columns",
+            Self::DenseSelectedColumns => "dense_selected_columns",
+            Self::DenseVisitedColumns => "dense_visited_columns",
         }
     }
 }

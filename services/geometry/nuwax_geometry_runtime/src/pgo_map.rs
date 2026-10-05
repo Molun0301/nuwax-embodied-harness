@@ -836,7 +836,6 @@ mod tests {
             mapping_session_id: "bounded-history".into(),
             mapping_session_generation: 1,
             map_frame_generation: 1,
-            envelope_sha256: [1; 32],
             frozen_odom_from_body: Isometry3::identity(),
             base_anchor_map_from_odom: Isometry3::identity(),
             registration_map_from_odom: Isometry3::identity(),

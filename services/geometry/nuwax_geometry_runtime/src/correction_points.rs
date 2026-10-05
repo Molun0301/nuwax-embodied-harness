@@ -4,10 +4,23 @@ use nalgebra::Point3;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
-pub(crate) struct CorrectionPoints(Arc<Vec<Point3<f64>>>);
+pub(crate) struct CorrectionPoints(Arc<CorrectionPointData>);
+
+#[derive(Debug)]
+struct CorrectionPointData {
+    points: Vec<Point3<f64>>,
+    finite: bool,
+}
+
+impl CorrectionPoints {
+    pub(crate) fn all_finite(&self) -> bool { self.0.finite }
+}
 
 impl From<Vec<Point3<f64>>> for CorrectionPoints {
-    fn from(points: Vec<Point3<f64>>) -> Self { Self(Arc::new(points)) }
+    fn from(points: Vec<Point3<f64>>) -> Self {
+        let finite = points.iter().all(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite());
+        Self(Arc::new(CorrectionPointData { points, finite }))
+    }
 }
 
 impl FromIterator<Point3<f64>> for CorrectionPoints {
@@ -18,7 +31,7 @@ impl FromIterator<Point3<f64>> for CorrectionPoints {
 
 impl std::ops::Deref for CorrectionPoints {
     type Target = [Point3<f64>];
-    fn deref(&self) -> &Self::Target { self.0.as_slice() }
+    fn deref(&self) -> &Self::Target { self.0.points.as_slice() }
 }
 
 impl<'a> IntoIterator for &'a CorrectionPoints {
@@ -43,7 +56,7 @@ impl CorrectionPoints {
     // Fixtures deliberately construct a new conflicting owner. Production has
     // no mutable accessor and cannot alter an already admitted frame in place.
     pub(crate) fn edited_for_test(&self, edit: impl FnOnce(&mut Vec<Point3<f64>>)) -> Self {
-        let mut points = self.0.as_ref().clone();
+        let mut points = self.0.points.clone();
         edit(&mut points);
         points.into()
     }
@@ -66,6 +79,21 @@ mod tests {
         assert!(weak.upgrade().is_some());
         drop(clones);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn finite_admission_is_cached_on_the_immutable_owner() {
+        let owner = CorrectionPoints::from(vec![Point3::new(-0.0, 1.0, 2.0)]);
+        let shared = owner.clone();
+        assert!(owner.all_finite());
+        assert!(Arc::ptr_eq(&owner.0, &shared.0));
+        assert!(shared.all_finite());
+        for invalid in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let changed = owner.edited_for_test(|points| points[0].z = invalid);
+            assert!(!changed.all_finite());
+            assert!(!changed.clone().all_finite());
+            assert!(owner.all_finite());
+        }
     }
 
     #[test]

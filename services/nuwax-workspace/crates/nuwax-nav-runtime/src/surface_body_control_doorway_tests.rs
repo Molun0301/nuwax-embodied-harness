@@ -1194,7 +1194,7 @@ fn tga_prove_command(
     let map = follower.map.as_ref().unwrap();
     let pose = planar(follower.odometry.as_ref().unwrap());
     let limits = forward_navigation_limits(follower.config.motion_limits.as_ref().unwrap());
-    follower.with_body_motion_checks(|clear, period_clear, last_failure| {
+    follower.with_body_motion_checks(|clear, period_clear, last_failure, _| {
         let choice = nuwax_nav_control::check_selected_stopping_trajectory_with_period_check(
             pose, applied, command, &limits,
             1.0 / follower.config.controller.control_frequency, 1,
@@ -1210,7 +1210,7 @@ fn tga_assert_initial_period_valid(follower: &SurfaceFollower) {
     let dt = 1.0 / follower.config.controller.control_frequency;
     let to = nuwax_nav_control::integrate(from, tga_speed(), dt);
     assert!((to.x - 1.025).abs() < 1e-12);
-    follower.with_body_motion_checks(|clear, period_clear, failure| {
+    follower.with_body_motion_checks(|clear, period_clear, failure, _| {
         assert!(clear(from, to, dt), "first geometric segment: {:?}", failure.borrow());
         assert!(period_clear(from, to, dt), "first control period: {:?}", failure.borrow());
     }).unwrap();

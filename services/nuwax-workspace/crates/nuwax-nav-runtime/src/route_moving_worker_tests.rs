@@ -194,6 +194,7 @@ impl Measured {
     }
 }
 impl NavPlanner for Measured {
+    fn take_command_dispatch_bound(&mut self)->Option<crate::CommandDispatchBound> {self.inner.take_command_dispatch_bound()}
     fn configure_goal(&mut self,g:&PoseStamped,o:GoalOptions)->Result<(),RuntimeError>{self.inner.configure_goal(g,o)}
     fn configure_boundary(&mut self,b:&[[f64;2]]){self.inner.configure_boundary(b)}
     fn replace_path(&mut self,p:Path2D){self.inner.replace_path(p)}
@@ -553,13 +554,15 @@ fn report_body_query_slow_step(context:&str,sample_scope:&str,ranking:&str,rank:
 // Fixed scalar categories describe the consumer's actual Pending reasons; an
 // empty 5Hz sensor queue during a 20Hz tick is expected and counted separately.
 #[derive(Default,Debug)]
-struct ConsumerWaits {pending:usize,source_fence:usize,expired_result:usize,pose_or_receipt:usize,arrival_pose:usize,planning:usize,other:usize,expired_at_receipt:usize}
+struct ConsumerWaits {pending:usize,source_fence:usize,expired_result:usize,pose_or_receipt:usize,arrival_pose:usize,planning:usize,other:usize,expired_at_receipt:usize,dispatch_expired_publication:usize,dispatch_expired_retrieval:usize,dispatch_expired_at_receipt:usize,finite_bound_nonzero:usize,unbounded_nonzero:usize}
 impl ConsumerWaits {
     fn record(&mut self,reason:Option<String>){
         self.pending+=1;
         match reason.as_deref() {
             Some("地图或边界已更新，保持零速并重新计算")=>self.source_fence+=1,
             Some("局部速度计算结果已过期，保持零速并重新计算")=>self.expired_result+=1,
+            Some("观察扫掠凭据在发布前已过期，保持零速并重新计算")=>self.dispatch_expired_publication+=1,
+            Some("观察扫掠凭据在交付前已过期，保持零速并重新计算")=>self.dispatch_expired_retrieval+=1,
             Some("位姿或执行回执已更新，保持零速并重新计算")=>self.pose_or_receipt+=1,
             Some("位姿已更新，保持零速并重新核对到达状态")=>self.arrival_pose+=1,
             Some("局部轨迹正在计算，保持零速等待")=>self.planning+=1,
@@ -670,16 +673,20 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
             }
             if released_at.is_none()&&now.duration_since(hold)>=Duration::from_millis(650)&&release.try_send(()).is_ok(){released_at=Some(now);}
         }
-        let t=Instant::now();let result=worker.step(WIDTH);consume_ms.push(t.elapsed().as_secs_f64()*1e3);
+        let t=Instant::now();let result=worker.step(WIDTH);let dispatch_bound=worker.take_command_dispatch_bound();consume_ms.push(t.elapsed().as_secs_f64()*1e3);
         if matches!(&result,PlannerStep::Pending(_)){consumer_waits.record(worker.execution_wait_reason());}
         let receipt_at=Instant::now();
+        // Local receipt admission uses the exact result's original bound. Keep
+        // the later unchanged receipt oracle to expose any remaining time gap.
+        let dispatch_expired=dispatch_bound.is_some_and(CommandDispatchBound::expired_now);
+        if dispatch_expired {consumer_waits.dispatch_expired_at_receipt+=1;}
         // Original worker result expiry is captured under its selection lock.
         // Replaying the same candidate never renews its permission horizon.
         let original_deadline=worker.delivered_command_deadline_for_test().unwrap_or(receipt_at);
         let permitted_until=original_deadline.min(receipt_at+PERIOD);
         if matches!(&result,PlannerStep::Command(_))&&permitted_until<=receipt_at{consumer_waits.expired_at_receipt+=1;}
         let before=command;command=match result {
-            PlannerStep::Command(v) if permitted_until>receipt_at=>{accepted+=1;if nonzero(v){nonzero_count+=1;if held.load(Ordering::Acquire)&&frames>hold_frame_count&&hold_start.is_some_and(|start|now.duration_since(start)>DEFAULT_CONTROL_HORIZON+PERIOD){held_nonzero+=1;}}v},
+            PlannerStep::Command(v) if permitted_until>receipt_at&&!dispatch_expired=>{accepted+=1;if nonzero(v){if dispatch_bound.is_some(){consumer_waits.finite_bound_nonzero+=1;}else{consumer_waits.unbounded_nonzero+=1;}nonzero_count+=1;if held.load(Ordering::Acquire)&&frames>hold_frame_count&&hold_start.is_some_and(|start|now.duration_since(start)>DEFAULT_CONTROL_HORIZON+PERIOD){held_nonzero+=1;}}v},
             PlannerStep::Succeeded=>{succeeded=true;Twist2::ZERO},
             negative @ (PlannerStep::ReplanRequired(_)|PlannerStep::Failed(_))=>{
                 expected_current_rejection=changed&&matches!(scenario,Scenario::ReplaceBoundary|Scenario::ReplaceGeometry)
@@ -1097,3 +1104,41 @@ fn moving_advice_factory_5cm_primed_off_full_goal(){run_with_budget(false,0.05,S
 fn moving_advice_factory_5cm_primed_on_full_goal(){run_with_budget(true,0.05,Scenario::Goal,true,true,MAX_TICKS);}
 #[test] #[ignore="experimental advice, primed current control during held planning"]
 fn moving_advice_5cm_primed_held_planning_continuity(){run_with_budget(true,0.05,Scenario::HoldSecondContinuity,false,true,MAX_TICKS);}
+
+#[tokio::test]
+async fn dispatch_real_observed_backends_preserve_bound_to_scheduler() {
+    // A stationary-state composition fixture with truthful two-frame priming.
+    // This checks metadata ownership, not closed-loop goal completion.
+    for variant in 0..4 {
+        let (config,base,keys)=fixture(variant>=2,0.05,3.0);
+        let sensor=Sensor::new(base,keys);
+        let first=sensor.receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        let frame=sensor.receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(frame.sequence>=2 && frame.sample_ns>first.sample_ns);
+        let mut worker=match variant {
+            0=>planner_worker::PlannerWorker::new(SurfaceFollower::new(config).unwrap()).unwrap(),
+            1|2=>production_surface_backend(config).unwrap(),
+            _=>planner_worker::PlannerWorker::new(Measured::new(RouteFollower::new(config).unwrap(),
+                Arc::new(Mutex::new(Probe::with_control_sample_budget(20))),Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicBool::new(false)),Arc::new(AtomicUsize::new(0)))).unwrap(),
+        };
+        let start=pose(0.75,1.5,0.0);let goal=pose(1.75,1.5,0.0);
+        worker.configure_goal(&goal,GoalOptions::default()).unwrap();
+        worker.update_execution_map(ExecutionMap::Surface(frame.map)).unwrap();
+        worker.update_odometry(start.clone());
+        worker.replace_execution_path(ExecutionPath::Surface(Path3D{poses:vec![start,goal.clone()]}),None,goal).unwrap();
+        worker.observe_applied_command(Twist2{linear:nuwax_nav_types_messages::Point2::new(0.3,0.0),angular_z:0.0});
+        let deadline=Instant::now()+Duration::from_secs(3);
+        let step=loop {
+            if let Ok(frame)=sensor.receive.try_recv() {worker.update_execution_map(ExecutionMap::Surface(frame.map)).unwrap();}
+            match worker.step(WIDTH) {
+                step@PlannerStep::Command(command) if command!=Twist2::ZERO=>break step,
+                PlannerStep::Pending(_)|PlannerStep::Command(_)=>{},
+                other=>panic!("real backend {variant} rejected metadata fixture: {other:?}"),
+            }
+            assert!(Instant::now()<deadline,"real backend {variant} did not produce a finite observed command");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        crate::tests::assert_real_bound_reaches_scheduler(worker,step).await;
+    }
+}

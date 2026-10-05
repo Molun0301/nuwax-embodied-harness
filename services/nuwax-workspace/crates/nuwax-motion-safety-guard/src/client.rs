@@ -6,7 +6,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use prost::Message;
 use rustix::time::{clock_gettime, ClockId};
@@ -193,6 +193,12 @@ pub enum MotionGuardClientError {
     /// Local configuration or caller input violates the wire contract.
     #[error("invalid motion-guard client input: {0}")]
     InvalidInput(String),
+    /// 观测绑定的分发截止已到；本次请求确定尚未发送。
+    #[error("motion dispatch expired before sending `{operation_id}`")]
+    DispatchExpired {
+        /// 尚未发送的运动操作幂等键。
+        operation_id: String,
+    },
     /// Initial connection or an established stream failed.
     #[error("motion-guard transport failed: {0}")]
     Transport(String),
@@ -668,9 +674,43 @@ impl MotionGuardClient {
         operation_id: &str,
         twist: TwistCommand,
     ) -> Result<CommandConfirmation, MotionGuardClientError> {
+        self.submit_twist_with_dispatch_deadline(operation_id, twist, None)
+            .await
+    }
+
+    /// 使用固定的观测截止约束接收端准入，仍等待相关联的 `APPLIED` 确认。
+    ///
+    /// 截止只限制接收端准入，不缩短传输超时或变更独立的速度租约。
+    /// 本地已到截止时返回 [`MotionGuardClientError::DispatchExpired`]，不发送请求。
+    pub async fn submit_twist_before(
+        &mut self,
+        operation_id: &str,
+        twist: TwistCommand,
+        dispatch_before: Instant,
+    ) -> Result<CommandConfirmation, MotionGuardClientError> {
+        self.submit_twist_with_dispatch_deadline(operation_id, twist, Some(dispatch_before))
+            .await
+    }
+
+    async fn submit_twist_with_dispatch_deadline(
+        &mut self,
+        operation_id: &str,
+        twist: TwistCommand,
+        dispatch_before: Option<Instant>,
+    ) -> Result<CommandConfirmation, MotionGuardClientError> {
         validate_twist(&twist)?;
         let operation_id = validate_operation_id(operation_id)?;
-        let envelope = self.next_envelope(GuardAction::Twist, &operation_id)?;
+        let mut envelope = self.next_envelope(GuardAction::Twist, &operation_id)?;
+        if let Some(dispatch_before) = dispatch_before {
+            // next_envelope 已先读取原始 CLOCK_MONOTONIC，再采样 Instant；
+            // 两次读取的间隔只会提前截止，不能把观测证明延长到固定截止之后。
+            let sampled_now = Instant::now();
+            envelope.deadline_monotonic_ns = command_deadline_monotonic_ns(
+                envelope.issued_monotonic_ns,
+                Some((dispatch_before, sampled_now)),
+                &operation_id,
+            )?;
+        }
         let mut request = MotionGuardRequest {
             api_version: API_VERSION,
             request_id: new_request_id(),
@@ -839,11 +879,7 @@ impl MotionGuardClient {
         sequence: u64,
     ) -> Result<RequestEnvelope, MotionGuardClientError> {
         let issued = monotonic_ns()?;
-        let deadline = issued
-            .checked_add(u64::from(COMMAND_DEADLINE_MS) * NANOS_PER_MILLISECOND)
-            .ok_or_else(|| {
-                MotionGuardClientError::InvalidInput("monotonic deadline overflow".into())
-            })?;
+        let deadline = command_deadline_monotonic_ns(issued, None, operation_id)?;
         Ok(RequestEnvelope {
             tuple: Some(tuple),
             source: GuardSource::Nav as i32,
@@ -1233,6 +1269,37 @@ fn monotonic_ns() -> Result<u64, MotionGuardClientError> {
         .ok_or_else(|| MotionGuardClientError::InvalidInput("monotonic clock overflow".into()))
 }
 
+/// 将固定 Instant 截止保守地映射到先采样的原始单调时钟；不跨 await 传递剩余预算。
+fn command_deadline_monotonic_ns(
+    issued: u64,
+    dispatch_sample: Option<(Instant, Instant)>,
+    operation_id: &str,
+) -> Result<u64, MotionGuardClientError> {
+    let ordinary_window = Duration::from_millis(u64::from(COMMAND_DEADLINE_MS));
+    let ordinary_deadline = issued
+        .checked_add(u64::from(COMMAND_DEADLINE_MS) * NANOS_PER_MILLISECOND)
+        .ok_or_else(|| {
+            MotionGuardClientError::InvalidInput("monotonic deadline overflow".into())
+        })?;
+    let Some((dispatch_before, sampled_now)) = dispatch_sample else {
+        return Ok(ordinary_deadline);
+    };
+    let remaining = dispatch_before
+        .checked_duration_since(sampled_now)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| MotionGuardClientError::DispatchExpired {
+            operation_id: operation_id.to_string(),
+        })?;
+    // 先取较小窗口再作整数转换，避免远期截止造成无关溢出；绝不补一纳秒。
+    let remaining_ns = u64::try_from(remaining.min(ordinary_window).as_nanos()).map_err(|_| {
+        MotionGuardClientError::InvalidInput("dispatch deadline duration overflow".into())
+    })?;
+    let dispatch_deadline = issued.checked_add(remaining_ns).ok_or_else(|| {
+        MotionGuardClientError::InvalidInput("dispatch monotonic deadline overflow".into())
+    })?;
+    Ok(ordinary_deadline.min(dispatch_deadline))
+}
+
 fn new_request_id() -> String {
     format!("request:{}", Uuid::new_v4())
 }
@@ -1415,6 +1482,147 @@ fn operation_envelope_mut(request: &mut MotionGuardRequest) -> Option<&mut Reque
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_deadline_rejects_at_and_after_fixed_bound_without_one_ns_extension() {
+        let deadline = Instant::now();
+        let one_ns = Duration::from_nanos(1);
+        let before = deadline.checked_sub(one_ns).unwrap();
+        let after = deadline.checked_add(one_ns).unwrap();
+        assert_eq!(
+            command_deadline_monotonic_ns(1_000, Some((deadline, before)), "twist:bound")
+                .unwrap(),
+            1_001
+        );
+        for sample in [deadline, after] {
+            assert!(matches!(
+                command_deadline_monotonic_ns(1_000, Some((deadline, sample)), "twist:bound"),
+                Err(MotionGuardClientError::DispatchExpired { operation_id })
+                    if operation_id == "twist:bound"
+            ));
+        }
+    }
+
+    #[test]
+    fn dispatch_deadline_conversion_uses_later_sample_without_refreshing_fixed_bound() {
+        let raw_sample_instant = Instant::now();
+        let deadline = raw_sample_instant + Duration::from_nanos(100);
+        let delayed_sample = raw_sample_instant + Duration::from_nanos(7);
+        let converted = command_deadline_monotonic_ns(
+            1_000,
+            Some((deadline, delayed_sample)),
+            "twist:bound",
+        )
+        .unwrap();
+        // 原始时钟先读，Instant 后读：7ns 的读取间隔只缩短准入窗口。
+        assert_eq!(converted, 1_093);
+        assert!(converted < 1_100);
+        let later_sample = delayed_sample + Duration::from_nanos(10);
+        assert_eq!(
+            command_deadline_monotonic_ns(1_010, Some((deadline, later_sample)), "twist:bound")
+                .unwrap(),
+            converted
+        );
+    }
+
+    #[test]
+    fn dispatch_deadline_never_extends_the_ordinary_300_ms_window() {
+        let sampled_now = Instant::now();
+        let ordinary_window = Duration::from_millis(300);
+        assert_eq!(COMMAND_DEADLINE_MS, 300);
+        assert_eq!(command_deadline_monotonic_ns(123, None, "ordinary").unwrap(), 300_000_123);
+        for remaining in [ordinary_window, ordinary_window + Duration::from_nanos(1)] {
+            assert_eq!(
+                command_deadline_monotonic_ns(
+                    123,
+                    Some((sampled_now + remaining, sampled_now)),
+                    "twist:bound",
+                )
+                .unwrap(),
+                300_000_123
+            );
+        }
+        assert_eq!(
+            command_deadline_monotonic_ns(
+                123,
+                Some((sampled_now + ordinary_window - Duration::from_nanos(1), sampled_now)),
+                "twist:bound",
+            )
+            .unwrap(),
+            300_000_122
+        );
+    }
+
+    #[test]
+    fn dispatch_deadline_caps_duration_before_u64_conversion_and_checks_addition() {
+        let sampled_now = Instant::now();
+        let beyond_u64_nanos = Duration::from_secs(u64::MAX / NANOS_PER_SECOND + 1);
+        assert!(beyond_u64_nanos.as_nanos() > u128::from(u64::MAX));
+        let far_deadline = sampled_now.checked_add(beyond_u64_nanos).unwrap();
+        assert_eq!(
+            command_deadline_monotonic_ns(
+                123,
+                Some((far_deadline, sampled_now)),
+                "twist:far",
+            )
+            .unwrap(),
+            300_000_123
+        );
+        let last_valid_issue = u64::MAX - 300_000_000;
+        assert_eq!(
+            command_deadline_monotonic_ns(last_valid_issue, None, "ordinary").unwrap(),
+            u64::MAX
+        );
+        for sample in [None, Some((far_deadline, sampled_now))] {
+            assert!(matches!(
+                command_deadline_monotonic_ns(last_valid_issue + 1, sample, "overflow"),
+                Err(MotionGuardClientError::InvalidInput(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn preexpired_dispatch_sends_no_bytes_and_does_not_poison_connection() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let config = ClientConfig::default();
+        let request_timeout = config.request_timeout;
+        let mut client = MotionGuardClient {
+            stream: Some(stream),
+            config,
+            lease_tuple: Some(LeaseTuple {
+                generation: 9,
+                boot_nonce: vec![7; BOOT_NONCE_BYTES],
+                lease_id: 41,
+            }),
+            sequence: 0,
+            poison_reason: None,
+            require_stationary: false,
+            renewal_due_at: None,
+        };
+        let error = client
+            .submit_twist_before(
+                "twist:expired",
+                TwistCommand {
+                    linear_x_mps: 0.2,
+                    linear_y_mps: 0.0,
+                    angular_z_rps: 0.0,
+                },
+                Instant::now().checked_sub(Duration::from_nanos(1)).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MotionGuardClientError::DispatchExpired { operation_id }
+                if operation_id == "twist:expired"
+        ));
+        let mut byte = [0_u8; 1];
+        assert_eq!(peer.try_read(&mut byte).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(client.config.request_timeout, request_timeout);
+        assert!(client.lease_tuple.is_some());
+        assert!(client.poison_reason.is_none());
+        client.ensure_usable().unwrap();
+    }
 
     fn held_proof() -> HeldRecoveryFenceProof {
         HeldRecoveryFenceProof {

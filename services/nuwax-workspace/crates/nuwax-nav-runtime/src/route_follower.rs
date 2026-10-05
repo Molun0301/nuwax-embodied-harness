@@ -303,6 +303,7 @@ impl RouteFollower {
 
 }
 impl NavPlanner for RouteFollower {
+    fn take_command_dispatch_bound(&mut self)->Option<crate::CommandDispatchBound> {self.controller.take_command_dispatch_bound()}
     fn configure_boundary(&mut self, boundary: &[[f64; 2]]) {
         self.preparation_fault=None;
         if !exact_points(&self.boundary,boundary) {self.cancel_planning();self.dirty=true;}

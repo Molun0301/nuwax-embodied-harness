@@ -40,8 +40,10 @@ impl CommandDispatchBound {
         self.monotonic_deadline.is_none_or(|deadline|now>deadline)
             || unix.is_none_or(|unix|unix<self.anchor_unix_ns || unix>self.latest_issue_unix_ns)
     }
-    pub(crate) fn expired_now(self)->bool {self.expired_at(Instant::now(),unix_ns())}
-    pub(crate) fn monotonic_deadline(self)->Option<Instant> {self.monotonic_deadline}
+    /// Whether either original clock qualification has expired or become invalid.
+    pub fn expired_now(self)->bool {self.expired_at(Instant::now(),unix_ns())}
+    /// Original absolute issue deadline; None denotes an invalid bound, never an unrestricted one.
+    pub fn monotonic_deadline(self)->Option<Instant> {self.monotonic_deadline}
 }
 
 /// Fixed scalar dependencies for one invocation. Ranking may accumulate values;

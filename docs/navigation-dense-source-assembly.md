@@ -99,3 +99,35 @@ The prepared full-coverage 1 cm OFF/ON runs now both reach the unchanged configu
 Observed evidence-loop medians are 8.435/8.544 ms and footprint-cell construction medians 9.994/10.076 ms. These whole runs traverse different later yaw states and finish earlier than the baseline, so their medians are not identical-work speedup ratios. The matched microbenchmark supports the iterator cost claim; moving runs establish functional progress with all checks retained. Guard/receipt state mismatch counts remain 216/212, preserving the delayed-activation caveat.
 
 Ordinary original-source 5 cm regressions pass: `sorted-difference-5cm-factory-v1.log` has both full goals, and `sorted-difference-5cm-held-v1.log` has six fresh held commands plus later admission, 213 moving receipts and 1.080909 m travel. All have zero delivered negatives/expiry observations and all oracles pass. Held current-step median/p95/max is 2.298/3.460/4.928 ms in this sampled mixed-profile run. The production build, hardware behavior and hard 20 Hz deadline remain unqualified. PolygonQuery hoisting is still a separate, unapplied candidate.
+
+## Per-footprint immutable polygon query
+
+The next scoped optimization constructs `PolygonQuery` once after the existing ground-patch lookup, then borrows it for each fine cell in that single footprint invocation. The polygon and cell size are immutable throughout the loop. Its axes/ranges computation has no clock, observation or cache input; support lookup, XYZ enumeration, evidence membership, sample order and first-error order are unchanged. The query is dropped inside the existing cell-stage timer. This introduces no cross-pose cache or reusable permission, and leaves the other polygon helper call sites untouched.
+
+A frozen copy of the previous full footprint method is retained as an independent reference, with only receiver/function naming changed. The parity matrix covers .1/.025/.01 m resolutions, rectangles and 24-vertex envelopes, negative and one-ULP boundary coordinates, yaw/pitch, geometry holes, current-body views, invalid poses, missing support, mismatched resolutions and the existing footprint-size limit. The temporary test-only candidate was removed when the reviewed production hoist was applied.
+
+Initial actual-source evidence:
+- `polygon-once-production-parity-v1.log`: exact complete XYZ sets and error parity pass
+- `polygon-once-production-mls-all-v1.log`: 243 passed / 6 ignored
+- `polygon-once-production-micro-v1.log`: matched alternating six-round benchmark passes
+
+Microbenchmark medians below use the five later rounds, milliseconds per 30 full raw-footprint calls including equality checking and returned-set retirement. Both versions are warmed by an untimed parity call. They run under the existing MLS-only opt-level=3 mixed test profile, with profiling feature enabled; this is not a deployed-release or live throughput measurement.
+
+| Resolution / envelope / yaw | Rebuild per cell | One query per footprint |
+|---|---:|---:|
+| .05 m / rectangle / 0 | 1.019 | .653 |
+| .05 m / rectangle / .37 | 1.697 | .768 |
+| .05 m / 24 vertices / 0 | 3.575 | .499 |
+| .05 m / 24 vertices / .37 | 3.490 | .505 |
+| .01 m / rectangle / 0 | 28.770 | 19.228 |
+| .01 m / rectangle / .37 | 39.790 | 19.167 |
+| .01 m / 24 vertices / 0 | 78.284 | 10.444 |
+| .01 m / 24 vertices / .37 | 80.108 | 10.566 |
+
+Actual integrated qualification is complete: `polygon-once-runtime-query-v1.log` passes all 22 query/selected-proof regressions; `polygon-once-runtime-all-v1.log` passes 182 tests / 45 ignored with the same five known UDS tests excluded; `polygon-once-feature-off-check-v1.log` passes the default-feature library check.
+
+Both prepared 1 cm goal trials complete all actual-edge and delivered-tail oracles and reach the original .15 m/.15 rad goal tolerances. OFF takes 21.700 s with 321 nonzero receipts, .067988 m position error and .142243 rad yaw error; ON takes 25.500 s with 314 receipts, .144248 m and .132488 rad errors. Both retain zero delivered negatives and dispatch-expiry observations. All 110/129 delivered frames retain 180,000 cells/190 blocks and there are no dropped frames. Guard/receipt state mismatch counts remain 213/205; this optimization does not close the existing moved-state activation limitation.
+
+Both tests in `polygon-once-prepared-moving-v1.log` nevertheless remain **FAILED** on the unchanged 50 ms maximum control-step criterion: OFF median/p95/max is 21.289/43.950/60.530 ms; ON is 17.558/46.479/62.422 ms. These are sampled mixed-profile runs with different state histories, not controlled whole-run speedup ratios. The matched raw-footprint benchmark is the causal work-removal evidence. All earlier failed trials remain preserved.
+
+Original-source 5 cm factory OFF/ON goals pass in `polygon-once-5cm-factory-v1.log`. `polygon-once-5cm-held-v1.log` passes with six fresh commands during held planning, later admission, 214 nonzero receipts and 1.068341 m travel. It has zero delivered negatives/dispatch-expiry observations, all oracles pass, and sampled current-step median/p95/max is 2.062/3.258/20.393 ms. No hard real-time, hardware, or deployed-release qualification follows.

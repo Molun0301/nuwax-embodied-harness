@@ -1587,10 +1587,11 @@ impl SurfaceSnapshot {
             self.ground_patch(centre, radius)
         };
         #[cfg(feature = "body-query-profile")] let cells_profile=query_profile::guard(QueryStage::ObservationFootprintCells);
+        let polygon_query=PolygonQuery::new(&polygon);
         let mut cells = std::collections::BTreeSet::new();
         for x in min[0]..=max[0] {
             for y in min[1]..=max[1] {
-                if !polygon_intersects_cell(&polygon, x, y, size) { continue; }
+                if !polygon_query.intersects(x, y, size) { continue; }
                 let column = (((x as f64 + 0.5) * size / planner_size).floor() as i32,
                     ((y as f64 + 0.5) * size / planner_size).floor() as i32);
                 let ground = *patch.get(&column).ok_or(SurfaceError::MissingSupport)?;
@@ -1615,6 +1616,7 @@ impl SurfaceSnapshot {
                 cells.insert([x, y, z]);
             }
         }
+        drop(polygon_query);
         #[cfg(feature = "body-query-profile")] {
             drop(cells_profile);
             query_profile::add(QueryCounter::ObservationFootprintCellsBuilt,cells.len() as u64);
@@ -2657,6 +2659,172 @@ mod tests {
         }));
         assert_eq!(expired.map(|_| ()), mixed.validate_observed_body_motion_in_boundary(
             pose, pose, &none, u64::MAX, 100, &[]));
+    }
+
+    // Frozen pre-hoist method; only the receiver and function name differ.
+    fn reference_observation_footprint_rebuilding_polygon(
+        map: &SurfaceSnapshot, pose: ([f64; 3], [f64; 4]),
+    ) -> Result<std::collections::BTreeSet<[i32; 3]>, SurfaceError> {
+        #[cfg(feature = "body-query-profile")] let _footprint_profile=query_profile::guard(QueryStage::ObservationFootprint);
+        let observations = map.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
+        if observations.size_m.to_bits() != map.source_voxel_size_m().to_bits() {
+            return Err(SurfaceError::InvalidConfig("观察精度与几何来源不一致".into()));
+        }
+        let model = map.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        let centre = {
+            #[cfg(feature = "body-query-profile")] let _support_profile=query_profile::guard(QueryStage::ObservationFootprintSupport);
+            map.locate_support_from_body(pose.0, pose.1, model.body_to_support_z_m)?
+        };
+        #[cfg(feature = "body-query-profile")] let shape_profile=query_profile::guard(QueryStage::ObservationFootprintShape);
+        let r = rotation(pose.1)?;
+        let vertices: Vec<_> = model.footprint_xy_m.iter()
+            .flat_map(|p| model.z_bounds_m.map(|z| world(r, pose.0, [p[0], p[1], z])))
+            .collect();
+        let polygon = hull(vertices.iter().map(|p| [p[0], p[1]]).collect());
+        let size = f64::from(observations.size_m);
+        let planner_size = f64::from(map.config().voxel_size);
+        let min: [i32; 2] = std::array::from_fn(|i| (vertices.iter().map(|p| p[i]).fold(f64::INFINITY, f64::min) / size).floor() as i32);
+        let max: [i32; 2] = std::array::from_fn(|i| (vertices.iter().map(|p| p[i]).fold(f64::NEG_INFINITY, f64::max) / size).floor() as i32);
+        if (i64::from(max[0]) - i64::from(min[0]) + 1) * (i64::from(max[1]) - i64::from(min[1]) + 1) > 16_384 {
+            return Err(SurfaceError::InvalidConfig("近场精细支撑查询超过预算".into()));
+        }
+        let radius = model.radius() + model.z_bounds_m[0].abs().max(model.z_bounds_m[1].abs())
+            + model.body_to_support_z_m + planner_size * 2.0;
+        #[cfg(feature = "body-query-profile")] drop(shape_profile);
+        let patch = {
+            #[cfg(feature = "body-query-profile")] let _patch_profile=query_profile::guard(QueryStage::ObservationFootprintPatch);
+            map.ground_patch(centre, radius)
+        };
+        #[cfg(feature = "body-query-profile")] let cells_profile=query_profile::guard(QueryStage::ObservationFootprintCells);
+        let mut cells = std::collections::BTreeSet::new();
+        for x in min[0]..=max[0] {
+            for y in min[1]..=max[1] {
+                if !polygon_intersects_cell(&polygon, x, y, size) { continue; }
+                let column = (((x as f64 + 0.5) * size / planner_size).floor() as i32,
+                    ((y as f64 + 0.5) * size / planner_size).floor() as i32);
+                let ground = *patch.get(&column).ok_or(SurfaceError::MissingSupport)?;
+                let height = map.cell_position(ground)[2];
+                // 粗格跨坡面/阶边时，低侧真实细格可以属于同列较低的占据粗格。
+                // 查询范围由一格内允许的坡差/阶差限制，并要求候选确在规范物理占据内。
+                // 始终先选实际最高回波再查时效，旧顶部不能被新低面替代。
+                let top = ((height / size).round() - 1.0) as i32;
+                let height_span = (planner_size * std::f64::consts::SQRT_2
+                    * f64::from(map.config().max_slope_deg).to_radians().tan())
+                    .max(model.max_step_up_m).max(model.max_step_down_m)
+                    + size + model.support_uncertainty_m;
+                let count = (height_span / size).ceil().min(128.0) as i32;
+                let bottom = top.saturating_sub(count);
+                let z = (bottom..=top).rev().find(|&z| {
+                    if observations.get([x,y,z]).is_none() { return false; }
+                    let centre = (z as f64 + 0.5) * size;
+                    let coarse_z = (centre / planner_size).floor() as i32;
+                    map.data.occupied_columns.get(&column)
+                        .is_some_and(|zs| zs.binary_search(&coarse_z).is_ok())
+                }).unwrap_or(top);
+                cells.insert([x, y, z]);
+            }
+        }
+        #[cfg(feature = "body-query-profile")] {
+            drop(cells_profile);
+            query_profile::add(QueryCounter::ObservationFootprintCellsBuilt,cells.len() as u64);
+        }
+        Ok(cells)
+    }
+
+
+    fn polygon_footprint_fixture(size:f32,hole:bool)->SurfaceSnapshot {
+        use std::collections::BTreeMap;
+        let n=(1.2/f64::from(size)).ceil() as i32;
+        let z=(0.1/f64::from(size)).round() as i32-1;
+        let keys:Vec<_>=(-n..n).flat_map(|x|(-n..n).map(move|y|[x,y,z]))
+            .filter(|key|!hole || !(key[0]==0&&key[1]==0)).collect();
+        let points:Vec<_>=keys.iter().map(|key|((key[0]as f32+0.5)*size,(key[1]as f32+0.5)*size,(key[2]as f32+0.5)*size)).collect();
+        let base=scene(&[],false);
+        let map=SurfaceSnapshot::from_points(&points,base.config().clone(),size).unwrap().with_body_envelope(model()).unwrap();
+        let mut blocks=BTreeMap::<_,BTreeMap<_,_>>::new();
+        for key in keys {blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,
+            SurfaceObservation{observed_ns:10_000_000_000,hits:2});}
+        let mut observations=SurfaceObservations::new(size,32).unwrap();
+        for (block,values) in blocks {observations.replace_block(block,values).unwrap();}
+        observations.set_source_timestamp_ns(10_000_000_000);observations.mark_complete_geometry_source();
+        map.with_observations(Some(Arc::new(observations)))
+    }
+
+    #[test]
+    fn observation_polygon_once_matches_frozen_full_footprint_and_error_order() {
+        let mut success=0;let mut failures=0;
+        for size in [0.1,0.025,0.01] {
+            for hole in [false,true] {
+                let source=polygon_footprint_fixture(size,hole);
+                for rounded in [false,true] {
+                    let mut envelope=model();
+                    if rounded {envelope.footprint_xy_m=(0..24).map(|i| {
+                        let angle=i as f64*std::f64::consts::TAU/24.0;[0.3*angle.cos(),0.16*angle.sin()]
+                    }).collect();}
+                    let map=source.with_body_envelope(envelope).unwrap();
+                    for x in [-0.1,0.05,f64::from_bits(0.1_f64.to_bits()-1),0.1,f64::from_bits(0.1_f64.to_bits()+1),2.0] {
+                        for (yaw,pitch) in [(0.0_f64,0.0_f64),(0.37,0.0),(std::f64::consts::FRAC_PI_4,0.05),(-1.1,-0.04)] {
+                            let q=[-(yaw/2.0).sin()*(pitch/2.0).sin(),(yaw/2.0).cos()*(pitch/2.0).sin(),
+                                (yaw/2.0).sin()*(pitch/2.0).cos(),(yaw/2.0).cos()*(pitch/2.0).cos()];
+                            let pose=([x,-0.05,0.5],q);
+                            let old=reference_observation_footprint_rebuilding_polygon(&map,pose);
+                            let new=map.body_observation_footprint(pose);
+                            assert_eq!(new,old,"size={size} hole={hole} rounded={rounded} pose={pose:?}");
+                            if new.is_ok(){success+=1;}else{failures+=1;}
+                        }
+                    }
+                    let current=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+                    if let Ok(view)=map.with_current_body_support(current.0,current.1) {
+                        assert_eq!(view.body_observation_footprint(current),reference_observation_footprint_rebuilding_polygon(&view,current));
+                    }
+                    for pose in [([0.05,0.05,0.5],[0.0;4]),([f64::NAN,0.0,0.5],[0.0,0.0,0.0,1.0])] {
+                        assert_eq!(map.body_observation_footprint(pose),reference_observation_footprint_rebuilding_polygon(&map,pose));
+                    }
+                }
+            }
+        }
+        assert!(success>100 && failures>0,"matrix must exercise successful complete cell sets and errors");
+        let map=polygon_footprint_fixture(0.01,false);let mut huge=model();
+        huge.footprint_xy_m=vec![[-2.0,-2.0],[2.0,-2.0],[2.0,2.0],[-2.0,2.0]];
+        let huge=map.with_body_envelope(huge).unwrap();let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+        let old=reference_observation_footprint_rebuilding_polygon(&huge,pose);
+        assert!(matches!(old,Err(SurfaceError::InvalidConfig(_))));
+        assert_eq!(huge.body_observation_footprint(pose),old);
+        let wrong=map.with_observations(Some(Arc::new(SurfaceObservations::new(0.02,32).unwrap())));
+        assert_eq!(wrong.body_observation_footprint(pose),reference_observation_footprint_rebuilding_polygon(&wrong,pose));
+    }
+
+    #[test]
+    #[ignore="matched warmed raw-footprint microbenchmark; no live control claim"]
+    fn benchmark_observation_polygon_once() {
+        use std::{hint::black_box,time::Instant};
+        for size in [0.05,0.01] {
+            let source=polygon_footprint_fixture(size,false);
+            for rounded in [false,true] {
+                let mut envelope=model();
+                if rounded {envelope.footprint_xy_m=(0..24).map(|i| {let a=i as f64*std::f64::consts::TAU/24.0;[0.3*a.cos(),0.16*a.sin()]}).collect();}
+                let map=source.with_body_envelope(envelope).unwrap();
+                for yaw in [0.0_f64,0.37] {
+                    let pose=([0.05,0.05,0.5],[0.0,0.0,(yaw/2.0).sin(),(yaw/2.0).cos()]);
+                    let expected=reference_observation_footprint_rebuilding_polygon(&map,pose).unwrap();
+                    assert_eq!(map.body_observation_footprint(pose).unwrap(),expected);
+                    let mut old_ms=Vec::new();let mut new_ms=Vec::new();
+                    for round in 0..6 {
+                        for hoisted in if round%2==0 {[false,true]}else{[true,false]} {
+                            let started=Instant::now();
+                            for _ in 0..30 {
+                                let map=black_box(&map);let pose=black_box(pose);
+                                let cells=if hoisted {map.body_observation_footprint(pose)}else{reference_observation_footprint_rebuilding_polygon(map,pose)}.unwrap();
+                                assert_eq!(black_box(&cells),&expected);
+                            }
+                            let elapsed=started.elapsed().as_secs_f64()*1e3;
+                            if hoisted {new_ms.push(elapsed);}else{old_ms.push(elapsed);}
+                        }
+                    }
+                    eprintln!("FOOTPRINT_POLYGON size={size} rounded={rounded} yaw={yaw} cells={} loops_per_round=30 warmed_by_parity_check=true alternating=true includes=full_raw_footprint_output_equality_and_retirement old_ms={old_ms:?} hoisted_ms={new_ms:?}",expected.len());
+                }
+            }
+        }
     }
 
     #[test]

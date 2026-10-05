@@ -133,3 +133,29 @@ Evidence: `collinear-default-runtime-v1.log`, `collinear-default-factory-v1.log`
 Final continuation evidence: `collinear-default-transformed-v1.log` (four passes) and `collinear-default-downstream-v1.log` (one pass). Transformed runtime trials used two test threads and are functional evidence, not matched timing comparisons. Source activation removes only the eligible off-segment advice connector; the genuine-corner and full explicit-pivot branches remain. The dense captured guard still takes hundreds of milliseconds, and the reported total wall-time change is not a deployed-performance or hard-deadline claim.
 
 The unchanged downstream fixture's prior qualified run took 318.27 s and this run took 274.98 s. This is an observed whole-fixture comparison, not a controlled speedup percentage; the causal work-removal evidence is the independently reconstructed cold-step call-count comparison above.
+
+## Dense current-guard projection attribution
+
+The default-disabled `body-query-profile` Cargo feature records fixed thread-local wall timers and counters in MLS; runtime forwards it only for explicit measurement builds. Feature-off code performs no profiling work. This is diagnostic instrumentation, with no map, guard, cache-key or sampling-policy change. The existing captured-entry probe brackets the complete step including view refresh, excluding construction/admission, and formats both records only after measurement ends.
+
+The profiled cold step returns the identical command/index/progress and retains 62 projections and 62 geometry sweeps. Whole step is 412.04 ms, projection 349.75 ms and geometry sweeps 57.94 ms. MLS attribution:
+
+| Stage/counter | Cold measurement |
+|---|---:|
+| Motion total | 349.69 ms / 62 calls |
+| Contact frame, inclusive | 289.47 ms / 120 calls |
+| Contact-domain collection | 193.94 ms / 43 calls |
+| Contact-point sorting | 63.24 ms / 43 calls |
+| Contact-plane fitting | 31.65 ms / 43 calls |
+| Final body validation inside projection | 58.52 ms / 62 calls |
+| Plane cache | 77 hits / 43 misses |
+| Collected points | 165,560 |
+| Dense / sparse domain paths | 43 / 0 |
+
+Contact-frame/domain counters cover every call on the measured thread, including any contact-frame call made outside `body_pose_after_motion`; they are not automatically a strict partition of MotionTotal. Timers are inclusive wall time, not CPU time. Plane insertion/cache retirement and points-vector destruction fall only within the inclusive ContactFrame timer, not its named child timers. No timing percentages or sums should imply a disjoint partition.
+
+Both stationary exact-input warm repeats have 120 plane-cache hits and zero misses/domain builds. They are cache-cost evidence, not moving-source throughput. A retained uninstrumented binary records a separate cold 447.75 ms step with the same output/counts; this noisy pair neither measures profiler overhead precisely nor demonstrates a speedup. The fixture remains the static, observation-age-disabled dense source, so observed-evidence sweeps are zero and no live-sensor freshness claim follows.
+
+Initial logs: `body-query-default-reference-v1.log`, `body-query-profiler-tests-v1.log` (seven tests), and `body-query-profiled-entry-v1.log` (one checkpoint). Domain construction and ordering are the next measured targets; the 62 current checks remain required.
+
+Final instrumentation qualification: feature-on MLS suite **228 passed / 3 ignored** (`body-query-profiled-mls-v1.log`), and a freshly compiled feature-off captured-entry probe **1 passed** (`body-query-feature-off-entry-v1.log`). The latter preserves the same command, progress and 62-check counts without the MLS profiling feature.

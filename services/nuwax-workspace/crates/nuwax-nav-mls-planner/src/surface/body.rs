@@ -1,6 +1,8 @@
 //! 三维机体凸柱包络、支撑接触与方向性地形约束。
 use super::*;
 use std::collections::VecDeque;
+#[cfg(feature = "body-query-profile")]
+use crate::body_query_profile::{self as query_profile, Counter as QueryCounter, Stage as QueryStage};
 #[path = "body_translation.rs"]
 mod translation;
 #[path = "body_contact.rs"]
@@ -1383,6 +1385,8 @@ impl SurfaceSnapshot {
         xy: [f64; 2],
         yaw: f64,
     ) -> Result<([f64; 3], [f64; 4]), SurfaceError> {
+        #[cfg(feature = "body-query-profile")]
+        let _motion_profile = query_profile::guard(QueryStage::MotionTotal);
         if !from.0.into_iter().chain(xy).chain([yaw]).all(f64::is_finite) {
             return Err(SurfaceError::InvalidPose);
         }
@@ -1393,19 +1397,35 @@ impl SurfaceSnapshot {
         let yaw_delta = (yaw-current_yaw+std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
             - std::f64::consts::PI;
         if xy == [from.0[0],from.0[1]] && yaw_delta.abs() < 1e-12 {
+            #[cfg(feature = "body-query-profile")]
+            let validation_profile = query_profile::guard(QueryStage::FinalBodyValidation);
             self.validate_body_pose(from.0,from.1)?;
+            #[cfg(feature = "body-query-profile")]
+            drop(validation_profile);
             return Ok(from);
         }
+        #[cfg(feature = "body-query-profile")]
+        let current_support_profile = query_profile::guard(QueryStage::CurrentSupportLookup);
         let start = self.locate_support_from_body(from.0,from.1,model.body_to_support_z_m)?;
+        #[cfg(feature = "body-query-profile")]
+        drop(current_support_profile);
         if actual_rotation[2][2]<=0.0 {return Err(SurfaceError::InvalidPose);}
         // 拟合查询在机体中心XY；名义接触平面在这里的高度是z-d/n_z，
         // 不能把位于旋转支撑点XY的z-d*n_z直接当作中心参考。
         let initial_height=from.0[2]-model.body_to_support_z_m/actual_rotation[2][2];
         let normal_tolerance=f64::from(self.config().step_threshold_m+self.config().voxel_size);
+        #[cfg(feature = "body-query-profile")]
+        let base_support_profile = query_profile::guard(QueryStage::BaseNearSupportLookup);
         let base_projection=self.locate_near_support(
             [from.0[0],from.0[1],initial_height],normal_tolerance)?;
+        #[cfg(feature = "body-query-profile")]
+        drop(base_support_profile);
+        #[cfg(feature = "body-query-profile")]
+        let next_support_profile = query_profile::guard(QueryStage::NextNearSupportLookup);
         let projected=self.locate_near_support(
             [xy[0],xy[1],base_projection.surface_xyz[2]],normal_tolerance)?;
+        #[cfg(feature = "body-query-profile")]
+        drop(next_support_profile);
         let (base_height,base_attitude)=self.body_contact_frame(base_projection,initial_height,current_yaw)?;
         let (next_height,next_attitude)=self.body_contact_frame(projected,initial_height,yaw)?;
         let base_rotation=rotation(base_attitude)?;
@@ -1441,23 +1461,39 @@ impl SurfaceSnapshot {
         let height_delta=centre_height_delta+(after_contact-before_contact);
         // 只改变朝向时没有地面平移，实际机体中心不应因标定偏移自行升降。
         let body_z=if xy==[from.0[0],from.0[1]] {from.0[2]} else {from.0[2]+height_delta};
+        #[cfg(feature = "body-query-profile")]
+        let segment_profile = query_profile::guard(QueryStage::SegmentSupport);
         let _destination = match self.sample_segment_support(start.support_xyz,
             [xy[0]+offset[0],xy[1]+offset[1],projected.surface_xyz[2]],1.0) {
-            Ok(destination)=>destination,
+            Ok(destination)=> {
+                #[cfg(feature = "body-query-profile")]
+                drop(segment_profile);
+                destination
+            }
             Err(error)=> {
+                #[cfg(feature = "body-query-profile")]
+                drop(segment_profile);
                 let flat=([xy[0],xy[1],body_z],q);
                 tracing::debug!(?error, ?from, ?flat, start=?start.support_xyz, projected=?projected.surface_xyz,
                     offset=?offset, "实际机体推进的支撑参考连段被拒绝");
                 if matches!(error,SurfaceError::UntraversableSegment)
                     && self.fine_contact_support_samples(from,flat).is_some() {
+                    #[cfg(feature = "body-query-profile")]
+                    let validation_profile = query_profile::guard(QueryStage::FinalBodyValidation);
                     self.validate_body_pose(flat.0,flat.1)?;
+                    #[cfg(feature = "body-query-profile")]
+                    drop(validation_profile);
                     return Ok(flat);
                 }
                 return Err(error);
             }
         };
         let body = [xy[0],xy[1],body_z];
+        #[cfg(feature = "body-query-profile")]
+        let validation_profile = query_profile::guard(QueryStage::FinalBodyValidation);
         self.validate_body_pose(body,q)?;
+        #[cfg(feature = "body-query-profile")]
+        drop(validation_profile);
         Ok((body,q))
     }
 
@@ -1850,6 +1886,8 @@ impl SurfaceSnapshot {
         let Some(count)=nx.checked_mul(ny).filter(|n|nx>0&&ny>0&&*n<=16_384) else {
             return self.fine_contact_domain_sparse(origin,radius);
         };
+        #[cfg(feature = "body-query-profile")]
+        query_profile::count(QueryCounter::DenseDomainCalls);
         let stride=ny as usize;let count=count as usize;
         let mut in_domain=vec![false;count];
         let mut bands=vec![None;count];
@@ -1915,6 +1953,8 @@ impl SurfaceSnapshot {
     /// 从真实细带独立构建接触响应域；粗图不决定拟合输入，仍核验全部实际机体许可。
     fn fine_contact_domain_sparse(&self,origin:[f64;3],radius:f64)
         ->Result<Vec<([f64;3],f64,f64)>,SurfaceError> {
+        #[cfg(feature = "body-query-profile")]
+        query_profile::count(QueryCounter::SparseDomainCalls);
         let observations=self.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
         let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
         let size=f64::from(observations.size_m);
@@ -1978,12 +2018,26 @@ impl SurfaceSnapshot {
     /// 在连续足迹邻域上共同拟合接触高度和法向；连续厚带保留实测参考允许的区间。
     fn body_contact_frame(&self,centre:SurfaceLocation,height:f64,yaw:f64)
         -> Result<(f64,[f64;4]),SurfaceError> {
+        #[cfg(feature = "body-query-profile")]
+        let _frame_profile = query_profile::guard(QueryStage::ContactFrame);
         let model=self.body_envelope()
             .ok_or_else(||SurfaceError::InvalidConfig("body envelope is unavailable".into()))?;
         let support=[centre.support_xyz[0],centre.support_xyz[1],height];
         let key=(centre.cell,support.map(f64::to_bits));
+        #[cfg(feature = "body-query-profile")]
+        let cache_profile = query_profile::guard(QueryStage::PlaneCacheLookup);
         let cached=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).planes.get(&key).copied();
-        let (a,b,z)=if let Some(plane)=cached {plane} else {
+        #[cfg(feature = "body-query-profile")]
+        drop(cache_profile);
+        let (a,b,z)=if let Some(plane)=cached {
+            #[cfg(feature = "body-query-profile")]
+            query_profile::count(QueryCounter::PlaneCacheHits);
+            plane
+        } else {
+            #[cfg(feature = "body-query-profile")]
+            query_profile::count(QueryCounter::PlaneCacheMisses);
+            #[cfg(feature = "body-query-profile")]
+            let domain_profile = query_profile::guard(QueryStage::ContactDomainCollection);
             // 足迹外包半径加实际接触样本间距；有精细观察时不随规划格改变。
             // 缺少精细观察时只保留粗格中心，不能用已丢失的细XY缩窄量化覆盖。
             let spacing=self.observations.as_ref().map_or(self.config().voxel_size,|o|o.size_m);
@@ -2004,12 +2058,26 @@ impl SurfaceSnapshot {
                 }
                 points
             };
+            #[cfg(feature = "body-query-profile")]
+            drop(domain_profile);
+            #[cfg(feature = "body-query-profile")]
+            query_profile::add(QueryCounter::ContactPoints, u64::try_from(points.len()).unwrap_or(u64::MAX));
+            #[cfg(feature = "body-query-profile")]
+            let sort_profile = query_profile::guard(QueryStage::ContactPointSort);
             points.sort_by(|a,b|a.0[0].total_cmp(&b.0[0]).then_with(||a.0[1].total_cmp(&b.0[1])));
+            #[cfg(feature = "body-query-profile")]
+            drop(sort_profile);
+            #[cfg(feature = "body-query-profile")]
+            let fit_profile = query_profile::guard(QueryStage::ContactPlaneFit);
             let plane=fit_contact_plane(&points,support).ok_or(SurfaceError::MissingSupport)?;
+            #[cfg(feature = "body-query-profile")]
+            drop(fit_profile);
             let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
             if cache.planes.len()>=8192 {cache.planes.clear();}
             cache.planes.insert(key,plane);plane
         };
+        #[cfg(feature = "body-query-profile")]
+        let _algebra_profile = query_profile::guard(QueryStage::ContactFrameAlgebra);
         let normal=normalize([-a,-b,1.0]);
         let forward=normalize([yaw.cos(),yaw.sin(),a*yaw.cos()+b*yaw.sin()]);
         let left=cross(normal,forward);

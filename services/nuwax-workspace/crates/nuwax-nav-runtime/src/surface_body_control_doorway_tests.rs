@@ -1880,10 +1880,19 @@ fn measured_collinear_progress_at_captured_entry() {
         follower.observe_applied_command(applied);
         follower.update_odometry(stamped(decode(CURRENT),TIME));
         control_profile::begin();
+        #[cfg(feature="body-query-profile")] nuwax_nav_mls_planner::body_query_profile::begin();
         let started=Instant::now();
         let result=follower.step(0.32);
         let wall=started.elapsed();
         let record=control_profile::end();
+        #[cfg(feature="body-query-profile")] let body_record=nuwax_nav_mls_planner::body_query_profile::end();
+        #[cfg(feature="body-query-profile")]
+        {
+            use nuwax_nav_mls_planner::body_query_profile::{Stage as BodyStage,Counter as BodyCounter};
+            let stages:Vec<_>=BodyStage::ALL.into_iter().map(|stage|(stage.label(),body_record.wall_nanos[stage as usize]as f64/1e6,body_record.calls[stage as usize])).collect();
+            let counters:Vec<_>=BodyCounter::ALL.into_iter().map(|counter|(counter.label(),body_record.counters[counter as usize])).collect();
+            eprintln!("BODY_QUERY_PROFILE sample={sample} scope=complete_step_including_view_refresh timers=inclusive_wall_not_cpu feature=nondefault setup_admission_excluded=true stages={stages:?} counters={counters:?}");
+        }
         let PlannerStep::Command(command)=result else {panic!("{result:?}")};
         assert!(command.linear.x>0.0 && command.linear.y==0.0);
         if let Some(previous)=reference {assert_eq!(command,previous,"query-cache warming must not change the command");}

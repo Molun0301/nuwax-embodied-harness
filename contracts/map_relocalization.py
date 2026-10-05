@@ -22,7 +22,7 @@ import sys
 from typing import Any, Mapping
 
 from contracts.map_activation import AssignedActivationReceipt, _cloud, _fields, _integer, _occupancy, _rust_trim, _text
-from contracts.map_workspace import AssetIdentityV2
+from contracts.map_identity import AssetIdentityV2
 
 MAX_TERMINAL_BYTES = 65_536
 MAX_TERMINAL_RECORD_BYTES = 2 * MAX_TERMINAL_BYTES + 128 + 3 * 64 + 512

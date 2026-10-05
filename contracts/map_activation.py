@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import json
 from typing import Any, Mapping
 
-from contracts.map_workspace import AssetIdentityV2
+from contracts.map_identity import AssetIdentityV2
 
 
 def _fields(value: Any, expected: set[str], name: str) -> Mapping[str, Any]:

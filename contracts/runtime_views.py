@@ -2,14 +2,19 @@ from __future__ import annotations
 
 from contracts.compat import StrEnum
 from datetime import datetime
+from copy import deepcopy
+import math
 
-from pydantic import ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from pydantic import ConfigDict, Field, PlainSerializer, PlainValidator, PrivateAttr, field_validator, model_serializer, model_validator
 
 from contracts.artifacts import ArtifactRef
 from contracts.base import ContractModel, MetadataDict, TimestampedContract, utc_now
-from contracts.geometry import FrameTree, Pose
+from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from contracts.image import CameraInfo
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap
+from contracts.map_identity import AssetIdentityV2
+from contracts.map_activation import AssignedActivationReceipt
+from contracts.map_relocalization import AssignedRelocalizationTerminal
 from contracts.navigation import ExplorationState, ExploreAreaRequest, NavigationGoal, NavigationState
 from contracts.perception import Observation
 from contracts.robot_state import RobotState, SafetyState
@@ -18,7 +23,7 @@ from contracts.spatial_memory import (
     SemanticRegion as SpatialSemanticRegion,
     SpatialAnchor,
 )
-from typing import List, Literal, Optional
+from typing import Annotated, List, Literal, Mapping, Optional
 
 
 class DiagnosticLevel(StrEnum):
@@ -145,8 +150,114 @@ class RelocalizationCandidate(TimestampedContract):
     metadata: MetadataDict = Field(default_factory=dict, description="附加诊断元数据。")
 
 
+# Assigned session descriptors are deliberately plain metadata. Reject objects
+# before calling serializers/deepcopy: an accidental map/cloud owner must never
+# be traversed by this boundary. No new identity hash, clock or size cap is used.
+_ASSIGNED_SESSION_FORBIDDEN_KEYS = frozenset({
+    "asset_manifest_sha256", "manifest_sha256", "content_sha256",
+    "activation_identity_sha256", "payload_sha256", "snapshot_sha256",
+    "asset_bundle_sha256", "activation_request_identity_sha256", "target_receipt_sha256",
+    "activation_target_manifest_sha256", "algorithm_options_sha256", "bundle_manifest_sha256",
+    "catalog_manifest_sha256", "cloud_source_sha256", "committed_occupancy_sha256",
+    "committed_payload_sha256", "companion_sha256", "deadline_policy_sha256",
+    "expected_asset_manifest_sha256", "expected_previous_manifest_sha256",
+    "request_identity_sha256", "resolved_asset_manifest_sha256", "runtime_asset_manifest_sha256",
+    "runtime_manifest_sha256", "source_policy_sha256", "target_manifest_sha256", "terminal_proof_sha256",
+    "map_version_id", "platform_map_version_id", "latest_map_version_id",
+    "localization_session_map_version_id", "seed_map_version_id",
+    "mapping_session_id", "session_generation", "activation_receipt_v2",
+    "relocalization_terminal_v2", "occupancy_grid", "cost_map", "cells",
+    "cloud", "source_points", "xyz_f32", "checkpoint_payload",
+    "candidate_payload_v3",
+})
+
+
+def _copy_assigned_session_descriptor(value):
+    """Detach JSON-like descriptors without invoking arbitrary object hooks."""
+    if value is None or type(value) in (str, bool, int):
+        return value
+    if type(value) is float and math.isfinite(value):
+        return value
+    if type(value) is dict:
+        if any(type(key) is not str or key in _ASSIGNED_SESSION_FORBIDDEN_KEYS for key in value):
+            raise ValueError("assigned session metadata contains legacy authority or payload fields")
+        return {key: _copy_assigned_session_descriptor(item) for key, item in value.items()}
+    if type(value) in (list, tuple):
+        return [_copy_assigned_session_descriptor(item) for item in value]
+    raise ValueError("assigned session metadata must contain only plain descriptors")
+
+
+def _copy_assigned_localization_fields(value, model_type=RelocalizationCandidate):
+    """Project known small fields before any serializer/deepcopy can see Any.
+
+    Candidate metadata/covariance/asset refs and forged provider pose/tree fields
+    may contain arbitrary models. Project the known geometry fields recursively
+    and reject bodies directly before any generic serializer or deepcopy sees
+    them. Final shape/value validation remains with the existing contracts.
+    """
+    if type(value) is model_type:
+        raw = dict(object.__getattribute__(value, "__dict__"))
+    elif type(value) is dict:
+        raw = dict(value)
+    else:
+        raise ValueError("assigned localization fields require plain typed descriptors")
+    if any(type(key) is not str or key not in model_type.model_fields for key in raw):
+        raise ValueError("assigned localization descriptor contains unsupported fields")
+    detached = {}
+    for name, item in raw.items():
+        if name == "timestamp" and type(item) is datetime:
+            detached[name] = item  # immutable scalar, with no serialization hook
+        elif model_type is RelocalizationCandidate and name == "pose" and item is not None:
+            detached[name] = _copy_assigned_localization_fields(item, Pose)
+        elif ((model_type is Pose and name == "position")
+              or (model_type is Transform and name == "translation")):
+            detached[name] = _copy_assigned_localization_fields(item, Vector3)
+        elif ((model_type is Pose and name == "orientation")
+              or (model_type is Transform and name == "rotation")):
+            detached[name] = _copy_assigned_localization_fields(item, Quaternion)
+        elif model_type is FrameTree and name == "transforms":
+            if type(item) not in (list, tuple):
+                raise ValueError("assigned frame tree transforms must be a plain sequence")
+            detached[name] = [_copy_assigned_localization_fields(transform, Transform) for transform in item]
+        else:
+            detached[name] = _copy_assigned_session_descriptor(item)
+    return detached
+
+
+def _session_activation_owner(value):
+    if type(value) is AssignedActivationReceipt:
+        return value
+    if type(value) is dict:
+        return AssignedActivationReceipt.admit(value)
+    raise ValueError("activation_receipt_v2 requires an admitted activation receipt")
+
+
+def _session_terminal_owner(value):
+    if type(value) is AssignedRelocalizationTerminal:
+        return value
+    if type(value) is dict:
+        return AssignedRelocalizationTerminal.from_dict(value)
+    raise ValueError("relocalization_terminal_v2 requires an admitted terminal")
+
+
+_SessionActivationOwner = Annotated[
+    AssignedActivationReceipt, PlainValidator(_session_activation_owner),
+    PlainSerializer(lambda owner: owner.to_dict(), return_type=dict),
+]
+_SessionTerminalOwner = Annotated[
+    AssignedRelocalizationTerminal, PlainValidator(_session_terminal_owner),
+    PlainSerializer(lambda owner: owner.to_dict(), return_type=dict),
+]
+
+
 class LocalizationSession(TimestampedContract):
     """平台侧定位会话。"""
+
+    identity_schema_version: Literal[1, 2] = 1
+    asset_identity: Optional[AssetIdentityV2] = None
+    activation_receipt_v2: Optional[_SessionActivationOwner] = None
+    relocalization_terminal_v2: Optional[_SessionTerminalOwner] = None
+    _assigned_owned: bool = PrivateAttr(default=False)
 
     session_id: str = Field(description="平台定位会话标识。")
     map_name: str = Field(description="当前绑定的地图名称。")
@@ -184,6 +295,119 @@ class LocalizationSession(TimestampedContract):
         ):
             raise ValueError("asset_manifest_sha256 必须为 64 位十六进制字符串。")
         return resolved
+
+
+    @model_validator(mode="before")
+    @classmethod
+    def _admit_session_generation(cls, value):
+        if not isinstance(value, dict):
+            return value
+        schema = value.get("identity_schema_version", 1)
+        if type(schema) is not int or schema not in (1, 2):
+            raise ValueError("identity_schema_version must be exactly 1 or 2")
+        if schema == 1:
+            if any(value.get(key) is not None for key in (
+                "asset_identity", "activation_receipt_v2", "relocalization_terminal_v2",
+            )):
+                raise ValueError("legacy sessions cannot carry assigned owners")
+            return value
+        value = dict(value)
+        for key in ("metadata", "geometry_asset"):
+            if key in value:
+                value[key] = _copy_assigned_session_descriptor(value[key])
+        # Candidates are UI summaries only. Their small public values are copied;
+        # canonical terminal bytes stay in the admitted terminal, by reference.
+        for key in ("relocalization_candidates", "last_relocalization"):
+            if key in value:
+                items = value[key] if key == "relocalization_candidates" else [value[key]]
+                detached = [None if item is None else _copy_assigned_localization_fields(item) for item in items]
+                value[key] = detached if key == "relocalization_candidates" else detached[0]
+        identity = value.get("asset_identity")
+        if type(identity) is AssetIdentityV2:
+            # AssetIdentityV2 semantics remain unchanged; reject unvalidated
+            # model_copy/model_construct values at this new admission boundary.
+            AssetIdentityV2.model_validate({"asset_id": identity.asset_id})
+        return value
+
+    @model_validator(mode="after")
+    def _seal_assigned_session(self):
+        if self.identity_schema_version == 1:
+            return self
+        owner = self.activation_receipt_v2
+        terminal = self.relocalization_terminal_v2
+        if (type(self.asset_identity) is not AssetIdentityV2 or owner is None
+                or self.asset_manifest_sha256 is not None
+                or self.map_name != owner.map_name or self.asset_identity != owner.asset_identity):
+            raise ValueError("assigned session requires the exact map, asset and activation owner without digest")
+        if terminal is not None and (
+            terminal.disposition not in (1, 2)
+            or not terminal.request.activation_receipt.exact_replay_of(owner)
+            or terminal.request.asset_identity != self.asset_identity
+        ):
+            raise ValueError("assigned session terminal must be applied for its exact activation owner")
+        if self.status == LocalizationSessionStatus.READY and not self.pose_available:
+            raise ValueError("assigned READY requires a usable pose")
+        for descriptor in (self.metadata, self.geometry_asset):
+            if descriptor and descriptor.get("map_name", self.map_name) != self.map_name:
+                raise ValueError("assigned session descriptor map_name differs")
+            if descriptor and "asset_identity" in descriptor and descriptor["asset_identity"] != {"asset_id": self.asset_identity.asset_id}:
+                raise ValueError("assigned session descriptor asset identity differs")
+        self.__pydantic_private__["_assigned_owned"] = True
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_session_generation(self, handler):
+        document = handler(self)
+        if self.identity_schema_version == 1:
+            for key in ("identity_schema_version", "asset_identity", "activation_receipt_v2", "relocalization_terminal_v2"):
+                document.pop(key, None)
+        return document
+
+    def __setattr__(self, name, value):
+        if getattr(self, "__pydantic_private__", None) and self.__pydantic_private__.get("_assigned_owned", False):
+            raise TypeError("assigned sessions are sealed; construct a validated successor")
+        if (self.__dict__.get("identity_schema_version") == 1
+                and name in {"identity_schema_version", "asset_identity", "activation_receipt_v2", "relocalization_terminal_v2"}):
+            # Pydantic after-validator failure can leave an assigned value in
+            # place. Reject before its assignment machinery touches a legacy
+            # object already retained by the active session/history/event queue.
+            raise TypeError("legacy session owner fields require explicit assigned admission")
+        return super().__setattr__(name, value)
+
+    def __getattribute__(self, name):
+        value = super().__getattribute__(name)
+        if name in {"metadata", "geometry_asset", "relocalization_candidates", "last_relocalization"}:
+            private = super().__getattribute__("__pydantic_private__")
+            if private and private.get("_assigned_owned", False):
+                return deepcopy(value)
+        return value
+
+    def model_copy(self, *, update: Optional[Mapping[str, object]] = None, deep: bool = False):
+        changes = dict(update or {})
+        if self.identity_schema_version == 1:
+            if any(key in changes for key in ("identity_schema_version", "asset_identity", "activation_receipt_v2", "relocalization_terminal_v2")):
+                schema = changes.get("identity_schema_version", 1)
+                if type(schema) is not int or schema != 1 or any(changes.get(key) is not None for key in ("asset_identity", "activation_receipt_v2", "relocalization_terminal_v2")):
+                    raise TypeError("legacy sessions require explicit assigned admission")
+            return super().model_copy(update=update, deep=deep)
+        owner_fields = {"identity_schema_version", "asset_identity", "activation_receipt_v2",
+                        "relocalization_terminal_v2", "session_id", "map_name", "asset_manifest_sha256", "frame_id"}
+        for name in owner_fields & changes.keys():
+            if changes[name] != getattr(self, name):
+                raise TypeError("assigned session owners cannot be rewritten by model_copy")
+        # Preserve receipt references even for deep=True, and revalidate every
+        # changed descriptor; generic Pydantic model_copy skips validation.
+        values = {name: getattr(self, name) for name in type(self).model_fields}
+        values.update(changes)
+        return type(self).model_validate(values)
+
+    def __deepcopy__(self, memo=None):
+        if self.identity_schema_version != 2:
+            return super().__deepcopy__(memo=memo)
+        copied = self.model_copy()
+        if memo is not None:
+            memo[id(self)] = copied
+        return copied
 
 
 class TopologyNodeSummary(TimestampedContract):

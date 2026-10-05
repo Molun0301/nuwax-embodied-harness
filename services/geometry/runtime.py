@@ -5343,6 +5343,16 @@ class PlatformGeometryRuntime:
                     manifest_sha256=stored_backend_checkpoint.manifest_sha256,
                     object_sha256=stored_backend_checkpoint.checkpoint.content_sha256.hex(),
                 )
+        # Geometry carries only the repository's explicit source authority.
+        # Keep the richer export/session diagnostics separately on the bundle.
+        checkpoint_geometry_source = backend_checkpoint_metadata
+        if (backend_checkpoint_metadata is not None
+                and backend_checkpoint_metadata["schema_version"] == 2):
+            checkpoint_geometry_source = {
+                key: backend_checkpoint_metadata[key]
+                for key in ("present", "schema_version", "backend_kind",
+                            "checkpoint_id", "manifest_path")
+            }
         quality_metrics = self._build_geometry_quality_metrics(
             database_metadata=database_metadata,
             pcd_metadata=pcd_metadata,
@@ -5455,8 +5465,8 @@ class PlatformGeometryRuntime:
                 "pcd": persisted_pcd_metadata,
                 "navigation_map": persisted_nav2_metadata,
                 "mapping_backend_checkpoint": self._clone_metadata(
-                    backend_checkpoint_metadata
-                ) if backend_checkpoint_metadata is not None else None,
+                    checkpoint_geometry_source
+                ) if checkpoint_geometry_source is not None else None,
                 "diagnostics": quality_metrics.get("diagnostics", []),
             },
         )

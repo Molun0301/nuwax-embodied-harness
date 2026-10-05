@@ -369,7 +369,7 @@ class IdentityV2Tests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'CHECKPOINT_V2_ACTIVATION_UNAVAILABLE'):
             instance._activate_backend_map_bundle(bundle, bundle_root=self.root)
 
-    def test_explicit_v2_preparation_keeps_assigned_metadata_and_exact_members(self):
+    def prepare_v2_bundle(self, root):
         from contracts.geometry_runtime import PlatformGeometryConfig
         from contracts.map_workspace import MapAssetBundle
         from contracts.runtime_views import MapSnapshot
@@ -405,15 +405,25 @@ class IdentityV2Tests(unittest.TestCase):
         with patch.object(provider.MappingBackendCheckpointExportBundle, 'canonical_cloud_checkpoint',
                           side_effect=AssertionError('protobuf cloud copy')):
             prepared = instance.prepare_map_asset_bundle(
-                candidate, bundle_root=self.root, checkpoint_schema_version=2,
+                candidate, bundle_root=root, checkpoint_schema_version=2,
             )
         self.assertEqual(calls, [{'checkpoint_schema_version': 2}])
+        return prepared, exported
+
+    def test_explicit_v2_preparation_keeps_assigned_metadata_and_exact_members(self):
+        prepared, exported = self.prepare_v2_bundle(self.root)
         checkpoint_metadata = prepared.geometry_asset.metadata['mapping_backend_checkpoint']
         self.assertEqual(checkpoint_metadata['schema_version'], 2)
         self.assertEqual(checkpoint_metadata['checkpoint_id'], 'a' * 32)
         self.assertFalse(any('sha256' in key for key in checkpoint_metadata))
-        self.assertEqual(set(checkpoint_metadata['member_paths']),
+        self.assertEqual(set(checkpoint_metadata),
+                         {'present', 'schema_version', 'backend_kind', 'checkpoint_id', 'manifest_path'})
+        diagnostics = prepared.metadata['mapping_backend_checkpoint']
+        self.assertEqual(set(diagnostics['member_paths']),
                          {'backend_state', 'canonical_occupancy', 'canonical_cloud', 'fine_map', 'dense_cloud'})
+        self.assertEqual(diagnostics['payload_size'], exported.checkpoint.payload_size)
+        self.assertEqual(diagnostics['source_session_id'], 'source')
+        self.assertEqual(diagnostics['source_session_generation'], 3)
         self.assertEqual(prepared.snapshot.occupancy_grid.data, [-1, 100])
         pcd = self.root / prepared.geometry_asset.pcd_path
         self.assertEqual(pcd.read_bytes().split(b'DATA binary\n', 1)[1],
@@ -422,6 +432,43 @@ class IdentityV2Tests(unittest.TestCase):
             self.root, 'voxel', expected_checkpoint_id='a' * 32,
         )
         self.assertEqual(reopened.canonical_cloud_checkpoint(), self.response.canonical_cloud_checkpoint)
+
+    def test_actual_v2_preparation_finalizes_and_reopens_assigned_asset(self):
+        from contracts.map_workspace import AssetIdentityV2, MapAssetBundle
+        from services.mapping.asset_store import MapAssetBundleRepository
+        repository = MapAssetBundleRepository(str(self.root / 'assets'))
+        stage = repository.create_staging_directory('map')
+        prepared, exported = self.prepare_v2_bundle(stage)
+        self.assertEqual(prepared.identity_schema_version, 1)
+        # Preparation precedes assignment: do not mutate an existing immutable
+        # owner or repair the producer's geometry metadata in this fixture.
+        identity = AssetIdentityV2(asset_id='d' * 32)
+        values = {name: getattr(prepared, name) for name in type(prepared).model_fields}
+        values.update(identity_schema_version=2, asset_identity=identity, asset_state='candidate')
+        candidate = MapAssetBundle(**values)
+        finalized = repository.finalize_assigned_map_asset_bundle(
+            candidate, staging_dir=stage, asset_identity=identity)
+        reopened = MapAssetBundleRepository(str(self.root / 'assets')).get_map_asset_bundle(
+            'map', migrate_legacy=False, expected_asset_identity=identity)
+        self.assertEqual(finalized.asset_identity, identity)
+        self.assertEqual(reopened.asset_identity, identity)
+        self.assertEqual(reopened.asset_state, 'finalized')
+        self.assertEqual(reopened.geometry_asset.metadata['mapping_backend_checkpoint'],
+                         prepared.geometry_asset.metadata['mapping_backend_checkpoint'])
+        self.assertEqual(reopened.metadata['mapping_backend_checkpoint'],
+                         prepared.metadata['mapping_backend_checkpoint'])
+        self.assertEqual(reopened.snapshot.occupancy_grid.data, [-1, 100])
+        current = repository.current_directory('map')
+        checkpoint = provider.reopen_mapping_backend_checkpoint(
+            current, 'voxel', expected_checkpoint_id=exported.checkpoint.checkpoint_id)
+        self.assertEqual(checkpoint.canonical_occupancy_checkpoint(),
+                         self.response.canonical_occupancy_checkpoint)
+        self.assertEqual(checkpoint.canonical_cloud_checkpoint(),
+                         self.response.canonical_cloud_checkpoint)
+        self.assertEqual(checkpoint.checkpoint.occupancy_receipt['source_timestamp_ns'], 11)
+        self.assertEqual(checkpoint.checkpoint.checkpoint_id, exported.checkpoint.checkpoint_id)
+        self.assertEqual((current / reopened.geometry_asset.pcd_path).read_bytes().split(b'DATA binary\n', 1)[1],
+                         self.response.canonical_cloud_checkpoint.xyz_f32_le)
 
     def test_finalization_default_stays_legacy_until_activation_contract_is_paired(self):
         import inspect

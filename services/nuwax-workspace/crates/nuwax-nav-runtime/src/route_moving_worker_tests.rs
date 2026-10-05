@@ -80,7 +80,9 @@ fn fixture(enabled:bool, resolution:f32, length:f32)->(SurfaceFollowerConfig,Arc
     (config,map,Arc::new(keys))
 }
 
-struct Frame {map:Arc<SurfaceSnapshot>,sample_ns:u64,ready_ns:u64,sequence:u16}
+#[derive(Clone,Copy,Debug)]
+struct SourceAssembly {group_ns:u64,replace_ns:u64,snapshot_ns:u64,cells:usize,blocks:usize}
+struct Frame {map:Arc<SurfaceSnapshot>,sample_ns:u64,ready_ns:u64,sequence:u16,assembly:SourceAssembly}
 struct Sensor {receive:mpsc::Receiver<Frame>,stop:Arc<AtomicBool>,join:Option<std::thread::JoinHandle<()>>,dropped:Arc<AtomicUsize>}
 impl Sensor {
     fn new(base:Arc<SurfaceSnapshot>,keys:Arc<Vec<[i32;3]>>)->Self {
@@ -97,14 +99,21 @@ impl Sensor {
                 // One actual synthetic sensor sample now, before assembly. No
                 // pre-dated frames; hits count distinct wall-spaced acquisitions.
                 let sample_ns=unix_ns();sequence=sequence.saturating_add(1);
+                let grouping=Instant::now();
                 let mut blocks=BTreeMap::<[i32;3],BTreeMap<[i32;3],SurfaceObservation>>::new();
                 for &key in keys.iter(){blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:sample_ns,hits:sequence});}
+                let group_ns=grouping.elapsed().as_nanos() as u64;
+                let block_count=blocks.len();let replacement=Instant::now();
                 for (key,block) in blocks {observations.replace_block(key,block).unwrap();}
+                let replace_ns=replacement.elapsed().as_nanos() as u64;
+                let snapshot=Instant::now();
                 observations.set_source_timestamp_ns(sample_ns);observations.mark_complete_geometry_source();
                 // Clone the previous persistent observation roots before replacing
                 // blocks: same occupied columns retain their actual identity.
                 let map=Arc::new(base.with_observations(Some(Arc::new(observations.clone()))));
-                let frame=Frame{map,sample_ns,ready_ns:unix_ns(),sequence};
+                let snapshot_ns=snapshot.elapsed().as_nanos() as u64;
+                let frame=Frame{map,sample_ns,ready_ns:unix_ns(),sequence,
+                    assembly:SourceAssembly{group_ns,replace_ns,snapshot_ns,cells:keys.len(),blocks:block_count}};
                 match send.try_send(frame){Ok(())=>{},Err(mpsc::TrySendError::Full(_))=>{skipped.fetch_add(1,Ordering::Relaxed);},Err(mpsc::TrySendError::Disconnected(_))=>break}
                 deadline+=SENSOR_PERIOD;
                 if deadline<Instant::now(){deadline=Instant::now()+SENSOR_PERIOD;} // missed samples are dropped, never backfilled
@@ -116,7 +125,7 @@ impl Sensor {
 impl Drop for Sensor {fn drop(&mut self){self.stop.store(true,Ordering::Release);if let Some(t)=self.join.take(){t.join().unwrap();}}}
 
 // No source payloads or query views are retained by these diagnostic records.
-struct SourceFrameSample {sample_ns:u64,ready_ns:u64,delivered_ns:u64}
+struct SourceFrameSample {sample_ns:u64,ready_ns:u64,delivered_ns:u64,assembly:SourceAssembly}
 struct SourceInstallSample {source_view_seq:u64,sample_ns:Option<u64>,completed_ns:u64}
 
 struct ControlStepSample {
@@ -169,7 +178,7 @@ impl Probe {
     }
     fn record_frame(&mut self,frame:&Frame,delivered_ns:u64) {
         if self.source_frames.len()<self.control_sample_limit {
-            self.source_frames.push(SourceFrameSample{sample_ns:frame.sample_ns,ready_ns:frame.ready_ns,delivered_ns});
+            self.source_frames.push(SourceFrameSample{sample_ns:frame.sample_ns,ready_ns:frame.ready_ns,delivered_ns,assembly:frame.assembly});
         }else{self.source_frame_overflow=self.source_frame_overflow.saturating_add(1);}
     }
 }
@@ -372,6 +381,15 @@ fn report_source_ages(p:&Probe,factory:bool,context:&str) {
     }
     eprintln!("MOVING_SOURCE_CADENCE {context} scope=consumer_delivered_frames_including_priming retained_frames={} record_limit={} omitted_frames={} delivered_frame_sample_spacing_ms_median_p95_max={} nonincreasing_sample_pairs={nonincreasing} configured_sensor_period_ms={} configured_period_is_not_achieved_cadence=true dropped_frame_samples_excluded=true producer_drop_count=MOVING_summary",
         p.source_frames.len(),p.control_sample_limit,p.source_frame_overflow,measured_distribution(&spacing),SENSOR_PERIOD.as_secs_f64()*1e3);
+    for (label,field) in [("full_plane_evidence_grouping",0),("observation_block_replacement",1),("metadata_stamp_and_snapshot_construction",2)] {
+        let values:Vec<_>=p.source_frames.iter().map(|frame|match field {
+            0=>frame.assembly.group_ns,1=>frame.assembly.replace_ns,_=>frame.assembly.snapshot_ns,
+        }as f64/1e6).collect();
+        eprintln!("SOURCE_ASSEMBLY {context} stage={label} duration=wall_ms median_p95_max={} frames={} omitted={} scope=consumer_delivered_frames_including_first_build full_coverage=true geometry=fixed_observation_only source_profile=unoptimized_runtime_for_declared_mixed_profile mls_profile=separately_reported acquisition_timestamp=before_all_stages excludes=channel_send_wait_drop_and_consumer_work cells_min_max={:?} blocks_min_max={:?}",
+            measured_distribution(&values),p.source_frames.len(),p.source_frame_overflow,
+            (p.source_frames.iter().map(|f|f.assembly.cells).min(),p.source_frames.iter().map(|f|f.assembly.cells).max()),
+            (p.source_frames.iter().map(|f|f.assembly.blocks).min(),p.source_frames.iter().map(|f|f.assembly.blocks).max()));
+    }
     report_ages("source_at_frame_ready",p.source_frames.iter().map(|frame|(Some(frame.sample_ns),frame.ready_ns)).collect(),p.source_frame_overflow);
     report_ages("source_at_consumer_delivery",p.source_frames.iter().map(|frame|(Some(frame.sample_ns),frame.delivered_ns)).collect(),p.source_frame_overflow);
     if factory {

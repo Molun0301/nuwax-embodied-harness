@@ -422,7 +422,7 @@ fn report_source_ages(p:&Probe,factory:bool,context:&str) {
         let values:Vec<_>=p.source_frames.iter().map(|frame|match field {
             0=>frame.assembly.group_ns,1=>frame.assembly.replace_ns,_=>frame.assembly.snapshot_ns,
         }as f64/1e6).collect();
-        eprintln!("SOURCE_ASSEMBLY {context} stage={label} duration=wall_ms median_p95_max={} frames={} omitted={} scope=consumer_delivered_frames_including_first_build full_coverage=true geometry=fixed_observation_only source_profile=unoptimized_runtime_for_declared_mixed_profile mls_profile=separately_reported acquisition_timestamp=before_all_stages excludes=channel_send_wait_drop_and_consumer_work cells_min_max={:?} blocks_min_max={:?}",
+        eprintln!("SOURCE_ASSEMBLY {context} stage={label} duration=wall_ms median_p95_max={} frames={} omitted={} scope=consumer_delivered_frames_including_first_build full_coverage=true geometry=fixed_observation_only source_profile=runtime_test_package_see_recorded_cargo_flags mls_profile=separately_reported acquisition_timestamp=before_all_stages excludes=channel_send_wait_drop_and_consumer_work cells_min_max={:?} blocks_min_max={:?}",
             measured_distribution(&values),p.source_frames.len(),p.source_frame_overflow,
             (p.source_frames.iter().map(|f|f.assembly.cells).min(),p.source_frames.iter().map(|f|f.assembly.cells).max()),
             (p.source_frames.iter().map(|f|f.assembly.blocks).min(),p.source_frames.iter().map(|f|f.assembly.blocks).max()));

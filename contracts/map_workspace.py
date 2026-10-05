@@ -5,14 +5,15 @@ import unicodedata
 from copy import deepcopy
 from datetime import datetime
 from pathlib import PurePosixPath
-from typing import Dict, List, Mapping, Optional
+from typing import Dict, List, Literal, Mapping, Optional
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, PrivateAttr, field_serializer, field_validator, model_serializer, model_validator
 
 from contracts.base import ContractModel, MetadataDict, TimestampedContract, utc_now
 from contracts.compat import StrEnum
 from contracts.memory import MemoryStoreSummary
 from contracts.naming import validate_frame_id
+from contracts.occupancy_cells import PackedOccupancyCells
 from contracts.runtime_views import (
     ExplorationContext,
     LocalizationSession,
@@ -231,6 +232,26 @@ class MapAssetStatus(StrEnum):
     DELETED = "deleted"
 
 
+class AssetIdentityV2(ContractModel):
+    """Assigned ownership of one immutable finalized asset, never a digest.
+
+    Replacing an asset allocates a new ID. Existing checkpoint/commit receipts
+    describe its source; there is no independent asset revision clock.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    asset_id: str
+
+    @field_validator("asset_id", mode="before")
+    @classmethod
+    def _validate_asset_id(cls, value: object) -> str:
+        if (not isinstance(value, str) or len(value) != 32
+                or any(character not in "0123456789abcdef" for character in value)
+                or value == "0" * 32):
+            raise ValueError("asset_id must be a nonzero 32-character lowercase hexadecimal assigned ID")
+        return value
+
+
 class MapAsset(TimestampedContract):
     """命名地图资产元数据。"""
 
@@ -240,6 +261,8 @@ class MapAsset(TimestampedContract):
     status: MapAssetStatus = Field(default=MapAssetStatus.CREATED, description="地图资产状态。")
     active: bool = Field(default=False, description="当前是否为激活地图。")
     finalized: bool = Field(default=False, description="地图是否已有不可变的 finalized 资产包。")
+    identity_schema_version: Literal[1, 2] = 1
+    asset_identity: Optional[AssetIdentityV2] = None
     asset_manifest_sha256: Optional[str] = Field(default=None, description="finalized 资产包清单 SHA-256。")
     finalized_at: Optional[datetime] = Field(default=None, description="地图资产包完成原子提交的时间。")
     frame_id: Optional[str] = Field(default=None, description="当前地图使用的坐标系。")
@@ -276,6 +299,29 @@ class MapAsset(TimestampedContract):
         if len(resolved) != 64 or any(char not in "0123456789abcdef" for char in resolved):
             raise ValueError("地图资产清单 SHA-256 非法。")
         return resolved
+
+
+    @model_serializer(mode="wrap")
+    def _serialize_asset_generation(self, handler):
+        document = handler(self)
+        if self.identity_schema_version == 1:
+            document.pop("identity_schema_version", None)
+            document.pop("asset_identity", None)
+        return document
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_asset_identity_generation(cls, value):
+        if isinstance(value, dict):
+            _validate_identity_generation(value, "asset_manifest_sha256")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_asset_identity_pair(self):
+        _validate_identity_generation({"identity_schema_version": self.identity_schema_version,
+            "asset_identity": self.asset_identity, "asset_manifest_sha256": self.asset_manifest_sha256},
+            "asset_manifest_sha256")
+        return self
 
 
 class MapWorkspace(TimestampedContract):
@@ -423,24 +469,6 @@ class MapGeometryAssetBinding(ContractModel):
         return self
 
 
-class AssetIdentityV2(ContractModel):
-    """Assigned ownership of one immutable finalized asset, never a digest.
-
-    Replacing an asset allocates a new ID. Existing checkpoint/commit receipts
-    describe its source; there is no independent asset revision clock.
-    """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-    asset_id: str
-
-    @field_validator("asset_id", mode="before")
-    @classmethod
-    def _validate_asset_id(cls, value: object) -> str:
-        if (not isinstance(value, str) or len(value) != 32
-                or any(character not in "0123456789abcdef" for character in value)
-                or value == "0" * 32):
-            raise ValueError("asset_id must be a nonzero 32-character lowercase hexadecimal assigned ID")
-        return value
 
 
 class MapAssetBundle(TimestampedContract):
@@ -460,6 +488,10 @@ class MapAssetBundle(TimestampedContract):
         default=None,
         description="资产包绑定的不可变地理参考；缺失表示只有本地地图坐标。",
     )
+    identity_schema_version: Literal[1, 2] = 1
+    asset_identity: Optional[AssetIdentityV2] = None
+    asset_state: Literal["legacy", "candidate", "finalized"] = "legacy"
+    _assigned_owned: bool = PrivateAttr(default=False)
     manifest_sha256: Optional[str] = Field(default=None, description="资产包清单 SHA-256；加载时计算。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
@@ -491,6 +523,17 @@ class MapAssetBundle(TimestampedContract):
             raise ValueError("地图资产包清单 SHA-256 非法。")
         return resolved
 
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_bundle_identity_generation(cls, value):
+        if isinstance(value, dict):
+            _validate_identity_generation(value, "manifest_sha256")
+            assigned = value.get("identity_schema_version", 1) == 2
+            if (assigned and value.get("asset_state") not in {"candidate", "finalized"}
+                    or not assigned and value.get("asset_state", "legacy") != "legacy"):
+                raise ValueError("asset_state must explicitly match its identity generation")
+        return value
+
     @model_validator(mode="after")
     def _validate_bundle_identity(self) -> "MapAssetBundle":
         if self.source_name != self.snapshot.source_name:
@@ -515,7 +558,41 @@ class MapAssetBundle(TimestampedContract):
             raise ValueError("地图资产包与 geometry_asset 的 frame_id 不一致。")
         if self.frame_id and self.snapshot.frame_id and self.frame_id != self.snapshot.frame_id:
             raise ValueError("地图资产包与运行态快照的 frame_id 不一致。")
+        _validate_identity_generation({"identity_schema_version": self.identity_schema_version,
+            "asset_identity": self.asset_identity, "manifest_sha256": self.manifest_sha256}, "manifest_sha256")
+        if self.identity_schema_version == 2:
+            if self.asset_state not in {"candidate", "finalized"}:
+                raise ValueError("assigned bundles require an explicit candidate/finalized state")
+            if self.georeference is not None and self.georeference.raw_sha256 is not None:
+                raise ValueError("assigned georeference may not carry a legacy digest")
+            if not self._assigned_owned:
+                # Capture once. Subsequent reads and state promotion share immutable
+                # cell owners and copy only mutable, small descriptors.
+                object.__setattr__(self, "snapshot", _owned_snapshot_view(
+                    super().__getattribute__("snapshot"), capture=True))
+                object.__setattr__(self, "geometry_asset", deepcopy(super().__getattribute__("geometry_asset")))
+                object.__setattr__(self, "metadata", deepcopy(super().__getattribute__("metadata")))
+                self._assigned_owned = True
         return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_bundle_generation(self, handler):
+        document = handler(self)
+        if self.identity_schema_version == 1:
+            for key in ("identity_schema_version", "asset_identity", "asset_state"):
+                document.pop(key, None)
+        return document
+
+    @field_serializer("snapshot", mode="wrap", when_used="json")
+    def _serialize_snapshot(self, snapshot, handler, info):
+        if self.identity_schema_version != 2:
+            return handler(snapshot)
+        # Tuple-backed cost cells are immutable internally. Expansion is confined
+        # to this explicit serialization boundary, never ordinary owner reads.
+        document = snapshot.model_dump(mode="json", exclude={"cost_map": {"data"}}, exclude_none=info.exclude_none)
+        if snapshot.cost_map is not None:
+            document["cost_map"]["data"] = list(snapshot.cost_map.data)
+        return document
 
     @property
     def snapshot_identity(self) -> Dict[str, object]:
@@ -530,12 +607,24 @@ class MapAssetBundle(TimestampedContract):
         if name not in {"snapshot", "geometry_asset", "metadata"}:
             return value
         try:
+            assigned = super().__getattribute__("identity_schema_version") == 2
+            owned = super().__getattribute__("__pydantic_private__").get("_assigned_owned", False)
+            if assigned and owned:
+                return _owned_snapshot_view(value) if name == "snapshot" else deepcopy(value)
             manifest_sha256 = super().__getattribute__("manifest_sha256")
         except AttributeError:
             return value
         if manifest_sha256 is None:
             return value
         return deepcopy(value)
+
+    def __deepcopy__(self, memo=None):
+        if self.identity_schema_version == 2:
+            copied = self.model_copy()
+            if memo is not None:
+                memo[id(self)] = copied
+            return copied
+        return super().__deepcopy__(memo=memo)
 
     def model_copy(
         self,
@@ -544,6 +633,14 @@ class MapAssetBundle(TimestampedContract):
         deep: bool = False,
     ) -> "MapAssetBundle":
         changes = dict(update or {})
+        if self.identity_schema_version == 2:
+            effective = {key: value for key, value in changes.items()
+                         if value != super(MapAssetBundle, self).__getattribute__(key)}
+            if effective and not (effective == {"asset_state": "finalized"} and self.asset_state == "candidate"):
+                raise TypeError("assigned asset owners are immutable; allocate a new candidate for changes")
+            # Pydantic's generic deep copy expands packed cells. The owner is
+            # already isolated and its public descriptors are detached views.
+            return super().model_copy(update=effective, deep=False)
         if self.manifest_sha256 is not None:
             changed_fields = {field_name for field_name, value in changes.items() if value != getattr(self, field_name)}
             if changed_fields:
@@ -574,3 +671,36 @@ def _validated_model_copy(
         payload = deepcopy(payload)
     payload.update(deepcopy(dict(update or {})) if deep else dict(update or {}))
     return type(model).model_validate(payload)
+
+
+def _validate_identity_generation(value, digest_field):
+    schema = value.get("identity_schema_version", 1)
+    if type(schema) is not int or schema not in {1, 2}:
+        raise ValueError("identity_schema_version must be explicitly 1 or 2")
+    identity = value.get("asset_identity")
+    if schema == 2:
+        if identity is None or value.get(digest_field) is not None:
+            raise ValueError("assigned assets require their assigned ID and forbid legacy digests")
+    elif identity is not None:
+        raise ValueError("legacy assets cannot carry assigned identities")
+
+
+def _owned_snapshot_view(snapshot, *, capture=False):
+    """Copy descriptor state without recursively cloning snapshot cell bodies."""
+    changes = {}
+    for field_name in type(snapshot).model_fields:
+        value = object.__getattribute__(snapshot, field_name)
+        if field_name in {"occupancy_grid", "cost_map"} and value is not None:
+            layer_changes = {key: deepcopy(object.__getattribute__(value, key))
+                             for key in type(value).model_fields if key != "data"}
+            data = object.__getattribute__(value, "data")
+            if capture:
+                if field_name == "occupancy_grid" and type(data) is not PackedOccupancyCells:
+                    data = PackedOccupancyCells(bytes(cell & 255 for cell in data))
+                elif field_name == "cost_map":
+                    data = tuple(data)
+            layer_changes["data"] = data
+            changes[field_name] = value.model_copy(update=layer_changes, deep=False)
+        else:
+            changes[field_name] = deepcopy(value)
+    return snapshot.model_copy(update=changes, deep=False)

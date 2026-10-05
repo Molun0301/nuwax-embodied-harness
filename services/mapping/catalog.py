@@ -14,7 +14,8 @@ from urllib.parse import quote
 import uuid
 import weakref
 
-from contracts.map_workspace import MapAsset
+from contracts.map_workspace import MapAsset, AssetIdentityV2
+from contracts.map_activation import AssignedActivationReceipt
 from contracts.naming import build_safe_dir_segment
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -280,6 +281,215 @@ class MapCatalogRepository:
         if self._active_map_path.exists():
             self._active_map_path.unlink()
 
+    @staticmethod
+    def _assigned_asset_identity(value: AssetIdentityV2) -> Dict[str, object]:
+        if not isinstance(value, AssetIdentityV2):
+            raise ValueError("assigned activation requires typed AssetIdentityV2")
+        return {"asset_id": AssetIdentityV2(asset_id=value.asset_id).asset_id}
+
+    @staticmethod
+    def _assigned_checkpoint_id(value: object) -> str:
+        if (not isinstance(value, str) or len(value) != 32 or value == "0" * 32
+                or any(c not in "0123456789abcdef" for c in value)):
+            raise ValueError("assigned checkpoint ID is missing or invalid")
+        return value
+
+    @staticmethod
+    def _validate_assigned_activation_journal(payload: Dict[str, object]) -> Dict[str, object]:
+        fields = {"schema_version", "previous_map_name", "target_map_name", "target_asset_identity",
+                  "target_checkpoint_id", "activation_request_id", "load_memory_history", "phase"}
+        if not isinstance(payload, dict) or set(payload) != fields or type(payload["schema_version"]) is not int or payload["schema_version"] != 3:
+            raise ValueError("assigned activation journal schema/fields are invalid")
+        raw_asset = payload["target_asset_identity"]
+        if not isinstance(raw_asset, dict) or set(raw_asset) != {"asset_id"}:
+            raise ValueError("assigned activation journal asset identity is missing")
+        asset = AssetIdentityV2(**raw_asset)
+        previous = payload["previous_map_name"]
+        if previous is not None:
+            previous = MapCatalogRepository._require_bounded_string(previous, "previous map name", max_length=256)
+        target = MapCatalogRepository._require_bounded_string(payload["target_map_name"], "target map name", max_length=256)
+        if (type(payload["load_memory_history"]) is not bool or not isinstance(payload["phase"], str)
+                or payload["phase"] not in _ACTIVATION_JOURNAL_PHASES):
+            raise ValueError("assigned activation journal flags/phase are invalid")
+        return {"schema_version": 3, "previous_map_name": previous, "target_map_name": target,
+                "target_asset_identity": {"asset_id": asset.asset_id},
+                "target_checkpoint_id": MapCatalogRepository._assigned_checkpoint_id(payload["target_checkpoint_id"]),
+                "activation_request_id": MapCatalogRepository._require_activation_request_id(payload["activation_request_id"]),
+                "load_memory_history": payload["load_memory_history"], "phase": payload["phase"]}
+
+    @staticmethod
+    def _validate_assigned_activation_receipt(payload: Dict[str, object]) -> Dict[str, object]:
+        fields = {"schema_version", "target_map_name", "target_asset_identity", "target_checkpoint_id",
+                  "activation_request_id", "activation_receipt_schema_version", "activation_receipt_disposition",
+                  "activation_receipt_disposition_name", "relocalization_target_available", "activation_receipt_v2"}
+        if not isinstance(payload, dict) or set(payload) != fields or type(payload["schema_version"]) is not int or payload["schema_version"] != 3:
+            raise ValueError("assigned durable receipt schema/fields are invalid")
+        if type(payload["activation_receipt_schema_version"]) is not int or payload["activation_receipt_schema_version"] != 2:
+            raise ValueError("assigned durable receipt requires native wire receipt 2")
+        raw_asset = payload["target_asset_identity"]
+        if not isinstance(raw_asset, dict) or set(raw_asset) != {"asset_id"}:
+            raise ValueError("assigned durable receipt asset identity is missing")
+        asset = AssetIdentityV2(**raw_asset)
+        owner = AssignedActivationReceipt.admit(payload["activation_receipt_v2"])
+        target = MapCatalogRepository._require_bounded_string(payload["target_map_name"], "target map name", max_length=256)
+        request_id = MapCatalogRepository._require_activation_request_id(payload["activation_request_id"])
+        checkpoint_id = MapCatalogRepository._assigned_checkpoint_id(payload["target_checkpoint_id"])
+        if (owner.asset_identity != asset or owner.map_name != target or owner.request_id != request_id
+                or owner.session_id != request_id or owner.checkpoint_id != checkpoint_id):
+            raise ValueError("assigned durable receipt differs from its transaction target")
+        disposition = payload["activation_receipt_disposition"]
+        name = payload["activation_receipt_disposition_name"]
+        if type(disposition) is not int or not isinstance(name, str) or (disposition, name) not in {(2, "sealed"), (3, "sealed_replay")}:
+            raise ValueError("assigned durable receipt is not sealed")
+        if type(payload["relocalization_target_available"]) is not bool:
+            raise ValueError("assigned target availability must be explicit")
+        return {"schema_version": 3, "target_map_name": target, "target_asset_identity": {"asset_id": asset.asset_id},
+                "target_checkpoint_id": checkpoint_id, "activation_request_id": request_id,
+                "activation_receipt_schema_version": 2, "activation_receipt_disposition": disposition,
+                "activation_receipt_disposition_name": name,
+                "relocalization_target_available": payload["relocalization_target_available"],
+                "activation_receipt_v2": owner.to_dict(), "trusted_identity": True}
+
+    @staticmethod
+    def _require_assigned_activation_identity(payload, *, target_map_name, target_asset_identity,
+                                              target_checkpoint_id, activation_request_id):
+        expected = (target_map_name, MapCatalogRepository._assigned_asset_identity(target_asset_identity),
+                    MapCatalogRepository._assigned_checkpoint_id(target_checkpoint_id), activation_request_id)
+        actual = (payload.get("target_map_name"), payload.get("target_asset_identity"),
+                  payload.get("target_checkpoint_id"), payload.get("activation_request_id"))
+        if payload.get("schema_version") != 3 or actual != expected:
+            raise ValueError("assigned activation transaction identity changed")
+
+    @staticmethod
+    def _assigned_activation_immutable_identity(receipt):
+        return (receipt.get("schema_version"), receipt.get("target_map_name"), receipt.get("target_asset_identity"),
+                receipt.get("target_checkpoint_id"), receipt.get("activation_request_id"),
+                receipt.get("activation_receipt_schema_version"), receipt.get("activation_receipt_v2"),
+                receipt.get("relocalization_target_available"))
+
+    def begin_assigned_map_activation(self, *, previous_map_name, target_map_name,
+                                     target_asset_identity: AssetIdentityV2, target_checkpoint_id: str,
+                                     load_memory_history: bool, reuse_completed_request_id: bool = True):
+        """Explicit schema-3 lane; defaults and old schema-1/2 operations stay separate."""
+        candidate = self._validate_assigned_activation_journal({
+            "schema_version": 3, "previous_map_name": previous_map_name, "target_map_name": target_map_name,
+            "target_asset_identity": self._assigned_asset_identity(target_asset_identity),
+            "target_checkpoint_id": target_checkpoint_id, "activation_request_id": "mapload:" + uuid.uuid4().hex,
+            "load_memory_history": load_memory_history, "phase": "prepared"})
+        with self.map_activation_guard():
+            existing = self.get_map_activation()
+            if existing is not None:
+                comparable = {key: value for key, value in existing.items() if key not in {"activation_request_id", "phase"}}
+                expected = {key: value for key, value in candidate.items() if key not in {"activation_request_id", "phase"}}
+                if comparable != expected:
+                    raise ValueError("another activation transaction or conflicting retry is pending")
+                return existing
+            if reuse_completed_request_id:
+                receipt = self.get_last_successful_map_activation_receipt()
+                if (receipt is not None and receipt.get("schema_version") == 3
+                        and receipt["target_map_name"] == candidate["target_map_name"]
+                        and receipt["target_asset_identity"] == candidate["target_asset_identity"]
+                        and receipt["target_checkpoint_id"] == candidate["target_checkpoint_id"]):
+                    candidate["activation_request_id"] = receipt["activation_request_id"]
+            _atomic_write_text(self._activation_journal_path, json.dumps(candidate, ensure_ascii=False, indent=2))
+            return candidate
+
+    def update_assigned_map_activation_phase(self, phase, *, target_map_name, target_asset_identity,
+                                            target_checkpoint_id, activation_request_id, expected_phases):
+        if phase not in _ACTIVATION_JOURNAL_PHASES:
+            raise ValueError("unsupported assigned activation phase")
+        allowed = set(expected_phases)
+        if not allowed or not allowed.issubset(_ACTIVATION_JOURNAL_PHASES):
+            raise ValueError("unsupported assigned activation expected phases")
+        with self.map_activation_guard():
+            payload = self.get_map_activation()
+            if payload is None:
+                raise ValueError("assigned activation journal is absent")
+            self._require_assigned_activation_identity(payload, target_map_name=target_map_name,
+                target_asset_identity=target_asset_identity, target_checkpoint_id=target_checkpoint_id,
+                activation_request_id=activation_request_id)
+            if payload["phase"] not in allowed:
+                raise ValueError("assigned activation phase changed")
+            payload["phase"] = phase
+            _atomic_write_text(self._activation_journal_path, json.dumps(payload, ensure_ascii=False, indent=2))
+            return payload
+
+    def rotate_assigned_map_activation_request_id(self, *, target_map_name, target_asset_identity,
+                                                 target_checkpoint_id, activation_request_id):
+        with self.map_activation_guard():
+            payload = self.get_map_activation()
+            if payload is None:
+                raise ValueError("assigned activation journal is absent")
+            self._require_assigned_activation_identity(payload, target_map_name=target_map_name,
+                target_asset_identity=target_asset_identity, target_checkpoint_id=target_checkpoint_id,
+                activation_request_id=activation_request_id)
+            if payload["phase"] != "prepared":
+                raise ValueError("only prepared assigned activation may rotate request identity")
+            replacement = "mapload:" + uuid.uuid4().hex
+            while replacement == activation_request_id:
+                replacement = "mapload:" + uuid.uuid4().hex
+            payload["activation_request_id"] = replacement
+            _atomic_write_text(self._activation_journal_path, json.dumps(payload, ensure_ascii=False, indent=2))
+            return payload
+
+    def clear_assigned_map_activation(self, *, target_map_name, target_asset_identity,
+                                     target_checkpoint_id, activation_request_id, expected_phases):
+        allowed = set(expected_phases)
+        if not allowed or not allowed.issubset(_ACTIVATION_JOURNAL_PHASES):
+            raise ValueError("unsupported assigned activation expected phases")
+        with self.map_activation_guard():
+            payload = self.get_map_activation()
+            if payload is None:
+                return
+            self._require_assigned_activation_identity(payload, target_map_name=target_map_name,
+                target_asset_identity=target_asset_identity, target_checkpoint_id=target_checkpoint_id,
+                activation_request_id=activation_request_id)
+            if payload["phase"] not in allowed:
+                raise ValueError("assigned activation phase changed")
+            self._clear_current_activation_journal(payload)
+
+    def complete_assigned_map_activation_durable(self, *, target_map_name, target_asset_identity,
+                                               target_checkpoint_id, activation_request_id,
+                                               activation_receipt: AssignedActivationReceipt,
+                                               expected_phases, idempotent_replay=False,
+                                               relocalization_target_available=False):
+        if not isinstance(activation_receipt, AssignedActivationReceipt):
+            raise ValueError("completion requires an admitted assigned activation receipt owner")
+        if type(idempotent_replay) is not bool:
+            raise ValueError("idempotent replay flag must be explicit")
+        allowed = set(expected_phases)
+        if not allowed or not allowed.issubset(_ACTIVATION_JOURNAL_PHASES):
+            raise ValueError("unsupported assigned activation expected phases")
+        receipt = self._validate_assigned_activation_receipt({
+            "schema_version": 3, "target_map_name": target_map_name,
+            "target_asset_identity": self._assigned_asset_identity(target_asset_identity),
+            "target_checkpoint_id": target_checkpoint_id, "activation_request_id": activation_request_id,
+            "activation_receipt_schema_version": 2, "activation_receipt_disposition": 3 if idempotent_replay else 2,
+            "activation_receipt_disposition_name": "sealed_replay" if idempotent_replay else "sealed",
+            "relocalization_target_available": relocalization_target_available,
+            "activation_receipt_v2": activation_receipt.to_dict()})
+        receipt.pop("trusted_identity")
+        with self.map_activation_guard():
+            payload = self.get_map_activation()
+            existing = self.get_last_successful_map_activation_receipt()
+            if existing is not None and existing.get("activation_request_id") == activation_request_id:
+                if self._assigned_activation_immutable_identity(existing) != self._assigned_activation_immutable_identity(receipt):
+                    raise ValueError("same activation request has a conflicting durable receipt")
+                receipt = {key: value for key, value in existing.items() if key != "trusted_identity"}
+            if payload is None:
+                if existing is None or self._assigned_activation_immutable_identity(existing) != self._assigned_activation_immutable_identity(receipt):
+                    raise ValueError("assigned activation journal/receipt is absent or differs")
+                return existing
+            self._require_assigned_activation_identity(payload, target_map_name=target_map_name,
+                target_asset_identity=target_asset_identity, target_checkpoint_id=target_checkpoint_id,
+                activation_request_id=activation_request_id)
+            if payload["phase"] not in allowed:
+                raise ValueError("assigned activation phase changed")
+            # Receipt fsync precedes journal removal, preserving crash reconciliation.
+            _atomic_write_text(self._activation_receipt_path, json.dumps(receipt, ensure_ascii=False, indent=2))
+            self._clear_current_activation_journal(payload)
+            return {**receipt, "trusted_identity": True}
+
     def begin_map_activation(
         self,
         *,
@@ -300,6 +510,8 @@ class MapCatalogRepository:
                 raise ValueError("地图激活日志 target_manifest_sha256 非法。")
             existing = self.get_map_activation()
             if existing is not None:
+                if existing.get("schema_version") == 3:
+                    raise ValueError("assigned activation journal requires typed assigned APIs")
                 if (
                     existing["target_map_name"] != target_name
                     or existing["target_manifest_sha256"] != manifest_sha256
@@ -314,6 +526,7 @@ class MapCatalogRepository:
                 receipt = self.get_last_successful_map_activation_receipt()
                 if receipt is not None and (
                     receipt.get("trusted_identity") is True
+                    and receipt.get("schema_version") == _ACTIVATION_RECEIPT_SCHEMA_VERSION
                     and receipt["target_map_name"] == target_name
                     and receipt["target_manifest_sha256"] == manifest_sha256
                 ):
@@ -352,6 +565,8 @@ class MapCatalogRepository:
                 schema_version, int
             ):
                 raise ValueError("地图激活成功凭据 schema_version 非法。")
+            if schema_version == 3:
+                return self._validate_assigned_activation_receipt(payload)
             if schema_version == 1:
                 return self._validate_legacy_map_activation_receipt(payload)
             if schema_version != _ACTIVATION_RECEIPT_SCHEMA_VERSION:
@@ -550,6 +765,8 @@ class MapCatalogRepository:
                 )
             except Exception as exc:
                 raise ValueError("地图激活日志不是有效 JSON。") from exc
+            if isinstance(payload, dict) and payload.get("schema_version") == 3:
+                return self._validate_assigned_activation_journal(payload)
             required_fields = {
                 "schema_version",
                 "previous_map_name",
@@ -706,26 +923,29 @@ class MapCatalogRepository:
                 raise ValueError(
                     "地图激活日志 phase 已变化：%s。" % payload["phase"]
                 )
-            tombstone_path = self._activation_journal_path.with_name(
-                ".map_activation.cleared.%s"
-                % str(payload["activation_request_id"])[len("mapload:") :]
-            )
-            os.replace(self._activation_journal_path, tombstone_path)
+            self._clear_current_activation_journal(payload)
+
+    def _clear_current_activation_journal(self, payload):
+        tombstone_path = self._activation_journal_path.with_name(
+            ".map_activation.cleared.%s"
+            % str(payload["activation_request_id"])[len("mapload:") :]
+        )
+        os.replace(self._activation_journal_path, tombstone_path)
+        try:
+            _fsync_directory(self._activation_journal_path.parent)
+        except Exception:
+            os.replace(tombstone_path, self._activation_journal_path)
             try:
                 _fsync_directory(self._activation_journal_path.parent)
             except Exception:
-                os.replace(tombstone_path, self._activation_journal_path)
-                try:
-                    _fsync_directory(self._activation_journal_path.parent)
-                except Exception:
-                    pass
-                raise
-            try:
-                tombstone_path.unlink(missing_ok=True)
-                _fsync_directory(self._activation_journal_path.parent)
-            except Exception:
-                # The journal removal is already durable; a hidden tombstone is inert.
                 pass
+            raise
+        try:
+            tombstone_path.unlink(missing_ok=True)
+            _fsync_directory(self._activation_journal_path.parent)
+        except Exception:
+            # The journal removal is already durable; a hidden tombstone is inert.
+            pass
 
     def complete_map_activation_durable(
         self,
@@ -1606,6 +1826,8 @@ class MapCatalogRepository:
         target_manifest_sha256: str,
         activation_request_id: str,
     ) -> None:
+        if payload.get("schema_version") == 3:
+            raise ValueError("assigned activation journal requires typed assigned APIs")
         expected_identity = (
             str(target_map_name or "").strip(),
             str(target_manifest_sha256 or "").strip().lower(),
@@ -1628,6 +1850,10 @@ class MapCatalogRepository:
             raise ValueError("地图 metadata.json 必须是 JSON object。")
         payload.pop("latest_version_id", None)
         payload.pop("latest_revision", None)
+        if payload.get("identity_schema_version") == 2:
+            # Assigned reads validate persisted authority; they never infer an ID,
+            # compute a manifest digest, or mutate finalized metadata during load.
+            return MapAsset.model_validate(payload)
         current_dir = metadata_path.parent / "current"
         manifest_path = current_dir / "manifest.json"
         if "finalized" not in payload:

@@ -9,13 +9,14 @@ import shlex
 import shutil
 import stat
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import quote
 
 from contracts.map_workspace import (
     MAP_GEOREFERENCE_RELATIVE_PATH,
+    AssetIdentityV2,
     MapAssetBundle,
     MapGeometryAssetBinding,
     MapGeometryAssetType,
@@ -67,6 +68,18 @@ class MapAlreadyFinalizedError(MapAssetBundleError):
         super().__init__("地图 %s 已 finalized；修改地图必须使用新的 map_name。" % map_name)
 
 
+class AssignedMapAlreadyFinalizedError(MapAlreadyFinalizedError):
+    """Assigned publication conflict; IDs never occupy legacy digest fields."""
+
+    def __init__(self, map_name: str, existing_identity: Optional[AssetIdentityV2],
+                 candidate_identity: AssetIdentityV2, *, existing_kind: str = "assigned") -> None:
+        self.map_name = map_name
+        self.existing_asset_identity = existing_identity
+        self.candidate_asset_identity = candidate_identity
+        self.existing_identity_kind = existing_kind
+        MapAssetBundleError.__init__(self, "Map %s already owns a different finalized %s asset" % (map_name, existing_kind))
+
+
 class MapAssetMigrationError(MapAssetBundleError):
     """Legacy version storage cannot be migrated without guessing."""
 
@@ -80,6 +93,7 @@ class ValidatedMapAssetBundleSnapshot:
     repository_device: int
     repository_inode: int
     repository_fingerprint: str
+    repository_observations: tuple = ()
 
 
 class MapAssetBundleRepository:
@@ -94,6 +108,7 @@ class MapAssetBundleRepository:
         self._root_dir = Path(root_dir).expanduser()
         self._root_dir.mkdir(parents=True, exist_ok=True)
         self._fault_injector = fault_injector
+        self._staging_owners: Dict[Path, Tuple[int, int]] = {}
 
     def create_staging_directory(self, map_name: str) -> Path:
         map_dir = self._map_dir(map_name)
@@ -101,27 +116,96 @@ class MapAssetBundleRepository:
         self._require_real_directory(map_dir, "地图目录")
         staging_dir = map_dir / (_STAGING_PREFIX + uuid.uuid4().hex)
         staging_dir.mkdir(mode=0o700)
+        owned = staging_dir.stat()
+        self._staging_owners[staging_dir.absolute()] = (owned.st_dev, owned.st_ino)
         _fsync_directory(map_dir)
         return staging_dir
 
     def discard_staging_directory(self, map_name: str, staging_dir: Path) -> None:
         resolved = self._require_staging_directory(map_name, staging_dir, must_exist=False)
-        if resolved.is_symlink():
-            resolved.unlink()
-        elif resolved.exists():
-            shutil.rmtree(resolved)
+        owner = self._staging_owners.get(resolved)
+        if not resolved.exists() and not resolved.is_symlink():
+            self._staging_owners.pop(resolved, None)
+            return
+        if owner is None:
+            raise MapAssetBundleValidationError("staging cleanup requires its original directory owner")
+        self._discard_owned_staging(map_name, resolved, owner)
+
+    def _discard_owned_staging(self, map_name, staging_dir, owner):
+        resolved = self._require_staging_directory(map_name, staging_dir, must_exist=False)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        parent_fd = os.open(resolved.parent, flags)
+        staging_fd = cleanup_fd = -1
+        cleanup_name = ".current.cleanup-" + uuid.uuid4().hex
+        cleanup_created = False
+        retired = False
+        try:
+            try:
+                staging_fd = os.open(resolved.name, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                self._staging_owners.pop(resolved, None)
+                return
+            except OSError as exc:
+                raise MapAssetBundleValidationError("staging directory was replaced; refusing unowned cleanup") from exc
+            opened = os.fstat(staging_fd)
+            if (opened.st_dev, opened.st_ino) != tuple(owner):
+                raise MapAssetBundleValidationError("staging directory was replaced; refusing unowned cleanup")
+            self._inject_fault("before_staging_quarantine")
+            os.mkdir(cleanup_name, mode=0o700, dir_fd=parent_fd)
+            cleanup_created = True
+            cleanup_fd = os.open(cleanup_name, flags, dir_fd=parent_fd)
+            # Move first into an exclusively owned namespace. If somebody replaced
+            # the public staging name after open, preserve/restore that entry;
+            # not one byte is deleted until the moved inode matches our owner.
+            _rename_directory_noreplace(parent_fd, resolved.name, "retired",
+                target_parent_descriptor=cleanup_fd)
+            retired = True
+            moved = os.stat("retired", dir_fd=cleanup_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(moved.st_mode) or (moved.st_dev, moved.st_ino) != tuple(owner):
+                try:
+                    _rename_directory_noreplace(cleanup_fd, "retired", resolved.name,
+                        target_parent_descriptor=parent_fd)
+                    retired = False
+                except OSError:
+                    # A new public entry appeared meanwhile. Both it and the
+                    # unowned quarantine entry must survive for reconciliation.
+                    pass
+                raise MapAssetBundleValidationError("staging directory was replaced; refusing unowned cleanup")
+            os.fsync(parent_fd)
+            os.fsync(cleanup_fd)
+            self._inject_fault("after_staging_quarantine")
+            # The public staging path is no longer a deletion target. Walk the
+            # originally pinned directory, never a newly opened replacement.
+            _remove_pinned_directory_contents(staging_fd)
+            named = os.stat("retired", dir_fd=cleanup_fd, follow_symlinks=False)
+            _require_same_file_identity(opened, named, "retired staging")
+            os.rmdir("retired", dir_fd=cleanup_fd)
+            retired = False
+            self._staging_owners.pop(resolved, None)
+            os.fsync(cleanup_fd)
+        finally:
+            if staging_fd >= 0:
+                os.close(staging_fd)
+            if cleanup_fd >= 0:
+                os.close(cleanup_fd)
+            if cleanup_created and not retired:
+                os.rmdir(cleanup_name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            os.close(parent_fd)
 
     def get_map_asset_bundle(
         self,
         map_name: str,
         *,
         migrate_legacy: bool = True,
+        expected_asset_identity: Optional[AssetIdentityV2] = None,
     ) -> Optional[MapAssetBundle]:
+        _require_typed_asset_identity(expected_asset_identity, optional=True)
         self._recover_planar_exchange(map_name)
         current_dir = self._current_dir(map_name)
         if current_dir.exists() or current_dir.is_symlink():
-            return self._load_validated_bundle(map_name, current_dir)
-        if not migrate_legacy:
+            return self._load_validated_bundle(map_name, current_dir, expected_asset_identity=expected_asset_identity)
+        if expected_asset_identity is not None or not migrate_legacy:
             return None
         return self._migrate_legacy_latest(map_name)
 
@@ -129,10 +213,14 @@ class MapAssetBundleRepository:
         self,
         map_name: str,
         *,
-        expected_manifest_sha256: str,
+        expected_manifest_sha256: Optional[str] = None,
+        expected_asset_identity: Optional[AssetIdentityV2] = None,
     ) -> Optional[ValidatedMapAssetBundleSnapshot]:
         """只读加载 modern current，并在同一稳定目录视图中返回地理参考原文。"""
 
+        _require_typed_asset_identity(expected_asset_identity, optional=True)
+        if expected_manifest_sha256 is not None and expected_asset_identity is not None:
+            raise MapAssetBundleValidationError("mixed asset identity expectations are forbidden")
         if (self._map_dir(map_name) / _PLANAR_EXCHANGE_JOURNAL).exists():
             raise MapAssetBundleValidationError("二维资产交换尚未完成持久对账")
         current_dir = self._current_dir(map_name)
@@ -143,7 +231,15 @@ class MapAssetBundleRepository:
                 map_name,
                 tree,
                 expected_manifest_sha256=expected_manifest_sha256,
+                expected_asset_identity=expected_asset_identity,
             )
+            if bundle.identity_schema_version == 2:
+                georeference_bytes = (tree.require_file(bundle.georeference.relative_path, "georeference")
+                    .read(_MAX_GEOREFERENCE_JSON_BYTES) if bundle.georeference is not None else b"")
+                tree.verify_all()
+                repository_stat = os.fstat(tree.root.descriptor)
+                return ValidatedMapAssetBundleSnapshot(bundle, georeference_bytes,
+                    repository_stat.st_dev, repository_stat.st_ino, "", _assigned_observations(tree))
             georeference_bytes = b""
             if bundle.georeference is not None:
                 georeference_bytes, _size, georeference_sha256 = tree.require_file(
@@ -180,11 +276,18 @@ class MapAssetBundleRepository:
     ) -> None:
         """从可信 current 命名项重建快照，并拒绝解析期间的任何变化。"""
 
-        refreshed = self.get_validated_map_asset_bundle_snapshot(
-            map_name,
-            expected_manifest_sha256=str(snapshot.bundle.manifest_sha256 or ""),
-        )
-        if refreshed is None or refreshed != snapshot:
+        assigned = snapshot.bundle.identity_schema_version == 2
+        refreshed = self.get_validated_map_asset_bundle_snapshot(map_name,
+            expected_manifest_sha256=None if assigned else str(snapshot.bundle.manifest_sha256 or ""),
+            expected_asset_identity=snapshot.bundle.asset_identity if assigned else None)
+        if assigned:
+            same = (refreshed is not None and refreshed.repository_device == snapshot.repository_device
+                and refreshed.repository_inode == snapshot.repository_inode
+                and refreshed.repository_observations == snapshot.repository_observations
+                and refreshed.georeference_bytes == snapshot.georeference_bytes)
+        else:
+            same = refreshed is not None and refreshed == snapshot
+        if not same:
             raise MapAssetBundleValidationError("finalized 地图 repository snapshot 已被替换。")
 
     def finalize_map_asset_bundle(
@@ -194,6 +297,8 @@ class MapAssetBundleRepository:
         staging_dir: Path,
         expected_previous_manifest_sha256: Optional[str] = None,
     ) -> MapAssetBundle:
+        if bundle.identity_schema_version != 1:
+            raise MapAssetBundleValidationError("assigned candidates require the explicit assigned finalize API")
         if expected_previous_manifest_sha256 is not None:
             return self._replace_planar_bundle(bundle, staging_dir=staging_dir, expected_previous_manifest_sha256=expected_previous_manifest_sha256)
         map_name = str(bundle.map_name or "").strip()
@@ -250,6 +355,280 @@ class MapAssetBundleRepository:
                 self.discard_staging_directory(map_name, staging)
             raise
 
+    def finalize_assigned_map_asset_bundle(
+        self,
+        bundle: MapAssetBundle,
+        *,
+        staging_dir: Path,
+        asset_identity: AssetIdentityV2,
+        expected_previous_identity: Optional[AssetIdentityV2] = None,
+    ) -> MapAssetBundle:
+        """Publish an explicitly assigned owner. Legacy/default writers stay v1.
+
+        IDs are supplied once by the candidate owner. Exact same-ID retry checks
+        metadata, complete inventory and streaming body equality, never a hash.
+        Planar replacement awaits a paired checkpoint-v2 planar producer (D2).
+        """
+        _require_typed_asset_identity(asset_identity)
+        _require_typed_asset_identity(expected_previous_identity, optional=True)
+        if expected_previous_identity is not None:
+            raise MapAssetBundleValidationError("assigned planar replacement requires the paired D2 producer")
+        if (bundle.identity_schema_version != 2 or bundle.asset_identity != asset_identity
+                or bundle.asset_state not in {"candidate", "finalized"}):
+            raise MapAssetBundleValidationError("candidate does not own the exact assigned asset identity")
+        map_name = bundle.map_name
+        staging = self._require_staging_directory(map_name, staging_dir, must_exist=True)
+        owner = self._staging_owners[staging]
+        current = self._current_dir(map_name)
+        try:
+            finalized = bundle.model_copy(update={"asset_state": "finalized"})
+            # Validate the source generation/descriptors before any outer body
+            # serialization. Checkpoint JSON is small and body reads are deferred.
+            with _StableDirectoryTree(staging) as tree:
+                source = self._assigned_checkpoint_source(tree, finalized.geometry_asset)
+                tree.verify_all()
+            self._write_assigned_candidate_bundle(finalized, staging)
+            self._write_assigned_manifest(finalized, staging, source)
+            with _StableDirectoryTree(staging) as candidate_tree:
+                _unused, validated = self._validate_open_directory(map_name, candidate_tree,
+                    expected_asset_identity=asset_identity)
+                _fsync_tree(candidate_tree)
+                candidate_tree.verify_all()
+                self._inject_fault("before_rename")
+                try:
+                    _rename_directory_noreplace(candidate_tree.parent_descriptor, staging.name, current.name)
+                except OSError as exc:
+                    if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                        raise
+                    with _StableDirectoryTree(current) as previous_tree:
+                        # An occupied legacy namespace is an explicit conflict,
+                        # not permission to enter its hashing/identity reader.
+                        prior_manifest = _parse_json_object(previous_tree.require_file(
+                            _MANIFEST_FILE_NAME, "current manifest").read(_MAX_MANIFEST_JSON_BYTES), "current manifest")
+                        version = prior_manifest.get("schema_version")
+                        if type(version) is not int or version not in (1, 2):
+                            raise MapAssetBundleValidationError("unsupported occupied asset manifest version")
+                        if version == 1:
+                            raise AssignedMapAlreadyFinalizedError(map_name, None, asset_identity, existing_kind="legacy")
+                        try:
+                            prior_identity = AssetIdentityV2.model_validate(prior_manifest.get("asset_identity"))
+                        except Exception as error:
+                            raise MapAssetBundleValidationError("occupied assigned asset identity is invalid") from error
+                        if prior_identity != asset_identity:
+                            raise AssignedMapAlreadyFinalizedError(map_name, prior_identity, asset_identity)
+                        _unused, existing = self._validate_open_directory(map_name, previous_tree,
+                            expected_asset_identity=asset_identity)
+                        if set(previous_tree.files) != set(candidate_tree.files):
+                            raise MapAssetBundleValidationError("assigned asset ID reused with different inventory")
+                        for relative, candidate_file in candidate_tree.files.items():
+                            if not candidate_file.streaming_equals(previous_tree.files[relative]):
+                                raise MapAssetBundleValidationError("assigned asset ID reused with different body: %s" % relative)
+                        previous_tree.verify_all()
+                        candidate_tree.verify_all()
+                        return existing
+                candidate_tree.rebind_root_after_rename(current.name)
+                os.fsync(candidate_tree.parent_descriptor)
+                self._inject_fault("after_rename")
+                return validated
+        finally:
+            # A post-rename failure leaves the durable current owner discoverable
+            # to restart/catalog reconciliation. Only this original staging inode
+            # may be removed; a replacement directory belongs to somebody else.
+            self._discard_owned_staging(map_name, staging, owner)
+
+    def _write_assigned_candidate_bundle(self, bundle, staging):
+        if bundle.georeference is not None:
+            relative = bundle.georeference.relative_path
+            path = _contained_path(staging, relative)
+            if not path.exists() and not path.is_symlink():
+                _atomic_write_relative(staging, relative, _model_json_bytes(bundle.georeference.contract),
+                    create_parents=True)
+        geometry = bundle.geometry_asset
+        if geometry is None:
+            raise MapAssetBundleValidationError("assigned bundle requires geometry_asset")
+        relative = PurePosixPath("geometry", build_safe_dir_segment(geometry.geometry_stack), "geometry_asset.json").as_posix()
+        _atomic_write_relative(staging, relative, _model_json_bytes(geometry), create_parents=True)
+        _atomic_write_relative(staging, _BUNDLE_FILE_NAME, _model_json_bytes(bundle))
+
+    def _write_assigned_manifest(self, bundle, directory, source):
+        with _StableDirectoryTree(directory) as tree:
+            entries = [{"path": path, "size": managed.size()}
+                       for path, managed in sorted(tree.files.items()) if path != _MANIFEST_FILE_NAME]
+            tree.verify_all()
+        document = {"schema_version": 2, "map_name": bundle.map_name, "bundle_path": _BUNDLE_FILE_NAME,
+            "asset_identity": bundle.asset_identity.model_dump(mode="json"),
+            "checkpoint_source": source, "files": entries}
+        payload = _canonical_json_bytes(document)
+        if len(entries) > _MAX_MANIFEST_FILE_ENTRIES or len(payload) > _MAX_MANIFEST_JSON_BYTES:
+            raise MapAssetBundleValidationError("assigned manifest exceeds its budget")
+        _atomic_write_relative(directory, _MANIFEST_FILE_NAME, payload)
+
+    def _validate_assigned_open_directory(self, map_name, tree, manifest, *, expected_asset_identity=None):
+        if set(manifest) != {"schema_version", "map_name", "bundle_path", "asset_identity", "checkpoint_source", "files"}:
+            raise MapAssetBundleValidationError("assigned manifest has missing or mixed-generation fields")
+        if manifest["map_name"] != map_name or manifest["bundle_path"] != _BUNDLE_FILE_NAME:
+            raise MapAssetBundleValidationError("assigned manifest map/path mismatch")
+        try:
+            identity = AssetIdentityV2.model_validate(manifest["asset_identity"])
+        except Exception as exc:
+            raise MapAssetBundleValidationError("invalid assigned asset identity") from exc
+        if expected_asset_identity is not None and identity != expected_asset_identity:
+            raise MapAssetBundleValidationError("assigned asset differs from the expected owner")
+        entries = manifest["files"]
+        if not isinstance(entries, list) or len(entries) > _MAX_MANIFEST_FILE_ENTRIES:
+            raise MapAssetBundleValidationError("invalid assigned file inventory")
+        files = {}
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"path", "size"}:
+                raise MapAssetBundleValidationError("assigned file descriptor has missing or legacy fields")
+            relative = _validate_relative_path(entry["path"], "assigned member path")
+            if relative != entry["path"] or relative in files or relative == _MANIFEST_FILE_NAME:
+                raise MapAssetBundleValidationError("assigned inventory contains duplicate/noncanonical path")
+            if type(entry["size"]) is not int or entry["size"] < 0:
+                raise MapAssetBundleValidationError("assigned member size is invalid")
+            files[relative] = entry["size"]
+        if set(tree.files) != set(files) | {_MANIFEST_FILE_NAME} or _BUNDLE_FILE_NAME not in files:
+            raise MapAssetBundleValidationError("assigned manifest inventory differs from directory")
+        # Decode/validate all source identities before reading any payload body.
+        self._validate_assigned_source_document(manifest["checkpoint_source"])
+        for path, size in files.items():
+            if tree.files[path].size() != size:
+                raise MapAssetBundleValidationError("assigned member size differs: %s" % path)
+        document = _parse_json_object(tree.require_file(_BUNDLE_FILE_NAME, "assigned bundle").read(_MAX_BUNDLE_JSON_BYTES), "assigned bundle")
+        if (type(document.get("identity_schema_version")) is not int or document["identity_schema_version"] != 2
+                or document.get("asset_identity") != manifest["asset_identity"]
+                or document.get("asset_state") != "finalized" or document.get("manifest_sha256") is not None):
+            raise MapAssetBundleValidationError("assigned bundle has missing or mixed-generation identity")
+        try:
+            bundle = MapAssetBundle.model_validate(document)
+        except Exception as exc:
+            raise MapAssetBundleValidationError("invalid assigned bundle contract") from exc
+        if bundle.map_name != map_name:
+            raise MapAssetBundleValidationError("assigned bundle map mismatch")
+        source = self._assigned_checkpoint_source(tree, bundle.geometry_asset)
+        if source != manifest["checkpoint_source"]:
+            raise MapAssetBundleValidationError("assigned checkpoint source/member descriptors changed")
+        geometry = bundle.geometry_asset
+        geometry_path = PurePosixPath("geometry", build_safe_dir_segment(geometry.geometry_stack), "geometry_asset.json").as_posix()
+        observed_geometry = _parse_json_object(tree.require_file(geometry_path, "geometry descriptor").read(_MAX_LEGACY_METADATA_JSON_BYTES), "geometry descriptor")
+        if observed_geometry != geometry.model_dump(mode="json", exclude_none=True):
+            raise MapAssetBundleValidationError("geometry descriptor differs from assigned bundle")
+        if bundle.georeference is not None:
+            raw = tree.require_file(bundle.georeference.relative_path, "georeference").read(_MAX_GEOREFERENCE_JSON_BYTES)
+            try:
+                contract = MapGeoreferenceV1.model_validate(_parse_json_object(raw, "georeference"))
+            except Exception as exc:
+                raise MapAssetBundleValidationError("invalid assigned georeference") from exc
+            if contract != bundle.georeference.contract:
+                raise MapAssetBundleValidationError("assigned georeference contract differs")
+        elif any(path == "georeference" or path.startswith("georeference/") for path in files):
+            raise MapAssetBundleValidationError("unbound georeference file")
+        self._validate_geometry_assets(tree, geometry, set(files), assigned=True)
+        self._validate_assigned_checkpoint_bodies(tree, source)
+        tree.verify_all()
+        return bundle
+
+    @staticmethod
+    def _validate_assigned_source_document(source):
+        from services.geometry.mapping_backend_checkpoint_store import _v2_manifest_metadata
+        if not isinstance(source, dict) or set(source) != {"selector_path", "manifest_path", "manifest"}:
+            raise MapAssetBundleValidationError("assigned checkpoint source descriptor is incomplete")
+        document = source["manifest"]
+        if not isinstance(document, dict) or type(document.get("schema_version")) is not int or document["schema_version"] != 2:
+            raise MapAssetBundleValidationError("assigned outer asset requires checkpoint schema 2")
+        kind, checkpoint_id = document.get("backend_kind"), document.get("checkpoint_id")
+        if kind not in {"voxel", "raytracing"}:
+            raise MapAssetBundleValidationError("assigned planar checkpoint producer is not yet paired")
+        root = "mapping_backend/%s/" % kind
+        if (source["selector_path"] != root + "checkpoint-v2.json"
+                or source["manifest_path"] != root + "manifests/id-%s.json" % checkpoint_id):
+            raise MapAssetBundleValidationError("assigned checkpoint source paths are not canonical")
+        try:
+            return _v2_manifest_metadata(document, checkpoint_id, kind)
+        except Exception as exc:
+            raise MapAssetBundleValidationError("invalid assigned checkpoint source/member metadata") from exc
+
+    def _assigned_checkpoint_source(self, tree, geometry):
+        from services.geometry.mapping_backend_checkpoint_store import _v2_selector, _artifact_from_document
+        if geometry is None:
+            raise MapAssetBundleValidationError("assigned asset requires checkpoint geometry")
+        raw = geometry.metadata.get("mapping_backend_checkpoint")
+        required = {"present", "schema_version", "backend_kind", "checkpoint_id", "manifest_path"}
+        if (not isinstance(raw, dict) or set(raw) != required or raw["present"] is not True
+                or type(raw["schema_version"]) is not int or raw["schema_version"] != 2):
+            raise MapAssetBundleValidationError("assigned asset requires explicit checkpoint-v2 source, without digest aliases")
+        kind, checkpoint_id = raw["backend_kind"], raw["checkpoint_id"]
+        if kind not in {"voxel", "raytracing"}:
+            raise MapAssetBundleValidationError("assigned planar checkpoint producer is not yet paired")
+        root = "mapping_backend/%s/" % kind
+        source = {"selector_path": root + "checkpoint-v2.json", "manifest_path": raw["manifest_path"]}
+        if raw["manifest_path"] != root + "manifests/id-%s.json" % checkpoint_id:
+            raise MapAssetBundleValidationError("checkpoint manifest path differs from its assigned ID")
+        if any(path.startswith("mapping_backend/") and ("checkpoint-v1.json" in path or "/sha256-" in path)
+               for path in tree.files):
+            raise MapAssetBundleValidationError("mixed legacy/assigned checkpoint inventory")
+        selector = _parse_json_object(tree.require_file(source["selector_path"], "assigned checkpoint selector").read(_MAX_CHECKPOINT_JSON_BYTES), "assigned checkpoint selector")
+        try:
+            selected, _name = _v2_selector(selector, kind)
+        except Exception as exc:
+            raise MapAssetBundleValidationError("invalid assigned checkpoint selector") from exc
+        if selected != checkpoint_id:
+            raise MapAssetBundleValidationError("checkpoint selector differs from declared assigned source")
+        source["manifest"] = _parse_json_object(tree.require_file(source["manifest_path"], "assigned checkpoint manifest").read(_MAX_CHECKPOINT_JSON_BYTES), "assigned checkpoint manifest")
+        checkpoint, _occupancy, _cloud, members = self._validate_assigned_source_document(source)
+        for role, member in members.items():
+            relative = root + member["path"]
+            if tree.require_file(relative, role).size() != member["size"]:
+                raise MapAssetBundleValidationError("checkpoint member size differs from retained descriptor")
+            if "artifact" in member:
+                companion = root + "objects/id-%s.json" % member["artifact"]["id"]
+                descriptor = _parse_json_object(tree.require_file(companion, "artifact companion").read(_MAX_CHECKPOINT_JSON_BYTES), "artifact companion")
+                try:
+                    retained = _artifact_from_document(descriptor, role)
+                except Exception as exc:
+                    raise MapAssetBundleValidationError("invalid assigned artifact companion") from exc
+                expected = checkpoint.fine_reference if role == "fine_map" else checkpoint.dense_reference
+                if retained != expected:
+                    raise MapAssetBundleValidationError("assigned artifact companion differs from retained descriptor")
+        return source
+
+    def _validate_assigned_checkpoint_bodies(self, tree, source):
+        from services.geometry.checkpoint_payload import FrozenPayload
+        from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore
+        # A borrowed immutable descriptor view satisfies the existing bounded
+        # semantic validators. It never materializes/copies a whole member and
+        # cannot escape this open, state-checked directory lifetime.
+        class BorrowedPayload(FrozenPayload):
+            def __init__(self, managed):
+                self.managed = managed
+            def __len__(self):
+                return self.managed.size()
+            def __getitem__(self, key):
+                if isinstance(key, slice):
+                    start, stop, step = key.indices(len(self))
+                    if step != 1:
+                        raise ValueError("borrowed payload only supports contiguous bounded slices")
+                    return self.managed.slice(start, stop)
+                index = key if key >= 0 else len(self) + key
+                if not 0 <= index < len(self):
+                    raise IndexError(index)
+                return self.managed.slice(index, index + 1)[0]
+            def chunks(self):
+                for offset in range(0, len(self), _FILE_READ_CHUNK_BYTES):
+                    yield self.managed.slice(offset, offset + _FILE_READ_CHUNK_BYTES)
+        checkpoint, occupancy, cloud, members = self._validate_assigned_source_document(source)
+        root = "mapping_backend/%s/" % checkpoint.backend_kind
+        bodies = {role: BorrowedPayload(tree.require_file(root + descriptor["path"], role))
+                  for role, descriptor in members.items()}
+        checkpoint = replace(checkpoint, payload=bodies["backend_state"],
+            canonical_occupancy_data=bodies["canonical_occupancy"], canonical_cloud_xyz=bodies["canonical_cloud"],
+            fine_archive=bodies.get("fine_map"), dense_archive=bodies.get("dense_cloud"))
+        try:
+            MappingBackendCheckpointStore.validate_checkpoint_bundle(checkpoint,
+                occupancy_asset=occupancy, cloud_asset=cloud)
+        except Exception as exc:
+            raise MapAssetBundleValidationError("invalid assigned checkpoint member body") from exc
+
     def _recover_planar_exchange(self, map_name):
         from services.mapping.catalog import MapCatalogRepository
         map_dir = self._map_dir(map_name)
@@ -278,7 +657,7 @@ class MapAssetBundleRepository:
             # 先证明current引用持久，再删除只属于本次事务的另一目录。
             _fsync_directory(map_dir)
             if staging.exists():
-                self.discard_staging_directory(map_name, staging)
+                self._discard_owned_staging(map_name, staging, identity)
             journal.unlink()
             _fsync_directory(map_dir)
 
@@ -330,7 +709,7 @@ class MapAssetBundleRepository:
                         os.fsync(candidate_tree.parent_descriptor)
                         self._inject_fault("after_planar_exchange")
                         committed = validated.model_copy(update={"manifest_sha256": manifest_sha}, deep=True)
-                    self.discard_staging_directory(map_name, staging)
+                    self._discard_owned_staging(map_name, staging, (old_stat.st_dev, old_stat.st_ino))
                     journal.unlink()
                     os.fsync(candidate_tree.parent_descriptor)
                     preserve_staging = False
@@ -464,12 +843,16 @@ class MapAssetBundleRepository:
         directory: Path,
         *,
         expected_manifest_sha256: Optional[str] = None,
+        expected_asset_identity: Optional[AssetIdentityV2] = None,
     ) -> MapAssetBundle:
         manifest_sha256, bundle = self._validate_directory(
             map_name,
             directory,
             expected_manifest_sha256=expected_manifest_sha256,
+            expected_asset_identity=expected_asset_identity,
         )
+        if bundle.identity_schema_version == 2:
+            return bundle
         return bundle.model_copy(update={"manifest_sha256": manifest_sha256}, deep=True)
 
     def _validate_directory(
@@ -478,12 +861,14 @@ class MapAssetBundleRepository:
         directory: Path,
         *,
         expected_manifest_sha256: Optional[str] = None,
-    ) -> Tuple[str, MapAssetBundle]:
+        expected_asset_identity: Optional[AssetIdentityV2] = None,
+    ) -> Tuple[Optional[str], MapAssetBundle]:
         with _StableDirectoryTree(directory) as tree:
             result = self._validate_open_directory(
                 map_name,
                 tree,
                 expected_manifest_sha256=expected_manifest_sha256,
+                expected_asset_identity=expected_asset_identity,
             )
             tree.verify_all()
             return result
@@ -494,8 +879,20 @@ class MapAssetBundleRepository:
         tree: _StableDirectoryTree,
         *,
         expected_manifest_sha256: Optional[str] = None,
-    ) -> Tuple[str, MapAssetBundle]:
+        expected_asset_identity: Optional[AssetIdentityV2] = None,
+    ) -> Tuple[Optional[str], MapAssetBundle]:
+        _require_typed_asset_identity(expected_asset_identity, optional=True)
         manifest_file = tree.require_file(_MANIFEST_FILE_NAME, "地图资产清单")
+        header = _parse_json_object(manifest_file.read(_MAX_MANIFEST_JSON_BYTES), "地图资产清单")
+        if type(header.get("schema_version")) is not int or header["schema_version"] not in {1, 2}:
+            raise MapAssetBundleValidationError("missing or unsupported explicit manifest schema")
+        if header["schema_version"] == 2:
+            if expected_manifest_sha256 is not None:
+                raise MapAssetBundleValidationError("assigned manifest cannot use a legacy digest expectation")
+            return None, self._validate_assigned_open_directory(map_name, tree, header,
+                expected_asset_identity=expected_asset_identity)
+        if expected_asset_identity is not None or "asset_identity" in header:
+            raise MapAssetBundleValidationError("legacy manifest cannot carry an assigned identity")
         manifest_payload, _manifest_size, manifest_sha256 = manifest_file.read_and_hash(_MAX_MANIFEST_JSON_BYTES)
         manifest_sha256 = _sha256_bytes(manifest_payload)
         if expected_manifest_sha256 and manifest_sha256 != expected_manifest_sha256:
@@ -555,6 +952,8 @@ class MapAssetBundleRepository:
             bundle = MapAssetBundle.model_validate(bundle_document)
         except Exception as exc:
             raise MapAssetBundleValidationError("地图资产包契约非法。") from exc
+        if bundle.identity_schema_version != 1:
+            raise MapAssetBundleValidationError("legacy manifest cannot wrap an assigned bundle")
         if bundle.map_name != map_name:
             raise MapAssetBundleValidationError("地图资产包 map_name 不匹配。")
         validated_paths = {_BUNDLE_FILE_NAME}
@@ -632,6 +1031,8 @@ class MapAssetBundleRepository:
         tree: _StableDirectoryTree,
         geometry_asset: Optional[MapGeometryAssetBinding],
         manifested_paths: set[str],
+        *,
+        assigned: bool = False,
     ) -> None:
         if geometry_asset is None:
             raise MapAssetBundleValidationError("地图资产包缺少 geometry_asset。")
@@ -678,11 +1079,8 @@ class MapAssetBundleRepository:
             raise MapAssetBundleValidationError("地图资产包缺少导航地图资产。")
         for asset in navigation_assets:
             self._validate_nav2_yaml(tree, asset.path, manifested_paths)
-        self._validate_backend_checkpoint(
-            tree,
-            geometry_asset,
-            manifested_paths,
-        )
+        if not assigned:
+            self._validate_backend_checkpoint(tree, geometry_asset, manifested_paths)
 
     def _validate_backend_checkpoint(
         self,
@@ -816,7 +1214,7 @@ class MapAssetBundleRepository:
                 yaml_relative,
                 "Nav2 地图 YAML",
             )
-            .read_and_hash(_MAX_NAV2_YAML_BYTES)[0]
+            .read(_MAX_NAV2_YAML_BYTES)
             .decode("utf-8")
         )
         image_values: List[str] = []
@@ -1146,6 +1544,11 @@ class MapAssetBundleRepository:
             raise MapAssetBundleValidationError("staging 目录不属于目标地图。")
         if must_exist:
             self._require_real_directory(candidate, "地图 staging 目录")
+            observed = candidate.stat()
+            owner = (observed.st_dev, observed.st_ino)
+            if candidate in self._staging_owners and self._staging_owners[candidate] != owner:
+                raise MapAssetBundleValidationError("staging owner has been replaced")
+            self._staging_owners[candidate] = owner
         return candidate
 
     @staticmethod
@@ -1285,20 +1688,48 @@ class _ManagedRegularFile:
         self._record_observation(None, observed_size, sha256)
         return observed_size, sha256
 
+    def read(self, maximum_bytes: int) -> bytes:
+        before = self._begin_observation()
+        if before.st_size > maximum_bytes:
+            raise MapAssetBundleValidationError("file exceeds read budget: %s" % self.relative_path)
+        chunks = []
+        offset = 0
+        while offset < before.st_size:
+            chunk = os.pread(self.descriptor, min(_FILE_READ_CHUNK_BYTES, before.st_size - offset), offset)
+            if not chunk:
+                raise MapAssetBundleValidationError("short file read: %s" % self.relative_path)
+            chunks.append(chunk)
+            offset += len(chunk)
+        self._finish_observation(before, observed_size=offset)
+        return b"".join(chunks)
+
+    def slice(self, start: int, stop: int) -> bytes:
+        before = self._begin_observation()
+        stop = min(stop, before.st_size)
+        payload = os.pread(self.descriptor, max(0, stop - start), start)
+        if len(payload) != max(0, stop - start):
+            raise MapAssetBundleValidationError("short file slice: %s" % self.relative_path)
+        self._finish_observation(before, observed_size=before.st_size)
+        return payload
+
     def prefix(self, size: int) -> bytes:
-        if self._size is None or self._sha256 is None:
-            self.hash()
-        if size <= len(self._prefix):
-            self.verify_named_entry()
-            return self._prefix[:size]
-        payload, _size, _sha256 = self.read_and_hash(size)
-        return payload[:size]
+        return self.slice(0, size)
 
     def size(self) -> int:
-        if self._size is None:
-            self.hash()
+        current = self._begin_observation()
         self.verify_named_entry()
-        return int(self._size or 0)
+        return int(current.st_size)
+
+    def streaming_equals(self, other: _ManagedRegularFile) -> bool:
+        size = self.size()
+        if size != other.size():
+            return False
+        for offset in range(0, size, _FILE_READ_CHUNK_BYTES):
+            if self.slice(offset, offset + _FILE_READ_CHUNK_BYTES) != other.slice(offset, offset + _FILE_READ_CHUNK_BYTES):
+                return False
+        self.verify_named_entry()
+        other.verify_named_entry()
+        return True
 
     def _record_observation(
         self,
@@ -1855,6 +2286,8 @@ def _rename_directory_noreplace(
     parent_descriptor: int,
     source_name: str,
     target_name: str,
+    *,
+    target_parent_descriptor: Optional[int] = None,
 ) -> None:
     if (
         not source_name
@@ -1880,7 +2313,7 @@ def _rename_directory_noreplace(
     result = renameat2(
         parent_descriptor,
         os.fsencode(source_name),
-        parent_descriptor,
+        parent_descriptor if target_parent_descriptor is None else target_parent_descriptor,
         os.fsencode(target_name),
         1,
     )
@@ -2034,3 +2467,45 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _require_typed_asset_identity(value, *, optional=False):
+    if value is None and optional:
+        return
+    if type(value) is not AssetIdentityV2:
+        raise MapAssetBundleValidationError("expected a typed AssetIdentityV2 owner, not a digest/string")
+
+
+def _assigned_observations(tree):
+    observations = []
+    for relative, managed in sorted(tree.files.items()):
+        managed.verify_named_entry()
+        state = os.fstat(managed.descriptor)
+        observations.append((relative, state.st_dev, state.st_ino, state.st_mode, state.st_nlink,
+            state.st_size, state.st_mtime_ns, state.st_ctime_ns))
+    tree.verify_all()
+    return tuple(observations)
+
+
+def _remove_pinned_directory_contents(directory_fd):
+    """Retire children only through an already owned, quarantined directory FD."""
+    with os.scandir(directory_fd) as iterator:
+        entries = list(iterator)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    for entry in entries:
+        named = entry.stat(follow_symlinks=False)
+        if stat.S_ISDIR(named.st_mode):
+            child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
+            try:
+                _require_same_file_identity(named, os.fstat(child_fd), entry.name)
+                _remove_pinned_directory_contents(child_fd)
+                _require_same_file_identity(named,
+                    os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False), entry.name)
+                os.rmdir(entry.name, dir_fd=directory_fd)
+            finally:
+                os.close(child_fd)
+        else:
+            # Symlinks are unlinked as names, never followed.
+            _require_same_file_identity(named,
+                os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False), entry.name)
+            os.unlink(entry.name, dir_fd=directory_fd)

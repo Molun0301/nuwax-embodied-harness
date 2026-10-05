@@ -174,11 +174,17 @@ pub enum Counter {
     /// Exact footprint cardinality supplied to each evidence callback, including
     /// exempt cells and cells after a possible early evidence error.
     ObservationInputCells,
+    /// Fine XY columns entering the original bounded height-selection loop.
+    ObservationHeightColumns,
+    /// Actual integer-Z membership probes, including rejected and absent candidates.
+    ObservationHeightProbes,
+    /// Height probes whose exact fine observation key is absent.
+    ObservationHeightAbsent,
 }
 
 impl Counter {
     /// Number of fixed counter categories.
-    pub const COUNT: usize = 18;
+    pub const COUNT: usize = 21;
     /// Every counter category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::PlaneCacheHits,
@@ -199,6 +205,9 @@ impl Counter {
         Self::ObservationVisitedCells,
         Self::ObservationCheckedCells,
         Self::ObservationInputCells,
+        Self::ObservationHeightColumns,
+        Self::ObservationHeightProbes,
+        Self::ObservationHeightAbsent,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -222,6 +231,9 @@ impl Counter {
             Self::ObservationVisitedCells => "observation_visited_cells",
             Self::ObservationCheckedCells => "observation_checked_cells",
             Self::ObservationInputCells => "observation_input_cells",
+            Self::ObservationHeightColumns => "observation_height_columns",
+            Self::ObservationHeightProbes => "observation_height_probes",
+            Self::ObservationHeightAbsent => "observation_height_absent",
 
         }
     }

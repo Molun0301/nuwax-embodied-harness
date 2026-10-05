@@ -131,3 +131,30 @@ Both prepared 1 cm goal trials complete all actual-edge and delivered-tail oracl
 Both tests in `polygon-once-prepared-moving-v1.log` nevertheless remain **FAILED** on the unchanged 50 ms maximum control-step criterion: OFF median/p95/max is 21.289/43.950/60.530 ms; ON is 17.558/46.479/62.422 ms. These are sampled mixed-profile runs with different state histories, not controlled whole-run speedup ratios. The matched raw-footprint benchmark is the causal work-removal evidence. All earlier failed trials remain preserved.
 
 Original-source 5 cm factory OFF/ON goals pass in `polygon-once-5cm-factory-v1.log`. `polygon-once-5cm-held-v1.log` passes with six fresh commands during held planning, later admission, 214 nonzero receipts and 1.068341 m travel. It has zero delivered negatives/dispatch-expiry observations, all oracles pass, and sampled current-step median/p95/max is 2.062/3.258/20.393 ms. No hard real-time, hardware, or deployed-release qualification follows.
+
+## Height-selection work counts: no production index change
+
+The next test-only experiment compares the original descending integer-Z scan with the existing immutable per-XY observed-level index, retaining the original exact-key lookup, canonical coarse-membership predicate and fallback to `top`. A second test-only variant first tries the original top candidate and consults the index only after that fails. Neither variant is used by production. Their preliminary matrix is not activation coverage for all mutation/current-view/extreme-bound cases.
+
+The live algorithm gains only default-off profiling counters, accumulated locally and flushed once per raw footprint (including early returns). `observation_height_columns` counts fine XY cells that reached height selection; `observation_height_probes` counts actual observation `get` calls; `observation_height_absent` counts missing keys. Present probes can still fail canonical coarse membership, so probes minus absent is not generally a count of selected support. Feature-off query order and behavior are unchanged.
+
+`level-selection-prototype-v1.log` records an invalid test setup: body height did not match the generated fine support, all cases returned before selection, and the positive-coverage assertion correctly failed. The corrected fixture computes body height from its actual fine support; v2 and the later hybrid v3 matrices pass. The v1 micro label `top_present` was misleading for its above-range layer and is corrected to `above_top_only` in v2. No production tolerance changed.
+
+Matched static micro medians in `level-selection-micro-v2.log` (five later alternating rounds, ms per 30 full raw calls, including local counting, output equality and retirement):
+
+| Fine-column evidence | Integer scan | Indexed | Original top first, then index |
+|---|---:|---:|---:|
+| Low fine floor, first candidate present | 19.846 | 26.852 | 19.521 |
+| Observations only above allowed top | 75.478 | 18.041 | 22.553 |
+| Dense levels, first candidate present | 20.415 | 28.609 | 19.776 |
+| No evidence | 66.489 | 13.701 | 15.187 |
+| Present but noncanonical layers | 108.745 | 26.759 | 31.646 |
+| Negative-height floor, first candidate present | 19.157 | 26.772 | 19.127 |
+
+Unconditional indexed lookup clearly regresses the common first-hit cases. The top-first variant avoids that sampled penalty and helps missing/incompatible layers, but a moving measurement is needed to establish whether those cases matter here.
+
+`level-selection-moving-off-v1.log` supplies that answer: across all 451 retained steps, 18,806,669 columns produce exactly 18,806,669 probes and zero absent keys. This prepared flat 1 cm workload performs no extra Z probes to remove. Therefore no indexed production change is justified for the measured bottleneck, and both variants remain test-only.
+
+That measurement reaches the configured goal in 22.100 s with 326 nonzero receipts, .066780 m position error and .147417 rad yaw error; all actual-edge/receipt-tail oracles pass, with zero delivered negatives/dispatch expiry observations. The test remains **FAILED** on the original 50 ms step limit (median/p95/max 21.702/43.886/84.745 ms). All 112 full-coverage frames retain truthful acquisition times, and no frames drop. The 216 guard/receipt state mismatches retain the existing activation limitation. This mixed-profile instrumentation run is not a causal performance comparison with the previous run.
+
+`level-selection-counter-v1.log` verifies aggregate counts against the original counted scan for first-hit, missing and incompatible cases. `level-selection-mls-all-v1.log` passes 245 tests / 7 ignored, and `level-selection-feature-off-v1.log` passes the production default-feature library check. The next useful measurement is work that actually occurs in the footprint/evidence lookup or set construction, not optimization of absent probes in this flat fixture.

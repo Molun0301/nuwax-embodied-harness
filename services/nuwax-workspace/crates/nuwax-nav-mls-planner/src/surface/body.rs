@@ -52,6 +52,18 @@ impl Drop for ObservationEvidenceCounts {
     }
 }
 
+#[cfg(feature = "body-query-profile")]
+#[derive(Default)]
+struct ObservationHeightCounts {columns:u64,probes:u64,absent:u64}
+#[cfg(feature = "body-query-profile")]
+impl Drop for ObservationHeightCounts {
+    fn drop(&mut self) {
+        query_profile::add(QueryCounter::ObservationHeightColumns,self.columns);
+        query_profile::add(QueryCounter::ObservationHeightProbes,self.probes);
+        query_profile::add(QueryCounter::ObservationHeightAbsent,self.absent);
+    }
+}
+
 /// 当前占据只证明精确足迹内的支撑，原始快照用于下一次位姿重新派生。
 pub(super) struct CurrentBodySupport {
     pub(super) source: SurfaceSnapshot,
@@ -1588,6 +1600,7 @@ impl SurfaceSnapshot {
         };
         #[cfg(feature = "body-query-profile")] let cells_profile=query_profile::guard(QueryStage::ObservationFootprintCells);
         let polygon_query=PolygonQuery::new(&polygon);
+        #[cfg(feature = "body-query-profile")] let mut height_counts=ObservationHeightCounts::default();
         let mut cells = std::collections::BTreeSet::new();
         for x in min[0]..=max[0] {
             for y in min[1]..=max[1] {
@@ -1606,8 +1619,13 @@ impl SurfaceSnapshot {
                     + size + model.support_uncertainty_m;
                 let count = (height_span / size).ceil().min(128.0) as i32;
                 let bottom = top.saturating_sub(count);
+                #[cfg(feature = "body-query-profile")] {height_counts.columns+=1;}
                 let z = (bottom..=top).rev().find(|&z| {
-                    if observations.get([x,y,z]).is_none() { return false; }
+                    #[cfg(feature = "body-query-profile")] {height_counts.probes+=1;}
+                    if observations.get([x,y,z]).is_none() {
+                        #[cfg(feature = "body-query-profile")] {height_counts.absent+=1;}
+                        return false;
+                    }
                     let centre = (z as f64 + 0.5) * size;
                     let coarse_z = (centre / planner_size).floor() as i32;
                     self.data.occupied_columns.get(&column)
@@ -1616,6 +1634,7 @@ impl SurfaceSnapshot {
                 cells.insert([x, y, z]);
             }
         }
+        #[cfg(feature = "body-query-profile")] drop(height_counts);
         drop(polygon_query);
         #[cfg(feature = "body-query-profile")] {
             drop(cells_profile);
@@ -2659,6 +2678,169 @@ mod tests {
         }));
         assert_eq!(expired.map(|_| ()), mixed.validate_observed_body_motion_in_boundary(
             pose, pose, &none, u64::MAX, 100, &[]));
+    }
+
+    // Test-only level-index work-count prototype; production selection remains unchanged.
+    fn measured_footprint_level_selection<const INDEXED:bool,const TOP_FIRST:bool>(
+        map: &SurfaceSnapshot, counters: &mut [u64;3], pose: ([f64; 3], [f64; 4]),
+    ) -> Result<std::collections::BTreeSet<[i32; 3]>, SurfaceError> {
+        #[cfg(feature = "body-query-profile")] let _footprint_profile=query_profile::guard(QueryStage::ObservationFootprint);
+        let observations = map.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
+        if observations.size_m.to_bits() != map.source_voxel_size_m().to_bits() {
+            return Err(SurfaceError::InvalidConfig("观察精度与几何来源不一致".into()));
+        }
+        let model = map.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        let centre = {
+            #[cfg(feature = "body-query-profile")] let _support_profile=query_profile::guard(QueryStage::ObservationFootprintSupport);
+            map.locate_support_from_body(pose.0, pose.1, model.body_to_support_z_m)?
+        };
+        #[cfg(feature = "body-query-profile")] let shape_profile=query_profile::guard(QueryStage::ObservationFootprintShape);
+        let r = rotation(pose.1)?;
+        let vertices: Vec<_> = model.footprint_xy_m.iter()
+            .flat_map(|p| model.z_bounds_m.map(|z| world(r, pose.0, [p[0], p[1], z])))
+            .collect();
+        let polygon = hull(vertices.iter().map(|p| [p[0], p[1]]).collect());
+        let size = f64::from(observations.size_m);
+        let planner_size = f64::from(map.config().voxel_size);
+        let min: [i32; 2] = std::array::from_fn(|i| (vertices.iter().map(|p| p[i]).fold(f64::INFINITY, f64::min) / size).floor() as i32);
+        let max: [i32; 2] = std::array::from_fn(|i| (vertices.iter().map(|p| p[i]).fold(f64::NEG_INFINITY, f64::max) / size).floor() as i32);
+        if (i64::from(max[0]) - i64::from(min[0]) + 1) * (i64::from(max[1]) - i64::from(min[1]) + 1) > 16_384 {
+            return Err(SurfaceError::InvalidConfig("近场精细支撑查询超过预算".into()));
+        }
+        let radius = model.radius() + model.z_bounds_m[0].abs().max(model.z_bounds_m[1].abs())
+            + model.body_to_support_z_m + planner_size * 2.0;
+        #[cfg(feature = "body-query-profile")] drop(shape_profile);
+        let patch = {
+            #[cfg(feature = "body-query-profile")] let _patch_profile=query_profile::guard(QueryStage::ObservationFootprintPatch);
+            map.ground_patch(centre, radius)
+        };
+        #[cfg(feature = "body-query-profile")] let cells_profile=query_profile::guard(QueryStage::ObservationFootprintCells);
+        let polygon_query=PolygonQuery::new(&polygon);
+        let mut cells = std::collections::BTreeSet::new();
+        for x in min[0]..=max[0] {
+            for y in min[1]..=max[1] {
+                if !polygon_query.intersects(x, y, size) { continue; }
+                let column = (((x as f64 + 0.5) * size / planner_size).floor() as i32,
+                    ((y as f64 + 0.5) * size / planner_size).floor() as i32);
+                let ground = *patch.get(&column).ok_or(SurfaceError::MissingSupport)?;
+                let height = map.cell_position(ground)[2];
+                // 粗格跨坡面/阶边时，低侧真实细格可以属于同列较低的占据粗格。
+                // 查询范围由一格内允许的坡差/阶差限制，并要求候选确在规范物理占据内。
+                // 始终先选实际最高回波再查时效，旧顶部不能被新低面替代。
+                let top = ((height / size).round() - 1.0) as i32;
+                let height_span = (planner_size * std::f64::consts::SQRT_2
+                    * f64::from(map.config().max_slope_deg).to_radians().tan())
+                    .max(model.max_step_up_m).max(model.max_step_down_m)
+                    + size + model.support_uncertainty_m;
+                let count = (height_span / size).ceil().min(128.0) as i32;
+                let bottom = top.saturating_sub(count);
+                counters[0]+=1;
+                let mut accepts=|z:i32| {
+                    counters[1]+=1;
+                    if observations.get([x,y,z]).is_none() { counters[2]+=1;return false; }
+                    let centre = (z as f64 + 0.5) * size;
+                    let coarse_z = (centre / planner_size).floor() as i32;
+                    map.data.occupied_columns.get(&column)
+                        .is_some_and(|zs| zs.binary_search(&coarse_z).is_ok())
+                };
+                let z=if TOP_FIRST && accepts(top) {Some(top)}else if INDEXED {
+                    let levels=observations.column_levels(x,y).unwrap_or(&[]);
+                    let end=levels.partition_point(|&z|if TOP_FIRST{z<top}else{z<=top});
+                    levels[..end].iter().rev().copied().take_while(|&z|z>=bottom)
+                        .find(|&z|accepts(z))
+                }else{(bottom..=top).rev().find(|&z|accepts(z))}.unwrap_or(top);
+                cells.insert([x, y, z]);
+            }
+        }
+        drop(polygon_query);
+        #[cfg(feature = "body-query-profile")] {
+            drop(cells_profile);
+            query_profile::add(QueryCounter::ObservationFootprintCellsBuilt,cells.len() as u64);
+        }
+        Ok(cells)
+    }
+    fn level_selection_fixture(size:f32,geometry_z:i32,observed_layers:&[i32])->SurfaceSnapshot {
+        use std::collections::BTreeMap;
+        let n=(0.7/f64::from(size)).ceil() as i32;
+        let points:Vec<_>=(-n..n).flat_map(|x|(-n..n).map(move|y|
+            ((x as f32+0.5)*size,(y as f32+0.5)*size,(geometry_z as f32+0.5)*size))).collect();
+        let base=scene(&[],false);
+        let map=SurfaceSnapshot::from_points(&points,base.config().clone(),size).unwrap().with_body_envelope(model()).unwrap();
+        let mut blocks=BTreeMap::<_,BTreeMap<_,_>>::new();
+        for x in -n..n {for y in -n..n {for &z in observed_layers {
+            let key=[x,y,z]; blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,
+                SurfaceObservation{observed_ns:10_000_000_000,hits:2});
+        }}}
+        let mut observations=SurfaceObservations::new(size,32).unwrap();
+        for (block,values) in blocks {observations.replace_block(block,values).unwrap();}
+        observations.set_source_timestamp_ns(10_000_000_000);
+        map.with_observations(Some(Arc::new(observations)))
+    }
+
+    #[test]
+    #[cfg(feature = "body-query-profile")]
+    fn observation_height_profile_matches_counted_original_scan() {
+        for layers in [vec![0],vec![],vec![-1,20]] {
+            let map=level_selection_fixture(0.01,0,&layers);
+            let pose=([0.05,0.05,0.41],[0.0,0.0,0.0,1.0]);
+            let mut counts=[0;3];
+            let expected=measured_footprint_level_selection::<false,false>(&map,&mut counts,pose);
+            query_profile::begin();let actual=map.body_observation_footprint(pose);let record=query_profile::end();
+            assert_eq!(actual,expected);assert!(actual.is_ok());
+            for (counter,count) in [QueryCounter::ObservationHeightColumns,QueryCounter::ObservationHeightProbes,QueryCounter::ObservationHeightAbsent].into_iter().zip(counts) {
+                assert_eq!(record.counters[counter as usize],count);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_level_selection_prototype_matches_full_integer_scan() {
+        let cases=[(0,vec![0]),(0,vec![9]),(0,(0..=9).collect()),(0,vec![-1,0,9,20,31,32]),
+            (0,vec![]),(0,vec![-1,20]),(-10,vec![-10]),(-10,vec![-11,-10,-1,0])];
+        let mut successes=0;
+        for (geometry_z,layers) in cases {
+            let map=level_selection_fixture(0.01,geometry_z,&layers);
+            for x in [-0.1,0.05] {for yaw in [0.0_f64,0.37] {
+                let body_z=0.4+(geometry_z as f64+1.0)*0.01;
+                let pose=([x,0.05,body_z],[0.0,0.0,(yaw/2.0).sin(),(yaw/2.0).cos()]);
+                let mut old_counts=[0;3];let mut new_counts=[0;3];
+                let old=measured_footprint_level_selection::<false,false>(&map,&mut old_counts,pose);
+                let new=measured_footprint_level_selection::<true,false>(&map,&mut new_counts,pose);
+                let hybrid=measured_footprint_level_selection::<true,true>(&map,&mut [0;3],pose);
+                assert_eq!(old,map.body_observation_footprint(pose));assert_eq!(new,old);assert_eq!(hybrid,old);
+                if old.is_ok(){successes+=1;assert_eq!(old_counts[0],new_counts[0]);}
+                eprintln!("LEVEL_SELECTION geometry_z={geometry_z} layers={layers:?} pose={pose:?} old_column_probe_absent={old_counts:?} indexed_column_probe_absent={new_counts:?} success={}",old.is_ok());
+            }}
+        }
+        assert!(successes>=24,"must exercise successful XYZ output, not only errors");
+    }
+
+    #[test]
+    #[ignore="static work-count and alternating prototype microbenchmark, no live throughput claim"]
+    fn benchmark_indexed_level_selection_prototype() {
+        use std::{hint::black_box,time::Instant};
+        for (label,geometry_z,layers) in [("low_fine_floor",0,vec![0]),("above_top_only",0,vec![9]),
+            ("dense_levels",0,(0..=9).collect()),("no_evidence",0,vec![]),
+            ("incompatible_layers",0,vec![-1,20]),("negative_low_floor",-10,vec![-10])] {
+            let map=level_selection_fixture(0.01,geometry_z,&layers);
+            let pose=([0.05,0.05,0.4+(geometry_z as f64+1.0)*0.01],[0.0,0.0,0.0,1.0]);
+            let mut counts=[0;3];let expected=map.body_observation_footprint(pose).unwrap();
+            assert_eq!(measured_footprint_level_selection::<true,false>(&map,&mut counts,pose).unwrap(),expected);
+            let mut old_ms=Vec::new();let mut new_ms=Vec::new();let mut hybrid_ms=Vec::new();
+            for round in 0..6 {for variant in if round%2==0{[0,1,2]}else{[2,1,0]} {
+                let mut counts=[0;3];let started=Instant::now();
+                for _ in 0..30 {
+                    let map=black_box(&map);let pose=black_box(pose);
+                    let actual=match variant {1=>measured_footprint_level_selection::<true,false>(map,&mut counts,pose),
+                        2=>measured_footprint_level_selection::<true,true>(map,&mut counts,pose),
+                        _=>measured_footprint_level_selection::<false,false>(map,&mut counts,pose)}.unwrap();
+                    assert_eq!(black_box(&actual),&expected);
+                }
+                let ms=started.elapsed().as_secs_f64()*1e3;
+                match variant {1=>new_ms.push(ms),2=>hybrid_ms.push(ms),_=>old_ms.push(ms)}
+            }}
+            eprintln!("LEVEL_SELECTION_MICRO label={label} cells={} loops=30 includes=counting_output_equality_retirement warmed_by_parity=true old_ms={old_ms:?} indexed_ms={new_ms:?} hybrid_ms={hybrid_ms:?}",expected.len());
+        }
     }
 
     // Frozen pre-hoist method; only the receiver and function name differ.

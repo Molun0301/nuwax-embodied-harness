@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
@@ -359,6 +360,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         image_size: int = 640,
         max_detections: int = 100,
         use_worker_process: bool = True,
+        worker_retry_backoff_sec: float = 2.0,
     ) -> None:
         self._weights = str(weights).strip() or "yolov8s-worldv2.pt"
         # 按模型文件后缀自动决定推理链路：.engine → TensorRT(YOLO 类)，其余 → PyTorch(YOLOWorld 开放词汇类)。
@@ -373,6 +375,8 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         self._resolved_backend_kind = "yolo_world_tensorrt" if self._use_tensorrt else "yolo_world_pytorch"
         self._inference_worker = None
         self._inference_worker_lock = threading.Lock()
+        self._worker_retry_backoff_sec = worker_retry_backoff_sec
+        self._worker_closed = False
         # 预热直接调用后端，需与正式感知共用模型、词表和本次遥测的互斥范围。
         self._detection_lock = threading.RLock()
         # vis-three-fixes 任务 3.4：worker 进程开关，默认 True；由配置/构造参数显式覆盖。
@@ -434,35 +438,28 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
             self._iou_threshold = float(iou_threshold)
             self._max_detections = int(max_detections)
             with self._inference_worker_lock:
-                if self._inference_worker is not None:
-                    self._inference_worker.update_thresholds(
-                        confidence_threshold=self._confidence_threshold,
-                        iou_threshold=self._iou_threshold, max_detections=self._max_detections,
-                    )
+                owner = self._inference_worker
+            if owner is not None:
+                owner.update_thresholds(
+                    confidence_threshold=self._confidence_threshold,
+                    iou_threshold=self._iou_threshold, max_detections=self._max_detections,
+                )
 
     def _predict(self, image_bgr) -> List[Any]:
         # 优先使用独立进程推理（释放主线程 GIL）
         self._last_worker_inference_ms = None
         if self._use_worker_process:
-            worker = self._get_inference_worker()
-            if worker is not None:
-                worker_identity = worker.resource_identity
-                result = worker.predict(image_bgr) if worker.is_ready else None
-                if result is not None:
-                    if any(current is not expected for current, expected in zip(worker.resource_identity, worker_identity)):
-                        raise RuntimeError("推理期间工作进程已替换，本次结果失效。")
-                    # vis-three-fixes 任务 3.9：记录 worker 推理耗时供 detect() 元数据透传。
-                    self._last_worker_inference_ms = getattr(worker, "last_inference_ms", None)
-                    self._last_inference_execution = "worker_process"
-                    self._resolved_model_source = self._weights
-                    return [_WorkerResult(*result)]
-                # 必须先回收旧工作进程，避免回退时同时保留两份模型或复用旧图像。
-                self._retire_inference_worker(
-                    worker, worker.failure_reason or "worker_inference_failed",
-                    expected_identity=worker_identity,
-                )
+            owner = self._get_inference_worker()
+            result = owner.predict(image_bgr) if owner is not None else None
+            if result is None:
+                reason = owner.failure_reason if owner is not None else "worker_not_started"
+                raise RuntimeError("推理工作进程暂不可用，正在独立恢复：%s" % (reason or "worker_starting"))
+            self._last_worker_inference_ms = owner.last_inference_ms
+            self._last_inference_execution = "worker_process"
+            self._resolved_model_source = self._weights
+            return [_WorkerResult(*result)]
 
-        # 回退：主线程直接推理
+        # 仅显式关闭进程模式时，允许在既有调用执行器中推理。
         model = self._get_model()
         kwargs = {
             "conf": self._confidence_threshold,
@@ -483,71 +480,46 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         return self._use_worker_process
 
     def start_inference_worker_nonblocking(self) -> bool:
-        """在当前线程创建 YOLO worker 进程，但不等待模型加载。"""
+        """仅启动独立生命周期拥有方；调用执行器不等待模型加载或重启。"""
         if not self.supports_worker_process:
             return False
         with self._inference_worker_lock:
-            if self._inference_worker is not None:
-                return True
-            try:
-                from services.perception.inference_worker import YoloInferenceWorker
-            except ImportError as exc:
-                DETECTOR_LOGGER.warning("无法导入 YoloInferenceWorker: %s", exc)
+            if self._worker_closed:
                 return False
-            worker = YoloInferenceWorker(
-                self._weights,
-                confidence_threshold=self._confidence_threshold,
-                iou_threshold=self._iou_threshold,
-                image_size=self._image_size,
-                max_detections=self._max_detections,
-                device=self._device,
-            )
-            self._inference_worker = worker
-            if not worker.start_nonblocking():
-                self._worker_fallback_reason = worker.failure_reason or "worker_start_failed"
-                if not worker.has_pending_resources:
-                    self._inference_worker = None
-                return False
-            return True
+            if self._inference_worker is None:
+                from services.perception.inference_owner import InferenceProcessOwner
+
+                self._inference_worker = InferenceProcessOwner(
+                    self._weights, retry_backoff_sec=self._worker_retry_backoff_sec,
+                    confidence_threshold=self._confidence_threshold,
+                    iou_threshold=self._iou_threshold, image_size=self._image_size,
+                    max_detections=self._max_detections, device=self._device,
+                )
+            return self._inference_worker.start_nonblocking()
 
     def _get_inference_worker(self):
-        """获取 YOLO 推理 worker，并在调用线程等待其完成加载。"""
-        if not self.start_inference_worker_nonblocking():
-            if self._inference_worker is not None:
-                self._retire_inference_worker(self._inference_worker, "worker_start_failed")
-            self._use_worker_process = False
-            self._worker_fallback_reason = self._worker_fallback_reason or "worker_start_failed"
-            return None
-        worker = self._inference_worker
-        if worker is not None:
-            worker_identity = worker.resource_identity
-            if worker.wait_until_ready():
-                if any(current is not expected for current, expected in zip(worker.resource_identity, worker_identity)):
-                    raise RuntimeError("等待就绪期间工作进程已替换，本次请求失效。")
-                return worker
-            self._retire_inference_worker(
-                worker, worker.failure_reason or "worker_start_failed",
-                expected_identity=worker_identity,
-            )
-        DETECTOR_LOGGER.warning("YOLO 推理 worker 启动失败，永久回退到主线程推理")
-        self._use_worker_process = False
-        return None
+        self.start_inference_worker_nonblocking()
+        return self._inference_worker
 
-    def _retire_inference_worker(
-        self, worker, reason: str, *, expected_identity: Optional[Tuple[object, object, object]] = None,
-    ) -> None:
-        """退出工作进程并保留失败原因，未完成回收时禁止再加载回退模型。"""
+    def _worker_status_metadata(self):
         with self._inference_worker_lock:
-            matched = worker.stop_if_current(expected_identity if expected_identity is not None else worker.resource_identity)
-            if worker.has_pending_resources:
-                if not matched:
-                    raise RuntimeError("推理工作进程已替换，本次旧请求不能停止新进程或启动回退模型。")
-                self._worker_fallback_reason = reason
-                raise RuntimeError("推理工作进程尚未退出，暂不能启动进程内回退模型。")
-            self._worker_fallback_reason = reason
-            if self._inference_worker is worker:
-                self._inference_worker = None
-            self._use_worker_process = False
+            owner = self._inference_worker
+            closed = self._worker_closed
+        return {
+            "use_worker_process": self._use_worker_process,
+            "supports_worker_process": self.supports_worker_process,
+            "worker_recovery": owner.status() if owner is not None else {
+                "state": "stopped" if closed else "not_started",
+                "failure_reason": None, "start_attempts": 0,
+                "worker_owned": False, "lifecycle_alive": False,
+            },
+        }
+
+    def close(self, timeout=5.0) -> bool:
+        with self._inference_worker_lock:
+            self._worker_closed = True
+            owner = self._inference_worker
+        return owner is None or owner.close(timeout)
 
     def _get_model(self):
         if self._model is not None:
@@ -878,6 +850,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         class_aliases: Tuple[str, ...] = (),
         dynamic_class_metadata_keys: Tuple[str, ...] = (),
         use_worker_process: bool = True,
+        worker_retry_backoff_sec: float = 2.0,
     ) -> None:
         super().__init__(
             name=name,
@@ -888,6 +861,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
             image_size=image_size,
             max_detections=max_detections,
             use_worker_process=use_worker_process,
+            worker_retry_backoff_sec=worker_retry_backoff_sec,
         )
         self._configured_class_names = self._normalize_class_names(class_names) or (() if self._use_tensorrt else ("object",))
         self._dynamic_class_metadata_keys = tuple(
@@ -978,6 +952,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
                             "model_loaded": self._model is not None,
                             "worker_fallback_used": bool(self._worker_fallback_reason) and self._last_inference_execution == "in_process",
                             "worker_fallback_reason": self._worker_fallback_reason,
+                            **self._worker_status_metadata(),
                         }
                     )
             else:
@@ -996,6 +971,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
                             "model_loaded": self._model is not None,
                             "worker_fallback_used": bool(self._worker_fallback_reason) and self._last_inference_execution == "in_process",
                             "worker_fallback_reason": self._worker_fallback_reason,
+                            **self._worker_status_metadata(),
                         }
                     )
             first_result = results[0] if results else None
@@ -1045,6 +1021,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
                     "inference_execution": self._last_inference_execution,
                     "worker_fallback_used": bool(self._worker_fallback_reason) and self._last_inference_execution == "in_process",
                     "worker_fallback_reason": self._worker_fallback_reason,
+                    **self._worker_status_metadata(),
                 },
             )
 
@@ -1246,6 +1223,15 @@ class DetectorPipeline:
             raise ValueError("默认检测后端未注册。")
         # 类无关 NMS 后处理（杠杆二）；None 时 detect() 原样透传，行为与改动前一致。
         self._post_processor = post_processor
+
+    def close(self, timeout=5.0) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        complete = True
+        for backend in self._backends.values():
+            close = getattr(backend, "close", None)
+            if callable(close) and not close(timeout=max(0.0, deadline - time.monotonic())):
+                complete = False
+        return complete
 
     def list_backends(self) -> Tuple[DetectorBackendSpec, ...]:
         """返回当前所有已注册检测后端规范。"""

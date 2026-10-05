@@ -360,6 +360,59 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
             self.assertEqual(raised.exception.grpc_code, grpc.StatusCode.UNAVAILABLE)
             self.assertEqual(raised.exception.grpc_details, 'owner offline')
 
+    def test_unactivated_active_cloud_projects_actual_policy_without_target(self):
+        response = pb.MappingSessionState(success=True, active=True, phase='ACTIVE',
+            mapping_backend_kind='voxel', session_id='mapping-live', runtime_generation=17)
+        response.relocalization_policy_v2.CopyFrom(request_owner().to_proto(pb.RelocalizeRequest).assigned_cloud_v2.policy)
+        payload = module.GeometryRuntimeProvider._mapping_state_payload(response)
+        self.assertEqual(payload['activation_receipt_schema_version'], 0)
+        self.assertIsNone(payload['activation_receipt_v2'])
+        self.assertFalse(payload['relocalization_target_available'])
+        self.assertTrue(payload['active'])
+        self.assertEqual(payload['runtime_generation'], 17)
+        self.assertEqual(payload['relocalization_policy_v2'], relocalization_contract.current_assigned_relocalization_policy())
+        stub = FakeStub()
+        with self.assertRaises(ValueError):
+            client(stub).relocalize(activation_state=payload, request_id='reloc:exact',
+                logical_timeout_ms=30000, assigned_request_v2=request_owner())
+        self.assertEqual(stub.calls, [])
+
+    def test_unactivated_planar_diagnostics_preserve_real_generation_without_cloud_policy(self):
+        response = pb.MappingSessionState(active=True, phase='ACTIVE', mapping_backend_kind='slam_toolbox',
+            planar_mode='localization', runtime_generation=91, activation_receipt_disposition=pb.ACTIVATION_RECEIPT_DISPOSITION_RETIRED)
+        payload = module.GeometryRuntimeProvider._mapping_state_payload(response)
+        self.assertEqual(payload['runtime_generation'], 91)
+        self.assertEqual(payload['planar_mode'], 'localization')
+        self.assertEqual(payload['activation_receipt_disposition'], pb.ACTIVATION_RECEIPT_DISPOSITION_RETIRED)
+        self.assertIsNone(payload['relocalization_policy_v2'])
+        self.assertFalse(payload['relocalization_target_available'])
+        response.relocalization_policy_v2.CopyFrom(request_owner().to_proto(pb.RelocalizeRequest).assigned_cloud_v2.policy)
+        with self.assertRaisesRegex(ValueError, 'does not support'):
+            module.GeometryRuntimeProvider._mapping_state_payload(response)
+
+    def test_schema_zero_rejects_stale_claims_and_unknown_fields(self):
+        for mutate in (
+            lambda r: setattr(r, 'activation_request_id', 'old'),
+            lambda r: setattr(r, 'backend_generation', 9),
+            lambda r: setattr(r, 'activation_receipt_disposition', pb.ACTIVATION_RECEIPT_DISPOSITION_OUTCOME_UNKNOWN),
+            lambda r: setattr(r, 'relocalization_target_available', True),
+            lambda r: setattr(r, 'source_policy_sha256', b'old'),
+            lambda r: r.activation_receipt_v2.CopyFrom(mapping_state().activation_receipt_v2),
+        ):
+            response = pb.MappingSessionState(mapping_backend_kind='voxel')
+            mutate(response)
+            with self.assertRaisesRegex(ValueError, 'claims'):
+                module.GeometryRuntimeProvider._mapping_state_payload(response)
+        response = pb.MappingSessionState.FromString(b'\xa0\x06\x01')
+        with self.assertRaisesRegex(ValueError, 'unknown fields'):
+            module.GeometryRuntimeProvider._mapping_state_payload(response)
+        stub = FakeStub()
+        with self.assertRaisesRegex(ValueError, 'cannot claim'):
+            client(stub).relocalize(activation_state={'activation_receipt_schema_version': 0,
+                'relocalization_target_available': True, 'activation_identity_sha256': 'aa' * 32},
+                request_id='reloc:exact', logical_timeout_ms=30000)
+        self.assertEqual(stub.calls, [])
+
     def test_unsupported_versions_fail_before_rpc_or_projection(self):
         state = mapping_state()
         state.activation_receipt_schema_version = 3

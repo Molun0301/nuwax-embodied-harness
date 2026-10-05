@@ -5026,7 +5026,12 @@ mod preflight_only_contract {
         }
 
         pub(crate) fn decorate_current_state(&self, state: &mut crate::proto::MappingSessionState) {
-            let before = self.phase_snapshot();
+            self.decorate_current_state_after_snapshot(state, self.phase_snapshot());
+        }
+
+        fn decorate_current_state_after_snapshot(
+            &self, state: &mut crate::proto::MappingSessionState, before: (bool, u64, u64),
+        ) {
             let ledger = self.inner.ledger.lock();
             let record = ledger
                 .current
@@ -5037,7 +5042,7 @@ mod preflight_only_contract {
                 if let Some(record) = record {
                     self.apply_record(state, record, crate::proto::ActivationReceiptDisposition::Retired, false);
                 } else {
-                    self.apply_policy_identity(state);
+                    self.apply_no_activation_identity(state);
                 }
                 state.relocalization_target_available = false;
                 state.activation_receipt_disposition =
@@ -5045,7 +5050,7 @@ mod preflight_only_contract {
                 return;
             }
             let Some(record) = record else {
-                self.apply_policy_identity(state);
+                self.apply_no_activation_identity(state);
                 return;
             };
             let disposition = if after.0 || record.epoch != after.1 {
@@ -5078,6 +5083,36 @@ mod preflight_only_contract {
             let available =
                 !after.0 && record.epoch == after.1 && Self::sealed_target_available(record);
             self.apply_record(state, record, disposition, available);
+        }
+
+        fn apply_no_activation_identity(&self, state: &mut crate::proto::MappingSessionState) {
+            // A live mapping session need not have an installed activation.
+            // Preserve its diagnostics; never invent a receipt or legacy digest.
+            state.activation_receipt_schema_version = 0;
+            state.activation_receipt_disposition = crate::proto::ActivationReceiptDisposition::Unspecified as i32;
+            state.runtime_generation = self.runtime_generation();
+            state.backend_generation = 0;
+            state.activation_request_id.clear();
+            state.activation_request_identity_sha256.clear();
+            state.activation_identity_sha256.clear();
+            state.target_receipt_sha256.clear();
+            state.asset_manifest_sha256.clear();
+            state.asset_bundle_sha256.clear();
+            state.target_graph_sha256.clear();
+            state.target_kind.clear();
+            state.relocalization_target_available = false;
+            state.activation_receipt_v2 = None;
+            state.source_policy_version = 0;
+            state.source_policy_sha256.clear();
+            state.deadline_policy_version = 0;
+            state.deadline_policy_sha256.clear();
+            state.algorithm_options_version = 0;
+            state.algorithm_options_sha256.clear();
+            state.relocalization_policy_v2 = match state.mapping_backend_kind.as_str() {
+                "voxel" | "raytracing" => Some(
+                    crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire()),
+                _ => None,
+            };
         }
 
         fn apply_policy_identity(&self, state: &mut crate::proto::MappingSessionState) {
@@ -15249,6 +15284,69 @@ mod preflight_only_contract {
             assert!(state.algorithm_options_sha256.is_empty());
             assert!(state.target_graph_sha256.is_empty());
             assert!(!state.relocalization_target_available);
+        }
+
+        #[test]
+        fn no_record_projection_clears_stale_claims_and_preserves_active_session() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let mut state = activation_base_state();
+            state.mapping_backend_kind = "voxel".into();
+            let request = assigned_request(assigned_wire_request());
+            control.apply_request_key(&mut state, "stale", &ActivationRequestKey::Assigned(request.metadata().clone()));
+            state.activation_identity_sha256 = vec![7; 32];
+            state.source_policy_sha256 = vec![8; 32];
+            state.source_policy_version = 9;
+            state.backend_generation = 10;
+            state.relocalization_target_available = true;
+            control.decorate_current_state(&mut state);
+            assert_eq!(state.activation_receipt_schema_version, 0);
+            assert_eq!(state.activation_receipt_disposition, 0);
+            assert!(state.activation_receipt_v2.is_none());
+            assert!(state.activation_request_id.is_empty());
+            assert!(state.activation_identity_sha256.is_empty());
+            assert!(state.source_policy_sha256.is_empty());
+            assert_eq!(state.source_policy_version, 0);
+            assert_eq!(state.backend_generation, 0);
+            assert!(!state.relocalization_target_available);
+            assert_eq!(state.runtime_generation, 17);
+            assert_eq!(state.session_id, "session");
+            assert_eq!(state.phase, "ACTIVE");
+            assert!(state.active);
+            assert_eq!(state.relocalization_policy_v2, Some(
+                crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire()));
+        }
+
+        #[test]
+        fn no_record_projection_preserves_planar_diagnostics_without_cloud_policy() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let mut state = activation_base_state();
+            state.mapping_backend_kind = "slam_toolbox".into();
+            state.planar_mode = "localization".into();
+            state.relocalization_policy_v2 = Some(
+                crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire());
+            control.decorate_current_state(&mut state);
+            assert!(state.relocalization_policy_v2.is_none());
+            assert_eq!(state.planar_mode, "localization");
+            assert_eq!(state.mapping_backend_kind, "slam_toolbox");
+            assert!(state.active);
+            assert!(!state.relocalization_target_available);
+        }
+
+        #[test]
+        fn no_record_lifecycle_race_projects_retired_without_claiming_target() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let before = control.phase_snapshot();
+            assert!(control.retire_for_phase_a_first_closer(|| true));
+            let mut state = activation_base_state();
+            state.mapping_backend_kind = "raytracing".into();
+            control.decorate_current_state_after_snapshot(&mut state, before);
+            assert_eq!(state.activation_receipt_schema_version, 0);
+            assert_eq!(state.activation_receipt_disposition,
+                crate::proto::ActivationReceiptDisposition::Retired as i32);
+            assert!(state.activation_receipt_v2.is_none());
+            assert!(!state.relocalization_target_available);
+            assert!(state.relocalization_policy_v2.is_some());
+            assert!(state.source_policy_sha256.is_empty());
         }
 
         #[test]

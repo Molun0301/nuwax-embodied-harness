@@ -998,6 +998,12 @@ def _require_supported_activation_schema(state: Mapping[str, object]) -> None:
     version = state.get("activation_receipt_schema_version", 0)
     if type(version) is not int or version not in {0, 1, 2}:
         raise ValueError("unsupported activation receipt schema")
+    if version == 0:
+        claims = tuple(name for name in _LEGACY_ACTIVATION_IDENTITY_FIELDS if name != "planar_mode")
+        if (state.get("activation_receipt_v2") is not None or state.get("relocalization_target_available")
+                or state.get("activation_request_id") or state.get("backend_generation")
+                or any(state.get(name) for name in claims)):
+            raise ValueError("schema-0 activation state cannot claim an installed target")
 
 
 def _assigned_activation_receipt_payload(message) -> Dict[str, Any]:
@@ -1030,6 +1036,42 @@ def _assigned_activation_receipt_payload(message) -> Dict[str, Any]:
             "request": request, "activation": activation, "target": target,
         }).to_dict()
     return {"request": request, "activation": activation, "target": target}
+
+
+def _unactivated_mapping_state_payload(response, disposition: int, disposition_name: str) -> Dict[str, Any]:
+    """No activation record is not an idle mapping session or an installed target."""
+    if response.DESCRIPTOR.full_name != "nuwax.geometry.MappingSessionState":
+        raise ValueError("unactivated mapping state protobuf type differs")
+    clean = type(response)()
+    clean.CopyFrom(response)
+    clean.DiscardUnknownFields()
+    if clean.SerializeToString(deterministic=True) != response.SerializeToString(deterministic=True):
+        raise ValueError("unactivated mapping state contains unknown fields")
+    identity_fields = tuple(name for name in _LEGACY_ACTIVATION_IDENTITY_FIELDS if name != "planar_mode")
+    if (disposition not in {pb2.ACTIVATION_RECEIPT_DISPOSITION_UNSPECIFIED, pb2.ACTIVATION_RECEIPT_DISPOSITION_RETIRED}
+            or response.HasField("activation_receipt_v2")
+            or response.relocalization_target_available or response.activation_request_id
+            or response.backend_generation or any(getattr(response, name) for name in identity_fields)):
+        raise ValueError("schema-0 mapping state contains activation/target claims")
+    policy = None
+    if response.HasField("relocalization_policy_v2"):
+        if response.mapping_backend_kind not in {"voxel", "raytracing"}:
+            raise ValueError("unactivated backend does not support the cloud policy")
+        policy = _project_assigned_proto(response.relocalization_policy_v2, "policy")
+        if policy != current_assigned_relocalization_policy():
+            raise ValueError("unactivated mapping state policy parameters differ")
+    fields = (
+        "success", "phase", "message", "session_id", "map_name", "session_generation",
+        "revision", "active", "idempotent_replay", "legacy_checkpoint_reconstructed",
+        "mapping_backend_kind", "runtime_generation", "planar_mode",
+    )
+    payload = {name: getattr(response, name) for name in fields}
+    payload.update(activation_receipt_schema_version=0,
+        activation_receipt_disposition=disposition,
+        activation_receipt_disposition_name=disposition_name,
+        activation_receipt_v2=None, relocalization_policy_v2=policy,
+        relocalization_target_available=False, backend_generation=0, activation_request_id="")
+    return payload
 
 
 def _assigned_mapping_state_payload(response, disposition: int, disposition_name: str) -> Dict[str, Any]:
@@ -4724,6 +4766,8 @@ class GeometryRuntimeProvider:
             activation_disposition_name = "unknown"
         _require_supported_activation_schema({"activation_receipt_schema_version":
             int(getattr(response, "activation_receipt_schema_version", 0) or 0)})
+        if int(getattr(response, "activation_receipt_schema_version", 0) or 0) == 0:
+            return _unactivated_mapping_state_payload(response, activation_disposition, activation_disposition_name)
         if int(getattr(response, "activation_receipt_schema_version", 0) or 0) == 2:
             return _assigned_mapping_state_payload(response, activation_disposition, activation_disposition_name)
         has_field = getattr(response, "HasField", lambda name: False)

@@ -45,9 +45,20 @@ def _commit(value: Any) -> dict[str, Any]:
             'sequence': _integer(value['sequence'], 'commit sequence')}
 
 
+# Rust char::is_whitespace / str::trim uses Unicode White_Space. Python's
+# default str.strip also removes U+001C..U+001F, which Rust deliberately retains.
+_RUST_WHITE_SPACE = ('\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680'
+                     '\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a'
+                     '\u2028\u2029\u202f\u205f\u3000')
+
+
+def _rust_trim(value: str) -> str:
+    return value.strip(_RUST_WHITE_SPACE)
+
+
 def _source_session(value: Any) -> str:
     # Native checkpoint receipts impose no new session-length/alphabet cap.
-    if not isinstance(value, str) or not value or value != value.strip():
+    if not isinstance(value, str) or not value or value != _rust_trim(value):
         raise ValueError('source occupancy session is incomplete')
     return value
 
@@ -122,7 +133,7 @@ def _source_cloud_member(value: Any) -> dict[str, Any]:
     result = {'checkpoint_id': _assigned_id(value['checkpoint_id'], 'source checkpoint ID'), 'role': 'canonical_cloud',
               'occupancy_receipt': _occupancy(value['occupancy_receipt']),
               'cloud_receipt': _cloud(value['cloud_receipt']),
-              'frame_id': _text(value['frame_id'], 'source frame', 256),
+              'frame_id': _text(value['frame_id'], 'source frame', 1024),
               'frame_generation': _integer(value['frame_generation'], 'source frame generation', 0),
               'producer_generation': _integer(value['producer_generation'], 'source producer generation', 0)}
     if result['frame_generation'] or result['producer_generation']:

@@ -3395,7 +3395,7 @@ int main(int argc, char **argv) {
         } else return 12;
         if (block->data_length != 28 || memcmp(block->data, "NUWAXBL1", 8)) return 13;
     }
-    message.producer_runtime_generation += 1;
+    if (!message.has_fine_map) message.producer_runtime_generation += 1;
     int encoded_size = nuwax_msgs_NavigationMap3D_encoded_size(&message);
     unsigned char *encoded = malloc((size_t)encoded_size);
     if (!encoded || nuwax_msgs_NavigationMap3D_encode(encoded, 0, encoded_size, &message) != encoded_size) return 6;
@@ -3435,8 +3435,13 @@ int main(int argc, char **argv) {
             let mut parity = Command::new(&binary);
             parity.arg(&input).arg(&c_output);
             run(parity);
+            // Fine roots bind producer generation; retain exact bytes instead of
+            // independently mutating one half of that immutable identity.
+            if message.fine.is_some() {
+                assert_eq!(fs::read(&c_output).unwrap(), fs::read(&input).unwrap());
+            }
             let mut expected = message.clone();
-            expected.producer_runtime_generation += 1;
+            if expected.fine.is_none() { expected.producer_runtime_generation += 1; }
             assert_eq!(
                 decode_navigation_map_3d(&fs::read(&c_output).unwrap()).unwrap(),
                 expected
@@ -3477,7 +3482,8 @@ if message.has_fine_map:
         assert bytes(block.object_id) == bytes(16)
         assert bytes(block.legacy_alias) == bytes([0x72] * 32)
     assert bytes(block.data).startswith(b"NUWAXBL1")
-message.producer_runtime_generation += 1
+if not message.has_fine_map:
+    message.producer_runtime_generation += 1
 Path(sys.argv[3]).write_bytes(message.encode())
 "#,
                 ])
@@ -3486,7 +3492,7 @@ Path(sys.argv[3]).write_bytes(message.encode())
                 .arg(&py_output);
             run(python);
             let mut expected = message;
-            expected.producer_runtime_generation += 1;
+            if expected.fine.is_none() { expected.producer_runtime_generation += 1; }
             assert_eq!(
                 decode_navigation_map_3d(&fs::read(py_output).unwrap()).unwrap(),
                 expected

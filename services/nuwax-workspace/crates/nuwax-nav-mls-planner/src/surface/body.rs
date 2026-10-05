@@ -2680,6 +2680,138 @@ mod tests {
             pose, pose, &none, u64::MAX, 100, &[]));
     }
 
+    // Test-only full-footprint borrowed-block comparison; production lookup is unchanged.
+    fn measured_footprint_block_probe<const BORROWED:bool>(
+        map: &SurfaceSnapshot, pose: ([f64; 3], [f64; 4]),
+    ) -> Result<std::collections::BTreeSet<[i32; 3]>, SurfaceError> {
+        #[cfg(feature = "body-query-profile")] let _footprint_profile=query_profile::guard(QueryStage::ObservationFootprint);
+        let observations = map.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
+        if observations.size_m.to_bits() != map.source_voxel_size_m().to_bits() {
+            return Err(SurfaceError::InvalidConfig("观察精度与几何来源不一致".into()));
+        }
+        let mut block_probe=crate::surface::observations::BorrowedBlockProbe::new(observations);
+        let model = map.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        let centre = {
+            #[cfg(feature = "body-query-profile")] let _support_profile=query_profile::guard(QueryStage::ObservationFootprintSupport);
+            map.locate_support_from_body(pose.0, pose.1, model.body_to_support_z_m)?
+        };
+        #[cfg(feature = "body-query-profile")] let shape_profile=query_profile::guard(QueryStage::ObservationFootprintShape);
+        let r = rotation(pose.1)?;
+        let vertices: Vec<_> = model.footprint_xy_m.iter()
+            .flat_map(|p| model.z_bounds_m.map(|z| world(r, pose.0, [p[0], p[1], z])))
+            .collect();
+        let polygon = hull(vertices.iter().map(|p| [p[0], p[1]]).collect());
+        let size = f64::from(observations.size_m);
+        let planner_size = f64::from(map.config().voxel_size);
+        let min: [i32; 2] = std::array::from_fn(|i| (vertices.iter().map(|p| p[i]).fold(f64::INFINITY, f64::min) / size).floor() as i32);
+        let max: [i32; 2] = std::array::from_fn(|i| (vertices.iter().map(|p| p[i]).fold(f64::NEG_INFINITY, f64::max) / size).floor() as i32);
+        if (i64::from(max[0]) - i64::from(min[0]) + 1) * (i64::from(max[1]) - i64::from(min[1]) + 1) > 16_384 {
+            return Err(SurfaceError::InvalidConfig("近场精细支撑查询超过预算".into()));
+        }
+        let radius = model.radius() + model.z_bounds_m[0].abs().max(model.z_bounds_m[1].abs())
+            + model.body_to_support_z_m + planner_size * 2.0;
+        #[cfg(feature = "body-query-profile")] drop(shape_profile);
+        let patch = {
+            #[cfg(feature = "body-query-profile")] let _patch_profile=query_profile::guard(QueryStage::ObservationFootprintPatch);
+            map.ground_patch(centre, radius)
+        };
+        #[cfg(feature = "body-query-profile")] let cells_profile=query_profile::guard(QueryStage::ObservationFootprintCells);
+        let polygon_query=PolygonQuery::new(&polygon);
+        #[cfg(feature = "body-query-profile")] let mut height_counts=ObservationHeightCounts::default();
+        let mut cells = std::collections::BTreeSet::new();
+        for x in min[0]..=max[0] {
+            for y in min[1]..=max[1] {
+                if !polygon_query.intersects(x, y, size) { continue; }
+                let column = (((x as f64 + 0.5) * size / planner_size).floor() as i32,
+                    ((y as f64 + 0.5) * size / planner_size).floor() as i32);
+                let ground = *patch.get(&column).ok_or(SurfaceError::MissingSupport)?;
+                let height = map.cell_position(ground)[2];
+                // 粗格跨坡面/阶边时，低侧真实细格可以属于同列较低的占据粗格。
+                // 查询范围由一格内允许的坡差/阶差限制，并要求候选确在规范物理占据内。
+                // 始终先选实际最高回波再查时效，旧顶部不能被新低面替代。
+                let top = ((height / size).round() - 1.0) as i32;
+                let height_span = (planner_size * std::f64::consts::SQRT_2
+                    * f64::from(map.config().max_slope_deg).to_radians().tan())
+                    .max(model.max_step_up_m).max(model.max_step_down_m)
+                    + size + model.support_uncertainty_m;
+                let count = (height_span / size).ceil().min(128.0) as i32;
+                let bottom = top.saturating_sub(count);
+                #[cfg(feature = "body-query-profile")] {height_counts.columns+=1;}
+                let z = (bottom..=top).rev().find(|&z| {
+                    #[cfg(feature = "body-query-profile")] {height_counts.probes+=1;}
+                    if (if BORROWED{block_probe.get([x,y,z])}else{observations.get([x,y,z])}).is_none() {
+                        #[cfg(feature = "body-query-profile")] {height_counts.absent+=1;}
+                        return false;
+                    }
+                    let centre = (z as f64 + 0.5) * size;
+                    let coarse_z = (centre / planner_size).floor() as i32;
+                    map.data.occupied_columns.get(&column)
+                        .is_some_and(|zs| zs.binary_search(&coarse_z).is_ok())
+                }).unwrap_or(top);
+                cells.insert([x, y, z]);
+            }
+        }
+        #[cfg(feature = "body-query-profile")] drop(height_counts);
+        drop(polygon_query);
+        #[cfg(feature = "body-query-profile")] {
+            drop(cells_profile);
+            query_profile::add(QueryCounter::ObservationFootprintCellsBuilt,cells.len() as u64);
+        }
+        Ok(cells)
+    }
+
+    #[test]
+    fn full_footprint_block_probe_matches_direct_queries() {
+        let mut successes=0;let mut failures=0;
+        for size in [0.05,0.01] {for hole in [false,true] {
+            let map=polygon_footprint_fixture(size,hole);
+            for x in [-0.1,0.05,2.0] {for yaw in [0.0_f64,0.37,-1.1] {
+                let pose=([x,-0.05,0.5],[0.0,0.0,(yaw/2.0).sin(),(yaw/2.0).cos()]);
+                let old=map.body_observation_footprint(pose);
+                assert_eq!(measured_footprint_block_probe::<false>(&map,pose),old);
+                assert_eq!(measured_footprint_block_probe::<true>(&map,pose),old);
+                if old.is_ok(){successes+=1}else{failures+=1}
+                if let Ok(view)=map.with_current_body_support(pose.0,pose.1) {
+                    assert_eq!(measured_footprint_block_probe::<true>(&view,pose),view.body_observation_footprint(pose));
+                }
+            }}
+            let empty=map.with_observations(Some(Arc::new(SurfaceObservations::new(size,32).unwrap())));
+            let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+            assert_eq!(measured_footprint_block_probe::<true>(&empty,pose),empty.body_observation_footprint(pose));
+            let missing=map.with_observations(None);
+            assert_eq!(measured_footprint_block_probe::<true>(&missing,pose),missing.body_observation_footprint(pose));
+        }}
+        assert!(successes>=12&&failures>0);
+    }
+
+    #[test]
+    #[ignore="matched complete raw-footprint accessor prototype; production remains direct"]
+    fn benchmark_full_footprint_block_probe() {
+        use std::{hint::black_box,time::Instant};
+        for size in [0.05,0.01] {
+            let source=polygon_footprint_fixture(size,false);
+            for rounded in [false,true] {
+                let mut envelope=model();if rounded{envelope.footprint_xy_m=(0..24).map(|i|{let a=i as f64*std::f64::consts::TAU/24.0;[0.3*a.cos(),0.16*a.sin()]}).collect();}
+                let map=source.with_body_envelope(envelope).unwrap();
+                for yaw in [0.0_f64,0.37] {
+                    let pose=([0.05,0.05,0.5],[0.0,0.0,(yaw/2.0).sin(),(yaw/2.0).cos()]);
+                    let expected=map.body_observation_footprint(pose).unwrap();
+                    assert_eq!(measured_footprint_block_probe::<true>(&map,pose).unwrap(),expected);
+                    let mut direct_ms=Vec::new();let mut borrowed_ms=Vec::new();
+                    for round in 0..6 {for borrowed in if round%2==0{[false,true]}else{[true,false]} {
+                        let started=Instant::now();for _ in 0..30 {
+                            let map=black_box(&map);let pose=black_box(pose);
+                            let actual=if borrowed{measured_footprint_block_probe::<true>(map,pose)}else{measured_footprint_block_probe::<false>(map,pose)}.unwrap();
+                            assert_eq!(black_box(&actual),&expected);
+                        }
+                        let ms=started.elapsed().as_secs_f64()*1e3;if borrowed{borrowed_ms.push(ms)}else{direct_ms.push(ms)}
+                    }}
+                    eprintln!("FULL_FOOTPRINT_BLOCK_PROBE size={size} rounded={rounded} yaw={yaw} cells={} loops=30 warmed_by_parity=true includes=full_raw_footprint_equality_retirement direct_ms={direct_ms:?} borrowed_ms={borrowed_ms:?}",expected.len());
+                }
+            }
+        }
+    }
+
     // Test-only level-index work-count prototype; production selection remains unchanged.
     fn measured_footprint_level_selection<const INDEXED:bool,const TOP_FIRST:bool>(
         map: &SurfaceSnapshot, counters: &mut [u64;3], pose: ([f64; 3], [f64; 4]),

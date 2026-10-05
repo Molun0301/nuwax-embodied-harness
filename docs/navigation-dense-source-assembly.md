@@ -158,3 +158,39 @@ Unconditional indexed lookup clearly regresses the common first-hit cases. The t
 That measurement reaches the configured goal in 22.100 s with 326 nonzero receipts, .066780 m position error and .147417 rad yaw error; all actual-edge/receipt-tail oracles pass, with zero delivered negatives/dispatch expiry observations. The test remains **FAILED** on the original 50 ms step limit (median/p95/max 21.702/43.886/84.745 ms). All 112 full-coverage frames retain truthful acquisition times, and no frames drop. The 216 guard/receipt state mismatches retain the existing activation limitation. This mixed-profile instrumentation run is not a causal performance comparison with the previous run.
 
 `level-selection-counter-v1.log` verifies aggregate counts against the original counted scan for first-hit, missing and incompatible cases. `level-selection-mls-all-v1.log` passes 245 tests / 7 ignored, and `level-selection-feature-off-v1.log` passes the production default-feature library check. The next useful measurement is work that actually occurs in the footprint/evidence lookup or set construction, not optimization of absent probes in this flat fixture.
+
+## Borrowed block lookup screening (test-only)
+
+`SurfaceObservations::get` already takes no lock and clones no Arc. It computes the exact three-axis block key, looks up the immutable persistent block map, then queries the block's inner hash table. A test-only probe retains one full block key and a borrowed present/absent block for one immutable owner. It still performs the exact inner lookup. Nothing is cached across owner replacement, and production lookup remains unchanged at this checkpoint.
+
+The parity tests cover missing keys/blocks, retained old roots, membership replacement/deletion, separate exact-membership metadata refresh, negative and block-boundary coordinates, all three axes and block edges 1/3/31/32/128. `lookup-probe-parity-v1.log` retains a test-only ambiguous-integer compile error; the explicit i32 correction passes both tests in v2.
+
+The warmed component microbenchmark uses a 180,000-cell/190-block owner. Medians of five later alternating rounds in `lookup-set-micro-v1.log`, milliseconds per 100 sequences of 1,920 queries:
+
+| Query sequence | Direct get | Borrowed last block |
+|---|---:|---:|
+| Ordered rectangle | 7.823 | 4.735 |
+| Missing keys in existing blocks | 6.006 | 3.050 |
+| Missing blocks | 3.040 | 1.660 |
+| Alternating far blocks | 6.874 | 6.897 |
+
+The rectangle performs 120 root resolutions over six unique blocks per sequence; the alternating case performs 1,920. These are preflight counts; unused timed bookkeeping may be optimized away. Timings include value equality. Additional outer-only and preborrowed-inner kernels are retained in the raw log; they exclude preborrow setup and are not an additive decomposition. An absent preborrowed block makes the inner arm only an Option/branch check. Missing-key and missing-block timings cannot be subtracted to infer a hash-layer cost.
+
+A separate borrowed-key-sequence → set benchmark includes equality and retirement but excludes geometry/height selection. Rectangular 1,920-cell insertion versus collect medians are 8.787/11.349 ms per 100 builds; a 7,843-cell rounded sequence gives 49.225/46.566 ms. The rectangular regression argues against a blanket bulk-set change. Production Vec construction followed by into_iter().collect may have different allocation reuse than this slice benchmark; no set change is activated.
+
+The next matched test-only helper copies the entire current raw footprint method, substituting only the observation lookup. Its direct specialization agrees with the public method, and the borrowed specialization returns the same complete sets/errors (`lookup-full-parity-v1.log`). It retains local allocation, geometry, canonical physical-membership checks and retirement. Conditional current-view comparisons are preliminary: a genuinely derived view must be asserted before any production qualification.
+
+`lookup-full-micro-v1.log` records five-later-round medians per 30 complete raw calls:
+
+| Resolution / envelope / yaw | Direct | Borrowed |
+|---|---:|---:|
+| .05 m / rectangle / 0 | .632 | .579 |
+| .05 m / rectangle / .37 | .832 | .764 |
+| .05 m / 24 vertices / 0 | .513 | .526 |
+| .05 m / 24 vertices / .37 | .584 | .521 |
+| .01 m / rectangle / 0 | 20.028 | 17.440 |
+| .01 m / rectangle / .37 | 21.257 | 18.142 |
+| .01 m / 24 vertices / 0 | 11.090 | 9.941 |
+| .01 m / 24 vertices / .37 | 11.369 | 10.316 |
+
+The 5 cm rounded/yaw-zero median regresses about 2.5%. This full-method fixture uses its own smaller map owner, not the component benchmark's 180,000-cell owner. These static warmed MLS-opt3 results justify further qualification only; they do not establish live guard throughput or permit skipped evidence checks. `lookup-prototype-mls-all-v1.log` passes 248 tests / 9 ignored, and `lookup-prototype-feature-off-v1.log` passes the non-test runtime library check. Actual production lookup and set construction are unchanged.

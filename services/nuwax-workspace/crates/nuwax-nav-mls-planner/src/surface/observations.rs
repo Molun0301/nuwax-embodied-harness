@@ -182,9 +182,137 @@ impl SurfaceObservations {
     }
 }
 
+// Measurement-only borrowed lookup; production SurfaceObservations::get is unchanged.
+#[cfg(test)]
+pub(super) struct BorrowedBlockProbe<'a> {
+    owner:&'a SurfaceObservations,
+    last:Option<([i32;3],Option<&'a AHashMap<[i32;3],SurfaceObservation>>)>,
+    roots:u64,
+}
+#[cfg(test)]
+impl<'a> BorrowedBlockProbe<'a> {
+    pub(super) fn new(owner:&'a SurfaceObservations)->Self{Self{owner,last:None,roots:0}}
+    pub(super) fn get(&mut self,key:[i32;3])->Option<SurfaceObservation> {
+        let block=key.map(|v|v.div_euclid(self.owner.block_edge));
+        if self.last.as_ref().is_none_or(|(old,_)|*old!=block) {
+            self.roots+=1;
+            self.last=Some((block,self.owner.blocks.get(&block).map(|values|values.as_ref())));
+        }
+        self.last.as_ref().and_then(|(_,values)|*values).and_then(|values|values.get(&key)).copied()
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_block_probe_matches_owner_updates_and_missing_keys() {
+        let mut original=SurfaceObservations::new(0.01,32).unwrap();
+        for key in [[-33,-1,-1],[-32,0,0],[-1,31,31],[0,0,0],[0,0,1],[32,32,32]] {
+            let block=key.map(|v:i32|v.div_euclid(32));
+            let mut values=original.blocks.get(&block).map_or_else(BTreeMap::new,|old|old.iter().map(|(&k,&v)|(k,v)).collect());
+            values.insert(key,SurfaceObservation{observed_ns:(key[2]+40)as u64,hits:2});original.replace_block(block,values).unwrap();
+        }
+        let retained=original.clone();
+        let mut metadata_only=retained.clone();
+        let refreshed:BTreeMap<_,_>=retained.blocks.get(&[0,0,0]).unwrap().iter().map(|(&key,&evidence)|
+            (key,SurfaceObservation{observed_ns:evidence.observed_ns+1000,hits:evidence.hits+1})).collect();
+        metadata_only.replace_block([0,0,0],refreshed).unwrap();
+        original.replace_block([0,0,0],BTreeMap::from([([0,0,0],SurfaceObservation{observed_ns:999,hits:7})])).unwrap();
+        original.replace_block([-2,-1,-1],BTreeMap::new()).unwrap();
+        for owner in [&retained,&metadata_only,&original] {
+            let mut probe=BorrowedBlockProbe::new(owner);
+            for _ in 0..3 {for key in [[-33,-1,-1],[-32,0,0],[-1,31,31],[0,0,0],[0,0,1],[0,0,2],[32,32,32],[64,0,0],[64,1,0],[0,0,0]] {
+                assert_eq!(probe.get(key),owner.get(key));
+            }}
+        }
+        assert_ne!(retained.get([0,0,0]),metadata_only.get([0,0,0]));
+        assert_eq!(retained.blocks.get(&[0,0,0]).unwrap().len(),metadata_only.blocks.get(&[0,0,0]).unwrap().len());
+        assert_ne!(retained.get([0,0,0]),original.get([0,0,0]));
+        assert!(retained.get([-33,-1,-1]).is_some());assert!(original.get([-33,-1,-1]).is_none());
+    }
+
+    #[test]
+    fn borrowed_block_probe_uses_all_axes_and_non_power_of_two_edges() {
+        for edge in [1,3,31,32,128] {
+            let mut owner=SurfaceObservations::new(0.01,edge).unwrap();
+            let mut groups=BTreeMap::<_,BTreeMap<_,_>>::new();
+            let keys:Vec<[i32;3]>=[i32::MIN,-129,-33,-1,0,1,31,32,128,i32::MAX].into_iter().flat_map(|x|
+                [[x,0,0],[0,x,0],[0,0,x]]).collect();
+            for &key in &keys {groups.entry(key.map(|v|v.div_euclid(edge))).or_default().insert(key,
+                SurfaceObservation{observed_ns:123,hits:2});}
+            for (block,values) in groups {owner.replace_block(block,values).unwrap();}
+            let mut probe=BorrowedBlockProbe::new(&owner);
+            for key in keys.into_iter().chain([[7,7,7],[-7,-7,-7],[0,0,0]]) {
+                assert_eq!(probe.get(key),owner.get(key),"edge={edge} key={key:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore="static lookup/set-construction attribution; production lookup is unchanged"]
+    fn benchmark_observation_lookup_and_ordered_set_construction() {
+        use std::{hint::black_box,time::Instant};
+        let mut groups=BTreeMap::<_,BTreeMap<_,_>>::new();
+        for x in 0_i32..600 {for y in 0_i32..300 {let key=[x,y,9];groups.entry(key.map(|v:i32|v.div_euclid(32))).or_default()
+            .insert(key,SurfaceObservation{observed_ns:10_000_000_000,hits:2});}}
+        let mut owner=SurfaceObservations::new(0.01,32).unwrap();for (block,values) in groups{owner.replace_block(block,values).unwrap();}
+        let rectangle:Vec<_>=(50..110).flat_map(|x|(100..132).map(move|y|[x,y,9])).collect();
+        let absent_keys:Vec<_>=rectangle.iter().map(|k|[k[0],k[1],10]).collect();
+        let absent_blocks:Vec<_>=rectangle.iter().map(|k|[k[0],k[1],41]).collect();
+        let alternating:Vec<_>=(0..rectangle.len()).map(|i|if i%2==0{[50,100,9]}else{[550,250,9]}).collect();
+        for (label,keys) in [("ordered_rectangle",&rectangle),("missing_keys_present_blocks",&absent_keys),
+            ("missing_blocks",&absent_blocks),("alternating_far_blocks",&alternating)] {
+            let expected:Vec<_>=keys.iter().map(|&k|owner.get(k)).collect();
+            let mut probe=BorrowedBlockProbe::new(&owner);let actual:Vec<_>=keys.iter().map(|&k|probe.get(k)).collect();
+            assert_eq!(actual,expected);let roots=probe.roots;
+            let mut direct_ms=Vec::new();let mut borrowed_ms=Vec::new();
+            for round in 0..6 {for borrowed in if round%2==0{[false,true]}else{[true,false]} {
+                let started=Instant::now();
+                for _ in 0..100 {
+                    let mut probe=BorrowedBlockProbe::new(black_box(&owner));
+                    for (key,expected) in keys.iter().zip(&expected) {
+                        let actual=if borrowed{probe.get(black_box(*key))}else{black_box(&owner).get(black_box(*key))};
+                        assert_eq!(black_box(actual),*expected);
+                    }
+                }
+                let ms=started.elapsed().as_secs_f64()*1e3;if borrowed{borrowed_ms.push(ms)}else{direct_ms.push(ms)}
+            }}
+            eprintln!("OBSERVATION_LOOKUP label={label} cells={} owner_cells=180000 owner_blocks={} preflight_root_resolutions_per_sequence={roots} loops=100 timed_counter_retention_unqualified=true captures_immutable_owner=true includes=value_equality warmed=true direct_ms={direct_ms:?} borrowed_ms={borrowed_ms:?}",keys.len(),owner.blocks.len());
+            let preborrowed:Vec<_>=keys.iter().map(|key|owner.blocks.get(&key.map(|v|v.div_euclid(owner.block_edge)))).collect();
+            let expected_presence:Vec<_>=preborrowed.iter().map(|v|v.is_some()).collect();
+            let mut outer_ms=Vec::new();let mut inner_ms=Vec::new();
+            for round in 0..6 {for outer in if round%2==0{[false,true]}else{[true,false]} {
+                let started=Instant::now();
+                for _ in 0..100 {for (i,key) in keys.iter().enumerate() {
+                    if outer {
+                        let block=black_box(*key).map(|v|v.div_euclid(owner.block_edge));
+                        assert_eq!(black_box(owner.blocks.get(&block)).is_some(),expected_presence[i]);
+                    }else {
+                        let actual=black_box(preborrowed[i]).and_then(|block|block.get(black_box(key))).copied();
+                        assert_eq!(black_box(actual),expected[i]);
+                    }
+                }}
+                let ms=started.elapsed().as_secs_f64()*1e3;if outer{outer_ms.push(ms)}else{inner_ms.push(ms)}
+            }}
+            eprintln!("OBSERVATION_LOOKUP_COMPONENT label={label} loops=100 outer_includes=block_key_arithmetic_and_presence_equality inner_preborrows_blocks=true absent_block_inner_is_option_branch_only=true excludes=preborrow_setup components_are_not_additive=true outer_ms={outer_ms:?} inner_ms={inner_ms:?}");
+        }
+        for (label,keys) in [("rectangle",rectangle),("rounded_ordered",(0..100).flat_map(|x|(0..100).map(move|y|[x,y,9])).filter(|k|{let x=k[0]-50;let y=k[1]-50;x*x+y*y<=2500}).collect())] {
+            let expected:std::collections::BTreeSet<_>=keys.iter().copied().collect();
+            let mut insertion_ms=Vec::new();let mut bulk_ms=Vec::new();
+            for round in 0..6 {for bulk in if round%2==0{[false,true]}else{[true,false]} {
+                let started=Instant::now();for _ in 0..100 {
+                    let actual:std::collections::BTreeSet<_>=if bulk{black_box(&keys).iter().copied().collect()}
+                        else{let mut set=std::collections::BTreeSet::new();for &key in black_box(&keys){set.insert(key);}set};
+                    assert_eq!(black_box(&actual),&expected);
+                }
+                let ms=started.elapsed().as_secs_f64()*1e3;if bulk{bulk_ms.push(ms)}else{insertion_ms.push(ms)}
+            }}
+            eprintln!("OBSERVATION_SET_BUILD label={label} cells={} loops=100 includes=construction_equality_retirement excludes=source_selection bulk_may_allocate_temporary_vector=true insertion_ms={insertion_ms:?} bulk_ms={bulk_ms:?}",keys.len());
+        }
+    }
 
     // Original rebuilding path retained only as a differential oracle and matched benchmark.
     // Returns the number of column vectors rebuilt (including unchanged columns).

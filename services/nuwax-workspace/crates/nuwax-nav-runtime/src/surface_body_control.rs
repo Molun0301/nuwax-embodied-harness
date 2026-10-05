@@ -81,6 +81,15 @@ fn forward_straight_run(path: &Path3D, first: usize, last: usize, actual: Point3
     (target.x-actual.x)*direction.cos()+(target.y-actual.y)*direction.sin()>0.0
 }
 
+// Eligibility for omitting future straight-line progress advice only. The
+// actual command still passes the complete current-state guard. Check every
+// duplicate's height, not just endpoints that a same-XY scan can skip over.
+fn collinear_same_height_progress_run(path: &Path3D, first: usize, last: usize, actual: Point3) -> bool {
+    forward_straight_run(path,first,last,actual)
+        && path.poses[first-1..=last].iter()
+            .all(|pose|pose.pose.position.z==path.poses[first-1].pose.position.z)
+}
+
 fn tracking_error(preview:&[PlanarPose],segments:&[(PlanarPose,PlanarPose)],radius:f64)->Option<f64> {
     #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::TrackingReferenceProjection);
     if segments.is_empty() {return None;}
@@ -348,6 +357,12 @@ impl SurfaceFollower {
     // Proposed default under isolated validation: route intent remains advice;
     // the unchanged calibrated current-state guard authorizes each command.
     fn follow_body_step_policy<const REUSE_LOOKAHEAD: bool, const STRAIGHT_INTENT: bool, const ALIGN_STRAIGHT: bool, const TRANSLATION_INTENT: bool>(&mut self, robot_width: f64) -> PlannerStep {
+        self.follow_body_step_progress_policy::<REUSE_LOOKAHEAD,STRAIGHT_INTENT,ALIGN_STRAIGHT,TRANSLATION_INTENT,false>(robot_width)
+    }
+
+    // Default-off specialization keeps an exact reference for measured parity
+    // and barrier tests before selecting any progress-policy change.
+    fn follow_body_step_progress_policy<const REUSE_LOOKAHEAD: bool, const STRAIGHT_INTENT: bool, const ALIGN_STRAIGHT: bool, const TRANSLATION_INTENT: bool, const COLLINEAR_PROGRESS: bool>(&mut self, robot_width: f64) -> PlannerStep {
         // Scalar provenance for a rejected connector; no additional geometry
         // query or hot-path allocation is needed to diagnose the chosen target.
         let initial_path_index=self.path_index;
@@ -510,9 +525,13 @@ impl SurfaceFollower {
                         // 真实折角仍核对后继接续；每拍完整机体及制动检查负责实际运动许可。
                         let off_segment = ((position.x-target.pose.position.x)*outgoing[1]
                             - (position.y-target.pose.position.y)*outgoing[0]).abs();
+                        let collinear_progress_advice=COLLINEAR_PROGRESS && TRANSLATION_INTENT
+                            && self.config.motion_limits.is_some() && same_support && !curved
+                            && collinear_same_height_progress_run(path,self.path_index,turn_end+1,position);
                         if lengths > 1e-10 && (incoming[0] * outgoing[0] + incoming[1] * outgoing[1]
                             < lengths * 0.25_f64.cos()
-                            || !curved && off_segment > outgoing[0].hypot(outgoing[1]) * 1e-5) {
+                            || !curved && !collinear_progress_advice
+                                && off_segment > outgoing[0].hypot(outgoing[1]) * 1e-5) {
                             // 短平移可能是绕过墙角所必需，只有接续可行才提前消费折点。
                             // 从实际站姿沿地形推进，不能借路径拟合的横滚/俯仰取得接续许可。
                             safe_to_skip = translation_connects(map,body(pose),next);

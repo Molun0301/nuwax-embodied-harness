@@ -1894,3 +1894,390 @@ fn measured_collinear_progress_at_captured_entry() {
             if sample==0 {"cold_checkpoint"}else{"exact_input_warm"},follower.path_index,follower.progress_m,wall.as_secs_f64()*1000.0);
     }
 }
+
+#[test]
+#[ignore = "cold independent-owner comparison of collinear progress advice"]
+fn measured_collinear_progress_cold_old_new() {
+    use crate::control_profile::{self,Counter,Stage};
+    let mut outputs=Vec::new();
+    for enabled in [false,true] {
+        let mut follower=checkpoint();
+        control_profile::begin();
+        let started=Instant::now();
+        follower.refresh_current_body_view();
+        let result=if enabled {follower.follow_body_step_progress_policy::<true,true,true,true,true>(0.32)}
+            else {follower.follow_body_step_progress_policy::<true,true,true,true,false>(0.32)};
+        let wall=started.elapsed();
+        let record=control_profile::end();
+        let stages:Vec<_>=Stage::ALL.into_iter().map(|stage|(stage.label(),record.wall_nanos[stage as usize]as f64/1e6,record.calls[stage as usize])).collect();
+        let counters:Vec<_>=Counter::ALL.into_iter().map(|counter|(counter.label(),record.counters[counter as usize])).collect();
+        eprintln!("COLLINEAR_COLD_COMPARISON enabled={enabled} independent_source=true wall_ms={} result={result:?} index={} progress={} target={:?} stages={stages:?} counters={counters:?}",wall.as_secs_f64()*1000.0,follower.path_index,follower.progress_m,follower.control_target);
+        assert!(matches!(result,PlannerStep::Command(v) if v.linear.x>0.0));
+        outputs.push((result,follower.path_index,follower.progress_m,follower.control_target,record));
+    }
+    assert_eq!(outputs[0].0,outputs[1].0);
+    assert_eq!(outputs[0].1,outputs[1].1);
+    assert_eq!(outputs[0].2.to_bits(),outputs[1].2.to_bits());
+    assert_eq!(outputs[0].3,outputs[1].3);
+    assert_eq!(outputs[0].4.calls[Stage::TranslationConnector as usize],15);
+    assert_eq!(outputs[1].4.calls[Stage::TranslationConnector as usize],0);
+    assert_eq!(outputs[0].4.counters[Counter::ConnectionSubsteps as usize],268);
+    assert_eq!(outputs[1].4.counters[Counter::ConnectionSubsteps as usize],0);
+    assert_eq!(outputs[0].4.counters[Counter::MotionMemoMisses as usize],outputs[1].4.counters[Counter::MotionMemoMisses as usize]);
+}
+
+// Collinear waypoint-progress advice is deliberately compared to its pre-change
+// specialization. Every follower/map below is constructed independently: a warm
+// clone would hide both connector work and accidental cache-state dependence.
+fn cpp_profile_step<const COLLINEAR: bool, const TRANSLATION: bool>(
+    follower: &mut SurfaceFollower,
+    width: f64,
+) -> (PlannerStep, crate::control_profile::Record) {
+    crate::control_profile::begin();
+    follower.refresh_current_body_view();
+    let result = follower.follow_body_step_progress_policy::<true, true, true, TRANSLATION, COLLINEAR>(width);
+    let record = crate::control_profile::end();
+    (result, record)
+}
+
+fn cpp_assert_same_step(
+    label: &str,
+    old: &SurfaceFollower,
+    new: &SurfaceFollower,
+    old_result: &PlannerStep,
+    new_result: &PlannerStep,
+) {
+    assert_eq!(format!("{old_result:?}"), format!("{new_result:?}"), "{label}: outcome/command changed");
+    assert_eq!(old.path_index, new.path_index, "{label}: waypoint progress changed");
+    assert_eq!(old.progress_m.to_bits(), new.progress_m.to_bits(), "{label}: distance progress changed");
+    assert_eq!(old.control_target, new.control_target, "{label}: advice target changed");
+    assert_eq!(old.alignment_target_index, new.alignment_target_index, "{label}: alignment state changed");
+    assert_eq!(old.last_command, new.last_command, "{label}: applied-command record changed");
+    assert_eq!(old.braking_deadline.is_some(), new.braking_deadline.is_some(), "{label}: braking state changed");
+    assert_eq!(old.simulation_braking_deadline_ns, new.simulation_braking_deadline_ns, "{label}: simulated braking state changed");
+}
+
+#[test]
+fn collinear_progress_cold_captured_entry_preserves_command_and_reduces_actual_connectors() {
+    use crate::control_profile::{Counter, Stage};
+    let mut old = checkpoint();
+    let mut new = checkpoint();
+    assert!(!Arc::ptr_eq(old.map.as_ref().unwrap(), new.map.as_ref().unwrap()),
+        "the differential test requires independent cold query caches");
+    assert_eq!(bits(body(old.odometry.as_ref().unwrap())), CURRENT);
+    assert_eq!(bits(body(new.odometry.as_ref().unwrap())), CURRENT);
+    assert_eq!(old.path_index, INITIAL_INDEX);
+    assert_eq!(new.path_index, INITIAL_INDEX);
+    assert_eq!(old.progress_m.to_bits(), INITIAL_PROGRESS_BITS);
+    assert_eq!(new.progress_m.to_bits(), INITIAL_PROGRESS_BITS);
+    let old_start = Instant::now();
+    let (old_result, old_record) = cpp_profile_step::<false, true>(&mut old, 0.32);
+    let old_wall = old_start.elapsed();
+    let new_start = Instant::now();
+    let (new_result, new_record) = cpp_profile_step::<true, true>(&mut new, 0.32);
+    let new_wall = new_start.elapsed();
+    cpp_assert_same_step("cold captured entry", &old, &new, &old_result, &new_result);
+    let PlannerStep::Command(command) = new_result else { panic!("{new_result:?}"); };
+    assert!(command.linear.x > 0.0 && command.linear.y == 0.0,
+        "an unchanged stop/rejection is not a positive checkpoint result: {command:?}");
+    assert!(new.path_index > INITIAL_INDEX, "the waypoint progress branch must be exercised");
+    for stage in [Stage::TranslationConnector, Stage::ConnectionEndpoint, Stage::ConnectorProjection] {
+        assert!(old_record.calls[stage as usize] > 0, "baseline did not exercise {}", stage.label());
+        assert!(new_record.calls[stage as usize] < old_record.calls[stage as usize],
+            "{} did not reduce: old={} new={}", stage.label(),
+            old_record.calls[stage as usize], new_record.calls[stage as usize]);
+    }
+    assert!(new_record.counters[Counter::ConnectionSubsteps as usize]
+        < old_record.counters[Counter::ConnectionSubsteps as usize]);
+    assert!(new_record.counters[Counter::BodyProjectionCalls as usize]
+        < old_record.counters[Counter::BodyProjectionCalls as usize]);
+    // Removing route-advice work must not remove calibrated command selection or
+    // the actual geometric/observation/braking proof on the chosen command.
+    for stage in [Stage::GuardSetup, Stage::CandidateRankingSweeps,
+        Stage::GuardProjection, Stage::GuardGeometrySweep] {
+        assert!(new_record.calls[stage as usize] > 0, "guard stage {} did not run", stage.label());
+        assert_eq!(old_record.calls[stage as usize], new_record.calls[stage as usize],
+            "guard stage {} changed", stage.label());
+    }
+    for counter in [Counter::CandidateEligibility, Counter::TrackingScores,
+        Counter::MotionMemoHits, Counter::MotionMemoMisses] {
+        assert_eq!(old_record.counters[counter as usize], new_record.counters[counter as usize],
+            "guard counter {} changed", counter.label());
+    }
+    let a = APPLIED.map(f64::from_bits);
+    let applied = Twist2 { linear: Point2::new(a[0], a[1]), angular_z: a[2] };
+    let (safe, why) = tga_prove_command(&new, applied, command);
+    assert!(safe, "unchanged checkpoint command failed full current-state stopping proof: {why:?}");
+    let stages: Vec<_> = [Stage::TranslationConnector, Stage::ConnectionEndpoint,
+        Stage::ConnectorProjection, Stage::WaypointProgress].into_iter().map(|stage|
+            (stage.label(), old_record.calls[stage as usize], new_record.calls[stage as usize],
+             old_record.wall_nanos[stage as usize] as f64 / 1e6,
+             new_record.wall_nanos[stage as usize] as f64 / 1e6)).collect();
+    eprintln!("COLLINEAR_PROGRESS_COLD_PARITY old_ms={} new_ms={} command={command:?} index={} progress={} target={:?} stage_old_new_calls_and_ms={stages:?} old_projection_calls={} new_projection_calls={}",
+        old_wall.as_secs_f64()*1000.0, new_wall.as_secs_f64()*1000.0,
+        new.path_index, new.progress_m, new.control_target,
+        old_record.counters[Counter::BodyProjectionCalls as usize],
+        new_record.counters[Counter::BodyProjectionCalls as usize]);
+}
+
+#[test]
+fn collinear_progress_scalar_eligibility_keeps_all_samples_and_station_barriers() {
+    let actual = Point3::new(1.0, 0.57, 0.4);
+    let base = vec![tga_pose(1.0,0.55,0.0), tga_pose(1.01,0.55,0.0),
+        tga_pose(1.01,0.55,0.0), tga_pose(1.3,0.55,0.0)];
+    let eligible = |poses: Vec<PoseStamped>, first, last, point| {
+        collinear_same_height_progress_run(&Path3D { poses }, first, last, point)
+    };
+    assert!(eligible(base.clone(), 1, 3, actual),
+        "same-position, same-height, same-yaw duplicates retain straight forward intent");
+    for (label, poses, first, last, point) in [
+        ("first has no predecessor", base.clone(), 0, 3, actual),
+        ("last before first", base.clone(), 2, 1, actual),
+        ("last out of range", base.clone(), 1, 4, actual),
+        ("first is a duplicate", base.clone(), 2, 3, actual),
+        ("next at actual station", base.clone(), 1, 3, Point3::new(1.3,0.57,0.4)),
+        ("next behind actual station", base.clone(), 1, 3, Point3::new(1.31,0.57,0.4)),
+    ] {
+        assert!(!eligible(poses, first, last, point), "{label}");
+    }
+    let mut variants = Vec::new();
+    let mut corner = base.clone(); corner[3].pose.position.y = 0.8;
+    variants.push(("genuine corner", corner));
+    let mut shallow_bend = base.clone(); shallow_bend[3].pose.position.y += 0.0001;
+    variants.push(("shallow non-collinear bend below the corner threshold", shallow_bend));
+    let mut reversal = base.clone(); reversal[3].pose.position.x = 0.9;
+    variants.push(("reversal", reversal));
+    let mut curve = base.clone(); curve[1].pose.orientation = Quaternion::from_yaw(0.1);
+    variants.push(("curved incoming sample", curve));
+    let mut yaw = base.clone(); yaw[3].pose.orientation = Quaternion::from_yaw(0.1);
+    variants.push(("outgoing yaw change", yaw));
+    let mut pivot = base.clone(); pivot[2].pose.orientation = Quaternion::from_yaw(0.1);
+    variants.push(("same-position explicit turn", pivot));
+    let mut layer = base.clone(); layer[3].pose.position.z = 0.5;
+    variants.push(("outgoing layer change", layer));
+    let mut previous_layer = base.clone(); previous_layer[0].pose.position.z = 0.5;
+    variants.push(("predecessor layer change", previous_layer));
+    let mut duplicate_layer = base.clone(); duplicate_layer[2].pose.position.z = 0.5;
+    // The run's first and last height are identical. Only examining the whole
+    // closed sample interval detects this intermediate same-XY vertical step.
+    assert_eq!(duplicate_layer[0].pose.position.z, duplicate_layer[3].pose.position.z);
+    assert_eq!(duplicate_layer[1].pose.position.x, duplicate_layer[2].pose.position.x);
+    assert_eq!(duplicate_layer[1].pose.position.y, duplicate_layer[2].pose.position.y);
+    variants.push(("intermediate vertical duplicate", duplicate_layer));
+    for (label, poses) in variants {
+        assert!(!eligible(poses, 1, 3, actual), "{label}");
+    }
+}
+
+fn cpp_reached_follower(poses: Vec<PoseStamped>, actual: PoseStamped) -> SurfaceFollower {
+    let mut follower = tga_follower(tga_map(false, false), poses, false);
+    follower.update_odometry(actual);
+    follower.observe_applied_command(Twist2 { linear: Point2::new(0.1, 0.0), angular_z: 0.0 });
+    follower
+}
+
+#[test]
+fn collinear_progress_preserves_reached_corner_yaw_layer_and_station_exclusions() {
+    use crate::control_profile::{Counter, Stage};
+    let actual = tga_pose(1.0, 0.57, 0.0);
+    let mut outgoing_layer = vec![tga_pose(1.0,0.55,0.0), tga_pose(1.01,0.55,0.0),
+        tga_pose(1.3,0.55,0.0)];
+    outgoing_layer[2].pose.position.z = 0.5;
+    let mut vertical_duplicate = vec![tga_pose(1.0,0.55,0.0), tga_pose(1.01,0.55,0.0),
+        tga_pose(1.01,0.55,0.0), tga_pose(1.3,0.55,0.0)];
+    vertical_duplicate[2].pose.position.z = 0.5;
+    let cases = vec![
+        ("genuine corner", vec![tga_pose(1.0,0.55,0.0), tga_pose(1.01,0.55,0.0),
+            tga_pose(1.01,0.85,0.0)], actual.clone()),
+        ("shallow non-collinear bend", vec![tga_pose(1.0,0.55,0.0), tga_pose(1.01,0.55,0.0),
+            tga_pose(1.3,0.5501,0.0)], actual.clone()),
+        ("outgoing yaw change", vec![tga_pose(1.0,0.55,0.0), tga_pose(1.01,0.55,0.0),
+            tga_pose(1.3,0.55,0.1)], actual.clone()),
+        ("outgoing layer change", outgoing_layer, actual.clone()),
+        ("intermediate vertical duplicate", vertical_duplicate, actual),
+        // Keep the goal outside its original 3-cm tolerance. Otherwise this
+        // fixture would return Succeeded before evaluating waypoint progress.
+        ("next at actual station", vec![tga_pose(1.0,0.55,0.0), tga_pose(1.01,0.55,0.0),
+            tga_pose(1.02,0.55,0.0)], tga_pose(1.02,0.59,0.0)),
+        ("next behind actual station", vec![tga_pose(1.0,0.55,0.0), tga_pose(1.01,0.55,0.0),
+            tga_pose(1.02,0.55,0.0)], tga_pose(1.03,0.59,0.0)),
+    ];
+    for (label, poses, actual) in cases {
+        let mut old = cpp_reached_follower(poses.clone(), actual.clone());
+        let mut new = cpp_reached_follower(poses, actual);
+        let initial = old.path_index;
+        assert_eq!(initial, 1);
+        let (old_result, old_record) = cpp_profile_step::<false, true>(&mut old, 0.3);
+        let (new_result, new_record) = cpp_profile_step::<true, true>(&mut new, 0.3);
+        cpp_assert_same_step(label, &old, &new, &old_result, &new_result);
+        assert!(old.path_index > initial,
+            "{label}: fixture failed to exercise a reached waypoint: {old_result:?}");
+        // A positive call count is essential here. Parity of two zeros would
+        // not establish preservation of the connector branch under test.
+        for stage in [Stage::TranslationConnector, Stage::ConnectionEndpoint, Stage::ConnectorProjection] {
+            assert!(old_record.calls[stage as usize] > 0,
+                "{label}: baseline never exercised {}", stage.label());
+            assert_eq!(old_record.calls[stage as usize], new_record.calls[stage as usize],
+                "{label}: excluded advice removed {}", stage.label());
+        }
+        for counter in [Counter::ConnectionSubsteps, Counter::BodyProjectionCalls,
+            Counter::CandidateEligibility, Counter::MotionMemoMisses] {
+            assert_eq!(old_record.counters[counter as usize], new_record.counters[counter as usize],
+                "{label}: excluded advice changed {}", counter.label());
+        }
+        eprintln!("COLLINEAR_PROGRESS_EXCLUSION label={label} outcome={new_result:?} index={} progress={} translation_calls={} endpoint_calls={} connection_substeps={}",
+            new.path_index, new.progress_m,
+            new_record.calls[Stage::TranslationConnector as usize],
+            new_record.calls[Stage::ConnectionEndpoint as usize],
+            new_record.counters[Counter::ConnectionSubsteps as usize]);
+    }
+}
+
+#[test]
+fn collinear_progress_preserves_curved_midpoint_consumption() {
+    use crate::control_profile::Stage;
+    let poses = vec![tga_pose(1.0,0.55,0.0), tga_pose(1.01,0.55,0.1),
+        tga_pose(1.3,0.55,0.1)];
+    let actual = tga_pose(1.008,0.565,0.08);
+    assert!(!collinear_same_height_progress_run(&Path3D { poses: poses.clone() },
+        1, 2, actual.pose.position));
+    let mut old = cpp_reached_follower(poses.clone(), actual.clone());
+    let mut new = cpp_reached_follower(poses, actual);
+    let (old_result, old_record) = cpp_profile_step::<false, true>(&mut old, 0.3);
+    let (new_result, new_record) = cpp_profile_step::<true, true>(&mut new, 0.3);
+    cpp_assert_same_step("curved midpoint", &old, &new, &old_result, &new_result);
+    assert_eq!(new.path_index, 2, "the genuine curved midpoint must be consumed");
+    assert_eq!(new.progress_m.to_bits(), new.cumulative[1].to_bits());
+    // This curve deliberately does not require a corner connector. The progress
+    // assertions above, rather than equality of zero connector counts, prove
+    // that curved midpoint handling was reached and preserved.
+    assert_eq!(old_record.calls[Stage::WaypointProgress as usize], 1);
+    assert_eq!(new_record.calls[Stage::WaypointProgress as usize], 1);
+    assert_eq!(old_record.calls, new_record.calls);
+    assert_eq!(old_record.counters, new_record.counters);
+}
+
+#[test]
+fn collinear_progress_keeps_flat_duplicates_and_reduces_only_advice_queries() {
+    use crate::control_profile::{Counter, Stage};
+    let poses = vec![tga_pose(1.0,0.55,0.0), tga_pose(1.01,0.55,0.0),
+        tga_pose(1.01,0.55,0.0), tga_pose(1.3,0.55,0.0)];
+    let actual = tga_pose(1.0,0.57,0.0);
+    let mut old = cpp_reached_follower(poses.clone(), actual.clone());
+    let mut new = cpp_reached_follower(poses, actual);
+    let (old_result, old_record) = cpp_profile_step::<false, true>(&mut old, 0.3);
+    let (new_result, new_record) = cpp_profile_step::<true, true>(&mut new, 0.3);
+    cpp_assert_same_step("flat duplicate", &old, &new, &old_result, &new_result);
+    assert_eq!(new.path_index, 3, "the duplicate must preserve ordinary progress");
+    assert_eq!(new.progress_m.to_bits(), new.cumulative[2].to_bits());
+    assert!(old_record.calls[Stage::TranslationConnector as usize] > 0);
+    assert_eq!(new_record.calls[Stage::TranslationConnector as usize], 0);
+    assert!(new_record.counters[Counter::ConnectionSubsteps as usize]
+        < old_record.counters[Counter::ConnectionSubsteps as usize]);
+    let PlannerStep::Command(command) = new_result else { panic!("{new_result:?}"); };
+    assert!(command.linear.x > 0.0, "an all-stop duplicate fixture is not a positive control");
+    let applied = Twist2 { linear: Point2::new(0.1,0.0), angular_z: 0.0 };
+    let (safe, why) = tga_prove_command(&new, applied, command);
+    assert!(safe, "duplicate progress lost the full current-state stopping guard: {why:?}");
+}
+
+#[test]
+fn collinear_progress_requires_translation_policy_and_full_motion_calibration() {
+    use crate::control_profile::Stage;
+    let poses = vec![tga_pose(1.0,0.55,0.0), tga_pose(1.01,0.55,0.0), tga_pose(1.3,0.55,0.0)];
+    let actual = tga_pose(1.0,0.57,0.0);
+    // Disable only TRANSLATION_INTENT. Straight-route intent remains enabled,
+    // so it cannot accidentally satisfy the narrower progress-policy gate.
+    let mut old = cpp_reached_follower(poses.clone(), actual.clone());
+    let mut new = cpp_reached_follower(poses.clone(), actual.clone());
+    let (old_result, old_record) = cpp_profile_step::<false, false>(&mut old, 0.3);
+    let (new_result, new_record) = cpp_profile_step::<true, false>(&mut new, 0.3);
+    cpp_assert_same_step("translation policy disabled", &old, &new, &old_result, &new_result);
+    assert!(old.path_index > 1);
+    assert!(old_record.calls[Stage::TranslationConnector as usize] > 0);
+    assert_eq!(old_record.calls, new_record.calls);
+    assert_eq!(old_record.counters, new_record.counters);
+
+    let mut old = cpp_reached_follower(poses.clone(), actual.clone());
+    let mut new = cpp_reached_follower(poses, actual);
+    for follower in [&mut old, &mut new] {
+        let limits = follower.config.motion_limits.take().unwrap();
+        follower.config.basic_kinematics = Some(limits.kinematics());
+    }
+    let (old_result, old_record) = cpp_profile_step::<false, true>(&mut old, 0.3);
+    let (new_result, new_record) = cpp_profile_step::<true, true>(&mut new, 0.3);
+    cpp_assert_same_step("full calibration absent", &old, &new, &old_result, &new_result);
+    assert!(old.path_index > 1);
+    assert!(old_record.calls[Stage::TranslationConnector as usize] > 0);
+    assert_eq!(old_record.calls, new_record.calls);
+    assert_eq!(old_record.counters, new_record.counters);
+}
+
+#[test]
+fn collinear_progress_preserves_one_centimetre_pivot_predecessor_checks() {
+    use crate::control_profile::{Counter, Stage};
+    let poses = vec![tga_pose(1.0,0.55,0.0), tga_pose(1.01,0.55,0.0),
+        tga_pose(1.01,0.55,0.35), tga_pose(1.3,0.65,0.35)];
+    let mut old = tga_follower(tga_map(false, false), poses.clone(), false);
+    let mut new = tga_follower(tga_map(false, false), poses, false);
+    assert_eq!(old.last_command, Twist2::ZERO);
+    assert_eq!(new.last_command, Twist2::ZERO);
+    assert!((horizontal_distance(&new.path.as_ref().unwrap().poses[0],
+        &new.path.as_ref().unwrap().poses[1]) - 0.01).abs() < 1e-12);
+    assert!(is_rotation(&new.path.as_ref().unwrap().poses[1], &new.path.as_ref().unwrap().poses[2]));
+    let (old_result, old_record) = cpp_profile_step::<false, true>(&mut old, 0.3);
+    let (new_result, new_record) = cpp_profile_step::<true, true>(&mut new, 0.3);
+    cpp_assert_same_step("one-centimetre pivot predecessor", &old, &new, &old_result, &new_result);
+    // On clear floor the has_turn branch really proves the turn at the actual
+    // station before consuming its 1-cm predecessor. The unfinished rotation
+    // remains the selected waypoint. This does not claim the obstacle-specific
+    // case where that 1-cm translation is required to make a turn possible.
+    assert_eq!(new.path_index, 2);
+    assert_eq!(new.progress_m.to_bits(), new.cumulative[1].to_bits());
+    assert!(old_record.calls[Stage::ConnectionEndpoint as usize] > 0,
+        "has_turn must actually prove a rotation before the predecessor is consumed");
+    assert!(old_record.counters[Counter::ConnectionSubsteps as usize] > 0);
+    assert_eq!(old_record.calls, new_record.calls);
+    assert_eq!(old_record.counters, new_record.counters);
+    let PlannerStep::Command(command) = new_result else { panic!("{new_result:?}"); };
+    assert_eq!(command.linear, Point2::new(0.0,0.0));
+    assert!(command.angular_z > 0.0, "unfinished explicit turn was lost: {command:?}");
+    assert!((new.control_target.unwrap().yaw - 0.35).abs() < 1e-12);
+    let (safe, why) = tga_prove_command(&new, Twist2::ZERO, command);
+    assert!(safe, "pivot lost the full current-state stopping guard: {why:?}");
+}
+
+#[test]
+fn collinear_progress_requires_the_actual_and_target_support_to_match() {
+    use crate::control_profile::Stage;
+    let poses = vec![tga_pose(1.0,0.55,0.0), tga_pose(1.01,0.55,0.0), tga_pose(1.3,0.55,0.0)];
+    let actual = tga_pose(1.01,0.57,0.0);
+    let mut old = cpp_reached_follower(poses.clone(), actual.clone());
+    let mut new = cpp_reached_follower(poses, actual);
+    for follower in [&mut old, &mut new] {
+        // Model stale uniform-height route metadata after admission, without
+        // changing the actual body, source geometry, limits, or any guard. The
+        // old and new routes remain strictly collinear and internally level;
+        // only their requested support layer is absent at the actual station.
+        for pose in &mut follower.path.as_mut().unwrap().poses {
+            pose.pose.position.z = 0.51;
+        }
+        follower.refresh_current_body_view();
+        let map = follower.map.as_ref().unwrap();
+        let actual = follower.odometry.as_ref().unwrap();
+        let target = &follower.path.as_ref().unwrap().poses[1];
+        assert!(map.locate_support_from_body(body(actual).0, body(actual).1,
+            follower.config.body_to_support_z_m).is_ok());
+        assert!(map.locate_goal_support_from_body(body(target).0, body(actual).1,
+            follower.config.body_to_support_z_m).is_err(), "fixture must have no matching target support");
+        assert!(collinear_same_height_progress_run(follower.path.as_ref().unwrap(),
+            1, 2, actual.pose.position), "the scalar straight/height gate must independently pass");
+    }
+    let (old_result, old_record) = cpp_profile_step::<false, true>(&mut old, 0.3);
+    let (new_result, new_record) = cpp_profile_step::<true, true>(&mut new, 0.3);
+    cpp_assert_same_step("target support unavailable", &old, &new, &old_result, &new_result);
+    assert!(old.path_index > 1, "existing passed-waypoint semantics must reach the connector branch");
+    assert!(old_record.calls[Stage::TranslationConnector as usize] > 0);
+    assert_eq!(old_record.calls, new_record.calls);
+    assert_eq!(old_record.counters, new_record.counters);
+}

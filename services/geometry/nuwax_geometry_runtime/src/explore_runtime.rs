@@ -7,6 +7,10 @@
 
 #![allow(dead_code)]
 
+#[cfg(test)]
+#[path = "explore_attribution.rs"]
+mod attribution;
+
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -1860,6 +1864,8 @@ impl OrphanCancellationRegistry {
 
 #[derive(Clone)]
 pub struct ExploreRuntimeHandle {
+    #[cfg(test)]
+    attribution: Option<Arc<attribution::Attribution>>,
     inner: Arc<Mutex<ExploreRuntimeInner>>,
     expected_map_frame: Arc<str>,
     readiness_cache: Arc<SyncMutex<ExplorationReadinessDetail>>,
@@ -2121,6 +2127,8 @@ impl ExploreRuntimeHandle {
         let (frontier_tx, _) = watch::channel(FrontierSnapshot::default());
         Self {
             inner: Arc::new(Mutex::new(ExploreRuntimeInner::new())),
+            #[cfg(test)]
+            attribution: None,
             expected_map_frame,
             readiness_cache: Arc::new(SyncMutex::new(ExplorationReadinessDetail {
                 ready: false,
@@ -3365,11 +3373,19 @@ impl ExploreRuntimeHandle {
             && guard.next_return_route_check.is_none_or(|deadline| Instant::now() >= deadline)
         {
             let progress = guard.mission.clone().expect("进度已存在");
-            let routes = guard.mission_routes();
+            let routes = {
+                #[cfg(test)]
+                let _span = self.attribution.as_ref().map(|p| p.begin(attribution::Stage::LockedRoutePreparation, if guard.surface_mode.is_some() { 0 } else { guard.costmap_input.as_ref().map_or(0, |m| m.grid.cells.len() * std::mem::size_of::<OccupancyCell>()) }));
+                guard.mission_routes()
+            };
             guard.next_return_route_check = Some(Instant::now() + Duration::from_secs(1));
             drop(guard);
+            #[cfg(test)]
+            let route_span = self.attribution.as_ref().map(|p| p.begin(attribution::Stage::UnlockedRouteQueries, 0));
             let query = routes.and_then(|routes| routes.distance(&mission_pose(&pose), &progress.home))
                 .and_then(|homeward| mission_policy.should_return(progress.travelled_m, homeward));
+            #[cfg(test)]
+            drop(route_span);
             guard = self.inner.lock().await;
             if generation != guard.generation || !guard.controller.is_active()
                 || guard.pending_child_cancellation.is_some()
@@ -3430,6 +3446,8 @@ impl ExploreRuntimeHandle {
             }
             None
         } else {
+            #[cfg(test)]
+            let _span = self.attribution.as_ref().map(|p| p.begin(attribution::Stage::RuntimeGridClone, guard.costmap_input.as_ref().map_or(0, |m| m.grid.cells.len() * std::mem::size_of::<OccupancyCell>())));
             guard.costmap_input.clone()
         };
         if !surface_mode && costmap.is_none() {
@@ -3544,11 +3562,15 @@ impl ExploreRuntimeHandle {
             },
         );
         state.global_costmap = costmap.as_ref().map(|costmap| &costmap.grid);
+        #[cfg(test)]
+        let selection_span = self.attribution.as_ref().map(|p| p.begin(attribution::Stage::LockedSelection, 0));
         let selection_started=Instant::now();
         let mut poll_result = if guard.mission.as_ref().is_some_and(|p|p.returning) {
             Ok(ExplorationPoll::Pending)
         }else{guard.controller.poll_next_goal_with_deferred_stop(&state,mission_policy.enabled())};
         let selection_ms=selection_started.elapsed().as_secs_f64()*1000.0;
+        #[cfg(test)]
+        drop(selection_span);
         if selection_ms>50.0 {tracing::warn!(selection_ms,"探索目标计算超过50毫秒");}
         let diagnostics = guard.controller.diagnostics();
         guard.last_selected_source = diagnostics.selected_source.unwrap_or_else(|| {
@@ -3567,10 +3589,16 @@ impl ExploreRuntimeHandle {
             let returning=progress.returning || natural && mission_policy.return_on_completion;
             if returning || candidate.is_some() {
                 let start=mission_pose(&pose);
-                let routes=guard.mission_routes();
+                let routes={
+                    #[cfg(test)]
+                    let _span = self.attribution.as_ref().map(|p| p.begin(attribution::Stage::LockedRoutePreparation, if guard.surface_mode.is_some() { 0 } else { guard.costmap_input.as_ref().map_or(0, |m| m.grid.cells.len() * std::mem::size_of::<OccupancyCell>()) }));
+                    guard.mission_routes()
+                };
                 let parent_id=guard.last_request_id.clone();
                 // 有界真实路线查询不持探索锁；取消仍可立即撤销原父任务。
                 drop(guard);
+                #[cfg(test)]
+                let route_span = self.attribution.as_ref().map(|p| p.begin(attribution::Stage::UnlockedRouteQueries, 0));
                 let query=(|| {
                     let routes=routes?;
                     let homeward=routes.distance(&start,&progress.home)?;
@@ -3580,6 +3608,8 @@ impl ExploreRuntimeHandle {
                     }else{Ok(false)};
                     Ok::<_,String>((homeward,can_visit))
                 })();
+                #[cfg(test)]
+                drop(route_span);
                 guard=self.inner.lock().await;
                 if generation!=guard.generation || !guard.controller.is_active() || guard.last_request_id!=parent_id {
                     return self.snapshot();
@@ -5107,6 +5137,8 @@ pub struct ControllerDiagnosticsView {
 
 #[cfg(test)]
 mod tests {
+    mod scheduler_attribution { include!("explore_scheduler_attribution_tests.rs"); }
+
     use super::*;
     use nuwax_nav_types_messages::geometry::Point2;
     use std::borrow::Cow;

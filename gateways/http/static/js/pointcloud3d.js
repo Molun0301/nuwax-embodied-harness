@@ -427,6 +427,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._robotPose = null;
     this._frontiers = [];
     this._forbiddenZones = [];
+    this._forbiddenZoneResources = [];
+    this._forbiddenZoneRenderState = null;
     this._forbiddenZoneMapName = null;
     this._forbiddenZoneGeneration = 0;
     this._trajectory = [];
@@ -1934,6 +1936,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
       else if (object.material) materials.add(object.material);
     });
     this._forbiddenZoneGroup.clear();
+    this._forbiddenZoneResources = [];
+    this._forbiddenZoneRenderState = null;
     geometries.forEach((geometry) => geometry.dispose?.());
     materials.forEach((material) => material.dispose?.());
   }
@@ -2056,6 +2060,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     mesh.position.set(position?.x || 0, position?.y || 0, outside ? 0.012 : 0.018);
     mesh.renderOrder = outside ? 1 : 2;
     this._forbiddenZoneGroup.add(mesh);
+    return mesh;
   }
 
   _addForbiddenBoundary(zone) {
@@ -2065,6 +2070,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     const edgeCount = closed ? vertices.length : vertices.length - 1;
     const width = THREE.MathUtils.clamp(Number(zone.stroke_width_m) || 0.25, 0.02, 5);
     const height = Math.max(0.22, Math.min(0.7, width * 1.5));
+    const walls = [];
     const material = new THREE.MeshBasicMaterial({
       color: zone.enabled === false
         ? COLORS.forbiddenDisabled
@@ -2088,22 +2094,107 @@ class PointCloud3DViewer extends PointCloudProcessor {
       wall.rotation.z = Math.atan2(dy, dx);
       wall.renderOrder = 3;
       this._forbiddenZoneGroup.add(wall);
+      walls.push(wall);
     }
+    if (!walls.length) material.dispose();
+    return walls;
+  }
+
+  _disposeForbiddenObjects(objects) {
+    const materials = new Set();
+    for (const object of objects) {
+      if (!object) continue;
+      object.removeFromParent();
+      object.geometry?.dispose();
+      if (object.material) materials.add(object.material);
+    }
+    for (const material of materials) material.dispose();
+  }
+
+  _sameForbiddenZone(left, right) {
+    return left.shape === right.shape && left.mode === right.mode
+      && left.enabled === right.enabled && left.stroke_width_m === right.stroke_width_m
+      && left.radius_m === right.radius_m && left.center?.x === right.center?.x
+      && left.center?.y === right.center?.y && left.vertices.length === right.vertices.length
+      && left.vertices.every((point, index) => point.x === right.vertices[index].x && point.y === right.vertices[index].y);
   }
 
   _rebuildForbiddenZones() {
     if (!this._forbiddenZoneGroup) return;
-    this._clearForbiddenZones();
     const zones = this._forbiddenZones;
-    const maskBounds = this._forbiddenMaskBounds(zones);
-    for (const zone of zones.filter((item) => item.mode === 'outside')) {
-      this._addForbiddenSurface(zone, maskBounds);
-      this._addForbiddenBoundary(zone);
+    const hasOutsideSurface = zones.some(zone => zone.mode === 'outside' && zone.enabled !== false && zone.shape !== 'line');
+    const bounds = hasOutsideSurface ? this._forbiddenMaskBounds(zones) : null;
+    const previous = this._forbiddenZoneRenderState;
+    const sameOwner = previous?.mapName === this._forbiddenZoneMapName;
+    const sameBounds = previous && ['minX', 'maxX', 'minY', 'maxY'].every(key => previous.bounds?.[key] === bounds?.[key]);
+    if (sameOwner && previous.generation === this._forbiddenZoneGeneration
+        && previous.zones === zones && sameBounds) return;
+
+    // IDs are explicit ownership, not content hashes. Duplicate/empty IDs retain
+    // occurrence order so legacy accepted envelopes cannot lose any zones.
+    const available = new Map();
+    for (const record of this._forbiddenZoneResources) {
+      if (!sameOwner) {
+        this._disposeForbiddenObjects([record.surface, ...record.walls]);
+        continue;
+      }
+      let records = available.get(record.zone.id);
+      if (!records) available.set(record.zone.id, records = []);
+      records.push(record);
     }
-    for (const zone of zones.filter((item) => item.mode !== 'outside')) {
-      this._addForbiddenSurface(zone, maskBounds);
-      this._addForbiddenBoundary(zone);
+    const next = [];
+    const ordered = [...zones.filter(zone => zone.mode === 'outside'), ...zones.filter(zone => zone.mode !== 'outside')];
+    for (const zone of ordered) {
+      let record = available.get(zone.id)?.shift();
+      if (record && !this._sameForbiddenZone(record.zone, zone)) {
+        this._disposeForbiddenObjects([record.surface, ...record.walls]);
+        record = null;
+      }
+      if (!record) {
+        record = { zone, surface: this._addForbiddenSurface(zone, bounds), walls: this._addForbiddenBoundary(zone) };
+      } else if (!sameBounds && zone.mode === 'outside' && zone.enabled !== false && zone.shape !== 'line') {
+        this._disposeForbiddenObjects([record.surface]);
+        record.surface = this._addForbiddenSurface(zone, bounds);
+      }
+      record.zone = zone;
+      next.push(record);
     }
+    for (const records of available.values()) for (const record of records) {
+      this._disposeForbiddenObjects([record.surface, ...record.walls]);
+    }
+    // Three's transparent sort breaks equal-depth ties with immutable Object3D
+    // IDs, not child order. A partial edit/reorder can invert those ties. Only
+    // then replace lightweight wrappers within that renderOrder cohort; keep
+    // geometry/material ownership in the records and never dispose on rewrap.
+    const cohorts = new Map();
+    for (const record of next) {
+      const entries = [{ record, index: null, object: record.surface },
+        ...record.walls.map((object, index) => ({ record, index, object }))];
+      for (const entry of entries) if (entry.object) {
+        let cohort = cohorts.get(entry.object.renderOrder);
+        if (!cohort) cohorts.set(entry.object.renderOrder, cohort = []);
+        cohort.push(entry);
+      }
+    }
+    for (const cohort of cohorts.values()) {
+      if (!cohort.some((entry, index) => index && cohort[index - 1].object.id > entry.object.id)) continue;
+      for (const { record, index, object } of cohort) {
+        const replacement = new THREE.Mesh(object.geometry, object.material).copy(object, false);
+        object.removeFromParent();
+        this._forbiddenZoneGroup.add(replacement);
+        if (index === null) record.surface = replacement;
+        else record.walls[index] = replacement;
+      }
+    }
+    // Reorder existing children without remove/add churn on bounds-only updates.
+    const order = new Map();
+    for (const record of next) for (const object of [record.surface, ...record.walls]) {
+      if (object) order.set(object, order.size);
+    }
+    this._forbiddenZoneGroup.children.sort((left, right) => order.get(left) - order.get(right));
+    this._forbiddenZoneResources = next;
+    this._forbiddenZoneRenderState = { mapName: this._forbiddenZoneMapName,
+      generation: this._forbiddenZoneGeneration, zones, bounds };
     this._requestRender();
   }
 

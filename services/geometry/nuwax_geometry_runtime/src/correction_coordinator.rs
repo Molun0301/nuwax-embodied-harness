@@ -5081,6 +5081,7 @@ mod preflight_only_contract {
         }
 
         fn apply_policy_identity(&self, state: &mut crate::proto::MappingSessionState) {
+            state.relocalization_policy_v2 = None;
             state.activation_receipt_schema_version = ACTIVATION_RECEIPT_SCHEMA_VERSION_V1;
             state.runtime_generation = self.inner.runtime_generation;
             state.source_policy_version = RELOCALIZATION_SOURCE_POLICY_VERSION;
@@ -5122,6 +5123,9 @@ mod preflight_only_contract {
                     state.deadline_policy_sha256.clear();
                     state.algorithm_options_version = 0;
                     state.algorithm_options_sha256.clear();
+                    state.relocalization_policy_v2 = Some(
+                        crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire(),
+                    );
                     state.activation_receipt_v2 = Some(crate::proto::ActivationReceiptV2 {
                         request: Some(crate::activation_contract::request_to_wire(request)),
                         activation: None,
@@ -15245,6 +15249,23 @@ mod preflight_only_contract {
             assert!(state.algorithm_options_sha256.is_empty());
             assert!(state.target_graph_sha256.is_empty());
             assert!(!state.relocalization_target_available);
+        }
+
+        #[test]
+        fn assigned_policy_projection_is_exact_without_opening_availability() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let request = assigned_request(assigned_wire_request());
+            let mut state = activation_base_state();
+            control.apply_request_key(&mut state, "activate-1",
+                &ActivationRequestKey::Assigned(request.metadata().clone()));
+            assert_assigned_wire_has_no_legacy_digests(&state);
+            assert_eq!(state.relocalization_policy_v2, Some(
+                crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire()));
+            assert!(!state.relocalization_target_available);
+            control.apply_request_key(&mut state, "legacy-1", &ActivationRequestKey::LegacyDigest([7; 32]));
+            assert!(state.relocalization_policy_v2.is_none());
+            assert!(state.activation_receipt_v2.is_none());
+            assert_eq!(state.activation_receipt_schema_version, 1);
         }
 
         #[test]

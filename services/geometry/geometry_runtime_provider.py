@@ -33,6 +33,18 @@ from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.maps import OccupancyGrid
 from contracts.navigation import NavigationGoal, NavigationState, NavigationStatus
+from contracts.map_activation import (
+    AssignedActivationReceipt,
+    _request as _admit_assigned_activation_request,
+    _activation as _admit_assigned_activation_identity,
+)
+from contracts.map_relocalization import (
+    AssignedRelocalizationRequest,
+    AssignedRelocalizationTerminal,
+    AssignedRelocalizationQuery,
+    current_assigned_relocalization_policy,
+    _project_proto as _project_assigned_proto,
+)
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
 from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
 from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
@@ -970,6 +982,171 @@ def _canonical_relocalization_request_id(
     ):
         raise ValueError("request_id must be canonical ASCII [A-Za-z0-9._:-]")
     return resolved
+
+
+_LEGACY_ACTIVATION_IDENTITY_FIELDS = (
+    "activation_request_identity_sha256", "activation_identity_sha256",
+    "target_receipt_sha256", "asset_manifest_sha256", "asset_bundle_sha256",
+    "source_policy_version", "source_policy_sha256", "deadline_policy_version",
+    "deadline_policy_sha256", "algorithm_options_version", "algorithm_options_sha256",
+    "target_graph_sha256", "planar_mode", "target_kind",
+)
+
+
+def _require_supported_activation_schema(state: Mapping[str, object]) -> None:
+    # Schema 0 is the existing pre-receipt/idle diagnostic compatibility shape.
+    version = state.get("activation_receipt_schema_version", 0)
+    if type(version) is not int or version not in {0, 1, 2}:
+        raise ValueError("unsupported activation receipt schema")
+
+
+def _assigned_activation_receipt_payload(message) -> Dict[str, Any]:
+    """按实际字段存在性投影；失败/退休回执不能补造成完整目标。"""
+    if message.DESCRIPTOR.full_name != "nuwax.geometry.ActivationReceiptV2":
+        raise ValueError("assigned activation receipt protobuf type differs")
+    clean = type(message)()
+    clean.CopyFrom(message)
+    clean.DiscardUnknownFields()
+    if clean.SerializeToString(deterministic=True) != message.SerializeToString(deterministic=True):
+        raise ValueError("assigned activation receipt contains unknown fields")
+    if not message.HasField("request"):
+        raise ValueError("assigned activation receipt omitted its request")
+    request = _admit_assigned_activation_request(
+        _project_assigned_proto(message.request, "activation_request")
+    )
+    activation = None
+    if message.HasField("activation"):
+        activation = _admit_assigned_activation_identity(
+            _project_assigned_proto(message.activation, "activation")
+        )
+        if activation["request"] != request:
+            raise ValueError("assigned activation and request differ")
+    target = None
+    if message.HasField("target"):
+        if activation is None:
+            raise ValueError("assigned target omitted its installed activation")
+        target = _project_assigned_proto(message.target, "target")
+        return AssignedActivationReceipt.admit({
+            "request": request, "activation": activation, "target": target,
+        }).to_dict()
+    return {"request": request, "activation": activation, "target": target}
+
+
+def _assigned_mapping_state_payload(response, disposition: int, disposition_name: str) -> Dict[str, Any]:
+    if response.DESCRIPTOR.full_name != "nuwax.geometry.MappingSessionState":
+        raise ValueError("assigned mapping state protobuf type differs")
+    clean = type(response)()
+    clean.CopyFrom(response)
+    clean.DiscardUnknownFields()
+    if clean.SerializeToString(deterministic=True) != response.SerializeToString(deterministic=True):
+        raise ValueError("assigned mapping state contains unknown fields")
+    if not response.HasField("activation_receipt_v2"):
+        raise ValueError("assigned mapping state omitted activation receipt")
+    if disposition not in {1, 2, 3, 5, 6, 7, 8, 9}:
+        raise ValueError("assigned activation disposition is unsupported")
+    if any(getattr(response, name) for name in _LEGACY_ACTIVATION_IDENTITY_FIELDS):
+        raise ValueError("assigned mapping state mixes legacy/planar identity")
+    receipt = _assigned_activation_receipt_payload(response.activation_receipt_v2)
+    sealed = disposition in {2, 3}
+    if sealed and receipt["target"] is None:
+        raise ValueError("sealed assigned activation omitted its complete target receipt")
+    if response.relocalization_target_available and (not sealed or receipt["target"] is None):
+        raise ValueError("partial/nonsealed assigned activation cannot expose an available target")
+    policy = None
+    if response.HasField("relocalization_policy_v2"):
+        policy = _project_assigned_proto(response.relocalization_policy_v2, "policy")
+        if policy != current_assigned_relocalization_policy():
+            raise ValueError("assigned mapping state policy parameters differ")
+    if sealed:
+        activation = receipt["activation"]
+        request = receipt["request"]
+        expected = {
+            "activation_request_id": request["activation_request_id"],
+            "session_id": request["session_id"], "map_name": request["map_name"],
+            "runtime_generation": activation["runtime_generation"],
+            "session_generation": activation["session_generation"],
+            "backend_generation": activation["backend_generation"],
+            "mapping_backend_kind": activation["backend_kind"],
+        }
+        if any(getattr(response, name) != value for name, value in expected.items()):
+            raise ValueError("sealed assigned mapping state and receipt ownership differ")
+    fields = (
+        "success", "phase", "message", "session_id", "map_name", "session_generation",
+        "revision", "active", "idempotent_replay", "legacy_checkpoint_reconstructed",
+        "mapping_backend_kind", "runtime_generation", "backend_generation", "activation_request_id",
+        "relocalization_target_available",
+    )
+    result = {name: getattr(response, name) for name in fields}
+    result.update(
+        activation_receipt_schema_version=2,
+        activation_receipt_disposition=disposition,
+        activation_receipt_disposition_name=disposition_name,
+        activation_receipt_v2=receipt,
+        relocalization_policy_v2=policy,
+    )
+    return result
+
+
+def _assigned_request_for_rpc(
+    *, activation_state: Mapping[str, object], assigned_request_v2,
+    request_id: Optional[str], logical_timeout_ms: int, query_only: bool,
+) -> AssignedRelocalizationRequest:
+    """查询必须使用持久化精确请求；不从旧 SHA 或缺失别名重建身份。"""
+    if assigned_request_v2 is not None:
+        request = (
+            assigned_request_v2 if isinstance(assigned_request_v2, AssignedRelocalizationRequest)
+            else AssignedRelocalizationRequest.from_dict(assigned_request_v2)
+        )
+        if request_id is not None and request_id != request.request_id:
+            raise ValueError("assigned request alias differs from durable request")
+        if type(logical_timeout_ms) is not int or logical_timeout_ms != request.logical_timeout_ms:
+            raise ValueError("assigned timeout differs from normalized durable request")
+    elif query_only:
+        raise ValueError("assigned terminal query requires the whole normalized durable request")
+    else:
+        receipt = AssignedActivationReceipt.admit(activation_state.get("activation_receipt_v2"))
+        policy = activation_state.get("relocalization_policy_v2")
+        if policy is None:
+            raise ValueError("assigned activation omitted relocalization_policy_v2")
+        request = AssignedRelocalizationRequest.admit({
+            "schema_version": 2,
+            "request_id": _canonical_relocalization_request_id(request_id, generate_if_missing=True),
+            "assigned_cloud_v2": {"target": receipt.to_dict()["target"],
+                                  "policy": policy, "logical_timeout_ms": logical_timeout_ms},
+        })
+    if not query_only:
+        if any(activation_state.get(name) for name in
+               _LEGACY_ACTIVATION_IDENTITY_FIELDS + ("cloud_source_sha256",)):
+            raise ValueError("assigned activation state mixes legacy/planar identity")
+        if activation_state.get("activation_receipt_schema_version") != 2:
+            raise ValueError("assigned request requires an assigned activation state")
+        receipt = AssignedActivationReceipt.admit(activation_state.get("activation_receipt_v2"))
+        if not request.activation_receipt.exact_replay_of(receipt):
+            raise ValueError("assigned request target differs from activation receipt")
+        policy = activation_state.get("relocalization_policy_v2")
+        if policy is None:
+            raise ValueError("assigned activation omitted relocalization_policy_v2")
+        if policy != request.to_dict()["assigned_cloud_v2"]["policy"]:
+            raise ValueError("assigned request policy differs from activation state")
+        if activation_state.get("activation_receipt_disposition") not in {2, 3}:
+            raise ValueError("assigned relocalization requires a sealed activation")
+        if activation_state.get("relocalization_target_available") is not True:
+            raise RuntimeError("当前激活地图没有可用的重定位目标回执。")
+    return request
+
+
+def _assigned_terminal_payload(terminal: AssignedRelocalizationTerminal) -> Dict[str, Any]:
+    payload = terminal.to_dict()
+    body = payload["assigned_cloud_v2"]
+    payload.update(
+        success=terminal.disposition in _RELOCALIZE_SUCCESS_DISPOSITIONS,
+        disposition=terminal.disposition,
+        disposition_name=pb2.RelocalizeDisposition.Name(terminal.disposition)
+            .removeprefix("RELOCALIZE_DISPOSITION_").lower(),
+        correction_revision=terminal.correction_revision,
+        detail=body["detail"],
+    )
+    return payload
 
 
 def _canonical_relocalize_request_sha256(request) -> bytes:
@@ -4545,6 +4722,13 @@ class GeometryRuntimeProvider:
             activation_disposition_name = activation_disposition_name.lower()
         except ValueError:
             activation_disposition_name = "unknown"
+        _require_supported_activation_schema({"activation_receipt_schema_version":
+            int(getattr(response, "activation_receipt_schema_version", 0) or 0)})
+        if int(getattr(response, "activation_receipt_schema_version", 0) or 0) == 2:
+            return _assigned_mapping_state_payload(response, activation_disposition, activation_disposition_name)
+        has_field = getattr(response, "HasField", lambda name: False)
+        if has_field("activation_receipt_v2") or has_field("relocalization_policy_v2"):
+            raise ValueError("legacy mapping state contains assigned metadata")
         return {
             "planar_mode": str(getattr(response, "planar_mode", "") or ""),
             "target_kind": str(getattr(response, "target_kind", "") or ""),
@@ -4622,6 +4806,12 @@ class GeometryRuntimeProvider:
 
     @staticmethod
     def _relocalize_result_payload(response) -> Dict[str, Any]:
+        if int(getattr(response, "schema_version", 0) or 0) not in {1, 2}:
+            raise ValueError("unsupported relocalization result schema")
+        if int(getattr(response, "schema_version", 0) or 0) == 2:
+            return _assigned_terminal_payload(AssignedRelocalizationTerminal.from_proto(response))
+        if getattr(response, "HasField", lambda name: False)("assigned_cloud_v2"):
+            raise ValueError("legacy relocalization result contains assigned metadata")
         disposition = int(getattr(response, "disposition", 0) or 0)
         try:
             disposition_name = pb2.RelocalizeDisposition.Name(disposition)
@@ -5811,6 +6001,7 @@ class GeometryRuntimeProvider:
         request_id: Optional[str] = None,
         logical_timeout_ms: int = 10_000,
         planar_seed: Optional[Tuple[float, float, float]] = None,
+        assigned_request_v2: Optional[Mapping[str, object] | AssignedRelocalizationRequest] = None,
     ) -> Dict[str, Any]:
         self._raise_if_stopping("relocalize")
         if not self._connected or not self._stub:
@@ -5820,6 +6011,25 @@ class GeometryRuntimeProvider:
             raise RuntimeError("Geometry runtime 不支持 Relocalize RPC。")
 
         state = dict(activation_state or {})
+        _require_supported_activation_schema(state)
+        if assigned_request_v2 is not None or state.get("activation_receipt_schema_version") == 2:
+            if planar_seed is not None:
+                raise ValueError("assigned cloud relocalization does not accept a planar seed")
+            assigned = _assigned_request_for_rpc(
+                activation_state=state, assigned_request_v2=assigned_request_v2,
+                request_id=request_id, logical_timeout_ms=logical_timeout_ms, query_only=False,
+            )
+            request = assigned.to_proto(pb2.RelocalizeRequest)
+            try:
+                response = rpc(request, timeout=max(_heavy_deadline_sec(), assigned.logical_timeout_ms / 1000.0 + 1.0))
+            except grpc.RpcError as exc:
+                raise GeometryRuntimeRpcError.from_rpc_error("Relocalize", exc) from exc
+            terminal = AssignedRelocalizationTerminal.from_proto(response)
+            if not assigned.exact_replay_of(terminal.request):
+                raise ValueError("assigned terminal belongs to a different exact request")
+            return _assigned_terminal_payload(terminal)
+        if state.get("activation_receipt_v2") is not None or state.get("relocalization_policy_v2") is not None:
+            raise ValueError("legacy activation state contains assigned metadata")
         resolved_request_id = _canonical_relocalization_request_id(
             request_id, generate_if_missing=True
         )
@@ -5898,6 +6108,8 @@ class GeometryRuntimeProvider:
             )
         except grpc.RpcError as exc:
             raise GeometryRuntimeRpcError.from_rpc_error("Relocalize", exc) from exc
+        if response.schema_version != 1 or response.HasField("assigned_cloud_v2"):
+            raise ValueError("legacy relocalization received a different identity schema")
         payload = self._relocalize_result_payload(response)
         if request.target_kind == "planar_graph":
             payload["planar_seed"] = list(values)
@@ -5910,6 +6122,7 @@ class GeometryRuntimeProvider:
         request_id: str,
         logical_timeout_ms: int,
         planar_seed: Optional[Tuple[float, float, float]] = None,
+        assigned_request_v2: Optional[Mapping[str, object] | AssignedRelocalizationRequest] = None,
     ) -> Dict[str, Any]:
         """只读查询已存在 request 的权威终态，不创建或推进请求。"""
 
@@ -5922,6 +6135,40 @@ class GeometryRuntimeProvider:
                 "Geometry runtime 不支持 GetRelocalizationTerminal RPC。"
             )
         state = dict(activation_state or {})
+        if assigned_request_v2 is None:
+            _require_supported_activation_schema(state)
+        if assigned_request_v2 is not None or state.get("activation_receipt_schema_version") == 2:
+            if planar_seed is not None:
+                raise ValueError("assigned cloud terminal query does not accept a planar seed")
+            assigned = _assigned_request_for_rpc(
+                activation_state=state, assigned_request_v2=assigned_request_v2,
+                request_id=request_id, logical_timeout_ms=logical_timeout_ms, query_only=True,
+            )
+            query = AssignedRelocalizationQuery.from_dict({
+                "schema_version": 2, "request_id": assigned.request_id,
+                "assigned_request_v2": assigned.to_dict(),
+            })
+            try:
+                response = rpc(query.to_proto(pb2.GetRelocalizationTerminalRequest), timeout=_read_deadline_sec())
+            except grpc.RpcError as exc:
+                raise GeometryRuntimeRpcError.from_rpc_error("GetRelocalizationTerminal", exc) from exc
+            terminal = query.validate_proto_response(response)
+            observation = None
+            if response.HasField("ledger_observation"):
+                candidate = _project_assigned_proto(response.ledger_observation, "observation")
+                if (candidate["observation_schema_version"] == 1 and candidate["observation_epoch"] != 0
+                        and candidate["terminal_record_count"] + candidate["pending_record_count"]
+                        <= candidate["admitted_command_count"]):
+                    observation = candidate
+            return {
+                "schema_version": 2, "request_id": assigned.request_id,
+                "status": {1: "terminal", 2: "pending", 3: "not_found", 4: "identity_conflict"}[response.status],
+                "assigned_request_v2": assigned.to_dict(),
+                "terminal": _assigned_terminal_payload(terminal) if terminal is not None else None,
+                "ledger_observation": observation,
+            }
+        if state.get("activation_receipt_v2") is not None or state.get("relocalization_policy_v2") is not None:
+            raise ValueError("legacy activation state contains assigned metadata")
         resolved_request_id = _canonical_relocalization_request_id(
             request_id, generate_if_missing=False
         )
@@ -5994,6 +6241,8 @@ class GeometryRuntimeProvider:
             raise GeometryRuntimeRpcError.from_rpc_error(
                 "GetRelocalizationTerminal", exc
             ) from exc
+        if response.schema_version != 1 or response.HasField("assigned_request_v2"):
+            raise ValueError("legacy terminal query received a different identity schema")
         try:
             raw_status = response.status
         except Exception:
@@ -6057,6 +6306,8 @@ class GeometryRuntimeProvider:
             }
         if not has_terminal:
             raise RuntimeError("terminal query response omitted terminal proof")
+        if response.terminal.schema_version != 1 or response.terminal.HasField("assigned_cloud_v2"):
+            raise ValueError("legacy terminal query contained a different nested identity schema")
         terminal = self._relocalize_result_payload(response.terminal)
         if relocalize_request.target_kind == "planar_graph":
             terminal["planar_seed"] = list(values)

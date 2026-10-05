@@ -55,11 +55,23 @@ pub enum Stage {
     DenseOrderedEmission,
     /// Acquire the existing dense batch-read cache lock, including poison recovery.
     DenseBandCacheAcquire,
+    /// Complete raw observation footprint construction, including local cleanup.
+    ObservationFootprint,
+    /// Locate the actual support used by observation footprint construction.
+    ObservationFootprintSupport,
+    /// Construct footprint hull and bounds, including existing validation.
+    ObservationFootprintShape,
+    /// Construct the existing coarse ground patch for this footprint.
+    ObservationFootprintPatch,
+    /// Build exact fine-cell geometry, including support/evidence-membership lookups.
+    ObservationFootprintCells,
+    /// Check occupied exemptions, exact evidence, time/hits and finite expiry.
+    ObservationEvidence,
 }
 
 impl Stage {
     /// Number of fixed timing categories.
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 23;
     /// Every timing category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::MotionTotal,
@@ -79,6 +91,12 @@ impl Stage {
         Self::DenseConnectivityBfs,
         Self::DenseOrderedEmission,
         Self::DenseBandCacheAcquire,
+        Self::ObservationFootprint,
+        Self::ObservationFootprintSupport,
+        Self::ObservationFootprintShape,
+        Self::ObservationFootprintPatch,
+        Self::ObservationFootprintCells,
+        Self::ObservationEvidence,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -101,6 +119,13 @@ impl Stage {
             Self::DenseConnectivityBfs => "dense_connectivity_bfs",
             Self::DenseOrderedEmission => "dense_ordered_emission",
             Self::DenseBandCacheAcquire => "dense_band_cache_acquire",
+            Self::ObservationFootprint => "observation_footprint",
+            Self::ObservationFootprintSupport => "observation_footprint_support",
+            Self::ObservationFootprintShape => "observation_footprint_shape",
+            Self::ObservationFootprintPatch => "observation_footprint_patch",
+            Self::ObservationFootprintCells => "observation_footprint_cells",
+            Self::ObservationEvidence => "observation_evidence",
+
         }
     }
 }
@@ -136,11 +161,21 @@ pub enum Counter {
     DenseCacheSingleBandColumns,
     /// Visited-table slots requested only after a valid dense seed exists.
     DenseVisitedTableSlots,
+    /// Exact-pose cell-set cache hits within the original immutable checker.
+    ObservationFootprintCacheHits,
+    /// Exact-pose cell-set cache misses, including failed constructions.
+    ObservationFootprintCacheMisses,
+    /// Fine cells returned by successful raw footprint constructions, repeated encounters.
+    ObservationFootprintCellsBuilt,
+    /// Cells visited by actual observed checker calls, including occupied exemptions.
+    ObservationVisitedCells,
+    /// Non-exempt cells whose evidence is checked, including a failing last cell.
+    ObservationCheckedCells,
 }
 
 impl Counter {
     /// Number of fixed counter categories.
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 17;
     /// Every counter category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::PlaneCacheHits,
@@ -155,6 +190,11 @@ impl Counter {
         Self::DenseVisitedColumns,
         Self::DenseCacheSingleBandColumns,
         Self::DenseVisitedTableSlots,
+        Self::ObservationFootprintCacheHits,
+        Self::ObservationFootprintCacheMisses,
+        Self::ObservationFootprintCellsBuilt,
+        Self::ObservationVisitedCells,
+        Self::ObservationCheckedCells,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -172,6 +212,12 @@ impl Counter {
             Self::DenseVisitedColumns => "dense_visited_columns",
             Self::DenseCacheSingleBandColumns => "dense_cache_single_band_columns",
             Self::DenseVisitedTableSlots => "dense_visited_table_slots",
+            Self::ObservationFootprintCacheHits => "observation_footprint_cache_hits",
+            Self::ObservationFootprintCacheMisses => "observation_footprint_cache_misses",
+            Self::ObservationFootprintCellsBuilt => "observation_footprint_cells_built",
+            Self::ObservationVisitedCells => "observation_visited_cells",
+            Self::ObservationCheckedCells => "observation_checked_cells",
+
         }
     }
 }

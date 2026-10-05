@@ -44,3 +44,24 @@ Each delivers 301 real samples, with median spacing 200.000 ms and maximum 200.1
 There are zero delivered negatives or observation-dispatch expiry observations in either prepared run. All 488/467 delivered tails pass; guard-versus-receipt state differences remain 55/59, so the existing delayed-activation limitation is unchanged. Goal timeout cannot be relabeled success just because fresh evidence and useful motion are now available.
 
 Current-step median/p95/max remains 34.513/72.635/108.157 ms OFF and 34.528/72.078/113.480 ms ON. In OFF, observed-sweep time is 31.323/69.921/105.704 ms versus projection 2.708/3.723/7.322 ms, measured over the same called steps with inclusive timers. This points to observation-sweep construction/checking as the next controller measurement target. It does not justify dropping samples or evidence checks. The prepared fixture's source improvement is not a production runtime speedup, full-goal qualification, or hard 20 Hz guarantee.
+
+## Observation-sweep substage attribution
+
+On prepared-fixture baseline `0ebe0f446ca4565da44956bbd629eb3f2171c27a`, six default-disabled MLS profiler stages split raw footprint support/shape/ground-patch/cell construction and the evidence loop. Five counters record exact cell-set cache hits/misses, successful raw cell construction, visited cells and non-exempt evidence checks. Loop counters flush once per callback, including early failure; there are no per-cell TLS updates, new query calls, payload owners, permission caches or changes to guard order.
+
+`observed-substages-focused-v1.log` passes the hit/miss, occupied-exemption and early-error counter test. `observed-substages-mls-all-v1.log` passes 241 tests / 4 ignored; `observed-substages-feature-off-check-v1.log` confirms default-feature runtime compilation. The prepared moving run `observed-substages-prepared-1cm-off-v1.log` remains **FAILED** on original 60-second final yaw: .931406 m travel, 514 delivered nonzero commands, zero negatives/expiry observations, position error .068594 m, yaw 1.019088 rad. All actual-edge/receipt-tail oracles pass. There are 64 guard/receipt state mismatches, preserving the earlier delayed-activation caveat.
+
+The bounded records retain the first 1,216 compute steps and omit 15 later steps, so attribution is explicitly incomplete. For that retained prefix, called-step wall median/p95/max (ms):
+
+| Stage | Median | p95 | Maximum |
+|---|---:|---:|---:|
+| Raw footprint total | 5.871 | 14.696 | 23.061 |
+| Support lookup | .00313 | .00700 | .04544 |
+| Hull/bounds preparation | .02209 | .05064 | .23463 |
+| Existing ground-patch lookup | .00280 | .00635 | .44686 |
+| Exact fine-cell construction | 5.837 | 14.634 | 22.945 |
+| Evidence/exemption/expiry loop | 25.145 | 52.383 | 93.435 |
+
+There are 18,302 footprint-cache hits, 28,143 misses and 28,356,199 cells returned by successful raw builds. The evidence loop visits 44,840,929 cells but only 643,046 (about 1.43%) are non-exempt evidence checks. These are repeated encounters, not unique cells. Source inspection shows a BTreeSet membership search for each visited cell, making ordered set-difference iteration a justified next exact-equivalence experiment. The separate footprint loop also reconstructs PolygonQuery for every fine cell; hoisting that immutable query is a smaller independent candidate, not yet applied.
+
+Scopes are inclusive and not a complete additive partition: raw footprint stages include direct initial-footprint calls outside the checker; evidence timing excludes footprint construction but includes final aggregate counter updates; raw total includes local cleanup, while returned cell-set retirement/cache replacement occurs outside it. The same mixed build profile and timing perturbation caveats apply. No algorithm change or performance gain is claimed by this instrumentation checkpoint.

@@ -28,11 +28,27 @@ impl<'a> ObservationFootprintCache<'a> {
         let key = [pose.0[0], pose.0[1], pose.0[2],
             pose.1[0], pose.1[1], pose.1[2], pose.1[3]].map(f64::to_bits);
         if self.entry.as_ref().is_none_or(|(cached, _)| *cached != key) {
+            #[cfg(feature = "body-query-profile")] query_profile::count(QueryCounter::ObservationFootprintCacheMisses);
             #[cfg(test)] { self.builds += 1; }
             let cells = self.snapshot.body_observation_footprint(pose)?;
             self.entry = Some((key, cells));
+        } else {
+            #[cfg(feature = "body-query-profile")] query_profile::count(QueryCounter::ObservationFootprintCacheHits);
         }
         Ok(&self.entry.as_ref().expect("successful footprint entry").1)
+    }
+}
+
+// Aggregate only after the cell loop, including early-error exits. These fixed
+// counters add no per-cell TLS updates and never affect evidence decisions.
+#[cfg(feature = "body-query-profile")]
+#[derive(Default)]
+struct ObservationEvidenceCounts {visited:u64,checked:u64}
+#[cfg(feature = "body-query-profile")]
+impl Drop for ObservationEvidenceCounts {
+    fn drop(&mut self) {
+        query_profile::add(QueryCounter::ObservationVisitedCells,self.visited);
+        query_profile::add(QueryCounter::ObservationCheckedCells,self.checked);
     }
 }
 
@@ -1540,12 +1556,17 @@ impl SurfaceSnapshot {
     pub fn body_observation_footprint(
         &self, pose: ([f64; 3], [f64; 4]),
     ) -> Result<std::collections::BTreeSet<[i32; 3]>, SurfaceError> {
+        #[cfg(feature = "body-query-profile")] let _footprint_profile=query_profile::guard(QueryStage::ObservationFootprint);
         let observations = self.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
         if observations.size_m.to_bits() != self.source_voxel_size_m().to_bits() {
             return Err(SurfaceError::InvalidConfig("观察精度与几何来源不一致".into()));
         }
         let model = self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
-        let centre = self.locate_support_from_body(pose.0, pose.1, model.body_to_support_z_m)?;
+        let centre = {
+            #[cfg(feature = "body-query-profile")] let _support_profile=query_profile::guard(QueryStage::ObservationFootprintSupport);
+            self.locate_support_from_body(pose.0, pose.1, model.body_to_support_z_m)?
+        };
+        #[cfg(feature = "body-query-profile")] let shape_profile=query_profile::guard(QueryStage::ObservationFootprintShape);
         let r = rotation(pose.1)?;
         let vertices: Vec<_> = model.footprint_xy_m.iter()
             .flat_map(|p| model.z_bounds_m.map(|z| world(r, pose.0, [p[0], p[1], z])))
@@ -1560,7 +1581,12 @@ impl SurfaceSnapshot {
         }
         let radius = model.radius() + model.z_bounds_m[0].abs().max(model.z_bounds_m[1].abs())
             + model.body_to_support_z_m + planner_size * 2.0;
-        let patch = self.ground_patch(centre, radius);
+        #[cfg(feature = "body-query-profile")] drop(shape_profile);
+        let patch = {
+            #[cfg(feature = "body-query-profile")] let _patch_profile=query_profile::guard(QueryStage::ObservationFootprintPatch);
+            self.ground_patch(centre, radius)
+        };
+        #[cfg(feature = "body-query-profile")] let cells_profile=query_profile::guard(QueryStage::ObservationFootprintCells);
         let mut cells = std::collections::BTreeSet::new();
         for x in min[0]..=max[0] {
             for y in min[1]..=max[1] {
@@ -1588,6 +1614,10 @@ impl SurfaceSnapshot {
                 }).unwrap_or(top);
                 cells.insert([x, y, z]);
             }
+        }
+        #[cfg(feature = "body-query-profile")] {
+            drop(cells_profile);
+            query_profile::add(QueryCounter::ObservationFootprintCellsBuilt,cells.len() as u64);
         }
         Ok(cells)
     }
@@ -1661,8 +1691,13 @@ impl SurfaceSnapshot {
             if checked_ns == 0 || max_age_ns == 0 { return Err(SurfaceError::MissingSupport); }
             let mut earliest_expiry: Option<u64> = None;
             self.validate_body_motion_checked(from, to, boundary, |pose| {
-                for &cell in footprints.cells(pose)? {
+                let cells=footprints.cells(pose)?;
+                #[cfg(feature = "body-query-profile")] let _evidence_profile=query_profile::guard(QueryStage::ObservationEvidence);
+                #[cfg(feature = "body-query-profile")] let mut counts=ObservationEvidenceCounts::default();
+                for &cell in cells {
+                    #[cfg(feature = "body-query-profile")] {counts.visited+=1;}
                     if occupied.contains(&cell) { continue; }
+                    #[cfg(feature = "body-query-profile")] {counts.checked+=1;}
                     let evidence = observations.get(cell).unwrap_or(SurfaceObservation {observed_ns:0,hits:0});
                     let reason = if evidence.observed_ns == 0 {Some("缺少真实观察")}
                         else if evidence.hits < 2 {Some("独立采样命中不足")}
@@ -2620,6 +2655,37 @@ mod tests {
         }));
         assert_eq!(expired.map(|_| ()), mixed.validate_observed_body_motion_in_boundary(
             pose, pose, &none, u64::MAX, 100, &[]));
+    }
+
+    #[cfg(feature = "body-query-profile")]
+    #[test]
+    fn observed_profile_separates_cached_geometry_exempt_cells_and_failure_prefix() {
+        let map=scene(&[],false).with_observations(Some(observation_grid(|_|{})));
+        let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+        let occupied=map.body_observation_footprint(pose).unwrap();
+        let mut cache=ObservationFootprintCache::new(&map);
+        query_profile::begin();
+        assert_eq!(cache.cells(pose).unwrap(),&occupied);
+        assert_eq!(cache.cells(pose).unwrap(),&occupied);
+        let geometry=query_profile::end();
+        assert_eq!(geometry.counters[QueryCounter::ObservationFootprintCacheMisses as usize],1);
+        assert_eq!(geometry.counters[QueryCounter::ObservationFootprintCacheHits as usize],1);
+        assert_eq!(geometry.counters[QueryCounter::ObservationFootprintCellsBuilt as usize],occupied.len() as u64);
+        assert_eq!(geometry.calls[QueryStage::ObservationFootprint as usize],1);
+        let mut exempt=map.observed_body_motion_checker_with_expiry(&occupied,1_000_000_000,&[]);
+        query_profile::begin();
+        assert_eq!(exempt(pose,pose,12_000_000_000).unwrap(),None);
+        let exempt=query_profile::end();
+        assert!(exempt.counters[QueryCounter::ObservationVisitedCells as usize]>0);
+        assert_eq!(exempt.counters[QueryCounter::ObservationCheckedCells as usize],0);
+        let none=std::collections::BTreeSet::new();
+        let mut expired=map.observed_body_motion_checker_with_expiry(&none,1_000_000_000,&[]);
+        query_profile::begin();
+        assert!(matches!(expired(pose,pose,12_000_000_000),Err(SurfaceError::NearFieldObservation{..})));
+        let failure=query_profile::end();
+        assert_eq!(failure.counters[QueryCounter::ObservationVisitedCells as usize],1);
+        assert_eq!(failure.counters[QueryCounter::ObservationCheckedCells as usize],1);
+        assert_eq!(failure.calls[QueryStage::ObservationEvidence as usize],1);
     }
 
     #[test]

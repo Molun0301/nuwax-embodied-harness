@@ -1893,19 +1893,26 @@ impl SurfaceSnapshot {
         let mut bands=vec![None;count];
         // 子阶段不移动生产临时值：表/队列初始化及保留缓冲清理仍只计入外层收集。
         #[cfg(feature = "body-query-profile")]
-        let (mut cache_present_columns,mut cache_absent_columns)=(0_u64,0_u64);
+        let (mut cache_present_columns,mut cache_absent_columns,mut cache_single_band_columns)=(0_u64,0_u64,0_u64);
         #[cfg(feature = "body-query-profile")]
         let cache_profile=query_profile::guard(QueryStage::DenseBandCacheRead);
         // 同一不可变来源的带缓存一次批量读取，避免每个实测细列分别取锁。
         {
+            #[cfg(feature = "body-query-profile")]
+            let acquire_profile=query_profile::guard(QueryStage::DenseBandCacheAcquire);
             let cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+            #[cfg(feature = "body-query-profile")]
+            drop(acquire_profile);
             for x in low[0]..=high[0] {for y in low[1]..=high[1] {
                 let dx=(f64::from(x)+0.5)*size-origin[0];let dy=(f64::from(y)+0.5)*size-origin[1];
                 if dx*dx+dy*dy>enumeration*enumeration {continue;}
                 let index=(i64::from(x)-i64::from(low[0])) as usize*stride+(i64::from(y)-i64::from(low[1])) as usize;
                 in_domain[index]=true;bands[index]=cache.fine_bands.get(&(x,y)).cloned();
                 #[cfg(feature = "body-query-profile")]
-                if bands[index].is_some() {cache_present_columns+=1;}else{cache_absent_columns+=1;}
+                if let Some(values)=&bands[index] {
+                    cache_present_columns+=1;
+                    if values.len()==1 {cache_single_band_columns+=1;}
+                }else{cache_absent_columns+=1;}
             }}
         }
         #[cfg(feature = "body-query-profile")]
@@ -1914,6 +1921,7 @@ impl SurfaceSnapshot {
             query_profile::add(QueryCounter::DenseAllocatedSlots,count as u64);
             query_profile::add(QueryCounter::DenseCachePresentColumns,cache_present_columns);
             query_profile::add(QueryCounter::DenseCacheAbsentColumns,cache_absent_columns);
+            query_profile::add(QueryCounter::DenseCacheSingleBandColumns,cache_single_band_columns);
         }
         let distance=|band:[f64;2]|(band[0]-origin[2]).max(origin[2]-band[1]).max(0.0);
         let mut selected=vec![None;count];let mut seed:Option<(usize,(i32,i32),[f64;4])>=None;
@@ -1947,6 +1955,8 @@ impl SurfaceSnapshot {
         }
         let seed=seed.ok_or(SurfaceError::MissingSupport)?.0;
         let mut queue=VecDeque::from([seed]);let mut visited=vec![false;count];visited[seed]=true;
+        #[cfg(feature = "body-query-profile")]
+        query_profile::add(QueryCounter::DenseVisitedTableSlots,count as u64);
         #[cfg(feature = "body-query-profile")]
         let mut visited_columns=0_u64;
         #[cfg(feature = "body-query-profile")]
@@ -3667,6 +3677,26 @@ mod tests {
                 assert_eq!(points.len(),2);
                 assert!(points.iter().all(|point|point.0[0]>=0.5*fine));
             }
+        }
+
+        #[cfg(feature="body-query-profile")]
+        #[test]
+        fn dense_payload_counter_counts_visited_table_only_after_seed() {
+            let keys=(-2..=2).flat_map(|x|(-2..=2).map(move |y|[x,y,-1])).collect();
+            let (map,_)=make(keys);
+            query_profile::begin();
+            let absent=map.fine_contact_domain([0.0,0.0,4.0],0.3);
+            let record=query_profile::end();
+            assert_eq!(absent,Err(SurfaceError::MissingSupport));
+            assert!(record.counters[QueryCounter::DenseAllocatedSlots as usize]>0);
+            assert_eq!(record.counters[QueryCounter::DenseVisitedTableSlots as usize],0);
+            query_profile::begin();
+            let present=map.fine_contact_domain([0.0;3],0.3);
+            let record=query_profile::end();
+            assert!(present.is_ok());
+            assert_eq!(record.counters[QueryCounter::DenseVisitedTableSlots as usize],
+                record.counters[QueryCounter::DenseAllocatedSlots as usize]);
+            assert!(record.counters[QueryCounter::DenseVisitedColumns as usize]>0);
         }
 
         #[test]

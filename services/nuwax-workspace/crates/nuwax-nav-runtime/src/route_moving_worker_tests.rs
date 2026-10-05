@@ -21,6 +21,8 @@ use super::*;
 use crate::control_profile::{self, Counter, Record as StageRecord, Stage};
 use nuwax_nav_control::{integrate, PlanarPose};
 use nuwax_nav_mls_planner::{mls_planner::Config, SurfaceBodyEnvelope, SurfaceObservation, SurfaceObservations};
+#[cfg(feature="body-query-profile")]
+use nuwax_nav_mls_planner::body_query_profile::{self, Counter as BodyCounter, Record as BodyRecord, Stage as BodyStage};
 use nuwax_nav_types_messages::{GoalOptions, NavFrameId, MotionLimits, MotionModel, Point3, Pose3, Quaternion, Timestamp};
 use std::collections::BTreeMap;
 use std::sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, mpsc, Mutex, Weak};
@@ -116,6 +118,8 @@ struct ControlStepSample {
     step_seq: u64,
     control_ms: f64,
     stages: StageRecord,
+    #[cfg(feature="body-query-profile")]
+    body_queries: BodyRecord,
     source_view_seq: u64,
     source_present: bool,
     first_after_view_change: bool,
@@ -208,12 +212,21 @@ impl NavPlanner for Measured {
         let jobs_before=self.jobs.load(Ordering::Acquire);let held_phase_before=self.held_phase.load(Ordering::Acquire);
         let held_before=self.held.load(Ordering::Acquire);
         control_profile::begin();
+        // This wrapper executes on the real compute-owner thread. MLS records
+        // only this step's TLS work, not the concurrent planning owner's work,
+        // map installation, or the independent post-run safety oracles.
+        #[cfg(feature="body-query-profile")]
+        body_query_profile::begin();
         let t=Instant::now();let result=self.inner.step(w);let ms=t.elapsed().as_secs_f64()*1e3;
         let stages=control_profile::end();
+        #[cfg(feature="body-query-profile")]
+        let body_queries=body_query_profile::end();
         let submitted_after=self.inner.local_planning_calls();let admitted_after=self.inner.local_plans();
         let jobs_after=self.jobs.load(Ordering::Acquire);let held_phase_after=self.held_phase.load(Ordering::Acquire);
         let held_after=self.held.load(Ordering::Acquire);
         let sample=ControlStepSample {step_seq:self.step_seq,control_ms:ms,stages,
+            #[cfg(feature="body-query-profile")]
+            body_queries,
             source_view_seq:self.source_view_seq,source_present:self.source.is_some(),
             first_after_view_change:std::mem::take(&mut self.first_after_view_change),pose_stamp_ns:self.pose_stamp_ns,
             submitted_before,submitted_after,admitted_before,admitted_after,jobs_before,jobs_after,
@@ -248,6 +261,7 @@ fn report_control_stages(p:&Probe,factory:bool,scenario:Scenario,enabled:bool,re
     let context=format!("scenario={scenario:?} enabled={enabled} source_cm={} startup={startup}",resolution*100.0);
     if factory {
         eprintln!("CONTROL_STAGE_SCOPE {context} available=false reason=unprobed_factory wall_not_thread_cpu=true");
+        eprintln!("BODY_QUERY_SCOPE {context} available=false reason=unprobed_factory wall_not_thread_cpu=true");
         return;
     }
     let sample_scope=if p.control_sample_overflow==0 {"all_recorded_steps"}else{"retained_prefix_only_incomplete"};
@@ -277,6 +291,10 @@ fn report_control_stages(p:&Probe,factory:bool,scenario:Scenario,enabled:bool,re
         eprintln!("CONTROL_COUNTER {context} sample_scope={sample_scope} counter={} total={total} nonzero_steps={nonzero_steps} retained_steps={} retained_step_count_median_p95_max={}",
             counter.label(),p.control_samples.len(),measured_distribution(&values));
     }
+    #[cfg(feature="body-query-profile")]
+    report_body_query_stages(p,&context,sample_scope);
+    #[cfg(not(feature="body-query-profile"))]
+    eprintln!("BODY_QUERY_SCOPE {context} available=false reason=feature_disabled required_feature=body-query-profile wall_not_thread_cpu=true");
     let mut slowest:[Option<&ControlStepSample>;5]=[None;5];
     for sample in &p.control_samples {
         if let Some(index)=slowest.iter().position(|old|old.is_none_or(|old|sample.control_ms>old.control_ms)) {
@@ -297,7 +315,96 @@ fn report_control_stages(p:&Probe,factory:bool,scenario:Scenario,enabled:bool,re
             sample.first_after_view_change,sample.pose_stamp_ns,sample.submitted_before,sample.submitted_after,
             sample.admitted_before,sample.admitted_after,sample.jobs_before,sample.jobs_after,
             sample.held_before,sample.held_after,sample.held_phase_before,sample.held_phase_after,sample.outcome);
+        #[cfg(feature="body-query-profile")]
+        report_body_query_slow_step(&context,sample_scope,"all_control_steps",rank+1,sample);
     }
+}
+
+#[cfg(feature="body-query-profile")]
+fn dense_initial_table_payload_bytes_per_slot()->usize {
+    std::mem::size_of::<bool>()+std::mem::size_of::<Option<Arc<Vec<[f64;2]>>>>()
+        +std::mem::size_of::<Option<[f64;2]>>()
+}
+
+#[cfg(feature="body-query-profile")]
+fn dense_initial_table_payload_bytes(record:&BodyRecord)->u64 {
+    record.counters[BodyCounter::DenseAllocatedSlots as usize]
+        .saturating_mul(dense_initial_table_payload_bytes_per_slot()as u64)
+        .saturating_add(record.counters[BodyCounter::DenseVisitedTableSlots as usize]
+            .saturating_mul(std::mem::size_of::<bool>()as u64))
+}
+
+#[cfg(feature="body-query-profile")]
+fn report_body_query_stages(p:&Probe,context:&str,sample_scope:&str) {
+    let query_steps=p.control_samples.iter().filter(|sample|sample.body_queries.calls.iter().any(|&calls|calls>0)).count();
+    let first_after_view_change_steps=p.control_samples.iter().filter(|sample|sample.first_after_view_change).count();
+    let query_steps_after_view_change=p.control_samples.iter().filter(|sample|sample.first_after_view_change
+        &&sample.body_queries.calls.iter().any(|&calls|calls>0)).count();
+    let nonzero_command_steps=p.control_samples.iter().filter(|sample|sample.outcome=="command_nonzero").count();
+    eprintln!("BODY_QUERY_SCOPE {context} available=true feature=nondefault sample_scope={sample_scope} retained_steps={} record_limit={} omitted_steps={} attribution_complete={} query_steps={query_steps} first_after_view_change_steps={first_after_view_change_steps} query_steps_after_view_change={query_steps_after_view_change} nonzero_command_steps={nonzero_command_steps} thread=compute_owner interval=complete_inner_step nested_stages=inclusive_do_not_sum duration=wall_not_thread_cpu planning_owner_excluded=true map_installation_excluded=true post_run_oracles_excluded=true metadata_cold_is_not_geometry_cold=true source_view_marker=successful_compute_owner_same_body_query_view_changes nonzero_command_is_not_receipt_or_displacement=true actual_motion_evidence=MOVING_summary dense_cache_present_columns=initial_batch_shallow_arc_clones_not_pointcloud_copies dense_cache_absent_columns=initial_batch_absence_not_guaranteed_later_misses",
+        p.control_samples.len(),p.control_sample_limit,p.control_sample_overflow,p.control_sample_overflow==0);
+    // The same bounded per-step records back all cohorts. A first step after an
+    // input-view change may itself return Pending; it does not prove a body-query
+    // cache miss or geometry rebuild. Subsequent steps may still have cold work.
+    let mut values=Vec::with_capacity(p.control_samples.len());
+    for (cohort,first_after_change) in [("all_steps",None),("first_after_view_change",Some(true)),("not_first_after_view_change",Some(false))] {
+        let samples=||p.control_samples.iter().filter(move |sample|first_after_change.is_none_or(|first|sample.first_after_view_change==first));
+        let retained_steps=samples().count();
+        for stage in BodyStage::ALL {
+            let index=stage as usize;
+            values.clear();
+            values.extend(samples().filter(|sample|sample.body_queries.calls[index]>0)
+                .map(|sample|sample.body_queries.wall_nanos[index]as f64/1e6));
+            let calls=samples().fold(0_u64,|sum,sample|sum.saturating_add(u64::from(sample.body_queries.calls[index])));
+            let total_ms=samples().map(|sample|sample.body_queries.wall_nanos[index]as f64/1e6).sum::<f64>();
+            eprintln!("BODY_QUERY_STAGE {context} sample_scope={sample_scope} cohort={cohort} stage={} inclusive=true retained_steps={retained_steps} called_steps={} calls={calls} total_ms={total_ms:.6} called_step_ms_median_p95_max={}",
+                stage.label(),values.len(),measured_distribution(&values));
+        }
+        for counter in BodyCounter::ALL {
+            let index=counter as usize;
+            values.clear();
+            values.extend(samples().map(|sample|sample.body_queries.counters[index]as f64));
+            let total=samples().fold(0_u64,|sum,sample|sum.saturating_add(sample.body_queries.counters[index]));
+            let nonzero_steps=samples().filter(|sample|sample.body_queries.counters[index]>0).count();
+            eprintln!("BODY_QUERY_COUNTER {context} sample_scope={sample_scope} cohort={cohort} counter={} total={total} nonzero_steps={nonzero_steps} retained_steps={retained_steps} retained_step_count_median_p95_max={}",
+                counter.label(),measured_distribution(&values));
+        }
+        values.clear();
+        values.extend(samples().map(|sample|dense_initial_table_payload_bytes(&sample.body_queries)as f64));
+        let total=samples().fold(0_u64,|sum,sample|sum.saturating_add(dense_initial_table_payload_bytes(&sample.body_queries)));
+        eprintln!("BODY_QUERY_DERIVED {context} sample_scope={sample_scope} cohort={cohort} metric=initial_dense_table_payload_bytes basis=base_and_actual_visited_table_slots base_bytes_per_slot={} visited_bytes_per_slot=1 cumulative_requested_payload_not_peak_memory_or_allocator_bytes=true excludes=allocator_overhead_queues_output_cache_contents_and_other_allocations retained_steps={retained_steps} total={total} retained_step_bytes_median_p95_max={}",
+            dense_initial_table_payload_bytes_per_slot(),measured_distribution(&values));
+    }
+    // Retain the existing top-five all-step join below and separately expose
+    // command-producing steps so startup/Pending work cannot hide moving control.
+    // A returned command is only a compute-owner outcome, not an applied receipt.
+    let mut slowest:[Option<&ControlStepSample>;5]=[None;5];
+    for sample in p.control_samples.iter().filter(|sample|sample.outcome=="command_nonzero") {
+        if let Some(index)=slowest.iter().position(|old|old.is_none_or(|old|sample.control_ms>old.control_ms)) {
+            for destination in ((index+1)..slowest.len()).rev() {slowest[destination]=slowest[destination-1];}
+            slowest[index]=Some(sample);
+        }
+    }
+    for (rank,sample) in slowest.into_iter().flatten().enumerate() {
+        report_body_query_slow_step(context,sample_scope,"nonzero_command_steps",rank+1,sample);
+    }
+}
+
+#[cfg(feature="body-query-profile")]
+fn report_body_query_slow_step(context:&str,sample_scope:&str,ranking:&str,rank:usize,sample:&ControlStepSample) {
+    // Format only after worker drain. Both profiles and every marker refer to
+    // this exact step; storing the MLS record retains no source or query view.
+    let stage_ms_calls=BodyStage::ALL.map(|stage|{
+        let index=stage as usize;
+        (stage.label(),sample.body_queries.wall_nanos[index]as f64/1e6,sample.body_queries.calls[index])
+    });
+    let counter_counts=BodyCounter::ALL.map(|counter|(counter.label(),sample.body_queries.counters[counter as usize]));
+    let dense_initial_table_payload_bytes=dense_initial_table_payload_bytes(&sample.body_queries);
+    eprintln!("BODY_QUERY_SLOW_STEP {context} sample_scope={sample_scope} ranking={ranking} rank={rank} step_seq={} control_wall_ms={:.6} source_view_seq={} source_present={} first_after_view_change={} pose_stamp_ns={:?} submitted_before={} submitted_after={} admitted_before={} admitted_after={} jobs_before={} jobs_after={} held_before={} held_after={} held_phase_before={} held_phase_after={} outcome={} inclusive_stage_ms_calls={stage_ms_calls:?} counter_counts={counter_counts:?} dense_initial_table_payload_bytes={dense_initial_table_payload_bytes}",
+        sample.step_seq,sample.control_ms,sample.source_view_seq,sample.source_present,
+        sample.first_after_view_change,sample.pose_stamp_ns,sample.submitted_before,sample.submitted_after,
+        sample.admitted_before,sample.admitted_after,sample.jobs_before,sample.jobs_after,
+        sample.held_before,sample.held_after,sample.held_phase_before,sample.held_phase_after,sample.outcome);
 }
 // Fixed scalar categories describe the consumer's actual Pending reasons; an
 // empty 5Hz sensor queue during a 20Hz tick is expected and counted separately.

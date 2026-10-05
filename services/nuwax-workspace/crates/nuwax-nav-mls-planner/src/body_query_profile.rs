@@ -53,11 +53,13 @@ pub enum Stage {
     /// Dense ordered point emission, including output growth and consumed
     /// visited-table cleanup, but excluding other retained-buffer cleanup.
     DenseOrderedEmission,
+    /// Acquire the existing dense batch-read cache lock, including poison recovery.
+    DenseBandCacheAcquire,
 }
 
 impl Stage {
     /// Number of fixed timing categories.
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 17;
     /// Every timing category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::MotionTotal,
@@ -76,6 +78,7 @@ impl Stage {
         Self::DenseBandSelectionSeed,
         Self::DenseConnectivityBfs,
         Self::DenseOrderedEmission,
+        Self::DenseBandCacheAcquire,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -97,6 +100,7 @@ impl Stage {
             Self::DenseBandSelectionSeed => "dense_band_selection_seed",
             Self::DenseConnectivityBfs => "dense_connectivity_bfs",
             Self::DenseOrderedEmission => "dense_ordered_emission",
+            Self::DenseBandCacheAcquire => "dense_band_cache_acquire",
         }
     }
 }
@@ -128,11 +132,15 @@ pub enum Counter {
     /// Unique dense columns visited by BFS, including the seed and columns
     /// whose final point weight is zero.
     DenseVisitedColumns,
+    /// Cached eligible columns whose immutable band vector has exactly one band.
+    DenseCacheSingleBandColumns,
+    /// Visited-table slots requested only after a valid dense seed exists.
+    DenseVisitedTableSlots,
 }
 
 impl Counter {
     /// Number of fixed counter categories.
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 12;
     /// Every counter category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::PlaneCacheHits,
@@ -145,6 +153,8 @@ impl Counter {
         Self::DenseCacheAbsentColumns,
         Self::DenseSelectedColumns,
         Self::DenseVisitedColumns,
+        Self::DenseCacheSingleBandColumns,
+        Self::DenseVisitedTableSlots,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -160,6 +170,8 @@ impl Counter {
             Self::DenseCacheAbsentColumns => "dense_cache_absent_columns",
             Self::DenseSelectedColumns => "dense_selected_columns",
             Self::DenseVisitedColumns => "dense_visited_columns",
+            Self::DenseCacheSingleBandColumns => "dense_cache_single_band_columns",
+            Self::DenseVisitedTableSlots => "dense_visited_table_slots",
         }
     }
 }

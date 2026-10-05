@@ -61,3 +61,27 @@ Explicit binary environment overrides or system-service environment files can se
 Documentation drift: `docs/公开文档/部署文档.md:119–147` still advertises old `update_go2.py plan/build/deploy/verify` commands. The actual `scripts/update_go2.py:8–11` forwards to the update client, and `docs/公开文档/升级与恢复.md:55` explicitly retires those old commands from that entrypoint. This audit records the discrepancy without changing installer behavior.
 
 Unknown without actual build/deployment provenance: the robot's selected executable, content/build revision, effective profile/architecture flags and runtime timings. No device, service, environment override or deployment was inspected or changed by this qualification.
+
+## Moving observation-view workload and cache ownership
+
+An additional optional diagnostic captures the fixed MLS profile record on the actual compute-owner thread inside each existing bounded moving-test sample. It adds no source/map owner; all output is formatted after the worker drains. Planning-owner queries, input-map installation and post-run oracles are excluded. Factory runs without the wrapper and builds without the feature explicitly report MLS attribution unavailable.
+
+The existing primed 5 cm held-planning fixture remains unchanged: real-clock 20 Hz consumer feedback, genuinely acquired 5 Hz observation metadata, moving poses/applied feedback, and the original command deadline. Geometry payload is fixed in this arm; observation-view changes must not be described as obstacle/geometry churn. The MLS-only opt-level 3 override is retained.
+
+Final run: **295 compute steps**, 71 first-after-input-view-change markers, 292 steps with body queries, no dropped profile records. It delivers **211 nonzero commands**, five fresh commands during the held-planning interval, later new admission, zero delivered negatives and **1.073824 m** travel. The 292 computed nonzero outcomes are not confused with the 211 delivered commands. Control median/p95/max is **3.09 / 5.04 / 7.00 ms**; this remains sampled backend/ideal-plant evidence, not a hard deadline or full seven-metre goal result.
+
+| MLS work over this run | Total | Called-step median / p95 / max |
+|---|---:|---:|
+| Contact-domain collection | 73.448 ms | 0.245 / 0.438 / 2.427 ms |
+| Batch band-cache read | 9.193 ms | 0.0347 / 0.0527 / 0.1235 ms |
+| Existing cache-lock acquisition | 0.116 ms | 0.000441 / 0.000690 / 0.000871 ms |
+
+Acquisition means elapsed time through the existing lock/poison-handling expression, including scheduling; it is not a pure contention measurement. Its timer is recorded while the acquired guard remains held, so the enclosing read stage includes the small profiler update. First-after-view-change domain median is 0.255 ms versus 0.243 ms for remaining called steps. These markers neither prove geometry-cold work nor imply later steps are warm.
+
+There are 721,798 initial dense-table slots and the same number of actually allocated visited-table slots in this successful run. Initial batch reads encounter 493,640 cached columns, all single-band; this counts repeated query encounters, not unique spatial columns. Current code shallow-clones those band references; it does not copy the pointcloud. This workload records **24,541,132 bytes** of cumulative requested dense-table payload, with retained-step median/p95/max 99,960 / 129,948 / 164,220 bytes. On this platform base tables request 33 bytes per slot and the separately counted visited table one byte per slot. This is neither peak memory nor allocator bytes; queues, output vectors, allocator overhead and cache contents are excluded.
+
+The visited table is counted only after seed success. A dedicated negative test verifies that MissingSupport after band selection reports initial tables but no unallocated visited table. The earlier v1 estimate assumed that allocation on every call; its log is preserved, and final evidence uses the corrected counters.
+
+These results do not identify cache-lock acquisition or batch-reference work as a substantial bottleneck in this ordinary 5 cm moving case. Frequent single-band references could motivate a small direct-copy experiment within the existing query buffers, but no new cache or ownership change is justified by counts alone.
+
+Final evidence: `moving-body-mls-v2.log` (**235 passed / 4 ignored**), `moving-body-opt3-held-v2.log` (**1 passed**), and `moving-body-feature-off-tests-v1.log` (**5 passed**, feature-off compilation/profile sanity checks). Earlier `moving-body-profiler-tests-v1.log` and `moving-body-opt3-held-v1.log` are retained. All logs use the same evidence directory above.

@@ -29,6 +29,11 @@ pub(super) enum ComputeInput {
 /// route queries. Calibration and behavior configuration were captured by start.
 #[derive(Clone)]
 pub(super) struct ComputeContext {
+    /// Deterministic owner-only gate/panic injection; absent from production.
+    #[cfg(test)]
+    pub homeward_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    pub attribution: Option<Arc<attribution::Attribution>>,
     pub input: ComputeInput,
     pub robot_pose: PoseStamped,
     pub now: Timestamp,
@@ -173,6 +178,8 @@ pub(super) struct ComputeLifecycleAck {
 }
 
 struct PreparedJob {
+    #[cfg(test)]
+    attribution: Option<Arc<attribution::Attribution>>,
     projection: ComputeProjection,
     controller_prepared: bool,
     // The controller's staged weak anchor names this ORIGINAL source. Keep it
@@ -214,6 +221,8 @@ impl ExploreComputeBackend {
             #[cfg(test)]
             ComputeRequest::InspectCheckpoint { context } => context,
         };
+        #[cfg(test)]
+        let attribution = context.attribution.clone();
         let original_surface = match &context.input {
             ComputeInput::Surface { original, .. } => Some(original.clone()),
             ComputeInput::Planar(_) => None,
@@ -227,6 +236,11 @@ impl ExploreComputeBackend {
                     (prepare_homeward_budget(request, &cancelled), false)
                 }
                 ComputeRequest::Coverage { context } => {
+                    #[cfg(test)]
+                    let _span = context
+                        .attribution
+                        .as_ref()
+                        .map(|trace| trace.begin(attribution::Stage::OwnerCoverage, 0));
                     let coverage = match &context.input {
                         ComputeInput::Planar(map) => {
                             coverage_pct(&map.grid, context.config.boundary.as_ref())
@@ -244,6 +258,8 @@ impl ExploreComputeBackend {
             }
         };
         self.prepared = Some(PreparedJob {
+            #[cfg(test)]
+            attribution,
             projection: projection.clone(),
             controller_prepared,
             _original_surface: original_surface,
@@ -269,6 +285,11 @@ impl ExploreComputeBackend {
         state.frozen_surface_input = planning.as_ref();
 
         // The legacy return phase does not poll and cannot consume IDs/stamps.
+        #[cfg(test)]
+        let selection_span = context
+            .attribution
+            .as_ref()
+            .map(|trace| trace.begin(attribution::Stage::OwnerSelection, 0));
         let (poll, controller_prepared) = if progress.as_ref().is_some_and(|p| p.returning) {
             (Ok(ExplorationPoll::Pending), false)
         } else {
@@ -285,6 +306,8 @@ impl ExploreComputeBackend {
                 Err(error) => (Err(error), false),
             }
         };
+        #[cfg(test)]
+        drop(selection_span);
         let mut output = SelectionProjection {
             poll,
             mission: None,
@@ -304,11 +327,26 @@ impl ExploreComputeBackend {
             let returning =
                 progress.returning || natural && context.config.return_policy.return_on_completion;
             if returning || candidate.is_some() {
-                match context.routes(planning.as_ref()) {
+                let routes = {
+                    #[cfg(test)]
+                    let _span = context.attribution.as_ref().map(|trace| {
+                        trace.begin(
+                            attribution::Stage::OwnerRoutePreparation,
+                            context.planar_route_copy_bytes(),
+                        )
+                    });
+                    context.routes(planning.as_ref())
+                };
+                match routes {
                     Err(error) => output.mission = Some(Err(error)),
                     Ok(routes) => {
                         let start = mission_pose_from_stamped(&context.robot_pose);
                         let target = candidate.map(|goal| mission_pose_from_stamped(&goal.pose));
+                        #[cfg(test)]
+                        let _span = context
+                            .attribution
+                            .as_ref()
+                            .map(|trace| trace.begin(attribution::Stage::OwnerRouteQueries, 0));
                         match ordered_mission_query(
                             &start,
                             progress,
@@ -386,6 +424,11 @@ impl Backend for ExploreComputeBackend {
             .prepared
             .take()
             .expect("resolve exactly one exploration job");
+        #[cfg(test)]
+        let _span = prepared
+            .attribution
+            .as_ref()
+            .map(|trace| trace.begin(attribution::Stage::OwnerFinalization, 0));
         match decision {
             Decision::Discard => {
                 if prepared.controller_prepared {
@@ -499,6 +542,16 @@ impl ComputeInput {
 }
 
 impl ComputeContext {
+    #[cfg(test)]
+    fn planar_route_copy_bytes(&self) -> usize {
+        match &self.input {
+            ComputeInput::Planar(map) => {
+                map.grid.cells.len() * std::mem::size_of::<OccupancyCell>()
+            }
+            ComputeInput::Surface { .. } => 0,
+        }
+    }
+
     fn routes(
         &self,
         planning: Option<&FrozenSurfacePlanningInput>,
@@ -598,17 +651,36 @@ fn prepare_homeward_budget(
     cancelled: &impl Fn() -> bool,
 ) -> ComputeProjection {
     let HomewardBudgetRequest { context, progress } = request;
+    #[cfg(test)]
+    if let Some(hook) = &context.homeward_test_hook {
+        hook();
+    }
     let planning = context.input.fork_for_planning();
     if cancelled() {
         return ComputeProjection::Cancelled;
     }
-    let routes = match context.routes(planning.as_ref()) {
+    let routes = {
+        #[cfg(test)]
+        let _span = context.attribution.as_ref().map(|trace| {
+            trace.begin(
+                attribution::Stage::OwnerRoutePreparation,
+                context.planar_route_copy_bytes(),
+            )
+        });
+        context.routes(planning.as_ref())
+    };
+    let routes = match routes {
         Ok(routes) => routes,
         Err(error) => return ComputeProjection::HomewardBudget(Err(error)),
     };
     if cancelled() {
         return ComputeProjection::Cancelled;
     }
+    #[cfg(test)]
+    let _span = context
+        .attribution
+        .as_ref()
+        .map(|trace| trace.begin(attribution::Stage::OwnerRouteQueries, 0));
     let result = routes
         .distance(
             &mission_pose_from_stamped(&context.robot_pose),

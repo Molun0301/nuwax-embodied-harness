@@ -1,4 +1,4 @@
-//! Opt-in, test-only synchronous exploration stage attribution.
+//! Opt-in, test-only exploration stage attribution.
 //! Records are bounded; payload counts describe explicit copied cell payload only.
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -12,6 +12,12 @@ pub(super) enum Stage {
     LockedSelection = 2,
     LockedRoutePreparation = 3,
     UnlockedRouteQueries = 4,
+    RuntimeInputCapture = 5,
+    OwnerSelection = 6,
+    OwnerRoutePreparation = 7,
+    OwnerRouteQueries = 8,
+    OwnerCoverage = 9,
+    OwnerFinalization = 10,
 }
 #[derive(Clone, Debug)]
 pub(super) struct Record {

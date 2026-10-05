@@ -45,6 +45,8 @@ fn context() -> ComputeContext {
         clock: ClockKind::Unix,
     };
     ComputeContext {
+        homeward_test_hook: None,
+        attribution: None,
         input: ComputeInput::Planar(Arc::new(ExploreCostmapSnapshot {
             grid,
             frame_id: "map".into(),

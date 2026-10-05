@@ -8,7 +8,8 @@
 // Frontier border and 8x8 occupied local-edit derivatives are separately labeled.
 // Explicit non-default scheduling fixture: 5 ms period, 600 s no-frontier window.
 // Copied payload is a lower bound: adapter/inflation/safe-grid and per-distance
-// Costmap clones are excluded. Test record pushes add small in-lock overhead.
+// Costmap clones are excluded. Owner stage record pushes occur on the compute thread.
+// The workload and request timestamp boundaries match the recorded synchronous baseline.
 // No process environment is changed here. Supply the companion environment file
 // before launching this one ignored test in its own process (--test-threads=1).
 
@@ -156,9 +157,9 @@ impl CallTiming {
         serde_json::json!({"queue_delay_ms":ms(self.first_polled.duration_since(self.submitted)),
             "execution_or_lock_wait_ms":ms(self.finished.duration_since(self.first_polled)),
             "end_to_end_ms":ms(self.finished.duration_since(self.submitted)),"status":self.status,
-            "selection_overlap_ms":overlap_ms(self.submitted,self.finished,records,Stage::LockedSelection),
-            "route_prepare_overlap_ms":overlap_ms(self.submitted,self.finished,records,Stage::LockedRoutePreparation),
-            "route_query_overlap_ms":overlap_ms(self.submitted,self.finished,records,Stage::UnlockedRouteQueries)})
+            "selection_overlap_ms":overlap_ms(self.submitted,self.finished,records,Stage::OwnerSelection),
+            "route_prepare_overlap_ms":overlap_ms(self.submitted,self.finished,records,Stage::OwnerRoutePreparation),
+            "route_query_overlap_ms":overlap_ms(self.submitted,self.finished,records,Stage::OwnerRouteQueries)})
     }
 }
 struct SnapshotSample {
@@ -197,7 +198,7 @@ fn observe_phase(
                 omitted += 1;
             }
             if diagnostics.is_none()
-                && trace.active_stage.load(Ordering::Acquire) == Stage::LockedSelection as usize
+                && trace.active_stage.load(Ordering::Acquire) == Stage::OwnerSelection as usize
             {
                 let submitted = Instant::now();
                 let h = handle.clone();
@@ -261,10 +262,12 @@ async fn heartbeat(done: Arc<AtomicBool>, ready: oneshot::Sender<()>) -> (Vec<Be
 fn stage_json(records: &[Record]) -> serde_json::Value {
     let mut rows = Vec::new();
     for stage in [
-        Stage::RuntimeGridClone,
-        Stage::LockedSelection,
-        Stage::LockedRoutePreparation,
-        Stage::UnlockedRouteQueries,
+        Stage::RuntimeInputCapture,
+        Stage::OwnerSelection,
+        Stage::OwnerRoutePreparation,
+        Stage::OwnerRouteQueries,
+        Stage::OwnerFinalization,
+        Stage::OwnerCoverage,
     ] {
         let selected: Vec<_> = records.iter().filter(|r| r.stage == stage).collect();
         rows.push(serde_json::json!({"stage":format!("{stage:?}"),"count":selected.len(),
@@ -367,40 +370,40 @@ async fn start_case(
 }
 
 async fn release_child_without_motion(handle: &ExploreRuntimeHandle) -> bool {
-    let before = {
+    let reached_before = {
         let guard = handle.inner.lock().await;
         if guard.active_child.is_none() {
             return false;
         }
-        (
-            guard
-                .controller
-                .checkpoint()
-                .unwrap()
-                .into_iter()
-                .map(|s| (s.name, s.payload))
-                .collect::<Vec<_>>(),
-            guard.reached_goals,
-        )
+        guard.reached_goals
     };
-    let lease = active_child_lease(handle).await;
-    let value=handle.report_navigation_result(&lease.session_id,ChildNavigationResult::Failed {
-        proof:terminal_proof(&lease), reason:"SafetyFailed cause=StaleInput: explicitly injected attribution fixture retirement; no motion occurred".into(),
-    }).await.unwrap();
-    assert_eq!(value.status, STATUS_ACTIVE);
-    let guard = handle.inner.lock().await;
-    let after = guard
-        .controller
-        .checkpoint()
+    // Explicit owner inspection occurs between measured ticks. It does not put a
+    // full checkpoint/history clone into ordinary per-step committed projections.
+    let before = handle
+        .inspect_compute_checkpoint()
+        .await
         .unwrap()
         .into_iter()
-        .map(|s| (s.name, s.payload))
+        .map(|source| (source.name, source.payload))
+        .collect::<Vec<_>>();
+    let lease = active_child_lease(handle).await;
+    let value = handle.report_navigation_result(&lease.session_id, ChildNavigationResult::Failed {
+        proof: terminal_proof(&lease), reason: "SafetyFailed cause=StaleInput: explicitly injected attribution fixture retirement; no motion occurred".into(),
+    }).await.unwrap();
+    assert_eq!(value.status, STATUS_ACTIVE);
+    let after = handle
+        .inspect_compute_checkpoint()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|source| (source.name, source.payload))
         .collect::<Vec<_>>();
     assert_eq!(
-        before.0, after,
+        before, after,
         "InputUnavailable retirement must not alter source history, blacklist or counters"
     );
-    assert_eq!(before.1, guard.reached_goals);
+    let guard = handle.inner.lock().await;
+    assert_eq!(reached_before, guard.reached_goals);
     assert!(guard.active_child.is_none());
     true
 }
@@ -524,27 +527,25 @@ async fn run_matrix_case(fixture: Fixture, return_budget: bool) {
         let records = &all[before.len()..];
         assert_eq!(trace.active_stage.load(Ordering::Acquire), 0);
         assert!(
-            records.iter().any(|r| r.stage == Stage::LockedSelection),
+            records.iter().any(|r| r.stage == Stage::OwnerSelection),
             "real selection stage required"
         );
         if matches!(fixture, Fixture::FrontierBorderDerivative) && return_budget {
             assert!(
                 records
                     .iter()
-                    .any(|r| r.stage == Stage::LockedRoutePreparation),
+                    .any(|r| r.stage == Stage::OwnerRoutePreparation),
                 "frontier budget case must actually prepare routes"
             );
             assert!(
-                records
-                    .iter()
-                    .any(|r| r.stage == Stage::UnlockedRouteQueries),
+                records.iter().any(|r| r.stage == Stage::OwnerRouteQueries),
                 "frontier budget case must actually query routes"
             );
         }
         if !return_budget {
             assert!(!records.iter().any(|r| matches!(
                 r.stage,
-                Stage::LockedRoutePreparation | Stage::UnlockedRouteQueries
+                Stage::OwnerRoutePreparation | Stage::OwnerRouteQueries
             )));
         }
         let state = handle.snapshot();
@@ -560,7 +561,7 @@ async fn run_matrix_case(fixture: Fixture, return_budget: bool) {
         }
         let goal_metadata = {
             let guard = handle.inner.lock().await;
-            assert_eq!(guard.costmap_input.as_ref(), Some(&expected_map));
+            assert_eq!(guard.costmap_input.as_deref(), Some(&expected_map));
             assert_eq!(guard.reached_goals, 0);
             guard
                 .last_frontier_goal
@@ -584,7 +585,7 @@ async fn run_matrix_case(fixture: Fixture, return_budget: bool) {
         eprintln!(
             "EXPLORE_ATTRIBUTION {}",
             serde_json::json!({"kind":"scheduler_phase","fixture":fixture.label(),"phase":phase,
-            "return_budget":return_budget,"runtime_flavor":"current_thread","runtime_workers":1,"scheduler_period_ms":ms(SCHEDULER_PERIOD),
+            "return_budget":return_budget,"runtime_flavor":"current_thread","runtime_workers":1,"compute_workers":1,"scheduler_period_ms":ms(SCHEDULER_PERIOD),
             "tick_and_next_pose_request_wall_ms":wall_ms,"state":state.status,"frontiers":state.frontier_count,
             "injected_input_unavailable_terminal_before_phase":retirement,"no_motion_or_reached_feedback":true,
             "stage_records":stage_json(records),"stage_records_omitted":omitted,"goal_metadata":goal_metadata,
@@ -600,10 +601,7 @@ async fn run_matrix_case(fixture: Fixture, return_budget: bool) {
         );
     }
     let stop = handle.stop(&label).await;
-    assert!(matches!(
-        stop.status,
-        STATUS_STOPPING | STATUS_CANCELLED
-    ));
+    assert!(matches!(stop.status, STATUS_STOPPING | STATUS_CANCELLED));
     finish_cancel_and_check_stale_proofs(&handle).await;
     pose.release();
     scheduler.shutdown().await.unwrap();
@@ -733,7 +731,7 @@ async fn run_interference_case(target: Stage, action: Action, lane: ControlLane)
     eprintln!(
         "EXPLORE_ATTRIBUTION {}",
         serde_json::json!({"kind":"concurrent_request","action":format!("{action:?}"),"lane":format!("{lane:?}"),
-        "target":format!("{target:?}"),"runtime_flavor":"current_thread","scheduler_workers":1,
+        "target":format!("{target:?}"),"runtime_flavor":"current_thread","scheduler_workers":1,"compute_workers":1,
         "independent_control_workers":usize::from(matches!(lane,ControlLane::IndependentControlRuntime)),
         "request":call.json(&records),"requested_during_target_stage":submitted_in_target,"first_polled_during_target_stage":control_polled_in_target,
         "finished_during_target_stage":control_finished_in_target,"stage_records":stage_json(&records),
@@ -743,8 +741,7 @@ async fn run_interference_case(target: Stage, action: Action, lane: ControlLane)
         submitted_in_target,
         "stage atomic was only a hint; this run missed actual interval overlap"
     );
-    if matches!(target, Stage::UnlockedRouteQueries)
-        && matches!(lane, ControlLane::IndependentControlRuntime)
+    if matches!(target, Stage::OwnerSelection | Stage::OwnerRouteQueries)
         && control_finished_in_target
     {
         assert!(
@@ -759,7 +756,7 @@ async fn run_interference_case(target: Stage, action: Action, lane: ControlLane)
             "replacement-map-domain"
         );
         assert_eq!(guard.costmap_frame_generation, 2);
-        assert!(!guard.controller.is_active());
+        assert!(!guard.logical_active);
         assert_eq!(guard.last_stop_reason, "map_revision_changed");
     } else {
         assert_eq!(handle.snapshot().last_stop_reason, "user_cancelled");
@@ -785,25 +782,25 @@ fn exploration_scheduler_stage_attribution_500x500() {
             }
         }
         run_interference_case(
-            Stage::LockedSelection,
+            Stage::OwnerSelection,
             Action::Stop,
             ControlLane::SharedSchedulerRuntime,
         )
         .await;
         run_interference_case(
-            Stage::LockedSelection,
+            Stage::OwnerSelection,
             Action::Stop,
             ControlLane::IndependentControlRuntime,
         )
         .await;
         run_interference_case(
-            Stage::UnlockedRouteQueries,
+            Stage::OwnerRouteQueries,
             Action::Stop,
             ControlLane::IndependentControlRuntime,
         )
         .await;
         run_interference_case(
-            Stage::UnlockedRouteQueries,
+            Stage::OwnerRouteQueries,
             Action::ReplaceMap,
             ControlLane::IndependentControlRuntime,
         )

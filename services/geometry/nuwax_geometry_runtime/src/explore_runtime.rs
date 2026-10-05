@@ -7,13 +7,16 @@
 
 #![allow(dead_code)]
 
-// Concrete owner backend; scheduler activation is qualified separately.
-#[path = "explore_compute_backend.rs"]
-mod compute_backend;
-
 #[cfg(test)]
 #[path = "explore_attribution.rs"]
 mod attribution;
+
+#[path = "explore_compute_backend.rs"]
+mod compute_backend;
+#[path = "explore_compute_service.rs"]
+mod explore_compute_service;
+use compute_backend::*;
+use explore_compute_service::*;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -1434,7 +1437,9 @@ struct SurfaceExplorationMode {
 }
 
 pub struct ExploreRuntimeInner {
-    controller: ExplorationController,
+    logical_active: bool,
+    committed: CommittedView,
+    compute: ComputeState,
     arbitration: ExplorationArbitrationPolicy,
     last_request_id: String,
     last_selected_source: String,
@@ -1442,14 +1447,14 @@ pub struct ExploreRuntimeInner {
     last_stop: Option<ExplorationStopReason>,
     last_frontier_goal: Option<FrontierGoal>,
     last_poll: Option<ExplorationPoll>,
-    costmap_input: Option<ExploreCostmapSnapshot>,
+    costmap_input: Option<Arc<ExploreCostmapSnapshot>>,
     surface_mode: Option<SurfaceExplorationMode>,
     /// 最近一次有效地图输入的本地接收时刻，不参与地图身份。
     costmap_received_monotonic_ns: u64,
     costmap_receipt_ttl: Duration,
     committed_map: Option<schema::CommittedMapIdentity>,
     costmap_frame_generation: i64,
-    active_config: Option<ExploreStartConfig>,
+    active_config: Option<Arc<ExploreStartConfig>>,
     // Captured once at start, including errors; saving never relabels a run with later environment values.
     navigation_configuration: Option<Result<NavigationConfiguration, String>>,
     mission: Option<MissionProgress>,
@@ -1477,26 +1482,14 @@ pub struct ExploreRuntimeInner {
 }
 
 impl ExploreRuntimeInner {
-    /// 复用本次运行捕获的地图与标定，所有距离查询在释放探索锁后执行。
-    fn mission_routes(&self) -> Result<MissionRoutes, String> {
-        let config = self.active_config.as_ref().ok_or("活动探索配置缺失")?;
-        if let Some(mode) = self.surface_mode.as_ref() {
-            let map = mode.receiver.snapshot().map_err(|e| e.to_string())?
-                .ok_or("返航三维图缺失")?;
-            Ok(MissionRoutes::Surface { map, config: mode.config.clone()?,
-                boundary: config.boundary.as_ref().map(|b| b.vertices().iter().map(|p| [p.x, p.y]).collect()).unwrap_or_default() })
-        } else {
-            let map = self.costmap_input.as_ref().ok_or("返航二维图缺失")?;
-            MissionRoutes::planar(map.grid.clone(), self.mission_calibration.as_ref().ok_or("返航标定缺失")?, config)
-        }
-    }
-
     fn new() -> Self {
         Self {
-            controller: build_controller(
+            logical_active: false,
+            committed: CommittedView::capture(&build_controller(
                 ExplorationArbitrationPolicy::PreferWavefront,
                 &ExploreStartConfig::default(),
-            ),
+            )),
+            compute: ComputeState::default(),
             arbitration: ExplorationArbitrationPolicy::PreferWavefront,
             last_request_id: String::new(),
             last_selected_source: String::new(),
@@ -1537,12 +1530,8 @@ impl ExploreRuntimeInner {
         }
     }
 
-    pub fn add_source<S: ExplorationGoalSource + 'static>(&mut self, source: S) {
-        self.controller.add_source(source);
-    }
-
     fn session_in_progress(&self) -> bool {
-        self.controller.is_active() || self.pending_child_cancellation.is_some()
+        self.logical_active || self.compute.start_reservation.is_some() || self.compute.control_pending() || self.pending_child_cancellation.is_some()
     }
 
     fn update_frontiers(&mut self, frontiers: Vec<FrontierGoal>) -> Option<FrontierSnapshot> {
@@ -1559,7 +1548,7 @@ impl ExploreRuntimeInner {
 
     fn snapshot(&self, status: &'static str, message: impl Into<String>) -> ExploreRuntimeSnapshot {
         let child_lease = self.active_child.as_ref().map(|child| child.lease.clone());
-        let rollover_recovery_eligible = !self.controller.is_active()
+        let rollover_recovery_eligible = !self.logical_active
             && child_lease.is_some()
             && self
                 .pending_child_cancellation
@@ -1574,7 +1563,7 @@ impl ExploreRuntimeInner {
                 let child_lease = child_lease.as_ref()?;
                 let motion_admission = self.active_config.as_ref()?.motion_admission;
                 Some(ExplorationGlobalStopReconciliationSnapshot {
-                    eligible: !self.controller.is_active()
+                    eligible: !self.logical_active
                         && ticket.cancel_generation > 0
                         && ticket.lease.matches(child_lease),
                     cancel_generation: ticket.cancel_generation,
@@ -1870,7 +1859,11 @@ impl OrphanCancellationRegistry {
 pub struct ExploreRuntimeHandle {
     #[cfg(test)]
     attribution: Option<Arc<attribution::Attribution>>,
+    #[cfg(test)]
+    homeward_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     inner: Arc<Mutex<ExploreRuntimeInner>>,
+    compute_service: Arc<ComputeService>,
+    tick_gate: Arc<Mutex<()>>,
     expected_map_frame: Arc<str>,
     readiness_cache: Arc<SyncMutex<ExplorationReadinessDetail>>,
     snapshot_cache: Arc<RwLock<ExploreRuntimeSnapshot>>,
@@ -1881,6 +1874,19 @@ pub struct ExploreRuntimeHandle {
 }
 
 impl ExploreRuntimeHandle {
+    fn next_exploration_generation(&self, guard: &mut ExploreRuntimeInner) -> u64 {
+        match self.generation.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| value.checked_add(1)) {
+            Ok(previous) => previous + 1,
+            Err(current) => {
+                guard.request_compute_stop(ExplorationStopReason::ConsecutiveFailuresExceeded);
+                guard.compute.fault = Some("exploration generation exhausted".into());
+                guard.compute.shutdown = true;
+                self.compute_service.wake.notify_one();
+                current
+            }
+        }
+    }
+
     /// 初始化时捕获三维配置；配置错误只撤销探索能力，不关闭几何服务。
     pub(crate) async fn configure_surface_source(
         &self,
@@ -1918,12 +1924,10 @@ impl ExploreRuntimeHandle {
             input_error: Some("surface map input is unavailable".into()),
             accepting: true,
         };
-        guard.controller = build_profile_controller(
-            guard.arbitration,
-            &ExploreStartConfig::default(),
-            Some(&mode),
-        )
-        .unwrap_or_else(|_| ExplorationController::new(guard.arbitration));
+        // The actual source/controller is installed by the worker at start.
+        guard.committed = CommittedView::capture(&build_profile_controller(
+            guard.arbitration, &ExploreStartConfig::default(), Some(&mode),
+        ).unwrap_or_else(|_| ExplorationController::new(guard.arbitration)));
         guard.surface_mode = Some(mode);
         guard.committed_map = None;
         guard.costmap_received_monotonic_ns = 0;
@@ -2002,9 +2006,7 @@ impl ExploreRuntimeHandle {
             guard.committed_map = None;
             guard.costmap_received_monotonic_ns = 0;
             guard.no_frontier_since = None;
-            guard
-                .controller
-                .is_active()
+            (guard.logical_active || guard.compute.start_reservation.is_some())
                 .then(|| guard.last_request_id.clone())
         } else {
             None
@@ -2074,9 +2076,7 @@ impl ExploreRuntimeHandle {
             guard.committed_map = None;
             guard.costmap_received_monotonic_ns = 0;
             guard.no_frontier_since = None;
-            guard
-                .controller
-                .is_active()
+            (guard.logical_active || guard.compute.start_reservation.is_some())
                 .then(|| guard.last_request_id.clone())
         } else {
             guard.committed_map = Some(ticket.committed_map);
@@ -2131,8 +2131,12 @@ impl ExploreRuntimeHandle {
         let (frontier_tx, _) = watch::channel(FrontierSnapshot::default());
         Self {
             inner: Arc::new(Mutex::new(ExploreRuntimeInner::new())),
+            compute_service: Arc::new(ComputeService::new()),
+            tick_gate: Arc::new(Mutex::new(())),
             #[cfg(test)]
             attribution: None,
+            #[cfg(test)]
+            homeward_test_hook: None,
             expected_map_frame,
             readiness_cache: Arc::new(SyncMutex::new(ExplorationReadinessDetail {
                 ready: false,
@@ -2414,7 +2418,7 @@ impl ExploreRuntimeHandle {
                 Err(error)=>{let snapshot=guard.snapshot(STATUS_REJECTED,error);drop(guard);return self.store_snapshot(snapshot);}
             }
         } else {None};
-        let mut controller =
+        let controller =
             match build_profile_controller(policy, &config, guard.surface_mode.as_ref()) {
                 Ok(controller) => controller,
                 Err(error) => {
@@ -2427,19 +2431,8 @@ impl ExploreRuntimeHandle {
                     return self.store_snapshot(snapshot);
                 }
             };
-        if let Err(error) = controller.begin_exploration() {
-            let snapshot = ExploreRuntimeSnapshot {
-                status: STATUS_REJECTED,
-                message: format!("begin_exploration failed: {error}"),
-                request_id: request_id.to_string(),
-                ..guard.snapshot(STATUS_REJECTED, "begin_exploration failed")
-            };
-            drop(guard);
-            return self.store_snapshot(snapshot);
-        }
-
         let mut legacy_replanned = false;
-        let restored=if config.resume_progress_json.is_empty(){None}else{
+        let mut restored=if config.resume_progress_json.is_empty(){None}else{
             let result=(|| {
                 let mut saved=ExplorationCheckpoint::parse(&config.resume_progress_json)?;
                 let map_name=self.navigation_sink.read().as_ref().ok_or("导航地图来源缺失")?.current_map_name()?;
@@ -2452,20 +2445,79 @@ impl ExploreRuntimeHandle {
                 )?;
                 if config.return_policy.enabled()!=saved.mission.is_some(){return Err("探索进度缺少行程或请求未启用行程".into());}
                 if legacy_replanned {
-                    controller.restore_checkpoint_for_replan(&saved.sources).map_err(|e|e.to_string())?;
                     saved.prepare_history_for_replan();
-                } else {
-                    controller.restore_checkpoint(&saved.sources).map_err(|e|e.to_string())?;
                 }
                 Ok::<_,String>(saved)
             })();
             match result {Ok(saved)=>Some(saved),Err(error)=>{
-                let _=controller.end_exploration();let snapshot=guard.snapshot(STATUS_REJECTED,error);drop(guard);return self.store_snapshot(snapshot);
+                let snapshot=guard.snapshot(STATUS_REJECTED,error);drop(guard);return self.store_snapshot(snapshot);
             }}
         };
 
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        guard.controller = controller;
+        if let Err(error) = self.compute_service.ensure(self, &mut guard.compute) {
+            let snapshot = guard.snapshot(STATUS_REJECTED, error); drop(guard); return self.store_snapshot(snapshot);
+        }
+        let generation = self.next_exploration_generation(&mut guard);
+        if let Some(error) = guard.compute.fault.clone() {
+            let snapshot = guard.snapshot(STATUS_REJECTED, error); drop(guard); return self.store_snapshot(snapshot);
+        }
+        guard.generation = generation;
+        guard.last_request_id = request_id.to_string();
+        let _reservation = self.reserve_start_locked(&mut guard, generation);
+        let reserved_domain = guard.committed_map.as_ref().map(|map| (
+            map.session_id.clone(), map.session_generation,
+            guard.surface_mode.as_ref().and_then(|mode| mode.latest.as_ref()).map_or(guard.costmap_frame_generation, |ticket| ticket.map_frame_generation),
+        ));
+        let reserved_map_name = self.navigation_sink.read().as_ref().and_then(|sink| sink.current_map_name().ok());
+        let reservation_matches = |guard: &ExploreRuntimeInner| {
+            guard.generation == generation && guard.compute.start_reservation == Some(generation)
+                && guard.last_request_id == request_id
+                && reserved_domain.as_ref().is_none_or(|(session, session_generation, frame)| {
+                    guard.committed_map.as_ref().is_some_and(|map| &map.session_id == session && map.session_generation == *session_generation)
+                        && guard.surface_mode.as_ref().and_then(|mode| mode.latest.as_ref()).map_or(guard.costmap_frame_generation, |ticket| ticket.map_frame_generation) == *frame
+                })
+                && reserved_map_name.as_ref().is_none_or(|expected| self.navigation_sink.read().as_ref()
+                    .is_some_and(|sink| sink.current_map_name().is_ok_and(|name| &name == expected)))
+        };
+        let restore = restored.as_mut().map(|saved| ComputeRestore {
+            sources: std::mem::take(&mut saved.sources), replan: legacy_replanned,
+        });
+        drop(guard);
+        // Old accepted feedback and end settle before begin/restore/install. This
+        // await holds no runtime lock, and the reservation survives cancellation.
+        if let Err(error) = self.await_compute_idle().await {
+            let mut guard = self.inner.lock().await;
+            guard.request_compute_stop(ExplorationStopReason::ConsecutiveFailuresExceeded);
+            let snapshot = guard.snapshot(STATUS_REJECTED, error); drop(guard); return self.store_snapshot(snapshot);
+        }
+        let mut guard = self.inner.lock().await;
+        if !reservation_matches(&guard) {
+            if guard.compute.start_reservation == Some(generation) { guard.request_compute_stop(ExplorationStopReason::MapRevisionChanged); self.compute_service.wake.notify_one(); }
+            return self.snapshot();
+        }
+        let install = match self.admit_lifecycle_locked(&mut guard, ComputeLifecycle::Install { controller, begin: true, restore }) {
+            Ok(ticket) => ticket,
+            Err(error) => { guard.request_compute_stop(ExplorationStopReason::ConsecutiveFailuresExceeded);
+                let snapshot = guard.snapshot(STATUS_REJECTED, error); drop(guard); return self.store_snapshot(snapshot); }
+        };
+        drop(guard);
+        let installed = self.await_lifecycle(&install).await;
+        let mut guard = self.inner.lock().await;
+        if !reservation_matches(&guard) {
+            if guard.compute.start_reservation == Some(generation) { guard.request_compute_stop(ExplorationStopReason::MapRevisionChanged); self.compute_service.wake.notify_one(); }
+            return self.snapshot();
+        }
+        if let Err(error) = installed {
+            guard.request_compute_stop(ExplorationStopReason::ConsecutiveFailuresExceeded);
+            self.compute_service.wake.notify_one();
+            let snapshot = guard.snapshot(STATUS_REJECTED, format!("begin/restore exploration failed: {error}"));
+            drop(guard); return self.store_snapshot(snapshot);
+        }
+        if let Err(error) = self.open_compute_locked(&mut guard) {
+            guard.request_compute_stop(ExplorationStopReason::ConsecutiveFailuresExceeded);
+            let snapshot = guard.snapshot(STATUS_REJECTED, error); drop(guard); return self.store_snapshot(snapshot);
+        }
+
         guard.arbitration = policy;
         guard.last_request_id = request_id.to_string();
         guard.last_selected_source.clear();
@@ -2479,7 +2531,7 @@ impl ExploreRuntimeHandle {
         let mut active_config=config.clone();
         // 恢复载荷只在新控制器安装时使用，不随运行期配置克隆反复复制。
         active_config.resume_progress_json.clear();
-        guard.active_config = Some(active_config);
+        guard.active_config = Some(Arc::new(active_config));
         guard.navigation_configuration = Some(navigation_configuration);
         guard.mission = None;
         guard.mission_calibration = mission_calibration;
@@ -2634,14 +2686,14 @@ impl ExploreRuntimeHandle {
             .pending_child_cancellation
             .as_ref()
             .is_some_and(|pending| pending.failure.is_some() && !pending.dispatch_in_flight);
-        if guard.controller.is_active() || !cancel_failed {
+        if guard.logical_active || !cancel_failed {
             return Err(ExplorationRecoveryError::FailedPrecondition(
                 "exploration recovery requires a stopped controller and failed child cancellation"
                     .to_string(),
             ));
         }
 
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = self.next_exploration_generation(&mut guard);
         guard.generation = generation;
         guard.pending_child_dispatch = None;
         guard.pending_child_cancellation = None;
@@ -2834,7 +2886,7 @@ impl ExploreRuntimeHandle {
                 "exploration reconciliation requires an exact retained cancel ticket".to_string(),
             )
         })?;
-        if guard.controller.is_active()
+        if guard.logical_active
             || pending.failure.is_none()
             || pending.dispatch_in_flight
             || ticket.cancel_generation != request.cancel_generation
@@ -2939,13 +2991,21 @@ impl ExploreRuntimeHandle {
         reason: ExplorationStopReason,
         message: String,
     ) -> ExploreRuntimeSnapshot {
-        self.begin_child_action(request_id, PendingChildAction { reason, message })
+        self.begin_child_action(request_id, PendingChildAction { reason, message }, None)
             .await
+    }
+
+    /// Claimed by the retained compute-service control coroutine. Identity and
+    /// generation are checked again atomically with existing cancel admission.
+    async fn finish_compute_action(&self, action: &ComputeStopAction) -> ExploreRuntimeSnapshot {
+        self.begin_child_action(Some(&action.parent), PendingChildAction {
+            reason: action.reason, message: action.message.clone(),
+        }, Some(action)).await
     }
 
     async fn cancel_child_for_return(&self,generation:u64,reason:ExplorationStopReason)->ExploreRuntimeSnapshot {
         let mut guard=self.inner.lock().await;
-        if generation!=guard.generation || !guard.controller.is_active() || guard.pending_child_cancellation.is_some(){return self.snapshot();}
+        if generation!=guard.generation || !guard.logical_active || guard.pending_child_cancellation.is_some(){return self.snapshot();}
         let Some(child)=guard.active_child.clone() else{return guard.snapshot(STATUS_ACTIVE,"返航等待派发");};
         guard.return_after_cancellation=true;
         guard.pending_child_dispatch=None;
@@ -2958,8 +3018,10 @@ impl ExploreRuntimeHandle {
         &self,
         request_id: Option<&str>,
         action: PendingChildAction,
+        compute_action: Option<&ComputeStopAction>,
     ) -> ExploreRuntimeSnapshot {
         let mut guard = self.inner.lock().await;
+        if compute_action.is_some_and(|action| !action.matches(&guard)) { return self.snapshot(); }
         if let Some(requested_id) = request_id.map(str::trim) {
             if requested_id.is_empty() || requested_id != guard.last_request_id {
                 let mut snapshot = guard.snapshot(
@@ -2976,8 +3038,9 @@ impl ExploreRuntimeHandle {
         if guard.return_after_cancellation {
             // 用户取消、故障或关闭覆盖返航意图，共用已经在途的停车事务。
             guard.return_after_cancellation=false;
-            guard.generation=self.generation.fetch_add(1,Ordering::SeqCst)+1;
-            let _=guard.controller.stop_with_reason(action.reason);
+            if compute_action.is_none() { guard.generation=self.next_exploration_generation(&mut guard); }
+            guard.request_compute_stop(action.reason);
+            self.compute_service.wake.notify_one();
             guard.last_stop=Some(action.reason);guard.last_stop_reason=stop_reason_str(action.reason).into();
             if let Some(pending)=guard.pending_child_cancellation.as_mut(){pending.action=action.clone();}
         }
@@ -2987,7 +3050,7 @@ impl ExploreRuntimeHandle {
                 .as_ref()
                 .map(|pending| (pending.failure.clone(), pending.dispatch_in_flight))
                 .expect("pending child cancellation checked above");
-            let retry_correlated = request_id.is_some() && failure.is_some() && !dispatch_in_flight;
+            let retry_correlated = compute_action.is_none() && request_id.is_some() && failure.is_some() && !dispatch_in_flight;
             if !retry_correlated {
                 let status = if failure.is_some() && !dispatch_in_flight {
                     STATUS_FAILED
@@ -3033,9 +3096,10 @@ impl ExploreRuntimeHandle {
                 guard.last_request_id = request_id.to_string();
             }
         }
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = if compute_action.is_some() { guard.generation } else { self.next_exploration_generation(&mut guard) };
         guard.generation = generation;
-        let _ = guard.controller.stop_with_reason(action.reason);
+        guard.request_compute_stop(action.reason);
+        self.compute_service.wake.notify_one();
         guard.last_stop = Some(action.reason);
         guard.last_stop_reason = stop_reason_str(action.reason).to_string();
         guard.last_poll = Some(ExplorationPoll::Stop(action.reason));
@@ -3233,9 +3297,8 @@ impl ExploreRuntimeHandle {
             pending.ticket = Some(ticket);
             take_early_cancel_terminal(pending, cancel_generation)
         });
-        let _ = guard
-            .controller
-            .stop_with_reason(ExplorationStopReason::ConsecutiveFailuresExceeded);
+        guard.request_compute_stop(ExplorationStopReason::ConsecutiveFailuresExceeded);
+        self.compute_service.wake.notify_one();
         guard.last_stop = Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
         guard.last_stop_reason = "child_cancel_failed".to_string();
         guard.last_poll = Some(ExplorationPoll::Stop(
@@ -3289,6 +3352,7 @@ impl ExploreRuntimeHandle {
         generation: u64,
         pose: ExploreRobotPose,
     ) -> ExploreRuntimeSnapshot {
+        let Ok(_tick_permit) = self.tick_gate.try_lock() else { return self.snapshot(); };
         if ![pose.x, pose.y, pose.z]
             .iter()
             .all(|value| value.is_finite())
@@ -3333,9 +3397,12 @@ impl ExploreRuntimeHandle {
                 .await;
         }
 
+        if let Err(error) = self.await_compute_idle().await {
+            return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await;
+        }
         let now_ns = now_unix_nanos();
         let mut guard = self.inner.lock().await;
-        if generation != guard.generation || !guard.controller.is_active() {
+        if generation != guard.generation || !guard.logical_active {
             return self.snapshot();
         }
 
@@ -3377,33 +3444,66 @@ impl ExploreRuntimeHandle {
             && guard.next_return_route_check.is_none_or(|deadline| Instant::now() >= deadline)
         {
             let progress = guard.mission.clone().expect("进度已存在");
-            let routes = {
-                #[cfg(test)]
-                let _span = self.attribution.as_ref().map(|p| p.begin(attribution::Stage::LockedRoutePreparation, if guard.surface_mode.is_some() { 0 } else { guard.costmap_input.as_ref().map_or(0, |m| m.grid.cells.len() * std::mem::size_of::<OccupancyCell>()) }));
-                guard.mission_routes()
+            let context = match self.capture_compute_context(&guard, &pose, now_ns) {
+                Ok(context) => context,
+                Err(error) => { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded,
+                    format!("活动探索返航路线核验失败：{error}")).await; }
+            };
+            let route_ticket = match self.admit_compute_locked(&mut guard, &context, &pose,
+                ComputeRequest::HomewardBudget(HomewardBudgetRequest { context: context.clone(), progress })) {
+                Ok(ticket) => ticket,
+                Err(error) => { let snapshot = guard.snapshot(STATUS_PENDING, error); drop(guard); return self.store_snapshot(snapshot); }
             };
             guard.next_return_route_check = Some(Instant::now() + Duration::from_secs(1));
             drop(guard);
-            #[cfg(test)]
-            let route_span = self.attribution.as_ref().map(|p| p.begin(attribution::Stage::UnlockedRouteQueries, 0));
-            let query = routes.and_then(|routes| routes.distance(&mission_pose(&pose), &progress.home))
-                .and_then(|homeward| mission_policy.should_return(progress.travelled_m, homeward));
-            #[cfg(test)]
-            drop(route_span);
+            let result = self.await_compute(&route_ticket).await;
             guard = self.inner.lock().await;
-            if generation != guard.generation || !guard.controller.is_active()
-                || guard.pending_child_cancellation.is_some()
-            { return self.snapshot(); }
+            if !route_ticket.current(&guard) { return self.snapshot(); }
+            let query = match result {
+                Ok(value) => match &value.projection { ComputeProjection::HomewardBudget(query) => query.clone(), _ => Err("invalid homeward compute projection".into()) },
+                Err(_) => { return self.snapshot(); }
+            };
+            route_ticket.finish(&mut guard);
+            drop(guard);
+            if let Err(error) = self.await_compute_idle().await {
+                return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await;
+            }
+            guard = self.inner.lock().await;
+            if !route_ticket.current(&guard) { return self.snapshot(); }
             return_balance_reached = match query {
                 Ok(value) => value,
-                Err(error) => {
-                    drop(guard);
-                    return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded,
-                        format!("活动探索返航路线核验失败：{error}")).await;
-                }
+                Err(error) => { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded,
+                    format!("活动探索返航路线核验失败：{error}")).await; }
             };
         }
-        let condition=if guard.return_reason.is_none(){evaluate_stop_conditions(&guard,now_ns)}else{None};
+        // Preserve duration -> max-goals -> coverage ordering. Coverage is the
+        // same full-grid calculation, evaluated only on this immutable input by
+        // the owner, never by the async control thread or under inner.
+        let mut condition = if guard.return_reason.is_none() { evaluate_stop_conditions(&guard, now_ns, None) } else { None };
+        if condition.is_none() && guard.return_reason.is_none()
+            && guard.active_config.as_ref().is_some_and(|config| config.stop_conditions.max_coverage_pct.is_some())
+            && guard.costmap_input.is_some() && guard.committed_map.is_some()
+            && guard.costmap_received_monotonic_ns != 0
+            && now_monotonic_nanos().saturating_sub(guard.costmap_received_monotonic_ns) <= guard.costmap_receipt_ttl.as_nanos() as u64
+        {
+            let context = match self.capture_compute_context(&guard, &pose, now_ns) { Ok(context) => context, Err(_) => return self.snapshot() };
+            let coverage_ticket = match self.admit_compute_locked(&mut guard, &context, &pose, ComputeRequest::Coverage { context: context.clone() }) {
+                Ok(ticket) => ticket, Err(_) => return self.snapshot(),
+            };
+            drop(guard);
+            let result = self.await_compute(&coverage_ticket).await;
+            guard = self.inner.lock().await;
+            if !coverage_ticket.current(&guard) { return self.snapshot(); }
+            let coverage = match result { Ok(value) => match &value.projection { ComputeProjection::Coverage(value) => *value, _ => None }, Err(_) => None };
+            condition = evaluate_stop_conditions(&guard, now_ns, coverage);
+            coverage_ticket.finish(&mut guard);
+            drop(guard);
+            if let Err(error) = self.await_compute_idle().await {
+                return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await;
+            }
+            guard = self.inner.lock().await;
+            if !coverage_ticket.current(&guard) { return self.snapshot(); }
+        }
         let exhausted=return_balance_reached || guard.mission.as_ref().is_some_and(|p|!p.returning && mission_policy.maximum_distance_m.is_some_and(|limit|p.travelled_m+mission_policy.reserve_distance_m>=limit));
         if exhausted || condition.is_some() {
             let reason=if exhausted {ExplorationStopReason::DistanceBudgetReached}else{condition.expect("条件已存在")};
@@ -3451,7 +3551,7 @@ impl ExploreRuntimeHandle {
             None
         } else {
             #[cfg(test)]
-            let _span = self.attribution.as_ref().map(|p| p.begin(attribution::Stage::RuntimeGridClone, guard.costmap_input.as_ref().map_or(0, |m| m.grid.cells.len() * std::mem::size_of::<OccupancyCell>())));
+            let _span = self.attribution.as_ref().map(|p| p.begin(attribution::Stage::RuntimeInputCapture, 0));
             guard.costmap_input.clone()
         };
         if !surface_mode && costmap.is_none() {
@@ -3540,116 +3640,104 @@ impl ExploreRuntimeHandle {
             let frame=guard.surface_mode.as_ref().and_then(|m|m.latest.as_ref()).map_or(guard.costmap_frame_generation,|t|t.map_frame_generation);
             if frame>0 {guard.progress_origin=Some((committed_map.session_id.clone(),committed_map.session_generation,frame));guard.progress_map_name=expected_map_name.clone();}
         }
-        let mut state = ExplorationStateSnapshot::new(
-            PoseStamped {
-                frame_id: if surface_mode {
-                    NavFrameId::from_static(self.expected_map_frame.as_ref())
-                } else {
-                    NavFrameId::Map
-                },
-                stamp: Timestamp {
-                    nanos: pose.source_timestamp_ns as i64,
-                    clock: ClockKind::Unix,
-                },
-                pose: Pose3 {
-                    position: Point3 {
-                        x: pose.x,
-                        y: pose.y,
-                        z: pose.z,
-                    },
-                    orientation: pose.orientation,
-                },
-            },
-            Timestamp {
-                nanos: now_ns as i64,
-                clock: ClockKind::Unix,
-            },
-        );
-        state.global_costmap = costmap.as_ref().map(|costmap| &costmap.grid);
-        #[cfg(test)]
-        let selection_span = self.attribution.as_ref().map(|p| p.begin(attribution::Stage::LockedSelection, 0));
-        let selection_started=Instant::now();
-        let mut poll_result = if guard.mission.as_ref().is_some_and(|p|p.returning) {
-            Ok(ExplorationPoll::Pending)
-        }else{guard.controller.poll_next_goal_with_deferred_stop(&state,mission_policy.enabled())};
-        let selection_ms=selection_started.elapsed().as_secs_f64()*1000.0;
-        #[cfg(test)]
-        drop(selection_span);
-        if selection_ms>50.0 {tracing::warn!(selection_ms,"探索目标计算超过50毫秒");}
-        let diagnostics = guard.controller.diagnostics();
-        guard.last_selected_source = diagnostics.selected_source.unwrap_or_else(|| {
-            if surface_mode {
-                "surface".into()
-            } else {
-                String::new()
-            }
-        });
-        let source_frontiers = guard.controller.frontier_snapshot();
+        let context = match self.capture_compute_context(&guard, &pose, now_ns) {
+            Ok(context) => context,
+            Err(error) => { let snapshot = guard.snapshot(STATUS_PENDING, error); drop(guard); return self.store_snapshot(snapshot); }
+        };
+        let mission_progress = guard.mission.clone();
+        let selection_ticket = match self.admit_compute_locked(&mut guard, &context, &pose,
+            ComputeRequest::Selection(SelectionRequest { context: context.clone(), progress: mission_progress.clone() })) {
+            Ok(ticket) => ticket,
+            Err(error) => { let snapshot = guard.snapshot(STATUS_PENDING, error); drop(guard); return self.store_snapshot(snapshot); }
+        };
+        let sampled_instant = selection_ticket.sampled_instant();
+        drop(guard);
+        let finalized = self.await_compute(&selection_ticket).await;
+        guard = self.inner.lock().await;
+        if !selection_ticket.current(&guard) { return self.snapshot(); }
+        let finalized = match finalized { Ok(value) => value, Err(_) => return self.snapshot() };
+        let selection = match &finalized.projection { ComputeProjection::Selection(selection) => selection.clone(), _ => {
+            drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, "invalid selection compute projection".into()).await;
+        }};
+        let mut poll_result = selection.poll;
+        let diagnostics = guard.committed.diagnostics.clone();
+        guard.last_selected_source = diagnostics.selected_source.unwrap_or_else(|| if surface_mode { "surface".into() } else { String::new() });
+        let source_frontiers = guard.committed.frontiers.clone();
         let frontier_update = guard.update_frontiers(source_frontiers);
 
-        if let Some(progress)=guard.mission.clone() {
-            let natural=matches!(&poll_result,Ok(ExplorationPoll::Stop(reason)) if reason.terminal_kind()==ExplorationTerminalKind::Succeeded);
-            let candidate=match &poll_result {Ok(ExplorationPoll::Goal(goal))=>Some(goal.clone()),_=>None};
-            let returning=progress.returning || natural && mission_policy.return_on_completion;
+        if let Some(progress) = mission_progress {
+            let natural = matches!(&poll_result, Ok(ExplorationPoll::Stop(reason)) if reason.terminal_kind() == ExplorationTerminalKind::Succeeded);
+            let candidate = match &poll_result { Ok(ExplorationPoll::Goal(goal)) => Some(goal.clone()), _ => None };
+            let returning = progress.returning || natural && mission_policy.return_on_completion;
             if returning || candidate.is_some() {
-                let start=mission_pose(&pose);
-                let routes={
-                    #[cfg(test)]
-                    let _span = self.attribution.as_ref().map(|p| p.begin(attribution::Stage::LockedRoutePreparation, if guard.surface_mode.is_some() { 0 } else { guard.costmap_input.as_ref().map_or(0, |m| m.grid.cells.len() * std::mem::size_of::<OccupancyCell>()) }));
-                    guard.mission_routes()
+                let parent_id = guard.last_request_id.clone();
+                let advice = match selection.mission {
+                    Some(Ok(advice)) => advice,
+                    Some(Err(error)) => { drop(guard); self.publish_frontiers(frontier_update);
+                        return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, format!("返航路线核验失败：{error}")).await; }
+                    None => { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, "missing mission route advice".into()).await; }
                 };
-                let parent_id=guard.last_request_id.clone();
-                // 有界真实路线查询不持探索锁；取消仍可立即撤销原父任务。
-                drop(guard);
-                #[cfg(test)]
-                let route_span = self.attribution.as_ref().map(|p| p.begin(attribution::Stage::UnlockedRouteQueries, 0));
-                let query=(|| {
-                    let routes=routes?;
-                    let homeward=routes.distance(&start,&progress.home)?;
-                    let can_visit=if let Some(goal)=candidate.as_ref() {
-                        let target=MissionPose {position:[goal.pose.pose.position.x,goal.pose.pose.position.y,goal.pose.pose.position.z],orientation_xyzw:{let q=goal.pose.pose.orientation;[q.x,q.y,q.z,q.w]}};
-                        routes.distance(&start,&target).and_then(|outward|routes.distance(&target,&progress.home).map(|back|mission_policy.can_visit(progress.travelled_m,outward,back)))
-                    }else{Ok(false)};
-                    Ok::<_,String>((homeward,can_visit))
-                })();
-                #[cfg(test)]
-                drop(route_span);
-                guard=self.inner.lock().await;
-                if generation!=guard.generation || !guard.controller.is_active() || guard.last_request_id!=parent_id {
-                    return self.snapshot();
-                }
-                let (homeward,can_visit)=match query {Ok(v)=>v,Err(error)=>{
-                    drop(guard);self.publish_frontiers(frontier_update);
-                    return self.finish_session(None,ExplorationStopReason::ConsecutiveFailuresExceeded,format!("返航路线核验失败：{error}")).await;
-                }};
-                let can_visit = match can_visit {
+                let homeward = advice.homeward;
+                let can_visit = match advice.can_visit {
                     Ok(value) => value,
                     Err(error) => {
-                        // 候选不可通行交回源的重试与区域调度，不能伪报预算耗尽。
                         let goal = candidate.as_ref().expect("仅候选路线查询会失败");
-                        if let Err(feedback_error) = guard.controller.report_goal_feedback(
-                            &goal.id, ExplorationGoalFeedback::Failed(format!("候选往返路线不可通行：{error}")),
-                        ) {
-                            drop(guard); self.publish_frontiers(frontier_update);
+                        let feedback = ExplorationGoalFeedback::Failed(format!("候选往返路线不可通行：{error}"));
+                        let ticket = match self.admit_feedback_locked(&mut guard,
+                            FeedbackIdentity::Internal { generation, lineage: format!("poll:{}:{}", selection_ticket.id.incarnation, selection_ticket.id.sequence), goal: goal.id.clone(), feedback: feedback.clone() },
+                            goal.id.clone(), feedback, None, false) {
+                            Ok(ticket) => ticket,
+                            Err(feedback_error) => { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded,
+                                format!("候选路线失败反馈未完成：{feedback_error}")).await; }
+                        };
+                        selection_ticket.feedback_handoff(&mut guard);
+                        drop(guard);
+                        let acknowledged = self.await_feedback(&ticket).await;
+                        guard = self.inner.lock().await;
+                        if generation != guard.generation || !guard.logical_active || guard.last_request_id != parent_id { return self.snapshot(); }
+                        if let Err(feedback_error) = acknowledged { drop(guard); self.publish_frontiers(frontier_update);
                             return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded,
-                                format!("候选路线失败反馈未完成：{feedback_error}")).await;
-                        }
+                                format!("候选路线失败反馈未完成：{feedback_error}")).await; }
                         guard.last_poll = Some(ExplorationPoll::Pending);
                         guard.no_frontier_since = None;
+                        selection_ticket.finish(&mut guard);
                         let snapshot = guard.snapshot(STATUS_PENDING, format!("候选往返路线不可通行，等待其它候选：{error}"));
-                        drop(guard); self.publish_frontiers(frontier_update);
-                        return self.store_snapshot(snapshot);
+                        drop(guard); self.publish_frontiers(frontier_update); return self.store_snapshot(snapshot);
                     }
                 };
                 if returning || !can_visit {
-                    if let Some(goal)=candidate.as_ref(){let _=guard.controller.report_goal_feedback(&goal.id,ExplorationGoalFeedback::Cancelled);}
-                    let reason=if progress.returning {guard.return_reason.unwrap_or(ExplorationStopReason::DistanceBudgetReached)}else if natural {match poll_result {Ok(ExplorationPoll::Stop(reason))=>reason,_=>unreachable!()}}else{ExplorationStopReason::DistanceBudgetReached};
-                    guard.return_reason=Some(reason);
-                    guard.mission.as_mut().expect("同一运行进度").returning=true;
-                    let mut home=FrontierGoal::new(format!("{}.return.{}",parent_id,guard.child_sequence+1),PoseStamped {frame_id:state.robot_pose.frame_id.clone(),stamp:state.now,pose:pose3(&progress.home)},0.0);
-                    home.producer="mission_return".into();home.distance_cost=Some(homeward as f32);
-                    guard.return_goal_id=Some(home.id.clone());
-                    poll_result=Ok(ExplorationPoll::Goal(home));
+                    if let Some(goal) = candidate.as_ref() {
+                        let feedback = ExplorationGoalFeedback::Cancelled;
+                        let ticket = match self.admit_feedback_locked(&mut guard,
+                            FeedbackIdentity::Internal { generation, lineage: format!("poll:{}:{}", selection_ticket.id.incarnation, selection_ticket.id.sequence), goal: goal.id.clone(), feedback: feedback.clone() },
+                            goal.id.clone(), feedback, None, false) {
+                            Ok(ticket) => ticket,
+                            Err(error) => { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await; }
+                        };
+                        selection_ticket.feedback_handoff(&mut guard);
+                        drop(guard);
+                        let acknowledged = self.await_feedback(&ticket).await;
+                        guard = self.inner.lock().await;
+                        if generation != guard.generation || !guard.logical_active || guard.last_request_id != parent_id { return self.snapshot(); }
+                        if let Err(error) = acknowledged { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await; }
+                        if !selection_ticket.current_after_feedback(&guard, &ticket) {
+                            selection_ticket.finish(&mut guard);
+                            guard.no_frontier_since = None;
+                            let snapshot = guard.snapshot(STATUS_PENDING, "mission source changed during candidate retirement; waiting for fresh route advice");
+                            drop(guard);
+                            return self.store_snapshot(snapshot);
+                        }
+                    }
+                    let reason = if progress.returning { guard.return_reason.unwrap_or(ExplorationStopReason::DistanceBudgetReached) }
+                        else if natural { match poll_result { Ok(ExplorationPoll::Stop(reason)) => reason, _ => unreachable!() } }
+                        else { ExplorationStopReason::DistanceBudgetReached };
+                    guard.return_reason = Some(reason);
+                    guard.mission.as_mut().expect("同一运行进度").returning = true;
+                    let mut home = FrontierGoal::new(format!("{}.return.{}", parent_id, guard.child_sequence + 1),
+                        PoseStamped { frame_id: context.robot_pose.frame_id.clone(), stamp: context.now, pose: pose3(&progress.home) }, 0.0);
+                    home.producer = "mission_return".into(); home.distance_cost = Some(homeward as f32);
+                    guard.return_goal_id = Some(home.id.clone());
+                    poll_result = Ok(ExplorationPoll::Goal(home));
                 }
             }
         }
@@ -3668,7 +3756,7 @@ impl ExploreRuntimeHandle {
                     navigation_goal.position_tolerance_m=0.1;
                     navigation_goal.yaw_tolerance_rad=0.2;
                 }
-                let config = guard.active_config.clone().unwrap_or_default();
+                let config = guard.active_config.as_deref().cloned().unwrap_or_default();
                 let mut intent = match build_wavefront_goal_intent(
                     guard.session_generation,
                     cancel_generation,
@@ -3681,6 +3769,7 @@ impl ExploreRuntimeHandle {
                 ) {
                     Ok(intent) => intent,
                     Err(error) => {
+                selection_ticket.finish(&mut guard);
                         drop(guard);
                         self.publish_frontiers(frontier_update);
                         return self
@@ -3722,10 +3811,13 @@ impl ExploreRuntimeHandle {
                 );
                 self.publish_frontiers(frontier_update);
                 self.store_snapshot(dispatching);
+                guard.pending_child_dispatch = Some(request.clone());
+                selection_ticket.finish(&mut guard);
                 self.dispatch_child(generation, request, guard).await
             }
             Ok(ExplorationPoll::NoFrontier) => {
-                let first_no_frontier = *guard.no_frontier_since.get_or_insert_with(Instant::now);
+                selection_ticket.finish(&mut guard);
+                let first_no_frontier = *guard.no_frontier_since.get_or_insert(sampled_instant);
                 guard.last_poll = Some(ExplorationPoll::NoFrontier);
                 let limit_ms = guard
                     .active_config
@@ -3755,6 +3847,7 @@ impl ExploreRuntimeHandle {
                 self.store_snapshot(snapshot)
             }
             Ok(ExplorationPoll::Pending) => {
+                selection_ticket.finish(&mut guard);
                 guard.no_frontier_since = None;
                 guard.last_poll = Some(ExplorationPoll::Pending);
                 let snapshot = guard.snapshot(
@@ -3766,6 +3859,7 @@ impl ExploreRuntimeHandle {
                 self.store_snapshot(snapshot)
             }
             Ok(ExplorationPoll::SourceUnavailable(reason)) => {
+                selection_ticket.finish(&mut guard);
                 guard.no_frontier_since = None;
                 guard.last_poll = Some(ExplorationPoll::SourceUnavailable(reason.clone()));
                 let snapshot =
@@ -3775,6 +3869,7 @@ impl ExploreRuntimeHandle {
                 self.store_snapshot(snapshot)
             }
             Ok(ExplorationPoll::Stop(reason)) => {
+                selection_ticket.finish(&mut guard);
                 drop(guard);
                 self.publish_frontiers(frontier_update);
                 self.finish_session(
@@ -3785,6 +3880,7 @@ impl ExploreRuntimeHandle {
                 .await
             }
             Err(error) => {
+                selection_ticket.finish(&mut guard);
                 drop(guard);
                 self.publish_frontiers(frontier_update);
                 self.finish_session(
@@ -3803,7 +3899,7 @@ impl ExploreRuntimeHandle {
         request: ChildNavigationRequest,
         mut guard: tokio::sync::MutexGuard<'_, ExploreRuntimeInner>,
     ) -> ExploreRuntimeSnapshot {
-        if generation != guard.generation || !guard.controller.is_active() {
+        if generation != guard.generation || !guard.logical_active {
             return self.snapshot();
         }
         let Some(sink) = self.navigation_sink.read().clone() else {
@@ -3864,7 +3960,7 @@ impl ExploreRuntimeHandle {
                     && pending.intent == request.intent
             });
         if generation != guard.generation
-            || !guard.controller.is_active()
+            || !guard.logical_active
             || !frozen_request_matches
         {
             drop(guard);
@@ -3902,14 +3998,24 @@ impl ExploreRuntimeHandle {
         error: ChildNavigationSubmitError,
     ) -> ExploreRuntimeSnapshot {
         let mut guard = self.inner.lock().await;
-        if generation != guard.generation || !guard.controller.is_active() {
+        if generation != guard.generation || !guard.logical_active {
             return self.snapshot();
         }
         let reason = error.reason().to_string();
         if matches!(error, ChildNavigationSubmitError::SourceChanged(_)) {
             guard.pending_child_dispatch = None;
             guard.no_frontier_since = None;
-            let _ = guard.controller.report_goal_feedback(&request.frontier_goal_id, ExplorationGoalFeedback::Cancelled);
+            let feedback = ExplorationGoalFeedback::Cancelled;
+            let ticket = match self.admit_feedback_locked(&mut guard,
+                FeedbackIdentity::Internal { generation, lineage: request.request_id.clone(), goal: request.frontier_goal_id.clone(), feedback: feedback.clone() },
+                request.frontier_goal_id.clone(), feedback, None, false) {
+                Ok(ticket) => ticket, Err(error) => { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await; }
+            };
+            drop(guard);
+            let acknowledged = self.await_feedback(&ticket).await;
+            guard = self.inner.lock().await;
+            if generation != guard.generation || !guard.logical_active { return self.snapshot(); }
+            if let Err(error) = acknowledged { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await; }
             let snapshot = guard.snapshot(STATUS_PENDING, format!("waiting for refreshed exploration input: {reason}"));
             drop(guard);
             return self.store_snapshot(snapshot);
@@ -3934,11 +4040,18 @@ impl ExploreRuntimeHandle {
                 )
                 .await;
         }
-        let _ = guard.controller.report_goal_feedback(
-            &request.frontier_goal_id,
-            ExplorationGoalFeedback::Failed(reason.clone()),
-        );
-        let frontiers = guard.controller.frontier_snapshot();
+        let feedback = ExplorationGoalFeedback::Failed(reason.clone());
+        let ticket = match self.admit_feedback_locked(&mut guard,
+            FeedbackIdentity::Internal { generation, lineage: request.request_id.clone(), goal: request.frontier_goal_id.clone(), feedback: feedback.clone() },
+            request.frontier_goal_id.clone(), feedback, None, false) {
+            Ok(ticket) => ticket, Err(error) => { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await; }
+        };
+        drop(guard);
+        let acknowledged = self.await_feedback(&ticket).await;
+        guard = self.inner.lock().await;
+        if generation != guard.generation || !guard.logical_active { return self.snapshot(); }
+        if let Err(error) = acknowledged { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await; }
+        let frontiers = guard.committed.frontiers.clone();
         let frontier_update = guard.update_frontiers(frontiers);
         let snapshot = guard.snapshot(
             STATUS_PENDING,
@@ -3955,6 +4068,11 @@ impl ExploreRuntimeHandle {
         result: ChildNavigationResult,
     ) -> Result<ExploreRuntimeSnapshot, String> {
         let mut guard = self.inner.lock().await;
+        if let Some(ticket) = self.existing_external_feedback_locked(&guard, child_request_id, &result)? {
+            drop(guard);
+            self.await_feedback(&ticket).await?;
+            return Ok(self.snapshot());
+        }
         let Some(active_child) = guard.active_child.as_ref() else {
             return Err("no active exploration child navigation".to_string());
         };
@@ -4190,9 +4308,8 @@ impl ExploreRuntimeHandle {
             guard.return_after_cancellation=false;
             guard.progress_stopped_ns.get_or_insert_with(now_unix_nanos);
             let (status, message, frontier_update) = if let Some(error) = pending.failure {
-                let _ = guard
-                    .controller
-                    .stop_with_reason(ExplorationStopReason::ConsecutiveFailuresExceeded);
+                guard.request_compute_stop(ExplorationStopReason::ConsecutiveFailuresExceeded);
+                self.compute_service.wake.notify_one();
                 guard.last_stop = Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
                 guard.last_stop_reason = "child_cancel_failed".to_string();
                 (
@@ -4258,18 +4375,7 @@ impl ExploreRuntimeHandle {
                 return Err("unexpected cancellation terminal without a pending action".to_string())
             }
         };
-        guard
-            .controller
-            .report_goal_feedback(&frontier_goal_id, feedback)
-            .map_err(|error| error.to_string())?;
-        if matches!(&result, ChildNavigationResult::Reached(_)) {
-            guard.reached_goals = guard.reached_goals.saturating_add(1);
-        }
-        guard.active_child = None;
-        guard.no_frontier_since = None;
-        let frontiers = guard.controller.frontier_snapshot();
-        let frontier_update = guard.update_frontiers(frontiers);
-        let message = match result {
+        let message = match &result {
             ChildNavigationResult::Failed {..} if input_interrupted => "child navigation input interrupted; waiting for fresh inputs",
             ChildNavigationResult::Reached(_) => {
                 "child navigation reached; selecting next frontier"
@@ -4281,10 +4387,15 @@ impl ExploreRuntimeHandle {
                 unreachable!("cancellation variants returned above")
             }
         };
-        let snapshot = guard.snapshot(STATUS_ACTIVE, message);
+        let reached = matches!(&result, ChildNavigationResult::Reached(_));
+        let ticket = self.admit_feedback_locked(&mut guard,
+            FeedbackIdentity::External { child: child_request_id.to_string(), terminal: result },
+            frontier_goal_id, feedback, Some(message), reached)?;
+        // The exact child and terminal stay retained until the persistent driver
+        // applies this acknowledgment, even if this caller is cancelled.
         drop(guard);
-        self.publish_frontiers(frontier_update);
-        Ok(self.store_snapshot(snapshot))
+        self.await_feedback(&ticket).await?;
+        Ok(self.snapshot())
     }
 
     pub async fn ingest_costmap(&self, costmap: OccupancyGrid2D) -> bool {
@@ -4362,12 +4473,12 @@ impl ExploreRuntimeHandle {
         let mut guard = self.inner.lock().await;
         if guard.surface_mode.is_some() {
             // 二维栅格仅保留展示，不覆盖三维输入的权威身份与原始接收时刻。
-            let changed = guard.costmap_input.as_ref() != Some(&snapshot);
-            guard.costmap_input = Some(snapshot);
+            let changed = guard.costmap_input.as_deref() != Some(&snapshot);
+            guard.costmap_input = Some(Arc::new(snapshot));
             return Ok(changed);
         }
         let (received, ttl) = observation.unwrap_or_else(|| (now_monotonic_nanos(), DEFAULT_COSTMAP_RECEIPT_TTL));
-        if guard.costmap_input.as_ref() == Some(&snapshot)
+        if guard.costmap_input.as_deref() == Some(&snapshot)
             && guard.committed_map.as_ref() == committed_map.as_ref()
             && guard.costmap_frame_generation == frame_generation
         {
@@ -4387,7 +4498,7 @@ impl ExploreRuntimeHandle {
                 return Err("committed costmap identity is stale or conflicting".to_string());
             }
         }
-        let finish_request = if guard.controller.is_active() && guard.committed_map.as_ref().zip(committed_map.as_ref()).is_some_and(|(old, new)|
+        let finish_request = if (guard.logical_active || guard.compute.start_reservation.is_some()) && guard.committed_map.as_ref().zip(committed_map.as_ref()).is_some_and(|(old, new)|
             old.session_id != new.session_id || old.session_generation != new.session_generation || guard.costmap_frame_generation != frame_generation) {
             Some(guard.last_request_id.clone())
         } else { None };
@@ -4398,7 +4509,7 @@ impl ExploreRuntimeHandle {
         guard.costmap_receipt_ttl = ttl;
 
         // 实时地图只刷新下一轮探索输入，不取消当前目标。
-        guard.costmap_input = Some(snapshot);
+        guard.costmap_input = Some(Arc::new(snapshot));
         let current_frontiers = guard.frontiers.clone();
         let frontier_update = guard.update_frontiers(current_frontiers);
         let backend_available = self.readiness_cache.lock().backend_available;
@@ -4438,7 +4549,7 @@ impl ExploreRuntimeHandle {
     /// still owns motion-safety state, including a failed cancellation barrier.
     pub async fn blocks_mapping_mutation(&self) -> bool {
         let guard = self.inner.lock().await;
-        guard.controller.is_active()
+        guard.logical_active
             || guard.active_child.is_some()
             || guard.pending_child_cancellation.is_some()
             || self.orphan_cancellations.blocks_motion_mutation()
@@ -4482,8 +4593,8 @@ impl ExploreRuntimeHandle {
         backend_available: bool,
         navigation_sink_ready: bool,
     ) -> ExplorationReadinessDetail {
-        let controller_active = guard.controller.is_active();
-        let source_count = guard.controller.source_count();
+        let controller_active = guard.logical_active;
+        let source_count = guard.committed.source_count;
         let frontier_source_ready = controller_active && source_count > 0;
         let costmap_input_ready = guard.surface_mode.as_ref().map_or_else(
             || {
@@ -4537,9 +4648,7 @@ impl ExploreRuntimeHandle {
             frontier_source_ready,
             costmap_input_ready,
             navigation_sink_ready,
-            active_source: guard
-                .controller
-                .diagnostics()
+            active_source: guard.committed.diagnostics.clone()
                 .selected_source
                 .unwrap_or_else(|| {
                     if guard.surface_mode.is_some() {
@@ -4554,9 +4663,25 @@ impl ExploreRuntimeHandle {
     }
 
     pub(crate) async fn checkpoint_progress(&self,request_id:&str)->Result<String,String> {
+        let initial = self.inner.lock().await;
+        if request_id.is_empty() || request_id != initial.last_request_id { return Err("探索进度请求身份不匹配".into()); }
+        if initial.logical_active || initial.compute.start_reservation.is_some() || initial.active_child.is_some()
+            || initial.pending_child_cancellation.is_some() || initial.pending_child_dispatch.is_some() || self.orphan_cancellations.has_entries() {
+            return Err("探索进度只可在原任务停止且导航拥有权已确认释放后保存".into());
+        }
+        let stopped_fence = (initial.generation, initial.committed_map.clone(), initial.progress_origin.clone(),
+            initial.surface_mode.as_ref().and_then(|mode| mode.latest.as_ref()).map_or(initial.costmap_frame_generation, |ticket| ticket.map_frame_generation));
+        drop(initial);
+        // Accepted feedback may still be mutating old confirmed history. Capture
+        // export fields only after it and old-session end have acknowledged.
+        self.await_compute_idle().await?;
         let guard=self.inner.lock().await;
+        if guard.generation != stopped_fence.0 || guard.committed_map != stopped_fence.1 || guard.progress_origin != stopped_fence.2
+            || guard.surface_mode.as_ref().and_then(|mode| mode.latest.as_ref()).map_or(guard.costmap_frame_generation, |ticket| ticket.map_frame_generation) != stopped_fence.3 {
+            return Err("探索停止代际或地图域在等待保存时发生变化".into());
+        }
         if request_id.is_empty() || request_id!=guard.last_request_id{return Err("探索进度请求身份不匹配".into());}
-        if guard.controller.is_active() || guard.active_child.is_some() || guard.pending_child_cancellation.is_some() || guard.pending_child_dispatch.is_some() || self.orphan_cancellations.has_entries(){
+        if guard.logical_active || guard.active_child.is_some() || guard.pending_child_cancellation.is_some() || guard.pending_child_dispatch.is_some() || self.orphan_cancellations.has_entries(){
             return Err("探索进度只可在原任务停止且导航拥有权已确认释放后保存".into());
         }
         let config=guard.active_config.as_ref().ok_or("探索配置不存在")?;
@@ -4564,13 +4689,33 @@ impl ExploreRuntimeHandle {
         let frame=guard.surface_mode.as_ref().and_then(|m|m.latest.as_ref()).map_or(guard.costmap_frame_generation,|t|t.map_frame_generation);
         let origin=guard.progress_origin.as_ref().ok_or("探索尚未消费有效坐标输入")?;
         if origin.0!=map.session_id || origin.1!=map.session_generation || origin.2!=frame{return Err("探索历史的坐标域已变化，不能保存成当前地图进度".into());}
-        let saved=ExplorationCheckpoint {schema_version:2,request_id:request_id.into(),map_name:guard.progress_map_name.clone(),map_frame_id:self.expected_map_frame.to_string(),
+        let generation = guard.generation;
+        let history = guard.compute.history;
+        let domain = (map.clone(), frame, origin.clone());
+        let mut saved=ExplorationCheckpoint {schema_version:2,request_id:request_id.into(),map_name:guard.progress_map_name.clone(),map_frame_id:self.expected_map_frame.to_string(),
             origin_session_id:origin.0.clone(),origin_session_generation:origin.1,origin_frame_generation:origin.2,
             configuration:Some(ExplorationConfiguration::capture(config, guard.surface_mode.is_some())),
             navigation_configuration:Some(guard.navigation_configuration.as_ref().ok_or("探索启动配置不存在")?.as_ref().map_err(Clone::clone)?.clone()),
             configuration_sha256:None,navigation_configuration_sha256:None,
             elapsed_ns:guard.progress_stopped_ns.unwrap_or_else(now_unix_nanos).saturating_sub(guard.started_at_ns),reached_goals:guard.reached_goals,mission:guard.mission.clone(),return_reason:guard.return_reason,
-            sources:guard.controller.checkpoint().map_err(|e|e.to_string())?};
+            sources:Vec::new()};
+        drop(guard);
+        self.await_compute_idle().await?;
+        let mut guard = self.inner.lock().await;
+        let unchanged = |guard: &ExploreRuntimeInner| !guard.logical_active && guard.generation == generation
+            && guard.compute.history == history && guard.last_request_id == request_id
+            && guard.active_child.is_none() && guard.pending_child_cancellation.is_none() && guard.pending_child_dispatch.is_none()
+            && guard.committed_map.as_ref() == Some(&domain.0)
+            && guard.surface_mode.as_ref().and_then(|mode| mode.latest.as_ref()).map_or(guard.costmap_frame_generation, |ticket| ticket.map_frame_generation) == domain.1
+            && guard.progress_origin.as_ref() == Some(&domain.2);
+        if !unchanged(&guard) { return Err("探索停止代际或历史在保存前发生变化".into()); }
+        let export = self.admit_lifecycle_locked(&mut guard, ComputeLifecycle::ExportCheckpoint)?;
+        drop(guard);
+        let output = self.await_lifecycle(&export).await?;
+        let guard = self.inner.lock().await;
+        if !unchanged(&guard) || self.orphan_cancellations.has_entries() { return Err("探索停止代际或历史在保存时发生变化".into()); }
+        saved.sources = match output.as_ref() { ComputeLifecycleOutput::Checkpoint(sources) => sources.clone(), _ => return Err("invalid exploration checkpoint acknowledgment".into()) };
+        drop(guard);
         let payload=serde_json::to_string(&saved).map_err(|e|e.to_string())?;
         ExplorationCheckpoint::parse(&payload)?;
         Ok(payload)
@@ -4578,9 +4723,9 @@ impl ExploreRuntimeHandle {
 
     pub async fn diagnostics(&self) -> ControllerDiagnosticsView {
         let guard = self.inner.lock().await;
-        let diagnostics = guard.controller.diagnostics();
+        let diagnostics = guard.committed.diagnostics.clone();
         ControllerDiagnosticsView {
-            active: diagnostics.active,
+            active: guard.logical_active,
             arbitration: arbitration_policy_str(guard.arbitration).to_string(),
             selected_source: diagnostics.selected_source.unwrap_or_default(),
             last_stop_reason: guard.last_stop_reason.clone(),
@@ -4654,6 +4799,7 @@ fn normalize_frame(frame_id: &str) -> &str {
 fn evaluate_stop_conditions(
     guard: &ExploreRuntimeInner,
     now_ns: u64,
+    coverage: Option<f64>,
 ) -> Option<ExplorationStopReason> {
     let config = guard.active_config.as_ref()?;
     let conditions = &config.stop_conditions;
@@ -4685,8 +4831,7 @@ fn evaluate_stop_conditions(
             && guard.costmap_received_monotonic_ns != 0
             && now_monotonic_nanos().saturating_sub(guard.costmap_received_monotonic_ns)
                 <= guard.costmap_receipt_ttl.as_nanos() as u64
-            && coverage_pct(&costmap.grid, config.boundary.as_ref())
-                .is_some_and(|coverage| coverage >= max_coverage)
+            && coverage.is_some_and(|coverage| coverage >= max_coverage)
         {
             return Some(ExplorationStopReason::CoverageReached);
         }
@@ -4717,6 +4862,7 @@ pub struct ExploreSchedulerHandle {
 }
 
 struct ExploreSchedulerInner {
+    compute_runtime: ExploreRuntimeHandle,
     shutdown_tx: watch::Sender<bool>,
     terminal_tx: watch::Sender<Option<Result<(), String>>>,
     terminal_rx: watch::Receiver<Option<Result<(), String>>>,
@@ -4860,6 +5006,7 @@ impl ExploreSchedulerHandle {
         } else {
             period
         };
+        let compute_runtime = runtime.clone();
         let worker = tokio::spawn(async move {
             #[cfg(test)]
             crate::lcm_runtime::wait_for_topology_scheduler_release(topology_control);
@@ -4879,7 +5026,7 @@ impl ExploreSchedulerHandle {
                                 // 决策层允许低频输入。活动子导航由执行守卫按源时效停车，
                                 // 探索保留任务并等待其具名终态，不能抢先终止整个父任务。
                                 let mut guard = runtime.inner.lock().await;
-                                if !guard.controller.is_active() || guard.pending_child_cancellation.is_some() {
+                                if !guard.logical_active || guard.pending_child_cancellation.is_some() {
                                     continue;
                                 }
                                 guard.no_frontier_since = None;
@@ -4920,6 +5067,7 @@ impl ExploreSchedulerHandle {
         });
         Self {
             inner: Arc::new(ExploreSchedulerInner {
+                compute_runtime,
                 shutdown_tx,
                 terminal_tx,
                 terminal_rx,
@@ -4953,23 +5101,48 @@ impl ExploreSchedulerHandle {
     /// `shutdown()` remains owned by the root task supervisor, which performs
     /// the final settlement when its persistent-stop signal arrives.
     pub async fn wait_terminal(&self) -> Result<(), String> {
-        let result = self.wait_final_result().await;
-        if result.is_ok() && self.shutdown_is_requested() {
-            std::future::pending::<Result<(), String>>().await
-        } else {
-            result
-        }
+        let scheduler = async {
+            let result = self.wait_final_result().await;
+            if result.is_ok() && self.shutdown_is_requested() {
+                std::future::pending::<Result<(), String>>().await
+            } else { result }
+        };
+        let compute = async {
+            let result = self.inner.compute_runtime.compute_service.wait_terminal().await;
+            if result.is_ok() && self.shutdown_is_requested() {
+                std::future::pending::<Result<(), String>>().await
+            } else { result }
+        };
+        // Suppress each clean requested terminal independently: one settled
+        // producer must not hide an unexpected failure in the other producer.
+        tokio::select! { result = scheduler => result, result = compute => result }
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
         self.shutdown_with_settlement().await.into_result()
     }
 
+    async fn with_compute_settlement(&self, scheduler_result: Result<(), String>) -> ExploreSchedulerShutdownOutcome {
+        let mut deadline = match WallClockWake::new(SCHEDULER_SHUTDOWN_TIMEOUT) {
+            Ok(deadline) => deadline,
+            Err(error) => return ExploreSchedulerShutdownOutcome::new(Err(error), false),
+        };
+        tokio::select! {
+            biased;
+            compute = self.inner.compute_runtime.compute_service.join() => {
+                ExploreSchedulerShutdownOutcome::new(scheduler_result.and(compute), true)
+            }
+            _ = deadline.wait() => ExploreSchedulerShutdownOutcome::new(
+                Err("exploration compute owner settlement timed out; original worker and driver remain supervised".into()), false),
+        }
+    }
+
     pub(crate) async fn shutdown_with_settlement(&self) -> ExploreSchedulerShutdownOutcome {
         self.inner.shutdown_tx.send_replace(true);
+        self.inner.compute_runtime.request_compute_shutdown().await;
         match self.inner.monitor_state.load(Ordering::Acquire) {
             SCHEDULER_MONITOR_SETTLED => {
-                return ExploreSchedulerShutdownOutcome::new(self.wait_final_result().await, true);
+                return self.with_compute_settlement(self.wait_final_result().await).await;
             }
             SCHEDULER_MONITOR_FAILED => {
                 let error = self
@@ -5008,7 +5181,7 @@ impl ExploreSchedulerHandle {
         match self.inner.monitor_state.load(Ordering::Acquire) {
             SCHEDULER_MONITOR_SETTLED => {
                 drop(monitor);
-                return ExploreSchedulerShutdownOutcome::new(self.wait_final_result().await, true);
+                return self.with_compute_settlement(self.wait_final_result().await).await;
             }
             SCHEDULER_MONITOR_FAILED => {
                 let error = self
@@ -5042,10 +5215,7 @@ impl ExploreSchedulerHandle {
                         .monitor_state
                         .store(SCHEDULER_MONITOR_SETTLED, Ordering::Release);
                     drop(monitor);
-                    return ExploreSchedulerShutdownOutcome::new(
-                        self.wait_final_result().await,
-                        true,
-                    );
+                    return self.with_compute_settlement(self.wait_final_result().await).await;
                 }
                 Err(error) => {
                     let detail = format!("exploration scheduler monitor join failed: {error}");
@@ -5082,7 +5252,7 @@ impl ExploreSchedulerHandle {
                         .monitor_state
                         .store(SCHEDULER_MONITOR_SETTLED, Ordering::Release);
                     drop(monitor);
-                    ExploreSchedulerShutdownOutcome::new(self.wait_final_result().await, true)
+                    self.with_compute_settlement(self.wait_final_result().await).await
                 }
                 Err(error) => {
                     let detail = format!(
@@ -6165,7 +6335,7 @@ mod tests {
             .expect_err("literal map must not satisfy configured robot/map");
         assert!(error.contains("costmap frame=robot/map"), "{error}");
 
-        handle.inner.lock().await.costmap_input = Some(literal_map);
+        handle.inner.lock().await.costmap_input = Some(Arc::new(literal_map));
         let readiness = handle.readiness(true).await;
         assert!(!readiness.costmap_input_ready);
         assert!(!readiness.ready);
@@ -7936,7 +8106,7 @@ mod tests {
                         "later input wait".into(),
                     ));
                     assert_eq!(
-                        evaluate_stop_conditions(&guard, now_unix_nanos()),
+                        evaluate_stop_conditions(&guard, now_unix_nanos(), None),
                         Some(ExplorationStopReason::DurationExceeded),
                         "已选择目标后的原限时规则保持"
                     );
@@ -8276,15 +8446,18 @@ mod tests {
         assert_ne!(next.child_task_id, active.child_task_id);
     }
 
+    include!("explore_compute_runtime_tests.rs");
+
     // These fixtures never dispatch a goal or compute a legacy identity.
     async fn hashfree_checkpoint_fixture() -> (String, ExploreStartConfig) {
         let (handle, sink) = configured_handle();
         let started = handle.start("settings-origin", "prefer_wavefront").await;
         assert_eq!(started.status, STATUS_ACCEPTED, "{}", started.message);
         let config;
+        let restore_sources;
         {
             let mut guard = handle.inner.lock().await;
-            config = guard.active_config.clone().unwrap();
+            config = guard.active_config.as_deref().cloned().unwrap();
             guard.committed_map = Some(schema::CommittedMapIdentity {
                 session_id: "legacy-map-alias".into(), session_generation: 1, revision: 1,
                 payload_sha256: [0x37; 32], frame_id: "map".into(),
@@ -8297,10 +8470,14 @@ mod tests {
             let mut session = nuwax_explore_wavefront::session::ExplorationSession::new();
             session.record_goal_reached(Point2::new(12.5, -3.25));
             session.record_goal_failed(Point2::new(7.0, 9.0), 0, 1.5);
-            guard.controller.restore_checkpoint(&[nuwax_exploration::mission::SourceCheckpoint {
+            restore_sources = vec![nuwax_exploration::mission::SourceCheckpoint {
                 name: "wavefront".into(), payload: serde_json::to_string(&(1_u32, session)).unwrap(),
-            }]).unwrap();
+            }];
         }
+        let mut controller = build_profile_controller(ExplorationArbitrationPolicy::PreferWavefront, &config, None).unwrap();
+        controller.begin_exploration().unwrap();
+        controller.restore_checkpoint(&restore_sources).unwrap();
+        handle.install_compute_controller(controller).await.unwrap();
         handle.stop("settings-origin").await;
         let payload = handle.checkpoint_progress("settings-origin").await.unwrap();
         assert!(sink.submitted.lock().unwrap().is_empty());
@@ -8321,9 +8498,10 @@ mod tests {
         let accepted = resumed.start_with_config("equal-settings", config.clone()).await;
         assert_eq!(accepted.status, STATUS_ACCEPTED, "{}", accepted.message);
         assert!(!accepted.message.contains("legacy history"));
+        let sources = resumed.inspect_compute_checkpoint().await.unwrap();
         let guard = resumed.inner.lock().await;
         assert_eq!(guard.reached_goals, 1);
-        assert_eq!(guard.controller.checkpoint().unwrap()[0].payload, saved.sources[0].payload);
+        assert_eq!(sources[0].payload, saved.sources[0].payload);
         assert!(guard.active_child.is_none());
         assert!(sink.submitted.lock().unwrap().is_empty());
         drop(guard);
@@ -8353,10 +8531,10 @@ mod tests {
         let accepted = resumed.start_with_config("legacy-current-settings", config).await;
         assert_eq!(accepted.status, STATUS_ACCEPTED, "{}", accepted.message);
         assert!(accepted.message.contains("legacy history resumed under current settings"));
+        let source = resumed.inspect_compute_checkpoint().await.unwrap();
         let guard = resumed.inner.lock().await;
         assert_eq!(guard.reached_goals, 1);
         assert!(now_unix_nanos().saturating_sub(guard.started_at_ns) >= saved.elapsed_ns);
-        let source = guard.controller.checkpoint().unwrap();
         let history: serde_json::Value = serde_json::from_str(&source[0].payload).unwrap();
         assert_eq!(history[1]["explored_goals"], serde_json::json!([{ "x": 12.5, "y": -3.25 }]));
         assert_eq!(history[1]["blacklisted_goals"], serde_json::json!([]));
@@ -8410,11 +8588,11 @@ mod tests {
         let (resumed,sink)=configured_handle();
         ingest_committed_costmap_fixture(&resumed,frontier_costmap(2),2).await.unwrap();
         resumed.inner.lock().await.costmap_frame_generation=2;
-        let mut config=handle.inner.lock().await.active_config.clone().unwrap();
+        let mut config=handle.inner.lock().await.active_config.as_deref().cloned().unwrap();
         config.resume_progress_json=checkpoint.clone();
         let accepted=resumed.start_with_config("checkpoint-new-parent",config.clone()).await;
         assert_eq!(accepted.status,STATUS_ACCEPTED,"{}",accepted.message);
-        assert_eq!(resumed.inner.lock().await.controller.checkpoint().unwrap()[0].payload,saved.sources[0].payload);
+        assert_eq!(resumed.inspect_compute_checkpoint().await.unwrap()[0].payload,saved.sources[0].payload);
         assert!(resumed.report_navigation_result(&active.child_task_id,ChildNavigationResult::Reached(terminal_proof(&old_lease))).await.is_err());
         let next=resumed.tick((2.0,2.0)).await;
         assert_eq!(next.status,STATUS_ACTIVE,"{}",next.message);
@@ -8437,7 +8615,7 @@ mod tests {
 
     async fn enable_test_mission(handle:&ExploreRuntimeHandle,limit:Option<f64>) {
         let mut guard=handle.inner.lock().await;
-        guard.active_config.as_mut().unwrap().return_policy=ReturnPolicy {maximum_distance_m:limit,reserve_distance_m:0.0,return_on_completion:true};
+        Arc::make_mut(guard.active_config.as_mut().unwrap()).return_policy=ReturnPolicy {maximum_distance_m:limit,reserve_distance_m:0.0,return_on_completion:true};
         guard.mission_calibration=Some(crate::explore_mission::tests::calibration());
         guard.costmap_frame_generation=1;
     }
@@ -8445,7 +8623,7 @@ mod tests {
     #[tokio::test]
     async fn mission_unreachable_candidate_is_not_budget_exhaustion() {
         use nuwax_exploration::{ExplorationGoalSource, ExplorationSourceDiagnostics, ExploreResult};
-        struct CandidateSource(Arc<StdMutex<Vec<ExplorationGoalFeedback>>>);
+        struct CandidateSource(Arc<StdMutex<Vec<ExplorationGoalFeedback>>>, Option<ExplorationPoll>);
         impl ExplorationGoalSource for CandidateSource {
             fn source_name(&self) -> std::borrow::Cow<'static, str> { "wavefront".into() }
             fn begin(&mut self) -> ExploreResult<()> { Ok(()) }
@@ -8456,6 +8634,16 @@ mod tests {
                 pose.pose.position.x = if self.0.lock().unwrap().is_empty() { 5.0 } else { 2.5 };
                 Ok(ExplorationPoll::Goal(FrontierGoal::new("candidate", pose, 1.0)))
             }
+            fn supports_prepared_poll(&self) -> bool { true }
+            fn prepare_poll(&mut self, state: &ExplorationStateSnapshot<'_>) -> ExploreResult<nuwax_exploration::PreparedExplorationPoll> {
+                let result = self.poll_goal(state);
+                self.1 = result.as_ref().ok().cloned();
+                Ok(nuwax_exploration::PreparedExplorationPoll::new(result))
+            }
+            fn commit_prepared_poll(&mut self) -> ExploreResult<ExplorationPoll> {
+                self.1.take().ok_or(nuwax_exploration::ExploreError::NoPreparedPoll)
+            }
+            fn discard_prepared_poll(&mut self) -> ExploreResult<()> { self.1 = None; Ok(()) }
             fn report_goal_feedback(&mut self, _: &str, feedback: ExplorationGoalFeedback) -> ExploreResult<()> {
                 self.0.lock().unwrap().push(feedback); Ok(())
             }
@@ -8469,9 +8657,9 @@ mod tests {
         enable_test_mission(&handle, None).await;
         let feedback = Arc::new(StdMutex::new(Vec::new()));
         let mut controller = ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
-        controller.add_source(CandidateSource(feedback.clone()));
+        controller.add_source(CandidateSource(feedback.clone(), None));
         controller.begin_exploration().unwrap();
-        handle.inner.lock().await.controller = controller;
+        handle.install_compute_controller(controller).await.unwrap();
         let waiting = handle.tick((2.0, 2.0)).await;
         assert_eq!(waiting.status, STATUS_PENDING, "{}", waiting.message);
         assert!(sink.submitted.lock().unwrap().is_empty());
@@ -8654,7 +8842,7 @@ mod tests {
 
         let guard = handle.inner.lock().await;
         assert_eq!(guard.reached_goals, 0);
-        assert_eq!(evaluate_stop_conditions(&guard, now_unix_nanos()), None);
+        assert_eq!(evaluate_stop_conditions(&guard, now_unix_nanos(), None), None);
         drop(guard);
 
         let next = handle.tick((2.0, 2.0)).await;

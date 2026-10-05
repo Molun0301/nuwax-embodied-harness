@@ -1497,6 +1497,7 @@ fn mapping_session_state(
         mapping_backend_kind: snapshot.mapping_backend_kind,
         activation_receipt_schema_version: 0,
         activation_receipt_v2: None,
+        relocalization_policy_v2: None,
         activation_receipt_disposition: ActivationReceiptDisposition::Unspecified as i32,
         runtime_generation: 0,
         backend_generation: 0,
@@ -6530,6 +6531,10 @@ impl GeometryRuntime for GeometryRuntimeService {
         &self,
         req: Request<RelocalizeRequest>,
     ) -> Result<Response<RelocalizeResult>, Status> {
+        // D2a only defines/adopts the metadata contract. Until the source,
+        // actor and terminal chain is paired, reject before legacy hashing.
+        crate::relocalization_identity::validate_live_request_boundary(req.get_ref())
+            .map_err(Status::failed_precondition)?;
         let ingress = self
             .relocalization_ingress
             .as_ref()

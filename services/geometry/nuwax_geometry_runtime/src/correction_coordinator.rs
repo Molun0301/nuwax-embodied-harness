@@ -50,10 +50,8 @@ mod preflight_only_contract {
     use crate::activation_contract::{
         ActivationIdentity, ActivationJournalKey, ActivationJournalVerifier,
         ActivationJournalVerifierV2, ActivationRequestKey, ActivationTargetSource,
-        InstalledActivationIdentityV2, TargetReceipt,
+        InstalledActivationIdentityV2, InstalledTargetReceiptV2, TargetReceipt,
     };
-    #[cfg(test)]
-    use crate::activation_contract::InstalledTargetReceiptV2;
     use crate::activation_request::{
         ActivationRequestMetadataV2, CanonicalCheckpointOwnerV2, ValidatedActivationRequestV2,
     };
@@ -3419,7 +3417,30 @@ mod preflight_only_contract {
         pub(crate) session_generation: u64,
         pub(crate) backend_generation: u64,
         pub(crate) publication_proof: ActivationPublicationProof,
-        pub(crate) immutable_target: crate::pointcloud::ImmutableActivatedTarget,
+        pub(crate) immutable_target: Arc<crate::pointcloud::ImmutableActivatedTarget>,
+    }
+
+    /// Assigned authority keeps the installed descriptors and the original immutable source
+    /// owner together. Capturing or cloning a snapshot never copies checkpoint/cloud bytes.
+    /// This internal read surface does not enable assigned relocalization availability.
+    #[derive(Clone, Debug)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) struct SealedAssignedActivatedTargetSnapshot {
+        pub(crate) activation_identity: InstalledActivationIdentityV2,
+        pub(crate) target_receipt: InstalledTargetReceiptV2,
+        pub(crate) publication_proof: ActivationPublicationProof,
+        pub(crate) checkpoint_owner: CanonicalCheckpointOwnerV2,
+    }
+
+    impl ActivationPublicationProof {
+        fn same_descriptors(&self, other: &Self) -> bool {
+            self.source_timestamp_ns == other.source_timestamp_ns
+                && self.cloud_revision == other.cloud_revision
+                && self.point_count == other.point_count
+                && self.voxel_size.to_bits() == other.voxel_size.to_bits()
+                && self.cloud_receipt == other.cloud_receipt
+                && self.target_receipt == other.target_receipt
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3482,6 +3503,8 @@ mod preflight_only_contract {
         seal_before_ledger_gate: parking_lot::Mutex<Option<ActivationSealTestGate>>,
         #[cfg(test)]
         replay_before_compare_gate: parking_lot::Mutex<Option<ActivationSealTestGate>>,
+        #[cfg(test)]
+        snapshot_before_recheck_gate: parking_lot::Mutex<Option<ActivationSealTestGate>>,
     }
 
     #[cfg(test)]
@@ -3512,6 +3535,8 @@ mod preflight_only_contract {
                     seal_before_ledger_gate: parking_lot::Mutex::new(None),
                     #[cfg(test)]
                     replay_before_compare_gate: parking_lot::Mutex::new(None),
+                    #[cfg(test)]
+                    snapshot_before_recheck_gate: parking_lot::Mutex::new(None),
                 }),
             }
         }
@@ -4415,7 +4440,7 @@ mod preflight_only_contract {
             if before.0 {
                 return None;
             }
-            let (mut snapshot, target) = {
+            let snapshot = {
                 let ledger = self.inner.ledger.lock();
                 let record = ledger.records.get(ledger.current.as_ref()?)?;
                 if self.phase_snapshot() != before
@@ -4428,9 +4453,9 @@ mod preflight_only_contract {
                 if terminal.session_id.is_empty() || terminal.map_name.is_empty() {
                     return None;
                 }
-                let target = record.immutable_target.clone()?;
-                // All digest extraction is explicit and fails closed for Assigned variants.
-                let snapshot = SealedActivatedTargetSnapshot {
+                // Capture only the immutable owner handle and small descriptors. All digest
+                // extraction is explicit and fails closed for Assigned variants.
+                SealedActivatedTargetSnapshot {
                     runtime_generation: self.runtime_generation(),
                     lifecycle_epoch: record.epoch,
                     session_id: terminal.session_id.clone(),
@@ -4447,27 +4472,28 @@ mod preflight_only_contract {
                     session_generation: record.session_generation,
                     backend_generation: record.backend_generation,
                     publication_proof: record.publication_proof.clone()?,
-                    // Filled outside the lock below, preserving the legacy detached-snapshot API.
-                    immutable_target: crate::pointcloud::ImmutableActivatedTarget {
-                        frame_id: target.frame_id.clone(),
-                        source_revision: target.source_revision,
-                        point_count: target.point_count,
-                        voxel_size: target.voxel_size,
-                        xyz_sha256: target.xyz_sha256,
-                        xyz_f32_le: Vec::new(),
-                        payload_schema_version: target.payload_schema_version,
-                    },
-                };
-                (snapshot, target)
+                    immutable_target: record.immutable_target.clone()?,
+                }
             };
-            snapshot.immutable_target.xyz_f32_le = target.xyz_f32_le.clone();
+            #[cfg(test)]
+            self.wait_for_snapshot_before_recheck_gate();
             let ledger = self.inner.ledger.lock();
             let current = ledger.current.as_ref()?;
             let record = ledger.records.get(current)?;
+            let terminal = record.terminal.as_ref()?;
             if current != &snapshot.activation_request_id
                 || self.phase_snapshot() != before
                 || record.epoch != snapshot.lifecycle_epoch
                 || !Self::sealed_target_available(record)
+                || record.seed.activation_request_id != snapshot.activation_request_id
+                || record.seed.request_key.legacy_digest()
+                    != Some(snapshot.activation_request_identity_sha256)
+                || record.seed.asset_manifest_sha256 != snapshot.asset_manifest_sha256
+                || record.seed.asset_bundle_sha256 != snapshot.asset_bundle_sha256
+                || terminal.session_id != snapshot.session_id
+                || terminal.map_name != snapshot.map_name
+                || record.session_generation != snapshot.session_generation
+                || record.backend_generation != snapshot.backend_generation
                 || record
                     .activation_identity
                     .as_ref()
@@ -4479,13 +4505,103 @@ mod preflight_only_contract {
                     .and_then(TargetReceipt::legacy_digest)
                     != Some(snapshot.target_receipt_sha256)
                 || !record
+                    .publication_proof
+                    .as_ref()
+                    .is_some_and(|proof| proof.same_descriptors(&snapshot.publication_proof))
+                || !record
                     .immutable_target
                     .as_ref()
-                    .is_some_and(|retained| Arc::ptr_eq(retained, &target))
+                    .is_some_and(|retained| Arc::ptr_eq(retained, &snapshot.immutable_target))
             {
                 return None;
             }
             Some(snapshot)
+        }
+
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) fn current_sealed_assigned_target_snapshot(
+            &self,
+        ) -> Option<SealedAssignedActivatedTargetSnapshot> {
+            let before = self.phase_snapshot();
+            if before.0 {
+                return None;
+            }
+            let snapshot = {
+                let ledger = self.inner.ledger.lock();
+                let record = ledger.records.get(ledger.current.as_ref()?)?;
+                if self.phase_snapshot() != before
+                    || record.epoch != before.1
+                    || record.state != PermanentActivationState::Sealed
+                    || !Self::has_complete_target_proof(record)
+                {
+                    return None;
+                }
+                let activation = record.activation_identity.as_ref()?.assigned()?;
+                let terminal = record.terminal.as_ref()?;
+                if activation.runtime_generation != self.runtime_generation()
+                    || record.seed.activation_request_id
+                        != activation.request.activation_request_id()
+                    || terminal.session_id != activation.request.session_id()
+                    || terminal.map_name != activation.request.map_name()
+                    || terminal.session_generation != activation.session_generation
+                {
+                    return None;
+                }
+                SealedAssignedActivatedTargetSnapshot {
+                    activation_identity: activation.clone(),
+                    target_receipt: record.target_receipt.as_ref()?.assigned()?.clone(),
+                    publication_proof: record.publication_proof.clone()?,
+                    checkpoint_owner: record.checkpoint_owner.clone()?,
+                }
+            };
+            #[cfg(test)]
+            self.wait_for_snapshot_before_recheck_gate();
+            let ledger = self.inner.ledger.lock();
+            let current = ledger.current.as_ref()?;
+            let record = ledger.records.get(current)?;
+            let terminal = record.terminal.as_ref()?;
+            let activation = &snapshot.activation_identity;
+            if current != activation.request.activation_request_id()
+                || self.phase_snapshot() != before
+                || record.epoch != activation.lifecycle_epoch
+                || record.state != PermanentActivationState::Sealed
+                || !Self::has_complete_target_proof(record)
+                || record.seed.activation_request_id != activation.request.activation_request_id()
+                || record.seed.request_key.assigned() != Some(&activation.request)
+                || terminal.session_id != activation.request.session_id()
+                || terminal.map_name != activation.request.map_name()
+                || terminal.session_generation != activation.session_generation
+                || record
+                    .activation_identity
+                    .as_ref()
+                    .and_then(ActivationIdentity::assigned)
+                    != Some(activation)
+                || record
+                    .target_receipt
+                    .as_ref()
+                    .and_then(TargetReceipt::assigned)
+                    != Some(&snapshot.target_receipt)
+                || !record
+                    .publication_proof
+                    .as_ref()
+                    .is_some_and(|proof| proof.same_descriptors(&snapshot.publication_proof))
+                || !record
+                    .checkpoint_owner
+                    .as_ref()
+                    .is_some_and(|retained| retained.shares_source_with(&snapshot.checkpoint_owner))
+            {
+                return None;
+            }
+            Some(snapshot)
+        }
+
+        #[cfg(test)]
+        fn wait_for_snapshot_before_recheck_gate(&self) {
+            let gate = self.inner.snapshot_before_recheck_gate.lock().take();
+            if let Some(gate) = gate {
+                gate.entered.wait();
+                gate.release.wait();
+            }
         }
 
         #[cfg(test)]
@@ -6390,7 +6506,7 @@ mod preflight_only_contract {
         Ok(())
     }
 
-    fn normalize_relocalization_logical_timeout_ms(value: u64) -> Result<u64, String> {
+    pub(crate) fn normalize_relocalization_logical_timeout_ms(value: u64) -> Result<u64, String> {
         match value {
             0 => Ok(RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS),
             RELOCALIZATION_MIN_LOGICAL_TIMEOUT_MS..=RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS => {
@@ -9621,7 +9737,7 @@ mod preflight_only_contract {
             && left.publication_proof.cloud_receipt == right.publication_proof.cloud_receipt
             && left.publication_proof.target_receipt
                 == right.publication_proof.target_receipt
-            && left.immutable_target == right.immutable_target
+            && Arc::ptr_eq(&left.immutable_target, &right.immutable_target)
     }
 
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -12856,7 +12972,7 @@ mod preflight_only_contract {
                     },
                     target_receipt: TargetReceipt::LegacyDigest(target_receipt_sha256),
                 },
-                immutable_target: crate::pointcloud::ImmutableActivatedTarget {
+                immutable_target: Arc::new(crate::pointcloud::ImmutableActivatedTarget {
                     frame_id: "map".to_owned(),
                     source_revision: 11,
                     point_count: 1,
@@ -12864,7 +12980,7 @@ mod preflight_only_contract {
                     xyz_f32_le: (0_u8..12).collect(),
                     xyz_sha256: [0x35; 32],
                     payload_schema_version: 1,
-                },
+                }),
             };
             let registered_cloud = RegisteredCloudProof {
                 source_sequence: 17,
@@ -13083,6 +13199,7 @@ mod preflight_only_contract {
             target_cloud_revision: u64,
         ) -> crate::proto::RelocalizeRequest {
             crate::proto::RelocalizeRequest {
+                assigned_target: None,
                 planar_seed: None,
                 target_kind: String::new(),
                 target_graph_sha256: Vec::new(),
@@ -15534,7 +15651,7 @@ mod preflight_only_contract {
                 session_generation: 3,
                 backend_generation: 4,
                 publication_proof: activation_publication_proof(target_receipt_sha256, 3, 3),
-                immutable_target: target,
+                immutable_target: Arc::new(target),
             };
             let mut first = frame(1, 10, 0.0);
             first.correlated_odom.odom_from_body = Isometry3::translation(1.0, 0.0, 0.0);
@@ -16055,9 +16172,11 @@ mod preflight_only_contract {
             let control = ActivatedTargetReceiptControl::new(17);
             let request = assigned_request(assigned_wire_request());
             let weak = request.checkpoint().downgrade();
+            let source_bytes = request.checkpoint().cloud().xyz_f32_le().as_ptr();
             let token = assigned_bound_token(&control, request);
             let proof = assigned_proof(&control, &token);
             let receipt = proof.target_receipt.clone();
+            assert!(control.current_sealed_assigned_target_snapshot().is_none());
             assert!(control.store_publication_proof(&token, proof));
             let sealed = control
                 .seal(&token, Some(receipt), assigned_base_state())
@@ -16070,17 +16189,71 @@ mod preflight_only_contract {
                 "sealed assigned activation retains its canonical owner"
             );
             assert!(control.current_sealed_target_snapshot().is_none());
-            let ActivationLedgerAdmission::Terminal(replay) = control.stage_assigned_or_replay(
-                assigned_request(assigned_wire_request()),
-                assigned_base_state(),
-                false,
-            ) else {
+            let snapshot = control.current_sealed_assigned_target_snapshot().unwrap();
+            assert_eq!(
+                snapshot.checkpoint_owner.cloud().xyz_f32_le().as_ptr(),
+                source_bytes
+            );
+            assert_eq!(
+                snapshot.activation_identity,
+                snapshot.target_receipt.activation
+            );
+            assert_eq!(snapshot.activation_identity.runtime_generation, 17);
+            assert_eq!(
+                snapshot.activation_identity.lifecycle_epoch,
+                control.lifecycle_epoch()
+            );
+            assert_eq!(
+                snapshot.publication_proof.target_receipt.assigned(),
+                Some(&snapshot.target_receipt)
+            );
+            let snapshot_copy = snapshot.clone();
+            assert!(snapshot
+                .checkpoint_owner
+                .shares_source_with(&snapshot_copy.checkpoint_owner));
+            {
+                let ledger = control.inner.ledger.lock();
+                let record = ledger.records.get("activate-1").unwrap();
+                assert!(record.seed.checkpoint_owner.is_none());
+                assert!(record.immutable_target.is_none());
+                assert!(record
+                    .checkpoint_owner
+                    .as_ref()
+                    .unwrap()
+                    .shares_source_with(&snapshot.checkpoint_owner));
+                assert_eq!(
+                    ledger
+                        .records
+                        .values()
+                        .filter(|record| record.checkpoint_owner.is_some())
+                        .count(),
+                    1
+                );
+            }
+            let candidate = assigned_request(assigned_wire_request());
+            let candidate_weak = candidate.checkpoint().downgrade();
+            assert!(!candidate
+                .checkpoint()
+                .shares_source_with(&snapshot.checkpoint_owner));
+            let ActivationLedgerAdmission::Terminal(replay) =
+                control.stage_assigned_or_replay(candidate, assigned_base_state(), false)
+            else {
                 panic!("sealed record executed");
             };
             assert_eq!(
                 replay.activation_receipt_disposition,
                 crate::proto::ActivationReceiptDisposition::SealedReplay as i32
             );
+            assert!(
+                candidate_weak.upgrade().is_none(),
+                "replay must release the independent input owner"
+            );
+            assert_assigned_wire_has_no_legacy_digests(&replay);
+            assert!(control
+                .current_sealed_assigned_target_snapshot()
+                .unwrap()
+                .checkpoint_owner
+                .shares_source_with(&snapshot.checkpoint_owner));
             let mut changed = assigned_wire_request();
             changed
                 .mapping_backend_checkpoint
@@ -16102,11 +16275,261 @@ mod preflight_only_contract {
                 conflict.activation_receipt_disposition,
                 crate::proto::ActivationReceiptDisposition::Conflict as i32
             );
+            assert!(control
+                .current_sealed_assigned_target_snapshot()
+                .unwrap()
+                .checkpoint_owner
+                .shares_source_with(&snapshot.checkpoint_owner));
             control.retire_for_mapping_change().unwrap();
+            assert!(control.current_sealed_assigned_target_snapshot().is_none());
+            assert!(
+                weak.upgrade().is_some(),
+                "retired source remains owned by live snapshots"
+            );
+            assert_eq!(
+                snapshot.checkpoint_owner.cloud().xyz_f32_le().as_ptr(),
+                source_bytes
+            );
+            drop(snapshot);
+            assert!(
+                weak.upgrade().is_some(),
+                "cloned snapshot retains the same owner"
+            );
+            drop(snapshot_copy);
             assert!(
                 weak.upgrade().is_none(),
                 "permanent receipt metadata must not pin source bytes"
             );
+        }
+
+        #[test]
+        fn assigned_target_snapshot_rechecks_owner_descriptors_and_lifecycle_without_ledger_lock() {
+            for change in [
+                "request",
+                "activation",
+                "receipt",
+                "proof",
+                "owner",
+                "terminal",
+                "retire",
+                "phase-a",
+                "replacement",
+            ] {
+                let control = ActivatedTargetReceiptControl::new(17);
+                assert!(control.current_sealed_assigned_target_snapshot().is_none());
+                let request = assigned_request(assigned_wire_request());
+                let weak = request.checkpoint().downgrade();
+                let token = assigned_bound_token(&control, request);
+                let proof = assigned_proof(&control, &token);
+                let receipt = proof.target_receipt.clone();
+                assert!(control.store_publication_proof(&token, proof));
+                assert!(control.current_sealed_assigned_target_snapshot().is_none());
+                control
+                    .seal(&token, Some(receipt), assigned_base_state())
+                    .unwrap();
+                assert!(control.current_sealed_assigned_target_snapshot().is_some());
+                let entered = Arc::new(std::sync::Barrier::new(2));
+                let release = Arc::new(std::sync::Barrier::new(2));
+                *control.inner.snapshot_before_recheck_gate.lock() = Some(ActivationSealTestGate {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                });
+                let worker = control.clone();
+                let join =
+                    std::thread::spawn(move || worker.current_sealed_assigned_target_snapshot());
+                entered.wait();
+                assert!(
+                    control.inner.ledger.try_lock().is_some(),
+                    "snapshot capture must release the ledger before recheck"
+                );
+                match change {
+                    "retire" => {
+                        control.retire_for_mapping_change().unwrap();
+                    }
+                    "phase-a" => {
+                        assert!(control.retire_for_phase_a_first_closer(|| true));
+                    }
+                    "replacement" => {
+                        let mut replacement = assigned_wire_request();
+                        replacement.activation_request_id = "activate-2".into();
+                        assigned_token(&control, assigned_request(replacement));
+                    }
+                    _ => {
+                        // Independent admission creates an equal source with a distinct owner.
+                        // Swapping it must fail snapshot freshness even if every descriptor matches.
+                        let independent = assigned_request(assigned_wire_request());
+                        let mut ledger = control.inner.ledger.lock();
+                        let record = ledger.records.get_mut("activate-1").unwrap();
+                        match change {
+                            "request" => record.seed.activation_request_id = "changed".into(),
+                            "activation" => {
+                                let Some(ActivationIdentity::Assigned(identity)) =
+                                    record.activation_identity.as_mut()
+                                else {
+                                    unreachable!()
+                                };
+                                identity.backend_generation += 1;
+                            }
+                            "receipt" => {
+                                let Some(TargetReceipt::Assigned(receipt)) =
+                                    record.target_receipt.as_mut()
+                                else {
+                                    unreachable!()
+                                };
+                                receipt.cloud_receipt.cloud_revision += 1;
+                            }
+                            "proof" => {
+                                record.publication_proof.as_mut().unwrap().cloud_revision += 1
+                            }
+                            "owner" => {
+                                assert!(!record
+                                    .checkpoint_owner
+                                    .as_ref()
+                                    .unwrap()
+                                    .shares_source_with(independent.checkpoint()));
+                                record.checkpoint_owner = Some(independent.checkpoint().clone());
+                                assert!(ActivatedTargetReceiptControl::has_complete_target_proof(
+                                    record
+                                ));
+                            }
+                            "terminal" => {
+                                record.terminal.as_mut().unwrap().map_name = "changed".into()
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                assert!(
+                    weak.upgrade().is_some(),
+                    "capture must retain its source until recheck after {change}"
+                );
+                release.wait();
+                assert!(
+                    join.join().unwrap().is_none(),
+                    "snapshot escaped changed {change}"
+                );
+                if matches!(change, "retire" | "phase-a" | "replacement" | "owner") {
+                    assert!(
+                        weak.upgrade().is_none(),
+                        "failed snapshot pinned the old source after {change}"
+                    );
+                }
+                control.retire_for_mapping_change().unwrap();
+                assert!(
+                    weak.upgrade().is_none(),
+                    "retired snapshot source leaked after {change}"
+                );
+            }
+        }
+
+        #[test]
+        fn legacy_target_snapshot_rechecks_owner_descriptors_and_lifecycle_without_ledger_lock() {
+            for change in [
+                "request",
+                "proof",
+                "owner",
+                "terminal",
+                "retire",
+                "phase-a",
+                "replacement",
+            ] {
+                let control = ActivatedTargetReceiptControl::new(7);
+                let token = match control.stage_or_replay(
+                    activation_seed_with_target("snapshot-race", 61, 2),
+                    activation_base_state(),
+                    true,
+                ) {
+                    ActivationLedgerAdmission::Execute(token) => token,
+                    ActivationLedgerAdmission::Terminal(_) => panic!("target must stage"),
+                };
+                let token = control.reserve_backend_generation(&token, 43).unwrap();
+                let token = control
+                    .bind_activation_identity(&token, [62; 32], 47)
+                    .unwrap();
+                assert!(control.store_publication_proof(
+                    &token,
+                    activation_publication_proof([63; 32], 2, 47)
+                ));
+                control
+                    .seal(
+                        &token,
+                        Some(TargetReceipt::LegacyDigest([63; 32])),
+                        activation_base_state(),
+                    )
+                    .unwrap();
+                let weak = Arc::downgrade(
+                    &control
+                        .current_sealed_target_snapshot()
+                        .unwrap()
+                        .immutable_target,
+                );
+                let entered = Arc::new(std::sync::Barrier::new(2));
+                let release = Arc::new(std::sync::Barrier::new(2));
+                *control.inner.snapshot_before_recheck_gate.lock() = Some(ActivationSealTestGate {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                });
+                let worker = control.clone();
+                let join = std::thread::spawn(move || worker.current_sealed_target_snapshot());
+                entered.wait();
+                assert!(control.inner.ledger.try_lock().is_some());
+                match change {
+                    "retire" => {
+                        control.retire_for_mapping_change().unwrap();
+                    }
+                    "phase-a" => {
+                        assert!(control.retire_for_phase_a_first_closer(|| true));
+                    }
+                    "replacement" => {
+                        assert!(matches!(
+                            control.stage_or_replay(
+                                activation_seed_with_target("snapshot-replacement", 71, 3),
+                                activation_base_state(),
+                                true,
+                            ),
+                            ActivationLedgerAdmission::Execute(_)
+                        ));
+                    }
+                    _ => {
+                        let mut ledger = control.inner.ledger.lock();
+                        let record = ledger.records.get_mut("snapshot-race").unwrap();
+                        match change {
+                            "request" => {
+                                record.seed.request_key =
+                                    ActivationRequestKey::LegacyDigest([99; 32])
+                            }
+                            "proof" => {
+                                let proof = record.publication_proof.as_mut().unwrap();
+                                proof.source_timestamp_ns += 1;
+                                proof.cloud_receipt.source_timestamp_ns = proof.source_timestamp_ns;
+                            }
+                            "owner" => {
+                                record.immutable_target = Some(Arc::new(
+                                    record.immutable_target.as_deref().unwrap().clone(),
+                                ))
+                            }
+                            "terminal" => {
+                                record.terminal.as_mut().unwrap().session_id = "changed".into()
+                            }
+                            _ => unreachable!(),
+                        }
+                        assert!(ActivatedTargetReceiptControl::has_complete_target_proof(
+                            record
+                        ));
+                    }
+                }
+                assert!(weak.upgrade().is_some());
+                release.wait();
+                assert!(
+                    join.join().unwrap().is_none(),
+                    "legacy snapshot escaped changed {change}"
+                );
+                if matches!(change, "retire" | "phase-a" | "replacement" | "owner") {
+                    assert!(weak.upgrade().is_none());
+                }
+                control.retire_for_mapping_change().unwrap();
+                assert!(weak.upgrade().is_none());
+            }
         }
 
         #[test]
@@ -16827,7 +17250,11 @@ mod preflight_only_contract {
                 activation_publication_proof([63; 32], 2, 47),
             ));
             control
-                .seal(&first_token, Some(TargetReceipt::LegacyDigest([63; 32])), activation_base_state())
+                .seal(
+                    &first_token,
+                    Some(TargetReceipt::LegacyDigest([63; 32])),
+                    activation_base_state(),
+                )
                 .expect("first target seal");
 
             let snapshot = control
@@ -16843,20 +17270,30 @@ mod preflight_only_contract {
             assert_eq!(snapshot.asset_bundle_sha256, Some([3; 32]));
             assert_eq!(snapshot.session_generation, 47);
             assert_eq!(snapshot.backend_generation, 43);
-            assert_eq!(snapshot.publication_proof.target_receipt.legacy_digest(), Some([63; 32]));
-            assert_eq!(snapshot.immutable_target, first_target);
-
-            let mut detached_snapshot = snapshot.clone();
-            detached_snapshot.immutable_target.xyz_f32_le[0] ^= 0xff;
             assert_eq!(
-                control
-                    .current_sealed_target_snapshot()
-                    .expect("ledger snapshot remains immutable")
-                    .immutable_target,
-                first_target
+                snapshot.publication_proof.target_receipt.legacy_digest(),
+                Some([63; 32])
             );
-            drop(detached_snapshot);
-            drop(snapshot);
+            assert_eq!(snapshot.immutable_target.as_ref(), &first_target);
+
+            let snapshot_copy = snapshot.clone();
+            let first_weak = Arc::downgrade(&snapshot.immutable_target);
+            assert!(Arc::ptr_eq(
+                &snapshot.immutable_target,
+                &snapshot_copy.immutable_target
+            ));
+            assert!(same_sealed_target(&snapshot, &snapshot_copy));
+            let current_snapshot = control.current_sealed_target_snapshot().unwrap();
+            assert!(Arc::ptr_eq(
+                &snapshot.immutable_target,
+                &current_snapshot.immutable_target
+            ));
+            assert_eq!(
+                snapshot.immutable_target.xyz_f32_le.as_ptr(),
+                current_snapshot.immutable_target.xyz_f32_le.as_ptr()
+            );
+            assert!(control.current_sealed_assigned_target_snapshot().is_none());
+            drop(current_snapshot);
 
             let second_seed = activation_seed_with_target("sealed-snapshot-second", 71, 3);
             let second_target = second_seed
@@ -16869,6 +17306,18 @@ mod preflight_only_contract {
                     ActivationLedgerAdmission::Terminal(_) => panic!("second target must stage"),
                 };
             assert!(control.current_sealed_target_snapshot().is_none());
+            assert!(first_weak.upgrade().is_some());
+            assert_eq!(snapshot.immutable_target.as_ref(), &first_target);
+            drop(snapshot);
+            assert!(
+                first_weak.upgrade().is_some(),
+                "snapshot clone retains the target allocation"
+            );
+            drop(snapshot_copy);
+            assert!(
+                first_weak.upgrade().is_none(),
+                "last snapshot releases the retired allocation"
+            );
             assert_eq!(
                 control.retained_immutable_target_bytes_for("sealed-snapshot-first"),
                 0
@@ -16901,7 +17350,11 @@ mod preflight_only_contract {
                 activation_publication_proof([73; 32], 3, 59),
             ));
             control
-                .seal(&second_token, Some(TargetReceipt::LegacyDigest([73; 32])), activation_base_state())
+                .seal(
+                    &second_token,
+                    Some(TargetReceipt::LegacyDigest([73; 32])),
+                    activation_base_state(),
+                )
                 .expect("second target seal");
             let second_snapshot = control
                 .current_sealed_target_snapshot()
@@ -16910,15 +17363,19 @@ mod preflight_only_contract {
                 second_snapshot.activation_request_id,
                 "sealed-snapshot-second"
             );
-            assert_eq!(second_snapshot.immutable_target, second_target);
+            assert_eq!(second_snapshot.immutable_target.as_ref(), &second_target);
             assert_eq!(
                 control.retained_immutable_target_bytes(),
                 second_target.xyz_f32_le.len()
             );
 
+            let second_weak = Arc::downgrade(&second_snapshot.immutable_target);
             control.retire_for_mapping_change().unwrap();
             assert!(control.current_sealed_target_snapshot().is_none());
             assert_eq!(control.retained_immutable_target_bytes(), 0);
+            assert!(second_weak.upgrade().is_some());
+            drop(second_snapshot);
+            assert!(second_weak.upgrade().is_none());
         }
 
         #[test]
@@ -21128,6 +21585,8 @@ pub(crate) use preflight_only_contract::{
     body_points_sha256, expected_map_boundary_sha256, odom_pose_sha256,
     relocalization_algorithm_options_sha256_v1, relocalization_deadline_policy_sha256_v1,
     relocalization_source_policy_sha256_v1, validate_relocalization_request_id,
+    relocalization_source_policy_preimage_v1, relocalization_deadline_policy_preimage_v1,
+    relocalization_algorithm_options_preimage_v1, normalize_relocalization_logical_timeout_ms,
     ActivatedTargetReceiptControl, ActivationJournalEntry, ActivationJournalStatus,
     ActivationJournalStep, ActivationLedgerAdmission, ActivationPublicationProof,
     ActivationReceiptSeed, ActivationToken, CanonicalCorrectionApplier,

@@ -198,6 +198,7 @@ message MappingSessionState {
   bytes target_graph_sha256 = 31;
   string planar_mode = 32;
   ActivationReceiptV2 activation_receipt_v2 = 33;
+  RelocalizationPolicyDescriptorV2 relocalization_policy_v2 = 34;
 }
 
 message CloudMapCheckpoint {
@@ -373,6 +374,26 @@ enum RelocalizeDisposition {
 
 message PlanarSeed { double x = 1; double y = 2; double yaw = 3; }
 
+// Exact small canonical policy parameters, not a hash or content-derived ID.
+// Policy versions and limits retain the existing production definitions.
+message RelocalizationPolicyDescriptorV2 {
+  uint32 schema_version = 1;
+  uint32 source_policy_version = 2;
+  bytes source_parameters = 3;
+  uint32 deadline_policy_version = 4;
+  bytes deadline_parameters = 5;
+  uint32 algorithm_options_version = 6;
+  bytes algorithm_parameters = 7;
+}
+
+// Cloud-specific assigned target. Planar activation requires its own genuine
+// target branch; it cannot populate an invented cloud receipt.
+message AssignedCloudRelocalizeRequestV2 {
+  InstalledTargetReceiptV2 target = 1;
+  RelocalizationPolicyDescriptorV2 policy = 2;
+  uint64 logical_timeout_ms = 3;
+}
+
 message RelocalizeRequest {
   uint32 schema_version = 1;
   string request_id = 2;
@@ -397,6 +418,10 @@ message RelocalizeRequest {
   string target_kind = 21;
   bytes target_graph_sha256 = 22;
   PlanarSeed planar_seed = 23;
+  // Schema 2 uses request_id plus this body only; all legacy fields are absent.
+  oneof assigned_target {
+    AssignedCloudRelocalizeRequestV2 assigned_cloud_v2 = 24;
+  }
 }
 
 enum RelocalizationTerminalStatus {

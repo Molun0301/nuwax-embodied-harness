@@ -79,6 +79,23 @@ impl ActivationRequestMetadataV2 {
             expected_runtime_generation,
         })
     }
+    /// Decode the existing receipt metadata without manufacturing checkpoint bytes.
+    pub(crate) fn from_receipt_wire(value: proto::ActivationRequestMetadataV2) -> Result<Self, String> {
+        crate::server::validate_canonical_protocol_id(&value.activation_request_id, "activation_request_id")?;
+        crate::server::validate_canonical_protocol_id(&value.session_id, "session_id")?;
+        crate::server::validate_canonical_text(&value.map_name, "map_name")?;
+        if value.map_name.chars().any(char::is_control) || value.expected_runtime_generation == 0 {
+            return Err("assigned activation receipt metadata is incomplete".into());
+        }
+        Ok(Self {
+            activation_request_id: value.activation_request_id,
+            session_id: value.session_id,
+            map_name: value.map_name,
+            asset_identity: AssetIdentityV2::try_from(value.asset_identity.as_ref().ok_or("assigned asset identity is missing")?)?,
+            checkpoint_identity: CheckpointIdentityV2::parse(&value.checkpoint_id)?,
+            expected_runtime_generation: value.expected_runtime_generation,
+        })
+    }
     pub(crate) fn activation_request_id(&self) -> &str {
         &self.activation_request_id
     }

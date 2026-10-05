@@ -23,6 +23,7 @@ pub mod channel_registry;
 mod activation_contract;
 mod activation_identity;
 mod activation_request;
+mod relocalization_identity;
 mod correction_coordinator;
 mod explore_runtime;
 mod explore_mission;

@@ -1318,7 +1318,7 @@ pub struct MappingAdapter {
     checkpoint_installed: bool,
     /// 带三维资产的新会话在真实坐标对齐提交前不融合扫描。
     pub(crate) checkpoint_localization_required: bool,
-    checkpoint_activation_digest: Option<[u8; 32]>,
+    checkpoint_activation_key: Option<crate::activation_contract::ActivationRequestKey>,
     /// Optional production-only shared forbidden-zone document.
     forbidden_zones_path: Option<PathBuf>,
     forbidden_zone_cache: parking_lot::Mutex<crate::forbidden_zones::ForbiddenZoneCache>,
@@ -1517,7 +1517,7 @@ impl MappingAdapter {
             persistent_grid: None,
             checkpoint_installed: false,
             checkpoint_localization_required: false,
-            checkpoint_activation_digest: None,
+            checkpoint_activation_key: None,
             forbidden_zones_path: None,
             forbidden_zone_cache: parking_lot::Mutex::new(
                 crate::forbidden_zones::ForbiddenZoneCache::default(),
@@ -1624,7 +1624,7 @@ impl MappingAdapter {
         self.lifecycle = MappingSessionSnapshot::idle(self.mapping_backend.kind());
         self.revision = 0;
         self.checkpoint_installed = false;
-        self.checkpoint_activation_digest = None;
+        self.checkpoint_activation_key = None;
         Ok(retirement)
     }
 
@@ -2537,7 +2537,7 @@ impl MappingAdapter {
         ),
         crate::pgo_map::RebuildError,
     > {
-        if self.checkpoint_activation_digest.is_some() {
+        if self.checkpoint_activation_key.is_some() {
             return Err(crate::pgo_map::RebuildError::HistoryUnavailable);
         }
         Ok((
@@ -2847,15 +2847,16 @@ impl MappingAdapter {
         self.checkpoint_installed && self.is_active() && self.current_revision() > 0
     }
 
-    pub(crate) fn checkpoint_activation_matches(&self, digest: &[u8; 32]) -> bool {
-        self.has_checkpoint() && self.checkpoint_activation_digest.as_ref() == Some(digest)
+    pub(crate) fn checkpoint_activation_matches<K>(&self, key: &K) -> bool
+    where K: Clone + Into<crate::activation_contract::ActivationRequestKey> {
+        self.has_checkpoint() && self.checkpoint_activation_key.as_ref() == Some(&key.clone().into())
     }
 
-    pub(crate) fn record_checkpoint_activation(&mut self, digest: [u8; 32]) -> Result<(), String> {
+    pub(crate) fn record_checkpoint_activation(&mut self, key: impl Into<crate::activation_contract::ActivationRequestKey>) -> Result<(), String> {
         if !self.has_checkpoint() {
             return Err("mapping checkpoint must be installed before activation commit".to_owned());
         }
-        self.checkpoint_activation_digest = Some(digest);
+        self.checkpoint_activation_key = Some(key.into());
         Ok(())
     }
 
@@ -3897,7 +3898,7 @@ impl MappingAdapter {
         self.latest_accepted_point_count = 0;
         self.persistent_grid = None;
         self.checkpoint_installed = false;
-        self.checkpoint_activation_digest = None;
+        self.checkpoint_activation_key = None;
         self.checkpoint_localization_required = false;
         self.raw_map = None;
         self.last_occupancy_commit_receipt = None;

@@ -30,6 +30,7 @@ use tokio::sync::{watch, RwLock};
 use tonic::{Request, Response, Status};
 use tracing::info;
 
+use crate::activation_contract::{ActivationRequestKey, ActivationIdentity, TargetReceipt, ActivationJournalKey, ActivationJournalVerifier, ActivationJournalVerifierV2, ActivationTargetSource, InstalledActivationIdentityV2, InstalledTargetReceiptV2};
 use crate::lcm_runtime::{
     accept_mapping_cloud_map_for_backend_candidate, build_committed_global_map_frame_in_frame,
     publish_committed_global_map_in_frame, publish_retained_global_map_frame, CloudMapNotification,
@@ -80,6 +81,7 @@ pub struct GeometryRuntimeService {
     relocalization_ingress: Option<crate::correction_coordinator::RelocalizationCommandIngress>,
     mapping_cloud_owner: Arc<MappingCloudOwner>,
     activation_lifecycle_fence: Arc<parking_lot::Mutex<Option<ActivationLifecycleFenceSlot>>>,
+    activation_checkpoint_owners: Arc<crate::activation_request::CheckpointOwnerInternerV2>,
     #[cfg(test)]
     activation_fault_after:
         Arc<parking_lot::Mutex<Option<crate::correction_coordinator::ActivationJournalStep>>>,
@@ -103,7 +105,7 @@ pub struct GeometryRuntimeService {
 
 struct ActivationLifecycleFence {
     activation_request_id: String,
-    activation_request_identity_sha256: [u8; 32],
+    activation_request_key: ActivationRequestKey,
     retained_global_map: Option<RetainedActivationGlobalMap>,
     projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
     lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
@@ -116,45 +118,49 @@ enum ActivationLifecycleFenceSlot {
 
 struct RestorePendingActivationLifecycleFence {
     activation_request_id: String,
-    activation_request_identity_sha256: [u8; 32],
+    activation_request_key: ActivationRequestKey,
     retained_global_map: Option<RetainedActivationGlobalMap>,
     projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
     reason: String,
 }
 
 struct RetainedActivationGlobalMap {
-    activation_request_identity_sha256: [u8; 32],
+    activation_request_key: ActivationRequestKey,
     map_frame_id: String,
     installed_cloud_revision: u64,
     cloud_metadata: crate::pointcloud::CommittedCloudMapMetadata,
     cloud_receipt: crate::mapping_commit::CloudCommitReceipt,
-    frame: RawLcmFrame,
+    legacy_frame: Option<RawLcmFrame>,
 }
 
 impl RetainedActivationGlobalMap {
     fn from_committed(
-        activation_request_identity_sha256: [u8; 32],
+        activation_request_key: impl Into<ActivationRequestKey>,
         map_frame_id: &str,
         committed: &CommittedMappingCloudMap,
         xyz_f32_le: &[u8],
     ) -> Result<Self, String> {
+        let activation_request_key = activation_request_key.into();
         Ok(Self {
-            activation_request_identity_sha256,
+            activation_request_key: activation_request_key.clone(),
             map_frame_id: map_frame_id.to_owned(),
             installed_cloud_revision: committed.notification.revision,
             cloud_metadata: committed.metadata,
             cloud_receipt: committed.receipt.clone(),
-            frame: build_committed_global_map_frame_in_frame(committed, xyz_f32_le, map_frame_id)?,
+            legacy_frame: if matches!(activation_request_key, ActivationRequestKey::LegacyDigest(_)) {
+                Some(build_committed_global_map_frame_in_frame(committed, xyz_f32_le, map_frame_id)?)
+            } else { None },
         })
     }
 
     fn validate_replay(
         &self,
-        activation_request_identity_sha256: [u8; 32],
+        activation_request_key: impl Into<ActivationRequestKey>,
         map_frame_id: &str,
         committed: &CommittedMappingCloudMap,
     ) -> Result<(), String> {
-        if self.activation_request_identity_sha256 != activation_request_identity_sha256
+        let activation_request_key = activation_request_key.into();
+        if self.activation_request_key != activation_request_key
             || self.map_frame_id != map_frame_id
             || self.installed_cloud_revision != committed.notification.revision
             || self.cloud_receipt != committed.receipt
@@ -748,6 +754,7 @@ impl GeometryRuntimeService {
             relocalization_ingress: None,
             mapping_cloud_owner,
             activation_lifecycle_fence: Arc::new(parking_lot::Mutex::new(None)),
+            activation_checkpoint_owners: Arc::new(crate::activation_request::CheckpointOwnerInternerV2::default()),
             activation_fault_after: Arc::new(parking_lot::Mutex::new(None)),
             stop_phase_a_after_detach: Arc::new(AtomicBool::new(false)),
             fail_start_mapping_stop_transition: Arc::new(AtomicBool::new(false)),
@@ -816,6 +823,7 @@ impl GeometryRuntimeService {
             relocalization_ingress,
             mapping_cloud_owner,
             activation_lifecycle_fence: Arc::new(parking_lot::Mutex::new(None)),
+            activation_checkpoint_owners: Arc::new(crate::activation_request::CheckpointOwnerInternerV2::default()),
             #[cfg(test)]
             activation_fault_after: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(test)]
@@ -870,15 +878,16 @@ impl GeometryRuntimeService {
     fn take_matching_activation_lifecycle_fence(
         &self,
         activation_request_id: &str,
-        activation_request_identity_sha256: [u8; 32],
+        activation_request_key: impl Into<ActivationRequestKey>,
     ) -> Result<Option<ActivationLifecycleFence>, &'static str> {
+        let activation_request_key = activation_request_key.into();
         let mut fence = self.activation_lifecycle_fence.lock();
         match fence.as_ref() {
             None => Ok(None),
             Some(ActivationLifecycleFenceSlot::Held(existing))
                 if existing.activation_request_id == activation_request_id
-                    && existing.activation_request_identity_sha256
-                        == activation_request_identity_sha256 =>
+                    && existing.activation_request_key
+                        == activation_request_key =>
             {
                 match fence.take() {
                     Some(ActivationLifecycleFenceSlot::Held(fence)) => Ok(Some(fence)),
@@ -895,7 +904,7 @@ impl GeometryRuntimeService {
     fn retain_activation_lifecycle_fence(
         &self,
         activation_request_id: &str,
-        activation_request_identity_sha256: [u8; 32],
+        activation_request_key: impl Into<ActivationRequestKey>,
         retained_global_map: Option<RetainedActivationGlobalMap>,
         projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
         lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
@@ -906,6 +915,7 @@ impl GeometryRuntimeService {
             tokio::sync::OwnedMutexGuard<()>,
         ),
     > {
+        let activation_request_key = activation_request_key.into();
         let mut fence = self.activation_lifecycle_fence.lock();
         if fence.is_some() {
             return Err((projection_guard, lifecycle_guard));
@@ -913,7 +923,7 @@ impl GeometryRuntimeService {
         *fence = Some(ActivationLifecycleFenceSlot::Held(
             ActivationLifecycleFence {
                 activation_request_id: activation_request_id.to_owned(),
-                activation_request_identity_sha256,
+                activation_request_key,
                 retained_global_map,
                 projection_guard,
                 lifecycle_guard,
@@ -933,8 +943,8 @@ impl GeometryRuntimeService {
             },
             Some(ActivationLifecycleFenceSlot::RestorePending(pending)) => {
                 let _retained_projection_guard = &pending.projection_guard;
-                let _activation_request_identity_sha256 =
-                    &pending.activation_request_identity_sha256;
+                let _activation_request_key =
+                    &pending.activation_request_key;
                 Err(Status::failed_precondition(format!(
                     "ACTIVATION_LIFECYCLE_FENCE_RESTORE_PENDING: activation_request_id={} retained_global_map={} reason={}",
                     pending.activation_request_id,
@@ -972,7 +982,7 @@ impl GeometryRuntimeService {
 
     fn consume_retained_activation_receipt_after_motion_terminal(
         &self,
-        retained_metadata: Option<(String, [u8; 32], Option<RetainedActivationGlobalMap>)>,
+        retained_metadata: Option<(String, ActivationRequestKey, Option<RetainedActivationGlobalMap>)>,
     ) {
         #[cfg(test)]
         let consumed_retained_receipt = retained_metadata.is_some();
@@ -987,11 +997,11 @@ impl GeometryRuntimeService {
 
     async fn settle_process_stop_failure(
         &self,
-        retained_metadata: Option<(String, [u8; 32], Option<RetainedActivationGlobalMap>)>,
+        retained_metadata: Option<(String, ActivationRequestKey, Option<RetainedActivationGlobalMap>)>,
         projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
         error: Status,
     ) -> Status {
-        let Some((activation_request_id, activation_request_identity_sha256, retained_global_map)) =
+        let Some((activation_request_id, activation_request_key, retained_global_map)) =
             retained_metadata
         else {
             return error;
@@ -1005,7 +1015,7 @@ impl GeometryRuntimeService {
             Ok(lifecycle_guard) => {
                 self.restore_activation_lifecycle_fence(ActivationLifecycleFence {
                     activation_request_id,
-                    activation_request_identity_sha256,
+                    activation_request_key,
                     retained_global_map,
                     projection_guard,
                     lifecycle_guard,
@@ -1017,7 +1027,7 @@ impl GeometryRuntimeService {
                 self.restore_pending_activation_lifecycle_fence(
                     RestorePendingActivationLifecycleFence {
                         activation_request_id,
-                        activation_request_identity_sha256,
+                        activation_request_key,
                         retained_global_map,
                         projection_guard,
                         reason: original_detail.clone(),
@@ -1486,6 +1496,7 @@ fn mapping_session_state(
         legacy_checkpoint_reconstructed: snapshot.legacy_checkpoint_reconstructed,
         mapping_backend_kind: snapshot.mapping_backend_kind,
         activation_receipt_schema_version: 0,
+        activation_receipt_v2: None,
         activation_receipt_disposition: ActivationReceiptDisposition::Unspecified as i32,
         runtime_generation: 0,
         backend_generation: 0,
@@ -1507,6 +1518,7 @@ fn mapping_session_state(
 
 #[derive(Clone, Debug)]
 enum ActivationRequestIdentityClass {
+    Assigned(crate::activation_request::ActivationRequestMetadataV2),
     Modern {
         request_id: String,
         asset_manifest_sha256: [u8; 32],
@@ -1521,11 +1533,12 @@ impl ActivationRequestIdentityClass {
     fn request_id(&self) -> &str {
         match self {
             Self::Modern { request_id, .. } | Self::Legacy { request_id } => request_id,
+            Self::Assigned(metadata) => metadata.activation_request_id(),
         }
     }
 
     const fn is_modern(&self) -> bool {
-        matches!(self, Self::Modern { .. })
+        matches!(self, Self::Modern { .. } | Self::Assigned(_))
     }
 
     const fn asset_manifest_sha256(&self) -> Option<[u8; 32]> {
@@ -1534,7 +1547,7 @@ impl ActivationRequestIdentityClass {
                 asset_manifest_sha256,
                 ..
             } => Some(*asset_manifest_sha256),
-            Self::Legacy { .. } => None,
+            Self::Legacy { .. } | Self::Assigned(_) => None,
         }
     }
 
@@ -1544,7 +1557,7 @@ impl ActivationRequestIdentityClass {
                 asset_bundle_sha256,
                 ..
             } => Some(*asset_bundle_sha256),
-            Self::Legacy { .. } => None,
+            Self::Legacy { .. } | Self::Assigned(_) => None,
         }
     }
 }
@@ -1573,7 +1586,7 @@ fn canonical_hash32(value: &[u8], label: &str) -> Result<[u8; 32], String> {
         .map_err(|_| format!("{label} must contain exactly 32 bytes"))
 }
 
-fn validate_canonical_protocol_id(value: &str, label: &str) -> Result<(), String> {
+pub(crate) fn validate_canonical_protocol_id(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 128
         || value != value.trim()
@@ -1588,7 +1601,7 @@ fn validate_canonical_protocol_id(value: &str, label: &str) -> Result<(), String
     Ok(())
 }
 
-fn validate_canonical_text(value: &str, label: &str) -> Result<(), String> {
+pub(crate) fn validate_canonical_text(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > 256 || value != value.trim() {
         return Err(format!("{label} must be 1..=256 bytes and already trimmed"));
     }
@@ -1599,7 +1612,12 @@ fn classify_activation_request_identity(
     request: &ActivateMapRequest,
     runtime_generation: u64,
 ) -> Result<ActivationRequestIdentityClass, String> {
+    if request.activation_contract_version == 2 {
+        return crate::activation_request::ActivationRequestMetadataV2::from_wire(request, runtime_generation)
+            .map(ActivationRequestIdentityClass::Assigned);
+    }
     let legacy = request.activation_contract_version == 0
+        && request.asset_identity.is_none()
         && request.activation_request_id.is_empty()
         && request.expected_runtime_generation == 0
         && request.asset_manifest_sha256.is_empty()
@@ -1613,6 +1631,7 @@ fn classify_activation_request_identity(
     }
 
     let modern = request.activation_contract_version == 1
+        && request.asset_identity.is_none()
         && validate_canonical_protocol_id(&request.activation_request_id, "activation_request_id")
             .is_ok()
         && request.expected_runtime_generation != 0
@@ -1986,22 +2005,33 @@ fn activation_journal_key(
 fn record_activation_journal(
     control: &crate::correction_coordinator::ActivatedTargetReceiptControl,
     token: &crate::correction_coordinator::ActivationToken,
-    request_identity: [u8; 32],
+    request_identity: impl Into<ActivationRequestKey>,
     step: crate::correction_coordinator::ActivationJournalStep,
     status: crate::correction_coordinator::ActivationJournalStatus,
-    verifier_receipt_sha256: Option<[u8; 32]>,
+    verifier_receipt: Option<ActivationJournalVerifier>,
     typed_failure: Option<String>,
 ) -> bool {
-    control.journal(
-        token,
-        crate::correction_coordinator::ActivationJournalEntry {
-            step,
-            idempotency_key: activation_journal_key(request_identity, step),
-            status,
-            verifier_receipt_sha256,
-            typed_failure,
-        },
-    )
+    let idempotency_key = match request_identity.into() {
+        ActivationRequestKey::LegacyDigest(digest) => activation_journal_key(digest, step).into(),
+        ActivationRequestKey::Assigned(request) => ActivationJournalKey::Assigned { request, step },
+    };
+    control.journal(token, crate::correction_coordinator::ActivationJournalEntry {
+        step, idempotency_key, status, verifier_receipt, typed_failure,
+    })
+}
+
+fn activation_verifier(identity: &ActivationIdentity) -> ActivationJournalVerifier {
+    match identity {
+        ActivationIdentity::LegacyDigest(digest) => (*digest).into(),
+        ActivationIdentity::Assigned(identity) => ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::Activation(identity.clone())),
+    }
+}
+
+fn cloud_activation_verifier(key: &ActivationRequestKey, legacy: Option<[u8; 32]>, receipt: &crate::mapping_commit::CloudCommitReceipt) -> Option<ActivationJournalVerifier> {
+    match key {
+        ActivationRequestKey::LegacyDigest(_) => legacy.map(Into::into),
+        ActivationRequestKey::Assigned(_) => Some(ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::Cloud(receipt.clone()))),
+    }
 }
 
 fn activation_failure_state(
@@ -2023,7 +2053,7 @@ async fn settle_failed_activation_retirement(
     adapter: &Arc<parking_lot::Mutex<MappingAdapter>>,
     bridge: &GeometryRuntimeHandle,
     token: &crate::correction_coordinator::ActivationToken,
-    request_identity: [u8; 32],
+    request_identity: ActivationRequestKey,
     retirement: Result<
         Option<crate::mapping_adapter::MappingBackendRetirement>,
         crate::mapping_adapter::MappingLifecycleError,
@@ -2044,8 +2074,10 @@ async fn settle_failed_activation_retirement(
     };
     if let Some(retirement) = retirement {
         let retirement_generation = retirement.generation();
-        let retirement_proof =
-            crate::map_checksum::sha256_bytes(&retirement_generation.to_be_bytes());
+        let retirement_proof = match &request_identity {
+            ActivationRequestKey::LegacyDigest(_) => crate::map_checksum::sha256_bytes(&retirement_generation.to_be_bytes()).into(),
+            ActivationRequestKey::Assigned(_) => ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::BackendGeneration(retirement_generation)),
+        };
         if !record_activation_journal(
             &service.activation_receipts,
             token,
@@ -2080,6 +2112,48 @@ async fn settle_failed_activation_retirement(
     service
         .activation_receipts
         .invalidate(token, disposition, &detail, state)
+}
+
+async fn prepare_assigned_activation_archives(
+    service: &GeometryRuntimeService,
+    owner: &crate::activation_request::CanonicalCheckpointOwnerV2,
+    expected_map_frame_id: &str,
+) -> Result<(Option<crate::pointcloud::PreparedFineCloud>, Option<crate::dense_cloud::DenseCloud>), Status> {
+    // Reopen an independent read-only cursor from the admitted pinned object,
+    // never a transfer-store lookup that could expire or name a recycled body.
+    let open = |artifact: &crate::activation_request::SealedArtifactOwnerV2| {
+        std::fs::File::open(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(artifact.file())))
+            .map_err(|error| Status::internal(error.to_string()))
+    };
+    let fine = if let Some(artifact) = owner.fine_map() {
+        let file = open(artifact)?;
+        let source_session = owner.occupancy_receipt().session_id.clone();
+        let source_generation = owner.occupancy_receipt().session_generation;
+        let receipt = owner.cloud_receipt().clone();
+        let receiver = service.bridge.register_navigation_map_operation(async move {
+            tokio::task::spawn_blocking(move || crate::pointcloud::prepare_fine_cloud_archive(file,
+                &source_session, source_generation, receipt.cloud_revision, receipt.source_timestamp_ns))
+                .await.map_err(|error| error.to_string()).and_then(|value| value)
+        }).map_err(Status::unavailable)?;
+        Some(receiver.await.map_err(|error| Status::unavailable(error.to_string()))?.map_err(Status::invalid_argument)?)
+    } else { None };
+    let dense = if let Some(artifact) = owner.dense_cloud() {
+        let file = open(artifact)?;
+        let voxel_size = fine.as_ref().map_or_else(|| owner.cloud().voxel_size(), |fine| fine.voxel_size());
+        let expected = crate::dense_cloud::Metadata {
+            version: 1, session_id: owner.occupancy_receipt().session_id.clone(),
+            session_generation: owner.occupancy_receipt().session_generation,
+            cloud_revision: owner.cloud_receipt().cloud_revision,
+            source_timestamp_ns: owner.cloud_receipt().source_timestamp_ns,
+            frame_id: expected_map_frame_id.to_owned(), point_count: 0, bounds_min: [0.; 3], bounds_max: [0.; 3],
+        };
+        let receiver = service.bridge.register_navigation_map_operation(async move {
+            tokio::task::spawn_blocking(move || crate::dense_cloud::DenseCloud::from_archive_with_voxel_size(file, &expected, voxel_size))
+                .await.map_err(|error| error.to_string()).and_then(|value| value)
+        }).map_err(Status::unavailable)?;
+        Some(receiver.await.map_err(|error| Status::unavailable(error.to_string()))?.map_err(Status::invalid_argument)?)
+    } else { None };
+    Ok((fine, dense))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2117,9 +2191,56 @@ async fn activate_map_r1(
     };
 
     if selected_backend_kind==crate::mapping_backend::MappingBackendKind::SlamToolbox {
+        if matches!(identity_class, ActivationRequestIdentityClass::Assigned(_)) {
+            return Err(Status::failed_precondition("PLANAR_ASSIGNED_ACTIVATION_NOT_PAIRED"));
+        }
         return service.activate_planar_map(request,identity_class).await;
     }
 
+    let (session_id, map_name, checkpoint, checkpoint_timestamp_ns, mapping_backend_checkpoint,
+         assigned_checkpoint, immutable_target, occupancy_sha256, cloud_sha256, backend_sha256,
+         prepared_fine, prepared_dense, seed, activation_request_key) =
+    if let ActivationRequestIdentityClass::Assigned(metadata) = &identity_class {
+        let state = mapping_session_state(adapter.lock().snapshot(), "assigned activation admission");
+        if let Some(terminal) = service.activation_receipts.assigned_terminal_before_admission(metadata, state) {
+            return Ok(Response::new(terminal));
+        }
+        let admitted = crate::activation_request::ValidatedActivationRequestV2::admit(
+            request, service.activation_receipts.runtime_generation(), selected_backend_kind,
+            &expected_map_frame_id, |reference| service.graph_artifacts.lock().open(reference),
+            &service.activation_checkpoint_owners,
+        ).map_err(Status::invalid_argument)?;
+        if service.activation_receipts.has_request(metadata.activation_request_id()) {
+            let current = adapter.lock().snapshot();
+            if let crate::correction_coordinator::ActivationLedgerAdmission::Terminal(terminal) =
+                service.activation_receipts.stage_assigned_or_replay(admitted.clone(),
+                    mapping_session_state(current, "assigned activation replay"), false) {
+                return Ok(Response::new(*terminal));
+            }
+        }
+        let (metadata, owner) = admitted.into_parts();
+        let checkpoint = decode_checkpoint_grid_borrowed(owner.occupancy(), &expected_map_frame_id)
+            .map_err(Status::invalid_argument)?;
+        let timestamp = owner.occupancy().meta.as_ref().ok_or_else(|| Status::invalid_argument("assigned occupancy metadata missing"))?.timestamp_ns;
+        {
+            let writer = service.bridge.cloud_map_writer.lock();
+            let writer = writer.as_ref().ok_or_else(|| Status::unavailable("cloud-map SHM writer is unavailable"))?;
+            writer.validate_checkpoint(owner.cloud().voxel_size(), owner.cloud().point_count(), owner.cloud().xyz_f32_le())
+                .map_err(Status::invalid_argument)?;
+        }
+        let currently_active = { adapter.lock().snapshot().active };
+        let (fine, dense) = if currently_active { (None, None) }
+            else { prepare_assigned_activation_archives(&service, &owner, &expected_map_frame_id).await? };
+        let key = ActivationRequestKey::Assigned(metadata.clone());
+        let seed = crate::correction_coordinator::ActivationReceiptSeed {
+            planar_target: None, activation_request_id: metadata.activation_request_id().to_owned(),
+            request_key: key.clone(), checkpoint_owner: Some(owner.clone()),
+            asset_manifest_sha256: None, asset_bundle_sha256: None, modern: true, immutable_target: None,
+        };
+        (metadata.session_id().to_owned(), metadata.map_name().to_owned(), checkpoint, timestamp, None,
+         Some(owner.clone()), Some(ActivationTargetSource::Assigned(owner)), None, None, None,
+         fine, dense, seed, key)
+    } else {
     let occupancy_checkpoint = request
         .checkpoint
         .take()
@@ -2256,11 +2377,18 @@ async fn activate_map_r1(
     let seed = crate::correction_coordinator::ActivationReceiptSeed {
         planar_target: None,
         activation_request_id: identity_class.request_id().to_owned(),
-        activation_request_identity_sha256,
+        request_key: activation_request_identity_sha256.into(),
+        checkpoint_owner: None,
         asset_manifest_sha256: identity_class.asset_manifest_sha256(),
         asset_bundle_sha256: identity_class.asset_bundle_sha256(),
         modern: identity_class.is_modern(),
         immutable_target: immutable_target.clone(),
+    };
+
+    let target = immutable_target.map(|value| ActivationTargetSource::Legacy(Arc::new(value)));
+    (session_id, map_name, checkpoint, checkpoint_timestamp_ns, mapping_backend_checkpoint, None,
+     target, Some(occupancy_sha256), cloud_sha256, backend_sha256, prepared_fine, prepared_dense,
+     seed, ActivationRequestKey::LegacyDigest(activation_request_identity_sha256))
     };
 
     let _mapping_transition = tokio::time::timeout(
@@ -2279,7 +2407,7 @@ async fn activate_map_r1(
         restore_fence_on_early_return,
     ) = match service.take_matching_activation_lifecycle_fence(
         identity_class.request_id(),
-        activation_request_identity_sha256,
+        activation_request_key.clone(),
     ) {
         Ok(Some(fence)) => (
             fence.retained_global_map,
@@ -2317,7 +2445,7 @@ async fn activate_map_r1(
         if restore_fence_on_early_return {
             service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
                 activation_request_id: identity_class.request_id().to_owned(),
-                activation_request_identity_sha256,
+                activation_request_key: activation_request_key.clone(),
                 retained_global_map,
                 projection_guard: projection_guard
                     .take()
@@ -2334,7 +2462,7 @@ async fn activate_map_r1(
         if restore_fence_on_early_return {
             service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
                 activation_request_id: identity_class.request_id().to_owned(),
-                activation_request_identity_sha256,
+                activation_request_key: activation_request_key.clone(),
                 retained_global_map,
                 projection_guard: projection_guard
                     .take()
@@ -2364,7 +2492,7 @@ async fn activate_map_r1(
             if restore_fence_on_early_return {
                 service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
                     activation_request_id: identity_class.request_id().to_owned(),
-                    activation_request_identity_sha256,
+                    activation_request_key: activation_request_key.clone(),
                     retained_global_map,
                     projection_guard: projection_guard
                         .take()
@@ -2406,7 +2534,7 @@ async fn activate_map_r1(
                     &adapter,
                     &bridge,
                     &token,
-                    activation_request_identity_sha256,
+                    activation_request_key.clone(),
                     retirement,
                     $disposition,
                     detail,
@@ -2420,7 +2548,7 @@ async fn activate_map_r1(
             || current.map_name != map_name
             || !adapter
                 .lock()
-                .checkpoint_activation_matches(&activation_request_identity_sha256)
+                .checkpoint_activation_matches(&activation_request_key)
         {
             settle_current_failure!(
                 ActivationReceiptDisposition::OutcomeUnknown,
@@ -2436,7 +2564,7 @@ async fn activate_map_r1(
                 );
             }
         };
-        let target = match service.activation_receipts.immutable_target(&token) {
+        let target = match service.activation_receipts.target_source(&token) {
             Some(target) => target,
             None => {
                 settle_current_failure!(
@@ -2472,7 +2600,7 @@ async fn activate_map_r1(
             let retained_publication = match retained_global_map.take() {
                 Some(retained) => {
                     if let Err(error) = retained.validate_replay(
-                        activation_request_identity_sha256,
+                        activation_request_key.clone(),
                         &expected_map_frame_id,
                         &committed,
                     ) {
@@ -2481,7 +2609,7 @@ async fn activate_map_r1(
                         );
                         match service.retain_activation_lifecycle_fence(
                             identity_class.request_id(),
-                            activation_request_identity_sha256,
+                            activation_request_key.clone(),
                             Some(retained),
                             projection_guard,
                             lifecycle_guard,
@@ -2500,10 +2628,10 @@ async fn activate_map_r1(
                     retained
                 }
                 None => match RetainedActivationGlobalMap::from_committed(
-                    activation_request_identity_sha256,
+                    activation_request_key.clone(),
                     &expected_map_frame_id,
                     &committed,
-                    &target.xyz_f32_le,
+                    target.xyz_f32_le(),
                 ) {
                     Ok(retained) => retained,
                     Err(error) => {
@@ -2514,11 +2642,9 @@ async fn activate_map_r1(
                     }
                 },
             };
-            let publish_result = if replaying_retained_publication {
-                publish_retained_global_map_frame(&bridge, &retained_publication.frame).await
-            } else {
-                publish_committed_global_map_in_frame(&bridge, &committed, &expected_map_frame_id)
-                    .await
+            let publish_result = match (replaying_retained_publication, retained_publication.legacy_frame.as_ref()) {
+                (true, Some(frame)) => publish_retained_global_map_frame(&bridge, frame).await,
+                _ => publish_committed_global_map_in_frame(&bridge, &committed, &expected_map_frame_id).await,
             };
             if let Err(error) = publish_result {
                 let detail = format!(
@@ -2526,7 +2652,7 @@ async fn activate_map_r1(
                 );
                 match service.retain_activation_lifecycle_fence(
                     identity_class.request_id(),
-                    activation_request_identity_sha256,
+                    activation_request_key.clone(),
                     Some(retained_publication),
                     projection_guard,
                     lifecycle_guard,
@@ -2554,10 +2680,13 @@ async fn activate_map_r1(
             if !record_activation_journal(
                 &service.activation_receipts,
                 &token,
-                activation_request_identity_sha256,
+                activation_request_key.clone(),
                 crate::correction_coordinator::ActivationJournalStep::TypedGlobalMap,
                 crate::correction_coordinator::ActivationJournalStatus::Applied,
-                Some(crate::map_checksum::sha256_bytes(&target.xyz_f32_le)),
+                Some(match &activation_request_key {
+                    ActivationRequestKey::LegacyDigest(_) => crate::map_checksum::sha256_bytes(target.xyz_f32_le()).into(),
+                    ActivationRequestKey::Assigned(_) => ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::Cloud(proof.cloud_receipt.clone())),
+                }),
                 None,
             ) {
                 settle_current_failure!(
@@ -2571,7 +2700,7 @@ async fn activate_map_r1(
         let state = mapping_session_state(replay, "map checkpoint publication resumed");
         let target_receipt = identity_class
             .is_modern()
-            .then_some(proof.target_receipt_sha256);
+            .then_some(proof.target_receipt.clone());
         let sealed = match service
             .activation_receipts
             .seal(&token, target_receipt, state)
@@ -2600,7 +2729,7 @@ async fn activate_map_r1(
             if restore_fence_on_early_return {
                 service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
                     activation_request_id: identity_class.request_id().to_owned(),
-                    activation_request_identity_sha256,
+                    activation_request_key: activation_request_key.clone(),
                     retained_global_map,
                     projection_guard: projection_guard
                         .take()
@@ -2638,14 +2767,18 @@ async fn activate_map_r1(
         }
     };
 
-    let mut restore_resolution = if let Some(checkpoint) = mapping_backend_checkpoint.as_ref() {
+    let backend_verifier = match &activation_request_key {
+        ActivationRequestKey::LegacyDigest(_) => backend_sha256.map(ActivationJournalVerifier::LegacyDigest),
+        ActivationRequestKey::Assigned(_) => Some(ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::BackendGeneration(reserved_backend_generation))),
+    };
+    let mut restore_resolution = if mapping_backend_checkpoint.is_some() || assigned_checkpoint.is_some() {
         if !record_activation_journal(
             &service.activation_receipts,
             &token,
-            activation_request_identity_sha256,
+            activation_request_key.clone(),
             crate::correction_coordinator::ActivationJournalStep::BackendRestoreSubmission,
             crate::correction_coordinator::ActivationJournalStatus::Prepared,
-            backend_sha256,
+            backend_verifier.clone(),
             None,
         ) {
             let _ = staged_worker.stop_and_join();
@@ -2654,10 +2787,12 @@ async fn activate_map_r1(
                 "ACTIVATE_MAP_RESTORE_PREPARE_CAS_FAILED"
             );
         }
-        let receiver = match staged_worker
-            .client()
-            .restore_checkpoint(checkpoint.payload.clone())
-        {
+        let restore = if let Some(owner) = assigned_checkpoint.as_ref() {
+            staged_worker.client().restore_owned_checkpoint(owner.clone())
+        } else {
+            staged_worker.client().restore_checkpoint(mapping_backend_checkpoint.as_ref().expect("legacy restore owns backend checkpoint").payload.clone())
+        };
+        let receiver = match restore {
             Ok(receiver) => receiver,
             Err(error) => {
                 let _ = staged_worker.stop_and_join();
@@ -2725,10 +2860,10 @@ async fn activate_map_r1(
         if !record_activation_journal(
             &service.activation_receipts,
             &token,
-            activation_request_identity_sha256,
+            activation_request_key.clone(),
             crate::correction_coordinator::ActivationJournalStep::BackendRestoreSubmission,
             crate::correction_coordinator::ActivationJournalStatus::Applied,
-            backend_sha256,
+            backend_verifier.clone(),
             None,
         ) {
             let _ = resolution.abort();
@@ -2783,7 +2918,7 @@ async fn activate_map_r1(
                 &adapter,
                 &bridge,
                 &token,
-                activation_request_identity_sha256,
+                activation_request_key.clone(),
                 retirement,
                 $disposition,
                 detail,
@@ -2802,15 +2937,21 @@ async fn activate_map_r1(
             "INJECTED_AFTER_SESSION_START".to_owned()
         );
     }
-    let final_activation_identity = if let ActivationRequestIdentityClass::Modern {
+    let final_activation_identity = if let ActivationRequestIdentityClass::Assigned(metadata) = &identity_class {
+        ActivationIdentity::Assigned(InstalledActivationIdentityV2 {
+            request: metadata.clone(), runtime_generation: service.activation_receipts.runtime_generation(),
+            lifecycle_epoch: service.activation_receipts.lifecycle_epoch(), session_generation: started.session_generation,
+            backend_kind: selected_backend_kind, backend_generation: reserved_backend_generation,
+        })
+    } else if let ActivationRequestIdentityClass::Modern {
         asset_manifest_sha256,
         asset_bundle_sha256,
         ..
     } = &identity_class
     {
-        crate::map_checksum::sha256_bytes(
+        ActivationIdentity::LegacyDigest(crate::map_checksum::sha256_bytes(
             &canonical_activation_identity_preimage(
-                activation_request_identity_sha256,
+                activation_request_key.legacy_digest().expect("legacy activation preimage"),
                 service.activation_receipts.runtime_generation(),
                 started.session_generation,
                 reserved_backend_generation,
@@ -2820,17 +2961,17 @@ async fn activate_map_r1(
                 *asset_bundle_sha256,
             )
             .map_err(Status::internal)?,
-        )
+        ))
     } else {
         let mut bytes = b"nuwax.geometry.activate-map.legacy-identity.v1\0".to_vec();
-        bytes.extend_from_slice(&activation_request_identity_sha256);
+        bytes.extend_from_slice(&activation_request_key.legacy_digest().expect("legacy activation identity"));
         bytes.extend_from_slice(&started.session_generation.to_be_bytes());
         bytes.extend_from_slice(&reserved_backend_generation.to_be_bytes());
-        crate::map_checksum::sha256_bytes(&bytes)
+        ActivationIdentity::LegacyDigest(crate::map_checksum::sha256_bytes(&bytes))
     };
     token = match service.activation_receipts.bind_activation_identity(
         &token,
-        final_activation_identity,
+        final_activation_identity.clone(),
         started.session_generation,
     ) {
         Some(token) => token,
@@ -2844,10 +2985,10 @@ async fn activate_map_r1(
     if !record_activation_journal(
         &service.activation_receipts,
         &token,
-        activation_request_identity_sha256,
+        activation_request_key.clone(),
         crate::correction_coordinator::ActivationJournalStep::SessionStart,
         crate::correction_coordinator::ActivationJournalStatus::Applied,
-        Some(final_activation_identity),
+        Some(activation_verifier(&final_activation_identity)),
         None,
     ) {
         settle_started_failure!(
@@ -2876,12 +3017,13 @@ async fn activate_map_r1(
         if !record_activation_journal(
             &service.activation_receipts,
             &token,
-            activation_request_identity_sha256,
+            activation_request_key.clone(),
             crate::correction_coordinator::ActivationJournalStep::OccupancyShmBegin,
             crate::correction_coordinator::ActivationJournalStatus::Applied,
-            Some(crate::map_checksum::sha256_bytes(
-                &started.session_generation.to_be_bytes(),
-            )),
+            Some(match &activation_request_key {
+                ActivationRequestKey::LegacyDigest(_) => crate::map_checksum::sha256_bytes(&started.session_generation.to_be_bytes()).into(),
+                ActivationRequestKey::Assigned(_) => ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::SessionGeneration(started.session_generation)),
+            }),
             None,
         ) {
             settle_started_failure!(
@@ -2931,13 +3073,17 @@ async fn activate_map_r1(
             "INJECTED_AFTER_OCCUPANCY_INSTALL".to_owned()
         );
     }
+    let occupancy_verifier = match &activation_request_key {
+        ActivationRequestKey::LegacyDigest(_) => ActivationJournalVerifier::LegacyDigest(occupancy_sha256.expect("legacy occupancy digest")),
+        ActivationRequestKey::Assigned(_) => ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::Occupancy(occupancy_receipt.clone())),
+    };
     if !record_activation_journal(
         &service.activation_receipts,
         &token,
-        activation_request_identity_sha256,
+        activation_request_key.clone(),
         crate::correction_coordinator::ActivationJournalStep::OccupancyInstall,
         crate::correction_coordinator::ActivationJournalStatus::Applied,
-        Some(occupancy_sha256),
+        Some(occupancy_verifier.clone()),
         None,
     ) {
         settle_started_failure!(
@@ -2957,9 +3103,9 @@ async fn activate_map_r1(
                     bridge.nav.producer_runtime_generation(),
                 ).and_then(|()| writer.install_checkpoint_with_sources(
                     &occupancy_receipt,
-                    target.voxel_size,
-                    target.point_count,
-                    &target.xyz_f32_le,
+                    target.voxel_size(),
+                    target.point_count(),
+                    target.xyz_f32_le(),
                     prepared_fine,
                     prepared_dense,
                 )),
@@ -2976,10 +3122,10 @@ async fn activate_map_r1(
             }
         };
         if correlated.snapshot.session_generation != started.session_generation
-            || correlated.snapshot.point_count != target.point_count
-            || correlated.snapshot.voxel_size.to_bits() != target.voxel_size.to_bits()
+            || correlated.snapshot.point_count != target.point_count()
+            || correlated.snapshot.voxel_size.to_bits() != target.voxel_size().to_bits()
             || correlated.receipt.session_generation != started.session_generation
-            || correlated.receipt.point_count != target.point_count
+            || correlated.receipt.point_count != target.point_count()
         {
             settle_started_failure!(
                 ActivationReceiptDisposition::OutcomeUnknown,
@@ -3010,31 +3156,36 @@ async fn activate_map_r1(
                 "INJECTED_AFTER_CLOUD_INSTALL".to_owned()
             );
         }
-        let target_receipt_preimage = match canonical_target_receipt_preimage(
-            final_activation_identity,
-            cloud_sha256.expect("cloud target digest exists"),
-            target.source_revision,
-            correlated.snapshot.revision,
-            started.session_generation,
-            reserved_backend_generation,
-            &correlated.receipt,
-        ) {
-            Ok(preimage) => preimage,
-            Err(error) => {
-                settle_started_failure!(
-                    ActivationReceiptDisposition::OutcomeUnknown,
-                    format!("ACTIVATE_MAP_TARGET_RECEIPT_OUTCOME_UNKNOWN: {error}")
-                );
+        let target_receipt = match &final_activation_identity {
+            ActivationIdentity::LegacyDigest(identity) => {
+                let preimage = match canonical_target_receipt_preimage(*identity,
+                    cloud_sha256.expect("legacy cloud target digest exists"), target.source_revision(),
+                    correlated.snapshot.revision, started.session_generation, reserved_backend_generation, &correlated.receipt) {
+                    Ok(preimage) => preimage,
+                    Err(error) => { settle_started_failure!(ActivationReceiptDisposition::OutcomeUnknown,
+                        format!("ACTIVATE_MAP_TARGET_RECEIPT_OUTCOME_UNKNOWN: {error}")); }
+                };
+                TargetReceipt::LegacyDigest(crate::map_checksum::sha256_bytes(&preimage))
+            }
+            ActivationIdentity::Assigned(identity) => {
+                let owner = assigned_checkpoint.as_ref().expect("assigned activation owns source");
+                let receipt = InstalledTargetReceiptV2 { activation: identity.clone(),
+                    source_cloud_member: owner.cloud().member().clone(), occupancy_receipt: occupancy_receipt.clone(),
+                    cloud_receipt: correlated.receipt.clone() };
+                if !receipt.validate(owner) {
+                    settle_started_failure!(ActivationReceiptDisposition::OutcomeUnknown,
+                        "ACTIVATE_MAP_TYPED_TARGET_RECEIPT_MISMATCH".to_owned());
+                }
+                TargetReceipt::Assigned(receipt)
             }
         };
-        let target_receipt_sha256 = crate::map_checksum::sha256_bytes(&target_receipt_preimage);
         let proof = crate::correction_coordinator::ActivationPublicationProof {
             source_timestamp_ns,
             cloud_revision: correlated.snapshot.revision,
-            point_count: target.point_count,
-            voxel_size: target.voxel_size,
+            point_count: target.point_count(),
+            voxel_size: target.voxel_size(),
             cloud_receipt: correlated.receipt.clone(),
-            target_receipt_sha256,
+            target_receipt: target_receipt.clone(),
         };
         if !service
             .activation_receipts
@@ -3042,10 +3193,10 @@ async fn activate_map_r1(
             || !record_activation_journal(
                 &service.activation_receipts,
                 &token,
-                activation_request_identity_sha256,
+                activation_request_key.clone(),
                 crate::correction_coordinator::ActivationJournalStep::CloudInstall,
                 crate::correction_coordinator::ActivationJournalStatus::Applied,
-                cloud_sha256,
+                cloud_activation_verifier(&activation_request_key, cloud_sha256, &correlated.receipt),
                 None,
             )
         {
@@ -3056,8 +3207,8 @@ async fn activate_map_r1(
         }
         let notification = CloudMapNotification {
             revision: correlated.snapshot.revision,
-            point_count: target.point_count,
-            voxel_size: target.voxel_size,
+            point_count: target.point_count(),
+            voxel_size: target.voxel_size(),
             session_generation: started.session_generation,
         };
         Some((
@@ -3068,7 +3219,7 @@ async fn activate_map_r1(
                 metadata: correlated.snapshot,
                 receipt: correlated.receipt,
             },
-            target_receipt_sha256,
+            target_receipt,
         ))
     } else {
         None
@@ -3093,10 +3244,10 @@ async fn activate_map_r1(
         if !record_activation_journal(
             &service.activation_receipts,
             &token,
-            activation_request_identity_sha256,
+            activation_request_key.clone(),
             crate::correction_coordinator::ActivationJournalStep::BackendCommit,
             crate::correction_coordinator::ActivationJournalStatus::Applied,
-            backend_sha256,
+            backend_verifier.clone(),
             None,
         ) {
             settle_started_failure!(
@@ -3108,8 +3259,8 @@ async fn activate_map_r1(
 
     let activation_record_result = {
         let mut adapter = adapter.lock();
-        adapter.set_legacy_checkpoint_reconstructed(mapping_backend_checkpoint.is_none());
-        adapter.record_checkpoint_activation(activation_request_identity_sha256)
+        adapter.set_legacy_checkpoint_reconstructed(mapping_backend_checkpoint.is_none() && assigned_checkpoint.is_none());
+        adapter.record_checkpoint_activation(activation_request_key.clone())
     };
     if let Err(error) = activation_record_result {
         settle_started_failure!(
@@ -3129,10 +3280,10 @@ async fn activate_map_r1(
     if !record_activation_journal(
         &service.activation_receipts,
         &token,
-        activation_request_identity_sha256,
+        activation_request_key.clone(),
         crate::correction_coordinator::ActivationJournalStep::ActivationRecord,
         crate::correction_coordinator::ActivationJournalStatus::Applied,
-        Some(final_activation_identity),
+        Some(activation_verifier(&final_activation_identity)),
         None,
     ) {
         settle_started_failure!(
@@ -3160,10 +3311,10 @@ async fn activate_map_r1(
     if !record_activation_journal(
         &service.activation_receipts,
         &token,
-        activation_request_identity_sha256,
+        activation_request_key.clone(),
         crate::correction_coordinator::ActivationJournalStep::SharedStateCommit,
         crate::correction_coordinator::ActivationJournalStatus::Applied,
-        Some(occupancy_sha256),
+        Some(occupancy_verifier.clone()),
         None,
     ) {
         settle_started_failure!(
@@ -3191,10 +3342,10 @@ async fn activate_map_r1(
     if !record_activation_journal(
         &service.activation_receipts,
         &token,
-        activation_request_identity_sha256,
+        activation_request_key.clone(),
         crate::correction_coordinator::ActivationJournalStep::CacheClears,
         crate::correction_coordinator::ActivationJournalStatus::Applied,
-        Some(occupancy_sha256),
+        Some(occupancy_verifier.clone()),
         None,
     ) {
         settle_started_failure!(
@@ -3215,10 +3366,10 @@ async fn activate_map_r1(
     if !record_activation_journal(
         &service.activation_receipts,
         &token,
-        activation_request_identity_sha256,
+        activation_request_key.clone(),
         crate::correction_coordinator::ActivationJournalStep::MapEvent,
         crate::correction_coordinator::ActivationJournalStatus::Applied,
-        Some(occupancy_sha256),
+        Some(occupancy_verifier.clone()),
         None,
     ) {
         settle_started_failure!(
@@ -3227,7 +3378,7 @@ async fn activate_map_r1(
         );
     }
 
-    let target_receipt_sha256 =
+    let target_receipt =
         if let Some((notification, committed, target_receipt)) = cloud_commit {
             let _ = bridge.cloud_map_tx.send(notification);
             if take_activation_fault_after(
@@ -3242,10 +3393,10 @@ async fn activate_map_r1(
             if !record_activation_journal(
                 &service.activation_receipts,
                 &token,
-                activation_request_identity_sha256,
+                activation_request_key.clone(),
                 crate::correction_coordinator::ActivationJournalStep::CloudEvent,
                 crate::correction_coordinator::ActivationJournalStatus::Applied,
-                cloud_sha256,
+                cloud_activation_verifier(&activation_request_key, cloud_sha256, &committed.receipt),
                 None,
             ) {
                 settle_started_failure!(
@@ -3254,10 +3405,10 @@ async fn activate_map_r1(
                 );
             }
             let retained_publication = match RetainedActivationGlobalMap::from_committed(
-                activation_request_identity_sha256,
+                activation_request_key.clone(),
                 &expected_map_frame_id,
                 &committed,
-                &immutable_target.as_ref().expect("cloud commit requires immutable activation target").xyz_f32_le,
+                immutable_target.as_ref().expect("cloud commit requires immutable activation target").xyz_f32_le(),
             ) {
                 Ok(retained) => retained,
                 Err(error) => {
@@ -3276,7 +3427,7 @@ async fn activate_map_r1(
             );
                 match service.retain_activation_lifecycle_fence(
                     identity_class.request_id(),
-                    activation_request_identity_sha256,
+                    activation_request_key.clone(),
                     Some(retained_publication),
                     projection_guard
                         .take()
@@ -3308,10 +3459,10 @@ async fn activate_map_r1(
             if !record_activation_journal(
                 &service.activation_receipts,
                 &token,
-                activation_request_identity_sha256,
+                activation_request_key.clone(),
                 crate::correction_coordinator::ActivationJournalStep::TypedGlobalMap,
                 crate::correction_coordinator::ActivationJournalStatus::Applied,
-                cloud_sha256,
+                cloud_activation_verifier(&activation_request_key, cloud_sha256, &committed.receipt),
                 None,
             ) {
                 settle_started_failure!(
@@ -3346,10 +3497,10 @@ async fn activate_map_r1(
     if !record_activation_journal(
         &service.activation_receipts,
         &token,
-        activation_request_identity_sha256,
+        activation_request_key.clone(),
         crate::correction_coordinator::ActivationJournalStep::Seal,
         crate::correction_coordinator::ActivationJournalStatus::Prepared,
-        Some(final_activation_identity),
+        Some(activation_verifier(&final_activation_identity)),
         None,
     ) {
         settle_started_failure!(
@@ -3358,7 +3509,7 @@ async fn activate_map_r1(
         );
     }
     let snapshot = adapter.lock().snapshot();
-    let activation_message = if mapping_backend_checkpoint.is_some() {
+    let activation_message = if mapping_backend_checkpoint.is_some() || assigned_checkpoint.is_some() {
         "map checkpoint activated; legacy_checkpoint_reconstructed=false"
     } else {
         "map checkpoint activated; legacy_checkpoint_reconstructed=true"
@@ -3366,7 +3517,7 @@ async fn activate_map_r1(
     let state = mapping_session_state(snapshot, activation_message);
     let target_receipt = identity_class
         .is_modern()
-        .then_some(target_receipt_sha256)
+        .then_some(target_receipt)
         .flatten();
     let sealed = match service
         .activation_receipts
@@ -3566,20 +3717,35 @@ fn decode_checkpoint_grid(
     checkpoint: OccupancyGridData,
     expected_map_frame_id: &str,
 ) -> Result<nuwax_mapping::OccupancyGrid, String> {
-    let meta = checkpoint
-        .meta
-        .ok_or_else(|| "checkpoint.meta is required".to_string())?;
+    let meta = checkpoint.meta.ok_or_else(|| "checkpoint.meta is required".to_string())?;
+    decode_checkpoint_grid_parts(&meta, checkpoint.data.len(), checkpoint.data.into_iter(), expected_map_frame_id)
+}
+
+fn decode_checkpoint_grid_borrowed(
+    checkpoint: &OccupancyGridData,
+    expected_map_frame_id: &str,
+) -> Result<nuwax_mapping::OccupancyGrid, String> {
+    let meta = checkpoint.meta.as_ref().ok_or_else(|| "checkpoint.meta is required".to_string())?;
+    decode_checkpoint_grid_parts(meta, checkpoint.data.len(), checkpoint.data.iter().copied(), expected_map_frame_id)
+}
+
+fn decode_checkpoint_grid_parts(
+    meta: &OccupancyGridMeta,
+    actual_size: usize,
+    values: impl Iterator<Item = u8>,
+    expected_map_frame_id: &str,
+) -> Result<nuwax_mapping::OccupancyGrid, String> {
     if meta.width == 0 || meta.height == 0 {
         return Err("checkpoint width/height must be positive".to_string());
     }
     let expected_size = (meta.width as usize)
         .checked_mul(meta.height as usize)
         .ok_or_else(|| "checkpoint dimensions overflow".to_string())?;
-    if checkpoint.data.len() != expected_size {
+    if actual_size != expected_size {
         return Err(format!(
             "checkpoint data size mismatch: expected={} actual={}",
             expected_size,
-            checkpoint.data.len()
+            actual_size
         ));
     }
     if !meta.resolution.is_finite() || meta.resolution <= 0.0 {
@@ -3592,10 +3758,7 @@ fn decode_checkpoint_grid(
             meta.frame_id,
         ));
     }
-    let data = checkpoint
-        .data
-        .into_iter()
-        .map(|value| value as i8)
+    let data = values.map(|value| value as i8)
         .collect::<Vec<_>>();
     if data.iter().any(|value| !(-1..=100).contains(value)) {
         return Err("checkpoint occupancy values must be within [-1, 100]".to_string());
@@ -3704,7 +3867,7 @@ fn cloud_checkpoint_proto(
     }
 }
 
-fn validate_mapping_checkpoint_envelope_size(
+pub(crate) fn validate_mapping_checkpoint_envelope_size(
     label: &str,
     encoded_len: usize,
 ) -> Result<(), String> {
@@ -3973,7 +4136,7 @@ fn validate_checkpoint_member_binding(checkpoint: &MappingBackendCheckpoint, mem
     }
     Ok(())
 }
-fn validate_assigned_mapping_checkpoint(checkpoint: &MappingBackendCheckpoint, expected_backend: crate::mapping_backend::MappingBackendKind) -> Result<(), String> {
+pub(crate) fn validate_assigned_mapping_checkpoint(checkpoint: &MappingBackendCheckpoint, expected_backend: crate::mapping_backend::MappingBackendKind) -> Result<(), String> {
     if checkpoint.schema_version != ASSIGNED_CHECKPOINT_ENVELOPE_VERSION
         || !crate::planar_artifacts::assigned_id(&checkpoint.checkpoint_id) || !checkpoint.content_sha256.is_empty()
         || checkpoint.backend_payload_schema_version != crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION
@@ -4884,7 +5047,7 @@ impl GeometryRuntimeService {
                 fence.lifecycle_guard,
                 Some((
                     fence.activation_request_id,
-                    fence.activation_request_identity_sha256,
+                    fence.activation_request_key,
                     fence.retained_global_map,
                 )),
             ),
@@ -9958,7 +10121,8 @@ mod lifecycle_tests {
             crate::correction_coordinator::ActivationReceiptSeed {
                 planar_target: None,
                 activation_request_id: "relocalize-r1-gate".to_owned(),
-                activation_request_identity_sha256,
+                request_key: activation_request_identity_sha256.into(),
+                checkpoint_owner: None,
                 asset_manifest_sha256: Some([0x32; 32]),
                 asset_bundle_sha256: Some([0x33; 32]),
                 modern: true,
@@ -11111,7 +11275,7 @@ mod lifecycle_tests {
         identity: [u8; 32],
     ) {
         let retained_global_map = RetainedActivationGlobalMap {
-            activation_request_identity_sha256: identity,
+            activation_request_key: identity.into(),
             map_frame_id: "map".to_string(),
             installed_cloud_revision: 7,
             cloud_metadata: crate::pointcloud::CommittedCloudMapMetadata {
@@ -11129,13 +11293,13 @@ mod lifecycle_tests {
                 source_timestamp_ns: 8,
                 point_count: 1,
             },
-            frame: nuwax_protocol::RawLcmFrameBuilder::new(
+            legacy_frame: Some(nuwax_protocol::RawLcmFrameBuilder::new(
                 LcmTopic::new("/global_map").expect("retained map topic"),
                 LcmMessageType::new("sensor_msgs.PointCloud2").expect("retained map message type"),
             )
             .payload(vec![identity[0]])
             .seqno(7)
-            .build(),
+            .build()),
         };
         let projection_guard = handle.lock_explore_projection_owned().await;
         let lifecycle_guard = handle.mapping_lifecycle_lock.clone().lock_owned().await;
@@ -11165,12 +11329,12 @@ mod lifecycle_tests {
             panic!("activation lifecycle fence must be restored as Held");
         };
         assert_eq!(fence.activation_request_id, activation_request_id);
-        assert_eq!(fence.activation_request_identity_sha256, identity);
+        assert_eq!(fence.activation_request_key.legacy_digest(), Some(identity));
         let retained = fence
             .retained_global_map
             .as_ref()
             .expect("retained global-map receipt");
-        assert_eq!(retained.activation_request_identity_sha256, identity);
+        assert_eq!(retained.activation_request_key.legacy_digest(), Some(identity));
         assert_eq!(retained.installed_cloud_revision, 7);
         assert_eq!(retained.cloud_receipt.cloud_revision, 7);
     }
@@ -11247,7 +11411,7 @@ mod lifecycle_tests {
                 pending.activation_request_id,
                 "process-stop-restore-pending"
             );
-            assert_eq!(pending.activation_request_identity_sha256, identity);
+            assert_eq!(pending.activation_request_key.legacy_digest(), Some(identity));
             assert!(pending.retained_global_map.is_some());
         }
         assert!(
@@ -11324,6 +11488,7 @@ mod lifecycle_tests {
             asset_bundle_sha256: Vec::new(),
             expected_runtime_generation: 0,
             activation_contract_version: 0,
+            asset_identity: None,
         }
     }
 
@@ -11360,6 +11525,7 @@ mod lifecycle_tests {
             asset_bundle_sha256: Vec::new(),
             expected_runtime_generation: 0,
             activation_contract_version: 0,
+            asset_identity: None,
         }
     }
 
@@ -11559,6 +11725,7 @@ mod lifecycle_tests {
             asset_bundle_sha256: Vec::new(),
             expected_runtime_generation: 0,
             activation_contract_version: 0,
+            asset_identity: None,
         }
     }
 
@@ -14371,6 +14538,7 @@ mod lifecycle_tests {
                 asset_bundle_sha256: Vec::new(),
                 expected_runtime_generation: 0,
                 activation_contract_version: 0,
+            asset_identity: None,
             }),
         )
         .await
@@ -18094,4 +18262,61 @@ fn assigned_v2_assembly_checks_full_artifact_parent_descriptor() {
     checkpoint.dense_cloud_artifact.as_mut().unwrap().member_identity.as_mut().unwrap().cloud_receipt.as_mut().unwrap().cloud_revision+=1;
     assert!(validate_assigned_mapping_checkpoint(&checkpoint,crate::mapping_backend::MappingBackendKind::Voxel).is_err());
 }
+}
+
+#[cfg(test)]
+mod assigned_activation_boundary_tests {
+    use super::*;
+
+    fn metadata_request() -> ActivateMapRequest {
+        ActivateMapRequest {
+            activation_contract_version: 2,
+            activation_request_id: "assigned-boundary:one".into(),
+            session_id: "loaded:one".into(), map_name: "warehouse".into(),
+            expected_runtime_generation: 7,
+            asset_identity: Some(crate::proto::AssetIdentityV2 { asset_id: "a".repeat(32) }),
+            mapping_backend_checkpoint: Some(MappingBackendCheckpoint {
+                schema_version: 2, checkpoint_id: "b".repeat(32), ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn assigned_metadata_never_enters_legacy_request_classification() {
+        let request = metadata_request();
+        assert!(matches!(classify_activation_request_identity(&request, 7).unwrap(), ActivationRequestIdentityClass::Assigned(_)));
+        assert!(classify_activation_request_identity(&request, 8).is_err());
+        for version in [0, 1, 3] {
+            let mut skew = request.clone(); skew.activation_contract_version = version;
+            assert!(classify_activation_request_identity(&skew, 7).is_err());
+        }
+        let mut duplicate = request; duplicate.cloud_checkpoint = Some(CloudMapCheckpoint::default());
+        assert!(classify_activation_request_identity(&duplicate, 7).is_err());
+    }
+
+    #[test]
+    fn assigned_publication_fence_retains_no_legacy_cloud_frame() {
+        let metadata = crate::activation_request::ActivationRequestMetadataV2::from_wire(&metadata_request(), 7).unwrap();
+        let key = ActivationRequestKey::Assigned(metadata);
+        let receipt = crate::mapping_commit::CloudCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 9, sequence: 10 },
+            session_generation: 2, occupancy_revision: 3, cloud_revision: 4,
+            source_timestamp_ns: 100, point_count: 1,
+        };
+        let committed = CommittedMappingCloudMap {
+            notification: CloudMapNotification { revision: 4, point_count: 1, voxel_size: 0.1, session_generation: 2 },
+            source_timestamp_ns: 100,
+            metadata: crate::pointcloud::CommittedCloudMapMetadata {
+                revision: 4, point_count: 1, voxel_size: 0.1, session_generation: 2,
+                producer_epoch: [1; 16], layout_generation: 1,
+            },
+            receipt,
+        };
+        // No XYZ body is supplied: a typed fence must not eagerly encode one.
+        let retained = RetainedActivationGlobalMap::from_committed(key.clone(), "map", &committed, &[]).unwrap();
+        assert!(retained.legacy_frame.is_none());
+        retained.validate_replay(key.clone(), "map", &committed).unwrap();
+        assert!(retained.validate_replay(key, "odom", &committed).is_err());
+    }
 }

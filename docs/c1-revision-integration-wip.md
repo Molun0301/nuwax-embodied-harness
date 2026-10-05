@@ -105,3 +105,31 @@ Commands used the existing baseline-build-env.sh, warmed geometry-runtime target
 Logs under /workspace/shared/neh-validation: c1-stage-a-native-compile-20261004.log; c1-stage-a-native-target-tests-20261004.log (original failure); c1-stage-a-native-target-tests-20261004-r2.log; c1-stage-a-native-assembly-tests-20261004.log and -r2.log.
 
 At 14:42 UTC the primary branch recovery/exploration-overlay-20261004 was restored to exact 0ea9997753cc0a7e19b4c27ce853dce8b5b10fd9/tree 398019c0c188efb6e23d8a718fe6b8679b5ef72e and verified clean; the native lane was explicitly returned. Runtime default-off experiments and diagnostic test helpers were preserved. Default typed activation/finalization remains a release gate.
+
+## Typed activation Stage B component checkpoint
+
+This stage starts from bad2ee331e3f632993a7caaae5f92db37bbd7a82. Its initial source-only checkpoint was followed by the native qualification below. It remains nondeployable; the Python/default activation gate is still closed.
+
+- Explicit native contract 2 carries one canonical checkpoint envelope and a separate typed finalized-asset ID. Legacy top-level duplicate cloud/occupancy bodies and digest fields are rejected. Python populates the nested protobuf in place, with one materialization per body and no second intermediate cloud/checkpoint CopyFrom. The isolated Python suite passes 41/41 in c1-stage-b-python-20261004-r3.log.
+- The immutable request owner moves backend, occupancy and cloud vectors once. A weak interner compares exact candidate bodies outside short locks, shares equal live ownership, and rejects conflicting candidates. Pinned read-only artifact files remain authoritative across transfer release/expiry; exact-reference retries cannot switch to a recycled transfer-store body. Fifteen new source tests cover ownership, races, replay, expiry and conflicts.
+- One existing activation ledger retains the current source owner; tokens, journal keys, adapter/publication fences and permanent terminal records contain small typed metadata/receipts only. Retired tombstones are checked before expensive source re-admission. Existing lifecycle epoch/CAS and retirement behavior remain the authority. Assigned journal variants are step-bound, cloud proofs compare exact installed receipts, and Applied entries cannot be changed or downgraded.
+- Assigned backend restore jobs borrow the admitted owner through a small read-only trait shared by binary/library worker code. The mutable installed occupancy grid is decoded from a borrowed source rather than cloning its protobuf first. No new clock or retention cap is introduced.
+- Assigned publication fences retain only key/metadata/receipt, not an eagerly encoded full legacy XYZ frame. Retry goes through the same demand-aware canonical publication sequencer after exact receipt validation. Legacy retry behavior remains isolated.
+- Existing legacy relocalization and mapping-cloud/goal authority consumers do not receive fabricated v2 digest snapshots. Typed relocalization/evidence, persistent outer assets and planar ownership remain required downstream work.
+
+Important audit limit: common occupancy installation still calls legacy MapRevisionEvent raw/effective hashing, and canonical navigation publication still produces a legacy committed-map payload digest. This stage therefore does not establish hash-free live activation. Those producers and their active-map/goal consumers must migrate together before default activation/finalization is enabled or the application-hash removal is claimed complete. The weak interner also makes no permanent-global-identity claim after every owner is released; persistent finalized-asset ownership and legacy import must supply that later boundary.
+
+
+### Stage B native qualification
+
+The exclusive owner granted clean primary 326fd0b2bfd996cd961ae1d85740739ae15bb60d/tree 5d3e9e8d251f0b67594c6e9c3d22a63be8a0416b. Temporary branch validation/c1-activation-stage-b-20261004 merged exact 0f58859e35be7c23468828e9ea4bf9bd6acd82c5 into that primary, producing merge d92a3e6c96c1eb909be4a467b49f0d4f7b4be824/tree 273857e892a6584313e8d7c26a97ba9704cf5995. Warmed default-feature native --no-run passed on the first attempt in 1m51s; no SDK rebuild or source fix was needed.
+
+The exact compiled binary passed 43 selected pure tests: 9 immutable target, 15 request/checkpoint ownership, 10 assigned ledger/journal, 3 existing legacy ledger/release, and 6 server metadata/publication-fence/checkpoint-assembly. Tests verify allocation sharing, weak/retired release, artifact expiry/reference ownership, conflicting exact replay, typed proof pairing, journal mutation rejection and phase-A/replay barriers. They do not execute a real-LCM activation transaction or establish hash-free live publication. No doorway/full-server tests ran in this window.
+
+Commands sourced baseline-build-env.sh and used the existing warmed target/jobs2:
+- cargo test --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml --bin nuwax-geometry-runtime --no-run
+- The retained binary c1-runtime-tests-d92a3e6c with --test-threads=1 --nocapture and filters activation_identity::tests, activation_request::tests, correction_coordinator::preflight_only_contract::tests::assigned_, correction_coordinator::preflight_only_contract::tests::activation_, server::assigned_
+
+Evidence: /workspace/shared/neh-validation/c1-stage-b-native-compile-20261004.log; c1-stage-b-selected-tests-20261004.txt; c1-stage-b-pure-tests-20261004.log. Python41/41 and pinned generated-protobuf check also pass on the source stage.
+
+At 15:32 UTC, primary recovery/exploration-overlay-20261004 was restored to exact 326fd0b2bfd996cd961ae1d85740739ae15bb60d/tree 5d3e9e8d251f0b67594c6e9c3d22a63be8a0416b and verified clean, and the native lane was explicitly returned. Common occupancy/committed-map hash identity, active-map/goal consumers, typed relocalization/evidence persistence, planar and outer-asset/default closure remain open.

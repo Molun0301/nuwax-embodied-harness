@@ -47,6 +47,16 @@ mod preflight_only_contract {
     use thiserror::Error;
     use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 
+    use crate::activation_contract::{
+        ActivationIdentity, ActivationJournalKey, ActivationJournalVerifier,
+        ActivationJournalVerifierV2, ActivationRequestKey, ActivationTargetSource,
+        InstalledActivationIdentityV2, TargetReceipt,
+    };
+    #[cfg(test)]
+    use crate::activation_contract::InstalledTargetReceiptV2;
+    use crate::activation_request::{
+        ActivationRequestMetadataV2, CanonicalCheckpointOwnerV2, ValidatedActivationRequestV2,
+    };
     use crate::lcm_runtime::ValidatedFrameBindings;
     use crate::map_checksum::sha256_bytes;
     use crate::mapping_commit::MappingCommitId;
@@ -3354,24 +3364,7 @@ mod preflight_only_contract {
         sha256_bytes(b"nuwax.planar-relocalization.v1;karto-2.10.0;explicit-se2-seed;candidate-process;static-graph;canonical-tf")
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    pub(crate) enum ActivationJournalStep {
-        BackendRestoreSubmission,
-        SessionStart,
-        OccupancyShmBegin,
-        OccupancyInstall,
-        CloudInstall,
-        BackendCommit,
-        ActivationRecord,
-        SharedStateCommit,
-        CacheClears,
-        MapEvent,
-        CloudEvent,
-        TypedGlobalMap,
-        RetirementPrepared,
-        Seal,
-        TargetReceiptVerification,
-    }
+    pub(crate) use crate::activation_contract::ActivationJournalStep;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum ActivationJournalStatus {
@@ -3382,9 +3375,9 @@ mod preflight_only_contract {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) struct ActivationJournalEntry {
         pub(crate) step: ActivationJournalStep,
-        pub(crate) idempotency_key: [u8; 32],
+        pub(crate) idempotency_key: ActivationJournalKey,
         pub(crate) status: ActivationJournalStatus,
-        pub(crate) verifier_receipt_sha256: Option<[u8; 32]>,
+        pub(crate) verifier_receipt: Option<ActivationJournalVerifier>,
         pub(crate) typed_failure: Option<String>,
     }
 
@@ -3392,11 +3385,12 @@ mod preflight_only_contract {
     pub(crate) struct ActivationReceiptSeed {
         pub(crate) planar_target: Option<Arc<crate::planar_artifacts::Target>>,
         pub(crate) activation_request_id: String,
-        pub(crate) activation_request_identity_sha256: [u8; 32],
+        pub(crate) request_key: ActivationRequestKey,
         pub(crate) asset_manifest_sha256: Option<[u8; 32]>,
         pub(crate) asset_bundle_sha256: Option<[u8; 32]>,
         pub(crate) modern: bool,
         pub(crate) immutable_target: Option<crate::pointcloud::ImmutableActivatedTarget>,
+        pub(crate) checkpoint_owner: Option<CanonicalCheckpointOwnerV2>,
     }
 
     #[derive(Clone, Debug)]
@@ -3406,7 +3400,7 @@ mod preflight_only_contract {
         pub(crate) point_count: u32,
         pub(crate) voxel_size: f32,
         pub(crate) cloud_receipt: crate::mapping_commit::CloudCommitReceipt,
-        pub(crate) target_receipt_sha256: [u8; 32],
+        pub(crate) target_receipt: TargetReceipt,
     }
 
     #[derive(Clone, Debug)]
@@ -3432,8 +3426,8 @@ mod preflight_only_contract {
     pub(crate) struct ActivationToken {
         epoch: u64,
         activation_request_id: String,
-        activation_request_identity_sha256: [u8; 32],
-        activation_identity_sha256: Option<[u8; 32]>,
+        request_key: ActivationRequestKey,
+        activation_identity: Option<ActivationIdentity>,
         reserved_backend_generation: Option<u64>,
     }
 
@@ -3456,14 +3450,15 @@ mod preflight_only_contract {
     #[derive(Clone, Debug)]
     struct PermanentActivationRecord {
         seed: ActivationReceiptSeed,
-        immutable_target: Option<crate::pointcloud::ImmutableActivatedTarget>,
+        immutable_target: Option<Arc<crate::pointcloud::ImmutableActivatedTarget>>,
+        checkpoint_owner: Option<CanonicalCheckpointOwnerV2>,
         cloud_target_required: bool,
         planar_target_required: bool,
         planar_receipt: Option<crate::mapping_commit::OccupancyCommitReceipt>,
         epoch: u64,
         state: PermanentActivationState,
-        activation_identity_sha256: Option<[u8; 32]>,
-        target_receipt_sha256: Option<[u8; 32]>,
+        activation_identity: Option<ActivationIdentity>,
+        target_receipt: Option<TargetReceipt>,
         session_generation: u64,
         backend_generation: u64,
         journal: Vec<ActivationJournalEntry>,
@@ -3485,6 +3480,8 @@ mod preflight_only_contract {
         ledger: parking_lot::Mutex<ActivatedTargetReceiptLedger>,
         #[cfg(test)]
         seal_before_ledger_gate: parking_lot::Mutex<Option<ActivationSealTestGate>>,
+        #[cfg(test)]
+        replay_before_compare_gate: parking_lot::Mutex<Option<ActivationSealTestGate>>,
     }
 
     #[cfg(test)]
@@ -3513,6 +3510,8 @@ mod preflight_only_contract {
                     ledger: parking_lot::Mutex::new(ActivatedTargetReceiptLedger::default()),
                     #[cfg(test)]
                     seal_before_ledger_gate: parking_lot::Mutex::new(None),
+                    #[cfg(test)]
+                    replay_before_compare_gate: parking_lot::Mutex::new(None),
                 }),
             }
         }
@@ -3547,9 +3546,8 @@ mod preflight_only_contract {
                 .is_some_and(|record| {
                     record.state == PermanentActivationState::Staged
                         && record.epoch == token.epoch
-                        && record.seed.activation_request_identity_sha256
-                            == token.activation_request_identity_sha256
-                        && record.activation_identity_sha256 == token.activation_identity_sha256
+                        && record.seed.request_key == token.request_key
+                        && record.activation_identity == token.activation_identity
                         && (token.reserved_backend_generation.is_none()
                             || record.backend_generation
                                 == token.reserved_backend_generation.unwrap())
@@ -3597,7 +3595,9 @@ mod preflight_only_contract {
 
         fn release_immutable_target(record: &mut PermanentActivationRecord) {
             record.immutable_target = None;
+            record.checkpoint_owner = None;
             record.seed.immutable_target = None;
+            record.seed.checkpoint_owner = None;
             record.seed.planar_target = None;
             record.planar_receipt = None;
             if let Some(terminal) = record.terminal.as_mut() {
@@ -3609,34 +3609,83 @@ mod preflight_only_contract {
             if !record.seed.modern
                 || record.session_generation == 0
                 || record.backend_generation == 0
-                || record.activation_identity_sha256.is_none()
+                || record.activation_identity.is_none()
             {
                 return false;
             }
-            if let Some(target)=record.seed.planar_target.as_ref() {
-                return record.planar_receipt.as_ref().is_some_and(|receipt|
-                    receipt.session_generation==record.session_generation && receipt.backend_generation==record.backend_generation
-                    && receipt.backend_kind==crate::mapping_backend::MappingBackendKind::SlamToolbox
-                    && record.target_receipt_sha256==Some(target.receipt(record.activation_identity_sha256.unwrap(),receipt)));
+            match &record.seed.request_key {
+                ActivationRequestKey::Assigned(metadata) => {
+                    let (
+                        Some(owner),
+                        Some(ActivationIdentity::Assigned(activation)),
+                        Some(TargetReceipt::Assigned(receipt)),
+                        Some(proof),
+                    ) = (
+                        record.checkpoint_owner.as_ref(),
+                        record.activation_identity.as_ref(),
+                        record.target_receipt.as_ref(),
+                        record.publication_proof.as_ref(),
+                    )
+                    else {
+                        return false;
+                    };
+                    // Only small, immutable descriptors are compared while holding the ledger lock.
+                    activation.request == *metadata
+                        && activation.lifecycle_epoch == record.epoch
+                        && activation.session_generation == record.session_generation
+                        && activation.backend_generation == record.backend_generation
+                        && receipt.activation == *activation
+                        && receipt.validate(owner)
+                        && proof.target_receipt == *record.target_receipt.as_ref().unwrap()
+                        && proof.cloud_receipt == receipt.cloud_receipt
+                        && proof.point_count == owner.cloud().point_count()
+                        && proof.voxel_size.to_bits() == owner.cloud().voxel_size().to_bits()
+                        && proof.cloud_revision == receipt.cloud_receipt.cloud_revision
+                        && proof.source_timestamp_ns == receipt.cloud_receipt.source_timestamp_ns
+                }
+                ActivationRequestKey::LegacyDigest(_) => {
+                    let Some(ActivationIdentity::LegacyDigest(activation)) =
+                        record.activation_identity.as_ref()
+                    else {
+                        return false;
+                    };
+                    if let Some(target) = record.seed.planar_target.as_ref() {
+                        return record.planar_receipt.as_ref().is_some_and(|receipt| {
+                            receipt.session_generation == record.session_generation
+                                && receipt.backend_generation == record.backend_generation
+                                && receipt.backend_kind
+                                    == crate::mapping_backend::MappingBackendKind::SlamToolbox
+                                && record.target_receipt
+                                    == Some(TargetReceipt::LegacyDigest(
+                                        target.receipt(*activation, receipt),
+                                    ))
+                        });
+                    }
+                    let (Some(target), Some(TargetReceipt::LegacyDigest(receipt)), Some(proof)) = (
+                        record.immutable_target.as_ref(),
+                        record.target_receipt.as_ref(),
+                        record.publication_proof.as_ref(),
+                    ) else {
+                        return false;
+                    };
+                    proof.target_receipt == TargetReceipt::LegacyDigest(*receipt)
+                        && proof.point_count == target.point_count
+                        && proof.voxel_size.to_bits() == target.voxel_size.to_bits()
+                        && proof.cloud_receipt.session_generation == record.session_generation
+                        && proof.cloud_receipt.cloud_revision == proof.cloud_revision
+                        && proof.cloud_receipt.source_timestamp_ns == proof.source_timestamp_ns
+                        && proof.cloud_receipt.point_count == target.point_count
+                }
             }
-            let (Some(target), Some(target_receipt_sha256), Some(proof)) = (
-                record.immutable_target.as_ref(),
-                record.target_receipt_sha256,
-                record.publication_proof.as_ref(),
-            ) else {
-                return false;
-            };
-            proof.target_receipt_sha256 == target_receipt_sha256
-                && proof.point_count == target.point_count
-                && proof.voxel_size.to_bits() == target.voxel_size.to_bits()
-                && proof.cloud_receipt.session_generation == record.session_generation
-                && proof.cloud_receipt.cloud_revision == proof.cloud_revision
-                && proof.cloud_receipt.source_timestamp_ns == proof.source_timestamp_ns
-                && proof.cloud_receipt.point_count == target.point_count
         }
 
         fn sealed_target_available(record: &PermanentActivationRecord) -> bool {
-            record.state == PermanentActivationState::Sealed
+            // Relocalization has not migrated to assigned identities yet. Keep its legacy snapshot
+            // and wire proof surface closed even when a schema-2 activation has sealed correctly.
+            matches!(
+                record.seed.request_key,
+                ActivationRequestKey::LegacyDigest(_)
+            ) && record.state == PermanentActivationState::Sealed
                 && Self::has_complete_target_proof(record)
         }
 
@@ -3667,7 +3716,83 @@ mod preflight_only_contract {
             self.with_staged_record(token, |_| ()).is_some()
         }
 
-        pub(crate) fn has_request(&self,id:&str)->bool {self.inner.ledger.lock().records.contains_key(id)}
+        pub(crate) fn has_request(&self, id: &str) -> bool {
+            self.inner.ledger.lock().records.contains_key(id)
+        }
+
+        /// Consult permanent small tombstones before admission can reopen any checkpoint files.
+        /// Current live staged/sealed records still require exact source comparison at admission.
+        pub(crate) fn assigned_terminal_before_admission(
+            &self,
+            metadata: &ActivationRequestMetadataV2,
+            mut state: crate::proto::MappingSessionState,
+        ) -> Option<crate::proto::MappingSessionState> {
+            let ledger = self.inner.ledger.lock();
+            let key = ActivationRequestKey::Assigned(metadata.clone());
+            let phase = self.phase_snapshot();
+            let record = ledger.records.get(metadata.activation_request_id());
+            let conflict = record.is_some_and(|record| record.seed.request_key != key);
+            let retired = phase.0
+                || record.is_some_and(|record| {
+                    !matches!(
+                        record.state,
+                        PermanentActivationState::Staged | PermanentActivationState::Sealed
+                    ) || record.epoch != phase.1
+                        || ledger.current.as_deref() != Some(metadata.activation_request_id())
+                });
+            if !conflict && !retired {
+                return None;
+            }
+            // Format according to the incoming assigned schema even for cross-version conflicts.
+            self.apply_request_key(&mut state, metadata.activation_request_id(), &key);
+            if !conflict {
+                if let Some(record) = record {
+                    self.apply_record(
+                        &mut state,
+                        record,
+                        crate::proto::ActivationReceiptDisposition::Retired,
+                        false,
+                    );
+                }
+            }
+            state.success = false;
+            state.idempotent_replay = true;
+            state.activation_receipt_disposition = if conflict {
+                crate::proto::ActivationReceiptDisposition::Conflict as i32
+            } else {
+                crate::proto::ActivationReceiptDisposition::Retired as i32
+            };
+            state.message = if conflict {
+                "ACTIVATE_MAP_REPLAY_CONFLICT"
+            } else {
+                "ACTIVATION_IDENTITY_RETIRED"
+            }
+            .into();
+            Some(state)
+        }
+
+        pub(crate) fn stage_assigned_or_replay(
+            &self,
+            request: ValidatedActivationRequestV2,
+            state: crate::proto::MappingSessionState,
+            allow_new: bool,
+        ) -> ActivationLedgerAdmission {
+            let (metadata, checkpoint_owner) = request.into_parts();
+            self.stage_or_replay(
+                ActivationReceiptSeed {
+                    activation_request_id: metadata.activation_request_id().into(),
+                    request_key: ActivationRequestKey::Assigned(metadata),
+                    asset_manifest_sha256: None,
+                    asset_bundle_sha256: None,
+                    modern: true,
+                    immutable_target: None,
+                    planar_target: None,
+                    checkpoint_owner: Some(checkpoint_owner),
+                },
+                state,
+                allow_new,
+            )
+        }
 
         pub(crate) fn stage_or_replay(
             &self,
@@ -3675,173 +3800,245 @@ mod preflight_only_contract {
             mut base_state: crate::proto::MappingSessionState,
             allow_new: bool,
         ) -> ActivationLedgerAdmission {
-            let before = self.phase_snapshot();
-            if before.0 {
-                self.apply_policy_identity(&mut base_state);
-                base_state.success = false;
-                base_state.idempotent_replay = true;
-                base_state.activation_receipt_disposition =
-                    crate::proto::ActivationReceiptDisposition::Retired as i32;
-                base_state.activation_request_id = seed.activation_request_id;
-                base_state.activation_request_identity_sha256 =
-                    seed.activation_request_identity_sha256.to_vec();
-                base_state.message = "ACTIVATION_IDENTITY_RETIRED".to_owned();
-                return ActivationLedgerAdmission::Terminal(Box::new(base_state));
-            }
-
-            let mut ledger = self.inner.ledger.lock();
-            let replay_is_current =
-                ledger.current.as_deref() == Some(seed.activation_request_id.as_str());
-            if let Some(record) = ledger.records.get(&seed.activation_request_id) {
-                let after = self.phase_snapshot();
-                if before != after || after.0 {
-                    drop(ledger);
-                    return self.stage_or_replay(seed, base_state, allow_new);
+            let seed_valid = match &seed.request_key {
+                ActivationRequestKey::LegacyDigest(_) => seed.checkpoint_owner.is_none(),
+                ActivationRequestKey::Assigned(metadata) => {
+                    seed.modern
+                        && seed.activation_request_id == metadata.activation_request_id()
+                        && metadata.expected_runtime_generation() == self.runtime_generation()
+                        && seed.asset_manifest_sha256.is_none()
+                        && seed.asset_bundle_sha256.is_none()
+                        && seed.immutable_target.is_none()
+                        && seed.planar_target.is_none()
+                        && seed
+                            .checkpoint_owner
+                            .as_ref()
+                            .is_some_and(|owner| owner.identity() == metadata.checkpoint_identity())
                 }
-                if record.seed.activation_request_identity_sha256
-                    != seed.activation_request_identity_sha256
-                    || record.state == PermanentActivationState::Staged
-                        && (record.immutable_target != seed.immutable_target || record.seed.planar_target != seed.planar_target)
-                {
-                    self.apply_record(
-                        &mut base_state,
-                        record,
-                        crate::proto::ActivationReceiptDisposition::Conflict,
-                        false,
-                    );
-                    base_state.success = false;
-                    base_state.idempotent_replay = true;
-                    base_state.message = "ACTIVATE_MAP_REPLAY_CONFLICT".to_owned();
-                    return ActivationLedgerAdmission::Terminal(Box::new(base_state));
-                }
-                return match record.state {
-                    PermanentActivationState::Staged if replay_is_current => {
-                        ActivationLedgerAdmission::Execute(ActivationToken {
-                            epoch: record.epoch,
-                            activation_request_id: seed.activation_request_id,
-                            activation_request_identity_sha256: seed
-                                .activation_request_identity_sha256,
-                            activation_identity_sha256: record.activation_identity_sha256,
-                            reserved_backend_generation: (record.backend_generation > 0)
-                                .then_some(record.backend_generation),
-                        })
-                    }
-                    PermanentActivationState::Sealed => {
-                        let mut terminal = record
-                            .terminal
-                            .clone()
-                            .unwrap_or_else(crate::proto::MappingSessionState::default);
-                        let target_available = replay_is_current
-                            && !after.0
-                            && record.epoch == after.1
-                            && Self::sealed_target_available(record);
-                        self.apply_record(
-                            &mut terminal,
-                            record,
-                            crate::proto::ActivationReceiptDisposition::SealedReplay,
-                            target_available,
-                        );
-                        terminal.idempotent_replay = true;
-                        terminal.message = "ACTIVATION_SEALED_REPLAY".to_owned();
-                        ActivationLedgerAdmission::Terminal(Box::new(terminal))
-                    }
-                    PermanentActivationState::Staged
-                    | PermanentActivationState::InvalidatedPrecommit
-                    | PermanentActivationState::InvalidatedPostcommit
-                    | PermanentActivationState::OutcomeUnknown
-                    | PermanentActivationState::Retired => {
-                        let mut terminal = record.terminal.clone().unwrap_or(base_state);
-                        self.apply_record(
-                            &mut terminal,
-                            record,
-                            crate::proto::ActivationReceiptDisposition::Retired,
-                            false,
-                        );
-                        terminal.success = false;
-                        terminal.idempotent_replay = true;
-                        terminal.message = "ACTIVATION_IDENTITY_RETIRED".to_owned();
-                        ActivationLedgerAdmission::Terminal(Box::new(terminal))
-                    }
-                };
-            }
-
-            if !allow_new {
-                self.apply_policy_identity(&mut base_state);
+            };
+            if !seed_valid {
+                self.apply_seed(&mut base_state, &seed);
                 base_state.success = false;
-                base_state.idempotent_replay = true;
                 base_state.activation_receipt_disposition =
                     crate::proto::ActivationReceiptDisposition::Conflict as i32;
-                base_state.activation_request_id = seed.activation_request_id;
-                base_state.activation_request_identity_sha256 =
-                    seed.activation_request_identity_sha256.to_vec();
-                base_state.message = "ACTIVATE_MAP_ACTIVE_IDENTITY_CONFLICT".to_owned();
+                base_state.message = "ACTIVATE_MAP_IDENTITY_SCHEMA_CONFLICT".into();
                 return ActivationLedgerAdmission::Terminal(Box::new(base_state));
             }
-
-            let epoch = before.1;
-            let request_id = seed.activation_request_id.clone();
-            let request_identity = seed.activation_request_identity_sha256;
-            let immutable_target = seed.immutable_target.take();
-            if let Some(previous_request_id) = ledger.current.clone() {
-                if let Some(previous) = ledger.records.get_mut(&previous_request_id) {
-                    self.retire_record(previous, crate::proto::MappingSessionState::default());
+            loop {
+                let before = self.phase_snapshot();
+                if before.0 {
+                    self.apply_seed(&mut base_state, &seed);
+                    base_state.success = false;
+                    base_state.idempotent_replay = true;
+                    base_state.activation_receipt_disposition =
+                        crate::proto::ActivationReceiptDisposition::Retired as i32;
+                    base_state.message = "ACTIVATION_IDENTITY_RETIRED".into();
+                    return ActivationLedgerAdmission::Terminal(Box::new(base_state));
                 }
-            }
-            debug_assert!(
-                ledger
+                // Snapshot only shared owners and small metadata. Byte/file equality must never
+                // run under the ledger mutex. Recheck lifecycle/state/owner before admission.
+                let replay = {
+                    let ledger = self.inner.ledger.lock();
+                    ledger
+                        .records
+                        .get(&seed.activation_request_id)
+                        .map(|record| {
+                            (
+                                record.epoch,
+                                record.state,
+                                record.seed.request_key.clone(),
+                                record.immutable_target.clone(),
+                                record.checkpoint_owner.clone(),
+                                record.seed.planar_target.clone(),
+                            )
+                        })
+                };
+                #[cfg(test)]
+                {
+                    let gate = self.inner.replay_before_compare_gate.lock().take();
+                    if let Some(gate) = gate {
+                        gate.entered.wait();
+                        gate.release.wait();
+                    }
+                }
+                let exact_source =
+                    replay
+                        .as_ref()
+                        .is_none_or(|(_, state, key, target, owner, planar)| {
+                            if key != &seed.request_key {
+                                return false;
+                            }
+                            if !matches!(
+                                state,
+                                PermanentActivationState::Staged | PermanentActivationState::Sealed
+                            ) {
+                                return true;
+                            }
+                            match key {
+                                ActivationRequestKey::LegacyDigest(_) => {
+                                    *state != PermanentActivationState::Staged
+                                        || (target.as_deref() == seed.immutable_target.as_ref()
+                                            && planar == &seed.planar_target)
+                                }
+                                ActivationRequestKey::Assigned(_) => {
+                                    match (owner.as_ref(), seed.checkpoint_owner.as_ref()) {
+                                        (Some(retained), Some(candidate)) => {
+                                            retained.validate_replay(candidate).is_ok()
+                                        }
+                                        _ => false,
+                                    }
+                                }
+                            }
+                        });
+                let mut ledger = self.inner.ledger.lock();
+                let after = self.phase_snapshot();
+                if before != after || after.0 {
+                    continue;
+                }
+                let replay_is_current =
+                    ledger.current.as_deref() == Some(seed.activation_request_id.as_str());
+                if let Some(record) = ledger.records.get(&seed.activation_request_id) {
+                    let Some((epoch, status, key, target, owner, planar)) = replay.as_ref() else {
+                        continue;
+                    };
+                    let source_unchanged = match (&record.checkpoint_owner, owner) {
+                        (Some(left), Some(right)) => left.shares_source_with(right),
+                        (None, None) => true,
+                        _ => false,
+                    } && match (&record.immutable_target, target) {
+                        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                        (None, None) => true,
+                        _ => false,
+                    } && match (&record.seed.planar_target, planar) {
+                        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if record.epoch != *epoch
+                        || record.state != *status
+                        || record.seed.request_key != *key
+                        || !source_unchanged
+                    {
+                        continue;
+                    }
+                    if !exact_source {
+                        if matches!(seed.request_key, ActivationRequestKey::Assigned(_)) {
+                            self.apply_seed(&mut base_state, &seed);
+                            base_state.activation_receipt_disposition =
+                                crate::proto::ActivationReceiptDisposition::Conflict as i32;
+                        } else {
+                            self.apply_record(
+                                &mut base_state,
+                                record,
+                                crate::proto::ActivationReceiptDisposition::Conflict,
+                                false,
+                            );
+                        }
+                        base_state.success = false;
+                        base_state.idempotent_replay = true;
+                        base_state.message = "ACTIVATE_MAP_REPLAY_CONFLICT".into();
+                        return ActivationLedgerAdmission::Terminal(Box::new(base_state));
+                    }
+                    return match record.state {
+                        PermanentActivationState::Staged
+                            if replay_is_current && record.epoch == after.1 =>
+                        {
+                            ActivationLedgerAdmission::Execute(ActivationToken {
+                                epoch: record.epoch,
+                                activation_request_id: seed.activation_request_id,
+                                request_key: seed.request_key,
+                                activation_identity: record.activation_identity.clone(),
+                                reserved_backend_generation: (record.backend_generation > 0)
+                                    .then_some(record.backend_generation),
+                            })
+                        }
+                        PermanentActivationState::Sealed => {
+                            let mut terminal = record.terminal.clone().unwrap_or_default();
+                            let available = replay_is_current
+                                && record.epoch == after.1
+                                && Self::sealed_target_available(record);
+                            self.apply_record(
+                                &mut terminal,
+                                record,
+                                crate::proto::ActivationReceiptDisposition::SealedReplay,
+                                available,
+                            );
+                            terminal.idempotent_replay = true;
+                            terminal.message = "ACTIVATION_SEALED_REPLAY".into();
+                            ActivationLedgerAdmission::Terminal(Box::new(terminal))
+                        }
+                        _ => {
+                            let mut terminal = record.terminal.clone().unwrap_or(base_state);
+                            self.apply_record(
+                                &mut terminal,
+                                record,
+                                crate::proto::ActivationReceiptDisposition::Retired,
+                                false,
+                            );
+                            terminal.success = false;
+                            terminal.idempotent_replay = true;
+                            terminal.message = "ACTIVATION_IDENTITY_RETIRED".into();
+                            ActivationLedgerAdmission::Terminal(Box::new(terminal))
+                        }
+                    };
+                }
+                if replay.is_some() {
+                    continue;
+                }
+                if !allow_new {
+                    self.apply_seed(&mut base_state, &seed);
+                    base_state.success = false;
+                    base_state.idempotent_replay = true;
+                    base_state.activation_receipt_disposition =
+                        crate::proto::ActivationReceiptDisposition::Conflict as i32;
+                    base_state.message = "ACTIVATE_MAP_ACTIVE_IDENTITY_CONFLICT".into();
+                    return ActivationLedgerAdmission::Terminal(Box::new(base_state));
+                }
+                let epoch = before.1;
+                let request_id = seed.activation_request_id.clone();
+                let request_key = seed.request_key.clone();
+                let immutable_target = seed.immutable_target.take().map(Arc::new);
+                let checkpoint_owner = seed.checkpoint_owner.take();
+                if let Some(previous_id) = ledger.current.clone() {
+                    if let Some(previous) = ledger.records.get_mut(&previous_id) {
+                        self.retire_record(previous, crate::proto::MappingSessionState::default());
+                    }
+                }
+                debug_assert!(ledger
                     .records
                     .values()
-                    .all(|record| record.immutable_target.is_none()),
-                "only the current activation may retain immutable target bytes"
-            );
-            ledger.records.insert(
-                request_id.clone(),
-                PermanentActivationRecord {
-                    planar_target_required: seed.planar_target.is_some(),
-                    planar_receipt: None,
-                    seed,
-                    cloud_target_required: immutable_target.is_some(),
-                    immutable_target,
+                    .all(|record| record.immutable_target.is_none()
+                        && record.checkpoint_owner.is_none()));
+                ledger.records.insert(
+                    request_id.clone(),
+                    PermanentActivationRecord {
+                        planar_target_required: seed.planar_target.is_some(),
+                        planar_receipt: None,
+                        cloud_target_required: immutable_target.is_some()
+                            || checkpoint_owner.is_some(),
+                        seed,
+                        immutable_target,
+                        checkpoint_owner,
+                        epoch,
+                        state: PermanentActivationState::Staged,
+                        activation_identity: None,
+                        target_receipt: None,
+                        session_generation: 0,
+                        backend_generation: 0,
+                        journal: Vec::new(),
+                        publication_proof: None,
+                        terminal: None,
+                    },
+                );
+                ledger.current = Some(request_id.clone());
+                return ActivationLedgerAdmission::Execute(ActivationToken {
                     epoch,
-                    state: PermanentActivationState::Staged,
-                    activation_identity_sha256: None,
-                    target_receipt_sha256: None,
-                    session_generation: 0,
-                    backend_generation: 0,
-                    journal: Vec::new(),
-                    publication_proof: None,
-                    terminal: None,
-                },
-            );
-            ledger.current = Some(request_id.clone());
-            debug_assert!(
-                ledger
-                    .records
-                    .values()
-                    .filter(|record| record.immutable_target.is_some())
-                    .count()
-                    <= 1,
-                "activation receipt ledger retained more than one immutable target"
-            );
-            let after = self.phase_snapshot();
-            if before != after || after.0 {
-                let mut terminal = ledger
-                    .records
-                    .get_mut(&request_id)
-                    .map(|record| self.retire_record(record, base_state.clone()))
-                    .unwrap_or(base_state);
-                terminal.idempotent_replay = true;
-                terminal.activation_request_id = request_id;
-                terminal.activation_request_identity_sha256 = request_identity.to_vec();
-                return ActivationLedgerAdmission::Terminal(Box::new(terminal));
+                    activation_request_id: request_id,
+                    request_key,
+                    activation_identity: None,
+                    reserved_backend_generation: None,
+                });
             }
-            ActivationLedgerAdmission::Execute(ActivationToken {
-                epoch,
-                activation_request_id: request_id,
-                activation_request_identity_sha256: request_identity,
-                activation_identity_sha256: None,
-                reserved_backend_generation: None,
-            })
         }
 
         pub(crate) fn reserve_backend_generation(
@@ -3853,29 +4050,100 @@ mod preflight_only_contract {
                 return None;
             }
             self.with_staged_record_mut(token, |record| {
+                if record.backend_generation > 0 && record.backend_generation != backend_generation
+                {
+                    return None;
+                }
                 record.backend_generation = backend_generation;
                 let mut token = token.clone();
                 token.reserved_backend_generation = Some(backend_generation);
-                token
+                Some(token)
             })
+            .flatten()
         }
 
         pub(crate) fn bind_activation_identity(
             &self,
             token: &ActivationToken,
-            activation_identity_sha256: [u8; 32],
+            activation_identity: impl Into<ActivationIdentity>,
             session_generation: u64,
         ) -> Option<ActivationToken> {
             if session_generation == 0 {
                 return None;
             }
+            let identity = activation_identity.into();
             self.with_staged_record_mut(token, |record| {
-                record.activation_identity_sha256 = Some(activation_identity_sha256);
+                let valid = match (&record.seed.request_key, &identity) {
+                    (
+                        ActivationRequestKey::LegacyDigest(_),
+                        ActivationIdentity::LegacyDigest(_),
+                    ) => true,
+                    (
+                        ActivationRequestKey::Assigned(request),
+                        ActivationIdentity::Assigned(activation),
+                    ) => {
+                        activation.request == *request
+                            && activation.runtime_generation == self.runtime_generation()
+                            && activation.lifecycle_epoch == record.epoch
+                            && activation.session_generation == session_generation
+                            && activation.backend_generation == record.backend_generation
+                            && activation.backend_generation > 0
+                            && record.checkpoint_owner.as_ref().is_some_and(|owner| {
+                                activation.backend_kind == owner.backend_kind()
+                            })
+                    }
+                    _ => false,
+                };
+                if !valid
+                    || record
+                        .activation_identity
+                        .as_ref()
+                        .is_some_and(|bound| bound != &identity)
+                {
+                    return None;
+                }
+                record.activation_identity = Some(identity.clone());
                 record.session_generation = session_generation;
                 let mut token = token.clone();
-                token.activation_identity_sha256 = Some(activation_identity_sha256);
-                token
+                token.activation_identity = Some(identity);
+                Some(token)
             })
+            .flatten()
+        }
+
+        pub(crate) fn bind_assigned_activation_identity(
+            &self,
+            token: &ActivationToken,
+            session_generation: u64,
+        ) -> Option<ActivationToken> {
+            let identity = self
+                .with_staged_record(token, |record| {
+                    let ActivationRequestKey::Assigned(request) = &record.seed.request_key else {
+                        return None;
+                    };
+                    Some(InstalledActivationIdentityV2 {
+                        request: request.clone(),
+                        runtime_generation: self.runtime_generation(),
+                        lifecycle_epoch: record.epoch,
+                        session_generation,
+                        backend_kind: record.checkpoint_owner.as_ref()?.backend_kind(),
+                        backend_generation: record.backend_generation,
+                    })
+                })
+                .flatten()?;
+            self.bind_activation_identity(
+                token,
+                ActivationIdentity::Assigned(identity),
+                session_generation,
+            )
+        }
+
+        pub(crate) fn activation_identity(
+            &self,
+            token: &ActivationToken,
+        ) -> Option<ActivationIdentity> {
+            self.with_staged_record(token, |record| record.activation_identity.clone())
+                .flatten()
         }
 
         pub(crate) fn journal(
@@ -3884,6 +4152,37 @@ mod preflight_only_contract {
             entry: ActivationJournalEntry,
         ) -> bool {
             self.with_staged_record_mut(token, |record| {
+                let key_matches = match (&record.seed.request_key, &entry.idempotency_key) {
+                    (
+                        ActivationRequestKey::LegacyDigest(_),
+                        ActivationJournalKey::LegacyDigest(_),
+                    ) => entry.verifier_receipt.as_ref().is_none_or(|value| {
+                        matches!(value, ActivationJournalVerifier::LegacyDigest(_))
+                    }),
+                    (
+                        ActivationRequestKey::Assigned(request),
+                        ActivationJournalKey::Assigned {
+                            request: keyed,
+                            step,
+                        },
+                    ) => {
+                        request == keyed
+                            && *step == entry.step
+                            && entry
+                                .verifier_receipt
+                                .as_ref()
+                                .is_some_and(|value| match value {
+                                    ActivationJournalVerifier::Assigned(verifier) => {
+                                        Self::assigned_verifier_matches(record, entry.step, verifier)
+                                    }
+                                    _ => false,
+                                })
+                    }
+                    _ => false,
+                };
+                if !key_matches {
+                    return false;
+                }
                 if let Some(existing) = record
                     .journal
                     .iter_mut()
@@ -3892,6 +4191,11 @@ mod preflight_only_contract {
                     if existing.idempotency_key != entry.idempotency_key {
                         return false;
                     }
+                    if matches!(record.seed.request_key, ActivationRequestKey::Assigned(_))
+                        && existing.status == ActivationJournalStatus::Applied
+                    {
+                        return *existing == entry;
+                    }
                     *existing = entry;
                 } else {
                     record.journal.push(entry);
@@ -3899,6 +4203,76 @@ mod preflight_only_contract {
                 true
             })
             .unwrap_or(false)
+        }
+
+        fn assigned_verifier_matches(
+            record: &PermanentActivationRecord,
+            step: ActivationJournalStep,
+            verifier: &ActivationJournalVerifierV2,
+        ) -> bool {
+            let ActivationRequestKey::Assigned(request) = &record.seed.request_key else {
+                return false;
+            };
+            use ActivationJournalStep as Step;
+            use ActivationJournalVerifierV2 as Verifier;
+            match (step, verifier) {
+                (
+                    Step::BackendRestoreSubmission | Step::BackendCommit | Step::RetirementPrepared,
+                    Verifier::BackendGeneration(value),
+                ) => *value > 0 && *value == record.backend_generation,
+                (Step::OccupancyShmBegin, Verifier::SessionGeneration(value)) => {
+                    *value > 0 && *value == record.session_generation
+                }
+                (
+                    Step::OccupancyInstall
+                    | Step::SharedStateCommit
+                    | Step::CacheClears
+                    | Step::MapEvent,
+                    Verifier::Occupancy(value),
+                ) => {
+                    value.session_id == request.session_id()
+                        && value.session_generation == record.session_generation
+                        && value.session_generation > 0
+                        && value.backend_generation == record.backend_generation
+                        && value.backend_generation > 0
+                        && value.commit_id.boot_nonce != 0
+                        && value.commit_id.sequence > 0
+                        && value.occupancy_revision > 0
+                        && value.source_timestamp_ns > 0
+                        && record
+                            .checkpoint_owner
+                            .as_ref()
+                            .is_some_and(|owner| owner.backend_kind() == value.backend_kind)
+                        && record.publication_proof.as_ref().is_none_or(|proof| {
+                            matches!(&proof.target_receipt, TargetReceipt::Assigned(receipt)
+                                if receipt.occupancy_receipt == *value)
+                        })
+                }
+                (
+                    Step::CloudInstall | Step::CloudEvent | Step::TypedGlobalMap,
+                    Verifier::Cloud(value),
+                ) => {
+                    // Cloud effects occur only after publication proof storage. Match its exact
+                    // installed receipt, not merely plausible positive revision/generation fields.
+                    record
+                        .publication_proof
+                        .as_ref()
+                        .is_some_and(|proof| proof.cloud_receipt == *value)
+                }
+                (
+                    Step::SessionStart | Step::ActivationRecord | Step::Seal,
+                    Verifier::Activation(value),
+                ) => {
+                    record.activation_identity.as_ref()
+                        == Some(&ActivationIdentity::Assigned(value.clone()))
+                }
+                (Step::TargetReceiptVerification, Verifier::Target(value)) => {
+                    record.target_receipt.as_ref() == Some(&TargetReceipt::Assigned(value.clone()))
+                }
+                // A matching key, another step's valid receipt, or CompletedStep is not proof
+                // of this effect. Prepared and Applied both retain the step's typed verifier.
+                _ => false,
+            }
         }
 
         pub(crate) fn journal_step_applied(
@@ -3920,10 +4294,37 @@ mod preflight_only_contract {
             proof: ActivationPublicationProof,
         ) -> bool {
             self.with_staged_record_mut(token, |record| {
-                record.target_receipt_sha256 = Some(proof.target_receipt_sha256);
+                let valid = match (&record.seed.request_key, &proof.target_receipt) {
+                    (ActivationRequestKey::LegacyDigest(_), TargetReceipt::LegacyDigest(_)) => true,
+                    (ActivationRequestKey::Assigned(_), TargetReceipt::Assigned(receipt)) => {
+                        record.activation_identity.as_ref()
+                            == Some(&ActivationIdentity::Assigned(receipt.activation.clone()))
+                            && record.checkpoint_owner.as_ref().is_some_and(|owner| {
+                                receipt.validate(owner)
+                                    && proof.point_count == owner.cloud().point_count()
+                                    && proof.voxel_size.to_bits()
+                                        == owner.cloud().voxel_size().to_bits()
+                            })
+                            && proof.cloud_receipt == receipt.cloud_receipt
+                            && proof.cloud_revision == receipt.cloud_receipt.cloud_revision
+                            && proof.source_timestamp_ns
+                                == receipt.cloud_receipt.source_timestamp_ns
+                    }
+                    _ => false,
+                };
+                if !valid
+                    || record
+                        .target_receipt
+                        .as_ref()
+                        .is_some_and(|stored| stored != &proof.target_receipt)
+                {
+                    return false;
+                }
+                record.target_receipt = Some(proof.target_receipt.clone());
                 record.publication_proof = Some(proof);
+                true
             })
-            .is_some()
+            .unwrap_or(false)
         }
 
         pub(crate) fn publication_proof(
@@ -3934,27 +4335,76 @@ mod preflight_only_contract {
                 .flatten()
         }
 
-        pub(crate) fn store_planar_proof(&self,token:&ActivationToken,receipt:crate::mapping_commit::OccupancyCommitReceipt)->Option<[u8;32]> {
-            self.with_staged_record_mut(token,|record| {
-                let target=record.seed.planar_target.as_ref()?;
-                let digest=target.receipt(record.activation_identity_sha256?,&receipt);
-                record.planar_receipt=Some(receipt);record.target_receipt_sha256=Some(digest);
+        pub(crate) fn store_planar_proof(
+            &self,
+            token: &ActivationToken,
+            receipt: crate::mapping_commit::OccupancyCommitReceipt,
+        ) -> Option<[u8; 32]> {
+            self.with_staged_record_mut(token, |record| {
+                let target = record.seed.planar_target.as_ref()?;
+                let digest = target.receipt(
+                    record.activation_identity.as_ref()?.legacy_digest()?,
+                    &receipt,
+                );
+                record.planar_receipt = Some(receipt);
+                record.target_receipt = Some(TargetReceipt::LegacyDigest(digest));
                 Some(digest)
-            }).flatten()
+            })
+            .flatten()
         }
-        pub(crate) fn current_sealed_planar_target(&self)->Option<(Arc<crate::planar_artifacts::Target>,crate::proto::MappingSessionState)> {
-            let before=self.phase_snapshot();if before.0 {return None;}
-            let ledger=self.inner.ledger.lock();
-            let record=ledger.records.get(ledger.current.as_ref()?)?;
-            if self.phase_snapshot()!=before || record.epoch!=before.1 || !Self::sealed_target_available(record) {return None;}
-            Some((record.seed.planar_target.clone()?,record.terminal.clone()?))
+        pub(crate) fn current_sealed_planar_target(
+            &self,
+        ) -> Option<(
+            Arc<crate::planar_artifacts::Target>,
+            crate::proto::MappingSessionState,
+        )> {
+            let before = self.phase_snapshot();
+            if before.0 {
+                return None;
+            }
+            let ledger = self.inner.ledger.lock();
+            let record = ledger.records.get(ledger.current.as_ref()?)?;
+            if self.phase_snapshot() != before
+                || record.epoch != before.1
+                || !Self::sealed_target_available(record)
+            {
+                return None;
+            }
+            Some((record.seed.planar_target.clone()?, record.terminal.clone()?))
         }
         pub(crate) fn immutable_target(
             &self,
             token: &ActivationToken,
         ) -> Option<crate::pointcloud::ImmutableActivatedTarget> {
+            // Compatibility API is legacy-only. Its existing copy occurs after releasing the lock.
             self.with_staged_record(token, |record| record.immutable_target.clone())
                 .flatten()
+                .map(|target| (*target).clone())
+        }
+
+        pub(crate) fn checkpoint_owner(
+            &self,
+            token: &ActivationToken,
+        ) -> Option<CanonicalCheckpointOwnerV2> {
+            self.with_staged_record(token, |record| record.checkpoint_owner.clone())
+                .flatten()
+        }
+
+        pub(crate) fn target_source(
+            &self,
+            token: &ActivationToken,
+        ) -> Option<ActivationTargetSource> {
+            self.with_staged_record(token, |record| match &record.seed.request_key {
+                ActivationRequestKey::LegacyDigest(_) => record
+                    .immutable_target
+                    .clone()
+                    .map(ActivationTargetSource::Legacy),
+                ActivationRequestKey::Assigned(_) => record
+                    .checkpoint_owner
+                    .clone()
+                    .map(ActivationTargetSource::Assigned),
+            })
+            .flatten()
         }
 
         #[cfg_attr(not(test), allow(dead_code))]
@@ -3965,54 +4415,73 @@ mod preflight_only_contract {
             if before.0 {
                 return None;
             }
-            let snapshot = {
+            let (mut snapshot, target) = {
                 let ledger = self.inner.ledger.lock();
-                let during = self.phase_snapshot();
-                if during != before || during.0 {
-                    return None;
-                }
-                let request_id = ledger.current.as_ref()?;
-                let record = ledger.records.get(request_id)?;
-                if record.epoch != during.1 || !Self::sealed_target_available(record) {
+                let record = ledger.records.get(ledger.current.as_ref()?)?;
+                if self.phase_snapshot() != before
+                    || record.epoch != before.1
+                    || !Self::sealed_target_available(record)
+                {
                     return None;
                 }
                 let terminal = record.terminal.as_ref()?;
                 if terminal.session_id.is_empty() || terminal.map_name.is_empty() {
                     return None;
                 }
-                SealedActivatedTargetSnapshot {
-                    runtime_generation: self.inner.runtime_generation,
+                let target = record.immutable_target.clone()?;
+                // All digest extraction is explicit and fails closed for Assigned variants.
+                let snapshot = SealedActivatedTargetSnapshot {
+                    runtime_generation: self.runtime_generation(),
                     lifecycle_epoch: record.epoch,
                     session_id: terminal.session_id.clone(),
                     map_name: terminal.map_name.clone(),
                     activation_request_id: record.seed.activation_request_id.clone(),
-                    activation_request_identity_sha256: record
-                        .seed
-                        .activation_request_identity_sha256,
-                    activation_identity_sha256: record.activation_identity_sha256?,
-                    target_receipt_sha256: record.target_receipt_sha256?,
+                    activation_request_identity_sha256: record.seed.request_key.legacy_digest()?,
+                    activation_identity_sha256: record
+                        .activation_identity
+                        .as_ref()?
+                        .legacy_digest()?,
+                    target_receipt_sha256: record.target_receipt.as_ref()?.legacy_digest()?,
                     asset_manifest_sha256: record.seed.asset_manifest_sha256,
                     asset_bundle_sha256: record.seed.asset_bundle_sha256,
                     session_generation: record.session_generation,
                     backend_generation: record.backend_generation,
                     publication_proof: record.publication_proof.clone()?,
-                    immutable_target: record.immutable_target.clone()?,
-                }
+                    // Filled outside the lock below, preserving the legacy detached-snapshot API.
+                    immutable_target: crate::pointcloud::ImmutableActivatedTarget {
+                        frame_id: target.frame_id.clone(),
+                        source_revision: target.source_revision,
+                        point_count: target.point_count,
+                        voxel_size: target.voxel_size,
+                        xyz_sha256: target.xyz_sha256,
+                        xyz_f32_le: Vec::new(),
+                        payload_schema_version: target.payload_schema_version,
+                    },
+                };
+                (snapshot, target)
             };
-            let after = self.phase_snapshot();
-            if after != before || after.0 {
-                return None;
-            }
+            snapshot.immutable_target.xyz_f32_le = target.xyz_f32_le.clone();
             let ledger = self.inner.ledger.lock();
             let current = ledger.current.as_ref()?;
             let record = ledger.records.get(current)?;
             if current != &snapshot.activation_request_id
-                || self.phase_snapshot() != after
+                || self.phase_snapshot() != before
                 || record.epoch != snapshot.lifecycle_epoch
                 || !Self::sealed_target_available(record)
-                || record.activation_identity_sha256 != Some(snapshot.activation_identity_sha256)
-                || record.target_receipt_sha256 != Some(snapshot.target_receipt_sha256)
-                || record.immutable_target.as_ref() != Some(&snapshot.immutable_target)
+                || record
+                    .activation_identity
+                    .as_ref()
+                    .and_then(ActivationIdentity::legacy_digest)
+                    != Some(snapshot.activation_identity_sha256)
+                || record
+                    .target_receipt
+                    .as_ref()
+                    .and_then(TargetReceipt::legacy_digest)
+                    != Some(snapshot.target_receipt_sha256)
+                || !record
+                    .immutable_target
+                    .as_ref()
+                    .is_some_and(|retained| Arc::ptr_eq(retained, &target))
             {
                 return None;
             }
@@ -4065,24 +4534,53 @@ mod preflight_only_contract {
         pub(crate) fn seal(
             &self,
             token: &ActivationToken,
-            target_receipt_sha256: Option<[u8; 32]>,
+            target_receipt: Option<TargetReceipt>,
             mut state: crate::proto::MappingSessionState,
         ) -> Option<crate::proto::MappingSessionState> {
             #[cfg(test)]
             self.wait_for_seal_before_ledger_gate();
             self.with_staged_record_mut(token, |record| {
-                record.target_receipt_sha256 = target_receipt_sha256;
+                if record
+                    .target_receipt
+                    .as_ref()
+                    .is_some_and(|stored| Some(stored) != target_receipt.as_ref())
+                {
+                    return None;
+                }
+                if !matches!(
+                    (&record.seed.request_key, &target_receipt),
+                    (_, None)
+                        | (
+                            ActivationRequestKey::LegacyDigest(_),
+                            Some(TargetReceipt::LegacyDigest(_))
+                        )
+                        | (
+                            ActivationRequestKey::Assigned(_),
+                            Some(TargetReceipt::Assigned(_))
+                        )
+                ) {
+                    return None;
+                }
                 let modern = record.seed.modern;
+                if let ActivationRequestKey::Assigned(request) = &record.seed.request_key {
+                    if state.session_id != request.session_id()
+                        || state.map_name != request.map_name()
+                        || state.session_generation != record.session_generation
+                    {
+                        return None;
+                    }
+                }
                 // 二维资产仍须完整激活身份；原本携带三维目标的请求不能靠丢失目标降级成功。
                 if modern
                     && (record.session_generation == 0
                         || record.backend_generation == 0
-                        || record.activation_identity_sha256.is_none()
+                        || record.activation_identity.is_none()
                         || ((record.cloud_target_required || record.planar_target_required)
                             && !Self::has_complete_target_proof(record)))
                 {
                     return None;
                 }
+                record.target_receipt = target_receipt;
                 record.state = PermanentActivationState::Sealed;
                 let disposition = if modern {
                     crate::proto::ActivationReceiptDisposition::Sealed
@@ -4091,7 +4589,7 @@ mod preflight_only_contract {
                 };
                 let target_available = Self::sealed_target_available(record);
                 self.apply_record(&mut state, record, disposition, target_available);
-                if !target_available {
+                if !Self::has_complete_target_proof(record) {
                     Self::release_immutable_target(record);
                 }
                 record.terminal = Some(state.clone());
@@ -4128,7 +4626,7 @@ mod preflight_only_contract {
             }) {
                 return terminal;
             }
-            self.apply_policy_identity(&mut state);
+            self.apply_request_key(&mut state, &token.activation_request_id, &token.request_key);
             state.success = false;
             state.activation_receipt_disposition = disposition as i32;
             state.message = detail.to_owned();
@@ -4179,7 +4677,6 @@ mod preflight_only_contract {
         }
 
         pub(crate) fn decorate_current_state(&self, state: &mut crate::proto::MappingSessionState) {
-            self.apply_policy_identity(state);
             let before = self.phase_snapshot();
             let ledger = self.inner.ledger.lock();
             let record = ledger
@@ -4188,12 +4685,18 @@ mod preflight_only_contract {
                 .and_then(|request_id| ledger.records.get(request_id));
             let after = self.phase_snapshot();
             if before != after {
+                if let Some(record) = record {
+                    self.apply_record(state, record, crate::proto::ActivationReceiptDisposition::Retired, false);
+                } else {
+                    self.apply_policy_identity(state);
+                }
                 state.relocalization_target_available = false;
                 state.activation_receipt_disposition =
                     crate::proto::ActivationReceiptDisposition::Retired as i32;
                 return;
             }
             let Some(record) = record else {
+                self.apply_policy_identity(state);
                 return;
             };
             let disposition = if after.0 || record.epoch != after.1 {
@@ -4239,6 +4742,64 @@ mod preflight_only_contract {
             state.algorithm_options_sha256 = relocalization_algorithm_options_sha256_v1().to_vec();
         }
 
+        fn apply_request_key(
+            &self,
+            state: &mut crate::proto::MappingSessionState,
+            request_id: &str,
+            key: &ActivationRequestKey,
+        ) {
+            state.activation_request_id = request_id.into();
+            state.activation_identity_sha256.clear();
+            state.target_receipt_sha256.clear();
+            state.asset_manifest_sha256.clear();
+            state.asset_bundle_sha256.clear();
+            state.target_graph_sha256.clear();
+            state.target_kind.clear();
+            state.relocalization_target_available = false;
+            match key {
+                ActivationRequestKey::LegacyDigest(digest) => {
+                    self.apply_policy_identity(state);
+                    state.activation_request_identity_sha256 = digest.to_vec();
+                    state.activation_receipt_v2 = None;
+                }
+                ActivationRequestKey::Assigned(request) => {
+                    // Do not call any application/policy hashing on the assigned path.
+                    state.activation_receipt_schema_version = 2;
+                    state.runtime_generation = self.runtime_generation();
+                    state.activation_request_identity_sha256.clear();
+                    state.source_policy_version = 0;
+                    state.source_policy_sha256.clear();
+                    state.deadline_policy_version = 0;
+                    state.deadline_policy_sha256.clear();
+                    state.algorithm_options_version = 0;
+                    state.algorithm_options_sha256.clear();
+                    state.activation_receipt_v2 = Some(crate::proto::ActivationReceiptV2 {
+                        request: Some(crate::activation_contract::request_to_wire(request)),
+                        activation: None,
+                        target: None,
+                    });
+                }
+            }
+        }
+
+        fn apply_seed(
+            &self,
+            state: &mut crate::proto::MappingSessionState,
+            seed: &ActivationReceiptSeed,
+        ) {
+            self.apply_request_key(state, &seed.activation_request_id, &seed.request_key);
+            if matches!(seed.request_key, ActivationRequestKey::LegacyDigest(_)) {
+                state.asset_manifest_sha256 = seed
+                    .asset_manifest_sha256
+                    .map(|value| value.to_vec())
+                    .unwrap_or_default();
+                state.asset_bundle_sha256 = seed
+                    .asset_bundle_sha256
+                    .map(|value| value.to_vec())
+                    .unwrap_or_default();
+            }
+        }
+
         fn apply_record(
             &self,
             state: &mut crate::proto::MappingSessionState,
@@ -4246,42 +4807,51 @@ mod preflight_only_contract {
             disposition: crate::proto::ActivationReceiptDisposition,
             target_available: bool,
         ) {
-            if let Some(target)=record.seed.planar_target.as_ref() {
-                state.target_kind="planar_graph".into();state.target_graph_sha256=target.sha.to_vec();
-            }
-
-            self.apply_policy_identity(state);
+            self.apply_seed(state, &record.seed);
             state.activation_receipt_disposition = disposition as i32;
             state.backend_generation = record.backend_generation;
-            state.activation_request_id = record.seed.activation_request_id.clone();
-            state.activation_request_identity_sha256 =
-                record.seed.activation_request_identity_sha256.to_vec();
-            state.activation_identity_sha256 = if record.seed.modern {
-                record
-                    .activation_identity_sha256
-                    .map(|digest| digest.to_vec())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            state.target_receipt_sha256 = record
-                .target_receipt_sha256
-                .map(|digest| digest.to_vec())
-                .unwrap_or_default();
-            state.asset_manifest_sha256 = record
-                .seed
-                .asset_manifest_sha256
-                .map(|digest| digest.to_vec())
-                .unwrap_or_default();
-            state.asset_bundle_sha256 = record
-                .seed
-                .asset_bundle_sha256
-                .map(|digest| digest.to_vec())
-                .unwrap_or_default();
-            state.relocalization_target_available = target_available;
-            if record.planar_target_required {
-                state.source_policy_sha256=planar_source_policy_sha256().to_vec();
-                state.algorithm_options_sha256=planar_algorithm_policy_sha256().to_vec();
+            match &record.seed.request_key {
+                ActivationRequestKey::LegacyDigest(_) => {
+                    state.activation_identity_sha256 = if record.seed.modern {
+                        record
+                            .activation_identity
+                            .as_ref()
+                            .and_then(ActivationIdentity::legacy_digest)
+                            .map(|value| value.to_vec())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    state.target_receipt_sha256 = record
+                        .target_receipt
+                        .as_ref()
+                        .and_then(TargetReceipt::legacy_digest)
+                        .map(|value| value.to_vec())
+                        .unwrap_or_default();
+                    state.relocalization_target_available = target_available;
+                    if let Some(target) = record.seed.planar_target.as_ref() {
+                        state.target_kind = "planar_graph".into();
+                        state.target_graph_sha256 = target.sha.to_vec();
+                    }
+                    if record.planar_target_required {
+                        state.source_policy_sha256 = planar_source_policy_sha256().to_vec();
+                        state.algorithm_options_sha256 = planar_algorithm_policy_sha256().to_vec();
+                    }
+                }
+                ActivationRequestKey::Assigned(_) => {
+                    let wire = state
+                        .activation_receipt_v2
+                        .as_mut()
+                        .expect("assigned receipt initialized");
+                    wire.activation = match &record.activation_identity {
+                        Some(ActivationIdentity::Assigned(value)) => Some(value.to_wire()),
+                        _ => None,
+                    };
+                    wire.target = match &record.target_receipt {
+                        Some(TargetReceipt::Assigned(value)) => Some(value.to_wire()),
+                        _ => None,
+                    };
+                }
             }
         }
     }
@@ -9049,8 +9619,8 @@ mod preflight_only_contract {
             && left.publication_proof.voxel_size.to_bits()
                 == right.publication_proof.voxel_size.to_bits()
             && left.publication_proof.cloud_receipt == right.publication_proof.cloud_receipt
-            && left.publication_proof.target_receipt_sha256
-                == right.publication_proof.target_receipt_sha256
+            && left.publication_proof.target_receipt
+                == right.publication_proof.target_receipt
             && left.immutable_target == right.immutable_target
     }
 
@@ -9490,7 +10060,7 @@ mod preflight_only_contract {
                 out.extend_from_slice(&receipt.cloud_revision.to_be_bytes());
                 out.extend_from_slice(&receipt.source_timestamp_ns.to_be_bytes());
                 out.extend_from_slice(&receipt.point_count.to_be_bytes());
-                out.extend_from_slice(&publication.target_receipt_sha256);
+                out.extend_from_slice(&publication.target_receipt.legacy_digest().expect("legacy-only relocalization snapshot"));
             }
             None => out.push(0),
         }
@@ -12284,7 +12854,7 @@ mod preflight_only_contract {
                         source_timestamp_ns: 6,
                         point_count: 1,
                     },
-                    target_receipt_sha256,
+                    target_receipt: TargetReceipt::LegacyDigest(target_receipt_sha256),
                 },
                 immutable_target: crate::pointcloud::ImmutableActivatedTarget {
                     frame_id: "map".to_owned(),
@@ -13356,9 +13926,10 @@ mod preflight_only_contract {
             request.target_cloud_sha256 = target_sha256.to_vec();
             let control = phase_a.activated_target_receipts();
             let seed = ActivationReceiptSeed {
+                checkpoint_owner: None,
                 planar_target: None,
                 activation_request_id: "activation-relocalization-runtime".to_owned(),
-                activation_request_identity_sha256: [4; 32],
+                request_key: ActivationRequestKey::LegacyDigest([4; 32]),
                 asset_manifest_sha256: Some([9; 32]),
                 asset_bundle_sha256: Some([10; 32]),
                 modern: true,
@@ -13391,7 +13962,7 @@ mod preflight_only_contract {
                 activation_publication_proof([6; 32], point_count, request.session_generation,),
             ));
             control
-                .seal(&token, Some([6; 32]), state)
+                .seal(&token, Some(TargetReceipt::LegacyDigest([6; 32])), state)
                 .expect("target seals");
         }
 
@@ -15150,9 +15721,10 @@ mod preflight_only_contract {
 
         fn activation_seed(request_id: &str, identity_byte: u8) -> ActivationReceiptSeed {
             ActivationReceiptSeed {
+                checkpoint_owner: None,
                 planar_target: None,
                 activation_request_id: request_id.to_owned(),
-                activation_request_identity_sha256: [identity_byte; 32],
+                request_key: ActivationRequestKey::LegacyDigest([identity_byte; 32]),
                 asset_manifest_sha256: Some([2; 32]),
                 asset_bundle_sha256: Some([3; 32]),
                 modern: true,
@@ -15214,8 +15786,792 @@ mod preflight_only_contract {
                     source_timestamp_ns: 17,
                     point_count,
                 },
-                target_receipt_sha256,
+                target_receipt: TargetReceipt::LegacyDigest(target_receipt_sha256),
             }
+        }
+
+        fn assigned_base_state() -> crate::proto::MappingSessionState {
+            crate::proto::MappingSessionState {
+                session_id: "destination".into(),
+                map_name: "Map One".into(),
+                session_generation: 23,
+                ..activation_base_state()
+            }
+        }
+
+        fn assigned_wire_request() -> crate::proto::ActivateMapRequest {
+            let commit = crate::proto::MappingCommitIdentity {
+                boot_nonce: vec![1; 16],
+                sequence: 5,
+            };
+            let occupancy = crate::proto::CanonicalOccupancyCommitReceipt {
+                commit_id: Some(commit.clone()),
+                session_id: "source".into(),
+                session_generation: 2,
+                occupancy_revision: 7,
+                source_timestamp_ns: 100,
+                backend_kind: "voxel".into(),
+                backend_generation: 3,
+            };
+            let cloud = crate::proto::CanonicalCloudCommitReceipt {
+                commit_id: Some(commit),
+                session_generation: 2,
+                occupancy_revision: 7,
+                cloud_revision: 9,
+                source_timestamp_ns: 100,
+                point_count: 1,
+            };
+            let member =
+                |role: crate::proto::CheckpointMemberRole| crate::proto::CheckpointMemberIdentity {
+                    checkpoint_id: "11111111111111111111111111111111".into(),
+                    role: role as i32,
+                    occupancy_receipt: Some(occupancy.clone()),
+                    cloud_receipt: Some(cloud.clone()),
+                    frame_id: "map".into(),
+                    frame_generation: 0,
+                    producer_generation: 0,
+                };
+            let payload = [
+                b"NWMBCKP\0".as_slice(),
+                &1_u32.to_le_bytes(),
+                &[0; 4],
+                &[0; 40],
+            ]
+            .concat();
+            let checkpoint = crate::proto::MappingBackendCheckpoint {
+                schema_version: 2,
+                backend_kind: "voxel".into(),
+                source_session_generation: 2,
+                payload_size: payload.len() as u64,
+                payload,
+                created_at_ns: 101,
+                source_session_id: "source".into(),
+                checkpoint_id: "11111111111111111111111111111111".into(),
+                backend_payload_schema_version: 1,
+                backend_identity: Some(member(crate::proto::CheckpointMemberRole::BackendState)),
+                occupancy_identity: Some(member(
+                    crate::proto::CheckpointMemberRole::CanonicalOccupancy,
+                )),
+                canonical_occupancy_checkpoint: Some(crate::proto::OccupancyGridData {
+                    meta: Some(crate::proto::OccupancyGridMeta {
+                        width: 1,
+                        height: 1,
+                        resolution: 0.05,
+                        origin_x: 0.0,
+                        origin_y: 0.0,
+                        frame_id: "map".into(),
+                        revision: 7,
+                        timestamp_ns: 100,
+                    }),
+                    data: vec![0],
+                }),
+                canonical_cloud_checkpoint: Some(crate::proto::CloudMapCheckpoint {
+                    frame_id: "map".into(),
+                    source_revision: 9,
+                    point_count: 1,
+                    voxel_size: 0.05,
+                    xyz_f32_le: [1_f32, 2.0, 3.0]
+                        .into_iter()
+                        .flat_map(f32::to_le_bytes)
+                        .collect(),
+                    payload_schema_version: 2,
+                    member_identity: Some(member(
+                        crate::proto::CheckpointMemberRole::CanonicalCloud,
+                    )),
+                    ..Default::default()
+                }),
+                occupancy_receipt: Some(occupancy),
+                cloud_receipt: Some(cloud),
+                ..Default::default()
+            };
+            crate::proto::ActivateMapRequest {
+                session_id: "destination".into(),
+                map_name: "Map One".into(),
+                activation_request_id: "activate-1".into(),
+                expected_runtime_generation: 17,
+                activation_contract_version: 2,
+                asset_identity: Some(crate::proto::AssetIdentityV2 {
+                    asset_id: "22222222222222222222222222222222".into(),
+                }),
+                mapping_backend_checkpoint: Some(checkpoint),
+                ..Default::default()
+            }
+        }
+
+        fn assigned_request(
+            wire: crate::proto::ActivateMapRequest,
+        ) -> ValidatedActivationRequestV2 {
+            ValidatedActivationRequestV2::admit(
+                wire,
+                17,
+                crate::mapping_backend::MappingBackendKind::Voxel,
+                "map",
+                |_| panic!("fixture has no artifacts"),
+                &crate::activation_request::CheckpointOwnerInternerV2::default(),
+            )
+            .expect("valid assigned request")
+        }
+
+        fn assigned_token(
+            control: &ActivatedTargetReceiptControl,
+            request: ValidatedActivationRequestV2,
+        ) -> ActivationToken {
+            match control.stage_assigned_or_replay(request, assigned_base_state(), true) {
+                ActivationLedgerAdmission::Execute(token) => token,
+                ActivationLedgerAdmission::Terminal(state) => {
+                    panic!("expected execute: {}", state.message)
+                }
+            }
+        }
+
+        fn assigned_proof(
+            control: &ActivatedTargetReceiptControl,
+            token: &ActivationToken,
+        ) -> ActivationPublicationProof {
+            let activation = control
+                .activation_identity(token)
+                .unwrap()
+                .assigned()
+                .unwrap()
+                .clone();
+            let owner = control.checkpoint_owner(token).unwrap();
+            let occupancy_receipt = crate::mapping_commit::OccupancyCommitReceipt {
+                commit_id: MappingCommitId {
+                    boot_nonce: 31,
+                    sequence: 32,
+                },
+                session_id: activation.request.session_id().into(),
+                session_generation: activation.session_generation,
+                occupancy_revision: 33,
+                source_timestamp_ns: 34,
+                backend_kind: activation.backend_kind,
+                backend_generation: activation.backend_generation,
+            };
+            let cloud_receipt = crate::mapping_commit::CloudCommitReceipt {
+                commit_id: occupancy_receipt.commit_id,
+                session_generation: activation.session_generation,
+                occupancy_revision: occupancy_receipt.occupancy_revision,
+                cloud_revision: 35,
+                source_timestamp_ns: occupancy_receipt.source_timestamp_ns,
+                point_count: owner.cloud().point_count(),
+            };
+            let target_receipt = InstalledTargetReceiptV2 {
+                activation,
+                source_cloud_member: owner.cloud().member().clone(),
+                occupancy_receipt,
+                cloud_receipt: cloud_receipt.clone(),
+            };
+            ActivationPublicationProof {
+                source_timestamp_ns: cloud_receipt.source_timestamp_ns,
+                cloud_revision: cloud_receipt.cloud_revision,
+                point_count: cloud_receipt.point_count,
+                voxel_size: owner.cloud().voxel_size(),
+                cloud_receipt,
+                target_receipt: TargetReceipt::Assigned(target_receipt),
+            }
+        }
+
+        fn assigned_bound_token(
+            control: &ActivatedTargetReceiptControl,
+            request: ValidatedActivationRequestV2,
+        ) -> ActivationToken {
+            let token = assigned_token(control, request);
+            let token = control.reserve_backend_generation(&token, 19).unwrap();
+            control
+                .bind_assigned_activation_identity(&token, 23)
+                .unwrap()
+        }
+
+        fn assert_assigned_wire_has_no_legacy_digests(state: &crate::proto::MappingSessionState) {
+            assert_eq!(state.activation_receipt_schema_version, 2);
+            assert!(state.activation_receipt_v2.is_some());
+            assert!(state.activation_request_identity_sha256.is_empty());
+            assert!(state.activation_identity_sha256.is_empty());
+            assert!(state.target_receipt_sha256.is_empty());
+            assert!(state.asset_manifest_sha256.is_empty());
+            assert!(state.asset_bundle_sha256.is_empty());
+            assert!(state.source_policy_sha256.is_empty());
+            assert!(state.deadline_policy_sha256.is_empty());
+            assert!(state.algorithm_options_sha256.is_empty());
+            assert!(state.target_graph_sha256.is_empty());
+            assert!(!state.relocalization_target_available);
+        }
+
+        #[test]
+        fn assigned_ledger_staged_replay_compares_exact_sources_and_reuses_current_owner() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let original = assigned_request(assigned_wire_request());
+            let owner = original.checkpoint().clone();
+            let token = assigned_token(&control, original.clone());
+            let replay = assigned_request(assigned_wire_request());
+            assert!(!owner.shares_source_with(replay.checkpoint()));
+            assert_eq!(assigned_token(&control, replay), token);
+            assert!(owner.shares_source_with(&control.checkpoint_owner(&token).unwrap()));
+            let source = control.target_source(&token).unwrap();
+            assert_eq!(
+                source.xyz_f32_le().as_ptr(),
+                owner.cloud().xyz_f32_le().as_ptr()
+            );
+            assert!(source.legacy_digest().is_none());
+            assert!(control.immutable_target(&token).is_none());
+            for member in ["cloud", "occupancy", "backend"] {
+                let mut changed = assigned_wire_request();
+                let checkpoint = changed.mapping_backend_checkpoint.as_mut().unwrap();
+                match member {
+                    "cloud" => checkpoint
+                        .canonical_cloud_checkpoint
+                        .as_mut()
+                        .unwrap()
+                        .xyz_f32_le[..4]
+                        .copy_from_slice(&4_f32.to_le_bytes()),
+                    "occupancy" => {
+                        checkpoint
+                            .canonical_occupancy_checkpoint
+                            .as_mut()
+                            .unwrap()
+                            .data[0] = 1
+                    }
+                    _ => *checkpoint.payload.last_mut().unwrap() = 1,
+                }
+                let result = control.stage_assigned_or_replay(
+                    assigned_request(changed),
+                    assigned_base_state(),
+                    false,
+                );
+                let ActivationLedgerAdmission::Terminal(state) = result else {
+                    panic!("altered source executed");
+                };
+                assert_eq!(
+                    state.activation_receipt_disposition,
+                    crate::proto::ActivationReceiptDisposition::Conflict as i32
+                );
+                assert_assigned_wire_has_no_legacy_digests(&state);
+            }
+            assert!(control.validate_token(&token));
+        }
+
+        #[test]
+        fn assigned_ledger_sealed_replay_retains_one_owner_and_rejects_altered_source() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let request = assigned_request(assigned_wire_request());
+            let weak = request.checkpoint().downgrade();
+            let token = assigned_bound_token(&control, request);
+            let proof = assigned_proof(&control, &token);
+            let receipt = proof.target_receipt.clone();
+            assert!(control.store_publication_proof(&token, proof));
+            let sealed = control
+                .seal(&token, Some(receipt), assigned_base_state())
+                .unwrap();
+            assert!(sealed.success);
+            assert_assigned_wire_has_no_legacy_digests(&sealed);
+            assert!(sealed.activation_receipt_v2.unwrap().target.is_some());
+            assert!(
+                weak.upgrade().is_some(),
+                "sealed assigned activation retains its canonical owner"
+            );
+            assert!(control.current_sealed_target_snapshot().is_none());
+            let ActivationLedgerAdmission::Terminal(replay) = control.stage_assigned_or_replay(
+                assigned_request(assigned_wire_request()),
+                assigned_base_state(),
+                false,
+            ) else {
+                panic!("sealed record executed");
+            };
+            assert_eq!(
+                replay.activation_receipt_disposition,
+                crate::proto::ActivationReceiptDisposition::SealedReplay as i32
+            );
+            let mut changed = assigned_wire_request();
+            changed
+                .mapping_backend_checkpoint
+                .as_mut()
+                .unwrap()
+                .canonical_cloud_checkpoint
+                .as_mut()
+                .unwrap()
+                .xyz_f32_le[..4]
+                .copy_from_slice(&5_f32.to_le_bytes());
+            let ActivationLedgerAdmission::Terminal(conflict) = control.stage_assigned_or_replay(
+                assigned_request(changed),
+                assigned_base_state(),
+                false,
+            ) else {
+                panic!("altered sealed source executed");
+            };
+            assert_eq!(
+                conflict.activation_receipt_disposition,
+                crate::proto::ActivationReceiptDisposition::Conflict as i32
+            );
+            control.retire_for_mapping_change().unwrap();
+            assert!(
+                weak.upgrade().is_none(),
+                "permanent receipt metadata must not pin source bytes"
+            );
+        }
+
+        #[test]
+        fn assigned_ledger_rejects_small_key_and_cross_version_reuse() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let original = assigned_request(assigned_wire_request());
+            assigned_token(&control, original.clone());
+            for field in ["session", "map", "asset"] {
+                let mut changed = assigned_wire_request();
+                match field {
+                    "session" => changed.session_id = "different-session".into(),
+                    "map" => changed.map_name = "Another Map".into(),
+                    _ => {
+                        changed.asset_identity.as_mut().unwrap().asset_id =
+                            "33333333333333333333333333333333".into()
+                    }
+                }
+                let request = assigned_request(changed);
+                let state = control
+                    .assigned_terminal_before_admission(request.metadata(), assigned_base_state())
+                    .unwrap();
+                assert_eq!(
+                    state.activation_receipt_disposition,
+                    crate::proto::ActivationReceiptDisposition::Conflict as i32
+                );
+                assert_assigned_wire_has_no_legacy_digests(&state);
+            }
+            let mut legacy = activation_seed("activate-1", 1);
+            legacy.modern = false;
+            assert!(matches!(
+                control.stage_or_replay(legacy, assigned_base_state(), true),
+                ActivationLedgerAdmission::Terminal(_)
+            ));
+            let legacy_control = ActivatedTargetReceiptControl::new(17);
+            let legacy = activation_seed("activate-1", 1);
+            assert!(matches!(
+                legacy_control.stage_or_replay(legacy, assigned_base_state(), true),
+                ActivationLedgerAdmission::Execute(_)
+            ));
+            let state = legacy_control
+                .assigned_terminal_before_admission(original.metadata(), assigned_base_state())
+                .unwrap();
+            assert_assigned_wire_has_no_legacy_digests(&state);
+            assert_eq!(
+                state.activation_receipt_disposition,
+                crate::proto::ActivationReceiptDisposition::Conflict as i32
+            );
+        }
+
+        #[test]
+        fn assigned_ledger_rejects_cross_schema_proof_and_installed_receipt_mismatch() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let token = assigned_bound_token(&control, assigned_request(assigned_wire_request()));
+            assert!(!control
+                .store_publication_proof(&token, activation_publication_proof([5; 32], 1, 23)));
+            assert!(control
+                .bind_activation_identity(&token, [6; 32], 23)
+                .is_none());
+            let good = assigned_proof(&control, &token);
+            for field in ["commit", "occupancy", "backend", "source"] {
+                let mut bad = good.clone();
+                let TargetReceipt::Assigned(receipt) = &mut bad.target_receipt else {
+                    unreachable!()
+                };
+                match field {
+                    "commit" => receipt.cloud_receipt.commit_id.sequence += 1,
+                    "occupancy" => receipt.cloud_receipt.occupancy_revision += 1,
+                    "backend" => {
+                        receipt.activation.backend_kind =
+                            crate::mapping_backend::MappingBackendKind::Raytracing
+                    }
+                    _ => {
+                        receipt.activation.request = assigned_request({
+                            let mut request = assigned_wire_request();
+                            request.map_name = "Other Map".into();
+                            request
+                        })
+                        .metadata()
+                        .clone()
+                    }
+                }
+                assert!(!control.store_publication_proof(&token, bad));
+            }
+            assert!(control.store_publication_proof(&token, good.clone()));
+            assert!(control
+                .seal(
+                    &token,
+                    Some(TargetReceipt::LegacyDigest([7; 32])),
+                    assigned_base_state()
+                )
+                .is_none());
+            assert!(control
+                .seal(&token, Some(good.target_receipt), assigned_base_state())
+                .is_some());
+        }
+
+        #[test]
+        fn assigned_ledger_terminal_paths_release_owner_and_never_reexecute() {
+            for path in [
+                "precommit",
+                "postcommit",
+                "unknown",
+                "mapping-change",
+                "replace",
+            ] {
+                let control = ActivatedTargetReceiptControl::new(17);
+                let request = assigned_request(assigned_wire_request());
+                let metadata = request.metadata().clone();
+                let weak = request.checkpoint().downgrade();
+                let token = assigned_token(&control, request);
+                match path {
+                    "mapping-change" => {
+                        control.retire_for_mapping_change().unwrap();
+                    }
+                    "replace" => {
+                        let mut replacement = assigned_wire_request();
+                        replacement.activation_request_id = "activate-2".into();
+                        assigned_token(&control, assigned_request(replacement));
+                    }
+                    _ => {
+                        let disposition = match path {
+                            "precommit" => {
+                                crate::proto::ActivationReceiptDisposition::InvalidatedPrecommit
+                            }
+                            "postcommit" => {
+                                crate::proto::ActivationReceiptDisposition::InvalidatedPostcommit
+                            }
+                            _ => crate::proto::ActivationReceiptDisposition::OutcomeUnknown,
+                        };
+                        let state = control.invalidate(
+                            &token,
+                            disposition,
+                            "terminal",
+                            assigned_base_state(),
+                        );
+                        assert_assigned_wire_has_no_legacy_digests(&state);
+                    }
+                }
+                assert!(weak.upgrade().is_none(), "source pinned after {path}");
+                assert!(!control.validate_token(&token));
+                assert!(control.checkpoint_owner(&token).is_none());
+                let retired = control
+                    .assigned_terminal_before_admission(&metadata, assigned_base_state())
+                    .unwrap();
+                assert_eq!(
+                    retired.activation_receipt_disposition,
+                    crate::proto::ActivationReceiptDisposition::Retired as i32
+                );
+                assert_assigned_wire_has_no_legacy_digests(&retired);
+                let ActivationLedgerAdmission::Terminal(_) = control.stage_assigned_or_replay(
+                    assigned_request(assigned_wire_request()),
+                    assigned_base_state(),
+                    true,
+                ) else {
+                    panic!("retired tombstone executed after {path}");
+                };
+            }
+        }
+
+        #[test]
+        fn assigned_ledger_phase_a_seal_barrier_releases_owner_and_rejects_late_mutation() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let request = assigned_request(assigned_wire_request());
+            let metadata = request.metadata().clone();
+            let weak = request.checkpoint().downgrade();
+            let token = assigned_bound_token(&control, request);
+            let proof = assigned_proof(&control, &token);
+            let receipt = proof.target_receipt.clone();
+            assert!(control.store_publication_proof(&token, proof));
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let release = Arc::new(std::sync::Barrier::new(2));
+            control.install_seal_before_ledger_gate(entered.clone(), release.clone());
+            let worker = control.clone();
+            let worker_token = token.clone();
+            let join = std::thread::spawn(move || {
+                worker.seal(&worker_token, Some(receipt), assigned_base_state())
+            });
+            entered.wait();
+            let epoch = control.lifecycle_epoch();
+            assert!(control.retire_for_phase_a_first_closer(|| true));
+            assert_eq!(control.lifecycle_epoch(), epoch + 1);
+            assert!(weak.upgrade().is_none());
+            assert!(!control.validate_token(&token));
+            assert!(control
+                .bind_assigned_activation_identity(&token, 23)
+                .is_none());
+            release.wait();
+            assert!(join.join().unwrap().is_none());
+            let state = control
+                .assigned_terminal_before_admission(&metadata, assigned_base_state())
+                .unwrap();
+            assert_assigned_wire_has_no_legacy_digests(&state);
+        }
+
+        #[test]
+        fn assigned_replay_comparison_does_not_hold_ledger_or_revive_retired_owner() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let request = assigned_request(assigned_wire_request());
+            let weak = request.checkpoint().downgrade();
+            assigned_token(&control, request);
+            let candidate = assigned_request(assigned_wire_request());
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let release = Arc::new(std::sync::Barrier::new(2));
+            *control.inner.replay_before_compare_gate.lock() = Some(ActivationSealTestGate {
+                entered: entered.clone(),
+                release: release.clone(),
+            });
+            let worker = control.clone();
+            let join = std::thread::spawn(move || {
+                worker.stage_assigned_or_replay(candidate, assigned_base_state(), true)
+            });
+            entered.wait();
+            assert!(
+                control.inner.ledger.try_lock().is_some(),
+                "source comparison must not pin the ledger mutex"
+            );
+            control.retire_for_mapping_change().unwrap();
+            release.wait();
+            let ActivationLedgerAdmission::Terminal(state) = join.join().unwrap() else {
+                panic!("racing replay revived retired owner");
+            };
+            assert_eq!(
+                state.activation_receipt_disposition,
+                crate::proto::ActivationReceiptDisposition::Retired as i32
+            );
+            assert!(weak.upgrade().is_none());
+        }
+
+        #[test]
+        fn assigned_ledger_journal_requires_matching_typed_request_and_verifier() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let request = assigned_request(assigned_wire_request());
+            let metadata = request.metadata().clone();
+            let token = assigned_bound_token(&control, request);
+            let key = ActivationJournalKey::Assigned {
+                request: metadata,
+                step: ActivationJournalStep::SessionStart,
+            };
+            let entry = ActivationJournalEntry {
+                step: ActivationJournalStep::SessionStart,
+                idempotency_key: key,
+                status: ActivationJournalStatus::Applied,
+                verifier_receipt: Some(ActivationJournalVerifier::Assigned(
+                    ActivationJournalVerifierV2::Activation(
+                        control
+                            .activation_identity(&token)
+                            .unwrap()
+                            .assigned()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )),
+                typed_failure: None,
+            };
+            assert!(control.journal(&token, entry.clone()));
+            assert!(control.journal_step_applied(&token, ActivationJournalStep::SessionStart));
+            let mut bad = entry.clone();
+            bad.idempotency_key = ActivationJournalKey::LegacyDigest([1; 32]);
+            assert!(!control.journal(&token, bad));
+            let mut bad = entry.clone();
+            bad.verifier_receipt = Some(ActivationJournalVerifier::LegacyDigest([2; 32]));
+            assert!(!control.journal(&token, bad));
+            let mut bad = entry;
+            bad.verifier_receipt = Some(ActivationJournalVerifier::Assigned(
+                ActivationJournalVerifierV2::SessionGeneration(24),
+            ));
+            assert!(!control.journal(&token, bad));
+        }
+
+        #[test]
+        fn assigned_journal_rejects_swapped_step_completed_key_and_missing_verifier() {
+            use ActivationJournalStep as Step;
+            use ActivationJournalVerifierV2 as Verifier;
+            let control = ActivatedTargetReceiptControl::new(17);
+            let request = assigned_request(assigned_wire_request());
+            let metadata = request.metadata().clone();
+            let token = assigned_bound_token(&control, request);
+            let proof = assigned_proof(&control, &token);
+            let target = proof.target_receipt.assigned().unwrap().clone();
+            let activation = target.activation.clone();
+            let occupancy = target.occupancy_receipt.clone();
+            let cloud = target.cloud_receipt.clone();
+            assert!(control.store_publication_proof(&token, proof));
+            let cases = [
+                (
+                    Step::BackendRestoreSubmission,
+                    Verifier::BackendGeneration(19),
+                ),
+                (Step::BackendCommit, Verifier::BackendGeneration(19)),
+                (Step::RetirementPrepared, Verifier::BackendGeneration(19)),
+                (Step::SessionStart, Verifier::Activation(activation.clone())),
+                (
+                    Step::ActivationRecord,
+                    Verifier::Activation(activation.clone()),
+                ),
+                (Step::Seal, Verifier::Activation(activation)),
+                (Step::OccupancyShmBegin, Verifier::SessionGeneration(23)),
+                (
+                    Step::OccupancyInstall,
+                    Verifier::Occupancy(occupancy.clone()),
+                ),
+                (
+                    Step::SharedStateCommit,
+                    Verifier::Occupancy(occupancy.clone()),
+                ),
+                (Step::CacheClears, Verifier::Occupancy(occupancy.clone())),
+                (Step::MapEvent, Verifier::Occupancy(occupancy)),
+                (Step::CloudInstall, Verifier::Cloud(cloud.clone())),
+                (Step::CloudEvent, Verifier::Cloud(cloud.clone())),
+                (Step::TypedGlobalMap, Verifier::Cloud(cloud)),
+                (Step::TargetReceiptVerification, Verifier::Target(target)),
+            ];
+            for (step, verifier) in cases {
+                let key = ActivationJournalKey::Assigned {
+                    request: metadata.clone(),
+                    step,
+                };
+                for status in [
+                    ActivationJournalStatus::Prepared,
+                    ActivationJournalStatus::Applied,
+                ] {
+                    let entry = ActivationJournalEntry {
+                        step,
+                        idempotency_key: key.clone(),
+                        status,
+                        verifier_receipt: Some(ActivationJournalVerifier::Assigned(
+                            verifier.clone(),
+                        )),
+                        typed_failure: None,
+                    };
+                    let mut missing = entry.clone();
+                    missing.verifier_receipt = None;
+                    assert!(!control.journal(&token, missing));
+                    let mut completed = entry.clone();
+                    completed.verifier_receipt = Some(ActivationJournalVerifier::Assigned(
+                        Verifier::CompletedStep(key.clone()),
+                    ));
+                    assert!(!control.journal(&token, completed));
+                    let swapped = if matches!(
+                        step,
+                        Step::CloudInstall | Step::CloudEvent | Step::TypedGlobalMap
+                    ) {
+                        Step::OccupancyShmBegin
+                    } else {
+                        Step::CloudInstall
+                    };
+                    let mut wrong_step = entry.clone();
+                    wrong_step.step = swapped;
+                    wrong_step.idempotency_key = ActivationJournalKey::Assigned {
+                        request: metadata.clone(),
+                        step: swapped,
+                    };
+                    assert!(
+                        !control.journal(&token, wrong_step),
+                        "wrong typed verifier for {swapped:?}"
+                    );
+                    assert!(
+                        control.journal(&token, entry),
+                        "legitimate {status:?} verifier for {step:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn assigned_journal_requires_exact_installed_cloud_and_occupancy_receipts() {
+            use ActivationJournalStep as Step;
+            use ActivationJournalVerifierV2 as Verifier;
+            let control = ActivatedTargetReceiptControl::new(17);
+            let request = assigned_request(assigned_wire_request());
+            let metadata = request.metadata().clone();
+            let token = assigned_bound_token(&control, request);
+            let proof = assigned_proof(&control, &token);
+            let target = proof.target_receipt.assigned().unwrap().clone();
+            let entry = |step, verifier| ActivationJournalEntry {
+                step,
+                idempotency_key: ActivationJournalKey::Assigned {
+                    request: metadata.clone(),
+                    step,
+                },
+                status: ActivationJournalStatus::Applied,
+                verifier_receipt: Some(ActivationJournalVerifier::Assigned(verifier)),
+                typed_failure: None,
+            };
+            // A plausible cloud receipt cannot precede the validated publication proof.
+            assert!(!control.journal(
+                &token,
+                entry(
+                    Step::CloudInstall,
+                    Verifier::Cloud(target.cloud_receipt.clone())
+                )
+            ));
+            for field in ["nonce", "sequence", "revision", "timestamp"] {
+                let mut occupancy = target.occupancy_receipt.clone();
+                match field {
+                    "nonce" => occupancy.commit_id.boot_nonce = 0,
+                    "sequence" => occupancy.commit_id.sequence = 0,
+                    "revision" => occupancy.occupancy_revision = 0,
+                    _ => occupancy.source_timestamp_ns = 0,
+                }
+                assert!(!control.journal(
+                    &token,
+                    entry(Step::OccupancyInstall, Verifier::Occupancy(occupancy))
+                ));
+            }
+            // Occupancy installation legitimately precedes cloud installation/proof storage.
+            assert!(control.journal(
+                &token,
+                entry(
+                    Step::OccupancyInstall,
+                    Verifier::Occupancy(target.occupancy_receipt.clone())
+                )
+            ));
+            assert!(control.store_publication_proof(&token, proof));
+            for field in [
+                "nonce",
+                "sequence",
+                "session",
+                "occupancy",
+                "cloud",
+                "timestamp",
+                "points",
+            ] {
+                let mut cloud = target.cloud_receipt.clone();
+                match field {
+                    "nonce" => cloud.commit_id.boot_nonce += 1,
+                    "sequence" => cloud.commit_id.sequence += 1,
+                    "session" => cloud.session_generation += 1,
+                    "occupancy" => cloud.occupancy_revision += 1,
+                    "cloud" => cloud.cloud_revision += 1,
+                    "timestamp" => cloud.source_timestamp_ns += 1,
+                    _ => cloud.point_count += 1,
+                }
+                assert!(
+                    !control.journal(&token, entry(Step::CloudInstall, Verifier::Cloud(cloud))),
+                    "changed cloud {field} proof accepted"
+                );
+            }
+            for field in ["nonce", "sequence", "revision", "timestamp"] {
+                let mut occupancy = target.occupancy_receipt.clone();
+                match field {
+                    "nonce" => occupancy.commit_id.boot_nonce += 1,
+                    "sequence" => occupancy.commit_id.sequence += 1,
+                    "revision" => occupancy.occupancy_revision += 1,
+                    _ => occupancy.source_timestamp_ns += 1,
+                }
+                assert!(
+                    !control.journal(
+                        &token,
+                        entry(Step::SharedStateCommit, Verifier::Occupancy(occupancy))
+                    ),
+                    "changed installed occupancy {field} accepted"
+                );
+            }
+            assert!(control.journal(
+                &token,
+                entry(Step::CloudInstall, Verifier::Cloud(target.cloud_receipt))
+            ));
+            assert!(control.journal(
+                &token,
+                entry(
+                    Step::SharedStateCommit,
+                    Verifier::Occupancy(target.occupancy_receipt)
+                )
+            ));
         }
 
         #[test]
@@ -15272,7 +16628,7 @@ mod preflight_only_contract {
             assert!(control
                 .store_publication_proof(&token, activation_publication_proof([5; 32], 1, 11),));
             let sealed = control
-                .seal(&token, Some([5; 32]), activation_base_state())
+                .seal(&token, Some(TargetReceipt::LegacyDigest([5; 32])), activation_base_state())
                 .unwrap();
             assert!(sealed.success);
             assert!(sealed.relocalization_target_available);
@@ -15371,7 +16727,7 @@ mod preflight_only_contract {
                             ),
                         ));
                         control
-                            .seal(&token, Some(target_receipt_sha256), activation_base_state())
+                            .seal(&token, Some(TargetReceipt::LegacyDigest(target_receipt_sha256)), activation_base_state())
                             .expect("seal target identity");
                     }
                     1 => {
@@ -15471,7 +16827,7 @@ mod preflight_only_contract {
                 activation_publication_proof([63; 32], 2, 47),
             ));
             control
-                .seal(&first_token, Some([63; 32]), activation_base_state())
+                .seal(&first_token, Some(TargetReceipt::LegacyDigest([63; 32])), activation_base_state())
                 .expect("first target seal");
 
             let snapshot = control
@@ -15487,7 +16843,7 @@ mod preflight_only_contract {
             assert_eq!(snapshot.asset_bundle_sha256, Some([3; 32]));
             assert_eq!(snapshot.session_generation, 47);
             assert_eq!(snapshot.backend_generation, 43);
-            assert_eq!(snapshot.publication_proof.target_receipt_sha256, [63; 32]);
+            assert_eq!(snapshot.publication_proof.target_receipt.legacy_digest(), Some([63; 32]));
             assert_eq!(snapshot.immutable_target, first_target);
 
             let mut detached_snapshot = snapshot.clone();
@@ -15545,7 +16901,7 @@ mod preflight_only_contract {
                 activation_publication_proof([73; 32], 3, 59),
             ));
             control
-                .seal(&second_token, Some([73; 32]), activation_base_state())
+                .seal(&second_token, Some(TargetReceipt::LegacyDigest([73; 32])), activation_base_state())
                 .expect("second target seal");
             let second_snapshot = control
                 .current_sealed_target_snapshot()
@@ -15584,7 +16940,7 @@ mod preflight_only_contract {
             let seal_control = control.clone();
             let seal_token = token.clone();
             let seal_thread = std::thread::spawn(move || {
-                seal_control.seal(&seal_token, Some([9; 32]), activation_base_state())
+                seal_control.seal(&seal_token, Some(TargetReceipt::LegacyDigest([9; 32])), activation_base_state())
             });
             entered.wait();
             let epoch = control.lifecycle_epoch();
@@ -15595,9 +16951,9 @@ mod preflight_only_contract {
                 &token,
                 ActivationJournalEntry {
                     step: ActivationJournalStep::Seal,
-                    idempotency_key: [10; 32],
+                    idempotency_key: ActivationJournalKey::LegacyDigest([10; 32]),
                     status: ActivationJournalStatus::Applied,
-                    verifier_receipt_sha256: Some([11; 32]),
+                    verifier_receipt: Some(ActivationJournalVerifier::LegacyDigest([11; 32])),
                     typed_failure: None,
                 },
             ));
@@ -15619,7 +16975,7 @@ mod preflight_only_contract {
                         source_timestamp_ns: 1,
                         point_count: 4,
                     },
-                    target_receipt_sha256: [12; 32],
+                    target_receipt: TargetReceipt::LegacyDigest([12; 32]),
                 },
             ));
             assert!(control.publication_proof(&token).is_none());

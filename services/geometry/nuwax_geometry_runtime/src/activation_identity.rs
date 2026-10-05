@@ -13,7 +13,7 @@ use crate::pointcloud::{
 use crate::proto::{self, CheckpointMemberRole};
 
 /// 不同拥有方只共用编码，不能互换身份：32 个小写十六进制字符，且不能全零。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct AssignedId([u8; 16]);
 
 impl AssignedId {
@@ -53,7 +53,7 @@ impl AssetIdentityV2 {
 }
 
 /// 冻结检查点的父身份，不能用完整资产身份代替。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckpointIdentityV2(AssignedId);
 
 impl CheckpointIdentityV2 {

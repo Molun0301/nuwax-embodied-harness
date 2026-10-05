@@ -81,7 +81,8 @@ impl GeometryRuntimeService {
         let current = adapter.lock().snapshot();
         let mut seed = crate::correction_coordinator::ActivationReceiptSeed {
             activation_request_id: class.request_id().into(),
-            activation_request_identity_sha256: request_sha,
+            request_key: request_sha.into(),
+            checkpoint_owner: None,
             asset_manifest_sha256: Some(manifest),
             asset_bundle_sha256: Some(bundle),
             modern: true,
@@ -299,7 +300,7 @@ impl GeometryRuntimeService {
                 request_sha,
                 crate::correction_coordinator::ActivationJournalStep::OccupancyInstall,
                 crate::correction_coordinator::ActivationJournalStatus::Applied,
-                Some(occupancy_sha),
+                Some(occupancy_sha.into()),
                 None,
             );
             let _ = self.bridge.map_revision_tx.send(event);
@@ -310,7 +311,7 @@ impl GeometryRuntimeService {
             state.planar_mode = "localization".into();
             let sealed = self
                 .activation_receipts
-                .seal(&token, Some(target_receipt), state)
+                .seal(&token, Some(target_receipt.into()), state)
                 .ok_or("二维激活封存失败")?;
             drop(lifecycle);
             drop(projection);

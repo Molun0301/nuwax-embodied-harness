@@ -487,8 +487,15 @@ struct MappingBackendRestoreJob {
     completion: tokio::sync::oneshot::Sender<Result<MappingBackendCommitHandle, String>>,
 }
 
+/// Immutable encoded checkpoint storage owned by a queued restore operation.
+/// Kept independent of the RPC binary so the reusable offline library uses the same worker.
+pub(crate) trait MappingBackendEncodedOwner: Send + Sync {
+    fn checkpoint_bytes(&self) -> &[u8];
+}
+
 enum MappingBackendRestoreInput {
     Encoded(Vec<u8>),
+    OwnedEncoded(Arc<dyn MappingBackendEncodedOwner>),
     Prepared(PreparedMappingBackendRestore),
 }
 
@@ -853,6 +860,9 @@ impl MappingBackendWorker {
                                         &payload,
                                     )
                                 }
+                                MappingBackendRestoreInput::OwnedEncoded(owner) => {
+                                    restore_mapping_kernel_checkpoint(spec, compute_config, owner.checkpoint_bytes())
+                                }
                                 MappingBackendRestoreInput::Prepared(prepared) => {
                                     if prepared.spec == spec
                                         && prepared.config.window_capacity
@@ -1086,6 +1096,17 @@ impl MappingBackendClient {
         MappingBackendSubmitError,
     > {
         self.restore_input(MappingBackendRestoreInput::Encoded(payload))
+    }
+
+    /// Share admitted immutable bytes with the queued job; no encoded checkpoint clone.
+    pub(crate) fn restore_owned_checkpoint<T: MappingBackendEncodedOwner + 'static>(
+        &self,
+        owner: T,
+    ) -> Result<
+        tokio::sync::oneshot::Receiver<Result<MappingBackendCommitHandle, String>>,
+        MappingBackendSubmitError,
+    > {
+        self.restore_input(MappingBackendRestoreInput::OwnedEncoded(Arc::new(owner)))
     }
 
     pub(crate) fn restore_prepared_checkpoint(

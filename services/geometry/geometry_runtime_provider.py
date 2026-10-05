@@ -719,19 +719,70 @@ def _mapping_backend_checkpoint_v2_proto(stored, *, graph_artifact=None, fine_ma
                                        (dense_cloud_artifact, checkpoint.dense_reference, MAX_DENSE_ARCHIVE_BYTES)):
         if supplied is not None and _artifact_reference_from_proto(supplied, maximum) != retained:
             raise ValueError("reupload must preserve the retained artifact identity")
-    return pb2.MappingBackendCheckpoint(schema_version=2, backend_kind=checkpoint.backend_kind,
-        source_session_id=checkpoint.source_session_id, source_session_generation=checkpoint.source_session_generation,
-        checkpoint_id=checkpoint.checkpoint_id, backend_payload_schema_version=checkpoint.backend_payload_schema_version,
-        payload_size=checkpoint.payload_size, created_at_ns=checkpoint.created_at_ns,
-        payload=_protobuf_payload_bytes(checkpoint.payload), occupancy_receipt=_occupancy_receipt_proto(checkpoint.occupancy_receipt),
-        cloud_receipt=_cloud_receipt_proto(checkpoint.cloud_receipt),
-        canonical_occupancy_checkpoint=_canonical_occupancy_from_stored(checkpoint, stored.occupancy_asset),
-        canonical_cloud_checkpoint=_canonical_cloud_from_stored(checkpoint, stored.cloud_asset),
-        fine_map_artifact=_artifact_reference_proto(checkpoint.fine_reference) if checkpoint.fine_reference else None,
-        dense_cloud_artifact=_artifact_reference_proto(checkpoint.dense_reference) if checkpoint.dense_reference else None,
-        target_kind=checkpoint.target_kind,
-        backend_identity=_member_identity_proto(checkpoint.backend_identity),
-        occupancy_identity=_member_identity_proto(checkpoint.occupancy_identity))
+    message = pb2.MappingBackendCheckpoint()
+    _populate_mapping_backend_checkpoint_v2(message, stored)
+    return message
+
+
+def _populate_mapping_backend_checkpoint_v2(message, stored):
+    """Fill a caller-owned protobuf submessage without a second full-body CopyFrom."""
+    checkpoint = stored.checkpoint
+    message.schema_version = 2
+    for field in ("backend_kind", "source_session_id", "source_session_generation", "checkpoint_id",
+                  "backend_payload_schema_version", "payload_size", "created_at_ns", "target_kind"):
+        setattr(message, field, getattr(checkpoint, field))
+    message.payload = _protobuf_payload_bytes(checkpoint.payload)
+    message.occupancy_receipt.CopyFrom(_occupancy_receipt_proto(checkpoint.occupancy_receipt))
+    message.cloud_receipt.CopyFrom(_cloud_receipt_proto(checkpoint.cloud_receipt))
+    message.backend_identity.CopyFrom(_member_identity_proto(checkpoint.backend_identity))
+    message.occupancy_identity.CopyFrom(_member_identity_proto(checkpoint.occupancy_identity))
+    occupancy = stored.occupancy_asset
+    meta = message.canonical_occupancy_checkpoint.meta
+    for field in ("width", "height", "resolution", "origin_x", "origin_y", "frame_id", "timestamp_ns"):
+        setattr(meta, field, occupancy[field])
+    meta.revision = occupancy["source_occupancy_revision"]
+    message.canonical_occupancy_checkpoint.data = _protobuf_payload_bytes(checkpoint.canonical_occupancy_data)
+    cloud = stored.cloud_asset
+    target = message.canonical_cloud_checkpoint
+    for field in ("frame_id", "point_count", "voxel_size"):
+        setattr(target, field, cloud[field])
+    target.source_revision = cloud["source_cloud_revision"]
+    target.payload_schema_version = 2
+    target.member_identity.CopyFrom(_member_identity_proto(checkpoint.cloud_identity))
+    target.xyz_f32_le = _protobuf_payload_bytes(checkpoint.canonical_cloud_xyz)
+    if checkpoint.fine_reference is not None:
+        message.fine_map_artifact.CopyFrom(_artifact_reference_proto(checkpoint.fine_reference))
+    if checkpoint.dense_reference is not None:
+        message.dense_cloud_artifact.CopyFrom(_artifact_reference_proto(checkpoint.dense_reference))
+
+
+def _assigned_activation_request_proto(stored, *, asset_identity, session_id, map_name,
+                                       activation_request_id, expected_runtime_generation):
+    """Construct explicit v2 wire ownership; this does not enable the activation endpoint."""
+    from contracts.map_workspace import AssetIdentityV2
+    if not isinstance(asset_identity, AssetIdentityV2):
+        raise ValueError("activation requires an admitted typed asset identity")
+    asset_identity = AssetIdentityV2(asset_id=asset_identity.asset_id)
+    if (type(expected_runtime_generation) is not int
+            or not 1 <= expected_runtime_generation <= (1 << 64) - 1):
+        raise ValueError("activation runtime generation must be a positive u64")
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+    for field, value in (("session_id", session_id), ("activation_request_id", activation_request_id)):
+        if not isinstance(value, str) or not 1 <= len(value) <= 128 or any(c not in alphabet for c in value):
+            raise ValueError(f"{field} must be canonical ASCII [A-Za-z0-9._:-]")
+    if (not isinstance(map_name, str) or not map_name or map_name != map_name.strip()
+            or len(map_name.encode("utf-8")) > 256
+            or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in map_name)):
+        raise ValueError("map_name must be canonical nonempty text within 256 bytes")
+    if stored.checkpoint.schema_version != 2 or stored.checkpoint._admission is None:
+        raise ValueError("activation requires admitted assigned checkpoint ownership")
+    MappingBackendCheckpointStore.validate_checkpoint_bundle(stored.checkpoint,
+        occupancy_asset=stored.occupancy_asset, cloud_asset=stored.cloud_asset)
+    message = pb2.ActivateMapRequest(session_id=session_id, map_name=map_name,
+        activation_request_id=activation_request_id, expected_runtime_generation=expected_runtime_generation,
+        activation_contract_version=2, asset_identity=pb2.AssetIdentityV2(asset_id=asset_identity.asset_id))
+    _populate_mapping_backend_checkpoint_v2(message.mapping_backend_checkpoint, stored)
+    return message
 
 
 def _canonical_string_bytes(value: str) -> bytes:

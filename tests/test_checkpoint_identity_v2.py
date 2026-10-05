@@ -232,6 +232,49 @@ class IdentityV2Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             AssetIdentityV2(asset_id="a" * 32, revision=1)
 
+    def test_assigned_activation_wire_contains_one_canonical_checkpoint_body(self):
+        from contracts.map_workspace import AssetIdentityV2
+        stored = self.bundle().publish_to(self.root)
+        materialized = []
+        original = provider._protobuf_payload_bytes
+        def once(value):
+            materialized.append(id(value))
+            return original(value)
+        with patch.object(provider, "_canonical_cloud_from_stored", side_effect=AssertionError("intermediate cloud copy")), \
+             patch.object(provider, "_canonical_occupancy_from_stored", side_effect=AssertionError("intermediate occupancy copy")), \
+             patch.object(provider, "_protobuf_payload_bytes", side_effect=once):
+            request = provider._assigned_activation_request_proto(stored,
+                asset_identity=AssetIdentityV2(asset_id="d" * 32), session_id="loaded:one", map_name="warehouse",
+                activation_request_id="activate:one", expected_runtime_generation=17)
+        self.assertEqual(request.activation_contract_version, 2)
+        self.assertFalse(request.HasField("checkpoint"))
+        self.assertFalse(request.HasField("cloud_checkpoint"))
+        self.assertEqual(request.asset_manifest_sha256, b"")
+        self.assertEqual(request.asset_bundle_sha256, b"")
+        self.assertEqual(request.mapping_backend_checkpoint, self.response)
+        self.assertEqual(request.asset_identity.asset_id, "d" * 32)
+        self.assertEqual(materialized, [id(stored.checkpoint.payload), id(stored.checkpoint.canonical_occupancy_data),
+                                        id(stored.checkpoint.canonical_cloud_xyz)])
+        decoded = pb.ActivateMapRequest.FromString(request.SerializeToString())
+        self.assertEqual(decoded, request)
+        self.assertEqual(request.SerializeToString().count(self.response.canonical_cloud_checkpoint.xyz_f32_le), 1)
+
+    def test_assigned_activation_metadata_rejects_before_body_materialization(self):
+        from contracts.map_workspace import AssetIdentityV2
+        stored = self.bundle().publish_to(self.root)
+        valid = dict(asset_identity=AssetIdentityV2(asset_id="d" * 32), session_id="loaded:one", map_name="warehouse",
+                     activation_request_id="activate:one", expected_runtime_generation=17)
+        for field, value in (("asset_identity", "d" * 32), ("session_id", " bad"),
+                             ("activation_request_id", "bad/one"), ("map_name", " map "),
+                             ("expected_runtime_generation", 0), ("expected_runtime_generation", True),
+                             ("expected_runtime_generation", 1 << 64)):
+            with patch.object(provider, "_protobuf_payload_bytes", side_effect=AssertionError("body read before metadata rejection")):
+                with self.assertRaises(ValueError):
+                    provider._assigned_activation_request_proto(stored, **dict(valid, **{field: value}))
+        forged = replace(stored, checkpoint=replace(stored.checkpoint))
+        with self.assertRaisesRegex(ValueError, "admitted assigned"):
+            provider._assigned_activation_request_proto(forged, **valid)
+
     def test_same_id_retry_streams_and_reuses_input(self):
         bundle = self.bundle()
         bundle.publish_to(self.root)

@@ -722,11 +722,12 @@ pub(super) fn run_worker_loop(
             }
             MappingBackendCommand::RestoreCheckpoint(job) => {
                 // 独立进程保留既有跨进程编码合同；进程内后端直接接收预解码内核。
-                let payload = match job.input {
-                    MappingBackendRestoreInput::Encoded(payload) => payload,
-                    MappingBackendRestoreInput::Prepared(prepared) => prepared.encoded,
+                let payload = match &job.input {
+                    MappingBackendRestoreInput::Encoded(payload) => payload.as_slice(),
+                    MappingBackendRestoreInput::Prepared(prepared) => prepared.encoded.as_slice(),
+                    MappingBackendRestoreInput::OwnedEncoded(owner) => owner.checkpoint_bytes(),
                 };
-                let result = sidecar.restore_checkpoint(job.transaction_id, &payload);
+                let result = sidecar.restore_checkpoint(job.transaction_id, payload);
                 match result {
                     Ok(()) => {
                         let (resolution, resolution_rx) =

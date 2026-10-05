@@ -190,6 +190,7 @@ message MappingSessionState {
   string target_kind = 30;
   bytes target_graph_sha256 = 31;
   string planar_mode = 32;
+  ActivationReceiptV2 activation_receipt_v2 = 33;
 }
 
 message CloudMapCheckpoint {
@@ -275,6 +276,34 @@ message GraphArtifactTransferResponse {
 // One assigned ID owns one immutable finalized asset; replacement assigns a new ID.
 message AssetIdentityV2 { string asset_id = 1; }
 
+message ActivationRequestMetadataV2 {
+  string activation_request_id = 1;
+  string session_id = 2;
+  string map_name = 3;
+  AssetIdentityV2 asset_identity = 4;
+  string checkpoint_id = 5;
+  uint64 expected_runtime_generation = 6;
+}
+message InstalledActivationIdentityV2 {
+  ActivationRequestMetadataV2 request = 1;
+  uint64 runtime_generation = 2;
+  uint64 lifecycle_epoch = 3;
+  uint64 session_generation = 4;
+  string backend_kind = 5;
+  uint64 backend_generation = 6;
+}
+message InstalledTargetReceiptV2 {
+  InstalledActivationIdentityV2 activation = 1;
+  CheckpointMemberIdentity source_cloud_member = 2;
+  CanonicalOccupancyCommitReceipt occupancy_receipt = 3;
+  CanonicalCloudCommitReceipt cloud_receipt = 4;
+}
+message ActivationReceiptV2 {
+  ActivationRequestMetadataV2 request = 1;
+  InstalledActivationIdentityV2 activation = 2;
+  InstalledTargetReceiptV2 target = 3;
+}
+
 message MappingBackendCheckpoint {
   uint32 schema_version = 1;
   string backend_kind = 2;
@@ -311,6 +340,9 @@ message ActivateMapRequest {
   bytes asset_bundle_sha256 = 9;
   uint64 expected_runtime_generation = 10;
   uint32 activation_contract_version = 11;
+  // Contract 2 uses only mapping_backend_checkpoint for canonical member bytes.
+  // Legacy digests and duplicate top-level checkpoint/cloud_checkpoint are absent.
+  AssetIdentityV2 asset_identity = 12;
 }
 
 enum RelocalizeDisposition {

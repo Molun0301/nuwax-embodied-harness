@@ -63,7 +63,7 @@ impl CanonicalRelocalizationPolicyV2 {
     }
 }
 
-fn activation_from_wire(value: proto::InstalledActivationIdentityV2) -> Result<InstalledActivationIdentityV2, String> {
+pub(crate) fn activation_from_wire(value: proto::InstalledActivationIdentityV2) -> Result<InstalledActivationIdentityV2, String> {
     let request = ActivationRequestMetadataV2::from_receipt_wire(value.request.ok_or("assigned activation request is absent")?)?;
     let backend_kind = match value.backend_kind.as_str() {
         "voxel" => MappingBackendKind::Voxel,
@@ -79,7 +79,7 @@ fn activation_from_wire(value: proto::InstalledActivationIdentityV2) -> Result<I
         backend_kind, backend_generation: value.backend_generation })
 }
 
-fn target_from_wire(value: proto::InstalledTargetReceiptV2) -> Result<InstalledTargetReceiptV2, String> {
+pub(crate) fn target_from_wire(value: proto::InstalledTargetReceiptV2) -> Result<InstalledTargetReceiptV2, String> {
     let activation = activation_from_wire(value.activation.ok_or("assigned activation identity is absent")?)?;
     let source_cloud_member = CheckpointMemberIdentityV2::try_from(value.source_cloud_member.ok_or("source cloud member is absent")?)?;
     let occupancy_receipt = occupancy_receipt_from_wire(value.occupancy_receipt.as_ref().ok_or("installed occupancy receipt is absent")?)?;
@@ -123,6 +123,18 @@ impl PartialEq for AssignedCloudRelocalizeRequestIdentityV2 {
 impl Eq for AssignedCloudRelocalizeRequestIdentityV2 {}
 
 impl AssignedCloudRelocalizeRequestIdentityV2 {
+    /// Durable identities must already use the canonical normalized descriptor.
+    /// Public request/query admission still accepts the defined zero timeout.
+    pub(crate) fn admit_canonical(request: proto::RelocalizeRequest) -> Result<Self, String> {
+        use prost::Message;
+        let encoded = request.encode_to_vec();
+        let identity = Self::admit(request)?;
+        if identity.to_wire().encode_to_vec() != encoded {
+            return Err("RELOCALIZATION_ASSIGNED_REQUEST_NON_CANONICAL".into());
+        }
+        Ok(identity)
+    }
+
     pub(crate) fn admit(request: proto::RelocalizeRequest) -> Result<Self, String> {
         if request.schema_version != 2 {
             return Err("RELOCALIZATION_ASSIGNED_SCHEMA_UNSUPPORTED".into());
@@ -164,10 +176,10 @@ impl AssignedCloudRelocalizeRequestIdentityV2 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn wire() -> proto::RelocalizeRequest {
+    pub(crate) fn wire() -> proto::RelocalizeRequest {
         let metadata = proto::ActivationRequestMetadataV2 { activation_request_id: "mapload:fixture".into(),
             session_id: "installed".into(), map_name: "room".into(),
             asset_identity: Some(proto::AssetIdentityV2 { asset_id: "a".repeat(32) }),
@@ -244,6 +256,13 @@ mod tests {
         }
         let mut changed = wire(); body(&mut changed).target.as_mut().unwrap().activation.as_mut().unwrap().lifecycle_epoch += 1;
         assert_ne!(AssignedCloudRelocalizeRequestIdentityV2::admit(changed).unwrap(), first);
+    }
+
+    #[test]
+    fn durable_identity_requires_normalization_but_admission_accepts_default() {
+        assert!(AssignedCloudRelocalizeRequestIdentityV2::admit_canonical(wire()).is_err());
+        let admitted = AssignedCloudRelocalizeRequestIdentityV2::admit(wire()).unwrap();
+        assert_eq!(AssignedCloudRelocalizeRequestIdentityV2::admit_canonical(admitted.to_wire()).unwrap(), admitted);
     }
 
     #[test]

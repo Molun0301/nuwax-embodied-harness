@@ -60,12 +60,12 @@ mod preflight_only_contract {
     use crate::mapping_commit::MappingCommitId;
     use crate::owner_profile::{CorrectionBackend, LioBackend};
 
-    const CORRECTION_SCHEMA_VERSION_V2: i32 = 2;
+    const CORRECTION_SCHEMA_VERSION_V3: i32 = 3;
     const CORRECTION_BACKEND_LIBRARY_PGO: i32 = 1;
     const CORRECTION_BACKEND_NATIVE_PGO: i32 = 2;
     const CORRECTION_BACKEND_RELOCALIZATION: i32 = 3;
     const CORRECTION_TRANSFORM_ABSOLUTE_LEFT_SE3: i32 = 1;
-    const CORRECTION_CANDIDATE_FINGERPRINT_V2: [u8; 8] = 0x05057b4c757c80f3u64.to_be_bytes();
+    const CORRECTION_CANDIDATE_FINGERPRINT_V3: [u8; 8] = 0xcaf86342b91bf47du64.to_be_bytes();
     const CORRECTION_CANDIDATE_MESSAGE_TYPE: &str = "nuwax_msgs.CorrectionCandidate";
     const MAX_IDENTITY_STRING_BYTES: usize = 255;
     const MAX_WIRE_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -88,8 +88,8 @@ mod preflight_only_contract {
     const RELOCALIZATION_COMMAND_QUEUE_CAPACITY: usize = 16;
     const RELOCALIZATION_MAX_WAITERS: usize = 16;
     const RELOCALIZATION_MAX_COMMAND_RECORDS: usize = 1_024;
-    const RELOCALIZATION_MAX_TERMINAL_BYTES: usize = 65_536;
-    const RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES: usize =
+    pub(crate) const RELOCALIZATION_MAX_TERMINAL_BYTES: usize = 65_536;
+    pub(crate) const RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES: usize =
         2 * RELOCALIZATION_MAX_TERMINAL_BYTES + 128 + 3 * 64 + 512;
     const RELOCALIZATION_TERMINAL_TEMP_PREFIX: &str = ".nuwax-relocalization-terminal-store-v4.";
     const RELOCALIZATION_TERMINAL_TEMP_SUFFIX: &str = ".tmp";
@@ -108,15 +108,15 @@ mod preflight_only_contract {
     const RELOCALIZATION_MIN_LOGICAL_TIMEOUT_MS: u64 = 250;
     const RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS: u64 = 30_000;
     const RELOCALIZATION_ACCUMULATION_TIMEOUT: Duration = Duration::from_secs(2);
-    const RELOCALIZATION_MAX_FRAMES: usize = 8;
+    pub(crate) const RELOCALIZATION_MAX_FRAMES: usize = 8;
     const RELOCALIZATION_MIN_AGGREGATE_POINTS: usize = 50_000;
     // 原匹配算法的数学输入下限；五万点只是收集目标，不代表几何质量。
     const RELOCALIZATION_MIN_SOURCE_POINTS: usize = 3;
-    const RELOCALIZATION_MAX_AGGREGATE_POINTS: usize = 250_000;
-    const RELOCALIZATION_MAX_EMITTED_POINTS: usize = 100_000;
+    pub(crate) const RELOCALIZATION_MAX_AGGREGATE_POINTS: usize = 250_000;
+    pub(crate) const RELOCALIZATION_MAX_EMITTED_POINTS: usize = 100_000;
     const RELOCALIZATION_MAX_PER_FRAME_F64_BYTES: usize = 2_400_000;
     const RELOCALIZATION_MAX_AGGREGATE_F64_BYTES: usize = 6_000_000;
-    const RELOCALIZATION_MAX_PROOF_BYTES: usize = 4_096;
+    pub(crate) const RELOCALIZATION_MAX_PROOF_BYTES: usize = 4_096;
     const RELOCALIZATION_MAX_ENVELOPE_DATA_BYTES: usize = 25_600_000;
     const RELOCALIZATION_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(10);
     const RELOCALIZATION_EVIDENCE_DOMAIN_V1: &[u8] = b"nuwax.geometry.relocalize.evidence.v1\0";
@@ -128,13 +128,13 @@ mod preflight_only_contract {
         b"nuwax.geometry.relocalize.source-commitment.v1\0";
     const RELOCALIZATION_TERMINAL_PROOF_DOMAIN_V1: &[u8] =
         b"nuwax.geometry.relocalize.terminal-proof.v1\0";
-    const RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES: usize = 4096;
+    pub(crate) const RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES: usize = 4096;
     const RELOCALIZATION_MAX_INLINE_EVIDENCE_PREIMAGE_BYTES: usize = 4_096;
-    const RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES: usize = 16_384;
-    const RELOCALIZATION_MAX_EVIDENCE_SUFFIX_BYTES: usize = 4_096;
+    pub(crate) const RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES: usize = 16_384;
+    pub(crate) const RELOCALIZATION_MAX_EVIDENCE_SUFFIX_BYTES: usize = 4_096;
     const RELOCALIZATION_MAX_CANONICAL_SOURCE_BYTES: usize =
         8 + RELOCALIZATION_MAX_EMITTED_POINTS * 3 * std::mem::size_of::<f64>();
-    const RELOCALIZATION_MAX_EVIDENCE_DISCLOSURE_BYTES: usize =
+    pub(crate) const RELOCALIZATION_MAX_EVIDENCE_DISCLOSURE_BYTES: usize =
         RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES + RELOCALIZATION_MAX_EVIDENCE_SUFFIX_BYTES + 256;
     const RELOCALIZATION_MAX_INLINE_EVIDENCE_DISCLOSURE_BYTES: usize =
         RELOCALIZATION_EVIDENCE_DISCLOSURE_DOMAIN_V1.len()
@@ -218,33 +218,89 @@ mod preflight_only_contract {
         pub(crate) generation: u64,
     }
 
+    /// Existing admitted LIO source receipt, not a content digest.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct RegisteredCloudProof {
+        pub(crate) backend: i32,
+        pub(crate) runtime_generation: u64,
         pub(crate) source_sequence: u64,
         pub(crate) source_timestamp_ns: u64,
         pub(crate) point_count: u64,
-        pub(crate) envelope_sha256: [u8; 32],
-        pub(crate) body_points_sha256: [u8; 32],
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    impl RegisteredCloudProof {
+        pub(crate) fn from_admitted(source: &crate::lio_ingress::AdmittedRegisteredScan) -> Result<Self, CorrectionOwnerError> {
+            let identity = source.source_identity();
+            Ok(Self {
+                backend: identity.backend,
+                runtime_generation: identity.runtime_generation.try_into().map_err(|_| CorrectionOwnerError::InvalidRegisteredCloudProof)?,
+                source_sequence: identity.source_sequence.try_into().map_err(|_| CorrectionOwnerError::InvalidRegisteredCloudProof)?,
+                source_timestamp_ns: identity.source_timestamp_ns.try_into().map_err(|_| CorrectionOwnerError::InvalidRegisteredCloudProof)?,
+                point_count: source.body_points().len().try_into().map_err(|_| CorrectionOwnerError::InvalidRegisteredCloudProof)?,
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
     pub(crate) struct CorrelatedOdomProof {
         pub(crate) source_sequence: u64,
         pub(crate) source_timestamp_ns: u64,
-        pub(crate) pose_sha256: [u8; 32],
+        pub(crate) translation_m: [f64; 3],
+        pub(crate) rotation_xyzw: [f64; 4],
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq)]
+    impl CorrelatedOdomProof {
+        pub(crate) fn from_registration(binding: &crate::lio_ingress::RegistrationBinding) -> Result<Self, CorrectionOwnerError> {
+            let pose = &binding.frozen_odom_from_body;
+            let q = pose.rotation.quaternion();
+            Ok(Self {
+                source_sequence: binding.correlated_odometry.source_sequence.try_into().map_err(|_| CorrectionOwnerError::InvalidCorrelatedOdomProof)?,
+                source_timestamp_ns: binding.correlated_odometry.source_timestamp_ns.try_into().map_err(|_| CorrectionOwnerError::InvalidCorrelatedOdomProof)?,
+                translation_m: pose.translation.vector.into(),
+                rotation_xyzw: [q.i, q.j, q.k, q.w],
+            })
+        }
+
+        fn matches_pose(&self, pose: &Isometry3<f64>) -> bool {
+            let q = pose.rotation.quaternion();
+            self.translation_m.iter().zip(pose.translation.vector.iter()).all(|(a,b)| a.to_bits() == b.to_bits())
+                && self.rotation_xyzw.iter().zip([q.i,q.j,q.k,q.w]).all(|(a,b)| a.to_bits() == b.to_bits())
+        }
+    }
+
+    impl PartialEq for CorrelatedOdomProof {
+        fn eq(&self, other: &Self) -> bool {
+            self.source_sequence == other.source_sequence
+                && self.source_timestamp_ns == other.source_timestamp_ns
+                && self.translation_m.iter().zip(other.translation_m).all(|(a,b)| a.to_bits() == b.to_bits())
+                && self.rotation_xyzw.iter().zip(other.rotation_xyzw).all(|(a,b)| a.to_bits() == b.to_bits())
+        }
+    }
+    impl Eq for CorrelatedOdomProof {}
+
+    #[derive(Clone, Copy, Debug)]
     pub(crate) struct CommittedMapProof {
+        pub(crate) backend_kind: crate::mapping_backend::MappingBackendKind,
+        pub(crate) backend_generation: u64,
         pub(crate) source_timestamp_ns: u64,
         pub(crate) width: u64,
         pub(crate) height: u64,
         pub(crate) resolution_m: f64,
         pub(crate) origin_x_m: f64,
         pub(crate) origin_y_m: f64,
-        pub(crate) payload_sha256: [u8; 32],
-        pub(crate) boundary_sha256: [u8; 32],
     }
+
+    impl PartialEq for CommittedMapProof {
+        fn eq(&self, other: &Self) -> bool {
+            self.backend_kind == other.backend_kind && self.backend_generation == other.backend_generation
+                && self.source_timestamp_ns == other.source_timestamp_ns
+                && self.width == other.width && self.height == other.height
+                && self.resolution_m.to_bits() == other.resolution_m.to_bits()
+                && self.origin_x_m.to_bits() == other.origin_x_m.to_bits()
+                && self.origin_y_m.to_bits() == other.origin_y_m.to_bits()
+        }
+    }
+    impl Eq for CommittedMapProof {}
 
     #[derive(Clone, Debug, PartialEq)]
     pub(crate) struct CorrectionCandidateIdentity {
@@ -303,7 +359,6 @@ mod preflight_only_contract {
             pub(super) identity: CorrectionCandidateIdentity,
             pub(super) transform: CorrectionTransform,
             pub(super) trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
-            pub(super) payload_sha256: [u8; 32],
         }
 
         impl std::ops::Deref for CorrectionCandidate {
@@ -320,6 +375,8 @@ mod preflight_only_contract {
             }
         }
 
+        impl Eq for CorrectionCandidate {}
+
         impl CorrectionCandidate {
             pub(crate) fn seal(
                 identity: CorrectionCandidateIdentity,
@@ -333,15 +390,17 @@ mod preflight_only_contract {
                 transform: CorrectionTransform,
                 trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
             ) -> Result<Self, CorrectionRejectReason> {
-                let mut candidate = CorrectionCandidateData {
+                let candidate = CorrectionCandidateData {
                     identity,
                     transform,
                     trajectory,
-                    payload_sha256: [0; 32],
                 };
                 candidate.validate_fields()?;
-                candidate.payload_sha256 = candidate.expected_payload_sha256()?;
                 Ok(Self(Arc::new(candidate)))
+            }
+
+            pub(crate) fn identity(&self) -> &CorrectionCandidateIdentity {
+                &self.0.identity
             }
 
             #[cfg(test)]
@@ -354,13 +413,11 @@ mod preflight_only_contract {
                 identity: CorrectionCandidateIdentity,
                 transform: CorrectionTransform,
                 trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
-                payload_sha256: [u8; 32],
             ) -> Self {
                 Self(Arc::new(CorrectionCandidateData {
                     identity,
                     transform,
                     trajectory,
-                    payload_sha256,
                 }))
             }
 
@@ -374,7 +431,6 @@ mod preflight_only_contract {
                     identity: self.identity.clone(),
                     transform: self.transform,
                     trajectory: self.trajectory.clone(),
-                    payload_sha256: self.payload_sha256,
                 };
                 edit(&mut data);
                 Self(Arc::new(data))
@@ -390,8 +446,7 @@ mod preflight_only_contract {
                 let mut out = self
                     .encode_body_prefix()
                     .map_err(|reason| CorrectionWireError::Invalid(reason.to_string()))?;
-                out.extend_from_slice(&self.payload_sha256);
-                if out.len() > MAX_WIRE_PAYLOAD_BYTES - CORRECTION_CANDIDATE_FINGERPRINT_V2.len() {
+                if out.len() > MAX_WIRE_PAYLOAD_BYTES - CORRECTION_CANDIDATE_FINGERPRINT_V3.len() {
                     return Err(CorrectionWireError::Invalid(
                         "correction candidate exceeds wire size bound".into(),
                     ));
@@ -403,8 +458,8 @@ mod preflight_only_contract {
             pub(crate) fn encode_wire(&self) -> Result<Vec<u8>, CorrectionWireError> {
                 let body = self.encode_body()?;
                 let mut out =
-                    Vec::with_capacity(CORRECTION_CANDIDATE_FINGERPRINT_V2.len() + body.len());
-                out.extend_from_slice(&CORRECTION_CANDIDATE_FINGERPRINT_V2);
+                    Vec::with_capacity(CORRECTION_CANDIDATE_FINGERPRINT_V3.len() + body.len());
+                out.extend_from_slice(&CORRECTION_CANDIDATE_FINGERPRINT_V3);
                 out.extend_from_slice(&body);
                 Ok(out)
             }
@@ -416,12 +471,12 @@ mod preflight_only_contract {
                     ));
                 }
                 let (fingerprint, body) = encoded
-                    .split_at_checked(CORRECTION_CANDIDATE_FINGERPRINT_V2.len())
+                    .split_at_checked(CORRECTION_CANDIDATE_FINGERPRINT_V3.len())
                     .ok_or(CorrectionWireError::Truncated {
-                        need: CORRECTION_CANDIDATE_FINGERPRINT_V2.len(),
+                        need: CORRECTION_CANDIDATE_FINGERPRINT_V3.len(),
                         have: encoded.len(),
                     })?;
-                if fingerprint != CORRECTION_CANDIDATE_FINGERPRINT_V2 {
+                if fingerprint != CORRECTION_CANDIDATE_FINGERPRINT_V3 {
                     return Err(CorrectionWireError::Invalid(
                         "correction candidate fingerprint mismatch".into(),
                     ));
@@ -433,7 +488,7 @@ mod preflight_only_contract {
             /// the single top-level fingerprint.
             pub(crate) fn decode_body(encoded: &[u8]) -> Result<Self, CorrectionWireError> {
                 if encoded.len()
-                    > MAX_WIRE_PAYLOAD_BYTES - CORRECTION_CANDIDATE_FINGERPRINT_V2.len()
+                    > MAX_WIRE_PAYLOAD_BYTES - CORRECTION_CANDIDATE_FINGERPRINT_V3.len()
                 {
                     return Err(CorrectionWireError::Invalid(
                         "correction candidate exceeds wire size bound".into(),
@@ -441,7 +496,7 @@ mod preflight_only_contract {
                 }
                 let mut cursor = WireCursor::new(encoded);
                 let schema_version = cursor.read_i32()?;
-                if schema_version != CORRECTION_SCHEMA_VERSION_V2 {
+                if schema_version != CORRECTION_SCHEMA_VERSION_V3 {
                     return Err(CorrectionWireError::Invalid(format!(
                         "unsupported correction schema version {schema_version}"
                     )));
@@ -455,6 +510,13 @@ mod preflight_only_contract {
                 let mapping_session_id = cursor.read_lcm_string("mapping_session_id")?;
                 let mapping_session_generation =
                     cursor.read_positive_u64("mapping_session_generation")?;
+                let mapping_backend_kind = match cursor.read_lcm_string("mapping_backend_kind")?.as_str() {
+                    "voxel" => crate::mapping_backend::MappingBackendKind::Voxel,
+                    "raytracing" => crate::mapping_backend::MappingBackendKind::Raytracing,
+                    "slam_toolbox" => crate::mapping_backend::MappingBackendKind::SlamToolbox,
+                    _ => return Err(CorrectionWireError::Invalid("unsupported mapping backend receipt".into())),
+                };
+                let mapping_backend_generation = cursor.read_positive_u64("mapping_backend_generation")?;
                 let map_frame_generation = cursor.read_positive_u64("map_frame_generation")?;
                 let mapping_commit_id = MappingCommitId {
                     boot_nonce: u128::from_be_bytes(cursor.read_array::<16>()?),
@@ -465,29 +527,32 @@ mod preflight_only_contract {
                 let committed_map_source_timestamp_ns =
                     cursor.read_nonnegative_u64("committed_map_source_timestamp_ns")?;
                 let registered_cloud = RegisteredCloudProof {
+                    backend: cursor.read_i32()?,
+                    runtime_generation: cursor.read_positive_u64("registered_cloud_runtime_generation")?,
                     source_sequence: cursor
                         .read_positive_u64("registered_cloud_source_sequence")?,
                     source_timestamp_ns: cursor
                         .read_nonnegative_u64("registered_cloud_source_timestamp_ns")?,
                     point_count: cursor.read_positive_u64("registered_cloud_point_count")?,
-                    envelope_sha256: cursor.read_array::<32>()?,
-                    body_points_sha256: cursor.read_array::<32>()?,
+
                 };
                 let correlated_odom = CorrelatedOdomProof {
                     source_sequence: cursor.read_positive_u64("correlated_odom_source_sequence")?,
                     source_timestamp_ns: cursor
                         .read_nonnegative_u64("correlated_odom_source_timestamp_ns")?,
-                    pose_sha256: cursor.read_array::<32>()?,
+                    translation_m: [cursor.read_f64()?, cursor.read_f64()?, cursor.read_f64()?],
+                    rotation_xyzw: [cursor.read_f64()?, cursor.read_f64()?, cursor.read_f64()?, cursor.read_f64()?],
                 };
                 let committed_map = CommittedMapProof {
+                    backend_kind: mapping_backend_kind,
+                    backend_generation: mapping_backend_generation,
                     source_timestamp_ns: committed_map_source_timestamp_ns,
                     width: cursor.read_positive_u64("committed_map_width")?,
                     height: cursor.read_positive_u64("committed_map_height")?,
                     resolution_m: cursor.read_f64()?,
                     origin_x_m: cursor.read_f64()?,
                     origin_y_m: cursor.read_f64()?,
-                    payload_sha256: cursor.read_array::<32>()?,
-                    boundary_sha256: cursor.read_array::<32>()?,
+
                 };
                 let source_timestamp_ns = cursor.read_nonnegative_u64("source_timestamp_ns")?;
                 let map_frame_id = cursor.read_lcm_string("map_frame_id")?;
@@ -524,7 +589,6 @@ mod preflight_only_contract {
                 )
                 .map_err(|error| CorrectionWireError::Invalid(error.to_string()))?;
                 cursor.offset = trajectory_end;
-                let payload_sha256 = cursor.read_array::<32>()?;
                 cursor.finish()?;
                 let candidate = CorrectionCandidateData {
                     identity: CorrectionCandidateIdentity {
@@ -554,7 +618,6 @@ mod preflight_only_contract {
                         rotation_xyzw,
                     },
                     trajectory,
-                    payload_sha256,
                 };
                 candidate
                     .validate_integrity()
@@ -580,18 +643,7 @@ mod preflight_only_contract {
                     && left.cloud_revision == right.cloud_revision
                     && left.registered_cloud == right.registered_cloud
                     && left.correlated_odom == right.correlated_odom
-                    && left.committed_map.source_timestamp_ns
-                        == right.committed_map.source_timestamp_ns
-                    && left.committed_map.width == right.committed_map.width
-                    && left.committed_map.height == right.committed_map.height
-                    && left.committed_map.resolution_m.to_bits()
-                        == right.committed_map.resolution_m.to_bits()
-                    && left.committed_map.origin_x_m.to_bits()
-                        == right.committed_map.origin_x_m.to_bits()
-                    && left.committed_map.origin_y_m.to_bits()
-                        == right.committed_map.origin_y_m.to_bits()
-                    && left.committed_map.payload_sha256 == right.committed_map.payload_sha256
-                    && left.committed_map.boundary_sha256 == right.committed_map.boundary_sha256
+                    && left.committed_map == right.committed_map
                     && left.source_timestamp_ns == right.source_timestamp_ns
                     && left.map_frame_id == right.map_frame_id
                     && left.odom_frame_id == right.odom_frame_id
@@ -616,21 +668,11 @@ mod preflight_only_contract {
                                 && same_float_bits(&left.translation_m, &right.translation_m)
                                 && same_float_bits(&left.rotation_xyzw, &right.rotation_xyzw)
                         })
-                    && self.payload_sha256 == other.payload_sha256
-            }
 
-            pub(super) fn expected_payload_sha256(
-                &self,
-            ) -> Result<[u8; 32], CorrectionRejectReason> {
-                Ok(sha256_bytes(&self.encode_body_prefix()?))
             }
 
             pub(super) fn validate_integrity(&self) -> Result<(), CorrectionRejectReason> {
-                self.validate_fields()?;
-                if self.payload_sha256 != self.expected_payload_sha256()? {
-                    return Err(CorrectionRejectReason::PayloadHashMismatch);
-                }
-                Ok(())
+                self.validate_fields()
             }
 
             fn validate_fields(&self) -> Result<(), CorrectionRejectReason> {
@@ -677,15 +719,16 @@ mod preflight_only_contract {
                 if cloud.source_sequence == 0
                     || cloud.point_count == 0
                     || cloud.point_count > MAX_REGISTERED_CLOUD_POINTS
-                    || !digest_is_present(&cloud.envelope_sha256)
-                    || !digest_is_present(&cloud.body_points_sha256)
+                    || !matches!(cloud.backend, 1 | 2 | 3)
+                    || cloud.runtime_generation == 0
                 {
                     return Err(CorrectionRejectReason::InvalidRegisteredCloudProof);
                 }
                 let odom = identity.correlated_odom;
                 if odom.source_sequence == 0
                     || odom.source_timestamp_ns > cloud.source_timestamp_ns
-                    || !digest_is_present(&odom.pose_sha256)
+                    || odom.translation_m.iter().chain(odom.rotation_xyzw.iter()).any(|value| !value.is_finite())
+                    || (odom.rotation_xyzw.iter().map(|value| value * value).sum::<f64>() - 1.0).abs() > QUATERNION_NORM_TOLERANCE
                 {
                     return Err(CorrectionRejectReason::InvalidCorrelatedOdomProof);
                 }
@@ -709,8 +752,7 @@ mod preflight_only_contract {
                     || map.resolution_m <= 0.0
                     || !map.origin_x_m.is_finite()
                     || !map.origin_y_m.is_finite()
-                    || !digest_is_present(&map.payload_sha256)
-                    || !digest_is_present(&map.boundary_sha256)
+                    || map.backend_generation == 0
                 {
                     return Err(CorrectionRejectReason::InvalidCommittedMapProof);
                 }
@@ -732,11 +774,6 @@ mod preflight_only_contract {
                 if identity.points_frame_id != identity.body_frame_id {
                     return Err(CorrectionRejectReason::UnsupportedPointsFrame);
                 }
-                if map.boundary_sha256
-                    != expected_map_boundary_sha256(&identity.map_frame_id, &map)?
-                {
-                    return Err(CorrectionRejectReason::MapBoundaryHashMismatch);
-                }
                 if identity.correction_lease.boot_nonce == 0
                     || identity.correction_lease.generation == 0
                 {
@@ -752,6 +789,8 @@ mod preflight_only_contract {
                     || identity.mapping_commit_id.sequence > i64::MAX as u64
                     || identity.occupancy_revision > i64::MAX as u64
                     || identity.cloud_revision > i64::MAX as u64
+                    || cloud.runtime_generation > i64::MAX as u64
+                    || map.backend_generation > i64::MAX as u64
                     || cloud.source_sequence > i64::MAX as u64
                     || cloud.source_timestamp_ns > i64::MAX as u64
                     || cloud.point_count > i64::MAX as u64
@@ -817,7 +856,7 @@ mod preflight_only_contract {
             pub(super) fn encode_body_prefix(&self) -> Result<Vec<u8>, CorrectionRejectReason> {
                 let identity = &self.identity;
                 let mut out = Vec::with_capacity(512);
-                out.extend_from_slice(&CORRECTION_SCHEMA_VERSION_V2.to_be_bytes());
+                out.extend_from_slice(&CORRECTION_SCHEMA_VERSION_V3.to_be_bytes());
                 out.extend_from_slice(&identity.backend.wire_code().to_be_bytes());
                 out.extend_from_slice(&identity.transform_semantics.wire_code().to_be_bytes());
                 encode_positive_i64(identity.runtime_generation, &mut out)?;
@@ -825,27 +864,28 @@ mod preflight_only_contract {
                 encode_positive_i64(identity.candidate_sequence, &mut out)?;
                 encode_lcm_string(&identity.mapping_session_id, &mut out)?;
                 encode_positive_i64(identity.mapping_session_generation, &mut out)?;
+                encode_lcm_string(identity.committed_map.backend_kind.stable_name(), &mut out)?;
+                encode_positive_i64(identity.committed_map.backend_generation, &mut out)?;
                 encode_positive_i64(identity.map_frame_generation, &mut out)?;
                 out.extend_from_slice(&identity.mapping_commit_id.boot_nonce.to_be_bytes());
                 encode_positive_i64(identity.mapping_commit_id.sequence, &mut out)?;
                 encode_positive_i64(identity.occupancy_revision, &mut out)?;
                 encode_positive_i64(identity.cloud_revision, &mut out)?;
                 encode_nonnegative_i64(identity.committed_map.source_timestamp_ns, &mut out)?;
+                out.extend_from_slice(&identity.registered_cloud.backend.to_be_bytes());
+                encode_positive_i64(identity.registered_cloud.runtime_generation, &mut out)?;
                 encode_positive_i64(identity.registered_cloud.source_sequence, &mut out)?;
                 encode_nonnegative_i64(identity.registered_cloud.source_timestamp_ns, &mut out)?;
                 encode_positive_i64(identity.registered_cloud.point_count, &mut out)?;
-                out.extend_from_slice(&identity.registered_cloud.envelope_sha256);
-                out.extend_from_slice(&identity.registered_cloud.body_points_sha256);
                 encode_positive_i64(identity.correlated_odom.source_sequence, &mut out)?;
                 encode_nonnegative_i64(identity.correlated_odom.source_timestamp_ns, &mut out)?;
-                out.extend_from_slice(&identity.correlated_odom.pose_sha256);
+                for value in identity.correlated_odom.translation_m { out.extend_from_slice(&value.to_be_bytes()); }
+                for value in identity.correlated_odom.rotation_xyzw { out.extend_from_slice(&value.to_be_bytes()); }
                 encode_positive_i64(identity.committed_map.width, &mut out)?;
                 encode_positive_i64(identity.committed_map.height, &mut out)?;
                 out.extend_from_slice(&identity.committed_map.resolution_m.to_be_bytes());
                 out.extend_from_slice(&identity.committed_map.origin_x_m.to_be_bytes());
                 out.extend_from_slice(&identity.committed_map.origin_y_m.to_be_bytes());
-                out.extend_from_slice(&identity.committed_map.payload_sha256);
-                out.extend_from_slice(&identity.committed_map.boundary_sha256);
                 encode_nonnegative_i64(identity.source_timestamp_ns, &mut out)?;
                 encode_lcm_string(&identity.map_frame_id, &mut out)?;
                 encode_lcm_string(&identity.odom_frame_id, &mut out)?;
@@ -927,65 +967,6 @@ mod preflight_only_contract {
         digest.iter().any(|byte| *byte != 0)
     }
 
-    pub(crate) fn expected_map_boundary_sha256(
-        map_frame_id: &str,
-        proof: &CommittedMapProof,
-    ) -> Result<[u8; 32], CorrectionRejectReason> {
-        let mut canonical = b"nuwax.correction.committed-map-boundary.v1\0".to_vec();
-        encode_lcm_string(map_frame_id, &mut canonical)?;
-        encode_positive_i64(proof.width, &mut canonical)?;
-        encode_positive_i64(proof.height, &mut canonical)?;
-        canonical.extend_from_slice(&proof.resolution_m.to_be_bytes());
-        canonical.extend_from_slice(&proof.origin_x_m.to_be_bytes());
-        canonical.extend_from_slice(&proof.origin_y_m.to_be_bytes());
-        Ok(sha256_bytes(&canonical))
-    }
-
-    pub(crate) fn body_points_sha256(
-        points: &[Point3<f64>],
-    ) -> Result<[u8; 32], CorrectionOwnerError> {
-        let point_count = u64::try_from(points.len())
-            .map_err(|_| CorrectionOwnerError::InvalidRegisteredCloudProof)?;
-        if point_count == 0 || point_count > MAX_REGISTERED_CLOUD_POINTS {
-            return Err(CorrectionOwnerError::InvalidRegisteredCloudProof);
-        }
-        let mut canonical = b"nuwax.correction.body-points.v1\0".to_vec();
-        canonical.reserve(8 + points.len() * 24);
-        canonical.extend_from_slice(&point_count.to_be_bytes());
-        for point in points {
-            if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
-                return Err(CorrectionOwnerError::InvalidRegisteredCloudProof);
-            }
-            canonical.extend_from_slice(&point.x.to_be_bytes());
-            canonical.extend_from_slice(&point.y.to_be_bytes());
-            canonical.extend_from_slice(&point.z.to_be_bytes());
-        }
-        Ok(sha256_bytes(&canonical))
-    }
-
-    pub(crate) fn odom_pose_sha256(
-        pose: &Isometry3<f64>,
-    ) -> Result<[u8; 32], CorrectionOwnerError> {
-        let transform = CorrectionTransform::from_isometry(pose);
-        if transform
-            .translation_m
-            .iter()
-            .chain(transform.rotation_xyzw.iter())
-            .any(|value| !value.is_finite())
-        {
-            return Err(CorrectionOwnerError::InvalidCorrelatedOdomProof);
-        }
-        let mut canonical = b"nuwax.correction.odom-from-body.v1\0".to_vec();
-        canonical.reserve(56);
-        for value in transform.translation_m {
-            canonical.extend_from_slice(&value.to_be_bytes());
-        }
-        for value in transform.rotation_xyzw {
-            canonical.extend_from_slice(&value.to_be_bytes());
-        }
-        Ok(sha256_bytes(&canonical))
-    }
-
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) enum CorrectionRejectReason {
         Stopped,
@@ -995,7 +976,6 @@ mod preflight_only_contract {
         NonFiniteTransform,
         TranslationOutOfBounds,
         InvalidRotation,
-        PayloadHashMismatch,
         BackendMismatch,
         RuntimeGenerationMismatch,
         BackendGenerationMismatch,
@@ -1015,7 +995,6 @@ mod preflight_only_contract {
         InvalidCorrelatedOdomProof,
         InvalidCommittedMapProof,
         UnsupportedPointsFrame,
-        MapBoundaryHashMismatch,
         NoStagedFrame,
         ReplayConflict,
         ApplyInFlight,
@@ -1044,7 +1023,7 @@ mod preflight_only_contract {
     pub(crate) struct CorrectionReceipt {
         pub(crate) candidate_sequence: u64,
         pub(crate) source_timestamp_ns: u64,
-        pub(crate) payload_sha256: [u8; 32],
+        pub(crate) candidate: CorrectionCandidate,
         pub(crate) disposition: CorrectionDisposition,
     }
 
@@ -1071,11 +1050,11 @@ mod preflight_only_contract {
         pub(crate) correction_lease: CorrectionLeaseId,
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     struct ReplayCursor {
         candidate_sequence: u64,
         source_timestamp_ns: u64,
-        payload_sha256: [u8; 32],
+        candidate: CorrectionCandidate,
     }
 
     #[derive(Default)]
@@ -1094,16 +1073,16 @@ mod preflight_only_contract {
             let cursor = ReplayCursor {
                 candidate_sequence: candidate.identity.candidate_sequence,
                 source_timestamp_ns: candidate.identity.source_timestamp_ns,
-                payload_sha256: candidate.payload_sha256,
+                candidate: candidate.clone(),
             };
-            let disposition = self.prepare_inner(candidate, boundary, cursor);
+            let disposition = self.prepare_inner(candidate, boundary, &cursor);
             if disposition == CorrectionDisposition::Prepared {
                 self.pending = Some(cursor);
             }
             CorrectionReceipt {
                 candidate_sequence: candidate.identity.candidate_sequence,
                 source_timestamp_ns: candidate.identity.source_timestamp_ns,
-                payload_sha256: candidate.payload_sha256,
+                candidate: candidate.clone(),
                 disposition,
             }
         }
@@ -1112,7 +1091,7 @@ mod preflight_only_contract {
             &self,
             candidate: &CorrectionCandidate,
             boundary: &CorrectionBoundary,
-            cursor: ReplayCursor,
+            cursor: &ReplayCursor,
         ) -> CorrectionDisposition {
             if self.stopped {
                 return CorrectionDisposition::Rejected(CorrectionRejectReason::Stopped);
@@ -1163,9 +1142,9 @@ mod preflight_only_contract {
             if let Some(reason) = mismatch {
                 return CorrectionDisposition::Rejected(reason);
             }
-            if let Some(applied) = self.last_applied {
+            if let Some(applied) = self.last_applied.as_ref() {
                 if cursor.candidate_sequence == applied.candidate_sequence {
-                    return if cursor.payload_sha256 == applied.payload_sha256 {
+                    return if cursor.candidate == applied.candidate {
                         CorrectionDisposition::AlreadyApplied
                     } else {
                         CorrectionDisposition::Rejected(CorrectionRejectReason::ReplayConflict)
@@ -1182,7 +1161,7 @@ mod preflight_only_contract {
                     );
                 }
             }
-            if let Some(pending) = self.pending {
+            if let Some(pending) = self.pending.as_ref() {
                 if cursor == pending {
                     return CorrectionDisposition::Prepared;
                 }
@@ -1203,15 +1182,15 @@ mod preflight_only_contract {
             if self.stopped {
                 return Err(CorrectionTransitionError::Stopped);
             }
-            if self.pending != Some(cursor) {
+            if self.pending.as_ref() != Some(&cursor) {
                 return Err(CorrectionTransitionError::ReceiptMismatch);
             }
             self.pending = None;
-            self.last_applied = Some(cursor);
+            self.last_applied = Some(cursor.clone());
             Ok(CorrectionReceipt {
                 candidate_sequence: cursor.candidate_sequence,
                 source_timestamp_ns: cursor.source_timestamp_ns,
-                payload_sha256: cursor.payload_sha256,
+                candidate: cursor.candidate,
                 disposition: CorrectionDisposition::Applied,
             })
         }
@@ -1224,7 +1203,7 @@ mod preflight_only_contract {
             if self.stopped {
                 return Err(CorrectionTransitionError::Stopped);
             }
-            if self.pending != Some(cursor) {
+            if self.pending.as_ref() != Some(&cursor) {
                 return Err(CorrectionTransitionError::ReceiptMismatch);
             }
             self.pending = None;
@@ -1242,10 +1221,14 @@ mod preflight_only_contract {
             if receipt.disposition != CorrectionDisposition::Prepared {
                 return Err(CorrectionTransitionError::NotPrepared);
             }
+            if receipt.candidate_sequence != receipt.candidate.identity.candidate_sequence
+                || receipt.source_timestamp_ns != receipt.candidate.identity.source_timestamp_ns {
+                return Err(CorrectionTransitionError::ReceiptMismatch);
+            }
             Ok(Self {
                 candidate_sequence: receipt.candidate_sequence,
                 source_timestamp_ns: receipt.source_timestamp_ns,
-                payload_sha256: receipt.payload_sha256,
+                candidate: receipt.candidate.clone(),
             })
         }
     }
@@ -1539,6 +1522,7 @@ mod preflight_only_contract {
         pub(crate) mapping_commit_id: MappingCommitId,
         pub(crate) occupancy_revision: u64,
         pub(crate) cloud_revision: u64,
+        pub(crate) cloud_receipt: crate::mapping_commit::CloudCommitReceipt,
         pub(crate) map_frame_generation: u64,
         pub(crate) registered_cloud: RegisteredCloudProof,
         pub(crate) correlated_odom: FrozenCorrelatedOdom,
@@ -1546,6 +1530,8 @@ mod preflight_only_contract {
         pub(crate) committed_map_occupancy: Arc<[u8]>,
         pub(crate) points_frame_id: String,
         pub(crate) body_points: crate::correction_points::CorrectionPoints,
+        /// The private admitted scan that owns these exact points and frozen source metadata.
+        pub(crate) source_owner: crate::lio_ingress::AdmittedRegisteredScan,
         /// 同一接纳扫描的静态子集；原始点与来源证明保留，回环算法只消费该子集。
         pub(crate) static_point_indices: Option<Arc<[u32]>>,
         /// Immutable canonical anchor captured before this frame was committed.
@@ -1561,6 +1547,56 @@ mod preflight_only_contract {
     }
 
     impl CorrectionFrameInput {
+        pub(crate) fn validate_source_ownership(&self) -> Result<(), CorrectionOwnerError> {
+            let binding = self.source_owner.binding();
+            if self.registered_cloud != RegisteredCloudProof::from_admitted(&self.source_owner)?
+                || self.body_points != *self.source_owner.body_points()
+                || !self.body_points.all_finite()
+                || self.mapping_session_id != binding.mapping_session_id
+                || self.mapping_session_generation != binding.mapping_session_generation
+                || self.map_frame_generation != binding.map_frame_generation
+                || self.points_frame_id != self.source_owner.body_frame_id()
+                || binding.frame_capture_relocalization_epoch != Some(self.frame_capture_relocalization_epoch)
+                || self.correlated_odom.proof != CorrelatedOdomProof::from_registration(binding)?
+                || !self.correlated_odom.proof.matches_pose(&self.correlated_odom.odom_from_body)
+                || !same_isometry_bits(&self.base_anchor_map_from_odom, &binding.base_anchor_map_from_odom)
+                || self.cloud_receipt.commit_id.boot_nonce == 0
+                || self.cloud_receipt.commit_id.sequence == 0
+                || self.cloud_receipt.occupancy_revision == 0
+                || self.cloud_receipt.cloud_revision == 0
+                || self.cloud_receipt.session_generation != self.mapping_session_generation
+                || self.cloud_receipt.cloud_revision != self.cloud_revision
+                || self.cloud_receipt.commit_id.boot_nonce != self.mapping_commit_id.boot_nonce
+                || self.cloud_receipt.commit_id.sequence > self.mapping_commit_id.sequence
+                || self.cloud_receipt.occupancy_revision > self.occupancy_revision {
+                return Err(CorrectionOwnerError::InvalidRegisteredCloudProof);
+            }
+            Ok(())
+        }
+
+        pub(crate) fn exactly_matches(&self, other: &Self) -> bool {
+            self.mapping_session_id == other.mapping_session_id
+                && self.mapping_session_generation == other.mapping_session_generation
+                && self.mapping_commit_id == other.mapping_commit_id
+                && self.occupancy_revision == other.occupancy_revision
+                && self.cloud_revision == other.cloud_revision
+                && self.cloud_receipt == other.cloud_receipt
+                && self.map_frame_generation == other.map_frame_generation
+                && self.registered_cloud == other.registered_cloud
+                && self.correlated_odom.proof == other.correlated_odom.proof
+                && same_isometry_bits(&self.correlated_odom.odom_from_body, &other.correlated_odom.odom_from_body)
+                && self.committed_map == other.committed_map
+                && (Arc::ptr_eq(&self.committed_map_occupancy, &other.committed_map_occupancy)
+                    || self.committed_map_occupancy == other.committed_map_occupancy)
+                && self.points_frame_id == other.points_frame_id
+                && self.body_points == other.body_points
+                && self.source_owner == other.source_owner
+                && self.static_point_indices == other.static_point_indices
+                && same_isometry_bits(&self.base_anchor_map_from_odom, &other.base_anchor_map_from_odom)
+                && self.frame_capture_relocalization_epoch == other.frame_capture_relocalization_epoch
+                && self.relocalization_mode_epoch == other.relocalization_mode_epoch
+        }
+
         fn pgo_points(&self) -> Result<std::borrow::Cow<'_, [Point3<f64>]>, CorrectionOwnerError> {
             let Some(indices) = &self.static_point_indices else {
                 return Ok(std::borrow::Cow::Borrowed(&self.body_points));
@@ -1861,8 +1897,7 @@ mod preflight_only_contract {
             || input.registered_cloud.point_count > MAX_REGISTERED_CLOUD_POINTS
             || input.registered_cloud.source_sequence > i64::MAX as u64
             || input.registered_cloud.source_timestamp_ns > i64::MAX as u64
-            || !digest_is_present(&input.registered_cloud.envelope_sha256)
-            || input.registered_cloud.body_points_sha256 != body_points_sha256(&input.body_points)?
+            || input.validate_source_ownership().is_err()
         {
             return Err(CorrectionOwnerError::InvalidRegisteredCloudProof);
         }
@@ -1871,8 +1906,7 @@ mod preflight_only_contract {
             || input.correlated_odom.proof.source_timestamp_ns > i64::MAX as u64
             || input.correlated_odom.proof.source_timestamp_ns
                 > input.registered_cloud.source_timestamp_ns
-            || input.correlated_odom.proof.pose_sha256
-                != odom_pose_sha256(&input.correlated_odom.odom_from_body)?
+            || !input.correlated_odom.proof.matches_pose(&input.correlated_odom.odom_from_body)
         {
             return Err(CorrectionOwnerError::InvalidCorrelatedOdomProof);
         }
@@ -1892,12 +1926,8 @@ mod preflight_only_contract {
             || map.resolution_m <= 0.0
             || !map.origin_x_m.is_finite()
             || !map.origin_y_m.is_finite()
-            || !digest_is_present(&map.payload_sha256)
+            || map.backend_generation == 0
             || expected_map_cells != Some(input.committed_map_occupancy.len())
-            || map.payload_sha256 != sha256_bytes(input.committed_map_occupancy.as_ref())
-            || map.boundary_sha256
-                != expected_map_boundary_sha256(&owner.map_frame_id, &map)
-                    .map_err(CorrectionOwnerError::CandidateRejected)?
         {
             return Err(CorrectionOwnerError::InvalidCommittedMapProof);
         }
@@ -1984,6 +2014,13 @@ mod preflight_only_contract {
         CandidateRejected(CorrectionRejectReason),
     }
 
+    fn same_isometry_bits(left: &Isometry3<f64>, right: &Isometry3<f64>) -> bool {
+        let a = CorrectionTransform::from_isometry(left);
+        let b = CorrectionTransform::from_isometry(right);
+        a.translation_m.iter().zip(b.translation_m).all(|(x,y)| x.to_bits() == y.to_bits())
+            && a.rotation_xyzw.iter().zip(b.rotation_xyzw).all(|(x,y)| x.to_bits() == y.to_bits())
+    }
+
     fn is_finite_isometry(transform: &Isometry3<f64>) -> bool {
         let transform = CorrectionTransform::from_isometry(transform);
         transform
@@ -2012,7 +2049,7 @@ mod preflight_only_contract {
         },
         CandidateProcessed {
             candidate_sequence: u64,
-            payload_sha256: [u8; 32],
+            candidate: CorrectionCandidate,
             disposition: CorrectionDisposition,
         },
     }
@@ -2573,7 +2610,7 @@ mod preflight_only_contract {
         pub(crate) backend_generation: u64,
         pub(crate) backend: CorrectionCandidateBackend,
         pub(crate) candidate_sequence: u64,
-        pub(crate) payload_sha256: [u8; 32],
+        pub(crate) candidate: CorrectionCandidate,
         pub(crate) correction_revision: u64,
         pub(crate) mapping_session_id: String,
         pub(crate) mapping_session_generation: u64,
@@ -2594,6 +2631,39 @@ mod preflight_only_contract {
         /// 冻结里程计自己的采样时间，可能略早于对应扫描。
         pub(crate) frozen_odom_source_timestamp_ns: u64,
         pub(crate) trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
+    }
+
+    impl CanonicalCorrectionTransaction {
+        pub(crate) fn matches_candidate_owner(&self) -> bool {
+            let identity = self.candidate.identity();
+            self.candidate.validate_integrity().is_ok()
+                && self.runtime_generation == identity.runtime_generation
+                && self.backend_generation == identity.backend_generation
+                && self.backend == identity.backend
+                && self.candidate_sequence == identity.candidate_sequence
+                && self.mapping_session_id == identity.mapping_session_id
+                && self.mapping_session_generation == identity.mapping_session_generation
+                && self.mapping_commit_id == identity.mapping_commit_id
+                && self.occupancy_revision == identity.occupancy_revision
+                && self.cloud_revision == identity.cloud_revision
+                && self.map_frame_generation == identity.map_frame_generation
+                && self.source_timestamp_ns == identity.source_timestamp_ns
+                && self.committed_map_source_timestamp_ns == identity.committed_map.source_timestamp_ns
+                && self.map_frame_id == identity.map_frame_id
+                && self.odom_frame_id == identity.odom_frame_id
+                && self.body_frame_id == identity.body_frame_id
+                && self.correction_lease == identity.correction_lease
+                && self.frozen_odom_source_timestamp_ns == identity.correlated_odom.source_timestamp_ns
+                && identity.correlated_odom.matches_pose(&self.frozen_odom_from_body)
+                && correction_transform_isometry(self.candidate.transform)
+                    .is_ok_and(|expected| same_isometry_bits(&expected, &self.absolute_left_correction))
+                && self.trajectory.len() == self.candidate.trajectory.len()
+                && self.trajectory.iter().zip(&self.candidate.trajectory).all(|(left, right)| {
+                    left.source_timestamp_ns == right.source_timestamp_ns
+                        && left.translation_m.iter().zip(right.translation_m).all(|(a, b)| a.to_bits() == b.to_bits())
+                        && left.rotation_xyzw.iter().zip(right.rotation_xyzw).all(|(a, b)| a.to_bits() == b.to_bits())
+                })
+        }
     }
 
     #[async_trait::async_trait]
@@ -2618,6 +2688,9 @@ mod preflight_only_contract {
 
     #[derive(Clone)]
     struct StagedCorrectionFrame {
+        // Only the existing staged/in-flight/last-applied slots retain this
+        // owner. Its point and occupancy allocations remain shared.
+        input: Arc<CorrectionFrameInput>,
         boundary: CorrectionBoundary,
         base_anchor_map_from_odom: Isometry3<f64>,
         frozen_odom_from_body: Isometry3<f64>,
@@ -2745,6 +2818,7 @@ mod preflight_only_contract {
                 &self.body_frame_id,
                 input,
             )?;
+            loop {
             let mut state = self.state.lock().await;
             if state.stop_requested || state.stopped {
                 return Err("correction apply sink is stopped".to_owned());
@@ -2786,26 +2860,36 @@ mod preflight_only_contract {
                 }
             }
             if let Some(existing) = &state.staged {
-                if existing.boundary == staged.boundary
-                    && existing.base_anchor_map_from_odom == staged.base_anchor_map_from_odom
-                    && existing.frozen_odom_from_body == staged.frozen_odom_from_body
-                {
-                    return Ok(());
+                let existing = Arc::clone(&existing.input);
+                drop(state);
+                // Independent replay may compare a whole grid. Never hold the
+                // state mutex while comparing retained immutable payloads.
+                let same = existing.exactly_matches(&staged.input);
+                let state = self.state.lock().await;
+                if state.stop_requested || state.stopped {
+                    return Err("correction apply sink is stopped".to_owned());
                 }
+                if state.in_flight.is_some() {
+                    return Err("a correction apply is in flight".to_owned());
+                }
+                if !state.staged.as_ref().is_some_and(|current| Arc::ptr_eq(&current.input, &existing)) {
+                    continue;
+                }
+                if same { return Ok(()); }
                 return Err("a different correction frame is already staged".to_owned());
             }
             state.staged = Some(staged);
-            Ok(())
+            return Ok(());
+            }
         }
 
         async fn discard(&self, input: &CorrectionFrameInput) {
+            let existing = self.state.lock().await.staged.as_ref()
+                .map(|staged| Arc::clone(&staged.input));
+            let Some(existing) = existing else { return; };
+            if !existing.exactly_matches(input) { return; }
             let mut state = self.state.lock().await;
-            let should_discard = state.staged.as_ref().is_some_and(|staged| {
-                staged.boundary.mapping_commit_id == input.mapping_commit_id
-                    && staged.boundary.registered_cloud == input.registered_cloud
-                    && staged.boundary.correlated_odom == input.correlated_odom.proof
-            });
-            if should_discard {
+            if state.staged.as_ref().is_some_and(|staged| Arc::ptr_eq(&staged.input, &existing)) {
                 state.staged = None;
             }
         }
@@ -2817,6 +2901,7 @@ mod preflight_only_contract {
         fn finalize_stop_locked(state: &mut GeometryCorrectionState) {
             if state.stop_requested && state.in_flight.is_none() && !state.stopped {
                 state.staged = None;
+                state.last_applied = None;
                 state.coordinator.stop();
                 state.stopped = true;
             }
@@ -2886,7 +2971,7 @@ mod preflight_only_contract {
                     backend_generation: candidate.identity.backend_generation,
                     backend: candidate.identity.backend,
                     candidate_sequence: candidate.identity.candidate_sequence,
-                    payload_sha256: candidate.payload_sha256,
+                    candidate: candidate.clone(),
                     correction_revision,
                     mapping_session_id: candidate.identity.mapping_session_id.clone(),
                     mapping_session_generation: candidate.identity.mapping_session_generation,
@@ -3115,19 +3200,14 @@ mod preflight_only_contract {
             || input.map_frame_generation == 0
             || input.points_frame_id != body_frame_id
             || !is_finite_isometry(&input.base_anchor_map_from_odom)
-            || input.registered_cloud.body_points_sha256
-                != body_points_sha256(&input.body_points).map_err(|error| error.to_string())?
-            || input.correlated_odom.proof.pose_sha256
-                != odom_pose_sha256(&input.correlated_odom.odom_from_body)
-                    .map_err(|error| error.to_string())?
+            || input.validate_source_ownership().is_err()
             || input
                 .committed_map
                 .width
                 .checked_mul(input.committed_map.height)
                 .and_then(|cells| usize::try_from(cells).ok())
                 != Some(input.committed_map_occupancy.len())
-            || input.committed_map.payload_sha256
-                != sha256_bytes(input.committed_map_occupancy.as_ref())
+
         {
             return Err("correction apply frame proof mismatch".to_owned());
         }
@@ -3146,6 +3226,7 @@ mod preflight_only_contract {
         )
         .map_err(|error| error.to_string())?;
         Ok(StagedCorrectionFrame {
+            input: Arc::new(input.clone()),
             boundary: CorrectionBoundary {
                 backend: identity.backend,
                 transform_semantics: identity.transform_semantics,
@@ -3227,8 +3308,22 @@ mod preflight_only_contract {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     struct CandidateApplyKey {
+        runtime_generation: u64,
+        backend_generation: u64,
+        lease_boot_nonce: u128,
+        lease_generation: u64,
         candidate_sequence: u64,
-        payload_sha256: [u8; 32],
+    }
+
+    impl From<&CorrectionCandidate> for CandidateApplyKey {
+        fn from(candidate: &CorrectionCandidate) -> Self {
+            let identity = &candidate.identity;
+            Self { runtime_generation: identity.runtime_generation,
+                backend_generation: identity.backend_generation,
+                lease_boot_nonce: identity.correction_lease.boot_nonce,
+                lease_generation: identity.correction_lease.generation,
+                candidate_sequence: identity.candidate_sequence }
+        }
     }
 
     type CandidateApplyResult = Result<CorrectionDisposition, String>;
@@ -3264,6 +3359,7 @@ mod preflight_only_contract {
     }
 
     struct CandidateApplyWaiter {
+        candidate: CorrectionCandidate,
         sender: oneshot::Sender<CandidateApplyResult>,
         lease: Arc<CorrectionRequestLease>,
         applying: bool,
@@ -3293,8 +3389,12 @@ mod preflight_only_contract {
         fn register(
             &self,
             key: CandidateApplyKey,
+            candidate: CorrectionCandidate,
             lease: Arc<CorrectionRequestLease>,
         ) -> Result<oneshot::Receiver<CandidateApplyResult>, String> {
+            if key != CandidateApplyKey::from(&candidate) {
+                return Err("correction apply waiter receipt differs from its owner".into());
+            }
             let (sender, receiver) = oneshot::channel();
             let mut pending = self.pending.lock();
             if !self.admission_open.load(Ordering::Acquire) {
@@ -3306,6 +3406,7 @@ mod preflight_only_contract {
             pending.insert(
                 key,
                 CandidateApplyWaiter {
+                    candidate,
                     sender,
                     lease,
                     applying: false,
@@ -3348,10 +3449,10 @@ mod preflight_only_contract {
                 .map(|waiter| waiter.lease.cancellation())
         }
 
-        fn claim_apply(&self, key: CandidateApplyKey) -> Option<Arc<CorrectionRequestLease>> {
+        fn claim_apply(&self, key: CandidateApplyKey, candidate: &CorrectionCandidate) -> Option<Arc<CorrectionRequestLease>> {
             let mut pending = self.pending.lock();
             let waiter = pending.get_mut(&key)?;
-            if waiter.applying {
+            if waiter.candidate != *candidate || waiter.applying {
                 return None;
             }
             waiter.applying = true;
@@ -5593,10 +5694,7 @@ mod preflight_only_contract {
             cancellation: &CorrectionRequestCancellation,
         ) -> Result<CandidateProduction, CorrectionRuntimeError> {
             if input.static_point_indices.as_ref().is_some_and(|indices| indices.is_empty()) {
-                if input.registered_cloud.point_count != input.body_points.len() as u64
-                    || input.registered_cloud.body_points_sha256 != body_points_sha256(&input.body_points)? {
-                    return Err(CorrectionOwnerError::InvalidRegisteredCloudProof.into());
-                }
+                input.validate_source_ownership()?;
                 return Ok(CandidateProduction::NoCandidate);
             }
             let request = native_pgo_request(
@@ -5684,10 +5782,7 @@ mod preflight_only_contract {
             i64::try_from(value)
                 .map_err(|_| CorrectionRuntimeError::NativePgo(format!("{label} exceeds i64")))
         };
-        if input.registered_cloud.point_count != input.body_points.len() as u64
-            || input.registered_cloud.body_points_sha256 != body_points_sha256(&input.body_points)? {
-            return Err(CorrectionOwnerError::InvalidRegisteredCloudProof.into());
-        }
+        input.validate_source_ownership()?;
         let static_points = input.pgo_points()?;
         let coordinate_count = static_points.len()
             .checked_mul(3)
@@ -5697,21 +5792,19 @@ mod preflight_only_contract {
                     "registered body coordinate count exceeds i32".to_owned(),
                 )
             })?;
-        let map_cell_count = i32::try_from(input.committed_map_occupancy.len()).map_err(|_| {
-            CorrectionRuntimeError::NativePgo("committed map cell count exceeds i32".to_owned())
-        })?;
         let mut registered_body_points_xyz = Vec::with_capacity(static_points.len() * 3);
         for point in static_points.iter() {
             registered_body_points_xyz.extend_from_slice(&[point.x, point.y, point.z]);
         }
-        let odom = CorrectionTransform::from_isometry(&input.correlated_odom.odom_from_body);
         Ok(native_pgo_codec::NativePgoRequest {
-            schema_version: native_pgo_codec::NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: native_pgo_codec::NATIVE_PGO_SCHEMA_VERSION_V3,
             identity: native_pgo_codec::NativePgoRequestIdentity {
                 backend: native_pgo_codec::NATIVE_PGO_BACKEND,
                 runtime_generation: checked_i64("runtime generation", owner.runtime_generation)?,
                 backend_generation: checked_i64("backend generation", owner.backend_generation)?,
                 request_sequence: 0,
+                mapping_backend_kind: input.committed_map.backend_kind.stable_name().to_owned(),
+                mapping_backend_generation: checked_i64("mapping backend generation", input.committed_map.backend_generation)?,
                 mapping_session_id: input.mapping_session_id.clone(),
                 mapping_session_generation: checked_i64(
                     "mapping session generation",
@@ -5731,6 +5824,9 @@ mod preflight_only_contract {
                 occupancy_revision: checked_i64("occupancy revision", input.occupancy_revision)?,
                 cloud_revision: checked_i64("cloud revision", input.cloud_revision)?,
                 registered_cloud: native_pgo_codec::NativePgoRegisteredCloudProof {
+                    backend: input.registered_cloud.backend,
+                    runtime_generation: checked_i64("LIO runtime generation", input.registered_cloud.runtime_generation)?,
+                    source_point_count: checked_i64("admitted cloud point count", input.registered_cloud.point_count)?,
                     source_sequence: checked_i64(
                         "registered cloud sequence",
                         input.registered_cloud.source_sequence,
@@ -5743,8 +5839,6 @@ mod preflight_only_contract {
                         "registered cloud point count",
                         static_points.len() as u64,
                     )?,
-                    envelope_sha256: input.registered_cloud.envelope_sha256,
-                    body_points_sha256: body_points_sha256(&static_points)?,
                 },
                 correlated_odom: native_pgo_codec::NativePgoCorrelatedOdomProof {
                     source_sequence: checked_i64(
@@ -5755,7 +5849,8 @@ mod preflight_only_contract {
                         "correlated odometry timestamp",
                         input.correlated_odom.proof.source_timestamp_ns,
                     )?,
-                    pose_sha256: input.correlated_odom.proof.pose_sha256,
+                    translation_m: input.correlated_odom.proof.translation_m,
+                    rotation_xyzw: input.correlated_odom.proof.rotation_xyzw,
                 },
                 committed_map: native_pgo_codec::NativePgoCommittedMapProof {
                     source_timestamp_ns: checked_i64(
@@ -5767,8 +5862,6 @@ mod preflight_only_contract {
                     resolution_m: input.committed_map.resolution_m,
                     origin_x_m: input.committed_map.origin_x_m,
                     origin_y_m: input.committed_map.origin_y_m,
-                    payload_sha256: input.committed_map.payload_sha256,
-                    boundary_sha256: input.committed_map.boundary_sha256,
                 },
                 source_timestamp_ns: checked_i64(
                     "source timestamp",
@@ -5788,15 +5881,6 @@ mod preflight_only_contract {
             },
             registered_body_coordinate_count: coordinate_count,
             registered_body_points_xyz,
-            frozen_odom_translation_m: odom.translation_m,
-            frozen_odom_rotation_xyzw: odom.rotation_xyzw,
-            committed_map_cell_count: map_cell_count,
-            committed_map_occupancy: input
-                .committed_map_occupancy
-                .iter()
-                .map(|byte| *byte as i8)
-                .collect(),
-            request_payload_sha256: [0; 32],
         })
     }
 
@@ -6301,6 +6385,8 @@ mod preflight_only_contract {
 
     #[derive(Debug, Error, Clone, PartialEq, Eq)]
     pub(crate) enum RelocalizationCommandError {
+        #[error("invalid relocalization request: {0}")]
+        InvalidRequest(String),
         #[error("relocalization command admission is closed")]
         Stopped,
         #[error("relocalization command owner is unavailable")]
@@ -6410,8 +6496,7 @@ mod preflight_only_contract {
 
     struct RelocalizationTerminalQueryRequest {
         request_id: String,
-        request_identity_sha256: [u8; 32],
-        activation_identity_sha256: [u8; 32],
+        identity: RelocalizationRequestIdentity,
         response: oneshot::Sender<Result<RelocalizationTerminalQuerySnapshot, &'static str>>,
     }
 
@@ -6450,6 +6535,8 @@ mod preflight_only_contract {
             mapping_lifecycle_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
             planar_work: Option<PlanarCommandWork>,
         ) -> Result<RelocalizationCommandWaiter, RelocalizationCommandError> {
+            validate_relocalize_request(request.clone()).map_err(RelocalizationCommandError::InvalidRequest)?;
+            if planar_work.is_some() { return Err(RelocalizationCommandError::InvalidRequest("RELOCALIZATION_ASSIGNED_TARGET_ABSENT_OR_UNSUPPORTED".into())); }
             if !self.admission_open.load(Ordering::Acquire) {
                 return Err(RelocalizationCommandError::Stopped);
             }
@@ -6494,24 +6581,28 @@ mod preflight_only_contract {
         }
 
         pub(crate) async fn terminal_snapshot(
-            &self,
-            request_id: &str,
-            request_identity_sha256: [u8; 32],
-            activation_identity_sha256: [u8; 32],
+            &self, request_id: &str, request_identity_sha256: [u8; 32], activation_identity_sha256: [u8; 32],
+        ) -> Result<RelocalizationTerminalQuerySnapshot, &'static str> {
+            self.terminal_snapshot_exact(request_id, RelocalizationRequestIdentity::LegacyV1 {
+                request_alias: request_identity_sha256, activation_alias: activation_identity_sha256,
+            }).await
+        }
+
+        pub(crate) async fn terminal_snapshot_assigned(
+            &self, query: &AssignedRelocalizationTerminalQueryV2,
+        ) -> Result<RelocalizationTerminalQuerySnapshot, &'static str> {
+            self.terminal_snapshot_exact(query.request().request_id(),
+                RelocalizationRequestIdentity::Assigned(query.request().clone())).await
+        }
+
+        async fn terminal_snapshot_exact(
+            &self, request_id: &str, identity: RelocalizationRequestIdentity,
         ) -> Result<RelocalizationTerminalQuerySnapshot, &'static str> {
             let (response, response_rx) = oneshot::channel();
-            self.terminal_query_sender
-                .send(RelocalizationTerminalQueryRequest {
-                    request_id: request_id.to_owned(),
-                    request_identity_sha256,
-                    activation_identity_sha256,
-                    response,
-                })
-                .await
-                .map_err(|_| "RELOCALIZATION_TERMINAL_QUERY_OWNER_UNAVAILABLE")?;
-            response_rx
-                .await
-                .map_err(|_| "RELOCALIZATION_TERMINAL_QUERY_RESPONSE_LOST")?
+            self.terminal_query_sender.send(RelocalizationTerminalQueryRequest {
+                request_id: request_id.to_owned(), identity, response,
+            }).await.map_err(|_| "RELOCALIZATION_TERMINAL_QUERY_OWNER_UNAVAILABLE")?;
+            response_rx.await.map_err(|_| "RELOCALIZATION_TERMINAL_QUERY_RESPONSE_LOST")?
         }
 
         #[cfg(test)]
@@ -6524,11 +6615,7 @@ mod preflight_only_contract {
             let query_store = terminal_store.clone();
             tokio::spawn(async move {
                 while let Some(query) = terminal_query_receiver.recv().await {
-                    let terminal = query_store.snapshot(
-                        &query.request_id,
-                        query.request_identity_sha256,
-                        query.activation_identity_sha256,
-                    );
+                    let terminal = query_store.snapshot_exact(&query.request_id, &query.identity);
                     let _ = query.response.send(Ok(RelocalizationTerminalQuerySnapshot {
                         terminal,
                         ledger_observation: crate::proto::RelocalizationLedgerObservation {
@@ -6559,35 +6646,22 @@ mod preflight_only_contract {
         ) {
             self.terminal_store.state.lock().pending.insert(
                 request_id.to_owned(),
-                (request_identity_sha256, activation_identity_sha256),
+                RelocalizationRequestIdentity::LegacyV1 {
+                    request_alias: request_identity_sha256, activation_alias: activation_identity_sha256,
+                },
             );
         }
 
         #[cfg(test)]
-        pub(crate) fn persist_terminal_query_result_for_tests(
-            &self,
-            result: crate::proto::RelocalizeResult,
-        ) {
-            let request_identity_sha256: [u8; 32] = result
-                .request_identity_sha256
-                .as_slice()
-                .try_into()
-                .expect("request identity");
-            let activation_identity_sha256: [u8; 32] = result
-                .activation_identity_sha256
-                .as_slice()
-                .try_into()
-                .expect("activation identity");
-            let request_id = result.request_id.clone();
-            let terminal = StoredRelocalizationResult::new(result);
-            self.terminal_store
-                .persist_terminal(
-                    &request_id,
-                    request_identity_sha256,
-                    activation_identity_sha256,
-                    &terminal,
-                )
-                .expect("persist terminal query fixture result");
+        pub(crate) fn persist_terminal_query_result_for_tests(&self, result: crate::proto::RelocalizeResult) {
+            // Explicit historical test fixture import, never a live V1 writer.
+            let request_alias = result.request_identity_sha256.as_slice().try_into().expect("request alias");
+            let activation_alias = result.activation_identity_sha256.as_slice().try_into().expect("activation alias");
+            let encoded = result.encode_to_vec();
+            self.terminal_store.state.lock().terminals.insert(result.request_id.clone(), DurableRelocalizationTerminal {
+                identity: RelocalizationRequestIdentity::LegacyV1 { request_alias, activation_alias },
+                terminal: StoredRelocalizationResult::LegacyReadOnly(Arc::new(LegacyRelocalizationTerminal { result, encoded })),
+            });
         }
 
         pub(crate) fn is_open(&self) -> bool {
@@ -6595,202 +6669,80 @@ mod preflight_only_contract {
         }
     }
 
+    use crate::relocalization_identity::AssignedCloudRelocalizeRequestIdentityV2;
+    use crate::relocalization_terminal_v2::{
+        AssignedRelocalizationTerminalV2, AssignedRelocalizationTerminalQueryV2,
+        assigned_terminal_filename_v2,
+    };
+
+    /// One identity domain in the existing ledger. Legacy values are opaque
+    /// read-only aliases; no assigned request is converted into a digest.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum RelocalizationRequestIdentity {
+        LegacyV1 { request_alias: [u8; 32], activation_alias: [u8; 32] },
+        Assigned(AssignedCloudRelocalizeRequestIdentityV2),
+    }
+
     #[derive(Clone)]
     struct ValidatedRelocalizeRequest {
-        request: crate::proto::RelocalizeRequest,
-        identity_sha256: [u8; 32],
-        activation_identity_sha256: [u8; 32],
-        target_receipt_sha256: [u8; 32],
-        target_cloud_sha256: [u8; 32],
-        asset_manifest_sha256: [u8; 32],
-        asset_bundle_sha256: [u8; 32],
-        source_policy_sha256: [u8; 32],
-        deadline_policy_sha256: [u8; 32],
-        algorithm_options_sha256: [u8; 32],
+        identity: AssignedCloudRelocalizeRequestIdentityV2,
     }
-
-    fn relocalization_digest(value: &[u8], field: &'static str) -> Result<[u8; 32], String> {
-        value
-            .try_into()
-            .map_err(|_| format!("{field} must contain exactly 32 bytes"))
-    }
-
-    fn validate_relocalization_string(field: &'static str, value: &str) -> Result<(), String> {
-        if value.is_empty()
-            || value.trim() != value
-            || value.len() > MAX_IDENTITY_STRING_BYTES
-            || value.contains('\0')
-        {
-            return Err(format!("{field} is not a canonical identity string"));
+    impl ValidatedRelocalizeRequest {
+        fn key(&self) -> RelocalizationRequestIdentity {
+            RelocalizationRequestIdentity::Assigned(self.identity.clone())
         }
-        Ok(())
+        fn request_id(&self) -> &str { self.identity.request_id() }
+        fn target(&self) -> &InstalledTargetReceiptV2 { self.identity.target() }
+        fn timeout_ms(&self) -> u64 { self.identity.logical_timeout_ms() }
     }
 
     pub(crate) fn validate_relocalization_request_id(value: &str) -> Result<(), String> {
-        if value.is_empty()
-            || value.len() > 128
-            || !value.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
-            })
-        {
-            return Err("RELOCALIZATION_REQUEST_ID_INVALID".to_owned());
-        }
+        if value.is_empty() || value.len() > 128 || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+        }) { return Err("RELOCALIZATION_REQUEST_ID_INVALID".into()); }
         Ok(())
     }
-
     pub(crate) fn normalize_relocalization_logical_timeout_ms(value: u64) -> Result<u64, String> {
         match value {
             0 => Ok(RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS),
-            RELOCALIZATION_MIN_LOGICAL_TIMEOUT_MS..=RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS => {
-                Ok(value)
-            }
-            _ => Err("RELOCALIZATION_LOGICAL_TIMEOUT_INVALID".to_owned()),
+            RELOCALIZATION_MIN_LOGICAL_TIMEOUT_MS..=RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS => Ok(value),
+            _ => Err("RELOCALIZATION_LOGICAL_TIMEOUT_INVALID".into()),
         }
     }
-
-    fn canonical_relocalization_request_preimage(
-        request: &crate::proto::RelocalizeRequest,
-    ) -> Result<Vec<u8>, String> {
-        validate_relocalization_request_id(&request.request_id)?;
-        validate_relocalization_string("session_id", &request.session_id)?;
-        validate_relocalization_string("map_name", &request.map_name)?;
-        let activation_identity =
-            relocalization_digest(&request.activation_identity_sha256, "activation identity")?;
-        let target_receipt =
-            relocalization_digest(&request.target_receipt_sha256, "target receipt")?;
-        let planar=request.target_kind=="planar_graph";
-        let target_cloud = if planar {[0;32]}else{relocalization_digest(&request.target_cloud_sha256, "target cloud")?};
-        let asset_manifest =
-            relocalization_digest(&request.asset_manifest_sha256, "asset manifest")?;
-        let asset_bundle = relocalization_digest(&request.asset_bundle_sha256, "asset bundle")?;
-        let source_policy = relocalization_digest(&request.source_policy_sha256, "source policy")?;
-        let deadline_policy =
-            relocalization_digest(&request.deadline_policy_sha256, "deadline policy")?;
-        let algorithm_options =
-            relocalization_digest(&request.algorithm_options_sha256, "algorithm options")?;
-
-        let mut out = b"nuwax.geometry.relocalize.request.v1\0".to_vec();
-        out.extend_from_slice(&request.schema_version.to_be_bytes());
-        canonical_push_string(&mut out, &request.request_id);
-        out.extend_from_slice(&request.runtime_generation.to_be_bytes());
-        canonical_push_string(&mut out, &request.session_id);
-        canonical_push_string(&mut out, &request.map_name);
-        out.extend_from_slice(&request.session_generation.to_be_bytes());
-        out.extend_from_slice(&request.backend_generation.to_be_bytes());
-        out.extend_from_slice(&activation_identity);
-        out.extend_from_slice(&target_receipt);
-        out.extend_from_slice(&request.target_cloud_revision.to_be_bytes());
-        out.extend_from_slice(&target_cloud);
-        out.extend_from_slice(&asset_manifest);
-        out.extend_from_slice(&asset_bundle);
-        out.extend_from_slice(&request.source_policy_version.to_be_bytes());
-        out.extend_from_slice(&source_policy);
-        out.extend_from_slice(&request.deadline_policy_version.to_be_bytes());
-        out.extend_from_slice(&deadline_policy);
-        out.extend_from_slice(
-            &normalize_relocalization_logical_timeout_ms(request.logical_timeout_ms)?.to_be_bytes(),
-        );
-        out.extend_from_slice(&request.algorithm_options_version.to_be_bytes());
-        out.extend_from_slice(&algorithm_options);
-        if planar {
-            if !request.target_cloud_sha256.is_empty() || request.target_cloud_revision!=0 {return Err("二维重定位不能携带点云身份".into());}
-            let seed=request.planar_seed.as_ref().ok_or("二维重定位缺少明确初始位置")?;
-            if [seed.x,seed.y,seed.yaw].iter().any(|v|!v.is_finite()) || seed.yaw.abs()>std::f64::consts::PI {return Err("二维重定位初值非法".into());}
-            out.extend_from_slice(b"nuwax.geometry.planar-relocalize.v1\0");
-            out.extend_from_slice(&relocalization_digest(&request.target_graph_sha256,"target graph")?);
-            for v in [seed.x,seed.y,seed.yaw] {out.extend_from_slice(&v.to_bits().to_be_bytes());}
-        } else if !request.target_kind.is_empty() || request.planar_seed.is_some() || !request.target_graph_sha256.is_empty() {
-            return Err("不支持的重定位目标类型".into());
-        }
-        Ok(out)
-    }
-
-    fn validate_relocalize_request(
-        mut request: crate::proto::RelocalizeRequest,
-    ) -> Result<ValidatedRelocalizeRequest, String> {
-        request.logical_timeout_ms =
-            normalize_relocalization_logical_timeout_ms(request.logical_timeout_ms)?;
-        let preimage = canonical_relocalization_request_preimage(&request)?;
-        if request.schema_version != RELOCALIZATION_SCHEMA_VERSION_V1 {
-            return Err("RELOCALIZATION_SCHEMA_VERSION_UNSUPPORTED".to_owned());
-        }
-        if request.runtime_generation == 0
-            || request.session_generation == 0
-            || request.backend_generation == 0
-            || (request.target_kind!="planar_graph" && request.target_cloud_revision == 0)
-        {
-            return Err("RELOCALIZATION_IDENTITY_GENERATION_INVALID".to_owned());
-        }
-        let activation_identity_sha256 =
-            relocalization_digest(&request.activation_identity_sha256, "activation identity")?;
-        let target_receipt_sha256 =
-            relocalization_digest(&request.target_receipt_sha256, "target receipt")?;
-        let target_cloud_sha256 = if request.target_kind=="planar_graph" {[0;32]} else {
-            relocalization_digest(&request.target_cloud_sha256, "target cloud")?};
-        let asset_manifest_sha256 =
-            relocalization_digest(&request.asset_manifest_sha256, "asset manifest")?;
-        let asset_bundle_sha256 =
-            relocalization_digest(&request.asset_bundle_sha256, "asset bundle")?;
-        let source_policy_sha256 =
-            relocalization_digest(&request.source_policy_sha256, "source policy")?;
-        let deadline_policy_sha256 =
-            relocalization_digest(&request.deadline_policy_sha256, "deadline policy")?;
-        let algorithm_options_sha256 =
-            relocalization_digest(&request.algorithm_options_sha256, "algorithm options")?;
-        if request.source_policy_version != RELOCALIZATION_SOURCE_POLICY_VERSION
-            || source_policy_sha256 != if request.target_kind=="planar_graph" {planar_source_policy_sha256()}else{relocalization_source_policy_sha256_v1()}
-            || request.deadline_policy_version != RELOCALIZATION_DEADLINE_POLICY_VERSION_V1
-            || deadline_policy_sha256 != relocalization_deadline_policy_sha256_v1()
-            || request.algorithm_options_version != RELOCALIZATION_ALGORITHM_OPTIONS_VERSION
-            || algorithm_options_sha256 != if request.target_kind=="planar_graph" {planar_algorithm_policy_sha256()}else{relocalization_algorithm_options_sha256_v1()}
-        {
-            return Err("RELOCALIZATION_POLICY_IDENTITY_MISMATCH".to_owned());
-        }
-        Ok(ValidatedRelocalizeRequest {
-            request,
-            identity_sha256: sha256_bytes(&preimage),
-            activation_identity_sha256,
-            target_receipt_sha256,
-            target_cloud_sha256,
-            asset_manifest_sha256,
-            asset_bundle_sha256,
-            source_policy_sha256,
-            deadline_policy_sha256,
-            algorithm_options_sha256,
-        })
-    }
-
-    fn invalid_relocalization_request_identity(
-        request: &crate::proto::RelocalizeRequest,
-    ) -> [u8; 32] {
-        let mut bytes = b"nuwax.geometry.relocalize.invalid-request.v1\0".to_vec();
-        bytes.extend_from_slice(&request.encode_to_vec());
-        sha256_bytes(&bytes)
+    fn validate_relocalize_request(request: crate::proto::RelocalizeRequest)
+        -> Result<ValidatedRelocalizeRequest, String>
+    {
+        // The outer availability gate remains closed until the paired caller
+        // chain is qualified. This actor never executes legacy live commands.
+        AssignedCloudRelocalizeRequestIdentityV2::admit(request)
+            .map(|identity| ValidatedRelocalizeRequest { identity })
     }
 
     #[derive(Clone)]
-    struct StoredRelocalizationResult {
+    enum StoredRelocalizationResult {
+        LegacyReadOnly(Arc<LegacyRelocalizationTerminal>),
+        Assigned(AssignedRelocalizationTerminalV2),
+    }
+    struct LegacyRelocalizationTerminal {
         result: crate::proto::RelocalizeResult,
         encoded: Vec<u8>,
-        encoded_sha256: [u8; 32],
+    }
+    impl StoredRelocalizationResult {
+        fn result(&self) -> &crate::proto::RelocalizeResult {
+            match self { Self::LegacyReadOnly(value) => &value.result, Self::Assigned(value) => value.result() }
+        }
+        fn encoded(&self) -> &[u8] {
+            match self { Self::LegacyReadOnly(value) => &value.encoded, Self::Assigned(value) => value.encoded() }
+        }
+        fn to_wire(&self) -> crate::proto::RelocalizeResult { self.result().clone() }
     }
 
-    impl StoredRelocalizationResult {
-        fn new(result: crate::proto::RelocalizeResult) -> Self {
-            let encoded = result.encode_to_vec();
-            let encoded_sha256 = sha256_bytes(&encoded);
-            Self {
-                result,
-                encoded,
-                encoded_sha256,
-            }
-        }
-    }
 
     #[allow(clippy::large_enum_variant)]
     #[derive(Clone, Debug)]
     pub(crate) enum RelocalizationTerminalSnapshot {
         Terminal(crate::proto::RelocalizeResult),
+        AssignedTerminal(AssignedRelocalizationTerminalV2),
         Pending,
         NotFound,
         IdentityConflict,
@@ -6813,14 +6765,13 @@ mod preflight_only_contract {
 
     #[derive(Clone)]
     struct DurableRelocalizationTerminal {
-        request_identity_sha256: [u8; 32],
-        activation_identity_sha256: [u8; 32],
+        identity: RelocalizationRequestIdentity,
         terminal: StoredRelocalizationResult,
     }
 
     struct RelocalizationTerminalStoreState {
         terminals: HashMap<String, DurableRelocalizationTerminal>,
-        pending: HashMap<String, ([u8; 32], [u8; 32])>,
+        pending: HashMap<String, RelocalizationRequestIdentity>,
     }
 
     struct RelocalizationTerminalOwnerLease {
@@ -7040,6 +6991,12 @@ mod preflight_only_contract {
         let body = file_name
             .strip_prefix(RELOCALIZATION_TERMINAL_TEMP_PREFIX)?
             .strip_suffix(RELOCALIZATION_TERMINAL_TEMP_SUFFIX)?;
+        let assigned_fields = body.split('.').collect::<Vec<_>>();
+        if let [owner, attempt, "assigned-v2"] = assigned_fields.as_slice() {
+            return (is_terminal_token(owner, RELOCALIZATION_TERMINAL_OWNER_TOKEN_BYTES)
+                && is_terminal_token(attempt, RELOCALIZATION_TERMINAL_ATTEMPT_TOKEN_BYTES))
+                .then_some(*owner);
+        }
         let mut fields = body.split('.');
         let (Some(owner), Some(attempt), Some(request), Some(record), None) = (
             fields.next(),
@@ -7307,56 +7264,29 @@ mod preflight_only_contract {
                 .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
             for entry in entries {
                 let path = entry.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                let filename = entry.file_name();
+                let filename = filename.to_str().ok_or("RELOCALIZATION_TERMINAL_STORE_FILENAME_INVALID")?;
+                let assigned = filename.starts_with("assigned-") || path.extension().and_then(|value| value.to_str()) == Some("terminal");
+                if !assigned && path.extension().and_then(|value| value.to_str()) != Some("json") {
                     continue;
                 }
                 if terminals.len() >= RELOCALIZATION_MAX_COMMAND_RECORDS {
-                    return Err("RELOCALIZATION_TERMINAL_STORE_RETENTION_EXCEEDED".to_owned());
+                    return Err("RELOCALIZATION_TERMINAL_STORE_RETENTION_EXCEEDED".into());
                 }
                 let bytes = read_terminal_record(&path)?;
-                let record: DurableRelocalizationTerminalV1 = serde_json::from_slice(&bytes)
-                    .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID".to_owned())?;
-                if record.schema_version != 1
-                    || validate_relocalization_request_id(&record.request_id).is_err()
-                {
-                    return Err("RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID".to_owned());
-                }
-                let request_identity_sha256: [u8; 32] =
-                    decode_hex(&record.request_identity_sha256, 32)?
-                        .try_into()
-                        .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID".to_owned())?;
-                let activation_identity_sha256: [u8; 32] =
-                    decode_hex(&record.activation_identity_sha256, 32)?
-                        .try_into()
-                        .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID".to_owned())?;
-                let encoded = decode_hex(&record.terminal_hex, RELOCALIZATION_MAX_TERMINAL_BYTES)?;
-                if encode_hex(&sha256_bytes(&encoded)) != record.terminal_sha256 {
-                    return Err("RELOCALIZATION_TERMINAL_STORE_DIGEST_MISMATCH".to_owned());
-                }
-                let result = crate::proto::RelocalizeResult::decode(encoded.as_slice())
-                    .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_TERMINAL_INVALID".to_owned())?;
-                if result.request_id != record.request_id
-                    || result.request_identity_sha256.as_slice() != request_identity_sha256
-                    || result.activation_identity_sha256.as_slice() != activation_identity_sha256
-                {
-                    return Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_MISMATCH".to_owned());
-                }
-                let terminal = StoredRelocalizationResult::new(result);
-                if terminal.encoded != encoded {
-                    return Err("RELOCALIZATION_TERMINAL_STORE_NON_CANONICAL".to_owned());
-                }
-                if terminals
-                    .insert(
-                        record.request_id,
-                        DurableRelocalizationTerminal {
-                            request_identity_sha256,
-                            activation_identity_sha256,
-                            terminal,
-                        },
-                    )
-                    .is_some()
-                {
-                    return Err("RELOCALIZATION_TERMINAL_STORE_DUPLICATE".to_owned());
+                let (request_id, durable) = if assigned {
+                    let terminal = AssignedRelocalizationTerminalV2::decode_durable_named(
+                        filename, &bytes, Some(&validate_assigned_terminal_retained),
+                    )?;
+                    (terminal.request().request_id().to_owned(), DurableRelocalizationTerminal {
+                        identity: RelocalizationRequestIdentity::Assigned(terminal.request().clone()),
+                        terminal: StoredRelocalizationResult::Assigned(terminal),
+                    })
+                } else {
+                    read_legacy_relocalization_terminal(&bytes)?
+                };
+                if terminals.insert(request_id, durable).is_some() {
+                    return Err("RELOCALIZATION_TERMINAL_STORE_DUPLICATE".into());
                 }
             }
             let cleanup_lock = lock_terminal_cleanup(&root)?;
@@ -7382,152 +7312,137 @@ mod preflight_only_contract {
 
         fn mark_pending(&self, request: &ValidatedRelocalizeRequest) -> Result<(), String> {
             let mut state = self.state.lock();
-            if let Some(existing) = state.terminals.get(&request.request.request_id) {
-                return if existing.request_identity_sha256 == request.identity_sha256
-                    && existing.activation_identity_sha256 == request.activation_identity_sha256
-                {
-                    Ok(())
-                } else {
-                    Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".to_owned())
-                };
+            let identity = request.key();
+            if let Some(existing) = state.terminals.get(request.request_id()) {
+                return if existing.identity == identity { Ok(()) }
+                    else { Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into()) };
             }
-            match state.pending.get(&request.request.request_id) {
-                Some(identity)
-                    if *identity
-                        != (request.identity_sha256, request.activation_identity_sha256) =>
-                {
-                    Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".to_owned())
-                }
-                _ => {
-                    state.pending.insert(
-                        request.request.request_id.clone(),
-                        (request.identity_sha256, request.activation_identity_sha256),
-                    );
-                    Ok(())
-                }
+            if state.pending.get(request.request_id()).is_some_and(|existing| existing != &identity) {
+                return Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into());
             }
+            state.pending.insert(request.request_id().to_owned(), identity);
+            Ok(())
         }
 
         fn persist_terminal(
-            &self,
-            request_id: &str,
-            request_identity_sha256: [u8; 32],
-            activation_identity_sha256: [u8; 32],
+            &self, request_id: &str, identity: &RelocalizationRequestIdentity,
             terminal: &StoredRelocalizationResult,
         ) -> Result<(), String> {
-            if terminal.encoded.len() > RELOCALIZATION_MAX_TERMINAL_BYTES {
-                return Err("RELOCALIZATION_TERMINAL_STORE_TERMINAL_TOO_LARGE".to_owned());
+            let (RelocalizationRequestIdentity::Assigned(request), StoredRelocalizationResult::Assigned(assigned))
+                = (identity, terminal) else {
+                return Err("RELOCALIZATION_LEGACY_TERMINAL_WRITE_UNSUPPORTED".into());
+            };
+            if request.request_id() != request_id || assigned.request() != request {
+                return Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into());
             }
             let mut state = self.state.lock();
             if let Some(existing) = state.terminals.get(request_id) {
-                return if existing.request_identity_sha256 == request_identity_sha256
-                    && existing.activation_identity_sha256 == activation_identity_sha256
-                    && existing.terminal.encoded == terminal.encoded
-                {
+                return if &existing.identity == identity && existing.terminal.encoded() == terminal.encoded() {
                     Ok(())
-                } else {
-                    Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".to_owned())
-                };
+                } else { Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into()) };
             }
             if state.terminals.len() >= RELOCALIZATION_MAX_COMMAND_RECORDS {
-                return Err("RELOCALIZATION_TERMINAL_STORE_RETENTION_EXCEEDED".to_owned());
+                return Err("RELOCALIZATION_TERMINAL_STORE_RETENTION_EXCEEDED".into());
             }
-            let record = DurableRelocalizationTerminalV1 {
-                schema_version: 1,
-                request_id: request_id.to_owned(),
-                request_identity_sha256: encode_hex(&request_identity_sha256),
-                activation_identity_sha256: encode_hex(&activation_identity_sha256),
-                terminal_hex: encode_hex(&terminal.encoded),
-                terminal_sha256: encode_hex(&terminal.encoded_sha256),
-            };
-            let bytes = serde_json::to_vec(&record)
-                .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_ENCODE_FAILED:{error}"))?;
-            let request_digest = encode_hex(&sha256_bytes(request_id.as_bytes()));
-            let file_name = format!("{request_digest}.json");
-            let final_path = self.root.join(file_name);
+            if state.pending.get(request_id).is_some_and(|existing| existing != identity) {
+                return Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into());
+            }
+            let bytes = assigned.encode_durable()?;
+            let final_path = self.root.join(assigned_terminal_filename_v2(request_id)?);
+            // Existing owner/attempt uniqueness, with no request/content digest.
             let attempt = terminal_owner_token();
             let temporary_path = self.root.join(format!(
-                "{RELOCALIZATION_TERMINAL_TEMP_PREFIX}{}.{}.{}.{}{RELOCALIZATION_TERMINAL_TEMP_SUFFIX}",
+                "{RELOCALIZATION_TERMINAL_TEMP_PREFIX}{}.{attempt}.assigned-v2{RELOCALIZATION_TERMINAL_TEMP_SUFFIX}",
                 self.owner_token,
-                attempt,
-                request_digest,
-                encode_hex(&sha256_bytes(&bytes))
             ));
-            let mut temporary = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary_path)
+            let mut temporary = OpenOptions::new().write(true).create_new(true).open(&temporary_path)
                 .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_CREATE_FAILED:{error}"))?;
             let write_result = (|| {
-                temporary.write_all(&bytes).map_err(|error| {
-                    format!("RELOCALIZATION_TERMINAL_STORE_WRITE_FAILED:{error}")
-                })?;
-                temporary.sync_all().map_err(|error| {
-                    format!("RELOCALIZATION_TERMINAL_STORE_FSYNC_FAILED:{error}")
-                })?;
+                temporary.write_all(&bytes).map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_WRITE_FAILED:{error}"))?;
+                temporary.sync_all().map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_FSYNC_FAILED:{error}"))?;
                 drop(temporary);
                 match fs::hard_link(&temporary_path, &final_path) {
-                    Ok(()) => {}
+                    Ok(()) => {},
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let existing = read_terminal_record(&final_path)?;
-                        if existing != bytes {
-                            return Err(
-                                "RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".to_owned()
-                            );
+                        if read_terminal_record(&final_path)? != bytes {
+                            return Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into());
                         }
-                    }
-                    Err(error) => {
-                        return Err(format!(
-                            "RELOCALIZATION_TERMINAL_STORE_PUBLISH_FAILED:{error}"
-                        ))
-                    }
+                    },
+                    Err(error) => return Err(format!("RELOCALIZATION_TERMINAL_STORE_PUBLISH_FAILED:{error}")),
                 }
                 fsync_directory(&self.root)
             })();
             let cleanup_result = remove_terminal_temporary(&temporary_path, &self.root);
             combine_terminal_persist_results(write_result, cleanup_result)?;
-            state.terminals.insert(
-                request_id.to_owned(),
-                DurableRelocalizationTerminal {
-                    request_identity_sha256,
-                    activation_identity_sha256,
-                    terminal: terminal.clone(),
-                },
-            );
+            state.terminals.insert(request_id.to_owned(), DurableRelocalizationTerminal {
+                identity: identity.clone(), terminal: terminal.clone(),
+            });
             state.pending.remove(request_id);
             Ok(())
         }
 
-        pub(crate) fn snapshot(
-            &self,
-            request_id: &str,
-            request_identity_sha256: [u8; 32],
-            activation_identity_sha256: [u8; 32],
-        ) -> RelocalizationTerminalSnapshot {
+        fn snapshot_exact(&self, request_id: &str, identity: &RelocalizationRequestIdentity)
+            -> RelocalizationTerminalSnapshot
+        {
             let state = self.state.lock();
             if let Some(terminal) = state.terminals.get(request_id) {
-                return if terminal.request_identity_sha256 == request_identity_sha256
-                    && terminal.activation_identity_sha256 == activation_identity_sha256
-                {
-                    RelocalizationTerminalSnapshot::Terminal(terminal.terminal.result.clone())
-                } else {
-                    RelocalizationTerminalSnapshot::IdentityConflict
-                };
+                return if &terminal.identity == identity {
+                    match &terminal.terminal {
+                        StoredRelocalizationResult::LegacyReadOnly(_) => RelocalizationTerminalSnapshot::Terminal(terminal.terminal.to_wire()),
+                        StoredRelocalizationResult::Assigned(value) => RelocalizationTerminalSnapshot::AssignedTerminal(value.clone()),
+                    }
+                } else { RelocalizationTerminalSnapshot::IdentityConflict };
             }
             match state.pending.get(request_id) {
-                Some(identity)
-                    if *identity == (request_identity_sha256, activation_identity_sha256) =>
-                {
-                    RelocalizationTerminalSnapshot::Pending
-                }
+                Some(existing) if existing == identity => RelocalizationTerminalSnapshot::Pending,
                 Some(_) => RelocalizationTerminalSnapshot::IdentityConflict,
                 None => RelocalizationTerminalSnapshot::NotFound,
             }
         }
+
+        /// Explicit historical read. Aliases are opaque and never recomputed.
+        pub(crate) fn snapshot(&self, request_id: &str, request_alias: [u8; 32], activation_alias: [u8; 32])
+            -> RelocalizationTerminalSnapshot
+        {
+            self.snapshot_exact(request_id, &RelocalizationRequestIdentity::LegacyV1 { request_alias, activation_alias })
+        }
     }
 
+    /// Reopening legacy bytes checks canonical protobuf shape and stored alias
+    /// bindings only. A stored checksum is opaque: this is not content attestation
+    /// and no historical V1 record is upgraded to assigned authority.
+    fn read_legacy_relocalization_terminal(bytes: &[u8]) -> Result<(String, DurableRelocalizationTerminal), String> {
+        let record: DurableRelocalizationTerminalV1 = serde_json::from_slice(bytes)
+            .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID")?;
+        if record.schema_version != 1 { return Err("RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID".into()); }
+        validate_relocalization_request_id(&record.request_id)?;
+        let request_alias = decode_hex(&record.request_identity_sha256, 32)?.try_into()
+            .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID")?;
+        let activation_alias = decode_hex(&record.activation_identity_sha256, 32)?.try_into()
+            .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID")?;
+        let opaque_checksum = decode_hex(&record.terminal_sha256, 32)?;
+        if opaque_checksum.len() != 32 { return Err("RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID".into()); }
+        let encoded = decode_hex(&record.terminal_hex, RELOCALIZATION_MAX_TERMINAL_BYTES)?;
+        let result = crate::proto::RelocalizeResult::decode(encoded.as_slice())
+            .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_TERMINAL_INVALID")?;
+        if result.schema_version != 1 || result.assigned_cloud_v2.is_some()
+            || result.request_id != record.request_id
+            || result.request_identity_sha256.as_slice() != request_alias
+            || result.activation_identity_sha256.as_slice() != activation_alias
+            || crate::proto::RelocalizeDisposition::try_from(result.disposition).is_err()
+            || result.disposition == crate::proto::RelocalizeDisposition::Unspecified as i32 {
+            return Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_MISMATCH".into());
+        }
+        if result.encode_to_vec() != encoded { return Err("RELOCALIZATION_TERMINAL_STORE_NON_CANONICAL".into()); }
+        Ok((record.request_id, DurableRelocalizationTerminal {
+            identity: RelocalizationRequestIdentity::LegacyV1 { request_alias, activation_alias },
+            terminal: StoredRelocalizationResult::LegacyReadOnly(Arc::new(LegacyRelocalizationTerminal { result, encoded })),
+        }))
+    }
+
+
     struct RelocalizationLedgerAdmissionMetadata {
-        request: crate::proto::RelocalizeRequest,
+        request: ValidatedRelocalizeRequest,
         admission_ordinal: u64,
         logical_deadline: Instant,
         claim_phase: RelocalizationClaimPhase,
@@ -7543,12 +7458,11 @@ mod preflight_only_contract {
 
     struct RelocalizationLedgerRecord {
         origin: RelocalizationLedgerOrigin,
-        identity_sha256: [u8; 32],
-        activation_identity_sha256: [u8; 32],
+        identity: RelocalizationRequestIdentity,
         waiter_ids: HashSet<u64>,
         terminal: Option<StoredRelocalizationResult>,
-        conflicts: HashMap<[u8; 32], StoredRelocalizationResult>,
-        conflict_overflow: Option<([u8; 32], StoredRelocalizationResult)>,
+        conflicts: Vec<(RelocalizationRequestIdentity, StoredRelocalizationResult)>,
+        conflict_overflow: Option<(RelocalizationRequestIdentity, StoredRelocalizationResult)>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7622,11 +7536,10 @@ mod preflight_only_contract {
                         request_id.clone(),
                         RelocalizationLedgerRecord {
                             origin: RelocalizationLedgerOrigin::RestoredTerminal,
-                            identity_sha256: durable.request_identity_sha256,
-                            activation_identity_sha256: durable.activation_identity_sha256,
+                            identity: durable.identity.clone(),
                             waiter_ids: HashSet::new(),
                             terminal: Some(durable.terminal.clone()),
-                            conflicts: HashMap::new(),
+                            conflicts: Vec::new(),
                             conflict_overflow: None,
                         },
                     )
@@ -7648,9 +7561,8 @@ mod preflight_only_contract {
             if waiter_id == 0 {
                 return Err("RELOCALIZATION_WAITER_ID_INVALID");
             }
-            if let Some(record) = self.records.get(&request.request.request_id) {
-                if record.identity_sha256 == request.identity_sha256
-                    && record.activation_identity_sha256 == request.activation_identity_sha256
+            if let Some(record) = self.records.get(request.request_id()) {
+                if record.identity == request.key()
                 {
                     if let Some(terminal) = &record.terminal {
                         return Ok(RelocalizationLedgerAdmission::Replay(terminal.clone()));
@@ -7662,7 +7574,7 @@ mod preflight_only_contract {
                     let logical_deadline = metadata.logical_deadline;
                     let record = self
                         .records
-                        .get_mut(&request.request.request_id)
+                        .get_mut(request.request_id())
                         .expect("relocalization record remains present");
                     record.waiter_ids.insert(waiter_id);
                     return Ok(RelocalizationLedgerAdmission::Joined {
@@ -7670,11 +7582,11 @@ mod preflight_only_contract {
                         logical_deadline,
                     });
                 }
-                if let Some(conflict) = record.conflicts.get(&request.identity_sha256) {
+                if let Some(conflict) = record.conflicts.iter().find(|(identity, _)| identity == &request.key()).map(|(_, terminal)| terminal) {
                     return Ok(RelocalizationLedgerAdmission::Conflict(conflict.clone()));
                 }
                 if let Some((overflow_identity, conflict)) = &record.conflict_overflow {
-                    if *overflow_identity == request.identity_sha256 {
+                    if *overflow_identity == request.key() {
                         return Ok(RelocalizationLedgerAdmission::Conflict(conflict.clone()));
                     }
                     return Ok(RelocalizationLedgerAdmission::CapacityExceeded(
@@ -7684,17 +7596,17 @@ mod preflight_only_contract {
                 if record.conflicts.len() >= RELOCALIZATION_MAX_CONFLICTS_PER_RECORD {
                     let conflict = conflict_result();
                     self.records
-                        .get_mut(&request.request.request_id)
+                        .get_mut(request.request_id())
                         .expect("relocalization record remains present")
-                        .conflict_overflow = Some((request.identity_sha256, conflict.clone()));
+                        .conflict_overflow = Some((request.key(), conflict.clone()));
                     return Ok(RelocalizationLedgerAdmission::ConflictOverflow(conflict));
                 }
                 let conflict = conflict_result();
                 self.records
-                    .get_mut(&request.request.request_id)
+                    .get_mut(request.request_id())
                     .expect("relocalization record remains present")
                     .conflicts
-                    .insert(request.identity_sha256, conflict.clone());
+                    .push((request.key(), conflict.clone()));
                 return Ok(RelocalizationLedgerAdmission::Conflict(conflict));
             }
 
@@ -7718,28 +7630,27 @@ mod preflight_only_contract {
                 .checked_add(1)
                 .ok_or("RELOCALIZATION_ADMITTED_COMMAND_COUNT_EXHAUSTED")?;
             let logical_deadline = now
-                .checked_add(Duration::from_millis(request.request.logical_timeout_ms))
+                .checked_add(Duration::from_millis(request.timeout_ms()))
                 .ok_or("RELOCALIZATION_LOGICAL_DEADLINE_OVERFLOW")?;
             self.relocalization_mode.activate()?;
             self.next_admission_ordinal = admission_ordinal;
             self.admitted_command_count = admitted_command_count;
-            self.active_request_id = Some(request.request.request_id.clone());
+            self.active_request_id = Some(request.request_id().to_owned());
             self.records.insert(
-                request.request.request_id.clone(),
+                request.request_id().to_owned(),
                 RelocalizationLedgerRecord {
                     origin: RelocalizationLedgerOrigin::Admitted(
                         RelocalizationLedgerAdmissionMetadata {
-                            request: request.request.clone(),
+                            request: request.clone(),
                             admission_ordinal,
                             logical_deadline,
                             claim_phase: RelocalizationClaimPhase::Preclaim,
                         },
                     ),
-                    identity_sha256: request.identity_sha256,
-                    activation_identity_sha256: request.activation_identity_sha256,
+                    identity: request.key(),
                     waiter_ids: HashSet::from([waiter_id]),
                     terminal: None,
-                    conflicts: HashMap::new(),
+                    conflicts: Vec::new(),
                     conflict_overflow: None,
                 },
             );
@@ -7755,7 +7666,7 @@ mod preflight_only_contract {
             now: Instant,
             terminal: StoredRelocalizationResult,
         ) -> Result<(), &'static str> {
-            if self.records.contains_key(&request.request.request_id) {
+            if self.records.contains_key(request.request_id()) {
                 return Err("RELOCALIZATION_COMMAND_CAPACITY_RECORD_ALREADY_EXISTS");
             }
             if self.active_request_id.is_some() {
@@ -7769,21 +7680,20 @@ mod preflight_only_contract {
                 .checked_add(1)
                 .ok_or("RELOCALIZATION_ADMITTED_COMMAND_COUNT_EXHAUSTED")?;
             self.records.insert(
-                request.request.request_id.clone(),
+                request.request_id().to_owned(),
                 RelocalizationLedgerRecord {
                     origin: RelocalizationLedgerOrigin::Admitted(
                         RelocalizationLedgerAdmissionMetadata {
-                            request: request.request.clone(),
+                            request: request.clone(),
                             admission_ordinal: 0,
                             logical_deadline: now,
                             claim_phase: RelocalizationClaimPhase::Preclaim,
                         },
                     ),
-                    identity_sha256: request.identity_sha256,
-                    activation_identity_sha256: request.activation_identity_sha256,
+                    identity: request.key(),
                     waiter_ids: HashSet::new(),
                     terminal: Some(terminal),
-                    conflicts: HashMap::new(),
+                    conflicts: Vec::new(),
                     conflict_overflow: None,
                 },
             );
@@ -7794,13 +7704,13 @@ mod preflight_only_contract {
         fn mark_postclaim(
             &mut self,
             request_id: &str,
-            identity_sha256: [u8; 32],
+            identity: &RelocalizationRequestIdentity,
         ) -> Result<(), &'static str> {
             let record = self
                 .records
                 .get_mut(request_id)
                 .ok_or("RELOCALIZATION_LEDGER_RECORD_MISSING")?;
-            if record.identity_sha256 != identity_sha256 || record.terminal.is_some() {
+            if &record.identity != identity || record.terminal.is_some() {
                 return Err("RELOCALIZATION_LEDGER_IDENTITY_MISMATCH");
             }
             let RelocalizationLedgerOrigin::Admitted(metadata) = &mut record.origin else {
@@ -7819,14 +7729,14 @@ mod preflight_only_contract {
         fn detach_waiter(
             &mut self,
             request_id: &str,
-            identity_sha256: [u8; 32],
+            identity: &RelocalizationRequestIdentity,
             waiter_id: u64,
         ) -> Result<bool, &'static str> {
             let record = self
                 .records
                 .get_mut(request_id)
                 .ok_or("RELOCALIZATION_LEDGER_RECORD_MISSING")?;
-            if record.identity_sha256 != identity_sha256 || record.terminal.is_some() {
+            if &record.identity != identity || record.terminal.is_some() {
                 return Err("RELOCALIZATION_LEDGER_IDENTITY_MISMATCH");
             }
             let RelocalizationLedgerOrigin::Admitted(metadata) = &record.origin else {
@@ -7840,18 +7750,18 @@ mod preflight_only_contract {
         fn settle_terminal(
             &mut self,
             request_id: &str,
-            identity_sha256: [u8; 32],
+            identity: &RelocalizationRequestIdentity,
             terminal: StoredRelocalizationResult,
         ) -> Result<RelocalizationTerminalWaiters, &'static str> {
             let record = self
                 .records
                 .get_mut(request_id)
                 .ok_or("RELOCALIZATION_LEDGER_RECORD_MISSING")?;
-            if record.identity_sha256 != identity_sha256 {
+            if &record.identity != identity {
                 return Err("RELOCALIZATION_LEDGER_IDENTITY_MISMATCH");
             }
             if let Some(stored) = &record.terminal {
-                if stored.encoded == terminal.encoded {
+                if stored.encoded() == terminal.encoded() {
                     return Ok(RelocalizationTerminalWaiters {
                         waiter_ids: Vec::new(),
                         result: stored.clone(),
@@ -7942,7 +7852,7 @@ mod preflight_only_contract {
                 .and_then(|record| record.terminal.as_ref())
         }
 
-        fn request(&self, request_id: &str) -> Option<&crate::proto::RelocalizeRequest> {
+        fn request(&self, request_id: &str) -> Option<&ValidatedRelocalizeRequest> {
             match &self.records.get(request_id)?.origin {
                 RelocalizationLedgerOrigin::Admitted(metadata) => Some(&metadata.request),
                 RelocalizationLedgerOrigin::RestoredTerminal => None,
@@ -7951,7 +7861,7 @@ mod preflight_only_contract {
 
         fn active_identity(
             &self,
-        ) -> Option<(String, [u8; 32], u64, Instant, RelocalizationClaimPhase)> {
+        ) -> Option<(String, RelocalizationRequestIdentity, u64, Instant, RelocalizationClaimPhase)> {
             let request_id = self.active_request_id.as_ref()?;
             let record = self.records.get(request_id)?;
             let RelocalizationLedgerOrigin::Admitted(metadata) = &record.origin else {
@@ -7959,7 +7869,7 @@ mod preflight_only_contract {
             };
             Some((
                 request_id.clone(),
-                record.identity_sha256,
+                record.identity.clone(),
                 metadata.admission_ordinal,
                 metadata.logical_deadline,
                 metadata.claim_phase,
@@ -8002,9 +7912,9 @@ mod preflight_only_contract {
         mode_epoch: u64,
         logical_deadline: Instant,
         accumulation_deadline: Instant,
-        snapshot: SealedActivatedTargetSnapshot,
+        snapshot: SealedAssignedActivatedTargetSnapshot,
         arm_watermark: Option<RelocalizationFrameKey>,
-        armed_map_watermarks: HashMap<u64, RelocalizationFrameKey>,
+        armed_map_watermarks: HashMap<RelocalizationFrameScope, RelocalizationFrameKey>,
         accepted: Vec<AccumulatedRelocalizationFrame>,
         aggregate_input_points: usize,
         session_map_frame_generation: Option<u64>,
@@ -8025,6 +7935,7 @@ mod preflight_only_contract {
             request: Box<ValidatedRelocalizeRequest>,
             admission_ordinal: u64,
             logical_deadline: Instant,
+            source_receipts: Vec<crate::proto::RelocalizationSourceReceiptV2>,
         },
         Reserving {
             computed: Option<Box<RelocalizationComputedCommand>>,
@@ -8042,7 +7953,7 @@ mod preflight_only_contract {
     enum RelocalizationTaskEvent {
         Computed {
             request_id: String,
-            identity_sha256: [u8; 32],
+            identity: RelocalizationRequestIdentity,
             source: Box<SealedRelocalizationSource>,
             output: RelocalizationComputeOutput,
         },
@@ -8196,11 +8107,9 @@ mod preflight_only_contract {
     }
 
     struct RelocalizationCommandActor {
-        planar_pending:Option<(ValidatedRelocalizeRequest,u64,u64,Instant,PlanarCommandWork)>,
-        planar_inflight:bool,
         ledger: RelocalizationCommandLedger,
         waiter_responses: HashMap<u64, oneshot::Sender<crate::proto::RelocalizeResult>>,
-        waiter_requests: HashMap<u64, (String, [u8; 32], Arc<RelocalizationWaiterCapacityLease>)>,
+        waiter_requests: HashMap<u64, (String, RelocalizationRequestIdentity, Arc<RelocalizationWaiterCapacityLease>)>,
         next_waiter_id: u64,
         owner_identity: CorrectionOwnerRuntimeIdentity,
         map_frame_id: String,
@@ -8209,7 +8118,7 @@ mod preflight_only_contract {
         execution: Option<RelocalizationExecution>,
         last_validated_frames: HashMap<RelocalizationFrameScope, RelocalizationFrameKey>,
         validated_frame_proofs:
-            HashMap<(RelocalizationFrameScope, RelocalizationFrameKey), [u8; 32]>,
+            HashMap<(RelocalizationFrameScope, RelocalizationFrameKey), std::sync::Weak<CorrectionFrameInput>>,
         next_candidate_sequence: u64,
         terminal_store: RelocalizationTerminalStore,
     }
@@ -8239,7 +8148,6 @@ mod preflight_only_contract {
             terminal_store: RelocalizationTerminalStore,
         ) -> Self {
             Self {
-                planar_pending:None,planar_inflight:false,
                 ledger: RelocalizationCommandLedger::from_terminal_store(&terminal_store),
                 waiter_responses: HashMap::new(),
                 waiter_requests: HashMap::new(),
@@ -8257,11 +8165,7 @@ mod preflight_only_contract {
         }
 
         fn handle_terminal_query(&self, query: RelocalizationTerminalQueryRequest) {
-            let terminal = self.terminal_store.snapshot(
-                &query.request_id,
-                query.request_identity_sha256,
-                query.activation_identity_sha256,
-            );
+            let terminal = self.terminal_store.snapshot_exact(&query.request_id, &query.identity);
             let result = self.ledger.observation().map(|ledger_observation| {
                 RelocalizationTerminalQuerySnapshot {
                     terminal,
@@ -8311,8 +8215,8 @@ mod preflight_only_contract {
             self.waiter_requests.insert(
                 waiter_id,
                 (
-                    request.request.request_id.clone(),
-                    request.identity_sha256,
+                    request.request_id().to_owned(),
+                    request.key(),
                     Arc::clone(&capacity_lease),
                 ),
             );
@@ -8329,128 +8233,53 @@ mod preflight_only_contract {
         }
 
         fn terminal_result(
-            &self,
-            request: &ValidatedRelocalizeRequest,
-            admission_ordinal: Option<u64>,
-            disposition: crate::proto::RelocalizeDisposition,
-            detail: &str,
-        ) -> StoredRelocalizationResult {
-            let evidence = RelocalizationEvidenceV1 {
-                request_identity_sha256: request.identity_sha256,
-                admission_ordinal,
-                normalized_logical_timeout_ms: Some(request.request.logical_timeout_ms),
-                runtime_generation: request.request.runtime_generation,
-                activated_mapping_backend_generation: request.request.backend_generation,
-                correction_owner_backend_generation: self.owner_identity.backend_generation,
-                session_id: &request.request.session_id,
-                map_name: &request.request.map_name,
-                session_generation: request.request.session_generation,
-                map_frame_id: &self.map_frame_id,
-                odom_frame_id: &self.odom_frame_id,
-                body_frame_id: &self.body_frame_id,
-                activation_identity_sha256: request.activation_identity_sha256,
-                target_receipt_sha256: request.target_receipt_sha256,
-                asset_manifest_sha256: request.asset_manifest_sha256,
-                asset_bundle_sha256: request.asset_bundle_sha256,
-                source_policy_version: request.request.source_policy_version,
-                source_policy_sha256: request.source_policy_sha256,
-                deadline_policy_version: request.request.deadline_policy_version,
-                deadline_policy_sha256: request.deadline_policy_sha256,
-                algorithm_options_version: request.request.algorithm_options_version,
-                algorithm_options_sha256: request.algorithm_options_sha256,
-                target: None,
-                source: None,
-                algorithm: None,
-                candidate: None,
-                terminal_disposition: disposition,
-                correction_revision: 0,
-                detail,
-            };
-            let evidence_preimage = canonical_relocalization_evidence_preimage_parts_v1(&evidence)
-                .expect("validated preclaim evidence is canonical");
-            let evidence_sha256 = sha256_bytes(&evidence_preimage.bytes);
-            let evidence_disclosure_v1 = build_relocalization_evidence_disclosure_v1(
-                &evidence_preimage.bytes,
-                evidence_preimage.canonical_source_range,
-            )
-            .expect("validated preclaim evidence disclosure is bounded");
-            StoredRelocalizationResult::new(build_relocalization_result(
-                &request.request,
-                request.identity_sha256,
-                disposition,
-                0,
-                None,
-                Vec::new(),
-                evidence_sha256,
-                evidence_disclosure_v1,
-                0,
-                detail,
-            ))
+            &self, request: &ValidatedRelocalizeRequest, admission_ordinal: Option<u64>,
+            disposition: crate::proto::RelocalizeDisposition, detail: &str,
+        ) -> Result<StoredRelocalizationResult, CorrectionRuntimeError> {
+            let mut evidence = self.assigned_evidence(request, admission_ordinal, None, None)?;
+            if admission_ordinal.is_some() {
+                match self.execution.as_ref() {
+                    Some(RelocalizationExecution::Accumulating(accumulation)) if accumulation.request.key() == request.key() => {
+                        for frame in &accumulation.accepted {
+                            evidence.source_frames.push(assigned_source_receipt(&frame.input, &self.map_frame_id,
+                                &self.odom_frame_id, &self.body_frame_id).map_err(CorrectionRuntimeError::Apply)?);
+                        }
+                    },
+                    Some(RelocalizationExecution::Computing { request: active, source_receipts, .. }) if active.key() == request.key() => {
+                        evidence.source_frames = source_receipts.clone();
+                    },
+                    Some(RelocalizationExecution::Reserving { computed: Some(computed) }
+                        | RelocalizationExecution::Staging { computed: Some(computed), .. }) if computed.request.key() == request.key() => {
+                        evidence = self.assigned_evidence(request, admission_ordinal, Some(&computed.source), Some(&computed.output))?;
+                    },
+                    _ => {},
+                }
+                if !evidence.source_frames.is_empty() && evidence.algorithm.is_none() {
+                    evidence.phase = crate::proto::AssignedRelocalizationEvidencePhaseV2::SourceSelected as i32;
+                }
+            }
+            let result = assigned_relocalization_result(&request.identity, disposition, 0, detail, Vec::new(), evidence);
+            AssignedRelocalizationTerminalV2::new(result, Some(&validate_assigned_terminal_retained))
+                .map(StoredRelocalizationResult::Assigned).map_err(CorrectionRuntimeError::Apply)
         }
 
-        fn busy_result(
-            &self,
-            request: &ValidatedRelocalizeRequest,
-        ) -> crate::proto::RelocalizeResult {
-            let mut result = self
-                .terminal_result(
-                    request,
-                    None,
-                    crate::proto::RelocalizeDisposition::Busy,
-                    "RELOCALIZATION_OWNER_BUSY",
-                )
-                .result;
-            result.terminal_proof_sha256.clear();
-            result
-        }
-
-        fn invalid_result(
-            &self,
-            request: &crate::proto::RelocalizeRequest,
-            detail: String,
-        ) -> crate::proto::RelocalizeResult {
-            let evidence_disclosure_v1 =
-                build_relocalization_evidence_disclosure_v1(detail.as_bytes(), None)
-                    .expect("invalid-request evidence disclosure is bounded");
-            build_relocalization_result(
-                request,
-                invalid_relocalization_request_identity(request),
-                crate::proto::RelocalizeDisposition::Rejected,
-                0,
-                None,
-                Vec::new(),
-                sha256_bytes(detail.as_bytes()),
-                evidence_disclosure_v1,
-                0,
-                detail,
-            )
+        fn busy_result(&self, request: &ValidatedRelocalizeRequest)
+            -> Result<crate::proto::RelocalizeResult, CorrectionRuntimeError>
+        {
+            Ok(self.terminal_result(request, None, crate::proto::RelocalizeDisposition::Busy,
+                "RELOCALIZATION_OWNER_BUSY")?.to_wire())
         }
 
         fn settle_terminal_durable(
-            &mut self,
-            request_id: &str,
-            identity_sha256: [u8; 32],
+            &mut self, request_id: &str, identity: &RelocalizationRequestIdentity,
             terminal: StoredRelocalizationResult,
         ) -> Result<RelocalizationTerminalWaiters, CorrectionRuntimeError> {
-            let request = self.ledger.request(request_id).ok_or_else(|| {
-                CorrectionRuntimeError::Apply(
-                    "relocalization request missing before durable terminal".to_owned(),
-                )
-            })?;
-            let activation_identity_sha256 =
-                relocalization_digest(&request.activation_identity_sha256, "activation identity")
-                    .map_err(CorrectionRuntimeError::Apply)?;
-            self.terminal_store
-                .persist_terminal(
-                    request_id,
-                    identity_sha256,
-                    activation_identity_sha256,
-                    &terminal,
-                )
-                .map_err(CorrectionRuntimeError::Apply)?;
-            self.ledger
-                .settle_terminal(request_id, identity_sha256, terminal)
-                .map_err(|detail| CorrectionRuntimeError::Apply(detail.to_owned()))
+            let request = self.ledger.request(request_id).ok_or_else(||
+                CorrectionRuntimeError::Apply("relocalization request missing before durable terminal".into()))?;
+            if &request.key() != identity { return Err(CorrectionRuntimeError::Apply("relocalization durable identity mismatch".into())); }
+            self.terminal_store.persist_terminal(request_id, identity, &terminal).map_err(CorrectionRuntimeError::Apply)?;
+            self.ledger.settle_terminal(request_id, identity, terminal)
+                .map_err(|detail| CorrectionRuntimeError::Apply(detail.into()))
         }
 
         fn notify_terminal(&mut self, terminal: RelocalizationTerminalWaiters) {
@@ -8459,7 +8288,7 @@ mod preflight_only_contract {
                     capacity_lease.release();
                 }
                 if let Some(response) = self.waiter_responses.remove(&waiter_id) {
-                    let _ = response.send(terminal.result.result.clone());
+                    let _ = response.send(terminal.result.to_wire());
                 }
             }
         }
@@ -8483,7 +8312,7 @@ mod preflight_only_contract {
             disposition: crate::proto::RelocalizeDisposition,
             detail: &str,
         ) -> Result<bool, CorrectionRuntimeError> {
-            let Some((request_id, identity_sha256, ordinal, _, phase)) =
+            let Some((request_id, identity, ordinal, _, phase)) =
                 self.ledger.active_identity()
             else {
                 return Ok(false);
@@ -8494,12 +8323,11 @@ mod preflight_only_contract {
             let request = self.ledger.request(&request_id).cloned().ok_or_else(|| {
                 CorrectionRuntimeError::Apply("relocalization request missing".to_owned())
             })?;
-            let request =
-                validate_relocalize_request(request).map_err(CorrectionRuntimeError::Apply)?;
-            let terminal = self.terminal_result(&request, Some(ordinal), disposition, detail);
-            let terminal = self.settle_terminal_durable(&request_id, identity_sha256, terminal)?;
+            let terminal = self.terminal_result(&request, Some(ordinal), disposition, detail)?;
+            let terminal = self.settle_terminal_durable(&request_id, &identity, terminal)?;
             self.notify_terminal(terminal);
             self.clear_frame_proofs();
+            self.drop_synchronous_preclaim_execution();
             Ok(true)
         }
 
@@ -8515,16 +8343,16 @@ mod preflight_only_contract {
                 .last_validated_frames
                 .iter()
                 .filter_map(|(scope, key)| {
-                    (scope.mapping_session_id == request.request.session_id
-                        && scope.mapping_session_generation == request.request.session_generation)
-                        .then_some((scope.map_frame_generation, *key))
+                    (scope.mapping_session_id == request.target().activation.request.session_id()
+                        && scope.mapping_session_generation == request.target().activation.session_generation)
+                        .then_some((scope.clone(), *key))
                 })
                 .collect();
             self.clear_frame_proofs();
             let Some(snapshot) = runtime
                 .phase_a
                 .activated_target_receipts()
-                .current_sealed_target_snapshot()
+                .current_sealed_assigned_target_snapshot()
             else {
                 self.settle_active(
                     crate::proto::RelocalizeDisposition::TargetUnavailable,
@@ -8581,7 +8409,9 @@ mod preflight_only_contract {
             // no mapping completion can pass its final commit boundary while
             // the mode fence changes to active.
             let _mapping_lifecycle_guard = mapping_lifecycle_guard;
-            let validated = validate_relocalize_request(raw_request.clone());
+            let validated = if planar_work.is_some() {
+                Err("RELOCALIZATION_ASSIGNED_TARGET_ABSENT_OR_UNSUPPORTED".into())
+            } else { validate_relocalize_request(raw_request) };
             let claim_fence = phase_a.command_claim_fence();
             let claim_guard = claim_fence.lock();
             if !phase_a.is_open() {
@@ -8598,22 +8428,25 @@ mod preflight_only_contract {
             let request = match validated {
                 Ok(request) => request,
                 Err(detail) => {
-                    let waiter = Self::immediate_waiter(
-                        waiter_id,
-                        self.invalid_result(&raw_request, detail),
-                        Arc::clone(&capacity_lease),
-                        detached_tx,
-                    );
-                    let _ = response.send(Ok(waiter));
+                    let _ = response.send(Err(RelocalizationCommandError::InvalidRequest(detail)));
                     return Ok(());
                 }
             };
-            if (self.execution.is_some() || self.planar_inflight)
-                && !self.ledger.records.contains_key(&request.request.request_id)
+
+            if !self.ledger.records.contains_key(request.request_id())
+                && request.target().activation.runtime_generation != self.owner_identity.runtime_generation {
+                let terminal = self.terminal_result(&request, None,
+                    crate::proto::RelocalizeDisposition::StaleSession, "RELOCALIZATION_RUNTIME_STALE")?;
+                let waiter = Self::immediate_waiter(waiter_id, terminal.to_wire(), Arc::clone(&capacity_lease), detached_tx);
+                let _ = response.send(Ok(waiter));
+                return Ok(());
+            }
+            if self.execution.is_some()
+                && !self.ledger.records.contains_key(request.request_id())
             {
                 let waiter = Self::immediate_waiter(
                     waiter_id,
-                    self.busy_result(&request),
+                    self.busy_result(&request)?,
                     Arc::clone(&capacity_lease),
                     detached_tx,
                 );
@@ -8625,7 +8458,7 @@ mod preflight_only_contract {
                 None,
                 crate::proto::RelocalizeDisposition::ReplayConflict,
                 "RELOCALIZATION_REPLAY_CONFLICT",
-            );
+            )?;
             let outcome = self
                 .ledger
                 .admit(&request, waiter_id, Instant::now(), || conflict)
@@ -8663,7 +8496,7 @@ mod preflight_only_contract {
                 RelocalizationLedgerAdmission::Replay(result)
                 | RelocalizationLedgerAdmission::Conflict(result) => Self::immediate_waiter(
                     waiter_id,
-                    result.result,
+                    result.to_wire(),
                     Arc::clone(&capacity_lease),
                     detached_tx,
                 ),
@@ -8671,14 +8504,14 @@ mod preflight_only_contract {
                     close_after_reply = true;
                     Self::immediate_waiter(
                         waiter_id,
-                        result.result,
+                        result.to_wire(),
                         Arc::clone(&capacity_lease),
                         detached_tx,
                     )
                 }
                 RelocalizationLedgerAdmission::Busy => Self::immediate_waiter(
                     waiter_id,
-                    self.busy_result(&request),
+                    self.busy_result(&request)?,
                     Arc::clone(&capacity_lease),
                     detached_tx,
                 ),
@@ -8687,7 +8520,7 @@ mod preflight_only_contract {
                         let admission_ordinal = self
                             .ledger
                             .records
-                            .get(&request.request.request_id)
+                            .get(request.request_id())
                             .and_then(|record| match &record.origin {
                                 RelocalizationLedgerOrigin::Admitted(metadata) => {
                                     Some(metadata.admission_ordinal)
@@ -8704,13 +8537,13 @@ mod preflight_only_contract {
                             Some(admission_ordinal),
                             crate::proto::RelocalizeDisposition::OwnerFailed,
                             detail,
-                        );
+                        )?;
                         let pending = self.settle_terminal_durable(
-                            &request.request.request_id,
-                            request.identity_sha256,
+                            request.request_id(),
+                            &request.key(),
                             terminal,
                         )?;
-                        let result = pending.result.result.clone();
+                        let result = pending.result.to_wire();
                         self.notify_terminal(pending);
                         self.drop_synchronous_preclaim_execution();
                         Self::immediate_waiter(
@@ -8725,12 +8558,11 @@ mod preflight_only_contract {
                             None,
                             crate::proto::RelocalizeDisposition::OwnerFailed,
                             detail,
-                        );
+                        )?;
                         self.terminal_store
                             .persist_terminal(
-                                &request.request.request_id,
-                                request.identity_sha256,
-                                request.activation_identity_sha256,
+                                request.request_id(),
+                                &request.key(),
                                 &terminal,
                             )
                             .map_err(CorrectionRuntimeError::Apply)?;
@@ -8740,19 +8572,20 @@ mod preflight_only_contract {
                         close_after_reply = true;
                         Self::immediate_waiter(
                             waiter_id,
-                            terminal.result,
+                            terminal.to_wire(),
                             Arc::clone(&capacity_lease),
                             detached_tx,
                         )
                     }
                 }
             };
-            if let Some((ordinal,epoch,deadline))=started {
-                if request.request.target_kind=="planar_graph" {
-                    if let Some(work)=planar_work {
-                        self.planar_pending=Some((request,ordinal,epoch,deadline,work));self.planar_inflight=true;
-                    } else {self.settle_active(crate::proto::RelocalizeDisposition::TargetUnavailable,"二维重定位执行器不可用")?;}
-                } else if let Some(runtime)=runtime {self.begin_runtime_execution(request,ordinal,epoch,deadline,runtime)?;}
+            if let Some((ordinal, epoch, deadline)) = started {
+                if let Some(runtime) = runtime {
+                    self.begin_runtime_execution(request, ordinal, epoch, deadline, runtime)?;
+                } else {
+                    self.settle_active(crate::proto::RelocalizeDisposition::TargetUnavailable,
+                        "RELOCALIZATION_TARGET_UNAVAILABLE")?;
+                }
             }
             let _ = response.send(Ok(waiter));
             drop(claim_guard);
@@ -8781,44 +8614,34 @@ mod preflight_only_contract {
         }
 
         fn record_frame_proof(
-            &mut self,
-            input: &CorrectionFrameInput,
-            key: RelocalizationFrameKey,
-            evidence_sha256: [u8; 32],
+            &mut self, input: &Arc<CorrectionFrameInput>, key: RelocalizationFrameKey,
         ) -> Result<bool, &'static str> {
             let scope = RelocalizationFrameScope::from_input(input);
             let proof_key = (scope.clone(), key);
             if let Some(existing) = self.validated_frame_proofs.get(&proof_key) {
-                return if *existing == evidence_sha256 {
-                    Ok(true)
-                } else {
-                    Err("RELOCALIZATION_FRAME_KEY_PROOF_CONFLICT")
+                // Released/unaccepted entries are tombstones: never claim equal
+                // source bytes after releasing their owner, and never retain a
+                // rejected cloud solely for duplicate comparison.
+                return match existing.upgrade() {
+                    Some(existing) if existing.exactly_matches(input) => Ok(true),
+                    Some(_) => Err("RELOCALIZATION_FRAME_KEY_PROOF_CONFLICT"),
+                    None => Err("RELOCALIZATION_FRAME_KEY_PROOF_RELEASED"),
                 };
             }
             let scope_is_new = !self.last_validated_frames.contains_key(&scope);
-            if scope_is_new
-                && self.last_validated_frames.len() >= RELOCALIZATION_MAX_FRAME_PROOF_SCOPES
-            {
+            if scope_is_new && self.last_validated_frames.len() >= RELOCALIZATION_MAX_FRAME_PROOF_SCOPES {
                 return Err("RELOCALIZATION_FRAME_PROOF_SCOPE_CAPACITY_EXCEEDED");
             }
             if self.validated_frame_proofs.len() >= RELOCALIZATION_MAX_FRAME_PROOFS_TOTAL {
                 return Err("RELOCALIZATION_FRAME_PROOF_TOTAL_CAPACITY_EXCEEDED");
             }
-            if self
-                .validated_frame_proofs
-                .keys()
-                .filter(|(existing_scope, _)| existing_scope == &scope)
-                .count()
-                >= RELOCALIZATION_MAX_FRAME_PROOFS_PER_SCOPE
-            {
+            if self.validated_frame_proofs.keys().filter(|(existing_scope, _)| existing_scope == &scope).count()
+                >= RELOCALIZATION_MAX_FRAME_PROOFS_PER_SCOPE {
                 return Err("RELOCALIZATION_FRAME_PROOF_SCOPE_CAPACITY_EXCEEDED");
             }
-            self.validated_frame_proofs
-                .insert(proof_key, evidence_sha256);
+            self.validated_frame_proofs.insert(proof_key, Arc::downgrade(input));
             let last = self.last_validated_frames.entry(scope).or_insert(key);
-            if key > *last {
-                *last = key;
-            }
+            if key > *last { *last = key; }
             Ok(false)
         }
 
@@ -8854,7 +8677,7 @@ mod preflight_only_contract {
                 Self::reply_frame(request.response, CorrectionSubmitDisposition::NoCandidate);
                 return Ok(());
             }
-            let (key, evidence_sha256) = match relocalization_frame_evidence(
+            let key = match relocalization_frame_evidence(
                 &self.owner_identity,
                 &self.map_frame_id,
                 &self.odom_frame_id,
@@ -8869,12 +8692,20 @@ mod preflight_only_contract {
                     return Ok(());
                 }
             };
-            match self.record_frame_proof(&request.input, key, evidence_sha256) {
+            let admitted_input = Arc::new(request.input.clone());
+            match self.record_frame_proof(&admitted_input, key) {
                 Ok(true) => {
                     Self::reply_frame(request.response, CorrectionSubmitDisposition::NoCandidate);
                     return Ok(());
                 }
                 Ok(false) => {}
+                Err("RELOCALIZATION_FRAME_KEY_PROOF_RELEASED") => {
+                    // The old source was never accepted or has been released.
+                    // This tombstone cannot establish content equality or a
+                    // conflict. Drop the stale retry and allow fresh progress.
+                    Self::reply_frame(request.response, CorrectionSubmitDisposition::NoCandidate);
+                    return Ok(());
+                }
                 Err(detail) => {
                     self.settle_active(crate::proto::RelocalizeDisposition::OwnerFailed, detail)?;
                     self.drop_synchronous_preclaim_execution();
@@ -8897,11 +8728,12 @@ mod preflight_only_contract {
             let current_snapshot = runtime
                 .phase_a
                 .activated_target_receipts()
-                .current_sealed_target_snapshot();
+                .current_sealed_assigned_target_snapshot();
             if !current_snapshot
                 .as_ref()
                 .is_some_and(|current| same_sealed_target(current, &accumulation.snapshot))
             {
+                self.execution = Some(RelocalizationExecution::Accumulating(accumulation));
                 self.settle_active(
                     crate::proto::RelocalizeDisposition::TargetInvalidated,
                     "RELOCALIZATION_TARGET_INVALIDATED_DURING_ACCUMULATION",
@@ -8909,10 +8741,12 @@ mod preflight_only_contract {
                 Self::reply_frame(request.response, CorrectionSubmitDisposition::NoCandidate);
                 return Ok(());
             }
-            if request.input.mapping_session_id != accumulation.request.request.session_id
-                || request.input.mapping_session_generation
-                    != accumulation.request.request.session_generation
+            if request.input.mapping_session_id != accumulation.request.target().activation.request.session_id()
+                || request.input.mapping_session_generation != accumulation.request.target().activation.session_generation
+                || request.input.committed_map.backend_kind != accumulation.request.target().activation.backend_kind
+                || request.input.committed_map.backend_generation != accumulation.request.target().activation.backend_generation
             {
+                self.execution = Some(RelocalizationExecution::Accumulating(accumulation));
                 self.settle_active(
                     crate::proto::RelocalizeDisposition::SessionInvalidated,
                     "RELOCALIZATION_FRAME_SESSION_INVALIDATED",
@@ -8923,10 +8757,12 @@ mod preflight_only_contract {
             if accumulation
                 .session_map_frame_generation
                 .is_some_and(|generation| generation != request.input.map_frame_generation)
-                || accumulation
-                    .mapping_commit_boot_nonce
-                    .is_some_and(|nonce| nonce != request.input.mapping_commit_id.boot_nonce)
+                || accumulation.mapping_commit_boot_nonce.is_some_and(|nonce| nonce != request.input.mapping_commit_id.boot_nonce)
+                || accumulation.accepted.first().is_some_and(|frame|
+                    frame.input.registered_cloud.backend != request.input.registered_cloud.backend
+                        || frame.input.registered_cloud.runtime_generation != request.input.registered_cloud.runtime_generation)
             {
+                self.execution = Some(RelocalizationExecution::Accumulating(accumulation));
                 self.settle_active(
                     crate::proto::RelocalizeDisposition::SessionInvalidated,
                     "RELOCALIZATION_FRAME_GENERATION_INVALIDATED",
@@ -8937,7 +8773,7 @@ mod preflight_only_contract {
             if accumulation.session_map_frame_generation.is_none() {
                 accumulation.arm_watermark = accumulation
                     .armed_map_watermarks
-                    .get(&request.input.map_frame_generation)
+                    .get(&RelocalizationFrameScope::from_input(&request.input))
                     .copied();
             }
             let last_accepted_key = accumulation
@@ -8954,11 +8790,19 @@ mod preflight_only_contract {
                 return Ok(());
             }
 
+            if accumulation.accepted.len() >= RELOCALIZATION_MAX_FRAMES {
+                self.execution = Some(RelocalizationExecution::Accumulating(accumulation));
+                self.settle_active(crate::proto::RelocalizeDisposition::InsufficientSource,
+                    "RELOCALIZATION_FRAME_COUNT_BOUND_EXCEEDED")?;
+                Self::reject_frame(request, "RELOCALIZATION_FRAME_COUNT_BOUND_EXCEEDED");
+                return Ok(());
+            }
             let frame_points = request.input.body_points.len();
             let Some(aggregate_input_points) = accumulation
                 .aggregate_input_points
                 .checked_add(frame_points)
             else {
+                self.execution = Some(RelocalizationExecution::Accumulating(accumulation));
                 self.settle_active(
                     crate::proto::RelocalizeDisposition::OwnerFailed,
                     "RELOCALIZATION_AGGREGATE_POINT_COUNT_OVERFLOW",
@@ -8967,6 +8811,7 @@ mod preflight_only_contract {
                 return Ok(());
             };
             if aggregate_input_points > RELOCALIZATION_MAX_AGGREGATE_POINTS {
+                self.execution = Some(RelocalizationExecution::Accumulating(accumulation));
                 self.settle_active(
                     crate::proto::RelocalizeDisposition::InsufficientSource,
                     "RELOCALIZATION_AGGREGATE_POINT_BOUND_EXCEEDED",
@@ -8981,10 +8826,7 @@ mod preflight_only_contract {
             accumulation
                 .mapping_commit_boot_nonce
                 .get_or_insert(request.input.mapping_commit_id.boot_nonce);
-            accumulation.accepted.push(AccumulatedRelocalizationFrame {
-                evidence_sha256,
-                input: request.input.clone(),
-            });
+            accumulation.accepted.push(AccumulatedRelocalizationFrame { input: admitted_input });
 
             let cutoff_reason = request.lease.has_lifecycle_guard()
                 .then_some(RelocalizationCutoffReasonV1::MinimumAggregateReached);
@@ -8995,8 +8837,8 @@ mod preflight_only_contract {
             };
 
             let request_metadata = accumulation.request.clone();
-            let request_id = request_metadata.request.request_id.clone();
-            let identity_sha256 = request_metadata.identity_sha256;
+            let request_id = request_metadata.request_id().to_owned();
+            let identity = request_metadata.key();
             let admission_ordinal = accumulation.admission_ordinal;
             let logical_deadline = accumulation.logical_deadline;
             Self::reply_frame(request.response, CorrectionSubmitDisposition::NoCandidate);
@@ -9012,10 +8854,11 @@ mod preflight_only_contract {
                     return Ok(());
                 }
             };
+            let source_receipts = source.frames.iter().map(|frame| assigned_source_receipt(&frame.input,
+                &self.map_frame_id, &self.odom_frame_id, &self.body_frame_id)).collect::<Result<Vec<_>, _>>()
+                .map_err(CorrectionRuntimeError::Apply)?;
             self.execution = Some(RelocalizationExecution::Computing {
-                request: Box::new(request_metadata),
-                admission_ordinal,
-                logical_deadline,
+                request: Box::new(request_metadata), admission_ordinal, logical_deadline, source_receipts,
             });
             let source_points = Arc::clone(&source.source_points);
             let target_points = Arc::clone(&source.target_points);
@@ -9026,7 +8869,7 @@ mod preflight_only_contract {
             let compute_panic = runtime.compute_panic.load(Ordering::Acquire);
             tasks.spawn_blocking(move || RelocalizationTaskEvent::Computed {
                 request_id,
-                identity_sha256,
+                identity,
                 source: Box::new(source),
                 output: {
                     #[cfg(test)]
@@ -9047,104 +8890,92 @@ mod preflight_only_contract {
         }
 
         fn completed_terminal_result(
-            &self,
-            computed: &RelocalizationComputedCommand,
-            disposition: crate::proto::RelocalizeDisposition,
-            candidate: Option<&CorrectionCandidate>,
-            correction_revision: u64,
-            detail: &str,
+            &self, computed: &RelocalizationComputedCommand,
+            disposition: crate::proto::RelocalizeDisposition, candidate: Option<&CorrectionCandidate>,
+            correction_revision: u64, detail: &str,
         ) -> Result<StoredRelocalizationResult, CorrectionRuntimeError> {
-            let source = &computed.source;
-            let evidence = RelocalizationEvidenceV1 {
-                request_identity_sha256: computed.request.identity_sha256,
-                admission_ordinal: Some(computed.admission_ordinal),
-                normalized_logical_timeout_ms: Some(computed.request.request.logical_timeout_ms),
-                runtime_generation: computed.request.request.runtime_generation,
-                activated_mapping_backend_generation: computed.request.request.backend_generation,
-                correction_owner_backend_generation: self.owner_identity.backend_generation,
-                session_id: &computed.request.request.session_id,
-                map_name: &computed.request.request.map_name,
-                session_generation: computed.request.request.session_generation,
-                map_frame_id: &self.map_frame_id,
-                odom_frame_id: &self.odom_frame_id,
-                body_frame_id: &self.body_frame_id,
-                activation_identity_sha256: computed.request.activation_identity_sha256,
-                target_receipt_sha256: computed.request.target_receipt_sha256,
-                asset_manifest_sha256: computed.request.asset_manifest_sha256,
-                asset_bundle_sha256: computed.request.asset_bundle_sha256,
-                source_policy_version: computed.request.request.source_policy_version,
-                source_policy_sha256: computed.request.source_policy_sha256,
-                deadline_policy_version: computed.request.request.deadline_policy_version,
-                deadline_policy_sha256: computed.request.deadline_policy_sha256,
-                algorithm_options_version: computed.request.request.algorithm_options_version,
-                algorithm_options_sha256: computed.request.algorithm_options_sha256,
-                target: Some(RelocalizationTargetEvidenceV1 {
-                    snapshot: &source.snapshot,
-                    decoded_point_count: source.target_decoded_point_count,
-                    decoded_f64_bytes: source.target_decoded_f64_bytes,
-                    decoded_sha256: source.target_decoded_sha256,
-                }),
-                source: Some(RelocalizationSourceEvidenceV1 {
-                    arm_watermark: source.arm_watermark,
-                    cutoff_reason: source.cutoff_reason,
-                    last_accepted_key: source
-                        .frames
-                        .last()
-                        .map(|frame| relocalization_frame_key(&frame.input)),
-                    frames: &source.frames,
-                    aggregate_input_points: source.aggregate_input_points,
-                    aggregate_input_f64_bytes: source.aggregate_input_f64_bytes,
-                    post_transform_points: source.post_transform_points,
-                    post_transform_f64_bytes: source.post_transform_f64_bytes,
-                    emitted_points: u64::try_from(source.source_points.len()).map_err(|_| {
-                        CorrectionRuntimeError::Apply(
-                            "relocalization emitted point count overflow".to_owned(),
-                        )
-                    })?,
-                    canonical_source_bytes: &source.canonical_source_bytes,
-                    source_sha256: source.source_sha256,
-                    boundary_key: relocalization_frame_key(&source.boundary_input),
-                    boundary_base_anchor_map_from_odom: &source
-                        .boundary_input
-                        .base_anchor_map_from_odom,
-                }),
-                algorithm: Some(RelocalizationAlgorithmEvidenceV1 {
-                    result: &computed.output.result,
-                    accepted: computed.output.correction.is_some(),
-                    correction: computed.output.correction.as_ref(),
-                }),
-                candidate: candidate
-                    .map(|candidate| RelocalizationCandidateEvidenceV1 { candidate }),
-                terminal_disposition: disposition,
-                correction_revision,
-                detail,
+            let mut evidence = self.assigned_evidence(&computed.request, Some(computed.admission_ordinal),
+                Some(&computed.source), Some(&computed.output))?;
+            if candidate.is_some() { evidence.phase = crate::proto::AssignedRelocalizationEvidencePhaseV2::Finalized as i32; }
+            let candidate_payload = candidate.map(CorrectionCandidate::encode_body).transpose()
+                .map_err(|error| CorrectionRuntimeError::Apply(error.to_string()))?.unwrap_or_default();
+            let result = assigned_relocalization_result(&computed.request.identity, disposition,
+                correction_revision, detail, candidate_payload, evidence);
+            let capture = |request: &AssignedCloudRelocalizeRequestIdentityV2, body: &crate::proto::AssignedCloudRelocalizeResultV2| {
+                validate_assigned_terminal_retained(request, body)?;
+                // Compare every retained receipt with the still-owned source;
+                // the closure captures the actual candidate and finalizer outcome.
+                let expected = result.assigned_cloud_v2.as_ref().expect("assigned body");
+                if request != &computed.request.identity || body != expected {
+                    return Err("RELOCALIZATION_ASSIGNED_CAPTURE_OUTCOME_MISMATCH".into());
+                }
+                if let Some(candidate) = candidate {
+                    let expected_identity = correction_candidate_identity(CorrectionCandidateBackend::Relocalization,
+                        &self.owner_identity, candidate.identity.candidate_sequence, &self.map_frame_id,
+                        &self.odom_frame_id, &self.body_frame_id, &computed.source.boundary_input);
+                    let expected_correction = computed.output.correction.as_ref()
+                        .ok_or("RELOCALIZATION_ASSIGNED_CAPTURE_CORRECTION_ABSENT")?;
+                    let expected_candidate = CorrectionCandidate::seal(expected_identity,
+                        CorrectionTransform::from_isometry(expected_correction)).map_err(|error| error.to_string())?;
+                    if candidate != &expected_candidate {
+                        return Err("RELOCALIZATION_ASSIGNED_CAPTURE_CANDIDATE_MISMATCH".into());
+                    }
+                }
+                Ok(())
             };
-            let evidence_preimage = canonical_relocalization_evidence_preimage_parts_v1(&evidence)
+            // Validate before moving the original terminal owner into storage.
+            let terminal = AssignedRelocalizationTerminalV2::new(result.clone(), Some(&capture))
                 .map_err(CorrectionRuntimeError::Apply)?;
-            let evidence_sha256 = canonical_relocalization_evidence_sha256_v1(&evidence_preimage)
-                .map_err(CorrectionRuntimeError::Apply)?;
-            let evidence_disclosure_v1 = build_relocalization_evidence_disclosure_v1(
-                &evidence_preimage.bytes,
-                evidence_preimage.canonical_source_range,
-            )
-            .map_err(CorrectionRuntimeError::Apply)?;
-            let candidate_payload_preimage_v1 =
-                relocalization_candidate_payload_preimage_v1(candidate)
-                    .map_err(CorrectionRuntimeError::Apply)?;
-            Ok(StoredRelocalizationResult::new(
-                build_relocalization_result(
-                    &computed.request.request,
-                    computed.request.identity_sha256,
-                    disposition,
-                    candidate.map_or(0, |candidate| candidate.identity.candidate_sequence),
-                    candidate.map(|candidate| candidate.payload_sha256),
-                    candidate_payload_preimage_v1,
-                    evidence_sha256,
-                    evidence_disclosure_v1,
-                    correction_revision,
-                    detail,
-                ),
-            ))
+            Ok(StoredRelocalizationResult::Assigned(terminal))
+        }
+
+        fn assigned_evidence(
+            &self, request: &ValidatedRelocalizeRequest, admission_ordinal: Option<u64>,
+            source: Option<&SealedRelocalizationSource>, output: Option<&RelocalizationComputeOutput>,
+        ) -> Result<crate::proto::AssignedRelocalizationEvidenceV2, CorrectionRuntimeError> {
+            use crate::proto::AssignedRelocalizationEvidencePhaseV2 as Phase;
+            let mut evidence = crate::proto::AssignedRelocalizationEvidenceV2 {
+                schema_version: 2, phase: Phase::PreAdmission as i32, ..Default::default()
+            };
+            if let Some(ordinal) = admission_ordinal {
+                if ordinal == 0 { return Err(CorrectionRuntimeError::Apply("relocalization admission ordinal is zero".into())); }
+                evidence.phase = Phase::Admitted as i32;
+                evidence.admission_ordinal = Some(ordinal);
+                evidence.owner = Some(crate::proto::RelocalizationOwnerReceiptV2 {
+                    runtime_generation: self.owner_identity.runtime_generation,
+                    correction_backend_generation: self.owner_identity.backend_generation,
+                    correction_lease_boot_nonce: self.owner_identity.correction_lease.boot_nonce.to_be_bytes().to_vec(),
+                    correction_lease_generation: self.owner_identity.correction_lease.generation,
+                    map_frame_id: self.map_frame_id.clone(), odom_frame_id: self.odom_frame_id.clone(),
+                    body_frame_id: self.body_frame_id.clone(),
+                    relocalization_epoch: source.map(|s| s.boundary_input.frame_capture_relocalization_epoch)
+                        .or_else(|| { let mode = self.ledger.relocalization_mode.snapshot(); mode.active.then_some(mode.epoch) }),
+                });
+            }
+            if let Some(source) = source {
+                if !request.identity.matches_target(&source.snapshot.target_receipt) {
+                    return Err(CorrectionRuntimeError::Apply("RELOCALIZATION_ASSIGNED_CAPTURE_TARGET_MISMATCH".into()));
+                }
+                evidence.phase = Phase::SourceSelected as i32;
+                for frame in &source.frames {
+                    frame.input.validate_source_ownership().map_err(|error| CorrectionRuntimeError::Apply(error.to_string()))?;
+                    evidence.source_frames.push(assigned_source_receipt(&frame.input, &self.map_frame_id,
+                        &self.odom_frame_id, &self.body_frame_id).map_err(CorrectionRuntimeError::Apply)?);
+                }
+            }
+            if let Some(output) = output {
+                evidence.phase = Phase::AlgorithmCompleted as i32;
+                evidence.algorithm = Some(crate::proto::RelocalizationAlgorithmReceiptV2 {
+                    converged: output.result.registration.converged, accepted: output.correction.is_some(),
+                    mse_bits: output.result.registration.mse.to_bits(), fitness_bits: output.result.fitness.to_bits(),
+                    iterations: output.result.registration.iterations.try_into().map_err(|_| CorrectionRuntimeError::Apply("relocalization iterations overflow".into()))?,
+                    feature_matches: output.result.feature_matches.try_into().map_err(|_| CorrectionRuntimeError::Apply("relocalization feature count overflow".into()))?,
+                    ransac_inliers: output.result.ransac_inliers.try_into().map_err(|_| CorrectionRuntimeError::Apply("relocalization inlier count overflow".into()))?,
+                    estimated_transform: Some(relocalization_pose_bits(&output.result.registration.transformation)),
+                    proposed_correction: output.correction.as_ref().map(relocalization_pose_bits),
+                });
+            }
+            Ok(evidence)
         }
 
         fn settle_completed(
@@ -9163,8 +8994,8 @@ mod preflight_only_contract {
                 detail,
             )?;
             let terminal = self.settle_terminal_durable(
-                &computed.request.request.request_id,
-                computed.request.identity_sha256,
+                computed.request.request_id(),
+                &computed.request.key(),
                 terminal,
             )?;
             self.notify_terminal(terminal);
@@ -9193,7 +9024,7 @@ mod preflight_only_contract {
             match event {
                 RelocalizationTaskEvent::Computed {
                     request_id,
-                    identity_sha256,
+                    identity,
                     source,
                     output,
                 } => {
@@ -9201,12 +9032,13 @@ mod preflight_only_contract {
                         request,
                         admission_ordinal,
                         logical_deadline,
+                        ..
                     }) = self.execution.take()
                     else {
                         return Ok(());
                     };
-                    if request.request.request_id != request_id
-                        || request.identity_sha256 != identity_sha256
+                    if request.request_id() != request_id
+                        || request.key() != identity
                     {
                         runtime.phase_a.begin();
                         return Err(CorrectionRuntimeError::Apply(
@@ -9222,7 +9054,7 @@ mod preflight_only_contract {
                     };
                     if self
                         .ledger
-                        .terminal(&computed.request.request.request_id)
+                        .terminal(computed.request.request_id())
                         .is_some()
                     {
                         return Ok(());
@@ -9276,7 +9108,7 @@ mod preflight_only_contract {
                     };
                     if self
                         .ledger
-                        .terminal(&computed.request.request.request_id)
+                        .terminal(computed.request.request_id())
                         .is_some()
                     {
                         return Ok(());
@@ -9322,7 +9154,7 @@ mod preflight_only_contract {
                     }
                     if self
                         .ledger
-                        .terminal(&computed.request.request.request_id)
+                        .terminal(computed.request.request_id())
                         .is_some()
                     {
                         Self::schedule_staged_discard(&computed, runtime, tasks);
@@ -9355,13 +9187,10 @@ mod preflight_only_contract {
                         CorrectionTransform::from_isometry(correction),
                     )
                     .map_err(|error| CorrectionRuntimeError::Apply(error.to_string()))?;
-                    let key = CandidateApplyKey {
-                        candidate_sequence,
-                        payload_sha256: candidate.payload_sha256,
-                    };
+                    let key = CandidateApplyKey::from(&candidate);
                     let apply_rx = match runtime
                         .apply_waiters
-                        .register(key, Arc::clone(&computed.source.boundary_lease))
+                        .register(key, candidate.clone(), Arc::clone(&computed.source.boundary_lease))
                     {
                         Ok(apply_rx) => apply_rx,
                         Err(detail) => {
@@ -9377,7 +9206,7 @@ mod preflight_only_contract {
                             return Ok(());
                         }
                     };
-                    let Some(lease) = runtime.apply_waiters.claim_apply(key) else {
+                    let Some(lease) = runtime.apply_waiters.claim_apply(key, &candidate) else {
                         runtime.apply_waiters.remove(key);
                         drop(_claim_guard);
                         self.settle_completed(
@@ -9391,8 +9220,8 @@ mod preflight_only_contract {
                         return Ok(());
                     };
                     if let Err(detail) = self.ledger.mark_postclaim(
-                        &computed.request.request.request_id,
-                        computed.request.identity_sha256,
+                        computed.request.request_id(),
+                        &computed.request.key(),
                     ) {
                         runtime.apply_waiters.remove(key);
                         lease.release();
@@ -9492,7 +9321,7 @@ mod preflight_only_contract {
 
         fn handle_detached(&mut self, waiter_id: u64) -> Result<(), CorrectionRuntimeError> {
             self.waiter_responses.remove(&waiter_id);
-            let Some((request_id, identity_sha256, capacity_lease)) =
+            let Some((request_id, identity, capacity_lease)) =
                 self.waiter_requests.remove(&waiter_id)
             else {
                 return Ok(());
@@ -9500,7 +9329,7 @@ mod preflight_only_contract {
             capacity_lease.release();
             let cancel = self
                 .ledger
-                .detach_waiter(&request_id, identity_sha256, waiter_id)
+                .detach_waiter(&request_id, &identity, waiter_id)
                 .map_err(|detail| CorrectionRuntimeError::Apply(detail.to_owned()))?;
             if cancel {
                 self.settle_active(
@@ -9565,63 +9394,30 @@ mod preflight_only_contract {
     }
 
     async fn run_relocalization_ledger_loop(
-        actor:&mut RelocalizationCommandActor,
-        admissions:&mut mpsc::Receiver<RelocalizationAdmissionRequest>,
-        terminal_queries:&mut mpsc::Receiver<RelocalizationTerminalQueryRequest>,
-        detached:&mut mpsc::UnboundedReceiver<RelocalizationWaiterEvent>,
-        detached_tx:&mpsc::UnboundedSender<RelocalizationWaiterEvent>,
-        phase_a:&CorrectionPhaseAControl,
-    )->Result<(),CorrectionRuntimeError> {
-        let mut admission_rx=phase_a.admission_tx.subscribe();
-        let (claims,mut claim_rx)=mpsc::channel::<PlanarClaim>(1);
-        let mut tasks=tokio::task::JoinSet::new();
-        let mut stopping=false;
+        actor: &mut RelocalizationCommandActor, admissions: &mut mpsc::Receiver<RelocalizationAdmissionRequest>,
+        terminal_queries: &mut mpsc::Receiver<RelocalizationTerminalQueryRequest>,
+        detached: &mut mpsc::UnboundedReceiver<RelocalizationWaiterEvent>,
+        detached_tx: &mpsc::UnboundedSender<RelocalizationWaiterEvent>, phase_a: &CorrectionPhaseAControl,
+    ) -> Result<(), CorrectionRuntimeError> {
+        let mut admission_rx = phase_a.admission_tx.subscribe();
         loop {
-            if let Some((request,ordinal,epoch,deadline,work))=actor.planar_pending.take() {
-                let context=PlanarCommandContext {epoch,deadline,request_identity:request.identity_sha256,
-                    request_id:request.request.request_id.clone(),claim:claims.clone()};
-                tasks.spawn(async move {(request,ordinal,work(context).await)});
-            }
-            if stopping && tasks.is_empty() {return Ok(());}
-            let deadline=actor.ledger.active_identity().and_then(|active|(active.4==RelocalizationClaimPhase::Preclaim).then_some(active.3));
-            tokio::select! {biased;
-                _=wait_for_admission_close(&mut admission_rx),if !stopping=>{
-                    stopping=true;admissions.close();
-                    actor.settle_active(crate::proto::RelocalizeDisposition::OwnerStopped,"RELOCALIZATION_OWNER_STOPPED_PRECLAIM")?;
+            tokio::select! { biased;
+                _ = wait_for_admission_close(&mut admission_rx) => {
+                    admissions.close();
+                    actor.settle_active(crate::proto::RelocalizeDisposition::OwnerStopped,
+                        "RELOCALIZATION_OWNER_STOPPED_PRECLAIM")?;
+                    return Ok(());
                 },
-                query=terminal_queries.recv()=>match query {Some(q)=>actor.handle_terminal_query(q),None=>return Err(CorrectionRuntimeError::IngressClosed)},
-                event=detached.recv()=>match event {Some(RelocalizationWaiterEvent::Detached(id))=>actor.handle_detached(id)?,None=>return Err(CorrectionRuntimeError::IngressClosed)},
-                _=wait_until_optional_instant(deadline),if deadline.is_some()=>{
-                    actor.settle_active(crate::proto::RelocalizeDisposition::DeadlineExceeded,"RELOCALIZATION_LOGICAL_DEADLINE_EXCEEDED_PRECLAIM")?;
+                query = terminal_queries.recv() => match query {
+                    Some(query) => actor.handle_terminal_query(query), None => return Err(CorrectionRuntimeError::IngressClosed),
                 },
-                claim=claim_rx.recv()=>if let Some(claim)=claim {
-                    let fence=phase_a.command_claim_fence();let _guard=fence.lock();
-                    let valid=!stopping && phase_a.is_open() && actor.ledger.active_identity().is_some_and(|active|
-                        active.0==claim.request_id && active.1==claim.identity && Instant::now()<active.3);
-                    let applied=valid && actor.ledger.mark_postclaim(&claim.request_id,claim.identity).is_ok();
-                    let _=claim.reply.send(applied);
+                event = detached.recv() => match event {
+                    Some(RelocalizationWaiterEvent::Detached(id)) => actor.handle_detached(id)?,
+                    None => return Err(CorrectionRuntimeError::IngressClosed),
                 },
-                joined=tasks.join_next(),if !tasks.is_empty()=>match joined {
-                    Some(Ok((request,ordinal,outcome)))=>{
-                        actor.planar_inflight=false;
-                        if actor.ledger.terminal(&request.request.request_id).is_none() {
-                            let terminal=if outcome.evidence.is_empty() {
-                                actor.terminal_result(&request,Some(ordinal),outcome.disposition,&outcome.detail)
-                            } else {
-                                let disclosure=build_relocalization_evidence_disclosure_v1(&outcome.evidence,None).map_err(|e|CorrectionRuntimeError::Apply(e.to_string()))?;
-                                StoredRelocalizationResult::new(build_relocalization_result(&request.request,request.identity_sha256,outcome.disposition,0,None,Vec::new(),
-                                    sha256_bytes(&outcome.evidence),disclosure,outcome.correction_revision,outcome.detail))
-                            };
-                            let terminal=actor.settle_terminal_durable(&request.request.request_id,request.identity_sha256,terminal)?;
-                            actor.notify_terminal(terminal);
-                        }
-                    },
-                    Some(Err(e))=>{phase_a.begin();return Err(CorrectionRuntimeError::WorkerJoin(format!("二维重定位保留任务异常：{e}")));},
-                    None=>{},
-                },
-                admission=admissions.recv(),if !stopping=>match admission {
-                    Some(a)=>actor.handle_admission(a,detached_tx,None,phase_a)?,
-                    None=>{stopping=true;actor.settle_active(crate::proto::RelocalizeDisposition::OwnerStopped,"RELOCALIZATION_OWNER_STOPPED_PRECLAIM")?;},
+                admission = admissions.recv() => match admission {
+                    Some(admission) => actor.handle_admission(admission, detached_tx, None, phase_a)?,
+                    None => return Ok(()),
                 },
             }
         }
@@ -9719,7 +9515,7 @@ mod preflight_only_contract {
                         Some(RelocalizationExecution::Accumulating(accumulation)) => runtime
                             .phase_a
                             .activated_target_receipts()
-                            .current_sealed_target_snapshot()
+                            .current_sealed_assigned_target_snapshot()
                             .is_none_or(|snapshot| {
                                 !same_sealed_target(&snapshot, &accumulation.snapshot)
                             }),
@@ -9762,202 +9558,38 @@ mod preflight_only_contract {
         }
     }
 
-    // 字段标签与 protobuf 字段号一致。字段 27 在计算原像时必须为空，
-    // 以消除 evidence -> terminal proof 的摘要环。
-    fn canonical_relocalization_terminal_proof_preimage_v1(
-        result: &crate::proto::RelocalizeResult,
-    ) -> Result<Vec<u8>, String> {
-        if !result.terminal_proof_sha256.is_empty() {
-            return Err("RELOCALIZATION_TERMINAL_PROOF_MUST_BE_CLEARED".to_owned());
-        }
-
-        let mut out = RELOCALIZATION_TERMINAL_PROOF_DOMAIN_V1.to_vec();
-        out.extend_from_slice(&RELOCALIZATION_SCHEMA_VERSION_V1.to_be_bytes());
-
-        macro_rules! tag {
-            ($value:expr) => {
-                out.extend_from_slice(&($value).to_be_bytes())
-            };
-        }
-
-        tag!(1_u32);
-        out.extend_from_slice(&result.schema_version.to_be_bytes());
-        tag!(2_u32);
-        canonical_push_string(&mut out, &result.request_id);
-        tag!(3_u32);
-        canonical_push_present_bytes(&mut out, &result.request_identity_sha256);
-        tag!(4_u32);
-        out.extend_from_slice(&result.runtime_generation.to_be_bytes());
-        tag!(5_u32);
-        canonical_push_string(&mut out, &result.session_id);
-        tag!(6_u32);
-        canonical_push_string(&mut out, &result.map_name);
-        tag!(7_u32);
-        out.extend_from_slice(&result.session_generation.to_be_bytes());
-        tag!(8_u32);
-        out.extend_from_slice(&result.backend_generation.to_be_bytes());
-        tag!(9_u32);
-        canonical_push_present_bytes(&mut out, &result.activation_identity_sha256);
-        tag!(10_u32);
-        canonical_push_present_bytes(&mut out, &result.target_receipt_sha256);
-        tag!(11_u32);
-        out.extend_from_slice(&result.target_cloud_revision.to_be_bytes());
-        tag!(12_u32);
-        canonical_push_present_bytes(&mut out, &result.target_cloud_sha256);
-        tag!(13_u32);
-        canonical_push_present_bytes(&mut out, &result.asset_manifest_sha256);
-        tag!(14_u32);
-        canonical_push_present_bytes(&mut out, &result.asset_bundle_sha256);
-        tag!(15_u32);
-        out.extend_from_slice(&result.source_policy_version.to_be_bytes());
-        tag!(16_u32);
-        canonical_push_present_bytes(&mut out, &result.source_policy_sha256);
-        tag!(17_u32);
-        out.extend_from_slice(&result.deadline_policy_version.to_be_bytes());
-        tag!(18_u32);
-        canonical_push_present_bytes(&mut out, &result.deadline_policy_sha256);
-        tag!(19_u32);
-        out.extend_from_slice(&result.logical_timeout_ms.to_be_bytes());
-        tag!(20_u32);
-        out.extend_from_slice(&result.algorithm_options_version.to_be_bytes());
-        tag!(21_u32);
-        canonical_push_present_bytes(&mut out, &result.algorithm_options_sha256);
-        tag!(22_u32);
-        out.extend_from_slice(&result.disposition.to_be_bytes());
-        tag!(23_u32);
-        out.extend_from_slice(&result.candidate_sequence.to_be_bytes());
-        tag!(24_u32);
-        canonical_push_present_bytes(&mut out, &result.candidate_payload_sha256);
-        tag!(25_u32);
-        canonical_push_present_bytes(&mut out, &result.evidence_sha256);
-        tag!(26_u32);
-        out.extend_from_slice(&result.correction_revision.to_be_bytes());
-        tag!(27_u32);
-        out.push(0);
-        tag!(28_u32);
-        canonical_push_string(&mut out, &result.detail);
-        Ok(out)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn build_relocalization_result(
-        request: &crate::proto::RelocalizeRequest,
-        request_identity_sha256: [u8; 32],
-        disposition: crate::proto::RelocalizeDisposition,
-        candidate_sequence: u64,
-        candidate_payload_sha256: Option<[u8; 32]>,
-        candidate_payload_preimage_v1: Vec<u8>,
-        evidence_sha256: [u8; 32],
-        evidence_disclosure_v1: Vec<u8>,
-        correction_revision: u64,
-        detail: impl Into<String>,
-    ) -> crate::proto::RelocalizeResult {
-        let detail = detail.into();
-        let mut result = crate::proto::RelocalizeResult {
-            target_kind:request.target_kind.clone(),target_graph_sha256:request.target_graph_sha256.clone(),
-            schema_version: RELOCALIZATION_SCHEMA_VERSION_V1,
-            request_id: request.request_id.clone(),
-            request_identity_sha256: request_identity_sha256.to_vec(),
-            runtime_generation: request.runtime_generation,
-            session_id: request.session_id.clone(),
-            map_name: request.map_name.clone(),
-            session_generation: request.session_generation,
-            backend_generation: request.backend_generation,
-            activation_identity_sha256: request.activation_identity_sha256.clone(),
-            target_receipt_sha256: request.target_receipt_sha256.clone(),
-            target_cloud_revision: request.target_cloud_revision,
-            target_cloud_sha256: request.target_cloud_sha256.clone(),
-            asset_manifest_sha256: request.asset_manifest_sha256.clone(),
-            asset_bundle_sha256: request.asset_bundle_sha256.clone(),
-            source_policy_version: request.source_policy_version,
-            source_policy_sha256: request.source_policy_sha256.clone(),
-            deadline_policy_version: request.deadline_policy_version,
-            deadline_policy_sha256: request.deadline_policy_sha256.clone(),
-            logical_timeout_ms: request.logical_timeout_ms,
-            algorithm_options_version: request.algorithm_options_version,
-            algorithm_options_sha256: request.algorithm_options_sha256.clone(),
-            disposition: disposition as i32,
-            candidate_sequence,
-            candidate_payload_sha256: candidate_payload_sha256
-                .map(|digest| digest.to_vec())
-                .unwrap_or_default(),
-            evidence_sha256: evidence_sha256.to_vec(),
-            correction_revision,
-            terminal_proof_sha256: Vec::new(),
-            detail,
-            candidate_payload_preimage_v1,
-            evidence_disclosure_v1,
-        };
-        let proof = canonical_relocalization_terminal_proof_preimage_v1(&result)
-            .expect("new relocalization result has a clear terminal proof field");
-        result.terminal_proof_sha256 = sha256_bytes(&proof).to_vec();
-        result
-    }
-
     fn snapshot_matches_relocalize_request(
-        snapshot: &SealedActivatedTargetSnapshot,
-        request: &ValidatedRelocalizeRequest,
+        snapshot: &SealedAssignedActivatedTargetSnapshot, request: &ValidatedRelocalizeRequest,
         map_frame_id: &str,
     ) -> Result<(), (crate::proto::RelocalizeDisposition, &'static str)> {
         use crate::proto::RelocalizeDisposition as Disposition;
-        if request.request.runtime_generation != snapshot.runtime_generation {
+        let requested = &request.target().activation;
+        let installed = &snapshot.activation_identity;
+        if requested.runtime_generation != installed.runtime_generation {
             return Err((Disposition::StaleSession, "RELOCALIZATION_RUNTIME_STALE"));
         }
-        if request.request.session_generation < snapshot.session_generation {
+        if requested.session_generation < installed.session_generation {
             return Err((Disposition::StaleSession, "RELOCALIZATION_SESSION_STALE"));
         }
-        if request.request.session_id != snapshot.session_id
-            || request.request.map_name != snapshot.map_name
-            || request.request.session_generation != snapshot.session_generation
-        {
-            return Err((
-                Disposition::SessionInvalidated,
-                "RELOCALIZATION_SESSION_IDENTITY_MISMATCH",
-            ));
+        if requested.request.session_id() != installed.request.session_id()
+            || requested.request.map_name() != installed.request.map_name()
+            || requested.session_generation != installed.session_generation {
+            return Err((Disposition::SessionInvalidated, "RELOCALIZATION_SESSION_IDENTITY_MISMATCH"));
         }
-        if request.request.backend_generation != snapshot.backend_generation
-            || request.activation_identity_sha256 != snapshot.activation_identity_sha256
-            || request.target_receipt_sha256 != snapshot.target_receipt_sha256
-            || request.request.target_cloud_revision != snapshot.immutable_target.source_revision
-            || request.target_cloud_sha256 != snapshot.immutable_target.xyz_sha256
-            || Some(request.asset_manifest_sha256) != snapshot.asset_manifest_sha256
-            || Some(request.asset_bundle_sha256) != snapshot.asset_bundle_sha256
-            || snapshot.immutable_target.frame_id != map_frame_id
-        {
-            return Err((
-                Disposition::TargetInvalidated,
-                "RELOCALIZATION_TARGET_IDENTITY_MISMATCH",
-            ));
+        if !request.identity.matches_target(&snapshot.target_receipt)
+            || !snapshot.target_receipt.validate(&snapshot.checkpoint_owner)
+            || snapshot.checkpoint_owner.cloud().member().frame_id() != map_frame_id
+            || snapshot.publication_proof.target_receipt != TargetReceipt::Assigned(snapshot.target_receipt.clone())
+            || snapshot.publication_proof.cloud_receipt != snapshot.target_receipt.cloud_receipt {
+            return Err((Disposition::TargetInvalidated, "RELOCALIZATION_TARGET_IDENTITY_MISMATCH"));
         }
         Ok(())
     }
 
-    fn same_sealed_target(
-        left: &SealedActivatedTargetSnapshot,
-        right: &SealedActivatedTargetSnapshot,
-    ) -> bool {
-        left.runtime_generation == right.runtime_generation
-            && left.lifecycle_epoch == right.lifecycle_epoch
-            && left.session_id == right.session_id
-            && left.map_name == right.map_name
-            && left.activation_request_id == right.activation_request_id
-            && left.activation_request_identity_sha256 == right.activation_request_identity_sha256
-            && left.activation_identity_sha256 == right.activation_identity_sha256
-            && left.target_receipt_sha256 == right.target_receipt_sha256
-            && left.asset_manifest_sha256 == right.asset_manifest_sha256
-            && left.asset_bundle_sha256 == right.asset_bundle_sha256
-            && left.session_generation == right.session_generation
-            && left.backend_generation == right.backend_generation
-            && left.publication_proof.source_timestamp_ns
-                == right.publication_proof.source_timestamp_ns
-            && left.publication_proof.cloud_revision == right.publication_proof.cloud_revision
-            && left.publication_proof.point_count == right.publication_proof.point_count
-            && left.publication_proof.voxel_size.to_bits()
-                == right.publication_proof.voxel_size.to_bits()
-            && left.publication_proof.cloud_receipt == right.publication_proof.cloud_receipt
-            && left.publication_proof.target_receipt
-                == right.publication_proof.target_receipt
-            && Arc::ptr_eq(&left.immutable_target, &right.immutable_target)
+    fn same_sealed_target(left: &SealedAssignedActivatedTargetSnapshot, right: &SealedAssignedActivatedTargetSnapshot) -> bool {
+        left.activation_identity == right.activation_identity && left.target_receipt == right.target_receipt
+            && left.publication_proof.same_descriptors(&right.publication_proof)
+            && left.checkpoint_owner.shares_source_with(&right.checkpoint_owner)
     }
 
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -9976,6 +9608,11 @@ mod preflight_only_contract {
         mapping_session_id: String,
         mapping_session_generation: u64,
         map_frame_generation: u64,
+        mapping_commit_boot_nonce: u128,
+        mapping_backend_kind: &'static str,
+        mapping_backend_generation: u64,
+        lio_backend: i32,
+        lio_runtime_generation: u64,
     }
 
     impl RelocalizationFrameScope {
@@ -9984,6 +9621,11 @@ mod preflight_only_contract {
                 mapping_session_id: input.mapping_session_id.clone(),
                 mapping_session_generation: input.mapping_session_generation,
                 map_frame_generation: input.map_frame_generation,
+                mapping_commit_boot_nonce: input.mapping_commit_id.boot_nonce,
+                mapping_backend_kind: input.committed_map.backend_kind.stable_name(),
+                mapping_backend_generation: input.committed_map.backend_generation,
+                lio_backend: input.registered_cloud.backend,
+                lio_runtime_generation: input.registered_cloud.runtime_generation,
             }
         }
     }
@@ -10000,585 +9642,193 @@ mod preflight_only_contract {
         }
     }
 
-    fn push_isometry(out: &mut Vec<u8>, transform: &Isometry3<f64>) {
-        let transform = CorrectionTransform::from_isometry(transform);
-        push_correction_transform(out, &transform);
-    }
-
-    fn push_correction_transform(out: &mut Vec<u8>, transform: &CorrectionTransform) {
-        for value in transform.translation_m {
-            out.extend_from_slice(&value.to_be_bytes());
-        }
-        for value in transform.rotation_xyzw {
-            out.extend_from_slice(&value.to_be_bytes());
-        }
-    }
-
-    fn push_relocalization_frame_key(out: &mut Vec<u8>, key: RelocalizationFrameKey) {
-        out.extend_from_slice(&key.mapping_commit_boot_nonce.to_be_bytes());
-        out.extend_from_slice(&key.mapping_commit_sequence.to_be_bytes());
-        out.extend_from_slice(&key.occupancy_revision.to_be_bytes());
-        out.extend_from_slice(&key.cloud_revision.to_be_bytes());
-        out.extend_from_slice(&key.registered_cloud_source_timestamp_ns.to_be_bytes());
-        out.extend_from_slice(&key.registered_cloud_source_sequence.to_be_bytes());
-        out.extend_from_slice(&key.correlated_odom_source_sequence.to_be_bytes());
-    }
-
-    fn push_optional_relocalization_frame_key(
-        out: &mut Vec<u8>,
-        key: Option<RelocalizationFrameKey>,
-    ) {
-        match key {
-            Some(key) => {
-                out.push(1);
-                push_relocalization_frame_key(out, key);
-            }
-            None => out.push(0),
-        }
-    }
-
-    #[cfg_attr(test, allow(dead_code))]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    #[repr(u32)]
-    enum RelocalizationCutoffReasonV1 {
-        MinimumAggregateReached = 1,
-        MaximumFramesReached = 2,
-        MaximumAggregateReached = 3,
-        AccumulationTimeout = 4,
-        LogicalDeadline = 5,
-        LastWaiterCancelled = 6,
-        PhaseAStopped = 7,
-        SessionInvalidated = 8,
-        TargetInvalidated = 9,
-        FrameIntegrityFailure = 10,
-        HardBoundExceeded = 11,
-        AlgorithmRejected = 12,
-        Finalized = 13,
-        OwnerFailed = 14,
+    enum RelocalizationCutoffReasonV1 { MinimumAggregateReached }
+
+    fn relocalization_pose_bits(pose: &Isometry3<f64>) -> crate::proto::RelocalizationPoseBitsV2 {
+        let pose = CorrectionTransform::from_isometry(pose);
+        crate::proto::RelocalizationPoseBitsV2 {
+            translation_m_bits: pose.translation_m.map(f64::to_bits).to_vec(),
+            rotation_xyzw_bits: pose.rotation_xyzw.map(f64::to_bits).to_vec(),
+        }
     }
 
-    struct RelocalizationTargetEvidenceV1<'a> {
-        snapshot: &'a SealedActivatedTargetSnapshot,
-        decoded_point_count: u64,
-        decoded_f64_bytes: u64,
-        decoded_sha256: [u8; 32],
-    }
-
-    struct RelocalizationSourceEvidenceV1<'a> {
-        arm_watermark: Option<RelocalizationFrameKey>,
-        cutoff_reason: RelocalizationCutoffReasonV1,
-        last_accepted_key: Option<RelocalizationFrameKey>,
-        frames: &'a [AccumulatedRelocalizationFrame],
-        aggregate_input_points: u64,
-        aggregate_input_f64_bytes: u64,
-        post_transform_points: u64,
-        post_transform_f64_bytes: u64,
-        emitted_points: u64,
-        canonical_source_bytes: &'a [u8],
-        source_sha256: [u8; 32],
-        boundary_key: RelocalizationFrameKey,
-        boundary_base_anchor_map_from_odom: &'a Isometry3<f64>,
-    }
-
-    struct RelocalizationAlgorithmEvidenceV1<'a> {
-        result: &'a RelocalizationResult,
-        accepted: bool,
-        correction: Option<&'a Isometry3<f64>>,
-    }
-
-    struct RelocalizationCandidateEvidenceV1<'a> {
-        candidate: &'a CorrectionCandidate,
-    }
-
-    struct RelocalizationEvidenceV1<'a> {
-        request_identity_sha256: [u8; 32],
-        admission_ordinal: Option<u64>,
-        normalized_logical_timeout_ms: Option<u64>,
-        runtime_generation: u64,
-        activated_mapping_backend_generation: u64,
-        correction_owner_backend_generation: u64,
-        session_id: &'a str,
-        map_name: &'a str,
-        session_generation: u64,
-        map_frame_id: &'a str,
-        odom_frame_id: &'a str,
-        body_frame_id: &'a str,
-        activation_identity_sha256: [u8; 32],
-        target_receipt_sha256: [u8; 32],
-        asset_manifest_sha256: [u8; 32],
-        asset_bundle_sha256: [u8; 32],
-        source_policy_version: u32,
-        source_policy_sha256: [u8; 32],
-        deadline_policy_version: u32,
-        deadline_policy_sha256: [u8; 32],
-        algorithm_options_version: u32,
-        algorithm_options_sha256: [u8; 32],
-        target: Option<RelocalizationTargetEvidenceV1<'a>>,
-        source: Option<RelocalizationSourceEvidenceV1<'a>>,
-        algorithm: Option<RelocalizationAlgorithmEvidenceV1<'a>>,
-        candidate: Option<RelocalizationCandidateEvidenceV1<'a>>,
-        terminal_disposition: crate::proto::RelocalizeDisposition,
-        correction_revision: u64,
-        detail: &'a str,
-    }
-
-    fn relocalization_candidate_payload_preimage_v1(
-        candidate: Option<&CorrectionCandidate>,
-    ) -> Result<Vec<u8>, String> {
-        let Some(candidate) = candidate else {
-            return Ok(Vec::new());
+    fn assigned_source_receipt(input: &CorrectionFrameInput, map: &str, odom: &str, body: &str)
+        -> Result<crate::proto::RelocalizationSourceReceiptV2, String>
+    {
+        input.validate_source_ownership().map_err(|error| error.to_string())?;
+        let binding = input.source_owner.binding();
+        let occupancy = crate::mapping_commit::OccupancyCommitReceipt {
+            commit_id: input.mapping_commit_id, session_id: input.mapping_session_id.clone(),
+            session_generation: input.mapping_session_generation, occupancy_revision: input.occupancy_revision,
+            source_timestamp_ns: input.committed_map.source_timestamp_ns,
+            backend_kind: input.committed_map.backend_kind, backend_generation: input.committed_map.backend_generation,
         };
-        let preimage = candidate
-            .encode_body_prefix()
-            .map_err(|reason| reason.to_string())?;
-        if preimage.len() > RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES
-            || sha256_bytes(&preimage) != candidate.payload_sha256
-        {
-            return Err("RELOCALIZATION_CANDIDATE_DISCLOSURE_INVALID".to_owned());
-        }
-        Ok(preimage)
-    }
-
-    fn relocalization_source_commitment_record_v1(source: &[u8]) -> Result<Vec<u8>, String> {
-        let mut out = RELOCALIZATION_SOURCE_COMMITMENT_DOMAIN_V1.to_vec();
-        out.extend_from_slice(&RELOCALIZATION_SCHEMA_VERSION_V1.to_be_bytes());
-        out.extend_from_slice(
-            &u64::try_from(source.len())
-                .map_err(|_| "RELOCALIZATION_EVIDENCE_LENGTH_OVERFLOW")?
-                .to_be_bytes(),
-        );
-        out.extend_from_slice(&sha256_bytes(source));
-        Ok(out)
-    }
-
-    fn build_relocalization_evidence_disclosure_v1(
-        preimage: &[u8],
-        canonical_source_range: Option<std::ops::Range<usize>>,
-    ) -> Result<Vec<u8>, String> {
-        let mut out = RELOCALIZATION_EVIDENCE_DISCLOSURE_DOMAIN_V1.to_vec();
-        out.extend_from_slice(&RELOCALIZATION_SCHEMA_VERSION_V1.to_be_bytes());
-        match canonical_source_range {
-            None => {
-                if preimage.len() > RELOCALIZATION_MAX_INLINE_EVIDENCE_PREIMAGE_BYTES {
-                    return Err("RELOCALIZATION_INLINE_EVIDENCE_DISCLOSURE_TOO_LARGE".to_owned());
-                }
-                out.push(0);
-                out.extend_from_slice(
-                    &u64::try_from(preimage.len())
-                        .map_err(|_| "RELOCALIZATION_EVIDENCE_LENGTH_OVERFLOW")?
-                        .to_be_bytes(),
-                );
-                out.extend_from_slice(preimage);
-            }
-            Some(source_range) => {
-                if source_range.start > source_range.end || source_range.end > preimage.len() {
-                    return Err("RELOCALIZATION_EVIDENCE_SOURCE_RANGE_INVALID".to_owned());
-                }
-                let prefix = &preimage[..source_range.start];
-                let source = &preimage[source_range.clone()];
-                let suffix = &preimage[source_range.end..];
-                if prefix.len() > RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES
-                    || source.is_empty()
-                    || source.len() > RELOCALIZATION_MAX_CANONICAL_SOURCE_BYTES
-                    || suffix.len() > RELOCALIZATION_MAX_EVIDENCE_SUFFIX_BYTES
-                {
-                    return Err("RELOCALIZATION_EVIDENCE_DISCLOSURE_BOUND_EXCEEDED".to_owned());
-                }
-                let source_sha256 = sha256_bytes(source);
-                let source_commitment = relocalization_source_commitment_record_v1(source)?;
-                if !prefix.ends_with(&source_commitment) {
-                    return Err("RELOCALIZATION_EVIDENCE_SOURCE_COMMITMENT_UNBOUND".to_owned());
-                }
-
-                out.push(1);
-                for length in [preimage.len(), prefix.len(), source.len(), suffix.len()] {
-                    out.extend_from_slice(
-                        &u64::try_from(length)
-                            .map_err(|_| "RELOCALIZATION_EVIDENCE_LENGTH_OVERFLOW")?
-                            .to_be_bytes(),
-                    );
-                }
-                out.extend_from_slice(prefix);
-                out.extend_from_slice(&source_sha256);
-                out.extend_from_slice(suffix);
-            }
-        }
-        if out.len() > RELOCALIZATION_MAX_EVIDENCE_DISCLOSURE_BYTES {
-            return Err("RELOCALIZATION_EVIDENCE_DISCLOSURE_TOO_LARGE".to_owned());
-        }
-        Ok(out)
-    }
-
-    struct CanonicalRelocalizationEvidencePreimageV1 {
-        bytes: Vec<u8>,
-        canonical_source_range: Option<std::ops::Range<usize>>,
-    }
-
-    fn canonical_relocalization_evidence_sha256_v1(
-        preimage: &CanonicalRelocalizationEvidencePreimageV1,
-    ) -> Result<[u8; 32], String> {
-        let Some(source_range) = preimage.canonical_source_range.clone() else {
-            return Ok(sha256_bytes(&preimage.bytes));
-        };
-        if source_range.start > source_range.end || source_range.end > preimage.bytes.len() {
-            return Err("RELOCALIZATION_EVIDENCE_SOURCE_RANGE_INVALID".to_owned());
-        }
-        let prefix = &preimage.bytes[..source_range.start];
-        let source = &preimage.bytes[source_range.clone()];
-        let suffix = &preimage.bytes[source_range.end..];
-        let full_length = prefix
-            .len()
-            .checked_add(source.len())
-            .and_then(|value| value.checked_add(suffix.len()))
-            .ok_or("RELOCALIZATION_EVIDENCE_LENGTH_OVERFLOW")?;
-        let source_commitment = relocalization_source_commitment_record_v1(source)?;
-        if !prefix.ends_with(&source_commitment) {
-            return Err("RELOCALIZATION_EVIDENCE_SOURCE_COMMITMENT_UNBOUND".to_owned());
-        }
-
-        let mut composable = RELOCALIZATION_EVIDENCE_COMPOSITE_DOMAIN_V1.to_vec();
-        composable.extend_from_slice(&RELOCALIZATION_SCHEMA_VERSION_V1.to_be_bytes());
-        composable.extend_from_slice(&0_u32.to_be_bytes());
-        composable.extend_from_slice(
-            &u64::try_from(full_length)
-                .map_err(|_| "RELOCALIZATION_EVIDENCE_LENGTH_OVERFLOW")?
-                .to_be_bytes(),
-        );
-        composable.extend_from_slice(&1_u32.to_be_bytes());
-        composable.extend_from_slice(
-            &u64::try_from(prefix.len())
-                .map_err(|_| "RELOCALIZATION_EVIDENCE_LENGTH_OVERFLOW")?
-                .to_be_bytes(),
-        );
-        composable.extend_from_slice(prefix);
-        composable.extend_from_slice(&2_u32.to_be_bytes());
-        composable.extend_from_slice(
-            &u64::try_from(source.len())
-                .map_err(|_| "RELOCALIZATION_EVIDENCE_LENGTH_OVERFLOW")?
-                .to_be_bytes(),
-        );
-        composable.extend_from_slice(&sha256_bytes(source));
-        composable.extend_from_slice(&3_u32.to_be_bytes());
-        composable.extend_from_slice(
-            &u64::try_from(suffix.len())
-                .map_err(|_| "RELOCALIZATION_EVIDENCE_LENGTH_OVERFLOW")?
-                .to_be_bytes(),
-        );
-        composable.extend_from_slice(suffix);
-        Ok(sha256_bytes(&composable))
-    }
-
-    // v1 数值统一大端；字符串为 u32 长度加 UTF-8；字节串为 u64 长度加原字节；
-    // 可选段以单字节 0/1 标记；f32/f64 使用原始 IEEE-754 位。顶层字段标签固定为
-    // 1..28，嵌套段按编码语句顺序固定，列表先编码 u32 元素数。
-    fn canonical_relocalization_evidence_preimage_v1(
-        evidence: &RelocalizationEvidenceV1<'_>,
-    ) -> Result<Vec<u8>, String> {
-        canonical_relocalization_evidence_preimage_parts_v1(evidence).map(|preimage| preimage.bytes)
-    }
-
-    fn canonical_relocalization_evidence_preimage_parts_v1(
-        evidence: &RelocalizationEvidenceV1<'_>,
-    ) -> Result<CanonicalRelocalizationEvidencePreimageV1, String> {
-        let mut out = RELOCALIZATION_EVIDENCE_DOMAIN_V1.to_vec();
-        let mut canonical_source_range = None;
-        out.extend_from_slice(&RELOCALIZATION_SCHEMA_VERSION_V1.to_be_bytes());
-
-        macro_rules! tag {
-            ($value:expr) => {
-                out.extend_from_slice(&($value).to_be_bytes())
-            };
-        }
-
-        tag!(1_u32);
-        out.extend_from_slice(&evidence.request_identity_sha256);
-        tag!(2_u32);
-        match evidence.admission_ordinal {
-            Some(value) => {
-                out.push(1);
-                out.extend_from_slice(&value.to_be_bytes());
-            }
-            None => out.push(0),
-        }
-        tag!(3_u32);
-        match evidence.normalized_logical_timeout_ms {
-            Some(value) => {
-                out.push(1);
-                out.extend_from_slice(&value.to_be_bytes());
-            }
-            None => out.push(0),
-        }
-        tag!(4_u32);
-        out.extend_from_slice(&evidence.runtime_generation.to_be_bytes());
-        tag!(5_u32);
-        out.extend_from_slice(&evidence.activated_mapping_backend_generation.to_be_bytes());
-        tag!(6_u32);
-        out.extend_from_slice(&evidence.correction_owner_backend_generation.to_be_bytes());
-        tag!(7_u32);
-        canonical_push_string(&mut out, evidence.session_id);
-        tag!(8_u32);
-        canonical_push_string(&mut out, evidence.map_name);
-        tag!(9_u32);
-        out.extend_from_slice(&evidence.session_generation.to_be_bytes());
-        tag!(10_u32);
-        canonical_push_string(&mut out, evidence.map_frame_id);
-        tag!(11_u32);
-        canonical_push_string(&mut out, evidence.odom_frame_id);
-        tag!(12_u32);
-        canonical_push_string(&mut out, evidence.body_frame_id);
-        tag!(13_u32);
-        out.extend_from_slice(&evidence.activation_identity_sha256);
-        tag!(14_u32);
-        out.extend_from_slice(&evidence.target_receipt_sha256);
-        tag!(15_u32);
-        out.extend_from_slice(&evidence.asset_manifest_sha256);
-        tag!(16_u32);
-        out.extend_from_slice(&evidence.asset_bundle_sha256);
-        tag!(17_u32);
-        out.extend_from_slice(&evidence.source_policy_version.to_be_bytes());
-        out.extend_from_slice(&evidence.source_policy_sha256);
-        tag!(18_u32);
-        out.extend_from_slice(&evidence.deadline_policy_version.to_be_bytes());
-        out.extend_from_slice(&evidence.deadline_policy_sha256);
-        tag!(19_u32);
-        out.extend_from_slice(&evidence.algorithm_options_version.to_be_bytes());
-        out.extend_from_slice(&evidence.algorithm_options_sha256);
-
-        tag!(20_u32);
-        match evidence.target.as_ref() {
-            Some(target) => {
-                out.push(1);
-                let snapshot = target.snapshot;
-                out.extend_from_slice(b"target.v1\0");
-                out.extend_from_slice(&snapshot.runtime_generation.to_be_bytes());
-                out.extend_from_slice(&snapshot.lifecycle_epoch.to_be_bytes());
-                canonical_push_string(&mut out, &snapshot.session_id);
-                canonical_push_string(&mut out, &snapshot.map_name);
-                out.extend_from_slice(&snapshot.session_generation.to_be_bytes());
-                out.extend_from_slice(&snapshot.backend_generation.to_be_bytes());
-                canonical_push_string(&mut out, &snapshot.activation_request_id);
-                out.extend_from_slice(&snapshot.activation_request_identity_sha256);
-                out.extend_from_slice(&snapshot.activation_identity_sha256);
-                out.extend_from_slice(&snapshot.target_receipt_sha256);
-                canonical_push_optional_digest(&mut out, snapshot.asset_manifest_sha256);
-                canonical_push_optional_digest(&mut out, snapshot.asset_bundle_sha256);
-                canonical_push_string(&mut out, &snapshot.immutable_target.frame_id);
-                out.extend_from_slice(&snapshot.immutable_target.source_revision.to_be_bytes());
-                out.extend_from_slice(&snapshot.immutable_target.point_count.to_be_bytes());
-                out.extend_from_slice(
-                    &snapshot.immutable_target.voxel_size.to_bits().to_be_bytes(),
-                );
-                out.extend_from_slice(
-                    &snapshot
-                        .immutable_target
-                        .payload_schema_version
-                        .to_be_bytes(),
-                );
-                out.extend_from_slice(
-                    &u64::try_from(snapshot.immutable_target.xyz_f32_le.len())
-                        .map_err(|_| "RELOCALIZATION_TARGET_LENGTH_OVERFLOW")?
-                        .to_be_bytes(),
-                );
-                out.extend_from_slice(&snapshot.immutable_target.xyz_sha256);
-                out.extend_from_slice(&target.decoded_point_count.to_be_bytes());
-                out.extend_from_slice(&target.decoded_f64_bytes.to_be_bytes());
-                out.extend_from_slice(&target.decoded_sha256);
-                let publication = &snapshot.publication_proof;
-                out.extend_from_slice(&publication.source_timestamp_ns.to_be_bytes());
-                out.extend_from_slice(&publication.cloud_revision.to_be_bytes());
-                out.extend_from_slice(&publication.point_count.to_be_bytes());
-                out.extend_from_slice(&publication.voxel_size.to_bits().to_be_bytes());
-                let receipt = &publication.cloud_receipt;
-                out.extend_from_slice(&receipt.commit_id.boot_nonce.to_be_bytes());
-                out.extend_from_slice(&receipt.commit_id.sequence.to_be_bytes());
-                out.extend_from_slice(&receipt.session_generation.to_be_bytes());
-                out.extend_from_slice(&receipt.occupancy_revision.to_be_bytes());
-                out.extend_from_slice(&receipt.cloud_revision.to_be_bytes());
-                out.extend_from_slice(&receipt.source_timestamp_ns.to_be_bytes());
-                out.extend_from_slice(&receipt.point_count.to_be_bytes());
-                out.extend_from_slice(&publication.target_receipt.legacy_digest().expect("legacy-only relocalization snapshot"));
-            }
-            None => out.push(0),
-        }
-
-        tag!(21_u32);
-        match evidence.source.as_ref() {
-            Some(source) => {
-                out.push(1);
-                out.extend_from_slice(b"source.v1\0");
-                push_optional_relocalization_frame_key(&mut out, source.arm_watermark);
-                out.extend_from_slice(&(source.cutoff_reason as u32).to_be_bytes());
-                push_optional_relocalization_frame_key(&mut out, source.last_accepted_key);
-                out.extend_from_slice(
-                    &u32::try_from(source.frames.len())
-                        .map_err(|_| "RELOCALIZATION_FRAME_COUNT_OVERFLOW")?
-                        .to_be_bytes(),
-                );
-                for frame in source.frames {
-                    out.extend_from_slice(b"frame.v1\0");
-                    let input = &frame.input;
-                    push_relocalization_frame_key(&mut out, relocalization_frame_key(input));
-                    canonical_push_string(&mut out, &input.mapping_session_id);
-                    out.extend_from_slice(&input.mapping_session_generation.to_be_bytes());
-                    out.extend_from_slice(&input.map_frame_generation.to_be_bytes());
-                    out.extend_from_slice(&input.registered_cloud.point_count.to_be_bytes());
-                    out.extend_from_slice(&input.registered_cloud.envelope_sha256);
-                    out.extend_from_slice(&input.registered_cloud.body_points_sha256);
-                    out.extend_from_slice(
-                        &input
-                            .correlated_odom
-                            .proof
-                            .source_timestamp_ns
-                            .to_be_bytes(),
-                    );
-                    out.extend_from_slice(&input.correlated_odom.proof.pose_sha256);
-                    out.extend_from_slice(&input.committed_map.source_timestamp_ns.to_be_bytes());
-                    out.extend_from_slice(&input.committed_map.width.to_be_bytes());
-                    out.extend_from_slice(&input.committed_map.height.to_be_bytes());
-                    out.extend_from_slice(
-                        &input.committed_map.resolution_m.to_bits().to_be_bytes(),
-                    );
-                    out.extend_from_slice(&input.committed_map.origin_x_m.to_bits().to_be_bytes());
-                    out.extend_from_slice(&input.committed_map.origin_y_m.to_bits().to_be_bytes());
-                    out.extend_from_slice(&input.committed_map.payload_sha256);
-                    out.extend_from_slice(&input.committed_map.boundary_sha256);
-                    canonical_push_string(&mut out, &input.points_frame_id);
-                    push_isometry(&mut out, &input.correlated_odom.odom_from_body);
-                    push_isometry(&mut out, &input.base_anchor_map_from_odom);
-                    out.extend_from_slice(&frame.evidence_sha256);
-                }
-                out.extend_from_slice(&source.aggregate_input_points.to_be_bytes());
-                out.extend_from_slice(&source.aggregate_input_f64_bytes.to_be_bytes());
-                out.extend_from_slice(&source.post_transform_points.to_be_bytes());
-                out.extend_from_slice(&source.post_transform_f64_bytes.to_be_bytes());
-                out.extend_from_slice(&source.emitted_points.to_be_bytes());
-                if sha256_bytes(source.canonical_source_bytes) != source.source_sha256 {
-                    return Err("RELOCALIZATION_EVIDENCE_SOURCE_DIGEST_MISMATCH".to_owned());
-                }
-                out.extend_from_slice(&relocalization_source_commitment_record_v1(
-                    source.canonical_source_bytes,
-                )?);
-                let source_start = out.len();
-                out.extend_from_slice(source.canonical_source_bytes);
-                let source_end = source_start
-                    .checked_add(source.canonical_source_bytes.len())
-                    .ok_or("RELOCALIZATION_EVIDENCE_LENGTH_OVERFLOW")?;
-                canonical_source_range = Some(source_start..source_end);
-                push_relocalization_frame_key(&mut out, source.boundary_key);
-                push_isometry(&mut out, source.boundary_base_anchor_map_from_odom);
-            }
-            None => out.push(0),
-        }
-
-        tag!(22_u32);
-        match evidence.algorithm.as_ref() {
-            Some(algorithm) => {
-                out.push(1);
-                out.extend_from_slice(b"algorithm.v1\0");
-                out.push(u8::from(algorithm.result.registration.converged));
-                out.extend_from_slice(&algorithm.result.registration.mse.to_bits().to_be_bytes());
-                out.extend_from_slice(
-                    &u64::try_from(algorithm.result.registration.iterations)
-                        .map_err(|_| "RELOCALIZATION_ITERATION_COUNT_OVERFLOW")?
-                        .to_be_bytes(),
-                );
-                out.extend_from_slice(
-                    &u64::try_from(algorithm.result.feature_matches)
-                        .map_err(|_| "RELOCALIZATION_FEATURE_COUNT_OVERFLOW")?
-                        .to_be_bytes(),
-                );
-                out.extend_from_slice(
-                    &u64::try_from(algorithm.result.ransac_inliers)
-                        .map_err(|_| "RELOCALIZATION_INLIER_COUNT_OVERFLOW")?
-                        .to_be_bytes(),
-                );
-                out.extend_from_slice(&algorithm.result.fitness.to_bits().to_be_bytes());
-                push_isometry(&mut out, &algorithm.result.registration.transformation);
-                out.push(u8::from(algorithm.accepted));
-                match algorithm.correction {
-                    Some(correction) => {
-                        out.push(1);
-                        push_isometry(&mut out, correction);
-                    }
-                    None => out.push(0),
-                }
-            }
-            None => out.push(0),
-        }
-
-        tag!(23_u32);
-        match evidence.candidate.as_ref() {
-            Some(candidate) => {
-                out.push(1);
-                out.extend_from_slice(b"candidate.v1\0");
-                let candidate = candidate.candidate;
-                out.extend_from_slice(&candidate.identity.backend.wire_code().to_be_bytes());
-                out.extend_from_slice(
-                    &candidate
-                        .identity
-                        .transform_semantics
-                        .wire_code()
-                        .to_be_bytes(),
-                );
-                out.extend_from_slice(&candidate.identity.runtime_generation.to_be_bytes());
-                out.extend_from_slice(&candidate.identity.backend_generation.to_be_bytes());
-                out.extend_from_slice(&candidate.identity.candidate_sequence.to_be_bytes());
-                canonical_push_string(&mut out, &candidate.identity.mapping_session_id);
-                out.extend_from_slice(&candidate.identity.mapping_session_generation.to_be_bytes());
-                out.extend_from_slice(&candidate.identity.map_frame_generation.to_be_bytes());
-                push_relocalization_frame_key(
-                    &mut out,
-                    RelocalizationFrameKey {
-                        mapping_commit_boot_nonce: candidate.identity.mapping_commit_id.boot_nonce,
-                        mapping_commit_sequence: candidate.identity.mapping_commit_id.sequence,
-                        occupancy_revision: candidate.identity.occupancy_revision,
-                        cloud_revision: candidate.identity.cloud_revision,
-                        registered_cloud_source_timestamp_ns: candidate
-                            .identity
-                            .registered_cloud
-                            .source_timestamp_ns,
-                        registered_cloud_source_sequence: candidate
-                            .identity
-                            .registered_cloud
-                            .source_sequence,
-                        correlated_odom_source_sequence: candidate
-                            .identity
-                            .correlated_odom
-                            .source_sequence,
-                    },
-                );
-                out.extend_from_slice(
-                    &candidate.identity.correction_lease.boot_nonce.to_be_bytes(),
-                );
-                out.extend_from_slice(
-                    &candidate.identity.correction_lease.generation.to_be_bytes(),
-                );
-                push_correction_transform(&mut out, &candidate.transform);
-                out.extend_from_slice(&candidate.payload_sha256);
-            }
-            None => out.push(0),
-        }
-        tag!(24_u32);
-        out.extend_from_slice(&(evidence.terminal_disposition as i32).to_be_bytes());
-        tag!(25_u32);
-        out.extend_from_slice(&evidence.correction_revision.to_be_bytes());
-        tag!(26_u32);
-        canonical_push_string(&mut out, evidence.detail);
-        tag!(27_u32);
-        out.extend_from_slice(b"terminal-proof-follows\0");
-        tag!(28_u32);
-        out.push(0);
-        Ok(CanonicalRelocalizationEvidencePreimageV1 {
-            bytes: out,
-            canonical_source_range,
+        Ok(crate::proto::RelocalizationSourceReceiptV2 {
+            occupancy_receipt: Some(crate::activation_contract::occupancy_to_wire(&occupancy)),
+            cloud_receipt: Some(crate::activation_contract::cloud_to_wire(&input.cloud_receipt)),
+            cloud_revision: input.cloud_revision, map_frame_generation: input.map_frame_generation,
+            lio_backend: input.registered_cloud.backend, runtime_generation: input.registered_cloud.runtime_generation,
+            source_sequence: input.registered_cloud.source_sequence, source_timestamp_ns: input.registered_cloud.source_timestamp_ns,
+            admitted_point_count: input.registered_cloud.point_count,
+            correlated_odom_source_sequence: input.correlated_odom.proof.source_sequence,
+            correlated_odom_source_timestamp_ns: input.correlated_odom.proof.source_timestamp_ns,
+            odom_from_body: Some(relocalization_pose_bits(&input.correlated_odom.odom_from_body)),
+            map_geometry: Some(crate::proto::RelocalizationMapGeometryV2 {
+                width: input.committed_map.width, height: input.committed_map.height,
+                resolution_m_bits: input.committed_map.resolution_m.to_bits(),
+                origin_x_m_bits: input.committed_map.origin_x_m.to_bits(), origin_y_m_bits: input.committed_map.origin_y_m.to_bits(),
+            }),
+            base_anchor_map_from_odom: Some(relocalization_pose_bits(&input.base_anchor_map_from_odom)),
+            registration_map_from_odom: Some(relocalization_pose_bits(&binding.registration_map_from_odom)),
+            map_frame_id: map.into(), odom_frame_id: odom.into(), body_frame_id: body.into(), points_frame_id: input.points_frame_id.clone(),
+            registration_correction_revision: binding.registration_correction_revision,
+            frame_capture_relocalization_epoch: input.frame_capture_relocalization_epoch,
+            relocalization_mode_epoch: input.relocalization_mode_epoch,
         })
     }
 
-    fn relocalization_evidence_sha256_v1(
-        evidence: &RelocalizationEvidenceV1<'_>,
-    ) -> Result<[u8; 32], String> {
-        let preimage = canonical_relocalization_evidence_preimage_parts_v1(evidence)?;
-        canonical_relocalization_evidence_sha256_v1(&preimage)
+    fn assigned_relocalization_result(
+        request: &AssignedCloudRelocalizeRequestIdentityV2, disposition: crate::proto::RelocalizeDisposition,
+        correction_revision: u64, detail: &str, candidate_payload_v3: Vec<u8>, evidence: crate::proto::AssignedRelocalizationEvidenceV2,
+    ) -> crate::proto::RelocalizeResult {
+        crate::proto::RelocalizeResult {
+            schema_version: 2, request_id: request.request_id().to_owned(),
+            assigned_cloud_v2: Some(crate::proto::AssignedCloudRelocalizeResultV2 {
+                request: Some(request.to_wire()), disposition: disposition as i32,
+                correction_revision, detail: detail.to_owned(), candidate_payload_v3, evidence: Some(evidence),
+            }), ..Default::default()
+        }
+    }
+
+    fn assigned_pose_transform(pose: Option<&crate::proto::RelocalizationPoseBitsV2>) -> Result<CorrectionTransform, String> {
+        let pose = pose.ok_or("RELOCALIZATION_ASSIGNED_POSE_ABSENT")?;
+        let translation_m: [u64; 3] = pose.translation_m_bits.as_slice().try_into().map_err(|_| "RELOCALIZATION_ASSIGNED_POSE_INVALID")?;
+        let rotation_xyzw: [u64; 4] = pose.rotation_xyzw_bits.as_slice().try_into().map_err(|_| "RELOCALIZATION_ASSIGNED_POSE_INVALID")?;
+        let transform = CorrectionTransform { translation_m: translation_m.map(f64::from_bits), rotation_xyzw: rotation_xyzw.map(f64::from_bits) };
+        correction_transform_isometry(transform)?;
+        Ok(transform)
+    }
+
+    fn assigned_pose_isometry(pose: Option<&crate::proto::RelocalizationPoseBitsV2>) -> Result<Isometry3<f64>, String> {
+        let transform = assigned_pose_transform(pose)?;
+        let [x, y, z, w] = transform.rotation_xyzw;
+        let [tx, ty, tz] = transform.translation_m;
+        // Norm and finiteness were checked above. Preserve the admitted bits;
+        // a second normalization would change the retained algorithm operands.
+        Ok(Isometry3::from_parts(Translation3::new(tx, ty, tz),
+            UnitQuaternion::new_unchecked(Quaternion::new(w, x, y, z))))
+    }
+
+    /// Durable validation checks retained exact bindings and canonical V3 body.
+    /// It does not claim that released source bytes or external side effects can
+    /// be independently attested after reopening. Capture additionally compares
+    /// these receipts with the real admitted owners and actual finalizer outcome.
+    fn validate_assigned_terminal_retained(
+        request: &AssignedCloudRelocalizeRequestIdentityV2, result: &crate::proto::AssignedCloudRelocalizeResultV2,
+    ) -> Result<(), String> {
+        use crate::proto::{AssignedRelocalizationEvidencePhaseV2 as Phase, RelocalizeDisposition as Disposition};
+        let evidence = result.evidence.as_ref().ok_or("RELOCALIZATION_ASSIGNED_EVIDENCE_ABSENT")?;
+        let phase = Phase::try_from(evidence.phase).map_err(|_| "RELOCALIZATION_ASSIGNED_PHASE_INVALID")?;
+        let disposition = Disposition::try_from(result.disposition).map_err(|_| "RELOCALIZATION_ASSIGNED_DISPOSITION_INVALID")?;
+        if phase == Phase::PreAdmission {
+            if evidence.owner.is_some() || evidence.admission_ordinal.is_some() || !evidence.source_frames.is_empty()
+                || evidence.algorithm.is_some() || !result.candidate_payload_v3.is_empty() || result.correction_revision != 0
+                || matches!(disposition, Disposition::Applied | Disposition::AlreadyApplied | Disposition::AlgorithmRejected) {
+                return Err("RELOCALIZATION_ASSIGNED_PRE_ADMISSION_CLAIMS_INVALID".into());
+            }
+            return Ok(());
+        }
+        let owner = evidence.owner.as_ref().ok_or("RELOCALIZATION_ASSIGNED_OWNER_ABSENT")?;
+        if owner.relocalization_epoch.is_none_or(|epoch| epoch == 0 || epoch % 2 == 0) {
+            return Err("RELOCALIZATION_ASSIGNED_OWNER_EPOCH_INVALID".into());
+        }
+        let mut source_scope = None;
+        for frame in &evidence.source_frames {
+            let occupancy = crate::activation_identity::occupancy_receipt_from_wire(frame.occupancy_receipt.as_ref().ok_or("RELOCALIZATION_ASSIGNED_OCCUPANCY_ABSENT")?)?;
+            let cloud = crate::activation_identity::cloud_receipt_from_wire(frame.cloud_receipt.as_ref().ok_or("RELOCALIZATION_ASSIGNED_CLOUD_ABSENT")?)?;
+            if cloud.commit_id.boot_nonce != occupancy.commit_id.boot_nonce
+                || cloud.commit_id.sequence > occupancy.commit_id.sequence
+                || cloud.occupancy_revision > occupancy.occupancy_revision
+                || cloud.source_timestamp_ns > occupancy.source_timestamp_ns
+                || occupancy.source_timestamp_ns > frame.source_timestamp_ns
+                || frame.correlated_odom_source_timestamp_ns > frame.source_timestamp_ns
+                || frame.relocalization_mode_epoch != owner.relocalization_epoch
+                || frame.frame_capture_relocalization_epoch != owner.relocalization_epoch.unwrap_or(0) {
+                return Err("RELOCALIZATION_ASSIGNED_SOURCE_ORDER_OR_EPOCH_MISMATCH".into());
+            }
+            let scope = (occupancy.commit_id.boot_nonce, frame.map_frame_generation, frame.lio_backend, frame.runtime_generation);
+            if source_scope.is_some_and(|expected| expected != scope) { return Err("RELOCALIZATION_ASSIGNED_SOURCE_SCOPE_MISMATCH".into()); }
+            source_scope = Some(scope);
+            assigned_pose_transform(frame.odom_from_body.as_ref())?;
+            assigned_pose_transform(frame.base_anchor_map_from_odom.as_ref())?;
+            assigned_pose_transform(frame.registration_map_from_odom.as_ref())?;
+        }
+        if let Some(algorithm) = &evidence.algorithm {
+            assigned_pose_transform(algorithm.estimated_transform.as_ref())?;
+            if algorithm.proposed_correction.is_some() { assigned_pose_transform(algorithm.proposed_correction.as_ref())?; }
+            // Accepted compute can settle before a candidate is claimed (for
+            // example cancellation, reserve failure, or staging failure). Its
+            // algorithm receipt still binds the exact frozen source operands.
+            if algorithm.accepted {
+                let boundary = evidence.source_frames.last().ok_or("RELOCALIZATION_ASSIGNED_ALGORITHM_BOUNDARY_ABSENT")?;
+                let transform = assigned_pose_transform(algorithm.proposed_correction.as_ref())?;
+                let base = assigned_pose_isometry(boundary.base_anchor_map_from_odom.as_ref())?;
+                let estimate = assigned_pose_isometry(algorithm.estimated_transform.as_ref())?;
+                let derived = CorrectionTransform::from_isometry(&(base.inverse() * estimate));
+                if transform.translation_m.iter().zip(derived.translation_m).any(|(a,b)| a.to_bits() != b.to_bits())
+                    || transform.rotation_xyzw.iter().zip(derived.rotation_xyzw).any(|(a,b)| a.to_bits() != b.to_bits())
+                    || request.target().cloud_receipt.point_count < RELOCALIZATION_MIN_SOURCE_POINTS as u32 {
+                    return Err("RELOCALIZATION_ASSIGNED_ALGORITHM_BINDING_MISMATCH".into());
+                }
+            }
+        }
+        if result.candidate_payload_v3.is_empty() {
+            if phase == Phase::Finalized || result.correction_revision != 0
+                || matches!(disposition, Disposition::Applied | Disposition::AlreadyApplied) {
+                return Err("RELOCALIZATION_ASSIGNED_OUTCOME_WITHOUT_CANDIDATE".into());
+            }
+            return Ok(());
+        }
+        if phase != Phase::Finalized || !matches!(disposition, Disposition::Applied | Disposition::AlreadyApplied | Disposition::Rejected) {
+            return Err("RELOCALIZATION_ASSIGNED_CANDIDATE_OUTCOME_INVALID".into());
+        }
+        let candidate = CorrectionCandidate::decode_body(&result.candidate_payload_v3).map_err(|error| error.to_string())?;
+        if candidate.encode_body().map_err(|error| error.to_string())? != result.candidate_payload_v3 {
+            return Err("RELOCALIZATION_ASSIGNED_CANDIDATE_NON_CANONICAL".into());
+        }
+        let boundary = evidence.source_frames.last().ok_or("RELOCALIZATION_ASSIGNED_CANDIDATE_BOUNDARY_ABSENT")?;
+        let occupancy = crate::activation_identity::occupancy_receipt_from_wire(boundary.occupancy_receipt.as_ref().ok_or("RELOCALIZATION_ASSIGNED_OCCUPANCY_ABSENT")?)?;
+        let geometry = boundary.map_geometry.as_ref().ok_or("RELOCALIZATION_ASSIGNED_GEOMETRY_ABSENT")?;
+        let odom = assigned_pose_transform(boundary.odom_from_body.as_ref())?;
+        let lease_nonce: [u8; 16] = owner.correction_lease_boot_nonce.as_slice().try_into().map_err(|_| "RELOCALIZATION_ASSIGNED_LEASE_INVALID")?;
+        let identity = CorrectionCandidateIdentity {
+            backend: CorrectionCandidateBackend::Relocalization,
+            transform_semantics: CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
+            runtime_generation: owner.runtime_generation, backend_generation: owner.correction_backend_generation,
+            candidate_sequence: candidate.identity.candidate_sequence,
+            mapping_session_id: occupancy.session_id, mapping_session_generation: occupancy.session_generation,
+            map_frame_generation: boundary.map_frame_generation, mapping_commit_id: occupancy.commit_id,
+            occupancy_revision: occupancy.occupancy_revision, cloud_revision: boundary.cloud_revision,
+            registered_cloud: RegisteredCloudProof { backend: boundary.lio_backend, runtime_generation: boundary.runtime_generation,
+                source_sequence: boundary.source_sequence, source_timestamp_ns: boundary.source_timestamp_ns, point_count: boundary.admitted_point_count },
+            correlated_odom: CorrelatedOdomProof { source_sequence: boundary.correlated_odom_source_sequence,
+                source_timestamp_ns: boundary.correlated_odom_source_timestamp_ns, translation_m: odom.translation_m, rotation_xyzw: odom.rotation_xyzw },
+            committed_map: CommittedMapProof { backend_kind: occupancy.backend_kind, backend_generation: occupancy.backend_generation,
+                source_timestamp_ns: occupancy.source_timestamp_ns, width: geometry.width, height: geometry.height,
+                resolution_m: f64::from_bits(geometry.resolution_m_bits), origin_x_m: f64::from_bits(geometry.origin_x_m_bits),
+                origin_y_m: f64::from_bits(geometry.origin_y_m_bits) },
+            source_timestamp_ns: boundary.source_timestamp_ns, map_frame_id: owner.map_frame_id.clone(),
+            odom_frame_id: owner.odom_frame_id.clone(), body_frame_id: owner.body_frame_id.clone(), points_frame_id: boundary.points_frame_id.clone(),
+            correction_lease: CorrectionLeaseId { boot_nonce: u128::from_be_bytes(lease_nonce), generation: owner.correction_lease_generation },
+        };
+        let algorithm = evidence.algorithm.as_ref().ok_or("RELOCALIZATION_ASSIGNED_ALGORITHM_ABSENT")?;
+        let transform = assigned_pose_transform(algorithm.proposed_correction.as_ref())?;
+        let expected = CorrectionCandidate::seal(identity, transform).map_err(|error| error.to_string())?;
+        if candidate != expected || candidate.identity.mapping_session_id != request.target().activation.request.session_id() {
+            return Err("RELOCALIZATION_ASSIGNED_CANDIDATE_BINDING_MISMATCH".into());
+        }
+        Ok(())
     }
 
     fn relocalization_frame_evidence(
@@ -10587,7 +9837,7 @@ mod preflight_only_contract {
         odom_frame_id: &str,
         body_frame_id: &str,
         input: &CorrectionFrameInput,
-    ) -> Result<(RelocalizationFrameKey, [u8; 32]), String> {
+    ) -> Result<RelocalizationFrameKey, String> {
         staged_correction_frame(
             CorrectionCandidateBackend::Relocalization,
             owner,
@@ -10613,76 +9863,32 @@ mod preflight_only_contract {
         if envelope_bound > RELOCALIZATION_MAX_ENVELOPE_DATA_BYTES {
             return Err("RELOCALIZATION_ENVELOPE_SIZE_EXCEEDED".to_owned());
         }
-        let key = relocalization_frame_key(input);
-        let mut proof = b"nuwax.geometry.relocalize.frame-evidence.v1\0".to_vec();
-        canonical_push_string(&mut proof, &input.mapping_session_id);
-        proof.extend_from_slice(&input.mapping_session_generation.to_be_bytes());
-        proof.extend_from_slice(&input.map_frame_generation.to_be_bytes());
-        proof.extend_from_slice(&key.mapping_commit_boot_nonce.to_be_bytes());
-        proof.extend_from_slice(&key.mapping_commit_sequence.to_be_bytes());
-        proof.extend_from_slice(&key.occupancy_revision.to_be_bytes());
-        proof.extend_from_slice(&key.cloud_revision.to_be_bytes());
-        proof.extend_from_slice(&key.registered_cloud_source_timestamp_ns.to_be_bytes());
-        proof.extend_from_slice(&key.registered_cloud_source_sequence.to_be_bytes());
-        proof.extend_from_slice(&key.correlated_odom_source_sequence.to_be_bytes());
-        proof.extend_from_slice(&input.registered_cloud.point_count.to_be_bytes());
-        proof.extend_from_slice(&input.registered_cloud.envelope_sha256);
-        proof.extend_from_slice(&input.registered_cloud.body_points_sha256);
-        proof.extend_from_slice(
-            &input
-                .correlated_odom
-                .proof
-                .source_timestamp_ns
-                .to_be_bytes(),
-        );
-        proof.extend_from_slice(&input.correlated_odom.proof.pose_sha256);
-        proof.extend_from_slice(&input.committed_map.source_timestamp_ns.to_be_bytes());
-        proof.extend_from_slice(&input.committed_map.width.to_be_bytes());
-        proof.extend_from_slice(&input.committed_map.height.to_be_bytes());
-        proof.extend_from_slice(&input.committed_map.resolution_m.to_be_bytes());
-        proof.extend_from_slice(&input.committed_map.origin_x_m.to_be_bytes());
-        proof.extend_from_slice(&input.committed_map.origin_y_m.to_be_bytes());
-        proof.extend_from_slice(&input.committed_map.payload_sha256);
-        proof.extend_from_slice(&input.committed_map.boundary_sha256);
-        canonical_push_string(&mut proof, &input.points_frame_id);
-        push_isometry(&mut proof, &input.correlated_odom.odom_from_body);
-        push_isometry(&mut proof, &input.base_anchor_map_from_odom);
-        if proof.len() > RELOCALIZATION_MAX_PROOF_BYTES {
-            return Err("RELOCALIZATION_FRAME_PROOF_SIZE_EXCEEDED".to_owned());
+        input.validate_source_ownership().map_err(|error| error.to_string())?;
+        let receipt = assigned_source_receipt(input, map_frame_id, odom_frame_id, body_frame_id)?;
+        if receipt.encoded_len() > RELOCALIZATION_MAX_PROOF_BYTES {
+            return Err("RELOCALIZATION_FRAME_PROOF_SIZE_EXCEEDED".into());
         }
-        Ok((key, sha256_bytes(&proof)))
+        Ok(relocalization_frame_key(input))
     }
 
     struct AccumulatedRelocalizationFrame {
-        evidence_sha256: [u8; 32],
-        input: CorrectionFrameInput,
+        input: Arc<CorrectionFrameInput>,
     }
 
     struct SealedRelocalizationSource {
         boundary_input: CorrectionFrameInput,
         boundary_lease: Arc<CorrectionRequestLease>,
-        snapshot: SealedActivatedTargetSnapshot,
-        arm_watermark: Option<RelocalizationFrameKey>,
-        cutoff_reason: RelocalizationCutoffReasonV1,
+        snapshot: SealedAssignedActivatedTargetSnapshot,
         frames: Vec<AccumulatedRelocalizationFrame>,
-        aggregate_input_points: u64,
-        aggregate_input_f64_bytes: u64,
-        post_transform_points: u64,
-        post_transform_f64_bytes: u64,
         source_points: Arc<[Point3<f64>]>,
         target_points: Arc<[Point3<f64>]>,
-        canonical_source_bytes: Vec<u8>,
-        source_sha256: [u8; 32],
-        target_decoded_point_count: u64,
-        target_decoded_f64_bytes: u64,
-        target_decoded_sha256: [u8; 32],
     }
 
     fn seal_relocalization_source(
         mut accumulation: RelocalizationAccumulation,
         boundary_input: CorrectionFrameInput,
         boundary_lease: Arc<CorrectionRequestLease>,
-        cutoff_reason: RelocalizationCutoffReasonV1,
+        _cutoff_reason: RelocalizationCutoffReasonV1,
     ) -> Result<SealedRelocalizationSource, String> {
         if !boundary_lease.has_lifecycle_guard() {
             return Err("RELOCALIZATION_BOUNDARY_LIFECYCLE_GUARD_MISSING".to_owned());
@@ -10690,6 +9896,10 @@ mod preflight_only_contract {
         accumulation
             .accepted
             .sort_by_key(|frame| relocalization_frame_key(&frame.input));
+        boundary_input.validate_source_ownership().map_err(|error| error.to_string())?;
+        if accumulation.accepted.last().is_none_or(|frame| !frame.input.exactly_matches(&boundary_input)) {
+            return Err("RELOCALIZATION_BOUNDARY_OWNER_MISMATCH".into());
+        }
         let boundary_key = relocalization_frame_key(&boundary_input);
         if accumulation
             .accepted
@@ -10731,115 +9941,46 @@ mod preflight_only_contract {
         if post_transform_f64_bytes > RELOCALIZATION_MAX_AGGREGATE_F64_BYTES {
             return Err("RELOCALIZATION_POST_TRANSFORM_BYTES_EXCEEDED".to_owned());
         }
-        let post_transform_points = ordered.len();
-        let (source_points, canonical_source_bytes, source_sha256) =
-            stable_stratified_source(ordered)?;
-        let (target_points, target_decoded_sha256) =
-            decode_relocalization_target(&accumulation.snapshot.immutable_target)?;
-        let target_decoded_f64_bytes = target_points
-            .len()
-            .checked_mul(3)
-            .and_then(|count| count.checked_mul(std::mem::size_of::<f64>()))
-            .ok_or_else(|| "RELOCALIZATION_TARGET_DECODED_BYTES_OVERFLOW".to_owned())?;
-        let target_decoded_point_count =
-            u64::from(accumulation.snapshot.immutable_target.point_count);
+        let source_points = stable_stratified_source(ordered)?;
+        let target_points = decode_relocalization_target(accumulation.snapshot.checkpoint_owner.cloud())?;
         Ok(SealedRelocalizationSource {
-            boundary_input,
-            boundary_lease,
-            snapshot: accumulation.snapshot,
-            arm_watermark: accumulation.arm_watermark,
-            cutoff_reason,
-            frames: accumulation.accepted,
-            aggregate_input_points: u64::try_from(accumulation.aggregate_input_points)
-                .map_err(|_| "RELOCALIZATION_AGGREGATE_POINT_COUNT_OVERFLOW".to_owned())?,
-            aggregate_input_f64_bytes: u64::try_from(aggregate_input_f64_bytes)
-                .map_err(|_| "RELOCALIZATION_AGGREGATE_BYTES_OVERFLOW".to_owned())?,
-            post_transform_points: u64::try_from(post_transform_points)
-                .map_err(|_| "RELOCALIZATION_POST_TRANSFORM_POINT_COUNT_OVERFLOW".to_owned())?,
-            post_transform_f64_bytes: u64::try_from(post_transform_f64_bytes)
-                .map_err(|_| "RELOCALIZATION_POST_TRANSFORM_BYTES_OVERFLOW".to_owned())?,
-            source_points: Arc::from(source_points),
-            target_points: Arc::from(target_points),
-            canonical_source_bytes,
-            source_sha256,
-            target_decoded_point_count,
-            target_decoded_f64_bytes: u64::try_from(target_decoded_f64_bytes)
-                .map_err(|_| "RELOCALIZATION_TARGET_DECODED_BYTES_OVERFLOW".to_owned())?,
-            target_decoded_sha256,
+            boundary_input, boundary_lease, snapshot: accumulation.snapshot,
+            frames: accumulation.accepted, source_points: Arc::from(source_points), target_points: Arc::from(target_points),
         })
     }
 
-    fn decode_relocalization_target(
-        target: &crate::pointcloud::ImmutableActivatedTarget,
-    ) -> Result<(Vec<Point3<f64>>, [u8; 32]), String> {
-        let point_count = usize::try_from(target.point_count)
-            .map_err(|_| "RELOCALIZATION_TARGET_POINT_COUNT_OVERFLOW".to_owned())?;
-        if point_count < 3
-            || point_count.checked_mul(12) != Some(target.xyz_f32_le.len())
-            || sha256_bytes(&target.xyz_f32_le) != target.xyz_sha256
-        {
-            return Err("RELOCALIZATION_TARGET_BYTES_INVALID".to_owned());
+    fn decode_relocalization_target(target: &crate::activation_identity::CanonicalCloudTargetV2)
+        -> Result<Vec<Point3<f64>>, String>
+    {
+        let count = usize::try_from(target.point_count()).map_err(|_| "RELOCALIZATION_TARGET_POINT_COUNT_OVERFLOW")?;
+        if count < RELOCALIZATION_MIN_SOURCE_POINTS || count.checked_mul(12) != Some(target.xyz_f32_le().len()) {
+            return Err("RELOCALIZATION_TARGET_BYTES_INVALID".into());
         }
-        let mut points = Vec::with_capacity(point_count);
-        let mut canonical = Vec::with_capacity(8 + point_count.saturating_mul(24));
-        canonical.extend_from_slice(&(point_count as u64).to_be_bytes());
-        for bytes in target.xyz_f32_le.chunks_exact(12) {
-            let point = Point3::new(
-                f64::from(f32::from_le_bytes(bytes[0..4].try_into().unwrap())),
+        let mut points = Vec::with_capacity(count);
+        for bytes in target.xyz_f32_le().chunks_exact(12) {
+            let point = Point3::new(f64::from(f32::from_le_bytes(bytes[0..4].try_into().unwrap())),
                 f64::from(f32::from_le_bytes(bytes[4..8].try_into().unwrap())),
-                f64::from(f32::from_le_bytes(bytes[8..12].try_into().unwrap())),
-            );
-            if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
-                return Err("RELOCALIZATION_TARGET_POINT_NONFINITE".to_owned());
-            }
-            canonical.extend_from_slice(&point.x.to_be_bytes());
-            canonical.extend_from_slice(&point.y.to_be_bytes());
-            canonical.extend_from_slice(&point.z.to_be_bytes());
+                f64::from(f32::from_le_bytes(bytes[8..12].try_into().unwrap())));
+            if point.iter().any(|coordinate| !coordinate.is_finite()) { return Err("RELOCALIZATION_TARGET_POINT_NONFINITE".into()); }
             points.push(point);
         }
-        Ok((points, sha256_bytes(&canonical)))
+        Ok(points)
     }
 
-    type StableRelocalizationSource = (Vec<Point3<f64>>, Vec<u8>, [u8; 32]);
-
-    fn stable_stratified_source(
-        ordered: Vec<Point3<f64>>,
-    ) -> Result<StableRelocalizationSource, String> {
-        if ordered.len() > RELOCALIZATION_MAX_AGGREGATE_POINTS
-        {
-            return Err("RELOCALIZATION_SOURCE_POINT_COUNT_INVALID".to_owned());
-        }
+    fn stable_stratified_source(ordered: Vec<Point3<f64>>) -> Result<Vec<Point3<f64>>, String> {
+        if ordered.len() > RELOCALIZATION_MAX_AGGREGATE_POINTS { return Err("RELOCALIZATION_SOURCE_POINT_COUNT_INVALID".into()); }
         let emitted_count = ordered.len().min(RELOCALIZATION_MAX_EMITTED_POINTS);
-        let mut emitted = Vec::with_capacity(emitted_count);
-        if ordered.len() <= emitted_count {
-            emitted = ordered;
-        } else {
+        let emitted = if ordered.len() <= emitted_count { ordered } else {
             let count = ordered.len() as u128;
-            let emitted_count_u128 = emitted_count as u128;
-            for index in 0..emitted_count {
-                let source_index = (index as u128)
-                    .checked_mul(count)
-                    .ok_or_else(|| "RELOCALIZATION_REDUCTION_INDEX_OVERFLOW".to_owned())?
-                    / emitted_count_u128;
-                emitted.push(ordered[source_index as usize]);
-            }
-        }
-        let canonical_bytes_len = emitted
-            .len()
-            .checked_mul(24)
-            .ok_or_else(|| "RELOCALIZATION_SOURCE_BYTES_OVERFLOW".to_owned())?;
-        if canonical_bytes_len > 2_400_000 {
-            return Err("RELOCALIZATION_EMITTED_SOURCE_BYTES_INVALID".to_owned());
-        }
-        let mut canonical = Vec::with_capacity(8 + canonical_bytes_len);
-        canonical.extend_from_slice(&(emitted.len() as u64).to_be_bytes());
-        for point in &emitted {
-            canonical.extend_from_slice(&point.x.to_be_bytes());
-            canonical.extend_from_slice(&point.y.to_be_bytes());
-            canonical.extend_from_slice(&point.z.to_be_bytes());
-        }
-        let digest = sha256_bytes(&canonical);
-        Ok((emitted, canonical, digest))
+            (0..emitted_count).map(|index| {
+                let source_index = (index as u128).checked_mul(count)
+                    .ok_or("RELOCALIZATION_REDUCTION_INDEX_OVERFLOW")? / emitted_count as u128;
+                Ok(ordered[source_index as usize])
+            }).collect::<Result<Vec<_>, String>>()?
+        };
+        let bytes = emitted.len().checked_mul(24).ok_or("RELOCALIZATION_SOURCE_BYTES_OVERFLOW")?;
+        if bytes > RELOCALIZATION_MAX_PER_FRAME_F64_BYTES { return Err("RELOCALIZATION_EMITTED_SOURCE_BYTES_INVALID".into()); }
+        Ok(emitted)
     }
 
     struct RelocalizationComputeOutput {
@@ -11648,7 +10789,7 @@ mod preflight_only_contract {
             .map_err(|error| CorrectionRuntimeError::Transport(error.to_string()))?;
         let message_type = LcmMessageType::new(CORRECTION_CANDIDATE_MESSAGE_TYPE)
             .map_err(|error| CorrectionRuntimeError::Transport(error.to_string()))?;
-        if message_type.fingerprint() != CORRECTION_CANDIDATE_FINGERPRINT_V2 {
+        if message_type.fingerprint() != CORRECTION_CANDIDATE_FINGERPRINT_V3 {
             return Err(CorrectionRuntimeError::Transport(
                 "correction candidate fingerprint registry mismatch".to_owned(),
             ));
@@ -11752,7 +10893,7 @@ mod preflight_only_contract {
         }
     }
 
-    const CANDIDATE_FINALIZATION_EVENT_NAME: &str = "nuwax_correction_candidate_finalized_v1";
+    const CANDIDATE_FINALIZATION_EVENT_NAME: &str = "nuwax_correction_candidate_finalized_v3";
 
     #[derive(Debug, serde::Serialize, PartialEq, Eq)]
     enum CandidateFinalizationDisposition {
@@ -11768,7 +10909,8 @@ mod preflight_only_contract {
         backend_generation: u64,
         session_generation: u64,
         candidate_sequence: u64,
-        payload_sha256: String,
+        correction_lease_boot_nonce: String,
+        correction_lease_generation: u64,
         disposition: CandidateFinalizationDisposition,
         #[serde(skip_serializing_if = "Option::is_none")]
         reject_reason: Option<String>,
@@ -11800,7 +10942,8 @@ mod preflight_only_contract {
                 backend_generation: candidate.identity.backend_generation,
                 session_generation: candidate.identity.mapping_session_generation,
                 candidate_sequence: candidate.identity.candidate_sequence,
-                payload_sha256: digest_hex(&candidate.payload_sha256),
+                correction_lease_boot_nonce: format!("{:032x}", candidate.identity.correction_lease.boot_nonce),
+                correction_lease_generation: candidate.identity.correction_lease.generation,
                 disposition,
                 reject_reason,
                 candidate_processed_delivered,
@@ -11834,7 +10977,7 @@ mod preflight_only_contract {
         event.candidate_processed_delivered = response
             .send(Ok(CorrectionSubmitDisposition::CandidateProcessed {
                 candidate_sequence: candidate.identity.candidate_sequence,
-                payload_sha256: candidate.payload_sha256,
+                candidate: candidate.clone(),
                 disposition,
             }))
             .is_ok();
@@ -11982,11 +11125,8 @@ mod preflight_only_contract {
                     delivery,
                 } => (*candidate, delivery),
             };
-            let apply_key = CandidateApplyKey {
-                candidate_sequence: candidate.identity.candidate_sequence,
-                payload_sha256: candidate.payload_sha256,
-            };
-            let apply_rx = match apply_waiters.register(apply_key, Arc::clone(&request.lease)) {
+            let apply_key = CandidateApplyKey::from(&candidate);
+            let apply_rx = match apply_waiters.register(apply_key, candidate.clone(), Arc::clone(&request.lease)) {
                 Ok(apply_rx) => apply_rx,
                 Err(_) if !phase_a.is_open() => {
                     request.cancellation.cancel();
@@ -12092,7 +11232,7 @@ mod preflight_only_contract {
                     }
                 }
                 CandidateDelivery::DirectFinalizer => {
-                    let Some(lease) = apply_waiters.claim_apply(apply_key) else {
+                    let Some(lease) = apply_waiters.claim_apply(apply_key, &candidate) else {
                         let detail = "native correction waiter could not be claimed".to_owned();
                         apply_waiters.remove(apply_key);
                         request.cancellation.cancel();
@@ -12243,11 +11383,8 @@ mod preflight_only_contract {
                     continue;
                 }
             };
-            let apply_key = CandidateApplyKey {
-                candidate_sequence: candidate.identity.candidate_sequence,
-                payload_sha256: candidate.payload_sha256,
-            };
-            let Some(lease) = apply_waiters.claim_apply(apply_key) else {
+            let apply_key = CandidateApplyKey::from(&candidate);
+            let Some(lease) = apply_waiters.claim_apply(apply_key, &candidate) else {
                 tracing::warn!(
                     candidate_sequence = apply_key.candidate_sequence,
                     "private correction candidate has no live request waiter"
@@ -12468,19 +11605,6 @@ mod preflight_only_contract {
             }
         }
 
-        const GENERATED_PAYLOAD_SHA256: [u8; 32] = [
-            15, 153, 227, 199, 234, 144, 47, 204, 248, 232, 226, 108, 76, 48, 122, 141, 208, 225,
-            86, 117, 119, 76, 205, 173, 72, 202, 151, 243, 146, 244, 101, 187,
-        ];
-        const GENERATED_BODY_SHA256: [u8; 32] = [
-            70, 16, 162, 128, 141, 41, 212, 41, 201, 60, 75, 22, 137, 225, 145, 62, 219, 95, 155,
-            142, 169, 86, 192, 119, 167, 4, 122, 125, 222, 251, 87, 121,
-        ];
-        const GENERATED_WIRE_SHA256: [u8; 32] = [
-            161, 79, 141, 116, 212, 233, 28, 125, 35, 3, 9, 228, 226, 211, 1, 77, 48, 145, 154, 79,
-            104, 125, 81, 12, 146, 78, 60, 177, 58, 216, 13, 75,
-        ];
-
         fn exact_hex(bytes: &[u8]) -> String {
             bytes.iter().map(|byte| format!("{byte:02x}")).collect()
         }
@@ -12577,160 +11701,136 @@ mod preflight_only_contract {
 
         #[test]
         fn relocalization_default_and_relative_roots_persist_and_reopen() {
-            for (explicit, runtime_data, expected) in [
-                (
-                    None,
-                    None,
-                    "runtime_data/geometry/relocalization_terminals_v1",
-                ),
+            for (explicit, runtime, expected) in [
+                (None, None, "runtime_data/geometry/relocalization_terminals_v1"),
                 (Some("relative-terminals"), None, "relative-terminals"),
-                (
-                    None,
-                    Some("relative-data"),
-                    "relative-data/geometry/relocalization_terminals_v1",
-                ),
+                (None, Some("relative-data"), "relative-data/geometry/relocalization_terminals_v1"),
             ] {
-                let current_directory = RelocalizationTerminalTestRoot::new();
-                let root = terminal_store_root_from(
-                    explicit.map(OsString::from),
-                    None,
-                    runtime_data.map(OsString::from),
-                    || Ok(current_directory.path().to_path_buf()),
-                )
-                .expect("默认和相对目录必须按当前工作目录解析");
-                assert_eq!(root, current_directory.path().join(expected));
-                let request_identity = [3_u8; 32];
-                let activation_identity = [5_u8; 32];
-                let result = crate::proto::RelocalizeResult {
-                    schema_version: 1,
-                    request_id: "req-relative-store-reopen".to_owned(),
-                    request_identity_sha256: request_identity.to_vec(),
-                    activation_identity_sha256: activation_identity.to_vec(),
-                    disposition: crate::proto::RelocalizeDisposition::Applied as i32,
-                    terminal_proof_sha256: vec![7; 32],
-                    ..Default::default()
-                };
-                {
-                    // 直接覆盖生产解析结果与真实存储，不经过测试专用的默认存储夹具。
-                    let store = RelocalizationTerminalStore::open_at(root.clone())
-                        .expect("按生产解析目录打开终态存储");
-                    store
-                        .persist_terminal(
-                            &result.request_id,
-                            request_identity,
-                            activation_identity,
-                            &StoredRelocalizationResult::new(result.clone()),
-                        )
-                        .expect("真实落盘重定位终态");
-                }
-                let reopened = RelocalizationTerminalStore::open_at(root)
-                    .expect("释放后重新打开同一生产解析目录");
-                match reopened.snapshot(&result.request_id, request_identity, activation_identity) {
-                    RelocalizationTerminalSnapshot::Terminal(replayed) => {
-                        assert_eq!(replayed.encode_to_vec(), result.encode_to_vec());
-                    }
-                    other => panic!("重新打开终态不一致：{other:?}"),
+                let base = RelocalizationTerminalTestRoot::new();
+                let root = terminal_store_root_from(explicit.map(OsString::from), None, runtime.map(OsString::from),
+                    || Ok(base.path().to_path_buf())).unwrap();
+                assert_eq!(root, base.path().join(expected));
+                let request = validate_relocalize_request(relocalization_command_request("relative-reopen", 7)).unwrap();
+                let terminal = relocalization_command_terminal(&request, crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
+                { let store = RelocalizationTerminalStore::open_at(root.clone()).unwrap();
+                  store.persist_terminal(request.request_id(), &request.key(), &terminal).unwrap(); }
+                let reopened = RelocalizationTerminalStore::open_at(root).unwrap();
+                match reopened.snapshot_exact(request.request_id(), &request.key()) {
+                    RelocalizationTerminalSnapshot::AssignedTerminal(value) => assert_eq!(value.encoded(), terminal.encoded()),
+                    other => panic!("unexpected reopened terminal {other:?}"),
                 }
             }
         }
 
         #[test]
         fn durable_relocalization_terminal_store_reopens_and_detects_identity_conflict() {
-            let root = std::env::temp_dir().join(format!(
-                "nuwax-relocalization-terminal-store-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock")
-                    .as_nanos(),
-            ));
-            let request_identity = [3_u8; 32];
-            let activation_identity = [5_u8; 32];
-            let result = crate::proto::RelocalizeResult {
-                schema_version: 1,
-                request_id: "req-store-reopen".to_owned(),
-                request_identity_sha256: request_identity.to_vec(),
-                activation_identity_sha256: activation_identity.to_vec(),
-                disposition: crate::proto::RelocalizeDisposition::Applied as i32,
-                terminal_proof_sha256: vec![7; 32],
-                ..Default::default()
-            };
-            let terminal = StoredRelocalizationResult::new(result.clone());
-            {
-                let store = RelocalizationTerminalStore::open_at(root.clone())
-                    .expect("open terminal store");
-                store
-                    .persist_terminal(
-                        &result.request_id,
-                        request_identity,
-                        activation_identity,
-                        &terminal,
-                    )
-                    .expect("persist terminal");
+            let root = RelocalizationTerminalTestRoot::new();
+            let request = validate_relocalize_request(relocalization_command_request("reopen-exact", 7)).unwrap();
+            let terminal = relocalization_command_terminal(&request, crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
+            { let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
+              store.mark_pending(&request).unwrap();
+              assert!(matches!(store.snapshot_exact(request.request_id(), &request.key()), RelocalizationTerminalSnapshot::Pending));
+              store.persist_terminal(request.request_id(), &request.key(), &terminal).unwrap(); }
+            let reopened = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
+            match reopened.snapshot_exact(request.request_id(), &request.key()) {
+                RelocalizationTerminalSnapshot::AssignedTerminal(value) => assert_eq!(value.encoded(), terminal.encoded()),
+                other => panic!("unexpected reopened terminal {other:?}"),
             }
-            let reopened =
-                RelocalizationTerminalStore::open_at(root.clone()).expect("reopen terminal store");
-            match reopened.snapshot(&result.request_id, request_identity, activation_identity) {
-                RelocalizationTerminalSnapshot::Terminal(replayed) => {
-                    assert_eq!(replayed.encode_to_vec(), result.encode_to_vec());
-                }
-                other => panic!("unexpected reopened snapshot: {other:?}"),
-            }
-            assert!(matches!(
-                reopened.snapshot(&result.request_id, [9; 32], activation_identity),
-                RelocalizationTerminalSnapshot::IdentityConflict
-            ));
-            fs::remove_dir_all(root).expect("remove terminal store");
+            let conflict = validate_relocalize_request(relocalization_command_request("reopen-exact", 8)).unwrap();
+            assert!(matches!(reopened.snapshot_exact(request.request_id(), &conflict.key()), RelocalizationTerminalSnapshot::IdentityConflict));
+            assert!(matches!(reopened.snapshot(request.request_id(), [3;32], [5;32]), RelocalizationTerminalSnapshot::IdentityConflict));
         }
 
         #[test]
         fn durable_relocalization_terminal_store_rejects_noncanonical_record_request_id() {
-            let root = std::env::temp_dir().join(format!(
-                "nuwax-relocalization-terminal-invalid-id-{}-{}",
-                std::process::id(),
-                terminal_owner_token(),
-            ));
-            let request_id = "req-store-invalid-id";
-            let request_identity = [3_u8; 32];
-            let activation_identity = [5_u8; 32];
-            let terminal = StoredRelocalizationResult::new(crate::proto::RelocalizeResult {
-                schema_version: 1,
-                request_id: request_id.to_owned(),
-                request_identity_sha256: request_identity.to_vec(),
-                activation_identity_sha256: activation_identity.to_vec(),
-                disposition: crate::proto::RelocalizeDisposition::Applied as i32,
-                terminal_proof_sha256: vec![7; 32],
-                ..Default::default()
-            });
-            {
-                let store = RelocalizationTerminalStore::open_at(root.clone())
-                    .expect("open terminal store");
-                store
-                    .persist_terminal(request_id, request_identity, activation_identity, &terminal)
-                    .expect("persist terminal");
-            }
-            let path = root.join(format!(
-                "{}.json",
-                encode_hex(&sha256_bytes(request_id.as_bytes()))
-            ));
-            let mut record: DurableRelocalizationTerminalV1 =
-                serde_json::from_slice(&fs::read(&path).expect("read terminal record"))
-                    .expect("decode terminal record");
-            record.request_id = " invalid".to_owned();
-            fs::write(
-                &path,
-                serde_json::to_vec(&record).expect("encode invalid terminal record"),
-            )
-            .expect("write invalid terminal record");
-
-            assert_eq!(
-                RelocalizationTerminalStore::open_at(root.clone())
-                    .err()
-                    .expect("invalid request ID must fail closed"),
-                "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID"
-            );
-            fs::remove_dir_all(root).expect("remove terminal store");
+            let root = RelocalizationTerminalTestRoot::new();
+            import_legacy_terminal_fixture(root.path(), "legacy-id");
+            let path = root.path().join("legacy-fixture.json");
+            let mut record: DurableRelocalizationTerminalV1 = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            record.request_id = " invalid".into();
+            fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+            assert_eq!(RelocalizationTerminalStore::open_at(root.path().into()).err().unwrap(), "RELOCALIZATION_REQUEST_ID_INVALID");
         }
+
+        #[test]
+        fn legacy_terminal_reads_are_opaque_alias_only_and_share_assigned_capacity() {
+            let root = RelocalizationTerminalTestRoot::new();
+            let historical = import_legacy_terminal_fixture(root.path(), "legacy-shared");
+            let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
+            match store.snapshot("legacy-shared", [3;32], [5;32]) {
+                RelocalizationTerminalSnapshot::Terminal(value) => assert_eq!(value.encode_to_vec(), historical.encode_to_vec()),
+                other => panic!("historical read mismatch {other:?}"),
+            }
+            let request = validate_relocalize_request(relocalization_command_request("legacy-shared", 7)).unwrap();
+            let mut ledger = RelocalizationCommandLedger::from_terminal_store(&store);
+            assert_eq!(ledger.records.len(), 1);
+            assert!(matches!(ledger.admit(&request, 1, Instant::now(), || relocalization_command_terminal(
+                &request, crate::proto::RelocalizeDisposition::ReplayConflict, "mixed identity" )).unwrap(), RelocalizationLedgerAdmission::Conflict(_)));
+            assert_eq!(ledger.admitted_command_count, 0);
+            assert_eq!(ledger.claimed_command_count, 0);
+            assert_eq!(ledger.next_admission_ordinal, 0);
+            assert!(!ledger.relocalization_mode.snapshot().active);
+            let assigned = relocalization_command_terminal(&request, crate::proto::RelocalizeDisposition::Cancelled, "assigned");
+            assert!(store.persist_terminal(request.request_id(), &request.key(), &assigned).is_err());
+            // Altering canonical historical content with unchanged checksum is
+            // accepted as an opaque read, never advertised as verified content.
+            drop(store); drop(ledger);
+            let path = root.path().join("legacy-fixture.json");
+            let mut record: DurableRelocalizationTerminalV1 = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let mut changed = historical;
+            changed.detail.push_str(" changed");
+            record.terminal_hex = encode_hex(&changed.encode_to_vec());
+            fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            assert!(RelocalizationTerminalStore::open_at(root.path().into()).is_ok());
+            record.terminal_hex.push_str("f80701"); // unknown protobuf field is noncanonical
+            fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            assert_eq!(RelocalizationTerminalStore::open_at(root.path().into()).err().unwrap(), "RELOCALIZATION_TERMINAL_STORE_NON_CANONICAL");
+        }
+
+        #[test]
+        fn assigned_terminal_reopen_rejects_truncation_mixed_schema_and_duplicate_ids() {
+            let root = RelocalizationTerminalTestRoot::new();
+            let request = validate_relocalize_request(relocalization_command_request("duplicate-record", 7)).unwrap();
+            let terminal = relocalization_command_terminal(&request, crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
+            { let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
+              store.persist_terminal(request.request_id(), &request.key(), &terminal).unwrap(); }
+            let path = root.path().join(assigned_terminal_filename_v2(request.request_id()).unwrap());
+            let original = fs::read(&path).unwrap();
+            fs::write(&path, &original[..original.len()-1]).unwrap();
+            assert!(RelocalizationTerminalStore::open_at(root.path().into()).is_err());
+            fs::write(&path, &original).unwrap();
+            import_legacy_terminal_fixture(root.path(), request.request_id());
+            assert_eq!(RelocalizationTerminalStore::open_at(root.path().into()).err().unwrap(), "RELOCALIZATION_TERMINAL_STORE_DUPLICATE");
+        }
+
+        #[test]
+        fn durable_relocalization_terminal_store_removes_temporary_on_publish_conflict() {
+            let root = RelocalizationTerminalTestRoot::new();
+            let request = validate_relocalize_request(relocalization_command_request("publish-conflict", 7)).unwrap();
+            let terminal = relocalization_command_terminal(&request, crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
+            let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
+            let path = root.path().join(assigned_terminal_filename_v2(request.request_id()).unwrap());
+            fs::write(&path, b"different terminal").unwrap();
+            assert_eq!(store.persist_terminal(request.request_id(), &request.key(), &terminal), Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into()));
+            assert_eq!(fs::read(&path).unwrap(), b"different terminal");
+            assert!(!fs::read_dir(root.path()).unwrap().map(Result::unwrap).any(|entry|
+                entry.file_name().to_str().is_some_and(is_owned_terminal_temporary_name)));
+            assert!(store.state.lock().terminals.is_empty());
+        }
+
+        #[test]
+        fn durable_relocalization_terminal_store_bounds_publish_conflict_read() {
+            let root = RelocalizationTerminalTestRoot::new();
+            let request = validate_relocalize_request(relocalization_command_request("bounded-conflict", 7)).unwrap();
+            let terminal = relocalization_command_terminal(&request, crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
+            let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
+            let path = root.path().join(assigned_terminal_filename_v2(request.request_id()).unwrap());
+            File::create(&path).unwrap().set_len(RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES as u64 + 1).unwrap();
+            assert_eq!(store.persist_terminal(request.request_id(), &request.key(), &terminal), Err("RELOCALIZATION_TERMINAL_STORE_RECORD_TOO_LARGE".into()));
+            assert!(!fs::read_dir(root.path()).unwrap().map(Result::unwrap).any(|entry|
+                entry.file_name().to_str().is_some_and(is_owned_terminal_temporary_name)));
+        }
+
 
         #[test]
         fn durable_relocalization_terminal_store_cleans_only_unlocked_owner() {
@@ -12852,65 +11952,6 @@ mod preflight_only_contract {
         }
 
         #[test]
-        fn durable_relocalization_terminal_store_removes_temporary_on_publish_conflict() {
-            let root = std::env::temp_dir().join(format!(
-                "nuwax-relocalization-terminal-temp-conflict-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock")
-                    .as_nanos(),
-            ));
-            let request_id = "req-store-conflict-cleanup";
-            let request_identity = [3_u8; 32];
-            let activation_identity = [5_u8; 32];
-            let result = crate::proto::RelocalizeResult {
-                schema_version: 1,
-                request_id: request_id.to_owned(),
-                request_identity_sha256: request_identity.to_vec(),
-                activation_identity_sha256: activation_identity.to_vec(),
-                disposition: crate::proto::RelocalizeDisposition::Applied as i32,
-                terminal_proof_sha256: vec![7; 32],
-                ..Default::default()
-            };
-            let terminal = StoredRelocalizationResult::new(result);
-            let store =
-                RelocalizationTerminalStore::open_at(root.clone()).expect("open terminal store");
-            let final_path = root.join(format!(
-                "{}.json",
-                encode_hex(&sha256_bytes(request_id.as_bytes()))
-            ));
-            fs::write(&final_path, b"different terminal").expect("write conflicting object");
-
-            assert_eq!(
-                store.persist_terminal(
-                    request_id,
-                    request_identity,
-                    activation_identity,
-                    &terminal,
-                ),
-                Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".to_owned())
-            );
-            let owned_temporary_count = fs::read_dir(&root)
-                .expect("read terminal store")
-                .map(|entry| entry.expect("read terminal entry"))
-                .filter(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .map(is_owned_terminal_temporary_name)
-                        .unwrap_or(false)
-                })
-                .count();
-            assert_eq!(owned_temporary_count, 0);
-            assert_eq!(
-                fs::read(&final_path).expect("read conflicting object"),
-                b"different terminal"
-            );
-            fs::remove_dir_all(root).expect("remove terminal store");
-        }
-
-        #[test]
         fn terminal_record_reader_enforces_fixed_limit_and_growth_boundary() {
             let at_limit = vec![b'x'; RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES];
             assert_eq!(
@@ -12938,620 +11979,80 @@ mod preflight_only_contract {
             );
         }
 
-        #[test]
-        fn durable_relocalization_terminal_store_bounds_publish_conflict_read() {
-            let root = std::env::temp_dir().join(format!(
-                "nuwax-relocalization-terminal-bounded-conflict-{}-{}",
-                std::process::id(),
-                terminal_owner_token(),
-            ));
-            let request_id = "req-store-bounded-conflict";
-            let request_identity = [3_u8; 32];
-            let activation_identity = [5_u8; 32];
-            let terminal = StoredRelocalizationResult::new(crate::proto::RelocalizeResult {
-                schema_version: 1,
-                request_id: request_id.to_owned(),
-                request_identity_sha256: request_identity.to_vec(),
-                activation_identity_sha256: activation_identity.to_vec(),
-                disposition: crate::proto::RelocalizeDisposition::Applied as i32,
-                terminal_proof_sha256: vec![7; 32],
+        fn relocalization_request_body(request: &mut crate::proto::RelocalizeRequest) -> &mut crate::proto::AssignedCloudRelocalizeRequestV2 {
+            match request.assigned_target.as_mut().unwrap() {
+                crate::proto::relocalize_request::AssignedTarget::AssignedCloudV2(body) => body,
+            }
+        }
+
+        fn relocalization_terminal_body(result: &crate::proto::RelocalizeResult) -> &crate::proto::AssignedCloudRelocalizeResultV2 {
+            assert_eq!(result.schema_version, 2);
+            assert!(result.request_identity_sha256.is_empty());
+            assert!(result.terminal_proof_sha256.is_empty());
+            assert!(result.candidate_payload_preimage_v1.is_empty());
+            assert!(result.evidence_disclosure_v1.is_empty());
+            result.assigned_cloud_v2.as_ref().unwrap()
+        }
+
+        fn relocalization_command_request(request_id: &str, target_cloud_revision: u64) -> crate::proto::RelocalizeRequest {
+            let mut request = crate::relocalization_identity::tests::wire();
+            request.request_id = request_id.into();
+            let body = relocalization_request_body(&mut request);
+            body.logical_timeout_ms = 1_000;
+            let target = body.target.as_mut().unwrap();
+            let activation = target.activation.as_mut().unwrap();
+            activation.runtime_generation = 2;
+            activation.session_generation = 1;
+            activation.backend_generation = 4;
+            let activation_request = activation.request.as_mut().unwrap();
+            activation_request.expected_runtime_generation = 2;
+            activation_request.session_id = "mapping-session-owner".into();
+            activation_request.map_name = "map-ledger".into();
+            let occupancy = target.occupancy_receipt.as_mut().unwrap();
+            occupancy.session_id = "mapping-session-owner".into();
+            occupancy.session_generation = 1;
+            occupancy.backend_generation = 4;
+            let cloud = target.cloud_receipt.as_mut().unwrap();
+            cloud.session_generation = 1;
+            cloud.cloud_revision = target_cloud_revision;
+            request
+        }
+
+        fn relocalization_command_terminal(request: &ValidatedRelocalizeRequest,
+            disposition: crate::proto::RelocalizeDisposition, detail: &str) -> StoredRelocalizationResult {
+            let result = assigned_relocalization_result(&request.identity, disposition, 0, detail, Vec::new(),
+                crate::proto::AssignedRelocalizationEvidenceV2 {
+                    schema_version: 2, phase: crate::proto::AssignedRelocalizationEvidencePhaseV2::PreAdmission as i32,
+                    ..Default::default()
+                });
+            StoredRelocalizationResult::Assigned(AssignedRelocalizationTerminalV2::new(result, None).unwrap())
+        }
+
+        fn relocalization_query(request: &ValidatedRelocalizeRequest) -> AssignedRelocalizationTerminalQueryV2 {
+            AssignedRelocalizationTerminalQueryV2::admit(crate::proto::GetRelocalizationTerminalRequest {
+                schema_version: 2, request_id: request.request_id().into(), assigned_request_v2: Some(request.identity.to_wire()),
                 ..Default::default()
-            });
-            let store =
-                RelocalizationTerminalStore::open_at(root.clone()).expect("open terminal store");
-            let final_path = root.join(format!(
-                "{}.json",
-                encode_hex(&sha256_bytes(request_id.as_bytes()))
-            ));
-            let oversized = File::create(&final_path).expect("create oversized conflicting object");
-            oversized
-                .set_len((RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES + 1) as u64)
-                .expect("extend oversized conflicting object");
-            drop(oversized);
-
-            assert_eq!(
-                store.persist_terminal(
-                    request_id,
-                    request_identity,
-                    activation_identity,
-                    &terminal,
-                ),
-                Err("RELOCALIZATION_TERMINAL_STORE_RECORD_TOO_LARGE".to_owned())
-            );
-            fs::remove_dir_all(root).expect("remove terminal store");
+            }).unwrap()
         }
 
-        #[test]
-        fn relocalization_terminal_proof_v1_matches_independent_full_result_golden() {
+        fn import_legacy_terminal_fixture(root: &Path, request_id: &str) -> crate::proto::RelocalizeResult {
+            fs::create_dir_all(root).unwrap();
             let result = crate::proto::RelocalizeResult {
-                target_kind: String::new(),
-                target_graph_sha256: Vec::new(),
-                schema_version: 1,
-                request_id: "req-golden".to_owned(),
-                request_identity_sha256: vec![1; 32],
-                runtime_generation: 2,
-                session_id: "session-golden".to_owned(),
-                map_name: "map-golden".to_owned(),
-                session_generation: 3,
-                backend_generation: 4,
-                activation_identity_sha256: vec![5; 32],
-                target_receipt_sha256: vec![6; 32],
-                target_cloud_revision: 7,
-                target_cloud_sha256: vec![8; 32],
-                asset_manifest_sha256: vec![9; 32],
-                asset_bundle_sha256: vec![10; 32],
-                source_policy_version: 1,
-                source_policy_sha256: vec![11; 32],
-                deadline_policy_version: 1,
-                deadline_policy_sha256: vec![12; 32],
-                logical_timeout_ms: 30_000,
-                algorithm_options_version: 1,
-                algorithm_options_sha256: vec![13; 32],
-                disposition: crate::proto::RelocalizeDisposition::Applied as i32,
-                candidate_sequence: 14,
-                candidate_payload_sha256: vec![15; 32],
-                evidence_sha256: vec![16; 32],
-                correction_revision: 17,
-                terminal_proof_sha256: Vec::new(),
-                detail: "APPLIED".to_owned(),
-                candidate_payload_preimage_v1: vec![0x29; 19],
-                evidence_disclosure_v1: vec![0x30; 23],
+                schema_version: 1, request_id: request_id.into(), request_identity_sha256: vec![3;32],
+                activation_identity_sha256: vec![5;32], disposition: crate::proto::RelocalizeDisposition::Cancelled as i32,
+                detail: "historical opaque alias fixture".into(), ..Default::default()
             };
-            let preimage = canonical_relocalization_terminal_proof_preimage_v1(&result)
-                .expect("clear proof field has a canonical preimage");
-            assert_eq!(preimage.len(), 745);
-            assert_eq!(
-                exact_hex(&preimage),
-                "6e757761782e67656f6d657472792e72656c6f63616c697a652e7465726d696e616c2d70726f6f662e763100000000010000000100000001000000020000000a7265712d676f6c64656e000000030100000000000000200101010101010101010101010101010101010101010101010101010101010101000000040000000000000002000000050000000e73657373696f6e2d676f6c64656e000000060000000a6d61702d676f6c64656e0000000700000000000000030000000800000000000000040000000901000000000000002005050505050505050505050505050505050505050505050505050505050505050000000a01000000000000002006060606060606060606060606060606060606060606060606060606060606060000000b00000000000000070000000c01000000000000002008080808080808080808080808080808080808080808080808080808080808080000000d01000000000000002009090909090909090909090909090909090909090909090909090909090909090000000e0100000000000000200a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0000000f00000001000000100100000000000000200b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0000001100000001000000120100000000000000200c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0000001300000000000075300000001400000001000000150100000000000000200d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d000000160000000100000017000000000000000e000000180100000000000000200f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0000001901000000000000002010101010101010101010101010101010101010101010101010101010101010100000001a00000000000000110000001b000000001c000000074150504c494544"
-            );
-            assert_eq!(
-                crate::map_checksum::sha256_hex(&preimage),
-                "c64dac3ba805655b262490a0db376552bfe41c1043a749eaf4819ef306a00358"
-            );
-
-            let mut already_hashed = result;
-            already_hashed.terminal_proof_sha256 = vec![0xaa; 32];
-            assert!(canonical_relocalization_terminal_proof_preimage_v1(&already_hashed).is_err());
-        }
-
-        #[test]
-        fn relocalization_composite_sha256_matches_independent_oracle_8515_cases() {
-            let mut case_count = 0_usize;
-            for case in 0..8_515 {
-                case_count += 1;
-                let source = (0..=case % 521)
-                    .map(|offset| ((case * 37 + offset * 19) & 0xff) as u8)
-                    .collect::<Vec<_>>();
-                let mut prefix = b"independent-prefix".to_vec();
-                prefix.extend_from_slice(&(case as u64).to_be_bytes());
-                prefix.extend_from_slice(
-                    &relocalization_source_commitment_record_v1(&source).unwrap(),
-                );
-                let mut suffix = b"independent-suffix".to_vec();
-                suffix.extend_from_slice(&(case as u64).rotate_left(17).to_be_bytes());
-                let mut bytes = prefix.clone();
-                let source_start = bytes.len();
-                bytes.extend_from_slice(&source);
-                let source_end = bytes.len();
-                bytes.extend_from_slice(&suffix);
-                let preimage = CanonicalRelocalizationEvidencePreimageV1 {
-                    bytes,
-                    canonical_source_range: Some(source_start..source_end),
-                };
-
-                let mut independent = RELOCALIZATION_EVIDENCE_COMPOSITE_DOMAIN_V1.to_vec();
-                independent.extend_from_slice(&RELOCALIZATION_SCHEMA_VERSION_V1.to_be_bytes());
-                independent.extend_from_slice(&0_u32.to_be_bytes());
-                independent.extend_from_slice(
-                    &u64::try_from(prefix.len() + source.len() + suffix.len())
-                        .unwrap()
-                        .to_be_bytes(),
-                );
-                independent.extend_from_slice(&1_u32.to_be_bytes());
-                independent.extend_from_slice(&u64::try_from(prefix.len()).unwrap().to_be_bytes());
-                independent.extend_from_slice(&prefix);
-                independent.extend_from_slice(&2_u32.to_be_bytes());
-                independent.extend_from_slice(&u64::try_from(source.len()).unwrap().to_be_bytes());
-                independent.extend_from_slice(&sha256_bytes(&source));
-                independent.extend_from_slice(&3_u32.to_be_bytes());
-                independent.extend_from_slice(&u64::try_from(suffix.len()).unwrap().to_be_bytes());
-                independent.extend_from_slice(&suffix);
-                assert_eq!(
-                    canonical_relocalization_evidence_sha256_v1(&preimage).unwrap(),
-                    sha256_bytes(&independent),
-                    "case={case}"
-                );
-            }
-            assert_eq!(case_count, 8_515);
-        }
-
-        #[test]
-        fn relocalization_source_elided_disclosure_has_hard_maximum_bound() {
-            let source = vec![0x22; RELOCALIZATION_MAX_CANONICAL_SOURCE_BYTES];
-            let source_commitment = relocalization_source_commitment_record_v1(&source).unwrap();
-            let mut prefix =
-                vec![0x11; RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES - source_commitment.len()];
-            prefix.extend_from_slice(&source_commitment);
-            let mut preimage = Vec::with_capacity(
-                prefix.len() + source.len() + RELOCALIZATION_MAX_EVIDENCE_SUFFIX_BYTES,
-            );
-            preimage.extend_from_slice(&prefix);
-            let source_start = preimage.len();
-            preimage.extend_from_slice(&source);
-            let source_end = preimage.len();
-            let mut suffix = Vec::new();
-            suffix.resize(RELOCALIZATION_MAX_EVIDENCE_SUFFIX_BYTES, 0x33);
-            preimage.extend_from_slice(&suffix);
-
-            let disclosure = build_relocalization_evidence_disclosure_v1(
-                &preimage,
-                Some(source_start..source_end),
-            )
-            .expect("maximum bounded source has a compact disclosure");
-            assert!(disclosure.len() <= RELOCALIZATION_MAX_EVIDENCE_DISCLOSURE_BYTES);
-            assert!(preimage.len() > disclosure.len() * 100);
-            assert_eq!(
-                disclosure[RELOCALIZATION_EVIDENCE_DISCLOSURE_DOMAIN_V1.len() + 4],
-                1
-            );
-
-            assert!(build_relocalization_evidence_disclosure_v1(
-                &[
-                    prefix,
-                    vec![0x44; RELOCALIZATION_MAX_CANONICAL_SOURCE_BYTES + 1],
-                    suffix,
-                ]
-                .concat(),
-                Some(
-                    RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES
-                        ..RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES
-                            + RELOCALIZATION_MAX_CANONICAL_SOURCE_BYTES
-                            + 1
-                ),
-            )
-            .is_err());
-        }
-
-        #[test]
-        fn relocalization_disclosure_retention_bounds_are_fixed() {
-            assert_eq!(RELOCALIZATION_MAX_INLINE_EVIDENCE_DISCLOSURE_BYTES, 4_158);
-            assert_eq!(RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_TERMINAL, 24_832);
-            assert_eq!(
-                RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_COMMAND_RECORD,
-                295_102
-            );
-            assert_eq!(RELOCALIZATION_MAX_RETAINED_DISCLOSURE_BYTES, 604_368_896);
-        }
-
-        #[test]
-        fn relocalization_candidate_disclosure_is_the_exact_payload_preimage() {
-            let candidate = sample_candidate(1, 200);
-            let preimage = relocalization_candidate_payload_preimage_v1(Some(&candidate)).unwrap();
-            assert!(!preimage.is_empty());
-            assert!(preimage.len() <= RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES);
-            assert_eq!(sha256_bytes(&preimage), candidate.payload_sha256);
-            assert!(preimage
-                .windows(std::mem::size_of::<u128>())
-                .any(|window| window == LEASE_NONCE.to_be_bytes()));
-            assert!(relocalization_candidate_payload_preimage_v1(None)
-                .unwrap()
-                .is_empty());
-        }
-
-        #[test]
-        fn relocalization_evidence_v1_matches_independent_full_execution_golden() {
-            let target_receipt_sha256 = [0x33; 32];
-            let snapshot = SealedActivatedTargetSnapshot {
-                runtime_generation: 2,
-                lifecycle_epoch: 3,
-                session_id: "s".to_owned(),
-                map_name: "m".to_owned(),
-                activation_request_id: "a".to_owned(),
-                activation_request_identity_sha256: [0x31; 32],
-                activation_identity_sha256: [0x32; 32],
-                target_receipt_sha256,
-                asset_manifest_sha256: Some([0x34; 32]),
-                asset_bundle_sha256: Some([0x35; 32]),
-                session_generation: 4,
-                backend_generation: 5,
-                publication_proof: ActivationPublicationProof {
-                    source_timestamp_ns: 6,
-                    cloud_revision: 7,
-                    point_count: 1,
-                    voxel_size: 0.5,
-                    cloud_receipt: crate::mapping_commit::CloudCommitReceipt {
-                        commit_id: MappingCommitId {
-                            boot_nonce: 8,
-                            sequence: 9,
-                        },
-                        session_generation: 4,
-                        occupancy_revision: 10,
-                        cloud_revision: 7,
-                        source_timestamp_ns: 6,
-                        point_count: 1,
-                    },
-                    target_receipt: TargetReceipt::LegacyDigest(target_receipt_sha256),
-                },
-                immutable_target: Arc::new(crate::pointcloud::ImmutableActivatedTarget {
-                    frame_id: "map".to_owned(),
-                    source_revision: 11,
-                    point_count: 1,
-                    voxel_size: 0.5,
-                    xyz_f32_le: (0_u8..12).collect(),
-                    xyz_sha256: [0x35; 32],
-                    payload_schema_version: 1,
-                }),
+            let record = DurableRelocalizationTerminalV1 {
+                schema_version: 1, request_id: request_id.into(), request_identity_sha256: encode_hex(&[3;32]),
+                activation_identity_sha256: encode_hex(&[5;32]), terminal_hex: encode_hex(&result.encode_to_vec()),
+                terminal_sha256: encode_hex(&[7;32]),
             };
-            let registered_cloud = RegisteredCloudProof {
-                source_sequence: 17,
-                source_timestamp_ns: 16,
-                point_count: 2,
-                envelope_sha256: [0x41; 32],
-                body_points_sha256: [0x42; 32],
-            };
-            let correlated_odom = CorrelatedOdomProof {
-                source_sequence: 18,
-                source_timestamp_ns: 15,
-                pose_sha256: [0x43; 32],
-            };
-            let committed_map = CommittedMapProof {
-                source_timestamp_ns: 16,
-                width: 21,
-                height: 22,
-                resolution_m: 0.25,
-                origin_x_m: -1.5,
-                origin_y_m: 2.5,
-                payload_sha256: [0x44; 32],
-                boundary_sha256: [0x45; 32],
-            };
-            let boundary_base_anchor = Isometry3::translation(-4.0, 5.0, -6.0);
-            let frames = vec![AccumulatedRelocalizationFrame {
-                evidence_sha256: [0x46; 32],
-                input: CorrectionFrameInput {
-                    mapping_session_id: "fs".to_owned(),
-                    mapping_session_generation: 19,
-                    mapping_commit_id: MappingCommitId {
-                        boot_nonce: 12,
-                        sequence: 13,
-                    },
-                    occupancy_revision: 14,
-                    cloud_revision: 15,
-                    map_frame_generation: 20,
-                    registered_cloud,
-                    correlated_odom: FrozenCorrelatedOdom {
-                        proof: correlated_odom,
-                        odom_from_body: Isometry3::translation(1.0, 2.0, 3.0),
-                    },
-                    committed_map,
-                    committed_map_occupancy: Arc::from(Vec::<u8>::new()),
-                    points_frame_id: "base".to_owned(),
-                    body_points: Vec::new().into(),
-                    static_point_indices: None,
-                    base_anchor_map_from_odom: boundary_base_anchor,
-                    frame_capture_relocalization_epoch: 1,
-                    relocalization_mode_epoch: Some(1),
-                },
-            }];
-            let boundary_key = relocalization_frame_key(&frames[0].input);
-            let algorithm_result = RelocalizationResult {
-                registration: nuwax_mapping::relocalization::IcpResult {
-                    transformation: Isometry3::translation(7.0, 8.0, 9.0),
-                    mse: 0.125,
-                    iterations: 23,
-                    converged: true,
-                },
-                feature_matches: 24,
-                ransac_inliers: 25,
-                fitness: 0.75,
-            };
-            let correction = Isometry3::translation(-1.0, -2.0, -3.0);
-            let candidate = CorrectionCandidate::from_unvalidated_test_parts(
-                CorrectionCandidateIdentity {
-                    backend: CorrectionCandidateBackend::Relocalization,
-                    transform_semantics: CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
-                    runtime_generation: 2,
-                    backend_generation: 99,
-                    candidate_sequence: 26,
-                    mapping_session_id: "fs".to_owned(),
-                    mapping_session_generation: 19,
-                    map_frame_generation: 20,
-                    mapping_commit_id: MappingCommitId {
-                        boot_nonce: 12,
-                        sequence: 13,
-                    },
-                    occupancy_revision: 14,
-                    cloud_revision: 15,
-                    registered_cloud,
-                    correlated_odom,
-                    committed_map,
-                    source_timestamp_ns: 16,
-                    map_frame_id: "map".to_owned(),
-                    odom_frame_id: "odom".to_owned(),
-                    body_frame_id: "base".to_owned(),
-                    points_frame_id: "base".to_owned(),
-                    correction_lease: CorrectionLeaseId {
-                        boot_nonce: 27,
-                        generation: 28,
-                    },
-                },
-                CorrectionTransform::from_isometry(&correction),
-                Vec::new(),
-                [0x48; 32],
-            );
-            let source_bytes = [0xaa, 0xbb, 0xcc];
-            let evidence = RelocalizationEvidenceV1 {
-                request_identity_sha256: [0x21; 32],
-                admission_ordinal: Some(29),
-                normalized_logical_timeout_ms: Some(30_000),
-                runtime_generation: 2,
-                activated_mapping_backend_generation: 5,
-                correction_owner_backend_generation: 99,
-                session_id: "s",
-                map_name: "m",
-                session_generation: 4,
-                map_frame_id: "map",
-                odom_frame_id: "odom",
-                body_frame_id: "base",
-                activation_identity_sha256: [0x32; 32],
-                target_receipt_sha256,
-                asset_manifest_sha256: [0x34; 32],
-                asset_bundle_sha256: [0x35; 32],
-                source_policy_version: 1,
-                source_policy_sha256: [0x51; 32],
-                deadline_policy_version: 1,
-                deadline_policy_sha256: [0x52; 32],
-                algorithm_options_version: 1,
-                algorithm_options_sha256: [0x53; 32],
-                target: Some(RelocalizationTargetEvidenceV1 {
-                    snapshot: &snapshot,
-                    decoded_point_count: 1,
-                    decoded_f64_bytes: 24,
-                    decoded_sha256: [0x36; 32],
-                }),
-                source: Some(RelocalizationSourceEvidenceV1 {
-                    arm_watermark: None,
-                    cutoff_reason: RelocalizationCutoffReasonV1::MinimumAggregateReached,
-                    last_accepted_key: Some(boundary_key),
-                    frames: &frames,
-                    aggregate_input_points: 2,
-                    aggregate_input_f64_bytes: 48,
-                    post_transform_points: 2,
-                    post_transform_f64_bytes: 48,
-                    emitted_points: 2,
-                    canonical_source_bytes: &source_bytes,
-                    source_sha256: sha256_bytes(&source_bytes),
-                    boundary_key,
-                    boundary_base_anchor_map_from_odom: &boundary_base_anchor,
-                }),
-                algorithm: Some(RelocalizationAlgorithmEvidenceV1 {
-                    result: &algorithm_result,
-                    accepted: true,
-                    correction: Some(&correction),
-                }),
-                candidate: Some(RelocalizationCandidateEvidenceV1 {
-                    candidate: &candidate,
-                }),
-                terminal_disposition: crate::proto::RelocalizeDisposition::Applied,
-                correction_revision: 30,
-                detail: "OK",
-            };
-            assert_ne!(
-                evidence.activated_mapping_backend_generation,
-                evidence.correction_owner_backend_generation
-            );
-            let preimage = canonical_relocalization_evidence_preimage_v1(&evidence)
-                .expect("full evidence fixture is encodable");
-            assert_eq!(preimage.len(), 2_221);
-            assert_ne!(
-                exact_hex(&preimage),
-                "6e757761782e67656f6d657472792e72656c6f63616c697a652e65766964656e63652e763100000000010000000121212121212121212121212121212121212121212121212121212121212121210000000201000000000000001d0000000301000000000000753000000004000000000000000200000005000000000000000500000006000000000000006300000007000000017300000008000000016d0000000900000000000000040000000a000000036d61700000000b000000046f646f6d0000000c00000004626173650000000d32323232323232323232323232323232323232323232323232323232323232320000000e33333333333333333333333333333333333333333333333333333333333333330000000f343434343434343434343434343434343434343434343434343434343434343400000010353535353535353535353535353535353535353535353535353535353535353500000011000000015151515151515151515151515151515151515151515151515151515151515151000000120000000152525252525252525252525252525252525252525252525252525252525252520000001300000001535353535353535353535353535353535353535353535353535353535353535300000014017461726765742e763100000000000000000200000000000000030000000173000000016d000000000000000400000000000000050000000161313131313131313131313131313131313131313131313131313131313131313132323232323232323232323232323232323232323232323232323232323232323333333333333333333333333333333333333333333333333333333333333333013434343434343434343434343434343434343434343434343434343434343434013535353535353535353535353535353535353535353535353535353535353535000000036d6170000000000000000b000000013f00000000000001000000000000000c353535353535353535353535353535353535353535353535353535353535353500000000000000010000000000000018363636363636363636363636363636363636363636363636363636363636363600000000000000060000000000000007000000013f0000000000000000000000000000000000000800000000000000090000000000000004000000000000000a000000000000000700000000000000060000000133333333333333333333333333333333333333333333333333333333333333330000001501736f757263652e7631000000000001010000000000000000000000000000000c000000000000000d000000000000000e000000000000000f000000000000001000000000000000110000000000000012000000016672616d652e7631000000000000000000000000000000000c000000000000000d000000000000000e000000000000000f00000000000000100000000000000011000000000000001200000002667300000000000000130000000000000014000000000000000241414141414141414141414141414141414141414141414141414141414141414242424242424242424242424242424242424242424242424242424242424242000000000000000f43434343434343434343434343434343434343434343434343434343434343430000000000000010000000000000001500000000000000163fd0000000000000bff800000000000040040000000000004444444444444444444444444444444444444444444444444444444444444444454545454545454545454545454545454545454545454545454545454545454500000004626173653ff0000000000000400000000000000040080000000000000000000000000000000000000000000000000000000000003ff0000000000000c0100000000000004014000000000000c0180000000000000000000000000000000000000000000000000000000000003ff00000000000004646464646464646464646464646464646464646464646464646464646464646000000000000000200000000000000300000000000000002000000000000003000000000000000020000000000000003aabbcc6302c5ce60f3079cff01ef770792a240edf870195e17045398a4c728167fb1150000000000000000000000000000000c000000000000000d000000000000000e000000000000000f000000000000001000000000000000110000000000000012c0100000000000004014000000000000c0180000000000000000000000000000000000000000000000000000000000003ff00000000000000000001601616c676f726974686d2e763100013fc00000000000000000000000000017000000000000001800000000000000193fe8000000000000401c000000000000402000000000000040220000000000000000000000000000000000000000000000000000000000003ff00000000000000101bff0000000000000c000000000000000c0080000000000000000000000000000000000000000000000000000000000003ff0000000000000000000170163616e6469646174652e763100000000030000000100000000000000020000000000000063000000000000001a000000026673000000000000001300000000000000140000000000000000000000000000000c000000000000000d000000000000000e000000000000000f0000000000000010000000000000001100000000000000120000000000000000000000000000001b000000000000001cbff0000000000000c000000000000000c0080000000000000000000000000000000000000000000000000000000000003ff00000000000004848484848484848484848484848484848484848484848484848484848484848000000180000000100000019000000000000001e0000001a000000024f4b0000001b7465726d696e616c2d70726f6f662d666f6c6c6f7773000000001c00"
-            );
-            assert_eq!(
-                crate::map_checksum::sha256_hex(&preimage),
-                "39f48623882635a76451a4f835c474c92b629226f89c537ab937eac896662d73"
-            );
-            let composable_sha256 = relocalization_evidence_sha256_v1(&evidence).unwrap();
-            assert_eq!(
-                exact_hex(&composable_sha256),
-                "af545f03b558c6303a76ae475548d35c306d60f2776e14484bb7852343bb3bfa"
-            );
-            assert_ne!(composable_sha256, sha256_bytes(&preimage));
+            // Name and checksum are historical opaque aliases; this is a test
+            // import, not the live assigned writer.
+            fs::write(root.join("legacy-fixture.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+            result
         }
 
-        #[test]
-        fn relocalization_policy_v1_preimages_and_hashes_match_fixed_literals() {
-            let source = relocalization_source_policy_preimage_v1();
-            assert_eq!(source.len(), 179);
-            assert_eq!(
-                exact_hex(&source),
-                "6e757761782e67656f6d657472792e72656c6f63616c697a652e736f757263652d706f6c6963792e76310000000002000000010000000100000008000000000000c35000000000000186a00000000000249f000000000000001000000000000186a000000000000003d09000000000005b8d80000000000003d09000000000005b8d80000000000000000300000000000186a000000000000000480000000000249f0000000000000007d00000000100000001"
-            );
-            assert_eq!(
-                crate::map_checksum::sha256_hex(&source),
-                "b07edaaea099c363d43e3eb8cc0d0e62811ea01a76a97c8b6675788cc737b828"
-            );
-
-            let deadline = relocalization_deadline_policy_preimage_v1();
-            assert_eq!(deadline.len(), 101);
-            assert_eq!(
-                exact_hex(&deadline),
-                "6e757761782e67656f6d657472792e72656c6f63616c697a652e646561646c696e652d706f6c6963792e7631000000000100000000000000fa0000000000007530000000000000753000000000000007d00000000000001388000000010000000100000001"
-            );
-            assert_eq!(
-                crate::map_checksum::sha256_hex(&deadline),
-                "cf2793085656ef81fadf12a80fb1147973ec71a77735a4a3e600ac1345b59c70"
-            );
-
-            let algorithm = relocalization_algorithm_options_preimage_v1();
-            assert_eq!(algorithm.len(), 221);
-            assert_eq!(
-                exact_hex(&algorithm),
-                "6e757761782e67656f6d657472792e72656c6f63616c697a652e616c676f726974686d2d6f7074696f6e732e763100000000010000002e6e757761785f6d617070696e673a3a72656c6f636174696f6e5f706970656c696e655f776974685f636f6e66696700000001000000033fc999999999999a3fd33333333333333fe999999999999a0000000000000064000000000000100000000000000000033fb999999999999a3fc333333333333400000000000000033fdccccccccccccd00000000000000323eb0c6f7a0b5ed8d3fc33333333333344024000000000000"
-            );
-            assert_eq!(
-                crate::map_checksum::sha256_hex(&algorithm),
-                "f8b5ef8b359eeb0129f6d523244ea8bca35102143f3bce28e619598749276090"
-            );
-        }
-
-        fn relocalization_command_request(
-            request_id: &str,
-            target_cloud_revision: u64,
-        ) -> crate::proto::RelocalizeRequest {
-            crate::proto::RelocalizeRequest {
-                assigned_target: None,
-                planar_seed: None,
-                target_kind: String::new(),
-                target_graph_sha256: Vec::new(),
-                schema_version: RELOCALIZATION_SCHEMA_VERSION_V1,
-                request_id: request_id.to_owned(),
-                runtime_generation: 2,
-                session_id: "session-ledger".to_owned(),
-                map_name: "map-ledger".to_owned(),
-                session_generation: 3,
-                backend_generation: 4,
-                activation_identity_sha256: vec![5; 32],
-                target_receipt_sha256: vec![6; 32],
-                target_cloud_revision,
-                target_cloud_sha256: vec![8; 32],
-                asset_manifest_sha256: vec![9; 32],
-                asset_bundle_sha256: vec![10; 32],
-                source_policy_version: RELOCALIZATION_SOURCE_POLICY_VERSION,
-                source_policy_sha256: relocalization_source_policy_sha256_v1().to_vec(),
-                deadline_policy_version: RELOCALIZATION_DEADLINE_POLICY_VERSION_V1,
-                deadline_policy_sha256: relocalization_deadline_policy_sha256_v1().to_vec(),
-                logical_timeout_ms: 1_000,
-                algorithm_options_version: RELOCALIZATION_ALGORITHM_OPTIONS_VERSION,
-                algorithm_options_sha256: relocalization_algorithm_options_sha256_v1().to_vec(),
-            }
-        }
-
-        fn relocalization_command_terminal(
-            request: &ValidatedRelocalizeRequest,
-            disposition: crate::proto::RelocalizeDisposition,
-            detail: &'static str,
-        ) -> StoredRelocalizationResult {
-            let evidence_disclosure_v1 =
-                build_relocalization_evidence_disclosure_v1(detail.as_bytes(), None).unwrap();
-            StoredRelocalizationResult::new(build_relocalization_result(
-                &request.request,
-                request.identity_sha256,
-                disposition,
-                0,
-                None,
-                Vec::new(),
-                sha256_bytes(detail.as_bytes()),
-                evidence_disclosure_v1,
-                0,
-                detail,
-            ))
-        }
-
-        #[tokio::test]
-        async fn relocalization_disclosure_replay_is_byte_identical() {
-            let raw_request = relocalization_command_request("req-disclosure-replay", 7);
-            let request = validate_relocalize_request(raw_request.clone()).unwrap();
-            let phase_a = CorrectionPhaseAControl::for_tests();
-            let mut actor = RelocalizationCommandActor::new(
-                owner_identity(),
-                "robot_map".to_owned(),
-                "robot_odom".to_owned(),
-                "robot_body".to_owned(),
-            );
-            actor.ledger.relocalization_mode = phase_a.relocalization_mode();
-            let (detached_tx, _detached_rx) = mpsc::unbounded_channel();
-            let first_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-            let (first_response, first_response_rx) = oneshot::channel();
-            actor
-                .handle_admission(
-                    RelocalizationAdmissionRequest {
-                        planar_work: None,
-                        request: raw_request.clone(),
-                        capacity_lease: Arc::new(RelocalizationWaiterCapacityLease::new(
-                            first_permit,
-                        )),
-                        response: first_response,
-                        mapping_lifecycle_guard: None,
-                    },
-                    &detached_tx,
-                    None,
-                    &phase_a,
-                )
-                .unwrap();
-            let first_waiter = first_response_rx.await.unwrap().unwrap();
-            let terminal = actor.terminal_result(
-                &request,
-                Some(1),
-                crate::proto::RelocalizeDisposition::InsufficientSource,
-                "RELOCALIZATION_INSUFFICIENT_SOURCE",
-            );
-            let pending = actor
-                .ledger
-                .settle_terminal(
-                    &request.request.request_id,
-                    request.identity_sha256,
-                    terminal,
-                )
-                .unwrap();
-            let stored = actor.ledger.terminal(&raw_request.request_id).unwrap();
-            let stored_encoded = stored.encoded.clone();
-            let stored_encoded_sha256 = stored.encoded_sha256;
-            actor.notify_terminal(pending);
-            let first = first_waiter.wait().await.unwrap();
-
-            let replay_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-            let (replay_response, replay_response_rx) = oneshot::channel();
-            actor
-                .handle_admission(
-                    RelocalizationAdmissionRequest {
-                        planar_work: None,
-                        request: raw_request,
-                        capacity_lease: Arc::new(RelocalizationWaiterCapacityLease::new(
-                            replay_permit,
-                        )),
-                        response: replay_response,
-                        mapping_lifecycle_guard: None,
-                    },
-                    &detached_tx,
-                    None,
-                    &phase_a,
-                )
-                .unwrap();
-            let replay = replay_response_rx
-                .await
-                .unwrap()
-                .unwrap()
-                .wait()
-                .await
-                .unwrap();
-
-            let first_encoded = first.encode_to_vec();
-            let replay_encoded = replay.encode_to_vec();
-            assert_eq!(first_encoded, stored_encoded);
-            assert_eq!(replay_encoded, stored_encoded);
-            assert_eq!(first_encoded, replay_encoded);
-            assert_eq!(sha256_bytes(&stored_encoded), stored_encoded_sha256);
-        }
 
         #[test]
         fn relocalization_command_ledger_join_preserves_first_logical_deadline() {
@@ -13624,10 +12125,10 @@ mod preflight_only_contract {
             assert_eq!(before_claim.active_waiter_count, 2);
 
             ledger
-                .mark_postclaim("req-a", request.identity_sha256)
+                .mark_postclaim("req-a", &request.key())
                 .expect("first claim");
             ledger
-                .mark_postclaim("req-a", request.identity_sha256)
+                .mark_postclaim("req-a", &request.key())
                 .expect("idempotent claim");
             let terminal = relocalization_command_terminal(
                 &request,
@@ -13635,7 +12136,7 @@ mod preflight_only_contract {
                 "RELOCALIZATION_CANCELLED",
             );
             ledger
-                .settle_terminal("req-a", request.identity_sha256, terminal)
+                .settle_terminal("req-a", &request.key(), terminal)
                 .expect("terminal settlement");
             let settled = ledger.observation().expect("settled observation");
             assert_eq!(settled.observation_epoch, epoch);
@@ -13660,13 +12161,13 @@ mod preflight_only_contract {
                 "RELOCALIZATION_LAST_WAITER_CANCELLED",
             );
             let pending_notifications = ledger
-                .settle_terminal("req-a", request.identity_sha256, terminal.clone())
+                .settle_terminal("req-a", &request.key(), terminal.clone())
                 .expect("terminal settlement");
 
             let stored_before_notify = ledger.terminal("req-a").expect("terminal is durable");
-            assert_eq!(stored_before_notify.encoded, terminal.encoded);
+            assert_eq!(stored_before_notify.encoded(), terminal.encoded());
             assert_eq!(pending_notifications.waiter_ids, vec![9]);
-            assert_eq!(pending_notifications.result.encoded, terminal.encoded);
+            assert_eq!(pending_notifications.result.encoded(), terminal.encoded());
 
             let replay = ledger
                 .admit(&request, 10, Instant::now(), || unreachable!("no conflict"))
@@ -13675,8 +12176,8 @@ mod preflight_only_contract {
                 RelocalizationLedgerAdmission::Replay(result) => result,
                 _ => panic!("terminal request must replay"),
             };
-            assert_eq!(replay.encoded, terminal.encoded);
-            assert_eq!(replay.encoded_sha256, terminal.encoded_sha256);
+            assert_eq!(replay.encoded(), terminal.encoded());
+            assert_eq!(replay.encoded(), terminal.encoded());
         }
 
         #[test]
@@ -13728,7 +12229,7 @@ mod preflight_only_contract {
                 _ => panic!("identity mismatch must replay conflict"),
             };
             assert_eq!(conflict_builds.get(), 1);
-            assert_eq!(first_conflict.encoded, second_conflict.encoded);
+            assert_eq!(first_conflict.encoded(), second_conflict.encoded());
 
             let terminal = relocalization_command_terminal(
                 &request_a,
@@ -13736,7 +12237,7 @@ mod preflight_only_contract {
                 "RELOCALIZATION_CANCELLED",
             );
             ledger
-                .settle_terminal("req-a", request_a.identity_sha256, terminal)
+                .settle_terminal("req-a", &request_a.key(), terminal)
                 .expect("finish active request");
             let started_b = ledger
                 .admit(&request_b, 5, Instant::now(), || {
@@ -13777,8 +12278,8 @@ mod preflight_only_contract {
                 );
                 ledger
                     .settle_terminal(
-                        &request.request.request_id,
-                        request.identity_sha256,
+                        request.request_id(),
+                        &request.key(),
                         terminal,
                     )
                     .expect("bounded request settles");
@@ -13814,7 +12315,7 @@ mod preflight_only_contract {
                 .expect("capacity terminal replays");
             match replay {
                 RelocalizationLedgerAdmission::Replay(result) => {
-                    assert_eq!(result.encoded, overflow_terminal.encoded)
+                    assert_eq!(result.encoded(), overflow_terminal.encoded())
                 }
                 _ => panic!("capacity terminal must replay"),
             }
@@ -13873,10 +12374,10 @@ mod preflight_only_contract {
                 ) => (first, second),
                 _ => panic!("overflow identity must remain a permanent conflict"),
             };
-            assert_eq!(first_overflow.encoded, second_overflow.encoded);
+            assert_eq!(first_overflow.encoded(), second_overflow.encoded());
             assert_eq!(
-                first_overflow.encoded_sha256,
-                second_overflow.encoded_sha256
+                first_overflow.encoded(),
+                second_overflow.encoded()
             );
             let record = conflicts
                 .records
@@ -13886,11 +12387,11 @@ mod preflight_only_contract {
                 .conflict_overflow
                 .as_ref()
                 .expect("overflow terminal is retained before reply");
-            assert_eq!(*stored_identity, overflow_conflict.identity_sha256);
-            assert_eq!(stored_overflow.encoded, first_overflow.encoded);
+            assert_eq!(*stored_identity, overflow_conflict.key());
+            assert_eq!(stored_overflow.encoded(), first_overflow.encoded());
             assert_eq!(
-                stored_overflow.encoded_sha256,
-                first_overflow.encoded_sha256
+                stored_overflow.encoded(),
+                first_overflow.encoded()
             );
             let next_conflict = validate_relocalize_request(relocalization_command_request(
                 "req-conflict-cap",
@@ -13968,7 +12469,7 @@ mod preflight_only_contract {
                     None,
                     crate::proto::RelocalizeDisposition::ReplayConflict,
                     "RELOCALIZATION_REPLAY_CONFLICT",
-                );
+                ).unwrap();
                 assert!(matches!(
                     actor
                         .ledger
@@ -14011,16 +12512,16 @@ mod preflight_only_contract {
                 .get("req-conflict-overflow-actor")
                 .and_then(|record| record.conflict_overflow.as_ref())
                 .expect("overflow terminal is stored before reply consumption");
-            assert_eq!(stored.0, overflow.identity_sha256);
-            let stored_encoded = stored.1.encoded.clone();
-            let stored_encoded_sha256 = stored.1.encoded_sha256;
+            assert_eq!(stored.0, overflow.key());
+            let stored_encoded = stored.1.encoded().to_vec();
+            let stored_encoded_bytes = stored.1.encoded().to_vec();
             let waiter = response_rx
                 .await
                 .expect("actor reply is delivered")
                 .expect("overflow conflict returns a waiter");
             let reply = waiter.wait().await.expect("overflow terminal is delivered");
             assert_eq!(reply.encode_to_vec(), stored_encoded);
-            assert_eq!(sha256_bytes(&reply.encode_to_vec()), stored_encoded_sha256);
+            assert_eq!(reply.encode_to_vec(), stored_encoded_bytes);
             assert!(!phase_a.is_open(), "overflow closes further admission");
 
             let replay = actor
@@ -14031,8 +12532,8 @@ mod preflight_only_contract {
                 .expect("overflow conflict replays");
             match replay {
                 RelocalizationLedgerAdmission::Conflict(result) => {
-                    assert_eq!(result.encoded, stored_encoded);
-                    assert_eq!(result.encoded_sha256, stored_encoded_sha256);
+                    assert_eq!(result.encoded(), stored_encoded);
+                    assert_eq!(result.encoded(), stored_encoded_bytes);
                 }
                 _ => panic!("stored overflow conflict must remain REPLAY_CONFLICT"),
             }
@@ -14050,10 +12551,10 @@ mod preflight_only_contract {
                 .admit(&request, 2, Instant::now(), || unreachable!("no conflict"))
                 .expect("second waiter");
             assert!(!preclaim
-                .detach_waiter("req-a", request.identity_sha256, 1)
+                .detach_waiter("req-a", &request.key(), 1)
                 .expect("detach first waiter"));
             assert!(preclaim
-                .detach_waiter("req-a", request.identity_sha256, 2)
+                .detach_waiter("req-a", &request.key(), 2)
                 .expect("detach final preclaim waiter"));
 
             let mut postclaim = RelocalizationCommandLedger::default();
@@ -14061,23 +12562,11 @@ mod preflight_only_contract {
                 .admit(&request, 3, Instant::now(), || unreachable!("no conflict"))
                 .expect("postclaim request");
             postclaim
-                .mark_postclaim("req-a", request.identity_sha256)
+                .mark_postclaim("req-a", &request.key())
                 .expect("mark claimed");
             assert!(!postclaim
-                .detach_waiter("req-a", request.identity_sha256, 3)
+                .detach_waiter("req-a", &request.key(), 3)
                 .expect("detach postclaim waiter"));
-        }
-
-        fn relocalization_command_supervisor(
-            phase_a: CorrectionPhaseAControl,
-        ) -> RelocalizationOwnerSupervisor {
-            RelocalizationOwnerSupervisor::start(
-                phase_a,
-                owner_identity(),
-                "map".to_owned(),
-                "odom".to_owned(),
-                "base_link".to_owned(),
-            )
         }
 
         #[test]
@@ -14098,9 +12587,8 @@ mod preflight_only_contract {
                     RelocalizationTerminalStore::open_at(root.path().to_path_buf()).unwrap();
                 store
                     .persist_terminal(
-                        &request.request.request_id,
-                        request.identity_sha256,
-                        request.activation_identity_sha256,
+                        request.request_id(),
+                        &request.key(),
                         &terminal,
                     )
                     .unwrap();
@@ -14109,25 +12597,25 @@ mod preflight_only_contract {
             let mut ledger = RelocalizationCommandLedger::from_terminal_store(&store);
             let before = ledger.observation().unwrap();
             let mode_before = ledger.relocalization_mode.snapshot();
-            assert!(ledger.request(&request.request.request_id).is_none());
+            assert!(ledger.request(request.request_id()).is_none());
             assert!(ledger.active_identity().is_none());
             assert!(matches!(
-                &ledger.records[&request.request.request_id].origin,
+                &ledger.records[request.request_id()].origin,
                 RelocalizationLedgerOrigin::RestoredTerminal
             ));
             assert_eq!(before.admitted_command_count, 0);
             assert_eq!(before.claimed_command_count, 0);
             assert_eq!(before.terminal_record_count, 0);
             assert!(ledger
-                .mark_postclaim(&request.request.request_id, request.identity_sha256)
+                .mark_postclaim(request.request_id(), &request.key())
                 .is_err());
             assert!(ledger
-                .detach_waiter(&request.request.request_id, request.identity_sha256, 1)
+                .detach_waiter(request.request_id(), &request.key(), 1)
                 .is_err());
 
             for index in 0..RELOCALIZATION_MAX_CONFLICTS_PER_RECORD {
                 let changed = validate_relocalize_request(relocalization_command_request(
-                    &request.request.request_id,
+                    request.request_id(),
                     index as u64 + 8,
                 ))
                 .unwrap();
@@ -14135,7 +12623,7 @@ mod preflight_only_contract {
                     &changed,
                     crate::proto::RelocalizeDisposition::ReplayConflict,
                     "RELOCALIZATION_REPLAY_CONFLICT",
-                );
+                ).unwrap();
                 let first = ledger
                     .admit(&changed, index as u64 + 1, Instant::now(), || {
                         conflict.clone()
@@ -14151,14 +12639,14 @@ mod preflight_only_contract {
                         RelocalizationLedgerAdmission::Conflict(first),
                         RelocalizationLedgerAdmission::Conflict(repeat),
                     ) => {
-                        assert_eq!(first.encoded, conflict.encoded);
-                        assert_eq!(repeat.encoded, first.encoded);
+                        assert_eq!(first.encoded(), conflict.encoded());
+                        assert_eq!(repeat.encoded(), first.encoded());
                     }
                     _ => panic!("restored binding must retain each bounded conflict"),
                 }
             }
             let overflow = validate_relocalize_request(relocalization_command_request(
-                &request.request.request_id,
+                request.request_id(),
                 RELOCALIZATION_MAX_CONFLICTS_PER_RECORD as u64 + 8,
             ))
             .unwrap();
@@ -14180,12 +12668,12 @@ mod preflight_only_contract {
                 .unwrap()
             {
                 RelocalizationLedgerAdmission::Conflict(replayed) => {
-                    assert_eq!(replayed.encoded, overflow_terminal.encoded)
+                    assert_eq!(replayed.encoded(), overflow_terminal.encoded())
                 }
                 _ => panic!("restored overflow identity must remain permanent"),
             }
             let next_conflict = validate_relocalize_request(relocalization_command_request(
-                &request.request.request_id,
+                request.request_id(),
                 RELOCALIZATION_MAX_CONFLICTS_PER_RECORD as u64 + 9,
             ))
             .unwrap();
@@ -14207,7 +12695,7 @@ mod preflight_only_contract {
                     .unwrap()
                 {
                     RelocalizationLedgerAdmission::Replay(replayed) => {
-                        assert_eq!(replayed.encoded, terminal.encoded)
+                        assert_eq!(replayed.encoded(), terminal.encoded())
                     }
                     _ => panic!("exact restored terminal survives conflict overflow"),
                 }
@@ -14219,15 +12707,16 @@ mod preflight_only_contract {
             assert_eq!(ledger.relocalization_mode.snapshot(), mode_before);
             assert_eq!(ledger.next_admission_ordinal, 0);
             assert_eq!(
-                ledger.records[&request.request.request_id].conflicts.len(),
+                ledger.records[request.request_id()].conflicts.len(),
                 RELOCALIZATION_MAX_CONFLICTS_PER_RECORD
             );
 
-            // The store binds both identities. Even if a caller presents an
-            // equal request digest, it cannot substitute the activation binding.
+            // The store binds the full assigned descriptor. A same-ID retry
+            // cannot substitute the activation lifecycle binding.
             let mut activation_ledger = RelocalizationCommandLedger::from_terminal_store(&store);
-            let mut changed_activation = request.clone();
-            changed_activation.activation_identity_sha256[0] ^= 1;
+            let mut changed_wire = request.identity.to_wire();
+            relocalization_request_body(&mut changed_wire).target.as_mut().unwrap().activation.as_mut().unwrap().lifecycle_epoch += 1;
+            let changed_activation = validate_relocalize_request(changed_wire).unwrap();
             assert!(matches!(
                 activation_ledger
                     .admit(&changed_activation, 1, Instant::now(), || terminal.clone())
@@ -14266,8 +12755,8 @@ mod preflight_only_contract {
                 );
                 bounded
                     .settle_terminal(
-                        &new_request.request.request_id,
-                        new_request.identity_sha256,
+                        new_request.request_id(),
+                        &new_request.key(),
                         relocalization_command_terminal(
                             &new_request,
                             crate::proto::RelocalizeDisposition::Cancelled,
@@ -14321,486 +12810,11 @@ mod preflight_only_contract {
                     .unwrap()
                 {
                     RelocalizationLedgerAdmission::Replay(replayed) => {
-                        assert_eq!(replayed.encoded, expected.encoded)
+                        assert_eq!(replayed.encoded(), expected.encoded())
                     }
                     _ => panic!("full ledger must still replay existing terminals"),
                 }
             }
-        }
-
-        fn relocalization_restart_request(request_id: &str) -> crate::proto::RelocalizeRequest {
-            let mut request = relocalization_command_request(request_id, 0);
-            request.target_kind = "planar_graph".to_owned();
-            request.target_cloud_sha256.clear();
-            request.target_graph_sha256 = vec![11; 32];
-            request.planar_seed = Some(crate::proto::PlanarSeed {
-                x: 1.0,
-                y: 2.0,
-                yaw: 0.25,
-            });
-            request.source_policy_sha256 = planar_source_policy_sha256().to_vec();
-            request.algorithm_options_sha256 = planar_algorithm_policy_sha256().to_vec();
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
-            request
-        }
-
-        fn relocalization_restart_supervisor(
-            phase_a: CorrectionPhaseAControl,
-            root: &Path,
-        ) -> RelocalizationOwnerSupervisor {
-            RelocalizationOwnerSupervisor::start_inner(
-                phase_a,
-                owner_identity(),
-                "map".to_owned(),
-                "odom".to_owned(),
-                "base_link".to_owned(),
-                None,
-                Some(RelocalizationTerminalStore::open_at(root.to_path_buf()).unwrap()),
-            )
-        }
-
-        fn relocalization_restart_work(
-            compute_calls: Arc<AtomicU64>,
-            sink: Arc<RelocalizationAppliedSink>,
-        ) -> PlanarCommandWork {
-            Box::new(move |context| {
-                Box::pin(async move {
-                    compute_calls.fetch_add(1, Ordering::AcqRel);
-                    assert!(
-                        context.claim().await,
-                        "fixture must claim before publication"
-                    );
-                    sink.apply_candidate(
-                        sample_candidate(1, 200),
-                        CorrectionRequestCancellation::new(),
-                    )
-                    .await
-                    .expect("fixture publication");
-                    PlanarCommandOutcome {
-                        disposition: crate::proto::RelocalizeDisposition::Applied,
-                        detail: "RELOCALIZATION_RESTART_FIXTURE_APPLIED".to_owned(),
-                        correction_revision: 1,
-                        evidence: b"relocalization-restart-fixture".to_vec(),
-                    }
-                })
-            })
-        }
-
-        async fn relocalization_restart_submit(
-            ingress: &RelocalizationCommandIngress,
-            request: crate::proto::RelocalizeRequest,
-            compute_calls: &Arc<AtomicU64>,
-            sink: &Arc<RelocalizationAppliedSink>,
-        ) -> crate::proto::RelocalizeResult {
-            tokio::time::timeout(Duration::from_secs(2), async {
-                ingress
-                    .admit_planar(
-                        request,
-                        Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
-                        relocalization_restart_work(Arc::clone(compute_calls), Arc::clone(sink)),
-                    )
-                    .await
-                    .expect("restart ingress admission")
-                    .wait()
-                    .await
-                    .expect("restart ingress terminal")
-            })
-            .await
-            .expect("stored terminal must not wait for execution")
-        }
-
-        async fn relocalization_restart_observation(
-            ingress: &RelocalizationCommandIngress,
-            request: &ValidatedRelocalizeRequest,
-        ) -> crate::proto::RelocalizationLedgerObservation {
-            let snapshot = ingress
-                .terminal_snapshot(
-                    &request.request.request_id,
-                    request.identity_sha256,
-                    request.activation_identity_sha256,
-                )
-                .await
-                .expect("actor terminal query");
-            assert!(matches!(
-                snapshot.terminal,
-                RelocalizationTerminalSnapshot::Terminal(_)
-            ));
-            snapshot.ledger_observation
-        }
-
-        #[tokio::test]
-        async fn relocalization_actor_restart_replays_before_conflict_busy_and_side_effects() {
-            let root = RelocalizationTerminalTestRoot::new();
-            let request = relocalization_restart_request("req-actor-restart");
-            let validated = validate_relocalize_request(request.clone()).unwrap();
-            let first_compute = Arc::new(AtomicU64::new(0));
-            let first_sink = Arc::new(RelocalizationAppliedSink::default());
-            let first_result = {
-                let phase_a = CorrectionPhaseAControl::for_tests();
-                let mut supervisor =
-                    relocalization_restart_supervisor(phase_a.clone(), root.path());
-                let ingress = supervisor.ingress();
-                let result = relocalization_restart_submit(
-                    &ingress,
-                    request.clone(),
-                    &first_compute,
-                    &first_sink,
-                )
-                .await;
-                assert_eq!(
-                    result.disposition,
-                    crate::proto::RelocalizeDisposition::Applied as i32
-                );
-                let observation = relocalization_restart_observation(&ingress, &validated).await;
-                assert_eq!(observation.admitted_command_count, 1);
-                assert_eq!(observation.claimed_command_count, 1);
-                assert_eq!(first_compute.load(Ordering::Acquire), 1);
-                assert_eq!(first_sink.applied.load(Ordering::Acquire), 1);
-                phase_a.begin();
-                supervisor.shutdown().await.expect("first actor stops");
-                result
-            };
-            // All references to the first store and actor have been dropped.
-            // The second supervisor really reopens and validates the JSON file.
-            let terminal_path = root.path().join(format!(
-                "{}.json",
-                encode_hex(&sha256_bytes(request.request_id.as_bytes())),
-            ));
-            let persisted_bytes = fs::read(&terminal_path).expect("first actor persisted terminal");
-            let phase_a = CorrectionPhaseAControl::for_tests();
-            let mut supervisor = relocalization_restart_supervisor(phase_a.clone(), root.path());
-            let ingress = supervisor.ingress();
-            let replay_compute = Arc::new(AtomicU64::new(0));
-            let replay_sink = Arc::new(RelocalizationAppliedSink::default());
-            let mode_before = phase_a.relocalization_mode().snapshot();
-            let restored = relocalization_restart_observation(&ingress, &validated).await;
-            assert_eq!(restored.admitted_command_count, 0);
-            assert_eq!(restored.claimed_command_count, 0);
-            assert_eq!(restored.terminal_record_count, 0);
-            assert_eq!(restored.pending_record_count, 0);
-            assert_eq!(restored.active_waiter_count, 0);
-
-            // Conflict arrives before the original request. It must not replace
-            // the durable binding, start work, or transiently activate the mode.
-            let mut changed = request.clone();
-            changed.activation_identity_sha256[0] ^= 1;
-            let conflict = relocalization_restart_submit(
-                &ingress,
-                changed.clone(),
-                &replay_compute,
-                &replay_sink,
-            )
-            .await;
-            assert_eq!(
-                conflict.disposition,
-                crate::proto::RelocalizeDisposition::ReplayConflict as i32
-            );
-            let repeated_conflict = relocalization_restart_submit(
-                &ingress,
-                changed.clone(),
-                &replay_compute,
-                &replay_sink,
-            )
-            .await;
-            assert_eq!(repeated_conflict.encode_to_vec(), conflict.encode_to_vec());
-            let changed = validate_relocalize_request(changed).unwrap();
-            assert!(matches!(
-                ingress
-                    .terminal_snapshot(
-                        &changed.request.request_id,
-                        changed.identity_sha256,
-                        changed.activation_identity_sha256,
-                    )
-                    .await
-                    .unwrap()
-                    .terminal,
-                RelocalizationTerminalSnapshot::IdentityConflict
-            ));
-            for _ in 0..2 {
-                let replay = relocalization_restart_submit(
-                    &ingress,
-                    request.clone(),
-                    &replay_compute,
-                    &replay_sink,
-                )
-                .await;
-                assert_eq!(replay.encode_to_vec(), first_result.encode_to_vec());
-            }
-            assert_eq!(phase_a.relocalization_mode().snapshot(), mode_before);
-            assert_eq!(
-                relocalization_restart_observation(&ingress, &validated)
-                    .await
-                    .encode_to_vec(),
-                restored.encode_to_vec(),
-            );
-            assert_eq!(replay_compute.load(Ordering::Acquire), 0);
-            assert_eq!(replay_sink.staged.load(Ordering::Acquire), 0);
-            assert_eq!(replay_sink.applied.load(Ordering::Acquire), 0);
-
-            // Exercise the actor's execution-busy guard, not only ledger Busy.
-            let busy_request = relocalization_restart_request("req-actor-restart-busy");
-            let busy_validated = validate_relocalize_request(busy_request.clone()).unwrap();
-            let (busy_started, busy_started_rx) = oneshot::channel();
-            let (release_busy, busy_release_rx) = oneshot::channel();
-            let busy_work: PlanarCommandWork = Box::new(move |_| {
-                Box::pin(async move {
-                    let _ = busy_started.send(());
-                    busy_release_rx.await.expect("release unrelated operation");
-                    PlanarCommandOutcome {
-                        disposition: crate::proto::RelocalizeDisposition::Rejected,
-                        detail: "RELOCALIZATION_RESTART_BUSY_FIXTURE".to_owned(),
-                        correction_revision: 0,
-                        evidence: Vec::new(),
-                    }
-                })
-            });
-            let busy_waiter = ingress
-                .admit_planar(
-                    busy_request,
-                    Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
-                    busy_work,
-                )
-                .await
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(2), busy_started_rx)
-                .await
-                .unwrap()
-                .unwrap();
-            let busy_mode = phase_a.relocalization_mode().snapshot();
-            assert!(busy_mode.active);
-            let busy_observation = relocalization_restart_observation(&ingress, &validated).await;
-            assert_eq!(busy_observation.admitted_command_count, 1);
-            assert_eq!(busy_observation.claimed_command_count, 0);
-            assert_eq!(busy_observation.pending_record_count, 1);
-            assert_eq!(busy_observation.active_waiter_count, 1);
-            assert!(matches!(
-                ingress
-                    .terminal_snapshot(
-                        &busy_validated.request.request_id,
-                        busy_validated.identity_sha256,
-                        busy_validated.activation_identity_sha256,
-                    )
-                    .await
-                    .unwrap()
-                    .terminal,
-                RelocalizationTerminalSnapshot::Pending
-            ));
-
-            let mut busy_conflict = request.clone();
-            busy_conflict.target_graph_sha256[0] ^= 1;
-            let conflict = relocalization_restart_submit(
-                &ingress,
-                busy_conflict.clone(),
-                &replay_compute,
-                &replay_sink,
-            )
-            .await;
-            assert_eq!(
-                conflict.disposition,
-                crate::proto::RelocalizeDisposition::ReplayConflict as i32
-            );
-            let repeated = relocalization_restart_submit(
-                &ingress,
-                busy_conflict,
-                &replay_compute,
-                &replay_sink,
-            )
-            .await;
-            assert_eq!(repeated.encode_to_vec(), conflict.encode_to_vec());
-            for _ in 0..2 {
-                let replay = relocalization_restart_submit(
-                    &ingress,
-                    request.clone(),
-                    &replay_compute,
-                    &replay_sink,
-                )
-                .await;
-                assert_eq!(replay.encode_to_vec(), first_result.encode_to_vec());
-            }
-            assert_eq!(phase_a.relocalization_mode().snapshot(), busy_mode);
-            assert_eq!(
-                relocalization_restart_observation(&ingress, &validated)
-                    .await
-                    .encode_to_vec(),
-                busy_observation.encode_to_vec(),
-            );
-            assert_eq!(replay_compute.load(Ordering::Acquire), 0);
-            assert_eq!(replay_sink.staged.load(Ordering::Acquire), 0);
-            assert_eq!(replay_sink.applied.load(Ordering::Acquire), 0);
-            assert_eq!(fs::read(&terminal_path).unwrap(), persisted_bytes);
-            release_busy.send(()).unwrap();
-            tokio::time::timeout(Duration::from_secs(2), busy_waiter.wait())
-                .await
-                .unwrap()
-                .unwrap();
-            phase_a.begin();
-            supervisor.shutdown().await.expect("restarted actor stops");
-        }
-
-        #[tokio::test]
-        async fn relocalization_retained_command_phase_a_stores_terminal_before_reply() {
-            let phase_a = CorrectionPhaseAControl::for_tests();
-            let mut supervisor = relocalization_command_supervisor(phase_a.clone());
-            let ingress = supervisor.ingress();
-            let request = relocalization_command_request("req-phase-a", 7);
-            let first = ingress
-                .admit(request.clone())
-                .await
-                .expect("first retained waiter");
-            let second = ingress
-                .admit(request.clone())
-                .await
-                .expect("joined retained waiter");
-            first.cancel_preclaim();
-            phase_a.begin();
-
-            let result = tokio::time::timeout(Duration::from_secs(1), second.wait())
-                .await
-                .expect("phase A settlement is bounded")
-                .expect("phase A returns a stored terminal");
-            assert_eq!(
-                result.disposition,
-                crate::proto::RelocalizeDisposition::OwnerStopped as i32
-            );
-            assert_eq!(result.candidate_sequence, 0);
-            assert_eq!(result.terminal_proof_sha256.len(), 32);
-            assert_eq!(result.detail, "RELOCALIZATION_OWNER_STOPPED_PRECLAIM");
-            supervisor.shutdown().await.expect("retained actor joins");
-            assert!(supervisor.is_finished());
-        }
-
-        #[tokio::test]
-        async fn relocalization_retained_command_deadline_replays_identical_terminal() {
-            let phase_a = CorrectionPhaseAControl::for_tests();
-            let mut supervisor = relocalization_command_supervisor(phase_a.clone());
-            let ingress = supervisor.ingress();
-            let mut request = relocalization_command_request("req-deadline", 7);
-            request.logical_timeout_ms = RELOCALIZATION_MIN_LOGICAL_TIMEOUT_MS;
-            let first = ingress
-                .admit(request.clone())
-                .await
-                .expect("deadline request admitted");
-            let first = tokio::time::timeout(Duration::from_secs(1), first.wait())
-                .await
-                .expect("logical deadline is bounded")
-                .expect("deadline terminal returned");
-            assert_eq!(
-                first.disposition,
-                crate::proto::RelocalizeDisposition::DeadlineExceeded as i32
-            );
-            assert_eq!(first.candidate_sequence, 0);
-            assert!(first.candidate_payload_sha256.is_empty());
-            assert!(first.candidate_payload_preimage_v1.is_empty());
-            assert!(
-                first.evidence_disclosure_v1.len()
-                    <= RELOCALIZATION_MAX_INLINE_EVIDENCE_DISCLOSURE_BYTES
-            );
-            assert_eq!(
-                first.evidence_disclosure_v1
-                    [RELOCALIZATION_EVIDENCE_DISCLOSURE_DOMAIN_V1.len() + 4],
-                0
-            );
-            assert_eq!(first.terminal_proof_sha256.len(), 32);
-
-            let replay = ingress
-                .admit(request)
-                .await
-                .expect("terminal replay admitted")
-                .wait()
-                .await
-                .expect("terminal replay returned");
-            assert_eq!(replay.encode_to_vec(), first.encode_to_vec());
-            phase_a.begin();
-            supervisor.shutdown().await.expect("retained actor joins");
-        }
-
-        #[tokio::test]
-        async fn relocalization_retained_command_busy_is_transient_and_unproved() {
-            let phase_a = CorrectionPhaseAControl::for_tests();
-            let mut supervisor = relocalization_command_supervisor(phase_a.clone());
-            let ingress = supervisor.ingress();
-            let active = ingress
-                .admit(relocalization_command_request("req-active", 7))
-                .await
-                .expect("active request admitted");
-            let busy = ingress
-                .admit(relocalization_command_request("req-busy", 7))
-                .await
-                .expect("busy request receives a waiter")
-                .wait()
-                .await
-                .expect("busy response returned");
-            assert_eq!(
-                busy.disposition,
-                crate::proto::RelocalizeDisposition::Busy as i32
-            );
-            assert!(busy.terminal_proof_sha256.is_empty());
-
-            active.cancel_preclaim();
-            let retried = ingress
-                .admit(relocalization_command_request("req-busy", 7))
-                .await
-                .expect("busy request was not permanently inserted");
-            phase_a.begin();
-            let terminal = retried.wait().await.expect("new request is retained");
-            assert_eq!(
-                terminal.disposition,
-                crate::proto::RelocalizeDisposition::OwnerStopped as i32
-            );
-            supervisor.shutdown().await.expect("retained actor joins");
-        }
-
-        #[tokio::test]
-        async fn default_profile_relocalization_replays_target_unavailable_terminal() {
-            let owner_identity = CorrectionOwnerRuntimeIdentity {
-                runtime_generation: 2,
-                backend_generation: 99,
-                correction_lease: CorrectionLeaseId {
-                    boot_nonce: LEASE_NONCE,
-                    generation: 1,
-                },
-            };
-            let owner = CorrectionTransportOwner::start(
-                CorrectionOwnerSpec::preflight_for_frames(
-                    CorrectionBackend::None,
-                    LioBackend::PointLio,
-                    "map",
-                    "odom",
-                    "base_link",
-                ).expect("关闭自动回环仍提供按需重定位"),
-                owner_identity,
-                "",
-                Arc::new(FailingStageSink),
-            )
-            .await
-            .expect("relocalization transport owner starts without private LCM");
-            let ingress = owner
-                .relocalization_ingress()
-                .expect("relocalization command ingress is retained");
-            assert!(ingress.is_open());
-            let request = relocalization_command_request("req-target-unavailable", 7);
-            let first = ingress
-                .admit(request.clone())
-                .await
-                .expect("command admission remains typed")
-                .wait()
-                .await
-                .expect("target-unavailable terminal is delivered");
-            assert_eq!(
-                first.disposition,
-                crate::proto::RelocalizeDisposition::TargetUnavailable as i32
-            );
-            assert_eq!(first.candidate_sequence, 0);
-            assert_eq!(first.terminal_proof_sha256.len(), 32);
-            let replay = ingress
-                .admit(request)
-                .await
-                .expect("terminal request is replayable")
-                .wait()
-                .await
-                .expect("terminal replay is delivered");
-            assert_eq!(replay.encode_to_vec(), first.encode_to_vec());
-            owner.shutdown().await.expect("runtime owner joins cleanly");
         }
 
         fn install_relocalization_target_for_request(
@@ -14808,60 +12822,233 @@ mod preflight_only_contract {
             request: &mut crate::proto::RelocalizeRequest,
             map_frame_id: &str,
         ) {
-            let points = asymmetric_cloud();
-            let mut xyz_f32_le = Vec::new();
-            for point in points {
-                for coordinate in [point.x, point.y, point.z] {
-                    xyz_f32_le.extend_from_slice(&(coordinate as f32).to_le_bytes());
-                }
-            }
-            let point_count = u32::try_from(xyz_f32_le.len() / 12).unwrap();
-            let target_sha256 = sha256_bytes(&xyz_f32_le);
-            request.target_cloud_sha256 = target_sha256.to_vec();
+            install_relocalization_target_points_for_request(phase_a, request, map_frame_id, asymmetric_cloud());
+        }
+
+        fn install_relocalization_target_points_for_request(
+            phase_a: &CorrectionPhaseAControl,
+            request: &mut crate::proto::RelocalizeRequest,
+            map_frame_id: &str,
+            points: Vec<Point3<f64>>,
+        ) -> SealedAssignedActivatedTargetSnapshot {
+            let requested = relocalization_request_body(request).target.as_ref().unwrap().clone();
+            let requested_activation = requested.activation.as_ref().unwrap();
+            let requested_metadata = requested_activation.request.as_ref().unwrap();
+            let cloud_revision = requested.cloud_receipt.as_ref().unwrap().cloud_revision;
             let control = phase_a.activated_target_receipts();
-            let seed = ActivationReceiptSeed {
-                checkpoint_owner: None,
-                planar_target: None,
-                activation_request_id: "activation-relocalization-runtime".to_owned(),
-                request_key: ActivationRequestKey::LegacyDigest([4; 32]),
-                asset_manifest_sha256: Some([9; 32]),
-                asset_bundle_sha256: Some([10; 32]),
-                modern: true,
-                immutable_target: Some(crate::pointcloud::ImmutableActivatedTarget {
-                    frame_id: map_frame_id.to_owned(),
-                    source_revision: request.target_cloud_revision,
-                    point_count,
-                    voxel_size: crate::pointcloud::VOXEL_SIZE,
-                    xyz_f32_le,
-                    xyz_sha256: target_sha256,
-                    payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
-                }),
-            };
+            let mut wire = assigned_wire_request();
+            wire.expected_runtime_generation = control.runtime_generation();
+            wire.activation_request_id = "activation-relocalization-runtime".into();
+            wire.session_id = requested_metadata.session_id.clone();
+            wire.map_name = requested_metadata.map_name.clone();
+            let checkpoint = wire.mapping_backend_checkpoint.as_mut().unwrap();
+            let point_count = points.len().try_into().unwrap();
+            checkpoint.cloud_receipt.as_mut().unwrap().point_count = point_count;
+            for member in [checkpoint.backend_identity.as_mut().unwrap(), checkpoint.occupancy_identity.as_mut().unwrap()] {
+                member.frame_id = map_frame_id.into();
+                member.cloud_receipt.as_mut().unwrap().point_count = point_count;
+            }
+            checkpoint.canonical_occupancy_checkpoint.as_mut().unwrap().meta.as_mut().unwrap().frame_id = map_frame_id.into();
+            let cloud = checkpoint.canonical_cloud_checkpoint.as_mut().unwrap();
+            cloud.frame_id = map_frame_id.into();
+            cloud.point_count = point_count;
+            cloud.xyz_f32_le = points.into_iter().flat_map(|p| [p.x as f32, p.y as f32, p.z as f32])
+                .flat_map(f32::to_le_bytes).collect();
+            let member = cloud.member_identity.as_mut().unwrap();
+            member.frame_id = map_frame_id.into();
+            member.cloud_receipt.as_mut().unwrap().point_count = point_count;
+            let admitted = ValidatedActivationRequestV2::admit(
+                wire, control.runtime_generation(), crate::mapping_backend::MappingBackendKind::Voxel,
+                map_frame_id, |_| panic!("fixture has no artifacts"),
+                &crate::activation_request::CheckpointOwnerInternerV2::default(),
+            ).unwrap();
             let mut state = activation_base_state();
-            state.session_id = request.session_id.clone();
-            state.map_name = request.map_name.clone();
-            state.session_generation = request.session_generation;
-            let token = match control.stage_or_replay(seed, state.clone(), true) {
+            state.session_id = requested_metadata.session_id.clone();
+            state.map_name = requested_metadata.map_name.clone();
+            state.session_generation = 1;
+            let token = match control.stage_assigned_or_replay(admitted, state.clone(), true) {
                 ActivationLedgerAdmission::Execute(token) => token,
-                ActivationLedgerAdmission::Terminal(_) => panic!("target must stage"),
+                ActivationLedgerAdmission::Terminal(_) => panic!("assigned target must stage"),
             };
-            let token = control
-                .reserve_backend_generation(&token, request.backend_generation)
-                .expect("backend generation binds");
-            let token = control
-                .bind_activation_identity(&token, [5; 32], request.session_generation)
-                .expect("activation identity binds");
-            assert!(control.store_publication_proof(
-                &token,
-                activation_publication_proof([6; 32], point_count, request.session_generation,),
+            let token = control.reserve_backend_generation(&token, 1).unwrap();
+            let token = control.bind_assigned_activation_identity(&token, state.session_generation).unwrap();
+            let mut proof = assigned_proof(&control, &token);
+            proof.cloud_revision = cloud_revision;
+            proof.cloud_receipt.cloud_revision = cloud_revision;
+            let TargetReceipt::Assigned(receipt) = &mut proof.target_receipt else { unreachable!() };
+            receipt.cloud_receipt.cloud_revision = cloud_revision;
+            let target = receipt.clone();
+            assert!(control.store_publication_proof(&token, proof));
+            control.seal(&token, Some(TargetReceipt::Assigned(target.clone())), state).unwrap();
+            relocalization_request_body(request).target = Some(target.to_wire());
+            validate_relocalize_request(request.clone()).unwrap();
+            control.current_sealed_assigned_target_snapshot().unwrap()
+        }
+
+        fn relocalization_terminal_candidate_sequence(result: &crate::proto::RelocalizeResult) -> u64 {
+            let body = relocalization_terminal_body(result);
+            if body.candidate_payload_v3.is_empty() { 0 } else {
+                CorrectionCandidate::decode_body(&body.candidate_payload_v3).unwrap().identity.candidate_sequence
+            }
+        }
+
+        fn active_relocalization_frame_with_points(
+            owner: &CorrectionTransportOwner,
+            sequence: u64,
+            timestamp_ns: u64,
+            pose: Isometry3<f64>,
+            body_points: Vec<Point3<f64>>,
+        ) -> CorrectionFrameInput {
+            let adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
+            let fence = owner.ingress().relocalization_mode_fence();
+            let mode = fence.snapshot();
+            assert!(mode.active);
+            let mut input = frame_from_admitted_source(sequence, admit_frame_source(
+                sequence, timestamp_ns, timestamp_ns, pose,
+                body_points.iter().map(|point| pose * point).collect(), &adapter, fence,
             ));
-            control
-                .seal(&token, Some(TargetReceipt::LegacyDigest([6; 32])), state)
-                .expect("target seals");
+            input.relocalization_mode_epoch = Some(mode.epoch);
+            input
+        }
+
+        async fn retained_relocalization_test_owner() -> CorrectionTransportOwner {
+            CorrectionTransportOwner::start(
+                CorrectionOwnerSpec::Relocalization { map_frame_id: "robot_map".into(),
+                    odom_frame_id: "robot_odom".into(), body_frame_id: "robot_body".into() },
+                CorrectionOwnerRuntimeIdentity { runtime_generation: 2, backend_generation: 99,
+                    correction_lease: CorrectionLeaseId { boot_nonce: LEASE_NONCE, generation: 20 } },
+                "", Arc::new(FailingStageSink),
+            ).await.unwrap()
         }
 
         #[tokio::test]
-        async fn relocalization_runtime_releases_non_cutoff_guard_and_keeps_first_deadline() {
+        async fn default_profile_relocalization_replays_target_unavailable_terminal() {
+            let owner = CorrectionTransportOwner::start(
+                CorrectionOwnerSpec::preflight_for_frames(CorrectionBackend::None, LioBackend::PointLio,
+                    "map", "odom", "base_link").unwrap(),
+                CorrectionOwnerRuntimeIdentity { runtime_generation: 2, backend_generation: 99,
+                    correction_lease: CorrectionLeaseId { boot_nonce: LEASE_NONCE, generation: 1 } },
+                "", Arc::new(FailingStageSink),
+            ).await.unwrap();
+            let ingress = owner.relocalization_ingress().unwrap();
+            let request = relocalization_command_request("req-default-target-unavailable", 7);
+            let first = ingress.admit(request.clone()).await.unwrap().wait().await.unwrap();
+            assert_eq!(relocalization_terminal_body(&first).disposition,
+                crate::proto::RelocalizeDisposition::TargetUnavailable as i32);
+            assert_eq!(relocalization_terminal_candidate_sequence(&first), 0);
+            assert!(relocalization_terminal_body(&first).candidate_payload_v3.is_empty());
+            let replay = ingress.admit(request).await.unwrap().wait().await.unwrap();
+            assert_eq!(replay.encode_to_vec(), first.encode_to_vec());
+            owner.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn relocalization_retained_command_phase_a_stores_terminal_before_reply() {
+            let owner = retained_relocalization_test_owner().await;
+            let phase_a = owner.phase_a_control();
+            let ingress = owner.relocalization_ingress().unwrap();
+            let mut request = relocalization_command_request("req-phase-a", 7);
+            install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
+            let validated = validate_relocalize_request(request.clone()).unwrap();
+            let first = ingress.admit(request.clone()).await.unwrap();
+            let second = ingress.admit(request).await.unwrap();
+            first.cancel_preclaim();
+            phase_a.begin();
+            let result = tokio::time::timeout(Duration::from_secs(1), second.wait()).await.unwrap().unwrap();
+            let body = relocalization_terminal_body(&result);
+            assert_eq!(body.disposition, crate::proto::RelocalizeDisposition::OwnerStopped as i32);
+            assert_eq!(body.detail, "RELOCALIZATION_OWNER_STOPPED_PRECLAIM");
+            assert_eq!(relocalization_terminal_candidate_sequence(&result), 0);
+            let RelocalizationTerminalSnapshot::AssignedTerminal(stored) = ingress.terminal_store
+                .snapshot_exact(validated.request_id(), &validated.key()) else { panic!("terminal must precede reply") };
+            assert_eq!(stored.encoded(), result.encode_to_vec());
+            owner.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn relocalization_retained_command_deadline_replays_identical_terminal() {
+            let owner = retained_relocalization_test_owner().await;
+            let phase_a = owner.phase_a_control();
+            let ingress = owner.relocalization_ingress().unwrap();
+            let mut request = relocalization_command_request("req-deadline", 7);
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MIN_LOGICAL_TIMEOUT_MS;
+            install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
+            let first = tokio::time::timeout(Duration::from_secs(1),
+                ingress.admit(request.clone()).await.unwrap().wait()).await.unwrap().unwrap();
+            let body = relocalization_terminal_body(&first);
+            assert_eq!(body.disposition, crate::proto::RelocalizeDisposition::DeadlineExceeded as i32);
+            assert!(body.candidate_payload_v3.is_empty());
+            let evidence = body.evidence.as_ref().unwrap();
+            assert_eq!(evidence.phase, crate::proto::AssignedRelocalizationEvidencePhaseV2::Admitted as i32);
+            assert!(evidence.admission_ordinal.is_some());
+            assert!(evidence.owner.is_some());
+            assert!(evidence.source_frames.is_empty());
+            let replay = ingress.admit(request).await.unwrap().wait().await.unwrap();
+            assert_eq!(replay.encode_to_vec(), first.encode_to_vec());
+            owner.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn relocalization_retained_command_busy_is_transient_and_unproved() {
+            let owner = retained_relocalization_test_owner().await;
+            let phase_a = owner.phase_a_control();
+            let ingress = owner.relocalization_ingress().unwrap();
+            let mut request = relocalization_command_request("req-active", 7);
+            install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
+            let active = ingress.admit(request.clone()).await.unwrap();
+            request.request_id = "req-busy".into();
+            let busy = ingress.admit(request.clone()).await.unwrap().wait().await.unwrap();
+            let body = relocalization_terminal_body(&busy);
+            assert_eq!(body.disposition, crate::proto::RelocalizeDisposition::Busy as i32);
+            let evidence = body.evidence.as_ref().unwrap();
+            assert_eq!(evidence.phase, crate::proto::AssignedRelocalizationEvidencePhaseV2::PreAdmission as i32);
+            assert!(evidence.owner.is_none() && evidence.admission_ordinal.is_none() && evidence.source_frames.is_empty());
+            active.cancel_preclaim();
+            let retried = ingress.admit(request).await.unwrap();
+            phase_a.begin();
+            let terminal = retried.wait().await.unwrap();
+            assert_eq!(relocalization_terminal_body(&terminal).disposition, crate::proto::RelocalizeDisposition::OwnerStopped as i32);
+            owner.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn relocalization_released_stale_proof_drops_without_blocking_fresh_guard() {
+            let sink = Arc::new(RelocalizationAppliedSink::default());
+            let owner = CorrectionTransportOwner::start(
+                CorrectionOwnerSpec::Relocalization { map_frame_id: "robot_map".into(),
+                    odom_frame_id: "robot_odom".into(), body_frame_id: "robot_body".into() },
+                CorrectionOwnerRuntimeIdentity { runtime_generation: 2, backend_generation: 99,
+                    correction_lease: CorrectionLeaseId { boot_nonce: LEASE_NONCE, generation: 21 } },
+                "", sink.clone(),
+            ).await.unwrap();
+            let mut request = relocalization_command_request("req-stale-proof-progress", 7);
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            install_relocalization_target_for_request(&owner.phase_a_control(), &mut request, "robot_map");
+            let waiter = owner.relocalization_ingress().unwrap().admit(request).await.unwrap();
+            let high = active_relocalization_frame_with_points(&owner, 100, 1_000, Isometry3::identity(), asymmetric_cloud());
+            assert_eq!(owner.ingress().submit(high).await.unwrap(), CorrectionSubmitDisposition::NoCandidate);
+            for _ in 0..2 {
+                let stale = active_relocalization_frame_with_points(&owner, 1, 10, Isometry3::identity(), asymmetric_cloud());
+                let stale_liveness = stale.source_owner.retention_probe_for_test();
+                assert_eq!(owner.ingress().submit(stale).await.unwrap(), CorrectionSubmitDisposition::NoCandidate);
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while stale_liveness() { tokio::task::yield_now().await; }
+                }).await.expect("stale proof tombstone never retains rejected source bytes");
+                assert!(owner.ingress().is_open());
+            }
+            let fresh = active_relocalization_frame_with_points(&owner, 101, 1_010, Isometry3::identity(), asymmetric_cloud());
+            let guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+            assert_eq!(owner.ingress().submit_with_lifecycle_guard(fresh, guard).await.unwrap(), CorrectionSubmitDisposition::NoCandidate);
+            let terminal = tokio::time::timeout(Duration::from_secs(20), waiter.wait()).await.unwrap().unwrap();
+            let body = relocalization_terminal_body(&terminal);
+            assert_eq!(body.disposition, crate::proto::RelocalizeDisposition::Applied as i32);
+            assert_eq!(body.evidence.as_ref().unwrap().source_frames.len(), 2);
+            assert_eq!(sink.applied.load(Ordering::Acquire), 1);
+            owner.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn relocalization_runtime_without_guard_keeps_first_deadline() {
             let owner_identity = CorrectionOwnerRuntimeIdentity {
                 runtime_generation: 2,
                 backend_generation: 99,
@@ -14884,9 +13071,7 @@ mod preflight_only_contract {
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-runtime-deadline", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MIN_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MIN_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -14894,24 +13079,21 @@ mod preflight_only_contract {
                 .admit(request)
                 .await
                 .expect("command starts accumulating");
-            let lifecycle = Arc::new(tokio::sync::Mutex::new(()));
-            let guard = Arc::clone(&lifecycle).lock_owned().await;
             let disposition = owner
                 .ingress()
-                .submit_with_lifecycle_guard(active_relocalization_frame(&owner, 1, 10, 0.0), guard)
+                .submit(active_relocalization_frame(&owner, 1, 10, 0.0))
                 .await
                 .expect("non-cutoff frame is acknowledged");
             assert_eq!(disposition, CorrectionSubmitDisposition::NoCandidate);
-            assert!(lifecycle.try_lock().is_ok());
             let terminal = tokio::time::timeout(Duration::from_secs(1), waiter.wait())
                 .await
                 .expect("first logical deadline remains bounded")
                 .expect("deadline terminal is delivered");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 crate::proto::RelocalizeDisposition::DeadlineExceeded as i32
             );
-            assert_eq!(terminal.candidate_sequence, 0);
+            assert_eq!(relocalization_terminal_candidate_sequence(&terminal), 0);
             owner.shutdown().await.expect("runtime owner joins");
         }
 
@@ -14940,9 +13122,7 @@ mod preflight_only_contract {
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-timer-frame-priority", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MIN_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MIN_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -14957,11 +13137,9 @@ mod preflight_only_contract {
                 let remaining = RELOCALIZATION_MIN_AGGREGATE_POINTS - body_points.len();
                 body_points.extend(pattern.iter().take(remaining).copied());
             }
-            let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points = (body_points).into();
-            cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
-            cutoff.registered_cloud.body_points_sha256 =
-                body_points_sha256(&cutoff.body_points).unwrap();
+            let cutoff = active_relocalization_frame_with_points(
+                &owner, 1, 10, Isometry3::identity(), body_points,
+            );
             let lifecycle = Arc::new(tokio::sync::Mutex::new(()));
             let guard = Arc::clone(&lifecycle).lock_owned().await;
 
@@ -14978,10 +13156,10 @@ mod preflight_only_contract {
             );
             let terminal = waiter.wait().await.expect("deadline terminal is delivered");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 crate::proto::RelocalizeDisposition::DeadlineExceeded as i32
             );
-            assert_eq!(terminal.candidate_sequence, 0);
+            assert_eq!(relocalization_terminal_candidate_sequence(&terminal), 0);
             assert_eq!(sink.staged.load(Ordering::Acquire), 0);
             let released =
                 tokio::time::timeout(Duration::from_secs(1), Arc::clone(&lifecycle).lock_owned())
@@ -15093,9 +13271,7 @@ mod preflight_only_contract {
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-runtime-applied", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -15109,11 +13285,9 @@ mod preflight_only_contract {
                 let remaining = RELOCALIZATION_MIN_AGGREGATE_POINTS - body_points.len();
                 body_points.extend(pattern.iter().take(remaining).copied());
             }
-            let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points = (body_points).into();
-            cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
-            cutoff.registered_cloud.body_points_sha256 =
-                body_points_sha256(&cutoff.body_points).unwrap();
+            let cutoff = active_relocalization_frame_with_points(
+                &owner, 1, 10, Isometry3::identity(), body_points,
+            );
             let lifecycle = Arc::new(tokio::sync::Mutex::new(()));
             let guard = Arc::clone(&lifecycle).lock_owned().await;
             let disposition = owner
@@ -15128,29 +13302,24 @@ mod preflight_only_contract {
                 .expect("retained compute and finalizer settle")
                 .expect("canonical terminal is delivered");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 crate::proto::RelocalizeDisposition::Applied as i32
             );
-            assert_eq!(terminal.candidate_sequence, 1);
-            assert_eq!(terminal.candidate_payload_sha256.len(), 32);
-            assert_eq!(
-                sha256_bytes(&terminal.candidate_payload_preimage_v1),
-                terminal.candidate_payload_sha256.as_slice()
-            );
-            assert!(
-                terminal.candidate_payload_preimage_v1.len()
-                    <= RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES
-            );
-            assert!(
-                terminal.evidence_disclosure_v1.len()
-                    <= RELOCALIZATION_MAX_EVIDENCE_DISCLOSURE_BYTES
-            );
-            assert_eq!(
-                terminal.evidence_disclosure_v1
-                    [RELOCALIZATION_EVIDENCE_DISCLOSURE_DOMAIN_V1.len() + 4],
-                1
-            );
-            assert_eq!(terminal.correction_revision, 1);
+            assert_eq!(relocalization_terminal_candidate_sequence(&terminal), 1);
+            let terminal_body = relocalization_terminal_body(&terminal);
+            let candidate = CorrectionCandidate::decode_body(&terminal_body.candidate_payload_v3).unwrap();
+            assert_eq!(candidate.encode_body().unwrap(), terminal_body.candidate_payload_v3);
+            assert!(terminal_body.candidate_payload_v3.len() <= RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES);
+            let evidence = terminal_body.evidence.as_ref().unwrap();
+            assert_eq!(evidence.phase, crate::proto::AssignedRelocalizationEvidencePhaseV2::Finalized as i32);
+            assert_eq!(evidence.source_frames.len(), 1);
+            assert_eq!(evidence.source_frames[0].admitted_point_count, RELOCALIZATION_MIN_AGGREGATE_POINTS as u64);
+            assert_eq!(evidence.source_frames[0].runtime_generation, 31);
+            assert_eq!(evidence.owner.as_ref().unwrap().runtime_generation, 2);
+            assert_eq!(candidate.identity.registered_cloud.runtime_generation, 31);
+            assert_eq!(evidence.source_frames[0].source_sequence, candidate.identity.registered_cloud.source_sequence);
+            assert!(evidence.encoded_len() <= RELOCALIZATION_MAX_PROOF_BYTES);
+            assert_eq!(relocalization_terminal_body(&terminal).correction_revision, 1);
             assert_eq!(sink.staged.load(Ordering::Acquire), 1);
             assert_eq!(sink.applied.load(Ordering::Acquire), 1);
             assert!(lifecycle.try_lock().is_ok());
@@ -15200,9 +13369,7 @@ mod preflight_only_contract {
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-sequence-stage-failure", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let pattern = asymmetric_cloud();
             let mut body_points = Vec::with_capacity(RELOCALIZATION_MIN_AGGREGATE_POINTS);
@@ -15217,11 +13384,9 @@ mod preflight_only_contract {
                 .admit(request.clone())
                 .await
                 .expect("first command accumulates");
-            let mut first_cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            first_cutoff.body_points = (body_points.clone()).into();
-            first_cutoff.registered_cloud.point_count = first_cutoff.body_points.len() as u64;
-            first_cutoff.registered_cloud.body_points_sha256 =
-                body_points_sha256(&first_cutoff.body_points).unwrap();
+            let first_cutoff = active_relocalization_frame_with_points(
+                &owner, 1, 10, Isometry3::identity(), body_points.clone(),
+            );
             let first_guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             assert_eq!(
                 owner
@@ -15233,10 +13398,10 @@ mod preflight_only_contract {
             );
             let first = first.wait().await.expect("stage failure settles");
             assert_eq!(
-                first.disposition,
+                relocalization_terminal_body(&first).disposition,
                 crate::proto::RelocalizeDisposition::OwnerFailed as i32
             );
-            assert_eq!(first.candidate_sequence, 0);
+            assert_eq!(relocalization_terminal_candidate_sequence(&first), 0);
 
             request.request_id = "req-sequence-applied".to_owned();
             let second = owner
@@ -15245,11 +13410,9 @@ mod preflight_only_contract {
                 .admit(request.clone())
                 .await
                 .expect("second command accumulates");
-            let mut second_cutoff = active_relocalization_frame(&owner, 2, 20, 0.0);
-            second_cutoff.body_points = (body_points.clone()).into();
-            second_cutoff.registered_cloud.point_count = second_cutoff.body_points.len() as u64;
-            second_cutoff.registered_cloud.body_points_sha256 =
-                body_points_sha256(&second_cutoff.body_points).unwrap();
+            let second_cutoff = active_relocalization_frame_with_points(
+                &owner, 2, 20, Isometry3::identity(), body_points.clone(),
+            );
             let second_guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             assert_eq!(
                 owner
@@ -15261,11 +13424,11 @@ mod preflight_only_contract {
             );
             let second = second.wait().await.expect("second command applies");
             assert_eq!(
-                second.disposition,
+                relocalization_terminal_body(&second).disposition,
                 crate::proto::RelocalizeDisposition::Applied as i32
             );
-            assert_eq!(second.candidate_sequence, 1);
-            assert_eq!(second.correction_revision, 1);
+            assert_eq!(relocalization_terminal_candidate_sequence(&second), 1);
+            assert_eq!(relocalization_terminal_body(&second).correction_revision, 1);
 
             request.request_id = "req-sequence-rejected".to_owned();
             let third = owner
@@ -15274,11 +13437,9 @@ mod preflight_only_contract {
                 .admit(request)
                 .await
                 .expect("third command accumulates");
-            let mut third_cutoff = active_relocalization_frame(&owner, 3, 30, 0.0);
-            third_cutoff.body_points = (body_points).into();
-            third_cutoff.registered_cloud.point_count = third_cutoff.body_points.len() as u64;
-            third_cutoff.registered_cloud.body_points_sha256 =
-                body_points_sha256(&third_cutoff.body_points).unwrap();
+            let third_cutoff = active_relocalization_frame_with_points(
+                &owner, 3, 30, Isometry3::identity(), body_points,
+            );
             let third_guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             assert_eq!(
                 owner
@@ -15290,12 +13451,12 @@ mod preflight_only_contract {
             );
             let third = third.wait().await.expect("canonical rejection settles");
             assert_eq!(
-                third.disposition,
+                relocalization_terminal_body(&third).disposition,
                 crate::proto::RelocalizeDisposition::Rejected as i32
             );
-            assert_eq!(third.candidate_sequence, 2);
-            assert_eq!(third.correction_revision, 1);
-            assert_eq!(third.candidate_payload_sha256.len(), 32);
+            assert_eq!(relocalization_terminal_candidate_sequence(&third), 2);
+            assert_eq!(relocalization_terminal_body(&third).correction_revision, 1);
+            assert!(!relocalization_terminal_body(&third).candidate_payload_v3.is_empty());
             assert_eq!(sink.stage_attempts.load(Ordering::Acquire), 3);
             assert_eq!(sink.apply_attempts.load(Ordering::Acquire), 2);
             assert_eq!(sink.applied.load(Ordering::Acquire), 1);
@@ -15359,9 +13520,7 @@ mod preflight_only_contract {
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-postclaim-phase-a", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let ingress = owner
                 .relocalization_ingress()
@@ -15380,11 +13539,9 @@ mod preflight_only_contract {
                 let remaining = RELOCALIZATION_MIN_AGGREGATE_POINTS - body_points.len();
                 body_points.extend(pattern.iter().take(remaining).copied());
             }
-            let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points = (body_points).into();
-            cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
-            cutoff.registered_cloud.body_points_sha256 =
-                body_points_sha256(&cutoff.body_points).unwrap();
+            let cutoff = active_relocalization_frame_with_points(
+                &owner, 1, 10, Isometry3::identity(), body_points,
+            );
             let guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             assert_eq!(
                 owner
@@ -15405,11 +13562,11 @@ mod preflight_only_contract {
                 .expect("postclaim Phase A still settles")
                 .expect("retained waiter receives canonical terminal");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 crate::proto::RelocalizeDisposition::Applied as i32
             );
-            assert_eq!(terminal.candidate_sequence, 1);
-            assert_eq!(terminal.correction_revision, 1);
+            assert_eq!(relocalization_terminal_candidate_sequence(&terminal), 1);
+            assert_eq!(relocalization_terminal_body(&terminal).correction_revision, 1);
             assert_eq!(sink.staged.load(Ordering::Acquire), 1);
             assert_eq!(sink.applied.load(Ordering::Acquire), 1);
             owner
@@ -15445,10 +13602,7 @@ mod preflight_only_contract {
             let mut dummy_receivers = Vec::new();
             for (index, sequence) in [100_u64, 101].into_iter().enumerate() {
                 let candidate = sample_candidate(sequence, sequence * 10);
-                let key = CandidateApplyKey {
-                    candidate_sequence: sequence,
-                    payload_sha256: candidate.payload_sha256,
-                };
+                let key = CandidateApplyKey::from(&candidate);
                 let lease = Arc::new(CorrectionRequestLease::new(
                     CorrectionRequestCancellation::new(),
                     None,
@@ -15456,12 +13610,12 @@ mod preflight_only_contract {
                 dummy_receivers.push(
                     owner
                         .apply_waiters
-                        .register(key, Arc::clone(&lease))
+                        .register(key, candidate.clone(), Arc::clone(&lease))
                         .expect("dummy waiter registers"),
                 );
                 let lease = owner
                     .apply_waiters
-                    .claim_apply(key)
+                    .claim_apply(key, &candidate)
                     .expect("dummy waiter claims");
                 let (outcome, _outcome_rx) = oneshot::channel();
                 owner
@@ -15486,9 +13640,7 @@ mod preflight_only_contract {
 
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-finalizer-full", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -15502,11 +13654,9 @@ mod preflight_only_contract {
                 let remaining = RELOCALIZATION_MIN_AGGREGATE_POINTS - body_points.len();
                 body_points.extend(pattern.iter().take(remaining).copied());
             }
-            let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points = (body_points).into();
-            cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
-            cutoff.registered_cloud.body_points_sha256 =
-                body_points_sha256(&cutoff.body_points).unwrap();
+            let cutoff = active_relocalization_frame_with_points(
+                &owner, 1, 10, Isometry3::identity(), body_points,
+            );
             let guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             assert_eq!(
                 owner
@@ -15521,10 +13671,10 @@ mod preflight_only_contract {
             phase_a.begin();
             let terminal = waiter.wait().await.expect("Phase A terminal delivered");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 crate::proto::RelocalizeDisposition::OwnerStopped as i32
             );
-            assert_eq!(terminal.candidate_sequence, 0);
+            assert_eq!(relocalization_terminal_candidate_sequence(&terminal), 0);
             sink.apply_release.notify_one();
             tokio::time::timeout(Duration::from_secs(1), sink.apply_started.notified())
                 .await
@@ -15561,9 +13711,7 @@ mod preflight_only_contract {
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request(if degenerate {"req-sparse-degenerate"} else {"req-sparse-valid"}, 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -15572,22 +13720,19 @@ mod preflight_only_contract {
                 .await
                 .expect("command accumulates");
             for sequence in 1..=RELOCALIZATION_MAX_FRAMES as u64 {
-                let guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
-                let mut input = active_relocalization_frame(&owner, sequence, sequence * 10, 0.0);
-                input.body_points = (asymmetric_cloud()).into();
-                input.registered_cloud.point_count = input.body_points.len() as u64;
-                if degenerate {
-                    input.body_points = input.body_points.edited_for_test(|points| points.fill(Point3::origin()));
-                }
-                input.registered_cloud.body_points_sha256 = body_points_sha256(&input.body_points).unwrap();
-                let disposition = owner
-                    .ingress()
-                    .submit_with_lifecycle_guard(
-                        input,
-                        guard,
-                    )
-                    .await
-                    .expect("small frame is acknowledged");
+                let mut points = asymmetric_cloud();
+                if degenerate { points.fill(Point3::origin()); }
+                let input = active_relocalization_frame_with_points(
+                    &owner, sequence, sequence * 10, Isometry3::identity(), points,
+                );
+                // First-guard progress is the current baseline. Accumulate
+                // unguarded frames, then give the eighth frame its fresh guard.
+                let disposition = if sequence == RELOCALIZATION_MAX_FRAMES as u64 {
+                    let guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+                    owner.ingress().submit_with_lifecycle_guard(input, guard).await
+                } else {
+                    owner.ingress().submit(input).await
+                }.expect("small frame is acknowledged");
                 assert_eq!(disposition, CorrectionSubmitDisposition::NoCandidate);
             }
             let terminal = tokio::time::timeout(Duration::from_secs(20), waiter.wait())
@@ -15595,17 +13740,17 @@ mod preflight_only_contract {
                 .expect("稀疏窗口进入实际算法并返回终态")
                 .expect("真实匹配终态已交付");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 if degenerate { crate::proto::RelocalizeDisposition::AlgorithmRejected as i32 }
                 else { crate::proto::RelocalizeDisposition::Applied as i32 }
             );
-            assert_eq!(terminal.candidate_sequence, if degenerate { 0 } else { 1 });
+            assert_eq!(relocalization_terminal_candidate_sequence(&terminal), if degenerate { 0 } else { 1 });
             owner.shutdown().await.expect("稀疏输入拥有方完成关闭");
             }
         }
 
         #[tokio::test]
-        async fn relocalization_exact_maximum_without_fresh_guard_terminates_current_frame() {
+        async fn relocalization_aggregate_maximum_without_guard_rejects_next_overflow() {
             let owner_identity = CorrectionOwnerRuntimeIdentity {
                 runtime_generation: 2,
                 backend_generation: 99,
@@ -15629,9 +13774,7 @@ mod preflight_only_contract {
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-exact-aggregate-maximum", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -15640,11 +13783,9 @@ mod preflight_only_contract {
                 .await
                 .expect("command accumulates");
             for (sequence, point_count) in [(1_u64, 100_000_usize), (2, 100_000), (3, 50_000)] {
-                let mut input = active_relocalization_frame(&owner, sequence, sequence * 10, 0.0);
-                input.body_points = (vec![Point3::new(0.0, 0.0, 0.0); point_count]).into();
-                input.registered_cloud.point_count = point_count as u64;
-                input.registered_cloud.body_points_sha256 =
-                    body_points_sha256(&input.body_points).unwrap();
+                let input = active_relocalization_frame_with_points(
+                    &owner, sequence, sequence * 10, Isometry3::identity(), vec![Point3::origin(); point_count],
+                );
                 assert_eq!(
                     owner
                         .ingress()
@@ -15654,19 +13795,23 @@ mod preflight_only_contract {
                     CorrectionSubmitDisposition::NoCandidate
                 );
             }
-            let terminal = waiter
-                .wait()
-                .await
-                .expect("exact maximum terminates without another frame");
+            assert_eq!(sink.staged.load(Ordering::Acquire), 0, "no guard means no canonical stage");
+            let overflow = active_relocalization_frame_with_points(
+                &owner, 4, 40, Isometry3::identity(), vec![Point3::origin()],
+            );
+            assert!(matches!(owner.ingress().submit(overflow).await.unwrap(),
+                CorrectionSubmitDisposition::Rejected { reason, .. }
+                    if reason == "RELOCALIZATION_AGGREGATE_POINT_BOUND_EXCEEDED"));
+            let terminal = waiter.wait().await.expect("next point beyond the exact maximum terminates");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 crate::proto::RelocalizeDisposition::InsufficientSource as i32
             );
             assert_eq!(
-                terminal.detail,
-                "RELOCALIZATION_MAXIMUM_AGGREGATE_FRESH_BOUNDARY_UNAVAILABLE"
+                relocalization_terminal_body(&terminal).detail,
+                "RELOCALIZATION_AGGREGATE_POINT_BOUND_EXCEEDED"
             );
-            assert_eq!(terminal.candidate_sequence, 0);
+            assert_eq!(relocalization_terminal_candidate_sequence(&terminal), 0);
             assert_eq!(sink.staged.load(Ordering::Acquire), 0);
             owner.shutdown().await.expect("bounded owner joins");
         }
@@ -15695,9 +13840,7 @@ mod preflight_only_contract {
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-algorithm-reject", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -15705,12 +13848,10 @@ mod preflight_only_contract {
                 .admit(request)
                 .await
                 .expect("command accumulates");
-            let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points =
-                (vec![Point3::new(0.0, 0.0, 0.0); RELOCALIZATION_MIN_AGGREGATE_POINTS]).into();
-            cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
-            cutoff.registered_cloud.body_points_sha256 =
-                body_points_sha256(&cutoff.body_points).unwrap();
+            let cutoff = active_relocalization_frame_with_points(
+                &owner, 1, 10, Isometry3::identity(),
+                vec![Point3::origin(); RELOCALIZATION_MIN_AGGREGATE_POINTS],
+            );
             let lifecycle = Arc::new(tokio::sync::Mutex::new(()));
             let guard = Arc::clone(&lifecycle).lock_owned().await;
             assert_eq!(
@@ -15726,22 +13867,17 @@ mod preflight_only_contract {
                 .expect("retained rejected compute settles")
                 .expect("algorithm terminal is delivered");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 crate::proto::RelocalizeDisposition::AlgorithmRejected as i32
             );
-            assert_eq!(terminal.candidate_sequence, 0);
-            assert!(terminal.candidate_payload_sha256.is_empty());
-            assert!(terminal.candidate_payload_preimage_v1.is_empty());
-            assert_eq!(terminal.evidence_sha256.len(), 32);
-            assert!(
-                terminal.evidence_disclosure_v1.len()
-                    <= RELOCALIZATION_MAX_EVIDENCE_DISCLOSURE_BYTES
-            );
-            assert_eq!(
-                terminal.evidence_disclosure_v1
-                    [RELOCALIZATION_EVIDENCE_DISCLOSURE_DOMAIN_V1.len() + 4],
-                1
-            );
+            assert_eq!(relocalization_terminal_candidate_sequence(&terminal), 0);
+            let body = relocalization_terminal_body(&terminal);
+            assert!(body.candidate_payload_v3.is_empty());
+            let evidence = body.evidence.as_ref().unwrap();
+            assert_eq!(evidence.phase, crate::proto::AssignedRelocalizationEvidencePhaseV2::AlgorithmCompleted as i32);
+            assert_eq!(evidence.source_frames.len(), 1);
+            assert!(evidence.algorithm.is_some());
+            assert!(evidence.encoded_len() <= RELOCALIZATION_MAX_PROOF_BYTES);
             assert!(lifecycle.try_lock().is_ok());
             owner
                 .shutdown()
@@ -15800,9 +13936,7 @@ mod preflight_only_contract {
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-stage-failure", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -15816,11 +13950,9 @@ mod preflight_only_contract {
                 let remaining = RELOCALIZATION_MIN_AGGREGATE_POINTS - body_points.len();
                 body_points.extend(pattern.iter().take(remaining).copied());
             }
-            let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points = (body_points).into();
-            cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
-            cutoff.registered_cloud.body_points_sha256 =
-                body_points_sha256(&cutoff.body_points).unwrap();
+            let cutoff = active_relocalization_frame_with_points(
+                &owner, 1, 10, Isometry3::identity(), body_points,
+            );
             let guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             assert_eq!(
                 owner
@@ -15835,10 +13967,10 @@ mod preflight_only_contract {
                 .expect("stage failure settles")
                 .expect("stage terminal delivered");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 crate::proto::RelocalizeDisposition::OwnerFailed as i32
             );
-            assert_eq!(terminal.candidate_sequence, 0);
+            assert_eq!(relocalization_terminal_candidate_sequence(&terminal), 0);
             owner
                 .shutdown()
                 .await
@@ -15871,9 +14003,7 @@ mod preflight_only_contract {
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-target-rollover", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -15890,10 +14020,10 @@ mod preflight_only_contract {
                 .expect("target poll is bounded")
                 .expect("target rollover terminal delivered");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 crate::proto::RelocalizeDisposition::TargetInvalidated as i32
             );
-            assert_eq!(terminal.candidate_sequence, 0);
+            assert_eq!(relocalization_terminal_candidate_sequence(&terminal), 0);
             owner.shutdown().await.expect("rollover owner joins");
         }
 
@@ -15921,9 +14051,7 @@ mod preflight_only_contract {
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-session-rollover", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -15931,9 +14059,17 @@ mod preflight_only_contract {
                 .admit(request)
                 .await
                 .expect("command snapshots the current session");
-            let mut rollover = active_relocalization_frame(&owner, 1, 10, 0.0);
-            rollover.mapping_session_id = "mapping-session-next".to_owned();
-            rollover.mapping_session_generation = 24;
+            let mut adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
+            adapter.stop_session("mapping-session-owner").unwrap();
+            adapter.start_session("mapping-session-next", "next-map").unwrap();
+            establish_frame_source_anchor(&mut adapter, Isometry3::identity());
+            let fence = owner.ingress().relocalization_mode_fence();
+            let epoch = fence.snapshot().epoch;
+            let mut rollover = frame_from_admitted_source(1, admit_frame_source(
+                1, 10, 10, Isometry3::identity(), asymmetric_cloud(), &adapter, fence,
+            ));
+            rollover.relocalization_mode_epoch = Some(epoch);
+            rollover.committed_map.backend_generation = adapter.backend_checkpoint_client().unwrap().backend_generation();
             assert_eq!(
                 owner
                     .ingress()
@@ -15944,11 +14080,11 @@ mod preflight_only_contract {
             );
             let terminal = waiter.wait().await.expect("session terminal is delivered");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 crate::proto::RelocalizeDisposition::SessionInvalidated as i32
             );
-            assert_eq!(terminal.candidate_sequence, 0);
-            assert_eq!(terminal.detail, "RELOCALIZATION_FRAME_SESSION_INVALIDATED");
+            assert_eq!(relocalization_terminal_candidate_sequence(&terminal), 0);
+            assert_eq!(relocalization_terminal_body(&terminal).detail, "RELOCALIZATION_FRAME_SESSION_INVALIDATED");
             owner.shutdown().await.expect("rollover owner joins");
         }
 
@@ -15976,9 +14112,7 @@ mod preflight_only_contract {
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-frame-proof-conflict", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -15995,10 +14129,13 @@ mod preflight_only_contract {
                 owner.ingress().submit(first.clone()).await.unwrap(),
                 CorrectionSubmitDisposition::NoCandidate
             );
-            let mut conflict = first;
-            conflict.body_points = conflict.body_points.edited_for_test(|points| points[0].x += 0.25);
-            conflict.registered_cloud.body_points_sha256 =
-                body_points_sha256(&conflict.body_points).unwrap();
+            let mut conflicting_points = first.body_points.to_vec();
+            conflicting_points[0].x += 0.25;
+            let conflict = active_relocalization_frame_with_points(
+                &owner, 1, 10, Isometry3::identity(), conflicting_points,
+            );
+            assert_eq!(relocalization_frame_key(&first), relocalization_frame_key(&conflict));
+            conflict.validate_source_ownership().unwrap();
             let rejected = owner
                 .ingress()
                 .submit(conflict)
@@ -16015,11 +14152,11 @@ mod preflight_only_contract {
                 .await
                 .expect("proof conflict stores typed command terminal first");
             assert_eq!(
-                command_terminal.disposition,
+                relocalization_terminal_body(&command_terminal).disposition,
                 crate::proto::RelocalizeDisposition::OwnerFailed as i32
             );
             assert_eq!(
-                command_terminal.detail,
+                relocalization_terminal_body(&command_terminal).detail,
                 "RELOCALIZATION_FRAME_KEY_PROOF_CONFLICT"
             );
             let terminal = owner
@@ -16096,9 +14233,7 @@ mod preflight_only_contract {
             .expect("runtime owner starts");
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-frame-proof-capacity", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -16148,11 +14283,11 @@ mod preflight_only_contract {
             ));
             let command_terminal = waiter.wait().await.expect("capacity terminal is stored");
             assert_eq!(
-                command_terminal.disposition,
+                relocalization_terminal_body(&command_terminal).disposition,
                 crate::proto::RelocalizeDisposition::OwnerFailed as i32
             );
             assert_eq!(
-                command_terminal.detail,
+                relocalization_terminal_body(&command_terminal).detail,
                 "RELOCALIZATION_FRAME_PROOF_SCOPE_CAPACITY_EXCEEDED"
             );
             assert!(owner.wait_terminal().await.is_err());
@@ -16190,9 +14325,7 @@ mod preflight_only_contract {
             owner.set_relocalization_compute_delay_for_tests(Duration::from_millis(200));
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-late-compute", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -16200,12 +14333,10 @@ mod preflight_only_contract {
                 .admit(request)
                 .await
                 .expect("command accumulates");
-            let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points =
-                (vec![Point3::new(0.0, 0.0, 0.0); RELOCALIZATION_MIN_AGGREGATE_POINTS]).into();
-            cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
-            cutoff.registered_cloud.body_points_sha256 =
-                body_points_sha256(&cutoff.body_points).unwrap();
+            let cutoff = active_relocalization_frame_with_points(
+                &owner, 1, 10, Isometry3::identity(),
+                vec![Point3::origin(); RELOCALIZATION_MIN_AGGREGATE_POINTS],
+            );
             let lifecycle = Arc::new(tokio::sync::Mutex::new(()));
             let guard = Arc::clone(&lifecycle).lock_owned().await;
             assert_eq!(
@@ -16222,7 +14353,7 @@ mod preflight_only_contract {
                 .expect("Phase A terminal is immediate")
                 .expect("Phase A terminal delivered");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 crate::proto::RelocalizeDisposition::OwnerStopped as i32
             );
             assert!(lifecycle.try_lock().is_err());
@@ -16261,9 +14392,7 @@ mod preflight_only_contract {
             owner.set_relocalization_compute_delay_for_tests(Duration::from_millis(100));
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-repeated-phase-a", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -16271,12 +14400,10 @@ mod preflight_only_contract {
                 .admit(request)
                 .await
                 .expect("command accumulates");
-            let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points =
-                (vec![Point3::new(0.0, 0.0, 0.0); RELOCALIZATION_MIN_AGGREGATE_POINTS]).into();
-            cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
-            cutoff.registered_cloud.body_points_sha256 =
-                body_points_sha256(&cutoff.body_points).unwrap();
+            let cutoff = active_relocalization_frame_with_points(
+                &owner, 1, 10, Isometry3::identity(),
+                vec![Point3::origin(); RELOCALIZATION_MIN_AGGREGATE_POINTS],
+            );
             let lifecycle = Arc::new(tokio::sync::Mutex::new(()));
             let guard = Arc::clone(&lifecycle).lock_owned().await;
             assert_eq!(
@@ -16301,10 +14428,10 @@ mod preflight_only_contract {
             phase_a.begin();
             let terminal = waiter.wait().await.expect("one terminal is retained");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 crate::proto::RelocalizeDisposition::OwnerStopped as i32
             );
-            assert_eq!(terminal.candidate_sequence, 0);
+            assert_eq!(relocalization_terminal_candidate_sequence(&terminal), 0);
             assert_eq!(sink.staged.load(Ordering::Acquire), 0);
             tokio::time::timeout(Duration::from_secs(2), owner.shutdown())
                 .await
@@ -16342,9 +14469,7 @@ mod preflight_only_contract {
             owner.set_relocalization_compute_panic_for_tests(true);
             let phase_a = owner.phase_a_control();
             let mut request = relocalization_command_request("req-compute-panic", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
-            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let waiter = owner
                 .relocalization_ingress()
@@ -16352,12 +14477,10 @@ mod preflight_only_contract {
                 .admit(request)
                 .await
                 .expect("command accumulates");
-            let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points =
-                (vec![Point3::new(0.0, 0.0, 0.0); RELOCALIZATION_MIN_AGGREGATE_POINTS]).into();
-            cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
-            cutoff.registered_cloud.body_points_sha256 =
-                body_points_sha256(&cutoff.body_points).unwrap();
+            let cutoff = active_relocalization_frame_with_points(
+                &owner, 1, 10, Isometry3::identity(),
+                vec![Point3::origin(); RELOCALIZATION_MIN_AGGREGATE_POINTS],
+            );
             let guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             assert_eq!(
                 owner
@@ -16372,11 +14495,11 @@ mod preflight_only_contract {
                 .expect("panic terminal is bounded")
                 .expect("panic terminal is stored before actor exit");
             assert_eq!(
-                terminal.disposition,
+                relocalization_terminal_body(&terminal).disposition,
                 crate::proto::RelocalizeDisposition::OwnerFailed as i32
             );
-            assert_eq!(terminal.detail, "RELOCALIZATION_RETAINED_TASK_FAILED");
-            assert_eq!(terminal.candidate_sequence, 0);
+            assert_eq!(relocalization_terminal_body(&terminal).detail, "RELOCALIZATION_RETAINED_TASK_FAILED");
+            assert_eq!(relocalization_terminal_candidate_sequence(&terminal), 0);
             let owner_error = owner
                 .wait_terminal()
                 .await
@@ -16393,225 +14516,386 @@ mod preflight_only_contract {
 
         #[tokio::test]
         async fn relocalization_source_seal_uses_each_frame_odom_and_retains_boundary_guard() {
-            let target_points = [
-                [0.0_f32, 0.0, 0.0],
-                [1.0_f32, 0.0, 0.0],
-                [0.0_f32, 1.0, 0.0],
-            ];
-            let mut target_bytes = Vec::new();
-            for point in target_points {
-                for coordinate in point {
-                    target_bytes.extend_from_slice(&coordinate.to_le_bytes());
-                }
-            }
-            let target = crate::pointcloud::ImmutableActivatedTarget {
-                frame_id: "map".to_owned(),
-                source_revision: 7,
-                point_count: 3,
-                voxel_size: crate::pointcloud::VOXEL_SIZE,
-                xyz_sha256: sha256_bytes(&target_bytes),
-                xyz_f32_le: target_bytes,
-                payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
+            let phase_a = CorrectionPhaseAControl::for_tests();
+            let mut request = relocalization_command_request("req-source-seal", 7);
+            let snapshot = install_relocalization_target_points_for_request(
+                &phase_a, &mut request, "robot_map",
+                vec![Point3::origin(), Point3::new(1.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+            );
+            let fence = phase_a.relocalization_mode();
+            let epoch = fence.activate_for_tests().epoch;
+            let adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
+            let make_frame = |sequence: u64, timestamp: u64, translation: [f64; 3]| {
+                let pose = Isometry3::translation(translation[0], translation[1], translation[2]);
+                let mut input = frame_from_admitted_source(sequence, admit_frame_source(
+                    sequence, timestamp, timestamp, pose,
+                    vec![pose * Point3::origin(); 25_000], &adapter, Arc::clone(&fence),
+                ));
+                input.relocalization_mode_epoch = Some(epoch);
+                input
             };
-            let target_receipt_sha256 = [6; 32];
-            let snapshot = SealedActivatedTargetSnapshot {
-                runtime_generation: 2,
-                lifecycle_epoch: 1,
-                session_id: "session-ledger".to_owned(),
-                map_name: "map-ledger".to_owned(),
-                activation_request_id: "activation-source".to_owned(),
-                activation_request_identity_sha256: [4; 32],
-                activation_identity_sha256: [5; 32],
-                target_receipt_sha256,
-                asset_manifest_sha256: Some([9; 32]),
-                asset_bundle_sha256: Some([10; 32]),
-                session_generation: 3,
-                backend_generation: 4,
-                publication_proof: activation_publication_proof(target_receipt_sha256, 3, 3),
-                immutable_target: Arc::new(target),
-            };
-            let mut first = frame(1, 10, 0.0);
-            first.correlated_odom.odom_from_body = Isometry3::translation(1.0, 0.0, 0.0);
-            first.body_points = (vec![Point3::new(0.0, 0.0, 0.0); 25_000]).into();
-            let mut second = frame(2, 20, 0.0);
-            second.correlated_odom.odom_from_body = Isometry3::translation(0.0, 2.0, 0.0);
-            second.body_points = (vec![Point3::new(0.0, 0.0, 0.0); 25_000]).into();
-            let request =
-                validate_relocalize_request(relocalization_command_request("req-source-seal", 7))
-                    .expect("request fixture is canonical");
+            let first = make_frame(1, 10, [1.0, 0.0, 0.0]);
+            let second = make_frame(2, 20, [0.0, 2.0, 0.0]);
+            let first_owner = first.source_owner.clone();
+            let second_owner = second.source_owner.clone();
             let accumulation = RelocalizationAccumulation {
-                request,
-                admission_ordinal: 1,
-                mode_epoch: 1,
+                request: validate_relocalize_request(request).unwrap(),
+                admission_ordinal: 1, mode_epoch: epoch,
                 logical_deadline: Instant::now() + Duration::from_secs(1),
                 accumulation_deadline: Instant::now() + Duration::from_secs(1),
-                snapshot,
-                arm_watermark: None,
-                armed_map_watermarks: HashMap::new(),
-                accepted: vec![
-                    AccumulatedRelocalizationFrame {
-                        evidence_sha256: [1; 32],
-                        input: first,
-                    },
-                    AccumulatedRelocalizationFrame {
-                        evidence_sha256: [2; 32],
-                        input: second.clone(),
-                    },
-                ],
+                snapshot, arm_watermark: None, armed_map_watermarks: HashMap::new(),
+                accepted: vec![AccumulatedRelocalizationFrame { input: Arc::new(first) },
+                    AccumulatedRelocalizationFrame { input: Arc::new(second.clone()) }],
                 aggregate_input_points: 50_000,
                 session_map_frame_generation: Some(second.map_frame_generation),
                 mapping_commit_boot_nonce: Some(second.mapping_commit_id.boot_nonce),
             };
-            let lifecycle = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+            let lifecycle = Arc::new(tokio::sync::Mutex::new(()));
             let lease = Arc::new(CorrectionRequestLease::new(
-                CorrectionRequestCancellation::new(),
-                Some(lifecycle),
+                CorrectionRequestCancellation::new(), Some(Arc::clone(&lifecycle).lock_owned().await),
             ));
-            let sealed = seal_relocalization_source(
-                accumulation,
-                second,
-                Arc::clone(&lease),
-                RelocalizationCutoffReasonV1::MinimumAggregateReached,
-            )
-            .expect("source seals deterministically");
+            let sealed = seal_relocalization_source(accumulation, second, Arc::clone(&lease),
+                RelocalizationCutoffReasonV1::MinimumAggregateReached).unwrap();
             assert!(sealed.boundary_lease.has_lifecycle_guard());
+            assert!(lifecycle.try_lock().is_err());
+            assert_eq!(sealed.frames[0].input.source_owner, first_owner);
+            assert_eq!(sealed.frames[1].input.source_owner, second_owner);
             assert_eq!(sealed.source_points.len(), 50_000);
             assert_eq!(sealed.source_points[0], Point3::new(1.0, 0.0, 0.0));
             assert_eq!(sealed.source_points[25_000], Point3::new(0.0, 2.0, 0.0));
             assert_eq!(sealed.target_points.len(), 3);
+            drop(sealed);
+            lease.release();
+            assert!(lifecycle.try_lock().is_ok());
         }
 
         #[tokio::test]
         async fn relocalization_source_hard_bounds_fail_closed() {
-            assert_eq!(
-                RELOCALIZATION_MAX_PER_FRAME_F64_BYTES,
-                MAX_REGISTERED_CLOUD_POINTS as usize * 3 * std::mem::size_of::<f64>()
-            );
-            assert_eq!(
-                RELOCALIZATION_MAX_AGGREGATE_F64_BYTES,
-                RELOCALIZATION_MAX_AGGREGATE_POINTS * 3 * std::mem::size_of::<f64>()
-            );
-
-            let mut at_frame_limit = frame(1, 10, 0.0);
-            at_frame_limit.body_points =
-                (vec![Point3::new(0.0, 0.0, 0.0); MAX_REGISTERED_CLOUD_POINTS as usize]).into();
-            at_frame_limit.registered_cloud.point_count =
-                u64::try_from(at_frame_limit.body_points.len()).unwrap();
-            at_frame_limit.registered_cloud.body_points_sha256 =
-                body_points_sha256(&at_frame_limit.body_points).unwrap();
-            assert!(relocalization_frame_evidence(
-                &owner_identity(),
-                "robot_map",
-                "robot_odom",
-                "robot_body",
-                &at_frame_limit,
-            )
-            .is_ok());
-
-            let mut above_frame_limit = frame(2, 20, 0.0);
-            above_frame_limit.body_points =
-                (vec![Point3::new(0.0, 0.0, 0.0); MAX_REGISTERED_CLOUD_POINTS as usize + 1]).into();
-            above_frame_limit.registered_cloud.point_count =
-                u64::try_from(above_frame_limit.body_points.len()).unwrap();
-            above_frame_limit.registered_cloud.body_points_sha256 = [1; 32];
-            assert!(relocalization_frame_evidence(
-                &owner_identity(),
-                "robot_map",
-                "robot_odom",
-                "robot_body",
-                &above_frame_limit,
-            )
-            .is_err());
-
+            assert_eq!(RELOCALIZATION_MAX_PER_FRAME_F64_BYTES,
+                MAX_REGISTERED_CLOUD_POINTS as usize * 3 * std::mem::size_of::<f64>());
+            assert_eq!(RELOCALIZATION_MAX_AGGREGATE_F64_BYTES,
+                RELOCALIZATION_MAX_AGGREGATE_POINTS * 3 * std::mem::size_of::<f64>());
+            let adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
+            let fence = Arc::new(RelocalizationModeFence::default());
+            let at_frame_limit = frame_from_admitted_source(1, admit_frame_source(
+                1, 10, 10, Isometry3::identity(),
+                vec![Point3::origin(); MAX_REGISTERED_CLOUD_POINTS as usize], &adapter, Arc::clone(&fence),
+            ));
+            assert!(relocalization_frame_evidence(&owner_identity(), "robot_map", "robot_odom", "robot_body", &at_frame_limit).is_ok());
+            // Real LIO admission already caps scans at100k; a hostile larger
+            // frame must fail rather than inventing an above-limit capability.
+            let mut above_frame_limit = at_frame_limit.clone();
+            above_frame_limit.body_points = above_frame_limit.body_points.edited_for_test(|points| points.push(Point3::origin()));
+            above_frame_limit.registered_cloud.point_count += 1;
+            assert!(relocalization_frame_evidence(&owner_identity(), "robot_map", "robot_odom", "robot_body", &above_frame_limit).is_err());
             let phase_a = CorrectionPhaseAControl::for_tests();
             let mut request = relocalization_command_request("req-aggregate-hard-bound", 7);
-            request.session_id = "mapping-session-owner".to_owned();
-            request.session_generation = 23;
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
-            let snapshot = phase_a
-                .activated_target_receipts()
-                .current_sealed_target_snapshot()
-                .expect("sealed target snapshot");
-            let request = validate_relocalize_request(request).expect("request is canonical");
-            let mut boundary = frame(3, 30, 0.0);
-            boundary.body_points = (vec![Point3::new(0.0, 0.0, 0.0)]).into();
-            boundary.registered_cloud.point_count = 1;
-            boundary.registered_cloud.body_points_sha256 =
-                body_points_sha256(&boundary.body_points).unwrap();
+            let snapshot = phase_a.activated_target_receipts().current_sealed_assigned_target_snapshot().unwrap();
+            let fence = phase_a.relocalization_mode();
+            let epoch = fence.activate_for_tests().epoch;
+            let mut boundary = frame_from_admitted_source(3, admit_frame_source(
+                3, 30, 30, Isometry3::identity(), vec![Point3::origin()], &adapter, fence,
+            ));
+            boundary.relocalization_mode_epoch = Some(epoch);
             let accumulation = RelocalizationAccumulation {
-                request,
-                admission_ordinal: 1,
-                mode_epoch: 1,
+                request: validate_relocalize_request(request).unwrap(), admission_ordinal: 1, mode_epoch: epoch,
                 logical_deadline: Instant::now() + Duration::from_secs(1),
                 accumulation_deadline: Instant::now() + Duration::from_secs(1),
-                snapshot,
-                arm_watermark: None,
-                armed_map_watermarks: HashMap::new(),
-                accepted: vec![AccumulatedRelocalizationFrame {
-                    evidence_sha256: [2; 32],
-                    input: boundary.clone(),
-                }],
+                snapshot, arm_watermark: None, armed_map_watermarks: HashMap::new(),
+                accepted: vec![AccumulatedRelocalizationFrame { input: Arc::new(boundary.clone()) }],
                 aggregate_input_points: RELOCALIZATION_MAX_AGGREGATE_POINTS + 1,
                 session_map_frame_generation: Some(boundary.map_frame_generation),
                 mapping_commit_boot_nonce: Some(boundary.mapping_commit_id.boot_nonce),
             };
-            let lifecycle = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
-            let lease = Arc::new(CorrectionRequestLease::new(
-                CorrectionRequestCancellation::new(),
-                Some(lifecycle),
-            ));
-            assert_eq!(
-                seal_relocalization_source(
-                    accumulation,
-                    boundary,
-                    lease,
-                    RelocalizationCutoffReasonV1::MinimumAggregateReached,
-                )
-                .err()
-                .expect("aggregate byte bound must fail closed"),
-                "RELOCALIZATION_AGGREGATE_BYTES_EXCEEDED"
-            );
+            let lease = Arc::new(CorrectionRequestLease::new(CorrectionRequestCancellation::new(),
+                Some(Arc::new(tokio::sync::Mutex::new(())).lock_owned().await)));
+            assert_eq!(seal_relocalization_source(accumulation, boundary, lease,
+                RelocalizationCutoffReasonV1::MinimumAggregateReached).err().unwrap(),
+                "RELOCALIZATION_AGGREGATE_BYTES_EXCEEDED");
+        }
+
+        fn assigned_finalized_terminal_fixture() -> crate::proto::RelocalizeResult {
+            let fence = Arc::new(RelocalizationModeFence::default());
+            let mode = fence.activate().unwrap();
+            let mut input = frame_with_mode_fence(1, 1002, 0.0, fence);
+            input.relocalization_mode_epoch = Some(mode.epoch);
+            let mut wire = relocalization_command_request("typed-finalized", 7);
+            let target = relocalization_request_body(&mut wire).target.as_mut().unwrap();
+            target.activation.as_mut().unwrap().backend_generation = input.committed_map.backend_generation;
+            target.occupancy_receipt.as_mut().unwrap().backend_generation = input.committed_map.backend_generation;
+            target.cloud_receipt.as_mut().unwrap().point_count = 3;
+            target.source_cloud_member.as_mut().unwrap().cloud_receipt.as_mut().unwrap().point_count = 3;
+            target.source_cloud_member.as_mut().unwrap().frame_id = "robot_map".into();
+            let request = validate_relocalize_request(wire).unwrap();
+            let owner = CorrectionOwnerRuntimeIdentity { runtime_generation: 2, ..owner_identity() };
+            let transform = CorrectionTransform::from_isometry(&Isometry3::identity());
+            let candidate = CorrectionCandidate::seal(correction_candidate_identity(CorrectionCandidateBackend::Relocalization,
+                &owner, 1, "robot_map", "robot_odom", "robot_body", &input), transform).unwrap();
+            let evidence = crate::proto::AssignedRelocalizationEvidenceV2 {
+                schema_version: 2, phase: crate::proto::AssignedRelocalizationEvidencePhaseV2::Finalized as i32,
+                admission_ordinal: Some(1), owner: Some(crate::proto::RelocalizationOwnerReceiptV2 {
+                    runtime_generation: owner.runtime_generation, correction_backend_generation: owner.backend_generation,
+                    correction_lease_boot_nonce: owner.correction_lease.boot_nonce.to_be_bytes().to_vec(),
+                    correction_lease_generation: owner.correction_lease.generation,
+                    map_frame_id: "robot_map".into(), odom_frame_id: "robot_odom".into(), body_frame_id: "robot_body".into(),
+                    relocalization_epoch: Some(mode.epoch),
+                }),
+                source_frames: vec![assigned_source_receipt(&input, "robot_map", "robot_odom", "robot_body").unwrap()],
+                algorithm: Some(crate::proto::RelocalizationAlgorithmReceiptV2 {
+                    converged: false, accepted: true, mse_bits: 0_f64.to_bits(), fitness_bits: 1_f64.to_bits(),
+                    iterations: 1, feature_matches: 0, ransac_inliers: input.registered_cloud.point_count,
+                    estimated_transform: Some(relocalization_pose_bits(&Isometry3::identity())),
+                    proposed_correction: Some(relocalization_pose_bits(&Isometry3::identity())),
+                }),
+            };
+            assigned_relocalization_result(&request.identity, crate::proto::RelocalizeDisposition::Applied,
+                7, "applied fixture", candidate.encode_body().unwrap(), evidence)
         }
 
         #[test]
-        fn relocalization_stable_stratified_source_has_fixed_indices() {
-            let ordered = (0..100_001)
-                .map(|index| Point3::new(index as f64, 0.0, 0.0))
-                .collect::<Vec<_>>();
-            let (emitted, canonical, digest) =
-                stable_stratified_source(ordered).expect("bounded source reduces");
-            assert_eq!(emitted.len(), 100_000);
-            assert_eq!(emitted[0].x, 0.0);
-            assert_eq!(emitted[50_000].x, 50_000.0);
-            assert_eq!(emitted[99_999].x, 99_999.0);
-            assert_eq!(canonical.len(), 8 + 100_000 * 24);
-            assert_eq!(digest, sha256_bytes(&canonical));
+        fn assigned_terminal_retained_validator_checks_real_v3_candidate_receipt_and_outcome() {
+            let result = assigned_finalized_terminal_fixture();
+            let terminal = AssignedRelocalizationTerminalV2::new(result.clone(), Some(&validate_assigned_terminal_retained)).unwrap();
+            let retained = terminal.clone();
+            assert_eq!(retained.encoded().as_ptr(), terminal.encoded().as_ptr());
+            let reopened = AssignedRelocalizationTerminalV2::decode_durable(&terminal.encode_durable().unwrap(),
+                Some(&validate_assigned_terminal_retained)).unwrap();
+            assert_eq!(reopened.encoded(), terminal.encoded());
+            let changes: [fn(&mut crate::proto::AssignedCloudRelocalizeResultV2); 9] = [
+                |b| b.candidate_payload_v3.push(0),
+                |b| b.evidence.as_mut().unwrap().owner.as_mut().unwrap().correction_lease_generation += 1,
+                |b| b.evidence.as_mut().unwrap().source_frames[0].source_sequence += 1,
+                |b| b.evidence.as_mut().unwrap().source_frames[0].cloud_revision += 1,
+                |b| b.evidence.as_mut().unwrap().source_frames[0].odom_from_body.as_mut().unwrap().translation_m_bits[0] = (-0_f64).to_bits(),
+                |b| b.evidence.as_mut().unwrap().algorithm.as_mut().unwrap().proposed_correction.as_mut().unwrap().translation_m_bits[0] = 1_f64.to_bits(),
+                |b| b.evidence.as_mut().unwrap().algorithm.as_mut().unwrap().estimated_transform.as_mut().unwrap().translation_m_bits[0] = 2_f64.to_bits(),
+                |b| b.disposition = crate::proto::RelocalizeDisposition::Cancelled as i32,
+                |b| b.correction_revision = 0,
+            ];
+            for change in changes {
+                let mut changed = result.clone();
+                change(changed.assigned_cloud_v2.as_mut().unwrap());
+                assert!(AssignedRelocalizationTerminalV2::new(changed, Some(&validate_assigned_terminal_retained)).is_err());
+            }
+            // A rejection can report the current canonical revision; it did not
+            // create a new revision, so retaining that observation is honest.
+            let mut rejected = result;
+            rejected.assigned_cloud_v2.as_mut().unwrap().disposition = crate::proto::RelocalizeDisposition::Rejected as i32;
+            assert!(AssignedRelocalizationTerminalV2::new(rejected, Some(&validate_assigned_terminal_retained)).is_ok());
+        }
+
+        #[test]
+        fn assigned_accepted_no_candidate_receipt_binds_algorithm_before_durable_reopen() {
+            let mut valid = assigned_finalized_terminal_fixture();
+            let body = valid.assigned_cloud_v2.as_mut().unwrap();
+            body.disposition = crate::proto::RelocalizeDisposition::Cancelled as i32;
+            body.correction_revision = 0;
+            body.candidate_payload_v3.clear();
+            body.evidence.as_mut().unwrap().phase = crate::proto::AssignedRelocalizationEvidencePhaseV2::AlgorithmCompleted as i32;
+            let terminal = AssignedRelocalizationTerminalV2::new(valid.clone(), Some(&validate_assigned_terminal_retained)).unwrap();
+            let reopened = AssignedRelocalizationTerminalV2::decode_durable(&terminal.encode_durable().unwrap(),
+                Some(&validate_assigned_terminal_retained)).unwrap();
+            assert_eq!(terminal.encoded(), reopened.encoded());
+            for mutate_estimate in [true, false] {
+                let mut changed = valid.clone();
+                let algorithm = changed.assigned_cloud_v2.as_mut().unwrap().evidence.as_mut().unwrap().algorithm.as_mut().unwrap();
+                let pose = if mutate_estimate { algorithm.estimated_transform.as_mut() } else { algorithm.proposed_correction.as_mut() }.unwrap();
+                pose.translation_m_bits[0] = 1_f64.to_bits();
+                let request_bytes = changed.assigned_cloud_v2.as_ref().unwrap().request.as_ref().unwrap().encode_to_vec();
+                let terminal_bytes = changed.encode_to_vec();
+                assert_eq!(AssignedRelocalizationTerminalV2::new(changed, Some(&validate_assigned_terminal_retained)).unwrap_err(),
+                    "RELOCALIZATION_ASSIGNED_ALGORITHM_BINDING_MISMATCH");
+                let mut durable = b"nuwax.geometry.relocalize.assigned-terminal.v2\0".to_vec();
+                durable.extend_from_slice(&(request_bytes.len() as u32).to_be_bytes());
+                durable.extend_from_slice(&request_bytes);
+                durable.extend_from_slice(&(terminal_bytes.len() as u32).to_be_bytes());
+                durable.extend_from_slice(&terminal_bytes);
+                assert_eq!(AssignedRelocalizationTerminalV2::decode_durable(&durable, Some(&validate_assigned_terminal_retained)).unwrap_err(),
+                    "RELOCALIZATION_ASSIGNED_ALGORITHM_BINDING_MISMATCH");
+            }
         }
 
         #[test]
         fn relocalization_frame_proof_ledger_is_scoped_and_conflict_permanent() {
-            let mut actor = RelocalizationCommandActor::new(
-                owner_identity(),
-                "robot_map".to_owned(),
-                "robot_odom".to_owned(),
-                "robot_body".to_owned(),
-            );
-            let input = frame(1, 10, 0.0);
+            let mut actor = RelocalizationCommandActor::new(owner_identity(), "robot_map".into(), "robot_odom".into(), "robot_body".into());
+            let input = Arc::new(frame(1, 10, 0.0));
             let key = relocalization_frame_key(&input);
-            assert!(!actor.record_frame_proof(&input, key, [1; 32]).unwrap());
-            assert!(actor.record_frame_proof(&input, key, [1; 32]).unwrap());
-            assert_eq!(
-                actor.record_frame_proof(&input, key, [2; 32]),
-                Err("RELOCALIZATION_FRAME_KEY_PROOF_CONFLICT")
-            );
-
-            let mut next_session = input;
-            next_session.mapping_session_id = "mapping-session-next".to_owned();
-            next_session.mapping_session_generation += 1;
-            assert!(!actor
-                .record_frame_proof(&next_session, key, [2; 32])
-                .unwrap());
+            assert!(!actor.record_frame_proof(&input, key).unwrap());
+            assert!(actor.record_frame_proof(&Arc::new((*input).clone()), key).unwrap());
+            let mut changed = (*input).clone();
+            let mut occupancy = changed.committed_map_occupancy.to_vec();
+            occupancy[0] ^= 1;
+            changed.committed_map_occupancy = occupancy.into();
+            assert_eq!(actor.record_frame_proof(&Arc::new(changed), key), Err("RELOCALIZATION_FRAME_KEY_PROOF_CONFLICT"));
+            assert!(actor.record_frame_proof(&input, key).unwrap());
+            let weak = Arc::downgrade(&input);
+            drop(input);
+            assert!(weak.upgrade().is_none(), "proof cache cannot retain rejected clouds");
+            assert_eq!(actor.record_frame_proof(&Arc::new(frame(1, 10, 0.0)), key), Err("RELOCALIZATION_FRAME_KEY_PROOF_RELEASED"));
         }
+
+        #[test]
+        fn relocalization_cache_scopes_real_lio_producer_domains_without_cross_ordering() {
+            let mut actor = RelocalizationCommandActor::new(owner_identity(), "robot_map".into(), "robot_odom".into(), "robot_body".into());
+            let first = Arc::new(frame(1, 10, 0.0));
+            let adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
+            let ingress = crate::lio_ingress::CommonLioIngress::new(crate::lio_ingress::DeviceLioIngressSpec::new(
+                32, "robot_sensor", "robot_body", "robot_odom", "robot_map").unwrap());
+            ingress.bind_relocalization_mode_fence(Arc::new(RelocalizationModeFence::default())).unwrap();
+            let source = admit_frame_source_with_ingress(1, 10, 10, Isometry3::identity(),
+                asymmetric_cloud(), &adapter, &ingress);
+            let second = Arc::new(frame_from_admitted_source(1, source));
+            first.validate_source_ownership().unwrap(); second.validate_source_ownership().unwrap();
+            assert_eq!(relocalization_frame_key(&first), relocalization_frame_key(&second));
+            assert_ne!(RelocalizationFrameScope::from_input(&first), RelocalizationFrameScope::from_input(&second));
+            assert!(!actor.record_frame_proof(&first, relocalization_frame_key(&first)).unwrap());
+            assert!(!actor.record_frame_proof(&second, relocalization_frame_key(&second)).unwrap());
+            assert_eq!(actor.last_validated_frames.len(), 2);
+        }
+
+        #[test]
+        fn relocalization_stable_stratified_source_has_fixed_indices() {
+            let ordered = (0..100_001).map(|index| Point3::new(index as f64, 0.0, 0.0)).collect();
+            let emitted = stable_stratified_source(ordered).unwrap();
+            assert_eq!(emitted.len(), 100_000);
+            assert_eq!(emitted[0].x, 0.0);
+            assert_eq!(emitted[50_000].x, 50_000.0);
+            assert_eq!(emitted[99_999].x, 99_999.0);
+            assert!(stable_stratified_source(vec![Point3::origin(); RELOCALIZATION_MAX_AGGREGATE_POINTS+1]).is_err());
+        }
+
+        #[tokio::test]
+        async fn relocalization_actor_restart_replays_before_conflict_busy_and_side_effects() {
+            let root = RelocalizationTerminalTestRoot::new();
+            let result = assigned_finalized_terminal_fixture();
+            let terminal = AssignedRelocalizationTerminalV2::new(result.clone(), Some(&validate_assigned_terminal_retained)).unwrap();
+            let request = ValidatedRelocalizeRequest { identity: terminal.request().clone() };
+            { let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
+              store.persist_terminal(request.request_id(), &request.key(), &StoredRelocalizationResult::Assigned(terminal)).unwrap(); }
+            let path = root.path().join(assigned_terminal_filename_v2(request.request_id()).unwrap());
+            let persisted = fs::read(&path).unwrap();
+            let phase_a = CorrectionPhaseAControl::for_tests();
+            let mut supervisor = RelocalizationOwnerSupervisor::start_inner(phase_a.clone(),
+                CorrectionOwnerRuntimeIdentity { runtime_generation: 2, ..owner_identity() },
+                "robot_map".into(), "robot_odom".into(), "robot_body".into(), None,
+                Some(RelocalizationTerminalStore::open_at(root.path().into()).unwrap()));
+            let ingress = supervisor.ingress();
+            let before = ingress.terminal_snapshot_assigned(&relocalization_query(&request)).await.unwrap().ledger_observation;
+            let mut conflict_wire = request.identity.to_wire();
+            relocalization_request_body(&mut conflict_wire).target.as_mut().unwrap().activation.as_mut().unwrap().lifecycle_epoch += 1;
+            let conflict = ingress.admit(conflict_wire.clone()).await.unwrap().wait().await.unwrap();
+            assert_eq!(relocalization_terminal_body(&conflict).disposition, crate::proto::RelocalizeDisposition::ReplayConflict as i32);
+            assert_eq!(ingress.admit(conflict_wire).await.unwrap().wait().await.unwrap().encode_to_vec(), conflict.encode_to_vec());
+            for _ in 0..3 {
+                assert_eq!(ingress.admit(request.identity.to_wire()).await.unwrap().wait().await.unwrap().encode_to_vec(), result.encode_to_vec());
+            }
+            let after = ingress.terminal_snapshot_assigned(&relocalization_query(&request)).await.unwrap();
+            assert!(matches!(after.terminal, RelocalizationTerminalSnapshot::AssignedTerminal(_)));
+            assert_eq!(before.encode_to_vec(), after.ledger_observation.encode_to_vec());
+            assert_eq!(after.ledger_observation.admitted_command_count, 0);
+            assert_eq!(after.ledger_observation.claimed_command_count, 0);
+            assert_eq!(phase_a.relocalization_mode().snapshot(), RelocalizationModeSnapshot { epoch: 0, active: false });
+            assert_eq!(fs::read(path).unwrap(), persisted);
+            phase_a.begin(); supervisor.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn relocalization_legacy_mixed_live_versions_fail_before_waiter_or_source_admission() {
+            let phase_a = CorrectionPhaseAControl::for_tests();
+            let mut supervisor = RelocalizationOwnerSupervisor::start(phase_a.clone(),
+                CorrectionOwnerRuntimeIdentity { runtime_generation: 2, ..owner_identity() },
+                "robot_map".into(), "robot_odom".into(), "robot_body".into());
+            let ingress = supervisor.ingress();
+            let mut mixed = relocalization_command_request("mixed", 7);
+            mixed.activation_identity_sha256 = vec![1;32];
+            for request in [crate::proto::RelocalizeRequest { schema_version: 1, request_id: "legacy".into(), ..Default::default() },
+                crate::proto::RelocalizeRequest { schema_version: 3, request_id: "unsupported".into(), ..Default::default() }, mixed] {
+                assert!(matches!(ingress.admit(request).await, Err(RelocalizationCommandError::InvalidRequest(_))));
+            }
+            assert_eq!(ingress.waiter_capacity.available_permits(), RELOCALIZATION_MAX_WAITERS);
+            assert!(ingress.terminal_store.state.lock().terminals.is_empty());
+            assert!(!phase_a.relocalization_mode().snapshot().active);
+            let called = Arc::new(AtomicBool::new(false));
+            let marker = called.clone();
+            let work: PlanarCommandWork = Box::new(move |_| { marker.store(true, Ordering::Release); Box::pin(async {
+                PlanarCommandOutcome { disposition: crate::proto::RelocalizeDisposition::Rejected, detail: "must not run".into(), correction_revision: 0, evidence: Vec::new() }
+            }) });
+            assert!(matches!(ingress.admit_planar(relocalization_command_request("planar-gated", 7),
+                Arc::new(tokio::sync::Mutex::new(())).lock_owned().await, work).await, Err(RelocalizationCommandError::InvalidRequest(_))));
+            assert!(!called.load(Ordering::Acquire));
+            phase_a.begin(); supervisor.shutdown().await.unwrap();
+        }
+
+
+        #[test]
+        fn relocalization_disclosure_retention_bounds_are_fixed() {
+            assert_eq!(RELOCALIZATION_MAX_INLINE_EVIDENCE_DISCLOSURE_BYTES, 4_158);
+            assert_eq!(RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_TERMINAL, 24_832);
+            assert_eq!(RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_COMMAND_RECORD, 295_102);
+            assert_eq!(RELOCALIZATION_MAX_RETAINED_DISCLOSURE_BYTES, 604_368_896);
+            assert_eq!(RELOCALIZATION_MAX_COMMAND_RECORDS, 1024);
+            assert_eq!(RELOCALIZATION_MAX_WAITERS, 16);
+            assert_eq!(RELOCALIZATION_MAX_CONFLICTS_PER_RECORD, 64);
+            assert_eq!(RELOCALIZATION_MAX_FRAMES, 8);
+        }
+
+        #[test]
+        fn relocalization_policy_parameters_preserve_current_exact_bytes_without_hashes() {
+            let source = relocalization_source_policy_preimage_v1();
+            let domain = b"nuwax.geometry.relocalize.source-policy.v1\0";
+            assert_eq!(&source[..domain.len()], domain);
+            assert_eq!(&source[domain.len()..domain.len()+4], &3_u32.to_be_bytes());
+            assert_eq!(&source[domain.len()+16..domain.len()+24], &0_u64.to_be_bytes());
+            let expected = [0_u64, 100_000, 2_400_000, 4_096, 25_600_000, 250_000, 6_000_000,
+                250_000, 6_000_000, 0, 100_000, 0, 2_400_000, 2_000];
+            for (index, value) in expected.into_iter().enumerate() {
+                let offset = domain.len() + 16 + index * 8;
+                assert_eq!(&source[offset..offset+8], &value.to_be_bytes());
+            }
+            let deadline = relocalization_deadline_policy_preimage_v1();
+            assert_eq!(exact_hex(&deadline), "6e757761782e67656f6d657472792e72656c6f63616c697a652e646561646c696e652d706f6c6963792e7631000000000100000000000000fa0000000000007530000000000000753000000000000007d00000000000001388000000010000000100000001");
+            let algorithm = relocalization_algorithm_options_preimage_v1();
+            let algorithm_domain = b"nuwax.geometry.relocalize.algorithm-options.v1\0";
+            assert_eq!(&algorithm[algorithm_domain.len()..algorithm_domain.len()+4], &2_u32.to_be_bytes());
+            assert_eq!(&algorithm[algorithm.len()-8..], &0.8_f64.to_be_bytes());
+            let policy = crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire();
+            assert_eq!(policy.source_parameters, source);
+            assert_eq!(policy.deadline_parameters, deadline);
+            assert_eq!(policy.algorithm_parameters, algorithm);
+        }
+
+        #[test]
+        fn relocalization_disclosure_replay_is_byte_identical() {
+            let terminal = AssignedRelocalizationTerminalV2::new(assigned_finalized_terminal_fixture(),
+                Some(&validate_assigned_terminal_retained)).unwrap();
+            let encoded = terminal.encoded().as_ptr();
+            let retries = (0..64).map(|_| terminal.clone()).collect::<Vec<_>>();
+            assert!(retries.iter().all(|value| value.encoded().as_ptr() == encoded));
+            assert!(retries.iter().all(|value| value.to_wire().encode_to_vec() == terminal.encoded()));
+            let reopened = AssignedRelocalizationTerminalV2::decode_durable(&terminal.encode_durable().unwrap(),
+                Some(&validate_assigned_terminal_retained)).unwrap();
+            assert_eq!(reopened.encoded(), terminal.encoded());
+        }
+
+        #[test]
+        fn relocalization_typed_source_elided_evidence_retains_existing_hard_bounds() {
+            let original = assigned_finalized_terminal_fixture();
+            let mut oversized = original.clone();
+            oversized.assigned_cloud_v2.as_mut().unwrap().candidate_payload_v3 = vec![0; RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES+1];
+            assert!(AssignedRelocalizationTerminalV2::new(oversized, Some(&validate_assigned_terminal_retained)).unwrap_err().contains("BOUND_EXCEEDED"));
+            let mut oversized = original.clone();
+            let evidence = oversized.assigned_cloud_v2.as_mut().unwrap().evidence.as_mut().unwrap();
+            evidence.source_frames = vec![evidence.source_frames[0].clone(); RELOCALIZATION_MAX_FRAMES+1];
+            assert!(AssignedRelocalizationTerminalV2::new(oversized, Some(&validate_assigned_terminal_retained)).unwrap_err().contains("BOUND_EXCEEDED"));
+            let mut oversized = original.clone();
+            oversized.assigned_cloud_v2.as_mut().unwrap().detail = "x".repeat(RELOCALIZATION_MAX_TERMINAL_BYTES);
+            assert!(AssignedRelocalizationTerminalV2::new(oversized, Some(&validate_assigned_terminal_retained)).unwrap_err().contains("BOUND_EXCEEDED"));
+            let mut changed = original;
+            changed.assigned_cloud_v2.as_mut().unwrap().evidence.as_mut().unwrap().source_frames[0].admitted_point_count = RELOCALIZATION_MAX_AGGREGATE_POINTS as u64 + 1;
+            assert!(AssignedRelocalizationTerminalV2::new(changed, Some(&validate_assigned_terminal_retained)).is_err());
+        }
+
 
         fn activation_seed(request_id: &str, identity_byte: u8) -> ActivationReceiptSeed {
             ActivationReceiptSeed {
@@ -18287,19 +16571,17 @@ mod preflight_only_contract {
             }
         }
 
-        fn committed_map(timestamp_ns: u64, map_frame_id: &str) -> CommittedMapProof {
-            let mut proof = CommittedMapProof {
+        fn committed_map(timestamp_ns: u64, _map_frame_id: &str) -> CommittedMapProof {
+            CommittedMapProof {
+                backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+                backend_generation: 1,
                 source_timestamp_ns: timestamp_ns,
                 width: 101,
                 height: 79,
                 resolution_m: 0.05,
                 origin_x_m: -3.25,
                 origin_y_m: 4.5,
-                payload_sha256: [0x44; 32],
-                boundary_sha256: [0; 32],
-            };
-            proof.boundary_sha256 = expected_map_boundary_sha256(map_frame_id, &proof).unwrap();
-            proof
+            }
         }
 
         fn assert_fresh_lcm_gen_decodes(wire: &[u8]) {
@@ -18339,7 +16621,7 @@ assert wire[:8] == fingerprint
 assert wire[8:16] != fingerprint
 candidate = CorrectionCandidate.decode(wire)
 assert candidate.encode() == wire
-assert candidate.schema_version == 2
+assert candidate.schema_version == 3
 assert candidate.transform_semantics == 1
 assert candidate.body_frame_id == candidate.points_frame_id == "robot_body"
 assert candidate.occupancy_revision != candidate.cloud_revision
@@ -18350,7 +16632,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 .arg(&temp)
                 .arg(&wire_path)
                 .arg(
-                    CORRECTION_CANDIDATE_FINGERPRINT_V2
+                    CORRECTION_CANDIDATE_FINGERPRINT_V3
                         .iter()
                         .map(|byte| format!("{byte:02x}"))
                         .collect::<String>(),
@@ -18383,16 +16665,17 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     occupancy_revision: 16,
                     cloud_revision: 7,
                     registered_cloud: RegisteredCloudProof {
+                        backend: nuwax_codec::lcm::lio::LIO_BACKEND_DEVICE,
+                        runtime_generation: 31,
                         source_sequence: 17,
                         source_timestamp_ns: timestamp_ns,
                         point_count: 60,
-                        envelope_sha256: [0x11; 32],
-                        body_points_sha256: [0x22; 32],
                     },
                     correlated_odom: CorrelatedOdomProof {
                         source_sequence: 18,
                         source_timestamp_ns: timestamp_ns.saturating_sub(1),
-                        pose_sha256: [0x33; 32],
+                        translation_m: [0.0, 0.0, 0.0],
+                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
                     },
                     committed_map: committed_map(timestamp_ns, "robot_map"),
                     source_timestamp_ns: timestamp_ns,
@@ -18556,11 +16839,11 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 ("cloud_point_count", |data| {
                     data.identity.registered_cloud.point_count += 1
                 }),
-                ("cloud_envelope_digest", |data| {
-                    data.identity.registered_cloud.envelope_sha256[0] ^= 1
+                ("cloud_backend", |data| {
+                    data.identity.registered_cloud.backend += 1
                 }),
-                ("cloud_points_digest", |data| {
-                    data.identity.registered_cloud.body_points_sha256[0] ^= 1
+                ("cloud_runtime_generation", |data| {
+                    data.identity.registered_cloud.runtime_generation += 1
                 }),
                 ("odom_source_sequence", |data| {
                     data.identity.correlated_odom.source_sequence += 1
@@ -18568,19 +16851,16 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 ("odom_source_timestamp", |data| {
                     data.identity.correlated_odom.source_timestamp_ns += 1
                 }),
-                ("odom_pose_digest", |data| {
-                    data.identity.correlated_odom.pose_sha256[0] ^= 1
-                }),
                 ("map_source_timestamp", |data| {
                     data.identity.committed_map.source_timestamp_ns += 1
                 }),
                 ("map_width", |data| data.identity.committed_map.width += 1),
                 ("map_height", |data| data.identity.committed_map.height += 1),
-                ("map_payload_digest", |data| {
-                    data.identity.committed_map.payload_sha256[0] ^= 1
+                ("map_backend_kind", |data| {
+                    data.identity.committed_map.backend_kind = crate::mapping_backend::MappingBackendKind::Raytracing
                 }),
-                ("map_boundary_digest", |data| {
-                    data.identity.committed_map.boundary_sha256[0] ^= 1
+                ("map_backend_generation", |data| {
+                    data.identity.committed_map.backend_generation += 1
                 }),
                 ("source_timestamp", |data| {
                     data.identity.source_timestamp_ns += 1
@@ -18607,7 +16887,6 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let original_wire = candidate.encode_wire().unwrap();
             for (field, edit) in edits {
                 let changed = candidate.edited_for_test(edit);
-                assert_eq!(candidate.payload_sha256, changed.payload_sha256);
                 assert_ne!(candidate, changed, "{field}");
                 assert_eq!(candidate, clone, "{field}");
                 assert!(!Arc::ptr_eq(
@@ -18616,15 +16895,13 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 ));
             }
             assert_eq!(candidate.encode_wire().unwrap(), original_wire);
-            let changed_digest = candidate.edited_for_test(|data| data.payload_sha256[0] ^= 1);
-            assert_ne!(candidate, changed_digest);
         }
 
         #[test]
         fn candidate_owner_exact_comparison_checks_every_float_bit() {
             let candidate = candidate_owner_test_candidate();
-            // 覆盖变换七个、地图三个，以及每个有序轨迹点的七个浮点字段。
-            for index in 0..10 + candidate.trajectory.len() * 7 {
+            // Transform, map, frozen odometry, and every ordered trajectory float are bit-exact.
+            for index in 0..17 + candidate.trajectory.len() * 7 {
                 let changed = candidate.edited_for_test(|data| {
                     let value = match index {
                         0..=2 => &mut data.transform.translation_m[index],
@@ -18632,9 +16909,11 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                         7 => &mut data.identity.committed_map.resolution_m,
                         8 => &mut data.identity.committed_map.origin_x_m,
                         9 => &mut data.identity.committed_map.origin_y_m,
+                        10..=12 => &mut data.identity.correlated_odom.translation_m[index - 10],
+                        13..=16 => &mut data.identity.correlated_odom.rotation_xyzw[index - 13],
                         _ => {
-                            let frame = &mut data.trajectory[(index - 10) / 7];
-                            let component = (index - 10) % 7;
+                            let frame = &mut data.trajectory[(index - 17) / 7];
+                            let component = (index - 17) % 7;
                             if component < 3 {
                                 &mut frame.translation_m[component]
                             } else {
@@ -18644,7 +16923,6 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     };
                     *value = f64::from_bits(value.to_bits() ^ 1);
                 });
-                assert_eq!(candidate.payload_sha256, changed.payload_sha256);
                 assert_ne!(candidate, changed, "float field {index}");
             }
         }
@@ -18695,25 +16973,23 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 data.trajectory[0].source_timestamp_ns -= 1;
             });
             for changed in [changed_count, changed_order, changed_timestamp] {
-                assert_eq!(candidate.payload_sha256, changed.payload_sha256);
                 assert_ne!(candidate, changed);
             }
         }
 
         #[test]
-        fn candidate_owner_decode_still_rejects_forged_hash_and_invalid_fields() {
+        fn candidate_owner_decode_rejects_schema_skew_and_invalid_fields() {
             let candidate = candidate_owner_test_candidate();
-            let mut bad_hash = candidate.encode_wire().unwrap();
-            *bad_hash.last_mut().unwrap() ^= 1;
+            let mut legacy_schema = candidate.encode_body().unwrap();
+            legacy_schema[..4].copy_from_slice(&2_i32.to_be_bytes());
             assert!(matches!(
-                CorrectionCandidate::decode_wire(&bad_hash),
-                Err(CorrectionWireError::Invalid(detail)) if detail == "PayloadHashMismatch"
+                CorrectionCandidate::decode_body(&legacy_schema),
+                Err(CorrectionWireError::Invalid(detail)) if detail == "unsupported correction schema version 2"
             ));
             let invalid = candidate.edited_for_test(|data| {
                 data.transform.rotation_xyzw = [0.0; 4];
             });
-            let mut invalid_body = invalid.encode_body_prefix().unwrap();
-            invalid_body.extend_from_slice(&sha256_bytes(&invalid_body));
+            let invalid_body = invalid.encode_body_prefix().unwrap();
             assert!(matches!(
                 CorrectionCandidate::decode_body(&invalid_body),
                 Err(CorrectionWireError::Invalid(detail)) if detail == "InvalidRotation"
@@ -18742,16 +17018,16 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 
             assert_eq!(
                 applied.to_string(),
-                r#"{"event":"nuwax_correction_candidate_finalized_v1","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"payload_sha256":"0f99e3c7ea902fccf8e8e26c4c307a8dd0e15675774ccdad48ca97f392f465bb","disposition":"Applied","candidate_processed_delivered":true}"#
+                r#"{"event":"nuwax_correction_candidate_finalized_v3","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"correction_lease_boot_nonce":"88776655443322111020304050607080","correction_lease_generation":19,"disposition":"Applied","candidate_processed_delivered":true}"#
             );
             assert_eq!(
                 already_applied.to_string(),
-                r#"{"event":"nuwax_correction_candidate_finalized_v1","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"payload_sha256":"0f99e3c7ea902fccf8e8e26c4c307a8dd0e15675774ccdad48ca97f392f465bb","disposition":"AlreadyApplied","candidate_processed_delivered":true}"#
+                r#"{"event":"nuwax_correction_candidate_finalized_v3","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"correction_lease_boot_nonce":"88776655443322111020304050607080","correction_lease_generation":19,"disposition":"AlreadyApplied","candidate_processed_delivered":true}"#
             );
             let rejected_json = rejected.to_string();
             assert_eq!(
                 rejected_json,
-                r#"{"event":"nuwax_correction_candidate_finalized_v1","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"payload_sha256":"0f99e3c7ea902fccf8e8e26c4c307a8dd0e15675774ccdad48ca97f392f465bb","disposition":"Rejected","reject_reason":"invalid identity: field=\"mapping\\identity\"\ncontrol=\u0001","candidate_processed_delivered":true}"#
+                r#"{"event":"nuwax_correction_candidate_finalized_v3","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"correction_lease_boot_nonce":"88776655443322111020304050607080","correction_lease_generation":19,"disposition":"Rejected","reject_reason":"invalid identity: field=\"mapping\\identity\"\ncontrol=\u0001","candidate_processed_delivered":true}"#
             );
             let decoded: serde_json::Value =
                 serde_json::from_str(&rejected_json).expect("finalization event is valid JSON");
@@ -18788,7 +17064,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 
             assert_eq!(
                 event.to_string(),
-                r#"{"event":"nuwax_correction_candidate_finalized_v1","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"payload_sha256":"0f99e3c7ea902fccf8e8e26c4c307a8dd0e15675774ccdad48ca97f392f465bb","disposition":"Applied","candidate_processed_delivered":false}"#
+                r#"{"event":"nuwax_correction_candidate_finalized_v3","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"correction_lease_boot_nonce":"88776655443322111020304050607080","correction_lease_generation":19,"disposition":"Applied","candidate_processed_delivered":false}"#
             );
             let output = captured.snapshot();
             assert_eq!(output.matches(CANDIDATE_FINALIZATION_EVENT_NAME).count(), 1);
@@ -18808,6 +17084,8 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let harness = start_direct_producer(Duration::from_secs(2));
             let (apply_key, submitter) =
                 submit_candidate_until_apply_wait(&harness.ingress, &harness.apply_waiters).await;
+            let expected_candidate = harness.apply_waiters.pending.lock()
+                .get(&apply_key).unwrap().candidate.clone();
 
             assert!(!captured
                 .snapshot()
@@ -18823,7 +17101,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     .expect("resolved candidate is reported"),
                 CorrectionSubmitDisposition::CandidateProcessed {
                     candidate_sequence: apply_key.candidate_sequence,
-                    payload_sha256: apply_key.payload_sha256,
+                    candidate: expected_candidate,
                     disposition: CorrectionDisposition::Applied,
                 }
             );
@@ -18876,6 +17154,8 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             );
             let (apply_key, submitter) =
                 submit_candidate_until_apply_wait(&harness.ingress, &harness.apply_waiters).await;
+            let expected_candidate = harness.apply_waiters.pending.lock()
+                .get(&apply_key).unwrap().candidate.clone();
 
             harness
                 .apply_waiters
@@ -18897,7 +17177,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     .expect("resolved candidate is reported"),
                 CorrectionSubmitDisposition::CandidateProcessed {
                     candidate_sequence: apply_key.candidate_sequence,
-                    payload_sha256: apply_key.payload_sha256,
+                    candidate: expected_candidate,
                     disposition,
                 }
             );
@@ -18915,8 +17195,8 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 apply_key.candidate_sequence
             )));
             assert!(output.contains(&format!(
-                "\"payload_sha256\":\"{}\"",
-                digest_hex(&apply_key.payload_sha256)
+                "\"correction_lease_boot_nonce\":\"{:032x}\"",
+                apply_key.lease_boot_nonce
             )));
             assert!(output.contains(&format!("\"disposition\":\"{expected_disposition}\"")));
             if let Some(reject_reason) = expected_reject_reason {
@@ -19190,6 +17470,119 @@ assert candidate.occupancy_revision != candidate.cloud_revision
         }
 
         #[test]
+        fn coordinator_receipt_requires_exact_candidate_owner_before_abort_or_commit() {
+            let candidate = candidate_owner_test_candidate();
+            let mut coordinator = CorrectionCoordinator::default();
+            let prepared = coordinator.prepare(&candidate, &boundary(&candidate));
+            let different = candidate.edited_for_test(|data| data.trajectory[0].translation_m[0] = 0.25);
+            let mut forged = prepared.clone();
+            forged.candidate = different;
+            assert_eq!(coordinator.abort(&forged), Err(CorrectionTransitionError::ReceiptMismatch));
+            assert_eq!(coordinator.commit_applied(&forged), Err(CorrectionTransitionError::ReceiptMismatch));
+            for change_sequence in [true, false] {
+                let mut forged = prepared.clone();
+                if change_sequence { forged.candidate_sequence += 1; }
+                else { forged.source_timestamp_ns += 1; }
+                assert_eq!(coordinator.commit_applied(&forged), Err(CorrectionTransitionError::ReceiptMismatch));
+            }
+            let mut independent_receipt = prepared.clone();
+            independent_receipt.candidate = CorrectionCandidate::decode_wire(&candidate.encode_wire().unwrap()).unwrap();
+            let applied = coordinator.commit_applied(&independent_receipt).unwrap();
+            assert_eq!(applied.candidate, candidate);
+            assert_eq!(coordinator.prepare(&candidate, &boundary(&candidate)).disposition,
+                CorrectionDisposition::AlreadyApplied);
+        }
+
+        #[test]
+        fn apply_waiter_key_domains_and_exact_owner_are_both_required() {
+            let candidate = candidate_owner_test_candidate();
+            let key = CandidateApplyKey::from(&candidate);
+            let waiters = CandidateApplyWaiters::default();
+            let lease = Arc::new(CorrectionRequestLease::new(CorrectionRequestCancellation::new(), None));
+            for field in 0..5 {
+                let mut wrong_key = key;
+                match field {
+                    0 => wrong_key.runtime_generation += 1,
+                    1 => wrong_key.backend_generation += 1,
+                    2 => wrong_key.lease_boot_nonce += 1,
+                    3 => wrong_key.lease_generation += 1,
+                    _ => wrong_key.candidate_sequence += 1,
+                }
+                assert!(waiters.register(wrong_key, candidate.clone(), lease.clone()).is_err());
+                assert!(waiters.pending.lock().is_empty());
+            }
+            let weak = Arc::downgrade(candidate.owner_for_test());
+            let receiver = waiters.register(key, candidate.clone(), lease.clone()).unwrap();
+            assert!(waiters.register(key, candidate.clone(), lease.clone()).is_err());
+            for different in [
+                candidate.edited_for_test(|data| data.transform.translation_m[0] += 0.25),
+                candidate.edited_for_test(|data| data.identity.registered_cloud.runtime_generation += 1),
+                candidate.edited_for_test(|data| data.trajectory[0].translation_m[0] += 0.25),
+            ] {
+                assert_eq!(CandidateApplyKey::from(&different), key);
+                assert!(waiters.claim_apply(key, &different).is_none());
+                assert!(!waiters.pending.lock().get(&key).unwrap().applying);
+            }
+            let exact = CorrectionCandidate::decode_wire(&candidate.encode_wire().unwrap()).unwrap();
+            drop(candidate);
+            assert!(weak.upgrade().is_some(), "the waiter retains the admitted owner");
+            assert!(waiters.claim_apply(key, &exact).is_some());
+            assert!(waiters.claim_apply(key, &exact).is_none(), "only one claimant");
+            assert!(waiters.apply_claimed_or_remove(key), "claimed owner cannot retire early");
+            waiters.complete(key, Ok(CorrectionDisposition::Applied));
+            assert!(weak.upgrade().is_none(), "completion releases the exact retained owner");
+            assert!(waiters.pending.lock().is_empty());
+            assert!(waiters.claim_apply(key, &exact).is_none(), "late owner cannot revive a retired waiter");
+            drop(receiver);
+        }
+
+        #[test]
+        fn admitted_frame_rejects_replaced_points_pose_owner_and_cloud_receipt() {
+            let input = frame(1, 100, 0.0);
+            let mut mutations = Vec::new();
+            let mut points = input.clone();
+            points.body_points = points.body_points.edited_for_test(|points| points[0].x += 0.25);
+            mutations.push(points);
+            let mut pose = input.clone();
+            pose.correlated_odom.odom_from_body.translation.x += 0.25;
+            mutations.push(pose);
+            let mut pose_receipt = input.clone();
+            pose_receipt.correlated_odom.proof.translation_m[0] += 0.25;
+            mutations.push(pose_receipt);
+            let mut source_owner = input.clone();
+            source_owner.source_owner = frame(1, 100, 1.0).source_owner;
+            mutations.push(source_owner);
+            for field in 0..5 {
+                let mut receipt = input.clone();
+                match field {
+                    0 => receipt.cloud_receipt.commit_id.boot_nonce += 1,
+                    1 => receipt.cloud_receipt.commit_id.sequence += 1,
+                    2 => receipt.cloud_receipt.occupancy_revision += 1,
+                    3 => receipt.cloud_receipt.cloud_revision += 1,
+                    _ => receipt.cloud_receipt.session_generation += 1,
+                }
+                mutations.push(receipt);
+            }
+            for changed in mutations {
+                assert!(!input.exactly_matches(&changed));
+                assert_eq!(changed.validate_source_ownership(), Err(CorrectionOwnerError::InvalidRegisteredCloudProof));
+            }
+            let exact_independent = frame(1, 100, 0.0);
+            assert!(input.exactly_matches(&exact_independent));
+            let mut later_occupancy = input.clone();
+            later_occupancy.mapping_commit_id.sequence += 1;
+            later_occupancy.occupancy_revision += 1;
+            later_occupancy.validate_source_ownership().unwrap();
+            assert!(!input.exactly_matches(&later_occupancy));
+            let source_liveness = input.source_owner.retention_probe_for_test();
+            drop(exact_independent);
+            drop(input);
+            assert!(source_liveness(), "cloned frame retains exact source owner");
+            drop(later_occupancy);
+            assert!(!source_liveness(), "source owner retires with the last frame");
+        }
+
+        #[test]
         fn coordinator_rejects_every_identity_boundary_mismatch() {
             let candidate = sample_candidate(1, 100);
             let cases: Vec<(CorrectionBoundary, CorrectionRejectReason)> = vec![
@@ -19286,7 +17679,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 (
                     {
                         let mut value = boundary(&candidate);
-                        value.registered_cloud.envelope_sha256[0] ^= 1;
+                        value.registered_cloud.runtime_generation += 1;
                         value
                     },
                     CorrectionRejectReason::RegisteredCloudProofMismatch,
@@ -19294,7 +17687,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 (
                     {
                         let mut value = boundary(&candidate);
-                        value.correlated_odom.pose_sha256[0] ^= 1;
+                        value.correlated_odom.translation_m[0] = 1.0;
                         value
                     },
                     CorrectionRejectReason::CorrelatedOdomProofMismatch,
@@ -19302,7 +17695,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 (
                     {
                         let mut value = boundary(&candidate);
-                        value.committed_map.payload_sha256[0] ^= 1;
+                        value.committed_map.backend_generation += 1;
                         value
                     },
                     CorrectionRejectReason::CommittedMapProofMismatch,
@@ -19326,18 +17719,18 @@ assert candidate.occupancy_revision != candidate.cloud_revision
         }
 
         #[test]
-        fn candidate_hash_transform_and_stop_fences_fail_closed() {
+        fn candidate_identity_transform_and_stop_fences_fail_closed() {
             let candidate = sample_candidate(1, 100);
             let exact = boundary(&candidate);
 
-            let bad_hash = candidate.edited_for_test(|data| {
-                data.payload_sha256[0] ^= 1;
+            let invalid_source = candidate.edited_for_test(|data| {
+                data.identity.registered_cloud.runtime_generation = 0;
             });
             assert_eq!(
                 CorrectionCoordinator::default()
-                    .prepare(&bad_hash, &exact)
+                    .prepare(&invalid_source, &exact)
                     .disposition,
-                CorrectionDisposition::Rejected(CorrectionRejectReason::PayloadHashMismatch)
+                CorrectionDisposition::Rejected(CorrectionRejectReason::InvalidRegisteredCloudProof)
             );
 
             let non_finite = candidate.edited_for_test(|data| {
@@ -19408,55 +17801,161 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             assert_eq!(original.correlated_odom, clone.correlated_odom);
         }
 
-        fn frame(sequence: u64, timestamp_ns: u64, x: f64) -> CorrectionFrameInput {
-            // 合成回环有0.4米漂移，点间距应足够区分真实对应与相邻重复结构。
-            let body_points: Vec<_> = asymmetric_cloud()
-                .iter()
-                .map(|point| Point3::from(point.coords * 3.0))
-                .collect();
-            let odom_from_body = Isometry3::translation(x, 0.0, 0.0);
+        fn frame_source_adapter(
+            session_id: &str,
+            base_anchor: Isometry3<f64>,
+        ) -> crate::mapping_adapter::MappingAdapter {
+            let mut adapter = crate::mapping_adapter::MappingAdapter::new_with_frames(
+                crate::mapping_adapter::MappingAdapterConfig {
+                    resolution: 0.05,
+                    width_cells: 101,
+                    height_cells: 79,
+                    origin_xy: (-3.25, 4.5),
+                    voxel_size: 0.05,
+                    initial_safe_radius_meters: 0.0,
+                },
+                "robot_map", "robot_odom",
+            );
+            adapter.start_session(session_id, "correction-fixture-map").unwrap();
+            establish_frame_source_anchor(&mut adapter, base_anchor);
+            adapter
+        }
+
+        fn establish_frame_source_anchor(
+            adapter: &mut crate::mapping_adapter::MappingAdapter,
+            base_anchor: Isometry3<f64>,
+        ) {
+            // Mapping admission exposes a translation/yaw base anchor. Full-SE3
+            // correction and frozen odometry remain independently exercised.
+            let anchor_pose = base_anchor.inverse();
+            let (roll, pitch, yaw) = anchor_pose.rotation.euler_angles();
+            assert!(roll.abs() < 1.0e-12 && pitch.abs() < 1.0e-12);
+            adapter.feed_pose_in_frame(
+                anchor_pose.translation.x, anchor_pose.translation.y,
+                anchor_pose.translation.z, yaw, "robot_odom",
+            ).unwrap();
+        }
+
+        fn admit_frame_source(
+            sequence: u64,
+            timestamp_ns: u64,
+            odom_timestamp_ns: u64,
+            odom_from_body: Isometry3<f64>,
+            odom_points: Vec<Point3<f64>>,
+            adapter: &crate::mapping_adapter::MappingAdapter,
+            mode_fence: Arc<RelocalizationModeFence>,
+        ) -> crate::lio_ingress::AdmittedRegisteredScan {
+            let ingress = crate::lio_ingress::CommonLioIngress::new(
+                crate::lio_ingress::DeviceLioIngressSpec::new(
+                    31, "robot_sensor", "robot_body", "robot_odom", "robot_map",
+                ).unwrap(),
+            );
+            ingress.bind_relocalization_mode_fence(mode_fence).unwrap();
+            admit_frame_source_with_ingress(
+                sequence, timestamp_ns, odom_timestamp_ns, odom_from_body,
+                odom_points, adapter, &ingress,
+            )
+        }
+
+        fn admit_frame_source_with_ingress(
+            sequence: u64,
+            timestamp_ns: u64,
+            odom_timestamp_ns: u64,
+            odom_from_body: Isometry3<f64>,
+            odom_points: Vec<Point3<f64>>,
+            adapter: &crate::mapping_adapter::MappingAdapter,
+            ingress: &crate::lio_ingress::CommonLioIngress,
+        ) -> crate::lio_ingress::AdmittedRegisteredScan {
+            let mut odometry = nuwax_codec::lcm::schema::Odometry::default();
+            odometry.header.frame_id = "robot_odom".into();
+            odometry.child_frame_id = "robot_body".into();
+            odometry.pose.position = odom_from_body.translation.vector.into();
+            let q = odom_from_body.rotation.quaternion();
+            odometry.pose.orientation_xyzw = [q.i, q.j, q.k, q.w];
+            let envelope = ingress.prepare_legacy_odometry(
+                odom_timestamp_ns.try_into().unwrap(), odometry,
+            ).unwrap();
+            let cloud_identity = crate::lio_ingress::SourceIdentity {
+                backend: envelope.backend,
+                runtime_generation: envelope.runtime_generation,
+                source_sequence: (sequence + 100).try_into().unwrap(),
+                source_timestamp_ns: timestamp_ns.try_into().unwrap(),
+            };
+            let correlated = crate::lio_ingress::CorrelatedOdometry {
+                source_sequence: envelope.source_sequence,
+                source_timestamp_ns: envelope.source_timestamp_ns,
+            };
+            ingress.accept_public_odometry(envelope, 1).unwrap();
+            let prepared = ingress.register_odom_points(
+                cloud_identity, correlated, 2, odom_points.len(), odom_points, adapter,
+            ).unwrap();
+            let accepted = ingress.accept_public_cloud(prepared.encoded_for_test().as_ref(), 3).unwrap();
+            accepted.scan().clone()
+        }
+
+        fn frame_from_admitted_source(
+            sequence: u64,
+            source: crate::lio_ingress::AdmittedRegisteredScan,
+        ) -> CorrectionFrameInput {
+            let binding = source.binding();
+            let registered_cloud = RegisteredCloudProof::from_admitted(&source).unwrap();
+            let correlated_odom = FrozenCorrelatedOdom {
+                proof: CorrelatedOdomProof::from_registration(binding).unwrap(),
+                odom_from_body: binding.frozen_odom_from_body,
+            };
             let mut occupancy = vec![0_u8; 101 * 79];
             occupancy[..4].copy_from_slice(&[0, 20, 80, 255]);
-            let committed_map_occupancy: Arc<[u8]> = Arc::from(occupancy);
-            let mut committed_map = committed_map(timestamp_ns, "robot_map");
-            committed_map.payload_sha256 = sha256_bytes(committed_map_occupancy.as_ref());
-            committed_map.boundary_sha256 =
-                expected_map_boundary_sha256("robot_map", &committed_map).unwrap();
-            let registered_cloud = RegisteredCloudProof {
-                source_sequence: sequence + 100,
-                source_timestamp_ns: timestamp_ns,
-                point_count: body_points.len() as u64,
-                envelope_sha256: sha256_bytes(&sequence.to_be_bytes()),
-                body_points_sha256: body_points_sha256(&body_points).unwrap(),
-            };
-            CorrectionFrameInput {
-                mapping_session_id: "mapping-session-owner".into(),
-                mapping_session_generation: 23,
-                mapping_commit_id: MappingCommitId {
-                    boot_nonce: COMMIT_NONCE,
-                    sequence,
-                },
+            let mapping_commit_id = MappingCommitId { boot_nonce: COMMIT_NONCE, sequence };
+            let input = CorrectionFrameInput {
+                mapping_session_id: binding.mapping_session_id.clone(),
+                mapping_session_generation: binding.mapping_session_generation,
+                mapping_commit_id,
                 occupancy_revision: sequence + 100,
                 cloud_revision: sequence,
-                map_frame_generation: 25,
-                registered_cloud,
-                correlated_odom: FrozenCorrelatedOdom {
-                    proof: CorrelatedOdomProof {
-                        source_sequence: sequence + 200,
-                        source_timestamp_ns: timestamp_ns,
-                        pose_sha256: odom_pose_sha256(&odom_from_body).unwrap(),
-                    },
-                    odom_from_body,
+                cloud_receipt: crate::mapping_commit::CloudCommitReceipt {
+                    commit_id: mapping_commit_id,
+                    session_generation: binding.mapping_session_generation,
+                    occupancy_revision: sequence + 100,
+                    cloud_revision: sequence,
+                    source_timestamp_ns: source.source_timestamp_ns(),
+                    point_count: source.body_points().len().try_into().unwrap(),
                 },
-                committed_map,
-                committed_map_occupancy,
-                points_frame_id: "robot_body".into(),
-                body_points: body_points.into(),
+                map_frame_generation: binding.map_frame_generation,
+                registered_cloud,
+                correlated_odom,
+                committed_map: committed_map(source.source_timestamp_ns(), "robot_map"),
+                committed_map_occupancy: Arc::from(occupancy),
+                points_frame_id: source.body_frame_id().to_owned(),
+                body_points: source.body_points().clone(),
                 static_point_indices: None,
-                base_anchor_map_from_odom: Isometry3::identity(),
-                frame_capture_relocalization_epoch: 0,
+                base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
+                frame_capture_relocalization_epoch: binding.frame_capture_relocalization_epoch.unwrap(),
                 relocalization_mode_epoch: None,
-            }
+                source_owner: source,
+            };
+            input.validate_source_ownership().unwrap();
+            input
+        }
+
+        fn frame_with_mode_fence(
+            sequence: u64,
+            timestamp_ns: u64,
+            x: f64,
+            mode_fence: Arc<RelocalizationModeFence>,
+        ) -> CorrectionFrameInput {
+            let adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
+            let odom_from_body = Isometry3::translation(x, 0.0, 0.0);
+            // The loop has 0.4 m drift; spacing separates true correspondences.
+            let odom_points = asymmetric_cloud().iter()
+                .map(|point| odom_from_body * Point3::from(point.coords * 3.0)).collect();
+            frame_from_admitted_source(sequence, admit_frame_source(
+                sequence, timestamp_ns, timestamp_ns, odom_from_body, odom_points,
+                &adapter, mode_fence,
+            ))
+        }
+
+        fn frame(sequence: u64, timestamp_ns: u64, x: f64) -> CorrectionFrameInput {
+            frame_with_mode_fence(sequence, timestamp_ns, x, Arc::new(RelocalizationModeFence::default()))
         }
 
         fn active_relocalization_frame(
@@ -19465,13 +17964,10 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             timestamp_ns: u64,
             x: f64,
         ) -> CorrectionFrameInput {
-            let mode = owner.ingress().relocalization_mode_snapshot();
-            assert!(
-                mode.active,
-                "fixture requires an active relocalization epoch"
-            );
-            let mut input = frame(sequence, timestamp_ns, x);
-            input.frame_capture_relocalization_epoch = mode.epoch;
+            let fence = owner.ingress().relocalization_mode_fence();
+            let mode = fence.snapshot();
+            assert!(mode.active, "fixture requires an active relocalization epoch");
+            let mut input = frame_with_mode_fence(sequence, timestamp_ns, x, fence);
             input.relocalization_mode_epoch = Some(mode.epoch);
             input
         }
@@ -19496,32 +17992,34 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let mut static_input = None;
             for sequence in 1..=7 {
                 let world_points = if sequence == 7 { people_scan.clone() } else { corridor(None, 0.0).0 };
-                let mut input = frame(sequence, sequence * 100_000_000, sequence as f64 * 0.1);
-                // 故意改变已提交地图校正，运动证据仍须留在同一原始里程计坐标。
+                let pose = Isometry3::translation(sequence as f64 * 0.1, 0.0, 0.0);
+                let mut adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
+                // Registration correction moves, but motion evidence stays in raw odometry.
                 let anchor = Isometry3::translation(sequence as f64 * 2.0, -1.0, 0.3);
-                let map_points = world_points.iter().map(|point| anchor * point).collect::<Vec<_>>();
-                let origin_map = anchor * Point3::from(ORIGIN);
-                let binding = crate::lio_ingress::RegistrationBinding {
-                    runtime_generation: 1, cloud_source_sequence: sequence as i64,
-                    correlated_odometry: crate::lio_ingress::CorrelatedOdometry {
-                        source_sequence: sequence as i64, source_timestamp_ns: (sequence * 100_000_000) as i64,
-                    },
-                    mapping_session_id: input.mapping_session_id.clone(),
-                    mapping_session_generation: input.mapping_session_generation,
-                    map_frame_generation: input.map_frame_generation,
-                    envelope_sha256: input.registered_cloud.envelope_sha256,
-                    frozen_odom_from_body: input.correlated_odom.odom_from_body,
-                    base_anchor_map_from_odom: Isometry3::identity(),
-                    registration_map_from_odom: anchor,
-                    registration_correction_revision: sequence,
-                    sensor_origin_map: Some(origin_map.coords.into()), frame_capture_relocalization_epoch: Some(0),
-                };
-                let source = crate::lio_ingress::AdmittedRegisteredScan::from_map_points_for_test(
-                    sequence * 100_000_000, binding.clone(), &map_points);
+                let mut transform = adapter.map_odom_transform_snapshot().unwrap();
+                transform.correction = anchor;
+                transform.correction_revision = sequence;
+                adapter.commit_relocalization_registration(transform);
+                let sensor_origin_body = pose.inverse() * Point3::from(ORIGIN);
+                let calibration = crate::native_lio_owner::BodyFromSensorTransform::from_json(
+                    &serde_json::json!({
+                        "translation_m": [sensor_origin_body.x, sensor_origin_body.y, sensor_origin_body.z],
+                        "rotation_row_major": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                    }).to_string(),
+                ).unwrap();
+                let ingress = crate::lio_ingress::NativeLioIngress::without_runtime(
+                    crate::lio_ingress::DeviceLioIngressSpec::new_for_backend(
+                        nuwax_codec::lcm::lio::LIO_BACKEND_FASTLIO2, 31,
+                        "robot_sensor", "robot_body", "robot_odom", "robot_map",
+                    ).unwrap(), calibration, Duration::from_millis(100),
+                ).unwrap();
+                ingress.bind_relocalization_mode_fence(Arc::new(RelocalizationModeFence::default())).unwrap();
+                let source = admit_frame_source_with_ingress(
+                    sequence, sequence * 100_000_000, sequence * 100_000_000,
+                    pose, world_points, &adapter, ingress.common_for_test(),
+                );
                 history.record(&source, sequence * 100_000_000).unwrap();
-                input.body_points = source.body_points().clone();
-                input.registered_cloud.point_count = input.body_points.len() as u64;
-                input.registered_cloud.body_points_sha256 = body_points_sha256(&input.body_points).unwrap();
+                let mut input = frame_from_admitted_source(sequence, source.clone());
                 input.static_point_indices = Some(history.static_point_indices(&source).unwrap());
                 if sequence == 7 {
                     let indices = input.static_point_indices.as_ref().unwrap();
@@ -19530,30 +18028,35 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     assert!(retained_people * 5 < people);
                     assert_eq!(retained_static, people_scan.len() - people);
                     assert!(indices.len() < threshold && input.body_points.len() > threshold);
-                    let raw_digest = input.registered_cloud.body_points_sha256;
+                    let raw_receipt = input.registered_cloud;
+                    let raw_owner = input.source_owner.clone();
                     let mut request = native_pgo_request(&owner_identity(), "robot_map", "robot_odom", "robot_body", &input).unwrap();
                     request.identity.request_sequence = 1;
                     let request = native_pgo_codec::seal_native_pgo_request(request).unwrap();
                     let wire = native_pgo_codec::encode_native_pgo_request_wire(&request).unwrap();
                     let decoded = native_pgo_codec::decode_native_pgo_request_wire(&wire).unwrap();
                     assert_eq!(decoded.identity.registered_cloud.point_count as usize, indices.len());
+                    assert_eq!(decoded.identity.registered_cloud.backend, raw_receipt.backend);
+                    assert_eq!(decoded.identity.registered_cloud.runtime_generation as u64, raw_receipt.runtime_generation);
+                    assert_eq!(decoded.identity.registered_cloud.source_sequence as u64, raw_receipt.source_sequence);
                     assert_eq!(decoded.registered_body_points_xyz,
                         input.pgo_points().unwrap().iter().flat_map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>());
-                    assert_ne!(decoded.identity.registered_cloud.body_points_sha256, raw_digest);
-                    assert_eq!(input.registered_cloud.body_points_sha256, raw_digest);
-                    static_input = Some((indices.clone(), raw_digest, source.clone()));
+                    assert_eq!(input.registered_cloud, raw_receipt);
+                    assert_eq!(input.source_owner, raw_owner);
+                    input.validate_source_ownership().unwrap();
+                    static_input = Some(source);
                 }
                 assert!(library.submit_frame(input).unwrap().is_none());
             }
             let CorrectionOwnerHandle::LibraryPgo { owner, .. } = &library else { unreachable!() };
-            // 前六帧已真实建关键帧；人体扫描过滤后低于准入点数，证明过滤发生在协调器之前。
+            // Six actual keyframes precede the filtered below-threshold people scan.
             assert_eq!(owner.coordinator.graph().nodes.len(), 6);
-            assert!(static_input.is_some());
-            let last_source = static_input.unwrap().2;
-            let mut wrong_binding = last_source.binding().clone();
-            wrong_binding.envelope_sha256 = [0; 32];
-            let wrong_source = crate::lio_ingress::AdmittedRegisteredScan::from_map_points_for_test(
-                700_000_000, wrong_binding, &people_scan);
+            let last_source = static_input.expect("last admitted static selection");
+            let adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
+            let wrong_source = admit_frame_source(
+                8, 700_000_000, 700_000_000, Isometry3::identity(), people_scan,
+                &adapter, Arc::new(RelocalizationModeFence::default()),
+            );
             assert!(history.static_point_indices(&wrong_source).is_err());
             history.clear();
             assert!(history.static_point_indices(&last_source).is_err());
@@ -19563,15 +18066,24 @@ assert candidate.occupancy_revision != candidate.cloud_revision
         fn static_selection_rejects_invalid_source_and_indices_before_resetting_owner() {
             let mut library = CorrectionOwnerHandle::start(transport_library_spec(), owner_identity()).unwrap();
             library.submit_frame(frame(1, 1_000_000_000, 0.0)).unwrap();
+            let mut adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
+            adapter.stop_session("mapping-session-owner").unwrap();
+            adapter.start_session("mapping-session-newer", "newer-map").unwrap();
+            establish_frame_source_anchor(&mut adapter, Isometry3::identity());
             for indices in [vec![1, 1], vec![u32::MAX], vec![2, 1]] {
-                let mut input = frame(2, 2_000_000_000, 1.0);
-                input.mapping_session_generation += 1;
-                input.map_frame_generation += 1;
+                let pose = Isometry3::translation(1.0, 0.0, 0.0);
+                let mut input = frame_from_admitted_source(2, admit_frame_source(
+                    2, 2_000_000_000, 2_000_000_000, pose,
+                    asymmetric_cloud().iter().map(|point| pose * point).collect(),
+                    &adapter, Arc::new(RelocalizationModeFence::default()),
+                ));
+                input.validate_source_ownership().unwrap();
+                assert!(input.mapping_session_generation > 1);
                 input.static_point_indices = Some(indices.into());
                 assert!(native_pgo_request(&owner_identity(), "robot_map", "robot_odom", "robot_body", &input).is_err());
                 assert_eq!(library.submit_frame(input), Err(CorrectionOwnerError::InvalidRegisteredCloudProof));
                 let CorrectionOwnerHandle::LibraryPgo { owner, .. } = &library else { unreachable!() };
-                assert_eq!(owner.session.as_ref().unwrap().mapping_session_generation, 23);
+                assert_eq!(owner.session.as_ref().unwrap().mapping_session_generation, 1);
                 assert_eq!(owner.coordinator.graph().nodes.len(), 1);
             }
             let mut input = frame(2, 2_000_000_000, 1.0);
@@ -19604,12 +18116,12 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 input.mapping_commit_id.boot_nonce.to_be_bytes()
             );
             assert_eq!(
-                request.identity.committed_map.payload_sha256,
-                input.committed_map.payload_sha256
+                request.identity.mapping_backend_kind,
+                input.committed_map.backend_kind.stable_name()
             );
             assert_eq!(
-                request.identity.committed_map.boundary_sha256,
-                input.committed_map.boundary_sha256
+                request.identity.mapping_backend_generation as u64,
+                input.committed_map.backend_generation
             );
             assert_eq!(
                 request.identity.correction_lease.boot_nonce,
@@ -19627,17 +18139,18 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     .flat_map(|point| [point.x, point.y, point.z])
                     .collect::<Vec<_>>()
             );
-            assert_eq!(
-                &request.committed_map_occupancy[..4],
-                &[0_i8, 20_i8, 80_i8, -1_i8]
-            );
-            assert_eq!(
-                request.committed_map_cell_count as usize,
-                input.committed_map_occupancy.len()
-            );
-            assert_eq!(request.frozen_odom_translation_m, [0.25, 0.0, 0.0]);
-            assert_eq!(request.frozen_odom_rotation_xyzw, [0.0, 0.0, 0.0, 1.0]);
-            assert_eq!(request.request_payload_sha256, [0; 32]);
+            assert_eq!(request.identity.committed_map.width as u64, input.committed_map.width);
+            assert_eq!(request.identity.committed_map.height as u64, input.committed_map.height);
+            assert_eq!(request.identity.committed_map.resolution_m.to_bits(), input.committed_map.resolution_m.to_bits());
+            assert_eq!(request.identity.committed_map.origin_x_m.to_bits(), input.committed_map.origin_x_m.to_bits());
+            assert_eq!(request.identity.committed_map.origin_y_m.to_bits(), input.committed_map.origin_y_m.to_bits());
+            assert_eq!(request.identity.registered_cloud.backend, input.registered_cloud.backend);
+            assert_eq!(request.identity.registered_cloud.runtime_generation as u64, input.registered_cloud.runtime_generation);
+            assert_ne!(request.identity.registered_cloud.runtime_generation, request.identity.runtime_generation);
+            assert_eq!(request.identity.correlated_odom.translation_m, [0.25, 0.0, 0.0]);
+            assert_eq!(request.identity.correlated_odom.rotation_xyzw, [0.0, 0.0, 0.0, 1.0]);
+            assert_eq!(request.identity.correlated_odom.source_sequence as u64, input.correlated_odom.proof.source_sequence);
+            assert_eq!(request.identity.correlated_odom.source_timestamp_ns as u64, input.correlated_odom.proof.source_timestamp_ns);
         }
 
         #[derive(Default)]
@@ -19833,11 +18346,12 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             assert!(owner.binding().is_none());
             let ingress = owner.ingress();
 
-            let mut rejected = frame(1, 1_000_000_000, 0.0);
-            rejected.body_points = rejected.body_points.edited_for_test(|points| points.truncate(3));
-            rejected.registered_cloud.point_count = rejected.body_points.len() as u64;
-            rejected.registered_cloud.body_points_sha256 =
-                body_points_sha256(&rejected.body_points).unwrap();
+            let adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
+            let rejected = frame_from_admitted_source(1, admit_frame_source(
+                1, 1_000_000_000, 1_000_000_000, Isometry3::identity(),
+                asymmetric_cloud().into_iter().take(3).collect(), &adapter,
+                ingress.relocalization_mode_fence(),
+            ));
             match ingress.submit(rejected).await.unwrap() {
                 CorrectionSubmitDisposition::Rejected {
                     reason_code,
@@ -19864,16 +18378,16 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 .submit(frame(4, 124_000_000_000, 0.2))
                 .await
                 .expect("native correction request");
-            let (candidate_sequence, payload_sha256) = match processed {
+            let (candidate_sequence, processed_candidate) = match processed {
                 CorrectionSubmitDisposition::CandidateProcessed {
                     candidate_sequence,
-                    payload_sha256,
+                    candidate,
                     disposition: CorrectionDisposition::Applied,
-                } => (candidate_sequence, payload_sha256),
+                } => (candidate_sequence, candidate),
                 disposition => panic!("expected applied native candidate, got {disposition:?}"),
             };
             assert_eq!(candidate_sequence, 4);
-            assert_ne!(payload_sha256, [0; 32]);
+            assert_eq!(CandidateApplyKey::from(&processed_candidate).candidate_sequence, candidate_sequence);
             {
                 let applied = sink.applied.lock();
                 assert_eq!(applied.len(), 1);
@@ -19882,7 +18396,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     CorrectionCandidateBackend::NativePgo
                 );
                 assert_eq!(applied[0].identity.candidate_sequence, candidate_sequence);
-                assert_eq!(applied[0].payload_sha256, payload_sha256);
+                assert_eq!(applied[0], processed_candidate);
                 applied[0].validate_integrity().unwrap();
             }
             assert_eq!(*sink.discarded.lock(), vec![1, 2, 3]);
@@ -20211,14 +18725,13 @@ assert candidate.occupancy_revision != candidate.cloud_revision
         ) {
             for delivered in [true, false] {
                 let cancellation = CorrectionRequestCancellation::for_background_mapping();
-                let key = CandidateApplyKey {
-                    candidate_sequence: 1,
-                    payload_sha256: [7; 32],
-                };
+                let candidate = sample_candidate(1, 100);
+            let key = CandidateApplyKey::from(&candidate);
                 let waiters = CandidateApplyWaiters::default();
                 let receiver = waiters
                     .register(
                         key,
+                        candidate.clone(),
                         Arc::new(CorrectionRequestLease::new(cancellation.clone(), None)),
                     )
                     .unwrap();
@@ -20259,14 +18772,13 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             }
             let cancellation = CorrectionRequestCancellation::for_background_mapping();
             cancellation.begin_background_preparation();
-            let key = CandidateApplyKey {
-                candidate_sequence: 2,
-                payload_sha256: [8; 32],
-            };
+            let candidate = sample_candidate(2, 100);
+            let key = CandidateApplyKey::from(&candidate);
             let waiters = CandidateApplyWaiters::default();
             let receiver = waiters
                 .register(
                     key,
+                    candidate.clone(),
                     Arc::new(CorrectionRequestLease::new(cancellation.clone(), None)),
                 )
                 .unwrap();
@@ -20402,19 +18914,16 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                         cancellation,
                         Some(lifecycle.clone().lock_owned().await),
                     ));
-                    let key = CandidateApplyKey {
-                        candidate_sequence: candidate.identity.candidate_sequence,
-                        payload_sha256: candidate.payload_sha256,
-                    };
-                    let apply_rx = waiters.register(key, lease).unwrap();
+                    let key = CandidateApplyKey::from(&candidate);
+                    let apply_rx = waiters.register(key, candidate.clone(), lease).unwrap();
                     let (outcome, outcome_rx) = oneshot::channel();
                     finalizer
                         .ingress
                         .sender
                         .send(CanonicalFinalizerJob {
                             key,
-                            candidate,
-                            lease: waiters.claim_apply(key).unwrap(),
+                            candidate: candidate.clone(),
+                            lease: waiters.claim_apply(key, &candidate).unwrap(),
                             release_lease_on_completion: true,
                             outcome,
                         })
@@ -20591,6 +19100,70 @@ assert candidate.occupancy_revision != candidate.cloud_revision
         }
 
         #[tokio::test]
+        async fn staged_frame_exact_replay_rejects_changed_bytes_and_conflicting_discard() {
+            let sink = GeometryCorrectionSink::new(
+                owner_identity(), "robot_map", "robot_odom", "robot_body",
+                Arc::new(RecordingCanonicalApplier::new(false)),
+            ).unwrap();
+            let input = frame(1, 100, 0.0);
+            let source_liveness = input.source_owner.retention_probe_for_test();
+            sink.stage_frame(&input).await.unwrap();
+            let staged_owner = {
+                let state = sink.state.lock().await;
+                let staged = state.staged.as_ref().unwrap();
+                assert_eq!(staged.input.body_points.as_ptr(), input.body_points.as_ptr());
+                assert!(Arc::ptr_eq(&staged.input.committed_map_occupancy, &input.committed_map_occupancy));
+                Arc::clone(&staged.input)
+            };
+            sink.stage_frame(&input.clone()).await.unwrap();
+            assert!(Arc::ptr_eq(&staged_owner, &sink.state.lock().await.staged.as_ref().unwrap().input));
+            let mut changed = input.clone();
+            let mut occupancy = input.committed_map_occupancy.to_vec();
+            occupancy[0] ^= 1;
+            changed.committed_map_occupancy = Arc::from(occupancy);
+            changed.validate_source_ownership().unwrap();
+            assert_eq!(changed.mapping_commit_id, input.mapping_commit_id);
+            assert_eq!(changed.committed_map, input.committed_map);
+            assert!(sink.stage_frame(&changed).await.is_err());
+            sink.discard_frame(&changed).await;
+            assert!(Arc::ptr_eq(&staged_owner, &sink.state.lock().await.staged.as_ref().unwrap().input));
+            drop(changed);
+            sink.discard_frame(&input).await;
+            assert!(sink.state.lock().await.staged.is_none());
+            drop(staged_owner);
+            drop(input);
+            assert!(!source_liveness());
+        }
+
+        #[tokio::test]
+        async fn staged_frame_discard_and_stop_release_retained_source_owners() {
+            let sink = GeometryCorrectionSink::new(
+                owner_identity(), "robot_map", "robot_odom", "robot_body",
+                Arc::new(RecordingCanonicalApplier::new(false)),
+            ).unwrap();
+            let first = frame(1, 100, 0.0);
+            let first_liveness = first.source_owner.retention_probe_for_test();
+            sink.stage_frame(&first).await.unwrap();
+            assert!(first_liveness());
+            let second = frame(2, 200, 1.0);
+            let second_liveness = second.source_owner.retention_probe_for_test();
+            assert!(sink.stage_frame(&second).await.is_err(), "a different in-flight frame cannot replace this session's staged owner");
+            sink.discard_frame(&first).await;
+            drop(first);
+            assert!(!first_liveness(), "exact discard releases the prior staged source");
+            sink.stage_frame(&second).await.unwrap();
+            let candidate = candidate_for_frame(&second, 1, Isometry3::identity());
+            assert_eq!(sink.apply_candidate(candidate, CorrectionRequestCancellation::new()).await.unwrap(),
+                CorrectionDisposition::Applied);
+            drop(second);
+            assert!(second_liveness(), "only the last-applied slot retains this source");
+            sink.stop().await;
+            assert!(!second_liveness(), "stop drops the last-applied owner too");
+            let state = sink.state.lock().await;
+            assert!(state.staged.is_none() && state.in_flight.is_none() && state.last_applied.is_none());
+        }
+
+        #[tokio::test]
         async fn canonical_transaction_uses_nonzero_anchor_and_absolute_c_without_accumulation() {
             let applier = Arc::new(RecordingCanonicalApplier::new(false));
             let sink = GeometryCorrectionSink::new(
@@ -20603,8 +19176,9 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             .unwrap();
             let base_anchor = Isometry3::from_parts(
                 Translation3::new(8.0, -3.0, 1.5),
-                UnitQuaternion::from_euler_angles(0.2, -0.15, 0.4),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, 0.4),
             );
+            let adapter = frame_source_adapter("mapping-session-owner", base_anchor);
             let correction_one = Isometry3::from_parts(
                 Translation3::new(-0.6, 0.2, 0.4),
                 UnitQuaternion::from_euler_angles(-0.1, 0.25, -0.3),
@@ -20614,8 +19188,10 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 UnitQuaternion::from_euler_angles(0.35, -0.2, 0.15),
             );
 
-            let mut first_input = frame(1, 100, 0.0);
-            first_input.base_anchor_map_from_odom = base_anchor;
+            let first_input = frame_from_admitted_source(1, admit_frame_source(
+                1, 100, 100, Isometry3::identity(), asymmetric_cloud(),
+                &adapter, Arc::new(RelocalizationModeFence::default()),
+            ));
             let first_candidate = candidate_for_frame(&first_input, 1, correction_one);
             sink.stage_frame(&first_input).await.unwrap();
             assert_eq!(
@@ -20625,10 +19201,14 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 CorrectionDisposition::Applied
             );
 
-            let mut second_input = frame(2, 200, 1.0);
-            second_input.base_anchor_map_from_odom = base_anchor;
+            let second_pose = Isometry3::translation(1.0, 0.0, 0.0);
+            let mut second_input = frame_from_admitted_source(2, admit_frame_source(
+                2, 200, 150, second_pose,
+                asymmetric_cloud().iter().map(|point| second_pose * point).collect(),
+                &adapter, Arc::new(RelocalizationModeFence::default()),
+            ));
             second_input.cloud_revision = 42;
-            second_input.correlated_odom.proof.source_timestamp_ns = 150;
+            second_input.cloud_receipt.cloud_revision = 42;
             let second_candidate = candidate_for_frame(&second_input, 2, correction_two);
             sink.stage_frame(&second_input).await.unwrap();
             assert_eq!(
@@ -20687,6 +19267,56 @@ assert candidate.occupancy_revision != candidate.cloud_revision
         }
 
         #[tokio::test]
+        async fn lower_level_canonical_stage_preserves_full_se3_anchor_pose_and_trajectory() {
+            let applier = Arc::new(RecordingCanonicalApplier::new(false));
+            let sink = GeometryCorrectionSink::new(
+                owner_identity(), "robot_map", "robot_odom", "robot_body", applier.clone(),
+            ).unwrap();
+            let adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
+            let frozen_pose = Isometry3::from_parts(
+                Translation3::new(1.2, -0.6, 0.4),
+                UnitQuaternion::from_euler_angles(0.15, -0.25, 0.35),
+            );
+            let input = frame_from_admitted_source(1, admit_frame_source(
+                1, 100, 90, frozen_pose,
+                asymmetric_cloud().iter().map(|point| frozen_pose * point).collect(),
+                &adapter, Arc::new(RelocalizationModeFence::default()),
+            ));
+            let full_anchor = Isometry3::from_parts(
+                Translation3::new(8.0, -3.0, 1.5),
+                UnitQuaternion::from_euler_angles(0.2, -0.15, 0.4),
+            );
+            let correction = Isometry3::from_parts(
+                Translation3::new(-0.6, 0.2, 0.4),
+                UnitQuaternion::from_euler_angles(-0.1, 0.25, -0.3),
+            );
+            let proposal = candidate_for_frame(&input, 1, correction);
+            let trajectory = candidate_owner_test_trajectory();
+            let candidate = CorrectionCandidate::seal_with_trajectory(
+                proposal.identity.clone(), proposal.transform, trajectory.clone(),
+            ).unwrap();
+            sink.stage_frame(&input).await.unwrap();
+            // Isolate the canonical stage's generic SE3 composition contract.
+            // Real registration above remains yaw-anchor-only; this controlled
+            // internal stage substitution is not an ingress integration claim.
+            sink.state.lock().await.staged.as_mut().unwrap().base_anchor_map_from_odom = full_anchor;
+            assert_eq!(sink.apply_candidate(candidate.clone(), CorrectionRequestCancellation::new()).await.unwrap(),
+                CorrectionDisposition::Applied);
+            let transactions = applier.transactions().await;
+            let transaction = &transactions[0];
+            assert!(transaction.matches_candidate_owner());
+            assert_eq!(transaction.candidate, candidate);
+            assert_isometry_close(&transaction.base_anchor_map_from_odom, &full_anchor);
+            assert_isometry_close(&transaction.effective_map_from_odom, &(full_anchor * correction));
+            assert_isometry_close(&transaction.frozen_odom_from_body, &input.correlated_odom.odom_from_body);
+            assert_eq!(transaction.frozen_odom_source_timestamp_ns, 90);
+            assert_eq!(transaction.trajectory, trajectory);
+            assert!((transaction.effective_map_from_odom.translation.vector
+                - (correction * full_anchor).translation.vector).norm() > 0.1);
+            input.validate_source_ownership().unwrap();
+        }
+
+        #[tokio::test]
         async fn canonical_transaction_rejects_identity_mismatch_and_abort_allows_exact_retry() {
             let applier = Arc::new(RecordingCanonicalApplier::new(true));
             let sink = GeometryCorrectionSink::new(
@@ -20697,8 +19327,11 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 applier.clone(),
             )
             .unwrap();
-            let mut input = frame(1, 100, 0.0);
-            input.base_anchor_map_from_odom = Isometry3::translation(5.0, 1.0, -2.0);
+            let adapter = frame_source_adapter("mapping-session-owner", Isometry3::translation(5.0, 1.0, -2.0));
+            let input = frame_from_admitted_source(1, admit_frame_source(
+                1, 100, 100, Isometry3::identity(), asymmetric_cloud(),
+                &adapter, Arc::new(RelocalizationModeFence::default()),
+            ));
             let candidate = candidate_for_frame(
                 &input,
                 1,
@@ -21171,7 +19804,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 .0
                 .channel()
                 .ends_with(&owner_identity().runtime_generation.to_string()));
-            assert_eq!(binding.1.fingerprint(), CORRECTION_CANDIDATE_FINGERPRINT_V2);
+            assert_eq!(binding.1.fingerprint(), CORRECTION_CANDIDATE_FINGERPRINT_V3);
 
             let ingress = owner.ingress();
             assert!(ingress.is_open());
@@ -21195,7 +19828,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 processed,
                 CorrectionSubmitDisposition::CandidateProcessed {
                     candidate_sequence: candidate.identity.candidate_sequence,
-                    payload_sha256: candidate.payload_sha256,
+                    candidate: candidate.clone(),
                     disposition: CorrectionDisposition::Applied,
                 }
             );
@@ -21539,6 +20172,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             assert!(library.submit_frame(frame(1, 0, 0.0)).unwrap().is_none());
             let mut wrong_namespace = frame(2, 10_000_000_000, 2.0);
             wrong_namespace.mapping_commit_id.boot_nonce += 1;
+            wrong_namespace.cloud_receipt.commit_id.boot_nonce = wrong_namespace.mapping_commit_id.boot_nonce;
             assert_eq!(
                 library.submit_frame(wrong_namespace),
                 Err(CorrectionOwnerError::MappingCommitNamespaceChanged)
@@ -21548,7 +20182,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 Isometry3::translation(3.0, 0.0, 0.0);
             assert_eq!(
                 library.submit_frame(changed_odom_after_proof),
-                Err(CorrectionOwnerError::InvalidCorrelatedOdomProof)
+                Err(CorrectionOwnerError::InvalidRegisteredCloudProof)
             );
             assert!(library
                 .submit_frame(frame(2, 10_000_000_000, 2.0))
@@ -21597,8 +20231,9 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let world = asymmetric_cloud();
             let anchor = Isometry3::from_parts(
                 Translation3::new(3.0, -2.0, 0.5),
-                UnitQuaternion::from_euler_angles(0.1, -0.2, 0.3),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, 0.3),
             );
+            let adapter = frame_source_adapter("mapping-session-owner", anchor);
             let mut effective = anchor;
             for (sequence, seconds, pose) in [
                 (1, 0, Isometry3::identity()),
@@ -21628,13 +20263,10 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     ),
                 ),
             ] {
-                let mut input = frame(sequence, seconds * 1_000_000_000, 0.0);
-                input.body_points = world.iter().map(|point| pose.inverse() * point).collect();
-                input.registered_cloud.body_points_sha256 =
-                    body_points_sha256(&input.body_points).unwrap();
-                input.correlated_odom.odom_from_body = pose;
-                input.correlated_odom.proof.pose_sha256 = odom_pose_sha256(&pose).unwrap();
-                input.base_anchor_map_from_odom = anchor;
+                let input = frame_from_admitted_source(sequence, admit_frame_source(
+                    sequence, seconds * 1_000_000_000, seconds * 1_000_000_000,
+                    pose, world.clone(), &adapter, Arc::new(RelocalizationModeFence::default()),
+                ));
                 // 对照原建图锚点与拥有方候选的公共位姿解释，保留上一校正以覆盖持续偏移。
                 if let Some(candidate) = library.submit_frame(input).unwrap() {
                     let q = candidate.transform.rotation_xyzw;
@@ -21674,16 +20306,28 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 .unwrap()
                 .expect("first session loop candidate");
             assert_eq!(first_candidate.identity.candidate_sequence, 1);
-            assert_eq!(first_candidate.identity.mapping_session_generation, 23);
+            assert_eq!(first_candidate.identity.mapping_session_generation, 1);
 
+            let mut adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
+            adapter.stop_session("mapping-session-owner").unwrap();
+            adapter.start_session("mapping-session-restarted", "restarted-map").unwrap();
+            establish_frame_source_anchor(&mut adapter, Isometry3::identity());
+            let restarted_generation = adapter.snapshot().session_generation;
+            let restarted_frame_generation = adapter.global_frame_generation();
             let restarted_frame = |sequence: u64, timestamp_ns: u64, x: f64| {
-                let mut input = frame(sequence, timestamp_ns, x);
-                input.mapping_session_id = "mapping-session-restarted".into();
-                input.mapping_session_generation = 24;
-                input.map_frame_generation = 26;
+                let pose = Isometry3::translation(x, 0.0, 0.0);
+                let odom_points = asymmetric_cloud().iter()
+                    .map(|point| pose * Point3::from(point.coords * 3.0)).collect();
+                let mut input = frame_from_admitted_source(sequence, admit_frame_source(
+                    sequence, timestamp_ns, timestamp_ns, pose, odom_points,
+                    &adapter, Arc::new(RelocalizationModeFence::default()),
+                ));
                 input.mapping_commit_id.boot_nonce = COMMIT_NONCE + 1;
                 input.occupancy_revision = sequence;
-                input.cloud_revision = sequence;
+                input.cloud_receipt.commit_id = input.mapping_commit_id;
+                input.cloud_receipt.occupancy_revision = sequence;
+                input.committed_map.backend_generation = adapter.backend_checkpoint_client().unwrap().backend_generation();
+                input.validate_source_ownership().unwrap();
                 input
             };
             assert!(library
@@ -21707,8 +20351,8 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 restarted_candidate.identity.mapping_session_id,
                 "mapping-session-restarted"
             );
-            assert_eq!(restarted_candidate.identity.mapping_session_generation, 24);
-            assert_eq!(restarted_candidate.identity.map_frame_generation, 26);
+            assert_eq!(restarted_candidate.identity.mapping_session_generation, restarted_generation);
+            assert_eq!(restarted_candidate.identity.map_frame_generation, restarted_frame_generation);
             assert_eq!(
                 restarted_candidate.identity.mapping_commit_id.boot_nonce,
                 COMMIT_NONCE + 1
@@ -21732,14 +20376,14 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             );
 
             let mut wrong_boundary = candidate.identity.clone();
-            wrong_boundary.committed_map.boundary_sha256[0] ^= 1;
+            wrong_boundary.committed_map.backend_generation = 0;
             assert_eq!(
                 CorrectionCandidate::seal(wrong_boundary, candidate.transform),
-                Err(CorrectionRejectReason::MapBoundaryHashMismatch)
+                Err(CorrectionRejectReason::InvalidCommittedMapProof)
             );
 
             let mut missing_cloud_proof = candidate.identity.clone();
-            missing_cloud_proof.registered_cloud.envelope_sha256 = [0; 32];
+            missing_cloud_proof.registered_cloud.runtime_generation = 0;
             assert_eq!(
                 CorrectionCandidate::seal(missing_cloud_proof, candidate.transform),
                 Err(CorrectionRejectReason::InvalidRegisteredCloudProof)
@@ -21747,18 +20391,48 @@ assert candidate.occupancy_revision != candidate.cloud_revision
         }
 
         #[test]
+        fn generated_python_v3_fixtures_match_complete_wire_both_directions() {
+            // Serialized by the checked-in actual lcm-gen 1.5.2 Python class,
+            // independently of this Rust encoder; generator is beside fixtures.
+            for (candidate, generated_hex, expected_len) in [
+                (sample_candidate(1, 100),
+                    include_str!("../tests/fixtures/correction_candidate_v3_generated.hex"), 447),
+                (candidate_owner_test_candidate(),
+                    include_str!("../tests/fixtures/correction_candidate_v3_generated_trajectory.hex"), 575),
+            ] {
+                let hex = generated_hex.trim();
+                assert_eq!(hex.len() % 2, 0);
+                let generated_wire = hex.as_bytes().chunks_exact(2).map(|pair| {
+                    u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
+                }).collect::<Vec<_>>();
+                assert_eq!(generated_wire.len(), expected_len);
+                assert_eq!(&generated_wire[..8], &CORRECTION_CANDIDATE_FINGERPRINT_V3);
+                assert_eq!(candidate.encode_wire().unwrap(), generated_wire);
+                assert_eq!(candidate.encode_body().unwrap(), &generated_wire[8..]);
+                let decoded = CorrectionCandidate::decode_wire(&generated_wire).unwrap();
+                assert_eq!(decoded, candidate);
+                assert_eq!(decoded.encode_wire().unwrap(), generated_wire);
+                assert_eq!(CorrectionCandidate::decode_body(&generated_wire[8..]).unwrap(), candidate);
+            }
+        }
+
+        #[test]
         fn generated_schema_wire_roundtrip_and_hostile_bytes_are_rejected() {
             let candidate = sample_candidate(1, 100);
             let body = candidate.encode_body().expect("encode candidate body");
             let encoded = candidate.encode_wire().expect("encode candidate");
-            assert_eq!(&encoded[..8], &CORRECTION_CANDIDATE_FINGERPRINT_V2);
+            assert_eq!(&encoded[..8], &CORRECTION_CANDIDATE_FINGERPRINT_V3);
             assert_eq!(&encoded[8..], body);
-            assert_ne!(&body[..8], &CORRECTION_CANDIDATE_FINGERPRINT_V2);
-            assert_eq!(candidate.payload_sha256, GENERATED_PAYLOAD_SHA256);
-            assert_eq!(body.len(), 545);
-            assert_eq!(encoded.len(), 553);
-            assert_eq!(sha256_bytes(&body), GENERATED_BODY_SHA256);
-            assert_eq!(sha256_bytes(&encoded), GENERATED_WIRE_SHA256);
+            assert_ne!(&body[..8], &CORRECTION_CANDIDATE_FINGERPRINT_V3);
+            assert_eq!(encoded.len(), body.len() + 8);
+            assert_eq!(&body[..4], &3_i32.to_be_bytes());
+            for old_version in [1_i32, 2_i32] {
+                let mut legacy = body.clone();
+                legacy[..4].copy_from_slice(&old_version.to_be_bytes());
+                assert!(matches!(CorrectionCandidate::decode_body(&legacy),
+                    Err(CorrectionWireError::Invalid(detail))
+                        if detail == format!("unsupported correction schema version {old_version}")));
+            }
             assert_eq!(CorrectionCandidate::decode_body(&body).unwrap(), candidate);
             assert_eq!(
                 CorrectionCandidate::decode_wire(&encoded).unwrap(),
@@ -21771,14 +20445,15 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let mut unsupported_semantics = encoded.clone();
             unsupported_semantics[16..20].copy_from_slice(&2_i32.to_be_bytes());
             assert!(CorrectionCandidate::decode_wire(&unsupported_semantics).is_err());
-            let mut double_fingerprint = CORRECTION_CANDIDATE_FINGERPRINT_V2.to_vec();
+            let mut double_fingerprint = CORRECTION_CANDIDATE_FINGERPRINT_V3.to_vec();
             double_fingerprint.extend_from_slice(&encoded);
             assert!(CorrectionCandidate::decode_wire(&double_fingerprint).is_err());
             assert!(CorrectionCandidate::decode_wire(&body).is_err());
             assert!(CorrectionCandidate::decode_body(&encoded).is_err());
-            let mut bad_hash = encoded.clone();
-            *bad_hash.last_mut().unwrap() ^= 1;
-            assert!(CorrectionCandidate::decode_wire(&bad_hash).is_err());
+            let mut invalid_trajectory_count = encoded.clone();
+            let count_offset = invalid_trajectory_count.len() - 4;
+            invalid_trajectory_count[count_offset..].copy_from_slice(&(-1_i32).to_be_bytes());
+            assert!(CorrectionCandidate::decode_wire(&invalid_trajectory_count).is_err());
             let mut trailing = encoded.clone();
             trailing.push(0);
             assert!(matches!(
@@ -21804,7 +20479,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let message_type = LcmMessageType::new(CORRECTION_CANDIDATE_MESSAGE_TYPE).unwrap();
             assert_eq!(
                 message_type.fingerprint(),
-                CORRECTION_CANDIDATE_FINGERPRINT_V2
+                CORRECTION_CANDIDATE_FINGERPRINT_V3
             );
             let mut subscription = subscriber
                 .subscribe_owned(topic.clone(), Some(message_type.clone()))
@@ -21829,7 +20504,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 candidate
             );
             assert_eq!(received.payload, candidate.encode_body().unwrap());
-            let mut generated_wire = CORRECTION_CANDIDATE_FINGERPRINT_V2.to_vec();
+            let mut generated_wire = CORRECTION_CANDIDATE_FINGERPRINT_V3.to_vec();
             generated_wire.extend_from_slice(&received.payload);
             assert_eq!(generated_wire, candidate.encode_wire().unwrap());
             assert_fresh_lcm_gen_decodes(&generated_wire);
@@ -21914,11 +20589,9 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let (phase_a, waiters) = phase_a_fixture();
             let cancellation = CorrectionRequestCancellation::new();
             let lease = Arc::new(CorrectionRequestLease::new(cancellation.clone(), None));
-            let key = CandidateApplyKey {
-                candidate_sequence: 1,
-                payload_sha256: [0x11; 32],
-            };
-            let apply_rx = waiters.register(key, lease).expect("admitted exact waiter");
+            let candidate = sample_candidate(1, 100);
+            let key = CandidateApplyKey::from(&candidate);
+            let apply_rx = waiters.register(key, candidate.clone(), lease).expect("admitted exact waiter");
 
             phase_a.begin();
             phase_a.begin();
@@ -21927,10 +20600,8 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             assert!(cancellation.is_cancelled());
             assert!(waiters
                 .register(
-                    CandidateApplyKey {
-                        candidate_sequence: 2,
-                        payload_sha256: [0x22; 32],
-                    },
+                    CandidateApplyKey::from(&sample_candidate(2, 101)),
+                    sample_candidate(2, 101),
                     Arc::new(CorrectionRequestLease::new(
                         CorrectionRequestCancellation::new(),
                         None,
@@ -21949,14 +20620,12 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let (phase_a, waiters) = phase_a_fixture();
             let cancellation = CorrectionRequestCancellation::new();
             let lease = Arc::new(CorrectionRequestLease::new(cancellation.clone(), None));
-            let key = CandidateApplyKey {
-                candidate_sequence: 1,
-                payload_sha256: [0x33; 32],
-            };
+            let candidate = sample_candidate(1, 100);
+            let key = CandidateApplyKey::from(&candidate);
             let apply_rx = waiters
-                .register(key, Arc::clone(&lease))
+                .register(key, candidate.clone(), Arc::clone(&lease))
                 .expect("admitted exact waiter");
-            let claimed = waiters.claim_apply(key).expect("claimed waiter lease");
+            let claimed = waiters.claim_apply(key, &candidate).expect("claimed waiter lease");
 
             phase_a.begin();
 
@@ -21995,14 +20664,11 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let cancellation = CorrectionRequestCancellation::new();
             let operation = cancellation.operation();
             let lease = Arc::new(CorrectionRequestLease::new(cancellation, None));
-            let key = CandidateApplyKey {
-                candidate_sequence: candidate.identity.candidate_sequence,
-                payload_sha256: candidate.payload_sha256,
-            };
+            let key = CandidateApplyKey::from(&candidate);
             let apply_rx = waiters
-                .register(key, Arc::clone(&lease))
+                .register(key, candidate.clone(), Arc::clone(&lease))
                 .expect("admitted exact waiter");
-            let claimed = waiters.claim_apply(key).expect("claimed waiter lease");
+            let claimed = waiters.claim_apply(key, &candidate).expect("claimed waiter lease");
             let (outcome, outcome_rx) = oneshot::channel();
             finalizer
                 .ingress()
@@ -22169,13 +20835,10 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 cancellation.clone(),
                 Some(guard),
             ));
-            let key = CandidateApplyKey {
-                candidate_sequence: candidate.identity.candidate_sequence,
-                payload_sha256: candidate.payload_sha256,
-            };
+            let key = CandidateApplyKey::from(&candidate);
             let waiters = Arc::new(CandidateApplyWaiters::default());
-            let apply_rx = waiters.register(key, Arc::clone(&lease)).unwrap();
-            let claimed_lease = waiters.claim_apply(key).unwrap();
+            let apply_rx = waiters.register(key, candidate.clone(), Arc::clone(&lease)).unwrap();
+            let claimed_lease = waiters.claim_apply(key, &candidate).unwrap();
             let (outcome, outcome_rx) = oneshot::channel();
             let sink_trait: Arc<dyn CorrectionCandidateSink> = sink.clone();
             let error = run_canonical_finalizer_job(
@@ -22228,13 +20891,10 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let cancellation = CorrectionRequestCancellation::with_fail_stop(hook);
             let operation = cancellation.operation();
             let lease = Arc::new(CorrectionRequestLease::new(cancellation, None));
-            let key = CandidateApplyKey {
-                candidate_sequence: candidate.identity.candidate_sequence,
-                payload_sha256: candidate.payload_sha256,
-            };
+            let key = CandidateApplyKey::from(&candidate);
             let waiters = Arc::new(CandidateApplyWaiters::default());
-            let _apply_rx = waiters.register(key, Arc::clone(&lease)).unwrap();
-            let claimed_lease = waiters.claim_apply(key).unwrap();
+            let _apply_rx = waiters.register(key, candidate.clone(), Arc::clone(&lease)).unwrap();
+            let claimed_lease = waiters.claim_apply(key, &candidate).unwrap();
             let (outcome, _outcome_rx) = oneshot::channel();
             let sink_trait: Arc<dyn CorrectionCandidateSink> = sink.clone();
             let error = run_canonical_finalizer_job(
@@ -22277,12 +20937,9 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let cancellation = CorrectionRequestCancellation::with_fail_stop(hook);
             let operation = cancellation.operation();
             let lease = Arc::new(CorrectionRequestLease::new(cancellation, None));
-            let key = CandidateApplyKey {
-                candidate_sequence: candidate.identity.candidate_sequence,
-                payload_sha256: candidate.payload_sha256,
-            };
-            let apply_rx = waiters.register(key, Arc::clone(&lease)).unwrap();
-            let claimed_lease = waiters.claim_apply(key).unwrap();
+            let key = CandidateApplyKey::from(&candidate);
+            let apply_rx = waiters.register(key, candidate.clone(), Arc::clone(&lease)).unwrap();
+            let claimed_lease = waiters.claim_apply(key, &candidate).unwrap();
             let (outcome, outcome_rx) = oneshot::channel();
             supervisor
                 .ingress()
@@ -22328,12 +20985,9 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let cancellation = CorrectionRequestCancellation::with_fail_stop(hook);
             let operation = cancellation.operation();
             let lease = Arc::new(CorrectionRequestLease::new(cancellation, None));
-            let key = CandidateApplyKey {
-                candidate_sequence: candidate.identity.candidate_sequence,
-                payload_sha256: candidate.payload_sha256,
-            };
-            let apply_rx = waiters.register(key, Arc::clone(&lease)).unwrap();
-            let claimed_lease = waiters.claim_apply(key).unwrap();
+            let key = CandidateApplyKey::from(&candidate);
+            let apply_rx = waiters.register(key, candidate.clone(), Arc::clone(&lease)).unwrap();
+            let claimed_lease = waiters.claim_apply(key, &candidate).unwrap();
             let (outcome, outcome_rx) = oneshot::channel();
             supervisor
                 .ingress()
@@ -22593,48 +21247,28 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 
         #[tokio::test]
         async fn relocalization_seventeenth_same_id_waiter_backpressures_then_replays() {
-            let phase_a = CorrectionPhaseAControl::for_tests();
-            let mut owner = RelocalizationOwnerSupervisor::start(
-                phase_a.clone(),
-                owner_identity(),
-                "robot_map".to_owned(),
-                "robot_odom".to_owned(),
-                "robot_body".to_owned(),
-            );
-            let ingress = owner.ingress();
+            let owner = CorrectionTransportOwner::start(CorrectionOwnerSpec::Relocalization {
+                map_frame_id: "robot_map".into(), odom_frame_id: "robot_odom".into(), body_frame_id: "robot_body".into(),
+            }, CorrectionOwnerRuntimeIdentity { runtime_generation: 2, ..owner_identity() }, "", Arc::new(FailingStageSink))
+                .await.unwrap();
+            let phase_a = owner.phase_a_control();
+            let ingress = owner.relocalization_ingress().unwrap();
             let mut request = relocalization_command_request("seventeenth-waiter", 7);
-            request.logical_timeout_ms = RELOCALIZATION_MIN_LOGICAL_TIMEOUT_MS;
+            relocalization_request_body(&mut request).logical_timeout_ms = RELOCALIZATION_MIN_LOGICAL_TIMEOUT_MS;
+            install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
             let mut waiters = Vec::new();
-            for _ in 0..RELOCALIZATION_MAX_WAITERS {
-                waiters.push(
-                    ingress
-                        .admit(request.clone())
-                        .await
-                        .expect("bounded waiter admits"),
-                );
-            }
+            for _ in 0..RELOCALIZATION_MAX_WAITERS { waiters.push(ingress.admit(request.clone()).await.unwrap()); }
             let pending_ingress = ingress.clone();
             let pending_request = request.clone();
-            let seventeenth =
-                tokio::spawn(async move { pending_ingress.admit(pending_request).await });
+            let seventeenth = tokio::spawn(async move { pending_ingress.admit(pending_request).await });
             tokio::task::yield_now().await;
             assert!(!seventeenth.is_finished(), "17th waiter must backpressure");
-            let seventeenth = tokio::time::timeout(Duration::from_secs(1), seventeenth)
-                .await
-                .expect("stored terminal releases waiter capacity")
-                .expect("17th admission task joins")
-                .expect("17th waiter replays instead of BUSY");
-            let terminal = seventeenth.wait().await.expect("replayed waiter terminal");
-            assert_eq!(
-                terminal.disposition,
-                crate::proto::RelocalizeDisposition::DeadlineExceeded as i32
-            );
-            phase_a.begin();
-            drop(waiters);
-            owner
-                .shutdown()
-                .await
-                .expect("ledger-only owner shuts down cleanly");
+            let seventeenth = tokio::time::timeout(Duration::from_secs(1), seventeenth).await.unwrap().unwrap().unwrap();
+            let terminal = seventeenth.wait().await.unwrap();
+            assert_eq!(relocalization_terminal_body(&terminal).disposition, crate::proto::RelocalizeDisposition::DeadlineExceeded as i32);
+            for waiter in waiters { assert_eq!(waiter.wait().await.unwrap().encode_to_vec(), terminal.encode_to_vec()); }
+            assert_eq!(ingress.waiter_capacity.available_permits(), RELOCALIZATION_MAX_WAITERS);
+            owner.shutdown().await.unwrap();
         }
 
         #[test]
@@ -22689,7 +21323,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 }
 
 pub(crate) use preflight_only_contract::{
-    body_points_sha256, expected_map_boundary_sha256, odom_pose_sha256,
+    RELOCALIZATION_MAX_TERMINAL_BYTES, RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES, RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES, RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES, RELOCALIZATION_MAX_EVIDENCE_SUFFIX_BYTES, RELOCALIZATION_MAX_EVIDENCE_DISCLOSURE_BYTES, RELOCALIZATION_MAX_FRAMES, RELOCALIZATION_MAX_PROOF_BYTES, RELOCALIZATION_MAX_AGGREGATE_POINTS, RELOCALIZATION_MAX_EMITTED_POINTS,
     relocalization_algorithm_options_sha256_v1, relocalization_deadline_policy_sha256_v1,
     relocalization_source_policy_sha256_v1, validate_relocalization_request_id,
     relocalization_source_policy_preimage_v1, relocalization_deadline_policy_preimage_v1,
@@ -22711,5 +21345,5 @@ pub(crate) use preflight_only_contract::{
 
 #[cfg(test)]
 pub(crate) use preflight_only_contract::{
-    CorrectionCandidate, CorrectionCandidateSink, CorrectionDisposition,
+    CorrectionCandidate, CorrectionCandidateIdentity, CorrectionTransform, CorrectionTransformSemantics, CorrectionCandidateSink, CorrectionDisposition,
 };

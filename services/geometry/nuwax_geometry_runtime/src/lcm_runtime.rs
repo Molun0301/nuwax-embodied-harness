@@ -4603,7 +4603,7 @@ impl GeometryCanonicalCorrectionApplier {
             return Err("canonical correction transaction identity mismatch".to_owned());
         }
         if transaction.candidate_sequence == 0
-            || transaction.payload_sha256.iter().all(|byte| *byte == 0)
+            || !transaction.matches_candidate_owner()
             || transaction.correction_revision == 0
             || transaction.mapping_commit_id.boot_nonce == 0
             || transaction.mapping_commit_id.sequence == 0
@@ -11293,20 +11293,16 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         return Err("canonical map/cloud state does not match correction receipts".to_owned());
     }
     let committed_map = crate::correction_coordinator::CommittedMapProof {
+        backend_kind: occupancy_receipt.backend_kind,
+        backend_generation: occupancy_receipt.backend_generation,
         source_timestamp_ns,
         width: u64::from(shared.map.width),
         height: u64::from(shared.map.height),
         resolution_m: f64::from(shared.map.resolution),
         origin_x_m: shared.map.origin_x,
         origin_y_m: shared.map.origin_y,
-        payload_sha256: crate::map_checksum::sha256_bytes(event.data.as_ref()),
-        boundary_sha256: [0; 32],
     };
     drop(shared);
-    let mut committed_map = committed_map;
-    committed_map.boundary_sha256 =
-        crate::correction_coordinator::expected_map_boundary_sha256(map_frame, &committed_map)
-            .map_err(|error| error.to_string())?;
     let source = accepted.scan();
     let body_points = source.body_points().clone();
     let input = crate::correction_coordinator::CorrectionFrameInput {
@@ -11315,28 +11311,13 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         mapping_commit_id: occupancy_receipt.commit_id,
         occupancy_revision: occupancy_receipt.occupancy_revision,
         cloud_revision: cloud.receipt.cloud_revision,
+        cloud_receipt: cloud.receipt.clone(),
         map_frame_generation: binding.map_frame_generation,
-        registered_cloud: crate::correction_coordinator::RegisteredCloudProof {
-            source_sequence: u64::try_from(binding.cloud_source_sequence)
-                .map_err(|_| "registered cloud sequence is negative".to_owned())?,
-            source_timestamp_ns,
-            point_count: u64::try_from(body_points.len())
-                .map_err(|_| "registered cloud point count overflow".to_owned())?,
-            envelope_sha256: binding.envelope_sha256,
-            body_points_sha256: crate::correction_coordinator::body_points_sha256(&body_points)
-                .map_err(|error| error.to_string())?,
-        },
+        registered_cloud: crate::correction_coordinator::RegisteredCloudProof::from_admitted(source)
+            .map_err(|error| error.to_string())?,
         correlated_odom: crate::correction_coordinator::FrozenCorrelatedOdom {
-            proof: crate::correction_coordinator::CorrelatedOdomProof {
-                source_sequence: u64::try_from(binding.correlated_odometry.source_sequence)
-                    .map_err(|_| "correlated odometry sequence is negative".to_owned())?,
-                source_timestamp_ns: u64::try_from(binding.correlated_odometry.source_timestamp_ns)
-                    .map_err(|_| "correlated odometry timestamp is negative".to_owned())?,
-                pose_sha256: crate::correction_coordinator::odom_pose_sha256(
-                    &binding.frozen_odom_from_body,
-                )
+            proof: crate::correction_coordinator::CorrelatedOdomProof::from_registration(binding)
                 .map_err(|error| error.to_string())?,
-            },
             odom_from_body: binding.frozen_odom_from_body,
         },
         committed_map,
@@ -11345,6 +11326,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         static_point_indices: handle.mapping_adapter.as_ref().ok_or("建图拥有方未就绪")?.lock()
             .pgo_static_point_indices(source)?,
         body_points,
+        source_owner: source.clone(),
         base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
         frame_capture_relocalization_epoch: frame_capture_epoch,
         relocalization_mode_epoch: None,
@@ -11642,20 +11624,16 @@ async fn registered_lio_correction_input(
         return Err("canonical map/cloud state does not match correction receipts".to_owned());
     }
     let committed_map = crate::correction_coordinator::CommittedMapProof {
+        backend_kind: occupancy_receipt.backend_kind,
+        backend_generation: occupancy_receipt.backend_generation,
         source_timestamp_ns,
         width: u64::from(shared.map.width),
         height: u64::from(shared.map.height),
         resolution_m: f64::from(shared.map.resolution),
         origin_x_m: shared.map.origin_x,
         origin_y_m: shared.map.origin_y,
-        payload_sha256: crate::map_checksum::sha256_bytes(event.data.as_ref()),
-        boundary_sha256: [0; 32],
     };
     drop(shared);
-    let mut committed_map = committed_map;
-    committed_map.boundary_sha256 =
-        crate::correction_coordinator::expected_map_boundary_sha256(map_frame, &committed_map)
-            .map_err(|error| error.to_string())?;
     let source = accepted.scan();
     let body_points = source.body_points().clone();
     Ok(crate::correction_coordinator::CorrectionFrameInput {
@@ -11664,28 +11642,13 @@ async fn registered_lio_correction_input(
         mapping_commit_id: occupancy_receipt.commit_id,
         occupancy_revision: occupancy_receipt.occupancy_revision,
         cloud_revision: cloud.receipt.cloud_revision,
+        cloud_receipt: cloud.receipt.clone(),
         map_frame_generation: binding.map_frame_generation,
-        registered_cloud: crate::correction_coordinator::RegisteredCloudProof {
-            source_sequence: u64::try_from(binding.cloud_source_sequence)
-                .map_err(|_| "registered cloud sequence is negative".to_owned())?,
-            source_timestamp_ns,
-            point_count: u64::try_from(body_points.len())
-                .map_err(|_| "registered cloud point count overflow".to_owned())?,
-            envelope_sha256: binding.envelope_sha256,
-            body_points_sha256: crate::correction_coordinator::body_points_sha256(&body_points)
-                .map_err(|error| error.to_string())?,
-        },
+        registered_cloud: crate::correction_coordinator::RegisteredCloudProof::from_admitted(source)
+            .map_err(|error| error.to_string())?,
         correlated_odom: crate::correction_coordinator::FrozenCorrelatedOdom {
-            proof: crate::correction_coordinator::CorrelatedOdomProof {
-                source_sequence: u64::try_from(binding.correlated_odometry.source_sequence)
-                    .map_err(|_| "correlated odometry sequence is negative".to_owned())?,
-                source_timestamp_ns: u64::try_from(binding.correlated_odometry.source_timestamp_ns)
-                    .map_err(|_| "correlated odometry timestamp is negative".to_owned())?,
-                pose_sha256: crate::correction_coordinator::odom_pose_sha256(
-                    &binding.frozen_odom_from_body,
-                )
+            proof: crate::correction_coordinator::CorrelatedOdomProof::from_registration(binding)
                 .map_err(|error| error.to_string())?,
-            },
             odom_from_body: binding.frozen_odom_from_body,
         },
         committed_map,
@@ -11694,6 +11657,7 @@ async fn registered_lio_correction_input(
         static_point_indices: handle.mapping_adapter.as_ref().ok_or("建图拥有方未就绪")?.lock()
             .pgo_static_point_indices(source)?,
         body_points,
+        source_owner: source.clone(),
         base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
         frame_capture_relocalization_epoch: frame_capture_epoch,
         relocalization_mode_epoch: None,
@@ -11786,53 +11750,36 @@ async fn registered_lio_read_only_correction_frame(
         .map(|value| *value as u8)
         .collect::<Vec<_>>()
         .into();
-    let mut committed_map = crate::correction_coordinator::CommittedMapProof {
+    let committed_map = crate::correction_coordinator::CommittedMapProof {
+        backend_kind: occupancy_receipt.backend_kind,
+        backend_generation: occupancy_receipt.backend_generation,
         source_timestamp_ns: map.timestamp_ns,
         width: u64::from(map.width),
         height: u64::from(map.height),
         resolution_m: f64::from(map.resolution),
         origin_x_m: map.origin_x,
         origin_y_m: map.origin_y,
-        payload_sha256: crate::map_checksum::sha256_bytes(committed_map_occupancy.as_ref()),
-        boundary_sha256: [0; 32],
     };
-    committed_map.boundary_sha256 =
-        crate::correction_coordinator::expected_map_boundary_sha256(map_frame, &committed_map)
-            .map_err(|error| error.to_string())?;
     let input = crate::correction_coordinator::CorrectionFrameInput {
         mapping_session_id: binding.mapping_session_id.clone(),
         mapping_session_generation: binding.mapping_session_generation,
         mapping_commit_id: occupancy_receipt.commit_id,
         occupancy_revision: occupancy_receipt.occupancy_revision,
         cloud_revision: cloud_receipt.cloud_revision,
+        cloud_receipt: cloud_receipt.clone(),
         map_frame_generation: binding.map_frame_generation,
-        registered_cloud: crate::correction_coordinator::RegisteredCloudProof {
-            source_sequence: u64::try_from(binding.cloud_source_sequence)
-                .map_err(|_| "registered cloud sequence is negative".to_owned())?,
-            source_timestamp_ns,
-            point_count: u64::try_from(body_points.len())
-                .map_err(|_| "registered cloud point count overflow".to_owned())?,
-            envelope_sha256: binding.envelope_sha256,
-            body_points_sha256: crate::correction_coordinator::body_points_sha256(&body_points)
-                .map_err(|error| error.to_string())?,
-        },
+        registered_cloud: crate::correction_coordinator::RegisteredCloudProof::from_admitted(source)
+            .map_err(|error| error.to_string())?,
         correlated_odom: crate::correction_coordinator::FrozenCorrelatedOdom {
-            proof: crate::correction_coordinator::CorrelatedOdomProof {
-                source_sequence: u64::try_from(binding.correlated_odometry.source_sequence)
-                    .map_err(|_| "correlated odometry sequence is negative".to_owned())?,
-                source_timestamp_ns: u64::try_from(binding.correlated_odometry.source_timestamp_ns)
-                    .map_err(|_| "correlated odometry timestamp is negative".to_owned())?,
-                pose_sha256: crate::correction_coordinator::odom_pose_sha256(
-                    &binding.frozen_odom_from_body,
-                )
+            proof: crate::correction_coordinator::CorrelatedOdomProof::from_registration(binding)
                 .map_err(|error| error.to_string())?,
-            },
             odom_from_body: binding.frozen_odom_from_body,
         },
         committed_map,
         committed_map_occupancy,
         points_frame_id: body_frame.to_owned(),
         body_points,
+        source_owner: source.clone(),
         static_point_indices: None,
         base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
         frame_capture_relocalization_epoch: mode_epoch,
@@ -12906,6 +12853,78 @@ mod mapping_feed_tests {
     use nalgebra::Point3;
     use nuwax_protocol::RawLcmFrame;
     use nuwax_transport::{LcmBackend, LcmFrameStream, TransportResult};
+
+    // Isolated canonical-applier fixtures still cross the real V3 candidate seal.
+    // Actual handoff fixtures supply the admitted scan and producer receipt proofs.
+    fn sealed_canonical_transaction_for_test(
+        identity: crate::correction_coordinator::CorrectionCandidateIdentity,
+        correction_revision: u64,
+        base_anchor_map_from_odom: nalgebra::Isometry3<f64>,
+        absolute_left_correction: nalgebra::Isometry3<f64>,
+        frozen_odom_from_body: nalgebra::Isometry3<f64>,
+        trajectory: Vec<nuwax_codec::lcm::native_pgo::OptimizedKeyframe>,
+    ) -> Result<
+        crate::correction_coordinator::CanonicalCorrectionTransaction,
+        crate::correction_coordinator::CorrectionRejectReason,
+    > {
+        use crate::correction_coordinator::{
+            CanonicalCorrectionTransaction, CorrectionCandidate, CorrectionTransform,
+        };
+        let q = absolute_left_correction.rotation.quaternion();
+        let transform = CorrectionTransform {
+            translation_m: absolute_left_correction.translation.vector.into(),
+            rotation_xyzw: [q.i, q.j, q.k, q.w],
+        };
+        let candidate = CorrectionCandidate::seal_with_trajectory(
+            identity.clone(), transform, trajectory.clone())?;
+        // The production canonical transaction uses this same V3 quaternion decode.
+        let absolute_left_correction = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::from(absolute_left_correction.translation.vector),
+            nalgebra::UnitQuaternion::new_normalize(*q),
+        );
+        let transaction = CanonicalCorrectionTransaction {
+            runtime_generation: identity.runtime_generation,
+            backend_generation: identity.backend_generation,
+            backend: identity.backend,
+            candidate_sequence: identity.candidate_sequence,
+            candidate,
+            correction_revision,
+            mapping_session_id: identity.mapping_session_id,
+            mapping_session_generation: identity.mapping_session_generation,
+            mapping_commit_id: identity.mapping_commit_id,
+            occupancy_revision: identity.occupancy_revision,
+            cloud_revision: identity.cloud_revision,
+            map_frame_generation: identity.map_frame_generation,
+            source_timestamp_ns: identity.source_timestamp_ns,
+            committed_map_source_timestamp_ns: identity.committed_map.source_timestamp_ns,
+            map_frame_id: identity.map_frame_id,
+            odom_frame_id: identity.odom_frame_id,
+            body_frame_id: identity.body_frame_id,
+            correction_lease: identity.correction_lease,
+            base_anchor_map_from_odom,
+            absolute_left_correction,
+            effective_map_from_odom: base_anchor_map_from_odom * absolute_left_correction,
+            frozen_odom_source_timestamp_ns: identity.correlated_odom.source_timestamp_ns,
+            frozen_odom_from_body,
+            trajectory,
+        };
+        assert!(transaction.matches_candidate_owner(), "fixture must retain its complete sealed V3 owner");
+        Ok(transaction)
+    }
+
+    fn frozen_odom_proof_for_test(
+        source_sequence: u64,
+        source_timestamp_ns: u64,
+        odom_from_body: &nalgebra::Isometry3<f64>,
+    ) -> crate::correction_coordinator::CorrelatedOdomProof {
+        let q = odom_from_body.rotation.quaternion();
+        crate::correction_coordinator::CorrelatedOdomProof {
+            source_sequence,
+            source_timestamp_ns,
+            translation_m: odom_from_body.translation.vector.into(),
+            rotation_xyzw: [q.i, q.j, q.k, q.w],
+        }
+    }
 
     #[derive(Default)]
     struct RecordingCorrectionFrameSink {
@@ -15881,35 +15900,50 @@ mod mapping_feed_tests {
             nalgebra::UnitQuaternion::from_euler_angles(0.15, -0.35, 0.6),
         );
         let effective = base_anchor * correction;
-        let transaction = crate::correction_coordinator::CanonicalCorrectionTransaction {
-            runtime_generation: identity.runtime_generation,
-            backend_generation: identity.backend_generation,
-            backend: crate::correction_coordinator::CorrectionCandidateBackend::Relocalization,
-            candidate_sequence: 1,
-            payload_sha256: [0x5a; 32],
-            correction_revision: 1,
-            mapping_session_id: "canonical-correction-session".into(),
-            mapping_session_generation: 33,
-            mapping_commit_id: crate::mapping_commit::MappingCommitId {
-                boot_nonce: 0x5678,
-                sequence: 1,
+        let transaction = sealed_canonical_transaction_for_test(
+            crate::correction_coordinator::CorrectionCandidateIdentity {
+                runtime_generation: identity.runtime_generation,
+                backend_generation: identity.backend_generation,
+                backend: crate::correction_coordinator::CorrectionCandidateBackend::Relocalization,
+                candidate_sequence: 1,
+                mapping_session_id: "canonical-correction-session".into(),
+                mapping_session_generation: 33,
+                mapping_commit_id: crate::mapping_commit::MappingCommitId {
+                    boot_nonce: 0x5678,
+                    sequence: 1,
+                },
+                occupancy_revision,
+                cloud_revision,
+                map_frame_generation: 34,
+                source_timestamp_ns,
+                map_frame_id: "robot_map".into(),
+                odom_frame_id: "robot_odom".into(),
+                body_frame_id: "robot_body".into(),
+                correction_lease: identity.correction_lease,
+                transform_semantics: crate::correction_coordinator::CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
+                points_frame_id: "robot_body".into(),
+                registered_cloud: crate::correction_coordinator::RegisteredCloudProof {
+                    backend: nuwax_codec::lcm::lio::LIO_BACKEND_DEVICE,
+                    runtime_generation: identity.runtime_generation,
+                    source_sequence: 1,
+                    source_timestamp_ns,
+                    point_count: 3,
+                },
+                correlated_odom: frozen_odom_proof_for_test(
+                    1, source_timestamp_ns, &frozen_odom),
+                committed_map: crate::correction_coordinator::CommittedMapProof {
+                    backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+                    backend_generation: 1,
+                    source_timestamp_ns,
+                    width: 1, height: 1, resolution_m: 0.1, origin_x_m: 0.0, origin_y_m: 0.0,
+                },
             },
-            occupancy_revision,
-            cloud_revision,
-            map_frame_generation: 34,
-            source_timestamp_ns,
-            committed_map_source_timestamp_ns: source_timestamp_ns,
-            map_frame_id: "robot_map".into(),
-            odom_frame_id: "robot_odom".into(),
-            body_frame_id: "robot_body".into(),
-            correction_lease: identity.correction_lease,
-            base_anchor_map_from_odom: base_anchor,
-            absolute_left_correction: correction,
-            effective_map_from_odom: effective,
-            frozen_odom_source_timestamp_ns: source_timestamp_ns,
-            trajectory: Vec::new(),
-            frozen_odom_from_body: frozen_odom,
-        };
+            1,
+            base_anchor,
+            correction,
+            frozen_odom,
+            Vec::new(),
+        ).expect("sealed V3 canonical transaction");
         let cancellation = crate::correction_coordinator::CorrectionRequestCancellation::new();
         crate::correction_coordinator::CanonicalCorrectionApplier::apply_transaction(
             &applier,
@@ -15963,10 +15997,16 @@ mod mapping_feed_tests {
         // A second relocalization uses a new cloud timestamp against the same
         // immutable map receipt.  This is legal only for relocalization; the
         // map/occupancy/cloud identities must remain exactly unchanged.
-        let mut second_relocalization = transaction.clone();
-        second_relocalization.candidate_sequence = 2;
-        second_relocalization.correction_revision = 2;
-        second_relocalization.source_timestamp_ns += 1;
+        let mut second_identity = transaction.candidate.identity().clone();
+        second_identity.candidate_sequence = 2;
+        second_identity.source_timestamp_ns += 1;
+        second_identity.registered_cloud.source_sequence += 1;
+        second_identity.registered_cloud.source_timestamp_ns = second_identity.source_timestamp_ns;
+        let second_relocalization = sealed_canonical_transaction_for_test(
+            second_identity, 2, transaction.base_anchor_map_from_odom,
+            transaction.absolute_left_correction, transaction.frozen_odom_from_body,
+            transaction.trajectory.clone(),
+        ).expect("new scan retains its exact sealed owner against the same map receipt");
         let second_cancellation =
             crate::correction_coordinator::CorrectionRequestCancellation::new();
         crate::correction_coordinator::CanonicalCorrectionApplier::apply_transaction(
@@ -16005,27 +16045,32 @@ mod mapping_feed_tests {
             transaction.source_timestamp_ns + 1
         );
 
-        let mut library_timestamp_split = second_relocalization.clone();
-        library_timestamp_split.backend =
-            crate::correction_coordinator::CorrectionCandidateBackend::LibraryPgo;
-        library_timestamp_split.candidate_sequence = 3;
-        library_timestamp_split.correction_revision = 3;
-        library_timestamp_split.source_timestamp_ns += 1;
-        assert!(
-            applier
-                .validate_transaction(&library_timestamp_split)
-                .is_err(),
-            "library PGO must retain same map/cloud source timestamp policy"
-        );
-        let mut native_timestamp_split = library_timestamp_split.clone();
-        native_timestamp_split.backend =
-            crate::correction_coordinator::CorrectionCandidateBackend::NativePgo;
-        assert!(
-            applier
-                .validate_transaction(&native_timestamp_split)
-                .is_err(),
-            "native PGO must retain same map/cloud source timestamp policy"
-        );
+        for backend in [
+            crate::correction_coordinator::CorrectionCandidateBackend::LibraryPgo,
+            crate::correction_coordinator::CorrectionCandidateBackend::NativePgo,
+        ] {
+            let mut timestamp_split = second_relocalization.candidate.identity().clone();
+            timestamp_split.backend = backend;
+            timestamp_split.candidate_sequence = 3;
+            timestamp_split.source_timestamp_ns += 1;
+            timestamp_split.registered_cloud.source_sequence += 1;
+            timestamp_split.registered_cloud.source_timestamp_ns = timestamp_split.source_timestamp_ns;
+            assert_eq!(
+                sealed_canonical_transaction_for_test(
+                    timestamp_split, 3, second_relocalization.base_anchor_map_from_odom,
+                    second_relocalization.absolute_left_correction,
+                    second_relocalization.frozen_odom_from_body, Vec::new(),
+                ).unwrap_err(),
+                crate::correction_coordinator::CorrectionRejectReason::InvalidCommittedMapProof,
+                "{backend:?} must reject split map/cloud clocks at the V3 sealing boundary",
+            );
+        }
+
+        let mut owner_mismatch = second_relocalization.clone();
+        owner_mismatch.candidate_sequence += 1;
+        assert!(!owner_mismatch.matches_candidate_owner());
+        assert!(applier.validate_transaction(&owner_mismatch).is_err(),
+            "a transaction cannot relabel its immutable candidate owner");
 
         let mut wrong_revision = transaction;
         wrong_revision.correction_revision = 3;
@@ -16049,7 +16094,7 @@ mod mapping_feed_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn correction_of_delayed_scan_preserves_newer_odometry_pose_and_timestamp() {
         use crate::correction_coordinator::{
-            CanonicalCorrectionApplier, CanonicalCorrectionTransaction, CorrectionCandidateBackend,
+            CanonicalCorrectionApplier, CorrectionCandidateBackend,
             CorrectionLeaseId, CorrectionOwnerRuntimeIdentity, CorrectionRequestCancellation,
         };
         for backend in [
@@ -16132,35 +16177,50 @@ mod mapping_feed_tests {
                         );
                     }
                 }
-                let transaction = CanonicalCorrectionTransaction {
-                    runtime_generation: 7,
-                    backend_generation: 7,
-                    backend,
-                    candidate_sequence: 1,
-                    payload_sha256: [3; 32],
-                    correction_revision: 1,
-                    mapping_session_id: "delayed-pgo".into(),
-                    mapping_session_generation: 1,
-                    mapping_commit_id: crate::mapping_commit::MappingCommitId {
-                        boot_nonce: 43,
-                        sequence: 1,
+                let transaction = sealed_canonical_transaction_for_test(
+                    crate::correction_coordinator::CorrectionCandidateIdentity {
+                        runtime_generation: 7,
+                        backend_generation: 7,
+                        backend,
+                        candidate_sequence: 1,
+                        mapping_session_id: "delayed-pgo".into(),
+                        mapping_session_generation: 1,
+                        mapping_commit_id: crate::mapping_commit::MappingCommitId {
+                            boot_nonce: 43,
+                            sequence: 1,
+                        },
+                        occupancy_revision: 11,
+                        cloud_revision: 21,
+                        map_frame_generation: 1,
+                        source_timestamp_ns,
+                        map_frame_id: "map".into(),
+                        odom_frame_id: "odom".into(),
+                        body_frame_id: "base_link".into(),
+                        correction_lease: identity.correction_lease,
+                        transform_semantics: crate::correction_coordinator::CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
+                        points_frame_id: "base_link".into(),
+                        registered_cloud: crate::correction_coordinator::RegisteredCloudProof {
+                            backend: nuwax_codec::lcm::lio::LIO_BACKEND_DEVICE,
+                            runtime_generation: 7,
+                            source_sequence: 1,
+                            source_timestamp_ns,
+                            point_count: 3,
+                        },
+                        correlated_odom: frozen_odom_proof_for_test(
+                            1, frozen_timestamp_ns, &frozen),
+                        committed_map: crate::correction_coordinator::CommittedMapProof {
+                            backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+                            backend_generation: 1,
+                            source_timestamp_ns,
+                            width: 1, height: 1, resolution_m: 0.1, origin_x_m: 0.0, origin_y_m: 0.0,
+                        },
                     },
-                    occupancy_revision: 11,
-                    cloud_revision: 21,
-                    map_frame_generation: 1,
-                    source_timestamp_ns,
-                    committed_map_source_timestamp_ns: source_timestamp_ns,
-                    map_frame_id: "map".into(),
-                    odom_frame_id: "odom".into(),
-                    body_frame_id: "base_link".into(),
-                    correction_lease: identity.correction_lease,
-                    base_anchor_map_from_odom: anchor,
-                    absolute_left_correction: correction,
-                    effective_map_from_odom: anchor * correction,
-                    frozen_odom_source_timestamp_ns: frozen_timestamp_ns,
-                    trajectory: Vec::new(),
-                    frozen_odom_from_body: frozen,
-                };
+                    1,
+                    anchor,
+                    correction,
+                    frozen,
+                    Vec::new(),
+                ).expect("sealed V3 canonical transaction");
                 // 公共位姿较新而同刻里程计缺失时，拒绝候选并保留既有公共状态。
                 if latest_delta.is_some() {
                     let latest_tree = {
@@ -16322,35 +16382,50 @@ mod mapping_feed_tests {
 
         let new_effective = nalgebra::Isometry3::translation(9.0, -1.0, 0.5);
         let frozen_odom_from_body = nalgebra::Isometry3::translation(0.25, 0.5, -0.25);
-        let transaction = crate::correction_coordinator::CanonicalCorrectionTransaction {
-            runtime_generation: identity.runtime_generation,
-            backend_generation: identity.backend_generation,
-            backend: crate::correction_coordinator::CorrectionCandidateBackend::Relocalization,
-            candidate_sequence: 2,
-            payload_sha256: [0x6b; 32],
-            correction_revision: 2,
-            mapping_session_id,
-            mapping_session_generation,
-            mapping_commit_id: crate::mapping_commit::MappingCommitId {
-                boot_nonce: 0x5678,
-                sequence: 2,
+        let transaction = sealed_canonical_transaction_for_test(
+            crate::correction_coordinator::CorrectionCandidateIdentity {
+                runtime_generation: identity.runtime_generation,
+                backend_generation: identity.backend_generation,
+                backend: crate::correction_coordinator::CorrectionCandidateBackend::Relocalization,
+                candidate_sequence: 2,
+                mapping_session_id,
+                mapping_session_generation,
+                mapping_commit_id: crate::mapping_commit::MappingCommitId {
+                    boot_nonce: 0x5678,
+                    sequence: 2,
+                },
+                occupancy_revision,
+                cloud_revision,
+                map_frame_generation,
+                source_timestamp_ns,
+                map_frame_id: "map".into(),
+                odom_frame_id: "odom".into(),
+                body_frame_id: "base_link".into(),
+                correction_lease: identity.correction_lease,
+                transform_semantics: crate::correction_coordinator::CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
+                points_frame_id: "base_link".into(),
+                registered_cloud: crate::correction_coordinator::RegisteredCloudProof {
+                    backend: nuwax_codec::lcm::lio::LIO_BACKEND_DEVICE,
+                    runtime_generation: identity.runtime_generation,
+                    source_sequence: 2,
+                    source_timestamp_ns,
+                    point_count: 3,
+                },
+                correlated_odom: frozen_odom_proof_for_test(
+                    2, source_timestamp_ns, &frozen_odom_from_body),
+                committed_map: crate::correction_coordinator::CommittedMapProof {
+                    backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+                    backend_generation: 1,
+                    source_timestamp_ns,
+                    width: 1, height: 1, resolution_m: 0.1, origin_x_m: 0.0, origin_y_m: 0.0,
+                },
             },
-            occupancy_revision,
-            cloud_revision,
-            map_frame_generation,
-            source_timestamp_ns,
-            committed_map_source_timestamp_ns: source_timestamp_ns,
-            map_frame_id: "map".into(),
-            odom_frame_id: "odom".into(),
-            body_frame_id: "base_link".into(),
-            correction_lease: identity.correction_lease,
-            base_anchor_map_from_odom: nalgebra::Isometry3::identity(),
-            absolute_left_correction: new_effective,
-            effective_map_from_odom: new_effective,
-            frozen_odom_source_timestamp_ns: source_timestamp_ns,
-            trajectory: Vec::new(),
+            2,
+            nalgebra::Isometry3::identity(),
+            new_effective,
             frozen_odom_from_body,
-        };
+            Vec::new(),
+        ).expect("sealed V3 canonical transaction");
 
         let blocked_current = applier.current.clone();
         let (current_locked_tx, current_locked_rx) = tokio::sync::oneshot::channel();
@@ -16464,7 +16539,7 @@ mod mapping_feed_tests {
 
     async fn pgo_large_corrections_case(background: bool) {
         use crate::correction_coordinator::{
-            CanonicalCorrectionApplier, CanonicalCorrectionTransaction, CorrectionCandidateBackend,
+            CanonicalCorrectionApplier, CorrectionCandidateBackend,
             CorrectionLeaseId, CorrectionOwnerRuntimeIdentity, CorrectionOwnerSpec,
             CorrectionRequestCancellation, CorrectionTransportOwner,
         };
@@ -16531,11 +16606,12 @@ mod mapping_feed_tests {
                     .unwrap();
                 register_test_cloud_session(&handle).await;
                 register_test_cloud_session(&baseline).await;
+                let correction_sink = Arc::new(RecordingCorrectionFrameSink::default());
                 let owner = CorrectionTransportOwner::start(
                     CorrectionOwnerSpec::None,
                     identity.clone(),
                     "unused",
-                    Arc::new(RecordingCorrectionFrameSink::default()),
+                    correction_sink.clone(),
                 )
                 .await
                 .unwrap();
@@ -16647,7 +16723,7 @@ mod mapping_feed_tests {
                                 mapping_session_id: adapter.snapshot().session_id,
                                 mapping_session_generation: adapter.snapshot().session_generation,
                                 map_frame_generation: adapter.global_frame_generation(),
-                                envelope_sha256: [index as u8 + 1; 32],
+
                                 frozen_odom_from_body: raw[index],
                                 base_anchor_map_from_odom: anchor,
                                 registration_map_from_odom: transform.effective_isometry(),
@@ -16698,7 +16774,7 @@ mod mapping_feed_tests {
                             source_timestamp_ns: latest_stamp as i64,
                         };
                         old_binding.frozen_odom_from_body = raw[5];
-                        old_binding.envelope_sha256 = [6; 32];
+
                         pending = Some((old.points, old_binding));
                     }
                     if index == 2 || index == 4 {
@@ -16721,32 +16797,40 @@ mod mapping_feed_tests {
                                 }
                             })
                             .collect();
-                        let transaction = CanonicalCorrectionTransaction {
-                            runtime_generation: 7,
-                            backend_generation: 7,
-                            backend,
-                            candidate_sequence: revision,
-                            payload_sha256: [revision as u8; 32],
-                            correction_revision: revision,
-                            mapping_session_id: binding.mapping_session_id.clone(),
-                            mapping_session_generation: binding.mapping_session_generation,
-                            mapping_commit_id: receipt.commit_id,
-                            occupancy_revision: receipt.occupancy_revision,
-                            cloud_revision: previous_cloud,
-                            map_frame_generation: binding.map_frame_generation,
-                            source_timestamp_ns: stamp,
-                            committed_map_source_timestamp_ns: stamp,
-                            map_frame_id: "map".into(),
-                            odom_frame_id: "odom".into(),
-                            body_frame_id: "base_link".into(),
-                            correction_lease: identity.correction_lease,
-                            base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
-                            absolute_left_correction: correction,
-                            effective_map_from_odom: binding.base_anchor_map_from_odom * correction,
-                            frozen_odom_source_timestamp_ns: stamp,
-                            frozen_odom_from_body: raw[index],
+                        let staged_frame = correction_sink.staged.lock().await.last().cloned()
+                            .expect("current admitted scan and producer receipts");
+                        assert_eq!(staged_frame.mapping_commit_id, receipt.commit_id);
+                        assert_eq!(staged_frame.cloud_revision, previous_cloud);
+                        staged_frame.validate_source_ownership().unwrap();
+                        let transaction = sealed_canonical_transaction_for_test(
+                            crate::correction_coordinator::CorrectionCandidateIdentity {
+                                runtime_generation: 7,
+                                backend_generation: 7,
+                                backend,
+                                candidate_sequence: revision,
+                                mapping_session_id: binding.mapping_session_id.clone(),
+                                mapping_session_generation: binding.mapping_session_generation,
+                                mapping_commit_id: receipt.commit_id,
+                                occupancy_revision: receipt.occupancy_revision,
+                                cloud_revision: previous_cloud,
+                                map_frame_generation: binding.map_frame_generation,
+                                source_timestamp_ns: stamp,
+                                map_frame_id: "map".into(),
+                                odom_frame_id: "odom".into(),
+                                body_frame_id: "base_link".into(),
+                                correction_lease: identity.correction_lease,
+                                transform_semantics: crate::correction_coordinator::CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
+                                points_frame_id: "base_link".into(),
+                                registered_cloud: staged_frame.registered_cloud,
+                                correlated_odom: staged_frame.correlated_odom.proof,
+                                committed_map: staged_frame.committed_map,
+                            },
+                            revision,
+                            binding.base_anchor_map_from_odom,
+                            correction,
+                            raw[index],
                             trajectory,
-                        };
+                        ).expect("sealed V3 canonical transaction");
                         if index == 2 {
                             let cancelled = new_cancellation();
                             cancelled.cancel();
@@ -16754,8 +16838,19 @@ mod mapping_feed_tests {
                                 .apply_transaction(transaction.clone(), cancelled)
                                 .await
                                 .is_err());
-                            let mut invalid = transaction.clone();
-                            invalid.trajectory[0].translation_m[0] += 1.0;
+                            let mut owner_mismatch = transaction.clone();
+                            owner_mismatch.trajectory[0].translation_m[0] += 1.0;
+                            assert!(!owner_mismatch.matches_candidate_owner());
+                            assert!(applier
+                                .apply_transaction(owner_mismatch.clone(), new_cancellation())
+                                .await
+                                .is_err());
+                            let invalid = sealed_canonical_transaction_for_test(
+                                transaction.candidate.identity().clone(), transaction.correction_revision,
+                                transaction.base_anchor_map_from_odom, transaction.absolute_left_correction,
+                                transaction.frozen_odom_from_body, owner_mismatch.trajectory,
+                            ).expect("invalid replay geometry still has a valid V3 candidate owner");
+                            assert!(invalid.matches_candidate_owner());
                             assert!(applier
                                 .apply_transaction(invalid, new_cancellation())
                                 .await
@@ -17171,9 +17266,7 @@ mod mapping_feed_tests {
                             mapping_session_id: snapshot.session_id,
                             mapping_session_generation: snapshot.session_generation,
                             map_frame_generation: adapter.global_frame_generation(),
-                            envelope_sha256: crate::map_checksum::sha256_bytes(
-                                &sequence.to_be_bytes(),
-                            ),
+
                             frozen_odom_from_body: odom,
                             registration_map_from_odom: nalgebra::Isometry3::identity(),
                             registration_correction_revision: 0,
@@ -17308,7 +17401,7 @@ mod mapping_feed_tests {
             mapping_session_id: mapping_snapshot.session_id.clone(),
             mapping_session_generation: mapping_snapshot.session_generation,
             map_frame_generation,
-            envelope_sha256: [0x5a; 32],
+
             frozen_odom_from_body,
             registration_map_from_odom: base_anchor_map_from_odom,
             registration_correction_revision: 0,
@@ -17385,23 +17478,45 @@ mod mapping_feed_tests {
             frame.registered_cloud.source_timestamp_ns,
             source_timestamp_ns
         );
-        assert_eq!(frame.registered_cloud.envelope_sha256, [0x5a; 32]);
+        assert_eq!(frame.registered_cloud,
+            crate::correction_coordinator::RegisteredCloudProof::from_admitted(accepted.scan()).unwrap());
+        assert_eq!(frame.registered_cloud.backend, accepted.scan().source_identity().backend);
+        assert_eq!(frame.registered_cloud.runtime_generation, binding.runtime_generation as u64);
+        assert_eq!(frame.registered_cloud.point_count, map_points.len() as u64);
+        assert_eq!(&frame.source_owner, accepted.scan());
+        frame.validate_source_ownership().expect("exact admitted source and current cloud receipt");
+        let cloud_receipt = handle.cloud_map_writer.lock().as_ref().unwrap()
+            .last_cloud_receipt().expect("actual producer cloud receipt");
+        assert_eq!(frame.cloud_receipt, cloud_receipt);
+        assert_eq!(frame.cloud_receipt.commit_id, occupancy_receipt.commit_id);
+        assert_eq!(frame.cloud_receipt.occupancy_revision, occupancy_receipt.occupancy_revision);
+        assert_eq!(frame.cloud_receipt.session_generation, occupancy_receipt.session_generation);
+        assert_eq!(frame.cloud_receipt.source_timestamp_ns, source_timestamp_ns);
         assert_eq!(frame.correlated_odom.proof.source_sequence, 6);
         assert_eq!(
             frame.correlated_odom.proof.source_timestamp_ns,
             8_765_432_000
         );
         assert_eq!(frame.correlated_odom.odom_from_body, frozen_odom_from_body);
-        assert_eq!(
-            frame.correlated_odom.proof.pose_sha256,
-            crate::correction_coordinator::odom_pose_sha256(&frozen_odom_from_body)
-                .expect("frozen odometry proof")
-        );
+        assert_eq!(frame.correlated_odom.proof,
+            crate::correction_coordinator::CorrelatedOdomProof::from_registration(&binding).unwrap());
+        assert_eq!(frame.correlated_odom.proof.translation_m.map(f64::to_bits),
+            <[f64; 3]>::from(frozen_odom_from_body.translation.vector).map(f64::to_bits));
+        let frozen_q = frozen_odom_from_body.rotation.quaternion();
+        assert_eq!(frame.correlated_odom.proof.rotation_xyzw.map(f64::to_bits),
+            [frozen_q.i, frozen_q.j, frozen_q.k, frozen_q.w].map(f64::to_bits));
         assert_eq!(frame.committed_map.source_timestamp_ns, source_timestamp_ns);
-        assert_eq!(
-            frame.committed_map.payload_sha256,
-            crate::map_checksum::sha256_bytes(event.data.as_ref())
-        );
+        assert_eq!(frame.committed_map.backend_kind, occupancy_receipt.backend_kind);
+        assert_eq!(frame.committed_map.backend_generation, occupancy_receipt.backend_generation);
+        assert_eq!((frame.committed_map.width, frame.committed_map.height),
+            (u64::from(shared.map.width), u64::from(shared.map.height)));
+        assert_eq!(frame.committed_map.resolution_m.to_bits(), f64::from(shared.map.resolution).to_bits());
+        assert_eq!(frame.committed_map.origin_x_m.to_bits(), shared.map.origin_x.to_bits());
+        assert_eq!(frame.committed_map.origin_y_m.to_bits(), shared.map.origin_y.to_bits());
+        assert_eq!(event.receipt, occupancy_receipt);
+        assert_eq!(frame.committed_map_occupancy.as_ref(), event.data.as_ref());
+        assert!(Arc::ptr_eq(&frame.committed_map_occupancy, &event.data),
+            "correction staging must retain the actual occupancy allocation");
         assert_eq!(shared.map.revision, frame.occupancy_revision);
         assert_eq!(shared.map.timestamp_ns, source_timestamp_ns);
         let expected_body_points = map_points
@@ -17416,11 +17531,8 @@ mod mapping_feed_tests {
         assert_eq!(frame.body_points.as_ptr(), admitted_body_allocation,
             "correction staging must share the admitted body allocation");
         assert_eq!(frame.static_point_indices.as_deref(), Some([0, 1, 2].as_slice()));
-        assert_eq!(
-            frame.registered_cloud.body_points_sha256,
-            crate::correction_coordinator::body_points_sha256(&expected_body_points)
-                .expect("body points proof")
-        );
+        assert_eq!(frame.source_owner.body_points().as_ptr(), admitted_body_allocation,
+            "retained source owner must share the same admitted body allocation");
         drop(shared);
         drop(frames);
 
@@ -17534,7 +17646,7 @@ mod mapping_feed_tests {
             sensor_origin_map: None, runtime_generation: 77, cloud_source_sequence: 9,
             correlated_odometry: crate::lio_ingress::CorrelatedOdometry { source_sequence: 8, source_timestamp_ns: 800 },
             mapping_session_id: "no-committed-receipt".into(), mapping_session_generation: 1,
-            map_frame_generation: 1, envelope_sha256: [0x77; 32],
+            map_frame_generation: 1,
             frozen_odom_from_body: nalgebra::Isometry3::identity(),
             registration_map_from_odom: nalgebra::Isometry3::identity(), registration_correction_revision: 0,
             base_anchor_map_from_odom: nalgebra::Isometry3::identity(),
@@ -17594,7 +17706,7 @@ mod mapping_feed_tests {
             mapping_session_id: "captured-before-admission".to_owned(),
             mapping_session_generation: 1,
             map_frame_generation: 1,
-            envelope_sha256: [0x77; 32],
+
             frozen_odom_from_body: nalgebra::Isometry3::identity(),
             registration_map_from_odom: nalgebra::Isometry3::identity(),
             registration_correction_revision: 0,
@@ -18816,7 +18928,15 @@ mod mapping_feed_tests {
         assert_eq!(client.export_checkpoint().unwrap().await.unwrap().unwrap(), before);
         let mut grid = nuwax_mapping::OccupancyGrid::new(1,1,0.5);
         grid.frame_id = "map".into();
-        let (map, _) = mapping.lock().install_checkpoint(grid,2_000_000_000,0).unwrap();
+        let (map, event) = mapping.lock().install_checkpoint(grid,2_000_000_000,0).unwrap();
+        let committed_map = crate::correction_coordinator::CommittedMapProof {
+            backend_kind: event.receipt.backend_kind,
+            backend_generation: event.receipt.backend_generation,
+            source_timestamp_ns: event.receipt.source_timestamp_ns,
+            width: u64::from(map.width), height: u64::from(map.height),
+            resolution_m: f64::from(map.resolution),
+            origin_x_m: map.origin_x, origin_y_m: map.origin_y,
+        };
         let occupancy_revision = map.revision;
         {
             let mut shared = handle.state.write().await;
@@ -18833,20 +18953,42 @@ mod mapping_feed_tests {
         applier.bind_relocalization_mapping(&handle).unwrap();
         let correction = nalgebra::Isometry3::from_parts(nalgebra::Translation3::new(1.0,-0.5,0.1),
             nalgebra::UnitQuaternion::from_euler_angles(0.02,-0.01,0.3));
-        let transaction = crate::correction_coordinator::CanonicalCorrectionTransaction {
-            runtime_generation:31,backend_generation:32,
-            backend:crate::correction_coordinator::CorrectionCandidateBackend::Relocalization,
-            candidate_sequence:1,payload_sha256:[5;32],correction_revision:1,
-            mapping_session_id:session.session_id,mapping_session_generation:session.session_generation,
-            mapping_commit_id:crate::mapping_commit::MappingCommitId {boot_nonce:5678,sequence:1},
-            occupancy_revision,cloud_revision:21,map_frame_generation:generation,
-            source_timestamp_ns:2_000_000_000,committed_map_source_timestamp_ns:2_000_000_000,
-            map_frame_id:"map".into(),odom_frame_id:"odom".into(),body_frame_id:"base_link".into(),
-            correction_lease:identity.correction_lease,base_anchor_map_from_odom:anchor,
-            absolute_left_correction:correction,effective_map_from_odom:anchor*correction,
-            frozen_odom_source_timestamp_ns:2_000_000_000,trajectory:vec![],
-            frozen_odom_from_body:nalgebra::Isometry3::identity(),
-        };
+        let transaction = sealed_canonical_transaction_for_test(
+            crate::correction_coordinator::CorrectionCandidateIdentity {
+                runtime_generation: 31,
+                backend_generation: 32,
+                backend: crate::correction_coordinator::CorrectionCandidateBackend::Relocalization,
+                candidate_sequence: 1,
+                mapping_session_id: session.session_id,
+                mapping_session_generation: session.session_generation,
+                mapping_commit_id: event.receipt.commit_id,
+                occupancy_revision,
+                cloud_revision: 21,
+                map_frame_generation: generation,
+                source_timestamp_ns: 2_000_000_000,
+                map_frame_id: "map".into(),
+                odom_frame_id: "odom".into(),
+                body_frame_id: "base_link".into(),
+                correction_lease: identity.correction_lease,
+                transform_semantics: crate::correction_coordinator::CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
+                points_frame_id: "base_link".into(),
+                registered_cloud: crate::correction_coordinator::RegisteredCloudProof {
+                    backend: nuwax_codec::lcm::lio::LIO_BACKEND_DEVICE,
+                    runtime_generation: 31,
+                    source_sequence: 1,
+                    source_timestamp_ns: 2_000_000_000,
+                    point_count: 3,
+                },
+                correlated_odom: frozen_odom_proof_for_test(
+                    1, 2_000_000_000, &nalgebra::Isometry3::identity()),
+                committed_map,
+            },
+            1,
+            anchor,
+            correction,
+            nalgebra::Isometry3::identity(),
+            vec![],
+        ).expect("sealed V3 canonical transaction");
         let cancel = CorrectionRequestCancellation::new();
         {
             let _lifecycle = handle.mapping_lifecycle_lock.lock().await;

@@ -437,6 +437,8 @@ message GetRelocalizationTerminalRequest {
   string request_id = 2;
   bytes request_identity_sha256 = 3;
   bytes activation_identity_sha256 = 4;
+  // Schema 2 binds the complete assigned request. Legacy digests are absent.
+  RelocalizeRequest assigned_request_v2 = 5;
 }
 
 message RelocalizationLedgerObservation {
@@ -457,6 +459,107 @@ message GetRelocalizationTerminalResponse {
   RelocalizationTerminalStatus status = 5;
   optional RelocalizeResult terminal = 6;
   optional RelocalizationLedgerObservation ledger_observation = 7;
+  // The normalized exact request queried, including when no terminal exists.
+  RelocalizeRequest assigned_request_v2 = 8;
+}
+
+// IEEE-754 bits, not numeric protobuf equality: signed zero is significant.
+message RelocalizationPoseBitsV2 {
+  repeated fixed64 translation_m_bits = 1; // exactly 3
+  repeated fixed64 rotation_xyzw_bits = 2; // exactly 4
+}
+
+// Existing correction-owner identity. No new generation or lease is allocated.
+message RelocalizationOwnerReceiptV2 {
+  uint64 runtime_generation = 1;
+  uint64 correction_backend_generation = 2;
+  bytes correction_lease_boot_nonce = 3; // exactly 16 bytes
+  uint64 correction_lease_generation = 4;
+  string map_frame_id = 5;
+  string odom_frame_id = 6;
+  string body_frame_id = 7;
+  optional uint64 relocalization_epoch = 8;
+}
+
+message RelocalizationMapGeometryV2 {
+  uint64 width = 1;
+  uint64 height = 2;
+  fixed64 resolution_m_bits = 3;
+  fixed64 origin_x_m_bits = 4;
+  fixed64 origin_y_m_bits = 5;
+}
+
+// Lineage of an actually admitted frame. This is not content attestation:
+// source XYZ and occupancy bytes have been released and are not reproduced.
+// The actual cloud receipt can lag the occupancy receipt. Do not fabricate a
+// same-commit cloud receipt or require installed-target same-commit coupling.
+message RelocalizationSourceReceiptV2 {
+  CanonicalOccupancyCommitReceipt occupancy_receipt = 1;
+  uint64 cloud_revision = 2;
+  uint64 map_frame_generation = 3;
+  int32 lio_backend = 4;
+  uint64 runtime_generation = 5;
+  uint64 source_sequence = 6;
+  uint64 source_timestamp_ns = 7;
+  uint64 admitted_point_count = 8;
+  uint64 correlated_odom_source_sequence = 9;
+  uint64 correlated_odom_source_timestamp_ns = 10;
+  RelocalizationPoseBitsV2 odom_from_body = 11;
+  RelocalizationMapGeometryV2 map_geometry = 12;
+  RelocalizationPoseBitsV2 base_anchor_map_from_odom = 13;
+  string map_frame_id = 14;
+  string odom_frame_id = 15;
+  string body_frame_id = 16;
+  string points_frame_id = 17;
+  uint64 registration_correction_revision = 18;
+  uint64 frame_capture_relocalization_epoch = 19;
+  optional uint64 relocalization_mode_epoch = 20;
+  CanonicalCloudCommitReceipt cloud_receipt = 21;
+  RelocalizationPoseBitsV2 registration_map_from_odom = 22;
+}
+
+message RelocalizationAlgorithmReceiptV2 {
+  bool converged = 1;
+  bool accepted = 2;
+  fixed64 mse_bits = 3;
+  fixed64 fitness_bits = 4;
+  uint64 iterations = 5;
+  uint64 feature_matches = 6;
+  uint64 ransac_inliers = 7;
+  RelocalizationPoseBitsV2 estimated_transform = 8;
+  RelocalizationPoseBitsV2 proposed_correction = 9;
+}
+
+enum AssignedRelocalizationEvidencePhaseV2 {
+  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_UNSPECIFIED = 0;
+  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_PRE_ADMISSION = 1;
+  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_ADMITTED = 2;
+  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_SOURCE_SELECTED = 3;
+  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_ALGORITHM_COMPLETED = 4;
+  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_FINALIZED = 5;
+}
+
+// Bounded typed lineage/outcome only, never a proof of source-elided content.
+// Production capture validates these fields against retained source owners;
+// durable reopening validates canonical shape and all retained exact bindings.
+message AssignedRelocalizationEvidenceV2 {
+  uint32 schema_version = 1;
+  AssignedRelocalizationEvidencePhaseV2 phase = 2;
+  optional uint64 admission_ordinal = 3;
+  RelocalizationOwnerReceiptV2 owner = 4;
+  repeated RelocalizationSourceReceiptV2 source_frames = 5;
+  RelocalizationAlgorithmReceiptV2 algorithm = 6;
+}
+
+message AssignedCloudRelocalizeResultV2 {
+  RelocalizeRequest request = 1;
+  RelocalizeDisposition disposition = 2;
+  uint64 correction_revision = 3;
+  string detail = 4;
+  // Full canonical V3 LCM body without its fingerprint; bounded at 4096 bytes.
+  // A real V3 candidate validator must bind it to the request and evidence.
+  bytes candidate_payload_v3 = 5;
+  AssignedRelocalizationEvidenceV2 evidence = 6;
 }
 
 message RelocalizeResult {
@@ -507,6 +610,9 @@ message RelocalizeResult {
   bytes evidence_disclosure_v1 = 30;
   string target_kind = 31;
   bytes target_graph_sha256 = 32;
+  // Schema 2 uses schema_version, request_id and this body exclusively.
+  // Every legacy field 3..32 is empty/zero, including legacy dispositions.
+  AssignedCloudRelocalizeResultV2 assigned_cloud_v2 = 33;
 }
 
 // === 视频帧共享内存 ===

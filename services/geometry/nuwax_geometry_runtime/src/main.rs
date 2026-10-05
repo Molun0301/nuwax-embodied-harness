@@ -24,6 +24,7 @@ mod activation_contract;
 mod activation_identity;
 mod activation_request;
 mod relocalization_identity;
+mod relocalization_terminal_v2;
 mod correction_coordinator;
 mod correction_points;
 mod explore_runtime;

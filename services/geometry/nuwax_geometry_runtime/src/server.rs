@@ -1456,6 +1456,7 @@ fn relocalization_command_status(
     use crate::correction_coordinator::RelocalizationCommandError;
 
     let detail = match error {
+        RelocalizationCommandError::InvalidRequest(detail) => return Status::failed_precondition(detail),
         RelocalizationCommandError::Stopped => "RELOCALIZATION_OWNER_STOPPED",
         RelocalizationCommandError::OwnerUnavailable => "RELOCALIZATION_OWNER_UNAVAILABLE",
         RelocalizationCommandError::ResponseLost => "RELOCALIZATION_RESPONSE_LOST",
@@ -6579,7 +6580,27 @@ impl GeometryRuntime for GeometryRuntimeService {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("RELOCALIZATION_OWNER_NOT_SELECTED"))?;
         let request = req.into_inner();
+        if request.schema_version == 2 {
+            let query = crate::relocalization_terminal_v2::AssignedRelocalizationTerminalQueryV2::admit(request)
+                .map_err(Status::invalid_argument)?;
+            let snapshot = ingress.terminal_snapshot_assigned(&query).await
+                .map_err(Status::failed_precondition)?;
+            let (status, terminal) = match snapshot.terminal {
+                crate::correction_coordinator::RelocalizationTerminalSnapshot::AssignedTerminal(terminal) =>
+                    (RelocalizationTerminalStatus::Terminal, Some(terminal)),
+                crate::correction_coordinator::RelocalizationTerminalSnapshot::Pending =>
+                    (RelocalizationTerminalStatus::Pending, None),
+                crate::correction_coordinator::RelocalizationTerminalSnapshot::NotFound =>
+                    (RelocalizationTerminalStatus::NotFound, None),
+                crate::correction_coordinator::RelocalizationTerminalSnapshot::IdentityConflict
+                | crate::correction_coordinator::RelocalizationTerminalSnapshot::Terminal(_) =>
+                    (RelocalizationTerminalStatus::IdentityConflict, None),
+            };
+            return query.response(status, terminal.as_ref(), Some(snapshot.ledger_observation))
+                .map(Response::new).map_err(Status::internal);
+        }
         if request.schema_version != 1
+            || request.assigned_request_v2.is_some()
             || crate::correction_coordinator::validate_relocalization_request_id(
                 &request.request_id,
             )
@@ -6618,7 +6639,8 @@ impl GeometryRuntime for GeometryRuntimeService {
             crate::correction_coordinator::RelocalizationTerminalSnapshot::NotFound => {
                 (RelocalizationTerminalStatus::NotFound, None)
             }
-            crate::correction_coordinator::RelocalizationTerminalSnapshot::IdentityConflict => {
+            crate::correction_coordinator::RelocalizationTerminalSnapshot::AssignedTerminal(_)
+            | crate::correction_coordinator::RelocalizationTerminalSnapshot::IdentityConflict => {
                 (RelocalizationTerminalStatus::IdentityConflict, None)
             }
         };
@@ -6630,6 +6652,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             status: status as i32,
             terminal,
             ledger_observation,
+            assigned_request_v2: None,
         }))
     }
 
@@ -18017,6 +18040,7 @@ mod relocalization_terminal_query_tests {
             request_id: request_id.to_owned(),
             request_identity_sha256,
             activation_identity_sha256,
+            assigned_request_v2: None,
         }
     }
 

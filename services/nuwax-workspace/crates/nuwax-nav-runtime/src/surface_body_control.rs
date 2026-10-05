@@ -354,14 +354,14 @@ impl SurfaceFollower {
         self.follow_body_step_policy::<REUSE_LOOKAHEAD, true, true, true>(robot_width)
     }
 
-    // Proposed default under isolated validation: route intent remains advice;
+    // Route intent and eligible collinear progress remain advice;
     // the unchanged calibrated current-state guard authorizes each command.
     fn follow_body_step_policy<const REUSE_LOOKAHEAD: bool, const STRAIGHT_INTENT: bool, const ALIGN_STRAIGHT: bool, const TRANSLATION_INTENT: bool>(&mut self, robot_width: f64) -> PlannerStep {
-        self.follow_body_step_progress_policy::<REUSE_LOOKAHEAD,STRAIGHT_INTENT,ALIGN_STRAIGHT,TRANSLATION_INTENT,false>(robot_width)
+        self.follow_body_step_progress_policy::<REUSE_LOOKAHEAD,STRAIGHT_INTENT,ALIGN_STRAIGHT,TRANSLATION_INTENT,true>(robot_width)
     }
 
-    // Default-off specialization keeps an exact reference for measured parity
-    // and barrier tests before selecting any progress-policy change.
+    // The explicit specialization retains the legacy progress reference for
+    // differential measurements and barrier tests.
     fn follow_body_step_progress_policy<const REUSE_LOOKAHEAD: bool, const STRAIGHT_INTENT: bool, const ALIGN_STRAIGHT: bool, const TRANSLATION_INTENT: bool, const COLLINEAR_PROGRESS: bool>(&mut self, robot_width: f64) -> PlannerStep {
         // Scalar provenance for a rejected connector; no additional geometry
         // query or hot-path allocation is needed to diagnose the chosen target.

@@ -2281,3 +2281,246 @@ fn collinear_progress_requires_the_actual_and_target_support_to_match() {
     assert_eq!(old_record.calls, new_record.calls);
     assert_eq!(old_record.counters, new_record.counters);
 }
+
+// Physical witness for a 1-cm translation that cannot be consumed merely because
+// it lies inside the existing waypoint tolerance. All occupied geometry below
+// is explicit 5-mm source data; the square body and guards are unchanged.
+fn cpp_hard_pivot_map() -> Arc<SurfaceSnapshot> {
+    let fine = 0.005_f32;
+    let config = Config {
+        world_frame: "map".into(),
+        voxel_size: 0.05,
+        robot_height: 0.1,
+        surface_closing_radius: 0.0,
+        node_spacing_m: 0.4,
+        wall_clearance_m: 0.0,
+        wall_buffer_m: 0.0,
+        wall_buffer_weight: 0.0,
+        step_threshold_m: 0.0,
+        max_slope_deg: 18.0,
+        min_step_tread_depth_m: 0.2,
+        step_penalty_weight: 0.0,
+        goal_tolerance: 0.03,
+        viz_publish_hz: 0.0,
+    };
+    let envelope = SurfaceBodyEnvelope {
+        footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+        z_bounds_m: [-0.15,0.15],
+        body_to_support_z_m: 0.4,
+        max_step_up_m: 0.0,
+        max_step_down_m: 0.0,
+        max_cross_slope_deg: 18.0,
+        support_uncertainty_m: 0.0,
+    };
+    let mut keys: BTreeSet<[i32;3]> = (100..300)
+        .flat_map(|x| (0..200).map(move |y| [x,y,-1])).collect();
+    // Behind the actual body, outside its initial [-.1,.1] square. A 45-degree
+    // turn sweeps its back vertex into this thin column, whereas +1 cm of X
+    // clearance puts the entire subsequent 90-degree turn ahead of the column.
+    keys.extend((0..130).map(|z| [172,100,z]));
+    assert_eq!(keys.len(), 40_130);
+    let mut blocks = BTreeMap::<[i32;3], BTreeMap<[i32;3], SurfaceObservation>>::new();
+    for &key in &keys {
+        blocks.entry(key.map(|v| v.div_euclid(32))).or_default()
+            .insert(key, SurfaceObservation { observed_ns: 1, hits: 1 });
+    }
+    let mut observations = SurfaceObservations::new(fine, 32).unwrap();
+    let mut dirty = BTreeSet::new();
+    for (&block, values) in &blocks {
+        observations.replace_block(block, values.clone()).unwrap();
+        // Preserve the same storage-block/point quantization used by the exact
+        // captured-map fixture, including empty source-block edge columns.
+        let convert = |v: i32| {
+            let center = ((f64::from(v) + 0.5) * f64::from(fine)) as f32;
+            (center / config.voxel_size).floor() as i32
+        };
+        let min = [convert(block[0]*32), convert(block[1]*32)];
+        let max = [convert(block[0]*32+31), convert(block[1]*32+31)];
+        for x in min[0]..=max[0] {
+            for y in min[1]..=max[1] { dirty.insert([x,y]); }
+        }
+    }
+    observations.set_source_timestamp_ns(1);
+    observations.mark_complete_geometry_source();
+    let mut columns = BTreeMap::<[i32;2], BTreeMap<i32,[f32;2]>>::new();
+    for key in &keys {
+        let xyz = key.map(|v| ((f64::from(v) + 0.5) * f64::from(fine)) as f32);
+        let cell = xyz.map(|v| (v / config.voxel_size).floor() as i32);
+        let column = [cell[0],cell[1]];
+        assert!(dirty.contains(&column));
+        let layer = (f64::from(xyz[2]) / f64::from(fine)).floor();
+        let low = (layer * f64::from(fine)) as f32;
+        let high = ((layer + 1.0) * f64::from(fine)) as f32;
+        columns.entry(column).or_default().entry(cell[2])
+            .and_modify(|bounds| {
+                bounds[0] = bounds[0].min(low);
+                bounds[1] = bounds[1].max(high);
+            }).or_insert([low,high]);
+    }
+    let updates: Vec<_> = dirty.into_iter().map(|column| SurfaceColumnUpdate {
+        column, cells: columns.remove(&column).unwrap_or_default().into_iter().collect(),
+    }).collect();
+    assert!(columns.is_empty());
+    let mut builder = SurfaceMapBuilder::configured(config, Some(envelope));
+    let built = builder.build_column_updates(&updates, fine, true, keys.len()).unwrap();
+    assert_eq!(built.stats.kind, SurfaceBuildKind::Full);
+    assert_eq!(built.stats.input_points, keys.len());
+    let observations = Arc::new(observations);
+    let map = Arc::new(built.snapshot.with_observations(Some(Arc::clone(&observations))));
+    assert_eq!(map.source_voxel_size_m().to_bits(), fine.to_bits());
+    assert!(Arc::ptr_eq(map.observations().unwrap(), &observations));
+    for key in keys {
+        assert_eq!(observations.get(key), Some(SurfaceObservation { observed_ns: 1, hits: 1 }));
+    }
+    map
+}
+
+fn cpp_hard_pivot_follower() -> SurfaceFollower {
+    let mut config = SurfaceFollowerConfig::new(0.4);
+    config.controller.speed = 0.5;
+    config.controller.nerf_speed = 1.0;
+    config.controller.control_frequency = 20.0;
+    config.controller.simulation = false;
+    config.max_angular_speed_rps = 0.7;
+    config.motion_limits = Some(tga_limits(false));
+    // This is a trusted static geometric witness. It does not reuse old
+    // timestamps as evidence for a dynamic observation-age test.
+    config.max_observation_age_sec = None;
+    let mut follower = SurfaceFollower::new(config).unwrap();
+    let poses = vec![tga_pose(1.0,0.5,0.0), tga_pose(1.01,0.5,0.0),
+        tga_pose(1.01,0.5,std::f64::consts::FRAC_PI_2),
+        tga_pose(1.01,0.8,std::f64::consts::FRAC_PI_2)];
+    let goal = poses.last().unwrap().clone();
+    follower.configure_goal(&goal, GoalOptions {
+        allow_reverse: false, position_tolerance_m: 0.03, yaw_tolerance_rad: 0.05,
+    }).unwrap();
+    follower.update_execution_map(ExecutionMap::Surface(cpp_hard_pivot_map())).unwrap();
+    follower.update_odometry(poses[0].clone());
+    follower.replace_execution_path(ExecutionPath::Surface(Path3D { poses }), None, goal).unwrap();
+    follower.refresh_current_body_view();
+    assert!(follower.current_body_error().is_none());
+    assert!(follower.invalid_input.is_none());
+    assert!(follower.braking_deadline.is_none());
+    assert!(follower.simulation_braking_deadline_ns.is_none());
+    assert_eq!(follower.last_command, Twist2::ZERO);
+    assert_eq!(follower.path_index, 1);
+    assert_eq!(follower.progress_m, 0.0);
+    assert_eq!(follower.config.motion_limits.as_ref().unwrap(), &tga_limits(false));
+    follower
+}
+
+#[test]
+fn collinear_progress_retains_one_centimetre_needed_to_clear_a_real_pivot_obstacle() {
+    use crate::control_profile::{Counter, Stage};
+    // Establish the physical witness before comparing policies. Failure of any
+    // assertion is a fixture failure; do not soften body geometry or tolerances
+    // to manufacture a passing differential result.
+    let witness = cpp_hard_pivot_follower();
+    let map = witness.map.as_ref().unwrap();
+    let actual = witness.odometry.as_ref().unwrap();
+    let path = witness.path.as_ref().unwrap();
+    let approach = &path.poses[1];
+    let pivot = &path.poses[2];
+    let tolerance = (f64::from(map.config().voxel_size)*0.7).min(0.07);
+    let distance = horizontal_distance(actual, approach);
+    assert!((distance - 0.01).abs() < 1e-12);
+    assert!(distance < tolerance, "fixture must trigger the ordinary reached-point threshold");
+    assert!(is_rotation(approach, pivot));
+    map.validate_body_pose(body(actual).0, body(actual).1).unwrap();
+    let mut actual_45 = actual.clone();
+    actual_45.pose.orientation = Quaternion::from_yaw(std::f64::consts::FRAC_PI_4);
+    let actual_45_result = map.validate_body_pose(body(&actual_45).0, body(&actual_45).1);
+    assert!(actual_45_result.is_err(),
+        "the thin obstacle must physically block the actual station's 45-degree intermediate pose");
+    let mut actual_pivot = pivot.clone();
+    actual_pivot.pose.position = actual.pose.position;
+    assert!(connection_endpoint(map, body(actual), &actual_pivot).is_none(),
+        "the complete actual-station turn must fail before retaining the 1-cm approach");
+    let arrival = connection_endpoint(map, body(actual), approach)
+        .expect("the exact 1-cm forward approach must remain geometrically feasible");
+    assert!((arrival.0[0] - 1.01).abs() < 1e-12);
+    assert!((arrival.0[1] - 0.5).abs() < 1e-12);
+    let mut arrival_45 = approach.clone();
+    arrival_45.pose.position = Point3::new(arrival.0[0],arrival.0[1],arrival.0[2]);
+    arrival_45.pose.orientation = Quaternion::from_yaw(std::f64::consts::FRAC_PI_4);
+    map.validate_body_pose(body(&arrival_45).0, body(&arrival_45).1)
+        .expect("the translated station must clear the same intermediate orientation");
+    let turned = connection_endpoint(map, arrival, pivot)
+        .expect("the complete 90-degree turn must pass only after the 1-cm approach");
+    assert!((turned.0[0] - arrival.0[0]).abs() < 1e-12);
+    assert!((turned.0[1] - arrival.0[1]).abs() < 1e-12);
+    eprintln!("COLLINEAR_HARD_PIVOT_WITNESS ordinary_tolerance={tolerance} approach_distance={distance} actual_45_error={actual_45_result:?} arrival={arrival:?} turned={turned:?}");
+
+    // Fresh sources and query views for both policies. The witness above does
+    // not warm either policy's cache or mutate its actual applied state.
+    let mut old = cpp_hard_pivot_follower();
+    let mut new = cpp_hard_pivot_follower();
+    assert!(!Arc::ptr_eq(old.source_map.as_ref().unwrap(), new.source_map.as_ref().unwrap()));
+    let (old_result, old_record) = cpp_profile_step::<false, true>(&mut old, 0.2);
+    let (new_result, new_record) = cpp_profile_step::<true, true>(&mut new, 0.2);
+    cpp_assert_same_step("physically required 1-cm pivot predecessor", &old, &new, &old_result, &new_result);
+    assert_eq!(old.path_index, 1, "the blocked actual-station turn must retain the approach waypoint");
+    assert_eq!(new.path_index, 1, "collinear advice must not consume the physically required approach");
+    assert_eq!(old.progress_m, 0.0);
+    assert_eq!(new.progress_m, 0.0);
+    let target = new.control_target.expect("the retained translation must supply control advice");
+    assert!((target.x - 1.01).abs() < 1e-12 && (target.y - 0.5).abs() < 1e-12,
+        "advice must remain on the 1-cm approach, not the later pivot: {target:?}");
+    assert!(target.yaw.abs() < 1e-12);
+    // has_turn tries the blocked actual rotation, then the feasible translation
+    // and feasible arrival rotation. Assert actual positive connector work,
+    // never treating parity of unused/zero counters as coverage.
+    assert!(old_record.calls[Stage::ConnectionEndpoint as usize] >= 3);
+    assert!(old_record.calls[Stage::ConnectorProjection as usize] > 0);
+    assert!(old_record.calls[Stage::ConnectorSweep as usize] > 0);
+    assert!(old_record.counters[Counter::ConnectionSubsteps as usize] > 0);
+    assert_eq!(old_record.calls, new_record.calls);
+    assert_eq!(old_record.counters, new_record.counters);
+    for stage in [Stage::GuardSetup, Stage::CandidateRankingSweeps,
+        Stage::GuardProjection, Stage::GuardGeometrySweep] {
+        assert!(new_record.calls[stage as usize] > 0,
+            "retained approach did not run current-state guard {}", stage.label());
+    }
+    let PlannerStep::Command(command) = new_result else { panic!("{new_result:?}"); };
+    assert!(command.linear.x > 0.0 && command.linear.y == 0.0,
+        "retention must produce a genuinely advancing guarded command, not an all-stop: {command:?}");
+    tga_assert_model_command(command, new.config.motion_limits.as_ref().unwrap());
+    let (safe, why) = tga_prove_command(&new, Twist2::ZERO, command);
+    assert!(safe, "retained 1-cm approach command failed the full current-state stopping proof: {why:?}");
+    eprintln!("COLLINEAR_HARD_PIVOT_PARITY command={command:?} index={} progress={} target={target:?} endpoint_calls={} connector_substeps={} guard_projection_calls={}",
+        new.path_index, new.progress_m,
+        new_record.calls[Stage::ConnectionEndpoint as usize],
+        new_record.counters[Counter::ConnectionSubsteps as usize],
+        new_record.calls[Stage::GuardProjection as usize]);
+}
+// Narrow advice eligibility must compose with the actual guard on the same step.
+#[test]
+fn collinear_progress_retains_current_guard_after_consuming_a_reached_sample() {
+    use crate::control_profile::{Counter,Stage};
+    for case in ["fresh", "expired_tail", "boundary_tail", "missing_tail"] {
+        let source=tga_map(false,case=="expired_tail");
+        let poses=vec![tga_pose(1.0,0.55,0.0),tga_pose(1.01,0.55,0.0),tga_pose(2.0,0.55,0.0)];
+        let mut follower=tga_follower(source,poses,false);
+        if case=="missing_tail" {follower.update_execution_map(ExecutionMap::Surface(tga_map(true,false))).unwrap();}
+        if case=="boundary_tail" {follower.configure_boundary(&[[0.0,0.0],[1.14,0.0],[1.14,3.5],[0.0,3.5]]);}
+        follower.update_odometry(tga_pose(1.0,0.57,0.0));
+        follower.observe_applied_command(tga_speed());
+        assert!(follower.current_body_error().is_none());
+        tga_assert_initial_period_valid(&follower);
+        let (result,record)=cpp_profile_step::<true,true>(&mut follower,0.3);
+        assert_eq!(follower.path_index,2,"{case}: the reached sample must really be consumed");
+        assert_eq!(record.calls[Stage::TranslationConnector as usize],0,"{case}: this must exercise the eligible bypass");
+        assert_eq!(record.counters[Counter::ConnectionSubsteps as usize],0);
+        assert!(record.calls[Stage::CandidateRankingSweeps as usize]>0,"{case}: the current guard must run");
+        if case=="fresh" {
+            let PlannerStep::Command(command)=result else {panic!("{case}: {result:?}")};
+            assert!(command.linear.x>0.0);
+            let (safe,why)=tga_prove_command(&follower,tga_speed(),command);assert!(safe,"{why:?}");
+        }else{
+            assert!(matches!(&result,PlannerStep::ReplanRequired(reason) if reason.contains("扫掠拒绝")),"{case}: {result:?}");
+            assert_eq!(follower.last_command,Twist2::ZERO);
+            assert!(follower.braking_deadline.is_some());
+        }
+        eprintln!("COLLINEAR_GUARD_COMPOSITION case={case} result={result:?} index={} guard_calls={}",follower.path_index,record.calls[Stage::CandidateRankingSweeps as usize]);
+    }
+}

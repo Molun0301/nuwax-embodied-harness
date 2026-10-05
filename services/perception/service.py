@@ -1035,6 +1035,12 @@ class PerceptionService:
         deadline = time.monotonic() + max(0.0, float(timeout))
         with self._context_condition:
             self._closing = True
+        # Signal detector lifecycle shutdown before waiting for active inference.
+        # Waiting happens outside the publication/status lock.
+        close = getattr(self._detector_pipeline, "close", None)
+        if callable(close) and not close(timeout=max(0.0, deadline - time.monotonic())):
+            return False
+        with self._context_condition:
             while self._active_operations:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:

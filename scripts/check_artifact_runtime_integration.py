@@ -63,7 +63,7 @@ class RuntimeChecks(unittest.TestCase):
         runtime.perception_video_runtime = SimpleNamespace(get_status=lambda: None)
         runtime.map_workspace_service = SimpleNamespace(get_active_workspace_identity=lambda: None, get_active_workspace=lambda: None)
         runtime.platform_geometry_runtime = SimpleNamespace(get_runtime_status=dict, get_live_mapping_diagnostics=dict)
-        runtime.audio_service = SimpleNamespace(get_volume_state=dict)
+        runtime.audio_service = SimpleNamespace(get_cached_volume_state=dict)
         runtime.task_manager = SimpleNamespace(list_active_tasks=list)
         runtime.event_bus = SimpleNamespace(latest_cursor=lambda: 0)
         runtime.stream_bus = SimpleNamespace(latest_cursor=lambda: 0, status=dict)

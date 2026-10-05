@@ -182,7 +182,7 @@ class YoloInferenceWorker:
         return self.wait_until_ready()
 
     def start_nonblocking(self) -> bool:
-        """只创建 worker 进程，不等待模型加载。必须由主线程调用。"""
+        """只创建 worker 进程，不等待模型加载；由唯一生命周期拥有方调用。"""
         with self._start_lock:
             with self._readiness_condition:
                 if self._readiness_state in ("starting", "ready"):
@@ -215,7 +215,7 @@ class YoloInferenceWorker:
                     logger.error("YOLO worker 旧资源仍被占用，拒绝启动新进程")
                     return False
             try:
-                # resource_tracker 和 spawn 必须在 Gateway 主线程创建；模型加载与
+                # resource_tracker 和 spawn 由生命周期拥有方创建；模型加载与
                 # 推理仍全部留在 worker 进程，调用方可异步等待 ready。exec -a 会让
                 # Python 3.8 的 sys.executable 变为空，先从 /proc 恢复真实解释器。
                 _configure_spawn_executable()
@@ -252,7 +252,7 @@ class YoloInferenceWorker:
             self._register_atexit_cleanup()
             return True
 
-    def wait_until_ready(self, timeout_sec: float = 120.0) -> bool:
+    def wait_until_ready(self, timeout_sec: float = 120.0, *, cancel_event=None) -> bool:
         """等待模型加载；并发调用时只有一个 owner 消费就绪队列。"""
         deadline = time.monotonic() + max(0.0, timeout_sec)
         with self._readiness_condition:
@@ -273,6 +273,9 @@ class YoloInferenceWorker:
 
         failure_reason = ""
         while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                failure_reason = "startup_cancelled"
+                break
             if process is None or response_queue is None:
                 failure_reason = "worker_resources_missing"
                 break
@@ -352,6 +355,7 @@ class YoloInferenceWorker:
         image_bgr: np.ndarray,
         *,
         timeout_sec: float = 10.0,
+        cleanup_on_failure: bool = True,
     ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, Any, Any]]:
         """提交单帧并等待同请求结果；失败后回收进程，禁止复用仍在读取的共享图像。"""
         failure_reason = ""
@@ -424,7 +428,8 @@ class YoloInferenceWorker:
                     self._readiness_condition.notify_all()
         logger.warning("YOLO worker 推理失败，停止旧工作进程: %s", failure_reason)
         # stop 的顺序为启动锁→停止锁→推理锁，必须先释放本次推理锁。
-        self.stop_if_current((process, request_queue, response_queue))
+        if cleanup_on_failure:
+            self.stop_if_current((process, request_queue, response_queue))
         return None
 
     def stop_if_current(self, expected_identity: Tuple[object, object, object]) -> bool:

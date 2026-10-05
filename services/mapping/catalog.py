@@ -16,6 +16,11 @@ import weakref
 
 from contracts.map_workspace import MapAsset, AssetIdentityV2
 from contracts.map_activation import AssignedActivationReceipt
+from contracts.map_relocalization import (
+    AssignedRelocalizationQuery,
+    AssignedRelocalizationRequest,
+    AssignedRelocalizationTerminal,
+)
 from contracts.naming import build_safe_dir_segment
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -24,6 +29,8 @@ _ACTIVATION_JOURNAL_SCHEMA_VERSION = 2
 _ACTIVATION_RECEIPT_SCHEMA_VERSION = 2
 _RELOCALIZATION_RECEIPT_SCHEMA_VERSION = 1
 _RELOCALIZATION_INTENT_SCHEMA_VERSION = 1
+# Durable envelopes are separate from the native request/result schema tag.
+_ASSIGNED_RELOCALIZATION_DURABLE_SCHEMA_VERSION = 2
 _RELOCALIZATION_INTENT_PHASES = frozenset(
     {
         "prepared",
@@ -1055,6 +1062,303 @@ class MapCatalogRepository:
         )
         return tuple(receipt.get(field_name) for field_name in fields + ("target_kind", "target_graph_sha256", "planar_seed"))
 
+    @staticmethod
+    def _require_assigned_relocalization_request(
+        request: AssignedRelocalizationRequest,
+    ) -> AssignedRelocalizationRequest:
+        if not isinstance(request, AssignedRelocalizationRequest):
+            raise ValueError("assigned relocalization requires an admitted request owner")
+        return AssignedRelocalizationRequest.from_dict(request.to_dict())
+
+    def _require_assigned_relocalization_ownership(
+        self, request: AssignedRelocalizationRequest,
+        activation_receipt: AssignedActivationReceipt,
+        target_asset_identity: AssetIdentityV2,
+    ) -> None:
+        """Check retained owners under the journal guard, without loading payloads.
+
+        Callers publishing/removing asset metadata must share this guard (as the
+        normal workspace delete path already does). Direct repository asset
+        save/delete calls do not provide atomic exclusion with this check.
+        """
+        if not isinstance(activation_receipt, AssignedActivationReceipt):
+            raise ValueError("assigned relocalization requires a typed activation receipt")
+        asset_identity = self._assigned_asset_identity(target_asset_identity)
+        if (request.asset_identity.asset_id != asset_identity["asset_id"]
+                or not request.activation_receipt.exact_replay_of(activation_receipt)):
+            raise ValueError("assigned request differs from activation/asset ownership")
+        current = self.get_last_successful_map_activation_receipt()
+        if (current is None or current.get("schema_version") != 3
+                or current.get("trusted_identity") is not True
+                or current.get("relocalization_target_available") is not True):
+            raise ValueError("assigned relocalization requires a current trusted sealed target")
+        owner = AssignedActivationReceipt.admit(current["activation_receipt_v2"])
+        if not owner.exact_replay_of(activation_receipt):
+            raise ValueError("assigned activation ownership changed or was retired")
+        if self.get_map_activation() is not None:
+            raise ValueError("an activation transition fences assigned relocalization")
+        metadata_path = self._metadata_path(owner.map_name)
+        if not metadata_path.is_file():
+            raise ValueError("assigned finalized asset ownership changed or was retired")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict) or metadata.get("identity_schema_version") != 2:
+            # Do not call the legacy loader: it can reconstruct a manifest SHA.
+            raise ValueError("assigned finalized asset ownership changed or was retired")
+        asset = MapAsset.model_validate(metadata)
+        if (asset.map_name != owner.map_name or not asset.finalized
+                or asset.identity_schema_version != 2
+                or asset.asset_identity != target_asset_identity):
+            raise ValueError("assigned finalized asset ownership changed or was retired")
+
+    @staticmethod
+    def _assigned_relocalization_receipt(
+        terminal: AssignedRelocalizationTerminal,
+    ) -> Dict[str, object]:
+        if not isinstance(terminal, AssignedRelocalizationTerminal):
+            raise ValueError("assigned completion requires an admitted terminal owner")
+        terminal = AssignedRelocalizationTerminal.from_dict(terminal.to_dict())
+        if terminal.disposition not in {1, 2}:
+            raise ValueError("assigned successful receipt requires an applied terminal")
+        return {"schema_version": _ASSIGNED_RELOCALIZATION_DURABLE_SCHEMA_VERSION,
+                "request_id": terminal.request_id,
+                "assigned_terminal_v2": terminal.to_dict()}
+
+    @staticmethod
+    def _validate_assigned_relocalization_receipt(payload) -> Dict[str, object]:
+        fields = {"schema_version", "request_id", "assigned_terminal_v2"}
+        if (not isinstance(payload, dict) or set(payload) != fields
+                or type(payload["schema_version"]) is not int
+                or payload["schema_version"] != _ASSIGNED_RELOCALIZATION_DURABLE_SCHEMA_VERSION):
+            raise ValueError("assigned relocalization receipt schema/fields are invalid")
+        terminal = AssignedRelocalizationTerminal.from_dict(payload["assigned_terminal_v2"])
+        if payload["request_id"] != terminal.request_id:
+            raise ValueError("assigned receipt request identity differs")
+        return MapCatalogRepository._assigned_relocalization_receipt(terminal)
+
+    @staticmethod
+    def _validate_assigned_relocalization_intent(payload) -> Dict[str, object]:
+        fields = {"schema_version", "phase", "request_id", "assigned_request_v2", "terminal_receipt"}
+        if (not isinstance(payload, dict) or set(payload) != fields
+                or type(payload["schema_version"]) is not int
+                or payload["schema_version"] != _ASSIGNED_RELOCALIZATION_DURABLE_SCHEMA_VERSION):
+            raise ValueError("assigned relocalization intent schema/fields are invalid")
+        request = AssignedRelocalizationRequest.from_dict(payload["assigned_request_v2"])
+        phase = payload["phase"]
+        if (payload["request_id"] != request.request_id or not isinstance(phase, str)
+                or phase not in _RELOCALIZATION_INTENT_PHASES):
+            raise ValueError("assigned relocalization intent identity/phase is invalid")
+        receipt = payload["terminal_receipt"]
+        if (phase == "backend_applied_pending_receipt") != (receipt is not None):
+            raise ValueError("assigned pending phase and terminal presence differ")
+        if receipt is not None:
+            receipt = MapCatalogRepository._validate_assigned_relocalization_receipt(receipt)
+            terminal = AssignedRelocalizationTerminal.from_dict(receipt["assigned_terminal_v2"])
+            if not request.exact_replay_of(terminal.request):
+                raise ValueError("assigned pending terminal differs from the whole request")
+        return {"schema_version": _ASSIGNED_RELOCALIZATION_DURABLE_SCHEMA_VERSION,
+                "phase": phase, "request_id": request.request_id,
+                "assigned_request_v2": request.to_dict(), "terminal_receipt": receipt}
+
+    def get_assigned_relocalization_intent(self) -> Optional[Dict[str, object]]:
+        """Reopen only the explicit assigned lane; never adopt legacy intents."""
+        payload = self.get_relocalization_intent()
+        if payload is not None and payload["schema_version"] != _ASSIGNED_RELOCALIZATION_DURABLE_SCHEMA_VERSION:
+            raise ValueError("legacy pending intent requires its original recovery lifecycle")
+        return payload
+
+    def _require_assigned_relocalization_intent(self, request) -> Dict[str, object]:
+        payload = self.get_assigned_relocalization_intent()
+        if payload is None:
+            raise ValueError("assigned relocalization intent is absent")
+        stored = AssignedRelocalizationRequest.from_dict(payload["assigned_request_v2"])
+        if not request.exact_replay_of(stored):
+            raise ValueError("assigned relocalization whole request identity changed")
+        return payload
+
+    def reopen_assigned_relocalization_query(self, *, request_id: str) -> AssignedRelocalizationQuery:
+        """Read the durable normalized request, even when its live owner retired.
+
+        Not-found, pending and version-skew outcomes confer no permission to
+        redispatch or release this owner. No legacy SHA alias can be recovered
+        here: legacy pending intents never retained request_identity_sha256.
+        """
+        with self.map_activation_guard():
+            payload = self.get_assigned_relocalization_intent()
+            if payload is None or payload["request_id"] != request_id:
+                raise ValueError("assigned relocalization query owner is absent or changed")
+            return AssignedRelocalizationQuery.from_dict({
+                "schema_version": 2, "request_id": request_id,
+                "assigned_request_v2": payload["assigned_request_v2"]})
+
+    def begin_assigned_relocalization_durable(
+        self, *, assigned_request: AssignedRelocalizationRequest,
+        activation_receipt: AssignedActivationReceipt, target_asset_identity: AssetIdentityV2,
+    ) -> Dict[str, object]:
+        request = self._require_assigned_relocalization_request(assigned_request)
+        with self.map_activation_guard():
+            self._require_assigned_relocalization_ownership(request, activation_receipt, target_asset_identity)
+            existing = self.get_relocalization_intent()
+            if existing is not None:
+                return self._require_assigned_relocalization_intent(request)
+            receipt = self.get_last_successful_relocalization_receipt()
+            terminal = None
+            if receipt is not None and receipt["request_id"] == request.request_id:
+                receipt = self._validate_assigned_relocalization_receipt(receipt)
+                completed = AssignedRelocalizationTerminal.from_dict(receipt["assigned_terminal_v2"])
+                if not request.exact_replay_of(completed.request):
+                    raise ValueError("same assigned request ID has a conflicting durable receipt")
+                # A settled retry can only re-synchronize the retained terminal.
+                # It must never become prepared or dispatch the backend again.
+                terminal = receipt
+            payload = {"schema_version": _ASSIGNED_RELOCALIZATION_DURABLE_SCHEMA_VERSION,
+                       "phase": "backend_applied_pending_receipt" if terminal else "prepared",
+                       "request_id": request.request_id, "assigned_request_v2": request.to_dict(),
+                       "terminal_receipt": terminal}
+            _atomic_write_text(self._relocalization_intent_path, json.dumps(payload, ensure_ascii=False, indent=2))
+            return payload
+
+    def _update_assigned_relocalization_phase(
+        self, phase, *, assigned_request, activation_receipt, target_asset_identity,
+    ) -> Dict[str, object]:
+        request = self._require_assigned_relocalization_request(assigned_request)
+        with self.map_activation_guard():
+            self._require_assigned_relocalization_ownership(request, activation_receipt, target_asset_identity)
+            payload = self._require_assigned_relocalization_intent(request)
+            if phase == "backend_dispatching":
+                if payload["phase"] != "prepared":
+                    raise ValueError("assigned relocalization cannot dispatch twice")
+            elif phase == "backend_outcome_unknown":
+                if payload["phase"] in {"backend_outcome_unknown", "backend_applied_pending_receipt"}:
+                    return payload
+                if payload["phase"] != "backend_dispatching":
+                    raise ValueError("assigned prepared owner has not crossed dispatch")
+            else:
+                raise ValueError("unsupported assigned relocalization transition")
+            payload["phase"] = phase
+            _atomic_write_text(self._relocalization_intent_path, json.dumps(payload, ensure_ascii=False, indent=2))
+            return payload
+
+    def mark_assigned_relocalization_backend_dispatching(
+        self, *, assigned_request, activation_receipt, target_asset_identity,
+    ) -> Dict[str, object]:
+        """Persist the single dispatch owner before crossing the provider boundary."""
+        return self._update_assigned_relocalization_phase("backend_dispatching",
+            assigned_request=assigned_request, activation_receipt=activation_receipt,
+            target_asset_identity=target_asset_identity)
+
+    def mark_assigned_relocalization_outcome_unknown(
+        self, *, assigned_request, activation_receipt, target_asset_identity,
+    ) -> Dict[str, object]:
+        return self._update_assigned_relocalization_phase("backend_outcome_unknown",
+            assigned_request=assigned_request, activation_receipt=activation_receipt,
+            target_asset_identity=target_asset_identity)
+
+    def abort_assigned_relocalization_before_apply(
+        self, *, assigned_request, activation_receipt, target_asset_identity,
+        terminal: Optional[AssignedRelocalizationTerminal] = None,
+    ) -> None:
+        """Release prepared intent or an exact, explicitly rejected dispatch.
+
+        Unknown/applied owners remain fenced; their retirement is a separate
+        lifecycle operation and is intentionally not inferred from query misses.
+        """
+        request = self._require_assigned_relocalization_request(assigned_request)
+        if terminal is not None:
+            if not isinstance(terminal, AssignedRelocalizationTerminal):
+                raise ValueError("assigned rejection requires an admitted terminal")
+            terminal = AssignedRelocalizationTerminal.from_dict(terminal.to_dict())
+            if not request.exact_replay_of(terminal.request) or terminal.disposition in {1, 2}:
+                raise ValueError("assigned rejection is applied or belongs to another request")
+        with self.map_activation_guard():
+            self._require_assigned_relocalization_ownership(request, activation_receipt, target_asset_identity)
+            payload = self._require_assigned_relocalization_intent(request)
+            if (payload["phase"] not in {"prepared", "backend_dispatching"}
+                    or payload["phase"] == "backend_dispatching" and terminal is None):
+                raise ValueError("assigned unknown/applied dispatch cannot be aborted")
+            self._clear_current_relocalization_intent(payload)
+
+    def mark_assigned_relocalization_backend_applied(
+        self, *, relocalization_terminal: AssignedRelocalizationTerminal,
+        activation_receipt: AssignedActivationReceipt, target_asset_identity: AssetIdentityV2,
+    ) -> Dict[str, object]:
+        receipt = self._assigned_relocalization_receipt(relocalization_terminal)
+        request = relocalization_terminal.request
+        with self.map_activation_guard():
+            self._require_assigned_relocalization_ownership(request, activation_receipt, target_asset_identity)
+            payload = self._require_assigned_relocalization_intent(request)
+            if payload["phase"] == "prepared":
+                raise ValueError("assigned terminal cannot precede backend dispatch")
+            if payload["terminal_receipt"] is not None:
+                if payload["terminal_receipt"] != receipt:
+                    raise ValueError("assigned pending terminal conflicts with retained exact terminal")
+                return payload
+            payload.update(phase="backend_applied_pending_receipt", terminal_receipt=receipt)
+            _atomic_write_text(self._relocalization_intent_path, json.dumps(payload, ensure_ascii=False, indent=2))
+            return payload
+
+    def complete_assigned_relocalization_durable(
+        self, *, relocalization_terminal: AssignedRelocalizationTerminal,
+        activation_receipt: AssignedActivationReceipt, target_asset_identity: AssetIdentityV2,
+    ) -> Dict[str, object]:
+        """Fsync the exact successful receipt; keep intent until session sync."""
+        receipt = self._assigned_relocalization_receipt(relocalization_terminal)
+        request = relocalization_terminal.request
+        with self.map_activation_guard():
+            self._require_assigned_relocalization_ownership(request, activation_receipt, target_asset_identity)
+            existing = self.get_last_successful_relocalization_receipt()
+            if existing is not None and existing["request_id"] == request.request_id and existing != receipt:
+                raise ValueError("same assigned request ID has a conflicting durable terminal")
+            intent = self.get_assigned_relocalization_intent()
+            if intent is None:
+                if existing != receipt:
+                    raise ValueError("assigned relocalization intent/receipt is absent or differs")
+                return existing
+            intent = self._require_assigned_relocalization_intent(request)
+            if intent["phase"] != "backend_applied_pending_receipt" or intent["terminal_receipt"] != receipt:
+                raise ValueError("assigned terminal is not retained by its pending intent")
+            if existing != receipt:
+                _atomic_write_text(self._relocalization_receipt_path, json.dumps(receipt, ensure_ascii=False, indent=2))
+            durable = self.get_last_successful_relocalization_receipt()
+            if durable != receipt:
+                raise ValueError("assigned terminal receipt changed after durable write")
+            return durable
+
+    def reconcile_assigned_relocalization_known_terminal(
+        self, *, relocalization_terminal, activation_receipt, target_asset_identity,
+    ) -> Dict[str, object]:
+        """Retain and persist one exact terminal within the existing short guard."""
+        with self.map_activation_guard():
+            if self.get_assigned_relocalization_intent() is not None:
+                self.mark_assigned_relocalization_backend_applied(
+                    relocalization_terminal=relocalization_terminal,
+                    activation_receipt=activation_receipt, target_asset_identity=target_asset_identity)
+            return self.complete_assigned_relocalization_durable(
+                relocalization_terminal=relocalization_terminal,
+                activation_receipt=activation_receipt, target_asset_identity=target_asset_identity)
+
+    def settle_assigned_relocalization_durable(
+        self, *, assigned_request, activation_receipt, target_asset_identity,
+    ) -> Dict[str, object]:
+        """Caller has synchronized the session; release only the exact durable owner."""
+        request = self._require_assigned_relocalization_request(assigned_request)
+        with self.map_activation_guard():
+            self._require_assigned_relocalization_ownership(request, activation_receipt, target_asset_identity)
+            durable = self.get_last_successful_relocalization_receipt()
+            if durable is None:
+                raise ValueError("assigned terminal receipt is not durable")
+            durable = self._validate_assigned_relocalization_receipt(durable)
+            terminal = AssignedRelocalizationTerminal.from_dict(durable["assigned_terminal_v2"])
+            if not request.exact_replay_of(terminal.request):
+                raise ValueError("assigned durable receipt belongs to another whole request")
+            intent = self.get_assigned_relocalization_intent()
+            if intent is None:
+                return durable
+            intent = self._require_assigned_relocalization_intent(request)
+            if intent["phase"] != "backend_applied_pending_receipt" or intent["terminal_receipt"] != durable:
+                raise ValueError("assigned pending terminal does not match durable receipt")
+            self._clear_current_relocalization_intent(intent)
+            return durable
+
     def begin_relocalization_durable(
         self,
         *,
@@ -1088,6 +1392,8 @@ class MapCatalogRepository:
             )
             existing = self.get_relocalization_intent()
             if existing is not None:
+                if existing.get("schema_version") == _ASSIGNED_RELOCALIZATION_DURABLE_SCHEMA_VERSION:
+                    raise ValueError("assigned relocalization intent requires typed assigned APIs")
                 if self._relocalization_intent_identity_from_payload(existing) != expected:
                     raise ValueError("已有不同身份的重定位 durable intent。")
                 return existing
@@ -1113,6 +1419,8 @@ class MapCatalogRepository:
                 )
             except Exception as exc:
                 raise ValueError("重定位 durable intent 不是有效 JSON。") from exc
+            if isinstance(payload, dict) and payload.get("schema_version") == _ASSIGNED_RELOCALIZATION_DURABLE_SCHEMA_VERSION:
+                return self._validate_assigned_relocalization_intent(payload)
             return self._validate_relocalization_intent(payload)
 
     def mark_relocalization_backend_dispatching(
@@ -1354,6 +1662,8 @@ class MapCatalogRepository:
         payload = self.get_relocalization_intent()
         if payload is None:
             raise ValueError("重定位 durable intent 不存在。")
+        if payload.get("schema_version") == _ASSIGNED_RELOCALIZATION_DURABLE_SCHEMA_VERSION:
+            raise ValueError("assigned relocalization intent requires typed assigned APIs")
         if payload["request_id"] != self._require_relocalization_request_id(request_id):
             raise ValueError("重定位 durable intent request_id 已变化。")
         return payload
@@ -1411,6 +1721,8 @@ class MapCatalogRepository:
                 )
             except Exception as exc:
                 raise ValueError("重定位终态凭据不是有效 JSON。") from exc
+            if isinstance(payload, dict) and payload.get("schema_version") == _ASSIGNED_RELOCALIZATION_DURABLE_SCHEMA_VERSION:
+                return self._validate_assigned_relocalization_receipt(payload)
             return self._validate_relocalization_receipt(payload)
 
     def validate_relocalization_terminal(
@@ -1564,6 +1876,13 @@ class MapCatalogRepository:
 
     def _clear_relocalization_intent(self, request_id: str) -> None:
         payload = self._require_relocalization_intent_request(request_id)
+        self._clear_current_relocalization_intent(payload)
+
+    def _clear_current_relocalization_intent(self, payload: Dict[str, object]) -> None:
+        # Both lanes use the same tombstone/fsync rollback protocol. Callers
+        # hold map_activation_guard and validate their own typed exact owner.
+        if self.get_relocalization_intent() != payload:
+            raise ValueError("relocalization intent changed before release")
         tombstone = self._relocalization_intent_path.with_name(
             ".map_relocalization.cleared.%s" % payload["request_id"].replace(":", "_")
         )

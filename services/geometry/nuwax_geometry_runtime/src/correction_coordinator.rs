@@ -12623,7 +12623,7 @@ mod preflight_only_contract {
                     &changed,
                     crate::proto::RelocalizeDisposition::ReplayConflict,
                     "RELOCALIZATION_REPLAY_CONFLICT",
-                ).unwrap();
+                );
                 let first = ledger
                     .admit(&changed, index as u64 + 1, Instant::now(), || {
                         conflict.clone()
@@ -16343,7 +16343,7 @@ mod preflight_only_contract {
                 &snapshot.immutable_target,
                 &snapshot_copy.immutable_target
             ));
-            assert!(same_sealed_target(&snapshot, &snapshot_copy));
+            assert!(same_sealed_legacy_target_for_test(&snapshot, &snapshot_copy));
             let current_snapshot = control.current_sealed_target_snapshot().unwrap();
             assert!(Arc::ptr_eq(
                 &snapshot.immutable_target,
@@ -16569,6 +16569,34 @@ mod preflight_only_contract {
             fn make_writer(&'writer self) -> Self::Writer {
                 FinalizationCapturedLogWriter(Arc::clone(&self.0))
             }
+        }
+
+        fn same_sealed_legacy_target_for_test(
+            left: &SealedActivatedTargetSnapshot,
+            right: &SealedActivatedTargetSnapshot,
+        ) -> bool {
+            left.runtime_generation == right.runtime_generation
+                && left.lifecycle_epoch == right.lifecycle_epoch
+                && left.session_id == right.session_id
+                && left.map_name == right.map_name
+                && left.activation_request_id == right.activation_request_id
+                && left.activation_request_identity_sha256 == right.activation_request_identity_sha256
+                && left.activation_identity_sha256 == right.activation_identity_sha256
+                && left.target_receipt_sha256 == right.target_receipt_sha256
+                && left.asset_manifest_sha256 == right.asset_manifest_sha256
+                && left.asset_bundle_sha256 == right.asset_bundle_sha256
+                && left.session_generation == right.session_generation
+                && left.backend_generation == right.backend_generation
+                && left.publication_proof.source_timestamp_ns
+                    == right.publication_proof.source_timestamp_ns
+                && left.publication_proof.cloud_revision == right.publication_proof.cloud_revision
+                && left.publication_proof.point_count == right.publication_proof.point_count
+                && left.publication_proof.voxel_size.to_bits()
+                    == right.publication_proof.voxel_size.to_bits()
+                && left.publication_proof.cloud_receipt == right.publication_proof.cloud_receipt
+                && left.publication_proof.target_receipt
+                    == right.publication_proof.target_receipt
+                && Arc::ptr_eq(&left.immutable_target, &right.immutable_target)
         }
 
         fn committed_map(timestamp_ns: u64, _map_frame_id: &str) -> CommittedMapProof {

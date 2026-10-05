@@ -14,9 +14,21 @@ find_program(LCM_GEN_EXECUTABLE lcm-gen)
 if(NOT LCM_GEN_EXECUTABLE)
   message(FATAL_ERROR "lcm-gen is required for the native PGO typed protocol")
 endif()
+execute_process(
+  COMMAND "${LCM_GEN_EXECUTABLE}" --version
+  RESULT_VARIABLE LCM_GEN_VERSION_RESULT
+  OUTPUT_VARIABLE LCM_GEN_VERSION
+  ERROR_VARIABLE LCM_GEN_VERSION_ERROR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT LCM_GEN_VERSION_RESULT EQUAL 0 OR NOT LCM_GEN_VERSION STREQUAL "lcm-gen 1.5.2")
+  message(FATAL_ERROR "Native PGO wire V3 requires lcm-gen 1.5.2; set LCM_GEN_EXECUTABLE explicitly. Found: ${LCM_GEN_VERSION} ${LCM_GEN_VERSION_ERROR}")
+endif()
 
 set(NATIVE_PGO_IDL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../lcmtypes/nuwax_msgs")
-set(NATIVE_PGO_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# Never reuse headers emitted by the older cached generator. No clean/delete is
+# needed: the version-specific output path starts with freshly generated files.
+set(NATIVE_PGO_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated-lcm-1.5.2")
 set(NATIVE_PGO_IDLS
   "${NATIVE_PGO_IDL_DIR}/NativePgoRequest.lcm"
   "${NATIVE_PGO_IDL_DIR}/NativePgoResult.lcm"
@@ -32,7 +44,7 @@ add_custom_command(
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${NATIVE_PGO_GENERATED_DIR}"
   COMMAND "${LCM_GEN_EXECUTABLE}" -x --cpp-std c++11
           --cpp-hpath "${NATIVE_PGO_GENERATED_DIR}" ${NATIVE_PGO_IDLS}
-  DEPENDS ${NATIVE_PGO_IDLS}
+  DEPENDS ${NATIVE_PGO_IDLS} "${LCM_GEN_EXECUTABLE}"
   VERBATIM
 )
 

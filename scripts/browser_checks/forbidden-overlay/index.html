@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8"><title>NEH forbidden overlay WebGL qualification</title>
+<style>body{background:#eef2f7;font:15px system-ui;margin:16px}iframe{width:480px;height:350px;border:0}pre{white-space:pre-wrap}img{width:480px}button{font-size:18px;padding:10px}</style>
+<h1>NEH offline WebGL qualification</h1>
+<p>Actual baseline/current viewer + Three. Synthetic pointcloud, mocked sockets. Driver API counts and pixel comparisons; no physical GPU speed claim.</p>
+<button id="run" disabled>Run comparison</button><p id="status">Ready</p>
+<iframe title="Baseline viewer" src="baseline/"></iframe><iframe title="Candidate viewer" src="candidate/"></iframe>
+<pre id="summary"></pre><div id="images"></div>
+<script>
+const outputs={};const initialized=new Set();let runTimer=null;const frames=document.querySelectorAll('iframe');
+const start=(index)=>{clearTimeout(runTimer);runTimer=setTimeout(()=>{document.querySelector('#status').textContent='FAIL: viewer did not finish within 60 seconds; no qualification result'},60000);frames[index].contentWindow.postMessage({type:'run'},location.origin)};
+document.querySelector('#run').onclick=()=>{document.querySelector('#run').disabled=true;document.querySelector('#status').textContent='Running baseline';start(0)};
+window.addEventListener('message',async event=>{
+ if(event.origin!==location.origin||!Array.from(frames).some(frame=>frame.contentWindow===event.source))return;
+ if(event.data.type==='ready'){initialized.add(event.source);if(initialized.size===2){document.querySelector('#run').disabled=false;document.querySelector('#status').textContent='Both viewers ready'}return;}
+ if(event.data.type!=='result')return;
+ const name=event.source===frames[0].contentWindow?'baseline':'candidate';outputs[name]=event.data.result;
+ if(name==='baseline'){document.querySelector('#status').textContent='Running candidate';start(1);return;}
+ clearTimeout(runTimer);
+ const expectedStages=['bootstrap','steady','outside-bounds','earlier-zone-disable','earlier-zone-edit','earlier-zone-delete','add-second','reorder-coincident','map-switch','camera-move','hidden-reveal'];
+ const sameBackend=outputs.baseline.backend&&outputs.candidate.backend&&['width','height','unmaskedRenderer','version'].every(key=>outputs.baseline.backend[key]===outputs.candidate.backend[key]);
+ const validStages=['baseline','candidate'].every(name=>JSON.stringify(outputs[name].stages?.map(stage=>stage.name))===JSON.stringify(expectedStages)&&outputs[name].stages[0].metrics.createBuffer>0&&outputs[name].stages.every(stage=>stage.distinctColors>=3&&stage.draw.points===1024&&stage.metrics.renderCalls===1));
+ const comparisons=outputs.baseline.stages?.map((stage,index)=>({stage:stage.name,pixelsEqual:stage.pixelHash===outputs.candidate.stages[index]?.pixelHash,baseline:stage,candidate:outputs.candidate.stages[index]}));
+ const result={scope:'actual WebGL calls and exact rendered pixel SHA256; synchronous requested frames, synthetic cloud, no real network/device timing',...outputs,comparisons};
+ const pass=Boolean(sameBackend&&validStages&&!outputs.baseline.error&&!outputs.candidate.error&&comparisons.length===11&&comparisons.every(item=>item.pixelsEqual)&&outputs.candidate.steady.createBuffer===0&&outputs.candidate.steady.deleteBuffer===0&&outputs.baseline.steady.createBuffer>0&&outputs.candidate.steady.bufferSubData===20&&outputs.candidate.steady.bufferSubDataBytes===20*12288&&outputs.candidate.steady.renderCalls===20&&outputs.candidate.finalMemory.geometries===0);
+ result.pass=pass;
+ document.querySelector('#status').textContent=pass?'PASS: all rendered scenes identical; steady overlay buffers reused':'FAIL: inspect report';
+ document.querySelector('#summary').textContent=JSON.stringify({pass,baseline:outputs.baseline.backend,candidate:outputs.candidate.backend,baselineSteady:outputs.baseline.steady,candidateSteady:outputs.candidate.steady,comparisons:comparisons?.map(({stage,pixelsEqual})=>({stage,pixelsEqual})),errors:[outputs.baseline.error,outputs.candidate.error]},null,2);
+ for(const name of ['baseline','candidate'])for(const capture of outputs[name].images||[]){const heading=document.createElement('h3');heading.textContent=`${name}: ${capture.name}`;const image=document.createElement('img');image.src=capture.image;document.querySelector('#images').append(heading,image)}
+ try{const saved=await fetch('/result',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(result)});if(!saved.ok)throw Error(`HTTP ${saved.status}`)}catch(error){document.querySelector('#status').textContent=`FAIL: result persistence failed (${error}); qualification not recorded`}
+});
+</script>

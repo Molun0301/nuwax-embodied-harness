@@ -11,11 +11,11 @@ import geometry_msgs
 
 class GoalEnvelope(object):
 
-    __slots__ = ["schema_version", "session_id", "owner_kind", "parent_request_id", "goal_generation", "producer", "producer_epoch", "producer_runtime_generation", "committed_map_session_id", "committed_map_session_generation", "committed_map_revision", "committed_map_payload_sha256", "committed_map_frame_id", "source_timestamp_ns", "boundary_id", "boundary_sha256", "boundary_frame_id", "boundary_points_length", "boundary_points", "motion_guard_generation", "motion_guard_boot_nonce", "motion_stop_generation", "allow_reverse", "position_tolerance_m", "yaw_tolerance_rad", "navigation_configuration_sha256", "map_frame_generation", "payload_sha256", "goal"]
+    __slots__ = ["schema_version", "session_id", "owner_kind", "parent_request_id", "goal_generation", "producer", "producer_epoch", "producer_runtime_generation", "committed_map_session_id", "committed_map_session_generation", "committed_map_revision", "committed_map_boot_nonce", "committed_map_commit_sequence", "committed_map_source_timestamp_ns", "committed_map_frame_id", "source_timestamp_ns", "boundary_id", "boundary_sha256", "boundary_frame_id", "boundary_points_length", "boundary_points", "motion_guard_generation", "motion_guard_boot_nonce", "motion_stop_generation", "allow_reverse", "position_tolerance_m", "yaw_tolerance_rad", "navigation_configuration_sha256", "map_frame_generation", "payload_sha256", "goal"]
 
-    __typenames__ = ["int32_t", "string", "int32_t", "string", "int64_t", "string", "int64_t", "int64_t", "string", "int64_t", "int64_t", "byte", "string", "int64_t", "string", "byte", "string", "int32_t", "geometry_msgs.Point", "int64_t", "byte", "int64_t", "int8_t", "double", "double", "byte", "int64_t", "byte", "geometry_msgs.PoseStamped"]
+    __typenames__ = ["int32_t", "string", "int32_t", "string", "int64_t", "string", "int64_t", "int64_t", "string", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "string", "int64_t", "string", "byte", "string", "int32_t", "geometry_msgs.Point", "int64_t", "byte", "int64_t", "int8_t", "double", "double", "byte", "int64_t", "byte", "geometry_msgs.PoseStamped"]
 
-    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, [32], None, None, None, [32], None, None, ["boundary_points_length"], None, [16], None, None, None, None, [32], None, [32], None]
+    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, [16], None, None, None, None, None, [32], None, None, ["boundary_points_length"], None, [16], None, None, None, None, [32], None, [32], None]
 
     def __init__(self):
         self.schema_version = 0
@@ -40,8 +40,12 @@ class GoalEnvelope(object):
         """ LCM Type: int64_t """
         self.committed_map_revision = 0
         """ LCM Type: int64_t """
-        self.committed_map_payload_sha256 = b""
-        """ LCM Type: byte[32] """
+        self.committed_map_boot_nonce = b""
+        """ LCM Type: byte[16] """
+        self.committed_map_commit_sequence = 0
+        """ LCM Type: int64_t """
+        self.committed_map_source_timestamp_ns = 0
+        """ LCM Type: int64_t """
         self.committed_map_frame_id = ""
         """ LCM Type: string """
         self.source_timestamp_ns = 0
@@ -109,7 +113,8 @@ class GoalEnvelope(object):
         buf.write(__committed_map_session_id_encoded)
         buf.write(b"\0")
         buf.write(struct.pack(">qq", self.committed_map_session_generation, self.committed_map_revision))
-        buf.write(bytearray(self.committed_map_payload_sha256[:32]))
+        buf.write(bytearray(self.committed_map_boot_nonce[:16]))
+        buf.write(struct.pack(">qq", self.committed_map_commit_sequence, self.committed_map_source_timestamp_ns))
         __committed_map_frame_id_encoded = self.committed_map_frame_id.encode('utf-8')
         buf.write(struct.pack('>I', len(__committed_map_frame_id_encoded)+1))
         buf.write(__committed_map_frame_id_encoded)
@@ -163,7 +168,8 @@ class GoalEnvelope(object):
         __committed_map_session_id_len = struct.unpack('>I', buf.read(4))[0]
         self.committed_map_session_id = buf.read(__committed_map_session_id_len)[:-1].decode('utf-8', 'replace')
         self.committed_map_session_generation, self.committed_map_revision = struct.unpack(">qq", buf.read(16))
-        self.committed_map_payload_sha256 = buf.read(32)
+        self.committed_map_boot_nonce = buf.read(16)
+        self.committed_map_commit_sequence, self.committed_map_source_timestamp_ns = struct.unpack(">qq", buf.read(16))
         __committed_map_frame_id_len = struct.unpack('>I', buf.read(4))[0]
         self.committed_map_frame_id = buf.read(__committed_map_frame_id_len)[:-1].decode('utf-8', 'replace')
         self.source_timestamp_ns = struct.unpack(">q", buf.read(8))[0]
@@ -189,7 +195,7 @@ class GoalEnvelope(object):
     def _get_hash_recursive(parents):
         if GoalEnvelope in parents: return 0
         newparents = parents + [GoalEnvelope]
-        tmphash = (0x558c14a217070464+ geometry_msgs.Point._get_hash_recursive(newparents)+ geometry_msgs.PoseStamped._get_hash_recursive(newparents)) & 0xffffffffffffffff
+        tmphash = (0x5d3968dcf3163b7b+ geometry_msgs.Point._get_hash_recursive(newparents)+ geometry_msgs.PoseStamped._get_hash_recursive(newparents)) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None
@@ -203,3 +209,4 @@ class GoalEnvelope(object):
     def get_hash(self):
         """Get the LCM hash of the struct"""
         return struct.unpack(">Q", GoalEnvelope._get_packed_fingerprint())[0]
+

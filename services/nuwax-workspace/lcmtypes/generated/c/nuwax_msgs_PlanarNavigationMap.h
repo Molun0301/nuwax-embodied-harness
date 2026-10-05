@@ -32,9 +32,11 @@ struct _nuwax_msgs_PlanarNavigationMap
     int64_t    map_revision;
 
     /**
-     * LCM Type: byte[32]
+     * LCM Type: byte[16]
      */
-    uint8_t    map_payload_sha256[32];
+    uint8_t    map_boot_nonce[16];
+    int64_t    map_commit_sequence;
+    int64_t    map_source_timestamp_ns;
     int64_t    observation_revision;
     int64_t    source_sequence;
     int64_t    source_timestamp_ns;

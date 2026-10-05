@@ -4299,7 +4299,9 @@ impl ExploreRuntimeHandle {
             value.grid.data.iter().map(|v| match v { -1 => OccupancyCell::Unknown, 0 => OccupancyCell::Free, _ => OccupancyCell::Occupied }).collect()),
             frame_id: value.grid.header.frame_id.clone() };
         let identity = schema::CommittedMapIdentity { session_id: value.session_id.clone(), session_generation: value.session_generation,
-            revision: value.map_revision, payload_sha256: value.map_payload_sha256, frame_id: value.grid.header.frame_id.clone() };
+            revision: value.map_revision, commit_boot_nonce: value.map_boot_nonce,
+            commit_sequence: value.map_commit_sequence, source_timestamp_ns: value.map_source_timestamp_ns,
+            frame_id: value.grid.header.frame_id.clone() };
         self.ingest_costmap_with_identity(snapshot, Some(identity), value.map_frame_generation,
             Some((now_monotonic_nanos().saturating_sub(source_age), ttl))).await
     }
@@ -4317,7 +4319,9 @@ impl ExploreRuntimeHandle {
             if identity.session_id.trim().is_empty()
                 || identity.session_generation <= 0
                 || identity.revision <= 0
-                || identity.payload_sha256 == [0; 32]
+                || identity.commit_boot_nonce == [0; 16]
+                || identity.commit_sequence <= 0
+                || identity.source_timestamp_ns < 0
                 || normalize_frame(&identity.frame_id) != self.expected_map_frame.as_ref()
             {
                 return Err(
@@ -4347,7 +4351,8 @@ impl ExploreRuntimeHandle {
                 let same_session = identity.session_id == current.session_id
                     && identity.session_generation == current.session_generation;
                 same_session
-                    && (frame_generation < guard.costmap_frame_generation || identity.revision < current.revision
+                    && (identity.commit_boot_nonce != current.commit_boot_nonce
+                        || frame_generation < guard.costmap_frame_generation || identity.revision < current.revision
                         || (identity.revision == current.revision && identity != current))
             }) {
                 return Err("committed costmap identity is stale or conflicting".to_string());
@@ -5323,8 +5328,53 @@ mod tests {
             session_id: "explore-test-map".to_string(),
             session_generation: 1,
             revision: revision as i64,
-            payload_sha256: crate::map_checksum::sha256_bytes(&revision.to_le_bytes()),
+            commit_boot_nonce: [1; 16],
+            commit_sequence: revision as i64,
+            source_timestamp_ns: revision as i64,
             frame_id: frame_id.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn planar_costmap_preserves_receipt_time_and_rejects_provenance_conflicts() {
+        let (handle, _) = configured_handle();
+        let timestamp = now_unix_nanos() as i64;
+        let value = nuwax_codec::lcm::planar_navigation::PlanarNavigationMap {
+            map_frame_generation: 1, runtime_generation: 1,
+            session_id: "planar-session".into(), session_generation: 1,
+            map_revision: 2, map_boot_nonce: [3; 16], map_commit_sequence: 4,
+            map_source_timestamp_ns: 7, observation_revision: 1,
+            source_sequence: 1, source_timestamp_ns: timestamp,
+            grid: schema::OccupancyGrid {
+                header: schema::Header {
+                    stamp_sec: (timestamp / 1_000_000_000) as i32,
+                    stamp_nsec: (timestamp % 1_000_000_000) as i32,
+                    frame_id: "map".into(), ..Default::default()
+                },
+                info: schema::MapMetaData {
+                    width: 2, height: 2, resolution: 0.5,
+                    origin: schema::Pose { position: [0.0; 3], orientation_xyzw: [0.0, 0.0, 0.0, 1.0] },
+                    ..Default::default()
+                },
+                data: vec![0; 4],
+            },
+            ..Default::default()
+        };
+        assert!(handle.ingest_planar_navigation(&value).await.unwrap());
+        let stored = handle.inner.lock().await.committed_map.clone().unwrap();
+        assert_eq!(stored.commit_boot_nonce, [3; 16]);
+        assert_eq!(stored.commit_sequence, 4);
+        assert_eq!(stored.source_timestamp_ns, 7);
+        assert_ne!(stored.source_timestamp_ns, value.source_timestamp_ns);
+        for field in 0..3 {
+            let mut conflict = value.clone();
+            match field {
+                0 => { conflict.map_boot_nonce[0] ^= 1; conflict.map_revision += 1; },
+                1 => conflict.map_commit_sequence += 1,
+                _ => conflict.map_source_timestamp_ns += 1,
+            }
+            assert!(handle.ingest_planar_navigation(&conflict).await.is_err());
+            assert_eq!(handle.inner.lock().await.committed_map.as_ref(), Some(&stored));
         }
     }
 
@@ -5372,11 +5422,14 @@ mod tests {
                 session_id: "surface-session".into(),
                 session_generation: 1,
                 revision: i64::from(revision),
-                payload_sha256: [4; 32],
+                commit_boot_nonce: [7; 16],
+                commit_sequence: i64::from(revision),
+                source_timestamp_ns: timestamp,
                 frame_id: frame.into(),
             },
             map_frame_generation: 1,
             cloud_revision: i64::from(revision),
+            cloud_occupancy_revision: i64::from(revision),
             source_timestamp_ns: timestamp,
             source_voxel_size: 0.1,
             commit_boot_nonce: [7; 16],
@@ -5526,7 +5579,10 @@ mod tests {
         clear.source_timestamp_ns = 0;
         clear.commit_sequence = 0;
         clear.committed_map.revision = 0;
-        clear.committed_map.payload_sha256 = [0; 32];
+        clear.committed_map.commit_boot_nonce = [0; 16];
+        clear.committed_map.commit_sequence = 0;
+        clear.committed_map.source_timestamp_ns = 0;
+        clear.cloud_occupancy_revision = 0;
         clear.cloud = schema::PointCloud2 {
             header: schema::Header {
                 seq: 2,
@@ -8251,7 +8307,7 @@ mod tests {
             config = guard.active_config.clone().unwrap();
             guard.committed_map = Some(schema::CommittedMapIdentity {
                 session_id: "legacy-map-alias".into(), session_generation: 1, revision: 1,
-                payload_sha256: [0x37; 32], frame_id: "map".into(),
+                commit_boot_nonce: [0x37; 16], commit_sequence: 1, source_timestamp_ns: 1, frame_id: "map".into(),
             });
             guard.costmap_frame_generation = 1;
             guard.progress_origin = Some(("legacy-map-alias".into(), 1, 1));
@@ -8345,7 +8401,7 @@ mod tests {
             guard.navigation_configuration = Some(Ok(navigation));
             guard.committed_map = Some(schema::CommittedMapIdentity {
                 session_id: "legacy-map-alias".into(), session_generation: 1, revision: 1,
-                payload_sha256: [0x37; 32], frame_id: "map".into(),
+                commit_boot_nonce: [0x37; 16], commit_sequence: 1, source_timestamp_ns: 1, frame_id: "map".into(),
             });
             guard.costmap_frame_generation = 1;
             guard.progress_origin = Some(("legacy-map-alias".into(), 1, 1));

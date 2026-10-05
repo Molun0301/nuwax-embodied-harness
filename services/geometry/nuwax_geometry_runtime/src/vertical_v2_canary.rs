@@ -499,7 +499,9 @@ fn path_matches_active_goal(path: &schema::PathEnvelope, goal: &schema::GoalEnve
         && path.committed_map_session_id == goal.committed_map_session_id
         && path.committed_map_session_generation == goal.committed_map_session_generation
         && path.committed_map_revision == goal.committed_map_revision
-        && path.committed_map_payload_sha256 == goal.committed_map_payload_sha256
+        && path.committed_map_boot_nonce == goal.committed_map_boot_nonce
+        && path.committed_map_commit_sequence == goal.committed_map_commit_sequence
+        && path.committed_map_source_timestamp_ns == goal.committed_map_source_timestamp_ns
         && path.committed_map_frame_id == goal.committed_map_frame_id
         && path.boundary_id == goal.boundary_id
         && path.boundary_sha256 == goal.boundary_sha256
@@ -1666,7 +1668,7 @@ fn spawn_path_ledger(
             let first = path.path.poses.first().map(|pose| pose.pose.position);
             let last = path.path.poses.last().map(|pose| pose.pose.position);
             eprintln!(
-                "V2 PATH_LEDGER ordinal={} elapsed_ns={} schema={} session={} owner={} parent={} goal_generation={} producer={} producer_epoch={} producer_runtime_generation={} map_session={} map_session_generation={} map_revision={} map_hash={:02x?} map_frame={} boundary_id={} boundary_hash={:02x?} guard_generation={} guard_nonce={:02x?} stop_generation={} planner_generation={} revision={} source_timestamp_ns={} goal_hash={:02x?} path_hash={:02x?} points={} first={:?} last={:?}",
+                "V2 PATH_LEDGER ordinal={} elapsed_ns={} schema={} session={} owner={} parent={} goal_generation={} producer={} producer_epoch={} producer_runtime_generation={} map_session={} map_session_generation={} map_revision={} map_boot_nonce={:02x?} map_commit_sequence={} map_source_timestamp_ns={} map_frame={} boundary_id={} boundary_hash={:02x?} guard_generation={} guard_nonce={:02x?} stop_generation={} planner_generation={} revision={} source_timestamp_ns={} goal_hash={:02x?} path_hash={:02x?} points={} first={:?} last={:?}",
                 ordinal,
                 elapsed_ns,
                 path.schema_version,
@@ -1680,7 +1682,9 @@ fn spawn_path_ledger(
                 path.committed_map_session_id,
                 path.committed_map_session_generation,
                 path.committed_map_revision,
-                path.committed_map_payload_sha256,
+                path.committed_map_boot_nonce,
+                path.committed_map_commit_sequence,
+                path.committed_map_source_timestamp_ns,
                 path.committed_map_frame_id,
                 path.boundary_id,
                 path.boundary_sha256,
@@ -2491,10 +2495,12 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
         .expect("production pointcloud ingest API");
         assert!(outcome.occupancy_committed);
         assert_eq!(adapter.current_revision(), 1);
-        MapRevisionEvent::from_map(
+        crate::lcm_runtime::PreparedMapRevisionEvent::from_map(
             &state.try_read().expect("committed map").map,
             &adapter.snapshot(),
         )
+        .seal(adapter.latest_occupancy_commit_receipt().expect("actual occupancy receipt"))
+        .expect("committed fixture matches actual receipt")
     };
     assert_eq!(event.revision, 1);
     assert_eq!(event.frame_id, "map");
@@ -3972,7 +3978,9 @@ fn acceptance_test_goal() -> schema::GoalEnvelope {
         committed_map_session_id: "acceptance-map".to_string(),
         committed_map_session_generation: 14,
         committed_map_revision: 15,
-        committed_map_payload_sha256: [0x16; 32],
+        committed_map_boot_nonce: [0x16; 16],
+        committed_map_commit_sequence: 16,
+        committed_map_source_timestamp_ns: 17,
         committed_map_frame_id: "map".to_string(),
         boundary_id: "acceptance-boundary".to_string(),
         boundary_sha256: [0x17; 32],
@@ -4001,7 +4009,9 @@ fn acceptance_test_path(
         committed_map_session_id: goal.committed_map_session_id.clone(),
         committed_map_session_generation: goal.committed_map_session_generation,
         committed_map_revision: goal.committed_map_revision,
-        committed_map_payload_sha256: goal.committed_map_payload_sha256,
+        committed_map_boot_nonce: goal.committed_map_boot_nonce,
+        committed_map_commit_sequence: goal.committed_map_commit_sequence,
+        committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
         committed_map_frame_id: goal.committed_map_frame_id.clone(),
         boundary_id: goal.boundary_id.clone(),
         boundary_sha256: goal.boundary_sha256,
@@ -4048,6 +4058,24 @@ fn acceptance_test_state(path: &schema::PathEnvelope) -> schema::NavigationState
         goal_payload_sha256: path.goal_payload_sha256,
         path_payload_sha256: path.path_payload_sha256,
         ..schema::NavigationState::default()
+    }
+}
+
+#[test]
+fn canonical_path_candidate_requires_exact_committed_map_receipt() {
+    let goal = acceptance_test_goal();
+    let candidate = acceptance_test_path(&goal, 1, 1);
+    assert!(is_canonical_path_candidate(&candidate, &goal));
+    for field in 0..3 {
+        let mut conflict = candidate.clone();
+        match field {
+            0 => conflict.path.committed_map_boot_nonce[0] ^= 1,
+            1 => conflict.path.committed_map_commit_sequence += 1,
+            _ => conflict.path.committed_map_source_timestamp_ns += 1,
+        }
+        // A valid path-body hash cannot repair mismatched canonical map provenance.
+        conflict.path.path_payload_sha256 = schema::path_envelope_payload_sha256(&conflict.path).unwrap();
+        assert!(!is_canonical_path_candidate(&conflict, &goal));
     }
 }
 

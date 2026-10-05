@@ -228,7 +228,9 @@ where
 /// 同一Geometry进程与点云修订不可变，进程代次由现有持久分配器排序。
 #[derive(Default)]
 struct SurfaceMapOrder {
-    latest: Option<(GuardedMapAuthority, Arc<Vec<u8>>)>,
+    latest: Option<(GuardedMapAuthority, Arc<Vec<u8>>, Arc<schema::NavigationMap3D>)>,
+    // Explicit no-map clears must not erase the last real receipt watermark.
+    committed_watermark: Option<GuardedMapAuthority>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -240,47 +242,145 @@ enum MapIngress {
 }
 
 impl SurfaceMapOrder {
-    fn observe(&mut self, authority: &GuardedMapAuthority, payload: &Arc<Vec<u8>>) -> MapIngress {
-        if let Some((previous, previous_payload)) = &self.latest {
+    fn observe(&mut self, message: &Arc<schema::NavigationMap3D>, payload: &Arc<Vec<u8>>) -> MapIngress {
+        let authority = map_authority(message);
+        let absent_clear = message.cleared && authority.committed_map.revision == 0;
+        if let Some((previous, previous_payload, previous_message)) = &self.latest {
             if authority.producer_runtime_generation < previous.producer_runtime_generation {
                 return MapIngress::Rejected("retired geometry map producer");
             }
             if authority.producer_runtime_generation == previous.producer_runtime_generation {
                 if authority.commit_boot_nonce != previous.commit_boot_nonce {
-                    return MapIngress::Invalidated(
-                        "map commit nonce changed inside one producer generation",
-                    );
+                    return MapIngress::Invalidated("map commit nonce changed inside one producer generation");
                 }
                 if authority.map_frame_generation < previous.map_frame_generation {
                     return MapIngress::Rejected("retired map coordinate generation");
                 }
-                if authority.same_domain(previous)
-                    && authority.committed_map.revision < previous.committed_map.revision
-                {
-                    return MapIngress::Rejected("stale committed map revision");
+                if !absent_clear && authority.committed_map.session_generation < previous.committed_map.session_generation {
+                    return MapIngress::Rejected("retired mapping session generation");
+                }
+                if !absent_clear && authority.committed_map.session_generation == previous.committed_map.session_generation
+                    && authority.committed_map.session_id != previous.committed_map.session_id {
+                    return MapIngress::Invalidated("mapping session changed inside one generation");
                 }
                 if authority.cloud_revision < previous.cloud_revision {
                     return MapIngress::Rejected("stale surface cloud revision");
                 }
-                let frame_rehome = authority.map_frame_generation > previous.map_frame_generation
-                    && authority.committed_map == previous.committed_map;
-                if authority.cloud_revision == previous.cloud_revision && !frame_rehome {
-                    // A real newer frame is a distinct root domain, even when
-                    // unchanged committed coordinates retain their cloud clock.
-                    // New publications retain immutable ownership in O(1). Only a
-                    // same-identity replay needs an exact payload comparison.
-                    return if authority == previous
-                        && (Arc::ptr_eq(payload, previous_payload) || payload == previous_payload)
-                    {
+                if authority.committed_map.revision > 0 && previous.committed_map.revision > 0
+                    && (authority.committed_map.revision < previous.committed_map.revision
+                        || authority.committed_map.commit_sequence < previous.committed_map.commit_sequence) {
+                    return MapIngress::Rejected("stale committed map revision");
+                }
+                if !absent_clear && (authority.cloud_commit_sequence < previous.cloud_commit_sequence
+                    || authority.cloud_occupancy_revision < previous.cloud_occupancy_revision) {
+                    return MapIngress::Rejected("stale surface cloud receipt");
+                }
+                if !absent_clear {
+                    if let Some(watermark) = self.committed_watermark.as_ref().filter(|old|
+                        old.producer_runtime_generation == authority.producer_runtime_generation) {
+                        if authority.committed_map.revision < watermark.committed_map.revision
+                            || authority.committed_map.commit_sequence < watermark.committed_map.commit_sequence
+                            || authority.cloud_commit_sequence < watermark.cloud_commit_sequence
+                            || authority.cloud_occupancy_revision < watermark.cloud_occupancy_revision {
+                            return MapIngress::Rejected("stale committed component after map clear");
+                        }
+                        if authority.committed_map.revision == watermark.committed_map.revision
+                            && authority.committed_map != watermark.committed_map {
+                            return MapIngress::Invalidated("occupancy receipt changed without a new revision");
+                        }
+                        if authority.committed_map.revision > watermark.committed_map.revision
+                            && authority.committed_map.commit_sequence <= watermark.committed_map.commit_sequence {
+                            return MapIngress::Invalidated("occupancy revision advanced without a commit");
+                        }
+                        if authority.cloud_commit_sequence == watermark.cloud_commit_sequence
+                            && (authority.cloud_occupancy_revision != watermark.cloud_occupancy_revision
+                                || authority.cloud_source_timestamp_ns != watermark.cloud_source_timestamp_ns) {
+                            return MapIngress::Invalidated("cloud receipt changed without a commit");
+                        }
+                    }
+                }
+                if authority == *previous {
+                    return if Arc::ptr_eq(payload, previous_payload) || payload == previous_payload {
                         MapIngress::Duplicate
                     } else {
                         MapIngress::Invalidated("surface map revision payload mutation")
                     };
                 }
+                if absent_clear {
+                    if authority.cloud_revision <= previous.cloud_revision {
+                        return MapIngress::Invalidated("map clear requires a newer cloud fence");
+                    }
+                } else if authority.same_domain(previous) {
+                    // A clear before any occupancy commit is a revocation variant,
+                    // not a live all-zero map identity. Its cloud fence still applies.
+                    let absent_clear = message.cleared && authority.committed_map.revision == 0;
+                    let previous_absent_clear = previous_message.cleared && previous.committed_map.revision == 0;
+                    if !absent_clear && !previous_absent_clear {
+                        let current = &authority.committed_map;
+                        let old = &previous.committed_map;
+                        if current.revision < old.revision || current.commit_sequence < old.commit_sequence {
+                            return MapIngress::Rejected("stale committed map revision");
+                        }
+                        if current.revision == old.revision {
+                            if current != old || (!message.cleared && !previous_message.cleared && !same_mask_content(message, previous_message)) {
+                                return MapIngress::Invalidated("occupancy receipt payload mutation");
+                            }
+                        } else if current.commit_sequence <= old.commit_sequence {
+                            return MapIngress::Invalidated("occupancy revision advanced without a commit");
+                        }
+                    }
+                    if authority.cloud_commit_sequence < previous.cloud_commit_sequence
+                        || authority.cloud_occupancy_revision < previous.cloud_occupancy_revision {
+                        return MapIngress::Rejected("stale surface cloud receipt");
+                    }
+                    if authority.cloud_commit_sequence == previous.cloud_commit_sequence
+                        && (authority.cloud_occupancy_revision != previous.cloud_occupancy_revision
+                            || authority.cloud_source_timestamp_ns != previous.cloud_source_timestamp_ns) {
+                        return MapIngress::Invalidated("cloud receipt changed without a commit");
+                    }
+                    if authority.cloud_revision == previous.cloud_revision
+                        && !same_cloud_content(message, previous_message) {
+                        return MapIngress::Invalidated("unchanged cloud revision payload mutation");
+                    }
+                } else if authority.cloud_revision == previous.cloud_revision
+                    && (authority.map_frame_generation <= previous.map_frame_generation
+                        || authority.committed_map != previous.committed_map) {
+                    return MapIngress::Invalidated("surface map domain changed without a new cloud root");
+                }
             }
         }
-        self.latest = Some((authority.clone(), Arc::clone(payload)));
+        // Retain both allocations by ownership only. FineMapReader separately
+        // checks immutable included block bodies, including unchanged roots.
+        if !absent_clear { self.committed_watermark = Some(authority.clone()); }
+        self.latest = Some((authority, Arc::clone(payload), Arc::clone(message)));
         MapIngress::New
+    }
+}
+
+fn same_cloud_content(left: &schema::NavigationMap3D, right: &schema::NavigationMap3D) -> bool {
+    left.cloud_revision == right.cloud_revision
+        && left.cloud_occupancy_revision == right.cloud_occupancy_revision
+        && left.commit_boot_nonce == right.commit_boot_nonce
+        && left.commit_sequence == right.commit_sequence
+        && left.source_timestamp_ns == right.source_timestamp_ns
+        && left.source_voxel_size.to_bits() == right.source_voxel_size.to_bits()
+        && left.cleared == right.cleared
+        && left.cloud == right.cloud
+        && match (&left.fine, &right.fine) {
+            (Some(a), Some(b)) => a.root == b.root,
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+fn same_mask_content(left: &schema::NavigationMap3D, right: &schema::NavigationMap3D) -> bool {
+    match (&left.virtual_obstacles, &right.virtual_obstacles) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b
+            && a.info.resolution.to_bits() == b.info.resolution.to_bits()
+            && a.info.origin.position.map(f64::to_bits) == b.info.origin.position.map(f64::to_bits)
+            && a.info.origin.orientation_xyzw.map(f64::to_bits) == b.info.origin.orientation_xyzw.map(f64::to_bits),
+        _ => false,
     }
 }
 
@@ -290,6 +390,9 @@ fn map_authority(map: &schema::NavigationMap3D) -> GuardedMapAuthority {
         producer_runtime_generation: map.producer_runtime_generation,
         map_frame_generation: map.map_frame_generation,
         cloud_revision: map.cloud_revision,
+        cloud_occupancy_revision: map.cloud_occupancy_revision,
+        cloud_commit_sequence: map.commit_sequence,
+        cloud_source_timestamp_ns: map.source_timestamp_ns,
         commit_boot_nonce: map.commit_boot_nonce,
     }
 }
@@ -643,7 +746,9 @@ async fn run_surface_planner_with_computer(
                 let (epoch, update) = computed.expect("已有表面任务").map_err(|e| NavStackError::Internal(e.to_string()))?;
                 let update = update.map_err(NavStackError::Internal)?;
                 if epoch != map_epoch || latest_map.as_ref().is_some_and(|old| old.authority.same_domain(&update.authority)
-                    && (old.authority.cloud_revision > update.authority.cloud_revision || (old.authority.cloud_revision == update.authority.cloud_revision && old.snapshot.is_ok()))) { continue; }
+                    && (old.authority.cloud_revision > update.authority.cloud_revision
+                        || old.authority.committed_map.revision > update.authority.committed_map.revision
+                        || (old.authority == update.authority && old.snapshot.is_ok()))) { continue; }
                 if update.snapshot.is_err() {
                     // 构建失败会撤销执行地图；尚未取得租约的目标仍归原拥有方，
                     // 待同域新图恢复或定向取消，不能只在规划端丢弃身份。
@@ -706,13 +811,13 @@ async fn run_surface_planner_with_computer(
                 // Move the transport allocation into immutable ownership; neither
                 // retaining a baseline nor accepting a new revision scans its bytes.
                 let payload = Arc::new(frame.payload);
-                match order.observe(&map_authority(&message), &payload) {
+                match order.observe(&message, &payload) {
                     MapIngress::Rejected(reason) => { diagnostics.reject("surface map", reason); continue; }
                     MapIngress::Duplicate => continue,
                     MapIngress::Invalidated(reason) => {
                         map_epoch = map_epoch.checked_add(1).ok_or_else(|| NavStackError::Internal("表面构建票据耗尽".into()))?;
                         pending_map.take();
-                        let authority = order.latest.as_ref().map_or_else(|| map_authority(&message), |(authority,_)| authority.clone());
+                        let authority = order.latest.as_ref().map_or_else(|| map_authority(&message), |(authority,_,_)| authority.clone());
                         let update = PreparedSurfaceMap { authority, source_timestamp_ns:message.source_timestamp_ns,
                             received_at, awaiting_build: false, snapshot:Err(reason.into()) };
                         retire_goal(&mut goal, &mut retired_goals);
@@ -1210,7 +1315,7 @@ mod tests {
         let first = map_message(1, "map");
         let goal = goal_for(&first, 1, [1.5, 1.5, 2.5]);
         let mut next = first.clone(); next.cloud_revision += 1;
-        next.committed_map.revision += 1; next.committed_map.payload_sha256 = [42; 32];
+        next.committed_map.revision += 1; next.committed_map.commit_sequence += 1;
         assert!(map_authority(&next).permits_goal(&goal));
         next.map_frame_generation += 1;
         assert!(!map_authority(&next).permits_goal(&goal));
@@ -1236,12 +1341,15 @@ mod tests {
             committed_map: schema::CommittedMapIdentity {
                 session_id: session.into(),
                 session_generation: 1,
-                revision: 1,
-                payload_sha256: [0x31; 32],
+                revision,
+                commit_boot_nonce: [0x44; 16],
+                commit_sequence: revision,
+                source_timestamp_ns: stamp,
                 frame_id: "map".into(),
             },
             map_frame_generation: 1,
             cloud_revision: revision,
+            cloud_occupancy_revision: revision,
             source_timestamp_ns: stamp,
             source_voxel_size: 0.1,
             commit_boot_nonce: [0x44; 16],
@@ -1296,7 +1404,9 @@ mod tests {
             committed_map_session_id: map.committed_map.session_id.clone(),
             committed_map_session_generation: map.committed_map.session_generation,
             committed_map_revision: map.committed_map.revision,
-            committed_map_payload_sha256: map.committed_map.payload_sha256,
+            committed_map_boot_nonce: map.committed_map.commit_boot_nonce,
+            committed_map_commit_sequence: map.committed_map.commit_sequence,
+            committed_map_source_timestamp_ns: map.committed_map.source_timestamp_ns,
             committed_map_frame_id: "map".into(),
             source_timestamp_ns: stamp,
             motion_guard_generation: 7,
@@ -1342,8 +1452,8 @@ mod tests {
         schema::OccupancyGrid {
             header: schema::Header {
                 seq: map.committed_map.revision as i32,
-                stamp_sec: (map.source_timestamp_ns / 1_000_000_000) as i32,
-                stamp_nsec: (map.source_timestamp_ns % 1_000_000_000) as i32,
+                stamp_sec: (map.committed_map.source_timestamp_ns / 1_000_000_000) as i32,
+                stamp_nsec: (map.committed_map.source_timestamp_ns % 1_000_000_000) as i32,
                 frame_id: "map".into(),
             },
             info: schema::MapMetaData {
@@ -1400,6 +1510,21 @@ mod tests {
         assert!(!Arc::ptr_eq(&observed_first, &observed_second));
         assert_eq!(observed_second.observations().unwrap().get([40,30,40]).unwrap().observed_ns, second_message.source_timestamp_ns as u64);
         assert_eq!(observed_first.observations().unwrap().get([40,30,40]), Some(old_evidence));
+        // Occupancy-only progress retains the physical graph and original fine
+        // observation allocation/time. A newer mask never refreshes evidence age.
+        let retained_physical = observed_cache.physical_snapshot().unwrap();
+        let retained_observations = Arc::clone(observed_second.observations().unwrap());
+        let mut mask_only = second_message.clone();
+        advance_mask(&mut mask_only, false);
+        let masked = observed_cache.build(&mask_only).unwrap();
+        assert!(Arc::ptr_eq(&retained_physical, &observed_cache.physical_snapshot().unwrap()));
+        assert!(Arc::ptr_eq(&retained_observations, masked.observations().unwrap()));
+        assert_eq!(masked.observations().unwrap().get([40,30,40]).unwrap().observed_ns,
+            second_message.source_timestamp_ns as u64);
+        assert_eq!(mask_only.source_timestamp_ns, second_message.source_timestamp_ns);
+        assert_eq!(observed_cache.last_build_stats().unwrap().input_points, 0);
+        assert_eq!(observed_cache.last_build_stats().unwrap().kind,
+            nuwax_nav_mls_planner::SurfaceBuildKind::Reused);
         cells.retain(|c|!(40..42).contains(&c[0]) || !(28..34).contains(&c[1]));
         let mut bad=message(&cells,3);
         bad.fine.as_mut().unwrap().included.values_mut().next().unwrap()[0]^=1;
@@ -1429,6 +1554,9 @@ mod tests {
         let mut resized = switched.clone();
         resized.cloud_revision += 1;
         resized.commit_sequence += 1;
+        resized.committed_map.commit_sequence = resized.commit_sequence;
+        resized.committed_map.revision += 1;
+        resized.cloud_occupancy_revision = resized.committed_map.revision;
         resized.cloud.header.seq += 1;
         resized.source_voxel_size = 0.025;
         root.revision += 1;
@@ -1537,18 +1665,7 @@ mod tests {
         assert!(Arc::ptr_eq(&physical, &cache.physical_snapshot().unwrap()));
         message.cloud_revision += 1;
         message.cloud.header.seq += 1;
-        message.commit_sequence += 1;
-        message.source_timestamp_ns += 1;
-        message.cloud.header.stamp_sec = (message.source_timestamp_ns / 1_000_000_000) as i32;
-        message.cloud.header.stamp_nsec = (message.source_timestamp_ns % 1_000_000_000) as i32;
-        message.virtual_obstacles.as_mut().unwrap().header.stamp_sec =
-            message.cloud.header.stamp_sec;
-        message
-            .virtual_obstacles
-            .as_mut()
-            .unwrap()
-            .header
-            .stamp_nsec = message.cloud.header.stamp_nsec;
+        // Scan-only publication retains the existing receipt and evidence clock.
         let repeated = prepare_surface_map(message, Instant::now(), &configured, &mut cache);
         assert!(Arc::ptr_eq(
             constrained.snapshot.as_ref().unwrap(),
@@ -1623,98 +1740,137 @@ mod tests {
         );
     }
 
+    fn observe_map(order: &mut SurfaceMapOrder, message: &schema::NavigationMap3D) -> MapIngress {
+        let payload = Arc::new(schema::encode_navigation_map_3d_body(message).unwrap());
+        order.observe(&Arc::new(message.clone()), &payload)
+    }
+
+    fn advance_mask(message: &mut schema::NavigationMap3D, blocked: bool) {
+        message.committed_map.revision += 1;
+        message.committed_map.commit_sequence += 1;
+        message.committed_map.source_timestamp_ns += 10;
+        message.virtual_obstacles = Some(virtual_mask(message, blocked));
+    }
+
+    fn advance_scan(message: &mut schema::NavigationMap3D) {
+        message.cloud_revision += 1;
+        message.cloud.header.seq = message.cloud_revision as i32;
+    }
+
     #[test]
     fn map_order_and_geometry_reuse_preserve_input_identity_and_receipt_age() {
-        let first = map_message(1, "first-map");
+        let first = Arc::new(map_message(1, "first-map"));
         let payload = Arc::new(schema::encode_navigation_map_3d_body(&first).unwrap());
-        let authority = map_authority(&first);
         let mut order = SurfaceMapOrder::default();
-        assert_eq!(order.observe(&authority, &payload), MapIngress::New);
-        assert!(Arc::ptr_eq(&order.latest.as_ref().unwrap().1, &payload));
-        assert_eq!(order.observe(&authority, &payload), MapIngress::Duplicate);
-        let duplicate = Arc::new(payload.as_ref().clone());
-        assert_eq!(order.observe(&authority, &duplicate), MapIngress::Duplicate);
-        let mut old = authority.clone();
-        old.producer_runtime_generation -= 1;
-        assert!(matches!(order.observe(&old, &payload), MapIngress::Rejected(_)));
+        assert_eq!(order.observe(&first, &payload), MapIngress::New);
+        let (_, bytes, retained) = order.latest.as_ref().unwrap();
+        assert!(Arc::ptr_eq(bytes, &payload));
+        assert!(Arc::ptr_eq(retained, &first));
+        assert_eq!(order.observe(&first, &payload), MapIngress::Duplicate);
+        assert_eq!(order.observe(&first, &Arc::new(payload.as_ref().clone())), MapIngress::Duplicate);
         let mut mutation = payload.as_ref().clone();
         mutation[0] ^= 1;
-        assert!(matches!(order.observe(&authority, &Arc::new(mutation)), MapIngress::Invalidated(_)));
+        assert!(matches!(order.observe(&first, &Arc::new(mutation)), MapIngress::Invalidated(_)));
         let mut cache = SurfaceGeometryCache::new(config().geometry);
         let received = Instant::now() - Duration::from_secs(2);
-        let prepared = prepare_surface_map(first, received, &config(), &mut cache);
-        let next = prepare_surface_map(
-            map_message(2, "second-map"),
-            received,
-            &config(),
-            &mut cache,
-        );
-        assert!(Arc::ptr_eq(
-            prepared.snapshot.as_ref().unwrap(),
-            next.snapshot.as_ref().unwrap()
-        ));
+        let prepared = prepare_surface_map(Arc::clone(&first), received, &config(), &mut cache);
+        let mut masked = first.as_ref().clone();
+        advance_mask(&mut masked, true);
+        assert_eq!(observe_map(&mut order, &masked), MapIngress::New);
+        let physical = cache.physical_snapshot().unwrap();
+        let next = prepare_surface_map(masked, received, &config(), &mut cache);
+        assert!(Arc::ptr_eq(&physical, &cache.physical_snapshot().unwrap()));
+        assert!(!Arc::ptr_eq(prepared.snapshot.as_ref().unwrap(), next.snapshot.as_ref().unwrap()));
         assert_eq!(next.received_at, received);
-        assert_eq!(next.authority.committed_map.session_id, "second-map");
+        assert_eq!(next.source_timestamp_ns, first.source_timestamp_ns);
     }
 
     #[test]
-    fn publication_order_retains_nonce_retired_and_stale_guards_without_hashes() {
-        let mut message = map_message(2, "order");
-        message.committed_map.revision = 2;
-        let authority = map_authority(&message);
-        let payload = Arc::new(schema::encode_navigation_map_3d_body(&message).unwrap());
+    fn publication_order_accepts_monotone_scan_and_mask_components_and_rejects_rollback() {
+        let first = map_message(1, "order");
         let mut order = SurfaceMapOrder::default();
-        assert_eq!(order.observe(&authority, &payload), MapIngress::New);
-        let mut retired_producer = authority.clone();
-        retired_producer.producer_runtime_generation -= 1;
-        let mut retired_frame = authority.clone();
-        retired_frame.map_frame_generation -= 1;
-        let mut stale_commit = authority.clone();
-        stale_commit.committed_map.revision -= 1;
-        let mut stale_cloud = authority.clone();
-        stale_cloud.cloud_revision -= 1;
-        for stale in [retired_producer, retired_frame, stale_commit, stale_cloud] {
-            assert!(matches!(order.observe(&stale, &payload), MapIngress::Rejected(_)));
-            assert!(Arc::ptr_eq(&order.latest.as_ref().unwrap().1, &payload));
+        assert_eq!(observe_map(&mut order, &first), MapIngress::New);
+        let mut mask = first.clone();
+        advance_mask(&mut mask, true);
+        assert_eq!(observe_map(&mut order, &mask), MapIngress::New);
+        assert_eq!(mask.source_timestamp_ns, first.source_timestamp_ns);
+        let mut scan = mask.clone();
+        advance_scan(&mut scan);
+        assert_eq!(observe_map(&mut order, &scan), MapIngress::New);
+        let mut both = scan.clone();
+        advance_scan(&mut both);
+        advance_mask(&mut both, false);
+        assert_eq!(observe_map(&mut order, &both), MapIngress::New);
+        for stale in [first, mask, scan] {
+            assert!(matches!(observe_map(&mut order, &stale), MapIngress::Rejected(_)));
         }
-        let mut changed_nonce = authority.clone();
-        changed_nonce.commit_boot_nonce[0] ^= 1;
-        assert!(matches!(order.observe(&changed_nonce, &payload), MapIngress::Invalidated(_)));
-        let mut conflicting_authority = authority.clone();
-        conflicting_authority.committed_map.revision += 1;
-        assert!(matches!(order.observe(&conflicting_authority, &payload), MapIngress::Invalidated(_)));
-        let mut next = authority.clone();
-        next.cloud_revision += 1;
-        let next_payload = Arc::new(vec![1, 2, 3]);
-        assert_eq!(order.observe(&next, &next_payload), MapIngress::New);
-        assert!(Arc::ptr_eq(&order.latest.as_ref().unwrap().1, &next_payload));
-        let mut replacement = changed_nonce;
-        replacement.producer_runtime_generation += 1;
-        replacement.cloud_revision = 1;
-        assert_eq!(order.observe(&replacement, &payload), MapIngress::New);
+        assert_eq!(observe_map(&mut order, &both), MapIngress::Duplicate);
+        let mut stale_mask = both.clone();
+        advance_scan(&mut stale_mask);
+        stale_mask.committed_map.revision -= 1;
+        assert!(matches!(observe_map(&mut order, &stale_mask), MapIngress::Rejected(_)));
+        let mut stale_cloud = both.clone();
+        advance_mask(&mut stale_cloud, true);
+        stale_cloud.cloud_revision -= 1;
+        stale_cloud.cloud.header.seq -= 1;
+        assert!(matches!(observe_map(&mut order, &stale_cloud), MapIngress::Rejected(_)));
     }
 
     #[test]
-    fn newer_frame_domain_accepts_unchanged_cloud_revision_but_not_same_identity_mutation() {
-        let message = map_message(2, "frame-rehome");
-        let old = map_authority(&message);
-        let old_bytes = Arc::new(schema::encode_navigation_map_3d_body(&message).unwrap());
+    fn mask_only_claim_cannot_change_cloud_and_scan_only_claim_cannot_change_mask() {
+        let mut first = map_message(1, "immutable-components");
+        first.virtual_obstacles = Some(virtual_mask(&first, true));
         let mut order = SurfaceMapOrder::default();
-        assert_eq!(order.observe(&old, &old_bytes), MapIngress::New);
-        let mut moved = message.clone();
+        assert_eq!(observe_map(&mut order, &first), MapIngress::New);
+        let mut changed_cloud = first.clone();
+        advance_mask(&mut changed_cloud, false);
+        changed_cloud.cloud.data[0] ^= 1;
+        assert!(matches!(observe_map(&mut order, &changed_cloud), MapIngress::Invalidated(_)));
+        let mut changed_mask = first.clone();
+        advance_scan(&mut changed_mask);
+        changed_mask.virtual_obstacles.as_mut().unwrap().data[0] = 100;
+        assert!(matches!(observe_map(&mut order, &changed_mask), MapIngress::Invalidated(_)));
+        assert_eq!(observe_map(&mut order, &first), MapIngress::Duplicate);
+        let mut valid = first.clone();
+        advance_mask(&mut valid, false);
+        assert_eq!(observe_map(&mut order, &valid), MapIngress::New);
+    }
+
+    #[test]
+    fn publication_domains_reject_nonce_session_frame_and_producer_rollback() {
+        let first = map_message(2, "order");
+        let mut order = SurfaceMapOrder::default();
+        assert_eq!(observe_map(&mut order, &first), MapIngress::New);
+        let mut nonce = first.clone();
+        nonce.commit_boot_nonce = [0x99; 16];
+        nonce.committed_map.commit_boot_nonce = nonce.commit_boot_nonce;
+        assert!(matches!(observe_map(&mut order, &nonce), MapIngress::Invalidated(_)));
+        let mut relabeled = first.clone();
+        relabeled.committed_map.session_id = "wrong-session".into();
+        assert!(matches!(observe_map(&mut order, &relabeled), MapIngress::Invalidated(_)));
+        let mut moved = first.clone();
         moved.map_frame_generation += 1;
-        let next = map_authority(&moved);
-        let bytes = Arc::new(schema::encode_navigation_map_3d_body(&moved).unwrap());
-        assert_eq!(order.observe(&next, &bytes), MapIngress::New);
-        assert_eq!(order.observe(&next, &bytes), MapIngress::Duplicate);
-        assert!(matches!(order.observe(&old, &old_bytes), MapIngress::Rejected(_)));
-        let mut mutated = (*bytes).clone();
-        mutated.push(0);
-        assert!(matches!(order.observe(&next, &Arc::new(mutated)), MapIngress::Invalidated(_)));
-        let mut mixed = next.clone();
-        mixed.map_frame_generation += 1;
-        mixed.committed_map.revision += 1;
-        assert!(matches!(order.observe(&mixed, &bytes), MapIngress::Invalidated(_)));
+        assert_eq!(observe_map(&mut order, &moved), MapIngress::New);
+        assert!(matches!(observe_map(&mut order, &first), MapIngress::Rejected(_)));
+        let mut session = moved.clone();
+        session.committed_map.session_generation += 1;
+        session.committed_map.session_id = "new-session".into();
+        advance_mask(&mut session, false);
+        advance_scan(&mut session);
+        assert_eq!(observe_map(&mut order, &session), MapIngress::New);
+        assert!(matches!(observe_map(&mut order, &moved), MapIngress::Rejected(_)));
+        let mut replacement = map_message(1, "new-owner");
+        replacement.producer_runtime_generation += 1;
+        replacement.commit_boot_nonce = [1; 16];
+        replacement.committed_map.commit_boot_nonce = replacement.commit_boot_nonce;
+        assert_eq!(observe_map(&mut order, &replacement), MapIngress::New);
+        assert!(matches!(observe_map(&mut order, &session), MapIngress::Rejected(_)));
+        let mut stale_conflict = session;
+        stale_conflict.committed_map.source_timestamp_ns += 1;
+        // A retired owner must not invalidate the replacement, even with an
+        // internally coherent but conflicting old receipt.
+        stale_conflict.virtual_obstacles = Some(virtual_mask(&stale_conflict, false));
+        assert!(matches!(observe_map(&mut order, &stale_conflict), MapIngress::Rejected(_)));
     }
 
     #[test]
@@ -1728,10 +1884,74 @@ mod tests {
         let changed_payload = Arc::new(schema::encode_navigation_map_3d_body(&same_values).unwrap());
         assert_ne!(payload, changed_payload);
         let mut order = SurfaceMapOrder::default();
-        let authority = map_authority(&message);
-        assert_eq!(order.observe(&authority, &payload), MapIngress::New);
-        assert!(matches!(order.observe(&authority, &changed_payload), MapIngress::Invalidated(_)));
+        assert_eq!(order.observe(&Arc::new(message), &payload), MapIngress::New);
+        assert!(matches!(order.observe(&Arc::new(same_values.clone()), &changed_payload), MapIngress::Invalidated(_)));
         assert!(Arc::ptr_eq(&order.latest.as_ref().unwrap().1, &payload));
+        advance_scan(&mut same_values);
+        assert!(matches!(observe_map(&mut order, &same_values), MapIngress::Invalidated(_)));
+    }
+
+    #[test]
+    fn absent_clear_is_revocation_and_does_not_erase_real_receipt_watermark() {
+        let first = map_message(2, "clear-watermark");
+        let mut order = SurfaceMapOrder::default();
+        assert_eq!(observe_map(&mut order, &first), MapIngress::New);
+        let mut clear = first.clone();
+        advance_scan(&mut clear);
+        clear.cleared = true;
+        clear.committed_map.revision = 0;
+        clear.committed_map.commit_boot_nonce = [0; 16];
+        clear.committed_map.commit_sequence = 0;
+        clear.committed_map.source_timestamp_ns = 0;
+        clear.cloud_occupancy_revision = 0;
+        clear.commit_sequence = 0;
+        clear.cloud.width = 0;
+        clear.cloud.row_step = 0;
+        clear.cloud.data.clear();
+        assert_eq!(observe_map(&mut order, &clear), MapIngress::New);
+        assert_eq!(observe_map(&mut order, &clear), MapIngress::Duplicate);
+        let mut rollback = map_message(1, "clear-watermark");
+        rollback.cloud_revision = clear.cloud_revision + 1;
+        rollback.cloud.header.seq = rollback.cloud_revision as i32;
+        assert!(matches!(observe_map(&mut order, &rollback), MapIngress::Rejected(_)));
+        let mut next = first.clone();
+        next.cloud_revision = clear.cloud_revision + 1;
+        next.cloud.header.seq = next.cloud_revision as i32;
+        advance_mask(&mut next, false);
+        assert_eq!(observe_map(&mut order, &next), MapIngress::New);
+    }
+
+    #[test]
+    fn surface_consumer_rejects_previous_wire_version_and_incomplete_receipt() {
+        let message = map_message(1, "version-skew");
+        let mut bytes = schema::encode_navigation_map_3d_body(&message).unwrap();
+        bytes[..4].copy_from_slice(&(schema::NAVIGATION_MAP_3D_SCHEMA_VERSION - 1).to_be_bytes());
+        assert!(schema::decode_navigation_map_3d_body(&bytes).is_err());
+        let mut missing = message;
+        missing.committed_map.commit_boot_nonce = [0; 16];
+        assert!(schema::encode_navigation_map_3d_body(&missing).is_err());
+    }
+
+    #[test]
+    fn explicit_clear_fences_live_replay_and_supports_a_real_subsequent_commit() {
+        let mut first = map_message(1, "clear");
+        first.virtual_obstacles = Some(virtual_mask(&first, true));
+        let mut order = SurfaceMapOrder::default();
+        assert_eq!(observe_map(&mut order, &first), MapIngress::New);
+        let mut clear = first.clone();
+        advance_scan(&mut clear);
+        clear.cleared = true;
+        clear.virtual_obstacles = None;
+        clear.cloud.width = 0;
+        clear.cloud.row_step = 0;
+        clear.cloud.data.clear();
+        assert_eq!(observe_map(&mut order, &clear), MapIngress::New);
+        assert!(matches!(observe_map(&mut order, &first), MapIngress::Rejected(_)));
+        let mut resumed = first.clone();
+        resumed.cloud_revision = clear.cloud_revision + 1;
+        resumed.cloud.header.seq = resumed.cloud_revision as i32;
+        advance_mask(&mut resumed, false);
+        assert_eq!(observe_map(&mut order, &resumed), MapIngress::New);
     }
 
     #[tokio::test]
@@ -1939,7 +2159,11 @@ mod tests {
                         };
                         let map = if state.map_enabled && count % 4 == 1 {
                             state.map.cloud_revision += 1;
-                            state.map.commit_sequence += 1;
+                            state.map.committed_map.revision += 1;
+                            state.map.committed_map.commit_sequence += 1;
+                            state.map.commit_sequence = state.map.committed_map.commit_sequence;
+                            state.map.cloud_occupancy_revision = state.map.committed_map.revision;
+                            state.map.committed_map.source_timestamp_ns = now;
                             state.map.source_timestamp_ns = now;
                             state.map.cloud.header.seq = state.map.cloud_revision as i32;
                             state.map.cloud.header.stamp_sec = (now / 1_000_000_000) as i32;
@@ -2365,6 +2589,9 @@ mod tests {
         harness.wait_ready().await;
         let mut future_map = harness.freeze_map().await;
         future_map.committed_map.revision += 100;
+        future_map.committed_map.commit_sequence += 100;
+        future_map.commit_sequence = future_map.committed_map.commit_sequence;
+        future_map.cloud_occupancy_revision = future_map.committed_map.revision;
         future_map.cloud_revision += 100;
         let goal = goal_for(&future_map, 1, [1.55, 1.55, 2.5]);
         harness.goal(&goal).await;
@@ -2590,7 +2817,7 @@ mod tests {
         {
             let mut feed = first.feed.lock().unwrap();
             feed.map.committed_map.revision += 1;
-            feed.map.committed_map.payload_sha256 = [0x32; 32];
+            feed.map.committed_map.commit_sequence += 1;
             feed.map.virtual_obstacles = Some(virtual_mask(&feed.map, true));
         }
         first.wait_phase(SchedulerPhase::AwaitingPath).await;
@@ -2601,18 +2828,22 @@ mod tests {
         {
             let mut feed = first.feed.lock().unwrap();
             feed.map.committed_map.revision += 1;
-            feed.map.committed_map.payload_sha256 = [0x33; 32];
+            feed.map.committed_map.commit_sequence += 1;
             feed.map.virtual_obstacles = None;
         }
         first.wait_controlling().await;
 
         let mut clear = first.freeze_map().await;
         clear.cloud_revision += 1;
-        clear.commit_sequence += 1;
+        clear.committed_map.revision += 1;
+        clear.committed_map.commit_sequence += 1;
+        clear.commit_sequence = clear.committed_map.commit_sequence;
+        clear.cloud_occupancy_revision = clear.committed_map.revision;
         clear.cleared = true;
         clear.virtual_obstacles = None;
         let stamp = current_unix_timestamp_ns().unwrap();
         clear.source_timestamp_ns = stamp;
+        clear.committed_map.source_timestamp_ns = stamp;
         clear.cloud = schema::PointCloud2 {
             header: schema::Header {
                 seq: clear.cloud_revision as i32,
@@ -2630,6 +2861,8 @@ mod tests {
             let mut feed = first.feed.lock().unwrap();
             feed.map.cloud_revision = clear.cloud_revision;
             feed.map.commit_sequence = clear.commit_sequence;
+            feed.map.committed_map = clear.committed_map.clone();
+            feed.map.cloud_occupancy_revision = clear.cloud_occupancy_revision;
             feed.map_enabled = true;
         }
         first.wait_ready().await;

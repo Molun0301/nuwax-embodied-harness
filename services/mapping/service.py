@@ -15,6 +15,58 @@ from providers import MapProvider
 from typing import Dict, List, Optional, Tuple
 
 
+def _committed_occupancy_identity(value):
+    """Validate/copy the small producer receipt, never inspect the grid body."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or value.get("kind") != "committed_occupancy":
+        raise ValueError("live map content identity must be a committed occupancy receipt")
+    if value.get("representation") not in {"effective", "raw_physical", "effective_fallback"}:
+        raise ValueError("live map representation is missing or unsupported")
+    provenance = value.get("provenance")
+    if not isinstance(provenance, dict) or type(provenance.get("schema_version")) is not int or provenance["schema_version"] != 2:
+        raise ValueError("live map provenance schema is missing or unsupported")
+    commit = provenance.get("commit_id")
+    if not isinstance(commit, dict):
+        raise ValueError("live map commit identity is missing")
+    nonce = commit.get("boot_nonce")
+    if (not isinstance(nonce, str) or len(nonce) != 32
+            or any(character not in "0123456789abcdef" for character in nonce)
+            or nonce == "0" * 32):
+        raise ValueError("live map boot nonce must be a nonzero 16-byte identity")
+    for name, item, minimum in (
+        ("sequence", commit.get("sequence"), 1),
+        ("session_generation", provenance.get("session_generation"), 1),
+        ("occupancy_revision", provenance.get("occupancy_revision"), 1),
+        ("source_timestamp_ns", provenance.get("source_timestamp_ns"), 0),
+        ("backend_generation", provenance.get("backend_generation"), 1),
+    ):
+        if type(item) is not int or not minimum <= item <= (1 << 64) - 1:
+            raise ValueError("live map %s is missing or invalid" % name)
+    for name in ("session_id", "frame_id"):
+        item = provenance.get(name)
+        if not isinstance(item, str) or not item or item != item.strip():
+            raise ValueError("live map %s is missing or invalid" % name)
+    if provenance.get("backend_kind") not in {"raytracing", "voxel", "slam_toolbox"}:
+        raise ValueError("live map backend kind is missing or unsupported")
+    return {"kind": "committed_occupancy", "representation": value["representation"],
+            "provenance": {**{key: provenance[key] for key in (
+                "schema_version", "session_id", "session_generation", "occupancy_revision",
+                "source_timestamp_ns", "backend_kind", "backend_generation", "frame_id")},
+                "commit_id": {"boot_nonce": nonce, "sequence": commit["sequence"]}}}
+
+
+def _receipt_source_epoch(identity):
+    provenance = identity["provenance"]
+    return "%s:%s:%d" % (provenance["commit_id"]["boot_nonce"],
+                           provenance["session_id"], provenance["session_generation"])
+
+
+def _snapshot_content_identity(metadata):
+    """Layer identities are a composite, never the sum of independent revisions."""
+    return (metadata.get("content_identity"), metadata.get("layer_content_identities"))
+
+
 class MappingService:
     """统一运行态地图快照服务。"""
 
@@ -63,6 +115,7 @@ class MappingService:
                         and latest.source_epoch == runtime_snapshot.source_epoch
                         and latest.update_sequence == runtime_snapshot.update_sequence
                         and latest.frame_id == runtime_snapshot.frame_id
+                        and _snapshot_content_identity(latest.metadata) == _snapshot_content_identity(runtime_snapshot.metadata)
                         and latest.metadata.get("semantic_reference_identity") == runtime_snapshot.metadata.get("semantic_reference_identity")
                     ):
                         self._require_current_snapshot_source(runtime_snapshot.map_name, runtime_snapshot.metadata)
@@ -182,6 +235,62 @@ class MappingService:
             raise GatewayError("地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。")
 
         source_metadata = dict(metadata or {})
+        live_source = (source_metadata.get("source_kind") != "map_asset_bundle"
+                       and (source_metadata.get("source_kind") == "platform_live_map_provider"
+                            or source_metadata.get("map_snapshot_kind") == "live_streaming"
+                            or source_metadata.get("mapping_live_streaming_ready") is True
+                            or source_metadata.get("live_streaming_ready") is True))
+        try:
+            receipt_identity = _committed_occupancy_identity(source_metadata.get("content_identity"))
+        except ValueError as exc:
+            raise GatewayError(str(exc), error_code="map_snapshot_receipt_invalid", http_status=409) from exc
+        if live_source and receipt_identity is None:
+            raise GatewayError("实时地图缺少已提交的占据栅格凭据。", error_code="map_snapshot_receipt_missing", http_status=409)
+        if receipt_identity is not None:
+            provenance = receipt_identity["provenance"]
+            revision = provenance["occupancy_revision"]
+            layer_metadata = getattr(occupancy_grid, "metadata", {})
+            if (receipt_identity["representation"] != "effective" or occupancy_grid is None
+                    or provenance["frame_id"] != occupancy_grid.frame_id
+                    or source_metadata.get("map_provenance", provenance) != provenance
+                    or layer_metadata.get("content_identity", receipt_identity) != receipt_identity
+                    or layer_metadata.get("map_provenance", provenance) != provenance
+                    or source_metadata.get("mapping_session_id", provenance["session_id"]) != provenance["session_id"]
+                    or source_metadata.get("session_generation", provenance["session_generation"]) != provenance["session_generation"]
+                    or any(value is not None and (type(value) is not int or value != revision)
+                           for value in (update_sequence_override, source_metadata.get("update_sequence"),
+                                         source_metadata.get("occupancy_content_revision"), source_metadata.get("content_revision")))):
+                raise GatewayError("实时地图与占据栅格凭据不一致。", error_code="map_snapshot_receipt_mismatch", http_status=409)
+            source_metadata.update(content_identity=receipt_identity, map_provenance=provenance,
+                                   occupancy_content_revision=revision, content_revision=revision,
+                                   content_identity_status="committed")
+            source_metadata["layer_content_identities"] = {
+                "occupancy": {"identity_status": "committed", "content_identity": receipt_identity, "revision": revision},
+                "cost_map": {"identity_status": "legacy_unbound" if cost_map is not None else "absent",
+                             "content_identity": None, "revision": None},
+            }
+            update_sequence_override = revision
+            receipt_epoch = _receipt_source_epoch(receipt_identity)
+            if any(value and value != receipt_epoch for value in (source_epoch, source_metadata.get("source_epoch"))):
+                raise GatewayError("实时地图来源代际与凭据不一致。", error_code="map_snapshot_receipt_mismatch", http_status=409)
+            source_epoch = receipt_epoch
+            if stream_occupancy_grid is not None:
+                try:
+                    display_identity = _committed_occupancy_identity((stream_occupancy_metadata or {}).get("content_identity"))
+                except ValueError as exc:
+                    raise GatewayError(str(exc), error_code="map_display_receipt_invalid", http_status=409) from exc
+                if (display_identity is None or display_identity["provenance"] != provenance
+                        or display_identity["representation"] not in {"raw_physical", "effective_fallback"}
+                        or (stream_occupancy_source is not None and stream_occupancy_source != display_identity["representation"])
+                        or stream_occupancy_grid.frame_id != provenance["frame_id"]):
+                    raise GatewayError("显示地图缺少相同提交的来源凭据。", error_code="map_display_receipt_mismatch", http_status=409)
+                stream_occupancy_metadata = {**dict(stream_occupancy_metadata or {}),
+                    "content_identity": display_identity, "map_provenance": display_identity["provenance"],
+                    "occupancy_content_revision": revision, "content_revision": revision,
+                    "layer_content_identities": {**source_metadata["layer_content_identities"],
+                        "occupancy": {"identity_status": "committed", "content_identity": display_identity, "revision": revision}}}
+        else:
+            source_metadata["content_identity_status"] = "legacy_unbound"
         if isinstance(source_metadata.get("semantic_reference_identity"), dict):
             source_metadata["semantic_reference_identity"] = dict(source_metadata["semantic_reference_identity"])
         source_metadata.pop("semantic_map_binding", None)
@@ -235,7 +344,9 @@ class MappingService:
 
         if stream_occupancy_key is not None:
             stream_occupancy_key = (resolved_source_epoch, stream_occupancy_source, stream_occupancy_key)
-        same_display_owner = stream_occupancy_grid is occupancy_grid
+        # Shared bytes still represent different effective/raw views and identities.
+        same_display_owner = (stream_occupancy_grid is occupancy_grid
+                              and receipt_identity is None)
         # 发布边界只捕获一次可变图层；只读栅格字节直接复用，普通读取不复制。
         occupancy_grid, cost_map, semantic_map = (
             _capture_map_layer(layer) for layer in (occupancy_grid, cost_map, semantic_map)
@@ -303,8 +414,10 @@ class MappingService:
                 duplicate_candidate.map_name, duplicate_candidate.source_name, duplicate_candidate.source_epoch,
                 duplicate_candidate.frame_id, duplicate_candidate.update_sequence
             ) == (prepared.map_name, prepared.source_name, prepared.source_epoch, prepared.frame_id, int(update_sequence_override)):
-                duplicate_equal = all(_same_map_layer_payload(getattr(duplicate_candidate, name), getattr(prepared, name))
+                duplicate_equal = (_snapshot_content_identity(duplicate_candidate.metadata) == _snapshot_content_identity(prepared.metadata)
+                    and all(_same_map_layer_payload(getattr(duplicate_candidate, name), getattr(prepared, name))
                                       for name in ("occupancy_grid", "cost_map", "semantic_map"))
+                )
             with self._publication_lock:
                 with self._lock:
                     self._require_current_snapshot_source(resolved_map_name, snapshot_metadata)
@@ -621,6 +734,7 @@ class MappingService:
             "cost_map_sequence": metadata.get("cost_map_sequence"),
             "live_streaming_ready": metadata.get("live_streaming_ready"),
             "mapping_live_streaming_ready": metadata.get("mapping_live_streaming_ready"),
+            **{key: metadata[key] for key in ("content_identity", "map_provenance", "raw_representation") if key in metadata},
         }
         sequence = self._extract_stream_sequence(heartbeat)
         revision = None
@@ -641,26 +755,17 @@ class MappingService:
         *,
         update_sequence: int,
     ) -> Dict[str, object]:
-        occupancy_metrics = metadata.get("occupancy_metrics") if isinstance(metadata.get("occupancy_metrics"), dict) else {}
-        cost_map_metrics = metadata.get("cost_map_metrics") if isinstance(metadata.get("cost_map_metrics"), dict) else {}
         occupancy_revision = metadata.get("occupancy_content_revision")
         cost_map_revision = metadata.get("cost_map_content_revision")
         content_revision = metadata.get("content_revision")
-        if content_revision is None:
-            revisions = []
-            for value in (occupancy_revision, cost_map_revision):
-                try:
-                    revisions.append(int(value))
-                except (TypeError, ValueError):
-                    pass
-            content_revision = (
-                sum(revisions) if revisions else update_sequence
-            )
         return {
             "event_type": "content_update",
             "occupancy_content_revision": occupancy_revision,
             "cost_map_content_revision": cost_map_revision,
             "content_revision": content_revision,
+            **{key: metadata[key] for key in (
+                "content_identity", "content_identity_status", "map_provenance", "layer_content_identities", "raw_representation"
+            ) if key in metadata},
         }
 
     def _build_stream_occupancy_key(
@@ -684,6 +789,8 @@ class MappingService:
             float(getattr(position, "x", 0.0) or 0.0),
             float(getattr(position, "y", 0.0) or 0.0),
             str(revision),
+            # A new owner or physical representation cannot alias the same revision.
+            _identity_token(values.get("content_identity")),
         )
 
     def _infer_snapshot_kind(self, metadata: Dict[str, object]) -> str:
@@ -821,7 +928,16 @@ def _same_map_layer_payload(left, right):
             return left == right
     if hasattr(left, "data") and getattr(left, "data") != getattr(right, "data"):
         return False
-    return without_timestamps(left.model_dump(mode="python", exclude={"data"})) == without_timestamps(right.model_dump(mode="python", exclude={"data"}))
+    excluded = {"data", "metadata"} if hasattr(left, "data") else {"data"}
+    return without_timestamps(left.model_dump(mode="python", exclude=excluded)) == without_timestamps(right.model_dump(mode="python", exclude=excluded))
+
+
+def _identity_token(value):
+    if isinstance(value, dict):
+        return tuple((key, _identity_token(item)) for key, item in sorted(value.items()))
+    if isinstance(value, (tuple, list)):
+        return tuple(_identity_token(item) for item in value)
+    return value
 
 
 def _view_epoch(source_epoch, view):
@@ -837,6 +953,9 @@ def _snapshot_binding(snapshot):
 
 def _display_revision(metadata):
     values = metadata or {}
+    identity = _committed_occupancy_identity(values.get("content_identity"))
+    if identity is not None:
+        return identity["provenance"]["occupancy_revision"]
     value = values.get("occupancy_content_revision")
     if value is None:
         value = values.get("content_revision")

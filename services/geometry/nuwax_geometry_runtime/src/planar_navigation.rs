@@ -163,6 +163,38 @@ pub(crate) async fn observe(
     observe_source(bridge,binding,session,ObservationInput{scan,odom_from_base:estimate.odom_from_base,basis_revision:estimate.graph_revision,minimum_rays:0},epoch).await
 }
 
+/// Freeze canonical occupancy provenance from its owner, independently of scan time.
+fn committed_map_identity(
+    receipt: &crate::mapping_commit::OccupancyCommitReceipt,
+    session: &crate::mapping_adapter::MappingSessionSnapshot,
+    frame_id: &str,
+) -> Result<schema::CommittedMapIdentity, String> {
+    if receipt.session_id != session.session_id
+        || receipt.session_generation != session.session_generation
+        || receipt.occupancy_revision != session.revision
+        || receipt.session_id.trim().is_empty()
+        || receipt.session_id.trim() != receipt.session_id
+        || receipt.session_generation == 0
+        || receipt.occupancy_revision == 0
+        || receipt.commit_id.boot_nonce == 0
+        || receipt.commit_id.sequence == 0
+        || receipt.backend_generation == 0
+        || frame_id.trim().is_empty()
+        || frame_id.trim() != frame_id
+    {
+        return Err("二维规范图与真实占据提交收据不一致".into());
+    }
+    Ok(schema::CommittedMapIdentity {
+        session_id: receipt.session_id.clone(),
+        session_generation: i64::try_from(receipt.session_generation).map_err(|_| "二维会话代际越界")?,
+        revision: i64::try_from(receipt.occupancy_revision).map_err(|_| "二维地图修订越界")?,
+        commit_boot_nonce: receipt.commit_id.boot_nonce.to_be_bytes(),
+        commit_sequence: i64::try_from(receipt.commit_id.sequence).map_err(|_| "二维占据提交序号越界")?,
+        source_timestamp_ns: i64::try_from(receipt.source_timestamp_ns).map_err(|_| "二维占据源时间越界")?,
+        frame_id: frame_id.to_owned(),
+    })
+}
+
 async fn observe_source(bridge:&GeometryRuntimeHandle,binding:&Binding,session:&Session,input:ObservationInput,epoch:u64)->Result<(),String> {
     let ObservationInput{scan,odom_from_base,basis_revision,minimum_rays}=input;
     let source_sequence=scan.source_sequence as u64;let source_timestamp_ns=scan.timestamp_ns as u64;
@@ -180,7 +212,7 @@ async fn observe_source(bridge:&GeometryRuntimeHandle,binding:&Binding,session:&
     }).await.map_err(|e|e.to_string())??;
     let Some(rays)=rays else {return Ok(())};
     if rays.len()<minimum_rays {return Ok(());}
-    let (grid, zones, transform, authority) = {
+    let (grid, zones, transform, authority, receipt) = {
         let _lifecycle = bridge.mapping_lifecycle_lock.lock().await;
         let Some(adapter) = &bridge.mapping_adapter else {
             return Ok(());
@@ -196,27 +228,17 @@ async fn observe_source(bridge:&GeometryRuntimeHandle,binding:&Binding,session:&
         {
             return Ok(());
         }
-        let Some(authority) = bridge
-            .committed_map_authority
-            .lock()
-            .map_err(|_| "规范地图身份锁失效")?
-            .clone()
-        else {
+        let Some(receipt) = a.latest_occupancy_commit_receipt() else {
             return Ok(());
         };
-        if authority.session_id != current.session_id
-            || authority.session_generation != current.session_generation as i64
-            || authority.revision != current.revision as i64
-        {
-            return Ok(());
-        }
         let Some((grid, zones)) = a.planar_navigation_source() else {
             return Ok(());
         };
+        let authority = committed_map_identity(&receipt, &current, &grid.grid.frame_id)?;
         let Some(transform) = a.map_odom_transform_snapshot() else {
             return Ok(());
         };
-        (grid, zones, transform, authority)
+        (grid, zones, transform, authority, receipt)
     };
     let odom = nalgebra::Isometry3::from_parts(
         nalgebra::Translation3::new(odom_from_base[0], odom_from_base[1], 0.0),
@@ -253,7 +275,9 @@ async fn observe_source(bridge:&GeometryRuntimeHandle,binding:&Binding,session:&
         session_id: session.session_id.clone(),
         session_generation: session.session_generation as i64,
         map_revision: authority.revision,
-        map_payload_sha256: authority.payload_sha256,
+        map_boot_nonce: authority.commit_boot_nonce,
+        map_commit_sequence: authority.commit_sequence,
+        map_source_timestamp_ns: authority.source_timestamp_ns,
         observation_revision: 0,
         source_sequence: source_sequence as i64,
         source_timestamp_ns: timestamp,
@@ -293,6 +317,7 @@ async fn observe_source(bridge:&GeometryRuntimeHandle,binding:&Binding,session:&
             || current.session_id != session.session_id
             || current.session_generation != session.session_generation
             || current.revision != authority.revision as u64
+            || a.latest_occupancy_commit_receipt().as_ref() != Some(&receipt)
             || a.planar_revision > basis_revision
             || now_ns().saturating_sub(timestamp) > planar_navigation::MAX_SOURCE_AGE_NS
             || a.global_frame_generation() != value.map_frame_generation as u64
@@ -355,6 +380,44 @@ mod tests {
             time_offsets_ns_le: vec![],
         }
     }
+    #[test]
+    fn canonical_identity_uses_exact_owner_receipt_and_rejects_metadata_mismatch() {
+        use crate::mapping_adapter::{MappingSessionPhase, MappingSessionSnapshot};
+        use crate::mapping_commit::{MappingCommitId, OccupancyCommitReceipt};
+        let session = MappingSessionSnapshot {
+            phase: MappingSessionPhase::Active,
+            session_id: "planar-receipt".into(), map_name: "test-map".into(),
+            session_generation: 3, revision: 7, active: true, idempotent_replay: false,
+            legacy_checkpoint_reconstructed: false, mapping_backend_kind: "slam_toolbox".into(),
+        };
+        let receipt = OccupancyCommitReceipt {
+            commit_id: MappingCommitId { boot_nonce: 0x1234, sequence: 11 },
+            session_id: session.session_id.clone(), session_generation: 3,
+            occupancy_revision: 7, source_timestamp_ns: 123_456_789,
+            backend_kind: crate::mapping_backend::MappingBackendKind::SlamToolbox,
+            backend_generation: 2,
+        };
+        let identity = committed_map_identity(&receipt, &session, "map").unwrap();
+        assert_eq!(identity.commit_boot_nonce, receipt.commit_id.boot_nonce.to_be_bytes());
+        assert_eq!(identity.commit_sequence, 11);
+        assert_eq!(identity.revision, 7);
+        assert_eq!(identity.source_timestamp_ns, 123_456_789);
+        for fault in 0..8 {
+            let mut invalid = receipt.clone();
+            match fault {
+                0 => invalid.session_id = "different-session".into(),
+                1 => invalid.session_generation += 1,
+                2 => invalid.occupancy_revision += 1,
+                3 => invalid.commit_id.boot_nonce = 0,
+                4 => invalid.commit_id.sequence = 0,
+                5 => invalid.commit_id.sequence = u64::MAX,
+                6 => invalid.source_timestamp_ns = u64::MAX,
+                _ => invalid.backend_generation = 0,
+            }
+            assert!(committed_map_identity(&invalid, &session, "map").is_err(), "fault {fault}");
+        }
+    }
+
     #[test]
     fn fresh_device_scan_uses_real_history_without_fabricating_native_match() {
         use nuwax_slam_2d_runtime::{input::TimedPose,protocol::OdometrySource};

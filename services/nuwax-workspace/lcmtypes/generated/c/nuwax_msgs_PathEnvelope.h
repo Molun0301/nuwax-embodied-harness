@@ -48,9 +48,11 @@ struct _nuwax_msgs_PathEnvelope
     int64_t    committed_map_revision;
 
     /**
-     * LCM Type: byte[32]
+     * LCM Type: byte[16]
      */
-    uint8_t    committed_map_payload_sha256[32];
+    uint8_t    committed_map_boot_nonce[16];
+    int64_t    committed_map_commit_sequence;
+    int64_t    committed_map_source_timestamp_ns;
 
     /**
      * LCM Type: string

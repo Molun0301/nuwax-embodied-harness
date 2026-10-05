@@ -65,6 +65,7 @@ from services.geometry.geometry_runtime_provider import (
 )
 from services.geometry.loop_closure_state import read_loop_closure_from_db
 from services.geometry.checkpoint_payload import payload_chunks
+from services.mapping.service import _committed_occupancy_identity, _receipt_source_epoch
 
 from contracts.naming import build_safe_dir_segment
 from services.localization.frame_tree_ops import resolve_frame_transform
@@ -254,92 +255,36 @@ def _live_map_layer_descriptor(
     *,
     mapping_identity_override: object = _MAPPING_IDENTITY_OVERRIDE_UNSET,
     content_revision: Optional[int] = None,
+    content_identity: object = None,
 ) -> Dict[str, object]:
+    """Describe producer authority without deriving identity from payload bytes."""
     if layer is None:
-        return {"revision": 0, "content_hash": None, "mapping_identity": None}
+        return {"revision": None, "content_identity": None, "mapping_identity": None,
+                "identity_status": "absent"}
     metadata = getattr(layer, "metadata", None)
     metadata = metadata if isinstance(metadata, dict) else {}
+    identity = _committed_occupancy_identity(
+        content_identity if content_identity is not None else metadata.get("content_identity")
+    )
     map_id = str(getattr(layer, "map_id", "") or "").strip()
-    revision = 0
-    for candidate in (
-        content_revision,
-        getattr(layer, "content_revision", None),
-        getattr(layer, "revision", None),
-        metadata.get("content_revision"),
-        metadata.get("revision"),
-    ):
-        try:
-            revision = int(candidate or 0)
-        except (TypeError, ValueError):
-            continue
-        if revision > 0:
-            break
-    content_hash = str(
-        metadata.get("content_hash")
-        or getattr(layer, "content_hash", "")
-        or ""
-    ).strip()
-    if not content_hash and revision > 0:
-        content_hash = "revision:%d:%s" % (revision, map_id)
-    if not content_hash:
-        hasher = hashlib.sha256()
-        for value in (
-            map_id,
-            getattr(layer, "timestamp", None),
-            getattr(layer, "frame_id", None),
-            getattr(layer, "width", None),
-            getattr(layer, "height", None),
-            getattr(layer, "resolution_m", None),
-        ):
-            hasher.update(str(value or "").encode("utf-8"))
-            hasher.update(b"\0")
-        for value in getattr(layer, "data", ()) or ():
-            hasher.update(str(value).encode("ascii", errors="backslashreplace"))
-            hasher.update(b"\0")
-        content_hash = hasher.hexdigest()
-    if mapping_identity_override is _MAPPING_IDENTITY_OVERRIDE_UNSET:
-        mapping_identity = _mapping_context_snapshot_token(
-            {
-                "session_id": metadata.get("mapping_session_id")
-                or metadata.get("session_id"),
-                "map_name": metadata.get("map_name"),
-                "session_generation": metadata.get("session_generation"),
-                "revision": metadata.get("mapping_revision"),
-                "active": metadata.get("mapping_active"),
-            }
-        )
-        if (
-            not mapping_identity[0]
-            or not mapping_identity[1]
-            or mapping_identity[2] <= 0
-        ):
-            mapping_identity = None
-        else:
-            mapping_identity = mapping_identity[:3]
-    else:
-        mapping_identity = None
-        if isinstance(mapping_identity_override, (list, tuple)) and len(
-            mapping_identity_override
-        ) == 3:
-            try:
-                candidate_identity = (
-                    str(mapping_identity_override[0] or "").strip(),
-                    str(mapping_identity_override[1] or "").strip(),
-                    int(mapping_identity_override[2] or 0),
-                )
-            except (TypeError, ValueError):
-                candidate_identity = ("", "", 0)
-            if (
-                candidate_identity[0]
-                and candidate_identity[1]
-                and candidate_identity[2] > 0
-            ):
-                mapping_identity = candidate_identity
-    return {
-        "revision": revision,
-        "content_hash": content_hash,
-        "mapping_identity": mapping_identity,
-    }
+    if identity is None:
+        # Legacy unary grids can still be inspected, but their bare revisions do
+        # not establish live authority and must not become a zero/default receipt.
+        return {"revision": None, "content_identity": None, "mapping_identity": None,
+                "identity_status": "legacy_unbound"}
+    provenance = identity["provenance"]
+    revision = provenance["occupancy_revision"]
+    mapping_identity = (provenance["session_id"], map_id, provenance["session_generation"])
+    if (not map_id or provenance["frame_id"] != getattr(layer, "frame_id", None)
+            or (content_revision is not None and (type(content_revision) is not int or content_revision != revision))
+            or (metadata.get("content_identity") is not None and metadata["content_identity"] != identity)
+            or (metadata.get("map_provenance") is not None and metadata["map_provenance"] != provenance)
+            or (mapping_identity_override is not _MAPPING_IDENTITY_OVERRIDE_UNSET
+                and (not isinstance(mapping_identity_override, (tuple, list))
+                     or tuple(mapping_identity_override) != mapping_identity))):
+        raise ValueError("live map layer differs from its committed occupancy receipt")
+    return {"revision": revision, "content_identity": identity,
+            "mapping_identity": mapping_identity, "identity_status": "committed"}
 
 _LIVE_MAPPING_DIAGNOSTICS_TTL_SEC = 0.5
 _EXTERNAL_EXPLORATION_LOG_SCAN_MIN_INTERVAL_SEC = 2.0
@@ -3170,15 +3115,15 @@ class PlatformGeometryRuntime:
         received_at = _parse_iso_timestamp(live_map_status.get("latest_occupancy_received_at"))
         metrics = live_map_status.get("occupancy_metrics") if isinstance(live_map_status.get("occupancy_metrics"), dict) else {}
         cost_metrics = live_map_status.get("cost_map_metrics") if isinstance(live_map_status.get("cost_map_metrics"), dict) else {}
-        content_hash = str(metrics.get("content_hash") or "")
-        costmap_hash = str(cost_metrics.get("content_hash") or "")
+        content_identity = _committed_occupancy_identity(metrics.get("content_identity"))
+        costmap_identity = _committed_occupancy_identity(cost_metrics.get("content_identity"))
         known_count = int(metrics.get("known_cell_count") or 0)
         costmap_known_count = int(cost_metrics.get("known_cell_count") or 0)
         now = datetime.now(timezone.utc)
         previous_count = int(self._map_stream_tracker.get("last_count") or 0)
         previous_costmap_count = int(self._map_stream_tracker.get("last_costmap_count") or 0)
-        previous_hash = str(self._map_stream_tracker.get("last_content_hash") or "")
-        previous_costmap_hash = str(self._map_stream_tracker.get("last_costmap_hash") or "")
+        previous_identity = self._map_stream_tracker.get("last_content_identity")
+        previous_costmap_identity = self._map_stream_tracker.get("last_costmap_identity")
         previous_known_count = int(self._map_stream_tracker.get("last_known_cell_count") or 0)
         previous_costmap_known_count = int(self._map_stream_tracker.get("last_costmap_known_cell_count") or 0)
         first_count = int(self._map_stream_tracker.get("first_count") or count)
@@ -3188,20 +3133,26 @@ class PlatformGeometryRuntime:
             if "first_growth_at" not in self._map_stream_tracker:
                 self._map_stream_tracker["first_growth_at"] = now.isoformat()
                 self._map_stream_tracker["first_count"] = count
-        content_changed = bool(content_hash and content_hash != previous_hash)
-        known_changed = known_count != previous_known_count
-        known_cell_delta = known_count - previous_known_count if previous_hash else known_count
-        costmap_delta = costmap_known_count - previous_costmap_known_count if previous_costmap_hash else costmap_known_count
-        if count > previous_count and (content_changed or known_changed):
+        receipt_progress = content_identity is not None and content_identity != previous_identity
+        costmap_receipt_progress = costmap_identity is not None and costmap_identity != previous_costmap_identity
+        known_cell_delta = known_count - previous_known_count
+        costmap_delta = costmap_known_count - previous_costmap_known_count
+        # Receipt progress and physical-body change are different observations.
+        # A timestamp-only/new-receipt update must not claim changed occupancy.
+        content_changed = receipt_progress and metrics.get("content_changed") is True
+        costmap_changed = costmap_receipt_progress and cost_metrics.get("content_changed") is True
+        if content_changed:
             self._map_stream_tracker["last_content_change_at"] = now.isoformat()
-            self._map_stream_tracker["content_revision"] = int(self._map_stream_tracker.get("content_revision") or 0) + 1
-        if costmap_hash and (costmap_hash != previous_costmap_hash or costmap_delta != 0):
+        if costmap_changed:
             self._map_stream_tracker["last_costmap_change_at"] = now.isoformat()
-            self._map_stream_tracker["costmap_revision"] = int(self._map_stream_tracker.get("costmap_revision") or 0) + 1
-        if content_hash:
-            self._map_stream_tracker["last_content_hash"] = content_hash
-        if costmap_hash:
-            self._map_stream_tracker["last_costmap_hash"] = costmap_hash
+        self._map_stream_tracker["content_revision"] = (
+            content_identity["provenance"]["occupancy_revision"] if content_identity else None)
+        self._map_stream_tracker["costmap_revision"] = (
+            costmap_identity["provenance"]["occupancy_revision"] if costmap_identity else None)
+        self._map_stream_tracker["last_content_identity"] = content_identity
+        self._map_stream_tracker["last_costmap_identity"] = costmap_identity
+        self._map_stream_tracker["receipt_progress"] = receipt_progress
+        self._map_stream_tracker["content_changed"] = content_changed
         self._map_stream_tracker["last_known_cell_count"] = known_count
         self._map_stream_tracker["last_costmap_known_cell_count"] = costmap_known_count
         self._map_stream_tracker["last_costmap_count"] = int(live_map_status.get("cost_map_message_count") or 0)
@@ -3220,7 +3171,8 @@ class PlatformGeometryRuntime:
         content_recent = last_content_change_at is not None and (now - last_content_change_at).total_seconds() <= _GEOMETRY_STREAMING_WINDOW_SEC * 2.0
         growth_window = (now - first_growth_at).total_seconds() if first_growth_at is not None else 0.0
         streaming = bool(
-            count >= max(first_count + 1, 2)
+            content_identity is not None
+            and count >= max(first_count + 1, 2)
             and source_fresh
             and count_recent
             and (content_recent or known_count > 0)
@@ -3232,11 +3184,11 @@ class PlatformGeometryRuntime:
         self._map_stream_tracker["message_count_recent"] = count_recent
         self._map_stream_tracker["content_recent"] = content_recent
         self._map_stream_tracker["message_count_delta"] = count - previous_count
-        self._map_stream_tracker["content_hash"] = content_hash or None
+        self._map_stream_tracker["content_identity"] = content_identity
         self._map_stream_tracker["known_cell_count"] = known_count
         self._map_stream_tracker["known_cell_delta"] = known_cell_delta
         self._map_stream_tracker["costmap_message_count_delta"] = int(live_map_status.get("cost_map_message_count") or 0) - previous_costmap_count
-        self._map_stream_tracker["costmap_hash"] = costmap_hash or None
+        self._map_stream_tracker["costmap_identity"] = costmap_identity
         self._map_stream_tracker["costmap_known_cell_count"] = costmap_known_count
         self._map_stream_tracker["costmap_delta"] = costmap_delta
         self._map_stream_tracker["last_message_at"] = received_at.isoformat() if received_at is not None else None
@@ -5905,6 +5857,7 @@ class PlatformGeometryRuntime:
                     live_cost_map = cost_map_reader()
             occupancy_mapping_identity = _MAPPING_IDENTITY_OVERRIDE_UNSET
             occupancy_content_revision = None
+            occupancy_content_identity = None
             if live_occupancy is not None and backend is not None:
                 descriptor_reader = getattr(backend, "get_occupancy_grid_descriptor", None)
                 occupancy_identity_reader = getattr(
@@ -5918,7 +5871,8 @@ class PlatformGeometryRuntime:
                         if descriptor is None:
                             continue
                         occupancy_mapping_identity = descriptor["mapping_identity"]
-                        occupancy_content_revision = int(descriptor["revision"])
+                        occupancy_content_revision = descriptor.get("revision")
+                        occupancy_content_identity = descriptor.get("content_identity")
                     except Exception:
                         LOGGER.warning("读取栅格修订和会话失败，重新获取一致快照。", exc_info=True)
                         continue
@@ -5950,15 +5904,24 @@ class PlatformGeometryRuntime:
                 *mapping_identity[:3],
                 mapping_identity[4],
             )
-            if occupancy_mapping_identity is _MAPPING_IDENTITY_OVERRIDE_UNSET:
-                occupancy_descriptor = _live_map_layer_descriptor(live_occupancy)
-            else:
-                occupancy_descriptor = _live_map_layer_descriptor(
-                    live_occupancy,
-                    mapping_identity_override=occupancy_mapping_identity,
-                    content_revision=occupancy_content_revision,
-                )
-            cost_map_descriptor = _live_map_layer_descriptor(live_cost_map)
+            try:
+                if occupancy_mapping_identity is _MAPPING_IDENTITY_OVERRIDE_UNSET:
+                    occupancy_descriptor = _live_map_layer_descriptor(live_occupancy)
+                else:
+                    occupancy_descriptor = _live_map_layer_descriptor(
+                        live_occupancy,
+                        mapping_identity_override=occupancy_mapping_identity,
+                        content_revision=occupancy_content_revision,
+                        content_identity=occupancy_content_identity,
+                    )
+                cost_map_descriptor = _live_map_layer_descriptor(live_cost_map)
+            except ValueError:
+                LOGGER.warning("Live map receipt does not match its layer; retrying snapshot.", exc_info=True)
+                continue
+            if live_occupancy is not None and occupancy_descriptor["content_identity"] is None:
+                continue
+            if live_occupancy is None and live_cost_map is not None:
+                continue
             layer_identities = {
                 descriptor["mapping_identity"]
                 for descriptor in (occupancy_descriptor, cost_map_descriptor)
@@ -6126,28 +6089,33 @@ class PlatformGeometryRuntime:
     ) -> MapSnapshot:
         live_status = self._clone_metadata(live_status)
         mapping_context = self._clone_metadata(mapping_context or {})
-        occupancy_content_revision = int(occupancy_descriptor["revision"] or 0)
-        cost_map_content_revision = int(cost_map_descriptor["revision"] or 0)
+        content_identity = _committed_occupancy_identity(occupancy_descriptor.get("content_identity"))
+        if content_identity is None or content_identity["representation"] != "effective":
+            raise ValueError("live map snapshot is missing its committed occupancy receipt")
+        provenance = content_identity["provenance"]
+        occupancy_content_revision = provenance["occupancy_revision"]
+        cost_map_content_revision = cost_map_descriptor.get("revision")
         occupancy_sequence = occupancy_content_revision
         cost_map_sequence = cost_map_content_revision
-        update_sequence = max(
-            1,
-            occupancy_content_revision + cost_map_content_revision,
-        )
-        message_count = int(live_occupancy is not None) + int(
-            live_cost_map is not None
-        )
-        content_revision = occupancy_content_revision + cost_map_content_revision
-        occupancy_content_hash = occupancy_descriptor["content_hash"]
-        cost_map_content_hash = cost_map_descriptor["content_hash"]
-        occupancy_metrics = {
-            "content_hash": occupancy_content_hash,
-            "content_revision": occupancy_content_revision,
+        update_sequence = occupancy_content_revision
+        occupancy_metadata = getattr(live_occupancy, "metadata", {})
+        occupancy_message_count = live_status.get("occupancy_message_count", occupancy_metadata.get("occupancy_message_count"))
+        cost_map_message_count = live_status.get("cost_map_message_count")
+        message_count = live_status.get("message_count", occupancy_message_count if live_cost_map is None else None)
+        # A composite retains each layer's identity. Independent revisions are
+        # never summed, maximized, or promoted to a locally generated clock.
+        layer_content_identities = {
+            "occupancy": {"identity_status": occupancy_descriptor["identity_status"],
+                          "content_identity": content_identity, "revision": occupancy_content_revision},
+            "cost_map": {"identity_status": cost_map_descriptor["identity_status"],
+                         "content_identity": cost_map_descriptor.get("content_identity"),
+                         "revision": cost_map_content_revision},
         }
-        cost_map_metrics = {
-            "content_hash": cost_map_content_hash,
-            "content_revision": cost_map_content_revision,
-        }
+        occupancy_metrics = dict(occupancy_metadata.get("occupancy_metrics") or {})
+        occupancy_metrics.update({"content_identity": content_identity,
+                                  "content_revision": occupancy_content_revision})
+        cost_map_metrics = {"content_identity": cost_map_descriptor.get("content_identity"),
+                            "content_revision": cost_map_content_revision}
         live_status = {
             key: live_status.get(key)
             for key in (
@@ -6159,6 +6127,8 @@ class PlatformGeometryRuntime:
                 "started",
                 "occupancy_topic",
                 "cost_map_topic",
+                "latest_occupancy_timestamp",
+                "latest_occupancy_received_at",
             )
             if key in live_status
         }
@@ -6169,8 +6139,8 @@ class PlatformGeometryRuntime:
             "occupancy_sequence": occupancy_sequence,
             "cost_map_sequence": cost_map_sequence,
             "message_count": message_count,
-            "occupancy_message_count": int(live_occupancy is not None),
-            "cost_map_message_count": int(live_cost_map is not None),
+            "occupancy_message_count": occupancy_message_count,
+            "cost_map_message_count": cost_map_message_count,
             "occupancy_revision": occupancy_content_revision,
             "cost_map_revision": cost_map_content_revision,
             "occupancy_metrics": occupancy_metrics,
@@ -6188,12 +6158,15 @@ class PlatformGeometryRuntime:
             "occupancy_sequence": occupancy_sequence,
             "cost_map_sequence": cost_map_sequence,
             "message_count": message_count,
-            "occupancy_content_hash": occupancy_content_hash,
-            "cost_map_content_hash": cost_map_content_hash,
-            "content_hash": occupancy_content_hash,
+            "content_identity": content_identity,
+            "content_identity_status": "committed",
+            "map_provenance": provenance,
+            "timestamp_ns": provenance["source_timestamp_ns"],
+            "raw_representation": getattr(live_occupancy, "metadata", {}).get("raw_representation"),
+            "layer_content_identities": layer_content_identities,
             "occupancy_content_revision": occupancy_content_revision,
             "cost_map_content_revision": cost_map_content_revision,
-            "content_revision": content_revision,
+            "content_revision": occupancy_content_revision,
             "occupancy_metrics": occupancy_metrics,
             "cost_map_metrics": cost_map_metrics,
             "occupancy_mapping_identity": (
@@ -6261,17 +6234,15 @@ class PlatformGeometryRuntime:
         )
         if not map_name:
             raise RuntimeError("live map snapshot is missing map_name")
-        if mapping_session_id and mapping_session_generation > 0:
-            source_epoch = "%s:%d" % (
-                mapping_session_id,
-                mapping_session_generation,
-            )
-        elif seed_bundle is not None:
-            source_epoch = seed_bundle.snapshot.source_epoch
-        else:
-            raise RuntimeError("live map snapshot is missing source epoch identity")
-        occupancy_grid = self._clone_contract(live_occupancy)
-        cost_map = self._clone_contract(live_cost_map)
+        if (mapping_session_id != provenance["session_id"]
+                or mapping_session_generation != provenance["session_generation"]):
+            raise ValueError("live map snapshot session differs from its occupancy receipt")
+        source_epoch = _receipt_source_epoch(content_identity)
+        # Provider-owned immutable byte storage remains shared; do not expand it
+        # into a mutable full-grid list just to assemble a read-only snapshot.
+        from services.mapping.service import _capture_map_layer
+        occupancy_grid = _capture_map_layer(live_occupancy)
+        cost_map = _capture_map_layer(live_cost_map)
         semantic_map = (
             self._clone_contract(seed_bundle.snapshot.semantic_map)
             if seed_bundle is not None

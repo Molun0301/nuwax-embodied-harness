@@ -930,6 +930,11 @@ impl CloudMapShmWriter {
         self.last_cloud_receipt.clone()
     }
 
+    /// The actual frozen occupancy baseline that owns the retained cloud commit.
+    pub(crate) fn last_occupancy_receipt(&self) -> Option<OccupancyCommitReceipt> {
+        self.last_occupancy_receipt.clone()
+    }
+
     fn replace_fine_cloud(&mut self, mut fine: Option<FineCloud>) {
         // A complete rebuild/checkpoint replaces mutable storage, not the
         // retained-root lookup authority used by already-published readers.

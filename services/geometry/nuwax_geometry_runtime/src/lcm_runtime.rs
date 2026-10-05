@@ -367,15 +367,17 @@ impl CloudMapSessionReservation {
 /// 避免慢下游阻塞其它链路。`data` / `raw_data` 使用 `Arc<[u8]>`，跨下游
 /// clone 不复制地图；二者属于同一 revision，避免 Web 再做一次有竞态的 unary 读取。
 ///
-/// 字段对齐 W29 `MapStreamEventBroker.StreamSnapshot.parsed` schema:
-/// - `revision` —— geometry 进程级 occupancy revision(u64,跨 mapping session 单调递增)
-/// - `data`     —— costmap 字节(`i8 as u8`,长度 = `width * height`)
-/// - `size`     —— `data.len()`(u64,等价于 wire 上 rbuf.data_size)
-/// - `schema_version` —— `NativeMapManifest` schema 版本(当前 v1)
-/// - `checksum` —— SHA-256(`data`)的 hex(由 `map_checksum::sha256_hex` 算)
-/// - `last_seen_ms` —— commit 时 `now_ns / 1_000_000`(i64,毫秒,给前端排序)
+/// Immutable complete occupancy delivery, sealed with the existing mapping owner's receipt.
+/// A prepared snapshot has `()` provenance and cannot enter committed event channels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawMapRepresentation {
+    SameAsEffective = 1,
+    SeparateRaw = 2,
+    EffectiveFallback = 3,
+}
+
 #[derive(Clone, Debug)]
-pub struct MapRevisionEvent {
+pub struct MapRevisionEvent<P = crate::mapping_commit::OccupancyCommitReceipt> {
     pub session_id: String,
     pub map_name: String,
     pub session_generation: u64,
@@ -389,100 +391,133 @@ pub struct MapRevisionEvent {
     pub timestamp_ns: u64,
     pub data: Arc<[u8]>,
     pub raw_data: Arc<[u8]>,
+    pub raw_representation: RawMapRepresentation,
+    pub receipt: P,
     pub size: u64,
     pub schema_version: u32,
-    pub checksum: String,
-    pub raw_checksum: String,
     pub last_seen_ms: i64,
 }
 
-impl MapRevisionEvent {
-    pub fn from_map(
-        map: &MapState,
-        session: &crate::mapping_adapter::MappingSessionSnapshot,
-    ) -> Self {
-        let data: Arc<[u8]> = map
-            .data
-            .iter()
-            .map(|&value| value as u8)
-            .collect::<Vec<_>>()
-            .into();
-        let checksum = crate::map_checksum::sha256_hex(data.as_ref());
-        Self {
-            session_id: session.session_id.clone(),
-            map_name: session.map_name.clone(),
-            session_generation: session.session_generation,
-            revision: map.revision,
-            width: map.width,
-            height: map.height,
-            resolution: map.resolution,
-            origin_x: map.origin_x,
-            origin_y: map.origin_y,
-            frame_id: map.frame_id.clone(),
-            timestamp_ns: map.timestamp_ns,
-            size: data.len() as u64,
-            checksum: checksum.clone(),
-            raw_checksum: checksum,
-            last_seen_ms: (map.timestamp_ns / 1_000_000) as i64,
-            schema_version: 1,
-            raw_data: Vec::<u8>::new().into(),
-            data,
-        }
+pub(crate) type PreparedMapRevisionEvent = MapRevisionEvent<()>;
+
+impl PreparedMapRevisionEvent {
+    pub fn from_map(map: &MapState, session: &crate::mapping_adapter::MappingSessionSnapshot) -> Self {
+        let data: Arc<[u8]> = map.data.iter().map(|&value| value as u8).collect::<Vec<_>>().into();
+        Self { session_id: session.session_id.clone(), map_name: session.map_name.clone(),
+            session_generation: session.session_generation, revision: map.revision,
+            width: map.width, height: map.height, resolution: map.resolution,
+            origin_x: map.origin_x, origin_y: map.origin_y, frame_id: map.frame_id.clone(),
+            timestamp_ns: map.timestamp_ns, size: data.len() as u64,
+            last_seen_ms: (map.timestamp_ns / 1_000_000) as i64, schema_version: 2,
+            raw_data: Vec::<u8>::new().into(), raw_representation: RawMapRepresentation::EffectiveFallback,
+            receipt: (), data }
     }
 
-    pub fn from_effective_and_raw(
-        effective: &MapState,
-        raw: &MapState,
-        session: &crate::mapping_adapter::MappingSessionSnapshot,
-    ) -> Self {
+    pub fn from_effective_and_raw(effective: &MapState, raw: &MapState,
+        session: &crate::mapping_adapter::MappingSessionSnapshot) -> Self {
         let mut event = Self::from_map(effective, session);
-        let same_layout = raw.revision == effective.revision
-            && raw.width == effective.width
-            && raw.height == effective.height
-            && raw.resolution == effective.resolution
-            && raw.origin_x == effective.origin_x
-            && raw.origin_y == effective.origin_y
-            && raw.frame_id == effective.frame_id
-            && raw.timestamp_ns == effective.timestamp_ns;
+        let same_layout = raw.revision == effective.revision && raw.width == effective.width
+            && raw.height == effective.height && raw.resolution.to_bits() == effective.resolution.to_bits()
+            && raw.origin_x.to_bits() == effective.origin_x.to_bits() && raw.origin_y.to_bits() == effective.origin_y.to_bits()
+            && raw.frame_id == effective.frame_id && raw.timestamp_ns == effective.timestamp_ns;
         if !same_layout {
-            warn!(
-                effective_revision = effective.revision,
-                raw_revision = raw.revision,
-                "raw occupancy layout differs from effective revision; stream falls back to effective data"
-            );
+            warn!(effective_revision = effective.revision, raw_revision = raw.revision,
+                "raw occupancy layout differs; explicit effective fallback retained");
             return event;
         }
-
-        // 未叠加禁区的同内容地图共用已编码字节与摘要，不再分配并散列第二份整图。
         if raw.data == effective.data {
-            return event;
-        }
-
-        let raw_data: Arc<[u8]> = raw
-            .data
-            .iter()
-            .map(|&value| value as u8)
-            .collect::<Vec<_>>()
-            .into();
-        event.raw_checksum = crate::map_checksum::sha256_hex(raw_data.as_ref());
-        if event.raw_checksum != event.checksum {
-            event.raw_data = raw_data;
+            event.raw_representation = RawMapRepresentation::SameAsEffective;
+        } else {
+            event.raw_data = raw.data.iter().map(|&value| value as u8).collect::<Vec<_>>().into();
+            event.raw_representation = RawMapRepresentation::SeparateRaw;
         }
         event
     }
 
+    fn bind_receipt(self, receipt: crate::mapping_commit::OccupancyCommitReceipt) -> MapRevisionEvent {
+        let Self { session_id, map_name, session_generation, revision, width, height, resolution,
+            origin_x, origin_y, frame_id, timestamp_ns, data, raw_data, raw_representation,
+            size, schema_version, last_seen_ms, receipt: () } = self;
+        MapRevisionEvent { session_id, map_name, session_generation, revision, width, height, resolution,
+            origin_x, origin_y, frame_id, timestamp_ns, data, raw_data, raw_representation,
+            size, schema_version, last_seen_ms, receipt }
+    }
+
+    pub(crate) fn seal(self, receipt: crate::mapping_commit::OccupancyCommitReceipt) -> Result<MapRevisionEvent, String> {
+        let event = self.bind_receipt(receipt);
+        event.validate_provenance()?;
+        Ok(event)
+    }
+}
+
+impl<P> MapRevisionEvent<P> {
     pub fn to_map_state(&self) -> MapState {
-        MapState {
-            width: self.width,
-            height: self.height,
-            resolution: self.resolution,
-            origin_x: self.origin_x,
-            origin_y: self.origin_y,
-            frame_id: self.frame_id.clone(),
-            revision: self.revision,
-            timestamp_ns: self.timestamp_ns,
-            data: self.data.iter().map(|&value| value as i8).collect(),
+        MapState { width: self.width, height: self.height, resolution: self.resolution,
+            origin_x: self.origin_x, origin_y: self.origin_y, frame_id: self.frame_id.clone(),
+            revision: self.revision, timestamp_ns: self.timestamp_ns,
+            data: self.data.iter().map(|&value| value as i8).collect() }
+    }
+}
+
+impl MapRevisionEvent {
+    pub(crate) fn validate_provenance(&self) -> Result<(), String> {
+        let receipt = &self.receipt;
+        let size = usize::try_from(self.width).ok().and_then(|width|
+            usize::try_from(self.height).ok().and_then(|height| width.checked_mul(height)))
+            .ok_or("committed occupancy dimensions overflow")?;
+        if self.schema_version != 2 || self.session_id.trim().is_empty() || self.session_generation == 0
+            || self.revision == 0 || self.width == 0 || self.height == 0 || self.frame_id.trim().is_empty()
+            || !self.resolution.is_finite() || self.resolution <= 0.0 || !self.origin_x.is_finite() || !self.origin_y.is_finite()
+            || self.data.len() != size || self.size != size as u64
+            || receipt.commit_id.boot_nonce == 0 || receipt.commit_id.sequence == 0
+            || receipt.session_id != self.session_id || receipt.session_generation != self.session_generation
+            || receipt.occupancy_revision != self.revision || receipt.source_timestamp_ns != self.timestamp_ns
+            || receipt.backend_generation == 0 {
+            return Err("committed occupancy snapshot differs from its owning receipt".into());
         }
+        match self.raw_representation {
+            RawMapRepresentation::SeparateRaw if self.raw_data.len() == size => {},
+            RawMapRepresentation::SameAsEffective | RawMapRepresentation::EffectiveFallback if self.raw_data.is_empty() => {},
+            _ => return Err("raw occupancy representation disagrees with its body".into()),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn exact_snapshot_eq(&self, other: &Self) -> bool {
+        self.receipt == other.receipt && self.session_id == other.session_id && self.map_name == other.map_name
+            && self.session_generation == other.session_generation && self.revision == other.revision
+            && self.width == other.width && self.height == other.height && self.resolution.to_bits() == other.resolution.to_bits()
+            && self.origin_x.to_bits() == other.origin_x.to_bits() && self.origin_y.to_bits() == other.origin_y.to_bits()
+            && self.frame_id == other.frame_id && self.timestamp_ns == other.timestamp_ns
+            && self.size == other.size && self.schema_version == other.schema_version && self.last_seen_ms == other.last_seen_ms
+            && self.raw_representation == other.raw_representation
+            && (Arc::ptr_eq(&self.data, &other.data) || self.data == other.data)
+            && (Arc::ptr_eq(&self.raw_data, &other.raw_data) || self.raw_data == other.raw_data)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_map_for_tests(map: &MapState, session: &crate::mapping_adapter::MappingSessionSnapshot) -> Self {
+        Self::test_bind(PreparedMapRevisionEvent::from_map(map, session), session)
+    }
+    #[cfg(test)]
+    pub(crate) fn from_effective_and_raw_for_tests(effective: &MapState, raw: &MapState,
+        session: &crate::mapping_adapter::MappingSessionSnapshot) -> Self {
+        Self::test_bind(PreparedMapRevisionEvent::from_effective_and_raw(effective, raw, session), session)
+    }
+    #[cfg(test)]
+    fn test_bind(prepared: PreparedMapRevisionEvent, session: &crate::mapping_adapter::MappingSessionSnapshot) -> Self {
+        // Explicit fixture authority; malformed fixture metadata remains malformed for negative tests.
+        let receipt = crate::mapping_commit::OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 1, sequence: prepared.revision.max(1) },
+            session_id: session.session_id.clone(), session_generation: session.session_generation,
+            occupancy_revision: prepared.revision, source_timestamp_ns: prepared.timestamp_ns,
+            backend_kind: match session.mapping_backend_kind.as_str() {
+                "raytracing" => crate::mapping_backend::MappingBackendKind::Raytracing,
+                "slam_toolbox" => crate::mapping_backend::MappingBackendKind::SlamToolbox,
+                _ => crate::mapping_backend::MappingBackendKind::Voxel,
+            }, backend_generation: 1,
+        };
+        prepared.bind_receipt(receipt)
     }
 }
 
@@ -534,12 +569,7 @@ fn encode_occupancy_revision_in_frame(
             event.data.len()
         ));
     }
-    if crate::map_checksum::sha256_hex(event.data.as_ref()) != event.checksum {
-        return Err(format!(
-            "occupancy revision {} checksum mismatch",
-            event.revision
-        ));
-    }
+    event.validate_provenance()?;
     let wire_revision = i32::try_from(event.revision).map_err(|_| {
         format!(
             "occupancy revision {} exceeds positive LCM i32 domain",
@@ -579,30 +609,25 @@ fn encode_occupancy_revision_in_frame(
     .map_err(|error| format!("encode occupancy revision failed: {error}"))
 }
 
-pub(crate) fn committed_map_identity_from_revision(
-    event: &MapRevisionEvent,
-) -> Result<schema::CommittedMapIdentity, String> {
-    let session_generation = i64::try_from(event.session_generation)
-        .map_err(|_| "committed map session_generation exceeds i64".to_string())?;
-    let revision = i64::try_from(event.revision)
-        .map_err(|_| "committed map revision exceeds i64".to_string())?;
-    if event.session_id.trim().is_empty()
-        || session_generation <= 0
-        || revision <= 0
-        || event.frame_id.trim().is_empty()
-    {
-        return Err("committed map identity is incomplete".to_string());
-    }
-    let payload_sha256 = crate::map_checksum::sha256_bytes(event.data.as_ref());
-    if crate::map_checksum::sha256_hex(event.data.as_ref()) != event.checksum {
-        return Err("committed map payload checksum mismatch".to_string());
+pub(crate) fn committed_map_identity_from_revision(event: &MapRevisionEvent) -> Result<schema::CommittedMapIdentity, String> {
+    event.validate_provenance()?;
+    committed_map_identity_from_receipt(&event.receipt, &event.frame_id)
+}
+
+pub(crate) fn committed_map_identity_from_receipt(receipt: &crate::mapping_commit::OccupancyCommitReceipt,
+    frame_id: &str) -> Result<schema::CommittedMapIdentity, String> {
+    if receipt.commit_id.boot_nonce == 0 || receipt.commit_id.sequence == 0 || receipt.session_id.trim().is_empty()
+        || receipt.session_generation == 0 || receipt.occupancy_revision == 0 || receipt.backend_generation == 0
+        || frame_id.trim().is_empty() {
+        return Err("committed map owner provenance is incomplete".into());
     }
     Ok(schema::CommittedMapIdentity {
-        session_id: event.session_id.clone(),
-        session_generation,
-        revision,
-        payload_sha256,
-        frame_id: event.frame_id.clone(),
+        session_id: receipt.session_id.clone(),
+        session_generation: i64::try_from(receipt.session_generation).map_err(|_| "map session generation exceeds i64")?,
+        revision: i64::try_from(receipt.occupancy_revision).map_err(|_| "map occupancy revision exceeds i64")?,
+        frame_id: frame_id.to_owned(), commit_boot_nonce: receipt.commit_id.boot_nonce.to_be_bytes(),
+        commit_sequence: i64::try_from(receipt.commit_id.sequence).map_err(|_| "map commit sequence exceeds i64")?,
+        source_timestamp_ns: i64::try_from(receipt.source_timestamp_ns).map_err(|_| "map source timestamp exceeds i64")?,
     })
 }
 
@@ -658,16 +683,126 @@ fn exploration_costmap_from_revision_in_frame(
     })
 }
 
-fn map_event_matches_current_session(
-    event: &MapRevisionEvent,
-    mapping_adapter: &Arc<parking_lot::Mutex<MappingAdapter>>,
-) -> bool {
-    let snapshot = mapping_adapter.lock().snapshot();
-    snapshot.active
-        && event.session_generation > 0
-        && event.session_generation == snapshot.session_generation
-        && event.session_id == snapshot.session_id
-        && event.map_name == snapshot.map_name
+pub(crate) fn map_event_matches_current_session(event: &MapRevisionEvent,
+    mapping_adapter: &Arc<parking_lot::Mutex<MappingAdapter>>) -> bool {
+    let mapping = mapping_adapter.lock();
+    let snapshot = mapping.snapshot();
+    let Some(latest) = mapping.latest_occupancy_commit_receipt() else { return false; };
+    let receipt = &event.receipt;
+    event.validate_provenance().is_ok() && snapshot.active
+        && event.session_generation == snapshot.session_generation && event.session_id == snapshot.session_id
+        && event.map_name == snapshot.map_name && event.frame_id == mapping.configured_map_frame_id()
+        && receipt.backend_kind == latest.backend_kind && receipt.backend_generation == latest.backend_generation
+        && receipt.commit_id.boot_nonce == latest.commit_id.boot_nonce
+        && receipt.commit_id.sequence <= latest.commit_id.sequence && receipt.occupancy_revision <= latest.occupancy_revision
+        && ((receipt.commit_id.sequence == latest.commit_id.sequence) == (receipt.occupancy_revision == latest.occupancy_revision))
+        && (receipt.commit_id.sequence != latest.commit_id.sequence || receipt == &latest)
+}
+
+/// False is an exact duplicate. Opaque nonces are equality-only domain markers.
+fn map_revision_admission(current: Option<&schema::CommittedMapIdentity>, previous: Option<&MapRevisionEvent>,
+    candidate: &MapRevisionEvent, identity: &schema::CommittedMapIdentity) -> Result<bool, &'static str> {
+    let Some(current) = current else { return Ok(true); };
+    if current.session_id != identity.session_id || current.session_generation != identity.session_generation
+        || current.frame_id != identity.frame_id || current.commit_boot_nonce != identity.commit_boot_nonce {
+        return Err("event-driven occupancy owner/domain switch is not authorized");
+    }
+    if identity.revision < current.revision || identity.commit_sequence < current.commit_sequence {
+        return Err("stale occupancy owner revision");
+    }
+    if identity.revision == current.revision || identity.commit_sequence == current.commit_sequence {
+        if identity != current { return Err("occupancy revision/receipt identity conflict"); }
+        return match previous {
+            Some(previous) if candidate.exact_snapshot_eq(previous) => Ok(false),
+            _ => Err("same occupancy identity has different or unavailable immutable body"),
+        };
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod occupancy_receipt_admission_tests {
+    use super::*;
+
+    fn event(revision: u64, sequence: u64) -> MapRevisionEvent {
+        let receipt = crate::mapping_commit::OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 31, sequence },
+            session_id: "receipt-owner".into(), session_generation: 2,
+            occupancy_revision: revision, source_timestamp_ns: 11,
+            backend_kind: crate::mapping_backend::MappingBackendKind::Voxel, backend_generation: 3,
+        };
+        PreparedMapRevisionEvent {
+            session_id: receipt.session_id.clone(), map_name: "room".into(), session_generation: 2,
+            revision, width: 2, height: 1, resolution: 0.125, origin_x: -1.0, origin_y: 2.0,
+            frame_id: "map".into(), timestamp_ns: 11, data: vec![255, 100].into(),
+            raw_data: Vec::<u8>::new().into(), raw_representation: RawMapRepresentation::SameAsEffective,
+            receipt: (), size: 2, schema_version: 2, last_seen_ms: 0,
+        }.seal(receipt).unwrap()
+    }
+
+    #[test]
+    fn exact_replay_preserves_owned_buffers_and_detects_conflicting_body() {
+        let current = event(4, 7);
+        let identity = committed_map_identity_from_revision(&current).unwrap();
+        let shared = current.clone();
+        assert!(Arc::ptr_eq(&current.data, &shared.data));
+        assert_eq!(map_revision_admission(Some(&identity), Some(&current), &shared, &identity), Ok(false));
+        let independent = event(4, 7);
+        assert!(!Arc::ptr_eq(&current.data, &independent.data));
+        assert_eq!(map_revision_admission(Some(&identity), Some(&current), &independent, &identity), Ok(false));
+        let mut conflict = independent;
+        conflict.data = vec![0, 100].into();
+        assert!(map_revision_admission(Some(&identity), Some(&current), &conflict, &identity).is_err());
+        assert_eq!(current.data.as_ref(), &[255, 100]);
+    }
+
+    #[test]
+    fn occupancy_and_commit_components_advance_together_without_nonce_ordering() {
+        let current = event(4, 7);
+        let identity = committed_map_identity_from_revision(&current).unwrap();
+        for candidate in [event(3, 8), event(5, 6), event(4, 8), event(5, 7)] {
+            let projected = committed_map_identity_from_revision(&candidate).unwrap();
+            assert!(map_revision_admission(Some(&identity), Some(&current), &candidate, &projected).is_err());
+        }
+        let next = event(8, 12);
+        let projected = committed_map_identity_from_revision(&next).unwrap();
+        assert_eq!(map_revision_admission(Some(&identity), Some(&current), &next, &projected), Ok(true));
+        for nonce in [1, u128::MAX] {
+            let mut changed = next.clone(); changed.receipt.commit_id.boot_nonce = nonce;
+            let projected = committed_map_identity_from_revision(&changed).unwrap();
+            assert!(map_revision_admission(Some(&identity), Some(&current), &changed, &projected).is_err());
+            assert_eq!(map_revision_admission(None, None, &changed, &projected), Ok(true));
+        }
+    }
+
+    #[test]
+    fn schema_raw_representation_and_receipt_fields_are_exact() {
+        let current = event(1, 1);
+        let mut changed = current.clone(); changed.schema_version = 1;
+        assert!(changed.validate_provenance().is_err());
+        let mut changed = current.clone(); changed.receipt.source_timestamp_ns += 1;
+        assert!(changed.validate_provenance().is_err());
+        let mut changed = current.clone(); changed.raw_data = vec![0, 0].into();
+        assert!(changed.validate_provenance().is_err());
+        changed.raw_representation = RawMapRepresentation::SeparateRaw;
+        assert!(changed.validate_provenance().is_ok());
+        let mut changed = current.clone(); changed.origin_x = -0.0;
+        let mut other = changed.clone(); other.origin_x = 0.0;
+        assert!(!changed.exact_snapshot_eq(&other));
+    }
+
+    #[test]
+    fn receipt_progress_preserves_source_time_and_payload_ownership() {
+        let current = event(4, 7);
+        let mut newer = current.clone();
+        newer.revision = 5; newer.receipt.occupancy_revision = 5; newer.receipt.commit_id.sequence = 9;
+        assert!(newer.validate_provenance().is_ok());
+        assert!(Arc::ptr_eq(&current.data, &newer.data));
+        assert_eq!(newer.timestamp_ns, current.timestamp_ns);
+        let identity = committed_map_identity_from_revision(&newer).unwrap();
+        assert_eq!(identity.source_timestamp_ns, 11);
+        assert_eq!(identity.commit_boot_nonce, 31u128.to_be_bytes());
+    }
 }
 
 type GeometryTaskFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
@@ -686,11 +821,7 @@ fn newer_projection_event(current: &MapRevisionEvent, candidate: &MapRevisionEve
 }
 
 fn same_projection_event(current: &MapRevisionEvent, candidate: &MapRevisionEvent) -> bool {
-    current.session_id == candidate.session_id
-        && current.map_name == candidate.map_name
-        && current.session_generation == candidate.session_generation
-        && current.revision == candidate.revision
-        && current.checksum == candidate.checksum
+    current.exact_snapshot_eq(candidate)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2327,24 +2458,19 @@ fn start_topology_mapping(
 
 #[cfg(test)]
 fn test_committed_map_identity(revision: u64) -> schema::CommittedMapIdentity {
-    schema::CommittedMapIdentity {
-        session_id: "exploration-test-map".to_string(),
-        session_generation: 1,
-        revision: i64::try_from(revision).expect("test committed map revision"),
-        payload_sha256: crate::map_checksum::sha256_bytes(&revision.to_le_bytes()),
-        frame_id: "map".to_string(),
-    }
+    committed_map_identity_from_revision(&test_map_revision_authority(
+        "exploration-test-map", "exploration-test-map", "map", revision,
+    ))
+    .expect("test committed map receipt identity")
 }
 
 #[cfg(test)]
-fn test_map_revision_authority(
+pub(crate) fn test_map_revision_authority(
     session_id: &str,
     map_name: &str,
     frame_id: &str,
     revision: u64,
 ) -> MapRevisionEvent {
-    let data: Arc<[u8]> = vec![0].into();
-    let checksum = crate::map_checksum::sha256_hex(data.as_ref());
     MapRevisionEvent {
         session_id: session_id.to_string(),
         map_name: map_name.to_string(),
@@ -2357,14 +2483,46 @@ fn test_map_revision_authority(
         origin_y: 0.0,
         frame_id: frame_id.to_string(),
         timestamp_ns: revision,
-        data,
+        data: vec![0].into(),
         raw_data: Vec::<u8>::new().into(),
+        raw_representation: RawMapRepresentation::EffectiveFallback,
+        receipt: crate::mapping_commit::OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId {
+                boot_nonce: 1,
+                sequence: revision,
+            },
+            session_id: session_id.to_owned(),
+            session_generation: 1,
+            occupancy_revision: revision,
+            source_timestamp_ns: revision,
+            backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+            backend_generation: 1,
+        },
         size: 1,
-        schema_version: 1,
-        checksum: checksum.clone(),
-        raw_checksum: checksum,
+        schema_version: 2,
         last_seen_ms: 0,
     }
+}
+
+/// Commit through the real test mapping owner before injecting its event into a sink.
+#[cfg(test)]
+pub(crate) fn test_owner_map_revision(mapping: &mut MappingAdapter, map: &MapState) -> MapRevisionEvent {
+    let mut grid = nuwax_mapping::OccupancyGrid::new(map.width, map.height, f64::from(map.resolution));
+    grid.origin = [map.origin_x, map.origin_y, 0.0];
+    grid.frame_id = map.frame_id.clone();
+    grid.data = map.data.clone();
+    let (_, event) = mapping
+        .install_checkpoint(grid, map.timestamp_ns, map.revision.checked_sub(1).expect("positive test revision"))
+        .expect("test mapping owner commit");
+    assert_eq!(event.revision, map.revision, "fixture must preserve requested revision");
+    assert_eq!((event.width, event.height), (map.width, map.height));
+    assert_eq!(event.resolution.to_bits(), map.resolution.to_bits());
+    assert_eq!((event.origin_x.to_bits(), event.origin_y.to_bits()), (map.origin_x.to_bits(), map.origin_y.to_bits()));
+    assert_eq!(event.frame_id, map.frame_id);
+    assert_eq!(event.timestamp_ns, map.timestamp_ns);
+    assert_eq!(event.data.as_ref(), map.data.iter().map(|cell| *cell as u8).collect::<Vec<_>>().as_slice());
+    assert_eq!(Some(event.receipt.clone()), mapping.latest_occupancy_commit_receipt());
+    event
 }
 
 #[cfg(test)]
@@ -2894,13 +3052,8 @@ async fn geometry_runtime_blocking_revision_prepare_settles_before_resource_clea
     })
     .await;
     let handle = fixture.handle();
-    let mapping = handle
-        .mapping_adapter
-        .as_ref()
-        .expect("production revision Mapping")
-        .lock()
-        .snapshot();
-    let event = MapRevisionEvent::from_map(
+    let event = test_owner_map_revision(
+        &mut handle.mapping_adapter.as_ref().expect("production revision Mapping").lock(),
         &MapState {
             width: 1,
             height: 1,
@@ -2911,7 +3064,6 @@ async fn geometry_runtime_blocking_revision_prepare_settles_before_resource_clea
             data: vec![0],
             ..MapState::default()
         },
-        &mapping,
     );
     handle
         .map_revision_tx
@@ -3131,6 +3283,7 @@ impl GeometryRuntimeHandle {
             enabled: self.nav.configured_profile() == crate::nav_runtime::PROFILE_MLS3D,
             producer_runtime_generation: self.nav.producer_runtime_generation(),
             mapping: self.mapping_adapter.as_ref()?.clone(),
+            writer: self.cloud_map_writer.clone(),
             committed_map_authority: self.committed_map_authority.clone(),
         })
     }
@@ -3210,6 +3363,7 @@ impl GeometryRuntimeHandle {
                         producer_runtime_generation: navigation_runtime
                             .producer_runtime_generation(),
                         mapping: mapping.clone(),
+                        writer: writer.clone(),
                         committed_map_authority,
                     });
             let _lifecycle_guard = lifecycle_lock.lock().await;
@@ -6378,6 +6532,10 @@ fn map_revision_coalescer_future_in_frame(
         loop {
             match map_revision_rx.recv().await {
                 Ok(event) => {
+                    let committed_map = match committed_map_identity_from_revision(&event) {
+                        Ok(identity) => identity,
+                        Err(error) => { warn!(%error, "unsealed occupancy event rejected before SHM preparation"); continue; }
+                    };
                     if event.frame_id != expected_map_frame.as_ref() {
                         warn!(
                             revision = event.revision,
@@ -6399,6 +6557,20 @@ fn map_revision_coalescer_future_in_frame(
                             "stale map revision rejected by lifecycle fence"
                         );
                         continue;
+                    }
+
+                    let prior = map_revision_latest_tx.borrow().clone();
+                    let admitted_authority = match committed_map_authority.lock() {
+                        Ok(authority) => authority.clone(),
+                        Err(_) => { warn!("committed map authority state is unavailable"); continue; }
+                    };
+                    // Independent replay comparison may scan bytes, so do it after
+                    // releasing authority and watch guards.
+                    let admission = map_revision_admission(admitted_authority.as_ref(), prior.as_ref(), &event, &committed_map);
+                    match admission {
+                        Ok(true) => {},
+                        Ok(false) => continue,
+                        Err(error) => { warn!(%error, "occupancy conflict rejected before SHM preparation"); continue; }
                     }
 
                     let prepared = match &occupancy_shm {
@@ -6461,17 +6633,41 @@ fn map_revision_coalescer_future_in_frame(
                         continue;
                     }
 
+                    let mut current_ref = match &occupancy_shm {
+                        OccupancyShmCommitMode::Ready { current, .. } => Some(current.write().await),
+                        _ => None,
+                    };
+                    let mut authority = match committed_map_authority.lock() {
+                        Ok(authority) => authority,
+                        Err(_) => {
+                            if let (OccupancyShmCommitMode::Ready { writer, .. }, Some(prepared)) = (&occupancy_shm, prepared) {
+                                let _ = writer.lock().abort_prepared(prepared);
+                            }
+                            continue;
+                        }
+                    };
+                    // This task is the sole watch publisher. Lifecycle resets hold
+                    // the same fence and clear authority; recheck the small authority
+                    // snapshot without rescanning a conflicting body under locks.
+                    if *authority != admitted_authority {
+                        if let (OccupancyShmCommitMode::Ready { writer, .. }, Some(prepared)) = (&occupancy_shm, prepared) {
+                            let _ = writer.lock().abort_prepared(prepared);
+                        }
+                        continue;
+                    }
+                    // No awaits after taking authority: committed SHM metadata, authority,
+                    // and the immutable watch snapshot are advanced in the same owner fence.
                     match (&occupancy_shm, prepared) {
                         (OccupancyShmCommitMode::Disabled, None) => {}
                         (
                             OccupancyShmCommitMode::Ready {
                                 writer,
                                 path,
-                                current,
+                                current: _,
                             },
                             Some(prepared),
                         ) => {
-                            let mut current = current.write().await;
+                            let current = current_ref.as_mut().expect("ready SHM holds current metadata");
                             if current
                                 .as_ref()
                                 .is_some_and(|snapshot| snapshot.revision > event.revision)
@@ -6498,13 +6694,13 @@ fn map_revision_coalescer_future_in_frame(
                                     continue;
                                 }
                             };
-                            *current = Some(OccupancyShmSnapshot {
+                            **current = Some(OccupancyShmSnapshot {
                                 key: path.clone(),
                                 file_size: commit.file_size,
                                 payload_size: event.size,
                                 revision: commit.revision,
                                 layout_version: commit.layout_version,
-                                payload_schema_version: event.schema_version,
+                                payload_schema_version: crate::occupancy_shm::OCCUPANCY_SHM_PAYLOAD_SCHEMA_VERSION,
                                 generation: commit.generation,
                                 active_slot: commit.active_slot,
                             });
@@ -6517,40 +6713,10 @@ fn map_revision_coalescer_future_in_frame(
                             continue;
                         }
                     }
-                    let committed_map = match committed_map_identity_from_revision(&event) {
-                        Ok(identity) => identity,
-                        Err(error) => {
-                            warn!(revision = event.revision, %error, "committed map identity rejected before authority publication");
-                            continue;
-                        }
-                    };
-                    let mut authority = match committed_map_authority.lock() {
-                        Ok(authority) => authority,
-                        Err(_) => {
-                            warn!(
-                                revision = event.revision,
-                                "committed map authority state is unavailable"
-                            );
-                            continue;
-                        }
-                    };
-                    if authority.as_ref().is_some_and(|current| {
-                        let same_domain = current.session_id == committed_map.session_id
-                            && current.session_generation == committed_map.session_generation;
-                        !same_domain
-                            || committed_map.revision < current.revision
-                            || (committed_map.revision == current.revision
-                                && committed_map != *current)
-                    }) {
-                        warn!(
-                            revision = event.revision,
-                            "stale, conflicting, or event-driven map domain switch rejected"
-                        );
-                        continue;
-                    }
                     *authority = Some(committed_map);
                     map_revision_latest_tx.send_replace(Some(event));
                     drop(authority);
+                    drop(current_ref);
                     drop(lifecycle_guard);
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -8259,6 +8425,17 @@ pub async fn spawn_geometry_runtime(
         ),
     ).await?;
 
+    if handle.navigation_map_3d_publish_context().is_some_and(|context| context.enabled) {
+        let navigation_revision_shutdown = task_control.shutdown_receiver();
+        let revisions = handle.map_revision_latest_tx.subscribe();
+        register_geometry_startup_persistent(
+            &task_control, &mut task_owner, &handle, &mut owned_subscriptions, &mut pending_children,
+            "canonical-navigation-map-revisions",
+            run_persistent_future_until_stop(navigation_revision_shutdown,
+                canonical_navigation_map_revision_future(handle.clone(), revisions)),
+        ).await?;
+    }
+
     let cancel_shutdown_rx = task_control.shutdown_receiver();
     register_geometry_startup_persistent(
         &task_control,
@@ -9169,6 +9346,7 @@ pub(crate) async fn publish_committed_global_map_in_frame(
     };
     let expected = canonical_mapping_cloud_identity_from_commit(
         mapping,
+        &handle.cloud_map_writer,
         frame_id,
         &direct_commit,
         None,
@@ -9281,6 +9459,7 @@ pub(crate) struct NavigationMap3DPublishContext {
     enabled: bool,
     producer_runtime_generation: u64,
     mapping: Arc<parking_lot::Mutex<MappingAdapter>>,
+    writer: Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
     committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
 }
 
@@ -9291,7 +9470,99 @@ struct NavigationMap3DPublicationMetadata {
     map_frame_generation: i64,
     commit_boot_nonce: [u8; 16],
     commit_sequence: i64,
+    cloud_occupancy_revision: i64,
     virtual_obstacles: Option<schema::OccupancyGrid>,
+}
+
+/// Relative ordering is only a consistency check. The baseline passed here
+/// must be the occupancy receipt retained by the actual cloud writer.
+fn validate_cloud_occupancy_progression(
+    current: &crate::mapping_commit::OccupancyCommitReceipt,
+    baseline: &crate::mapping_commit::OccupancyCommitReceipt,
+    cloud: &crate::mapping_commit::CloudCommitReceipt,
+) -> Result<(), String> {
+    if current.commit_id.boot_nonce == 0 || current.commit_id.sequence == 0
+        || baseline.commit_id.sequence == 0 || current.backend_generation == 0
+        || current.session_id.is_empty() || current.session_generation == 0
+        || current.occupancy_revision == 0 || baseline.occupancy_revision == 0
+        || current.commit_id.boot_nonce != baseline.commit_id.boot_nonce
+        || current.session_id != baseline.session_id
+        || current.session_generation != baseline.session_generation
+        || current.backend_kind != baseline.backend_kind
+        || current.backend_generation != baseline.backend_generation
+        || baseline.commit_id != cloud.commit_id
+        || baseline.session_generation != cloud.session_generation
+        || baseline.occupancy_revision != cloud.occupancy_revision
+        || baseline.source_timestamp_ns != cloud.source_timestamp_ns
+        || current.occupancy_revision < baseline.occupancy_revision
+        || current.commit_id.sequence < baseline.commit_id.sequence
+        || (current.occupancy_revision == baseline.occupancy_revision)
+            != (current.commit_id.sequence == baseline.commit_id.sequence)
+        || (current.commit_id.sequence == baseline.commit_id.sequence && current != baseline)
+    {
+        return Err("retained cloud baseline differs from current occupancy owner lineage".into());
+    }
+    Ok(())
+}
+
+fn validate_retained_cloud_publication(
+    writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+    publication: &CanonicalCloudPublication,
+    occupancy: &crate::mapping_commit::OccupancyCommitReceipt,
+    frame_generation: u64,
+    producer_generation: u64,
+) -> Result<(), String> {
+    if !canonical_committed_cloud_publication_matches_writer(writer, publication) {
+        return Err("NavigationMap3D retained cloud receipt/root is not the current writer owner".into());
+    }
+    let guard = writer.lock();
+    let writer = guard.as_ref().ok_or("NavigationMap3D cloud writer is unavailable")?;
+    let baseline = writer.last_occupancy_receipt()
+        .ok_or("NavigationMap3D cloud writer occupancy baseline is unavailable")?;
+    let cloud = publication.receipt.as_ref().ok_or("NavigationMap3D live cloud receipt is absent")?;
+    validate_cloud_occupancy_progression(occupancy, &baseline, cloud)?;
+    if let Some(fine) = publication.fine.as_ref() {
+        let root = fine.manifest();
+        if root.domain.session != occupancy.session_id
+            || root.domain.generation != occupancy.session_generation
+            || root.domain.frame_generation != frame_generation
+            || root.domain.producer_generation != producer_generation
+            || root.revision != cloud.cloud_revision
+            || root.source_timestamp_ns != cloud.source_timestamp_ns
+        {
+            return Err("NavigationMap3D retained root differs from current session/frame owner".into());
+        }
+    }
+    Ok(())
+}
+
+/// Occupancy/frame half of the composite publication key. These are existing
+/// owner receipts, not a second publication clock or synthesized scan commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NavigationMap3DPublicationIdentity {
+    session_id: String,
+    session_generation: u64,
+    boot_nonce: u128,
+    map_frame_generation: u64,
+    frame_id: String,
+    producer_runtime_generation: u64,
+    occupancy: Option<crate::mapping_commit::OccupancyCommitReceipt>,
+}
+
+fn current_navigation_map_3d_identity(context: &NavigationMap3DPublishContext)
+    -> NavigationMap3DPublicationIdentity
+{
+    let mapping = context.mapping.lock();
+    let session = mapping.snapshot();
+    NavigationMap3DPublicationIdentity {
+        session_id: session.session_id,
+        session_generation: session.session_generation,
+        boot_nonce: mapping.mapping_commit_boot_nonce(),
+        map_frame_generation: mapping.global_frame_generation(),
+        frame_id: mapping.configured_map_frame_id().to_owned(),
+        producer_runtime_generation: context.producer_runtime_generation,
+        occupancy: mapping.latest_occupancy_commit_receipt(),
+    }
 }
 
 async fn navigation_map_3d_publication_metadata(
@@ -9342,6 +9613,7 @@ async fn navigation_map_3d_publication_metadata(
             .map_err(|_| "NavigationMap3D frame generation exceeds i64".to_string())?,
         commit_boot_nonce: boot_nonce.to_be_bytes(),
         commit_sequence: 0,
+        cloud_occupancy_revision: 0,
         virtual_obstacles: None,
     };
     let Some(cloud_receipt) = publication.receipt.as_ref() else {
@@ -9359,11 +9631,7 @@ async fn navigation_map_3d_publication_metadata(
         || session.session_id != occupancy_receipt.session_id
         || session.revision != occupancy_receipt.occupancy_revision
         || session.session_generation != occupancy_receipt.session_generation
-        || cloud_receipt.commit_id != occupancy_receipt.commit_id
-        || cloud_receipt.commit_id.boot_nonce != boot_nonce
-        || cloud_receipt.session_generation != occupancy_receipt.session_generation
-        || cloud_receipt.occupancy_revision != occupancy_receipt.occupancy_revision
-        || cloud_receipt.source_timestamp_ns != occupancy_receipt.source_timestamp_ns
+        || occupancy_receipt.commit_id.boot_nonce != boot_nonce
         || cloud_receipt.source_timestamp_ns != publication.source_timestamp_ns
         || cloud_receipt.cloud_revision != publication.notification.revision
         || cloud_receipt.point_count != publication.notification.point_count
@@ -9377,18 +9645,16 @@ async fn navigation_map_3d_publication_metadata(
     {
         return Err("NavigationMap3D canonical occupancy state does not match receipt".into());
     }
-    // 摘要沿用规范占据载荷算法，不为三维地图创建另一套内容身份。
-    let canonical_data = shared
-        .map
-        .data
-        .iter()
-        .map(|value| *value as u8)
-        .collect::<Vec<_>>();
-    metadata.committed_map.revision = i64::try_from(occupancy_receipt.occupancy_revision)
-        .map_err(|_| "NavigationMap3D occupancy revision exceeds i64".to_string())?;
-    metadata.committed_map.payload_sha256 = crate::map_checksum::sha256_bytes(&canonical_data);
+    // Identity is the actual owner receipt, never a clone/hash of occupancy bytes.
+    validate_retained_cloud_publication(
+        &context.writer, publication, &occupancy_receipt,
+        map_frame_generation, context.producer_runtime_generation,
+    )?;
+    metadata.committed_map = committed_map_identity_from_receipt(&occupancy_receipt, frame_id)?;
     metadata.commit_sequence = i64::try_from(cloud_receipt.commit_id.sequence)
         .map_err(|_| "NavigationMap3D commit sequence exceeds i64".to_string())?;
+    metadata.cloud_occupancy_revision = i64::try_from(cloud_receipt.occupancy_revision)
+        .map_err(|_| "NavigationMap3D cloud occupancy baseline exceeds i64".to_string())?;
     if let Some(mask) = virtual_obstacles {
         if mask.revision != occupancy_receipt.occupancy_revision
             || mask.timestamp_ns != occupancy_receipt.source_timestamp_ns
@@ -9441,16 +9707,26 @@ async fn navigation_map_3d_publication_metadata(
             && authority.revision == metadata.committed_map.revision
             && authority != &metadata.committed_map
         {
-            return Err("NavigationMap3D canonical occupancy hash conflicts with authority".into());
+            return Err("NavigationMap3D canonical occupancy receipt conflicts with authority".into());
         }
     }
     Ok(metadata)
 }
 
+#[cfg(test)]
 fn build_navigation_map_3d_publication_frame(
     publication: &CanonicalCloudPublication,
     metadata: &NavigationMap3DPublicationMetadata,
     legacy_xyz_f32_le: Option<&[u8]>,
+) -> Result<RawLcmFrame, String> {
+    build_navigation_map_3d_publication_frame_with_baseline(publication, metadata, legacy_xyz_f32_le, None)
+}
+
+fn build_navigation_map_3d_publication_frame_with_baseline(
+    publication: &CanonicalCloudPublication,
+    metadata: &NavigationMap3DPublicationMetadata,
+    legacy_xyz_f32_le: Option<&[u8]>,
+    published_root: Option<&nuwax_map_chunks::RootIdentity>,
 ) -> Result<RawLcmFrame, String> {
     let source_timestamp_ns = i64::try_from(publication.source_timestamp_ns)
         .map_err(|_| "NavigationMap3D source time exceeds i64".to_string())?;
@@ -9495,11 +9771,12 @@ fn build_navigation_map_3d_publication_frame(
         ..schema::PointCloud2::default()
     };
     let mut message = schema::NavigationMap3D {
-        schema_version: 3,
+        schema_version: schema::NAVIGATION_MAP_3D_SCHEMA_VERSION,
         producer_runtime_generation: metadata.producer_runtime_generation,
         committed_map: metadata.committed_map.clone(),
         map_frame_generation: metadata.map_frame_generation,
         cloud_revision: revision,
+        cloud_occupancy_revision: metadata.cloud_occupancy_revision,
         source_timestamp_ns,
         source_voxel_size: publication.notification.voxel_size,
         commit_boot_nonce: metadata.commit_boot_nonce,
@@ -9511,7 +9788,7 @@ fn build_navigation_map_3d_publication_frame(
     };
     if let Some(fine) = &publication.fine {
         if fine.manifest().source_timestamp_ns != publication.source_timestamp_ns {
-            return Err("精细导航源与占据提交时间不一致".into());
+            return Err("fine-map source time differs from retained cloud receipt".into());
         }
         let root = fine.manifest();
         if root.domain != schema::navigation_map_3d_domain(&message) || root.revision != revision as u64 {
@@ -9520,12 +9797,16 @@ fn build_navigation_map_3d_publication_frame(
         let root_bytes = root.encode()?;
         let mut included = std::collections::BTreeMap::new();
         let mut included_bytes = 0;
-        for block in &root.blocks {
-            if included_bytes + 16 + block.points as usize * 12 > 128 * 1024 { continue; }
-            let bytes = fine.repository.read_object(block.object, nuwax_map_chunks::MAX_BLOCK_BYTES)?;
-            if included_bytes + bytes.len() > 128 * 1024 { continue; }
-            included_bytes += bytes.len();
-            included.insert(block.object, bytes);
+        // A mask-only update names the already-published immutable root. Do not
+        // read/re-encode unchanged objects; late readers use the retained-root RPC.
+        if published_root != Some(&root.identity()) {
+            for block in &root.blocks {
+                if included_bytes + 16 + block.points as usize * 12 > 128 * 1024 { continue; }
+                let bytes = fine.repository.read_object(block.object, nuwax_map_chunks::MAX_BLOCK_BYTES)?;
+                if included_bytes + bytes.len() > 128 * 1024 { continue; }
+                included_bytes += bytes.len();
+                included.insert(block.object, bytes);
+            }
         }
         message.source_voxel_size = root.voxel_size_m;
         message.fine = Some(nuwax_map_chunks::Transfer {
@@ -9717,12 +9998,15 @@ impl LegacyGlobalMapDemandConfig {
     }
 }
 
+// Preserve the existing canonical compatibility retry cadence for all sinks.
+const CANONICAL_PUBLICATION_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
 fn legacy_global_map_demand_future(
     handle: GeometryRuntimeHandle,
     config: LegacyGlobalMapDemandConfig,
 ) -> GeometryTaskFuture {
     Box::pin(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        let mut interval = tokio::time::interval(CANONICAL_PUBLICATION_RETRY_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let invalidation = canonical_cloud_publication_invalidation(&handle.cloud_map_writer);
         let mut previous_error = None;
@@ -9756,15 +10040,97 @@ fn legacy_global_map_demand_future(
     })
 }
 
+/// Committed occupancy exposure drives the existing canonical sequencer even
+/// when no sensor/cloud commit occurs. Keep listening while publication waits
+/// so a newer occupancy receipt can cancel an older same-cloud send.
+fn canonical_navigation_map_revision_future(
+    handle: GeometryRuntimeHandle,
+    mut revisions: watch::Receiver<Option<MapRevisionEvent>>,
+) -> GeometryTaskFuture {
+    Box::pin(async move {
+        let Some(context) = handle.navigation_map_3d_publish_context().filter(|context| context.enabled) else {
+            return Ok(());
+        };
+        let invalidation = canonical_cloud_publication_invalidation(&handle.cloud_map_writer);
+        let mut process_current = true;
+        let mut retry = false;
+        let mut previous_error = None;
+        loop {
+            if !process_current {
+                if retry {
+                    tokio::select! {
+                        changed = revisions.changed() => { if changed.is_err() { return Ok(()); } }
+                        _ = tokio::time::sleep(CANONICAL_PUBLICATION_RETRY_INTERVAL) => {}
+                    }
+                } else if revisions.changed().await.is_err() {
+                    return Ok(());
+                }
+            }
+            process_current = false;
+            retry = false;
+            let event = revisions.borrow_and_update().clone();
+            invalidation.observe_navigation(Some(current_navigation_map_3d_identity(&context)));
+            let Some(event) = event else { continue; };
+            let attempt = async {
+                let _lifecycle = handle.mapping_lifecycle_lock.lock().await;
+                let current = current_navigation_map_3d_identity(&context);
+                // The exposure watch may lag a just-installed owner. Wait for
+                // that owner's committed event; never publish around failed SHM.
+                if current.occupancy.as_ref() != Some(&event.receipt)
+                    || current.frame_id != event.frame_id {
+                    return Ok(false);
+                }
+                let exposed = committed_map_identity_from_revision(&event)?;
+                if context.committed_map_authority.lock()
+                    .map_err(|_| "NavigationMap3D authority is unavailable".to_string())?
+                    .as_ref() != Some(&exposed) {
+                    return Ok(false);
+                }
+                // Transport backpressure must not block the next owner commit:
+                // its committed watch update cancels this attempt, and the
+                // sequencer revalidates both immutable receipt components.
+                drop(_lifecycle);
+                publish_latest_canonical_cloud_map_with_exposure(
+                    &handle.transport, &handle.cloud_map_writer, &handle.state,
+                    &handle.cloud_map_tx, &current.frame_id, Some(&context), Some(&exposed),
+                ).await.map(|_| true)
+            };
+            tokio::select! {
+                biased;
+                changed = revisions.changed() => {
+                    if changed.is_err() { return Ok(()); }
+                    process_current = true;
+                }
+                result = attempt => {
+                    match result {
+                        Ok(_) => previous_error = None,
+                        Err(error) => {
+                            if previous_error.as_ref() != Some(&error) {
+                                warn!(%error, "committed occupancy/cloud composite publication failed; will retry");
+                            }
+                            previous_error = Some(error);
+                            retry = true;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Per-writer invalidation signal for the canonical `/global_map` sequencer.
 ///
 /// `TypedCloudPublishState` owns ordering, but it only exposes a session watch.
 /// A newer revision in the same session must also cancel a blocked older send so
 /// the sequencer can publish the current canonical snapshot instead.
-type CanonicalPublicationIdentity = (u64, u64, [u8; 16], u64, Option<nuwax_map_chunks::RootIdentity>);
+type CanonicalPublicationIdentity = (u64, u64, [u8; 16], u64,
+    Option<nuwax_map_chunks::RootIdentity>, Option<crate::mapping_commit::CloudCommitReceipt>);
 struct CanonicalCloudPublicationInvalidation {
     identity_tx: watch::Sender<CanonicalPublicationIdentity>,
-    canonical_metadata_published: parking_lot::Mutex<Option<(CommittedCloudMapMetadata, Option<nuwax_map_chunks::RootIdentity>)>>,
+    canonical_metadata_published: parking_lot::Mutex<Option<(CommittedCloudMapMetadata,
+        Option<nuwax_map_chunks::RootIdentity>, Option<NavigationMap3DPublicationIdentity>,
+        Option<crate::mapping_commit::CloudCommitReceipt>)>>,
+    navigation_identity_tx: watch::Sender<Option<NavigationMap3DPublicationIdentity>>,
     // Only the owned lifecycle watcher reads the marker/environment. Hot commits
     // consult this bounded metadata, never the filesystem or cloud payload.
     legacy_full_demand: parking_lot::Mutex<Option<String>>,
@@ -9773,9 +10139,11 @@ struct CanonicalCloudPublicationInvalidation {
 
 impl CanonicalCloudPublicationInvalidation {
     fn new() -> Self {
-        let (identity_tx, _) = watch::channel((0, 0, [0; 16], 0, None));
+        let (identity_tx, _) = watch::channel((0, 0, [0; 16], 0, None, None));
+        let (navigation_identity_tx, _) = watch::channel(None);
         Self {
             identity_tx,
+            navigation_identity_tx,
             canonical_metadata_published: parking_lot::Mutex::new(None),
             legacy_full_demand: parking_lot::Mutex::new(None),
             legacy_full_published: parking_lot::Mutex::new(None),
@@ -9812,6 +10180,12 @@ impl CanonicalCloudPublicationInvalidation {
     fn observe(&self, identity: CanonicalPublicationIdentity) {
         if *self.identity_tx.borrow() != identity {
             self.identity_tx.send_replace(identity);
+        }
+    }
+
+    fn observe_navigation(&self, identity: Option<NavigationMap3DPublicationIdentity>) {
+        if *self.navigation_identity_tx.borrow() != identity {
+            self.navigation_identity_tx.send_replace(identity);
         }
     }
 
@@ -9890,7 +10264,7 @@ fn latest_canonical_cloud_publication(
         .map_or(0, |receipt| receipt.source_timestamp_ns);
     publish_state.observe_session_generation(snapshot.session_generation);
     invalidation.observe((snapshot.session_generation, snapshot.revision, snapshot.producer_epoch, snapshot.layout_generation,
-        writer.committed_fine_cloud().map(|fine| fine.manifest().identity())));
+        writer.committed_fine_cloud().map(|fine| fine.manifest().identity()), receipt.clone()));
     Ok(Some((
         publish_state,
         invalidation,
@@ -9936,7 +10310,7 @@ fn canonical_fine_publication_pending(writer: &Arc<parking_lot::Mutex<Option<Clo
         .map(|fine| fine.manifest().identity());
     let Some(root) = root else { return false; };
     let published = invalidation.canonical_metadata_published.lock();
-    published.as_ref().is_none_or(|(_, previous)| previous.as_ref() != Some(&root))
+    published.as_ref().is_none_or(|(_, previous, _, _)| previous.as_ref() != Some(&root))
 }
 
 async fn publish_latest_canonical_cloud_map_with_navigation(
@@ -9947,7 +10321,47 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
     frame_id: &str,
     navigation_context: Option<&NavigationMap3DPublishContext>,
 ) -> Result<Option<CloudMapNotification>, String> {
+    // Direct callers own their lifecycle transaction. They may legitimately
+    // publish before the asynchronous SHM coalescer obtains that same fence.
+    publish_latest_canonical_cloud_map_with_exposure(transport, writer, state,
+        cloud_map_tx, frame_id, navigation_context, None).await
+}
+
+fn validate_expected_navigation_exposure(
+    context: Option<&NavigationMap3DPublishContext>,
+    metadata: Option<&NavigationMap3DPublicationMetadata>,
+    expected: Option<&schema::CommittedMapIdentity>,
+) -> Result<(), String> {
+    let Some(expected) = expected else { return Ok(()); };
+    let context = context.ok_or("committed-watch publication lacks navigation owner")?;
+    let current = current_navigation_map_3d_identity(context);
+    let projected = current.occupancy.as_ref()
+        .map(|receipt| committed_map_identity_from_receipt(receipt, &current.frame_id)).transpose()?;
+    if projected.as_ref() != Some(expected)
+        || metadata.is_some_and(|metadata| &metadata.committed_map != expected)
+        || context.committed_map_authority.lock()
+            .map_err(|_| "NavigationMap3D exposed authority is unavailable".to_string())?
+            .as_ref() != Some(expected) {
+        return Err("NavigationMap3D committed-watch exposure changed before publication".into());
+    }
+    Ok(())
+}
+
+async fn publish_latest_canonical_cloud_map_with_exposure(
+    transport: &LcmTransport,
+    writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+    state: &Arc<RwLock<SharedState>>,
+    cloud_map_tx: &broadcast::Sender<CloudMapNotification>,
+    frame_id: &str,
+    navigation_context: Option<&NavigationMap3DPublishContext>,
+    expected_exposure: Option<&schema::CommittedMapIdentity>,
+) -> Result<Option<CloudMapNotification>, String> {
+    let navigation_context = navigation_context.filter(|context| context.enabled);
     'acquire_sequencer: loop {
+        let invalidation = canonical_cloud_publication_invalidation(writer);
+        if let Some(context) = navigation_context {
+            invalidation.observe_navigation(Some(current_navigation_map_3d_identity(context)));
+        }
         let Some((publish_state, _, _)) = latest_canonical_cloud_publication(writer)? else {
             return Ok(None);
         };
@@ -9969,6 +10383,7 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                 latest_publication.metadata.producer_epoch,
                 latest_publication.metadata.layout_generation,
                 latest_publication.fine.as_ref().map(|fine| fine.manifest().identity()),
+                latest_publication.receipt.clone(),
             );
             let publication = pending_clear
                 .as_ref()
@@ -9996,12 +10411,22 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                 publication.notification.session_generation,
                 publication.notification.revision,
             );
+            let navigation_identity = navigation_context.map(current_navigation_map_3d_identity);
+            if navigation_context.is_some() {
+                invalidation.observe_navigation(navigation_identity.clone());
+            }
+            let published_root = invalidation.canonical_metadata_published.lock().as_ref()
+                .and_then(|(_, root, _, _)| root.clone());
             let legacy_full_demand = invalidation.legacy_full_required(&publication.metadata);
             let canonical_already_published = publish_state.published_identity() == Some(identity)
                 && invalidation.canonical_metadata_published.lock().as_ref()
-                    .is_some_and(|(metadata, root)| same_cloud_metadata(metadata, &publication.metadata)
-                        && *root == publication.fine.as_ref().map(|fine| fine.manifest().identity()));
+                    .is_some_and(|(metadata, root, occupancy, cloud)| same_cloud_metadata(metadata, &publication.metadata)
+                        && *root == publication.fine.as_ref().map(|fine| fine.manifest().identity())
+                        && *occupancy == navigation_identity && *cloud == publication.receipt);
             if canonical_already_published && legacy_full_demand.is_none() {
+                if let Some(expected) = expected_exposure {
+                    validate_expected_navigation_exposure(navigation_context, None, Some(expected))?;
+                }
                 publish_state.mark_published(identity);
                 if pending_clear.is_some() {
                     continue;
@@ -10025,6 +10450,11 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
             } else {
                 None
             };
+            validate_expected_navigation_exposure(navigation_context, navigation_metadata.as_ref(), expected_exposure)?;
+            if navigation_context.is_some_and(|context|
+                Some(current_navigation_map_3d_identity(context)) != navigation_identity) {
+                continue;
+            }
             // Fine chunks never flatten the full cloud, even transiently. A
             // legacy full export is shared only by consumers that demanded it.
             let legacy_navigation = navigation_metadata.is_some()
@@ -10035,10 +10465,15 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                 None
             };
             let navigation_frame = navigation_metadata.as_ref()
-                .map(|metadata| build_navigation_map_3d_publication_frame(
-                    &publication, metadata, exported_xyz.as_deref()))
+                .map(|metadata| build_navigation_map_3d_publication_frame_with_baseline(
+                    &publication, metadata, exported_xyz.as_deref(), published_root.as_ref()))
                 .transpose()?;
 
+            let mut navigation_identity_rx = invalidation.navigation_identity_tx.subscribe();
+            if navigation_context.is_some()
+                && *navigation_identity_rx.borrow_and_update() != navigation_identity {
+                continue;
+            }
             let mut canonical_identity_rx = invalidation.subscribe();
             if *canonical_identity_rx.borrow_and_update() != canonical_identity {
                 continue;
@@ -10052,6 +10487,12 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
             let publish_result = tokio::select! {
                 biased;
                 changed = session_generation_rx.changed() => {
+                    match changed {
+                        Ok(()) => None,
+                        Err(_) => return Ok(None),
+                    }
+                }
+                changed = navigation_identity_rx.changed(), if navigation_context.is_some() => {
                     match changed {
                         Ok(()) => None,
                         Err(_) => return Ok(None),
@@ -10079,7 +10520,7 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                         };
                         if (current.notification.session_generation, current.notification.revision,
                             current.metadata.producer_epoch, current.metadata.layout_generation,
-                            current.fine.as_ref().map(|fine| fine.manifest().identity())) != canonical_identity
+                            current.fine.as_ref().map(|fine| fine.manifest().identity()), current.receipt.clone()) != canonical_identity
                             || (publication.receipt.is_some()
                                 && !same_canonical_cloud_publication_identity(&current, &publication))
                         {
@@ -10091,6 +10532,7 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                                 return Ok(false);
                             }
                         }
+                        validate_expected_navigation_exposure(navigation_context, navigation_metadata.as_ref(), expected_exposure)?;
                         tokio::time::timeout_at(publish_deadline, publish_raw_lcm_frame(transport, frame))
                             .await
                             .map_err(|_| "NavigationMap3D publish exceeded canonical cloud deadline".to_string())??;
@@ -10134,6 +10576,7 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                     && current_snapshot.producer_epoch == canonical_identity.2
                     && current_snapshot.layout_generation == canonical_identity.3
                     && current_writer.committed_fine_cloud().map(|fine| fine.manifest().identity()) == canonical_identity.4
+                    && current_writer.last_cloud_receipt() == canonical_identity.5
             };
             let committed_publication_matches = publication.receipt.as_ref().is_none_or(|_| {
                 canonical_committed_cloud_publication_matches_writer(writer, &publication)
@@ -10142,16 +10585,31 @@ async fn publish_latest_canonical_cloud_map_with_navigation(
                 || !committed_publication_matches
                 || *session_generation_rx.borrow_and_update() != canonical_identity.0
                 || *canonical_identity_rx.borrow_and_update() != canonical_identity
+                || (navigation_context.is_some()
+                    && *navigation_identity_rx.borrow_and_update() != navigation_identity)
             {
                 drop(shared);
                 continue;
             }
 
+            // Bind the final publication mark to the same exposed receipt. This
+            // short guard contains no await or payload comparison/materialization.
+            let exposed_authority = navigation_context
+                .filter(|_| expected_exposure.is_some())
+                .map(|context| context.committed_map_authority.lock()
+                    .map_err(|_| "NavigationMap3D exposed authority is unavailable".to_string()))
+                .transpose()?;
+            if let (Some(exposed), Some(expected)) = (exposed_authority.as_ref(), expected_exposure) {
+                if exposed.as_ref() != Some(expected) {
+                    return Err("NavigationMap3D exposed receipt changed before publication mark".into());
+                }
+            }
             if let Some(demand) = legacy_full_demand.as_ref() {
                 invalidation.mark_legacy_full_published(publication.metadata, demand);
             }
             *invalidation.canonical_metadata_published.lock() = Some((publication.metadata,
-                publication.fine.as_ref().map(|fine| fine.manifest().identity())));
+                publication.fine.as_ref().map(|fine| fine.manifest().identity()), navigation_identity,
+                publication.receipt.clone()));
             publish_state.mark_published(identity);
             if shared.cloud_map_revision < publication.notification.revision {
                 shared.cloud_map_revision = publication.notification.revision;
@@ -10182,6 +10640,7 @@ struct CanonicalMappingCloudIdentity<'a> {
     map_frame_generation: u64,
     occupancy_receipt: &'a crate::mapping_commit::OccupancyCommitReceipt,
     cloud: &'a CommittedMappingCloudMap,
+    fine: Option<Arc<nuwax_map_chunks::SealedMap>>,
     expected_mode: Option<ExpectedRelocalizationMode>,
 }
 
@@ -10194,6 +10653,7 @@ fn same_cloud_map_notification(left: &CloudMapNotification, right: &CloudMapNoti
 
 fn canonical_mapping_cloud_identity_from_commit<'a>(
     mapping: &Arc<parking_lot::Mutex<MappingAdapter>>,
+    writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
     map_frame: &str,
     commit: &'a MappingIngestCommit,
     binding: Option<&crate::lio_ingress::RegistrationBinding>,
@@ -10230,10 +10690,7 @@ fn canonical_mapping_cloud_identity_from_commit<'a>(
         };
     if occupancy_receipt.session_id != mapping_session_id
         || occupancy_receipt.session_generation != mapping_session_generation
-        || cloud.receipt.commit_id != occupancy_receipt.commit_id
         || cloud.receipt.session_generation != mapping_session_generation
-        || cloud.receipt.occupancy_revision != occupancy_receipt.occupancy_revision
-        || cloud.receipt.source_timestamp_ns != occupancy_receipt.source_timestamp_ns
         || cloud.notification.revision != cloud.receipt.cloud_revision
         || cloud.notification.point_count != cloud.receipt.point_count
         || cloud.notification.session_generation != mapping_session_generation
@@ -10243,6 +10700,30 @@ fn canonical_mapping_cloud_identity_from_commit<'a>(
         return Err("canonical cloud publication commit identity mismatch".to_owned());
     }
 
+    let fine = {
+        let guard = writer.lock();
+        let writer = guard.as_ref().ok_or("canonical cloud publication writer is unavailable")?;
+        let baseline = writer.last_occupancy_receipt()
+            .ok_or("canonical cloud publication occupancy baseline is unavailable")?;
+        validate_cloud_occupancy_progression(occupancy_receipt, &baseline, &cloud.receipt)?;
+        if writer.last_cloud_receipt().as_ref() != Some(&cloud.receipt)
+            || !writer.committed_metadata().as_ref().is_some_and(|metadata|
+                same_cloud_metadata(metadata, &cloud.metadata)) {
+            return Err("canonical cloud publication is not the retained writer commit".into());
+        }
+        writer.committed_fine_cloud()
+    };
+    if fine.as_ref().is_some_and(|fine| {
+        let root = fine.manifest();
+        root.domain.session != mapping_session_id
+            || root.domain.generation != mapping_session_generation
+            || root.domain.frame_generation != map_frame_generation
+            || root.revision != cloud.receipt.cloud_revision
+            || root.source_timestamp_ns != cloud.receipt.source_timestamp_ns
+    }) {
+        return Err("canonical cloud publication retained root has a stale owner/frame".into());
+    }
+
     Ok(Some(CanonicalMappingCloudIdentity {
         map_frame_id,
         mapping_session_id,
@@ -10250,6 +10731,7 @@ fn canonical_mapping_cloud_identity_from_commit<'a>(
         map_frame_generation,
         occupancy_receipt,
         cloud,
+        fine,
         expected_mode,
     }))
 }
@@ -10281,7 +10763,7 @@ async fn ensure_canonical_mapping_cloud_identity(
             normalize_frame(mapping.configured_map_frame_id()),
         )
     };
-    let (cloud_snapshot, cloud_receipt) = {
+    let (cloud_snapshot, cloud_receipt, cloud_baseline, fine) = {
         let writer = writer.lock();
         let writer = writer
             .as_ref()
@@ -10293,7 +10775,16 @@ async fn ensure_canonical_mapping_cloud_identity(
             writer
                 .last_cloud_receipt()
                 .ok_or_else(|| "canonical cloud publication receipt is unavailable".to_owned())?,
+            writer.last_occupancy_receipt()
+                .ok_or("canonical cloud publication occupancy baseline is unavailable")?,
+            writer.committed_fine_cloud(),
         )
+    };
+    validate_cloud_occupancy_progression(expected.occupancy_receipt, &cloud_baseline, &cloud_receipt)?;
+    let fine_matches = match (&fine, &expected.fine) {
+        (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
+        (None, None) => true,
+        _ => false,
     };
     let shared = state.read().await;
     let cloud_revision_matches = if require_published_cloud_revision {
@@ -10308,6 +10799,7 @@ async fn ensure_canonical_mapping_cloud_identity(
         || map_frame_generation != expected.map_frame_generation
         || configured_map_frame != expected.map_frame_id
         || occupancy_receipt.as_ref() != Some(expected.occupancy_receipt)
+        || !fine_matches
         || cloud_receipt != expected.cloud.receipt
         || cloud_snapshot.revision != expected.cloud.notification.revision
         || cloud_snapshot.point_count != expected.cloud.notification.point_count
@@ -10374,6 +10866,7 @@ async fn publish_mapping_ingest_commit_while_lifecycle_fenced(
     }
     let Some(expected) = canonical_mapping_cloud_identity_from_commit(
         mapping,
+        writer,
         map_frame,
         commit,
         binding,
@@ -11788,6 +12281,17 @@ async fn build_handle_for_tests_with_cloud_writer(
     with_cloud_writer: bool,
     backend_override: Option<crate::mapping_backend::MappingBackendSpec>,
 ) -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
+    build_test_handle_parts(with_cloud_writer, backend_override, None).await
+}
+
+// The optional transport is exclusively for separately named in-process unit
+// tests. Existing real-LCM integration constructors always pass None.
+async fn build_test_handle_parts(
+    with_cloud_writer: bool,
+    backend_override: Option<crate::mapping_backend::MappingBackendSpec>,
+    unit_transport: Option<LcmTransport>,
+) -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
+    let in_process_unit_transport = unit_transport.is_some();
     let (cloud_map_tx, _) = broadcast::channel::<CloudMapNotification>(4);
     let (nav_state_tx, _) = broadcast::channel::<NavigationUpdate>(8);
     let (frontiers_tx, _) = broadcast::channel::<Vec<FrontierEntry>>(4);
@@ -11809,8 +12313,9 @@ async fn build_handle_for_tests_with_cloud_writer(
             .expect("test sequence state must be writable and exclusively lockable"),
     );
     // 显式测试端点不受 NUWAX_LCM_URL / LCM_DEFAULT_URL 影响。
-    let transport = LcmTransport::new_real(&crate::lcm_runtime::test_lcm_url())
-        .expect("test real LCM 启动失败,需先 apt-get install -y liblcm-dev 1.3~1.5");
+    let transport = unit_transport.unwrap_or_else(||
+        LcmTransport::new_real(&crate::lcm_runtime::test_lcm_url())
+            .expect("test real LCM 启动失败,需先 apt-get install -y liblcm-dev 1.3~1.5"));
     // Phase 3: 测试 helper 也构造 mapping_adapter,便于 unit test 走完整链路。
     let mapping_adapter = Some(Arc::new(parking_lot::Mutex::new(match backend_override {
         Some(backend) => MappingAdapter::new_with_frames_and_optional_sequence_store(
@@ -11887,12 +12392,12 @@ async fn build_handle_for_tests_with_cloud_writer(
         explore_projection_gate,
         committed_map_authority,
         transport,
-        transport_backend_name: "real-lcm",
-        lcm_backend_available: true,
+        transport_backend_name: if in_process_unit_transport { "in-process-unit" } else { "real-lcm" },
+        lcm_backend_available: !in_process_unit_transport,
         // Phase 6 / Rework-9:test helper 默认保留 `true`。
         // 配套测试用 `set_cmd_vel_sink_ready(false)` 验证 readiness 拒绝分支。
         // 生产 spawn 路径(`spawn_geometry_runtime`)默认 `false`。
-        cmd_vel_sink_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        cmd_vel_sink_ready: Arc::new(std::sync::atomic::AtomicBool::new(!in_process_unit_transport)),
         nav,
         explore,
         mapping_adapter,
@@ -12689,6 +13194,7 @@ mod mapping_feed_tests {
                     enabled: true,
                     producer_runtime_generation: 37,
                     mapping,
+                    writer: writer.clone(),
                     committed_map_authority: Arc::new(std::sync::Mutex::new(None)),
                 },
                 state: Arc::new(RwLock::new(SharedState::default())),
@@ -12735,6 +13241,416 @@ mod mapping_feed_tests {
             update_mapping_cloud_map_if_current(&outcome, &mapping.snapshot(), &self.writer)
                 .expect("真实关联点云提交")
         }
+    }
+
+    struct MaskPublicationFixture {
+        fixture: NavigationMap3DFixture,
+        root: std::path::PathBuf,
+        zones: std::path::PathBuf,
+    }
+
+    impl MaskPublicationFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("nuwax-composite-mask-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let zones = root.join("zones.json");
+            Self::write_generation(&zones, 1);
+            let store = Arc::new(crate::sequence_state::SequenceStateStore::open(&root.join("sequence.json")).unwrap());
+            let mut mapping = MappingAdapter::new_with_frames_sequence_store_and_forbidden_zones(
+                mapping_config(), crate::mapping_backend::MappingBackendSpec::Voxel,
+                "map", "odom", store, zones.clone());
+            mapping.start_session("test-session", "test-map").unwrap();
+            Self { fixture: NavigationMap3DFixture::with_mapping(Arc::new(parking_lot::Mutex::new(mapping))), root, zones }
+        }
+
+        fn write_generation(path: &std::path::Path, generation: u64) {
+            std::fs::write(path, format!(r#"{{"schema_version":1,"maps":{{"test-map":{{"map_name":"test-map","generation":{generation},"zones":[]}}}}}}"#)).unwrap();
+        }
+
+        fn refresh(&self, generation: u64) -> MapRevisionEvent {
+            Self::write_generation(&self.zones, generation);
+            let mut updates = self.fixture.map_tx.subscribe();
+            assert!(self.fixture.context.mapping.lock()
+                .refresh_forbidden_zones(&self.fixture.state, &self.fixture.map_tx).unwrap());
+            updates.try_recv().unwrap()
+        }
+
+        fn expose(&self, event: &MapRevisionEvent) {
+            *self.fixture.context.committed_map_authority.lock().unwrap() =
+                Some(committed_map_identity_from_revision(event).unwrap());
+        }
+    }
+
+    impl Drop for MaskPublicationFixture {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.root); }
+    }
+
+    #[test]
+    fn retained_cloud_lineage_rejects_forged_and_inconsistent_receipts() {
+        let fixture = NavigationMap3DFixture::new();
+        let cloud = fixture.commit(1_000_000_000);
+        let baseline = fixture.writer.lock().as_ref().unwrap().last_occupancy_receipt().unwrap();
+        validate_cloud_occupancy_progression(&baseline, &baseline, &cloud.receipt).unwrap();
+        let mut newer = baseline.clone();
+        newer.occupancy_revision += 3;
+        newer.commit_id.sequence += 3;
+        newer.source_timestamp_ns += 100;
+        validate_cloud_occupancy_progression(&newer, &baseline, &cloud.receipt).unwrap();
+        let mutations: [fn(&mut crate::mapping_commit::OccupancyCommitReceipt); 7] = [
+            |r| r.commit_id.boot_nonce ^= 1,
+            |r: &mut crate::mapping_commit::OccupancyCommitReceipt| r.session_id.push_str("-foreign"),
+            |r: &mut crate::mapping_commit::OccupancyCommitReceipt| r.session_generation += 1,
+            |r: &mut crate::mapping_commit::OccupancyCommitReceipt| r.backend_generation += 1,
+            |r: &mut crate::mapping_commit::OccupancyCommitReceipt| r.backend_kind = crate::mapping_backend::MappingBackendKind::Raytracing,
+            |r: &mut crate::mapping_commit::OccupancyCommitReceipt| r.occupancy_revision -= 3,
+            |r: &mut crate::mapping_commit::OccupancyCommitReceipt| r.commit_id.sequence -= 3,
+        ];
+        for mutate in mutations {
+            let mut forged = newer.clone(); mutate(&mut forged);
+            assert!(validate_cloud_occupancy_progression(&forged, &baseline, &cloud.receipt).is_err());
+        }
+        let mut forged = cloud.receipt.clone();
+        forged.source_timestamp_ns += 1;
+        assert!(validate_cloud_occupancy_progression(&newer, &baseline, &forged).is_err());
+        let mut same_commit_wrong_time = baseline.clone();
+        same_commit_wrong_time.source_timestamp_ns += 1;
+        assert!(validate_cloud_occupancy_progression(&same_commit_wrong_time, &baseline, &cloud.receipt).is_err());
+    }
+
+    #[tokio::test]
+    async fn retained_cloud_metadata_rejects_forged_receipt_root_and_frame() {
+        let fixture = NavigationMap3DFixture::new();
+        fixture.commit(1_000_000_000);
+        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer).unwrap().unwrap();
+        for kind in 0..4 {
+            let mut forged = publication.clone();
+            match kind {
+                0 => forged.receipt.as_mut().unwrap().commit_id.sequence += 1,
+                1 => forged.source_timestamp_ns += 1,
+                2 => {
+                    let original = forged.fine.as_ref().unwrap();
+                    forged.fine = Some(Arc::new((**original).clone()));
+                }
+                _ => {
+                    let original = forged.fine.as_ref().unwrap();
+                    forged.fine = Some(Arc::new(original.rehome_frame(&original.manifest().identity(),
+                        original.manifest().domain.frame_generation + 1).unwrap()));
+                }
+            }
+            assert!(navigation_map_3d_publication_metadata(&fixture.context, &forged, &fixture.state, "map")
+                .await.is_err());
+        }
+        assert!(navigation_map_3d_publication_metadata(&fixture.context, &publication, &fixture.state, "foreign")
+            .await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mask_only_and_noop_publish_without_fine_object_io_or_cloud_materialization() {
+        let masks = MaskPublicationFixture::new();
+        let fixture = &masks.fixture;
+        let committed = fixture.commit(1_000_000_000);
+        canonical_cloud_publication_invalidation(&fixture.writer).set_legacy_full_demand(None);
+        let backend = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/composite-io").unwrap());
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        publish_latest_canonical_cloud_map_with_navigation(&transport, &fixture.writer, &fixture.state,
+            &fixture.cloud_tx, "map", Some(&fixture.context)).await.unwrap();
+        let before = backend.published.lock().unwrap().len();
+        let fine = fixture.writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap();
+        let root_before = fine.manifest().encode().unwrap();
+        let evidence_before = fine.manifest().blocks.iter().map(|block| {
+            let bytes = fine.repository.read_object(block.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
+            (block.clone(), bytes)
+        }).collect::<Vec<_>>();
+        let first = masks.refresh(2);
+        let latest = masks.refresh(3); // The composite may skip intermediate mask receipts.
+        masks.expose(&latest);
+        assert!(latest.revision > first.revision);
+        let retry_commit = MappingIngestCommit {
+            outcome: MappingIngestOutcome {
+                sensor_origin_map: None, accepted_map_points: Vec::new(), occupancy_event: None,
+                occupancy_receipt: Some(latest.receipt.clone()), occupancy_committed: false,
+                session_generation: latest.session_generation,
+                source_timestamp_ns: committed.source_timestamp_ns,
+            },
+            cloud_commit: Some(CommittedMappingCloudMap {
+                notification: committed.notification.clone(), source_timestamp_ns: committed.source_timestamp_ns,
+                metadata: committed.metadata, receipt: committed.receipt.clone(),
+            }),
+        };
+        let expected = canonical_mapping_cloud_identity_from_commit(&fixture.context.mapping, &fixture.writer,
+            "map", &retry_commit, None, None).unwrap().unwrap();
+        let missing = fine.repository.path().with_extension("temporarily-unavailable");
+        std::fs::rename(fine.repository.path(), &missing).unwrap();
+        let mask_result = publish_canonical_mapping_cloud_while_lifecycle_fenced(&transport,
+            &fixture.context.mapping, &fixture.writer, &fixture.state, &fixture.cloud_tx,
+            &expected, Some(&fixture.context)).await;
+        let noop_result = publish_latest_canonical_cloud_map_with_navigation(&transport, &fixture.writer,
+            &fixture.state, &fixture.cloud_tx, "map", Some(&fixture.context)).await;
+        std::fs::rename(&missing, fine.repository.path()).unwrap();
+        mask_result.expect("unchanged fine objects must not be opened for a mask-only publication");
+        noop_result.expect("no-op publication must not open fine objects");
+        assert_eq!(backend.published.lock().unwrap().len(), before + 1);
+        let frames = backend.published.lock().unwrap();
+        let message = schema::decode_navigation_map_3d_body(&frames.last().unwrap().payload).unwrap();
+        assert_eq!(message.committed_map, committed_map_identity_from_revision(&latest).unwrap());
+        assert_eq!(message.cloud_revision, committed.receipt.cloud_revision as i64);
+        assert_eq!(message.cloud_occupancy_revision, committed.receipt.occupancy_revision as i64);
+        assert_eq!(message.source_timestamp_ns, committed.source_timestamp_ns as i64);
+        assert_eq!(message.fine.as_ref().unwrap().root, root_before);
+        assert!(message.fine.as_ref().unwrap().included.is_empty());
+        let writer = fixture.writer.lock(); let writer = writer.as_ref().unwrap();
+        assert!(!writer.full_snapshot_materialized());
+        assert_eq!(writer.last_cloud_receipt().unwrap(), committed.receipt);
+        assert!(Arc::ptr_eq(&fine, &writer.committed_fine_cloud().unwrap()));
+        for (block, before) in evidence_before {
+            assert_eq!(fine.repository.read_object(block.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap(), before);
+            assert!(writer.pin_fine_map_root(&fine.manifest().identity(), &block).is_ok(),
+                "late readers must retain the existing missing-object RPC owner");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn newer_occupancy_cancels_blocked_same_cloud_publication() {
+        let masks = MaskPublicationFixture::new();
+        let fixture = &masks.fixture;
+        let committed = fixture.commit(1_000_000_000);
+        canonical_cloud_publication_invalidation(&fixture.writer).set_legacy_full_demand(None);
+        let initial_backend = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/composite-initial").unwrap());
+        publish_latest_canonical_cloud_map_with_navigation(&LcmTransport::new(Arc::new(initial_backend)),
+            &fixture.writer, &fixture.state, &fixture.cloud_tx, "map", Some(&fixture.context)).await.unwrap();
+        let first = masks.refresh(2); masks.expose(&first);
+        let backend = FirstGlobalMapPublishGateBackend::default();
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        let delayed = {
+            let transport = transport.clone(); let writer = fixture.writer.clone();
+            let state = fixture.state.clone(); let cloud_tx = fixture.cloud_tx.clone();
+            let context = fixture.context.clone();
+            tokio::spawn(async move {
+                publish_latest_canonical_cloud_map_with_navigation(&transport, &writer, &state,
+                    &cloud_tx, "map", Some(&context)).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), backend.first_publish_started.notified()).await.unwrap();
+        let latest = masks.refresh(3); masks.expose(&latest);
+        publish_latest_canonical_cloud_map_with_navigation(&transport, &fixture.writer, &fixture.state,
+            &fixture.cloud_tx, "map", Some(&fixture.context)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), delayed).await.unwrap().unwrap().unwrap();
+        let frames = backend.published.lock().unwrap();
+        assert_eq!(frames.len(), 1, "blocked older occupancy must never escape after newer composite");
+        let message = schema::decode_navigation_map_3d_body(&frames[0].payload).unwrap();
+        assert_eq!(message.committed_map, committed_map_identity_from_revision(&latest).unwrap());
+        assert_eq!(message.cloud_revision, committed.receipt.cloud_revision as i64);
+        assert_eq!(message.source_timestamp_ns, committed.source_timestamp_ns as i64);
+        assert!(message.fine.as_ref().unwrap().included.is_empty());
+    }
+
+    #[tokio::test]
+    async fn committed_occupancy_watch_publishes_mask_only_and_waits_for_exact_exposure() {
+        let mut masks = MaskPublicationFixture::new();
+        let mut handle = build_test_handle_parts(false, None, Some(LcmTransport::new(Arc::new(
+            MappingFeedRecordingBackend::new(LcmTopic::new("/unused/unit-composite-handle").unwrap()))))).await.unwrap();
+        // Match the actual runtime owner before the first cloud is sealed.
+        masks.fixture.context.producer_runtime_generation = handle.nav.producer_runtime_generation();
+        let fixture = &masks.fixture;
+        fixture.commit(1_000_000_000);
+        canonical_cloud_publication_invalidation(&fixture.writer).set_legacy_full_demand(None);
+        let backend = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/composite-watch").unwrap());
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        publish_latest_canonical_cloud_map_with_navigation(&transport, &fixture.writer, &fixture.state,
+            &fixture.cloud_tx, "map", Some(&fixture.context)).await.unwrap();
+        let initial_count = backend.published.lock().unwrap().len();
+        handle.mapping_adapter = Some(fixture.context.mapping.clone());
+        handle.cloud_map_writer = fixture.writer.clone(); handle.state = fixture.state.clone();
+        handle.cloud_map_tx = fixture.cloud_tx.clone(); handle.transport = transport;
+        handle.committed_map_authority = fixture.context.committed_map_authority.clone();
+        let (latest, updates) = watch::channel(None);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let watcher = tokio::spawn(run_persistent_future_until_stop(shutdown_rx,
+            canonical_navigation_map_revision_future(handle, updates)));
+        let wait_for_count = |count| {
+            let published = backend.published.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(1), async move {
+                    while published.lock().unwrap().len() < count {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }).await.unwrap();
+            }
+        };
+        let first = masks.refresh(2);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(backend.published.lock().unwrap().len(), initial_count,
+            "raw owner event alone must not bypass committed exposure");
+        masks.expose(&first); latest.send_replace(Some(first));
+        wait_for_count(initial_count + 1).await;
+        let skipped = masks.refresh(3);
+        let current = masks.refresh(4);
+        masks.expose(&skipped); latest.send_replace(Some(skipped));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(backend.published.lock().unwrap().len(), initial_count + 1,
+            "older exposed event must wait when its actual occupancy owner advanced");
+        masks.expose(&current); latest.send_replace(Some(current.clone()));
+        wait_for_count(initial_count + 2).await;
+        let frames = backend.published.lock().unwrap();
+        let message = schema::decode_navigation_map_3d_body(&frames.last().unwrap().payload).unwrap();
+        assert_eq!(message.committed_map, committed_map_identity_from_revision(&current).unwrap());
+        assert!(message.fine.as_ref().unwrap().included.is_empty());
+        drop(frames);
+        shutdown.send_replace(true); watcher.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exposed_noop_receipt_allows_new_legacy_full_demand() {
+        let fixture = NavigationMap3DFixture::new();
+        fixture.commit(1_000_000_000);
+        let invalidation = canonical_cloud_publication_invalidation(&fixture.writer);
+        invalidation.set_legacy_full_demand(None);
+        let backend = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/exposed-demand").unwrap());
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        publish_latest_canonical_cloud_map_with_navigation(&transport, &fixture.writer,
+            &fixture.state, &fixture.cloud_tx, "map", Some(&fixture.context)).await.unwrap();
+        let before = backend.published.lock().unwrap().len();
+        let admitted = fixture.context.committed_map_authority.lock().unwrap().clone().unwrap();
+        invalidation.set_legacy_full_demand(Some("new-unit-legacy-demand".into()));
+        publish_latest_canonical_cloud_map_with_exposure(&transport, &fixture.writer,
+            &fixture.state, &fixture.cloud_tx, "map", Some(&fixture.context), Some(&admitted)).await.unwrap();
+        assert_eq!(backend.published.lock().unwrap().len(), before + 1,
+            "new full-cloud demand must be delivered even without a new navigation frame");
+        assert!(invalidation.legacy_full_required(&fixture.writer.lock().as_ref().unwrap().committed_metadata().unwrap()).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_exposed_send_never_substitutes_unexposed_owner_commit() {
+        let masks = MaskPublicationFixture::new();
+        let fixture = &masks.fixture;
+        fixture.commit(1_000_000_000);
+        canonical_cloud_publication_invalidation(&fixture.writer).set_legacy_full_demand(None);
+        let admitted = fixture.context.committed_map_authority.lock().unwrap().clone().unwrap();
+        let backend = SameSessionGlobalMapPublishGateBackend::default();
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        let delayed = {
+            let transport = transport.clone(); let writer = fixture.writer.clone();
+            let state = fixture.state.clone(); let cloud_tx = fixture.cloud_tx.clone();
+            let context = fixture.context.clone(); let admitted = admitted.clone();
+            tokio::spawn(async move {
+                publish_latest_canonical_cloud_map_with_exposure(&transport, &writer, &state,
+                    &cloud_tx, "map", Some(&context), Some(&admitted)).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), backend.first_publish_started.notified()).await.unwrap();
+        let newer = masks.refresh(2); // B is owned, but has not completed SHM exposure.
+        backend.release_first_publish();
+        assert!(tokio::time::timeout(Duration::from_secs(1), delayed).await.unwrap().unwrap().is_err());
+        {
+            let frames = backend.published.lock().unwrap();
+            assert_eq!(frames.len(), 1);
+            let message = schema::decode_navigation_map_3d_body(&frames[0].payload).unwrap();
+            assert_eq!(message.committed_map, admitted, "a retained send may only carry admitted A, never recaptured B");
+        }
+        let expected = committed_map_identity_from_revision(&newer).unwrap();
+        masks.expose(&newer);
+        publish_latest_canonical_cloud_map_with_exposure(&transport, &fixture.writer,
+            &fixture.state, &fixture.cloud_tx, "map", Some(&fixture.context), Some(&expected)).await.unwrap();
+        let frames = backend.published.lock().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(schema::decode_navigation_map_3d_body(&frames[1].payload).unwrap().committed_map, expected);
+    }
+
+    #[tokio::test]
+    async fn direct_activation_owner_publication_does_not_wait_for_its_coalescer() {
+        let mut masks = MaskPublicationFixture::new();
+        let mut handle = build_test_handle_parts(false, None, Some(LcmTransport::new(Arc::new(
+            MappingFeedRecordingBackend::new(LcmTopic::new("/unused/unit-composite-handle").unwrap()))))).await.unwrap();
+        masks.fixture.context.producer_runtime_generation = handle.nav.producer_runtime_generation();
+        let fixture = &masks.fixture;
+        let committed = fixture.commit(1_000_000_000);
+        canonical_cloud_publication_invalidation(&fixture.writer).set_legacy_full_demand(None);
+        *fixture.context.committed_map_authority.lock().unwrap() = None;
+        let backend = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/direct-activation-owner").unwrap());
+        handle.mapping_adapter = Some(fixture.context.mapping.clone());
+        handle.cloud_map_writer = fixture.writer.clone(); handle.state = fixture.state.clone();
+        handle.cloud_map_tx = fixture.cloud_tx.clone(); handle.transport = LcmTransport::new(Arc::new(backend.clone()));
+        handle.committed_map_authority = fixture.context.committed_map_authority.clone();
+        let owner = handle.mapping_lifecycle_lock.lock().await;
+        // Activation already holds this owner fence and has queued, but cannot
+        // yet expose, the asynchronous occupancy coalescer event.
+        tokio::time::timeout(Duration::from_secs(1),
+            publish_committed_global_map_in_frame(&handle, &committed, "map"))
+            .await.expect("direct owner publication must not wait for coalescer reentrancy").unwrap();
+        assert_eq!(backend.published.lock().unwrap().len(), 1);
+        assert!(fixture.context.committed_map_authority.lock().unwrap().is_none());
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn sequencer_never_recaptures_unexposed_newer_occupancy() {
+        let masks = MaskPublicationFixture::new();
+        let fixture = &masks.fixture;
+        fixture.commit(1_000_000_000);
+        canonical_cloud_publication_invalidation(&fixture.writer).set_legacy_full_demand(None);
+        let backend = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/composite-exposure").unwrap());
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        publish_latest_canonical_cloud_map_with_navigation(&transport, &fixture.writer, &fixture.state,
+            &fixture.cloud_tx, "map", Some(&fixture.context)).await.unwrap();
+        let before = backend.published.lock().unwrap().len();
+        // An admitted watcher may release lifecycle with A still exposed, while
+        // B installs in the owner but its SHM exposure is pending or has failed.
+        let admitted = fixture.context.committed_map_authority.lock().unwrap().clone();
+        let newer = masks.refresh(2);
+        assert_eq!(*fixture.context.committed_map_authority.lock().unwrap(), admitted);
+        let error = publish_latest_canonical_cloud_map_with_exposure(&transport, &fixture.writer,
+            &fixture.state, &fixture.cloud_tx, "map", Some(&fixture.context), admitted.as_ref()).await.unwrap_err();
+        assert!(error.contains("committed-watch exposure"));
+        assert_eq!(backend.published.lock().unwrap().len(), before);
+        masks.expose(&newer);
+        publish_latest_canonical_cloud_map_with_navigation(&transport, &fixture.writer, &fixture.state,
+            &fixture.cloud_tx, "map", Some(&fixture.context)).await.unwrap();
+        let frames = backend.published.lock().unwrap();
+        assert_eq!(frames.len(), before + 1);
+        let message = schema::decode_navigation_map_3d_body(&frames.last().unwrap().payload).unwrap();
+        assert_eq!(message.committed_map, committed_map_identity_from_revision(&newer).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_composite_watch_releases_lifecycle_for_next_mask_commit() {
+        let mut masks = MaskPublicationFixture::new();
+        let mut handle = build_test_handle_parts(false, None, Some(LcmTransport::new(Arc::new(
+            MappingFeedRecordingBackend::new(LcmTopic::new("/unused/unit-composite-handle").unwrap()))))).await.unwrap();
+        masks.fixture.context.producer_runtime_generation = handle.nav.producer_runtime_generation();
+        let fixture = &masks.fixture;
+        fixture.commit(1_000_000_000);
+        canonical_cloud_publication_invalidation(&fixture.writer).set_legacy_full_demand(None);
+        let initial = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/composite-before-gate").unwrap());
+        publish_latest_canonical_cloud_map_with_navigation(&LcmTransport::new(Arc::new(initial)),
+            &fixture.writer, &fixture.state, &fixture.cloud_tx, "map", Some(&fixture.context)).await.unwrap();
+        let backend = FirstGlobalMapPublishGateBackend::default();
+        handle.mapping_adapter = Some(fixture.context.mapping.clone());
+        handle.cloud_map_writer = fixture.writer.clone(); handle.state = fixture.state.clone();
+        handle.cloud_map_tx = fixture.cloud_tx.clone(); handle.transport = LcmTransport::new(Arc::new(backend.clone()));
+        handle.committed_map_authority = fixture.context.committed_map_authority.clone();
+        let lifecycle = handle.mapping_lifecycle_lock.clone();
+        let (latest, updates) = watch::channel(None);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let watcher = tokio::spawn(run_persistent_future_until_stop(shutdown_rx,
+            canonical_navigation_map_revision_future(handle, updates)));
+        let first = masks.refresh(2); masks.expose(&first); latest.send_replace(Some(first));
+        tokio::time::timeout(Duration::from_secs(1), backend.first_publish_started.notified()).await.unwrap();
+        // This is the actual owner fence, not a direct test-only watch mutation.
+        let owner = tokio::time::timeout(Duration::from_secs(1), lifecycle.lock()).await
+            .expect("blocked transport must not hold the lifecycle fence");
+        let current = masks.refresh(3); masks.expose(&current); latest.send_replace(Some(current.clone()));
+        drop(owner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backend.published.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        let frames = backend.published.lock().unwrap();
+        assert_eq!(frames.len(), 1);
+        let message = schema::decode_navigation_map_3d_body(&frames[0].payload).unwrap();
+        assert_eq!(message.committed_map, committed_map_identity_from_revision(&current).unwrap());
+        drop(frames);
+        shutdown.send_replace(true); watcher.await.unwrap().unwrap();
     }
 
     async fn activated_fine_frame_fixture() -> NavigationMap3DFixture {
@@ -13002,10 +13918,10 @@ mod mapping_feed_tests {
 
         let mut identity = state.subscribe();
         state.observe((metadata.session_generation, metadata.revision,
-            metadata.producer_epoch, metadata.layout_generation, None));
+            metadata.producer_epoch, metadata.layout_generation, None, None));
         identity.borrow_and_update();
         state.observe((metadata.session_generation, metadata.revision,
-            changed.producer_epoch, changed.layout_generation, None));
+            changed.producer_epoch, changed.layout_generation, None, None));
         assert!(identity.has_changed().unwrap(), "layout change must invalidate a blocked publication");
 
         state.set_legacy_full_demand(None);
@@ -13230,21 +14146,9 @@ mod mapping_feed_tests {
                 .refresh_forbidden_zones(&fixture.state, &fixture.map_tx)
                 .unwrap());
         }
-        assert!(
-            navigation_map_3d_publication_metadata(
-                &fixture.context,
-                &publication,
-                &fixture.state,
-                "map"
-            )
-            .await
-            .is_err(),
-            "只更新二维禁区后不得伪造一条新传感器点云提交"
-        );
-        fixture.commit_points(1_700_000_001_000_000_000, &points);
-        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer)
-            .unwrap()
-            .unwrap();
+        let (_, _, retained) = latest_canonical_cloud_publication(&fixture.writer).unwrap().unwrap();
+        assert!(same_canonical_cloud_publication_identity(&publication, &retained));
+        let baseline = publication.fine.as_ref().unwrap().manifest().identity();
         let metadata = navigation_map_3d_publication_metadata(
             &fixture.context,
             &publication,
@@ -13253,6 +14157,21 @@ mod mapping_feed_tests {
         )
         .await
         .unwrap();
+        assert!(metadata.committed_map.revision > message.committed_map.revision);
+        assert!(metadata.committed_map.commit_sequence > message.committed_map.commit_sequence);
+        assert_eq!(metadata.cloud_occupancy_revision, message.committed_map.revision);
+        assert_eq!(metadata.commit_sequence, message.commit_sequence);
+        let metadata_only = build_navigation_map_3d_publication_frame_with_baseline(
+            &publication, &metadata, None, Some(&baseline)).unwrap();
+        let composite = schema::decode_navigation_map_3d_body(&metadata_only.payload).unwrap();
+        assert!(composite.fine.as_ref().unwrap().included.is_empty());
+        assert_eq!(composite.source_timestamp_ns, message.source_timestamp_ns);
+        assert_eq!(composite.fine.as_ref().unwrap().root, message.fine.as_ref().unwrap().root);
+        assert_eq!(composite.virtual_obstacles.as_ref().unwrap().header.stamp_sec as i64 * 1_000_000_000
+            + composite.virtual_obstacles.as_ref().unwrap().header.stamp_nsec as i64,
+            composite.committed_map.source_timestamp_ns);
+        // Standalone surface construction needs its own included-object fixture;
+        // the production mask-only message fetches missing objects by retained root.
         let frame = build_navigation_map_3d_publication_frame(&publication, &metadata, None).unwrap();
         let blocked = schema::decode_navigation_map_3d_body(&frame.payload).unwrap();
         assert!(blocked
@@ -13312,6 +14231,11 @@ mod mapping_feed_tests {
         assert!(!live.cleared);
         assert!(clear.cloud_revision < live.cloud_revision);
         assert_eq!(clear.commit_sequence, 0);
+        assert_eq!(clear.cloud_occupancy_revision, 0);
+        assert_eq!(clear.committed_map.revision, 0);
+        assert_eq!(clear.committed_map.commit_sequence, 0);
+        assert_eq!(clear.committed_map.commit_boot_nonce, [0; 16]);
+        assert_eq!(live.cloud_occupancy_revision, live.committed_map.revision);
         assert_eq!(
             clear.commit_boot_nonce,
             committed.receipt.commit_id.boot_nonce.to_be_bytes()
@@ -13400,7 +14324,7 @@ mod mapping_feed_tests {
                 .unwrap()
                 .as_mut()
                 .unwrap()
-                .payload_sha256[0] ^= 1;
+                .commit_sequence += 1;
             backend.published.lock().unwrap().clear();
             let result = publish_latest_canonical_cloud_map_with_navigation(
                 &transport,
@@ -13413,7 +14337,7 @@ mod mapping_feed_tests {
             .await;
             let frames = backend.published.lock().unwrap().clone();
             if enabled {
-                assert!(result.unwrap_err().contains("hash conflicts"));
+                assert!(result.unwrap_err().contains("receipt conflicts"));
                 assert!(frames.is_empty(), "错误权威身份不得发布生效三维图");
             } else {
                 assert!(result.is_ok());
@@ -13948,7 +14872,7 @@ mod mapping_feed_tests {
 
     fn map_revision_event(map: MapState) -> MapRevisionEvent {
         let adapter = active_mapping_adapter();
-        MapRevisionEvent::from_map(&map, &adapter.snapshot())
+        MapRevisionEvent::from_map_for_tests(&map, &adapter.snapshot())
     }
 
     fn occupancy_test_path(label: &str) -> std::path::PathBuf {
@@ -14010,10 +14934,14 @@ mod mapping_feed_tests {
         assert_eq!(event.session_generation, 1);
         assert!(event.size > 0);
         assert_eq!(event.data.len() as u64, event.size);
-        assert_eq!(
-            event.checksum,
-            crate::map_checksum::sha256_hex(event.data.as_ref())
-        );
+        assert_eq!(event.schema_version, 2);
+        assert_eq!(Some(event.receipt.clone()), adapter.latest_occupancy_commit_receipt());
+        assert_eq!(Some(&event.receipt), outcome.occupancy_receipt.as_ref());
+        assert_eq!(event.receipt.occupancy_revision, event.revision);
+        assert_eq!(event.receipt.source_timestamp_ns, event.timestamp_ns);
+        assert_eq!(event.raw_representation, RawMapRepresentation::SameAsEffective);
+        assert!(event.raw_data.is_empty());
+        event.validate_provenance().expect("actual mapping receipt seals revision");
         let committed = state.try_read().expect("committed mapping state");
         assert_eq!(committed.map.frame_id, "map");
         assert_eq!(committed.map.timestamp_ns, 1_234_567_890_123_456_789);
@@ -17086,14 +18014,15 @@ mod mapping_feed_tests {
             ingress_rx,
             latest_tx,
             Arc::new(std::sync::Mutex::new(None)),
-            mapping_adapter,
+            mapping_adapter.clone(),
             Arc::new(tokio::sync::Mutex::new(())),
         );
         for revision in 1..=64 {
             ingress_tx
-                .send(map_revision_event(MapState {
+                .send(test_owner_map_revision(&mut mapping_adapter.lock(), &MapState {
                     width: 1,
                     height: 1,
+                    resolution: 0.1,
                     frame_id: "map".to_string(),
                     revision,
                     data: vec![revision as i8],
@@ -17332,10 +18261,10 @@ mod mapping_feed_tests {
             None,
             Arc::new(RwLock::new(None)),
             crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
-            mapping_adapter,
+            mapping_adapter.clone(),
             Arc::new(tokio::sync::Mutex::new(())),
         );
-        let event = map_revision_event(MapState {
+        let event = test_owner_map_revision(&mut mapping_adapter.lock(), &MapState {
             width: 2,
             height: 1,
             resolution: 0.1,
@@ -17366,7 +18295,6 @@ mod mapping_feed_tests {
         adapter
             .start_session("configured-session", "configured-map")
             .expect("active configured mapping session");
-        let session = adapter.snapshot();
         let mapping_adapter = Arc::new(parking_lot::Mutex::new(adapter));
 
         static SHM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -17399,25 +18327,28 @@ mod mapping_feed_tests {
             current.clone(),
             crate::explore_runtime::ExploreRuntimeHandle::with_wavefront_map_frame(MAP_FRAME)
                 .expect("configured explore runtime"),
-            mapping_adapter,
+            mapping_adapter.clone(),
             Arc::new(tokio::sync::Mutex::new(())),
             Arc::from(MAP_FRAME),
         );
 
-        tx.send(MapRevisionEvent::from_map(
+        let mut event = test_owner_map_revision(
+            &mut mapping_adapter.lock(),
             &MapState {
                 width: 1,
                 height: 1,
                 resolution: 0.25,
-                frame_id: "map".to_string(),
+                frame_id: MAP_FRAME.to_string(),
                 revision: 1,
                 timestamp_ns: crate::explore_runtime::now_unix_nanos(),
                 data: vec![0],
                 ..MapState::default()
             },
-            &session,
-        ))
-        .expect("configured fanout receiver registered");
+        );
+        assert!(map_event_matches_current_session(&event, &mapping_adapter));
+        event.frame_id = "map".to_string();
+        assert!(!map_event_matches_current_session(&event, &mapping_adapter));
+        tx.send(event).expect("configured fanout receiver registered");
 
         assert!(
             tokio::time::timeout(Duration::from_millis(150), latest_rx.changed())
@@ -17460,11 +18391,11 @@ mod mapping_feed_tests {
             Some(shm_path.to_string_lossy().into_owned()),
             current.clone(),
             crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
-            mapping_adapter,
+            mapping_adapter.clone(),
             Arc::new(tokio::sync::Mutex::new(())),
             Arc::from("map"),
         );
-        let event = map_revision_event(MapState {
+        let event = test_owner_map_revision(&mut mapping_adapter.lock(), &MapState {
             width: 2,
             height: 2,
             resolution: 0.1,
@@ -17527,21 +18458,82 @@ mod mapping_feed_tests {
             Some(shm_path.to_string_lossy().into_owned()),
             current.clone(),
             crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
-            mapping_adapter,
+            mapping_adapter.clone(),
             Arc::new(tokio::sync::Mutex::new(())),
             Arc::from("map"),
         );
-        let malformed = map_revision_event(MapState {
+        let mut malformed = test_owner_map_revision(&mut mapping_adapter.lock(), &MapState {
             width: 2,
             height: 2,
             resolution: 0.1,
             frame_id: "map".to_string(),
             revision: 1,
             timestamp_ns: 1,
-            data: vec![0],
+            data: vec![0; 4],
             ..MapState::default()
         });
+        malformed.data = vec![0].into();
+        malformed.size = 1;
+        assert!(malformed.validate_provenance().is_err());
         tx.send(malformed).expect("fanout receiver");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), latest_rx.changed())
+                .await
+                .is_err(),
+            "failed SHM prepare must withhold watch visibility"
+        );
+        assert!(current.read().await.is_none());
+        assert!(reader.read_stable().expect("stable SHM read").is_none());
+        assert_eq!(writer.lock().published_generation(), 0);
+        assert_eq!(backend.published_count(), 0);
+        let _ = std::fs::remove_file(shm_path);
+    }
+
+    #[tokio::test]
+    async fn shm_owner_fence_failure_withholds_descriptor_watch_and_typed_fanout() {
+        let shm_path = occupancy_test_path("failed-owner-fence");
+        let writer = Arc::new(parking_lot::Mutex::new(
+            OccupancyGridShmWriter::new(&shm_path).expect("temporary occupancy SHM"),
+        ));
+        let mut reader = OccupancyGridShmReader::open(&shm_path).expect("separate SHM reader");
+        let current = Arc::new(RwLock::new(None));
+        let mapping_adapter = shared_active_mapping_adapter();
+        let (tx, rx) = broadcast::channel(4);
+        let (latest_tx, mut latest_rx) = watch::channel(None);
+        let backend = MappingFeedRecordingBackend::new(
+            LcmTopic::new("/test/failed-owner-fence/unused-odom").expect("unused odom topic"),
+        );
+        spawn_map_revision_fanout_in_frame(
+            rx,
+            latest_tx,
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default())),
+            LcmTransport::new(Arc::new(backend.clone())),
+            LcmTopic::new("/test/failed-owner-fence/occupancy").expect("occupancy topic"),
+            LcmMessageType::new("nav_msgs.OccupancyGrid").expect("occupancy type"),
+            Some(writer.clone()),
+            Some(shm_path.to_string_lossy().into_owned()),
+            current.clone(),
+            crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
+            mapping_adapter.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::from("map"),
+        );
+        let event = test_owner_map_revision(&mut mapping_adapter.lock(), &MapState {
+            width: 2,
+            height: 2,
+            resolution: 0.1,
+            frame_id: "map".to_string(),
+            revision: 1,
+            timestamp_ns: 1,
+            data: vec![0; 4],
+            ..MapState::default()
+        });
+        event.validate_provenance().expect("valid body and actual owner receipt");
+        assert!(map_event_matches_current_session(&event, &mapping_adapter));
+        writer.lock().begin_session(event.session_generation + 1).expect("advance SHM owner fence");
+        tx.send(event).expect("fanout receiver");
 
         assert!(
             tokio::time::timeout(Duration::from_millis(150), latest_rx.changed())
@@ -17562,7 +18554,7 @@ mod mapping_feed_tests {
         let mut writer = OccupancyGridShmWriter::new(&shm_path).expect("temporary occupancy SHM");
         let mut reader = OccupancyGridShmReader::open(&shm_path).expect("separate SHM reader");
         let mapping_adapter = shared_active_mapping_adapter();
-        let event = map_revision_event(MapState {
+        let event = test_owner_map_revision(&mut mapping_adapter.lock(), &MapState {
             width: 1,
             height: 1,
             resolution: 0.1,
@@ -17601,13 +18593,8 @@ mod mapping_feed_tests {
         ));
         let mut reader = OccupancyGridShmReader::open(&shm_path).expect("separate SHM reader");
         let mapping_adapter = shared_active_mapping_adapter();
-        let stopped_snapshot = {
-            let mut adapter = mapping_adapter.lock();
-            adapter
-                .stop_session("test-session")
-                .expect("stop mapping before event")
-        };
-        let event = MapRevisionEvent::from_map(
+        let event = test_owner_map_revision(
+            &mut mapping_adapter.lock(),
             &MapState {
                 width: 1,
                 height: 1,
@@ -17618,8 +18605,9 @@ mod mapping_feed_tests {
                 data: vec![100],
                 ..MapState::default()
             },
-            &stopped_snapshot,
         );
+        assert!(map_event_matches_current_session(&event, &mapping_adapter));
+        mapping_adapter.lock().stop_session("test-session").expect("stop mapping before event delivery");
         let current = Arc::new(RwLock::new(None));
         let (tx, rx) = broadcast::channel(4);
         let (latest_tx, mut latest_rx) = watch::channel(None);
@@ -19360,26 +20348,14 @@ mod exploration_cancel_retry_tests {
         let (nav_state_tx, _) = broadcast::channel(4);
         let (frontiers_tx, _) = broadcast::channel(4);
         let (map_revision_tx, _) = broadcast::channel(4);
-        let (map_revision_latest_tx, _) = watch::channel(Some(MapRevisionEvent {
-            session_id: "exploration-test-map".to_string(),
-            map_name: "office".to_string(),
-            session_generation: 1,
-            revision: 1,
-            width: 12,
-            height: 12,
-            resolution: 0.5,
-            origin_x: 0.0,
-            origin_y: 0.0,
-            frame_id: "map".to_string(),
-            timestamp_ns: crate::explore_runtime::now_unix_nanos(),
-            data: Vec::<u8>::new().into(),
-            raw_data: Vec::<u8>::new().into(),
-            size: 0,
-            schema_version: 1,
-            checksum: crate::map_checksum::sha256_hex(&[]),
-            raw_checksum: crate::map_checksum::sha256_hex(&[]),
-            last_seen_ms: 0,
-        }));
+        let mut event = test_map_revision_authority("exploration-test-map", "office", "map", 1);
+        event.width = 12;
+        event.height = 12;
+        event.resolution = 0.5;
+        event.data = vec![0; 144].into();
+        event.size = 144;
+        let committed_map = committed_map_identity_from_revision(&event).expect("fixture receipt identity");
+        let (map_revision_latest_tx, _) = watch::channel(Some(event));
         let state = Arc::new(RwLock::new(SharedState::default()));
         let bridge = ExploreNavigationBridge {
             mapping_adapter: None,
@@ -19410,7 +20386,7 @@ mod exploration_cancel_retry_tests {
             .committed_map_authority
             .lock()
             .expect("exploration fixture committed map authority") =
-            Some(test_committed_map_identity(1));
+            Some(committed_map);
         (bridge, backend)
     }
 
@@ -20275,19 +21251,9 @@ mod exploration_lcm_smoke_tests {
         let (frontiers_tx, _) = broadcast::channel(4);
         let (map_revision_tx, _) = broadcast::channel(4);
         let (map_revision_latest_tx, _) = watch::channel(None);
-        let committed_map = schema::CommittedMapIdentity {
-            session_id: "smoke-map".to_string(),
-            session_generation: 1,
-            revision: MAP_REVISION as i64,
-            payload_sha256: crate::map_checksum::sha256_bytes(&[]),
-            frame_id: map_frame.to_string(),
-        };
-        map_revision_latest_tx.send_replace(Some(test_map_revision_authority(
-            &committed_map.session_id,
-            "smoke-map",
-            map_frame,
-            MAP_REVISION,
-        )));
+        let event = test_map_revision_authority("smoke-map", "smoke-map", map_frame, MAP_REVISION);
+        let committed_map = committed_map_identity_from_revision(&event).expect("smoke receipt identity");
+        map_revision_latest_tx.send_replace(Some(event));
         let explore =
             crate::explore_runtime::ExploreRuntimeHandle::with_wavefront_map_frame(map_frame)
                 .expect("configured exploration runtime");

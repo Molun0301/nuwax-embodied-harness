@@ -10,12 +10,12 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at, Instant};
 
 use crate::{
-    adapt_wgs84_goal_intent, ActiveMapIdentityV1, CloudError, CloudQueryIdentityV1,
-    GoalAdapterError, GoogleMapsClient, LatLng, MappingCloudGoalIntentV1, OsmClient, Sha256Digest,
+    adapt_wgs84_goal_intent, ActiveMapIdentityV2, CloudError, CloudQueryIdentityV1,
+    GoalAdapterError, GoogleMapsClient, LatLng, MappingCloudGoalIntentV2, OsmClient, Sha256Digest,
     VerifiedGeoreferenceV1,
 };
 
-const REQUEST_DIGEST_DOMAIN: &[u8] = b"nuwax.mapping-cloud.owner-request.v1\0";
+const REQUEST_DIGEST_DOMAIN: &[u8] = b"nuwax.mapping-cloud.owner-request.v2\0";
 
 /// Owner 使用的真实地图查询后端。
 #[derive(Clone)]
@@ -59,7 +59,7 @@ pub struct MappingCloudRequest {
     /// 发送给真实 provider 的非空查询文本。
     pub query_text: String,
     /// 查询结果必须绑定的 active-map 快照。
-    pub active_map: ActiveMapIdentityV1,
+    pub active_map: ActiveMapIdentityV2,
     /// 已校验且绑定原始资产字节的地理参考。
     pub georeference: Arc<VerifiedGeoreferenceV1>,
     /// 调用者允许的端到端时长。
@@ -85,7 +85,6 @@ impl MappingCloudRequest {
             self.active_map.asset_bundle_sha256,
             self.active_map.georeference_sha256,
             self.active_map.activation_identity_sha256,
-            self.active_map.committed_occupancy_sha256,
             self.georeference.raw_sha256(),
             self.georeference.canonical_sha256(),
         ] {
@@ -98,6 +97,9 @@ impl MappingCloudRequest {
         ] {
             bytes.extend_from_slice(&value.to_be_bytes());
         }
+        bytes.extend_from_slice(&self.active_map.committed_occupancy_boot_nonce);
+        bytes.extend_from_slice(&self.active_map.committed_occupancy_commit_sequence.to_be_bytes());
+        bytes.extend_from_slice(&self.active_map.committed_occupancy_source_timestamp_ns.to_be_bytes());
         bytes.extend_from_slice(&self.caller_timeout.as_nanos().to_be_bytes());
         bytes.extend_from_slice(&self.provider_timeout.as_nanos().to_be_bytes());
         Sha256Digest::of_bytes(&bytes)
@@ -108,7 +110,7 @@ impl MappingCloudRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MappingCloudTerminal {
     /// 查询、坐标转换及 intent 校验全部成功。
-    Succeeded(MappingCloudGoalIntentV1),
+    Succeeded(MappingCloudGoalIntentV2),
     /// provider 成功响应但没有匹配项。
     ProviderRejected,
     /// provider 在自身超时前返回失败。
@@ -520,4 +522,65 @@ fn push_text(output: &mut Vec<u8>, value: &str) {
     let length = u32::try_from(value.len()).unwrap_or(u32::MAX);
     output.extend_from_slice(&length.to_be_bytes());
     output.extend_from_slice(value.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::GeoreferenceBindingV1;
+
+    fn request() -> MappingCloudRequest {
+        let raw = br#"{"schema_version":1,"map_name":"shanghai_lab","map_frame_id":"map/cloud","source_crs":"EPSG:4326","projected_crs":"EPSG:3857","axis_convention":"projected_x_east_y_north_z_up","anchor_lat_deg":31.2304,"anchor_lng_deg":121.4737,"anchor_easting_m":13522390.428774875,"anchor_northing_m":3662707.257050403,"map_origin_x_m":10.0,"map_origin_y_m":-4.0,"map_from_projected_yaw_rad":0.0,"altitude_policy":"map_plane_constant","map_plane_z_m":1.25}"#;
+        let georeference = Arc::new(VerifiedGeoreferenceV1::from_json(raw,
+            &GeoreferenceBindingV1::for_document(raw)).unwrap());
+        MappingCloudRequest {
+            query_identity: CloudQueryIdentityV1 {
+                query_request_id: "receipt-request".into(), producer: "mapping-cloud-test".into(),
+                producer_epoch: 1, source_timestamp_ns: 100,
+            },
+            query_text: "destination".into(),
+            active_map: ActiveMapIdentityV2 {
+                map_name: georeference.contract().map_name.clone(),
+                map_frame_id: georeference.contract().map_frame_id.clone(),
+                asset_manifest_sha256: Sha256Digest::of_bytes(b"manifest"),
+                asset_bundle_sha256: Sha256Digest::of_bytes(b"bundle"),
+                georeference_sha256: georeference.raw_sha256(),
+                activation_identity_sha256: Sha256Digest::of_bytes(b"activation"),
+                runtime_generation: 1, mapping_session_generation: 2,
+                committed_occupancy_revision: 3, committed_occupancy_boot_nonce: [4; 16],
+                committed_occupancy_commit_sequence: 5, committed_occupancy_source_timestamp_ns: 6,
+            },
+            georeference,
+            caller_timeout: Duration::from_secs(2), provider_timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn owner_request_identity_binds_each_receipt_component() {
+        let provider = MappingCloudProvider::OsmNominatim(Arc::new(OsmClient::new()));
+        let baseline = request();
+        validate_request(&baseline).unwrap();
+        let original = baseline.digest(&provider);
+        assert_eq!(request().digest(&provider), original);
+        assert_eq!(REQUEST_DIGEST_DOMAIN, b"nuwax.mapping-cloud.owner-request.v2\0");
+        for component in 0..3 {
+            let mut changed = request();
+            match component {
+                0 => changed.active_map.committed_occupancy_boot_nonce[0] ^= 1,
+                1 => changed.active_map.committed_occupancy_commit_sequence += 1,
+                _ => changed.active_map.committed_occupancy_source_timestamp_ns += 1,
+            }
+            assert_ne!(changed.digest(&provider), original);
+        }
+    }
+
+    #[test]
+    fn owner_rejects_missing_receipt_before_provider_query() {
+        let mut missing = request();
+        missing.active_map.committed_occupancy_boot_nonce = [0; 16];
+        assert!(validate_request(&missing).is_err());
+        missing = request();
+        missing.active_map.committed_occupancy_commit_sequence = 0;
+        assert!(validate_request(&missing).is_err());
+    }
 }

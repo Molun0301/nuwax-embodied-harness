@@ -20,23 +20,23 @@ pub const BOOL_FINGERPRINT: [u8; 8] = 0x1ebe_f06a_5095_0e3e_u64.to_be_bytes();
 /// `nav_msgs.Path` fingerprint from `dimos-lcm==0.1.3`.
 pub const PATH_FINGERPRINT: [u8; 8] = 0xc3ae_62ac_b357_93e2_u64.to_be_bytes();
 /// `nuwax_msgs.GoalEnvelope` generated-C recursive fingerprint.
-pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0xdd19bb819d6c3e44_u64.to_be_bytes();
+pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0xec74_63f7_558a_ac72_u64.to_be_bytes();
 /// `nuwax_msgs.PathEnvelope` generated-C recursive fingerprint.
-pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0xf11d_70cc_600f_1ab1_u64.to_be_bytes();
+pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0xeec1_8428_127b_3f5a_u64.to_be_bytes();
 /// `nav_msgs.OccupancyGrid` fingerprint from `dimos-lcm==0.1.3`.
 pub const OCCUPANCY_GRID_FINGERPRINT: [u8; 8] = 0xe7df_d179_cdfc_3b65_u64.to_be_bytes();
 /// `nav_msgs.Odometry` fingerprint from `dimos-lcm==0.1.3`.
 pub const ODOMETRY_FINGERPRINT: [u8; 8] = 0x94e1_7f94_648c_f0e4_u64.to_be_bytes();
 /// `sensor_msgs.PointCloud2` fingerprint from `dimos-lcm==0.1.3`.
 pub const POINT_CLOUD2_FINGERPRINT: [u8; 8] = 0xf5eb_3da1_c285_3175_u64.to_be_bytes();
-/// Verified historical v2 fingerprint; never used to encode the C1 v3 layout.
+/// Verified historical v2 fingerprint; never used to encode the C1 v4 layout.
 pub const NAVIGATION_MAP_3D_V2_FINGERPRINT: [u8; 8] = 0xd11d6dd10d5490b8_u64.to_be_bytes();
-/// C1 v3 recursive fingerprint from the checked-in `lcm-gen 1.5.2` bindings.
-pub const NAVIGATION_MAP_3D_FINGERPRINT: [u8; 8] = 0x06bd_4e44_dd7a_2e13_u64.to_be_bytes();
+/// C1 v4 recursive fingerprint from the checked-in `lcm-gen 1.5.2` bindings.
+pub const NAVIGATION_MAP_3D_FINGERPRINT: [u8; 8] = 0x131a_5884_d2d6_8d28_u64.to_be_bytes();
 /// Tagged immutable-object block fingerprint from `lcm-gen 1.5.2`.
 pub const NAVIGATION_MAP_BLOCK_FINGERPRINT: [u8; 8] = 0xe544_975d_2a8d_dc13_u64.to_be_bytes();
 /// C1 object/revision wire layout, distinct from the old digest-addressed v2 body.
-pub const NAVIGATION_MAP_3D_SCHEMA_VERSION: i32 = 3;
+pub const NAVIGATION_MAP_3D_SCHEMA_VERSION: i32 = 4;
 const NAVIGATION_MAP_BLOCK_KIND_ASSIGNED: u8 = 1;
 const NAVIGATION_MAP_BLOCK_KIND_LEGACY: u8 = 2;
 const NAVIGATION_MAP_MAX_INCLUDED_BLOCKS: usize = 16_384;
@@ -59,7 +59,7 @@ pub const FRONTIER_LIST_FINGERPRINT: [u8; 8] = 0x213d_b68f_b817_1f76_u64.to_be_b
 /// The checked-in `FrontierList.lcm` declares a fixed array of this size.
 pub const FRONTIER_LIST_CAPACITY: usize = 256;
 /// Current immutable navigation-envelope schema.
-pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 6;
+pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 7;
 /// A public navigation request owns the goal lease.
 pub const NAVIGATION_OWNER_KIND_PUBLIC_NAV: i32 = 1;
 /// An exploration parent owns the child navigation goal lease.
@@ -130,8 +130,12 @@ pub struct CommittedMapIdentity {
     pub session_generation: i64,
     /// 进程级已提交占据栅格修订号。
     pub revision: i64,
-    /// 规范占据栅格载荷摘要。
-    pub payload_sha256: [u8; 32],
+    /// 真实占据提交回执的进程启动域；不能跨域排序。
+    pub commit_boot_nonce: [u8; 16],
+    /// 真实占据提交序号。
+    pub commit_sequence: i64,
+    /// 真实占据提交来源时间，纳秒。
+    pub source_timestamp_ns: i64,
     /// 已提交快照携带的规范规划坐标系。
     pub frame_id: String,
 }
@@ -226,7 +230,7 @@ pub struct GoalEnvelope {
     pub navigation_configuration_sha256: [u8;32],
     /// 随目标载荷摘要封存的执行约束。
     pub options: nuwax_types::navigation::GoalOptions,
-    /// 当前线格式版本为6。
+    /// 当前线格式版本为7。
     pub schema_version: i32,
     /// Single public business identifier; API `goal_id` maps here losslessly.
     pub session_id: String,
@@ -248,8 +252,12 @@ pub struct GoalEnvelope {
     pub committed_map_session_generation: i64,
     /// Committed map revision used for planning.
     pub committed_map_revision: i64,
-    /// Canonical committed map payload digest.
-    pub committed_map_payload_sha256: [u8; 32],
+    /// Occupancy commit boot domain copied from the actual receipt.
+    pub committed_map_boot_nonce: [u8; 16],
+    /// Actual occupancy commit sequence.
+    pub committed_map_commit_sequence: i64,
+    /// Actual occupancy commit source timestamp, in nanoseconds.
+    pub committed_map_source_timestamp_ns: i64,
     /// Authoritative planning frame carried by the committed map.
     pub committed_map_frame_id: String,
     /// Source timestamp in nanoseconds.
@@ -277,7 +285,7 @@ pub struct GoalEnvelope {
 /// Planner output correlated to exactly one versioned goal.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PathEnvelope {
-    /// 当前线格式版本为6。
+    /// 当前线格式版本为7。
     pub schema_version: i32,
     /// Public business identifier copied from the goal envelope.
     pub session_id: String,
@@ -299,8 +307,12 @@ pub struct PathEnvelope {
     pub committed_map_session_generation: i64,
     /// Committed map revision copied from the goal envelope.
     pub committed_map_revision: i64,
-    /// Committed map payload digest copied from the goal envelope.
-    pub committed_map_payload_sha256: [u8; 32],
+    /// Occupancy commit boot domain copied from the actual receipt.
+    pub committed_map_boot_nonce: [u8; 16],
+    /// Actual occupancy commit sequence.
+    pub committed_map_commit_sequence: i64,
+    /// Actual occupancy commit source timestamp, in nanoseconds.
+    pub committed_map_source_timestamp_ns: i64,
     /// Committed map frame copied from the goal envelope.
     pub committed_map_frame_id: String,
     /// Boundary identifier copied from the goal envelope.
@@ -584,7 +596,7 @@ pub struct PointCloud2 {
 /// 复用规范地图身份与真实点云提交回执的三维导航地图。
 #[derive(Debug, Clone, PartialEq)]
 pub struct NavigationMap3D {
-    /// 当前消息版本，固定为3；旧摘要寻址布局不兼容。
+    /// 当前消息版本，固定为4；旧摘要寻址布局不兼容。
     pub schema_version: i32,
     /// 复用导航生产者的持久运行代际，生效与清空消息均必须为正。
     pub producer_runtime_generation: i64,
@@ -594,6 +606,8 @@ pub struct NavigationMap3D {
     pub map_frame_generation: i64,
     /// 已提交点云修订，对应内部云头序号。
     pub cloud_revision: i64,
+    /// 点云回执保留的占据修订基线；可落后于当前规范占据修订。
+    pub cloud_occupancy_revision: i64,
     /// 原始观测时间，纳秒。
     pub source_timestamp_ns: i64,
     /// 来源点云的体素大小，单位米。
@@ -620,6 +634,7 @@ impl Default for NavigationMap3D {
             committed_map: CommittedMapIdentity::default(),
             map_frame_generation: 0,
             cloud_revision: 0,
+            cloud_occupancy_revision: 0,
             source_timestamp_ns: 0,
             source_voxel_size: 0.0,
             commit_boot_nonce: [0; 16],
@@ -664,32 +679,56 @@ pub fn validate_navigation_map_3d(message: &NavigationMap3D) -> Result<(), Strin
     {
         return Err("NavigationMap3D commit receipt and source timestamp are invalid".into());
     }
-    if !message.cleared {
-        if map.session_id.is_empty()
-            || map.session_generation == 0
-            || map.revision == 0
-            || map.payload_sha256 == [0; 32]
-            || message.commit_sequence == 0
-            || message.source_timestamp_ns == 0
+    let occupancy_absent = map.revision == 0
+        && map.commit_boot_nonce == [0; 16]
+        && map.commit_sequence == 0
+        && map.source_timestamp_ns == 0;
+    let occupancy_complete = !map.session_id.is_empty()
+        && map.session_generation > 0
+        && map.revision > 0
+        && map.commit_boot_nonce != [0; 16]
+        && map.commit_sequence > 0
+        && map.source_timestamp_ns >= 0;
+    if message.cleared {
+        // A clear before the first occupancy commit is an explicit no-map
+        // variant. These zero fields never constitute a committed identity.
+        if (!occupancy_absent && !occupancy_complete)
+            || (map.session_id.is_empty() && map.session_generation != 0)
         {
-            return Err(
-                "live NavigationMap3D requires complete committed map and cloud receipt".into(),
-            );
+            return Err("cleared NavigationMap3D must carry either absent or complete occupancy provenance".into());
         }
-    } else if map.session_id.is_empty() {
-        if map.session_generation != 0 || map.revision != 0 || map.payload_sha256 != [0; 32] {
-            return Err(
-                "empty NavigationMap3D map identity must not carry partial commitment".into(),
-            );
+    } else if !occupancy_complete
+        || message.commit_sequence == 0
+        || message.source_timestamp_ns == 0
+        || message.cloud_occupancy_revision <= 0
+    {
+        return Err("live NavigationMap3D requires complete committed map and cloud receipt".into());
+    }
+    if message.cloud_occupancy_revision < 0 {
+        return Err("NavigationMap3D cloud occupancy baseline must be non-negative".into());
+    }
+    if occupancy_absent {
+        if message.cloud_occupancy_revision != 0 {
+            return Err("absent occupancy provenance cannot carry a cloud occupancy baseline".into());
         }
-    } else if map.revision == 0 {
-        if map.payload_sha256 != [0; 32] {
-            return Err(
-                "uncommitted NavigationMap3D map must not carry an occupancy digest".into(),
-            );
+    } else {
+        // Both receipts share the single session/frame domain carried by this
+        // envelope. Nonces are opaque domains, never ordered integers. Numeric
+        // ordering is only a consistency check: the producer must prove lineage.
+        if map.commit_boot_nonce != message.commit_boot_nonce
+            || message.cloud_occupancy_revision > map.revision
+            || message.commit_sequence > map.commit_sequence
+        {
+            return Err("NavigationMap3D cloud receipt must belong to the current occupancy domain and baseline".into());
         }
-    } else if map.session_generation == 0 || map.payload_sha256 == [0; 32] {
-        return Err("committed NavigationMap3D map identity is incomplete".into());
+        if (message.commit_sequence == map.commit_sequence
+            || message.cloud_occupancy_revision == map.revision)
+            && (message.commit_sequence != map.commit_sequence
+                || message.cloud_occupancy_revision != map.revision
+                || message.source_timestamp_ns != map.source_timestamp_ns)
+        {
+            return Err("equal NavigationMap3D occupancy/cloud commits require the same revision, sequence and source timestamp".into());
+        }
     }
     let header = &message.cloud.header;
     if header.frame_id != map.frame_id || i64::from(header.seq) != message.cloud_revision {
@@ -708,8 +747,10 @@ pub fn validate_navigation_map_3d(message: &NavigationMap3D) -> Result<(), Strin
         }
         if mask.header.frame_id != map.frame_id
             || i64::from(mask.header.seq) != map.revision
-            || mask.header.stamp_sec != header.stamp_sec
-            || mask.header.stamp_nsec != header.stamp_nsec
+            || mask.header.stamp_sec < 0
+            || !(0..1_000_000_000).contains(&mask.header.stamp_nsec)
+            || i64::from(mask.header.stamp_sec) * 1_000_000_000
+                + i64::from(mask.header.stamp_nsec) != map.source_timestamp_ns
         {
             return Err(
                 "NavigationMap3D virtual obstacle header must match occupancy commit".into(),
@@ -943,10 +984,13 @@ pub fn encode_navigation_map_3d_body(message: &NavigationMap3D) -> CodecResult<V
     encode_string(&map.session_id, &mut out)?;
     out.extend_from_slice(&map.session_generation.to_be_bytes());
     out.extend_from_slice(&map.revision.to_be_bytes());
-    out.extend_from_slice(&map.payload_sha256);
+    out.extend_from_slice(&map.commit_boot_nonce);
+    out.extend_from_slice(&map.commit_sequence.to_be_bytes());
+    out.extend_from_slice(&map.source_timestamp_ns.to_be_bytes());
     encode_string(&map.frame_id, &mut out)?;
     out.extend_from_slice(&message.map_frame_generation.to_be_bytes());
     out.extend_from_slice(&message.cloud_revision.to_be_bytes());
+    out.extend_from_slice(&message.cloud_occupancy_revision.to_be_bytes());
     out.extend_from_slice(&message.source_timestamp_ns.to_be_bytes());
     out.extend_from_slice(&message.source_voxel_size.to_be_bytes());
     out.extend_from_slice(&message.commit_boot_nonce);
@@ -995,14 +1039,14 @@ pub fn decode_navigation_map_3d_body(encoded: &[u8]) -> CodecResult<NavigationMa
         session_id: cursor.read_string()?,
         session_generation: cursor.read_i64()?,
         revision: cursor.read_i64()?,
-        payload_sha256: cursor
-            .read_exact(32)?
-            .try_into()
-            .expect("32字节占据地图摘要"),
+        commit_boot_nonce: cursor.read_exact(16)?.try_into().expect("16-byte occupancy boot nonce"),
+        commit_sequence: cursor.read_i64()?,
+        source_timestamp_ns: cursor.read_i64()?,
         frame_id: cursor.read_string()?,
     };
     let map_frame_generation = cursor.read_i64()?;
     let cloud_revision = cursor.read_i64()?;
+    let cloud_occupancy_revision = cursor.read_i64()?;
     let source_timestamp_ns = cursor.read_i64()?;
     let source_voxel_size = cursor.read_f32()?;
     let commit_boot_nonce = cursor
@@ -1069,6 +1113,7 @@ pub fn decode_navigation_map_3d_body(encoded: &[u8]) -> CodecResult<NavigationMa
         committed_map,
         map_frame_generation,
         cloud_revision,
+        cloud_occupancy_revision,
         source_timestamp_ns,
         source_voxel_size,
         commit_boot_nonce,
@@ -1372,7 +1417,9 @@ fn encode_goal_envelope_prefix(message: &GoalEnvelope, out: &mut Vec<u8>) -> Cod
     encode_string(&message.committed_map_session_id, out)?;
     out.extend_from_slice(&message.committed_map_session_generation.to_be_bytes());
     out.extend_from_slice(&message.committed_map_revision.to_be_bytes());
-    out.extend_from_slice(&message.committed_map_payload_sha256);
+    out.extend_from_slice(&message.committed_map_boot_nonce);
+    out.extend_from_slice(&message.committed_map_commit_sequence.to_be_bytes());
+    out.extend_from_slice(&message.committed_map_source_timestamp_ns.to_be_bytes());
     encode_string(&message.committed_map_frame_id, out)?;
     out.extend_from_slice(&message.source_timestamp_ns.to_be_bytes());
     encode_string(&message.boundary_id, out)?;
@@ -1403,10 +1450,9 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
     let committed_map_session_id = cursor.read_string()?;
     let committed_map_session_generation = cursor.read_i64()?;
     let committed_map_revision = cursor.read_i64()?;
-    let committed_map_payload_sha256 = cursor
-        .read_exact(32)?
-        .try_into()
-        .expect("32-byte committed map digest");
+    let committed_map_boot_nonce = cursor.read_exact(16)?.try_into().expect("16-byte committed map boot nonce");
+    let committed_map_commit_sequence = cursor.read_i64()?;
+    let committed_map_source_timestamp_ns = cursor.read_i64()?;
     let committed_map_frame_id = cursor.read_string()?;
     let source_timestamp_ns = cursor.read_i64()?;
     let boundary_id = cursor.read_string()?;
@@ -1458,7 +1504,9 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
         committed_map_session_id,
         committed_map_session_generation,
         committed_map_revision,
-        committed_map_payload_sha256,
+        committed_map_boot_nonce,
+        committed_map_commit_sequence,
+        committed_map_source_timestamp_ns,
         committed_map_frame_id,
         source_timestamp_ns,
         boundary_id,
@@ -1494,7 +1542,9 @@ fn validate_goal_envelope_semantics(
         &message.committed_map_session_id,
         message.committed_map_session_generation,
         message.committed_map_revision,
-        &message.committed_map_payload_sha256,
+        &message.committed_map_boot_nonce,
+        message.committed_map_commit_sequence,
+        message.committed_map_source_timestamp_ns,
         &message.committed_map_frame_id,
     )?;
     if message.motion_guard_generation <= 0 {
@@ -1638,7 +1688,9 @@ fn encode_path_envelope_prefix(message: &PathEnvelope, out: &mut Vec<u8>) -> Cod
     encode_string(&message.committed_map_session_id, out)?;
     out.extend_from_slice(&message.committed_map_session_generation.to_be_bytes());
     out.extend_from_slice(&message.committed_map_revision.to_be_bytes());
-    out.extend_from_slice(&message.committed_map_payload_sha256);
+    out.extend_from_slice(&message.committed_map_boot_nonce);
+    out.extend_from_slice(&message.committed_map_commit_sequence.to_be_bytes());
+    out.extend_from_slice(&message.committed_map_source_timestamp_ns.to_be_bytes());
     encode_string(&message.committed_map_frame_id, out)?;
     encode_string(&message.boundary_id, out)?;
     out.extend_from_slice(&message.boundary_sha256);
@@ -1664,10 +1716,9 @@ fn decode_path_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<PathEnvelop
     let committed_map_session_id = cursor.read_string()?;
     let committed_map_session_generation = cursor.read_i64()?;
     let committed_map_revision = cursor.read_i64()?;
-    let committed_map_payload_sha256 = cursor
-        .read_exact(32)?
-        .try_into()
-        .expect("32-byte committed map digest");
+    let committed_map_boot_nonce = cursor.read_exact(16)?.try_into().expect("16-byte committed map boot nonce");
+    let committed_map_commit_sequence = cursor.read_i64()?;
+    let committed_map_source_timestamp_ns = cursor.read_i64()?;
     let committed_map_frame_id = cursor.read_string()?;
     let boundary_id = cursor.read_string()?;
     let boundary_sha256 = cursor
@@ -1704,7 +1755,9 @@ fn decode_path_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<PathEnvelop
         committed_map_session_id,
         committed_map_session_generation,
         committed_map_revision,
-        committed_map_payload_sha256,
+        committed_map_boot_nonce,
+        committed_map_commit_sequence,
+        committed_map_source_timestamp_ns,
         committed_map_frame_id,
         boundary_id,
         boundary_sha256,
@@ -1739,7 +1792,9 @@ fn validate_path_envelope_semantics(
         &message.committed_map_session_id,
         message.committed_map_session_generation,
         message.committed_map_revision,
-        &message.committed_map_payload_sha256,
+        &message.committed_map_boot_nonce,
+        message.committed_map_commit_sequence,
+        message.committed_map_source_timestamp_ns,
         &message.committed_map_frame_id,
     )?;
     if message.boundary_id.is_empty() != (message.boundary_sha256 == [0; 32]) {
@@ -1851,7 +1906,9 @@ fn validate_goal_authority_identity(
     committed_map_session_id: &str,
     committed_map_session_generation: i64,
     committed_map_revision: i64,
-    committed_map_payload_sha256: &[u8; 32],
+    committed_map_boot_nonce: &[u8; 16],
+    committed_map_commit_sequence: i64,
+    committed_map_source_timestamp_ns: i64,
     committed_map_frame_id: &str,
 ) -> Result<(), String> {
     if producer.trim().is_empty() || producer.trim() != producer {
@@ -1874,8 +1931,11 @@ fn validate_goal_authority_identity(
     if committed_map_revision <= 0 {
         return Err("committed_map_revision must be positive".into());
     }
-    if *committed_map_payload_sha256 == [0; 32] {
-        return Err("committed_map_payload_sha256 must be populated".into());
+    if *committed_map_boot_nonce == [0; 16]
+        || committed_map_commit_sequence <= 0
+        || committed_map_source_timestamp_ns < 0
+    {
+        return Err("committed map requires an actual populated occupancy commit receipt".into());
     }
     validate_navigation_frame_id(committed_map_frame_id, "committed map")
 }
@@ -2742,11 +2802,14 @@ mod navigation_map_3d_tests {
                 session_id: "mapping:test".into(),
                 session_generation: 2,
                 revision: 9,
-                payload_sha256: [0x12; 32],
+                commit_boot_nonce: [0x34; 16],
+                commit_sequence: 41,
+                source_timestamp_ns: 2_000_000_003,
                 frame_id: "robot/map".into(),
             },
             map_frame_generation: 0,
             cloud_revision: 17,
+            cloud_occupancy_revision: 9,
             source_timestamp_ns: 2_000_000_003,
             source_voxel_size: 0.125,
             commit_boot_nonce: [0x34; 16],
@@ -2792,6 +2855,7 @@ mod navigation_map_3d_tests {
         };
         message.source_timestamp_ns = 0;
         message.commit_sequence = 0;
+        message.cloud_occupancy_revision = 0;
         message.cloud = PointCloud2 {
             header: Header {
                 seq: 17,
@@ -2851,6 +2915,64 @@ mod navigation_map_3d_tests {
         message.cloud.row_step = 0;
         message.cloud.data.clear();
         message
+    }
+
+    #[test]
+    fn composite_receipt_keeps_retained_cloud_time_and_current_mask_time_distinct() {
+        let mut message = fine_map(nuwax_map_chunks::ObjectIdentity::Assigned(
+            nuwax_map_chunks::ObjectId([0x51; 16])));
+        let retained_fine = message.fine.clone();
+        let retained_cloud = message.cloud.clone();
+        message.committed_map.revision += 1;
+        message.committed_map.commit_sequence += 1;
+        message.committed_map.source_timestamp_ns += 100;
+        let mut mask = map_with_virtual_obstacles().virtual_obstacles.unwrap();
+        mask.header.seq = message.committed_map.revision as i32;
+        mask.header.stamp_nsec += 100;
+        message.virtual_obstacles = Some(mask);
+        let wire = encode_navigation_map_3d(&message).unwrap();
+        assert_eq!(decode_navigation_map_3d(&wire).unwrap(), message);
+        assert_eq!(message.fine, retained_fine);
+        assert_eq!(message.cloud, retained_cloud);
+        assert_eq!(message.cloud_occupancy_revision, 9);
+        assert_eq!(message.source_timestamp_ns, 2_000_000_003);
+        let mut wrong_mask = message.clone();
+        wrong_mask.virtual_obstacles.as_mut().unwrap().header.stamp_nsec -= 100;
+        assert!(validate_navigation_map_3d(&wrong_mask).is_err());
+        for mutate in [
+            (|m: &mut NavigationMap3D| m.commit_boot_nonce = [0x01; 16]) as fn(&mut NavigationMap3D),
+            |m| m.commit_boot_nonce = [0xff; 16],
+            |m| m.cloud_occupancy_revision = m.committed_map.revision + 1,
+            |m| m.commit_sequence = m.committed_map.commit_sequence + 1,
+            |m| m.cloud_occupancy_revision = m.committed_map.revision,
+            |m| m.commit_sequence = m.committed_map.commit_sequence,
+        ] {
+            let mut bad = message.clone();
+            mutate(&mut bad);
+            assert!(validate_navigation_map_3d(&bad).is_err());
+        }
+        let mut conflicting_time = live_map();
+        conflicting_time.committed_map.source_timestamp_ns += 1;
+        assert!(validate_navigation_map_3d(&conflicting_time).is_err());
+    }
+
+    #[test]
+    fn clear_is_explicit_absence_and_partial_occupancy_receipts_are_rejected() {
+        let cleared = cleared_map();
+        assert!(validate_navigation_map_3d(&cleared).is_ok());
+        let mut live_absence = cleared.clone();
+        live_absence.cleared = false;
+        assert!(validate_navigation_map_3d(&live_absence).is_err());
+        for mutate in [
+            (|m: &mut NavigationMap3D| m.committed_map.commit_boot_nonce = [1; 16]) as fn(&mut NavigationMap3D),
+            |m| m.committed_map.commit_sequence = 1,
+            |m| m.committed_map.source_timestamp_ns = 1,
+            |m| m.cloud_occupancy_revision = 1,
+        ] {
+            let mut partial = cleared.clone();
+            mutate(&mut partial);
+            assert!(validate_navigation_map_3d(&partial).is_err());
+        }
     }
 
     #[test]
@@ -2920,7 +3042,10 @@ mod navigation_map_3d_tests {
             |m| m.committed_map.session_id.push('\0'),
             |m| m.committed_map.session_generation = 0,
             |m| m.committed_map.revision = 0,
-            |m| m.committed_map.payload_sha256 = [0; 32],
+            |m| m.committed_map.commit_boot_nonce = [0; 16],
+            |m| m.committed_map.commit_sequence = 0,
+            |m| m.committed_map.source_timestamp_ns = -1,
+            |m| m.cloud_occupancy_revision = 0,
             |m| m.committed_map.frame_id = "/map".into(),
             |m| m.map_frame_generation = -1,
             |m| m.cloud_revision = 0,
@@ -3134,9 +3259,14 @@ mod navigation_map_3d_tests {
         let mut old_fingerprint = wire.clone();
         old_fingerprint[..8].copy_from_slice(&NAVIGATION_MAP_3D_V2_FINGERPRINT);
         assert!(decode_navigation_map_3d(&old_fingerprint).is_err());
-        let mut old_version = wire.clone();
-        old_version[8..12].copy_from_slice(&2_i32.to_be_bytes());
-        assert!(decode_navigation_map_3d(&old_version).is_err());
+        for version in [2_i32, 3] {
+            let mut old_version = wire.clone();
+            old_version[8..12].copy_from_slice(&version.to_be_bytes());
+            assert!(decode_navigation_map_3d(&old_version).is_err());
+        }
+        let mut prior_fingerprint = wire.clone();
+        prior_fingerprint[..8].copy_from_slice(&0x06bd_4e44_dd7a_2e13_u64.to_be_bytes());
+        assert!(decode_navigation_map_3d(&prior_fingerprint).is_err());
         let mut hidden = wire.clone();
         hidden[fine_flag_offset] = 0;
         assert!(decode_navigation_map_3d(&hidden).is_err());
@@ -3182,12 +3312,17 @@ mod navigation_map_3d_tests {
             "geometry_msgs/Point",
             "geometry_msgs/Quaternion",
             "geometry_msgs/Pose",
+            "geometry_msgs/PoseStamped",
+            "nav_msgs/Path",
             "nav_msgs/MapMetaData",
             "nav_msgs/OccupancyGrid",
             "sensor_msgs/PointField",
             "sensor_msgs/PointCloud2",
             "nuwax_msgs/NavigationMapBlock",
             "nuwax_msgs/NavigationMap3D",
+            "nuwax_msgs/GoalEnvelope",
+            "nuwax_msgs/PathEnvelope",
+            "nuwax_msgs/PlanarNavigationMap",
         ];
         for python in [false, true] {
             let mut command = Command::new("lcm-gen");
@@ -3208,13 +3343,19 @@ mod navigation_map_3d_tests {
             "nuwax_msgs_NavigationMapBlock.h",
             "nuwax_msgs_NavigationMap3D.c",
             "nuwax_msgs_NavigationMap3D.h",
+            "nuwax_msgs_GoalEnvelope.c",
+            "nuwax_msgs_GoalEnvelope.h",
+            "nuwax_msgs_PathEnvelope.c",
+            "nuwax_msgs_PathEnvelope.h",
+            "nuwax_msgs_PlanarNavigationMap.c",
+            "nuwax_msgs_PlanarNavigationMap.h",
         ] {
             assert_eq!(
                 fs::read(c_dir.join(file)).unwrap(),
                 fs::read(root.join("generated/c").join(file)).unwrap()
             );
         }
-        for file in ["NavigationMap3D.py", "NavigationMapBlock.py"] {
+        for file in ["NavigationMap3D.py", "NavigationMapBlock.py", "GoalEnvelope.py", "PathEnvelope.py", "PlanarNavigationMap.py"] {
             assert_eq!(
                 fs::read(py_dir.join("nuwax_msgs").join(file)).unwrap(),
                 fs::read(root.join("generated/python/nuwax_msgs").join(file)).unwrap()
@@ -3237,8 +3378,11 @@ int main(int argc, char **argv) {
     fclose(input);
     nuwax_msgs_NavigationMap3D message;
     if (nuwax_msgs_NavigationMap3D_decode(data, 0, (int)size, &message) != size) return 4;
-    if (message.schema_version != 3 || message.cloud_revision != 17 || message.commit_boot_nonce[0] != 0x34 ||
+    if (message.schema_version != 4 || message.cloud_revision != 17 || message.commit_boot_nonce[0] != 0x34 ||
         message.cloud.header.seq != 17 || strcmp(message.frame_id, "robot/map")) return 5;
+    if (!message.cleared && (message.occupancy_commit_boot_nonce[0] != 0x34 ||
+        message.occupancy_commit_sequence != 41 || message.occupancy_source_timestamp_ns != 2000000003LL ||
+        message.cloud_occupancy_revision != 9)) return 14;
     if (message.has_virtual_obstacles && (message.virtual_obstacles.data_length != 4 ||
         message.virtual_obstacles.data[1] != 100 || message.virtual_obstacles.header.seq != message.occupancy_revision)) return 8;
     if (message.has_fine_map) {
@@ -3251,7 +3395,7 @@ int main(int argc, char **argv) {
         } else return 12;
         if (block->data_length != 28 || memcmp(block->data, "NUWAXBL1", 8)) return 13;
     }
-    message.commit_sequence += 1;
+    message.producer_runtime_generation += 1;
     int encoded_size = nuwax_msgs_NavigationMap3D_encoded_size(&message);
     unsigned char *encoded = malloc((size_t)encoded_size);
     if (!encoded || nuwax_msgs_NavigationMap3D_encode(encoded, 0, encoded_size, &message) != encoded_size) return 6;
@@ -3292,7 +3436,7 @@ int main(int argc, char **argv) {
             parity.arg(&input).arg(&c_output);
             run(parity);
             let mut expected = message.clone();
-            expected.commit_sequence += 1;
+            expected.producer_runtime_generation += 1;
             assert_eq!(
                 decode_navigation_map_3d(&fs::read(&c_output).unwrap()).unwrap(),
                 expected
@@ -3311,9 +3455,14 @@ from nuwax_msgs import NavigationMap3D
 raw = Path(sys.argv[2]).read_bytes()
 message = NavigationMap3D.decode(raw)
 assert message.encode() == raw
-assert message.schema_version == 3
+assert message.schema_version == 4
 assert message.cloud_revision == message.cloud.header.seq == 17
 assert message.frame_id == message.cloud.header.frame_id == "robot/map"
+if not message.cleared:
+    assert bytes(message.occupancy_commit_boot_nonce) == bytes([0x34] * 16)
+    assert message.occupancy_commit_sequence == 41
+    assert message.occupancy_source_timestamp_ns == 2_000_000_003
+    assert message.cloud_occupancy_revision == 9
 if message.has_virtual_obstacles:
     assert message.virtual_obstacles.header.seq == message.occupancy_revision
     assert list(message.virtual_obstacles.data) == [0, 100, 100, 0]
@@ -3328,7 +3477,7 @@ if message.has_fine_map:
         assert bytes(block.object_id) == bytes(16)
         assert bytes(block.legacy_alias) == bytes([0x72] * 32)
     assert bytes(block.data).startswith(b"NUWAXBL1")
-message.commit_sequence += 1
+message.producer_runtime_generation += 1
 Path(sys.argv[3]).write_bytes(message.encode())
 "#,
                 ])
@@ -3337,7 +3486,7 @@ Path(sys.argv[3]).write_bytes(message.encode())
                 .arg(&py_output);
             run(python);
             let mut expected = message;
-            expected.commit_sequence += 1;
+            expected.producer_runtime_generation += 1;
             assert_eq!(
                 decode_navigation_map_3d(&fs::read(py_output).unwrap()).unwrap(),
                 expected
@@ -3450,7 +3599,9 @@ mod tests {
             committed_map_session_id: "configured-map-session".into(),
             committed_map_session_generation: 3,
             committed_map_revision: 9,
-            committed_map_payload_sha256: [0x31; 32],
+            committed_map_boot_nonce: [0x31; 16],
+            committed_map_commit_sequence: 29,
+            committed_map_source_timestamp_ns: 122_000_000_456,
             committed_map_frame_id: frame_id.into(),
             source_timestamp_ns: 123_000_000_456,
             boundary_id,
@@ -3489,7 +3640,9 @@ mod tests {
             committed_map_session_id: goal.committed_map_session_id.clone(),
             committed_map_session_generation: goal.committed_map_session_generation,
             committed_map_revision: goal.committed_map_revision,
-            committed_map_payload_sha256: goal.committed_map_payload_sha256,
+            committed_map_boot_nonce: goal.committed_map_boot_nonce,
+            committed_map_commit_sequence: goal.committed_map_commit_sequence,
+            committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
             committed_map_frame_id: goal.committed_map_frame_id.clone(),
             boundary_id: goal.boundary_id.clone(),
             boundary_sha256: goal.boundary_sha256,
@@ -3574,6 +3727,114 @@ mod tests {
 
         assert_ne!(goal_digests[0], goal_digests[1]);
         assert_ne!(path_digests[0], path_digests[1]);
+    }
+
+    #[test]
+    fn envelope_receipts_are_required_bound_and_versioned_without_digest_compatibility() {
+        let mut goal = configured_frame_goal("robot/map");
+        seal_goal_envelope(&mut goal).unwrap();
+        let mut path = configured_frame_path(&goal, "robot/map");
+        seal_path_envelope(&mut path).unwrap();
+        for mutate in [
+            (|m: &mut GoalEnvelope| m.committed_map_boot_nonce[0] ^= 1) as fn(&mut GoalEnvelope),
+            |m| m.committed_map_commit_sequence += 1,
+            |m| m.committed_map_source_timestamp_ns += 1,
+        ] {
+            let mut altered = goal.clone();
+            mutate(&mut altered);
+            assert!(validate_goal_envelope(&altered).is_err());
+            seal_goal_envelope(&mut altered).unwrap();
+            assert_ne!(altered.payload_sha256, goal.payload_sha256);
+        }
+        for mutate in [
+            (|m: &mut PathEnvelope| m.committed_map_boot_nonce[0] ^= 1) as fn(&mut PathEnvelope),
+            |m| m.committed_map_commit_sequence += 1,
+            |m| m.committed_map_source_timestamp_ns += 1,
+        ] {
+            let mut altered = path.clone();
+            mutate(&mut altered);
+            assert!(validate_path_envelope(&altered).is_err());
+            seal_path_envelope(&mut altered).unwrap();
+            assert_ne!(altered.path_payload_sha256, path.path_payload_sha256);
+        }
+        for mutate in [
+            (|m: &mut GoalEnvelope| m.committed_map_boot_nonce = [0; 16]) as fn(&mut GoalEnvelope),
+            |m| m.committed_map_commit_sequence = 0,
+            |m| m.committed_map_source_timestamp_ns = -1,
+        ] {
+            let mut absent = goal.clone();
+            mutate(&mut absent);
+            assert!(seal_goal_envelope(&mut absent).is_err());
+        }
+        let mut old_goal = encode_goal_envelope(&goal).unwrap();
+        old_goal[8..12].copy_from_slice(&6_i32.to_be_bytes());
+        assert!(decode_goal_envelope(&old_goal).is_err());
+        let mut old_path = encode_path_envelope(&path).unwrap();
+        old_path[8..12].copy_from_slice(&6_i32.to_be_bytes());
+        assert!(decode_path_envelope(&old_path).is_err());
+        let mut old_goal = encode_goal_envelope(&goal).unwrap();
+        old_goal[..8].copy_from_slice(&0xdd19_bb81_9d6c_3e44_u64.to_be_bytes());
+        assert!(decode_goal_envelope(&old_goal).is_err());
+        let mut old_path = encode_path_envelope(&path).unwrap();
+        old_path[..8].copy_from_slice(&0xf11d_70cc_600f_1ab1_u64.to_be_bytes());
+        assert!(decode_path_envelope(&old_path).is_err());
+    }
+
+    #[test]
+    fn generated_python_preserves_goal_path_and_planar_occupancy_receipts() {
+        let mut goal = configured_frame_goal("robot/map");
+        // An epoch-zero source timestamp is legitimate receipt data.
+        goal.committed_map_source_timestamp_ns = 0;
+        seal_goal_envelope(&mut goal).unwrap();
+        let mut path = configured_frame_path(&goal, "robot/map");
+        seal_path_envelope(&mut path).unwrap();
+        let planar = crate::lcm::planar_navigation::PlanarNavigationMap {
+            map_frame_generation: 1, runtime_generation: 7,
+            session_id: goal.committed_map_session_id.clone(), session_generation: 3,
+            map_revision: 9, map_boot_nonce: goal.committed_map_boot_nonce,
+            map_commit_sequence: 29, map_source_timestamp_ns: 0,
+            observation_revision: 2, source_sequence: 3, source_timestamp_ns: 1_000_000_001,
+            cleared: false, grid: OccupancyGrid {
+                header: Header { stamp_sec: 1, stamp_nsec: 1, frame_id: "robot/map".into(), ..Header::default() },
+                info: MapMetaData { width: 1, height: 1, resolution: 0.1,
+                    origin: Pose { orientation_xyzw: [0.0, 0.0, 0.0, 1.0], ..Pose::default() },
+                    ..MapMetaData::default() }, data: vec![0],
+            },
+        };
+        let planar_body = crate::lcm::planar_navigation::encode_body(&planar).unwrap();
+        let cases = [
+            ("GoalEnvelope", encode_goal_envelope(&goal).unwrap()),
+            ("PathEnvelope", encode_path_envelope(&path).unwrap()),
+            ("PlanarNavigationMap", with_fingerprint(crate::lcm::planar_navigation::FINGERPRINT, planar_body)),
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lcmtypes/generated/python");
+        for (name, wire) in cases {
+            let result = std::process::Command::new("python3")
+                .args(["-I", "-S", "-c", r#"
+import sys
+sys.path.insert(0, sys.argv[1])
+import nuwax_msgs
+name = sys.argv[2]
+raw = bytes.fromhex(sys.argv[3])
+message = getattr(nuwax_msgs, name).decode(raw)
+if name == 'PlanarNavigationMap':
+    assert message.schema_version == 3
+    assert bytes(message.map_boot_nonce) == bytes([0x31] * 16)
+    assert message.map_commit_sequence == 29 and message.map_source_timestamp_ns == 0
+    assert message.source_timestamp_ns == 1_000_000_001
+else:
+    assert message.schema_version == 7
+    assert bytes(message.committed_map_boot_nonce) == bytes([0x31] * 16)
+    assert message.committed_map_commit_sequence == 29
+    assert message.committed_map_source_timestamp_ns == 0
+    assert message.committed_map_frame_id == 'robot/map'
+assert message.encode() == raw
+sys.stdout.buffer.write(message.encode())
+"#])
+                .arg(&root).arg(name).arg(hex(&wire)).output().unwrap();
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            assert_eq!(result.stdout, wire);
+        }
     }
 
     #[test]
@@ -3714,7 +3975,9 @@ mod tests {
             committed_map_session_id: goal.committed_map_session_id.clone(),
             committed_map_session_generation: goal.committed_map_session_generation,
             committed_map_revision: goal.committed_map_revision,
-            committed_map_payload_sha256: goal.committed_map_payload_sha256,
+            committed_map_boot_nonce: goal.committed_map_boot_nonce,
+            committed_map_commit_sequence: goal.committed_map_commit_sequence,
+            committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
             committed_map_frame_id: goal.committed_map_frame_id.clone(),
             boundary_id: goal.boundary_id.clone(),
             boundary_sha256: goal.boundary_sha256,

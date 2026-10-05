@@ -19,6 +19,7 @@ class OccupancyGrid(TimestampedContract):
     height: int = Field(ge=1, description="地图高度，单位格。")
     resolution_m: float = Field(gt=0.0, description="每格分辨率，单位米。")
     origin: Pose = Field(description="地图原点位姿。")
+    metadata: MetadataDict = Field(default_factory=dict, description="Source-owned map provenance and presentation metadata.")
     data: Annotated[
         Union[PackedOccupancyCells, List[int]],
         WithJsonSchema({"type": "array", "items": {"type": "integer"}}),

@@ -14,9 +14,9 @@ use crate::georeference::{
 use crate::LatLng;
 
 /// Exact schema version for the backend-local mapping-cloud intent.
-pub const MAPPING_CLOUD_GOAL_INTENT_SCHEMA_VERSION: u32 = 1;
+pub const MAPPING_CLOUD_GOAL_INTENT_SCHEMA_VERSION: u32 = 2;
 
-const GOAL_INTENT_DIGEST_DOMAIN: &[u8] = b"nuwax.mapping-cloud.goal-intent.v1\0";
+const GOAL_INTENT_DIGEST_DOMAIN: &[u8] = b"nuwax.mapping-cloud.goal-intent.v2\0";
 const MAX_QUERY_ID_BYTES: usize = 128;
 const MAX_PRODUCER_BYTES: usize = 128;
 const MAX_MAP_NAME_BYTES: usize = 255;
@@ -56,7 +56,7 @@ impl CloudQueryIdentityV1 {
 
 /// Immutable active-map snapshot carried into shared goal arbitration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveMapIdentityV1 {
+pub struct ActiveMapIdentityV2 {
     /// Finalized map name.
     pub map_name: String,
     /// Exact map frame.
@@ -75,11 +75,15 @@ pub struct ActiveMapIdentityV1 {
     pub mapping_session_generation: u64,
     /// Non-zero committed occupancy revision.
     pub committed_occupancy_revision: u64,
-    /// Content digest for that committed occupancy revision.
-    pub committed_occupancy_sha256: Sha256Digest,
+    /// Opaque process domain from the real committed occupancy receipt.
+    pub committed_occupancy_boot_nonce: [u8; 16],
+    /// Non-zero sequence from the same committed occupancy receipt.
+    pub committed_occupancy_commit_sequence: u64,
+    /// Original source timestamp from that receipt; not query time.
+    pub committed_occupancy_source_timestamp_ns: u64,
 }
 
-impl ActiveMapIdentityV1 {
+impl ActiveMapIdentityV2 {
     fn validate(&self) -> Result<(), GoalAdapterError> {
         if !valid_map_name(&self.map_name) {
             return Err(GoalAdapterError::InvalidMapName);
@@ -87,7 +91,11 @@ impl ActiveMapIdentityV1 {
         if !valid_frame_id(&self.map_frame_id) {
             return Err(GoalAdapterError::InvalidMapFrame);
         }
+        if self.committed_occupancy_boot_nonce == [0; 16] {
+            return Err(GoalAdapterError::UnpopulatedOccupancyBootNonce);
+        }
         for (field, value) in [
+            ("committed_occupancy_commit_sequence", self.committed_occupancy_commit_sequence),
             ("runtime_generation", self.runtime_generation),
             (
                 "mapping_session_generation",
@@ -123,7 +131,7 @@ impl TerminalHeadingPolicy {
 
 /// Backend-local metric goal intent awaiting shared arbitration.
 #[derive(Debug, Clone, PartialEq)]
-pub struct MappingCloudGoalIntentV1 {
+pub struct MappingCloudGoalIntentV2 {
     /// Exact DTO schema version.
     schema_version: u32,
     /// Cloud query identity and source time.
@@ -135,12 +143,12 @@ pub struct MappingCloudGoalIntentV1 {
     /// Heading remains unspecified; no quaternion is fabricated.
     terminal_heading: TerminalHeadingPolicy,
     /// Active-map identity snapshot to be revalidated by shared arbitration.
-    active_map: ActiveMapIdentityV1,
+    active_map: ActiveMapIdentityV2,
     /// SHA-256 over the canonical intent body, excluding this field.
     payload_sha256: Sha256Digest,
 }
 
-impl MappingCloudGoalIntentV1 {
+impl MappingCloudGoalIntentV2 {
     /// Return the exact DTO schema version.
     #[must_use]
     pub const fn schema_version(&self) -> u32 {
@@ -173,7 +181,7 @@ impl MappingCloudGoalIntentV1 {
 
     /// Borrow the active-map snapshot that arbitration must revalidate.
     #[must_use]
-    pub const fn active_map(&self) -> &ActiveMapIdentityV1 {
+    pub const fn active_map(&self) -> &ActiveMapIdentityV2 {
         &self.active_map
     }
 
@@ -189,7 +197,8 @@ impl MappingCloudGoalIntentV1 {
     /// and producer as length-prefixed UTF-8, producer epoch `u64`, source time
     /// `i64`, source lat/lng f64, map name/frame as length-prefixed UTF-8,
     /// metric XYZ f64, heading `u32`, four asset/activation digests, runtime and
-    /// mapping generations `u64`, occupancy revision `u64`, and occupancy hash.
+    /// mapping generations `u64`, occupancy revision `u64`, boot nonce `[u8; 16]`, commit sequence `u64`,
+    /// and original occupancy source timestamp `u64`.
     /// All numbers are big-endian and floating zeroes use positive-zero bits.
     ///
     /// # Errors
@@ -258,9 +267,9 @@ impl MappingCloudGoalIntentV1 {
 pub fn adapt_wgs84_goal_intent(
     georeference: &VerifiedGeoreferenceV1,
     query: CloudQueryIdentityV1,
-    active_map: ActiveMapIdentityV1,
+    active_map: ActiveMapIdentityV2,
     source_wgs84: LatLng,
-) -> Result<MappingCloudGoalIntentV1, GoalAdapterError> {
+) -> Result<MappingCloudGoalIntentV2, GoalAdapterError> {
     query.validate()?;
     active_map.validate()?;
     let contract = georeference.contract();
@@ -296,7 +305,7 @@ pub fn adapt_wgs84_goal_intent(
         terminal_heading,
         &active_map,
     ));
-    Ok(MappingCloudGoalIntentV1 {
+    Ok(MappingCloudGoalIntentV2 {
         schema_version: MAPPING_CLOUD_GOAL_INTENT_SCHEMA_VERSION,
         query,
         source_wgs84,
@@ -310,7 +319,7 @@ pub fn adapt_wgs84_goal_intent(
 /// Fail-closed mapping-cloud goal adaptation errors.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum GoalAdapterError {
-    /// The backend-local intent schema was not exactly one.
+    /// The backend-local intent schema was not exactly two.
     #[error("unsupported mapping-cloud goal intent schema {0}")]
     UnsupportedIntentSchema(u32),
     /// The stable query/request ID was not canonical bounded ASCII.
@@ -322,6 +331,9 @@ pub enum GoalAdapterError {
     /// A required generation/revision counter was zero.
     #[error("{0} must be non-zero")]
     UnpopulatedCounter(&'static str),
+    /// A real occupancy commit must name its opaque process domain.
+    #[error("committed_occupancy_boot_nonce must be populated")]
+    UnpopulatedOccupancyBootNonce,
     /// Source time was absent or negative.
     #[error("source_timestamp_ns must be positive, got {0}")]
     InvalidSourceTimestamp(i64),
@@ -396,7 +408,7 @@ fn encode_goal_intent_preimage(
     source_wgs84: LatLng,
     map_position: MapMetricPosition,
     terminal_heading: TerminalHeadingPolicy,
-    active_map: &ActiveMapIdentityV1,
+    active_map: &ActiveMapIdentityV2,
 ) -> Vec<u8> {
     let mut output = Vec::with_capacity(384);
     output.extend_from_slice(GOAL_INTENT_DIGEST_DOMAIN);
@@ -420,7 +432,9 @@ fn encode_goal_intent_preimage(
     push_u64(&mut output, active_map.runtime_generation);
     push_u64(&mut output, active_map.mapping_session_generation);
     push_u64(&mut output, active_map.committed_occupancy_revision);
-    push_digest(&mut output, active_map.committed_occupancy_sha256);
+    output.extend_from_slice(&active_map.committed_occupancy_boot_nonce);
+    push_u64(&mut output, active_map.committed_occupancy_commit_sequence);
+    push_u64(&mut output, active_map.committed_occupancy_source_timestamp_ns);
     output
 }
 
@@ -494,8 +508,8 @@ mod tests {
         }
     }
 
-    fn active_map(georeference: &VerifiedGeoreferenceV1) -> ActiveMapIdentityV1 {
-        ActiveMapIdentityV1 {
+    fn active_map(georeference: &VerifiedGeoreferenceV1) -> ActiveMapIdentityV2 {
+        ActiveMapIdentityV2 {
             map_name: georeference.contract().map_name.clone(),
             map_frame_id: georeference.contract().map_frame_id.clone(),
             asset_manifest_sha256: Sha256Digest::of_bytes(b"asset manifest"),
@@ -505,7 +519,9 @@ mod tests {
             runtime_generation: 11,
             mapping_session_generation: 13,
             committed_occupancy_revision: 17,
-            committed_occupancy_sha256: Sha256Digest::of_bytes(b"occupancy payload"),
+            committed_occupancy_boot_nonce: [0x2a; 16],
+            committed_occupancy_commit_sequence: 19,
+            committed_occupancy_source_timestamp_ns: 23,
         }
     }
 
@@ -564,22 +580,22 @@ mod tests {
         assert!(first.starts_with(GOAL_INTENT_DIGEST_DOMAIN));
         assert_eq!(first.len(), 358);
         let python_preimage = decode_hex(concat!(
-            "6e757761782e6d617070696e672d636c6f75642e676f616c2d696e74656e742e763100",
-            "000000010000001371756572792d32303236303733312d30303031000000136e757761",
-            "782d6d617070696e672d636c6f7564000000000000000718573b22ace96000403f3b3d",
-            "07c84b5e405e5e5119ce075f0000000c7368616e676861695f6c6162000000096d6170",
-            "2f636c6f75644024000000000000405f8bdc6deb00003ff4000000000000000000000d",
-            "8addb628b5adf9475633f32612b54a0ab2a6cacac69477d887d3c17dacbcdcd5557b0",
-            "0692cc5f50e55dcacdffbbb62ff2f484b3850ffb0d2ea1bac082451a7bd79c32346a19",
-            "0c0ef227ffe0b27084cb0a71563297723d54ebe54e557d9a4806c4e92d1a1bb00f51f",
-            "70185443fab5343ee12fcbd939601ad827eadfba69fe6c000000000000000b00000000",
-            "0000000d00000000000000118798e94238d24c318934c7524e826d728b0fd02f63668d",
-            "fe6eaf1e5170621627"
+            "6e757761782e6d617070696e672d636c6f75642e676f616c2d696e74656e742e76",
+            "3200000000020000001371756572792d32303236303733312d3030303100000013",
+            "6e757761782d6d617070696e672d636c6f7564000000000000000718573b22ace9",
+            "6000403f3b3d07c84b5e405e5e5119ce075f0000000c7368616e676861695f6c61",
+            "62000000096d61702f636c6f75644024000000000000405f8bdc6deb00003ff400",
+            "0000000000000000000d8addb628b5adf9475633f32612b54a0ab2a6cacac69477",
+            "d887d3c17dacbcdcd5557b00692cc5f50e55dcacdffbbb62ff2f484b3850ffb0d2",
+            "ea1bac082451a7bd79c32346a190c0ef227ffe0b27084cb0a71563297723d54ebe",
+            "54e557d9a4806c4e92d1a1bb00f51f70185443fab5343ee12fcbd939601ad827ea",
+            "dfba69fe6c000000000000000b000000000000000d00000000000000112a2a2a2a",
+            "2a2a2a2a2a2a2a2a2a2a2a2a00000000000000130000000000000017",
         ));
         assert_eq!(first, python_preimage);
         assert_eq!(
             Sha256Digest::of_bytes(&first).to_lower_hex(),
-            "e90ec247326f1ea7843571354d39475f5143a72dcf5851b741148b88658de8ce"
+            "ac428ecf0a129df3f19a4a85c9cc681ebd9c8dcc18f1192202bfc2ad3d81e050"
         );
         assert_ne!(
             Sha256Digest::of_bytes(&first).to_lower_hex(),
@@ -615,7 +631,7 @@ mod tests {
         assert_eq!(intent.map_position().x_m.to_bits(), 10.0_f64.to_bits());
         assert_eq!(
             intent.payload_sha256().to_lower_hex(),
-            "ad5eb407d7df2cc442ed78e3091d83bcdb8e95cb270c177fd31f6d858f60e2e1"
+            "c6b4444ec28656e690cb875a5f6772bb47c00f073485343c5303e5b3b43039d7"
         );
         assert_ne!(
             intent.payload_sha256().to_lower_hex(),
@@ -662,6 +678,35 @@ mod tests {
     }
 
     #[test]
+    fn occupancy_receipt_fields_are_required_and_bound_to_the_intent() {
+        let georeference = georeference();
+        let baseline = adapt_wgs84_goal_intent(&georeference, query(),
+            active_map(&georeference), source(&georeference)).unwrap();
+        for component in 0..3 {
+            let mut map = active_map(&georeference);
+            match component {
+                0 => map.committed_occupancy_boot_nonce[0] ^= 1,
+                1 => map.committed_occupancy_commit_sequence += 1,
+                _ => map.committed_occupancy_source_timestamp_ns += 1,
+            }
+            let next = adapt_wgs84_goal_intent(&georeference, query(),
+                map.clone(), source(&georeference)).unwrap();
+            assert_ne!(next.payload_sha256(), baseline.payload_sha256());
+            let mut tampered = baseline.clone();
+            tampered.active_map = map;
+            assert!(matches!(tampered.verify(), Err(GoalAdapterError::PayloadDigestMismatch { .. })));
+        }
+        let mut no_nonce = active_map(&georeference);
+        no_nonce.committed_occupancy_boot_nonce = [0; 16];
+        assert!(matches!(adapt_wgs84_goal_intent(&georeference, query(), no_nonce,
+            source(&georeference)), Err(GoalAdapterError::UnpopulatedOccupancyBootNonce)));
+        let mut no_sequence = active_map(&georeference);
+        no_sequence.committed_occupancy_commit_sequence = 0;
+        assert!(matches!(adapt_wgs84_goal_intent(&georeference, query(), no_sequence,
+            source(&georeference)), Err(GoalAdapterError::UnpopulatedCounter("committed_occupancy_commit_sequence"))));
+    }
+
+    #[test]
     fn verify_rejects_tampering_without_resealing() {
         let georeference = georeference();
         let intent = adapt_wgs84_goal_intent(
@@ -694,10 +739,10 @@ mod tests {
         ));
 
         let mut malformed = intent.clone();
-        malformed.schema_version = 2;
+        malformed.schema_version = 1;
         assert!(matches!(
             malformed.verify(),
-            Err(GoalAdapterError::UnsupportedIntentSchema(2))
+            Err(GoalAdapterError::UnsupportedIntentSchema(1))
         ));
 
         let mut malformed = intent;

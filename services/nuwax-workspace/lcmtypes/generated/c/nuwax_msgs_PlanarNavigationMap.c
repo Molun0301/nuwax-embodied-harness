@@ -21,7 +21,7 @@ uint64_t __nuwax_msgs_PlanarNavigationMap_hash_recursive(const __lcm_hash_ptr *p
     cp.v = __nuwax_msgs_PlanarNavigationMap_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0x55e5987faf7e4385LL
+    uint64_t hash = (uint64_t)0xad39b5a6ee41ea3dLL
          + __int32_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
@@ -29,6 +29,8 @@ uint64_t __nuwax_msgs_PlanarNavigationMap_hash_recursive(const __lcm_hash_ptr *p
          + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __byte_hash_recursive(&cp)
+         + __int64_t_hash_recursive(&cp)
+         + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
@@ -74,7 +76,13 @@ int __nuwax_msgs_PlanarNavigationMap_encode_array(void *buf, int offset, int max
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_revision), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].map_payload_sha256, 32);
+        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].map_boot_nonce, 16);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_commit_sequence), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_source_timestamp_ns), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].observation_revision), 1);
@@ -127,7 +135,11 @@ int __nuwax_msgs_PlanarNavigationMap_encoded_array_size(const nuwax_msgs_PlanarN
 
         size += __int64_t_encoded_array_size(&(p[element].map_revision), 1);
 
-        size += __byte_encoded_array_size(p[element].map_payload_sha256, 32);
+        size += __byte_encoded_array_size(p[element].map_boot_nonce, 16);
+
+        size += __int64_t_encoded_array_size(&(p[element].map_commit_sequence), 1);
+
+        size += __int64_t_encoded_array_size(&(p[element].map_source_timestamp_ns), 1);
 
         size += __int64_t_encoded_array_size(&(p[element].observation_revision), 1);
 
@@ -172,7 +184,13 @@ int __nuwax_msgs_PlanarNavigationMap_decode_array(const void *buf, int offset, i
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_revision), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].map_payload_sha256, 32);
+        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].map_boot_nonce, 16);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_commit_sequence), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_source_timestamp_ns), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].observation_revision), 1);
@@ -212,7 +230,11 @@ int __nuwax_msgs_PlanarNavigationMap_decode_array_cleanup(nuwax_msgs_PlanarNavig
 
         __int64_t_decode_array_cleanup(&(p[element].map_revision), 1);
 
-        __byte_decode_array_cleanup(p[element].map_payload_sha256, 32);
+        __byte_decode_array_cleanup(p[element].map_boot_nonce, 16);
+
+        __int64_t_decode_array_cleanup(&(p[element].map_commit_sequence), 1);
+
+        __int64_t_decode_array_cleanup(&(p[element].map_source_timestamp_ns), 1);
 
         __int64_t_decode_array_cleanup(&(p[element].observation_revision), 1);
 
@@ -266,7 +288,11 @@ int __nuwax_msgs_PlanarNavigationMap_clone_array(const nuwax_msgs_PlanarNavigati
 
         __int64_t_clone_array(&(p[element].map_revision), &(q[element].map_revision), 1);
 
-        __byte_clone_array(p[element].map_payload_sha256, q[element].map_payload_sha256, 32);
+        __byte_clone_array(p[element].map_boot_nonce, q[element].map_boot_nonce, 16);
+
+        __int64_t_clone_array(&(p[element].map_commit_sequence), &(q[element].map_commit_sequence), 1);
+
+        __int64_t_clone_array(&(p[element].map_source_timestamp_ns), &(q[element].map_source_timestamp_ns), 1);
 
         __int64_t_clone_array(&(p[element].observation_revision), &(q[element].observation_revision), 1);
 

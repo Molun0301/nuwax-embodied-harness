@@ -107,7 +107,15 @@ message OccupancyGridMeta {
   uint64 revision = 7;
   uint64 timestamp_ns = 8;
 }
+enum RawMapRepresentation {
+  RAW_MAP_REPRESENTATION_UNSPECIFIED = 0;
+  RAW_MAP_REPRESENTATION_SAME_AS_EFFECTIVE = 1;
+  RAW_MAP_REPRESENTATION_SEPARATE_RAW = 2;
+  RAW_MAP_REPRESENTATION_EFFECTIVE_FALLBACK = 3;
+}
 message MapUpdateNotification {
+  reserved 6, 12;
+  reserved "checksum", "raw_checksum";
   reserved 9;
   reserved "map_version_id";
   OccupancyGridMeta meta = 1;
@@ -115,16 +123,15 @@ message MapUpdateNotification {
   bytes data = 3;
   uint64 size = 4;
   uint32 schema_version = 5;
-  string checksum = 6;
   int64 last_seen_ms = 7;
   string session_id = 8;
   uint64 session_generation = 10;
-  // Physical occupancy from the same committed revision, before virtual
-  // forbidden zones are composed into `data`. Empty means byte-identical to
-  // `data` when raw_checksum equals checksum.
+  // Physical occupancy from the same committed revision. The explicit
+  // representation distinguishes shared data from unavailable raw occupancy.
   bytes raw_data = 11;
-  string raw_checksum = 12;
   string map_name = 13;
+  CanonicalOccupancyCommitReceipt occupancy_receipt = 14;
+  RawMapRepresentation raw_representation = 15;
 }
 message OccupancyGridData {
   OccupancyGridMeta meta = 1;
@@ -872,8 +879,12 @@ message MappingCloudAuthority {
   string backend_kind = 13;
   uint64 backend_generation = 14;
   uint64 committed_occupancy_revision = 15;
-  bytes committed_occupancy_sha256 = 16;
+  reserved 16;
+  reserved "committed_occupancy_sha256";
   uint64 owner_epoch = 17;
+  uint32 schema_version = 18;
+  MappingCommitIdentity committed_occupancy_commit_id = 19;
+  uint64 committed_occupancy_source_timestamp_ns = 20;
 }
 
 message MappingCloudGoalRequest {
@@ -891,10 +902,14 @@ message MappingCloudGoalRequest {
   string mapping_session_id = 12;
   uint64 mapping_session_generation = 13;
   uint64 committed_occupancy_revision = 14;
-  bytes committed_occupancy_sha256 = 15;
+  reserved 15;
+  reserved "committed_occupancy_sha256";
   uint64 motion_guard_generation = 16;
   bytes motion_guard_boot_nonce = 17;
   uint64 motion_stop_generation = 18;
+  uint32 schema_version = 19;
+  MappingCommitIdentity committed_occupancy_commit_id = 20;
+  uint64 committed_occupancy_source_timestamp_ns = 21;
 }
 
 message MappingCloudGoalTerminal {

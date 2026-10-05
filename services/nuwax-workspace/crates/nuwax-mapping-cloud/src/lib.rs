@@ -54,8 +54,8 @@ pub use georeference::{
 };
 #[cfg(feature = "cloud-enabled")]
 pub use goal_adapter::{
-    adapt_wgs84_goal_intent, ActiveMapIdentityV1, CloudQueryIdentityV1, GoalAdapterError,
-    MappingCloudGoalIntentV1, TerminalHeadingPolicy, MAPPING_CLOUD_GOAL_INTENT_SCHEMA_VERSION,
+    adapt_wgs84_goal_intent, ActiveMapIdentityV2, CloudQueryIdentityV1, GoalAdapterError,
+    MappingCloudGoalIntentV2, TerminalHeadingPolicy, MAPPING_CLOUD_GOAL_INTENT_SCHEMA_VERSION,
 };
 #[cfg(feature = "cloud-enabled")]
 pub use google_maps::{

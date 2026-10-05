@@ -926,7 +926,9 @@ fn guarded_goal_execution_identity(
         committed_map_session_id: goal.committed_map_session_id.clone(),
         committed_map_session_generation: goal.committed_map_session_generation,
         committed_map_revision: goal.committed_map_revision,
-        committed_map_payload_sha256: goal.committed_map_payload_sha256,
+        committed_map_boot_nonce: goal.committed_map_boot_nonce,
+        committed_map_commit_sequence: goal.committed_map_commit_sequence,
+        committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
         committed_map_frame_id: goal.committed_map_frame_id.clone(),
         boundary_id: goal.boundary_id.clone(),
         boundary_sha256: goal.boundary_sha256,
@@ -955,7 +957,9 @@ fn guarded_path_execution_identity(
         committed_map_session_id: path.committed_map_session_id.clone(),
         committed_map_session_generation: path.committed_map_session_generation,
         committed_map_revision: path.committed_map_revision,
-        committed_map_payload_sha256: path.committed_map_payload_sha256,
+        committed_map_boot_nonce: path.committed_map_boot_nonce,
+        committed_map_commit_sequence: path.committed_map_commit_sequence,
+        committed_map_source_timestamp_ns: path.committed_map_source_timestamp_ns,
         committed_map_frame_id: path.committed_map_frame_id.clone(),
         boundary_id: path.boundary_id.clone(),
         boundary_sha256: path.boundary_sha256,
@@ -1392,6 +1396,9 @@ struct GuardedMapAuthority {
     producer_runtime_generation: i64,
     map_frame_generation: i64,
     cloud_revision: i64,
+    cloud_occupancy_revision: i64,
+    cloud_commit_sequence: i64,
+    cloud_source_timestamp_ns: i64,
     commit_boot_nonce: [u8; 16],
 }
 
@@ -1412,9 +1419,14 @@ impl GuardedMapAuthority {
             && self.committed_map.session_id == goal.committed_map_session_id
             && self.committed_map.session_generation == goal.committed_map_session_generation
             && self.committed_map.frame_id == goal.committed_map_frame_id
+            && self.committed_map.commit_boot_nonce == goal.committed_map_boot_nonce
             && self.committed_map.revision >= goal.committed_map_revision
-            && (self.committed_map.revision != goal.committed_map_revision
-                || self.committed_map.payload_sha256 == goal.committed_map_payload_sha256)
+            && if self.committed_map.revision == goal.committed_map_revision {
+                self.committed_map.commit_sequence == goal.committed_map_commit_sequence
+                    && self.committed_map.source_timestamp_ns == goal.committed_map_source_timestamp_ns
+            } else {
+                self.committed_map.commit_sequence > goal.committed_map_commit_sequence
+            }
     }
 }
 
@@ -1745,10 +1757,14 @@ where
                             let authority=GuardedMapAuthority {
                                 committed_map:schema::CommittedMapIdentity {
                                     session_id:value.session_id.clone(),session_generation:value.session_generation,
-                                    revision:value.map_revision,payload_sha256:value.map_payload_sha256,frame_id:value.grid.header.frame_id.clone(),
+                                    revision:value.map_revision,commit_boot_nonce:value.map_boot_nonce,
+                                    commit_sequence:value.map_commit_sequence,source_timestamp_ns:value.map_source_timestamp_ns,
+                                    frame_id:value.grid.header.frame_id.clone(),
                                 },
                                 producer_runtime_generation:value.runtime_generation,
-                                map_frame_generation:value.map_frame_generation,cloud_revision:0,commit_boot_nonce:[0;16],
+                                map_frame_generation:value.map_frame_generation,cloud_revision:0,
+                                cloud_occupancy_revision:0,cloud_commit_sequence:0,cloud_source_timestamp_ns:0,
+                                commit_boot_nonce:value.map_boot_nonce,
                             };
                             if changed || value.cleared {
                                 // 切域的同一输入共享来源时间基准，避免首帧被自己的处理时刻拒绝。
@@ -2818,7 +2834,9 @@ fn validate_path_goal_correlation(
         || path.committed_map_session_id != goal.committed_map_session_id
         || path.committed_map_session_generation != goal.committed_map_session_generation
         || path.committed_map_revision != goal.committed_map_revision
-        || path.committed_map_payload_sha256 != goal.committed_map_payload_sha256
+        || path.committed_map_boot_nonce != goal.committed_map_boot_nonce
+        || path.committed_map_commit_sequence != goal.committed_map_commit_sequence
+        || path.committed_map_source_timestamp_ns != goal.committed_map_source_timestamp_ns
         || path.committed_map_frame_id != goal.committed_map_frame_id
         || path.boundary_id != goal.boundary_id
         || path.boundary_sha256 != goal.boundary_sha256
@@ -4048,7 +4066,9 @@ fn planner_goal_identity_matches(
         && left.committed_map_session_id == right.committed_map_session_id
         && left.committed_map_session_generation == right.committed_map_session_generation
         && left.committed_map_revision == right.committed_map_revision
-        && left.committed_map_payload_sha256 == right.committed_map_payload_sha256
+        && left.committed_map_boot_nonce == right.committed_map_boot_nonce
+        && left.committed_map_commit_sequence == right.committed_map_commit_sequence
+        && left.committed_map_source_timestamp_ns == right.committed_map_source_timestamp_ns
         && left.committed_map_frame_id == right.committed_map_frame_id
         && left.boundary_id == right.boundary_id
         && left.boundary_sha256 == right.boundary_sha256
@@ -6408,7 +6428,9 @@ fn build_versioned_path_from_schema(
         committed_map_session_id: goal.committed_map_session_id.clone(),
         committed_map_session_generation: goal.committed_map_session_generation,
         committed_map_revision: goal.committed_map_revision,
-        committed_map_payload_sha256: goal.committed_map_payload_sha256,
+        committed_map_boot_nonce: goal.committed_map_boot_nonce,
+        committed_map_commit_sequence: goal.committed_map_commit_sequence,
+        committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
         committed_map_frame_id: goal.committed_map_frame_id.clone(),
         boundary_id: goal.boundary_id.clone(),
         boundary_sha256: goal.boundary_sha256,
@@ -6594,7 +6616,9 @@ fn planner_test_goal(session_id: &str, goal_generation: i64) -> schema::GoalEnve
         committed_map_session_id: "planner-test-map".into(),
         committed_map_session_generation: 3,
         committed_map_revision: 5,
-        committed_map_payload_sha256: [0x31; 32],
+        committed_map_boot_nonce: [0x31; 16],
+        committed_map_commit_sequence: 1,
+        committed_map_source_timestamp_ns: 1,
         committed_map_frame_id: "map".into(),
         source_timestamp_ns: goal_generation * 1_000_000_000,
         boundary_id: "explore-parent:boundary".into(),
@@ -7884,7 +7908,9 @@ mod guarded_tests {
             committed_map_session_id: "guarded-test-map".into(),
             committed_map_session_generation: 2,
             committed_map_revision: 4,
-            committed_map_payload_sha256: [0x42; 32],
+            committed_map_boot_nonce: [0x42; 16],
+            committed_map_commit_sequence: 1,
+            committed_map_source_timestamp_ns: 1,
             committed_map_frame_id: "map".into(),
             source_timestamp_ns: 1_000_000_000,
             motion_guard_generation: 7,
@@ -7920,7 +7946,9 @@ mod guarded_tests {
             committed_map_session_id: goal.committed_map_session_id.clone(),
             committed_map_session_generation: goal.committed_map_session_generation,
             committed_map_revision: goal.committed_map_revision,
-            committed_map_payload_sha256: goal.committed_map_payload_sha256,
+            committed_map_boot_nonce: goal.committed_map_boot_nonce,
+            committed_map_commit_sequence: goal.committed_map_commit_sequence,
+            committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
             committed_map_frame_id: goal.committed_map_frame_id.clone(),
             boundary_id: goal.boundary_id.clone(),
             boundary_sha256: goal.boundary_sha256,
@@ -8976,7 +9004,8 @@ mod guarded_tests {
             map_frame_generation: goal.map_frame_generation,
             runtime_generation:goal.producer_runtime_generation,session_id:goal.committed_map_session_id.clone(),
             session_generation:goal.committed_map_session_generation,map_revision:goal.committed_map_revision,
-            map_payload_sha256:goal.committed_map_payload_sha256,observation_revision:1,source_sequence:0,
+            map_boot_nonce:goal.committed_map_boot_nonce,map_commit_sequence:goal.committed_map_commit_sequence,
+            map_source_timestamp_ns:goal.committed_map_source_timestamp_ns,observation_revision:1,source_sequence:0,
             source_timestamp_ns:timestamp,cleared:false,grid,
         };
         let body=planar_navigation::encode_body(&value).unwrap();
@@ -9843,9 +9872,17 @@ mod guarded_tests {
         let mut wrong_revision = path.clone();
         wrong_revision.committed_map_revision += 1;
         assert!(validate_path_goal_correlation(&wrong_revision, &goal).is_err());
-        let mut wrong_map_hash = path.clone();
-        wrong_map_hash.committed_map_payload_sha256[0] ^= 0xff;
-        assert!(validate_path_goal_correlation(&wrong_map_hash, &goal).is_err());
+        let mut wrong_map_nonce = path.clone();
+        wrong_map_nonce.committed_map_boot_nonce[0] ^= 0xff;
+        assert!(validate_path_goal_correlation(&wrong_map_nonce, &goal).is_err());
+        let mut wrong_map_sequence = path.clone();
+        wrong_map_sequence.committed_map_commit_sequence += 1;
+        schema::seal_path_envelope(&mut wrong_map_sequence).unwrap();
+        assert!(validate_path_goal_correlation(&wrong_map_sequence, &goal).is_err());
+        let mut wrong_map_time = path.clone();
+        wrong_map_time.committed_map_source_timestamp_ns += 1;
+        schema::seal_path_envelope(&mut wrong_map_time).unwrap();
+        assert!(validate_path_goal_correlation(&wrong_map_time, &goal).is_err());
         let mut wrong_boundary = path.clone();
         wrong_boundary.boundary_sha256[0] ^= 0xff;
         assert!(validate_path_goal_correlation(&wrong_boundary, &goal).is_err());
@@ -11629,7 +11666,9 @@ mod native_adapter_tests {
             committed_map_session_id: "map-session".into(),
             committed_map_session_generation: 5,
             committed_map_revision: 6,
-            committed_map_payload_sha256: [0x21; 32],
+            committed_map_boot_nonce: [0x21; 16],
+            committed_map_commit_sequence: 1,
+            committed_map_source_timestamp_ns: 1,
             committed_map_frame_id: "map".into(),
             source_timestamp_ns: 7_000_000_000,
             boundary_id: "native-boundary".into(),

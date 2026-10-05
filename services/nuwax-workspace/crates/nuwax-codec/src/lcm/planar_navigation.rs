@@ -2,8 +2,10 @@
 use super::schema::{self, OccupancyGrid};
 use crate::{CodecError, CodecResult};
 
-/// 由lcm-gen（类型生成器）生成并经真实通信核对的指纹。
-pub const FINGERPRINT: [u8; 8] = 0x7b8a_d3f2_faf4_fdd4_u64.to_be_bytes();
+/// 当前线格式版本，拒绝旧的栅格摘要布局。
+pub const SCHEMA_VERSION: i32 = 3;
+/// 由实际IDL生成的递归指纹。
+pub const FINGERPRINT: [u8; 8] = 0x2a33_0e41_787c_4b45_u64.to_be_bytes();
 /// 二维导航观测的完整协议类型。
 pub const TYPE_NAME: &str = "nuwax_msgs.PlanarNavigationMap";
 /// 与规范栅格通道分离的导航派生通道。
@@ -26,8 +28,12 @@ pub struct PlanarNavigationMap {
     pub session_generation: i64,
     /// 已提交规范地图修订。
     pub map_revision: i64,
-    /// 已提交规范地图的有效栅格摘要。
-    pub map_payload_sha256: [u8; 32],
+    /// 真实规范占据提交的启动域；只比较相等性。
+    pub map_boot_nonce: [u8; 16],
+    /// 真实规范占据提交序号。
+    pub map_commit_sequence: i64,
+    /// 真实规范占据提交来源时间；独立于本次扫描时间。
+    pub map_source_timestamp_ns: i64,
     /// 当前运行中单调递增的观测修订。
     pub observation_revision: i64,
     /// 本次真实扫描来源序号。
@@ -56,6 +62,13 @@ impl PlanarNavigationMap {
             return Err(bad("二维导航拥有方或观测身份非法"));
         }
         if self.cleared {
+            let absent = self.map_revision == 0 && self.map_boot_nonce == [0; 16]
+                && self.map_commit_sequence == 0 && self.map_source_timestamp_ns == 0;
+            let complete = self.map_revision > 0 && self.map_boot_nonce != [0; 16]
+                && self.map_commit_sequence > 0 && self.map_source_timestamp_ns >= 0;
+            if !absent && !complete {
+                return Err(bad("二维撤销的占据来源必须明确缺省或完整"));
+            }
             if !self.grid.data.is_empty() || self.grid.info.width != 0 || self.grid.info.height != 0
             {
                 return Err(bad("二维导航撤销必须不含栅格"));
@@ -64,7 +77,9 @@ impl PlanarNavigationMap {
         }
         let grid = &self.grid;
         if self.map_revision <= 0
-            || self.map_payload_sha256 == [0; 32]
+            || self.map_boot_nonce == [0; 16]
+            || self.map_commit_sequence <= 0
+            || self.map_source_timestamp_ns < 0
             || self.source_sequence < 0
             || self.source_timestamp_ns <= 0
             || grid.header.frame_id.is_empty()
@@ -90,7 +105,7 @@ impl PlanarNavigationMap {
 pub fn encode_body(value: &PlanarNavigationMap) -> CodecResult<Vec<u8>> {
     value.validate()?;
     let mut out = Vec::new();
-    out.extend(2i32.to_be_bytes());
+    out.extend(SCHEMA_VERSION.to_be_bytes());
     out.extend(value.runtime_generation.to_be_bytes());
     out.extend(((value.session_id.len() + 1) as i32).to_be_bytes());
     out.extend(value.session_id.as_bytes());
@@ -98,7 +113,9 @@ pub fn encode_body(value: &PlanarNavigationMap) -> CodecResult<Vec<u8>> {
     out.extend(value.session_generation.to_be_bytes());
     out.extend(value.map_frame_generation.to_be_bytes());
     out.extend(value.map_revision.to_be_bytes());
-    out.extend(value.map_payload_sha256);
+    out.extend(value.map_boot_nonce);
+    out.extend(value.map_commit_sequence.to_be_bytes());
+    out.extend(value.map_source_timestamp_ns.to_be_bytes());
     for n in [
         value.observation_revision,
         value.source_sequence,
@@ -119,7 +136,7 @@ pub fn decode_body(input: &[u8]) -> CodecResult<PlanarNavigationMap> {
         return Err(bad("二维导航观测超限"));
     }
     let mut reader = Reader { input, pos: 0 };
-    if i32::from_be_bytes(reader.take(4)?.try_into().unwrap()) != 2 {
+    if i32::from_be_bytes(reader.take(4)?.try_into().unwrap()) != SCHEMA_VERSION {
         return Err(bad("二维导航版本不支持"));
     }
     let runtime_generation = reader.i64()?;
@@ -137,7 +154,9 @@ pub fn decode_body(input: &[u8]) -> CodecResult<PlanarNavigationMap> {
     let session_generation = reader.i64()?;
     let map_frame_generation = reader.i64()?;
     let map_revision = reader.i64()?;
-    let map_payload_sha256 = reader.take(32)?.try_into().unwrap();
+    let map_boot_nonce = reader.take(16)?.try_into().unwrap();
+    let map_commit_sequence = reader.i64()?;
+    let map_source_timestamp_ns = reader.i64()?;
     let observation_revision = reader.i64()?;
     let source_sequence = reader.i64()?;
     let source_timestamp_ns = reader.i64()?;
@@ -153,7 +172,9 @@ pub fn decode_body(input: &[u8]) -> CodecResult<PlanarNavigationMap> {
         session_id,
         session_generation,
         map_revision,
-        map_payload_sha256,
+        map_boot_nonce,
+        map_commit_sequence,
+        map_source_timestamp_ns,
         observation_revision,
         source_sequence,
         source_timestamp_ns,
@@ -186,7 +207,7 @@ impl<'a> Reader<'a> {
 /// 每个实际消费者保存自己的已接纳顺序；来源倒退不刷新任何接收期限。
 #[derive(Default)]
 pub struct Admission {
-    latest: Option<(i64, i64, String, i64, i64, i64)>,
+    latest: Option<(i64, i64, String, i64, i64, i64, [u8; 16])>,
 }
 impl Admission {
     /// 接纳严格前进的真实观测；返回是否切换来源域。
@@ -207,12 +228,17 @@ impl Admission {
             if domain < (old.0, old.1, old.5)
                 || (domain == (old.0, old.1, old.5)
                     && (old.2 != value.session_id
+                        || (old.6 != [0; 16] && value.map_boot_nonce != [0; 16]
+                            && old.6 != value.map_boot_nonce)
                         || value.observation_revision <= old.3
                         || !value.cleared && value.source_timestamp_ns <= old.4))
             {
                 return Err("二维导航观测来源已过期或冲突".into());
             }
         }
+        let boot = if !changed && value.map_boot_nonce == [0; 16] {
+            self.latest.as_ref().map_or([0; 16], |old| old.6)
+        } else { value.map_boot_nonce };
         self.latest = Some((
             value.runtime_generation,
             value.session_generation,
@@ -220,6 +246,7 @@ impl Admission {
             value.observation_revision,
             value.source_timestamp_ns,
             value.map_frame_generation,
+            boot,
         ));
         Ok(changed)
     }
@@ -235,7 +262,9 @@ mod tests {
             session_id: "map-a".into(),
             session_generation: 1,
             map_revision: 4,
-            map_payload_sha256: [3; 32],
+            map_boot_nonce: [3; 16],
+            map_commit_sequence: 7,
+            map_source_timestamp_ns: 900_000_000,
             observation_revision: 1,
             source_sequence: 0,
             source_timestamp_ns: 1_000_000_000,
@@ -286,6 +315,48 @@ mod tests {
         assert!(admission.admit(&map, 1_000_000_001).unwrap());
         assert!(admission.admit(&cleared, 1_000_000_001).is_err());
     }
+    #[test]
+    fn receipts_are_required_except_for_explicit_no_map_clears() {
+        let map = value();
+        for mutate in [
+            (|m: &mut PlanarNavigationMap| m.map_boot_nonce = [0; 16]) as fn(&mut PlanarNavigationMap),
+            |m| m.map_commit_sequence = 0,
+            |m| m.map_source_timestamp_ns = -1,
+        ] {
+            let mut missing = map.clone();
+            mutate(&mut missing);
+            assert!(encode_body(&missing).is_err());
+        }
+        let mut clear = PlanarNavigationMap {
+            cleared: true, map_revision: 0, map_boot_nonce: [0; 16],
+            map_commit_sequence: 0, map_source_timestamp_ns: 0,
+            grid: OccupancyGrid::default(), ..map.clone()
+        };
+        assert_eq!(decode_body(&encode_body(&clear).unwrap()).unwrap(), clear);
+        clear.map_commit_sequence = 1;
+        assert!(encode_body(&clear).is_err());
+        let mut old = encode_body(&map).unwrap();
+        old[..4].copy_from_slice(&2_i32.to_be_bytes());
+        assert!(decode_body(&old).is_err());
+    }
+
+    #[test]
+    fn boot_nonce_is_an_opaque_domain_and_requires_an_owner_transition() {
+        for nonce in [[1; 16], [0xff; 16]] {
+            let mut admission = Admission::default();
+            let map = value();
+            admission.admit(&map, map.source_timestamp_ns).unwrap();
+            let mut changed_boot = map.clone();
+            changed_boot.map_boot_nonce = nonce;
+            changed_boot.observation_revision += 1;
+            changed_boot.source_timestamp_ns += 1;
+            changed_boot.grid.header.stamp_nsec += 1;
+            assert!(admission.admit(&changed_boot, changed_boot.source_timestamp_ns).is_err());
+            changed_boot.runtime_generation += 1;
+            assert!(admission.admit(&changed_boot, changed_boot.source_timestamp_ns).unwrap());
+        }
+    }
+
     #[test]
     fn codec_rejects_truncated_nested_grid_and_conflicting_source_stamp() {
         let map = value();

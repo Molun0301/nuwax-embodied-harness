@@ -547,7 +547,7 @@ struct PreparedCandidateMap {
     persistent: PersistentOccupancyGrid,
     raw: MapState,
     effective: MapState,
-    event: MapRevisionEvent,
+    event: crate::lcm_runtime::PreparedMapRevisionEvent,
     zones: crate::forbidden_zones::LoadedForbiddenZones,
     zone_cache: crate::forbidden_zones::ForbiddenZoneCache,
 }
@@ -619,7 +619,7 @@ impl PlanarMapPreparation {
         };
         let effective = crate::forbidden_zones::compose_effective_map(&raw, &zones)?;
         self.session.revision = revision;
-        let event = MapRevisionEvent::from_effective_and_raw(&effective, &raw, &self.session);
+        let event = crate::lcm_runtime::PreparedMapRevisionEvent::from_effective_and_raw(&effective, &raw, &self.session);
         Ok(PreparedPlanarMap {
             has_observation: self.has_observation,
             snapshot: self.snapshot,
@@ -670,7 +670,7 @@ impl MappingCommitPreparation {
         };
         let effective = crate::forbidden_zones::compose_effective_map(&raw, &zones)?;
         self.session.revision = revision;
-        let event = MapRevisionEvent::from_effective_and_raw(&effective, &raw, &self.session);
+        let event = crate::lcm_runtime::PreparedMapRevisionEvent::from_effective_and_raw(&effective, &raw, &self.session);
         Ok(Some(PreparedCandidateMap { persistent, raw, effective, event, zones,
                                     zone_cache: self.zone_cache.clone() }))
     }
@@ -2413,6 +2413,7 @@ impl MappingAdapter {
         let occupancy_receipt = self.reserve_occupancy_commit_receipt(
             next_revision, candidate.source_timestamp_ns, candidate.backend_kind, candidate.backend_generation,
         )?;
+        let event = prepared.event.seal(occupancy_receipt.clone())?;
         self.persistent_grid = Some(Arc::new(prepared.persistent));
         self.record_forbidden_zone_application(&prepared.zones, next_revision);
         *self.forbidden_zone_cache.lock() = prepared.zone_cache;
@@ -2427,7 +2428,7 @@ impl MappingAdapter {
         self.raw_map = Some(prepared.raw);
         Ok(CommittedMappingCandidate {
             token: token.clone(), resolution, accepted_map_points: candidate.accepted_points_map,
-            event: Some(prepared.event), session_generation: token.session_generation,
+            event: Some(event), session_generation: token.session_generation,
             source_timestamp_ns: token.source_timestamp_ns, backend_kind: candidate.backend_kind,
             backend_generation: candidate.backend_generation, occupancy_receipt: Some(occupancy_receipt),
         })
@@ -2617,7 +2618,7 @@ impl MappingAdapter {
             self.mapping_backend.kind(),
             self.backend_generation,
         )?;
-        let event = MapRevisionEvent::from_effective_and_raw(&map, &raw_map, &self.lifecycle);
+        let event = crate::lcm_runtime::PreparedMapRevisionEvent::from_effective_and_raw(&map, &raw_map, &self.lifecycle).seal(receipt.clone())?;
         Ok(PreparedPgoInstall {
             map,
             event,
@@ -2692,13 +2693,13 @@ impl MappingAdapter {
             self.mapping_backend.kind(),
             self.backend_generation,
         )?;
+        let event = crate::lcm_runtime::PreparedMapRevisionEvent::from_effective_and_raw(&map, &raw_map, &self.lifecycle).seal(receipt.clone())?;
         self.checkpoint_installed = true;
         self.persistent_grid = Some(Arc::new(persistent_grid));
         self.record_forbidden_zone_application(&loaded, next_revision);
         self.global_revision = next_revision;
         self.revision = next_revision;
         self.lifecycle.revision = next_revision;
-        let event = MapRevisionEvent::from_effective_and_raw(&map, &raw_map, &self.lifecycle);
         self.last_occupancy_commit_receipt = Some(receipt);
         self.raw_map = Some(raw_map);
         Ok((map, event))
@@ -2819,6 +2820,7 @@ impl MappingAdapter {
             MappingBackendKind::SlamToolbox,
             self.backend_generation,
         )?;
+        let event = map.event.seal(receipt.clone())?;
         self.checkpoint_installed = true;
         self.persistent_grid = Some(Arc::new(map.persistent));
         self.record_forbidden_zone_application(&map.zones, revision);
@@ -2828,7 +2830,7 @@ impl MappingAdapter {
         self.lifecycle.revision = revision;
         self.last_occupancy_commit_receipt = Some(receipt);
         self.raw_map = Some(map.raw);
-        let result = (map.effective, map.event);
+        let result = (map.effective, event);
         if let Some(transform)=transform {
         self.frame_generation = transform.generation;
         self.global_frame_established = true;
@@ -3044,13 +3046,16 @@ impl MappingAdapter {
         raw_map.timestamp_ns = timestamp_ns;
         let effective_map = self.compose_forbidden_zones(&raw_map, &loaded)?;
 
+        let receipt = self.reserve_occupancy_commit_receipt(next_revision, timestamp_ns,
+            self.mapping_backend.kind(), self.backend_generation)?;
+        let event = crate::lcm_runtime::PreparedMapRevisionEvent::from_effective_and_raw(
+            &effective_map, &raw_map, &self.lifecycle).seal(receipt.clone())?;
         self.record_forbidden_zone_application(&loaded, next_revision);
         self.global_revision = next_revision;
         self.revision = next_revision;
         self.lifecycle.revision = next_revision;
         shared.map = effective_map;
-        let event =
-            MapRevisionEvent::from_effective_and_raw(&shared.map, &raw_map, &self.lifecycle);
+        self.last_occupancy_commit_receipt = Some(receipt);
         self.raw_map = Some(raw_map);
         drop(shared);
         let _ = map_revision_tx.send(event);
@@ -3818,6 +3823,11 @@ impl MappingAdapter {
                     return false;
                 }
             };
+            let event = match crate::lcm_runtime::PreparedMapRevisionEvent::from_effective_and_raw(
+                &effective_map, &raw_map, &self.lifecycle).seal(receipt.clone()) {
+                Ok(event) => event,
+                Err(error) => { warn!(%error, "mapping event receipt seal rejected"); return false; }
+            };
             self.persistent_grid = Some(Arc::new(next_persistent));
             self.record_forbidden_zone_application(&loaded, next_revision);
             self.global_revision = next_revision;
@@ -3826,10 +3836,9 @@ impl MappingAdapter {
             self.last_built_generation = built_generation;
             self.last_built_point_count = built_point_count;
             self.last_built_received_at_ns = built_received_at_ns;
-            // 从刚 commit 的 MapState 构造自包含事件，确保 metadata/data/checksum
+            // 从刚 commit 的 MapState 构造自包含事件，确保 metadata/data/receipt
             // 属于同一 revision，server 不需要再读取可能已前进的 SharedState。
             self.lifecycle.revision = next_revision;
-            let event = MapRevisionEvent::from_effective_and_raw(&s.map, &raw_map, &self.lifecycle);
             self.last_occupancy_commit_receipt = Some(receipt);
             self.raw_map = Some(raw_map);
             drop(s); // 释放 write lock,后续 send 不持锁

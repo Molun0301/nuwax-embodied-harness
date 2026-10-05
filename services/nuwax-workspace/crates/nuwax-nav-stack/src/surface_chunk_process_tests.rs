@@ -116,8 +116,8 @@ fn message(repository:&Repository,revision:u64,variant:u16)->schema::NavigationM
     std::fs::write(repository.path().join(format!("manifest-{revision}.json")), &root).unwrap();
     schema::NavigationMap3D {
         schema_version:schema::NAVIGATION_MAP_3D_SCHEMA_VERSION,producer_runtime_generation:17,
-        committed_map:schema::CommittedMapIdentity{session_id:"remote-fine".into(),session_generation:1,revision:revision as i64,payload_sha256:[3;32],frame_id:"map".into()},
-        map_frame_generation:1,cloud_revision:revision as i64,source_timestamp_ns:stamp as i64,source_voxel_size:0.05,
+        committed_map:schema::CommittedMapIdentity{session_id:"remote-fine".into(),session_generation:1,revision:revision as i64,commit_boot_nonce:[4;16],commit_sequence:revision as i64,source_timestamp_ns:stamp as i64,frame_id:"map".into()},
+        map_frame_generation:1,cloud_revision:revision as i64,cloud_occupancy_revision:revision as i64,source_timestamp_ns:stamp as i64,source_voxel_size:0.05,
         commit_boot_nonce:[4;16],commit_sequence:revision as i64,cleared:false,virtual_obstacles:None,
         fine:Some(Transfer{root,included:BTreeMap::new()}),
         cloud:schema::PointCloud2{header:schema::Header{seq:revision as i32,stamp_sec:(stamp/1_000_000_000) as i32,stamp_nsec:(stamp%1_000_000_000) as i32,frame_id:"map".into()},height:1,width:0,fields:["x","y","z"].iter().enumerate().map(|(i,name)|schema::PointField{name:(*name).into(),offset:(i*4) as i32,datatype:7,count:1}).collect(),is_bigendian:false,point_step:12,row_step:0,data:Vec::new(),is_dense:true},

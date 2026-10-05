@@ -18,7 +18,7 @@ extern "C" {
 #include "nav_msgs_OccupancyGrid.h"
 #include "nuwax_msgs_NavigationMapBlock.h"
 #include "sensor_msgs_PointCloud2.h"
-#define NUWAX_MSGS_NAVIGATIONMAP3D_SCHEMA_VERSION_V3 3
+#define NUWAX_MSGS_NAVIGATIONMAP3D_SCHEMA_VERSION_V4 4
 
 typedef struct _nuwax_msgs_NavigationMap3D nuwax_msgs_NavigationMap3D;
 struct _nuwax_msgs_NavigationMap3D
@@ -34,9 +34,11 @@ struct _nuwax_msgs_NavigationMap3D
     int64_t    occupancy_revision;
 
     /**
-     * LCM Type: byte[32]
+     * LCM Type: byte[16]
      */
-    uint8_t    occupancy_payload_sha256[32];
+    uint8_t    occupancy_commit_boot_nonce[16];
+    int64_t    occupancy_commit_sequence;
+    int64_t    occupancy_source_timestamp_ns;
 
     /**
      * LCM Type: string
@@ -44,6 +46,11 @@ struct _nuwax_msgs_NavigationMap3D
     char*      frame_id;
     int64_t    map_frame_generation;
     int64_t    cloud_revision;
+
+    /**
+     * The occupancy baseline retained in the original cloud receipt.
+     */
+    int64_t    cloud_occupancy_revision;
     int64_t    source_timestamp_ns;
     float      source_voxel_size;
 

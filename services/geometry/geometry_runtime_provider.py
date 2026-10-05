@@ -10,6 +10,7 @@ from core.config_values import runtime_value
 
 from contextlib import contextmanager
 from collections import deque
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -50,7 +51,7 @@ from services.geometry.mapping_backend_checkpoint_store import (
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.geometry_runtime_provider")
 
 _DEFAULT_GRPC_MESSAGE_LIMIT_BYTES = 128 * 1024 * 1024
-_OCCUPANCY_SCHEMA_VERSION = 1
+_OCCUPANCY_SCHEMA_VERSION = 2
 _ROLLOVER_RECOVERY_DEADLINE_SEC = 4.0
 
 _MappingIdentity = Tuple[str, str, int]
@@ -6463,65 +6464,47 @@ class GeometryRuntimeProvider:
         )
 
     def get_occupancy_grid(self) -> Optional[OccupancyGrid]:
-        """通过全量 gRPC getter 返回 MapProvider 标准 OccupancyGrid。"""
-
+        """Return the receipt-bound stream owner, or an explicitly unbound unary view."""
         with self._map_state_lock:
             if self._stopping or self._mapping_transition_inflight:
                 return None
             request_identity = self._mapping_identity
             request_token = self._map_delivery_token_locked()
+            cached = getattr(self, "_last_occupancy_grid", None)
+            evidence = getattr(self, "_last_map_update_evidence", None)
+            bound = (cached is not None and evidence is not None and evidence[0] == request_token
+                     and getattr(self, "_last_occupancy_grid_identity", None) == request_identity)
         if request_identity is None:
             return None
-        payload = self.get_occupancy_grid_data()
-        if payload is None:
-            with self._map_state_lock:
-                if (
-                    self._stopping
-                    or self._mapping_transition_inflight
-                    or self._map_delivery_token_locked() != request_token
-                    or request_identity is None
-                    or self._last_occupancy_grid_identity != request_identity
-                ):
-                    return None
-                cached = self._last_occupancy_grid
-            # 整图复制随地图增长，不能占用实时位姿也需要的来源状态锁。
-            result = cached.model_copy(deep=True) if cached is not None else None
+        if bound:
+            # Packed cells own immutable bytes. Copy only editable descriptor shells,
+            # never expand the whole grid merely to return an existing owner.
+            result = cached.model_copy(update={"origin": cached.origin.model_copy(deep=True),
+                                               "metadata": copy.deepcopy(cached.metadata)})
             with self._map_state_lock:
                 if (self._stopping or self._mapping_transition_inflight
-                        or self._map_delivery_token_locked() != request_token):
+                        or self._map_delivery_token_locked() != request_token
+                        or self._last_occupancy_grid is not cached):
                     return None
             return result
+        payload = self.get_occupancy_grid_data()
+        if payload is None:
+            return None
         try:
             grid = self._occupancy_grid_from_components(
-                map_name=request_identity[1],
-                width=int(payload["width"]),
-                height=int(payload["height"]),
-                resolution=float(payload["resolution"]),
-                origin_x=float(payload["origin_x"]),
-                origin_y=float(payload["origin_y"]),
-                frame_id=str(payload["frame_id"]),
-                timestamp_ns=int(payload.get("timestamp_ns") or 0),
-                data=bytes(payload["data"]),
-            )
+                map_name=request_identity[1], width=int(payload["width"]), height=int(payload["height"]),
+                resolution=float(payload["resolution"]), origin_x=float(payload["origin_x"]),
+                origin_y=float(payload["origin_y"]), frame_id=str(payload["frame_id"]),
+                timestamp_ns=int(payload.get("timestamp_ns") or 0), data=bytes(payload["data"]))
         except (KeyError, TypeError, ValueError):
-            LOGGER.exception("GetOccupancyGridData 返回了无效栅格。")
+            LOGGER.exception("GetOccupancyGridData returned an invalid unbound grid")
             return None
-        cached_grid = grid.model_copy(deep=True)
+        grid.metadata = {"source_name": "geometry_runtime", "identity_status": "unbound_unary"}
         with self._map_state_lock:
-            if (
-                self._stopping
-                or self._mapping_transition_inflight
-                or self._map_delivery_token_locked() != request_token
-            ):
-                LOGGER.warning(
-                    "GetOccupancyGridData 返回期间连接或建图 transition 已切换，"
-                    "丢弃无身份 unary 栅格。"
-                )
+            if (self._stopping or self._mapping_transition_inflight
+                    or self._map_delivery_token_locked() != request_token):
                 return None
-            if request_identity is not None:
-                self._last_occupancy_grid = cached_grid
-                self._last_occupancy_grid_identity = request_identity
-                self._last_occupancy_grid_revision = int(payload["revision"])
+        # The unary wire lacks a receipt: it cannot replace the committed stream cache.
         return grid
 
     def get_occupancy_grid_identity(
@@ -6563,6 +6546,8 @@ class GeometryRuntimeProvider:
             return {
                 "mapping_identity": identity,
                 "revision": revision,
+                "content_identity": copy.deepcopy(cached.metadata.get("content_identity")),
+                "map_provenance": copy.deepcopy(cached.metadata.get("map_provenance")),
             }
 
     def get_mapping_stream_status(self) -> Dict[str, Any]:
@@ -6630,204 +6615,178 @@ class GeometryRuntimeProvider:
 
         return None
 
-    def _map_update_to_payload(self, update) -> Dict[str, Any]:
-        """校验 MapUpdateNotification 并构造 MappingService 可消费 payload。"""
+    def _map_update_to_payload(self, update) -> Optional[Dict[str, Any]]:
+        """Admit a complete owned map update without content-derived identity."""
         import numpy as np
-        meta = update.meta
-        data = bytes(update.data)
-        declared_size = int(update.size)
-        schema_version = int(update.schema_version)
-        checksum = str(update.checksum or "").strip().lower()
-        session_id = str(update.session_id or "").strip()
-        map_name = str(update.map_name or "").strip()
-        session_generation = int(update.session_generation)
-        if not session_id or not map_name or session_generation <= 0:
-            raise ValueError("map update is missing mapping session identity")
-        expected_size = int(meta.width) * int(meta.height)
-        if declared_size != len(data) or declared_size != expected_size:
-            raise ValueError(
-                "map update size mismatch: declared=%d data=%d expected=%d"
-                % (declared_size, len(data), expected_size)
-            )
-        if schema_version != _OCCUPANCY_SCHEMA_VERSION:
-            raise ValueError(
-                "unsupported map schema_version=%d" % schema_version
-            )
-        actual_checksum = hashlib.sha256(data).hexdigest()
-        if not checksum or checksum != actual_checksum:
-            raise ValueError("map update checksum mismatch")
-        grid = self._occupancy_grid_from_components(
-            map_name=map_name,
-            width=meta.width,
-            height=meta.height,
-            resolution=meta.resolution,
-            origin_x=meta.origin_x,
-            origin_y=meta.origin_y,
-            frame_id=meta.frame_id,
-            timestamp_ns=meta.timestamp_ns,
-            data=data,
-        )
-        revision = int(meta.revision)
-        cells = np.frombuffer(data, dtype=np.int8)
-        known_cell_count = int(np.count_nonzero(cells >= 0))
-        occupied_cell_count = int(np.count_nonzero(cells >= 50))
-        display_grid = grid
-        display_revision = revision
-        display_occupancy_source = "effective_fallback"
-        display_occupancy_fallback_reason = "raw_grid_unavailable"
-        display_checksum = actual_checksum
-        raw_data = bytes(getattr(update, "raw_data", b"") or b"")
-        raw_checksum = str(getattr(update, "raw_checksum", "") or "").strip().lower()
-        if not raw_data and raw_checksum == actual_checksum:
-            display_occupancy_source = "raw_physical"
-            display_occupancy_fallback_reason = None
-        elif raw_data:
-            raw_checksum_actual = hashlib.sha256(raw_data).hexdigest()
-            try:
-                if len(raw_data) != declared_size:
-                    raise ValueError(
-                        "raw map update size mismatch: raw=%d expected=%d"
-                        % (len(raw_data), declared_size)
-                    )
-                if not raw_checksum or raw_checksum != raw_checksum_actual:
-                    raise ValueError("raw map update checksum mismatch")
-                display_grid = self._occupancy_grid_from_components(
-                    map_name=map_name,
-                    width=meta.width,
-                    height=meta.height,
-                    resolution=meta.resolution,
-                    origin_x=meta.origin_x,
-                    origin_y=meta.origin_y,
-                    frame_id=meta.frame_id,
-                    timestamp_ns=meta.timestamp_ns,
-                    data=raw_data,
-                )
-            except (TypeError, ValueError):
-                display_occupancy_fallback_reason = "raw_grid_invalid"
-                LOGGER.exception(
-                    "地图修订携带的物理展示栅格无效，回退到有效栅格。"
-                )
-            else:
-                display_checksum = raw_checksum_actual
-                display_occupancy_source = "raw_physical"
-                display_occupancy_fallback_reason = None
-        if display_grid is grid:
-            # 同一次更新的同一个栅格复用已计算标量，不再次遍历整张地图。
-            display_known_cell_count = known_cell_count
-            display_occupied_cell_count = occupied_cell_count
+        if int(update.schema_version) != _OCCUPANCY_SCHEMA_VERSION:
+            raise ValueError("unsupported map schema_version=%d" % int(update.schema_version))
+        meta = _require_proto_message_field(update, "meta")
+        receipt = _occupancy_receipt_dict(_require_proto_message_field(update, "occupancy_receipt"))
+        commit = receipt["commit_id"]
+        session_id, map_name = str(update.session_id), str(update.map_name)
+        generation, revision, timestamp = int(update.session_generation), int(meta.revision), int(meta.timestamp_ns)
+        if (not session_id or session_id != session_id.strip() or not map_name or map_name != map_name.strip()
+                or generation <= 0 or revision <= 0 or receipt["session_id"] != session_id
+                or receipt["session_generation"] != generation or receipt["occupancy_revision"] != revision
+                or receipt["source_timestamp_ns"] != timestamp or receipt["backend_generation"] <= 0
+                or receipt["backend_kind"] not in _SUPPORTED_MAPPING_BACKEND_KINDS
+                or len(commit["boot_nonce"]) != 16 or not any(commit["boot_nonce"]) or commit["sequence"] <= 0):
+            raise ValueError("map update differs from its actual occupancy receipt")
+        if (not meta.frame_id or meta.frame_id != meta.frame_id.strip()
+                or not all(math.isfinite(value) for value in (meta.resolution, meta.origin_x, meta.origin_y))
+                or meta.resolution <= 0 or meta.width <= 0 or meta.height <= 0):
+            raise ValueError("map update geometry is invalid")
+        from contracts.naming import validate_frame_id
+        validate_frame_id(str(meta.frame_id))
+        data, raw = bytes(update.data), bytes(update.raw_data)
+        size, representation = int(update.size), int(update.raw_representation)
+        if size != len(data) or size != int(meta.width) * int(meta.height):
+            raise ValueError("map update size differs from its complete snapshot")
+        if representation == int(pb2.RAW_MAP_REPRESENTATION_SEPARATE_RAW):
+            if len(raw) != size:
+                raise ValueError("separate raw map must carry a complete same-layout body")
+            display_body = raw
+        elif representation in (int(pb2.RAW_MAP_REPRESENTATION_SAME_AS_EFFECTIVE), int(pb2.RAW_MAP_REPRESENTATION_EFFECTIVE_FALLBACK)):
+            if raw:
+                raise ValueError("shared/fallback raw representation must not carry a second body")
+            display_body = data if representation == int(pb2.RAW_MAP_REPRESENTATION_SAME_AS_EFFECTIVE) else None
         else:
-            display_cells = np.frombuffer(raw_data, dtype=np.int8)
-            display_known_cell_count = int(np.count_nonzero(display_cells >= 0))
-            display_occupied_cell_count = int(np.count_nonzero(display_cells >= 50))
-        display_occupancy_metadata = {
-            "checksum": display_checksum,
-            "occupancy_content_hash": display_checksum,
-            "content_hash": display_checksum,
-            "occupancy_content_revision": display_revision,
-            "content_revision": display_revision,
-            "known_cell_count": display_known_cell_count,
-            "occupied_cell_count": display_occupied_cell_count,
-            "occupancy_metrics": {
-                "content_hash": display_checksum,
-                "content_revision": display_revision,
-                "known_cell_count": display_known_cell_count,
-                "occupied_cell_count": display_occupied_cell_count,
-            },
-        }
-        metadata = {
-            "event_type": "content_update",
-            "source_kind": "platform_live_map_provider",
-            "source_name": "geometry_runtime",
-            "map_snapshot_kind": "live_streaming",
-            "live_streaming_ready": True,
-            "mapping_live_streaming_ready": True,
-            "source_alive": True,
-            "streaming": True,
-            "frame_id": grid.frame_id,
-            "revision": revision,
-            "update_sequence": revision,
-            "occupancy_sequence": revision,
-            "occupancy_message_count": revision,
-            "occupancy_content_revision": revision,
-            "content_revision": revision,
-            "checksum": actual_checksum,
-            "occupancy_content_hash": actual_checksum,
-            "content_hash": actual_checksum,
-            "schema_version": schema_version,
-            "size": declared_size,
-            "last_seen_ms": int(update.last_seen_ms),
-            "timestamp_ns": int(meta.timestamp_ns),
-            "mapping_session_id": session_id,
-            "session_id": session_id,
-            "map_name": map_name,
-            "source_epoch": "%s:%d" % (session_id, session_generation),
-            "session_generation": session_generation,
-            "known_cell_count": known_cell_count,
-            "occupied_cell_count": occupied_cell_count,
-            "occupancy_metrics": {
-                "content_hash": actual_checksum,
-                "content_revision": revision,
-                "known_cell_count": known_cell_count,
-                "occupied_cell_count": occupied_cell_count,
-            },
-        }
-        identity = (session_id, map_name, session_generation)
+            raise ValueError("map update raw representation is missing or unsupported")
+        identity = (session_id, map_name, generation)
+        provenance = {"schema_version": 2, "commit_id": {"boot_nonce": commit["boot_nonce"].hex(), "sequence": commit["sequence"]},
+            "session_id": session_id, "session_generation": generation, "occupancy_revision": revision,
+            "source_timestamp_ns": timestamp, "backend_kind": receipt["backend_kind"],
+            "backend_generation": receipt["backend_generation"], "frame_id": str(meta.frame_id)}
+        receipt_key = (commit["boot_nonce"], commit["sequence"], session_id, generation,
+                       receipt["backend_kind"], receipt["backend_generation"], revision, timestamp, str(meta.frame_id), map_name)
+        layout = (int(meta.width), int(meta.height), struct.pack("<fdd", meta.resolution, meta.origin_x, meta.origin_y), str(meta.frame_id))
+        body = (layout, representation, data, raw, int(update.last_seen_ms))
         with self._map_state_lock:
-            if self._stopping or self._mapping_transition_inflight:
-                raise ValueError(
-                    "map update arrived during provider disconnect or mapping transition"
-                )
-            if self._mapping_identity is None:
-                self._mapping_identity = identity
-                self._mapping_transition_epoch += 1
-            elif self._mapping_identity != identity:
-                raise ValueError(
-                    "map update mapping identity mismatch: expected=%r actual=%r"
-                    % (self._mapping_identity, identity)
-                )
-            # 与地图服务共享本次已发布的只读图层，不在状态锁内复制整图。
-            self._last_occupancy_grid = grid
-            self._last_occupancy_grid_identity = identity
-            self._last_occupancy_grid_revision = revision
-            delivery_token = self._map_delivery_token_locked()
-            self._last_map_stream_observation = (delivery_token, {
-                "mapping_session_id": session_id,
-                "map_name": map_name,
-                "session_generation": session_generation,
-                "occupancy_grid_ready": revision > 0,
-                "occupancy_has_publisher": True,
-                "occupancy_revision": revision,
-                "occupancy_sequence": revision,
-                "occupancy_message_count": revision,
-                "latest_occupancy_timestamp": (
-                    grid.timestamp.isoformat() if int(meta.timestamp_ns) > 0 else None
-                ),
-                "latest_occupancy_received_at": datetime.now(timezone.utc).isoformat(),
-                "occupancy_metrics": dict(metadata["occupancy_metrics"]),
-            })
-        return _MapUpdatePayload(
-            {
-                "source_name": "geometry_runtime",
-                "source_epoch": "%s:%d" % (session_id, session_generation),
-                "occupancy_grid": grid,
-                "display_occupancy_grid": display_grid,
-                "display_occupancy_source": display_occupancy_source,
-                "display_occupancy_fallback_reason": display_occupancy_fallback_reason,
-                "display_occupancy_metadata": display_occupancy_metadata,
-                "cost_map": None,
-                "semantic_map": None,
-                "width": grid.width,
-                "height": grid.height,
-                "resolution": grid.resolution_m,
-                "frame_id": grid.frame_id,
-                "revision": revision,
-                "session_id": session_id,
-                "map_name": map_name,
-                "session_generation": session_generation,
-                "metadata": metadata,
-            },
-            delivery_token=delivery_token,
-        )
+            admission_token = self._map_delivery_token_locked()
+        # Exact duplicate admission is outside the short state lock and occurs
+        # before grid/count materialization. No opaque nonce is numerically ordered.
+        previous = None
+        while True:
+            with self._map_state_lock:
+                if self._stopping or self._mapping_transition_inflight or self._map_delivery_token_locked() != admission_token:
+                    raise ValueError("map update crossed provider connection/mapping transition")
+                if self._mapping_identity is not None and self._mapping_identity != identity:
+                    raise ValueError("map update mapping identity mismatch")
+                observed = getattr(self, "_last_map_update_evidence", None)
+                previous = observed if observed is not None and observed[0] == admission_token else None
+            if previous is not None:
+                prior = previous[1]
+                if (receipt_key[0] != prior[0] or receipt_key[2:6] != prior[2:6] or receipt_key[8:] != prior[8:]):
+                    raise ValueError("map owner changed without an admitted provider transition")
+                if revision < prior[6] or commit["sequence"] < prior[1]:
+                    raise ValueError("stale map occupancy receipt")
+                if revision == prior[6] or commit["sequence"] == prior[1]:
+                    if receipt_key != prior or body != previous[2]:
+                        raise ValueError("same map receipt has conflicting immutable content")
+                    with self._map_state_lock:
+                        if getattr(self, "_last_map_update_evidence", None) is observed and self._map_delivery_token_locked() == admission_token:
+                            return None
+                    continue
+            break
+        grid = self._occupancy_grid_from_components(map_name=map_name, width=meta.width, height=meta.height,
+            resolution=meta.resolution, origin_x=meta.origin_x, origin_y=meta.origin_y,
+            frame_id=meta.frame_id, timestamp_ns=timestamp, data=data)
+        cells = np.frombuffer(data, dtype=np.int8)
+        known = int(np.count_nonzero(cells >= 0)); occupied = int(np.count_nonzero(cells >= 50))
+        display_grid = grid
+        if display_body is not None and representation == int(pb2.RAW_MAP_REPRESENTATION_SEPARATE_RAW):
+            display_grid = self._occupancy_grid_from_components(map_name=map_name, width=meta.width, height=meta.height,
+                resolution=meta.resolution, origin_x=meta.origin_x, origin_y=meta.origin_y,
+                frame_id=meta.frame_id, timestamp_ns=timestamp, data=display_body)
+            display_cells = np.frombuffer(display_body, dtype=np.int8)
+            display_known = int(np.count_nonzero(display_cells >= 0)); display_occupied = int(np.count_nonzero(display_cells >= 50))
+        else:
+            display_known, display_occupied = known, occupied
+        content_identity = {"kind": "committed_occupancy", "representation": "effective", "provenance": provenance}
+        display_identity = {"kind": "committed_occupancy", "representation": "raw_physical" if display_body is not None else "effective_fallback", "provenance": provenance}
+        # Recheck an immutable evidence snapshot after concurrent admissions;
+        # comparisons never hold the lock, and a newer complete receipt wins.
+        while True:
+            with self._map_state_lock:
+                if self._stopping or self._mapping_transition_inflight or self._map_delivery_token_locked() != admission_token:
+                    raise ValueError("map update crossed provider connection/mapping transition")
+                observed = getattr(self, "_last_map_update_evidence", None)
+                previous = observed if observed is not None and observed[0] == admission_token else None
+            if previous is not None:
+                prior = previous[1]
+                if receipt_key[0] != prior[0] or receipt_key[2:6] != prior[2:6] or receipt_key[8:] != prior[8:]:
+                    raise ValueError("map owner changed without an admitted provider transition")
+                if revision < prior[6] or commit["sequence"] < prior[1]:
+                    raise ValueError("stale map occupancy receipt")
+                if revision == prior[6] or commit["sequence"] == prior[1]:
+                    if receipt_key != prior or body != previous[2]:
+                        raise ValueError("same map receipt has conflicting immutable content")
+                    with self._map_state_lock:
+                        if getattr(self, "_last_map_update_evidence", None) is observed and self._map_delivery_token_locked() == admission_token:
+                            return None
+                    continue
+            content_changed = previous is None or previous[2][0] != layout or previous[2][2] != data
+            raw_changed = (previous is None or previous[2][0] != layout
+                or previous[2][1] != representation
+                or (previous[3] if previous[3] is not None else previous[2][2])
+                    != (display_body if display_body is not None else data))
+            # Prepare immutable delivery metadata before exposing the cached grid.
+            count = 1 if previous is None else previous[4] + 1
+            effective_metrics = {"content_identity": content_identity, "content_revision": revision,
+                "content_changed": content_changed, "receipt_progress": True, "known_cell_count": known, "occupied_cell_count": occupied}
+            display_metrics = {"content_identity": display_identity, "content_revision": revision,
+                "content_changed": raw_changed, "receipt_progress": True, "known_cell_count": display_known, "occupied_cell_count": display_occupied}
+            metadata = {"event_type": "content_update", "source_kind": "platform_live_map_provider", "source_name": "geometry_runtime",
+                "map_snapshot_kind": "live_streaming", "live_streaming_ready": True, "mapping_live_streaming_ready": True,
+                "source_alive": True, "streaming": True, "frame_id": grid.frame_id, "revision": revision,
+                "update_sequence": revision, "occupancy_sequence": revision, "occupancy_message_count": count,
+                "occupancy_content_revision": revision, "content_revision": revision, "content_identity": content_identity,
+                "map_provenance": provenance, "raw_representation": representation, "schema_version": 2,
+                "size": size, "last_seen_ms": int(update.last_seen_ms), "timestamp_ns": timestamp,
+                "mapping_session_id": session_id, "session_id": session_id, "map_name": map_name,
+                "source_epoch": "%s:%s:%d" % (commit["boot_nonce"].hex(), session_id, generation), "session_generation": generation,
+                "known_cell_count": known, "occupied_cell_count": occupied, "occupancy_metrics": effective_metrics}
+            display_metadata = {"content_identity": display_identity, "map_provenance": provenance,
+                "occupancy_content_revision": revision, "content_revision": revision,
+                "known_cell_count": display_known, "occupied_cell_count": display_occupied, "occupancy_metrics": display_metrics}
+            grid.metadata = dict(metadata)
+            if display_grid is not grid:
+                display_grid.metadata = dict(metadata, **display_metadata)
+            cached_grid = grid.model_copy(update={"origin": grid.origin.model_copy(deep=True),
+                                                  "metadata": copy.deepcopy(grid.metadata)})
+            with self._map_state_lock:
+                if getattr(self, "_last_map_update_evidence", None) is not observed:
+                    continue
+                if self._stopping or self._mapping_transition_inflight or self._map_delivery_token_locked() != admission_token:
+                    raise ValueError("map update crossed provider connection/mapping transition")
+                if self._mapping_identity is None:
+                    self._mapping_identity = identity
+                    self._mapping_transition_epoch += 1
+                elif self._mapping_identity != identity:
+                    raise ValueError("map update mapping identity mismatch")
+                delivery_token = self._map_delivery_token_locked()
+                # This is an observed delivery count only, never an identity clock.
+                self._last_map_update_evidence = (delivery_token, receipt_key, body, display_body, count)
+                self._last_occupancy_grid = cached_grid
+                self._last_occupancy_grid_identity = identity
+                self._last_occupancy_grid_revision = revision
+                break
+        with self._map_state_lock:
+            if self._map_delivery_token_locked() == delivery_token and self._last_map_update_evidence[1] == receipt_key:
+                self._last_map_stream_observation = (delivery_token, {
+                    "mapping_session_id": session_id, "map_name": map_name, "session_generation": generation,
+                    "occupancy_grid_ready": True, "occupancy_has_publisher": True, "occupancy_revision": revision,
+                    "occupancy_sequence": revision, "occupancy_message_count": count,
+                    "latest_occupancy_timestamp": grid.timestamp.isoformat() if timestamp > 0 else None,
+                    "latest_occupancy_received_at": datetime.now(timezone.utc).isoformat(), "occupancy_metrics": effective_metrics})
+        return _MapUpdatePayload({"source_name": "geometry_runtime", "source_epoch": metadata["source_epoch"],
+            "occupancy_grid": grid, "display_occupancy_grid": display_grid,
+            "display_occupancy_source": "raw_physical" if display_body is not None else "effective_fallback",
+            "display_occupancy_fallback_reason": None if display_body is not None else "raw_grid_unavailable",
+            "display_occupancy_metadata": display_metadata, "cost_map": None, "semantic_map": None,
+            "width": grid.width, "height": grid.height, "resolution": grid.resolution_m, "frame_id": grid.frame_id,
+            "revision": revision, "session_id": session_id, "map_name": map_name, "session_generation": generation,
+            "metadata": metadata}, delivery_token=delivery_token)
 
     # === Navigation ===
     # Rust proto 字段映射（round-4 HIGH 3 同步）：
@@ -6845,7 +6804,13 @@ class GeometryRuntimeProvider:
         response = self._stub.GetMappingCloudAuthority(
             pb2.Empty(), timeout=_read_deadline_sec()
         )
+        if response.schema_version != 2:
+            raise ValueError("unsupported MappingCloudAuthority schema_version")
+        commit = _mapping_commit_identity_dict(_require_proto_message_field(response, "committed_occupancy_commit_id"))
+        if len(commit["boot_nonce"]) != 16 or not any(commit["boot_nonce"]) or commit["sequence"] <= 0:
+            raise ValueError("mapping-cloud occupancy receipt is missing or invalid")
         return {
+            "schema_version": 2,
             "map_name": str(response.map_name),
             "map_frame_id": str(response.map_frame_id),
             "asset_manifest_sha256": bytes(response.asset_manifest_sha256).hex(),
@@ -6867,9 +6832,8 @@ class GeometryRuntimeProvider:
             "committed_occupancy_revision": int(
                 response.committed_occupancy_revision
             ),
-            "committed_occupancy_sha256": bytes(
-                response.committed_occupancy_sha256
-            ).hex(),
+            "committed_occupancy_commit_id": {"boot_nonce": commit["boot_nonce"].hex(), "sequence": commit["sequence"]},
+            "committed_occupancy_source_timestamp_ns": int(response.committed_occupancy_source_timestamp_ns),
             "owner_epoch": int(response.owner_epoch),
         }
 
@@ -6889,7 +6853,14 @@ class GeometryRuntimeProvider:
         self._raise_if_stopping("submit_mapping_cloud_goal")
         if not self._connected or not self._stub:
             raise RuntimeError("Geometry runtime 未连接。")
+        if authority.get("schema_version") != 2:
+            raise ValueError("mapping-cloud authority requires schema 2")
+        commit = authority["committed_occupancy_commit_id"]
+        nonce = bytes.fromhex(commit["boot_nonce"])
+        if len(nonce) != 16 or not any(nonce) or type(commit["sequence"]) is not int or not 1 <= commit["sequence"] <= (1 << 64) - 1:
+            raise ValueError("mapping-cloud occupancy receipt is missing or invalid")
         request = pb2.MappingCloudGoalRequest(
+            schema_version=2,
             query_request_id=str(query_request_id),
             query_text=str(query_text),
             caller_timeout_ms=int(caller_timeout_ms),
@@ -6908,9 +6879,8 @@ class GeometryRuntimeProvider:
             committed_occupancy_revision=int(
                 authority["committed_occupancy_revision"]
             ),
-            committed_occupancy_sha256=bytes.fromhex(
-                authority["committed_occupancy_sha256"]
-            ),
+            committed_occupancy_commit_id=pb2.MappingCommitIdentity(boot_nonce=nonce, sequence=commit["sequence"]),
+            committed_occupancy_source_timestamp_ns=int(authority["committed_occupancy_source_timestamp_ns"]),
             motion_guard_generation=int(motion_admission["guard_generation"]),
             motion_guard_boot_nonce=bytes(motion_admission["guard_boot_nonce"]),
             motion_stop_generation=int(motion_admission["motion_stop_generation"]),
@@ -9542,6 +9512,8 @@ class GeometryRuntimeProvider:
                             return
                         try:
                             payload = self._map_update_to_payload(update)
+                            if payload is None:
+                                continue
                         except Exception:
                             LOGGER.exception("丢弃无效 MapUpdateNotification，订阅继续。")
                             continue

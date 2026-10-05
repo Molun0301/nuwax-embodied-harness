@@ -142,8 +142,12 @@ pub struct PathExecutionIdentity {
     pub committed_map_session_generation: i64,
     /// Committed map revision.
     pub committed_map_revision: i64,
-    /// Committed map payload digest.
-    pub committed_map_payload_sha256: [u8; 32],
+    /// Opaque occupancy commit process domain.
+    pub committed_map_boot_nonce: [u8; 16],
+    /// Occupancy commit sequence.
+    pub committed_map_commit_sequence: i64,
+    /// Original occupancy commit timestamp.
+    pub committed_map_source_timestamp_ns: i64,
     /// Authoritative committed map frame.
     pub committed_map_frame_id: String,
     /// Navigation boundary identifier.
@@ -178,7 +182,9 @@ impl PathExecutionIdentity {
             && self.committed_map_session_id == other.committed_map_session_id
             && self.committed_map_session_generation == other.committed_map_session_generation
             && self.committed_map_revision == other.committed_map_revision
-            && self.committed_map_payload_sha256 == other.committed_map_payload_sha256
+            && self.committed_map_boot_nonce == other.committed_map_boot_nonce
+            && self.committed_map_commit_sequence == other.committed_map_commit_sequence
+            && self.committed_map_source_timestamp_ns == other.committed_map_source_timestamp_ns
             && self.committed_map_frame_id == other.committed_map_frame_id
             && self.boundary_id == other.boundary_id
             && self.boundary_sha256 == other.boundary_sha256
@@ -3067,7 +3073,9 @@ mod tests {
             committed_map_session_id: "map-session".into(),
             committed_map_session_generation: 1,
             committed_map_revision: 1,
-            committed_map_payload_sha256: [3; 32],
+            committed_map_boot_nonce: [3; 16],
+            committed_map_commit_sequence: 1,
+            committed_map_source_timestamp_ns: 1,
             committed_map_frame_id: "map".into(),
             boundary_id: String::new(),
             boundary_sha256: [0; 32],

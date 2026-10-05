@@ -52,7 +52,7 @@ use crate::runtime_diagnostics::{self, RuntimeDiagnostics, ServiceState, SharedS
 use crate::typed_codec;
 use nuwax_exploration::{BoundarySegment, ExplorationBoundary};
 use nuwax_mapping_cloud::{
-    ActiveMapIdentityV1, CloudQueryIdentityV1, GeoreferenceBindingV1, MappingCloudOwner,
+    ActiveMapIdentityV2, CloudQueryIdentityV1, GeoreferenceBindingV1, MappingCloudOwner,
     MappingCloudProvider, MappingCloudRequest, MappingCloudTerminal, OsmClient, Sha256Digest,
     VerifiedGeoreferenceV1,
 };
@@ -4476,47 +4476,10 @@ async fn forward_map_revision(
             .await
             .is_ok();
     }
-    if crate::map_checksum::sha256_hex(event.data.as_ref()) != event.checksum {
-        return tx
-            .send(Err(Status::data_loss(format!(
-                "map revision {} checksum mismatch",
-                event.revision
-            ))))
-            .await
-            .is_ok();
+    if let Err(error) = event.validate_provenance() {
+        return tx.send(Err(Status::data_loss(error))).await.is_ok();
     }
-    if event.raw_data.is_empty() && event.raw_checksum != event.checksum {
-        return tx
-            .send(Err(Status::data_loss(format!(
-                "raw map revision {} omitted data without an equivalent checksum",
-                event.revision
-            ))))
-            .await
-            .is_ok();
-    }
-    if !event.raw_data.is_empty() && event.raw_data.len() as u64 != event.size {
-        return tx
-            .send(Err(Status::data_loss(format!(
-                "raw map revision {} size mismatch: expected={}, actual={}",
-                event.revision,
-                event.size,
-                event.raw_data.len()
-            ))))
-            .await
-            .is_ok();
-    }
-    if !event.raw_data.is_empty()
-        && crate::map_checksum::sha256_hex(event.raw_data.as_ref()) != event.raw_checksum
-    {
-        return tx
-            .send(Err(Status::data_loss(format!(
-                "raw map revision {} checksum mismatch",
-                event.revision
-            ))))
-            .await
-            .is_ok();
-    }
-
+    let occupancy_receipt = occupancy_commit_receipt_proto(&event.receipt);
     let shm_ref = match occupancy_shm_current.read().await.clone() {
         Some(snapshot) if snapshot.revision == event.revision => {
             match occupancy_shm_ref(snapshot) {
@@ -4543,12 +4506,12 @@ async fn forward_map_revision(
         data: event.data.as_ref().to_vec(),
         size: event.size,
         schema_version: event.schema_version,
-        checksum: event.checksum,
+        occupancy_receipt: Some(occupancy_receipt),
+        raw_representation: event.raw_representation as i32,
         last_seen_ms: event.last_seen_ms,
         session_id: event.session_id,
         session_generation: event.session_generation,
         raw_data: event.raw_data.as_ref().to_vec(),
-        raw_checksum: event.raw_checksum,
         map_name: event.map_name,
     }))
     .await
@@ -4561,12 +4524,7 @@ async fn map_revision_claim_is_current(
     mapping_lifecycle_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> bool {
     let _lifecycle_guard = mapping_lifecycle_lock.lock().await;
-    let snapshot = mapping_adapter.lock().snapshot();
-    snapshot.active
-        && event.session_generation > 0
-        && event.session_generation == snapshot.session_generation
-        && event.session_id == snapshot.session_id
-        && event.map_name == snapshot.map_name
+    crate::lcm_runtime::map_event_matches_current_session(event, mapping_adapter)
 }
 
 async fn await_occupancy_shm_revision(
@@ -7103,7 +7061,13 @@ impl GeometryRuntime for GeometryRuntimeService {
             backend_generation: sealed.backend_generation,
             committed_occupancy_revision: u64::try_from(committed.revision)
                 .map_err(|_| Status::internal("committed revision is invalid"))?,
-            committed_occupancy_sha256: committed.payload_sha256.to_vec(),
+            schema_version: 2,
+            committed_occupancy_commit_id: Some(MappingCommitIdentity {
+                boot_nonce: committed.commit_boot_nonce.to_vec(),
+                sequence: u64::try_from(committed.commit_sequence).map_err(|_| Status::internal("map commit sequence is invalid"))?,
+            }),
+            committed_occupancy_source_timestamp_ns: u64::try_from(committed.source_timestamp_ns)
+                .map_err(|_| Status::internal("map source timestamp is invalid"))?,
             owner_epoch: self.bridge.nav.producer_runtime_generation(),
         }))
     }
@@ -7115,6 +7079,11 @@ impl GeometryRuntime for GeometryRuntimeService {
         self.ensure_running_admission("SubmitMappingCloudGoal")
             .await?;
         let request = req.into_inner();
+        if request.schema_version != 2 {
+            return Err(Status::invalid_argument("unsupported MappingCloudGoalRequest schema_version"));
+        }
+        let request_commit = validate_mapping_commit_identity(request.committed_occupancy_commit_id.as_ref(), "mapping-cloud occupancy")
+            .map_err(Status::invalid_argument)?;
         let digest = |field: &'static str, bytes: &[u8]| -> Result<Sha256Digest, Status> {
             let value: [u8; 32] = bytes
                 .try_into()
@@ -7159,7 +7128,9 @@ impl GeometryRuntime for GeometryRuntimeService {
                 != Some(request.mapping_session_generation)
             || u64::try_from(committed_map.revision).ok()
                 != Some(request.committed_occupancy_revision)
-            || committed_map.payload_sha256.as_slice() != request.committed_occupancy_sha256
+            || committed_map.commit_boot_nonce.as_slice() != request_commit.boot_nonce
+            || u64::try_from(committed_map.commit_sequence).ok() != Some(request_commit.sequence)
+            || u64::try_from(committed_map.source_timestamp_ns).ok() != Some(request.committed_occupancy_source_timestamp_ns)
             || committed_map.frame_id != request.map_frame_id
         {
             return Err(Status::failed_precondition(
@@ -7192,7 +7163,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             self.bridge.map_revision_latest_tx.subscribe(),
             Some(sealed.map_name.clone()),
         ).with_mapping_adapter(self.bridge.mapping_adapter.clone());
-        let active_map = ActiveMapIdentityV1 {
+        let active_map = ActiveMapIdentityV2 {
             map_name: request.map_name,
             map_frame_id: request.map_frame_id,
             asset_manifest_sha256: digest("asset_manifest_sha256", &request.asset_manifest_sha256)?,
@@ -7205,10 +7176,10 @@ impl GeometryRuntime for GeometryRuntimeService {
             runtime_generation: request.runtime_generation,
             mapping_session_generation: request.mapping_session_generation,
             committed_occupancy_revision: request.committed_occupancy_revision,
-            committed_occupancy_sha256: digest(
-                "committed_occupancy_sha256",
-                &request.committed_occupancy_sha256,
-            )?,
+            committed_occupancy_boot_nonce: request_commit.boot_nonce.as_slice().try_into()
+                .map_err(|_| Status::invalid_argument("map commit nonce must be 16 bytes"))?,
+            committed_occupancy_commit_sequence: request_commit.sequence,
+            committed_occupancy_source_timestamp_ns: request.committed_occupancy_source_timestamp_ns,
         };
         let query_request_id = request.query_request_id.trim().to_owned();
         let cloud_request = MappingCloudRequest {
@@ -8547,14 +8518,9 @@ mod occupancy_rpc_tests {
             data: vec![0, 100, -1, 42],
             ..crate::lcm_runtime::MapState::default()
         };
-        let event = MapRevisionEvent::from_map(
+        let event = crate::lcm_runtime::test_owner_map_revision(
+            &mut handle.mapping_adapter.as_ref().expect("mapping adapter").lock(),
             &map,
-            &handle
-                .mapping_adapter
-                .as_ref()
-                .expect("mapping adapter")
-                .lock()
-                .snapshot(),
         );
         handle.state.write().await.map = map.clone();
 
@@ -8624,17 +8590,13 @@ mod occupancy_rpc_tests {
             ..crate::lcm_runtime::MapState::default()
         };
         handle.state.write().await.map = canonical.clone();
-        let mut malformed = canonical;
-        malformed.data.pop();
-        let event = MapRevisionEvent::from_map(
-            &malformed,
-            &handle
-                .mapping_adapter
-                .as_ref()
-                .expect("mapping adapter")
-                .lock()
-                .snapshot(),
+        let mut event = crate::lcm_runtime::test_owner_map_revision(
+            &mut handle.mapping_adapter.as_ref().expect("mapping adapter").lock(),
+            &canonical,
         );
+        event.data = event.data[..event.data.len() - 1].to_vec().into();
+        event.size = event.data.len() as u64;
+        assert!(event.validate_provenance().is_err(), "malformed body must not pass its receipt guard");
         handle
             .map_revision_tx
             .send(event)
@@ -9329,14 +9291,15 @@ mod subscription_shutdown_tests {
     #[tokio::test]
     async fn subscription_shutdown_cancels_mapping_lifecycle_lock_wait() {
         let handle = crate::lcm_runtime::build_handle_for_tests().await.unwrap();
-        let session = handle
+        handle
             .mapping_adapter
             .as_ref()
             .unwrap()
             .lock()
             .start_session("stream-session", "warehouse")
             .unwrap();
-        let event = MapRevisionEvent::from_map(
+        let event = crate::lcm_runtime::test_owner_map_revision(
+            &mut handle.mapping_adapter.as_ref().expect("mapping adapter").lock(),
             &MapState {
                 width: 1,
                 height: 1,
@@ -9348,7 +9311,6 @@ mod subscription_shutdown_tests {
                 timestamp_ns: 1,
                 data: vec![0],
             },
-            &session,
         );
         handle.map_revision_latest_tx.send_replace(Some(event));
         let lifecycle_guard = handle.mapping_lifecycle_lock.lock().await;
@@ -9392,7 +9354,7 @@ mod map_update_tests {
         let session = adapter
             .start_session("stream-session", "warehouse")
             .expect("test mapping session");
-        MapRevisionEvent::from_map(&map, &session)
+        MapRevisionEvent::from_map_for_tests(&map, &session)
     }
 
     #[tokio::test]
@@ -9413,7 +9375,9 @@ mod map_update_tests {
             .expect("SubscribeMapUpdates RPC");
         let mut stream = response.into_inner();
 
-        let event = test_mapping_event(MapState {
+        let event = crate::lcm_runtime::test_owner_map_revision(
+            &mut handle.mapping_adapter.as_ref().expect("mapping adapter").lock(),
+            &MapState {
             width: 2,
             height: 2,
             resolution: 0.05,
@@ -9442,10 +9406,11 @@ mod map_update_tests {
         assert_eq!(meta.height, event.height);
         assert_eq!(update.data.as_slice(), event.data.as_ref());
         assert_eq!(update.size, event.size);
-        assert_eq!(update.schema_version, 1);
-        assert_eq!(update.checksum, event.checksum);
+        assert_eq!(update.schema_version, 2);
+        assert_eq!(update.occupancy_receipt.as_ref(), Some(&occupancy_commit_receipt_proto(&event.receipt)));
+        assert_eq!(update.raw_representation, event.raw_representation as i32);
         assert!(update.raw_data.is_empty());
-        assert_eq!(update.raw_checksum, event.checksum);
+        assert_eq!(update.raw_representation, crate::lcm_runtime::RawMapRepresentation::SameAsEffective as i32);
         assert_eq!(update.last_seen_ms, event.last_seen_ms);
         assert_eq!(update.session_id, "stream-session");
         assert_eq!(update.map_name, "warehouse");
@@ -9516,7 +9481,7 @@ mod map_update_tests {
             data: vec![100, 100, 50, 100],
             ..raw.clone()
         };
-        let event = MapRevisionEvent::from_effective_and_raw(&effective, &raw, &session);
+        let event = MapRevisionEvent::from_effective_and_raw_for_tests(&effective, &raw, &session);
         let current = Arc::new(RwLock::new(None));
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
@@ -9529,9 +9494,44 @@ mod map_update_tests {
 
         assert_eq!(update.data, vec![100, 100, 50, 100]);
         assert_eq!(update.raw_data, vec![255, 0, 50, 100]);
-        assert_eq!(update.checksum, event.checksum);
-        assert_eq!(update.raw_checksum, event.raw_checksum);
-        assert_ne!(update.raw_checksum, update.checksum);
+        assert_eq!(update.occupancy_receipt.as_ref(), Some(&occupancy_commit_receipt_proto(&event.receipt)));
+        assert_eq!(update.raw_representation, event.raw_representation as i32);
+        assert_eq!(event.raw_representation, crate::lcm_runtime::RawMapRepresentation::SeparateRaw);
+        assert_ne!(update.raw_data, update.data);
+    }
+
+    #[tokio::test]
+    async fn map_update_rejects_receipt_and_raw_representation_mismatches() {
+        let event = test_mapping_event(MapState {
+            width: 2,
+            height: 1,
+            resolution: 0.1,
+            frame_id: "map".to_owned(),
+            revision: 9,
+            timestamp_ns: 9,
+            data: vec![0, 100],
+            ..MapState::default()
+        });
+        event.validate_provenance().expect("valid receipt-bound fixture");
+        assert_eq!(event.raw_representation, crate::lcm_runtime::RawMapRepresentation::EffectiveFallback);
+        let mutations: [fn(&mut MapRevisionEvent); 7] = [
+            |event| event.receipt.session_id.push_str("-foreign"),
+            |event| event.receipt.session_generation += 1,
+            |event| event.receipt.occupancy_revision += 1,
+            |event| event.receipt.source_timestamp_ns += 1,
+            |event| event.receipt.commit_id.sequence = 0,
+            |event| event.raw_representation = crate::lcm_runtime::RawMapRepresentation::SeparateRaw,
+            |event| event.raw_data = vec![0, 100].into(),
+        ];
+        for mutate in mutations {
+            let mut invalid = event.clone();
+            mutate(&mut invalid);
+            let current = Arc::new(RwLock::new(None));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            assert!(forward_map_revision(&tx, invalid, &current, "map").await);
+            let error = rx.recv().await.expect("stream result").expect_err("invalid receipt or representation must fail closed");
+            assert_eq!(error.code(), tonic::Code::DataLoss);
+        }
     }
 
     #[tokio::test]
@@ -9570,7 +9570,8 @@ mod map_update_tests {
             assert_eq!(update.meta.as_ref().unwrap().revision, event.revision);
             assert_eq!(update.data.as_slice(), event.data.as_ref());
             assert_eq!(update.size, event.size);
-            assert_eq!(update.checksum, event.checksum);
+            assert_eq!(update.occupancy_receipt.as_ref(), Some(&occupancy_commit_receipt_proto(&event.receipt)));
+        assert_eq!(update.raw_representation, event.raw_representation as i32);
             assert!(
                 update.shm_ref.is_none(),
                 "revision {current_revision} must not be attached to event revision {}",
@@ -9614,7 +9615,8 @@ mod map_update_tests {
         assert_eq!(update.meta.as_ref().unwrap().revision, event.revision);
         assert_eq!(update.data.as_slice(), event.data.as_ref());
         assert_eq!(update.size, event.size);
-        assert_eq!(update.checksum, event.checksum);
+        assert_eq!(update.occupancy_receipt.as_ref(), Some(&occupancy_commit_receipt_proto(&event.receipt)));
+        assert_eq!(update.raw_representation, event.raw_representation as i32);
         let shm_ref = update.shm_ref.expect("matching SHM reference");
         assert_eq!(shm_ref.revision, event.revision);
         assert_eq!(shm_ref.size, 8192);
@@ -9637,7 +9639,8 @@ mod map_update_tests {
             .lock()
             .start_session("post-commit-stop", "warehouse")
             .expect("active mapping session");
-        let event = MapRevisionEvent::from_map(
+        let event = crate::lcm_runtime::test_owner_map_revision(
+            &mut handle.mapping_adapter.as_ref().expect("mapping adapter").lock(),
             &MapState {
                 width: 1,
                 height: 1,
@@ -9648,12 +9651,6 @@ mod map_update_tests {
                 data: vec![100],
                 ..MapState::default()
             },
-            &handle
-                .mapping_adapter
-                .as_ref()
-                .expect("mapping adapter")
-                .lock()
-                .snapshot(),
         );
         *handle.occupancy_shm_current.write().await =
             Some(crate::lcm_runtime::OccupancyShmSnapshot {
@@ -9863,13 +9860,9 @@ fn server_test_committed_map_identity(
     revision: u64,
     frame_id: &str,
 ) -> schema::CommittedMapIdentity {
-    schema::CommittedMapIdentity {
-        session_id: "server-test-map".to_string(),
-        session_generation: 1,
-        revision: i64::try_from(revision).expect("server test map revision"),
-        payload_sha256: crate::map_checksum::sha256_bytes(&revision.to_le_bytes()),
-        frame_id: frame_id.to_string(),
-    }
+    crate::lcm_runtime::committed_map_identity_from_revision(
+        &crate::lcm_runtime::test_map_revision_authority("server-test-map", "server-test-map", frame_id, revision),
+    ).expect("server test committed receipt identity")
 }
 
 #[cfg(test)]
@@ -9883,29 +9876,9 @@ fn install_server_test_committed_map_in_frame(
         .lock()
         .expect("server test committed map authority") =
         Some(server_test_committed_map_identity(revision, frame_id));
-    let checksum = crate::map_checksum::sha256_hex(&[0]);
-    handle
-        .map_revision_latest_tx
-        .send_replace(Some(MapRevisionEvent {
-            session_id: "server-test-map".to_string(),
-            map_name: "server-test-map".to_string(),
-            session_generation: 1,
-            revision,
-            width: 1,
-            height: 1,
-            resolution: 0.1,
-            origin_x: 0.0,
-            origin_y: 0.0,
-            frame_id: frame_id.to_string(),
-            timestamp_ns: revision,
-            data: vec![0].into(),
-            raw_data: Vec::<u8>::new().into(),
-            size: 1,
-            schema_version: 1,
-            checksum: checksum.clone(),
-            raw_checksum: checksum,
-            last_seen_ms: 0,
-        }));
+    handle.map_revision_latest_tx.send_replace(Some(
+        crate::lcm_runtime::test_map_revision_authority("server-test-map", "server-test-map", frame_id, revision),
+    ));
 }
 
 #[cfg(test)]
@@ -13262,6 +13235,8 @@ mod lifecycle_tests {
         assert_eq!(first_update.meta.as_ref().unwrap().revision, first_revision);
         assert_eq!(first_update.session_generation, 1);
 
+        let queued_event = handle.map_revision_latest_tx.borrow().clone().expect("actual committed first-session event");
+        assert_eq!(queued_event.revision, first_revision);
         let stopped = GeometryRuntime::stop_mapping(
             &service,
             Request::new(StopMappingRequest {
@@ -13274,28 +13249,7 @@ mod lifecycle_tests {
         .into_inner();
         assert_eq!(stopped.phase, "STOPPED");
         assert!(!stopped.active);
-        let stopped_snapshot = handle
-            .mapping_adapter
-            .as_ref()
-            .expect("mapping adapter")
-            .lock()
-            .snapshot();
-        handle
-            .map_revision_tx
-            .send(MapRevisionEvent::from_map(
-                &MapState {
-                    width: 1,
-                    height: 1,
-                    resolution: 0.1,
-                    frame_id: "map".to_string(),
-                    revision: first_revision + 1,
-                    timestamp_ns: first_revision + 1,
-                    data: vec![100],
-                    ..MapState::default()
-                },
-                &stopped_snapshot,
-            ))
-            .expect("coalescer remains registered");
+        handle.map_revision_tx.send(queued_event).expect("coalescer remains registered");
         assert!(
             tokio::time::timeout(Duration::from_millis(100), stream.next())
                 .await

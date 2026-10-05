@@ -2471,7 +2471,9 @@ fn validate_committed_map_identity(
         || committed_map.session_id.trim() != committed_map.session_id
         || committed_map.session_generation <= 0
         || committed_map.revision <= 0
-        || committed_map.payload_sha256 == [0; 32]
+        || committed_map.commit_boot_nonce == [0; 16]
+        || committed_map.commit_sequence <= 0
+        || committed_map.source_timestamp_ns < 0
         || committed_map.frame_id.trim().is_empty()
         || committed_map.frame_id.trim() != committed_map.frame_id
     {
@@ -2508,7 +2510,8 @@ fn goal_map_rejection(admission: &NavAdmissionContext, source: &schema::Committe
         outcome.retry_reason = Some(SetGoalRetryReason::MapRevisionAdvanced);
         return Some(outcome);
     };
-    let same_domain = source.session_id == current.session_id && source.session_generation == current.session_generation && source.frame_id == current.frame_id;
+    let same_domain = source.session_id == current.session_id && source.session_generation == current.session_generation && source.frame_id == current.frame_id
+        && source.commit_boot_nonce == current.commit_boot_nonce;
     if frame_generation < 0 || !same_domain || frame_generation != admission.map_frame_generation() {
         return Some(rejected_goal_intent_with_reason(goal_id.into(), "map session or coordinate generation changed before admission", SetGoalRejectReason::MapFrameChanged));
     }
@@ -2519,7 +2522,7 @@ fn goal_map_rejection(admission: &NavAdmissionContext, source: &schema::Committe
         outcome.retry_reason = Some(SetGoalRetryReason::MapRevisionAdvanced);
         return Some(outcome);
     }
-    Some(rejected_goal_intent(goal_id.into(), "committed map revision or hash conflicts with authority"))
+    Some(rejected_goal_intent(goal_id.into(), "committed map revision or receipt conflicts with authority"))
 }
 
 fn rejected_goal_intent_with_reason(
@@ -3116,7 +3119,9 @@ async fn admit_goal_input(
         committed_map_session_id: committed_map.session_id,
         committed_map_session_generation: committed_map.session_generation,
         committed_map_revision: committed_map.revision,
-        committed_map_payload_sha256: committed_map.payload_sha256,
+        committed_map_boot_nonce: committed_map.commit_boot_nonce,
+        committed_map_commit_sequence: committed_map.commit_sequence,
+        committed_map_source_timestamp_ns: committed_map.source_timestamp_ns,
         committed_map_frame_id: committed_map.frame_id,
         source_timestamp_ns: input.target.timestamp_ns as i64,
         boundary_id,
@@ -4012,6 +4017,46 @@ mod tests {
         assert_eq!(slot.phase, NavPhase::Idle);
     }
 
+    #[test]
+    fn committed_map_requires_complete_receipt_without_content_digest() {
+        let identity = schema::CommittedMapIdentity {
+            session_id: "map-session".into(), session_generation: 1, revision: 2,
+            commit_boot_nonce: [3; 16], commit_sequence: 4, source_timestamp_ns: 0,
+            frame_id: "map".into(),
+        };
+        assert!(validate_committed_map_identity(&identity).is_ok());
+        for field in 0..3 {
+            let mut invalid = identity.clone();
+            match field {
+                0 => invalid.commit_boot_nonce = [0; 16],
+                1 => invalid.commit_sequence = 0,
+                _ => invalid.source_timestamp_ns = -1,
+            }
+            assert!(validate_committed_map_identity(&invalid).is_err());
+        }
+    }
+
+    fn map_revision_fixture(
+        map: &MapState,
+        session_id: &str,
+        map_name: &str,
+    ) -> crate::lcm_runtime::MapRevisionEvent {
+        crate::lcm_runtime::MapRevisionEvent::from_map_for_tests(
+            map,
+            &crate::mapping_adapter::MappingSessionSnapshot {
+                phase: crate::mapping_adapter::MappingSessionPhase::Active,
+                session_id: session_id.into(),
+                map_name: map_name.into(),
+                session_generation: 1,
+                revision: map.revision,
+                active: true,
+                idempotent_replay: false,
+                legacy_checkpoint_reconstructed: false,
+                mapping_backend_kind: "voxel".into(),
+            },
+        )
+    }
+
     async fn install_committed_map_fixture(
         handle: &GeometryRuntimeHandle,
         frame_id: &str,
@@ -4029,33 +4074,7 @@ mod tests {
             timestamp_ns,
             data: vec![0; 100],
         };
-        let data: Arc<[u8]> = map
-            .data
-            .iter()
-            .map(|value| *value as u8)
-            .collect::<Vec<_>>()
-            .into();
-        let checksum = crate::map_checksum::sha256_hex(data.as_ref());
-        let event = crate::lcm_runtime::MapRevisionEvent {
-            session_id: "nav-fixture-session".to_string(),
-            map_name: "nav-fixture-map".to_string(),
-            session_generation: 1,
-            revision: map.revision,
-            width: map.width,
-            height: map.height,
-            resolution: map.resolution,
-            origin_x: map.origin_x,
-            origin_y: map.origin_y,
-            frame_id: map.frame_id.clone(),
-            timestamp_ns: map.timestamp_ns,
-            data: data.clone(),
-            raw_data: Vec::<u8>::new().into(),
-            size: data.len() as u64,
-            schema_version: 1,
-            checksum: checksum.clone(),
-            raw_checksum: checksum,
-            last_seen_ms: (timestamp_ns / 1_000_000) as i64,
-        };
+        let event = map_revision_fixture(&map, "nav-fixture-session", "nav-fixture-map");
         {
             let mut shared = handle.state.write().await;
             shared.map = map;
@@ -4086,7 +4105,8 @@ mod tests {
             .expect("committed map fixture must be visible before returning");
         assert_eq!(visible.revision, event.revision);
         assert_eq!(visible.frame_id, event.frame_id);
-        assert_eq!(visible.checksum, event.checksum);
+        assert_eq!(visible.receipt, event.receipt);
+        assert_eq!(visible.raw_representation, event.raw_representation);
     }
 
     /// 构造一个测试 handle:test backend(走 real-lcm + test_lcm_url 隔离端口)+ 一个非空 pose 与 map。
@@ -4125,12 +4145,19 @@ mod tests {
         let handle = make_handle().await;
         let mut current = handle.committed_map_authority.lock().unwrap().clone().unwrap();
         current.revision = 3;
+        current.commit_sequence = 3;
         *handle.committed_map_authority.lock().unwrap() = Some(current.clone());
-        let mut source = current.clone(); source.revision = 2; source.payload_sha256 = [7; 32];
+        let mut source = current.clone(); source.revision = 2; source.commit_sequence = 2;
         let context = NavAdmissionContext::new(handle.mapping_lifecycle_lock.clone(), handle.committed_map_authority.clone(), handle.map_revision_latest_tx.subscribe())
             .with_mapping_adapter(handle.mapping_adapter.clone()).with_previous_map_revisions(true);
         let frame = context.map_frame_generation();
         assert!(goal_map_rejection(&context, &source, frame, "old-source", false).is_none());
+        let mut previous_boot = source.clone();
+        previous_boot.commit_boot_nonce[0] ^= 1;
+        for prevalidated in [false, true] {
+            assert_eq!(goal_map_rejection(&context, &previous_boot, frame, "old-boot", prevalidated)
+                .unwrap().reject_reason, Some(SetGoalRejectReason::MapFrameChanged));
+        }
         assert_eq!(goal_map_rejection(&context, &source, frame + 1, "wrong-frame", false).unwrap().reject_reason, Some(SetGoalRejectReason::MapFrameChanged));
         source.revision = current.revision;
         assert!(goal_map_rejection(&context, &source, frame, "mutated-revision", false).unwrap().retry_reason.is_none());
@@ -4377,7 +4404,9 @@ mod tests {
             committed_map_session_id: "geometry-test-map".to_string(),
             committed_map_session_generation: 1,
             committed_map_revision: 1,
-            committed_map_payload_sha256: [0x41; 32],
+            committed_map_boot_nonce: [0x41; 16],
+            committed_map_commit_sequence: 1,
+            committed_map_source_timestamp_ns: 1,
             committed_map_frame_id: "map".to_string(),
             motion_guard_generation: 1,
             motion_guard_boot_nonce: [1; 16],
@@ -4844,8 +4873,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_committed_map_revision_or_hash_rejects_intent_without_side_effects() {
-        for mutate_hash in [false, true] {
+    async fn changed_committed_map_provenance_rejects_intent_without_side_effects() {
+        for changed_field in ["revision", "boot_nonce", "commit_sequence", "source_timestamp"] {
             let (handle, backend) = make_blocking_handle([None]).await;
             let state = NavRuntimeState::from_env();
             observe_ready_execution_chain(&state).await;
@@ -4857,11 +4886,7 @@ mod tests {
             let intent = goal_intent_from_set_goal(
                 &admission,
                 &state,
-                test_goal_input(if mutate_hash {
-                    "changed-map-hash"
-                } else {
-                    "changed-map-revision"
-                }),
+                test_goal_input(changed_field),
                 None,
             )
             .await
@@ -4872,10 +4897,11 @@ mod tests {
                     .lock()
                     .expect("committed map authority");
                 let current = authority.as_mut().expect("installed committed map");
-                if mutate_hash {
-                    current.payload_sha256[0] ^= 0xff;
-                } else {
-                    current.revision += 1;
+                match changed_field {
+                    "boot_nonce" => current.commit_boot_nonce[0] ^= 0xff,
+                    "commit_sequence" => current.commit_sequence += 1,
+                    "source_timestamp" => current.source_timestamp_ns += 1,
+                    _ => current.revision += 1,
                 }
             }
 
@@ -4897,7 +4923,11 @@ mod tests {
             assert!(outcome
                 .state
                 .message
-                .contains(if mutate_hash { "committed map revision or hash conflicts" } else { "committed map revision advanced" }));
+                .contains(match changed_field {
+                    "revision" => "committed map revision advanced",
+                    "boot_nonce" => "map session or coordinate generation changed",
+                    _ => "committed map revision or receipt conflicts",
+                }));
             assert!(outcome.lease.is_none());
             assert!(state.inner.read().await.goal.is_none());
             assert_eq!(state.next_goal_generation.load(AtomicOrdering::Acquire), 0);
@@ -5231,7 +5261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_map_name_allows_revision_and_hash_change_at_admission() {
+    async fn same_map_name_allows_revision_and_receipt_change_at_admission() {
         let handle = make_handle().await;
         let state = NavRuntimeState::from_env();
         observe_ready_execution_chain(&state).await;
@@ -5254,7 +5284,8 @@ mod tests {
             .clone()
             .expect("initial map revision");
         increment.revision += 1;
-        increment.checksum = "f".repeat(64);
+        increment.receipt.occupancy_revision = increment.revision;
+        increment.receipt.commit_id.sequence += 1;
         handle.map_revision_latest_tx.send_replace(Some(increment));
 
         let outcome = admit_goal_intent(
@@ -5340,26 +5371,21 @@ mod tests {
     #[test]
     fn mapping_cloud_frozen_name_survives_provider_wait_map_switch() {
         let (map_tx, map_rx) =
-            tokio::sync::watch::channel(Some(crate::lcm_runtime::MapRevisionEvent {
-                session_id: "mapping-cloud-session".to_string(),
-                map_name: "office".to_string(),
-                session_generation: 1,
-                revision: 1,
-                width: 1,
-                height: 1,
-                resolution: 0.1,
-                origin_x: 0.0,
-                origin_y: 0.0,
-                frame_id: "map".to_string(),
-                timestamp_ns: 1,
-                data: vec![0].into(),
-                raw_data: Vec::<u8>::new().into(),
-                size: 1,
-                schema_version: 1,
-                checksum: "a".repeat(64),
-                raw_checksum: "a".repeat(64),
-                last_seen_ms: 0,
-            }));
+            tokio::sync::watch::channel(Some(map_revision_fixture(
+                &MapState {
+                    width: 1,
+                    height: 1,
+                    resolution: 0.1,
+                    origin_x: 0.0,
+                    origin_y: 0.0,
+                    frame_id: "map".to_string(),
+                    revision: 1,
+                    timestamp_ns: 1,
+                    data: vec![0],
+                },
+                "mapping-cloud-session",
+                "office",
+            )));
         let admission = NavAdmissionContext::with_expected_map_name(
             Arc::new(tokio::sync::Mutex::new(())),
             Arc::new(StdMutex::new(None)),

@@ -1,17 +1,21 @@
 package nuwax_msgs;
 
 struct NavigationMap3D {
-    const int32_t SCHEMA_VERSION_V3 = 3;
+    const int32_t SCHEMA_VERSION_V4 = 4;
 
     int32_t schema_version;
     int64_t producer_runtime_generation;
     string map_session_id;
     int64_t map_session_generation;
     int64_t occupancy_revision;
-    byte occupancy_payload_sha256[32];
+    byte occupancy_commit_boot_nonce[16];
+    int64_t occupancy_commit_sequence;
+    int64_t occupancy_source_timestamp_ns;
     string frame_id;
     int64_t map_frame_generation;
     int64_t cloud_revision;
+    // The occupancy baseline retained in the original cloud receipt.
+    int64_t cloud_occupancy_revision;
     int64_t source_timestamp_ns;
     float source_voxel_size;
     byte commit_boot_nonce[16];

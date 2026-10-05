@@ -11,11 +11,11 @@ import nav_msgs
 
 class PathEnvelope(object):
 
-    __slots__ = ["schema_version", "session_id", "owner_kind", "parent_request_id", "goal_generation", "producer", "producer_epoch", "producer_runtime_generation", "committed_map_session_id", "committed_map_session_generation", "committed_map_revision", "committed_map_payload_sha256", "committed_map_frame_id", "boundary_id", "boundary_sha256", "motion_guard_generation", "motion_guard_boot_nonce", "motion_stop_generation", "planner_runtime_generation", "path_revision", "source_timestamp_ns", "goal_payload_sha256", "path_payload_sha256", "path"]
+    __slots__ = ["schema_version", "session_id", "owner_kind", "parent_request_id", "goal_generation", "producer", "producer_epoch", "producer_runtime_generation", "committed_map_session_id", "committed_map_session_generation", "committed_map_revision", "committed_map_boot_nonce", "committed_map_commit_sequence", "committed_map_source_timestamp_ns", "committed_map_frame_id", "boundary_id", "boundary_sha256", "motion_guard_generation", "motion_guard_boot_nonce", "motion_stop_generation", "planner_runtime_generation", "path_revision", "source_timestamp_ns", "goal_payload_sha256", "path_payload_sha256", "path"]
 
-    __typenames__ = ["int32_t", "string", "int32_t", "string", "int64_t", "string", "int64_t", "int64_t", "string", "int64_t", "int64_t", "byte", "string", "string", "byte", "int64_t", "byte", "int64_t", "int64_t", "int64_t", "int64_t", "byte", "byte", "nav_msgs.Path"]
+    __typenames__ = ["int32_t", "string", "int32_t", "string", "int64_t", "string", "int64_t", "int64_t", "string", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "string", "string", "byte", "int64_t", "byte", "int64_t", "int64_t", "int64_t", "int64_t", "byte", "byte", "nav_msgs.Path"]
 
-    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, [32], None, None, [32], None, [16], None, None, None, None, [32], [32], None]
+    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, [16], None, None, None, None, [32], None, [16], None, None, None, None, [32], [32], None]
 
     def __init__(self):
         self.schema_version = 0
@@ -40,8 +40,12 @@ class PathEnvelope(object):
         """ LCM Type: int64_t """
         self.committed_map_revision = 0
         """ LCM Type: int64_t """
-        self.committed_map_payload_sha256 = b""
-        """ LCM Type: byte[32] """
+        self.committed_map_boot_nonce = b""
+        """ LCM Type: byte[16] """
+        self.committed_map_commit_sequence = 0
+        """ LCM Type: int64_t """
+        self.committed_map_source_timestamp_ns = 0
+        """ LCM Type: int64_t """
         self.committed_map_frame_id = ""
         """ LCM Type: string """
         self.boundary_id = ""
@@ -95,7 +99,8 @@ class PathEnvelope(object):
         buf.write(__committed_map_session_id_encoded)
         buf.write(b"\0")
         buf.write(struct.pack(">qq", self.committed_map_session_generation, self.committed_map_revision))
-        buf.write(bytearray(self.committed_map_payload_sha256[:32]))
+        buf.write(bytearray(self.committed_map_boot_nonce[:16]))
+        buf.write(struct.pack(">qq", self.committed_map_commit_sequence, self.committed_map_source_timestamp_ns))
         __committed_map_frame_id_encoded = self.committed_map_frame_id.encode('utf-8')
         buf.write(struct.pack('>I', len(__committed_map_frame_id_encoded)+1))
         buf.write(__committed_map_frame_id_encoded)
@@ -139,7 +144,8 @@ class PathEnvelope(object):
         __committed_map_session_id_len = struct.unpack('>I', buf.read(4))[0]
         self.committed_map_session_id = buf.read(__committed_map_session_id_len)[:-1].decode('utf-8', 'replace')
         self.committed_map_session_generation, self.committed_map_revision = struct.unpack(">qq", buf.read(16))
-        self.committed_map_payload_sha256 = buf.read(32)
+        self.committed_map_boot_nonce = buf.read(16)
+        self.committed_map_commit_sequence, self.committed_map_source_timestamp_ns = struct.unpack(">qq", buf.read(16))
         __committed_map_frame_id_len = struct.unpack('>I', buf.read(4))[0]
         self.committed_map_frame_id = buf.read(__committed_map_frame_id_len)[:-1].decode('utf-8', 'replace')
         __boundary_id_len = struct.unpack('>I', buf.read(4))[0]
@@ -157,7 +163,7 @@ class PathEnvelope(object):
     def _get_hash_recursive(parents):
         if PathEnvelope in parents: return 0
         newparents = parents + [PathEnvelope]
-        tmphash = (0x34e055b97caff976+ nav_msgs.Path._get_hash_recursive(newparents)) & 0xffffffffffffffff
+        tmphash = (0xb3b25f6755e60bcb+ nav_msgs.Path._get_hash_recursive(newparents)) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None
@@ -171,3 +177,4 @@ class PathEnvelope(object):
     def get_hash(self):
         """Get the LCM hash of the struct"""
         return struct.unpack(">Q", PathEnvelope._get_packed_fingerprint())[0]
+

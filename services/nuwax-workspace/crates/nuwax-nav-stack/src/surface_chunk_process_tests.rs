@@ -7,6 +7,39 @@ use std::path::PathBuf;
 use std::process::{Child,Command,Stdio};
 use std::sync::atomic::{AtomicUsize,Ordering};
 
+const TEST_MULTICAST_PREFIX: &str = "udpm://239.254.76.68:";
+const TEST_RPC_PREFIX: &str = "test/map-block/";
+
+fn assert_test_endpoint(url: &str, name: &str) {
+    let port = url.strip_prefix(TEST_MULTICAST_PREFIX).unwrap()
+        .strip_suffix("?ttl=0").unwrap().parse::<u16>().unwrap();
+    assert!((49_152..=u16::MAX).contains(&port));
+    let id = name.strip_prefix(TEST_RPC_PREFIX).unwrap();
+    assert_eq!(id.len(), 32);
+    assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let topics = nuwax_rpc::rpc_topics(name).unwrap();
+    assert_eq!(topics.request, format!("/rpc/{name}/req"));
+    assert_eq!(topics.response, format!("/rpc/{name}/res"));
+}
+
+fn test_endpoint() -> (String, String) {
+    let id = ObjectId::random().unwrap();
+    let namespace = id.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let name = format!("{TEST_RPC_PREFIX}{namespace}");
+    let first = u16::from_le_bytes([id.0[0], id.0[1]]) as u32;
+    for offset in 0..16_384 {
+        let port = (49_152 + (first + offset) % 16_384) as u16;
+        if let Ok(socket) = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+            // 仅探测测试动态端口；liblcm 接管前仍存在端口竞争，不能视作独占预留。
+            drop(socket);
+            let url = format!("{TEST_MULTICAST_PREFIX}{port}?ttl=0");
+            assert_test_endpoint(&url, &name);
+            return (url, name);
+        }
+    }
+    panic!("没有可用的测试 LCM 动态端口");
+}
+
 struct BlockServer { root:PathBuf, calls:AtomicUsize }
 #[async_trait::async_trait]
 impl RpcHandler for BlockServer {
@@ -50,11 +83,13 @@ impl RpcHandler for BlockServer {
 fn map_block_server_process() {
     let root=PathBuf::from(std::env::var("NUWAX_BLOCK_TEST_ROOT").expect("仅测试提供器"));
     let url=std::env::var("NUWAX_BLOCK_TEST_URL").unwrap();
+    let name=std::env::var("NUWAX_BLOCK_TEST_RPC_NAME").unwrap();
+    assert_test_endpoint(&url, &name);
     tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async {
         let transport=Arc::new(nuwax_rpc::LcmRpcTransport::from_provider(&url).unwrap());
-        let broker=RpcBroker::new();let name="GeometryRuntimeService/get_navigation_map_block";
-        broker.register(name,Box::new(BlockServer{root:root.clone(),calls:AtomicUsize::new(0)})).await.unwrap();
-        let server=broker.serve(transport,name).await.unwrap();
+        let broker=RpcBroker::new();
+        broker.register(&name,Box::new(BlockServer{root:root.clone(),calls:AtomicUsize::new(0)})).await.unwrap();
+        let server=broker.serve(transport,&name).await.unwrap();
         std::fs::write(root.join("ready"),"ready").unwrap();
         let deadline=Instant::now()+Duration::from_secs(20);
         while !root.join("stop").exists() && Instant::now()<deadline {tokio::time::sleep(Duration::from_millis(10)).await;}
@@ -95,15 +130,19 @@ async fn receive(reader:FineMapReader,message:schema::NavigationMap3D)->(FineMap
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn real_process_rpc_recovers_late_missing_and_corrupt_blocks_without_partial_install() {
     let repository=Repository::temporary().unwrap();let root=repository.path();
-    let socket=std::net::UdpSocket::bind("127.0.0.1:0").unwrap();let port=socket.local_addr().unwrap().port();drop(socket);
-    let url=format!("udpm://239.255.76.67:{port}?ttl=0");
+    let (url, rpc_name)=test_endpoint();
     std::fs::write(root.join("mode"),"delay").unwrap();
     let mut child=ChildOwner(Command::new(std::env::current_exe().unwrap()).args(["--exact","surface_chunks::rpc_process_tests::map_block_server_process","--ignored","--nocapture"])
-        .env("NUWAX_BLOCK_TEST_ROOT",root).env("NUWAX_BLOCK_TEST_URL",&url).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap());
+        .env("NUWAX_BLOCK_TEST_ROOT",root).env("NUWAX_BLOCK_TEST_URL",&url).env("NUWAX_BLOCK_TEST_RPC_NAME",&rpc_name).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap());
     let deadline=Instant::now()+Duration::from_secs(3);
     while !root.join("ready").exists(){assert!(Instant::now()<deadline,"块服务未就绪");assert!(child.0.try_wait().unwrap().is_none());tokio::time::sleep(Duration::from_millis(10)).await;}
     let first=message(&repository,1,1);
-    let (reader,result)=receive(FineMapReader::new(url).unwrap(),first.clone()).await;
+    let mut reader=FineMapReader::new(url.clone()).unwrap();
+    // 仍使用真实 liblcm、RpcClient 和补取协议，仅为此测试注入独占 RPC 名称。
+    reader.client=Some(nuwax_rpc::RpcClient::new(
+        Arc::new(nuwax_rpc::LcmRpcTransport::from_provider(&url).unwrap()), rpc_name,
+    ).unwrap());
+    let (reader,result)=receive(reader,first.clone()).await;
     let old=result.unwrap();assert_eq!(old.revision,1);
     let calls=std::fs::read_to_string(root.join("calls")).unwrap().parse::<usize>().unwrap();assert!(calls>=2,"必须实际出现迟到重试");
     let current=reader.receiver.current().unwrap();

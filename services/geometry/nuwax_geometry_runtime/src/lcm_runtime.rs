@@ -11716,13 +11716,11 @@ fn spawn_mapping_feed_tasks(
     });
 }
 
-/// 单测端口隔离:Architect R1 防止重现 07_08 实机 175 GB 崩溃。
+/// 测试专用组播组和动态端口区间，不读取部署环境中的 LCM URL。
 ///
-/// `pid * 10000 + counter` 让 cargo test 的 N 个并行 test 进程分到不同端口,
-/// 避免互相 bind 失败 / udpm 重复收包导致 Rust 进程内存爆涨。
-///
-/// 所有 `build_handle_for_tests` 走 real-lcm，必须用隔离 URL 防止
-/// cargo test 并发撞端口。
+/// 端口始终在 49152..=65535，不能落到生产默认 7667 或越过 u16。
+/// TTL=0 限制在本机；不同组播组和端口隔离默认生产总线，但不是安全沙箱，
+/// 不能阻止显式加入同一测试端点的本机进程。有限端口空间也不保证跨进程唯一。
 ///
 /// 不加 `#[cfg(test)]`:函数本身只返回 String(无 test-only 依赖),
 /// 公开供 `build_handle_for_tests` 跨 #[cfg(test)] 模块引用,且允许 binary
@@ -11730,10 +11728,40 @@ fn spawn_mapping_feed_tasks(
 pub fn test_lcm_url() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let pid = std::process::id() as u64;
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let port = (pid * 10_000 + counter) % 60_000 + 7_667; // [7667, 67666]
-    format!("udpm://239.255.76.67:{}?ttl=0", port)
+    test_lcm_url_for(std::process::id(), counter)
+}
+
+fn test_lcm_url_for(pid: u32, counter: u64) -> String {
+    const PORT_COUNT: u64 = 16_384;
+    let offset = (u64::from(pid) * 257 + counter % PORT_COUNT) % PORT_COUNT;
+    let port = 49_152_u16 + offset as u16;
+    format!("udpm://239.254.76.67:{port}?ttl=0")
+}
+
+#[cfg(test)]
+mod test_lcm_endpoint_tests {
+    #[test]
+    fn test_endpoint_excludes_production_and_stays_in_u16_range() {
+        for pid in [0, 6, 12, 65_536, u32::MAX] {
+            for counter in 0..16_384 {
+                let url = super::test_lcm_url_for(pid, counter);
+                let port = url
+                    .strip_prefix("udpm://239.254.76.67:")
+                    .unwrap()
+                    .strip_suffix("?ttl=0")
+                    .unwrap()
+                    .parse::<u16>()
+                    .unwrap();
+                assert!((49_152..=u16::MAX).contains(&port));
+                assert_ne!(port, 7_667);
+            }
+            assert_eq!(
+                super::test_lcm_url_for(pid, u64::MAX),
+                super::test_lcm_url_for(pid, u64::MAX % 16_384)
+            );
+        }
+    }
 }
 
 /// 单元测试 helper:构造一个最简 `GeometryRuntimeHandle`。
@@ -11770,19 +11798,17 @@ async fn build_handle_for_tests_with_cloud_writer(
     let explore_projection_gate =
         Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default()));
     let state = Arc::new(RwLock::new(SharedState::default()));
-    static SEQUENCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence_state_path = std::env::temp_dir()
-        .join(format!(
-            "nuwax-geometry-sequence-test-{}-{}",
-            std::process::id(),
-            SEQUENCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        ))
-        .join("sequence_state.json");
+    // 每个句柄独占新目录；不复用 PID 重启后可能遗留的状态或 mmap。
+    // 目录须随句柄中的映射/后台任务保持有效，不能在本函数返回时清理。
+    let fixture_id = uuid::Uuid::new_v4().simple().to_string();
+    let fixture_root = std::env::temp_dir().join(format!("nuwax-geometry-test-{fixture_id}"));
+    std::fs::create_dir(&fixture_root).expect("test fixture directory must be new and writable");
+    let sequence_state_path = fixture_root.join("sequence_state.json");
     let sequence_store = Arc::new(
         SequenceStateStore::open(&sequence_state_path)
             .expect("test sequence state must be writable and exclusively lockable"),
     );
-    // test_lcm_url() 端口公式防止 cargo test 并发端口冲突。
+    // 显式测试端点不受 NUWAX_LCM_URL / LCM_DEFAULT_URL 影响。
     let transport = LcmTransport::new_real(&crate::lcm_runtime::test_lcm_url())
         .expect("test real LCM 启动失败,需先 apt-get install -y liblcm-dev 1.3~1.5");
     // Phase 3: 测试 helper 也构造 mapping_adapter,便于 unit test 走完整链路。
@@ -11801,17 +11827,8 @@ async fn build_handle_for_tests_with_cloud_writer(
             sequence_store.clone(),
         ),
     })));
-    // Phase 3: 测试 helper 也构造 occupancy_shm(走 /tmp 测试路径)
-    // 注意:必须包含 per-call 唯一后缀(monotonic counter),否则并行
-    // cargo test 跑多次 build_handle_for_tests 时,多个
-    // OccupancyGridShmWriter::new() 会同时 truncate 同一文件 + 同一
-    // mmap 段,导致 SIGBUS(实测:28 tests pass 后崩溃)。
-    static OCC_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let occ_test_path = std::path::PathBuf::from(format!(
-        "/tmp/nuwax_occupancy_test_{}_{}.mmap",
-        std::process::id(),
-        OCC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-    ));
+    // 每个句柄使用独占测试 mmap，避免并行构造时 truncate 同一文件。
+    let occ_test_path = fixture_root.join("occupancy.mmap");
     let occupancy_shm = match OccupancyGridShmWriter::new(&occ_test_path) {
         Ok(w) => Some(Arc::new(parking_lot::Mutex::new(w))),
         Err(_) => None,
@@ -11828,10 +11845,7 @@ async fn build_handle_for_tests_with_cloud_writer(
         committed_map_authority.clone(),
         explore_projection_gate.clone(),
         transport.clone(),
-        LcmTopic::new(&format!(
-            "/test/geometry/occupancy/helper/{}",
-            std::process::id()
-        ))
+        LcmTopic::new(&format!("/test/o/{fixture_id}"))
         .expect("test occupancy topic"),
         LcmMessageType::new("nav_msgs.OccupancyGrid").expect("test occupancy type"),
         occupancy_shm.clone(),
@@ -11847,12 +11861,7 @@ async fn build_handle_for_tests_with_cloud_writer(
     let nav = crate::nav_runtime::NavRuntimeState::try_from_sequence_store(sequence_store.as_ref())
         .expect("test producer generation reservation");
     let cloud_map_writer = if with_cloud_writer {
-        static CM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let cloud_map_path = std::path::PathBuf::from(format!(
-            "/tmp/nuwax_cloudmap_test_{}_{}.mmap",
-            std::process::id(),
-            CM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        ));
+        let cloud_map_path = fixture_root.join("cloud-map.mmap");
         let mut cloud_map_writer = CloudMapShmWriter::new(&cloud_map_path).map_err(|error| {
             RealLcmBackendUnavailable::persistence(format!(
                 "test cloud-map SHM initialization failed: {error}"

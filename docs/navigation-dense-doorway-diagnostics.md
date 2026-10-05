@@ -2,6 +2,8 @@
 
 Status: the translation-advice policy and qualified collinear same-height progress reduction are selected by the shared default dispatch in this revision. The unchanged original downstream doorway test, full runtime regressions, transformed scenes and real-clock factory/worker trials pass. Complete current-command guards remain unchanged. Timing qualification and the separate command-lifetime limitations below remain open; these tests do not deploy a device.
 
+For the subsequent MLS-only optimized timing arm and read-only generic deployment-profile audit, see [navigation build-profile qualification](navigation-build-profile-qualification.md). The historical unoptimized measurements below remain unchanged.
+
 ## Reproducible baseline
 
 Primary `5a24498ba716cd9c89577ed0470a5af9fde965e2` and the separate C1 validation branch reproduced the same existing doorway failure: heading zero, waypoint 287, actual position `[-0.3444407956247275, 0.1621489949961421, 0.4]`, quaternion `[0,0,-0.04023318620060342,0.9991903175712561]`. The unmodified primary and C1 runs took 529.87 and 523.16 seconds respectively. C1 causality is excluded for this observed identical failure, not for unrelated behavior.

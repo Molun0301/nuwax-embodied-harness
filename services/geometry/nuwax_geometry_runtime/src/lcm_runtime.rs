@@ -13525,6 +13525,12 @@ mod mapping_feed_tests {
         let fixture = &masks.fixture;
         fixture.commit(1_000_000_000);
         canonical_cloud_publication_invalidation(&fixture.writer).set_legacy_full_demand(None);
+        // Complete the initial explicit-clear/live sequence before testing an
+        // already-live watch exposure; a clear has no admitted occupancy A.
+        let initial = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/before-exposed-gate").unwrap());
+        publish_latest_canonical_cloud_map_with_navigation(&LcmTransport::new(Arc::new(initial)),
+            &fixture.writer, &fixture.state, &fixture.cloud_tx, "map", Some(&fixture.context)).await.unwrap();
+        let first = masks.refresh(2); masks.expose(&first);
         let admitted = fixture.context.committed_map_authority.lock().unwrap().clone().unwrap();
         let backend = SameSessionGlobalMapPublishGateBackend::default();
         let transport = LcmTransport::new(Arc::new(backend.clone()));
@@ -13538,7 +13544,7 @@ mod mapping_feed_tests {
             })
         };
         tokio::time::timeout(Duration::from_secs(1), backend.first_publish_started.notified()).await.unwrap();
-        let newer = masks.refresh(2); // B is owned, but has not completed SHM exposure.
+        let newer = masks.refresh(3); // B is owned, but has not completed SHM exposure.
         backend.release_first_publish();
         assert!(tokio::time::timeout(Duration::from_secs(1), delayed).await.unwrap().unwrap().is_err());
         {
@@ -13577,7 +13583,14 @@ mod mapping_feed_tests {
         tokio::time::timeout(Duration::from_secs(1),
             publish_committed_global_map_in_frame(&handle, &committed, "map"))
             .await.expect("direct owner publication must not wait for coalescer reentrancy").unwrap();
-        assert_eq!(backend.published.lock().unwrap().len(), 1);
+        let frames = backend.published.lock().unwrap();
+        assert_eq!(frames.len(), 2, "activation must retain the ordered clear then live publication");
+        assert!(schema::decode_navigation_map_3d_body(&frames[0].payload).unwrap().cleared);
+        let live = schema::decode_navigation_map_3d_body(&frames[1].payload).unwrap();
+        assert!(!live.cleared);
+        assert_eq!(live.committed_map, committed_map_identity_from_receipt(
+            &fixture.context.mapping.lock().latest_occupancy_commit_receipt().unwrap(), "map").unwrap());
+        drop(frames);
         assert!(fixture.context.committed_map_authority.lock().unwrap().is_none());
         drop(owner);
     }

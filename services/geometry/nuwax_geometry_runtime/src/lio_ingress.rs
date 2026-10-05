@@ -6347,7 +6347,7 @@ mod tests {
             DeviceLioIngressSpec::new_for_backend(LIO_BACKEND_FASTLIO2, 7,
                 "lidar", "base_link", "odom", "map").unwrap(),
             BodyFromSensorTransform::from_json(
-                r#"{"translation_m":[0.0,0.0,0.0],"rotation_row_major":[1.0,0.0,0.0,0.0,1.0,0.0,0.0,1.0]}"#).unwrap(),
+                r#"{"translation_m":[0.0,0.0,0.0],"rotation_row_major":[1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0]}"#).unwrap(),
             Duration::from_nanos(10)).unwrap();
         ingress.pair_state.lock().probe_phase = NativeProbePhase::Runtime;
         ingress

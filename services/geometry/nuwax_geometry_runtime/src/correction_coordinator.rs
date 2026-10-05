@@ -13721,7 +13721,9 @@ mod preflight_only_contract {
                 .expect("command accumulates");
             for sequence in 1..=RELOCALIZATION_MAX_FRAMES as u64 {
                 let mut points = asymmetric_cloud();
-                if degenerate { points.fill(Point3::origin()); }
+                // Finite local ICP may legitimately accept coincident origin points.
+                // This degenerate cloud has no target correspondences under the unchanged policy.
+                if degenerate { points.fill(Point3::new(10_000.0, 10_000.0, 10_000.0)); }
                 let input = active_relocalization_frame_with_points(
                     &owner, sequence, sequence * 10, Isometry3::identity(), points,
                 );
@@ -13850,7 +13852,7 @@ mod preflight_only_contract {
                 .expect("command accumulates");
             let cutoff = active_relocalization_frame_with_points(
                 &owner, 1, 10, Isometry3::identity(),
-                vec![Point3::origin(); RELOCALIZATION_MIN_AGGREGATE_POINTS],
+                vec![Point3::new(10_000.0, 10_000.0, 10_000.0); RELOCALIZATION_MIN_AGGREGATE_POINTS],
             );
             let lifecycle = Arc::new(tokio::sync::Mutex::new(()));
             let guard = Arc::clone(&lifecycle).lock_owned().await;

@@ -220,3 +220,18 @@ Using baseline-build-env.sh/warmed target/jobs2, cargo test --manifest-path serv
 Evidence: /workspace/shared/neh-validation/c1-d2a-native-compile-20261004.log, c1-d2a-native-pure-20261004.log, c1-d2a-native-pure-allowlist.txt, c1-d2a-native-pure-audit.txt, c1-d2a-native-inventory.txt and c1-d2a-python-integrated-20261004.log. Retained binary: c1-runtime-tests-18df87ff.
 
 At 18:18:31 UTC, primary recovery/exploration-overlay-20261004 was restored to exact 5450edfe58185f7ad9227b6ba230434834d7db58/tree afb234797bb65afe54952f6fb28ed2132bdff6a1 and verified clean; native lane was explicitly returned. Qualification is limited to the ownership/protocol foundation. Assigned live relocalization and the final default chain remain gated pending D2/D3.
+
+## D2b restart and source ownership preparation (2026-10-04)
+
+The bounded actor-restart checkpoint restores verified durable V1 terminal records into the existing command ledger at actor construction. Restored records have an explicit origin, without fabricated original requests, process-local deadlines, claim phases or admission ordinals. They consume existing capacity, replay before busy/admission side effects, and retain existing conflict/overflow behavior. Current-generation observation counters exclude restored records, preserving the provider invariant that pending plus terminal counts cannot exceed admissions. This repairs legacy restart semantics needed by the upcoming assigned terminal migration; it does not enable assigned requests or remove the remaining V1 durable digest format.
+
+The separate source-ownership preparation moves each correction frame's existing point Vec allocation into a private Arc-backed immutable owner. Frame clones share that allocation and existing immutable occupancy bytes. Exact owner comparison distinguishes coordinate bits, order and duplicate count. Deliberately conflicting test fixtures construct a new owner rather than mutating an admitted one. Relocalization math, source limits, wire contracts and default availability are unchanged. Remaining source/candidate hash removal still needs the paired LIO/PGO/actor protocol migration.
+
+At source preparation time only syntax parsing and diff checks have run. Native compilation and the exact pure tests below remain pending; none establish real LCM integration:
+- `relocalization_actor_restart_replays_before_conflict_busy_and_side_effects`
+- `relocalization_restored_ledger_preserves_binding_conflicts_overflow_and_capacity`
+- `correction_frame_clones_share_immutable_body_and_mask_allocations`
+- `correction_points::tests::capture_and_frame_clones_preserve_original_allocation_until_last_owner`
+- `correction_points::tests::independent_replay_compares_exact_bits_order_and_duplicate_count`
+
+Independent bounded source review found no blocking defect in the restart or point-owner changes. The reopened-store capacity test starts from one durable terminal and fills the existing ledger in memory; it does not qualify reopening an already-full 1,024-terminal store. At that pre-existing retention edge, persisting a terminal for an entirely new request can fail closed because no durable slot remains. No broader retention-policy change is included here.

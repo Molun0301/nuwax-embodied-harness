@@ -1413,7 +1413,7 @@ mod preflight_only_contract {
         pub(crate) committed_map: CommittedMapProof,
         pub(crate) committed_map_occupancy: Arc<[u8]>,
         pub(crate) points_frame_id: String,
-        pub(crate) body_points: Vec<Point3<f64>>,
+        pub(crate) body_points: crate::correction_points::CorrectionPoints,
         /// 同一接纳扫描的静态子集；原始点与来源证明保留，回环算法只消费该子集。
         pub(crate) static_point_indices: Option<Arc<[u32]>>,
         /// Immutable canonical anchor captured before this frame was committed.
@@ -13113,7 +13113,7 @@ mod preflight_only_contract {
                     committed_map,
                     committed_map_occupancy: Arc::from(Vec::<u8>::new()),
                     points_frame_id: "base".to_owned(),
-                    body_points: Vec::new(),
+                    body_points: Vec::new().into(),
                     static_point_indices: None,
                     base_anchor_map_from_odom: boundary_base_anchor,
                     frame_capture_relocalization_epoch: 1,
@@ -14826,7 +14826,7 @@ mod preflight_only_contract {
                 body_points.extend(pattern.iter().take(remaining).copied());
             }
             let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points = body_points;
+            cutoff.body_points = (body_points).into();
             cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
             cutoff.registered_cloud.body_points_sha256 =
                 body_points_sha256(&cutoff.body_points).unwrap();
@@ -14978,7 +14978,7 @@ mod preflight_only_contract {
                 body_points.extend(pattern.iter().take(remaining).copied());
             }
             let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points = body_points;
+            cutoff.body_points = (body_points).into();
             cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
             cutoff.registered_cloud.body_points_sha256 =
                 body_points_sha256(&cutoff.body_points).unwrap();
@@ -15086,7 +15086,7 @@ mod preflight_only_contract {
                 .await
                 .expect("first command accumulates");
             let mut first_cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            first_cutoff.body_points = body_points.clone();
+            first_cutoff.body_points = (body_points.clone()).into();
             first_cutoff.registered_cloud.point_count = first_cutoff.body_points.len() as u64;
             first_cutoff.registered_cloud.body_points_sha256 =
                 body_points_sha256(&first_cutoff.body_points).unwrap();
@@ -15114,7 +15114,7 @@ mod preflight_only_contract {
                 .await
                 .expect("second command accumulates");
             let mut second_cutoff = active_relocalization_frame(&owner, 2, 20, 0.0);
-            second_cutoff.body_points = body_points.clone();
+            second_cutoff.body_points = (body_points.clone()).into();
             second_cutoff.registered_cloud.point_count = second_cutoff.body_points.len() as u64;
             second_cutoff.registered_cloud.body_points_sha256 =
                 body_points_sha256(&second_cutoff.body_points).unwrap();
@@ -15143,7 +15143,7 @@ mod preflight_only_contract {
                 .await
                 .expect("third command accumulates");
             let mut third_cutoff = active_relocalization_frame(&owner, 3, 30, 0.0);
-            third_cutoff.body_points = body_points;
+            third_cutoff.body_points = (body_points).into();
             third_cutoff.registered_cloud.point_count = third_cutoff.body_points.len() as u64;
             third_cutoff.registered_cloud.body_points_sha256 =
                 body_points_sha256(&third_cutoff.body_points).unwrap();
@@ -15249,7 +15249,7 @@ mod preflight_only_contract {
                 body_points.extend(pattern.iter().take(remaining).copied());
             }
             let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points = body_points;
+            cutoff.body_points = (body_points).into();
             cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
             cutoff.registered_cloud.body_points_sha256 =
                 body_points_sha256(&cutoff.body_points).unwrap();
@@ -15371,7 +15371,7 @@ mod preflight_only_contract {
                 body_points.extend(pattern.iter().take(remaining).copied());
             }
             let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points = body_points;
+            cutoff.body_points = (body_points).into();
             cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
             cutoff.registered_cloud.body_points_sha256 =
                 body_points_sha256(&cutoff.body_points).unwrap();
@@ -15442,10 +15442,10 @@ mod preflight_only_contract {
             for sequence in 1..=RELOCALIZATION_MAX_FRAMES as u64 {
                 let guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
                 let mut input = active_relocalization_frame(&owner, sequence, sequence * 10, 0.0);
-                input.body_points = asymmetric_cloud();
+                input.body_points = (asymmetric_cloud()).into();
                 input.registered_cloud.point_count = input.body_points.len() as u64;
                 if degenerate {
-                    input.body_points.fill(Point3::origin());
+                    input.body_points = input.body_points.edited_for_test(|points| points.fill(Point3::origin()));
                 }
                 input.registered_cloud.body_points_sha256 = body_points_sha256(&input.body_points).unwrap();
                 let disposition = owner
@@ -15509,7 +15509,7 @@ mod preflight_only_contract {
                 .expect("command accumulates");
             for (sequence, point_count) in [(1_u64, 100_000_usize), (2, 100_000), (3, 50_000)] {
                 let mut input = active_relocalization_frame(&owner, sequence, sequence * 10, 0.0);
-                input.body_points = vec![Point3::new(0.0, 0.0, 0.0); point_count];
+                input.body_points = (vec![Point3::new(0.0, 0.0, 0.0); point_count]).into();
                 input.registered_cloud.point_count = point_count as u64;
                 input.registered_cloud.body_points_sha256 =
                     body_points_sha256(&input.body_points).unwrap();
@@ -15575,7 +15575,7 @@ mod preflight_only_contract {
                 .expect("command accumulates");
             let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
             cutoff.body_points =
-                vec![Point3::new(0.0, 0.0, 0.0); RELOCALIZATION_MIN_AGGREGATE_POINTS];
+                (vec![Point3::new(0.0, 0.0, 0.0); RELOCALIZATION_MIN_AGGREGATE_POINTS]).into();
             cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
             cutoff.registered_cloud.body_points_sha256 =
                 body_points_sha256(&cutoff.body_points).unwrap();
@@ -15685,7 +15685,7 @@ mod preflight_only_contract {
                 body_points.extend(pattern.iter().take(remaining).copied());
             }
             let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
-            cutoff.body_points = body_points;
+            cutoff.body_points = (body_points).into();
             cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
             cutoff.registered_cloud.body_points_sha256 =
                 body_points_sha256(&cutoff.body_points).unwrap();
@@ -15864,7 +15864,7 @@ mod preflight_only_contract {
                 CorrectionSubmitDisposition::NoCandidate
             );
             let mut conflict = first;
-            conflict.body_points[0].x += 0.25;
+            conflict.body_points = conflict.body_points.edited_for_test(|points| points[0].x += 0.25);
             conflict.registered_cloud.body_points_sha256 =
                 body_points_sha256(&conflict.body_points).unwrap();
             let rejected = owner
@@ -16070,7 +16070,7 @@ mod preflight_only_contract {
                 .expect("command accumulates");
             let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
             cutoff.body_points =
-                vec![Point3::new(0.0, 0.0, 0.0); RELOCALIZATION_MIN_AGGREGATE_POINTS];
+                (vec![Point3::new(0.0, 0.0, 0.0); RELOCALIZATION_MIN_AGGREGATE_POINTS]).into();
             cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
             cutoff.registered_cloud.body_points_sha256 =
                 body_points_sha256(&cutoff.body_points).unwrap();
@@ -16141,7 +16141,7 @@ mod preflight_only_contract {
                 .expect("command accumulates");
             let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
             cutoff.body_points =
-                vec![Point3::new(0.0, 0.0, 0.0); RELOCALIZATION_MIN_AGGREGATE_POINTS];
+                (vec![Point3::new(0.0, 0.0, 0.0); RELOCALIZATION_MIN_AGGREGATE_POINTS]).into();
             cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
             cutoff.registered_cloud.body_points_sha256 =
                 body_points_sha256(&cutoff.body_points).unwrap();
@@ -16222,7 +16222,7 @@ mod preflight_only_contract {
                 .expect("command accumulates");
             let mut cutoff = active_relocalization_frame(&owner, 1, 10, 0.0);
             cutoff.body_points =
-                vec![Point3::new(0.0, 0.0, 0.0); RELOCALIZATION_MIN_AGGREGATE_POINTS];
+                (vec![Point3::new(0.0, 0.0, 0.0); RELOCALIZATION_MIN_AGGREGATE_POINTS]).into();
             cutoff.registered_cloud.point_count = cutoff.body_points.len() as u64;
             cutoff.registered_cloud.body_points_sha256 =
                 body_points_sha256(&cutoff.body_points).unwrap();
@@ -16300,10 +16300,10 @@ mod preflight_only_contract {
             };
             let mut first = frame(1, 10, 0.0);
             first.correlated_odom.odom_from_body = Isometry3::translation(1.0, 0.0, 0.0);
-            first.body_points = vec![Point3::new(0.0, 0.0, 0.0); 25_000];
+            first.body_points = (vec![Point3::new(0.0, 0.0, 0.0); 25_000]).into();
             let mut second = frame(2, 20, 0.0);
             second.correlated_odom.odom_from_body = Isometry3::translation(0.0, 2.0, 0.0);
-            second.body_points = vec![Point3::new(0.0, 0.0, 0.0); 25_000];
+            second.body_points = (vec![Point3::new(0.0, 0.0, 0.0); 25_000]).into();
             let request =
                 validate_relocalize_request(relocalization_command_request("req-source-seal", 7))
                     .expect("request fixture is canonical");
@@ -16362,7 +16362,7 @@ mod preflight_only_contract {
 
             let mut at_frame_limit = frame(1, 10, 0.0);
             at_frame_limit.body_points =
-                vec![Point3::new(0.0, 0.0, 0.0); MAX_REGISTERED_CLOUD_POINTS as usize];
+                (vec![Point3::new(0.0, 0.0, 0.0); MAX_REGISTERED_CLOUD_POINTS as usize]).into();
             at_frame_limit.registered_cloud.point_count =
                 u64::try_from(at_frame_limit.body_points.len()).unwrap();
             at_frame_limit.registered_cloud.body_points_sha256 =
@@ -16378,7 +16378,7 @@ mod preflight_only_contract {
 
             let mut above_frame_limit = frame(2, 20, 0.0);
             above_frame_limit.body_points =
-                vec![Point3::new(0.0, 0.0, 0.0); MAX_REGISTERED_CLOUD_POINTS as usize + 1];
+                (vec![Point3::new(0.0, 0.0, 0.0); MAX_REGISTERED_CLOUD_POINTS as usize + 1]).into();
             above_frame_limit.registered_cloud.point_count =
                 u64::try_from(above_frame_limit.body_points.len()).unwrap();
             above_frame_limit.registered_cloud.body_points_sha256 = [1; 32];
@@ -16402,7 +16402,7 @@ mod preflight_only_contract {
                 .expect("sealed target snapshot");
             let request = validate_relocalize_request(request).expect("request is canonical");
             let mut boundary = frame(3, 30, 0.0);
-            boundary.body_points = vec![Point3::new(0.0, 0.0, 0.0)];
+            boundary.body_points = (vec![Point3::new(0.0, 0.0, 0.0)]).into();
             boundary.registered_cloud.point_count = 1;
             boundary.registered_cloud.body_points_sha256 =
                 body_points_sha256(&boundary.body_points).unwrap();
@@ -18951,6 +18951,19 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 .collect()
         }
 
+        #[test]
+        fn correction_frame_clones_share_immutable_body_and_mask_allocations() {
+            let original = frame(1, 10, 0.0);
+            let clone = original.clone();
+            assert_eq!(original.body_points.as_ptr(), clone.body_points.as_ptr());
+            assert!(Arc::ptr_eq(&original.committed_map_occupancy, &clone.committed_map_occupancy));
+            let conflicting = clone.body_points.edited_for_test(|points| points[0].x += 0.25);
+            assert_ne!(original.body_points, conflicting);
+            assert_eq!(original.body_points, clone.body_points);
+            assert_eq!(original.registered_cloud, clone.registered_cloud);
+            assert_eq!(original.correlated_odom, clone.correlated_odom);
+        }
+
         fn frame(sequence: u64, timestamp_ns: u64, x: f64) -> CorrectionFrameInput {
             // 合成回环有0.4米漂移，点间距应足够区分真实对应与相邻重复结构。
             let body_points: Vec<_> = asymmetric_cloud()
@@ -18994,7 +19007,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 committed_map,
                 committed_map_occupancy,
                 points_frame_id: "robot_body".into(),
-                body_points,
+                body_points: body_points.into(),
                 static_point_indices: None,
                 base_anchor_map_from_odom: Isometry3::identity(),
                 frame_capture_relocalization_epoch: 0,
@@ -19372,7 +19385,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let ingress = owner.ingress();
 
             let mut rejected = frame(1, 1_000_000_000, 0.0);
-            rejected.body_points.truncate(3);
+            rejected.body_points = rejected.body_points.edited_for_test(|points| points.truncate(3));
             rejected.registered_cloud.point_count = rejected.body_points.len() as u64;
             rejected.registered_cloud.body_points_sha256 =
                 body_points_sha256(&rejected.body_points).unwrap();
@@ -21069,7 +21082,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 Err(CorrectionOwnerError::UnsupportedPointsFrame)
             );
             let mut changed_points_after_proof = frame(1, 0, 0.0);
-            changed_points_after_proof.body_points[0].x += 0.25;
+            changed_points_after_proof.body_points = changed_points_after_proof.body_points.edited_for_test(|points| points[0].x += 0.25);
             assert_eq!(
                 library.submit_frame(changed_points_after_proof),
                 Err(CorrectionOwnerError::InvalidRegisteredCloudProof)

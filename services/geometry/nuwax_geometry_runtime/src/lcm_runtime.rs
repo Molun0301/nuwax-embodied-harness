@@ -11341,7 +11341,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         points_frame_id: body_frame.to_owned(),
         static_point_indices: handle.mapping_adapter.as_ref().ok_or("建图拥有方未就绪")?.lock()
             .pgo_static_point_indices(source_timestamp_ns, binding.envelope_sha256, body_points.len())?,
-        body_points,
+        body_points: body_points.into(),
         base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
         frame_capture_relocalization_epoch: frame_capture_epoch,
         relocalization_mode_epoch: None,
@@ -11706,7 +11706,7 @@ async fn registered_lio_correction_input(
         points_frame_id: body_frame.to_owned(),
         static_point_indices: handle.mapping_adapter.as_ref().ok_or("建图拥有方未就绪")?.lock()
             .pgo_static_point_indices(source_timestamp_ns, binding.envelope_sha256, body_points.len())?,
-        body_points,
+        body_points: body_points.into(),
         base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
         frame_capture_relocalization_epoch: frame_capture_epoch,
         relocalization_mode_epoch: None,
@@ -11848,7 +11848,7 @@ async fn registered_lio_read_only_correction_frame(
         committed_map,
         committed_map_occupancy,
         points_frame_id: body_frame.to_owned(),
-        body_points,
+        body_points: body_points.into(),
         static_point_indices: None,
         base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
         frame_capture_relocalization_epoch: mode_epoch,
@@ -17435,7 +17435,7 @@ mod mapping_feed_tests {
                     .transform_point(point)
             })
             .collect::<Vec<_>>();
-        assert_eq!(frame.body_points, expected_body_points);
+        assert_eq!(&*frame.body_points, expected_body_points.as_slice());
         assert_eq!(frame.static_point_indices.as_deref(), Some([0, 1, 2].as_slice()));
         assert_eq!(
             frame.registered_cloud.body_points_sha256,

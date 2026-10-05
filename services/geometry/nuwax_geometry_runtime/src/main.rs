@@ -25,6 +25,7 @@ mod activation_identity;
 mod activation_request;
 mod relocalization_identity;
 mod correction_coordinator;
+mod correction_points;
 mod explore_runtime;
 mod explore_mission;
 mod forbidden_zones;

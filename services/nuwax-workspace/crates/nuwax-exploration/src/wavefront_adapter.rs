@@ -39,7 +39,17 @@ impl FrontierGoalIdSource for CountingIdSource {
 /// wavefront -> facade source adapter
 ///
 /// 必须持 injectable `id_source`;`begin` / `end` 由 controller 触发。
+enum PendingWavefrontPoll {
+    Ready {
+        outcome: ExploreResult<ExplorationPoll>,
+        error: Option<Option<String>>,
+    },
+    Selection(nuwax_explore_wavefront::selector::PreparedWavefrontSelection),
+}
+
+/// Wavefront source with one explicitly resolved semantic poll transaction.
 pub struct WavefrontGoalSourceAdapter {
+    prepared: Option<PendingWavefrontPoll>,
     name: Cow<'static, str>,
     selector: WavefrontGoalSelector,
     session: ExplorationSession,
@@ -71,6 +81,7 @@ impl WavefrontGoalSourceAdapter {
         let max_consecutive_failures = config.max_consecutive_failures;
         Self {
             name,
+            prepared: None,
             selector: WavefrontGoalSelector::new(config),
             session: ExplorationSession::new(),
             id_source,
@@ -100,17 +111,28 @@ impl WavefrontGoalSourceAdapter {
         &mut self,
         model: nuwax_nav_types_messages::ObservationModel,
     ) -> ExploreResult<()> {
+        if self.prepared.is_some() {
+            return Err(ExploreError::PreparedPollBusy);
+        }
         self.selector
             .set_observation_model(model)
             .map_err(|error| ExploreError::SourceError(error.to_string()))
     }
     /// 使用原拥有方捕获的机体外形。
     pub fn set_robot_geometry(&mut self, geometry: nuwax_nav_types_messages::RobotGeometry) {
+        assert!(
+            self.prepared.is_none(),
+            "resolve prepared poll before configuration"
+        );
         self.robot_geometry = Some(geometry);
     }
 
     /// 替换 id source(便于上层注入 deterministic generator)
     pub fn set_id_source(&mut self, id_source: Box<dyn FrontierGoalIdSource + Send>) {
+        assert!(
+            self.prepared.is_none(),
+            "resolve prepared poll before configuration"
+        );
         self.id_source = id_source;
     }
 
@@ -127,6 +149,10 @@ impl WavefrontGoalSourceAdapter {
         max_navigation_retries: u32,
         blacklist_radius_m: f64,
     ) {
+        assert!(
+            self.prepared.is_none(),
+            "resolve prepared poll before configuration"
+        );
         self.boundary = boundary;
         self.max_navigation_retries = max_navigation_retries;
         self.blacklist_radius_m = blacklist_radius_m.max(0.0);
@@ -157,16 +183,33 @@ impl WavefrontInputReceiver for WavefrontGoalSourceAdapter {
 }
 
 impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
-    fn checkpoint(&self)->ExploreResult<String> {
-        self.session.validate_checkpoint().map_err(ExploreError::SourceError)?;
-        serde_json::to_string(&(1_u32,&self.session)).map_err(|e|ExploreError::SourceError(e.to_string()))
+    fn checkpoint(&self) -> ExploreResult<String> {
+        self.session
+            .validate_checkpoint()
+            .map_err(ExploreError::SourceError)?;
+        serde_json::to_string(&(1_u32, &self.session))
+            .map_err(|e| ExploreError::SourceError(e.to_string()))
     }
-    fn restore_checkpoint(&mut self,payload:&str)->ExploreResult<()> {
-        if self.last_goal.is_some() || payload.len()>1_048_576{return Err(ExploreError::SourceError("二维探索恢复时已有目标或载荷过大".into()));}
-        let (version,session):(u32,ExplorationSession)=serde_json::from_str(payload).map_err(|e|ExploreError::SourceError(e.to_string()))?;
-        if version!=1{return Err(ExploreError::SourceError("二维探索进度版本不支持".into()));}
-        session.validate_checkpoint().map_err(ExploreError::SourceError)?;
-        self.session=session;self.last_frontiers.clear();Ok(())
+    fn restore_checkpoint(&mut self, payload: &str) -> ExploreResult<()> {
+        if self.prepared.is_some() {
+            return Err(ExploreError::PreparedPollBusy);
+        }
+        if self.last_goal.is_some() || payload.len() > 1_048_576 {
+            return Err(ExploreError::SourceError(
+                "二维探索恢复时已有目标或载荷过大".into(),
+            ));
+        }
+        let (version, session): (u32, ExplorationSession) =
+            serde_json::from_str(payload).map_err(|e| ExploreError::SourceError(e.to_string()))?;
+        if version != 1 {
+            return Err(ExploreError::SourceError("二维探索进度版本不支持".into()));
+        }
+        session
+            .validate_checkpoint()
+            .map_err(ExploreError::SourceError)?;
+        self.session = session;
+        self.last_frontiers.clear();
+        Ok(())
     }
     fn restore_checkpoint_for_replan(&mut self, payload: &str) -> ExploreResult<()> {
         self.restore_checkpoint(payload)?;
@@ -178,6 +221,9 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
     }
 
     fn begin(&mut self) -> ExploreResult<()> {
+        if self.prepared.is_some() {
+            return Err(ExploreError::PreparedPollBusy);
+        }
         self.is_active = true;
         self.session = ExplorationSession::new();
         self.last_goal_id = None;
@@ -188,6 +234,9 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
     }
 
     fn end(&mut self) -> ExploreResult<()> {
+        if self.prepared.is_some() {
+            return Err(ExploreError::PreparedPollBusy);
+        }
         self.is_active = false;
         Ok(())
     }
@@ -196,145 +245,155 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
         &mut self,
         state: &ExplorationStateSnapshot<'_>,
     ) -> ExploreResult<ExplorationPoll> {
-        if !self.is_active {
-            return Ok(ExplorationPoll::SourceUnavailable(
-                "wavefront source not active".to_string(),
-            ));
-        }
-        if self.last_goal.is_some() {
-            return Ok(ExplorationPoll::Pending);
-        }
-        if self.session.consecutive_failures() >= self.max_consecutive_failures
-            && self.max_consecutive_failures > 0
-        {
-            return Ok(ExplorationPoll::Stop(
-                crate::ExplorationStopReason::ConsecutiveFailuresExceeded,
-            ));
-        }
-        // 优先用 snapshot 中的 costmap,否则用缓存
-        let cached_costmap = self.cached_costmap.borrow();
-        let Some(observations) = state.global_costmap.or(cached_costmap.as_ref()) else {
-            self.last_error = Some("missing costmap".to_string());
-            return Ok(ExplorationPoll::SourceUnavailable(
-                "missing costmap".to_string(),
-            ));
-        };
-        let mut costmap = observations.clone();
+        self.prepare_poll(state)?;
+        self.commit_prepared_poll()
+    }
 
-        let robot_pose = state.robot_position();
-        if let Some(geometry) = self.robot_geometry.as_ref() {
-            let footprint = geometry
-                .grid_footprint(
-                    costmap.resolution,
-                    state.robot_pose.pose.orientation.yaw(),
-                    costmap.width,
-                    costmap.height,
-                )
-                .map_err(ExploreError::SourceError)?;
-            // 当前机体已经占据这一区域，范围约束在随后施加，不写回规范地图。
-            footprint.clear_current_occupancy(&mut costmap, robot_pose);
-            self.selector.set_grid_footprint(Some(footprint));
-        } else {
-            self.selector.set_grid_footprint(None);
+    fn supports_prepared_poll(&self) -> bool {
+        true
+    }
+
+    fn prepare_poll(
+        &mut self,
+        state: &ExplorationStateSnapshot<'_>,
+    ) -> ExploreResult<crate::PreparedExplorationPoll> {
+        if self.prepared.is_some() {
+            return Err(ExploreError::PreparedPollBusy);
         }
-        if let Some(boundary) = &self.boundary {
-            if !boundary.contains(Point2::new(robot_pose.x, robot_pose.y)) {
-                self.last_error = Some("robot pose outside exploration boundary".to_owned());
-                return Ok(ExplorationPoll::Stop(
-                    crate::ExplorationStopReason::NoReachableFreeSpace,
+        enum PrepareWavefrontValue {
+            Early(ExplorationPoll),
+            Selection(nuwax_explore_wavefront::selector::PreparedWavefrontSelection),
+        }
+        let mut error_update = None;
+        let value = (|| -> ExploreResult<PrepareWavefrontValue> {
+            if !self.is_active {
+                return Ok(PrepareWavefrontValue::Early(
+                    ExplorationPoll::SourceUnavailable("wavefront source not active".to_string()),
                 ));
             }
-            // 在候选搜索前应用边界，目标及其机体轮廓与导航使用同一区域。
-            // 只修改私有候选栅格，范围外未知不作为新的待探索前沿。
-            for y in 0..costmap.height {
-                for x in 0..costmap.width {
-                    if costmap
-                        .cell_center(x, y)
-                        .is_some_and(|point| !boundary.contains(point))
-                    {
-                        costmap.set(
-                            x,
-                            y,
-                            nuwax_nav_types_messages::grid::OccupancyCell::Occupied,
-                        );
+            if self.last_goal.is_some() {
+                return Ok(PrepareWavefrontValue::Early(ExplorationPoll::Pending));
+            }
+            if self.session.consecutive_failures() >= self.max_consecutive_failures
+                && self.max_consecutive_failures > 0
+            {
+                return Ok(PrepareWavefrontValue::Early(ExplorationPoll::Stop(
+                    crate::ExplorationStopReason::ConsecutiveFailuresExceeded,
+                )));
+            }
+            // 优先用 snapshot 中的 costmap,否则用缓存
+            let cached_costmap = self.cached_costmap.borrow();
+            let Some(observations) = state.global_costmap.or(cached_costmap.as_ref()) else {
+                error_update = Some(Some("missing costmap".to_string()));
+                return Ok(PrepareWavefrontValue::Early(
+                    ExplorationPoll::SourceUnavailable("missing costmap".to_string()),
+                ));
+            };
+            let mut costmap = observations.clone();
+
+            let robot_pose = state.robot_position();
+            if let Some(geometry) = self.robot_geometry.as_ref() {
+                let footprint = geometry
+                    .grid_footprint(
+                        costmap.resolution,
+                        state.robot_pose.pose.orientation.yaw(),
+                        costmap.width,
+                        costmap.height,
+                    )
+                    .map_err(ExploreError::SourceError)?;
+                // 当前机体已经占据这一区域，范围约束在随后施加，不写回规范地图。
+                footprint.clear_current_occupancy(&mut costmap, robot_pose);
+                self.selector.set_grid_footprint(Some(footprint));
+            } else {
+                self.selector.set_grid_footprint(None);
+            }
+            if let Some(boundary) = &self.boundary {
+                if !boundary.contains(Point2::new(robot_pose.x, robot_pose.y)) {
+                    error_update = Some(Some("robot pose outside exploration boundary".to_owned()));
+                    return Ok(PrepareWavefrontValue::Early(ExplorationPoll::Stop(
+                        crate::ExplorationStopReason::NoReachableFreeSpace,
+                    )));
+                }
+                // 在候选搜索前应用边界，目标及其机体轮廓与导航使用同一区域。
+                // 只修改私有候选栅格，范围外未知不作为新的待探索前沿。
+                for y in 0..costmap.height {
+                    for x in 0..costmap.width {
+                        if costmap
+                            .cell_center(x, y)
+                            .is_some_and(|point| !boundary.contains(point))
+                        {
+                            costmap.set(
+                                x,
+                                y,
+                                nuwax_nav_types_messages::grid::OccupancyCell::Occupied,
+                            );
+                        }
                     }
                 }
             }
-        }
-        let now = state.now;
-        match self.selector.select_goal_with_observations(
-            Point2 {
-                x: robot_pose.x,
-                y: robot_pose.y,
-            },
-            &costmap,
-            Some(observations),
-            &mut self.session,
-            now,
-            &mut *self.id_source,
-        ) {
-            Ok(GoalSelection::Goal(goal)) => {
-                let goal_point = goal.pose.pose.position.to_2d();
-                if self
-                    .boundary
-                    .as_ref()
-                    .is_some_and(|boundary| !boundary.contains(goal_point))
-                {
-                    self.session
-                        .blacklist_goal(goal_point, self.blacklist_radius_m);
-                    self.last_frontiers.clear();
-                    self.last_error = Some(format!(
-                        "frontier {} rejected: outside exploration boundary",
-                        goal.id
-                    ));
-                    return Ok(ExplorationPoll::Pending);
+            let now = state.now;
+
+            Ok(PrepareWavefrontValue::Selection(
+                self.selector.prepare_goal_with_observations(
+                    Point2 {
+                        x: robot_pose.x,
+                        y: robot_pose.y,
+                    },
+                    &costmap,
+                    Some(observations),
+                    &self.session,
+                    now,
+                ),
+            ))
+        })();
+        let (pending, outcome) = match value {
+            Ok(PrepareWavefrontValue::Selection(selection)) => {
+                let outcome = self.selection_preview(&selection);
+                (PendingWavefrontPoll::Selection(selection), outcome)
+            }
+            Ok(PrepareWavefrontValue::Early(poll)) => {
+                let outcome = Ok(poll);
+                (
+                    PendingWavefrontPoll::Ready {
+                        outcome: outcome.clone(),
+                        error: error_update,
+                    },
+                    outcome,
+                )
+            }
+            Err(error) => {
+                let outcome = Err(error);
+                (
+                    PendingWavefrontPoll::Ready {
+                        outcome: outcome.clone(),
+                        error: error_update,
+                    },
+                    outcome,
+                )
+            }
+        };
+        self.prepared = Some(pending);
+        Ok(crate::PreparedExplorationPoll::new(outcome))
+    }
+
+    fn commit_prepared_poll(&mut self) -> ExploreResult<ExplorationPoll> {
+        match self.prepared.take().ok_or(ExploreError::NoPreparedPoll)? {
+            PendingWavefrontPoll::Ready { outcome, error } => {
+                if let Some(error) = error {
+                    self.last_error = error;
                 }
-                let id = goal.id.clone();
-                self.session.record_goal_published();
-                self.last_frontiers = vec![goal.clone()];
-                self.last_goal = Some(goal.clone());
-                let polled = ExplorationPoll::Goal(goal);
-                self.last_goal_id = Some(id);
-                self.last_error = None;
-                Ok(polled)
+                outcome
             }
-            Ok(GoalSelection::NoFrontier) => {
-                self.last_frontiers.clear();
-                self.last_error = None;
-                Ok(ExplorationPoll::NoFrontier)
-            }
-            Ok(GoalSelection::Stop(stop)) => {
-                let facade_stop = match stop {
-                    StopReason::NoInformationGain => {
-                        crate::ExplorationStopReason::NoInformationGain
-                    }
-                    StopReason::NoReachableFreeSpace => {
-                        crate::ExplorationStopReason::NoReachableFreeSpace
-                    }
-                    StopReason::ConsecutiveFailuresExceeded => {
-                        crate::ExplorationStopReason::ConsecutiveFailuresExceeded
-                    }
-                    // MEDIUM-2 修正:用户 stop_movement 走独立 reason
-                    StopReason::UserCancelled => crate::ExplorationStopReason::UserCancelled,
-                };
-                self.last_error = None;
-                self.last_goal = None;
-                self.last_frontiers.clear();
-                Ok(ExplorationPoll::Stop(facade_stop))
-            }
-            Err(e @ WavefrontError::RobotFootprintUnobserved(..)) => {
-                // 初图缺测属于输入不可用，等待后续真实地图补齐；原父任务截止和取消仍有效。
-                let msg = e.to_string();
-                self.last_error = Some(msg.clone());
-                self.last_frontiers.clear();
-                Ok(ExplorationPoll::SourceUnavailable(msg))
-            }
-            Err(e) => {
-                let msg = format!("{e}");
-                self.last_error = Some(msg.clone());
-                Err(ExploreError::SourceError(msg))
+            PendingWavefrontPoll::Selection(selection) => {
+                let selection = selection.resolve(&mut self.session, &mut *self.id_source);
+                self.apply_selection(selection)
             }
         }
+    }
+
+    fn discard_prepared_poll(&mut self) -> ExploreResult<()> {
+        self.prepared.take().ok_or(ExploreError::NoPreparedPoll)?;
+        Ok(())
     }
 
     fn report_goal_feedback(
@@ -342,6 +401,9 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
         goal_id: &str,
         feedback: ExplorationGoalFeedback,
     ) -> ExploreResult<()> {
+        if self.prepared.is_some() {
+            return Err(ExploreError::PreparedPollBusy);
+        }
         let Some(goal) = self.last_goal.as_ref() else {
             return Ok(());
         };
@@ -397,13 +459,19 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
 mod tests {
     #[test]
     fn legacy_replan_selects_again_under_current_constraints() {
-        let mut previous = WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+        let mut previous =
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
         previous.begin().unwrap();
-        previous.session.record_goal_reached(Point2::new(12.5, -3.25));
-        previous.session.blacklist_goal(Point2::new(2.25, 2.25), 100.0);
+        previous
+            .session
+            .record_goal_reached(Point2::new(12.5, -3.25));
+        previous
+            .session
+            .blacklist_goal(Point2::new(2.25, 2.25), 100.0);
         previous.session.record_failure();
         let payload = previous.checkpoint().unwrap();
-        let mut restored = WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+        let mut restored =
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
         restored.configure_constraints(None, 8, 0.25);
         restored.begin().unwrap();
         restored.restore_checkpoint_for_replan(&payload).unwrap();
@@ -412,7 +480,10 @@ mod tests {
         let mut state = sample_state(Some(&grid), Timestamp::default());
         state.robot_pose.pose.position.x = 2.25;
         state.robot_pose.pose.position.y = 2.25;
-        assert!(matches!(restored.poll_goal(&state).unwrap(), ExplorationPoll::Goal(_)));
+        assert!(matches!(
+            restored.poll_goal(&state).unwrap(),
+            ExplorationPoll::Goal(_)
+        ));
         assert_eq!(previous.checkpoint().unwrap(), payload);
     }
 
@@ -849,5 +920,111 @@ mod tests {
             Some(OccupancyCell::Unknown),
             "原始观测不得被边界掩码修改"
         );
+    }
+}
+
+impl WavefrontGoalSourceAdapter {
+    fn apply_selection(
+        &mut self,
+        selection: Result<GoalSelection, WavefrontError>,
+    ) -> ExploreResult<ExplorationPoll> {
+        match selection {
+            Ok(GoalSelection::Goal(goal)) => {
+                let goal_point = goal.pose.pose.position.to_2d();
+                if self
+                    .boundary
+                    .as_ref()
+                    .is_some_and(|boundary| !boundary.contains(goal_point))
+                {
+                    self.session
+                        .blacklist_goal(goal_point, self.blacklist_radius_m);
+                    self.last_frontiers.clear();
+                    self.last_error = Some(format!(
+                        "frontier {} rejected: outside exploration boundary",
+                        goal.id
+                    ));
+                    return Ok(ExplorationPoll::Pending);
+                }
+                let id = goal.id.clone();
+                self.session.record_goal_published();
+                self.last_frontiers = vec![goal.clone()];
+                self.last_goal = Some(goal.clone());
+                let polled = ExplorationPoll::Goal(goal);
+                self.last_goal_id = Some(id);
+                self.last_error = None;
+                Ok(polled)
+            }
+            Ok(GoalSelection::NoFrontier) => {
+                self.last_frontiers.clear();
+                self.last_error = None;
+                Ok(ExplorationPoll::NoFrontier)
+            }
+            Ok(GoalSelection::Stop(stop)) => {
+                let facade_stop = match stop {
+                    StopReason::NoInformationGain => {
+                        crate::ExplorationStopReason::NoInformationGain
+                    }
+                    StopReason::NoReachableFreeSpace => {
+                        crate::ExplorationStopReason::NoReachableFreeSpace
+                    }
+                    StopReason::ConsecutiveFailuresExceeded => {
+                        crate::ExplorationStopReason::ConsecutiveFailuresExceeded
+                    }
+                    // MEDIUM-2 修正:用户 stop_movement 走独立 reason
+                    StopReason::UserCancelled => crate::ExplorationStopReason::UserCancelled,
+                };
+                self.last_error = None;
+                self.last_goal = None;
+                self.last_frontiers.clear();
+                Ok(ExplorationPoll::Stop(facade_stop))
+            }
+            Err(e @ WavefrontError::RobotFootprintUnobserved(..)) => {
+                // 初图缺测属于输入不可用，等待后续真实地图补齐；原父任务截止和取消仍有效。
+                let msg = e.to_string();
+                self.last_error = Some(msg.clone());
+                self.last_frontiers.clear();
+                Ok(ExplorationPoll::SourceUnavailable(msg))
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                self.last_error = Some(msg.clone());
+                Err(ExploreError::SourceError(msg))
+            }
+        }
+    }
+    fn selection_preview(
+        &self,
+        prepared: &nuwax_explore_wavefront::selector::PreparedWavefrontSelection,
+    ) -> ExploreResult<ExplorationPoll> {
+        use nuwax_explore_wavefront::frontier_goal::PreparedGoalSelection;
+        match &prepared.outcome {
+            Ok(PreparedGoalSelection::Goal(draft)) => {
+                let goal = draft.preview_goal();
+                if self
+                    .boundary
+                    .as_ref()
+                    .is_some_and(|boundary| !boundary.contains(goal.pose.pose.position.to_2d()))
+                {
+                    Ok(ExplorationPoll::Pending)
+                } else {
+                    Ok(ExplorationPoll::Goal(goal))
+                }
+            }
+            Ok(PreparedGoalSelection::NoFrontier) => Ok(ExplorationPoll::NoFrontier),
+            Ok(PreparedGoalSelection::Stop(stop)) => Ok(ExplorationPoll::Stop(match stop {
+                StopReason::NoInformationGain => crate::ExplorationStopReason::NoInformationGain,
+                StopReason::NoReachableFreeSpace => {
+                    crate::ExplorationStopReason::NoReachableFreeSpace
+                }
+                StopReason::ConsecutiveFailuresExceeded => {
+                    crate::ExplorationStopReason::ConsecutiveFailuresExceeded
+                }
+                StopReason::UserCancelled => crate::ExplorationStopReason::UserCancelled,
+            })),
+            Err(error @ WavefrontError::RobotFootprintUnobserved(..)) => {
+                Ok(ExplorationPoll::SourceUnavailable(error.to_string()))
+            }
+            Err(error) => Err(ExploreError::SourceError(error.to_string())),
+        }
     }
 }

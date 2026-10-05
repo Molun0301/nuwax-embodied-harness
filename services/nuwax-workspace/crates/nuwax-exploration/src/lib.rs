@@ -36,6 +36,8 @@ pub mod mission;
 
 #[cfg(feature = "surface")]
 pub mod surface_adapter;
+#[cfg(feature = "surface")]
+pub use surface_adapter::{FrozenSurfaceInput, FrozenSurfacePlanningInput};
 
 #[cfg(all(feature = "runtime", feature = "tare"))]
 pub mod tare_adapter;
@@ -58,8 +60,20 @@ pub type ExploreResult<T> = Result<T, ExploreError>;
 ///
 /// 按方案 §8.2 最小 enum;来源 / 转换 / native bridge / nav-side 错误统一
 /// 收敛为字符串 variant,避免 facade 暴露具体 crate 的 typed error 类型。
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ExploreError {
+    /// This source does not implement transactional polling.
+    #[error("exploration source does not support prepared polling")]
+    PreparedPollUnsupported,
+    /// Finalization changed the prepared logical outcome; this controller is poisoned.
+    #[error("prepared exploration protocol fault: {0}")]
+    PreparedPollProtocol(String),
+    /// Resolve the existing prepared poll before another mutation.
+    #[error("exploration prepared poll is unresolved")]
+    PreparedPollBusy,
+    /// No prepared poll exists to resolve.
+    #[error("no exploration prepared poll exists")]
+    NoPreparedPoll,
     /// controller 没有注册任何 goal source
     #[error("no exploration goal sources registered")]
     NoSources,
@@ -349,6 +363,25 @@ pub enum ExplorationPoll {
     SourceUnavailable(String),
 }
 
+/// A provisional poll projection. Its goal IDs are not committed dispatch identities.
+/// Resolve it through its source/controller before publishing or sending feedback.
+/// An algorithm error is retained here with its source's semantic delta; an outer
+/// `prepare_poll` error instead denotes unsupported/busy API use.
+#[derive(Debug, Clone)]
+pub struct PreparedExplorationPoll {
+    outcome: ExploreResult<ExplorationPoll>,
+}
+impl PreparedExplorationPoll {
+    /// Wrap a prepared algorithm outcome without committing its semantic changes.
+    pub fn new(outcome: ExploreResult<ExplorationPoll>) -> Self {
+        Self { outcome }
+    }
+    /// Inspect advice only; this is not a committed frontier or terminal outcome.
+    pub fn outcome(&self) -> &ExploreResult<ExplorationPoll> {
+        &self.outcome
+    }
+}
+
 /// controller 与 source adapter 之间共享的 explore-time 状态快照
 ///
 /// lifetime `'a` 用于零拷贝引用 `OccupancyGrid2D`;caller 既可以传入
@@ -455,6 +488,28 @@ pub trait ExplorationGoalSource: Send {
     fn poll_goal(&mut self, state: &ExplorationStateSnapshot<'_>)
         -> ExploreResult<ExplorationPoll>;
 
+    /// Explicit capability; checkpoint support does not imply transactional polling.
+    fn supports_prepared_poll(&self) -> bool {
+        false
+    }
+    /// Prepare one poll without committing semantic history or allocating a goal ID.
+    fn prepare_poll(
+        &mut self,
+        _state: &ExplorationStateSnapshot<'_>,
+    ) -> ExploreResult<PreparedExplorationPoll> {
+        Err(ExploreError::PreparedPollUnsupported)
+    }
+    /// Commit the exact pending poll once, including its accepted error-path changes.
+    /// The logical outcome must equal its preview except for deferred goal ID allocation.
+    /// Controller resolution treats any other difference as a terminal protocol fault.
+    fn commit_prepared_poll(&mut self) -> ExploreResult<ExplorationPoll> {
+        Err(ExploreError::PreparedPollUnsupported)
+    }
+    /// Discard the exact pending poll without semantic history/notification effects.
+    fn discard_prepared_poll(&mut self) -> ExploreResult<()> {
+        Err(ExploreError::PreparedPollUnsupported)
+    }
+
     /// 将 child navigation 终态反馈回 source。无状态 source 可使用默认 no-op。
     fn report_goal_feedback(
         &mut self,
@@ -470,12 +525,18 @@ pub trait ExplorationGoalSource: Send {
     }
 
     /// 保存已经确认的源历史；无支持的源必须明确拒绝。
-    fn checkpoint(&self)->ExploreResult<String> {Err(ExploreError::SourceError("探索源不支持持久进度".into()))}
+    fn checkpoint(&self) -> ExploreResult<String> {
+        Err(ExploreError::SourceError("探索源不支持持久进度".into()))
+    }
     /// 在新控制器已启动但尚未轮询前恢复历史，当前输入仍须重新核验。
-    fn restore_checkpoint(&mut self,_payload:&str)->ExploreResult<()> {Err(ExploreError::SourceError("探索源不支持恢复进度".into()))}
+    fn restore_checkpoint(&mut self, _payload: &str) -> ExploreResult<()> {
+        Err(ExploreError::SourceError("探索源不支持恢复进度".into()))
+    }
     /// Restore confirmed history while dropping decisions derived from unknown prior settings.
     fn restore_checkpoint_for_replan(&mut self, _payload: &str) -> ExploreResult<()> {
-        Err(ExploreError::SourceError("探索源不支持按当前配置恢复历史".into()))
+        Err(ExploreError::SourceError(
+            "探索源不支持按当前配置恢复历史".into(),
+        ))
     }
 
     /// 当前 source diagnostics(只读)
@@ -502,7 +563,19 @@ pub enum ExplorationArbitrationPolicy {
 ///
 /// 标准 controller 持有 `Vec<Box<dyn ExplorationGoalSource>>`,以支持
 /// heterogeneous source(纯算法 + native bridge adapter)。
+struct PreparedControllerPoll {
+    visited: Vec<(usize, ExploreResult<ExplorationPoll>)>,
+    defer_stop: bool,
+}
+struct CommittedSourcePoll {
+    index: usize,
+    outcome: ExploreResult<ExplorationPoll>,
+    diagnostics: ExplorationSourceDiagnostics,
+}
+
 pub struct ExplorationController {
+    prepared: Option<PreparedControllerPoll>,
+    prepared_fault: Option<String>,
     sources: Vec<Box<dyn ExplorationGoalSource>>,
     arbitration: ExplorationArbitrationPolicy,
     active: bool,
@@ -513,29 +586,67 @@ pub struct ExplorationController {
 
 impl ExplorationController {
     /// 由原任务在确认停止后取得所有源的版本化进度。
-    pub fn checkpoint(&self)->ExploreResult<Vec<mission::SourceCheckpoint>> {
-        self.sources.iter().map(|source| {
-            let payload=source.checkpoint()?;
-            if payload.len()>1_048_576{return Err(ExploreError::SourceError("探索源进度超过一兆字节".into()));}
-            Ok(mission::SourceCheckpoint {name:source.source_name().into_owned(),payload})
-        }).collect()
+    pub fn checkpoint(&self) -> ExploreResult<Vec<mission::SourceCheckpoint>> {
+        if let Some(error) = &self.prepared_fault {
+            return Err(ExploreError::PreparedPollProtocol(error.clone()));
+        }
+        self.sources
+            .iter()
+            .map(|source| {
+                let payload = source.checkpoint()?;
+                if payload.len() > 1_048_576 {
+                    return Err(ExploreError::SourceError("探索源进度超过一兆字节".into()));
+                }
+                Ok(mission::SourceCheckpoint {
+                    name: source.source_name().into_owned(),
+                    payload,
+                })
+            })
+            .collect()
     }
     /// 只安装到新建控制器；上层失败时丢弃整个候选，防止部分恢复。
-    pub fn restore_checkpoint(&mut self, states: &[mission::SourceCheckpoint]) -> ExploreResult<()> {
+    pub fn restore_checkpoint(
+        &mut self,
+        states: &[mission::SourceCheckpoint],
+    ) -> ExploreResult<()> {
         self.restore_checkpoint_inner(states, false)
     }
     /// A legacy checkpoint lacks its original settings; only confirmed history may survive.
-    pub fn restore_checkpoint_for_replan(&mut self, states: &[mission::SourceCheckpoint]) -> ExploreResult<()> {
+    pub fn restore_checkpoint_for_replan(
+        &mut self,
+        states: &[mission::SourceCheckpoint],
+    ) -> ExploreResult<()> {
         self.restore_checkpoint_inner(states, true)
     }
-    fn restore_checkpoint_inner(&mut self, states: &[mission::SourceCheckpoint], replan: bool) -> ExploreResult<()> {
-        if !self.active || states.len()!=self.sources.len() || states.len()>16 {return Err(ExploreError::SourceError("探索恢复源集合不匹配".into()));}
-        let mut seen=std::collections::HashSet::new();
+    fn restore_checkpoint_inner(
+        &mut self,
+        states: &[mission::SourceCheckpoint],
+        replan: bool,
+    ) -> ExploreResult<()> {
+        if let Some(error) = &self.prepared_fault {
+            return Err(ExploreError::PreparedPollProtocol(error.clone()));
+        }
+        if self.prepared.is_some() {
+            return Err(ExploreError::PreparedPollBusy);
+        }
+        if !self.active || states.len() != self.sources.len() || states.len() > 16 {
+            return Err(ExploreError::SourceError("探索恢复源集合不匹配".into()));
+        }
+        let mut seen = std::collections::HashSet::new();
         for state in states {
-            if state.payload.len()>1_048_576 || !seen.insert(&state.name){return Err(ExploreError::SourceError("探索恢复源重复或载荷过大".into()));}
-            let source=self.sources.iter_mut().find(|s|s.source_name()==state.name).ok_or_else(||ExploreError::SourceError("探索恢复源名称不匹配".into()))?;
-            if replan { source.restore_checkpoint_for_replan(&state.payload)?; }
-            else { source.restore_checkpoint(&state.payload)?; }
+            if state.payload.len() > 1_048_576 || !seen.insert(&state.name) {
+                return Err(ExploreError::SourceError("探索恢复源重复或载荷过大".into()));
+            }
+            let source = self
+                .sources
+                .iter_mut()
+                .find(|s| s.source_name() == state.name)
+                .ok_or_else(|| ExploreError::SourceError("探索恢复源名称不匹配".into()))?;
+            if replan {
+                source.restore_checkpoint_for_replan(&state.payload)?;
+            } else {
+                source.restore_checkpoint(&state.payload)?;
+            }
         }
         Ok(())
     }
@@ -545,6 +656,8 @@ impl ExplorationController {
     pub fn new(arbitration: ExplorationArbitrationPolicy) -> Self {
         Self {
             sources: Vec::new(),
+            prepared: None,
+            prepared_fault: None,
             arbitration,
             active: false,
             last_stop_reason: None,
@@ -570,11 +683,19 @@ impl ExplorationController {
     where
         T: ExplorationGoalSource + 'static,
     {
+        assert!(
+            self.prepared.is_none(),
+            "resolve prepared poll before changing sources"
+        );
         self.sources.push(Box::new(source));
     }
 
     /// 注册任意满足 trait object 的 source(便于 trait-object-only 调用方)
     pub fn add_source_boxed(&mut self, source: Box<dyn ExplorationGoalSource>) {
+        assert!(
+            self.prepared.is_none(),
+            "resolve prepared poll before changing sources"
+        );
         self.sources.push(source);
     }
 
@@ -592,6 +713,12 @@ impl ExplorationController {
     ///
     /// `active == true` 时返回 `AlreadyActive`(保持状态)。
     pub fn begin_exploration(&mut self) -> ExploreResult<()> {
+        if let Some(error) = &self.prepared_fault {
+            return Err(ExploreError::PreparedPollProtocol(error.clone()));
+        }
+        if self.prepared.is_some() {
+            return Err(ExploreError::PreparedPollBusy);
+        }
         if self.active {
             return Err(ExploreError::AlreadyActive);
         }
@@ -630,6 +757,9 @@ impl ExplorationController {
 
     /// 以明确原因结束 exploration，并按 reverse order 释放全部 source。
     pub fn stop_with_reason(&mut self, reason: ExplorationStopReason) -> ExploreResult<()> {
+        if self.prepared.is_some() {
+            self.discard_prepared_poll()?;
+        }
         if self.active {
             for source in self.sources.iter_mut().rev() {
                 let _ = source.end();
@@ -647,6 +777,9 @@ impl ExplorationController {
 
     /// 关闭 controller 并丢弃所有 source(state)
     pub fn shutdown(&mut self) {
+        if self.prepared.is_some() {
+            let _ = self.discard_prepared_poll();
+        }
         if self.active {
             for source in self.sources.iter_mut().rev() {
                 let _ = source.end();
@@ -670,10 +803,184 @@ impl ExplorationController {
     }
 
     /// 父任务需要完成返航时保留源和控制器，终态由原父任务明确收尾。
+    /// Prepare one whole arbitration without committing any visited source's semantic delta.
+    /// Unsupported sources are rejected before any source is polled. A returned
+    /// algorithm error remains part of the pending transaction until resolution.
+    pub fn prepare_poll_with_deferred_stop(
+        &mut self,
+        state: &ExplorationStateSnapshot<'_>,
+        defer_stop: bool,
+    ) -> ExploreResult<PreparedExplorationPoll> {
+        if let Some(error) = &self.prepared_fault {
+            return Err(ExploreError::PreparedPollProtocol(error.clone()));
+        }
+        if self.prepared.is_some() {
+            return Err(ExploreError::PreparedPollBusy);
+        }
+        if self.sources.iter().any(|s| !s.supports_prepared_poll()) {
+            return Err(ExploreError::PreparedPollUnsupported);
+        }
+        let mut visited: Vec<(usize, ExploreResult<ExplorationPoll>)> = Vec::new();
+        let mut best_goal: Option<FrontierGoal> = None;
+        let mut pending = false;
+        let mut no_frontier = false;
+        let mut unavailable = None;
+        let mut immediate = None;
+        if self.active {
+            for index in self.arbitration_order() {
+                let prepared = match self.sources[index].prepare_poll(state) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let mut detail = format!(
+                            "source `{}` rejected preparation: {error}",
+                            self.sources[index].source_name()
+                        );
+                        for (prior, _) in &visited {
+                            if let Err(discard) = self.sources[*prior].discard_prepared_poll() {
+                                detail.push_str(&format!(
+                                    "; source `{}` failed discard: {discard}",
+                                    self.sources[*prior].source_name()
+                                ));
+                            }
+                        }
+                        return Err(self.poison_prepared_protocol(detail));
+                    }
+                };
+                visited.push((index, prepared.outcome().clone()));
+                match prepared.outcome() {
+                    Err(error) => {
+                        unavailable =
+                            Some(format!("{}: {error}", self.sources[index].source_name()))
+                    }
+                    Ok(ExplorationPoll::Goal(goal)) => {
+                        if self.arbitration == ExplorationArbitrationPolicy::HighestScore {
+                            if best_goal
+                                .as_ref()
+                                .is_none_or(|best| goal.score > best.score)
+                            {
+                                best_goal = Some(goal.clone());
+                            }
+                        } else {
+                            immediate = Some(ExplorationPoll::Goal(goal.clone()));
+                            break;
+                        }
+                    }
+                    Ok(ExplorationPoll::Pending) => pending = true,
+                    Ok(ExplorationPoll::NoFrontier) => no_frontier = true,
+                    Ok(ExplorationPoll::SourceUnavailable(reason)) => {
+                        unavailable = Some(reason.clone())
+                    }
+                    Ok(ExplorationPoll::Stop(reason)) => {
+                        immediate = Some(ExplorationPoll::Stop(*reason));
+                        break;
+                    }
+                }
+            }
+        } else {
+            immediate = Some(ExplorationPoll::SourceUnavailable(
+                "controller not active".into(),
+            ));
+        }
+        let outcome = immediate.unwrap_or_else(|| {
+            if let Some(goal) = best_goal {
+                ExplorationPoll::Goal(goal)
+            } else if let Some(reason) = unavailable {
+                if pending {
+                    ExplorationPoll::Pending
+                } else {
+                    ExplorationPoll::SourceUnavailable(reason)
+                }
+            } else if pending {
+                ExplorationPoll::Pending
+            } else if no_frontier {
+                ExplorationPoll::NoFrontier
+            } else {
+                ExplorationPoll::Pending
+            }
+        });
+        self.prepared = Some(PreparedControllerPoll {
+            visited,
+            defer_stop,
+        });
+        Ok(PreparedExplorationPoll::new(Ok(outcome)))
+    }
+
+    /// Accept the exact pending arbitration. ID allocation and source end calls happen here.
+    pub fn commit_prepared_poll(&mut self) -> ExploreResult<ExplorationPoll> {
+        let prepared = self.prepared.take().ok_or(ExploreError::NoPreparedPoll)?;
+        let mut committed = Vec::with_capacity(prepared.visited.len());
+        let mut visited = prepared.visited.into_iter();
+        while let Some((index, expected)) = visited.next() {
+            let outcome = self.sources[index].commit_prepared_poll();
+            let diagnostics = self.sources[index].diagnostics();
+            if !prepared_outcome_matches(&expected, &outcome) {
+                let mut detail = format!(
+                    "source `{}` changed its prepared logical outcome",
+                    self.sources[index].source_name()
+                );
+                for (remaining, _) in visited {
+                    if let Err(error) = self.sources[remaining].discard_prepared_poll() {
+                        detail.push_str(&format!("; discard failed: {error}"));
+                    }
+                }
+                return Err(self.poison_prepared_protocol(detail));
+            }
+            committed.push(CommittedSourcePoll {
+                index,
+                outcome,
+                diagnostics,
+            });
+        }
+        self.poll_next_goal_impl(None, prepared.defer_stop, Some(committed))
+    }
+
+    /// Retire all visited-source patches, including losing goals and partial errors.
+    pub fn discard_prepared_poll(&mut self) -> ExploreResult<()> {
+        let prepared = self.prepared.take().ok_or(ExploreError::NoPreparedPoll)?;
+        let mut first_error = None;
+        for (index, _) in prepared.visited {
+            if let Err(error) = self.sources[index].discard_prepared_poll() {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => {
+                Err(self.poison_prepared_protocol(format!("prepared discard failed: {error}")))
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn poison_prepared_protocol(&mut self, detail: String) -> ExploreError {
+        self.prepared_fault = Some(detail.clone());
+        self.active = false;
+        self.last_stop_reason = Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
+        for source in self.sources.iter_mut().rev() {
+            let _ = source.end();
+        }
+        ExploreError::PreparedPollProtocol(detail)
+    }
+
+    /// Synchronously arbitrate and apply source effects; prepared transactions must be resolved first.
     pub fn poll_next_goal_with_deferred_stop(
         &mut self,
         state: &ExplorationStateSnapshot<'_>,
         defer_stop: bool,
+    ) -> ExploreResult<ExplorationPoll> {
+        if let Some(error) = &self.prepared_fault {
+            return Err(ExploreError::PreparedPollProtocol(error.clone()));
+        }
+        if self.prepared.is_some() {
+            return Err(ExploreError::PreparedPollBusy);
+        }
+        self.poll_next_goal_impl(Some(state), defer_stop, None)
+    }
+
+    fn poll_next_goal_impl(
+        &mut self,
+        state: Option<&ExplorationStateSnapshot<'_>>,
+        defer_stop: bool,
+        committed: Option<Vec<CommittedSourcePoll>>,
     ) -> ExploreResult<ExplorationPoll> {
         if !self.active {
             return Ok(ExplorationPoll::SourceUnavailable(
@@ -684,6 +991,7 @@ impl ExplorationController {
         self.last_source_diag.clear();
 
         let order = self.arbitration_order();
+        let mut committed = committed.map(Vec::into_iter);
         let mut best_goal: Option<(f32, usize, FrontierGoal)> = None;
         let mut any_pending = false;
         let mut any_no_frontier = false;
@@ -692,13 +1000,31 @@ impl ExplorationController {
 
         for &idx in &order {
             let source_name = self.sources[idx].source_name();
-            let poll = match self.sources[idx].poll_goal(state) {
+            let mut saved_diagnostics = None;
+            let outcome = if let Some(committed) = committed.as_mut() {
+                let Some(entry) = committed.next() else {
+                    return Err(self.poison_prepared_protocol(
+                        "prepared arbitration exhausted before its logical outcome".into(),
+                    ));
+                };
+                if entry.index != idx {
+                    return Err(self.poison_prepared_protocol(
+                        "prepared arbitration source order changed".into(),
+                    ));
+                }
+                saved_diagnostics = Some(entry.diagnostics);
+                entry.outcome
+            } else {
+                self.sources[idx].poll_goal(state.expect("synchronous poll state"))
+            };
+            let poll = match outcome {
                 Ok(p) => p,
                 Err(e) => {
                     any_unavailable = true;
                     last_unavailable = Some(format!("{source_name}: {e}"));
-                    self.last_source_diag.push(diag_for(
+                    self.last_source_diag.push(diag_for_saved(
                         &*self.sources[idx],
+                        saved_diagnostics.as_ref(),
                         None,
                         Some(format!("{e}")),
                     ));
@@ -718,8 +1044,9 @@ impl ExplorationController {
                             if replace {
                                 best_goal = Some((score, idx, goal.clone()));
                                 self.last_selected = Some(source_name.to_string());
-                                self.last_source_diag.push(diag_for(
+                                self.last_source_diag.push(diag_for_saved(
                                     &*self.sources[idx],
+                                    saved_diagnostics.as_ref(),
                                     Some(goal.id.clone()),
                                     None,
                                 ));
@@ -727,8 +1054,9 @@ impl ExplorationController {
                         }
                         _ => {
                             self.last_selected = Some(source_name.to_string());
-                            self.last_source_diag.push(diag_for(
+                            self.last_source_diag.push(diag_for_saved(
                                 &*self.sources[idx],
+                                saved_diagnostics.as_ref(),
                                 Some(goal.id.clone()),
                                 None,
                             ));
@@ -738,19 +1066,28 @@ impl ExplorationController {
                 }
                 ExplorationPoll::Pending => {
                     any_pending = true;
-                    self.last_source_diag
-                        .push(diag_for(&*self.sources[idx], None, None));
+                    self.last_source_diag.push(diag_for_saved(
+                        &*self.sources[idx],
+                        saved_diagnostics.as_ref(),
+                        None,
+                        None,
+                    ));
                 }
                 ExplorationPoll::NoFrontier => {
                     any_no_frontier = true;
-                    self.last_source_diag
-                        .push(diag_for(&*self.sources[idx], None, None));
+                    self.last_source_diag.push(diag_for_saved(
+                        &*self.sources[idx],
+                        saved_diagnostics.as_ref(),
+                        None,
+                        None,
+                    ));
                 }
                 ExplorationPoll::SourceUnavailable(reason) => {
                     any_unavailable = true;
                     last_unavailable = Some(reason);
-                    self.last_source_diag.push(diag_for(
+                    self.last_source_diag.push(diag_for_saved(
                         &*self.sources[idx],
+                        saved_diagnostics.as_ref(),
                         None,
                         last_unavailable.clone(),
                     ));
@@ -800,6 +1137,12 @@ impl ExplorationController {
         goal_id: &str,
         feedback: ExplorationGoalFeedback,
     ) -> ExploreResult<()> {
+        if let Some(error) = &self.prepared_fault {
+            return Err(ExploreError::PreparedPollProtocol(error.clone()));
+        }
+        if self.prepared.is_some() {
+            return Err(ExploreError::PreparedPollBusy);
+        }
         for source in &mut self.sources {
             source.report_goal_feedback(goal_id, feedback.clone())?;
         }
@@ -883,6 +1226,51 @@ impl ExplorationController {
             }
         }
         order
+    }
+}
+
+fn prepared_outcome_matches(
+    expected: &ExploreResult<ExplorationPoll>,
+    actual: &ExploreResult<ExplorationPoll>,
+) -> bool {
+    match (expected, actual) {
+        (Ok(ExplorationPoll::Goal(a)), Ok(ExplorationPoll::Goal(b))) => {
+            let position = |g: &FrontierGoal| {
+                let p = g.pose.pose.position;
+                [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]
+            };
+            let orientation = |g: &FrontierGoal| {
+                let q = g.pose.pose.orientation;
+                [q.x.to_bits(), q.y.to_bits(), q.z.to_bits(), q.w.to_bits()]
+            };
+            position(a) == position(b)
+                && orientation(a) == orientation(b)
+                && a.pose.frame_id == b.pose.frame_id
+                && a.pose.stamp == b.pose.stamp
+                && a.score.to_bits() == b.score.to_bits()
+                && a.information_gain.map(f32::to_bits) == b.information_gain.map(f32::to_bits)
+                && a.distance_cost.map(f32::to_bits) == b.distance_cost.map(f32::to_bits)
+                && a.frontier_area_m2.map(f32::to_bits) == b.frontier_area_m2.map(f32::to_bits)
+                && a.producer == b.producer
+                && a.stamp == b.stamp
+                && a.metadata == b.metadata
+        }
+        _ => expected == actual,
+    }
+}
+
+fn diag_for_saved(
+    source: &dyn ExplorationGoalSource,
+    saved: Option<&ExplorationSourceDiagnostics>,
+    last_goal_id: Option<String>,
+    last_error: Option<String>,
+) -> ExplorationSourceDiagnostics {
+    let base = saved.cloned().unwrap_or_else(|| source.diagnostics());
+    ExplorationSourceDiagnostics {
+        source_name: base.source_name,
+        is_active: base.is_active,
+        last_goal_id: last_goal_id.or(base.last_goal_id),
+        last_error: last_error.or(base.last_error),
     }
 }
 
@@ -1176,3 +1564,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod prepared_tests;

@@ -3655,6 +3655,21 @@ mod tests {
         }
 
         #[test]
+        fn visited_incompatible_column_still_stops_ray_before_far_layer() {
+            let fine=f64::from(0.05_f32);
+            for stride in [1,2] {
+                // The low seed reaches +0.2 m, but cannot reach the far +0.4 m.
+                // From +0.2 m, the already-visited low column blocks the ray even
+                // though descending to it is incompatible. Empty columns may be
+                // scanned through; visited real columns may never be skipped.
+                let (map,keys)=make(vec![[-stride,0,7],[0,0,-1],[stride,0,3]]);
+                let points=compare(&map,&keys,[0.5*fine,0.5*fine,0.0],0.3).unwrap();
+                assert_eq!(points.len(),2);
+                assert!(points.iter().all(|point|point.0[0]>=0.5*fine));
+            }
+        }
+
+        #[test]
         fn masked_current_view_never_emits_inferred_support() {
             let mut keys:Vec<_>=(-10_i32..=10).flat_map(|x|(-10_i32..=10)
                 .filter(move |y|x.abs()>=2 || y.abs()>=2).map(move |y|[x,y,-1])).collect();

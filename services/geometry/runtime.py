@@ -18,7 +18,7 @@ import threading
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Protocol, Set, Tuple, TYPE_CHECKING, runtime_checkable
+from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Mapping, Optional, Protocol, Set, Tuple, TYPE_CHECKING, runtime_checkable
 from urllib.parse import quote
 
 import grpc
@@ -27,7 +27,15 @@ from contracts.geometry import Pose, Vector3
 from contracts.maps import OccupancyGrid
 from core.errors import GatewayError
 from core.logging_utils import JsonLineFormatter
+from contracts.map_activation import AssignedActivationReceipt
+from contracts.map_relocalization import (
+    AssignedRelocalizationQuery,
+    AssignedRelocalizationRequest,
+    AssignedRelocalizationTerminal,
+    current_assigned_relocalization_policy,
+)
 from contracts.map_workspace import (
+    AssetIdentityV2,
     MapAssetBundle,
     MapGeometryAssetBinding,
     MapGeometryAssetRef,
@@ -62,6 +70,7 @@ from services.geometry.geometry_runtime_provider import (
     GeometryRuntimeRpcError,
     MappingBackendCheckpointExportBundle,
     _exploration_child_lease_fingerprint,
+    _LEGACY_ACTIVATION_IDENTITY_FIELDS,
 )
 from services.geometry.loop_closure_state import read_loop_closure_from_db
 from services.geometry.checkpoint_payload import payload_chunks
@@ -214,7 +223,80 @@ class _MapActivationSnapshot:
     bundle_root: Optional[Path]
     activation_result_json: str
     generation: int
-    identity: Tuple[object, ...]
+
+
+@dataclass(frozen=True, init=False)
+class _AssignedMapActivationTarget:
+    """Process-local handle to an actual captured installation, never a receipt claim."""
+
+    _snapshot: _MapActivationSnapshot = field(repr=False)
+    activation_receipt: AssignedActivationReceipt
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError("assigned targets must be captured from the runtime owner")
+
+    @property
+    def asset_identity(self) -> AssetIdentityV2:
+        return self.activation_receipt.asset_identity
+
+    @property
+    def map_name(self) -> str:
+        return self.activation_receipt.map_name
+
+    @property
+    def relocalization_policy(self) -> Dict[str, object]:
+        # Return the actual projected native policy, detached from its owner.
+        return json.loads(self._snapshot.activation_result_json)["relocalization_policy_v2"]
+
+
+_ASSIGNED_QUERY_STATUS_NAMES = {
+    1: "terminal", 2: "pending", 3: "not_found", 4: "identity_conflict",
+}
+
+
+@dataclass(frozen=True, init=False)
+class _AssignedRelocalizationQueryResult:
+    """Validated query evidence, distinct from a new dispatch's terminal reply."""
+
+    query: AssignedRelocalizationQuery
+    terminal: Optional[AssignedRelocalizationTerminal]
+    _response_json: str = field(repr=False)
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError("assigned query results must come from validated retrieval")
+
+    @property
+    def status(self) -> str:
+        return _ASSIGNED_QUERY_STATUS_NAMES[self.to_dict()["status"]]
+
+    def to_dict(self) -> Dict[str, object]:
+        """Complete canonical response, including the whole durable request echo."""
+        return json.loads(self._response_json)
+
+
+def _retained_assigned_request(value) -> AssignedRelocalizationRequest:
+    # A replay may never allocate a fresh alias or normalize timeout zero again.
+    return (value if isinstance(value, AssignedRelocalizationRequest)
+            else AssignedRelocalizationRequest.from_dict(value))
+
+
+def _assigned_terminal_from_result(
+    result, request: AssignedRelocalizationRequest,
+) -> AssignedRelocalizationTerminal:
+    if isinstance(result, AssignedRelocalizationTerminal):
+        terminal = result
+    else:
+        envelope = {"schema_version", "request_id", "assigned_cloud_v2"}
+        convenience = {"success", "disposition", "disposition_name", "correction_revision", "detail"}
+        if (not isinstance(result, Mapping) or not envelope <= result.keys()
+                or set(result) - envelope - convenience):
+            raise ValueError("assigned terminal envelope is missing, mixed, or unsupported")
+        # Provider convenience fields are never proof or settlement authority.
+        terminal = AssignedRelocalizationTerminal.from_dict(
+            {name: result[name] for name in envelope})
+    if not request.exact_replay_of(terminal.request):
+        raise ValueError("assigned terminal belongs to a different whole request")
+    return terminal
 
 
 @dataclass(frozen=True)
@@ -887,7 +969,6 @@ class PlatformGeometryRuntime:
             bundle_root=None,
             activation_result_json="{}",
             generation=0,
-            identity=(0, None, None, None, None),
         )
         # 以下4个 Python provider 已由 Rust bridge (GeometryRuntimeProvider) 替代，保留 None 占位以兼容现有引用
         self._live_map_provider = None
@@ -3599,7 +3680,6 @@ class PlatformGeometryRuntime:
                 bundle_root=None,
                 activation_result_json="{}",
                 generation=0,
-                identity=(0, None, None, None, None),
             )
             self._map_activation_snapshot = snapshot
         return snapshot
@@ -3613,14 +3693,14 @@ class PlatformGeometryRuntime:
                 snapshot = self._map_activation_snapshot_locked()
         # 已封存资产字段不可改写，嵌套可变数据由契约按读取隔离。
         # 内部查询只需稳定身份和代次，不复制、重新校验整张地图。
-        if snapshot.bundle is None or snapshot.bundle.manifest_sha256 is not None:
+        if (snapshot.bundle is None or snapshot.bundle.identity_schema_version == 2
+                or snapshot.bundle.manifest_sha256 is not None):
             return snapshot
         return _MapActivationSnapshot(
             bundle=self._clone_contract(snapshot.bundle),
             bundle_root=snapshot.bundle_root,
             activation_result_json=snapshot.activation_result_json,
             generation=snapshot.generation,
-            identity=snapshot.identity,
         )
 
     def _install_map_activation_snapshot_locked(
@@ -3639,21 +3719,11 @@ class PlatformGeometryRuntime:
             separators=(",", ":"),
         )
         generation = previous.generation + 1
-        identity = (
-            generation,
-            installed_bundle.map_name if installed_bundle is not None else None,
-            str(installed_bundle.manifest_sha256 or "").strip().lower()
-            if installed_bundle is not None
-            else None,
-            installed_result.get("activation_identity_sha256"),
-            hashlib.sha256(installed_result_json.encode("utf-8")).hexdigest(),
-        )
         snapshot = _MapActivationSnapshot(
             bundle=installed_bundle,
             bundle_root=bundle_root,
             activation_result_json=installed_result_json,
             generation=generation,
-            identity=identity,
         )
         self._map_activation_snapshot = snapshot
         if installed_bundle is not None:
@@ -3666,10 +3736,201 @@ class PlatformGeometryRuntime:
         expected: _MapActivationSnapshot,
     ) -> bool:
         current = self._map_activation_snapshot
-        return (
-            current.generation == expected.generation
-            and current.identity == expected.identity
+        # Legacy unsealed readers receive detached descriptors, but retain this
+        # installation's existing generation. Equal metadata reinstallation is
+        # still a different generation; no content digest is an owner fence.
+        return current.generation == expected.generation
+
+    def capture_assigned_map_activation_target(
+        self, *, map_name: str, asset_identity: AssetIdentityV2,
+    ) -> _AssignedMapActivationTarget:
+        """Capture a sealed assigned owner without enabling native availability.
+
+        Partial/staged/retired diagnostics remain in the activation snapshot;
+        they cannot be promoted into a complete target by this consumer API.
+        """
+        if not isinstance(asset_identity, AssetIdentityV2):
+            raise ValueError("assigned target requires an exact AssetIdentityV2")
+        with self._runtime_state_lock:
+            snapshot = self._map_activation_snapshot_locked()
+            bundle = snapshot.bundle
+            if (bundle is None or bundle.identity_schema_version != 2
+                    or bundle.asset_state != "finalized"
+                    or bundle.manifest_sha256 is not None
+                    or bundle.asset_identity != asset_identity
+                    or bundle.map_name != map_name):
+                raise ValueError("assigned target differs from the installed finalized asset")
+            activation = self._activation_result_from_snapshot(snapshot)
+            if (type(activation.get("activation_receipt_schema_version")) is not int
+                    or activation["activation_receipt_schema_version"] != 2
+                    or type(activation.get("activation_receipt_disposition")) is not int
+                    or activation["activation_receipt_disposition"] not in {2, 3}
+                    or type(activation.get("relocalization_target_available")) is not bool):
+                raise ValueError("assigned target requires a complete sealed activation")
+            if any(name in activation for name in
+                   _LEGACY_ACTIVATION_IDENTITY_FIELDS + ("cloud_source_sha256",)):
+                raise ValueError("assigned activation mixes legacy or planar identity")
+            receipt = AssignedActivationReceipt.admit(activation.get("activation_receipt_v2"))
+            if receipt.asset_identity != asset_identity or receipt.map_name != map_name:
+                raise ValueError("assigned receipt differs from the installed asset identity")
+            installed = receipt.to_dict()["activation"]
+            expected = {
+                "map_name": receipt.map_name, "session_id": receipt.session_id,
+                "activation_request_id": receipt.request_id,
+                "runtime_generation": receipt.runtime_generation,
+                "session_generation": installed["session_generation"],
+                "backend_generation": installed["backend_generation"],
+                "mapping_backend_kind": installed["backend_kind"],
+            }
+            if any(type(activation.get(name)) is not type(value)
+                   or activation[name] != value for name, value in expected.items()):
+                raise ValueError("assigned state and complete receipt ownership differ")
+            # Validate the actual projected policy, never fill a missing policy
+            # from Python's current parameters or from a legacy digest alias.
+            policy = activation.get("relocalization_policy_v2")
+            expected_policy = current_assigned_relocalization_policy()
+            if (not isinstance(policy, dict) or set(policy) != set(expected_policy)
+                    or any(type(policy[name]) is not type(value) or policy[name] != value
+                           for name, value in expected_policy.items())):
+                raise ValueError("assigned target omitted or changed the actual native policy")
+            target = object.__new__(_AssignedMapActivationTarget)
+            object.__setattr__(target, "_snapshot", snapshot)
+            object.__setattr__(target, "activation_receipt", receipt)
+            return target
+
+    def _require_assigned_map_activation_target_locked(
+        self, expected_target: _AssignedMapActivationTarget,
+        request: Optional[AssignedRelocalizationRequest] = None,
+        *, require_available: bool = False,
+    ) -> Dict[str, object]:
+        if not isinstance(expected_target, _AssignedMapActivationTarget):
+            raise TypeError("assigned operation requires a runtime-captured target")
+        if self._map_activation_snapshot_locked() is not expected_target._snapshot:
+            raise RuntimeError("assigned activation installation changed")
+        activation = self._activation_result_from_snapshot(expected_target._snapshot)
+        if request is not None:
+            if (request.asset_identity != expected_target.asset_identity
+                    or not request.activation_receipt.exact_replay_of(expected_target.activation_receipt)
+                    or request.to_dict()["assigned_cloud_v2"]["policy"]
+                    != activation["relocalization_policy_v2"]):
+                raise ValueError("durable assigned request differs from the captured target or policy")
+        if require_available and activation["relocalization_target_available"] is not True:
+            raise RuntimeError("captured assigned relocalization target is unavailable")
+        return activation
+
+    def get_validated_assigned_map_activation_receipt(
+        self, *, expected_target: _AssignedMapActivationTarget,
+    ) -> Dict[str, object]:
+        """Project the complete receipt of this exact current installation."""
+        with self._runtime_state_lock:
+            self._require_assigned_map_activation_target_locked(expected_target)
+            return expected_target.activation_receipt.to_dict()
+
+    @contextmanager
+    def _assigned_relocalization_result_guard(
+        self, result, *, assigned_request_v2,
+        expected_target: _AssignedMapActivationTarget,
+    ) -> Iterator[Dict[str, object]]:
+        """Private future integration fence for a short metadata-only install.
+
+        Validate metadata before taking the existing runtime lock. The caller
+        must establish localization/session lock ordering before wiring this
+        primitive. While held: no RPC, asset/body I/O, map serialization,
+        callbacks, or arbitrary user work. No default caller uses this yet.
+        """
+        request = _retained_assigned_request(assigned_request_v2)
+        terminal = _assigned_terminal_from_result(result, request)
+        receipt = terminal.to_dict()
+        with self._runtime_state_lock:
+            self._require_assigned_map_activation_target_locked(
+                expected_target, request, require_available=True)
+            yield receipt
+
+    def get_validated_assigned_relocalization_receipt(
+        self, result, *, assigned_request_v2,
+        expected_target: _AssignedMapActivationTarget,
+    ) -> Dict[str, object]:
+        """Canonical projection with an instantaneous exact-current check.
+
+        This alone does not fence a later write. A future metadata-only session
+        installation must use the private result guard after lock-order review.
+        """
+        with self._assigned_relocalization_result_guard(
+            result, assigned_request_v2=assigned_request_v2,
+            expected_target=expected_target,
+        ) as receipt:
+            return receipt
+
+    def relocalize_assigned_active_map(
+        self, *, assigned_request_v2, expected_target: _AssignedMapActivationTarget,
+    ) -> AssignedRelocalizationTerminal:
+        """Dispatch one retained normalized request, preserving its caller alias.
+
+        A valid non-applied terminal is returned as evidence, not fabricated
+        into success. It is a dispatch reply, not durable query-retirement proof.
+        """
+        request = _retained_assigned_request(assigned_request_v2)
+        provider = self.get_geometry_runtime_provider()
+        dispatch = getattr(provider, "relocalize", None)
+        if not callable(dispatch):
+            raise RuntimeError("Geometry runtime does not support assigned relocalization")
+        with self._runtime_state_lock:
+            activation = self._require_assigned_map_activation_target_locked(
+                expected_target, request, require_available=True)
+        result = dispatch(
+            activation_state=activation, request_id=request.request_id,
+            logical_timeout_ms=request.logical_timeout_ms, assigned_request_v2=request,
         )
+        terminal = _assigned_terminal_from_result(result, request)
+        with self._runtime_state_lock:
+            self._require_assigned_map_activation_target_locked(
+                expected_target, request, require_available=True)
+        return terminal
+
+    def get_assigned_relocalization_terminal(
+        self, *, assigned_request_v2,
+    ) -> _AssignedRelocalizationQueryResult:
+        """Retrieve durable evidence even after the target is unavailable/retired.
+
+        This method never installs a terminal into the current local session.
+        Query identity comes only from the retained normalized request, with no
+        current activation lookup and no regenerated request alias.
+        """
+        request = _retained_assigned_request(assigned_request_v2)
+        query = AssignedRelocalizationQuery.from_dict({
+            "schema_version": 2, "request_id": request.request_id,
+            "assigned_request_v2": request.to_dict(),
+        })
+        provider = self.get_geometry_runtime_provider()
+        retrieve = getattr(provider, "get_relocalization_terminal", None)
+        if not callable(retrieve):
+            raise RuntimeError("Geometry runtime does not support assigned terminal queries")
+        result = retrieve(
+            activation_state={}, request_id=request.request_id,
+            logical_timeout_ms=request.logical_timeout_ms, assigned_request_v2=request,
+        )
+        fields = {"schema_version", "request_id", "status", "terminal",
+                  "ledger_observation", "assigned_request_v2"}
+        if not isinstance(result, Mapping) or set(result) != fields:
+            raise ValueError("assigned query response is missing, mixed, or unsupported")
+        statuses = {name: number for number, name in _ASSIGNED_QUERY_STATUS_NAMES.items()}
+        status = result["status"]
+        if not isinstance(status, str) or status not in statuses:
+            raise ValueError("assigned query response status is unsupported")
+        terminal = (_assigned_terminal_from_result(result["terminal"], request)
+                    if result["terminal"] is not None else None)
+        canonical = dict(result, status=statuses[status],
+                         terminal=terminal.to_dict() if terminal is not None else None)
+        # Seal first, then validate that exact retained value. The provider's
+        # nested request/observation dictionaries may still have mutable aliases.
+        response_json = json.dumps(
+            canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        terminal = query.validate_response(json.loads(response_json))
+        evidence = object.__new__(_AssignedRelocalizationQueryResult)
+        object.__setattr__(evidence, "query", query)
+        object.__setattr__(evidence, "terminal", terminal)
+        object.__setattr__(evidence, "_response_json", response_json)
+        return evidence
 
     def _require_map_activation_target_locked(
         self,

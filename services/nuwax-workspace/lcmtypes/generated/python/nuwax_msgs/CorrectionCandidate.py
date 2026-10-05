@@ -9,13 +9,13 @@ import struct
 
 class CorrectionCandidate(object):
 
-    __slots__ = ["schema_version", "backend", "transform_semantics", "runtime_generation", "backend_generation", "candidate_sequence", "mapping_session_id", "mapping_session_generation", "map_frame_generation", "mapping_commit_boot_nonce", "mapping_commit_sequence", "occupancy_revision", "cloud_revision", "committed_map_source_timestamp_ns", "registered_cloud_source_sequence", "registered_cloud_source_timestamp_ns", "registered_cloud_point_count", "registered_cloud_envelope_sha256", "body_points_sha256", "correlated_odom_source_sequence", "correlated_odom_source_timestamp_ns", "correlated_odom_pose_sha256", "committed_map_width", "committed_map_height", "committed_map_resolution_m", "committed_map_origin_x_m", "committed_map_origin_y_m", "committed_map_payload_sha256", "committed_map_boundary_sha256", "source_timestamp_ns", "map_frame_id", "odom_frame_id", "body_frame_id", "points_frame_id", "correction_lease_boot_nonce", "correction_lease_generation", "translation_m", "rotation_xyzw", "trajectory_count", "trajectory_timestamp_ns", "trajectory_translation_m", "trajectory_rotation_xyzw", "payload_sha256"]
+    __slots__ = ["schema_version", "backend", "transform_semantics", "runtime_generation", "backend_generation", "candidate_sequence", "mapping_session_id", "mapping_session_generation", "mapping_backend_kind", "mapping_backend_generation", "map_frame_generation", "mapping_commit_boot_nonce", "mapping_commit_sequence", "occupancy_revision", "cloud_revision", "committed_map_source_timestamp_ns", "registered_cloud_backend", "registered_cloud_runtime_generation", "registered_cloud_source_sequence", "registered_cloud_source_timestamp_ns", "registered_cloud_point_count", "correlated_odom_source_sequence", "correlated_odom_source_timestamp_ns", "correlated_odom_translation_m", "correlated_odom_rotation_xyzw", "committed_map_width", "committed_map_height", "committed_map_resolution_m", "committed_map_origin_x_m", "committed_map_origin_y_m", "source_timestamp_ns", "map_frame_id", "odom_frame_id", "body_frame_id", "points_frame_id", "correction_lease_boot_nonce", "correction_lease_generation", "translation_m", "rotation_xyzw", "trajectory_count", "trajectory_timestamp_ns", "trajectory_translation_m", "trajectory_rotation_xyzw"]
 
-    __typenames__ = ["int32_t", "int32_t", "int32_t", "int64_t", "int64_t", "int64_t", "string", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "int64_t", "int64_t", "int64_t", "int64_t", "int64_t", "byte", "byte", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "double", "double", "double", "byte", "byte", "int64_t", "string", "string", "string", "string", "byte", "int64_t", "double", "double", "int32_t", "int64_t", "double", "double", "byte"]
+    __typenames__ = ["int32_t", "int32_t", "int32_t", "int64_t", "int64_t", "int64_t", "string", "int64_t", "string", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "int64_t", "int64_t", "int32_t", "int64_t", "int64_t", "int64_t", "int64_t", "int64_t", "int64_t", "double", "double", "int64_t", "int64_t", "double", "double", "double", "int64_t", "string", "string", "string", "string", "byte", "int64_t", "double", "double", "int32_t", "int64_t", "double", "double"]
 
-    __dimensions__ = [None, None, None, None, None, None, None, None, None, [16], None, None, None, None, None, None, None, [32], [32], None, None, [32], None, None, None, None, None, [32], [32], None, None, None, None, None, [16], None, [3], [4], None, ["trajectory_count"], ["trajectory_count", 3], ["trajectory_count", 4], [32]]
+    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, [16], None, None, None, None, None, None, None, None, None, None, None, [3], [4], None, None, None, None, None, None, None, None, None, None, [16], None, [3], [4], None, ["trajectory_count"], ["trajectory_count", 3], ["trajectory_count", 4]]
 
-    SCHEMA_VERSION_V2 = 2
+    SCHEMA_VERSION_V3 = 3
     BACKEND_LIBRARY_PGO = 1
     BACKEND_NATIVE_PGO = 2
     BACKEND_RELOCALIZATION = 3
@@ -42,6 +42,14 @@ class CorrectionCandidate(object):
         """ LCM Type: string """
         self.mapping_session_generation = 0
         """ LCM Type: int64_t """
+        self.mapping_backend_kind = ""
+        """
+        Actual occupancy-owner domain; distinct from correction backend_generation.
+        LCM Type: string
+        """
+
+        self.mapping_backend_generation = 0
+        """ LCM Type: int64_t """
         self.map_frame_generation = 0
         """ LCM Type: int64_t """
         self.mapping_commit_boot_nonce = b""
@@ -58,37 +66,32 @@ class CorrectionCandidate(object):
 
         self.committed_map_source_timestamp_ns = 0
         """ LCM Type: int64_t """
+        self.registered_cloud_backend = 0
+        """
+        Existing admitted LIO source domain, not the correction backend.
+        LCM Type: int32_t
+        """
+
+        self.registered_cloud_runtime_generation = 0
+        """ LCM Type: int64_t """
         self.registered_cloud_source_sequence = 0
         """ LCM Type: int64_t """
         self.registered_cloud_source_timestamp_ns = 0
         """ LCM Type: int64_t """
         self.registered_cloud_point_count = 0
         """ LCM Type: int64_t """
-        self.registered_cloud_envelope_sha256 = b""
-        """
-        SHA-256 of the complete generated registered LioCloudEnvelope
-        (one top-level fingerprint followed by its body).
-        LCM Type: byte[32]
-        """
-
-        self.body_points_sha256 = b""
-        """
-        SHA-256("nuwax.correction.body-points.v1\0" + point_count_u64_be
-        + repeated x/y/z f64 big-endian body-frame coordinates).
-        LCM Type: byte[32]
-        """
-
         self.correlated_odom_source_sequence = 0
         """ LCM Type: int64_t """
         self.correlated_odom_source_timestamp_ns = 0
         """ LCM Type: int64_t """
-        self.correlated_odom_pose_sha256 = b""
+        self.correlated_odom_translation_m = [ 0.0 for dim0 in range(3) ]
         """
-        SHA-256("nuwax.correction.odom-from-body.v1\0" + translation xyz
-        + quaternion xyzw, with all seven values encoded as f64 big-endian).
-        LCM Type: byte[32]
+        Exact frozen odom<-body pose; quaternion order is x, y, z, w.
+        LCM Type: double[3]
         """
 
+        self.correlated_odom_rotation_xyzw = [ 0.0 for dim0 in range(4) ]
+        """ LCM Type: double[4] """
         self.committed_map_width = 0
         """ LCM Type: int64_t """
         self.committed_map_height = 0
@@ -99,19 +102,6 @@ class CorrectionCandidate(object):
         """ LCM Type: double """
         self.committed_map_origin_y_m = 0.0
         """ LCM Type: double """
-        self.committed_map_payload_sha256 = b""
-        """
-        SHA-256 of the canonical committed effective occupancy payload bytes.
-        LCM Type: byte[32]
-        """
-
-        self.committed_map_boundary_sha256 = b""
-        """
-        SHA-256("nuwax.correction.committed-map-boundary.v1\0" + map-frame
-        LCM string + width/height i64 big-endian + resolution/origin f64 BE).
-        LCM Type: byte[32]
-        """
-
         self.source_timestamp_ns = 0
         """
         Zero is a valid present source timestamp, never an absence sentinel.
@@ -140,7 +130,6 @@ class CorrectionCandidate(object):
 
         self.trajectory_count = 0
         """
-        SHA-256 over the canonical candidate fields preceding this digest.
         完整优化关键帧，时间精确保留源纳秒，位姿属于优化后的里程计世界坐标。
         LCM Type: int32_t
         """
@@ -151,8 +140,6 @@ class CorrectionCandidate(object):
         """ LCM Type: double[trajectory_count][3] """
         self.trajectory_rotation_xyzw = []
         """ LCM Type: double[trajectory_count][4] """
-        self.payload_sha256 = b""
-        """ LCM Type: byte[32] """
 
     def encode(self):
         buf = BytesIO()
@@ -166,17 +153,17 @@ class CorrectionCandidate(object):
         buf.write(struct.pack('>I', len(__mapping_session_id_encoded)+1))
         buf.write(__mapping_session_id_encoded)
         buf.write(b"\0")
-        buf.write(struct.pack(">qq", self.mapping_session_generation, self.map_frame_generation))
+        buf.write(struct.pack(">q", self.mapping_session_generation))
+        __mapping_backend_kind_encoded = self.mapping_backend_kind.encode('utf-8')
+        buf.write(struct.pack('>I', len(__mapping_backend_kind_encoded)+1))
+        buf.write(__mapping_backend_kind_encoded)
+        buf.write(b"\0")
+        buf.write(struct.pack(">qq", self.mapping_backend_generation, self.map_frame_generation))
         buf.write(bytearray(self.mapping_commit_boot_nonce[:16]))
-        buf.write(struct.pack(">qqqqqqq", self.mapping_commit_sequence, self.occupancy_revision, self.cloud_revision, self.committed_map_source_timestamp_ns, self.registered_cloud_source_sequence, self.registered_cloud_source_timestamp_ns, self.registered_cloud_point_count))
-        buf.write(bytearray(self.registered_cloud_envelope_sha256[:32]))
-        buf.write(bytearray(self.body_points_sha256[:32]))
-        buf.write(struct.pack(">qq", self.correlated_odom_source_sequence, self.correlated_odom_source_timestamp_ns))
-        buf.write(bytearray(self.correlated_odom_pose_sha256[:32]))
-        buf.write(struct.pack(">qqddd", self.committed_map_width, self.committed_map_height, self.committed_map_resolution_m, self.committed_map_origin_x_m, self.committed_map_origin_y_m))
-        buf.write(bytearray(self.committed_map_payload_sha256[:32]))
-        buf.write(bytearray(self.committed_map_boundary_sha256[:32]))
-        buf.write(struct.pack(">q", self.source_timestamp_ns))
+        buf.write(struct.pack(">qqqqiqqqqqq", self.mapping_commit_sequence, self.occupancy_revision, self.cloud_revision, self.committed_map_source_timestamp_ns, self.registered_cloud_backend, self.registered_cloud_runtime_generation, self.registered_cloud_source_sequence, self.registered_cloud_source_timestamp_ns, self.registered_cloud_point_count, self.correlated_odom_source_sequence, self.correlated_odom_source_timestamp_ns))
+        buf.write(struct.pack('>3d', *self.correlated_odom_translation_m[:3]))
+        buf.write(struct.pack('>4d', *self.correlated_odom_rotation_xyzw[:4]))
+        buf.write(struct.pack(">qqdddq", self.committed_map_width, self.committed_map_height, self.committed_map_resolution_m, self.committed_map_origin_x_m, self.committed_map_origin_y_m, self.source_timestamp_ns))
         __map_frame_id_encoded = self.map_frame_id.encode('utf-8')
         buf.write(struct.pack('>I', len(__map_frame_id_encoded)+1))
         buf.write(__map_frame_id_encoded)
@@ -203,7 +190,6 @@ class CorrectionCandidate(object):
             buf.write(struct.pack('>3d', *self.trajectory_translation_m[i0][:3]))
         for i0 in range(self.trajectory_count):
             buf.write(struct.pack('>4d', *self.trajectory_rotation_xyzw[i0][:4]))
-        buf.write(bytearray(self.payload_sha256[:32]))
 
     @staticmethod
     def decode(data: bytes):
@@ -221,17 +207,15 @@ class CorrectionCandidate(object):
         self.schema_version, self.backend, self.transform_semantics, self.runtime_generation, self.backend_generation, self.candidate_sequence = struct.unpack(">iiiqqq", buf.read(36))
         __mapping_session_id_len = struct.unpack('>I', buf.read(4))[0]
         self.mapping_session_id = buf.read(__mapping_session_id_len)[:-1].decode('utf-8', 'replace')
-        self.mapping_session_generation, self.map_frame_generation = struct.unpack(">qq", buf.read(16))
+        self.mapping_session_generation = struct.unpack(">q", buf.read(8))[0]
+        __mapping_backend_kind_len = struct.unpack('>I', buf.read(4))[0]
+        self.mapping_backend_kind = buf.read(__mapping_backend_kind_len)[:-1].decode('utf-8', 'replace')
+        self.mapping_backend_generation, self.map_frame_generation = struct.unpack(">qq", buf.read(16))
         self.mapping_commit_boot_nonce = buf.read(16)
-        self.mapping_commit_sequence, self.occupancy_revision, self.cloud_revision, self.committed_map_source_timestamp_ns, self.registered_cloud_source_sequence, self.registered_cloud_source_timestamp_ns, self.registered_cloud_point_count = struct.unpack(">qqqqqqq", buf.read(56))
-        self.registered_cloud_envelope_sha256 = buf.read(32)
-        self.body_points_sha256 = buf.read(32)
-        self.correlated_odom_source_sequence, self.correlated_odom_source_timestamp_ns = struct.unpack(">qq", buf.read(16))
-        self.correlated_odom_pose_sha256 = buf.read(32)
-        self.committed_map_width, self.committed_map_height, self.committed_map_resolution_m, self.committed_map_origin_x_m, self.committed_map_origin_y_m = struct.unpack(">qqddd", buf.read(40))
-        self.committed_map_payload_sha256 = buf.read(32)
-        self.committed_map_boundary_sha256 = buf.read(32)
-        self.source_timestamp_ns = struct.unpack(">q", buf.read(8))[0]
+        self.mapping_commit_sequence, self.occupancy_revision, self.cloud_revision, self.committed_map_source_timestamp_ns, self.registered_cloud_backend, self.registered_cloud_runtime_generation, self.registered_cloud_source_sequence, self.registered_cloud_source_timestamp_ns, self.registered_cloud_point_count, self.correlated_odom_source_sequence, self.correlated_odom_source_timestamp_ns = struct.unpack(">qqqqiqqqqqq", buf.read(84))
+        self.correlated_odom_translation_m = struct.unpack('>3d', buf.read(24))
+        self.correlated_odom_rotation_xyzw = struct.unpack('>4d', buf.read(32))
+        self.committed_map_width, self.committed_map_height, self.committed_map_resolution_m, self.committed_map_origin_x_m, self.committed_map_origin_y_m, self.source_timestamp_ns = struct.unpack(">qqdddq", buf.read(48))
         __map_frame_id_len = struct.unpack('>I', buf.read(4))[0]
         self.map_frame_id = buf.read(__map_frame_id_len)[:-1].decode('utf-8', 'replace')
         __odom_frame_id_len = struct.unpack('>I', buf.read(4))[0]
@@ -252,13 +236,12 @@ class CorrectionCandidate(object):
         self.trajectory_rotation_xyzw = []
         for i0 in range(self.trajectory_count):
             self.trajectory_rotation_xyzw.append(struct.unpack('>4d', buf.read(32)))
-        self.payload_sha256 = buf.read(32)
         return self
 
     @staticmethod
     def _get_hash_recursive(parents):
         if CorrectionCandidate in parents: return 0
-        tmphash = (0x8282bda63abe4079) & 0xffffffffffffffff
+        tmphash = (0xe57c31a15c8dfa3e) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None
@@ -272,3 +255,4 @@ class CorrectionCandidate(object):
     def get_hash(self):
         """Get the LCM hash of the struct"""
         return struct.unpack(">Q", CorrectionCandidate._get_packed_fingerprint())[0]
+

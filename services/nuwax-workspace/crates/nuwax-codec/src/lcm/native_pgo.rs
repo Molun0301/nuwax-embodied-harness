@@ -1,30 +1,30 @@
-//! 原生PGO第二版协议：校正携完整优化轨迹，基本传感器证明保持原定义。
+//! Native-PGO V3: exact owner-scoped receipts and complete optimized trajectories.
 //!
 //! The repository IDL is authoritative. `*_body` functions operate on the
 //! generated body without the top-level eight-byte LCM fingerprint; `*_wire`
-//! functions operate on the complete generated value. Payload digests exclude
-//! both that fingerprint and the final self-digest field.
+//! functions operate on the complete generated value. Receipts echo concrete
+//! source domains and frozen pose bits; application payload digests are absent.
 
-use crate::{hash::sha256_bytes, CodecError, CodecResult};
+use crate::{CodecError, CodecResult};
 
-/// Locked `nuwax_msgs.NativePgoRequest` V1 fingerprint from lcm-gen 1.5.2.
-pub const NATIVE_PGO_REQUEST_FINGERPRINT_V2: [u8; 8] = 0xa714e98d60d0b620u64.to_be_bytes();
-/// Locked `nuwax_msgs.NativePgoResult` V1 fingerprint from lcm-gen 1.5.2.
-pub const NATIVE_PGO_RESULT_FINGERPRINT_V2: [u8; 8] = 0xadd11e19aa0ec18bu64.to_be_bytes();
-/// Locked `nuwax_msgs.NativePgoStatus` V1 fingerprint from lcm-gen 1.5.2.
-pub const NATIVE_PGO_STATUS_FINGERPRINT_V2: [u8; 8] = 0x3091859182a57b03u64.to_be_bytes();
+/// Locked `nuwax_msgs.NativePgoRequest` V3 fingerprint from lcm-gen 1.5.2.
+pub const NATIVE_PGO_REQUEST_FINGERPRINT_V3: [u8; 8] = 0x1dfa283cdea6215du64.to_be_bytes();
+/// Locked `nuwax_msgs.NativePgoResult` V3 fingerprint from lcm-gen 1.5.2.
+pub const NATIVE_PGO_RESULT_FINGERPRINT_V3: [u8; 8] = 0x7918f955c88ef8d6u64.to_be_bytes();
+/// Locked `nuwax_msgs.NativePgoStatus` V3 fingerprint from lcm-gen 1.5.2.
+pub const NATIVE_PGO_STATUS_FINGERPRINT_V3: [u8; 8] = 0xf61ebd2220fa5de3u64.to_be_bytes();
 
-/// First immutable native-PGO wire schema.
-pub const NATIVE_PGO_SCHEMA_VERSION_V2: i32 = 2;
+/// Current immutable native-PGO wire schema.
+pub const NATIVE_PGO_SCHEMA_VERSION_V3: i32 = 3;
 /// Native-PGO backend code, aligned with `CorrectionCandidate`.
 pub const NATIVE_PGO_BACKEND: i32 = 2;
 /// Full SE(3) correction applied on the left of the frozen odometry pose.
 pub const NATIVE_PGO_TRANSFORM_ABSOLUTE_LEFT_CORRECTION_SE3: i32 = 1;
-/// Maximum registered body points accepted by V1.
+/// Maximum registered body points accepted by V3.
 pub const MAX_NATIVE_PGO_REGISTERED_BODY_POINT_COUNT: i64 = 100_000;
-/// Maximum flattened XYZ coordinates accepted by V1.
+/// Maximum flattened XYZ coordinates accepted by V3.
 pub const MAX_NATIVE_PGO_REGISTERED_BODY_COORDINATE_COUNT: i32 = 300_000;
-/// Maximum committed occupancy cells accepted by V1.
+/// Maximum committed map width*height accepted by V3; no cells are transported.
 pub const MAX_NATIVE_PGO_COMMITTED_MAP_CELL_COUNT: i32 = 67_108_864;
 
 /// No admissible loop was found; this is a successful terminal result.
@@ -118,8 +118,8 @@ pub const NATIVE_PGO_REASON_TRANSPORT_ERROR: i32 = 3;
 pub const NATIVE_PGO_REASON_PROTOCOL_DECODE_FAILED: i32 = 4;
 /// Request or response identity did not correlate.
 pub const NATIVE_PGO_REASON_PROTOCOL_IDENTITY_MISMATCH: i32 = 5;
-/// A canonical payload digest did not match.
-pub const NATIVE_PGO_REASON_PROTOCOL_HASH_MISMATCH: i32 = 6;
+/// A concrete source receipt did not match.
+pub const NATIVE_PGO_REASON_PROTOCOL_RECEIPT_MISMATCH: i32 = 6;
 /// Request fields failed protocol admission.
 pub const NATIVE_PGO_REASON_INVALID_REQUEST: i32 = 7;
 /// Optimization failed after admission.
@@ -137,20 +137,6 @@ pub const NATIVE_PGO_REASON_CHILD_EXITED: i32 = 13;
 /// Native child crashed.
 pub const NATIVE_PGO_REASON_CHILD_CRASHED: i32 = 14;
 
-/// Request self-digest domain, including its NUL terminator.
-pub const NATIVE_PGO_REQUEST_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.request.v2\0";
-/// Result self-digest domain, including its NUL terminator.
-pub const NATIVE_PGO_RESULT_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.result.v2\0";
-/// Status self-digest domain, including its NUL terminator.
-pub const NATIVE_PGO_STATUS_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.status.v2\0";
-/// Loop-proof digest domain, including its NUL terminator.
-pub const NATIVE_PGO_LOOP_PROOF_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.loop-proof.v1\0";
-/// Optimized-graph digest domain, including its NUL terminator.
-pub const NATIVE_PGO_OPTIMIZED_GRAPH_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.optimized-graph.v2\0";
-
-const BODY_POINTS_HASH_DOMAIN: &[u8] = b"nuwax.correction.body-points.v1\0";
-const ODOM_POSE_HASH_DOMAIN: &[u8] = b"nuwax.correction.odom-from-body.v1\0";
-const MAP_BOUNDARY_HASH_DOMAIN: &[u8] = b"nuwax.correction.committed-map-boundary.v1\0";
 const MAX_IDENTITY_STRING_BYTES: usize = 255;
 const MAX_REASON_BYTES: usize = 1_024;
 const MAX_TRANSLATION_ABS_METERS: f64 = 1_000_000.0;
@@ -165,34 +151,48 @@ pub struct NativePgoMappingCommitId {
     pub sequence: i64,
 }
 
-/// Proof for the registered body-frame cloud.
+/// Receipt for the admitted registered cloud and its selected body-frame payload.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NativePgoRegisteredCloudProof {
+    /// Admitted LIO backend, distinct from the correction backend.
+    pub backend: i32,
+    /// Admitted LIO runtime generation.
+    pub runtime_generation: i64,
     /// Source cloud sequence.
     pub source_sequence: i64,
     /// Source cloud timestamp in nanoseconds; zero is valid.
     pub source_timestamp_ns: i64,
-    /// Number of body-frame XYZ points.
+    /// Original admitted registered-cloud count before native point selection.
+    pub source_point_count: i64,
+    /// Number of selected body-frame XYZ points.
     pub point_count: i64,
-    /// Digest of the complete generated `LioCloudEnvelope` value.
-    pub envelope_sha256: [u8; 32],
-    /// Digest of the canonical body-frame XYZ triples.
-    pub body_points_sha256: [u8; 32],
 }
 
-/// Proof for the frozen absolute odometry pose.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Exact receipt for the frozen absolute odometry pose.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct NativePgoCorrelatedOdomProof {
     /// Source odometry sequence.
     pub source_sequence: i64,
     /// Source odometry timestamp in nanoseconds; zero is valid.
     pub source_timestamp_ns: i64,
-    /// Digest of the frozen absolute `odom <- body` pose.
-    pub pose_sha256: [u8; 32],
+    /// Frozen absolute odom<-body translation.
+    pub translation_m: [f64; 3],
+    /// Frozen absolute odom<-body quaternion in XYZW order.
+    pub rotation_xyzw: [f64; 4],
 }
 
-/// Proof and geometry for the committed occupancy map.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+impl PartialEq for NativePgoCorrelatedOdomProof {
+    fn eq(&self, other: &Self) -> bool {
+        self.source_sequence == other.source_sequence
+            && self.source_timestamp_ns == other.source_timestamp_ns
+            && f64_slice_bits_eq(&self.translation_m, &other.translation_m)
+            && f64_slice_bits_eq(&self.rotation_xyzw, &other.rotation_xyzw)
+    }
+}
+impl Eq for NativePgoCorrelatedOdomProof {}
+
+/// Committed occupancy-map receipt and geometry; no occupancy payload is sent.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct NativePgoCommittedMapProof {
     /// Committed map source timestamp in nanoseconds; zero is valid.
     pub source_timestamp_ns: i64,
@@ -206,10 +206,26 @@ pub struct NativePgoCommittedMapProof {
     pub origin_x_m: f64,
     /// Map origin Y in metres.
     pub origin_y_m: f64,
-    /// Digest of the canonical signed occupancy bytes.
-    pub payload_sha256: [u8; 32],
-    /// Digest binding frame and map geometry.
-    pub boundary_sha256: [u8; 32],
+}
+
+impl PartialEq for NativePgoCommittedMapProof {
+    fn eq(&self, other: &Self) -> bool {
+        self.source_timestamp_ns == other.source_timestamp_ns
+            && self.width == other.width
+            && self.height == other.height
+            && self.resolution_m.to_bits() == other.resolution_m.to_bits()
+            && self.origin_x_m.to_bits() == other.origin_x_m.to_bits()
+            && self.origin_y_m.to_bits() == other.origin_y_m.to_bits()
+    }
+}
+impl Eq for NativePgoCommittedMapProof {}
+
+fn f64_slice_bits_eq(left: &[f64], right: &[f64]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
 }
 
 /// Geometry-owned correction lease identity.
@@ -224,7 +240,7 @@ pub struct NativePgoCorrectionLeaseId {
 /// Request identity echoed by every request-scoped result and status.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NativePgoRequestIdentity {
-    /// Backend code; V1 only accepts native PGO.
+    /// Backend code; V3 only accepts native PGO.
     pub backend: i32,
     /// Geometry runtime generation.
     pub runtime_generation: i64,
@@ -236,6 +252,11 @@ pub struct NativePgoRequestIdentity {
     pub mapping_session_id: String,
     /// Mapping session generation.
     pub mapping_session_generation: i64,
+    /// Actual occupancy-owner backend kind, carried as a bounded opaque provenance label.
+    /// Native PGO only compares/echoes it; it never selects or defaults a backend from it.
+    pub mapping_backend_kind: String,
+    /// Actual occupancy-owner generation, distinct from the correction owner.
+    pub mapping_backend_generation: i64,
     /// Generation of the authoritative map frame.
     pub map_frame_generation: i64,
     /// Mapping commit identity.
@@ -244,11 +265,11 @@ pub struct NativePgoRequestIdentity {
     pub occupancy_revision: i64,
     /// Independently monotonic cumulative cloud-map revision.
     pub cloud_revision: i64,
-    /// Registered-cloud proof.
+    /// Admitted registered-cloud receipt.
     pub registered_cloud: NativePgoRegisteredCloudProof,
-    /// Frozen correlated-odometry proof.
+    /// Exact frozen correlated-odometry receipt.
     pub correlated_odom: NativePgoCorrelatedOdomProof,
-    /// Committed-map proof.
+    /// Committed-map receipt and geometry.
     pub committed_map: NativePgoCommittedMapProof,
     /// Canonical request source timestamp in nanoseconds.
     pub source_timestamp_ns: i64,
@@ -258,51 +279,50 @@ pub struct NativePgoRequestIdentity {
     pub odom_frame_id: String,
     /// Authoritative robot body frame.
     pub body_frame_id: String,
-    /// Point coordinate frame; V1 requires the body frame.
+    /// Point coordinate frame; V3 requires the body frame.
     pub points_frame_id: String,
     /// Geometry correction lease.
     pub correction_lease: NativePgoCorrectionLeaseId,
 }
 
-/// Complete input for one native-PGO optimization attempt.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Complete immutable input for one native-PGO optimization attempt.
+#[derive(Clone, Debug, Default)]
 pub struct NativePgoRequest {
     /// Wire schema version.
     pub schema_version: i32,
-    /// Immutable request identity and proofs.
+    /// Immutable request receipt, including the frozen absolute odometry pose.
     pub identity: NativePgoRequestIdentity,
     /// Redundant generated-wire coordinate count.
     pub registered_body_coordinate_count: i32,
-    /// Flattened body-frame XYZ triples.
+    /// Flattened selected body-frame XYZ triples in their original order.
     pub registered_body_points_xyz: Vec<f64>,
-    /// Frozen absolute odometry translation.
-    pub frozen_odom_translation_m: [f64; 3],
-    /// Frozen absolute odometry quaternion in XYZW order.
-    pub frozen_odom_rotation_xyzw: [f64; 4],
-    /// Redundant generated-wire occupancy cell count.
-    pub committed_map_cell_count: i32,
-    /// Signed occupancy payload.
-    pub committed_map_occupancy: Vec<i8>,
-    /// Self-digest over the canonical body prefix.
-    pub request_payload_sha256: [u8; 32],
 }
 
-/// Exact request identity and digest echoed by the native owner.
+impl PartialEq for NativePgoRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.identity == other.identity
+            && self.registered_body_coordinate_count == other.registered_body_coordinate_count
+            && f64_slice_bits_eq(
+                &self.registered_body_points_xyz,
+                &other.registered_body_points_xyz,
+            )
+    }
+}
+
+/// Exact request receipt echoed by the native owner.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NativePgoRequestEcho {
-    /// Immutable request identity and proof values.
+    /// Immutable concrete request receipt.
     pub identity: NativePgoRequestIdentity,
-    /// Exact request self-digest.
-    pub request_payload_sha256: [u8; 32],
 }
 
 impl NativePgoRequest {
-    /// Returns the exact identity/hash tuple required in result and status messages.
+    /// Returns the exact receipt required in result and status messages.
     #[must_use]
     pub fn echo(&self) -> NativePgoRequestEcho {
         NativePgoRequestEcho {
             identity: self.identity.clone(),
-            request_payload_sha256: self.request_payload_sha256,
         }
     }
 }
@@ -312,7 +332,7 @@ impl NativePgoRequest {
 pub struct NativePgoResult {
     /// Wire schema version.
     pub schema_version: i32,
-    /// Exact request identity and digest.
+    /// Exact concrete request receipt.
     pub request: NativePgoRequestEcho,
     /// One of the `NATIVE_PGO_DISPOSITION_*` values.
     pub result_disposition: i32,
@@ -334,8 +354,6 @@ pub struct NativePgoResult {
     pub loop_target_node_id: i64,
     /// Number of loop inliers.
     pub loop_inlier_count: i64,
-    /// Canonical loop-proof digest.
-    pub loop_proof_sha256: [u8; 32],
     /// Number of optimized graph nodes.
     pub optimized_graph_node_count: i64,
     /// Number of optimized graph edges.
@@ -350,16 +368,12 @@ pub struct NativePgoResult {
     pub optimization_initial_cost: f64,
     /// Nonnegative cost after optimization.
     pub optimization_final_cost: f64,
-    /// Canonical optimized-graph metadata digest.
-    pub optimized_graph_sha256: [u8; 32],
     /// 校正必须同时提供完整优化轨迹，不允许只移动公共位姿。
     pub trajectory: Vec<OptimizedKeyframe>,
     /// Typed rejection reason for `DISPOSITION_REJECTED`.
     pub rejection_reason_code: i32,
     /// Bounded rejection detail for `DISPOSITION_REJECTED`.
     pub rejection_reason: String,
-    /// Self-digest over the canonical body prefix.
-    pub result_payload_sha256: [u8; 32],
 }
 
 /// 精确源时间对应的优化机体位姿，供规范地图与位姿一起重建。
@@ -445,7 +459,7 @@ fn decode_trajectory(cursor: &mut Cursor<'_>) -> CodecResult<Vec<OptimizedKeyfra
 pub struct NativePgoStatus {
     /// Wire schema version.
     pub schema_version: i32,
-    /// Backend code; V1 only accepts native PGO.
+    /// Backend code; V3 only accepts native PGO.
     pub backend: i32,
     /// Geometry runtime generation.
     pub runtime_generation: i64,
@@ -469,200 +483,35 @@ pub struct NativePgoStatus {
     pub reason_code: i32,
     /// Bounded typed-reason detail.
     pub reason: String,
-    /// Self-digest over the canonical body prefix.
-    pub status_payload_sha256: [u8; 32],
 }
 
-/// Computes the canonical body-point proof used by correction candidates.
-pub fn compute_native_pgo_body_points_sha256(points_xyz: &[f64]) -> CodecResult<[u8; 32]> {
-    if points_xyz.is_empty()
-        || points_xyz.len() % 3 != 0
-        || points_xyz.len()
-            > usize::try_from(MAX_NATIVE_PGO_REGISTERED_BODY_COORDINATE_COUNT)
-                .expect("coordinate limit fits usize")
-        || points_xyz.iter().any(|value| !value.is_finite())
-    {
-        return Err(encode_error(
-            "registered body points must be finite nonempty XYZ triples within the V1 limit".into(),
-        ));
-    }
-    let point_count = u64::try_from(points_xyz.len() / 3)
-        .map_err(|_| encode_error("registered body point count overflow".into()))?;
-    let mut canonical =
-        Vec::with_capacity(BODY_POINTS_HASH_DOMAIN.len() + 8 + points_xyz.len() * 8);
-    canonical.extend_from_slice(BODY_POINTS_HASH_DOMAIN);
-    canonical.extend_from_slice(&point_count.to_be_bytes());
-    for value in points_xyz {
-        canonical.extend_from_slice(&value.to_be_bytes());
-    }
-    Ok(sha256_bytes(&canonical))
-}
-
-/// Computes the canonical frozen absolute-odometry pose proof.
-pub fn compute_native_pgo_odom_pose_sha256(
-    translation_m: &[f64; 3],
-    rotation_xyzw: &[f64; 4],
-) -> CodecResult<[u8; 32]> {
-    validate_transform(translation_m, rotation_xyzw, "frozen odometry").map_err(encode_error)?;
-    let mut canonical = Vec::with_capacity(ODOM_POSE_HASH_DOMAIN.len() + 56);
-    canonical.extend_from_slice(ODOM_POSE_HASH_DOMAIN);
-    for value in translation_m.iter().chain(rotation_xyzw.iter()) {
-        canonical.extend_from_slice(&value.to_be_bytes());
-    }
-    Ok(sha256_bytes(&canonical))
-}
-
-/// Computes the canonical committed signed-occupancy payload proof.
-#[must_use]
-pub fn compute_native_pgo_map_payload_sha256(occupancy: &[i8]) -> [u8; 32] {
-    let bytes: Vec<u8> = occupancy.iter().map(|value| *value as u8).collect();
-    sha256_bytes(&bytes)
-}
-
-/// Computes the canonical committed-map boundary proof.
-pub fn compute_native_pgo_map_boundary_sha256(
-    map_frame_id: &str,
-    proof: &NativePgoCommittedMapProof,
-) -> CodecResult<[u8; 32]> {
-    validate_frame_id("map_frame_id", map_frame_id).map_err(encode_error)?;
-    if proof.width <= 0
-        || proof.height <= 0
-        || !proof.resolution_m.is_finite()
-        || proof.resolution_m <= 0.0
-        || !proof.origin_x_m.is_finite()
-        || !proof.origin_y_m.is_finite()
-    {
-        return Err(encode_error("committed map geometry is invalid".into()));
-    }
-    let mut canonical = Vec::new();
-    canonical.extend_from_slice(MAP_BOUNDARY_HASH_DOMAIN);
-    encode_string(map_frame_id, &mut canonical)?;
-    canonical.extend_from_slice(&proof.width.to_be_bytes());
-    canonical.extend_from_slice(&proof.height.to_be_bytes());
-    canonical.extend_from_slice(&proof.resolution_m.to_be_bytes());
-    canonical.extend_from_slice(&proof.origin_x_m.to_be_bytes());
-    canonical.extend_from_slice(&proof.origin_y_m.to_be_bytes());
-    Ok(sha256_bytes(&canonical))
-}
-
-/// Computes the correction-only loop proof bound to the request digest.
-pub fn compute_native_pgo_loop_proof_sha256(result: &NativePgoResult) -> CodecResult<[u8; 32]> {
-    validate_loop_metadata(result).map_err(encode_error)?;
-    let mut canonical = Vec::new();
-    canonical.extend_from_slice(NATIVE_PGO_LOOP_PROOF_HASH_DOMAIN);
-    canonical.extend_from_slice(&result.request.request_payload_sha256);
-    canonical.extend_from_slice(&result.loop_source_node_id.to_be_bytes());
-    canonical.extend_from_slice(&result.loop_target_node_id.to_be_bytes());
-    canonical.extend_from_slice(&result.loop_inlier_count.to_be_bytes());
-    canonical.extend_from_slice(&result.fitness_score.to_be_bytes());
-    canonical.extend_from_slice(&result.inlier_rmse_m.to_be_bytes());
-    Ok(sha256_bytes(&canonical))
-}
-
-/// Computes the correction-only optimized-graph metadata proof.
-pub fn compute_native_pgo_optimized_graph_sha256(
-    result: &NativePgoResult,
-) -> CodecResult<[u8; 32]> {
-    validate_graph_metadata(result).map_err(encode_error)?;
-    validate_transform(&result.translation_m, &result.rotation_xyzw, "correction")
-        .map_err(encode_error)?;
-    let mut canonical = Vec::new();
-    canonical.extend_from_slice(NATIVE_PGO_OPTIMIZED_GRAPH_HASH_DOMAIN);
-    canonical.extend_from_slice(&result.request.request_payload_sha256);
-    canonical.extend_from_slice(&result.optimized_graph_node_count.to_be_bytes());
-    canonical.extend_from_slice(&result.optimized_graph_edge_count.to_be_bytes());
-    canonical.extend_from_slice(&result.optimized_graph_loop_edge_count.to_be_bytes());
-    canonical.extend_from_slice(&result.optimization_iterations.to_be_bytes());
-    canonical.push(result.optimization_converged as u8);
-    canonical.extend_from_slice(&result.optimization_initial_cost.to_be_bytes());
-    canonical.extend_from_slice(&result.optimization_final_cost.to_be_bytes());
-    for value in result
-        .translation_m
-        .iter()
-        .chain(result.rotation_xyzw.iter())
-    {
-        canonical.extend_from_slice(&value.to_be_bytes());
-    }
-    canonical.extend_from_slice(&encode_optimized_keyframes(&result.trajectory)?);
-    Ok(sha256_bytes(&canonical))
-}
-
-/// Computes the request self-digest over the generated body before its final digest.
-pub fn compute_native_pgo_request_payload_sha256(
-    message: &NativePgoRequest,
-) -> CodecResult<[u8; 32]> {
-    Ok(hash_body_prefix(
-        NATIVE_PGO_REQUEST_HASH_DOMAIN,
-        &encode_request_body_prefix(message)?,
-    ))
-}
-
-/// Computes the result self-digest over the generated body before its final digest.
-pub fn compute_native_pgo_result_payload_sha256(
-    message: &NativePgoResult,
-) -> CodecResult<[u8; 32]> {
-    Ok(hash_body_prefix(
-        NATIVE_PGO_RESULT_HASH_DOMAIN,
-        &encode_result_body_prefix(message)?,
-    ))
-}
-
-/// Computes the status self-digest over the generated body before its final digest.
-pub fn compute_native_pgo_status_payload_sha256(
-    message: &NativePgoStatus,
-) -> CodecResult<[u8; 32]> {
-    Ok(hash_body_prefix(
-        NATIVE_PGO_STATUS_HASH_DOMAIN,
-        &encode_status_body_prefix(message)?,
-    ))
-}
-
-/// Fills all request proofs derivable from its typed payload and seals its self-digest.
-pub fn seal_native_pgo_request(mut message: NativePgoRequest) -> CodecResult<NativePgoRequest> {
-    message.identity.registered_cloud.body_points_sha256 =
-        compute_native_pgo_body_points_sha256(&message.registered_body_points_xyz)?;
-    message.identity.correlated_odom.pose_sha256 = compute_native_pgo_odom_pose_sha256(
-        &message.frozen_odom_translation_m,
-        &message.frozen_odom_rotation_xyzw,
-    )?;
-    message.identity.committed_map.payload_sha256 =
-        compute_native_pgo_map_payload_sha256(&message.committed_map_occupancy);
-    message.identity.committed_map.boundary_sha256 = compute_native_pgo_map_boundary_sha256(
-        &message.identity.map_frame_id,
-        &message.identity.committed_map,
-    )?;
-    message.request_payload_sha256 = compute_native_pgo_request_payload_sha256(&message)?;
+/// Validates the complete immutable request without synthesizing application hashes.
+pub fn seal_native_pgo_request(message: NativePgoRequest) -> CodecResult<NativePgoRequest> {
+    validate_request_fields(&message).map_err(encode_error)?;
     Ok(message)
 }
 
-/// Fills correction-only derived proofs and seals the result self-digest.
-pub fn seal_native_pgo_result(mut message: NativePgoResult) -> CodecResult<NativePgoResult> {
-    if message.result_disposition == NATIVE_PGO_DISPOSITION_CORRECTION {
-        message.loop_proof_sha256 = compute_native_pgo_loop_proof_sha256(&message)?;
-        message.optimized_graph_sha256 = compute_native_pgo_optimized_graph_sha256(&message)?;
-    }
-    message.result_payload_sha256 = compute_native_pgo_result_payload_sha256(&message)?;
+/// Validates all correction, graph, trajectory, and disposition metadata.
+pub fn seal_native_pgo_result(message: NativePgoResult) -> CodecResult<NativePgoResult> {
+    validate_result_fields(&message).map_err(encode_error)?;
     Ok(message)
 }
 
-/// Seals a typed status self-digest.
-pub fn seal_native_pgo_status(mut message: NativePgoStatus) -> CodecResult<NativePgoStatus> {
-    message.status_payload_sha256 = compute_native_pgo_status_payload_sha256(&message)?;
+/// Validates the typed status event matrix and concrete receipt.
+pub fn seal_native_pgo_status(message: NativePgoStatus) -> CodecResult<NativePgoStatus> {
+    validate_status_fields(&message).map_err(encode_error)?;
     Ok(message)
 }
 
 /// Encodes a generated request body without its top-level fingerprint.
 pub fn encode_native_pgo_request_body(message: &NativePgoRequest) -> CodecResult<Vec<u8>> {
-    validate_request_integrity(message).map_err(encode_error)?;
-    let mut body = encode_request_body_prefix(message)?;
-    body.extend_from_slice(&message.request_payload_sha256);
-    Ok(body)
+    encode_request_body_prefix(message)
 }
 
 /// Encodes a complete generated request value including its fingerprint.
 pub fn encode_native_pgo_request_wire(message: &NativePgoRequest) -> CodecResult<Vec<u8>> {
     encode_wire(
-        NATIVE_PGO_REQUEST_FINGERPRINT_V2,
+        NATIVE_PGO_REQUEST_FINGERPRINT_V3,
         encode_native_pgo_request_body(message)?,
     )
 }
@@ -672,7 +521,7 @@ pub fn decode_native_pgo_request_body(body: &[u8]) -> CodecResult<NativePgoReque
     let mut cursor = Cursor::new(body);
     let message = decode_request_body_from_cursor(&mut cursor)?;
     cursor.finish("nuwax_msgs.NativePgoRequest body")?;
-    validate_request_integrity(&message).map_err(decode_error)?;
+    validate_request_fields(&message).map_err(decode_error)?;
     Ok(message)
 }
 
@@ -680,7 +529,7 @@ pub fn decode_native_pgo_request_body(body: &[u8]) -> CodecResult<NativePgoReque
 pub fn decode_native_pgo_request_wire(wire: &[u8]) -> CodecResult<NativePgoRequest> {
     decode_wire(
         wire,
-        NATIVE_PGO_REQUEST_FINGERPRINT_V2,
+        NATIVE_PGO_REQUEST_FINGERPRINT_V3,
         "nuwax_msgs.NativePgoRequest",
         decode_native_pgo_request_body,
     )
@@ -688,16 +537,13 @@ pub fn decode_native_pgo_request_wire(wire: &[u8]) -> CodecResult<NativePgoReque
 
 /// Encodes a generated result body without its top-level fingerprint.
 pub fn encode_native_pgo_result_body(message: &NativePgoResult) -> CodecResult<Vec<u8>> {
-    validate_result_integrity(message).map_err(encode_error)?;
-    let mut body = encode_result_body_prefix(message)?;
-    body.extend_from_slice(&message.result_payload_sha256);
-    Ok(body)
+    encode_result_body_prefix(message)
 }
 
 /// Encodes a complete generated result value including its fingerprint.
 pub fn encode_native_pgo_result_wire(message: &NativePgoResult) -> CodecResult<Vec<u8>> {
     encode_wire(
-        NATIVE_PGO_RESULT_FINGERPRINT_V2,
+        NATIVE_PGO_RESULT_FINGERPRINT_V3,
         encode_native_pgo_result_body(message)?,
     )
 }
@@ -707,7 +553,7 @@ pub fn decode_native_pgo_result_body(body: &[u8]) -> CodecResult<NativePgoResult
     let mut cursor = Cursor::new(body);
     let message = decode_result_body_from_cursor(&mut cursor)?;
     cursor.finish("nuwax_msgs.NativePgoResult body")?;
-    validate_result_integrity(&message).map_err(decode_error)?;
+    validate_result_fields(&message).map_err(decode_error)?;
     Ok(message)
 }
 
@@ -715,7 +561,7 @@ pub fn decode_native_pgo_result_body(body: &[u8]) -> CodecResult<NativePgoResult
 pub fn decode_native_pgo_result_wire(wire: &[u8]) -> CodecResult<NativePgoResult> {
     decode_wire(
         wire,
-        NATIVE_PGO_RESULT_FINGERPRINT_V2,
+        NATIVE_PGO_RESULT_FINGERPRINT_V3,
         "nuwax_msgs.NativePgoResult",
         decode_native_pgo_result_body,
     )
@@ -723,16 +569,13 @@ pub fn decode_native_pgo_result_wire(wire: &[u8]) -> CodecResult<NativePgoResult
 
 /// Encodes a generated status body without its top-level fingerprint.
 pub fn encode_native_pgo_status_body(message: &NativePgoStatus) -> CodecResult<Vec<u8>> {
-    validate_status_integrity(message).map_err(encode_error)?;
-    let mut body = encode_status_body_prefix(message)?;
-    body.extend_from_slice(&message.status_payload_sha256);
-    Ok(body)
+    encode_status_body_prefix(message)
 }
 
 /// Encodes a complete generated status value including its fingerprint.
 pub fn encode_native_pgo_status_wire(message: &NativePgoStatus) -> CodecResult<Vec<u8>> {
     encode_wire(
-        NATIVE_PGO_STATUS_FINGERPRINT_V2,
+        NATIVE_PGO_STATUS_FINGERPRINT_V3,
         encode_native_pgo_status_body(message)?,
     )
 }
@@ -742,7 +585,7 @@ pub fn decode_native_pgo_status_body(body: &[u8]) -> CodecResult<NativePgoStatus
     let mut cursor = Cursor::new(body);
     let message = decode_status_body_from_cursor(&mut cursor)?;
     cursor.finish("nuwax_msgs.NativePgoStatus body")?;
-    validate_status_integrity(&message).map_err(decode_error)?;
+    validate_status_fields(&message).map_err(decode_error)?;
     Ok(message)
 }
 
@@ -750,22 +593,22 @@ pub fn decode_native_pgo_status_body(body: &[u8]) -> CodecResult<NativePgoStatus
 pub fn decode_native_pgo_status_wire(wire: &[u8]) -> CodecResult<NativePgoStatus> {
     decode_wire(
         wire,
-        NATIVE_PGO_STATUS_FINGERPRINT_V2,
+        NATIVE_PGO_STATUS_FINGERPRINT_V3,
         "nuwax_msgs.NativePgoStatus",
         decode_native_pgo_status_body,
     )
 }
 
-/// Verifies that a result echoes the request identity and digest exactly.
+/// Verifies that a result echoes the concrete request receipt bit for bit.
 pub fn validate_native_pgo_result_echo(
     request: &NativePgoRequest,
     result: &NativePgoResult,
 ) -> CodecResult<()> {
-    if result.request == request.echo() {
+    if result.request.identity == request.identity {
         Ok(())
     } else {
         Err(CodecError::LcmDecode(
-            "native PGO result request identity/hash mismatch".into(),
+            "native PGO result request receipt mismatch".into(),
         ))
     }
 }
@@ -775,11 +618,15 @@ pub fn validate_native_pgo_status_echo(
     request: &NativePgoRequest,
     status: &NativePgoStatus,
 ) -> CodecResult<()> {
-    if status.request.as_ref() == Some(&request.echo()) {
+    if status
+        .request
+        .as_ref()
+        .is_some_and(|echo| echo.identity == request.identity)
+    {
         Ok(())
     } else {
         Err(CodecError::LcmDecode(
-            "native PGO status request identity/hash mismatch".into(),
+            "native PGO status request receipt mismatch".into(),
         ))
     }
 }
@@ -794,28 +641,8 @@ fn encode_request_body_prefix(message: &NativePgoRequest) -> CodecResult<Vec<u8>
     for value in &message.registered_body_points_xyz {
         out.extend_from_slice(&value.to_be_bytes());
     }
-    out.extend_from_slice(&identity.registered_cloud.envelope_sha256);
-    out.extend_from_slice(&identity.registered_cloud.body_points_sha256);
-    out.extend_from_slice(&identity.correlated_odom.source_sequence.to_be_bytes());
-    out.extend_from_slice(&identity.correlated_odom.source_timestamp_ns.to_be_bytes());
-    for value in message
-        .frozen_odom_translation_m
-        .iter()
-        .chain(message.frozen_odom_rotation_xyzw.iter())
-    {
-        out.extend_from_slice(&value.to_be_bytes());
-    }
-    out.extend_from_slice(&identity.correlated_odom.pose_sha256);
+    encode_correlated_odom(&identity.correlated_odom, &mut out);
     encode_map_geometry(&identity.committed_map, &mut out);
-    out.extend_from_slice(&message.committed_map_cell_count.to_be_bytes());
-    out.extend(
-        message
-            .committed_map_occupancy
-            .iter()
-            .map(|value| *value as u8),
-    );
-    out.extend_from_slice(&identity.committed_map.payload_sha256);
-    out.extend_from_slice(&identity.committed_map.boundary_sha256);
     encode_identity_tail(identity, &mut out)?;
     Ok(out)
 }
@@ -840,7 +667,6 @@ fn encode_result_body_prefix(message: &NativePgoResult) -> CodecResult<Vec<u8>> 
     out.extend_from_slice(&message.loop_source_node_id.to_be_bytes());
     out.extend_from_slice(&message.loop_target_node_id.to_be_bytes());
     out.extend_from_slice(&message.loop_inlier_count.to_be_bytes());
-    out.extend_from_slice(&message.loop_proof_sha256);
     out.extend_from_slice(&message.optimized_graph_node_count.to_be_bytes());
     out.extend_from_slice(&message.optimized_graph_edge_count.to_be_bytes());
     out.extend_from_slice(&message.optimized_graph_loop_edge_count.to_be_bytes());
@@ -848,7 +674,6 @@ fn encode_result_body_prefix(message: &NativePgoResult) -> CodecResult<Vec<u8>> 
     out.push(message.optimization_converged as u8);
     out.extend_from_slice(&message.optimization_initial_cost.to_be_bytes());
     out.extend_from_slice(&message.optimization_final_cost.to_be_bytes());
-    out.extend_from_slice(&message.optimized_graph_sha256);
     out.extend_from_slice(&encode_optimized_keyframes(&message.trajectory)?);
     out.extend_from_slice(&message.rejection_reason_code.to_be_bytes());
     encode_string(&message.rejection_reason, &mut out)?;
@@ -870,6 +695,8 @@ fn encode_status_body_prefix(message: &NativePgoStatus) -> CodecResult<Vec<u8>> 
             encode_status_identity_tail(request, &mut out)?;
         }
         None => {
+            // The validated event matrix explicitly permits an absent receipt here.
+            // Request-scoped events cannot reach this canonical owner-status branch.
             out.push(0);
             encode_status_identity_tail(&NativePgoRequestEcho::default(), &mut out)?;
         }
@@ -896,16 +723,33 @@ fn encode_identity_until_cloud_count(
     out.extend_from_slice(&identity.request_sequence.to_be_bytes());
     encode_string(&identity.mapping_session_id, out)?;
     out.extend_from_slice(&identity.mapping_session_generation.to_be_bytes());
+    encode_string(&identity.mapping_backend_kind, out)?;
+    out.extend_from_slice(&identity.mapping_backend_generation.to_be_bytes());
     out.extend_from_slice(&identity.map_frame_generation.to_be_bytes());
     out.extend_from_slice(&identity.mapping_commit_id.boot_nonce);
     out.extend_from_slice(&identity.mapping_commit_id.sequence.to_be_bytes());
     out.extend_from_slice(&identity.occupancy_revision.to_be_bytes());
     out.extend_from_slice(&identity.cloud_revision.to_be_bytes());
     out.extend_from_slice(&identity.committed_map.source_timestamp_ns.to_be_bytes());
+    out.extend_from_slice(&identity.registered_cloud.backend.to_be_bytes());
+    out.extend_from_slice(&identity.registered_cloud.runtime_generation.to_be_bytes());
     out.extend_from_slice(&identity.registered_cloud.source_sequence.to_be_bytes());
     out.extend_from_slice(&identity.registered_cloud.source_timestamp_ns.to_be_bytes());
+    out.extend_from_slice(&identity.registered_cloud.source_point_count.to_be_bytes());
     out.extend_from_slice(&identity.registered_cloud.point_count.to_be_bytes());
     Ok(())
+}
+
+fn encode_correlated_odom(receipt: &NativePgoCorrelatedOdomProof, out: &mut Vec<u8>) {
+    out.extend_from_slice(&receipt.source_sequence.to_be_bytes());
+    out.extend_from_slice(&receipt.source_timestamp_ns.to_be_bytes());
+    for value in receipt
+        .translation_m
+        .iter()
+        .chain(receipt.rotation_xyzw.iter())
+    {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
 }
 
 fn encode_map_geometry(proof: &NativePgoCommittedMapProof, out: &mut Vec<u8>) {
@@ -930,16 +774,9 @@ fn encode_identity_tail(identity: &NativePgoRequestIdentity, out: &mut Vec<u8>) 
 fn encode_request_echo(request: &NativePgoRequestEcho, out: &mut Vec<u8>) -> CodecResult<()> {
     let identity = &request.identity;
     encode_identity_until_cloud_count(identity, true, out)?;
-    out.extend_from_slice(&identity.registered_cloud.envelope_sha256);
-    out.extend_from_slice(&identity.registered_cloud.body_points_sha256);
-    out.extend_from_slice(&identity.correlated_odom.source_sequence.to_be_bytes());
-    out.extend_from_slice(&identity.correlated_odom.source_timestamp_ns.to_be_bytes());
-    out.extend_from_slice(&identity.correlated_odom.pose_sha256);
+    encode_correlated_odom(&identity.correlated_odom, out);
     encode_map_geometry(&identity.committed_map, out);
-    out.extend_from_slice(&identity.committed_map.payload_sha256);
-    out.extend_from_slice(&identity.committed_map.boundary_sha256);
     encode_identity_tail(identity, out)?;
-    out.extend_from_slice(&request.request_payload_sha256);
     Ok(())
 }
 
@@ -949,55 +786,28 @@ fn encode_status_identity_tail(
 ) -> CodecResult<()> {
     let identity = &request.identity;
     encode_identity_until_cloud_count(identity, false, out)?;
-    out.extend_from_slice(&identity.registered_cloud.envelope_sha256);
-    out.extend_from_slice(&identity.registered_cloud.body_points_sha256);
-    out.extend_from_slice(&identity.correlated_odom.source_sequence.to_be_bytes());
-    out.extend_from_slice(&identity.correlated_odom.source_timestamp_ns.to_be_bytes());
-    out.extend_from_slice(&identity.correlated_odom.pose_sha256);
+    encode_correlated_odom(&identity.correlated_odom, out);
     encode_map_geometry(&identity.committed_map, out);
-    out.extend_from_slice(&identity.committed_map.payload_sha256);
-    out.extend_from_slice(&identity.committed_map.boundary_sha256);
     encode_identity_tail(identity, out)?;
-    out.extend_from_slice(&request.request_payload_sha256);
     Ok(())
 }
 
 fn decode_request_body_from_cursor(cursor: &mut Cursor<'_>) -> CodecResult<NativePgoRequest> {
     let schema_version = cursor.read_i32()?;
-    let (mut identity, point_count) = decode_identity_until_cloud_count(cursor, None)?;
-    identity.registered_cloud.point_count = point_count;
+    let (mut identity, _) = decode_identity_until_cloud_count(cursor, None)?;
     let registered_body_coordinate_count = cursor.read_bounded_count(
         MAX_NATIVE_PGO_REGISTERED_BODY_COORDINATE_COUNT,
         "registered_body_coordinate_count",
     )?;
     let registered_body_points_xyz = cursor.read_f64_vec(registered_body_coordinate_count)?;
-    identity.registered_cloud.envelope_sha256 = cursor.read_array()?;
-    identity.registered_cloud.body_points_sha256 = cursor.read_array()?;
-    identity.correlated_odom.source_sequence = cursor.read_i64()?;
-    identity.correlated_odom.source_timestamp_ns = cursor.read_i64()?;
-    let frozen_odom_translation_m = cursor.read_f64_array()?;
-    let frozen_odom_rotation_xyzw = cursor.read_f64_array()?;
-    identity.correlated_odom.pose_sha256 = cursor.read_array()?;
+    decode_correlated_odom(cursor, &mut identity.correlated_odom)?;
     decode_map_geometry(cursor, &mut identity.committed_map)?;
-    let committed_map_cell_count = cursor.read_bounded_count(
-        MAX_NATIVE_PGO_COMMITTED_MAP_CELL_COUNT,
-        "committed_map_cell_count",
-    )?;
-    let committed_map_occupancy = cursor.read_i8_vec(committed_map_cell_count)?;
-    identity.committed_map.payload_sha256 = cursor.read_array()?;
-    identity.committed_map.boundary_sha256 = cursor.read_array()?;
     decode_identity_tail(cursor, &mut identity)?;
-    let request_payload_sha256 = cursor.read_array()?;
     Ok(NativePgoRequest {
         schema_version,
         identity,
         registered_body_coordinate_count,
         registered_body_points_xyz,
-        frozen_odom_translation_m,
-        frozen_odom_rotation_xyzw,
-        committed_map_cell_count,
-        committed_map_occupancy,
-        request_payload_sha256,
     })
 }
 
@@ -1017,7 +827,6 @@ fn decode_result_body_from_cursor(cursor: &mut Cursor<'_>) -> CodecResult<Native
         loop_source_node_id: cursor.read_i64()?,
         loop_target_node_id: cursor.read_i64()?,
         loop_inlier_count: cursor.read_i64()?,
-        loop_proof_sha256: cursor.read_array()?,
         optimized_graph_node_count: cursor.read_i64()?,
         optimized_graph_edge_count: cursor.read_i64()?,
         optimized_graph_loop_edge_count: cursor.read_i64()?,
@@ -1025,11 +834,9 @@ fn decode_result_body_from_cursor(cursor: &mut Cursor<'_>) -> CodecResult<Native
         optimization_converged: cursor.read_i8()?,
         optimization_initial_cost: cursor.read_f64()?,
         optimization_final_cost: cursor.read_f64()?,
-        optimized_graph_sha256: cursor.read_array()?,
         trajectory: decode_trajectory(cursor)?,
         rejection_reason_code: cursor.read_i32()?,
         rejection_reason: cursor.read_string(MAX_REASON_BYTES, "rejection_reason")?,
-        result_payload_sha256: cursor.read_array()?,
     })
 }
 
@@ -1073,7 +880,6 @@ fn decode_status_body_from_cursor(cursor: &mut Cursor<'_>) -> CodecResult<Native
         cancel_state: cursor.read_i32()?,
         reason_code: cursor.read_i32()?,
         reason: cursor.read_string(MAX_REASON_BYTES, "reason")?,
-        status_payload_sha256: cursor.read_array()?,
     })
 }
 
@@ -1088,6 +894,9 @@ fn decode_identity_until_cloud_count(
     let request_sequence = cursor.read_i64()?;
     let mapping_session_id = cursor.read_string(MAX_IDENTITY_STRING_BYTES, "mapping_session_id")?;
     let mapping_session_generation = cursor.read_i64()?;
+    let mapping_backend_kind =
+        cursor.read_string(MAX_IDENTITY_STRING_BYTES, "mapping_backend_kind")?;
+    let mapping_backend_generation = cursor.read_i64()?;
     let map_frame_generation = cursor.read_i64()?;
     let mapping_commit_id = NativePgoMappingCommitId {
         boot_nonce: cursor.read_array()?,
@@ -1096,8 +905,11 @@ fn decode_identity_until_cloud_count(
     let occupancy_revision = cursor.read_i64()?;
     let cloud_revision = cursor.read_i64()?;
     let committed_map_source_timestamp_ns = cursor.read_i64()?;
+    let registered_cloud_backend = cursor.read_i32()?;
+    let registered_cloud_runtime_generation = cursor.read_i64()?;
     let registered_cloud_source_sequence = cursor.read_i64()?;
     let registered_cloud_source_timestamp_ns = cursor.read_i64()?;
+    let source_point_count = cursor.read_i64()?;
     let point_count = cursor.read_i64()?;
     Ok((
         NativePgoRequestIdentity {
@@ -1107,15 +919,19 @@ fn decode_identity_until_cloud_count(
             request_sequence,
             mapping_session_id,
             mapping_session_generation,
+            mapping_backend_kind,
+            mapping_backend_generation,
             map_frame_generation,
             mapping_commit_id,
             occupancy_revision,
             cloud_revision,
             registered_cloud: NativePgoRegisteredCloudProof {
+                backend: registered_cloud_backend,
+                runtime_generation: registered_cloud_runtime_generation,
+                source_point_count,
                 source_sequence: registered_cloud_source_sequence,
                 source_timestamp_ns: registered_cloud_source_timestamp_ns,
                 point_count,
-                ..NativePgoRegisteredCloudProof::default()
             },
             correlated_odom: NativePgoCorrelatedOdomProof::default(),
             committed_map: NativePgoCommittedMapProof {
@@ -1137,21 +953,22 @@ fn decode_request_echo(
     cursor: &mut Cursor<'_>,
     owner_header: Option<(i32, i64, i64)>,
 ) -> CodecResult<NativePgoRequestEcho> {
-    let (mut identity, point_count) = decode_identity_until_cloud_count(cursor, owner_header)?;
-    identity.registered_cloud.point_count = point_count;
-    identity.registered_cloud.envelope_sha256 = cursor.read_array()?;
-    identity.registered_cloud.body_points_sha256 = cursor.read_array()?;
-    identity.correlated_odom.source_sequence = cursor.read_i64()?;
-    identity.correlated_odom.source_timestamp_ns = cursor.read_i64()?;
-    identity.correlated_odom.pose_sha256 = cursor.read_array()?;
+    let (mut identity, _) = decode_identity_until_cloud_count(cursor, owner_header)?;
+    decode_correlated_odom(cursor, &mut identity.correlated_odom)?;
     decode_map_geometry(cursor, &mut identity.committed_map)?;
-    identity.committed_map.payload_sha256 = cursor.read_array()?;
-    identity.committed_map.boundary_sha256 = cursor.read_array()?;
     decode_identity_tail(cursor, &mut identity)?;
-    Ok(NativePgoRequestEcho {
-        identity,
-        request_payload_sha256: cursor.read_array()?,
-    })
+    Ok(NativePgoRequestEcho { identity })
+}
+
+fn decode_correlated_odom(
+    cursor: &mut Cursor<'_>,
+    receipt: &mut NativePgoCorrelatedOdomProof,
+) -> CodecResult<()> {
+    receipt.source_sequence = cursor.read_i64()?;
+    receipt.source_timestamp_ns = cursor.read_i64()?;
+    receipt.translation_m = cursor.read_f64_array()?;
+    receipt.rotation_xyzw = cursor.read_f64_array()?;
+    Ok(())
 }
 
 fn decode_map_geometry(
@@ -1180,33 +997,6 @@ fn decode_identity_tail(
     Ok(())
 }
 
-fn validate_request_integrity(message: &NativePgoRequest) -> Result<(), String> {
-    validate_request_fields(message)?;
-    let expected = compute_native_pgo_request_payload_sha256(message).map_err(codec_message)?;
-    if message.request_payload_sha256 != expected {
-        return Err("native PGO request payload hash mismatch".into());
-    }
-    Ok(())
-}
-
-fn validate_result_integrity(message: &NativePgoResult) -> Result<(), String> {
-    validate_result_fields(message)?;
-    let expected = compute_native_pgo_result_payload_sha256(message).map_err(codec_message)?;
-    if message.result_payload_sha256 != expected {
-        return Err("native PGO result payload hash mismatch".into());
-    }
-    Ok(())
-}
-
-fn validate_status_integrity(message: &NativePgoStatus) -> Result<(), String> {
-    validate_status_fields(message)?;
-    let expected = compute_native_pgo_status_payload_sha256(message).map_err(codec_message)?;
-    if message.status_payload_sha256 != expected {
-        return Err("native PGO status payload hash mismatch".into());
-    }
-    Ok(())
-}
-
 fn validate_request_fields(message: &NativePgoRequest) -> Result<(), String> {
     validate_schema_version(message.schema_version)?;
     validate_request_identity(&message.identity)?;
@@ -1228,56 +1018,12 @@ fn validate_request_fields(message: &NativePgoRequest) -> Result<(), String> {
                 .into(),
         );
     }
-    let body_points_sha256 =
-        compute_native_pgo_body_points_sha256(&message.registered_body_points_xyz)
-            .map_err(codec_message)?;
-    if message.identity.registered_cloud.body_points_sha256 != body_points_sha256 {
-        return Err("registered body points hash mismatch".into());
-    }
-    let odom_pose_sha256 = compute_native_pgo_odom_pose_sha256(
-        &message.frozen_odom_translation_m,
-        &message.frozen_odom_rotation_xyzw,
-    )
-    .map_err(codec_message)?;
-    if message.identity.correlated_odom.pose_sha256 != odom_pose_sha256 {
-        return Err("frozen odometry pose hash mismatch".into());
-    }
-    let expected_cells = message
-        .identity
-        .committed_map
-        .width
-        .checked_mul(message.identity.committed_map.height)
-        .and_then(|value| i32::try_from(value).ok())
-        .ok_or_else(|| "committed map cell count overflow".to_string())?;
-    if message.committed_map_cell_count != expected_cells
-        || usize::try_from(message.committed_map_cell_count).ok()
-            != Some(message.committed_map_occupancy.len())
-        || message.committed_map_cell_count > MAX_NATIVE_PGO_COMMITTED_MAP_CELL_COUNT
-    {
-        return Err(
-            "committed_map_cell_count must equal width*height and the occupancy payload length"
-                .into(),
-        );
-    }
     if message
-        .committed_map_occupancy
+        .registered_body_points_xyz
         .iter()
-        .any(|value| !(-1..=100).contains(value))
+        .any(|value| !value.is_finite())
     {
-        return Err("committed occupancy values must be in [-1,100]".into());
-    }
-    if message.identity.committed_map.payload_sha256
-        != compute_native_pgo_map_payload_sha256(&message.committed_map_occupancy)
-    {
-        return Err("committed map payload hash mismatch".into());
-    }
-    let expected_boundary = compute_native_pgo_map_boundary_sha256(
-        &message.identity.map_frame_id,
-        &message.identity.committed_map,
-    )
-    .map_err(codec_message)?;
-    if message.identity.committed_map.boundary_sha256 != expected_boundary {
-        return Err("committed map boundary hash mismatch".into());
+        return Err("registered body points must be finite".into());
     }
     Ok(())
 }
@@ -1296,6 +1042,18 @@ fn validate_request_identity(identity: &NativePgoRequestIdentity) -> Result<(), 
         (
             "mapping_session_generation",
             identity.mapping_session_generation,
+        ),
+        (
+            "mapping_backend_generation",
+            identity.mapping_backend_generation,
+        ),
+        (
+            "registered_cloud_runtime_generation",
+            identity.registered_cloud.runtime_generation,
+        ),
+        (
+            "registered_cloud_point_count",
+            identity.registered_cloud.source_point_count,
         ),
         ("map_frame_generation", identity.map_frame_generation),
         (
@@ -1326,11 +1084,20 @@ fn validate_request_identity(identity: &NativePgoRequestIdentity) -> Result<(), 
         }
     }
     validate_identity_string("mapping_session_id", &identity.mapping_session_id)?;
-    if !digest_is_present(&identity.mapping_commit_id.boot_nonce) {
+    validate_identity_string("mapping_backend_kind", &identity.mapping_backend_kind)?;
+    if !matches!(identity.registered_cloud.backend, 1 | 2 | 3) {
+        return Err("unsupported registered cloud LIO backend".into());
+    }
+    if identity.registered_cloud.source_point_count < identity.registered_cloud.point_count
+        || identity.registered_cloud.source_point_count > MAX_NATIVE_PGO_REGISTERED_BODY_POINT_COUNT
+    {
+        return Err("registered cloud original count must bound the selected count within the admitted cloud limit".into());
+    }
+    if !nonce_is_present(&identity.mapping_commit_id.boot_nonce) {
         return Err("mapping commit boot nonce must be present".into());
     }
     if identity.registered_cloud.point_count > MAX_NATIVE_PGO_REGISTERED_BODY_POINT_COUNT {
-        return Err("registered body point count exceeds the V1 limit".into());
+        return Err("registered body point count exceeds the V3 limit".into());
     }
     for (name, value) in [
         (
@@ -1361,32 +1128,11 @@ fn validate_request_identity(identity: &NativePgoRequestIdentity) -> Result<(), 
     if identity.correlated_odom.source_timestamp_ns > identity.source_timestamp_ns {
         return Err("correlated odometry timestamp cannot follow the source cloud".into());
     }
-    for (name, digest) in [
-        (
-            "registered_cloud_envelope_sha256",
-            &identity.registered_cloud.envelope_sha256,
-        ),
-        (
-            "registered_body_points_sha256",
-            &identity.registered_cloud.body_points_sha256,
-        ),
-        (
-            "frozen_odom_pose_sha256",
-            &identity.correlated_odom.pose_sha256,
-        ),
-        (
-            "committed_map_payload_sha256",
-            &identity.committed_map.payload_sha256,
-        ),
-        (
-            "committed_map_boundary_sha256",
-            &identity.committed_map.boundary_sha256,
-        ),
-    ] {
-        if !digest_is_present(digest) {
-            return Err(format!("{name} must be present"));
-        }
-    }
+    validate_transform(
+        &identity.correlated_odom.translation_m,
+        &identity.correlated_odom.rotation_xyzw,
+        "frozen odometry",
+    )?;
     let map = &identity.committed_map;
     if map.width <= 0
         || map.height <= 0
@@ -1401,7 +1147,7 @@ fn validate_request_identity(identity: &NativePgoRequestIdentity) -> Result<(), 
         || !map.origin_x_m.is_finite()
         || !map.origin_y_m.is_finite()
     {
-        return Err("committed map geometry is invalid or exceeds the V1 limit".into());
+        return Err("committed map geometry is invalid or exceeds the V3 limit".into());
     }
     for (name, frame) in [
         ("map_frame_id", identity.map_frame_id.as_str()),
@@ -1418,20 +1164,16 @@ fn validate_request_identity(identity: &NativePgoRequestIdentity) -> Result<(), 
         return Err("map, odom, and body frames must be distinct".into());
     }
     if identity.points_frame_id != identity.body_frame_id {
-        return Err("points_frame_id must equal body_frame_id in V1".into());
+        return Err("points_frame_id must equal body_frame_id in V3".into());
     }
-    if !digest_is_present(&identity.correction_lease.boot_nonce) {
+    if !nonce_is_present(&identity.correction_lease.boot_nonce) {
         return Err("correction lease boot nonce must be present".into());
     }
     Ok(())
 }
 
 fn validate_request_echo(request: &NativePgoRequestEcho) -> Result<(), String> {
-    validate_request_identity(&request.identity)?;
-    if !digest_is_present(&request.request_payload_sha256) {
-        return Err("request payload hash must be present".into());
-    }
-    Ok(())
+    validate_request_identity(&request.identity)
 }
 
 fn validate_result_fields(message: &NativePgoResult) -> Result<(), String> {
@@ -1491,14 +1233,6 @@ fn validate_correction_result(message: &NativePgoResult) -> Result<(), String> {
         || !message.rejection_reason.is_empty()
     {
         return Err("CORRECTION must not carry rejection metadata".into());
-    }
-    let loop_proof = compute_native_pgo_loop_proof_sha256(message).map_err(codec_message)?;
-    if message.loop_proof_sha256 != loop_proof {
-        return Err("loop proof hash mismatch".into());
-    }
-    let graph_proof = compute_native_pgo_optimized_graph_sha256(message).map_err(codec_message)?;
-    if message.optimized_graph_sha256 != graph_proof {
-        return Err("optimized graph hash mismatch".into());
     }
     Ok(())
 }
@@ -1572,13 +1306,11 @@ fn validate_zero_correction_fields(message: &NativePgoResult) -> Result<(), Stri
         || message.loop_source_node_id != 0
         || message.loop_target_node_id != 0
         || message.loop_inlier_count != 0
-        || digest_is_present(&message.loop_proof_sha256)
         || message.optimized_graph_node_count != 0
         || message.optimized_graph_edge_count != 0
         || message.optimized_graph_loop_edge_count != 0
         || message.optimization_iterations != 0
         || message.optimization_converged != 0
-        || digest_is_present(&message.optimized_graph_sha256)
     {
         return Err(
             "NO_CANDIDATE/REJECTED must canonicalize every correction-only field to zero".into(),
@@ -1686,7 +1418,7 @@ fn validate_status_fields(message: &NativePgoStatus) -> Result<(), String> {
                     message.reason_code,
                     NATIVE_PGO_REASON_PROTOCOL_DECODE_FAILED
                         | NATIVE_PGO_REASON_PROTOCOL_IDENTITY_MISMATCH
-                        | NATIVE_PGO_REASON_PROTOCOL_HASH_MISMATCH
+                        | NATIVE_PGO_REASON_PROTOCOL_RECEIPT_MISMATCH
                         | NATIVE_PGO_REASON_INVALID_REQUEST
                 )
                 && reason_present
@@ -1762,7 +1494,7 @@ fn no_terminal_or_cancel(message: &NativePgoStatus) -> bool {
 }
 
 fn validate_schema_version(schema_version: i32) -> Result<(), String> {
-    if schema_version == NATIVE_PGO_SCHEMA_VERSION_V2 {
+    if schema_version == NATIVE_PGO_SCHEMA_VERSION_V3 {
         Ok(())
     } else {
         Err(format!(
@@ -1787,7 +1519,7 @@ fn validate_transform(
         .iter()
         .any(|value| value.abs() > MAX_TRANSLATION_ABS_METERS)
     {
-        return Err(format!("{name} translation exceeds the V1 bound"));
+        return Err(format!("{name} translation exceeds the V3 bound"));
     }
     let norm_squared = rotation_xyzw.iter().map(|value| value * value).sum::<f64>();
     if (norm_squared - 1.0).abs() > QUATERNION_NORM_TOLERANCE {
@@ -1842,8 +1574,10 @@ fn request_echo_tail_is_canonical_zero(request: &NativePgoRequestEcho) -> bool {
     identity.request_sequence == 0
         && identity.mapping_session_id.is_empty()
         && identity.mapping_session_generation == 0
+        && identity.mapping_backend_kind.is_empty()
+        && identity.mapping_backend_generation == 0
         && identity.map_frame_generation == 0
-        && !digest_is_present(&identity.mapping_commit_id.boot_nonce)
+        && !nonce_is_present(&identity.mapping_commit_id.boot_nonce)
         && identity.mapping_commit_id.sequence == 0
         && identity.occupancy_revision == 0
         && identity.cloud_revision == 0
@@ -1855,27 +1589,17 @@ fn request_echo_tail_is_canonical_zero(request: &NativePgoRequestEcho) -> bool {
         && identity.committed_map.resolution_m.to_bits() == 0
         && identity.committed_map.origin_x_m.to_bits() == 0
         && identity.committed_map.origin_y_m.to_bits() == 0
-        && !digest_is_present(&identity.committed_map.payload_sha256)
-        && !digest_is_present(&identity.committed_map.boundary_sha256)
         && identity.source_timestamp_ns == 0
         && identity.map_frame_id.is_empty()
         && identity.odom_frame_id.is_empty()
         && identity.body_frame_id.is_empty()
         && identity.points_frame_id.is_empty()
-        && !digest_is_present(&identity.correction_lease.boot_nonce)
+        && !nonce_is_present(&identity.correction_lease.boot_nonce)
         && identity.correction_lease.generation == 0
-        && !digest_is_present(&request.request_payload_sha256)
 }
 
-fn digest_is_present<const N: usize>(digest: &[u8; N]) -> bool {
-    digest.iter().any(|byte| *byte != 0)
-}
-
-fn hash_body_prefix(domain: &[u8], body_prefix: &[u8]) -> [u8; 32] {
-    let mut canonical = Vec::with_capacity(domain.len() + body_prefix.len());
-    canonical.extend_from_slice(domain);
-    canonical.extend_from_slice(body_prefix);
-    sha256_bytes(&canonical)
+fn nonce_is_present<const N: usize>(nonce: &[u8; N]) -> bool {
+    nonce.iter().any(|byte| *byte != 0)
 }
 
 fn encode_string(value: &str, out: &mut Vec<u8>) -> CodecResult<()> {
@@ -1926,13 +1650,6 @@ fn encode_error(message: String) -> CodecError {
 
 fn decode_error(message: String) -> CodecError {
     CodecError::LcmDecode(message)
-}
-
-fn codec_message(error: CodecError) -> String {
-    match error {
-        CodecError::LcmEncode(message) | CodecError::LcmDecode(message) => message,
-        other => other.to_string(),
-    }
 }
 
 struct Cursor<'a> {
@@ -2010,20 +1727,14 @@ impl<'a> Cursor<'a> {
 
     fn read_f64_vec(&mut self, count: i32) -> CodecResult<Vec<f64>> {
         let count = usize::try_from(count).expect("bounded count is nonnegative");
+        if self.input.len().saturating_sub(self.offset) < count.saturating_mul(8) {
+            return Err(decode_error("truncated registered body coordinates".into()));
+        }
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
             values.push(self.read_f64()?);
         }
         Ok(values)
-    }
-
-    fn read_i8_vec(&mut self, count: i32) -> CodecResult<Vec<i8>> {
-        let count = usize::try_from(count).expect("bounded count is nonnegative");
-        Ok(self
-            .read_exact(count)?
-            .iter()
-            .map(|byte| *byte as i8)
-            .collect())
     }
 
     fn read_string(&mut self, maximum: usize, name: &str) -> CodecResult<String> {
@@ -2075,6 +1786,8 @@ mod tests {
             request_sequence: 11,
             mapping_session_id: "session-a".into(),
             mapping_session_generation: 5,
+            mapping_backend_kind: "voxel".into(),
+            mapping_backend_generation: 31,
             map_frame_generation: 9,
             mapping_commit_id: NativePgoMappingCommitId {
                 boot_nonce: [0x10; 16],
@@ -2083,16 +1796,18 @@ mod tests {
             occupancy_revision: 17,
             cloud_revision: 19,
             registered_cloud: NativePgoRegisteredCloudProof {
+                backend: 2,
+                runtime_generation: 37,
+                source_point_count: 3,
                 source_sequence: 23,
                 source_timestamp_ns: 42,
                 point_count: 2,
-                envelope_sha256: [0x31; 32],
-                ..NativePgoRegisteredCloudProof::default()
             },
             correlated_odom: NativePgoCorrelatedOdomProof {
                 source_sequence: 21,
                 source_timestamp_ns: 40,
-                ..NativePgoCorrelatedOdomProof::default()
+                translation_m: [4.0, 5.0, 6.0],
+                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
             },
             committed_map: NativePgoCommittedMapProof {
                 source_timestamp_ns: 42,
@@ -2101,7 +1816,6 @@ mod tests {
                 resolution_m: 0.5,
                 origin_x_m: 1.0,
                 origin_y_m: 2.0,
-                ..NativePgoCommittedMapProof::default()
             },
             source_timestamp_ns: 42,
             map_frame_id: "map".into(),
@@ -2114,22 +1828,17 @@ mod tests {
             },
         };
         seal_native_pgo_request(NativePgoRequest {
-            schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: NATIVE_PGO_SCHEMA_VERSION_V3,
             identity,
             registered_body_coordinate_count: 6,
             registered_body_points_xyz: vec![1.25, 2.5, 3.75, -1.0, -2.0, -3.0],
-            frozen_odom_translation_m: [4.0, 5.0, 6.0],
-            frozen_odom_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-            committed_map_cell_count: 4,
-            committed_map_occupancy: vec![-1, 0, 50, 100],
-            request_payload_sha256: [0; 32],
         })
         .unwrap()
     }
 
     fn no_candidate_result(request: &NativePgoRequest) -> NativePgoResult {
         seal_native_pgo_result(NativePgoResult {
-            schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: NATIVE_PGO_SCHEMA_VERSION_V3,
             request: request.echo(),
             result_disposition: NATIVE_PGO_DISPOSITION_NO_CANDIDATE,
             result_timestamp_ns: 43,
@@ -2141,7 +1850,7 @@ mod tests {
 
     fn correction_result(request: &NativePgoRequest) -> NativePgoResult {
         seal_native_pgo_result(NativePgoResult {
-            schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: NATIVE_PGO_SCHEMA_VERSION_V3,
             request: request.echo(),
             result_disposition: NATIVE_PGO_DISPOSITION_CORRECTION,
             result_timestamp_ns: 44,
@@ -2175,7 +1884,7 @@ mod tests {
 
     fn cancelled_result(request: &NativePgoRequest) -> NativePgoResult {
         seal_native_pgo_result(NativePgoResult {
-            schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: NATIVE_PGO_SCHEMA_VERSION_V3,
             request: request.echo(),
             result_disposition: NATIVE_PGO_DISPOSITION_REJECTED,
             result_timestamp_ns: 45,
@@ -2188,7 +1897,7 @@ mod tests {
 
     fn ready_status() -> NativePgoStatus {
         seal_native_pgo_status(NativePgoStatus {
-            schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: NATIVE_PGO_SCHEMA_VERSION_V3,
             backend: NATIVE_PGO_BACKEND,
             runtime_generation: 7,
             backend_generation: 3,
@@ -2206,7 +1915,7 @@ mod tests {
 
     fn cancelled_status(request: &NativePgoRequest) -> NativePgoStatus {
         seal_native_pgo_status(NativePgoStatus {
-            schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: NATIVE_PGO_SCHEMA_VERSION_V3,
             backend: NATIVE_PGO_BACKEND,
             runtime_generation: 7,
             backend_generation: 3,
@@ -2228,15 +1937,15 @@ mod tests {
     fn fresh_lcm_gen_fingerprints_are_locked() {
         assert_eq!(
             crate::hash::fingerprint("nuwax_msgs.NativePgoRequest", 0).unwrap(),
-            NATIVE_PGO_REQUEST_FINGERPRINT_V2
+            NATIVE_PGO_REQUEST_FINGERPRINT_V3
         );
         assert_eq!(
             crate::hash::fingerprint("nuwax_msgs.NativePgoResult", 0).unwrap(),
-            NATIVE_PGO_RESULT_FINGERPRINT_V2
+            NATIVE_PGO_RESULT_FINGERPRINT_V3
         );
         assert_eq!(
             crate::hash::fingerprint("nuwax_msgs.NativePgoStatus", 0).unwrap(),
-            NATIVE_PGO_STATUS_FINGERPRINT_V2
+            NATIVE_PGO_STATUS_FINGERPRINT_V3
         );
     }
 
@@ -2381,7 +2090,7 @@ mod tests {
         let request = request();
         let request_body = encode_native_pgo_request_body(&request).unwrap();
         let request_wire = encode_native_pgo_request_wire(&request).unwrap();
-        assert_eq!(&request_wire[..8], &NATIVE_PGO_REQUEST_FINGERPRINT_V2);
+        assert_eq!(&request_wire[..8], &NATIVE_PGO_REQUEST_FINGERPRINT_V3);
         assert_eq!(&request_wire[8..], request_body);
         assert_eq!(
             decode_native_pgo_request_body(&request_body).unwrap(),
@@ -2395,7 +2104,7 @@ mod tests {
         let result = correction_result(&request);
         let result_body = encode_native_pgo_result_body(&result).unwrap();
         let result_wire = encode_native_pgo_result_wire(&result).unwrap();
-        assert_eq!(&result_wire[..8], &NATIVE_PGO_RESULT_FINGERPRINT_V2);
+        assert_eq!(&result_wire[..8], &NATIVE_PGO_RESULT_FINGERPRINT_V3);
         assert_eq!(&result_wire[8..], result_body);
         assert_eq!(decode_native_pgo_result_body(&result_body).unwrap(), result);
         assert_eq!(decode_native_pgo_result_wire(&result_wire).unwrap(), result);
@@ -2403,7 +2112,7 @@ mod tests {
         let status = cancelled_status(&request);
         let status_body = encode_native_pgo_status_body(&status).unwrap();
         let status_wire = encode_native_pgo_status_wire(&status).unwrap();
-        assert_eq!(&status_wire[..8], &NATIVE_PGO_STATUS_FINGERPRINT_V2);
+        assert_eq!(&status_wire[..8], &NATIVE_PGO_STATUS_FINGERPRINT_V3);
         assert_eq!(&status_wire[8..], status_body);
         assert_eq!(decode_native_pgo_status_body(&status_body).unwrap(), status);
         assert_eq!(decode_native_pgo_status_wire(&status_wire).unwrap(), status);
@@ -2505,7 +2214,7 @@ mod tests {
         let statuses = [
             ready_status(),
             seal_native_pgo_status(NativePgoStatus {
-                schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
+                schema_version: NATIVE_PGO_SCHEMA_VERSION_V3,
                 backend: NATIVE_PGO_BACKEND,
                 runtime_generation: 7,
                 backend_generation: 3,
@@ -2520,7 +2229,7 @@ mod tests {
             })
             .unwrap(),
             seal_native_pgo_status(NativePgoStatus {
-                schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
+                schema_version: NATIVE_PGO_SCHEMA_VERSION_V3,
                 backend: NATIVE_PGO_BACKEND,
                 runtime_generation: 7,
                 backend_generation: 3,
@@ -2590,21 +2299,14 @@ mod tests {
     fn dynamic_counts_and_nonfinite_payloads_fail_before_allocation_or_use() {
         let request = request();
         let mut wire = encode_native_pgo_request_wire(&request).unwrap();
-        let (coordinate_count_offset, first_coordinate_offset, map_cell_count_offset) =
-            request_dynamic_offsets(&wire);
+        let (coordinate_count_offset, first_coordinate_offset) = request_dynamic_offsets(&wire);
         wire[coordinate_count_offset..coordinate_count_offset + 4]
             .copy_from_slice(&(MAX_NATIVE_PGO_REGISTERED_BODY_COORDINATE_COUNT + 1).to_be_bytes());
         assert!(decode_native_pgo_request_wire(&wire).is_err());
 
         let mut wire = encode_native_pgo_request_wire(&request).unwrap();
-        wire[map_cell_count_offset..map_cell_count_offset + 4]
-            .copy_from_slice(&(MAX_NATIVE_PGO_COMMITTED_MAP_CELL_COUNT + 1).to_be_bytes());
-        assert!(decode_native_pgo_request_wire(&wire).is_err());
-
-        let mut wire = encode_native_pgo_request_wire(&request).unwrap();
         wire[first_coordinate_offset..first_coordinate_offset + 8]
             .copy_from_slice(&f64::NAN.to_be_bytes());
-        reseal_wire(NATIVE_PGO_REQUEST_HASH_DOMAIN, &mut wire);
         assert!(decode_native_pgo_request_wire(&wire).is_err());
 
         let mut result = correction_result(&request);
@@ -2613,110 +2315,234 @@ mod tests {
         let mut wire = encode_native_pgo_result_wire(&correction_result(&request)).unwrap();
         let fitness_offset = unique_window_offset(&wire, &0.25_f64.to_be_bytes());
         wire[fitness_offset..fitness_offset + 8].copy_from_slice(&f64::NAN.to_be_bytes());
-        reseal_wire(NATIVE_PGO_RESULT_HASH_DOMAIN, &mut wire);
         assert!(decode_native_pgo_result_wire(&wire).is_err());
 
         let status = ready_status();
         let mut wire = encode_native_pgo_status_wire(&status).unwrap();
-        let event_offset = wire.len() - 32 - (5 * 4 + 4 + status.reason.len() + 1);
+        let event_offset = wire.len() - (5 * 4 + 4 + status.reason.len() + 1);
         wire[event_offset..event_offset + 4]
             .copy_from_slice(&NATIVE_PGO_EVENT_CANCEL_REQUESTED.to_be_bytes());
-        reseal_wire(NATIVE_PGO_STATUS_HASH_DOMAIN, &mut wire);
         assert!(decode_native_pgo_status_wire(&wire).is_err());
 
         let mut request = request;
-        request.committed_map_occupancy[0] = 101;
+        request.identity.committed_map.width =
+            i64::from(MAX_NATIVE_PGO_COMMITTED_MAP_CELL_COUNT) + 1;
         assert!(seal_native_pgo_request(request).is_err());
     }
 
     #[test]
-    fn proof_hashes_and_exact_echo_are_fail_closed() {
-        let request = request();
-        let mut corrupt = request.clone();
-        corrupt.request_payload_sha256[0] ^= 1;
-        assert!(encode_native_pgo_request_wire(&corrupt).is_err());
-
-        let mut result = correction_result(&request);
-        result.loop_proof_sha256[0] ^= 1;
-        assert!(encode_native_pgo_result_wire(&result).is_err());
-
-        let mut wrong_echo = no_candidate_result(&request);
-        wrong_echo.request.identity.occupancy_revision += 1;
-        wrong_echo = seal_native_pgo_result(wrong_echo).unwrap();
-        assert!(validate_native_pgo_result_echo(&request, &wrong_echo).is_err());
+    fn obsolete_schema_and_fingerprint_fail_closed() {
+        let mut wire = encode_native_pgo_request_wire(&request()).unwrap();
+        wire[8..12].copy_from_slice(&2_i32.to_be_bytes());
+        assert!(decode_native_pgo_request_wire(&wire).is_err());
+        let mut wire = encode_native_pgo_request_wire(&request()).unwrap();
+        wire[..8].copy_from_slice(&0xa714e98d60d0b620_u64.to_be_bytes());
+        assert!(decode_native_pgo_request_wire(&wire).is_err());
     }
 
     #[test]
-    fn wire_digest_goldens_are_stable() {
+    fn concrete_receipts_and_exact_echo_are_fail_closed() {
+        let request = request();
+        let mut corrupt = request.clone();
+        corrupt.registered_body_coordinate_count += 3;
+        assert!(encode_native_pgo_request_wire(&corrupt).is_err());
+
+        let mut result = correction_result(&request);
+        result.loop_source_node_id = result.loop_target_node_id;
+        assert!(encode_native_pgo_result_wire(&result).is_err());
+
+        for alter in [
+            |id: &mut NativePgoRequestIdentity| id.occupancy_revision += 1,
+            |id: &mut NativePgoRequestIdentity| id.mapping_backend_generation += 1,
+            |id: &mut NativePgoRequestIdentity| id.mapping_backend_kind = "raytracing".into(),
+            |id: &mut NativePgoRequestIdentity| id.registered_cloud.backend = 3,
+            |id: &mut NativePgoRequestIdentity| id.registered_cloud.runtime_generation += 1,
+            |id: &mut NativePgoRequestIdentity| id.registered_cloud.source_point_count += 1,
+            |id: &mut NativePgoRequestIdentity| id.correlated_odom.rotation_xyzw[0] = -0.0,
+        ] {
+            let mut result = no_candidate_result(&request);
+            alter(&mut result.request.identity);
+            let result = seal_native_pgo_result(result).unwrap();
+            assert!(validate_native_pgo_result_echo(&request, &result).is_err());
+            let mut status = cancelled_status(&request);
+            alter(&mut status.request.as_mut().unwrap().identity);
+            let status = seal_native_pgo_status(status).unwrap();
+            assert!(validate_native_pgo_status_echo(&request, &status).is_err());
+        }
+
+        let mut signed_zero_request = request.clone();
+        signed_zero_request.identity.committed_map.origin_x_m = 0.0;
+        let mut result = no_candidate_result(&signed_zero_request);
+        result.request.identity.committed_map.origin_x_m = -0.0;
+        assert!(validate_native_pgo_result_echo(&signed_zero_request, &result).is_err());
+    }
+
+    #[test]
+    fn request_replay_compares_all_xyz_bits_counts_and_order() {
+        let request = request();
+        assert_eq!(request, request.clone());
+        let mut changed = request.clone();
+        changed.registered_body_points_xyz[5] = -4.0;
+        assert_eq!(changed.echo(), request.echo());
+        assert_ne!(changed, request);
+        let mut reordered = request.clone();
+        reordered.registered_body_points_xyz.swap(0, 3);
+        assert_eq!(reordered.echo(), request.echo());
+        assert_ne!(reordered, request);
+        let mut counted = request.clone();
+        counted.registered_body_coordinate_count -= 3;
+        assert_ne!(counted, request);
+        let mut positive_zero = request;
+        positive_zero.registered_body_points_xyz[0] = 0.0;
+        let mut negative_zero = positive_zero.clone();
+        negative_zero.registered_body_points_xyz[0] = -0.0;
+        assert_ne!(positive_zero, negative_zero);
+    }
+
+    #[test]
+    fn admitted_source_counts_domains_and_frozen_pose_are_validated() {
+        for alter in [
+            |id: &mut NativePgoRequestIdentity| id.mapping_backend_generation = 0,
+            |id: &mut NativePgoRequestIdentity| id.mapping_backend_kind.clear(),
+            |id: &mut NativePgoRequestIdentity| id.registered_cloud.backend = 4,
+            |id: &mut NativePgoRequestIdentity| id.registered_cloud.runtime_generation = 0,
+            |id: &mut NativePgoRequestIdentity| id.registered_cloud.source_point_count = 1,
+            |id: &mut NativePgoRequestIdentity| {
+                id.registered_cloud.source_point_count =
+                    MAX_NATIVE_PGO_REGISTERED_BODY_POINT_COUNT + 1
+            },
+            |id: &mut NativePgoRequestIdentity| id.correlated_odom.translation_m[0] = f64::NAN,
+            |id: &mut NativePgoRequestIdentity| id.correlated_odom.rotation_xyzw = [0.0; 4],
+        ] {
+            let mut request = request();
+            alter(&mut request.identity);
+            assert!(seal_native_pgo_request(request).is_err());
+        }
+    }
+
+    #[test]
+    fn mapping_backend_labels_are_opaque_and_never_defaulted() {
+        let mut request = request();
+        request.identity.mapping_backend_kind = "future_mapping_backend".into();
+        let request = seal_native_pgo_request(request).unwrap();
+        let wire = encode_native_pgo_request_wire(&request).unwrap();
+        let decoded = decode_native_pgo_request_wire(&wire).unwrap();
+        assert_eq!(
+            decoded.identity.mapping_backend_kind,
+            "future_mapping_backend"
+        );
+        assert_eq!(decoded, request);
+        let mut result = no_candidate_result(&request);
+        result.request.identity.mapping_backend_kind = "voxel".into();
+        assert!(validate_native_pgo_result_echo(&request, &result).is_err());
+    }
+
+    #[test]
+    fn owner_status_cannot_hide_a_live_or_noncanonical_receipt() {
+        let request = request();
+        let mut live = cancelled_status(&request);
+        live.request = None;
+        assert!(seal_native_pgo_status(live).is_err());
+        let mut owner = ready_status();
+        owner.request = Some(request.echo());
+        assert!(seal_native_pgo_status(owner).is_err());
+        let mut zero = NativePgoRequestEcho::default();
+        assert!(request_echo_tail_is_canonical_zero(&zero));
+        zero.identity.correlated_odom.rotation_xyzw[0] = -0.0;
+        assert!(!request_echo_tail_is_canonical_zero(&zero));
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(&NATIVE_PGO_STATUS_FINGERPRINT_V3);
+        hostile.extend_from_slice(&NATIVE_PGO_SCHEMA_VERSION_V3.to_be_bytes());
+        hostile.extend_from_slice(&NATIVE_PGO_BACKEND.to_be_bytes());
+        for value in [7_i64, 3, 1, 0] {
+            hostile.extend_from_slice(&value.to_be_bytes());
+        }
+        hostile.push(0); // Explicit owner-scoped event, never a missing live receipt.
+        encode_status_identity_tail(&zero, &mut hostile).unwrap();
+        for value in [NATIVE_PGO_EVENT_READY, NATIVE_PGO_HEALTH_HEALTHY, 0, 0, 0] {
+            hostile.extend_from_slice(&value.to_be_bytes());
+        }
+        encode_string("", &mut hostile).unwrap();
+        assert!(decode_native_pgo_status_wire(&hostile).is_err());
+    }
+
+    // Native tests and fresh C/C++ parity remain unrun in the 2026-10-04 source-only lane.
+    #[test]
+    fn complete_v3_wire_goldens_are_stable() {
         let request = request();
         let result = correction_result(&request);
         let status = cancelled_status(&request);
-        let request_wire = encode_native_pgo_request_wire(&request).unwrap();
-        let result_wire = encode_native_pgo_result_wire(&result).unwrap();
-        let status_wire = encode_native_pgo_status_wire(&status).unwrap();
-        assert_eq!(request_wire.len(), 583);
-        assert_eq!(
-            hex(&sha256_bytes(&request_wire)),
-            "a274800c8d7ba751cc520cba4a4ac706642eab179e87778f2b721ce19dd5123d"
-        );
-        assert_eq!(result_wire.len(), 925);
-        assert_eq!(
-            hex(&sha256_bytes(&result_wire)),
-            "164f1d6055179e5eeb859ee5ad9d57475658659e286c956f806785d2183771cd"
-        );
-        assert_eq!(status_wire.len(), 550);
-        assert_eq!(
-            hex(&sha256_bytes(&status_wire)),
-            "be249c8ef74ae26757c175340d8b76d9fb812376df468d1cadfa879d8b2fa687"
-        );
+        for (wire, expected) in [
+            (
+                encode_native_pgo_request_wire(&request).unwrap(),
+                REQUEST_V3_WIRE_HEX,
+            ),
+            (
+                encode_native_pgo_result_wire(&result).unwrap(),
+                RESULT_V3_WIRE_HEX,
+            ),
+            (
+                encode_native_pgo_status_wire(&status).unwrap(),
+                STATUS_V3_WIRE_HEX,
+            ),
+        ] {
+            assert_eq!(hex(&wire), expected.trim());
+        }
     }
 
-    fn request_dynamic_offsets(wire: &[u8]) -> (usize, usize, usize) {
+    // Complete wire fixture generated by authoritative lcm-gen 1.5.2 Python bindings.
+    const REQUEST_V3_WIRE_HEX: &str = concat!(
+        "1dfa283cdea6215d000000030000000200000000000000070000000000000003000000000000000b0000000a73657373",
+        "696f6e2d6100000000000000000500000006766f78656c00000000000000001f00000000000000091010101010101010",
+        "1010101010101010000000000000000d00000000000000110000000000000013000000000000002a0000000200000000",
+        "000000250000000000000017000000000000002a00000000000000030000000000000002000000063ff4000000000000",
+        "4004000000000000400e000000000000bff0000000000000c000000000000000c0080000000000000000000000000015",
+        "000000000000002840100000000000004014000000000000401800000000000000000000000000000000000000000000",
+        "00000000000000003ff0000000000000000000000000000200000000000000023fe00000000000003ff0000000000000",
+        "4000000000000000000000000000002a000000046d617000000000056f646f6d000000000a626173655f6c696e6b0000",
+        "00000a626173655f6c696e6b0020202020202020202020202020202020000000000000001d",
+    );
+
+    // Complete wire fixture generated by authoritative lcm-gen 1.5.2 Python bindings.
+    const RESULT_V3_WIRE_HEX: &str = concat!(
+        "7918f955c88ef8d6000000030000000200000000000000070000000000000003000000000000000b0000000a73657373",
+        "696f6e2d6100000000000000000500000006766f78656c00000000000000001f00000000000000091010101010101010",
+        "1010101010101010000000000000000d00000000000000110000000000000013000000000000002a0000000200000000",
+        "000000250000000000000017000000000000002a00000000000000030000000000000002000000000000001500000000",
+        "000000284010000000000000401400000000000040180000000000000000000000000000000000000000000000000000",
+        "000000003ff0000000000000000000000000000200000000000000023fe00000000000003ff000000000000040000000",
+        "00000000000000000000002a000000046d617000000000056f646f6d000000000a626173655f6c696e6b000000000a62",
+        "6173655f6c696e6b0020202020202020202020202020202020000000000000001d00000002000000000000002c000000",
+        "013fb999999999999abfc999999999999a3fd33333333333330000000000000000000000000000000000000000000000",
+        "003ff00000000000003fd00000000000003fc00000000000000000000000000000000000000000000100000000000000",
+        "140000000000000003000000000000000300000000000000010000000301402400000000000040000000000000000000",
+        "000300000000000000280000000000000029000000000000002a00000000000000000000000000000000000000000000",
+        "00003ff00000000000000000000000000000000000000000000040000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000003ff00000000000000000000000000000000000000000",
+        "000000000000000000003ff00000000000000000000000000000000000000000000000000000000000003ff000000000",
+        "0000000000000000000100",
+    );
+
+    // Complete wire fixture generated by authoritative lcm-gen 1.5.2 Python bindings.
+    const STATUS_V3_WIRE_HEX: &str = concat!(
+        "f61ebd2220fa5de30000000300000002000000000000000700000000000000030000000000000005000000000000002e",
+        "01000000000000000b0000000a73657373696f6e2d6100000000000000000500000006766f78656c0000000000000000",
+        "1f000000000000000910101010101010101010101010101010000000000000000d000000000000001100000000000000",
+        "13000000000000002a0000000200000000000000250000000000000017000000000000002a0000000000000003000000",
+        "000000000200000000000000150000000000000028401000000000000040140000000000004018000000000000000000",
+        "0000000000000000000000000000000000000000003ff0000000000000000000000000000200000000000000023fe000",
+        "00000000003ff00000000000004000000000000000000000000000002a000000046d617000000000056f646f6d000000",
+        "000a626173655f6c696e6b000000000a626173655f6c696e6b0020202020202020202020202020202020000000000000",
+        "001d000000080000000100000004000000020000000b0000000a63616e63656c6c656400",
+    );
+
+    fn request_dynamic_offsets(wire: &[u8]) -> (usize, usize) {
         let mut cursor = Cursor::new(&wire[8..]);
         cursor.read_i32().unwrap();
-        cursor.read_i32().unwrap();
-        cursor.read_i64().unwrap();
-        cursor.read_i64().unwrap();
-        cursor.read_i64().unwrap();
-        cursor
-            .read_string(MAX_IDENTITY_STRING_BYTES, "mapping_session_id")
-            .unwrap();
-        cursor.read_i64().unwrap();
-        cursor.read_i64().unwrap();
-        cursor.read_array::<16>().unwrap();
-        for _ in 0..7 {
-            cursor.read_i64().unwrap();
-        }
+        decode_identity_until_cloud_count(&mut cursor, None).unwrap();
         let coordinate_count_offset = 8 + cursor.offset;
-        let coordinate_count = cursor.read_i32().unwrap();
-        let first_coordinate_offset = 8 + cursor.offset;
-        for _ in 0..coordinate_count {
-            cursor.read_f64().unwrap();
-        }
-        cursor.read_array::<32>().unwrap();
-        cursor.read_array::<32>().unwrap();
-        cursor.read_i64().unwrap();
-        cursor.read_i64().unwrap();
-        for _ in 0..7 {
-            cursor.read_f64().unwrap();
-        }
-        cursor.read_array::<32>().unwrap();
-        cursor.read_i64().unwrap();
-        cursor.read_i64().unwrap();
-        cursor.read_f64().unwrap();
-        cursor.read_f64().unwrap();
-        cursor.read_f64().unwrap();
-        (
-            coordinate_count_offset,
-            first_coordinate_offset,
-            8 + cursor.offset,
-        )
-    }
-
-    fn reseal_wire(domain: &[u8], wire: &mut [u8]) {
-        let body_end = wire.len() - 32;
-        let digest = hash_body_prefix(domain, &wire[8..body_end]);
-        wire[body_end..].copy_from_slice(&digest);
+        cursor.read_i32().unwrap();
+        (coordinate_count_offset, 8 + cursor.offset)
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -2793,13 +2619,13 @@ mod tests {
 #include "nuwax_msgs_NativePgoResult.h"
 #include "nuwax_msgs_NativePgoStatus.h"
 
-_Static_assert(NUWAX_MSGS_NATIVEPGOREQUEST_SCHEMA_VERSION_V2 == 2, "request schema");
+_Static_assert(NUWAX_MSGS_NATIVEPGOREQUEST_SCHEMA_VERSION_V3 == 3, "request schema");
 _Static_assert(NUWAX_MSGS_NATIVEPGOREQUEST_BACKEND_NATIVE_PGO == 2, "request backend");
 _Static_assert(NUWAX_MSGS_NATIVEPGOREQUEST_MAX_REGISTERED_BODY_POINT_COUNT == 100000LL, "request point max");
 _Static_assert(NUWAX_MSGS_NATIVEPGOREQUEST_MAX_REGISTERED_BODY_COORDINATE_COUNT == 300000, "request coordinate max");
 _Static_assert(NUWAX_MSGS_NATIVEPGOREQUEST_MAX_COMMITTED_MAP_CELL_COUNT == 67108864, "request map max");
 
-_Static_assert(NUWAX_MSGS_NATIVEPGORESULT_SCHEMA_VERSION_V2 == 2, "result schema");
+_Static_assert(NUWAX_MSGS_NATIVEPGORESULT_SCHEMA_VERSION_V3 == 3, "result schema");
 _Static_assert(NUWAX_MSGS_NATIVEPGORESULT_BACKEND_NATIVE_PGO == 2, "result backend");
 _Static_assert(NUWAX_MSGS_NATIVEPGORESULT_REJECTION_CANCELLED == 5, "cancelled result");
 _Static_assert(NUWAX_MSGS_NATIVEPGORESULT_MAX_GRAPH_NODES == 2000LL, "node max");
@@ -2808,7 +2634,7 @@ _Static_assert(NUWAX_MSGS_NATIVEPGORESULT_MAX_GRAPH_LOOP_EDGES == 1998LL, "loop 
 _Static_assert(NUWAX_MSGS_NATIVEPGORESULT_MAX_LOOP_INLIERS == 20000LL, "inlier max");
 _Static_assert(NUWAX_MSGS_NATIVEPGORESULT_MAX_OPTIMIZATION_ITERATIONS == 300, "iteration max");
 
-_Static_assert(NUWAX_MSGS_NATIVEPGOSTATUS_SCHEMA_VERSION_V2 == 2, "status schema");
+_Static_assert(NUWAX_MSGS_NATIVEPGOSTATUS_SCHEMA_VERSION_V3 == 3, "status schema");
 _Static_assert(NUWAX_MSGS_NATIVEPGOSTATUS_EVENT_CANCEL_ACKNOWLEDGED == 8, "cancel ack event");
 _Static_assert(NUWAX_MSGS_NATIVEPGOSTATUS_TERMINAL_CANCELLED == 4, "cancel terminal");
 _Static_assert(NUWAX_MSGS_NATIVEPGOSTATUS_CANCEL_ACKNOWLEDGED == 2, "cancel ack");
@@ -2840,9 +2666,9 @@ static int nibble(char value) {
 
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
-    if ((uint64_t) __nuwax_msgs_NativePgoRequest_get_hash() != UINT64_C(0xa714e98d60d0b620)) return 20;
-    if ((uint64_t) __nuwax_msgs_NativePgoResult_get_hash() != UINT64_C(0xadd11e19aa0ec18b)) return 21;
-    if ((uint64_t) __nuwax_msgs_NativePgoStatus_get_hash() != UINT64_C(0x3091859182a57b03)) return 22;
+    if ((uint64_t) __nuwax_msgs_NativePgoRequest_get_hash() != UINT64_C(0x1dfa283cdea6215d)) return 20;
+    if ((uint64_t) __nuwax_msgs_NativePgoResult_get_hash() != UINT64_C(0x7918f955c88ef8d6)) return 21;
+    if ((uint64_t) __nuwax_msgs_NativePgoStatus_get_hash() != UINT64_C(0xf61ebd2220fa5de3)) return 22;
 
     size_t hex_length = strlen(argv[2]);
     if (hex_length == 0 || hex_length % 2 != 0) return 3;
@@ -2869,13 +2695,13 @@ import sys
 sys.path.insert(0, sys.argv[1])
 from nuwax_msgs import NativePgoRequest, NativePgoResult, NativePgoStatus
 
-assert NativePgoRequest.SCHEMA_VERSION_V2 == 2
+assert NativePgoRequest.SCHEMA_VERSION_V3 == 3
 assert NativePgoRequest.BACKEND_NATIVE_PGO == 2
 assert NativePgoRequest.MAX_REGISTERED_BODY_POINT_COUNT == 100000
 assert NativePgoRequest.MAX_REGISTERED_BODY_COORDINATE_COUNT == 300000
 assert NativePgoRequest.MAX_COMMITTED_MAP_CELL_COUNT == 67108864
 
-assert NativePgoResult.SCHEMA_VERSION_V2 == 2
+assert NativePgoResult.SCHEMA_VERSION_V3 == 3
 assert NativePgoResult.BACKEND_NATIVE_PGO == 2
 assert NativePgoResult.REJECTION_CANCELLED == 5
 assert NativePgoResult.MAX_GRAPH_NODES == 2000
@@ -2884,15 +2710,15 @@ assert NativePgoResult.MAX_GRAPH_LOOP_EDGES == 1998
 assert NativePgoResult.MAX_LOOP_INLIERS == 20000
 assert NativePgoResult.MAX_OPTIMIZATION_ITERATIONS == 300
 
-assert NativePgoStatus.SCHEMA_VERSION_V2 == 2
+assert NativePgoStatus.SCHEMA_VERSION_V3 == 3
 assert NativePgoStatus.EVENT_CANCEL_ACKNOWLEDGED == 8
 assert NativePgoStatus.TERMINAL_CANCELLED == 4
 assert NativePgoStatus.CANCEL_ACKNOWLEDGED == 2
 assert NativePgoStatus.REASON_CANCELLED == 11
 
-assert NativePgoRequest().get_hash() == 0xa714e98d60d0b620
-assert NativePgoResult().get_hash() == 0xadd11e19aa0ec18b
-assert NativePgoStatus().get_hash() == 0x3091859182a57b03
+assert NativePgoRequest().get_hash() == 0x1dfa283cdea6215d
+assert NativePgoResult().get_hash() == 0x7918f955c88ef8d6
+assert NativePgoStatus().get_hash() == 0xf61ebd2220fa5de3
 
 for cls, encoded_hex in zip(
     (NativePgoRequest, NativePgoResult, NativePgoStatus),
@@ -2919,13 +2745,13 @@ using Request = nuwax_msgs::NativePgoRequest;
 using Result = nuwax_msgs::NativePgoResult;
 using Status = nuwax_msgs::NativePgoStatus;
 
-static_assert(Request::SCHEMA_VERSION_V2 == 2, "request schema");
+static_assert(Request::SCHEMA_VERSION_V3 == 3, "request schema");
 static_assert(Request::BACKEND_NATIVE_PGO == 2, "request backend");
 static_assert(Request::MAX_REGISTERED_BODY_POINT_COUNT == 100000LL, "request point max");
 static_assert(Request::MAX_REGISTERED_BODY_COORDINATE_COUNT == 300000, "request coordinate max");
 static_assert(Request::MAX_COMMITTED_MAP_CELL_COUNT == 67108864, "request map max");
 
-static_assert(Result::SCHEMA_VERSION_V2 == 2, "result schema");
+static_assert(Result::SCHEMA_VERSION_V3 == 3, "result schema");
 static_assert(Result::BACKEND_NATIVE_PGO == 2, "result backend");
 static_assert(Result::REJECTION_CANCELLED == 5, "cancelled result");
 static_assert(Result::MAX_GRAPH_NODES == 2000LL, "node max");
@@ -2936,7 +2762,7 @@ static_assert(Result::MAX_OPTIMIZATION_ITERATIONS == 300, "iteration max");
 static_assert(std::is_same<decltype(Result::MAX_GRAPH_NODES), const int64_t>::value,
               "graph maxima must remain int64");
 
-static_assert(Status::SCHEMA_VERSION_V2 == 2, "status schema");
+static_assert(Status::SCHEMA_VERSION_V3 == 3, "status schema");
 static_assert(Status::EVENT_CANCEL_ACKNOWLEDGED == 8, "cancel ack event");
 static_assert(Status::TERMINAL_CANCELLED == 4, "cancel terminal");
 static_assert(Status::CANCEL_ACKNOWLEDGED == 2, "cancel ack");
@@ -2962,9 +2788,9 @@ static int roundtrip(const std::vector<uint8_t>& input) {
 
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
-    if (static_cast<uint64_t>(Request::getHash()) != UINT64_C(0xa714e98d60d0b620)) return 20;
-    if (static_cast<uint64_t>(Result::getHash()) != UINT64_C(0xadd11e19aa0ec18b)) return 21;
-    if (static_cast<uint64_t>(Status::getHash()) != UINT64_C(0x3091859182a57b03)) return 22;
+    if (static_cast<uint64_t>(Request::getHash()) != UINT64_C(0x1dfa283cdea6215d)) return 20;
+    if (static_cast<uint64_t>(Result::getHash()) != UINT64_C(0x7918f955c88ef8d6)) return 21;
+    if (static_cast<uint64_t>(Status::getHash()) != UINT64_C(0xf61ebd2220fa5de3)) return 22;
 
     std::string encoded_hex(argv[2]);
     if (encoded_hex.empty() || encoded_hex.size() % 2 != 0) return 3;

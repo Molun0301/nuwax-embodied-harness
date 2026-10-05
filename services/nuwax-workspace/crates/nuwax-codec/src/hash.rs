@@ -336,10 +336,10 @@ pub const STRUCT_SEEDS: &[(&str, u64)] = &[
     ("nuwax_msgs.LioStatus", 0x36bd_731b_6c5d_20d9_u64),
     ("nuwax_msgs.LioInputAck", 0xbb64_9f22_aa1e_d58c_u64),
     ("nuwax_msgs.LioInputFrame", 0x6191_9fad_0a2d_4535_u64),
-    ("nuwax_msgs.CorrectionCandidate", 0x8282bda63abe4079u64),
-    ("nuwax_msgs.NativePgoRequest", 0x538a74c6b0685b10u64),
-    ("nuwax_msgs.NativePgoResult", 0xd6e88f0cd50760c5u64),
-    ("nuwax_msgs.NativePgoStatus", 0x9848c2c8c152bd81u64),
+    ("nuwax_msgs.CorrectionCandidate", 0xe57c31a15c8dfa3eu64),
+    ("nuwax_msgs.NativePgoRequest", 0x8efd141e6f5310aeu64),
+    ("nuwax_msgs.NativePgoResult", 0x3c8c7caae4477c6bu64),
+    ("nuwax_msgs.NativePgoStatus", 0xfb0f5e91107d2ef1u64),
 ];
 
 /// 按 FQN 查 per-type seed(线性搜索,固定表小)。`None` 表示未在 STRUCT_SEEDS

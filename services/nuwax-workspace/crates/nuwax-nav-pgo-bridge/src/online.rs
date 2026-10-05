@@ -277,7 +277,7 @@ pub enum OnlinePgoError {
     /// Real typed LCM failed.
     #[error("native PGO transport failed: {0}")]
     Transport(String),
-    /// A typed status/result violated identity, hash, ordering, or matrix rules.
+    /// A typed status/result violated identity, receipt, ordering, or matrix rules.
     #[error("native PGO protocol failed: {0}")]
     Protocol(String),
     /// A typed post-READY health sample closed this backend generation.
@@ -1090,7 +1090,7 @@ fn prepare_request(
     backend_generation: i64,
     request_sequence: i64,
 ) -> Result<NativePgoRequest, OnlinePgoError> {
-    if request.schema_version != codec::NATIVE_PGO_SCHEMA_VERSION_V2
+    if request.schema_version != codec::NATIVE_PGO_SCHEMA_VERSION_V3
         || request.identity.backend != codec::NATIVE_PGO_BACKEND
         || request.identity.runtime_generation != runtime_generation
         || request.identity.backend_generation != backend_generation
@@ -1110,48 +1110,10 @@ fn prepare_request(
             != Some(request.registered_body_points_xyz.len())
     {
         return Err(OnlinePgoError::InvalidRequest(
-            "registered body point/count proof mismatch".into(),
-        ));
-    }
-    let expected_cells = request
-        .identity
-        .committed_map
-        .width
-        .checked_mul(request.identity.committed_map.height)
-        .and_then(|value| i32::try_from(value).ok());
-    if expected_cells != Some(request.committed_map_cell_count)
-        || usize::try_from(request.committed_map_cell_count).ok()
-            != Some(request.committed_map_occupancy.len())
-    {
-        return Err(OnlinePgoError::InvalidRequest(
-            "committed map cell/count proof mismatch".into(),
-        ));
-    }
-    let body_hash =
-        codec::compute_native_pgo_body_points_sha256(&request.registered_body_points_xyz)
-            .map_err(|error| OnlinePgoError::InvalidRequest(error.to_string()))?;
-    let odom_hash = codec::compute_native_pgo_odom_pose_sha256(
-        &request.frozen_odom_translation_m,
-        &request.frozen_odom_rotation_xyzw,
-    )
-    .map_err(|error| OnlinePgoError::InvalidRequest(error.to_string()))?;
-    let map_hash = codec::compute_native_pgo_map_payload_sha256(&request.committed_map_occupancy);
-    let boundary_hash = codec::compute_native_pgo_map_boundary_sha256(
-        &request.identity.map_frame_id,
-        &request.identity.committed_map,
-    )
-    .map_err(|error| OnlinePgoError::InvalidRequest(error.to_string()))?;
-    if request.identity.registered_cloud.body_points_sha256 != body_hash
-        || request.identity.correlated_odom.pose_sha256 != odom_hash
-        || request.identity.committed_map.payload_sha256 != map_hash
-        || request.identity.committed_map.boundary_sha256 != boundary_hash
-    {
-        return Err(OnlinePgoError::InvalidRequest(
-            "Geometry-supplied cloud, odom, or map proof does not match payload bytes".into(),
+            "registered body point/count receipt mismatch".into(),
         ));
     }
     request.identity.request_sequence = request_sequence;
-    request.request_payload_sha256 = [0; 32];
     codec::seal_native_pgo_request(request)
         .map_err(|error| OnlinePgoError::InvalidRequest(error.to_string()))
 }
@@ -1165,7 +1127,7 @@ async fn publish_cancel(
         .checked_add(1)
         .ok_or_else(|| OnlinePgoError::Protocol("cancel status sequence exhausted".into()))?;
     let status = NativePgoStatus {
-        schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
+        schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V3,
         backend: codec::NATIVE_PGO_BACKEND,
         runtime_generation: runtime.runtime_generation,
         backend_generation: runtime.backend_generation,
@@ -1178,7 +1140,6 @@ async fn publish_cancel(
         cancel_state: codec::NATIVE_PGO_CANCEL_REQUESTED,
         reason_code: codec::NATIVE_PGO_REASON_CANCEL_REQUESTED,
         reason: "cancel_requested".into(),
-        status_payload_sha256: [0; 32],
     };
     let status = codec::seal_native_pgo_status(status)
         .map_err(|error| OnlinePgoError::Protocol(error.to_string()))?;
@@ -1442,7 +1403,7 @@ fn validate_owner_identity(
     runtime_generation: i64,
     backend_generation: i64,
 ) -> Result<(), OnlinePgoError> {
-    if status.schema_version != codec::NATIVE_PGO_SCHEMA_VERSION_V2
+    if status.schema_version != codec::NATIVE_PGO_SCHEMA_VERSION_V3
         || status.backend != codec::NATIVE_PGO_BACKEND
         || status.runtime_generation != runtime_generation
         || status.backend_generation != backend_generation
@@ -1560,9 +1521,8 @@ mod tests {
             points.extend_from_slice(&[index * 0.2, (index % 5.0) * 0.21, index * 0.03]);
         }
         let point_count = i64::try_from(points.len() / 3).unwrap();
-        let occupancy = vec![0_i8, 20, 80, -1];
         let request = NativePgoRequest {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V3,
             identity: codec::NativePgoRequestIdentity {
                 backend: codec::NATIVE_PGO_BACKEND,
                 runtime_generation,
@@ -1570,6 +1530,8 @@ mod tests {
                 request_sequence: 91,
                 mapping_session_id: "mapping-session-a".into(),
                 mapping_session_generation: 3,
+                mapping_backend_kind: "voxel".into(),
+                mapping_backend_generation: 17,
                 map_frame_generation: 4,
                 mapping_commit_id: codec::NativePgoMappingCommitId {
                     boot_nonce: [0x11; 16],
@@ -1578,16 +1540,18 @@ mod tests {
                 occupancy_revision: mapping_sequence,
                 cloud_revision: mapping_sequence,
                 registered_cloud: codec::NativePgoRegisteredCloudProof {
+                    backend: 2,
+                    runtime_generation: 23,
+                    source_point_count: point_count,
                     source_sequence: mapping_sequence,
                     source_timestamp_ns,
                     point_count,
-                    envelope_sha256: [0x22; 32],
-                    body_points_sha256: [0; 32],
                 },
                 correlated_odom: codec::NativePgoCorrelatedOdomProof {
+                    translation_m: [0.0, 0.0, 0.0],
+                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
                     source_sequence: mapping_sequence,
                     source_timestamp_ns,
-                    pose_sha256: [0; 32],
                 },
                 committed_map: codec::NativePgoCommittedMapProof {
                     source_timestamp_ns,
@@ -1596,8 +1560,6 @@ mod tests {
                     resolution_m: 0.1,
                     origin_x_m: -0.1,
                     origin_y_m: -0.1,
-                    payload_sha256: [0; 32],
-                    boundary_sha256: [0; 32],
                 },
                 source_timestamp_ns,
                 map_frame_id: "map".into(),
@@ -1611,11 +1573,6 @@ mod tests {
             },
             registered_body_coordinate_count: i32::try_from(points.len()).unwrap(),
             registered_body_points_xyz: points,
-            frozen_odom_translation_m: [0.0, 0.0, 0.0],
-            frozen_odom_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-            committed_map_cell_count: i32::try_from(occupancy.len()).unwrap(),
-            committed_map_occupancy: occupancy,
-            request_payload_sha256: [0; 32],
         };
         let request = codec::seal_native_pgo_request(request).unwrap();
         codec::encode_native_pgo_request_wire(&request).unwrap();
@@ -1624,7 +1581,7 @@ mod tests {
 
     fn no_candidate(request: &NativePgoRequest) -> NativePgoResult {
         codec::seal_native_pgo_result(NativePgoResult {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V3,
             request: request.echo(),
             result_disposition: codec::NATIVE_PGO_DISPOSITION_NO_CANDIDATE,
             result_timestamp_ns: request.identity.source_timestamp_ns,
@@ -1638,9 +1595,7 @@ mod tests {
         mut request: NativePgoRequest,
         translation_m: [f64; 3],
     ) -> NativePgoRequest {
-        request.frozen_odom_translation_m = translation_m;
-        request.identity.correlated_odom.pose_sha256 = [0; 32];
-        request.request_payload_sha256 = [0; 32];
+        request.identity.correlated_odom.translation_m = translation_m;
         codec::seal_native_pgo_request(request).unwrap()
     }
 
@@ -1654,16 +1609,15 @@ mod tests {
             points.extend_from_slice(&[x, y, z]);
         }
         request.identity.registered_cloud.point_count = i64::try_from(point_count).unwrap();
+        request.identity.registered_cloud.source_point_count = i64::try_from(point_count).unwrap();
         request.registered_body_coordinate_count = i32::try_from(points.len()).unwrap();
         request.registered_body_points_xyz = points;
-        request.identity.registered_cloud.body_points_sha256 = [0; 32];
-        request.request_payload_sha256 = [0; 32];
         codec::seal_native_pgo_request(request).unwrap()
     }
 
     fn correction(request: &NativePgoRequest) -> NativePgoResult {
         codec::seal_native_pgo_result(NativePgoResult {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V3,
             request: request.echo(),
             result_disposition: codec::NATIVE_PGO_DISPOSITION_CORRECTION,
             result_timestamp_ns: request.identity.source_timestamp_ns,
@@ -1697,7 +1651,7 @@ mod tests {
 
     fn rejected(request: &NativePgoRequest, cancelled: bool) -> NativePgoResult {
         codec::seal_native_pgo_result(NativePgoResult {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V3,
             request: request.echo(),
             result_disposition: codec::NATIVE_PGO_DISPOSITION_REJECTED,
             result_timestamp_ns: request.identity.source_timestamp_ns,
@@ -1727,7 +1681,7 @@ mod tests {
         reason: &str,
     ) -> NativePgoStatus {
         codec::seal_native_pgo_status(NativePgoStatus {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V3,
             backend: codec::NATIVE_PGO_BACKEND,
             runtime_generation: request.identity.runtime_generation,
             backend_generation: request.identity.backend_generation,
@@ -1740,7 +1694,6 @@ mod tests {
             cancel_state,
             reason_code,
             reason: reason.into(),
-            status_payload_sha256: [0; 32],
         })
         .unwrap()
     }
@@ -1752,7 +1705,7 @@ mod tests {
         health_state: i32,
     ) -> NativePgoStatus {
         codec::seal_native_pgo_status(NativePgoStatus {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V3,
             backend: codec::NATIVE_PGO_BACKEND,
             runtime_generation,
             backend_generation,
@@ -1765,7 +1718,6 @@ mod tests {
             cancel_state: codec::NATIVE_PGO_CANCEL_NONE,
             reason_code: codec::NATIVE_PGO_REASON_TRANSPORT_ERROR,
             reason: "injected_owner_health".into(),
-            status_payload_sha256: [0; 32],
         })
         .unwrap()
     }
@@ -1775,7 +1727,7 @@ mod tests {
         status_sequence: i64,
     ) -> NativePgoStatus {
         codec::seal_native_pgo_status(NativePgoStatus {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V3,
             backend: codec::NATIVE_PGO_BACKEND,
             runtime_generation: request.identity.runtime_generation,
             backend_generation: request.identity.backend_generation,
@@ -1788,7 +1740,6 @@ mod tests {
             cancel_state: codec::NATIVE_PGO_CANCEL_REQUESTED,
             reason_code: codec::NATIVE_PGO_REASON_CANCEL_REQUESTED,
             reason: "cancel_requested".into(),
-            status_payload_sha256: [0; 32],
         })
         .unwrap()
     }
@@ -1972,13 +1923,17 @@ mod tests {
     }
 
     #[test]
-    fn owner_assigns_monotonic_sequence_and_reseals_complete_request() {
+    fn owner_assigns_monotonic_sequence_and_validates_complete_request() {
         let request = complete_request(11, 2, 1, 1_000_000_000);
         let prepared = prepare_request(request.clone(), 11, 2, 1).unwrap();
         assert_eq!(prepared.identity.request_sequence, 1);
         assert_ne!(
-            prepared.request_payload_sha256,
-            request.request_payload_sha256
+            prepared.identity.request_sequence,
+            request.identity.request_sequence
+        );
+        assert_eq!(
+            prepared.registered_body_points_xyz,
+            request.registered_body_points_xyz
         );
         let wire = codec::encode_native_pgo_request_wire(&prepared).unwrap();
         assert_eq!(
@@ -1987,11 +1942,11 @@ mod tests {
         );
 
         let mut hostile = request;
-        hostile.identity.registered_cloud.body_points_sha256[0] ^= 0x80;
+        hostile.registered_body_coordinate_count += 3;
         assert!(matches!(
             prepare_request(hostile, 11, 2, 2),
             Err(OnlinePgoError::InvalidRequest(message))
-                if message.contains("does not match payload bytes")
+                if message.contains("point/count receipt mismatch")
         ));
     }
 
@@ -2027,13 +1982,12 @@ mod tests {
 
         let mut nonfinite = correction(&request);
         nonfinite.translation_m[0] = f64::NAN;
-        nonfinite.result_payload_sha256 = [0; 32];
         assert!(codec::seal_native_pgo_result(nonfinite).is_err());
         assert!(codec::decode_native_pgo_result_wire(&[0_u8; 24]).is_err());
     }
 
     #[tokio::test]
-    async fn status_and_result_require_exact_order_identity_hash_and_single_terminal() {
+    async fn status_and_result_require_exact_order_identity_receipt_and_single_terminal() {
         let topics = OnlinePgoTopics::for_runtime(13, 4).unwrap();
         let request = prepare_request(complete_request(13, 4, 1, 3_000_000_000), 13, 4, 1).unwrap();
         let (current, reply_rx) = active_request(request.clone());
@@ -2136,7 +2090,7 @@ mod tests {
         let topics = OnlinePgoTopics::for_runtime(14, 5).unwrap();
         let request = prepare_request(complete_request(14, 5, 1, 4_000_000_000), 14, 5, 1).unwrap();
         let wrong_generation = codec::seal_native_pgo_status(NativePgoStatus {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V3,
             backend: codec::NATIVE_PGO_BACKEND,
             runtime_generation: 14,
             backend_generation: 6,
@@ -2149,7 +2103,6 @@ mod tests {
             cancel_state: codec::NATIVE_PGO_CANCEL_NONE,
             reason_code: codec::NATIVE_PGO_REASON_NONE,
             reason: String::new(),
-            status_payload_sha256: [0; 32],
         })
         .unwrap();
         let mut sequence = 2;
@@ -2167,7 +2120,6 @@ mod tests {
             let foreign_generation = codec::seal_native_pgo_status(NativePgoStatus {
                 runtime_generation,
                 backend_generation,
-                status_payload_sha256: [0; 32],
                 ..wrong_generation.clone()
             })
             .unwrap();
@@ -2186,7 +2138,6 @@ mod tests {
 
         let current_generation = codec::seal_native_pgo_status(NativePgoStatus {
             backend_generation: 5,
-            status_payload_sha256: [0; 32],
             ..wrong_generation.clone()
         })
         .unwrap();

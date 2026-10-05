@@ -1,7 +1,7 @@
 package nuwax_msgs;
 
 struct CorrectionCandidate {
-    const int32_t SCHEMA_VERSION_V2 = 2;
+    const int32_t SCHEMA_VERSION_V3 = 3;
     const int32_t BACKEND_LIBRARY_PGO = 1;
     const int32_t BACKEND_NATIVE_PGO = 2;
     const int32_t BACKEND_RELOCALIZATION = 3;
@@ -17,6 +17,9 @@ struct CorrectionCandidate {
     int64_t candidate_sequence;
     string mapping_session_id;
     int64_t mapping_session_generation;
+    // Actual occupancy-owner domain; distinct from correction backend_generation.
+    string mapping_backend_kind;
+    int64_t mapping_backend_generation;
     int64_t map_frame_generation;
     byte mapping_commit_boot_nonce[16];
     int64_t mapping_commit_sequence;
@@ -24,30 +27,22 @@ struct CorrectionCandidate {
     // Independent cumulative cloud-map revision; it is not occupancy_revision.
     int64_t cloud_revision;
     int64_t committed_map_source_timestamp_ns;
+    // Existing admitted LIO source domain, not the correction backend.
+    int32_t registered_cloud_backend;
+    int64_t registered_cloud_runtime_generation;
     int64_t registered_cloud_source_sequence;
     int64_t registered_cloud_source_timestamp_ns;
     int64_t registered_cloud_point_count;
-    // SHA-256 of the complete generated registered LioCloudEnvelope
-    // (one top-level fingerprint followed by its body).
-    byte registered_cloud_envelope_sha256[32];
-    // SHA-256("nuwax.correction.body-points.v1\0" + point_count_u64_be
-    // + repeated x/y/z f64 big-endian body-frame coordinates).
-    byte body_points_sha256[32];
     int64_t correlated_odom_source_sequence;
     int64_t correlated_odom_source_timestamp_ns;
-    // SHA-256("nuwax.correction.odom-from-body.v1\0" + translation xyz
-    // + quaternion xyzw, with all seven values encoded as f64 big-endian).
-    byte correlated_odom_pose_sha256[32];
+    // Exact frozen odom<-body pose; quaternion order is x, y, z, w.
+    double correlated_odom_translation_m[3];
+    double correlated_odom_rotation_xyzw[4];
     int64_t committed_map_width;
     int64_t committed_map_height;
     double committed_map_resolution_m;
     double committed_map_origin_x_m;
     double committed_map_origin_y_m;
-    // SHA-256 of the canonical committed effective occupancy payload bytes.
-    byte committed_map_payload_sha256[32];
-    // SHA-256("nuwax.correction.committed-map-boundary.v1\0" + map-frame
-    // LCM string + width/height i64 big-endian + resolution/origin f64 BE).
-    byte committed_map_boundary_sha256[32];
     // Zero is a valid present source timestamp, never an absence sentinel.
     int64_t source_timestamp_ns;
     string map_frame_id;
@@ -59,11 +54,9 @@ struct CorrectionCandidate {
     double translation_m[3];
     // Quaternion component order is x, y, z, w.
     double rotation_xyzw[4];
-    // SHA-256 over the canonical candidate fields preceding this digest.
     // 完整优化关键帧，时间精确保留源纳秒，位姿属于优化后的里程计世界坐标。
     int32_t trajectory_count;
     int64_t trajectory_timestamp_ns[trajectory_count];
     double trajectory_translation_m[trajectory_count][3];
     double trajectory_rotation_xyzw[trajectory_count][4];
-    byte payload_sha256[32];
 }

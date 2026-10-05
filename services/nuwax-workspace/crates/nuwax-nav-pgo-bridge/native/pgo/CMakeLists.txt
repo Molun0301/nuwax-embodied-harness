@@ -6,7 +6,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(PkgConfig REQUIRED)
-find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../../nuwax-gtsam/native" "${CMAKE_CURRENT_BINARY_DIR}/gtsam-core")
 pkg_check_modules(LCM REQUIRED IMPORTED_TARGET lcm)
@@ -48,7 +47,7 @@ add_executable(
 target_include_directories(pgo PRIVATE "${NATIVE_PGO_GENERATED_DIR}")
 target_link_libraries(
   pgo
-  PRIVATE PkgConfig::LCM PkgConfig::PCL OpenSSL::Crypto Threads::Threads nuwax_gtsam
+  PRIVATE PkgConfig::LCM PkgConfig::PCL Threads::Threads nuwax_gtsam
 )
 target_compile_options(pgo PRIVATE -Wall -Wextra -Wpedantic -O2)
 
@@ -72,4 +71,20 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests.cpp")
   target_compile_options(pgo_tests PRIVATE -Wall -Wextra -Wpedantic -O2)
   add_test(NAME pgo_non_finite_safety COMMAND pgo_tests)
   set_tests_properties(pgo_non_finite_safety PROPERTIES TIMEOUT 5)
+endif()
+
+# Explicit opt-in keeps this isolated implementation fixture out of production builds.
+option(NUWAX_BUILD_PGO_OWNER_TESTS "Register the socket-free online PGO owner fixture" OFF)
+if(NUWAX_BUILD_PGO_OWNER_TESTS)
+  add_executable(
+    pgo_online_owner_tests EXCLUDE_FROM_ALL
+    online_owner_tests.cpp simple_pgo.cpp commons.cpp ${NATIVE_PGO_GENERATED_HEADERS}
+  )
+  target_include_directories(pgo_online_owner_tests PRIVATE "${NATIVE_PGO_GENERATED_DIR}")
+  target_link_libraries(
+    pgo_online_owner_tests
+    PRIVATE PkgConfig::LCM PkgConfig::PCL Threads::Threads nuwax_gtsam
+  )
+  target_compile_options(pgo_online_owner_tests PRIVATE -Wall -Wextra -Wpedantic -O2)
+  add_test(NAME pgo_online_owner_contract COMMAND pgo_online_owner_tests)
 endif()

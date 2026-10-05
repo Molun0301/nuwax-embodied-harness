@@ -9,17 +9,18 @@ import struct
 
 class NativePgoRequest(object):
 
-    __slots__ = ["schema_version", "backend", "runtime_generation", "backend_generation", "request_sequence", "mapping_session_id", "mapping_session_generation", "map_frame_generation", "mapping_commit_boot_nonce", "mapping_commit_sequence", "occupancy_revision", "cloud_revision", "committed_map_source_timestamp_ns", "registered_cloud_source_sequence", "registered_cloud_source_timestamp_ns", "registered_body_point_count", "registered_body_coordinate_count", "registered_body_points_xyz", "registered_cloud_envelope_sha256", "registered_body_points_sha256", "correlated_odom_source_sequence", "correlated_odom_source_timestamp_ns", "frozen_odom_translation_m", "frozen_odom_rotation_xyzw", "frozen_odom_pose_sha256", "committed_map_width", "committed_map_height", "committed_map_resolution_m", "committed_map_origin_x_m", "committed_map_origin_y_m", "committed_map_cell_count", "committed_map_occupancy", "committed_map_payload_sha256", "committed_map_boundary_sha256", "source_timestamp_ns", "map_frame_id", "odom_frame_id", "body_frame_id", "points_frame_id", "correction_lease_boot_nonce", "correction_lease_generation", "request_payload_sha256"]
+    __slots__ = ["schema_version", "backend", "runtime_generation", "backend_generation", "request_sequence", "mapping_session_id", "mapping_session_generation", "mapping_backend_kind", "mapping_backend_generation", "map_frame_generation", "mapping_commit_boot_nonce", "mapping_commit_sequence", "occupancy_revision", "cloud_revision", "committed_map_source_timestamp_ns", "registered_cloud_backend", "registered_cloud_runtime_generation", "registered_cloud_source_sequence", "registered_cloud_source_timestamp_ns", "registered_cloud_point_count", "registered_body_point_count", "registered_body_coordinate_count", "registered_body_points_xyz", "correlated_odom_source_sequence", "correlated_odom_source_timestamp_ns", "frozen_odom_translation_m", "frozen_odom_rotation_xyzw", "committed_map_width", "committed_map_height", "committed_map_resolution_m", "committed_map_origin_x_m", "committed_map_origin_y_m", "source_timestamp_ns", "map_frame_id", "odom_frame_id", "body_frame_id", "points_frame_id", "correction_lease_boot_nonce", "correction_lease_generation"]
 
-    __typenames__ = ["int32_t", "int32_t", "int64_t", "int64_t", "int64_t", "string", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "int64_t", "int64_t", "int64_t", "int64_t", "int64_t", "int32_t", "double", "byte", "byte", "int64_t", "int64_t", "double", "double", "byte", "int64_t", "int64_t", "double", "double", "double", "int32_t", "int8_t", "byte", "byte", "int64_t", "string", "string", "string", "string", "byte", "int64_t", "byte"]
+    __typenames__ = ["int32_t", "int32_t", "int64_t", "int64_t", "int64_t", "string", "int64_t", "string", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "int64_t", "int64_t", "int32_t", "int64_t", "int64_t", "int64_t", "int64_t", "int64_t", "int32_t", "double", "int64_t", "int64_t", "double", "double", "int64_t", "int64_t", "double", "double", "double", "int64_t", "string", "string", "string", "string", "byte", "int64_t"]
 
-    __dimensions__ = [None, None, None, None, None, None, None, None, [16], None, None, None, None, None, None, None, None, ["registered_body_coordinate_count"], [32], [32], None, None, [3], [4], [32], None, None, None, None, None, None, ["committed_map_cell_count"], [32], [32], None, None, None, None, None, [16], None, [32]]
+    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, [16], None, None, None, None, None, None, None, None, None, None, None, ["registered_body_coordinate_count"], None, None, [3], [4], None, None, None, None, None, None, None, None, None, None, [16], None]
 
-    SCHEMA_VERSION_V2 = 2
+    SCHEMA_VERSION_V3 = 3
     BACKEND_NATIVE_PGO = 2
     MAX_REGISTERED_BODY_POINT_COUNT = 100000
     MAX_REGISTERED_BODY_COORDINATE_COUNT = 300000
     MAX_COMMITTED_MAP_CELL_COUNT = 67108864
+    """ Existing geometry bound; occupancy payload is not consumed by native PGO. """
 
     def __init__(self):
         self.schema_version = 0
@@ -35,6 +36,14 @@ class NativePgoRequest(object):
         self.mapping_session_id = ""
         """ LCM Type: string """
         self.mapping_session_generation = 0
+        """ LCM Type: int64_t """
+        self.mapping_backend_kind = ""
+        """
+        Actual occupancy-owner domain; distinct from correction backend_generation.
+        LCM Type: string
+        """
+
+        self.mapping_backend_generation = 0
         """ LCM Type: int64_t """
         self.map_frame_generation = 0
         """ LCM Type: int64_t """
@@ -52,11 +61,25 @@ class NativePgoRequest(object):
         LCM Type: int64_t
         """
 
+        self.registered_cloud_backend = 0
+        """
+        Existing admitted LIO source domain, not the correction backend.
+        LCM Type: int32_t
+        """
+
+        self.registered_cloud_runtime_generation = 0
+        """ LCM Type: int64_t """
         self.registered_cloud_source_sequence = 0
         """ LCM Type: int64_t """
         self.registered_cloud_source_timestamp_ns = 0
         """
         Zero is valid when registered_cloud_source_sequence is positive.
+        LCM Type: int64_t
+        """
+
+        self.registered_cloud_point_count = 0
+        """
+        Original admitted scan count; the selected body payload may be smaller.
         LCM Type: int64_t
         """
 
@@ -66,20 +89,8 @@ class NativePgoRequest(object):
         """ LCM Type: int32_t """
         self.registered_body_points_xyz = []
         """
-        Flat x/y/z triples in points_frame_id, which V1 requires to equal body_frame_id.
+        Exact selected x/y/z triples in points_frame_id, which equals body_frame_id.
         LCM Type: double[registered_body_coordinate_count]
-        """
-
-        self.registered_cloud_envelope_sha256 = b""
-        """
-        SHA-256 of the complete generated registered LioCloudEnvelope wire value.
-        LCM Type: byte[32]
-        """
-
-        self.registered_body_points_sha256 = b""
-        """
-        SHA-256("nuwax.correction.body-points.v1\0" + count + xyz f64 BE triples).
-        LCM Type: byte[32]
         """
 
         self.correlated_odom_source_sequence = 0
@@ -102,12 +113,6 @@ class NativePgoRequest(object):
         LCM Type: double[4]
         """
 
-        self.frozen_odom_pose_sha256 = b""
-        """
-        SHA-256("nuwax.correction.odom-from-body.v1\0" + translation + quaternion).
-        LCM Type: byte[32]
-        """
-
         self.committed_map_width = 0
         """ LCM Type: int64_t """
         self.committed_map_height = 0
@@ -118,22 +123,6 @@ class NativePgoRequest(object):
         """ LCM Type: double """
         self.committed_map_origin_y_m = 0.0
         """ LCM Type: double """
-        self.committed_map_cell_count = 0
-        """ LCM Type: int32_t """
-        self.committed_map_occupancy = []
-        """ LCM Type: int8_t[committed_map_cell_count] """
-        self.committed_map_payload_sha256 = b""
-        """
-        SHA-256 of the canonical committed effective occupancy payload bytes.
-        LCM Type: byte[32]
-        """
-
-        self.committed_map_boundary_sha256 = b""
-        """
-        SHA-256("nuwax.correction.committed-map-boundary.v1\0" + map frame + geometry).
-        LCM Type: byte[32]
-        """
-
         self.source_timestamp_ns = 0
         """ LCM Type: int64_t """
         self.map_frame_id = ""
@@ -148,12 +137,6 @@ class NativePgoRequest(object):
         """ LCM Type: byte[16] """
         self.correction_lease_generation = 0
         """ LCM Type: int64_t """
-        self.request_payload_sha256 = b""
-        """
-        SHA-256("nuwax.native-pgo.request.v1\0" + canonical fields above).
-        LCM Type: byte[32]
-        """
-
 
     def encode(self):
         buf = BytesIO()
@@ -167,21 +150,19 @@ class NativePgoRequest(object):
         buf.write(struct.pack('>I', len(__mapping_session_id_encoded)+1))
         buf.write(__mapping_session_id_encoded)
         buf.write(b"\0")
-        buf.write(struct.pack(">qq", self.mapping_session_generation, self.map_frame_generation))
+        buf.write(struct.pack(">q", self.mapping_session_generation))
+        __mapping_backend_kind_encoded = self.mapping_backend_kind.encode('utf-8')
+        buf.write(struct.pack('>I', len(__mapping_backend_kind_encoded)+1))
+        buf.write(__mapping_backend_kind_encoded)
+        buf.write(b"\0")
+        buf.write(struct.pack(">qq", self.mapping_backend_generation, self.map_frame_generation))
         buf.write(bytearray(self.mapping_commit_boot_nonce[:16]))
-        buf.write(struct.pack(">qqqqqqqi", self.mapping_commit_sequence, self.occupancy_revision, self.cloud_revision, self.committed_map_source_timestamp_ns, self.registered_cloud_source_sequence, self.registered_cloud_source_timestamp_ns, self.registered_body_point_count, self.registered_body_coordinate_count))
+        buf.write(struct.pack(">qqqqiqqqqqi", self.mapping_commit_sequence, self.occupancy_revision, self.cloud_revision, self.committed_map_source_timestamp_ns, self.registered_cloud_backend, self.registered_cloud_runtime_generation, self.registered_cloud_source_sequence, self.registered_cloud_source_timestamp_ns, self.registered_cloud_point_count, self.registered_body_point_count, self.registered_body_coordinate_count))
         buf.write(struct.pack('>%dd' % self.registered_body_coordinate_count, *self.registered_body_points_xyz[:self.registered_body_coordinate_count]))
-        buf.write(bytearray(self.registered_cloud_envelope_sha256[:32]))
-        buf.write(bytearray(self.registered_body_points_sha256[:32]))
         buf.write(struct.pack(">qq", self.correlated_odom_source_sequence, self.correlated_odom_source_timestamp_ns))
         buf.write(struct.pack('>3d', *self.frozen_odom_translation_m[:3]))
         buf.write(struct.pack('>4d', *self.frozen_odom_rotation_xyzw[:4]))
-        buf.write(bytearray(self.frozen_odom_pose_sha256[:32]))
-        buf.write(struct.pack(">qqdddi", self.committed_map_width, self.committed_map_height, self.committed_map_resolution_m, self.committed_map_origin_x_m, self.committed_map_origin_y_m, self.committed_map_cell_count))
-        buf.write(struct.pack('>%db' % self.committed_map_cell_count, *self.committed_map_occupancy[:self.committed_map_cell_count]))
-        buf.write(bytearray(self.committed_map_payload_sha256[:32]))
-        buf.write(bytearray(self.committed_map_boundary_sha256[:32]))
-        buf.write(struct.pack(">q", self.source_timestamp_ns))
+        buf.write(struct.pack(">qqdddq", self.committed_map_width, self.committed_map_height, self.committed_map_resolution_m, self.committed_map_origin_x_m, self.committed_map_origin_y_m, self.source_timestamp_ns))
         __map_frame_id_encoded = self.map_frame_id.encode('utf-8')
         buf.write(struct.pack('>I', len(__map_frame_id_encoded)+1))
         buf.write(__map_frame_id_encoded)
@@ -200,7 +181,6 @@ class NativePgoRequest(object):
         buf.write(b"\0")
         buf.write(bytearray(self.correction_lease_boot_nonce[:16]))
         buf.write(struct.pack(">q", self.correction_lease_generation))
-        buf.write(bytearray(self.request_payload_sha256[:32]))
 
     @staticmethod
     def decode(data: bytes):
@@ -218,21 +198,17 @@ class NativePgoRequest(object):
         self.schema_version, self.backend, self.runtime_generation, self.backend_generation, self.request_sequence = struct.unpack(">iiqqq", buf.read(32))
         __mapping_session_id_len = struct.unpack('>I', buf.read(4))[0]
         self.mapping_session_id = buf.read(__mapping_session_id_len)[:-1].decode('utf-8', 'replace')
-        self.mapping_session_generation, self.map_frame_generation = struct.unpack(">qq", buf.read(16))
+        self.mapping_session_generation = struct.unpack(">q", buf.read(8))[0]
+        __mapping_backend_kind_len = struct.unpack('>I', buf.read(4))[0]
+        self.mapping_backend_kind = buf.read(__mapping_backend_kind_len)[:-1].decode('utf-8', 'replace')
+        self.mapping_backend_generation, self.map_frame_generation = struct.unpack(">qq", buf.read(16))
         self.mapping_commit_boot_nonce = buf.read(16)
-        self.mapping_commit_sequence, self.occupancy_revision, self.cloud_revision, self.committed_map_source_timestamp_ns, self.registered_cloud_source_sequence, self.registered_cloud_source_timestamp_ns, self.registered_body_point_count, self.registered_body_coordinate_count = struct.unpack(">qqqqqqqi", buf.read(60))
+        self.mapping_commit_sequence, self.occupancy_revision, self.cloud_revision, self.committed_map_source_timestamp_ns, self.registered_cloud_backend, self.registered_cloud_runtime_generation, self.registered_cloud_source_sequence, self.registered_cloud_source_timestamp_ns, self.registered_cloud_point_count, self.registered_body_point_count, self.registered_body_coordinate_count = struct.unpack(">qqqqiqqqqqi", buf.read(80))
         self.registered_body_points_xyz = struct.unpack('>%dd' % self.registered_body_coordinate_count, buf.read(self.registered_body_coordinate_count * 8))
-        self.registered_cloud_envelope_sha256 = buf.read(32)
-        self.registered_body_points_sha256 = buf.read(32)
         self.correlated_odom_source_sequence, self.correlated_odom_source_timestamp_ns = struct.unpack(">qq", buf.read(16))
         self.frozen_odom_translation_m = struct.unpack('>3d', buf.read(24))
         self.frozen_odom_rotation_xyzw = struct.unpack('>4d', buf.read(32))
-        self.frozen_odom_pose_sha256 = buf.read(32)
-        self.committed_map_width, self.committed_map_height, self.committed_map_resolution_m, self.committed_map_origin_x_m, self.committed_map_origin_y_m, self.committed_map_cell_count = struct.unpack(">qqdddi", buf.read(44))
-        self.committed_map_occupancy = struct.unpack('>%db' % self.committed_map_cell_count, buf.read(self.committed_map_cell_count))
-        self.committed_map_payload_sha256 = buf.read(32)
-        self.committed_map_boundary_sha256 = buf.read(32)
-        self.source_timestamp_ns = struct.unpack(">q", buf.read(8))[0]
+        self.committed_map_width, self.committed_map_height, self.committed_map_resolution_m, self.committed_map_origin_x_m, self.committed_map_origin_y_m, self.source_timestamp_ns = struct.unpack(">qqdddq", buf.read(48))
         __map_frame_id_len = struct.unpack('>I', buf.read(4))[0]
         self.map_frame_id = buf.read(__map_frame_id_len)[:-1].decode('utf-8', 'replace')
         __odom_frame_id_len = struct.unpack('>I', buf.read(4))[0]
@@ -243,13 +219,12 @@ class NativePgoRequest(object):
         self.points_frame_id = buf.read(__points_frame_id_len)[:-1].decode('utf-8', 'replace')
         self.correction_lease_boot_nonce = buf.read(16)
         self.correction_lease_generation = struct.unpack(">q", buf.read(8))[0]
-        self.request_payload_sha256 = buf.read(32)
         return self
 
     @staticmethod
     def _get_hash_recursive(parents):
         if NativePgoRequest in parents: return 0
-        tmphash = (0x538a74c6b0685b10) & 0xffffffffffffffff
+        tmphash = (0x8efd141e6f5310ae) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None
@@ -263,3 +238,4 @@ class NativePgoRequest(object):
     def get_hash(self):
         """Get the LCM hash of the struct"""
         return struct.unpack(">Q", NativePgoRequest._get_packed_fingerprint())[0]
+

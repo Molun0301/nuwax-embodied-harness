@@ -5,7 +5,6 @@
 #include <nuwax_msgs/NativePgoStatus.hpp>
 
 #include <lcm/lcm-cpp.hpp>
-#include <openssl/evp.h>
 #include <pcl/common/transforms.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/kdtree/kdtree_flann.h>
@@ -32,7 +31,6 @@
 #include <optional>
 #include <string>
 #include <thread>
-#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -41,12 +39,18 @@
 
 namespace {
 
-using Digest = std::array<uint8_t, 32>;
 using Point = pcl::PointXYZ;
 using PointCloud = pcl::PointCloud<Point>;
 using Request = nuwax_msgs::NativePgoRequest;
 using Result = nuwax_msgs::NativePgoResult;
 using Status = nuwax_msgs::NativePgoStatus;
+
+#ifdef NUWAX_NATIVE_PGO_OWNER_TEST
+// The isolated fixture supplies a socket-free transport before including this file.
+using OwnerTransport = OnlinePgoRecordingTransport;
+#else
+using OwnerTransport = lcm::LCM;
+#endif
 
 constexpr std::size_t kMaxIdentityBytes = 255;
 constexpr std::size_t kMaxIcpCloudPoints =
@@ -57,8 +61,8 @@ constexpr std::size_t kMaxGraphNodes =
 constexpr int kIcpIterationLimit = 50;
 constexpr double kIcpMaxCorrespondenceDistanceM = 10.0;
 constexpr std::size_t kMinIcpInliers = 20;
-constexpr std::size_t kStatusFixedWireBytes = 477;
-constexpr std::size_t kStatusStringCount = 6;
+constexpr std::size_t kStatusFixedWireBytes = 337;
+constexpr std::size_t kStatusStringCount = 7;
 constexpr std::size_t kMaxStatusWireBytes =
     kStatusFixedWireBytes +
     kStatusStringCount * (sizeof(int32_t) + kMaxIdentityBytes + 1);
@@ -74,106 +78,7 @@ static_assert(Result::MAX_GRAPH_EDGES ==
 static_assert(Result::MAX_LOOP_INLIERS == 20'000);
 static_assert(Result::MAX_OPTIMIZATION_ITERATIONS == 300);
 static_assert(Request::MAX_REGISTERED_BODY_POINT_COUNT >= Result::MAX_LOOP_INLIERS);
-static_assert(kMaxStatusWireBytes == 2'037);
-
-constexpr char kRequestHashDomain[] = "nuwax.native-pgo.request.v2\0";
-constexpr char kResultHashDomain[] = "nuwax.native-pgo.result.v2\0";
-constexpr char kStatusHashDomain[] = "nuwax.native-pgo.status.v2\0";
-constexpr char kBodyPointsHashDomain[] = "nuwax.correction.body-points.v1\0";
-constexpr char kOdomPoseHashDomain[] = "nuwax.correction.odom-from-body.v1\0";
-constexpr char kMapBoundaryHashDomain[] =
-    "nuwax.correction.committed-map-boundary.v1\0";
-constexpr char kLoopProofHashDomain[] = "nuwax.native-pgo.loop-proof.v1\0";
-constexpr char kGraphHashDomain[] = "nuwax.native-pgo.optimized-graph.v2\0";
-
-class DigestBuilder {
-public:
-    DigestBuilder() : context_(EVP_MD_CTX_new()) {
-        good_ = context_ != nullptr && EVP_DigestInit_ex(context_, EVP_sha256(), nullptr) == 1;
-    }
-
-    DigestBuilder(const DigestBuilder&) = delete;
-    DigestBuilder& operator=(const DigestBuilder&) = delete;
-
-    ~DigestBuilder() {
-        if (context_ != nullptr) EVP_MD_CTX_free(context_);
-    }
-
-    bool update(const void* data, std::size_t size) {
-        if (!good_ || (data == nullptr && size != 0)) return false;
-        if (size == 0) return true;
-        good_ = EVP_DigestUpdate(context_, data, size) == 1;
-        return good_;
-    }
-
-    template <std::size_t N>
-    bool updateDomain(const char (&domain)[N]) {
-        static_assert(N >= 2);
-        return update(domain, N - 1);
-    }
-
-    std::optional<Digest> finish() {
-        if (!good_) return std::nullopt;
-        Digest digest{};
-        unsigned int size = 0;
-        good_ = EVP_DigestFinal_ex(context_, digest.data(), &size) == 1 &&
-                size == digest.size();
-        if (!good_) return std::nullopt;
-        return digest;
-    }
-
-private:
-    EVP_MD_CTX* context_{nullptr};
-    bool good_{false};
-};
-
-template <typename Integer>
-bool appendBigEndian(DigestBuilder& builder, Integer value) {
-    static_assert(std::is_integral_v<Integer>);
-    using Unsigned = std::make_unsigned_t<Integer>;
-    Unsigned encoded = static_cast<Unsigned>(value);
-    std::array<uint8_t, sizeof(Integer)> bytes{};
-    for (std::size_t index = 0; index < bytes.size(); ++index) {
-        bytes[bytes.size() - index - 1] = static_cast<uint8_t>(encoded & 0xffU);
-        encoded >>= 8U;
-    }
-    return builder.update(bytes.data(), bytes.size());
-}
-
-bool appendBigEndianDouble(DigestBuilder& builder, double value) {
-    static_assert(sizeof(double) == sizeof(uint64_t));
-    uint64_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    return appendBigEndian(builder, bits);
-}
-
-bool appendLcmString(DigestBuilder& builder, const std::string& value) {
-    if (value.size() >= static_cast<std::size_t>(std::numeric_limits<int32_t>::max())) {
-        return false;
-    }
-    const int32_t encoded_size = static_cast<int32_t>(value.size() + 1);
-    const uint8_t terminator = 0;
-    return appendBigEndian(builder, encoded_size) && builder.update(value.data(), value.size()) &&
-           builder.update(&terminator, 1);
-}
-
-template <typename Message, std::size_t DomainSize>
-std::optional<Digest> hashGeneratedBody(const Message& message,
-                                        const char (&domain)[DomainSize]) {
-    const int encoded_size = message.getEncodedSize();
-    constexpr int fingerprint_size = 8;
-    constexpr int self_hash_size = 32;
-    if (encoded_size < fingerprint_size + self_hash_size) return std::nullopt;
-    std::vector<uint8_t> wire(static_cast<std::size_t>(encoded_size));
-    if (message.encode(wire.data(), 0, encoded_size) != encoded_size) return std::nullopt;
-    DigestBuilder builder;
-    if (!builder.updateDomain(domain) ||
-        !builder.update(wire.data() + fingerprint_size,
-                        wire.size() - fingerprint_size - self_hash_size)) {
-        return std::nullopt;
-    }
-    return builder.finish();
-}
+static_assert(kMaxStatusWireBytes == 2'157);
 
 template <std::size_t N>
 bool allZero(const uint8_t (&value)[N]) {
@@ -191,16 +96,38 @@ void copyBytes(const uint8_t (&source)[N], uint8_t (&target)[N]) {
     std::copy(std::begin(source), std::end(source), std::begin(target));
 }
 
-template <std::size_t N>
-void copyDigest(const Digest& source, uint8_t (&target)[N]) {
-    static_assert(N == 32);
-    std::copy(source.begin(), source.end(), std::begin(target));
+uint64_t doubleBits(double value) {
+    static_assert(sizeof(double) == sizeof(uint64_t));
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
 }
 
 template <std::size_t N>
-bool digestEquals(const Digest& expected, const uint8_t (&actual)[N]) {
-    static_assert(N == 32);
-    return std::equal(expected.begin(), expected.end(), std::begin(actual));
+bool equalDoubleBits(const double (&left)[N], const double (&right)[N]) {
+    for (std::size_t index = 0; index < N; ++index) {
+        if (doubleBits(left[index]) != doubleBits(right[index])) return false;
+    }
+    return true;
+}
+
+bool equalDoubleBits(const std::vector<double>& left, const std::vector<double>& right) {
+    if (left.size() != right.size()) return false;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        if (doubleBits(left[index]) != doubleBits(right[index])) return false;
+    }
+    return true;
+}
+
+std::array<uint64_t, 7> frozenOdomPoseBits(const Request& request) {
+    std::array<uint64_t, 7> bits{};
+    for (std::size_t index = 0; index < 3; ++index) {
+        bits[index] = doubleBits(request.frozen_odom_translation_m[index]);
+    }
+    for (std::size_t index = 0; index < 4; ++index) {
+        bits[index + 3] = doubleBits(request.frozen_odom_rotation_xyzw[index]);
+    }
+    return bits;
 }
 
 bool validIdentityString(const std::string& value) {
@@ -277,61 +204,6 @@ bool finiteTranslation(const double (&translation)[3]) {
     return true;
 }
 
-std::optional<Digest> bodyPointsHash(const Request& request) {
-    DigestBuilder builder;
-    if (!builder.updateDomain(kBodyPointsHashDomain) ||
-        !appendBigEndian(builder, request.registered_body_point_count)) {
-        return std::nullopt;
-    }
-    for (double coordinate : request.registered_body_points_xyz) {
-        if (!appendBigEndianDouble(builder, coordinate)) return std::nullopt;
-    }
-    return builder.finish();
-}
-
-std::optional<Digest> odomPoseHash(const Request& request) {
-    DigestBuilder builder;
-    if (!builder.updateDomain(kOdomPoseHashDomain)) return std::nullopt;
-    for (double value : request.frozen_odom_translation_m) {
-        if (!appendBigEndianDouble(builder, value)) return std::nullopt;
-    }
-    for (double value : request.frozen_odom_rotation_xyzw) {
-        if (!appendBigEndianDouble(builder, value)) return std::nullopt;
-    }
-    return builder.finish();
-}
-
-std::optional<Digest> mapBoundaryHash(const Request& request) {
-    DigestBuilder builder;
-    if (!builder.updateDomain(kMapBoundaryHashDomain) ||
-        !appendLcmString(builder, request.map_frame_id) ||
-        !appendBigEndian(builder, request.committed_map_width) ||
-        !appendBigEndian(builder, request.committed_map_height) ||
-        !appendBigEndianDouble(builder, request.committed_map_resolution_m) ||
-        !appendBigEndianDouble(builder, request.committed_map_origin_x_m) ||
-        !appendBigEndianDouble(builder, request.committed_map_origin_y_m)) {
-        return std::nullopt;
-    }
-    return builder.finish();
-}
-
-std::optional<Digest> mapPayloadHash(const Request& request) {
-    DigestBuilder builder;
-    if (!request.committed_map_occupancy.empty() &&
-        !builder.update(request.committed_map_occupancy.data(),
-                        request.committed_map_occupancy.size())) {
-        return std::nullopt;
-    }
-    return builder.finish();
-}
-
-std::optional<Digest> requestPayloadHash(const Request& request) {
-    Request canonical = request;
-    std::fill(std::begin(canonical.request_payload_sha256),
-              std::end(canonical.request_payload_sha256), 0);
-    return hashGeneratedBody(canonical, kRequestHashDomain);
-}
-
 class RequestWireCursor {
 public:
     RequestWireCursor(const void* data, std::size_t size)
@@ -401,35 +273,36 @@ bool preflightRequestWire(const void* data, std::size_t size) {
     const auto schema_version = cursor.readI32();
     const auto backend = cursor.readI32();
     if (!fingerprint || *fingerprint != Request::getHash() || !schema_version || !backend ||
-        !cursor.skip(3 * 8) || !cursor.skipBoundedString() || !cursor.skip(2 * 8 + 16) ||
-        !cursor.skip(6 * 8)) {
+        !cursor.skip(3 * sizeof(int64_t)) || !cursor.skipBoundedString() ||
+        !cursor.skip(sizeof(int64_t)) || !cursor.skipBoundedString() ||
+        !cursor.skip(2 * sizeof(int64_t) + 16 + 4 * sizeof(int64_t)) ||
+        !cursor.skip(sizeof(int32_t) + 3 * sizeof(int64_t))) {
         return false;
     }
+    const auto original_point_count = cursor.readI64();
     const auto point_count = cursor.readI64();
     const auto coordinate_count = cursor.readI32();
-    if (!point_count || !coordinate_count || *point_count <= 0 ||
-        *point_count > Request::MAX_REGISTERED_BODY_POINT_COUNT || *coordinate_count <= 0 ||
+    if (!original_point_count || !point_count || !coordinate_count ||
+        *original_point_count <= 0 ||
+        *original_point_count > Request::MAX_REGISTERED_BODY_POINT_COUNT ||
+        *point_count <= 0 || *point_count > *original_point_count || *coordinate_count <= 0 ||
         *coordinate_count > Request::MAX_REGISTERED_BODY_COORDINATE_COUNT ||
         *coordinate_count != *point_count * 3 ||
         !cursor.skip(static_cast<std::size_t>(*coordinate_count) * sizeof(double)) ||
-        !cursor.skip(2 * 32 + 2 * 8 + 3 * 8 + 4 * 8 + 32)) {
+        !cursor.skip(2 * sizeof(int64_t) + 7 * sizeof(double))) {
         return false;
     }
     const auto map_width = cursor.readI64();
     const auto map_height = cursor.readI64();
     if (!map_width || !map_height || *map_width <= 0 || *map_height <= 0 ||
-        !cursor.skip(3 * 8)) {
-        return false;
-    }
-    const auto cell_count = cursor.readI32();
-    if (!cell_count || *cell_count <= 0 ||
-        *cell_count > Request::MAX_COMMITTED_MAP_CELL_COUNT ||
+        *map_width > std::numeric_limits<int32_t>::max() ||
+        *map_height > std::numeric_limits<int32_t>::max() ||
         *map_width > std::numeric_limits<int64_t>::max() / *map_height ||
-        *map_width * *map_height != *cell_count ||
-        !cursor.skip(static_cast<std::size_t>(*cell_count)) || !cursor.skip(2 * 32 + 8) ||
+        *map_width * *map_height > Request::MAX_COMMITTED_MAP_CELL_COUNT ||
+        !cursor.skip(3 * sizeof(double) + sizeof(int64_t)) ||
         !cursor.skipBoundedString() || !cursor.skipBoundedString() ||
         !cursor.skipBoundedString() || !cursor.skipBoundedString() ||
-        !cursor.skip(16 + 8 + 32)) {
+        !cursor.skip(16 + sizeof(int64_t))) {
         return false;
     }
     return cursor.finished();
@@ -445,15 +318,14 @@ bool preflightStatusWire(const void* data, std::size_t size) {
     const auto identity_present = cursor.readI8();
     if (!identity_present || *identity_present != 1 ||
         !cursor.skip(sizeof(int64_t)) || !cursor.skipBoundedString() ||
-        !cursor.skip(2 * sizeof(int64_t) + 16 + 7 * sizeof(int64_t)) ||
-        !cursor.skip(2 * 32) || !cursor.skip(2 * sizeof(int64_t) + 32) ||
-        !cursor.skip(2 * sizeof(int64_t) + 3 * sizeof(double)) ||
-        !cursor.skip(2 * 32 + sizeof(int64_t)) ||
+        !cursor.skip(sizeof(int64_t)) || !cursor.skipBoundedString() ||
+        !cursor.skip(2 * sizeof(int64_t) + 16 + 4 * sizeof(int64_t)) ||
+        !cursor.skip(sizeof(int32_t) + 7 * sizeof(int64_t) + 7 * sizeof(double)) ||
+        !cursor.skip(2 * sizeof(int64_t) + 3 * sizeof(double) + sizeof(int64_t)) ||
         !cursor.skipBoundedString() || !cursor.skipBoundedString() ||
         !cursor.skipBoundedString() || !cursor.skipBoundedString() ||
-        !cursor.skip(16 + sizeof(int64_t) + 32) ||
-        !cursor.skip(5 * sizeof(int32_t)) || !cursor.skipBoundedString() ||
-        !cursor.skip(32)) {
+        !cursor.skip(16 + sizeof(int64_t) + 5 * sizeof(int32_t)) ||
+        !cursor.skipBoundedString()) {
         return false;
     }
     return cursor.finished();
@@ -470,7 +342,7 @@ std::optional<RequestValidationError> validateRequest(const Request& request,
         return std::optional<RequestValidationError>(
             RequestValidationError{Status::REASON_INVALID_REQUEST, std::move(reason)});
     };
-    if (request.schema_version != Request::SCHEMA_VERSION_V2 ||
+    if (request.schema_version != Request::SCHEMA_VERSION_V3 ||
         request.backend != Request::BACKEND_NATIVE_PGO) {
         return invalid("unsupported request schema or backend");
     }
@@ -479,13 +351,19 @@ std::optional<RequestValidationError> validateRequest(const Request& request,
         return RequestValidationError{Status::REASON_PROTOCOL_IDENTITY_MISMATCH,
                                       "owner generation mismatch"};
     }
+    // The mapping kind is an opaque provenance label here, not a backend selector.
+    // Geometry owns its typed value; this boundary validates and echoes it exactly.
     if (request.request_sequence <= 0 || !validIdentityString(request.mapping_session_id) ||
-        request.mapping_session_generation <= 0 || request.map_frame_generation <= 0 ||
+        request.mapping_session_generation <= 0 ||
+        !validIdentityString(request.mapping_backend_kind) ||
+        request.mapping_backend_generation <= 0 || request.map_frame_generation <= 0 ||
         allZero(request.mapping_commit_boot_nonce) || request.mapping_commit_sequence <= 0 ||
         request.occupancy_revision <= 0 || request.cloud_revision <= 0) {
         return invalid("incomplete request identity");
     }
-    if (request.committed_map_source_timestamp_ns < 0 ||
+    if (request.registered_cloud_backend < 1 || request.registered_cloud_backend > 3 ||
+        request.registered_cloud_runtime_generation <= 0 ||
+        request.committed_map_source_timestamp_ns < 0 ||
         request.registered_cloud_source_sequence <= 0 ||
         request.registered_cloud_source_timestamp_ns < 0 ||
         request.correlated_odom_source_sequence <= 0 ||
@@ -497,7 +375,10 @@ std::optional<RequestValidationError> validateRequest(const Request& request,
         request.correlated_odom_source_timestamp_ns > request.source_timestamp_ns) {
         return invalid("uncorrelated source timestamps");
     }
-    if (request.registered_body_point_count <= 0 ||
+    if (request.registered_cloud_point_count <= 0 ||
+        request.registered_cloud_point_count > Request::MAX_REGISTERED_BODY_POINT_COUNT ||
+        request.registered_body_point_count > request.registered_cloud_point_count ||
+        request.registered_body_point_count <= 0 ||
         request.registered_body_point_count > Request::MAX_REGISTERED_BODY_POINT_COUNT ||
         request.registered_body_coordinate_count <= 0 ||
         request.registered_body_coordinate_count > Request::MAX_REGISTERED_BODY_COORDINATE_COUNT ||
@@ -512,34 +393,24 @@ std::optional<RequestValidationError> validateRequest(const Request& request,
             return invalid("registered body cloud contains invalid coordinate");
         }
     }
-    if (allZero(request.registered_cloud_envelope_sha256) ||
-        !finiteTranslation(request.frozen_odom_translation_m) ||
+    if (!finiteTranslation(request.frozen_odom_translation_m) ||
         !finiteQuaternion(request.frozen_odom_rotation_xyzw) ||
         allZero(request.correction_lease_boot_nonce) ||
         request.correction_lease_generation <= 0) {
-        return invalid("registered cloud, odometry, or lease proof is invalid");
+        return invalid("frozen odometry or correction lease is invalid");
     }
     if (request.committed_map_width <= 0 || request.committed_map_height <= 0 ||
         request.committed_map_width > std::numeric_limits<int32_t>::max() ||
         request.committed_map_height > std::numeric_limits<int32_t>::max() ||
         request.committed_map_width >
             std::numeric_limits<int64_t>::max() / request.committed_map_height ||
-        request.committed_map_width * request.committed_map_height !=
-            request.committed_map_cell_count ||
-        request.committed_map_cell_count <= 0 ||
-        request.committed_map_cell_count > Request::MAX_COMMITTED_MAP_CELL_COUNT ||
-        request.committed_map_occupancy.size() !=
-            static_cast<std::size_t>(request.committed_map_cell_count) ||
+        request.committed_map_width * request.committed_map_height >
+            Request::MAX_COMMITTED_MAP_CELL_COUNT ||
         !std::isfinite(request.committed_map_resolution_m) ||
         request.committed_map_resolution_m <= 0.0 ||
         !std::isfinite(request.committed_map_origin_x_m) ||
         !std::isfinite(request.committed_map_origin_y_m)) {
         return invalid("committed map geometry is invalid");
-    }
-    if (std::any_of(request.committed_map_occupancy.begin(),
-                    request.committed_map_occupancy.end(),
-                    [](int8_t value) { return value < -1 || value > 100; })) {
-        return invalid("committed map occupancy is outside [-1,100]");
     }
     if (!validIdentityString(request.map_frame_id) ||
         !validIdentityString(request.odom_frame_id) ||
@@ -550,24 +421,6 @@ std::optional<RequestValidationError> validateRequest(const Request& request,
         request.odom_frame_id == request.body_frame_id ||
         request.points_frame_id != request.body_frame_id) {
         return invalid("request frame contract is invalid");
-    }
-    const auto points_hash = bodyPointsHash(request);
-    const auto odom_hash = odomPoseHash(request);
-    const auto map_payload_hash = mapPayloadHash(request);
-    const auto map_boundary_hash = mapBoundaryHash(request);
-    if (!points_hash || !digestEquals(*points_hash, request.registered_body_points_sha256) ||
-        !odom_hash || !digestEquals(*odom_hash, request.frozen_odom_pose_sha256) ||
-        !map_payload_hash ||
-        !digestEquals(*map_payload_hash, request.committed_map_payload_sha256) ||
-        !map_boundary_hash ||
-        !digestEquals(*map_boundary_hash, request.committed_map_boundary_sha256)) {
-        return RequestValidationError{Status::REASON_PROTOCOL_HASH_MISMATCH,
-                                      "request proof hash mismatch"};
-    }
-    const auto request_hash = requestPayloadHash(request);
-    if (!request_hash || !digestEquals(*request_hash, request.request_payload_sha256)) {
-        return RequestValidationError{Status::REASON_PROTOCOL_HASH_MISMATCH,
-                                      "request payload hash mismatch"};
     }
     return std::nullopt;
 }
@@ -689,6 +542,54 @@ bool parseOnlinePgoOptions(int argc, char** argv, OnlinePgoOptions& options,
 
 namespace {
 
+template <typename Receipt>
+bool sameRequestReceipt(const Receipt& receipt, const Request& request) {
+    return receipt.schema_version == request.schema_version &&
+           receipt.backend == request.backend &&
+           receipt.runtime_generation == request.runtime_generation &&
+           receipt.backend_generation == request.backend_generation &&
+           receipt.request_sequence == request.request_sequence &&
+           receipt.mapping_session_id == request.mapping_session_id &&
+           receipt.mapping_session_generation == request.mapping_session_generation &&
+           receipt.mapping_backend_kind == request.mapping_backend_kind &&
+           receipt.mapping_backend_generation == request.mapping_backend_generation &&
+           receipt.map_frame_generation == request.map_frame_generation &&
+           equalBytes(receipt.mapping_commit_boot_nonce, request.mapping_commit_boot_nonce) &&
+           receipt.mapping_commit_sequence == request.mapping_commit_sequence &&
+           receipt.occupancy_revision == request.occupancy_revision &&
+           receipt.cloud_revision == request.cloud_revision &&
+           receipt.committed_map_source_timestamp_ns ==
+               request.committed_map_source_timestamp_ns &&
+           receipt.registered_cloud_backend == request.registered_cloud_backend &&
+           receipt.registered_cloud_runtime_generation ==
+               request.registered_cloud_runtime_generation &&
+           receipt.registered_cloud_source_sequence == request.registered_cloud_source_sequence &&
+           receipt.registered_cloud_source_timestamp_ns ==
+               request.registered_cloud_source_timestamp_ns &&
+           receipt.registered_cloud_point_count == request.registered_cloud_point_count &&
+           receipt.registered_body_point_count == request.registered_body_point_count &&
+           receipt.correlated_odom_source_sequence == request.correlated_odom_source_sequence &&
+           receipt.correlated_odom_source_timestamp_ns ==
+               request.correlated_odom_source_timestamp_ns &&
+           equalDoubleBits(receipt.frozen_odom_translation_m, request.frozen_odom_translation_m) &&
+           equalDoubleBits(receipt.frozen_odom_rotation_xyzw, request.frozen_odom_rotation_xyzw) &&
+           receipt.committed_map_width == request.committed_map_width &&
+           receipt.committed_map_height == request.committed_map_height &&
+           doubleBits(receipt.committed_map_resolution_m) ==
+               doubleBits(request.committed_map_resolution_m) &&
+           doubleBits(receipt.committed_map_origin_x_m) ==
+               doubleBits(request.committed_map_origin_x_m) &&
+           doubleBits(receipt.committed_map_origin_y_m) ==
+               doubleBits(request.committed_map_origin_y_m) &&
+           receipt.source_timestamp_ns == request.source_timestamp_ns &&
+           receipt.map_frame_id == request.map_frame_id &&
+           receipt.odom_frame_id == request.odom_frame_id &&
+           receipt.body_frame_id == request.body_frame_id &&
+           receipt.points_frame_id == request.points_frame_id &&
+           equalBytes(receipt.correction_lease_boot_nonce, request.correction_lease_boot_nonce) &&
+           receipt.correction_lease_generation == request.correction_lease_generation;
+}
+
 template <typename Target>
 void copyRequestIdentity(const Request& request, Target& target) {
     target.runtime_generation = request.runtime_generation;
@@ -696,28 +597,33 @@ void copyRequestIdentity(const Request& request, Target& target) {
     target.request_sequence = request.request_sequence;
     target.mapping_session_id = request.mapping_session_id;
     target.mapping_session_generation = request.mapping_session_generation;
+    target.mapping_backend_kind = request.mapping_backend_kind;
+    target.mapping_backend_generation = request.mapping_backend_generation;
     target.map_frame_generation = request.map_frame_generation;
     copyBytes(request.mapping_commit_boot_nonce, target.mapping_commit_boot_nonce);
     target.mapping_commit_sequence = request.mapping_commit_sequence;
     target.occupancy_revision = request.occupancy_revision;
     target.cloud_revision = request.cloud_revision;
     target.committed_map_source_timestamp_ns = request.committed_map_source_timestamp_ns;
+    target.registered_cloud_backend = request.registered_cloud_backend;
+    target.registered_cloud_runtime_generation = request.registered_cloud_runtime_generation;
     target.registered_cloud_source_sequence = request.registered_cloud_source_sequence;
     target.registered_cloud_source_timestamp_ns = request.registered_cloud_source_timestamp_ns;
+    target.registered_cloud_point_count = request.registered_cloud_point_count;
     target.registered_body_point_count = request.registered_body_point_count;
-    copyBytes(request.registered_cloud_envelope_sha256,
-              target.registered_cloud_envelope_sha256);
-    copyBytes(request.registered_body_points_sha256, target.registered_body_points_sha256);
     target.correlated_odom_source_sequence = request.correlated_odom_source_sequence;
     target.correlated_odom_source_timestamp_ns = request.correlated_odom_source_timestamp_ns;
-    copyBytes(request.frozen_odom_pose_sha256, target.frozen_odom_pose_sha256);
+    std::copy(std::begin(request.frozen_odom_translation_m),
+              std::end(request.frozen_odom_translation_m),
+              std::begin(target.frozen_odom_translation_m));
+    std::copy(std::begin(request.frozen_odom_rotation_xyzw),
+              std::end(request.frozen_odom_rotation_xyzw),
+              std::begin(target.frozen_odom_rotation_xyzw));
     target.committed_map_width = request.committed_map_width;
     target.committed_map_height = request.committed_map_height;
     target.committed_map_resolution_m = request.committed_map_resolution_m;
     target.committed_map_origin_x_m = request.committed_map_origin_x_m;
     target.committed_map_origin_y_m = request.committed_map_origin_y_m;
-    copyBytes(request.committed_map_payload_sha256, target.committed_map_payload_sha256);
-    copyBytes(request.committed_map_boundary_sha256, target.committed_map_boundary_sha256);
     target.source_timestamp_ns = request.source_timestamp_ns;
     target.map_frame_id = request.map_frame_id;
     target.odom_frame_id = request.odom_frame_id;
@@ -725,30 +631,11 @@ void copyRequestIdentity(const Request& request, Target& target) {
     target.points_frame_id = request.points_frame_id;
     copyBytes(request.correction_lease_boot_nonce, target.correction_lease_boot_nonce);
     target.correction_lease_generation = request.correction_lease_generation;
-    copyBytes(request.request_payload_sha256, target.request_payload_sha256);
-}
-
-bool sealResult(Result& result) {
-    std::fill(std::begin(result.result_payload_sha256),
-              std::end(result.result_payload_sha256), 0);
-    const auto digest = hashGeneratedBody(result, kResultHashDomain);
-    if (!digest) return false;
-    copyDigest(*digest, result.result_payload_sha256);
-    return true;
-}
-
-bool sealStatus(Status& status) {
-    std::fill(std::begin(status.status_payload_sha256),
-              std::end(status.status_payload_sha256), 0);
-    const auto digest = hashGeneratedBody(status, kStatusHashDomain);
-    if (!digest) return false;
-    copyDigest(*digest, status.status_payload_sha256);
-    return true;
 }
 
 Result resultBase(const Request& request) {
     Result result{};
-    result.schema_version = Result::SCHEMA_VERSION_V2;
+    result.schema_version = Result::SCHEMA_VERSION_V3;
     result.backend = Result::BACKEND_NATIVE_PGO;
     copyRequestIdentity(request, result);
     result.result_timestamp_ns = timestampNowNs();
@@ -759,7 +646,6 @@ Result noCandidateResult(const Request& request) {
     Result result = resultBase(request);
     result.result_disposition = Result::DISPOSITION_NO_CANDIDATE;
     result.rejection_reason_code = Result::REJECTION_NONE;
-    sealResult(result);
     return result;
 }
 
@@ -769,53 +655,7 @@ Result rejectedResult(const Request& request, int32_t rejection_code,
     result.result_disposition = Result::DISPOSITION_REJECTED;
     result.rejection_reason_code = rejection_code;
     result.rejection_reason = reason.substr(0, kMaxIdentityBytes);
-    sealResult(result);
     return result;
-}
-
-std::optional<Digest> loopProofHash(const Request& request, int64_t source_node,
-                                    int64_t target_node, int64_t inlier_count,
-                                    double fitness_score, double inlier_rmse_m) {
-    DigestBuilder builder;
-    if (!builder.updateDomain(kLoopProofHashDomain) ||
-        !builder.update(request.request_payload_sha256,
-                        sizeof(request.request_payload_sha256)) ||
-        !appendBigEndian(builder, source_node) || !appendBigEndian(builder, target_node) ||
-        !appendBigEndian(builder, inlier_count) ||
-        !appendBigEndianDouble(builder, fitness_score) ||
-        !appendBigEndianDouble(builder, inlier_rmse_m)) {
-        return std::nullopt;
-    }
-    return builder.finish();
-}
-
-std::optional<Digest> optimizedGraphHash(const Request& request, const Result& result) {
-    DigestBuilder builder;
-    if (!builder.updateDomain(kGraphHashDomain) ||
-        !builder.update(request.request_payload_sha256,
-                        sizeof(request.request_payload_sha256)) ||
-        !appendBigEndian(builder, result.optimized_graph_node_count) ||
-        !appendBigEndian(builder, result.optimized_graph_edge_count) ||
-        !appendBigEndian(builder, result.optimized_graph_loop_edge_count) ||
-        !appendBigEndian(builder, result.optimization_iterations) ||
-        !appendBigEndian(builder, result.optimization_converged) ||
-        !appendBigEndianDouble(builder, result.optimization_initial_cost) ||
-        !appendBigEndianDouble(builder, result.optimization_final_cost)) {
-        return std::nullopt;
-    }
-    for (double value : result.translation_m) {
-        if (!appendBigEndianDouble(builder, value)) return std::nullopt;
-    }
-    for (double value : result.rotation_xyzw) {
-        if (!appendBigEndianDouble(builder, value)) return std::nullopt;
-    }
-    if (!appendBigEndian(builder,result.trajectory_count)) return std::nullopt;
-    for (auto stamp:result.trajectory_timestamp_ns) if (!appendBigEndian(builder,stamp)) return std::nullopt;
-    for (const auto& pose:result.trajectory_translation_m) for (double value:pose)
-        if (!appendBigEndianDouble(builder,value)) return std::nullopt;
-    for (const auto& pose:result.trajectory_rotation_xyzw) for (double value:pose)
-        if (!appendBigEndianDouble(builder,value)) return std::nullopt;
-    return builder.finish();
 }
 
 bool graphShapeWithinLimits(const SimplePGO& graph, bool correction_required) {
@@ -889,19 +729,8 @@ bool correctionProofWithinLimits(const Result& result) {
     return true;
 }
 
-bool sealedCorrectionResultIsValid(const Request& request, const Result& result) {
-    if (!correctionProofWithinLimits(result)) return false;
-    const auto expected_loop = loopProofHash(
-        request, result.loop_source_node_id, result.loop_target_node_id,
-        result.loop_inlier_count, result.fitness_score, result.inlier_rmse_m);
-    const auto expected_graph = optimizedGraphHash(request, result);
-    Result canonical = result;
-    std::fill(std::begin(canonical.result_payload_sha256),
-              std::end(canonical.result_payload_sha256), 0);
-    const auto expected_result = hashGeneratedBody(canonical, kResultHashDomain);
-    return expected_loop && digestEquals(*expected_loop, result.loop_proof_sha256) &&
-           expected_graph && digestEquals(*expected_graph, result.optimized_graph_sha256) &&
-           expected_result && digestEquals(*expected_result, result.result_payload_sha256);
+bool correctionResultIsValid(const Request& request, const Result& result) {
+    return sameRequestReceipt(result, request) && correctionProofWithinLimits(result);
 }
 
 std::optional<Result> correctionResult(const Request& request, const RigidPose& correction,
@@ -939,15 +768,7 @@ std::optional<Result> correctionResult(const Request& request, const RigidPose& 
     result.optimization_initial_cost = optimization.cost_before;
     result.optimization_final_cost = optimization.cost_after;
     result.rejection_reason_code = Result::REJECTION_NONE;
-    if (!correctionProofWithinLimits(result)) return std::nullopt;
-    const auto loop_hash = loopProofHash(request, source_node, target_node, inlier_count,
-                                         fitness_score, inlier_rmse_m);
-    const auto graph_hash = optimizedGraphHash(request, result);
-    if (!loop_hash || !graph_hash) return std::nullopt;
-    copyDigest(*loop_hash, result.loop_proof_sha256);
-    copyDigest(*graph_hash, result.optimized_graph_sha256);
-    if (!sealResult(result)) return std::nullopt;
-    if (!sealedCorrectionResultIsValid(request, result)) return std::nullopt;
+    if (!correctionResultIsValid(request, result)) return std::nullopt;
     return result;
 }
 
@@ -955,7 +776,7 @@ Status ownerStatus(const OnlinePgoOptions& options, int64_t status_sequence,
                    int32_t event_kind, int32_t health_state, int32_t terminal_state,
                    int32_t reason_code, const std::string& reason) {
     Status status{};
-    status.schema_version = Status::SCHEMA_VERSION_V2;
+    status.schema_version = Status::SCHEMA_VERSION_V3;
     status.backend = Status::BACKEND_NATIVE_PGO;
     status.runtime_generation = options.runtime_generation;
     status.backend_generation = options.backend_generation;
@@ -966,7 +787,6 @@ Status ownerStatus(const OnlinePgoOptions& options, int64_t status_sequence,
     status.terminal_state = terminal_state;
     status.reason_code = reason_code;
     status.reason = reason.substr(0, kMaxIdentityBytes);
-    sealStatus(status);
     return status;
 }
 
@@ -974,7 +794,7 @@ Status requestStatus(const Request& request, int64_t status_sequence, int32_t ev
                      int32_t health_state, int32_t terminal_state, int32_t cancel_state,
                      int32_t reason_code, const std::string& reason) {
     Status status{};
-    status.schema_version = Status::SCHEMA_VERSION_V2;
+    status.schema_version = Status::SCHEMA_VERSION_V3;
     status.backend = Status::BACKEND_NATIVE_PGO;
     status.runtime_generation = request.runtime_generation;
     status.backend_generation = request.backend_generation;
@@ -988,107 +808,23 @@ Status requestStatus(const Request& request, int64_t status_sequence, int32_t ev
     status.cancel_state = cancel_state;
     status.reason_code = reason_code;
     status.reason = reason.substr(0, kMaxIdentityBytes);
-    sealStatus(status);
     return status;
 }
 
 bool sameRequestIdentity(const Status& status, const Request& request) {
-    return status.identity_present == 1 &&
-           status.runtime_generation == request.runtime_generation &&
-           status.backend_generation == request.backend_generation &&
-           status.request_sequence == request.request_sequence &&
-           status.mapping_session_id == request.mapping_session_id &&
-           status.mapping_session_generation == request.mapping_session_generation &&
-           status.map_frame_generation == request.map_frame_generation &&
-           equalBytes(status.mapping_commit_boot_nonce, request.mapping_commit_boot_nonce) &&
-           status.mapping_commit_sequence == request.mapping_commit_sequence &&
-           status.occupancy_revision == request.occupancy_revision &&
-           status.cloud_revision == request.cloud_revision &&
-           status.committed_map_source_timestamp_ns ==
-               request.committed_map_source_timestamp_ns &&
-           status.registered_cloud_source_sequence ==
-               request.registered_cloud_source_sequence &&
-           status.registered_cloud_source_timestamp_ns ==
-               request.registered_cloud_source_timestamp_ns &&
-           status.registered_body_point_count == request.registered_body_point_count &&
-           equalBytes(status.registered_cloud_envelope_sha256,
-                      request.registered_cloud_envelope_sha256) &&
-           equalBytes(status.registered_body_points_sha256,
-                      request.registered_body_points_sha256) &&
-           status.correlated_odom_source_sequence == request.correlated_odom_source_sequence &&
-           status.correlated_odom_source_timestamp_ns ==
-               request.correlated_odom_source_timestamp_ns &&
-           equalBytes(status.frozen_odom_pose_sha256, request.frozen_odom_pose_sha256) &&
-           status.committed_map_width == request.committed_map_width &&
-           status.committed_map_height == request.committed_map_height &&
-           status.committed_map_resolution_m == request.committed_map_resolution_m &&
-           status.committed_map_origin_x_m == request.committed_map_origin_x_m &&
-           status.committed_map_origin_y_m == request.committed_map_origin_y_m &&
-           equalBytes(status.committed_map_payload_sha256,
-                      request.committed_map_payload_sha256) &&
-           equalBytes(status.committed_map_boundary_sha256,
-                      request.committed_map_boundary_sha256) &&
-           status.source_timestamp_ns == request.source_timestamp_ns &&
-           status.map_frame_id == request.map_frame_id &&
-           status.odom_frame_id == request.odom_frame_id &&
-           status.body_frame_id == request.body_frame_id &&
-           status.points_frame_id == request.points_frame_id &&
-           equalBytes(status.correction_lease_boot_nonce,
-                      request.correction_lease_boot_nonce) &&
-           status.correction_lease_generation == request.correction_lease_generation &&
-           equalBytes(status.request_payload_sha256, request.request_payload_sha256);
+    return status.identity_present == 1 && sameRequestReceipt(status, request);
 }
 
 bool sameRequestIdentity(const Request& left, const Request& right) {
-    return left.schema_version == right.schema_version && left.backend == right.backend &&
-           left.runtime_generation == right.runtime_generation &&
-           left.backend_generation == right.backend_generation &&
-           left.request_sequence == right.request_sequence &&
-           left.mapping_session_id == right.mapping_session_id &&
-           left.mapping_session_generation == right.mapping_session_generation &&
-           left.map_frame_generation == right.map_frame_generation &&
-           equalBytes(left.mapping_commit_boot_nonce, right.mapping_commit_boot_nonce) &&
-           left.mapping_commit_sequence == right.mapping_commit_sequence &&
-           left.occupancy_revision == right.occupancy_revision &&
-           left.cloud_revision == right.cloud_revision &&
-           left.committed_map_source_timestamp_ns ==
-               right.committed_map_source_timestamp_ns &&
-           left.registered_cloud_source_sequence ==
-               right.registered_cloud_source_sequence &&
-           left.registered_cloud_source_timestamp_ns ==
-               right.registered_cloud_source_timestamp_ns &&
-           left.registered_body_point_count == right.registered_body_point_count &&
-           equalBytes(left.registered_cloud_envelope_sha256,
-                      right.registered_cloud_envelope_sha256) &&
-           equalBytes(left.registered_body_points_sha256,
-                      right.registered_body_points_sha256) &&
-           left.correlated_odom_source_sequence ==
-               right.correlated_odom_source_sequence &&
-           left.correlated_odom_source_timestamp_ns ==
-               right.correlated_odom_source_timestamp_ns &&
-           equalBytes(left.frozen_odom_pose_sha256, right.frozen_odom_pose_sha256) &&
-           left.committed_map_width == right.committed_map_width &&
-           left.committed_map_height == right.committed_map_height &&
-           left.committed_map_resolution_m == right.committed_map_resolution_m &&
-           left.committed_map_origin_x_m == right.committed_map_origin_x_m &&
-           left.committed_map_origin_y_m == right.committed_map_origin_y_m &&
-           equalBytes(left.committed_map_payload_sha256,
-                      right.committed_map_payload_sha256) &&
-           equalBytes(left.committed_map_boundary_sha256,
-                      right.committed_map_boundary_sha256) &&
-           left.source_timestamp_ns == right.source_timestamp_ns &&
-           left.map_frame_id == right.map_frame_id &&
-           left.odom_frame_id == right.odom_frame_id &&
-           left.body_frame_id == right.body_frame_id &&
-           left.points_frame_id == right.points_frame_id &&
-           equalBytes(left.correction_lease_boot_nonce,
-                      right.correction_lease_boot_nonce) &&
-           left.correction_lease_generation == right.correction_lease_generation &&
-           equalBytes(left.request_payload_sha256, right.request_payload_sha256);
+    // The receipt alone cannot detect a mutation of the current request's selected XYZ.
+    // The one retained immutable request keeps these exact bytes through its terminal.
+    return sameRequestReceipt(left, right) &&
+           left.registered_body_coordinate_count == right.registered_body_coordinate_count &&
+           equalDoubleBits(left.registered_body_points_xyz, right.registered_body_points_xyz);
 }
 
 bool validateCancelMessage(const Status& status, const OnlinePgoOptions& options) {
-    if (status.schema_version != Status::SCHEMA_VERSION_V2 ||
+    if (status.schema_version != Status::SCHEMA_VERSION_V3 ||
         status.backend != Status::BACKEND_NATIVE_PGO ||
         status.runtime_generation != options.runtime_generation ||
         status.backend_generation != options.backend_generation || status.status_sequence <= 0 ||
@@ -1099,6 +835,7 @@ bool validateCancelMessage(const Status& status, const OnlinePgoOptions& options
         status.cancel_state != Status::CANCEL_REQUESTED ||
         status.reason_code != Status::REASON_CANCEL_REQUESTED ||
         !validIdentityString(status.mapping_session_id) ||
+        !validIdentityString(status.mapping_backend_kind) ||
         !validIdentityString(status.map_frame_id) ||
         !validIdentityString(status.odom_frame_id) ||
         !validIdentityString(status.body_frame_id) ||
@@ -1106,11 +843,7 @@ bool validateCancelMessage(const Status& status, const OnlinePgoOptions& options
         status.reason != "cancel_requested") {
         return false;
     }
-    Status canonical = status;
-    std::fill(std::begin(canonical.status_payload_sha256),
-              std::end(canonical.status_payload_sha256), 0);
-    const auto expected = hashGeneratedBody(canonical, kStatusHashDomain);
-    return expected && digestEquals(*expected, status.status_payload_sha256);
+    return true;
 }
 
 }  // namespace
@@ -1232,9 +965,11 @@ struct RetainedOdomFence {
     std::string body_frame_id;
     std::array<uint8_t, 16> correction_lease_boot_nonce{};
     int64_t correction_lease_generation{0};
+    int32_t source_backend{0};
+    int64_t source_runtime_generation{0};
     int64_t source_sequence{0};
     int64_t source_timestamp_ns{0};
-    std::array<uint8_t, 32> pose_sha256{};
+    std::array<uint64_t, 7> pose_bits{};
 };
 
 template <std::size_t N>
@@ -1271,15 +1006,21 @@ std::optional<std::string> validateAndAdvanceRetainedOdomFence(
          request.correction_lease_generation != fence.correction_lease_generation)) {
         return "same-generation session, frame, commit, or lease identity changed";
     }
-    if (!first_session && !newer_session) {
+    // Source sequence numbers belong to the admitted LIO domain. A domain restart
+    // does not authorize changing coordinate frames; the existing boundary above
+    // still applies, and GraphState retains its session/frame transition policy.
+    const bool same_source_domain =
+        fence.source_backend == request.registered_cloud_backend &&
+        fence.source_runtime_generation == request.registered_cloud_runtime_generation;
+    if (!first_session && !newer_session && same_source_domain) {
         if (request.correlated_odom_source_sequence < fence.source_sequence ||
             request.correlated_odom_source_timestamp_ns < fence.source_timestamp_ns) {
             return "frozen odom sequence or timestamp regressed";
         }
         if (request.correlated_odom_source_sequence == fence.source_sequence &&
             (request.correlated_odom_source_timestamp_ns != fence.source_timestamp_ns ||
-             !arrayEquals(fence.pose_sha256, request.frozen_odom_pose_sha256))) {
-            return "same frozen odom sequence changed timestamp or pose hash";
+             fence.pose_bits != frozenOdomPoseBits(request))) {
+            return "same frozen odom sequence changed timestamp or exact pose";
         }
     }
     if (first_session || newer_session) {
@@ -1295,9 +1036,11 @@ std::optional<std::string> validateAndAdvanceRetainedOdomFence(
                   fence.correction_lease_boot_nonce);
         fence.correction_lease_generation = request.correction_lease_generation;
     }
+    fence.source_backend = request.registered_cloud_backend;
+    fence.source_runtime_generation = request.registered_cloud_runtime_generation;
     fence.source_sequence = request.correlated_odom_source_sequence;
     fence.source_timestamp_ns = request.correlated_odom_source_timestamp_ns;
-    copyArray(request.frozen_odom_pose_sha256, fence.pose_sha256);
+    fence.pose_bits = frozenOdomPoseBits(request);
     return std::nullopt;
 }
 
@@ -1460,7 +1203,7 @@ IcpResult registerLoop(const PointCloud::ConstPtr& source, const PointCloud::Con
         target->size() > kMaxSubmapPoints) {
         IcpResult result;
         result.disposition = IcpDisposition::Failure;
-        result.error = "ICP cloud exceeds the frozen V2 proof limits";
+        result.error = "ICP cloud exceeds the frozen V3 proof limits";
         return result;
     }
     if (source->size() < kMinIcpInliers || target->size() < kMinIcpInliers) {
@@ -1534,7 +1277,7 @@ IcpResult registerLoop(const PointCloud::ConstPtr& source, const PointCloud::Con
             if (inlier_count > Result::MAX_LOOP_INLIERS) {
                 IcpResult result;
                 result.disposition = IcpDisposition::Failure;
-                result.error = "ICP inlier proof exceeds the frozen V2 limit";
+                result.error = "ICP inlier proof exceeds the frozen V3 limit";
                 return result;
             }
         }
@@ -1612,9 +1355,9 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
     }
     if (!graphShapeWithinLimits(trial.graph, false)) {
         return {rejectedResult(request, Result::REJECTION_RESOURCE_LIMIT,
-                               "pose graph violates the frozen V2 limits"),
+                               "pose graph violates the frozen V3 limits"),
                 TerminalKind::Rejected, Status::REASON_OPTIMIZATION_FAILED,
-                "pose graph violates the frozen V2 limits"};
+                "pose graph violates the frozen V3 limits"};
     }
     if (trial.graph.keyPosesSe3().size() >= kMaxGraphNodes) {
         return {rejectedResult(request, Result::REJECTION_RESOURCE_LIMIT,
@@ -1647,9 +1390,9 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
     }
     if (!graphShapeWithinLimits(trial.graph, false)) {
         return {rejectedResult(request, Result::REJECTION_RESOURCE_LIMIT,
-                               "keyframe exceeds the frozen V2 graph limits"),
+                               "keyframe exceeds the frozen V3 graph limits"),
                 TerminalKind::Rejected, Status::REASON_OPTIMIZATION_FAILED,
-                "keyframe exceeds the frozen V2 graph limits"};
+                "keyframe exceeds the frozen V3 graph limits"};
     }
     PointCloud::Ptr body_cloud = requestBodyCloud(request, options.submap_resolution_m);
     if (body_cloud->size() < kMinIcpInliers ||
@@ -1714,9 +1457,9 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
     }
     if (!graphShapeWithinLimits(trial.graph, true)) {
         return {rejectedResult(request, Result::REJECTION_RESOURCE_LIMIT,
-                               "loop edge exceeds the frozen V2 graph limits"),
+                               "loop edge exceeds the frozen V3 graph limits"),
                 TerminalKind::Rejected, Status::REASON_OPTIMIZATION_FAILED,
-                "loop edge exceeds the frozen V2 graph limits"};
+                "loop edge exceeds the frozen V3 graph limits"};
     }
     const Se3OptimizationSummary optimization =
         trial.graph.smoothAndUpdateSe3(*cancelled);
@@ -1746,9 +1489,9 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
     if (!graphShapeWithinLimits(trial.graph, true) || optimization.iterations < 1 ||
         optimization.iterations > Result::MAX_OPTIMIZATION_ITERATIONS) {
         return {rejectedResult(request, Result::REJECTION_RESOURCE_LIMIT,
-                               "optimized proof exceeds the frozen V2 limits"),
+                               "optimized proof exceeds the frozen V3 limits"),
                 TerminalKind::Rejected, Status::REASON_OPTIMIZATION_FAILED,
-                "optimized proof exceeds the frozen V2 limits"};
+                "optimized proof exceeds the frozen V3 limits"};
     }
     if (cancelled->load()) return cancelledRequest(request);
     const RigidPose correction = trial.graph.offsetSe3();
@@ -1758,9 +1501,9 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
         registration.inlier_count, trial.graph, optimization);
     if (!result) {
         return {rejectedResult(request, Result::REJECTION_NUMERIC_FAILURE,
-                               "failed to seal correction proof"),
+                               "invalid correction receipt or graph proof"),
                 TerminalKind::Rejected, Status::REASON_OPTIMIZATION_FAILED,
-                "failed to seal correction proof"};
+                "invalid correction receipt or graph proof"};
     }
     trial.loop_pairs.emplace_back(current_index, *loop_target);
     trial.last_loop_timestamp_ns = request.source_timestamp_ns;
@@ -1775,33 +1518,32 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
 namespace {
 
 struct WorkItem {
-    std::shared_ptr<Request> request;
+    std::shared_ptr<const Request> request;
     std::shared_ptr<std::atomic<bool>> cancelled;
 };
 
 enum class RequestPhase { Accepted, Running, CancelAcknowledged, Terminal };
 
 struct RequestLedgerEntry {
-    explicit RequestLedgerEntry(std::shared_ptr<Request> request_value)
+    explicit RequestLedgerEntry(std::shared_ptr<const Request> request_value)
         : request(std::move(request_value)) {}
 
-    std::shared_ptr<Request> request;
+    // This sole current-sequence ledger entry retains exact XYZ after terminal so
+    // duplicate requests remain byte-exact. Retirement/shutdown releases ownership.
+    std::shared_ptr<const Request> request;
     RequestPhase phase{RequestPhase::Accepted};
     bool cancel_ack_emitted{false};
     bool protocol_cancelled{false};
     bool terminal_committed{false};
 };
 
-void releaseRequestPayload(Request& request) {
-    request.registered_body_points_xyz.clear();
-    request.registered_body_points_xyz.shrink_to_fit();
-    request.committed_map_occupancy.clear();
-    request.committed_map_occupancy.shrink_to_fit();
-}
-
 using OutboundMessage = std::variant<Result, Status>;
 
 class OnlinePgoOwnerImpl {
+#ifdef NUWAX_NATIVE_PGO_OWNER_TEST
+    friend struct OnlinePgoOwnerTestAccess;
+#endif
+
 public:
     explicit OnlinePgoOwnerImpl(OnlinePgoOptions options)
         : options_(std::move(options)),
@@ -1906,9 +1648,10 @@ public:
         if (worker_.joinable()) worker_.join();
         {
             std::lock_guard<std::mutex> lock(work_mutex_);
-            if (active_request_) releaseRequestPayload(*active_request_);
             active_request_.reset();
             active_cancel_.reset();
+            pending_work_.reset();
+            current_request_.reset();
         }
         drainOutbound();
         enqueueOwnerStatus(Status::EVENT_STOPPING, Status::HEALTH_UNKNOWN,
@@ -1993,8 +1736,8 @@ private:
 
     void handleRequestMessage(const lcm::ReceiveBuffer* buffer, const std::string&) {
         constexpr std::size_t max_request_wire_bytes =
-            8 + 4 * 16 + 8 * 32 + Request::MAX_REGISTERED_BODY_COORDINATE_COUNT * 8ULL +
-            Request::MAX_COMMITTED_MAP_CELL_COUNT + 4'096;
+            304 + 6 * (sizeof(int32_t) + kMaxIdentityBytes + 1) +
+            Request::MAX_REGISTERED_BODY_COORDINATE_COUNT * sizeof(double);
         if (buffer == nullptr || buffer->data == nullptr || buffer->data_size <= 0 ||
             static_cast<std::size_t>(buffer->data_size) > max_request_wire_bytes) {
             protocolError(Status::REASON_PROTOCOL_DECODE_FAILED,
@@ -2025,7 +1768,7 @@ private:
             return;
         }
 
-        auto request = std::make_shared<Request>(std::move(decoded));
+        auto request = std::make_shared<const Request>(std::move(decoded));
         std::lock_guard<std::mutex> lock(work_mutex_);
         const int64_t request_sequence = request->request_sequence;
         if (request_sequence <= retired_request_sequence_through_) return;
@@ -2036,8 +1779,8 @@ private:
             if (request_sequence == current_sequence) {
                 if (sameRequestIdentity(*request, *current_request_->request)) return;
                 protocolError(
-                    Status::REASON_PROTOCOL_IDENTITY_MISMATCH,
-                    "request sequence was replayed with a conflicting identity or hash");
+                    Status::REASON_PROTOCOL_RECEIPT_MISMATCH,
+                    "request sequence was replayed with a conflicting receipt or exact body payload");
                 fatal_.store(true);
                 return;
             }
@@ -2086,7 +1829,6 @@ private:
                 Status::REASON_INVALID_REQUEST, "owner is stopping");
             ledger.phase = RequestPhase::Terminal;
             ledger.terminal_committed = true;
-            releaseRequestPayload(*request);
             return;
         }
         busy_ = true;
@@ -2132,7 +1874,7 @@ private:
         }
         auto& entry = *current_request_;
         if (!sameRequestIdentity(cancel, *entry.request)) {
-            protocolError(Status::REASON_PROTOCOL_IDENTITY_MISMATCH,
+            protocolError(Status::REASON_PROTOCOL_RECEIPT_MISMATCH,
                           "cancel identity conflicts with its request sequence");
             fatal_.store(true);
             return;
@@ -2196,7 +1938,6 @@ private:
                 }
                 auto& entry = *current_request_;
                 if (entry.phase == RequestPhase::Terminal) {
-                    releaseRequestPayload(*work.request);
                     if (active_request_ &&
                         active_request_->request_sequence ==
                             work.request->request_sequence) {
@@ -2288,7 +2029,6 @@ private:
                         entry.terminal_committed = true;
                     }
                 }
-                releaseRequestPayload(*work.request);
                 if (active_request_ &&
                     active_request_->request_sequence == work.request->request_sequence) {
                     active_request_.reset();
@@ -2317,7 +2057,7 @@ private:
     }
 
     OnlinePgoOptions options_;
-    lcm::LCM lcm_;
+    OwnerTransport lcm_;
     std::string request_lcm_channel_;
     std::string result_lcm_channel_;
     std::string status_lcm_channel_;
@@ -2334,7 +2074,7 @@ private:
     bool worker_done_{false};
     bool busy_{false};
     std::optional<WorkItem> pending_work_;
-    std::shared_ptr<Request> active_request_;
+    std::shared_ptr<const Request> active_request_;
     std::shared_ptr<std::atomic<bool>> active_cancel_;
     std::optional<RequestLedgerEntry> current_request_;
     int64_t retired_request_sequence_through_{0};

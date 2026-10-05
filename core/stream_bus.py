@@ -238,12 +238,13 @@ class StreamBus:
         self._async_queue[key] = (subscription, frame)
 
     def _drain_dispatch_queue(self) -> None:
+        first_interruption: Optional[BaseException] = None
         while True:
             with self._lock:
                 if not self._dispatch_queue:
                     self._dispatch_draining = False
                     self._dispatch_owner_thread_id = None
-                    return
+                    break
                 dispatch_item = self._dispatch_queue.popleft()
 
             try:
@@ -260,8 +261,19 @@ class StreamBus:
                     extra={"stream_bus_internal": True},
                     exc_info=True,
                 )
+            except BaseException as exc:
+                # Finish accepted FIFO work before returning ownership to the
+                # caller. Completion means attempted, not delivered to every
+                # subscriber of the interrupted frame; never replay that item.
+                if first_interruption is None:
+                    first_interruption = exc
             finally:
                 dispatch_item.completion.set()
+
+        # Ownership was released under _lock. Do not clear it again here: a
+        # newer publisher may already have become the drainer.
+        if first_interruption is not None:
+            raise first_interruption
 
     def _dispatch_frame(
         self,

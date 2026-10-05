@@ -711,6 +711,14 @@ impl ExplorationController {
         self.sources.len()
     }
 
+    /// Whether every registered source explicitly supports prepare/commit polling.
+    /// This capability read does not poll, begin, or mutate a source. Empty-source
+    /// admission remains the responsibility of `begin_exploration`.
+    #[must_use]
+    pub fn supports_prepared_poll(&self) -> bool {
+        self.sources.iter().all(|source| source.supports_prepared_poll())
+    }
+
     /// 启动 exploration。
     ///
     /// 行为:按 insertion order 依次 `begin()` 每个 source;若第 `k` 个 source 失败,

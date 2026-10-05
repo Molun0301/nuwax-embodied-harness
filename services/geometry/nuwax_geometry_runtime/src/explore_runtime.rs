@@ -7,6 +7,10 @@
 
 #![allow(dead_code)]
 
+// Concrete owner backend; scheduler activation is qualified separately.
+#[path = "explore_compute_backend.rs"]
+mod compute_backend;
+
 #[cfg(test)]
 #[path = "explore_attribution.rs"]
 mod attribution;

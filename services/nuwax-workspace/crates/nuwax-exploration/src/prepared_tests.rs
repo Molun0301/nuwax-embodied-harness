@@ -315,7 +315,10 @@ fn unsupported_source_is_rejected_before_any_preparation() {
     }
     let (mut controller, counts_, _) =
         controller(ExplorationArbitrationPolicy::HighestScore, vec![goal(1.0)]);
+    assert!(controller.supports_prepared_poll());
     controller.add_source(Unsupported);
+    assert!(!controller.supports_prepared_poll());
+    assert_eq!(counts(&counts_), vec![Counts::default()]);
     assert!(matches!(
         controller.prepare_poll_with_deferred_stop(&state(), false),
         Err(ExploreError::PreparedPollUnsupported)

@@ -1359,6 +1359,53 @@ class MapCatalogRepository:
             self._clear_current_relocalization_intent(intent)
             return durable
 
+    def settle_assigned_relocalization_query(
+        self, *, query: AssignedRelocalizationQuery, response: Dict[str, object],
+        replacement_activation: Optional[AssignedActivationReceipt] = None,
+    ) -> Dict[str, object]:
+        """Release an exact authoritative query terminal without installing it.
+
+        A negative dispatch reply is deliberately insufficient here: it may be
+        a new pre-admission rejection rather than the old uncertain attempt's
+        retained terminal. Pending/not-found/conflict queries never release.
+        Applied results require a different currently durable sealed activation;
+        deletion without such a receipt still needs a native retirement fence.
+        """
+        if not isinstance(query, AssignedRelocalizationQuery):
+            raise ValueError("assigned recovery requires the retained whole query")
+        terminal = query.validate_response(response)
+        if terminal is None:
+            raise ValueError("assigned recovery requires an authoritative terminal query")
+        request = query.request
+        applied = terminal.disposition in {1, 2}
+        receipt = self._assigned_relocalization_receipt(terminal) if applied else None
+        with self.map_activation_guard():
+            if applied:
+                if (not isinstance(replacement_activation, AssignedActivationReceipt)
+                        or replacement_activation.exact_replay_of(request.activation_receipt)):
+                    raise ValueError("applied recovery requires a distinct sealed replacement owner")
+                current = self.get_last_successful_map_activation_receipt()
+                if (current is None or current.get("schema_version") != 3
+                        or current.get("trusted_identity") is not True
+                        or not AssignedActivationReceipt.admit(current["activation_receipt_v2"])
+                            .exact_replay_of(replacement_activation)):
+                    raise ValueError("assigned replacement activation is not the current durable owner")
+            existing = self.get_last_successful_relocalization_receipt()
+            if existing is not None and existing["request_id"] == request.request_id:
+                if not applied or existing != receipt:
+                    raise ValueError("queried terminal conflicts with durable successful receipt")
+            intent = self.get_assigned_relocalization_intent()
+            if intent is not None:
+                intent = self._require_assigned_relocalization_intent(request)
+                if intent["phase"] == "prepared":
+                    raise ValueError("query retirement cannot precede backend dispatch")
+                if intent["terminal_receipt"] is not None and intent["terminal_receipt"] != receipt:
+                    raise ValueError("queried terminal conflicts with retained pending terminal")
+                self._clear_current_relocalization_intent(intent)
+            # Do not overwrite a later successful receipt or install old geometry.
+            return {"assigned_request_v2": request.to_dict(),
+                    "assigned_terminal_v2": terminal.to_dict(), "retired": applied}
+
     def begin_relocalization_durable(
         self,
         *,

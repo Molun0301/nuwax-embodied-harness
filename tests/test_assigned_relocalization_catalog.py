@@ -138,6 +138,102 @@ class AssignedRelocalizationCatalogTests(unittest.TestCase):
     def reopen(self):
         return module.MapCatalogRepository(self.directory.name)
 
+    def recovery_query(self):
+        return self.repo.reopen_assigned_relocalization_query(request_id=self.request.request_id)
+
+    def replace_activation(self):
+        transition = self.repo.begin_assigned_map_activation(previous_map_name='room',
+            load_memory_history=False, reuse_completed_request_id=False, **self.activation_args)
+        replacement = AssignedRelocalizationRequest.admit(request_dict(
+            activation_id=transition['activation_request_id'], request_id='relocalize:new')).activation_receipt
+        self.repo.complete_assigned_map_activation_durable(**self.activation_args,
+            activation_request_id=transition['activation_request_id'], activation_receipt=replacement,
+            expected_phases=['prepared'], relocalization_target_available=True)
+        return replacement
+
+    def test_unknown_exact_negative_query_releases_without_live_owner(self):
+        self.begin(); self.dispatch()
+        self.repo.mark_assigned_relocalization_outcome_unknown(assigned_request=self.request, **self.owner_args)
+        query = self.recovery_query()
+        replacement = self.replace_activation()
+        response = query.response(1, self.terminal(1))
+        with patch.object(module.hashlib, 'sha256', side_effect=AssertionError('hash forbidden')):
+            result = self.repo.settle_assigned_relocalization_query(query=query, response=response)
+        self.assertFalse(result['retired'])
+        self.assertIsNone(self.reopen().get_relocalization_intent())
+        self.assertEqual(self.repo.get_last_successful_map_activation_receipt()['activation_receipt_v2'], replacement.to_dict())
+        self.assertEqual(self.repo.settle_assigned_relocalization_query(query=query, response=response), result)
+
+    def test_query_misses_and_mismatched_requests_never_release_unknown(self):
+        self.begin(); self.dispatch()
+        self.repo.mark_assigned_relocalization_outcome_unknown(assigned_request=self.request, **self.owner_args)
+        query = self.recovery_query(); before = self.repo._relocalization_intent_path.read_bytes()
+        for status in (2, 3, 4):
+            with self.assertRaisesRegex(ValueError, 'authoritative terminal'):
+                self.repo.settle_assigned_relocalization_query(query=query, response=query.response(status))
+            self.assertEqual(self.repo._relocalization_intent_path.read_bytes(), before)
+        wrong = query.response(1, self.terminal(1)); wrong['request_id'] = 'different'
+        with self.assertRaises(ValueError):
+            self.repo.settle_assigned_relocalization_query(query=query, response=wrong)
+        self.assertEqual(self.repo._relocalization_intent_path.read_bytes(), before)
+
+    def test_applied_query_retirement_requires_actual_replacement_and_keeps_receipt(self):
+        self.begin(); self.dispatch(); self.reconcile()
+        query = self.recovery_query(); response = query.response(1, self.terminal())
+        before = self.repo._relocalization_receipt_path.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'distinct sealed replacement'):
+            self.repo.settle_assigned_relocalization_query(query=query, response=response,
+                replacement_activation=self.activation)
+        replacement = self.replace_activation()
+        result = self.repo.settle_assigned_relocalization_query(query=query, response=response,
+            replacement_activation=replacement)
+        self.assertTrue(result['retired'])
+        self.assertIsNone(self.reopen().get_relocalization_intent())
+        self.assertEqual(self.repo._relocalization_receipt_path.read_bytes(), before)
+        self.assertEqual(self.repo.settle_assigned_relocalization_query(query=query, response=response,
+            replacement_activation=replacement), result)
+
+    def test_retired_query_never_overwrites_a_newer_successful_receipt(self):
+        self.begin(); self.dispatch()
+        query = self.recovery_query(); replacement = self.replace_activation()
+        newer = AssignedRelocalizationTerminal.admit(terminal_dict(5,
+            activation_id=replacement.request_id, request_id='relocalize:new'))
+        receipt = self.repo._assigned_relocalization_receipt(newer)
+        # A later completed owner's already durable record is independent of the
+        # old recovery intent. Retirement must neither replace nor delete it.
+        with self.repo.map_activation_guard():
+            module._atomic_write_text(self.repo._relocalization_receipt_path, json.dumps(receipt))
+        before = self.repo._relocalization_receipt_path.read_bytes()
+        self.repo.settle_assigned_relocalization_query(query=query, response=query.response(1, self.terminal()),
+            replacement_activation=replacement)
+        self.assertEqual(self.repo._relocalization_receipt_path.read_bytes(), before)
+        self.assertIsNone(self.repo.get_relocalization_intent())
+
+    def test_negative_query_cannot_discard_retained_applied_terminal(self):
+        self.begin(); self.dispatch(); self.reconcile()
+        query = self.recovery_query(); before = self.repo._relocalization_intent_path.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'conflicts with durable successful'):
+            self.repo.settle_assigned_relocalization_query(query=query, response=query.response(1, self.terminal(1)))
+        self.assertEqual(self.repo._relocalization_intent_path.read_bytes(), before)
+
+    def test_terminal_query_release_fsync_failure_rolls_back_exact_owner(self):
+        self.begin(); self.dispatch()
+        query = self.recovery_query(); response = query.response(1, self.terminal(1))
+        original = self.repo._relocalization_intent_path.read_bytes()
+        real = module._fsync_directory; calls = 0
+        def fail_once(path):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError('query release fsync fault')
+            return real(path)
+        with patch.object(module, '_fsync_directory', side_effect=fail_once):
+            with self.assertRaises(OSError):
+                self.repo.settle_assigned_relocalization_query(query=query, response=response)
+        self.assertEqual(self.repo._relocalization_intent_path.read_bytes(), original)
+        self.repo.settle_assigned_relocalization_query(query=query, response=response)
+        self.assertIsNone(self.reopen().get_relocalization_intent())
+
     def test_restart_reopens_exact_request_in_every_phase_and_settles(self):
         with patch.object(module.hashlib, 'sha256', side_effect=AssertionError('hash forbidden')):
             self.assertEqual(self.begin()['phase'], 'prepared')

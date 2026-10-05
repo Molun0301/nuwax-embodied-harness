@@ -1808,6 +1808,9 @@ mod tests {
         let mut stale_mask = both.clone();
         advance_scan(&mut stale_mask);
         stale_mask.committed_map.revision -= 1;
+        // Keep this candidate wire-valid so the ordering layer, rather than
+        // the header/receipt codec guard, proves the rollback rejection.
+        stale_mask.virtual_obstacles = Some(virtual_mask(&stale_mask, false));
         assert!(matches!(observe_map(&mut order, &stale_mask), MapIngress::Rejected(_)));
         let mut stale_cloud = both.clone();
         advance_mask(&mut stale_cloud, true);

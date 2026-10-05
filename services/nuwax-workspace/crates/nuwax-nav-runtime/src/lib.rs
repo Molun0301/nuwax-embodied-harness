@@ -26,6 +26,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
+mod command_dispatch;
+pub use command_dispatch::CommandDispatchBound;
 mod planner_worker;
 pub mod surface_follower;
 pub use nuwax_nav_mls_planner::SurfaceSnapshot;

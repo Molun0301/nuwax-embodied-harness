@@ -61,3 +61,13 @@ Evidence directory: `/workspace/shared/neh-validation/doorway/`.
 - `mls-opt3-1cm-off-proof-trace-v2.log`: exact time-only witness, still a failed trial
 
 The source-age and reason reports retain bounded sample counts, explicitly report omitted records/examples, and do not infer TTL rejection from age or substrings. Exact Pending/Failed/ReplanRequired payloads are diagnostic; their byte size is not separately capped.
+
+## Dependency API checkpoint (delivery wiring still pending)
+
+The MLS sibling checker now returns the minimum finite observation expiry from the exact non-exempt cells checked by a successful sweep. Its geometry, evidence lookup, first-error order, occupied exemption and inclusive TTL decision are unchanged. Each sweep resets its dependency minimum; the independent raw validator remains the oracle. Exact `u64::MAX` or overflowing expiry is unrestricted under the original saturated checked-time semantics and does not become an artificial `MAX - elapsed` constraint. The existing unit-return checker delegates to this implementation, so it also incurs the small scalar accumulation cost; semantic parity does not mean zero added work.
+
+A separate runtime scalar module represents the latest admissible issue time, without activating a gate yet. It captures monotonic time immediately before the exact Unix observation clock, derives an immutable conservative deadline, and rejects a later Unix clock below the anchor as well as either clock exceeding its bound. Equality remains admissible. Selected-query aggregation resets once per selected replay and propagates memoized dependencies; this checkpoint tests those scalar operations only, not their still-pending integration into candidate selection. No finite constraint requires no clock conversion. The existing 250 ms velocity lease is not modified.
+
+Focused validation uses the same mixed profile (MLS opt-level 3, runtime and remaining crates unoptimized test profile with debuginfo): `observation-expiry-api-v1.log` has five passing API groups; `dispatch-clock-api-v3.log` has three passing clock/aggregation groups, including the corrected missing-clock zero-anchor regression. The earlier v1 is retained; v2 records a wrong-working-directory Cargo invocation that did not build. Production publication, first retrieval, scheduler and transport enforcement remain pending, as do selected-replay cost and moving continuity qualification.
+
+The full feature-on MLS suite also passes on this checkpoint: `observation-expiry-mls-all-v1.log`, 240 passed / 4 ignored. No delivery correction or moving performance claim follows from these API tests.

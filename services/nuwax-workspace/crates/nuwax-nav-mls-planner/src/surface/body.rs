@@ -1639,10 +1639,27 @@ impl SurfaceSnapshot {
         boundary: &'a [[f64; 2]],
     ) -> impl FnMut(([f64; 3], [f64; 4]), ([f64; 3], [f64; 4]), u64)
         -> Result<(), SurfaceError> + 'a {
+        let mut checker = self.observed_body_motion_checker_with_expiry(occupied, max_age_ns, boundary);
+        move |from, to, checked_ns| checker(from, to, checked_ns).map(|_| ())
+    }
+
+    /// 在同一次完整扫掠成功后，返回实际检查的非豁免单元中最早的观察到期时刻。
+    /// 到期时刻仍可通过检查；只有超过该时刻才过期。每次调用重新累计，失败不返回凭据。
+    /// `None` 仅表示成功检查没有有限的时效上界：全部豁免，或时间加法达到/超过
+    /// `u64::MAX`；它不豁免几何、观察来源、采样命中或未来时间检查。
+    /// 与单位返回值入口共享精确足迹缓存和借用范围，不缓存观察许可。
+    pub fn observed_body_motion_checker_with_expiry<'a>(
+        &'a self,
+        occupied: &'a std::collections::BTreeSet<[i32; 3]>,
+        max_age_ns: u64,
+        boundary: &'a [[f64; 2]],
+    ) -> impl FnMut(([f64; 3], [f64; 4]), ([f64; 3], [f64; 4]), u64)
+        -> Result<Option<u64>, SurfaceError> + 'a {
         let mut footprints = ObservationFootprintCache::new(self);
         move |from, to, checked_ns| {
             let observations = self.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
             if checked_ns == 0 || max_age_ns == 0 { return Err(SurfaceError::MissingSupport); }
+            let mut earliest_expiry: Option<u64> = None;
             self.validate_body_motion_checked(from, to, boundary, |pose| {
                 for &cell in footprints.cells(pose)? {
                     if occupied.contains(&cell) { continue; }
@@ -1657,9 +1674,16 @@ impl SurfaceSnapshot {
                             cell, reason, observed_ns:evidence.observed_ns, checked_ns,
                         });
                     }
+                    // 饱和年龄判定在可表示时钟内不会越过 MAX；不能把 MAX 作为
+                    // 有限期限交给上层减去执行耗时，否则会凭空提前限制许可。
+                    if let Some(expiry) = evidence.observed_ns.checked_add(max_age_ns)
+                        .filter(|&expiry| expiry < u64::MAX) {
+                        earliest_expiry = Some(earliest_expiry.map_or(expiry, |old| old.min(expiry)));
+                    }
                 }
                 Ok(())
-            })
+            })?;
+            Ok(earliest_expiry)
         }
     }
 
@@ -2448,12 +2472,154 @@ mod tests {
         queries: &[(([f64; 3], [f64; 4]), ([f64; 3], [f64; 4]), u64)],
     ) {
         let mut cached = map.observed_body_motion_checker(occupied, max_age_ns, boundary);
+        let mut with_expiry = map.observed_body_motion_checker_with_expiry(occupied, max_age_ns, boundary);
         for &(from, to, checked_ns) in queries {
             let expected = map.validate_observed_body_motion_in_boundary(
                 from, to, occupied, checked_ns, max_age_ns, boundary);
             assert_eq!(cached(from, to, checked_ns), expected,
                 "足迹复用必须保留完整结果、首个错误及时间字段: {from:?} -> {to:?}, {checked_ns}");
+            assert_eq!(with_expiry(from, to, checked_ns).map(|_| ()), expected,
+                "到期凭据必须保留独立原始检查的完整结果和首个错误: {from:?} -> {to:?}, {checked_ns}");
         }
+    }
+
+    #[test]
+    fn observed_motion_expiry_uses_only_checked_nonexempt_cells_and_resets_each_sweep() {
+        let map = scene(&[], false).with_observations(Some(observation_grid(|cells| {
+            cells.get_mut(&[-4, 0, 0]).unwrap().observed_ns = 1;
+            cells.get_mut(&[-20, 0, 0]).unwrap().observed_ns = 1;
+            cells.get_mut(&[8, 0, 0]).unwrap().observed_ns = 9_900_000_000;
+            cells.get_mut(&[10, 0, 0]).unwrap().observed_ns = 9_500_000_000;
+            cells.get_mut(&[18, 0, 0]).unwrap().observed_ns = 9_700_000_000;
+        })));
+        let from = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let to = ([1.85, 0.05, 0.5], from.1);
+        let occupied = map.body_observation_footprint(from).unwrap();
+        let destination = map.body_observation_footprint(to).unwrap();
+        assert!(occupied.contains(&[-4, 0, 0]));
+        assert!(!occupied.contains(&[10, 0, 0]) && !destination.contains(&[10, 0, 0]),
+            "最早到期证据仅出现在中间扫掠，不能只累计端点");
+        let mut checker = map.observed_body_motion_checker_with_expiry(&occupied, 1_000_000_000, &[]);
+        assert_eq!(checker(from, to, 10_100_000_000), Ok(Some(10_500_000_000)));
+        assert_eq!(checker(to, to, 10_100_000_000), Ok(Some(10_700_000_000)),
+            "下一次扫掠不能继承前次中间单元的最小值");
+        assert_eq!(checker(from, from, 12_000_000_000), Ok(None),
+            "全部位于实际足下时没有时效上界，过期足下证据不能约束新运动");
+        assert_eq!(checker(from, to, 10_500_000_000), Ok(Some(10_500_000_000)));
+        let expired = checker(from, to, 10_500_000_001);
+        assert_eq!(expired.as_ref().map(|_| ()), map.validate_observed_body_motion_in_boundary(
+            from, to, &occupied, 10_500_000_001, 1_000_000_000, &[]).as_ref().map(|_| ()));
+        assert_eq!(expired, Err(SurfaceError::NearFieldObservation {
+            cell: [10, 0, 0], reason: "观察已过期", observed_ns: 9_500_000_000,
+            checked_ns: 10_500_000_001,
+        }));
+    }
+
+    #[test]
+    fn observed_motion_expiry_rechecks_cached_footprint_at_exact_expiry_and_one_ns_later() {
+        let map = scene(&[], false).with_observations(Some(observation_grid(|_| {})));
+        let pose = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let none = Default::default();
+        let mut checker = map.observed_body_motion_checker_with_expiry(&none, 1_000_000_000, &[]);
+        assert_eq!(checker(pose, pose, 10_100_000_000), Ok(Some(11_000_000_000)));
+        assert_eq!(checker(pose, pose, 11_000_000_000), Ok(Some(11_000_000_000)));
+        let expected = map.validate_observed_body_motion_in_boundary(
+            pose, pose, &none, 11_000_000_001, 1_000_000_000, &[]).unwrap_err();
+        assert!(matches!(expected, SurfaceError::NearFieldObservation {
+            reason: "观察已过期", observed_ns: 10_000_000_000, checked_ns: 11_000_000_001, ..
+        }));
+        assert_eq!(checker(pose, pose, 11_000_000_001), Err(expected));
+        assert_eq!(checker(pose, pose, 10_100_000_000), Ok(Some(11_000_000_000)),
+            "相同足迹命中仍重查时刻，不能缓存成功或失败许可");
+    }
+
+    #[test]
+    fn observed_motion_expiry_returns_no_certificate_for_failure_and_keeps_first_error() {
+        let map = scene(&[], false).with_observations(Some(observation_grid(|cells| {
+            cells.get_mut(&[-4, 0, 0]).unwrap().observed_ns = 9_500_000_000;
+            let first_error = cells.get_mut(&[8, 0, 0]).unwrap();
+            first_error.observed_ns = 11_000_000_000;
+            first_error.hits = 1;
+            cells.remove(&[9, 0, 0]);
+        })));
+        let from = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let to = ([0.45, 0.05, 0.5], from.1);
+        let later = ([1.65, 0.05, 0.5], from.1);
+        let none = Default::default();
+        let mut checker = map.observed_body_motion_checker_with_expiry(&none, 1_000_000_000, &[]);
+        assert_eq!(checker(from, from, 10_100_000_000), Ok(Some(10_500_000_000)));
+        let expected = map.validate_observed_body_motion_in_boundary(
+            from, to, &none, 10_100_000_000, 1_000_000_000, &[]).unwrap_err();
+        assert_eq!(expected, SurfaceError::NearFieldObservation {
+            cell: [8, 0, 0], reason: "独立采样命中不足", observed_ns: 11_000_000_000,
+            checked_ns: 10_100_000_000,
+        });
+        assert_eq!(checker(from, to, 10_100_000_000), Err(expected.clone()));
+        assert_eq!(checker(from, to, 10_100_000_000), Err(expected));
+        assert_eq!(checker(later, later, 10_100_000_000), Ok(Some(11_000_000_000)),
+            "失败前累计的更早期限不能泄漏到后续成功检查");
+    }
+
+    #[test]
+    fn observed_motion_expiry_without_nonexempt_cells_still_checks_geometry_and_source() {
+        let base = scene(&[], false);
+        let map = base.with_observations(Some(observation_grid(|cells| {
+            for evidence in cells.values_mut() { *evidence = SurfaceObservation { observed_ns: 1, hits: 0 }; }
+        })));
+        let pose = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let occupied = map.body_observation_footprint(pose).unwrap();
+        let mut checker = map.observed_body_motion_checker_with_expiry(&occupied, 1_000_000_000, &[]);
+        assert_eq!(checker(pose, pose, 12_000_000_000), Ok(None));
+        assert_eq!(checker(pose, pose, 0), Err(SurfaceError::MissingSupport));
+        let invalid = (pose.0, [0.0; 4]);
+        assert_eq!(checker(invalid, pose, 12_000_000_000).map(|_| ()),
+            map.validate_observed_body_motion_in_boundary(invalid, pose, &occupied,
+                12_000_000_000, 1_000_000_000, &[]));
+        assert!(checker(invalid, pose, 12_000_000_000).is_err());
+        let boundary = [[2.0, 2.0], [3.0, 2.0], [3.0, 3.0], [2.0, 3.0]];
+        let mut bounded = map.observed_body_motion_checker_with_expiry(&occupied, 1_000_000_000, &boundary);
+        assert_eq!(bounded(pose, pose, 12_000_000_000), Err(SurfaceError::InvalidBoundary));
+        let mut missing = base.observed_body_motion_checker_with_expiry(&occupied, 1_000_000_000, &[]);
+        assert_eq!(missing(pose, pose, 12_000_000_000), Err(SurfaceError::MissingSupport));
+    }
+
+    #[test]
+    fn observed_motion_expiry_does_not_turn_clock_saturation_into_a_finite_bound() {
+        let base = scene(&[], false);
+        let pose = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let none = Default::default();
+        for (observed_ns, max_age_ns, checked_ns, expiry) in [
+            (u64::MAX - 100, 99, u64::MAX - 1, Some(u64::MAX - 1)),
+            (u64::MAX - 100, 100, u64::MAX, None),
+            (u64::MAX - 100, 101, u64::MAX, None),
+            (u64::MAX, 1, u64::MAX, None),
+            (u64::MAX, u64::MAX, u64::MAX, None),
+        ] {
+            let map = base.with_observations(Some(observation_grid(|cells| {
+                for evidence in cells.values_mut() { evidence.observed_ns = observed_ns; }
+            })));
+            let mut checker = map.observed_body_motion_checker_with_expiry(&none, max_age_ns, &[]);
+            assert_eq!(checker(pose, pose, checked_ns), Ok(expiry));
+            assert_observation_checker_matches(&map, &none, max_age_ns, &[], &[
+                (pose, pose, checked_ns), (pose, pose, u64::MAX),
+                (pose, pose, observed_ns.saturating_sub(50_000_001)),
+            ]);
+        }
+        let mixed = base.with_observations(Some(observation_grid(|cells| {
+            for evidence in cells.values_mut() { evidence.observed_ns = u64::MAX - 50; }
+            cells.get_mut(&[0, 0, 0]).unwrap().observed_ns = u64::MAX - 101;
+            cells.get_mut(&[1, 0, 0]).unwrap().observed_ns = u64::MAX - 100;
+        })));
+        let mut checker = mixed.observed_body_motion_checker_with_expiry(&none, 100, &[]);
+        assert_eq!(checker(pose, pose, u64::MAX - 1), Ok(Some(u64::MAX - 1)),
+            "有限单元仍约束混合了溢出和恰好 MAX 的成功扫掠");
+        let expired = checker(pose, pose, u64::MAX);
+        assert_eq!(expired, Err(SurfaceError::NearFieldObservation {
+            cell: [0, 0, 0], reason: "观察已过期", observed_ns: u64::MAX - 101,
+            checked_ns: u64::MAX,
+        }));
+        assert_eq!(expired.map(|_| ()), mixed.validate_observed_body_motion_in_boundary(
+            pose, pose, &none, u64::MAX, 100, &[]));
     }
 
     #[test]

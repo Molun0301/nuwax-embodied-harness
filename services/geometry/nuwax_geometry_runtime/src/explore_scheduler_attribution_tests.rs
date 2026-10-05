@@ -604,7 +604,7 @@ async fn run_matrix_case(fixture: Fixture, return_budget: bool) {
     assert!(matches!(stop.status, STATUS_STOPPING | STATUS_CANCELLED));
     finish_cancel_and_check_stale_proofs(&handle).await;
     pose.release();
-    scheduler.shutdown().await.unwrap();
+    settle_attribution_scheduler(&scheduler, &label).await;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -686,6 +686,57 @@ fn race_action(
     })
 }
 
+/// Mirror root settlement without erasing its sticky first-error result. This is
+/// diagnostic completion, not a claim that every production shutdown deadline met.
+async fn settle_attribution_scheduler(scheduler: &ExploreSchedulerHandle, label: &str) {
+    let started = Instant::now();
+    let mut attempts = Vec::new();
+    let mut attempt_count = 0usize;
+    let mut omitted_attempts = 0usize;
+    let mut sticky_error: Option<String> = None;
+    let mut unexpected: Option<String> = None;
+    let settled = tokio::time::timeout(WAIT_LIMIT, async {
+        loop {
+            let attempt_started = Instant::now();
+            let outcome = scheduler.shutdown_with_settlement().await;
+            let producers_settled = outcome.producers_settled();
+            let result = outcome.into_result();
+            if let Err(error) = &result {
+                sticky_error.get_or_insert_with(|| error.clone());
+                if !error.contains("exploration compute owner settlement timed out; original worker and driver remain supervised") {
+                    unexpected.get_or_insert_with(|| error.clone());
+                }
+            }
+            attempt_count += 1;
+            if attempts.len() < 512 {
+                attempts.push(serde_json::json!({"attempt":attempt_count,
+                    "elapsed_ms":ms(attempt_started.elapsed()),"producers_settled":producers_settled,
+                    "error":result.as_ref().err()}));
+            } else {
+                omitted_attempts += 1;
+            }
+            if producers_settled { break result; }
+            tokio::task::yield_now().await;
+        }
+    }).await;
+    eprintln!(
+        "EXPLORE_ATTRIBUTION {}",
+        serde_json::json!({"kind":"scheduler_shutdown_settlement",
+        "label":label,"attempts":attempts,"attempt_count":attempt_count,
+        "omitted_attempts":omitted_attempts,"watchdog_expired":settled.is_err(),
+        "total_settlement_ms":ms(started.elapsed()),
+        "root_equivalent_error":sticky_error,
+        "final_attempt_error":settled.as_ref().ok().and_then(|result| result.as_ref().err()),
+        "test_settlement_deadline_ms":ms(SCHEDULER_SHUTDOWN_TIMEOUT)})
+    );
+    assert!(
+        unexpected.is_none(),
+        "unexpected shutdown error after cleanup: {unexpected:?}"
+    );
+    settled.expect("retained scheduler did not settle within diagnostic watchdog")
+        .expect("final retained owner settlement must be clean");
+}
+
 async fn run_interference_case(target: Stage, action: Action, lane: ControlLane) {
     let label = format!("attribute-interference-{target:?}-{action:?}-{lane:?}");
     let (handle, sink, trace) = start_case(&label, Fixture::FrontierBorderDerivative, true).await;
@@ -714,7 +765,7 @@ async fn run_interference_case(target: Stage, action: Action, lane: ControlLane)
         );
     // Drain real compute before inspecting final dispatch/cancellation outcomes.
     pose.release();
-    scheduler.shutdown().await.unwrap();
+    settle_attribution_scheduler(&scheduler, &label).await;
     done.store(true, Ordering::Release);
     let (beats, omitted) = pulse.await.unwrap();
     let (records, dropped) = trace.snapshot();
@@ -733,6 +784,7 @@ async fn run_interference_case(target: Stage, action: Action, lane: ControlLane)
         serde_json::json!({"kind":"concurrent_request","action":format!("{action:?}"),"lane":format!("{lane:?}"),
         "target":format!("{target:?}"),"runtime_flavor":"current_thread","scheduler_workers":1,"compute_workers":1,
         "independent_control_workers":usize::from(matches!(lane,ControlLane::IndependentControlRuntime)),
+        "heartbeat_samples_include_shutdown_cleanup":true,
         "request":call.json(&records),"requested_during_target_stage":submitted_in_target,"first_polled_during_target_stage":control_polled_in_target,
         "finished_during_target_stage":control_finished_in_target,"stage_records":stage_json(&records),
         "heartbeat_max_actual_gap_ms":beats.iter().map(|b|ms(b.actual.duration_since(b.previous))).fold(0.0,f64::max),"heartbeat_omitted":omitted})

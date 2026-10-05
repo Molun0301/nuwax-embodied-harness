@@ -73,17 +73,58 @@ impl WeakRuntimeContext {
         reason: ExplorationStopReason,
         message: String,
     ) -> Result<(), String> {
+        if inner
+            .compute
+            .control_stop
+            .as_ref()
+            .is_some_and(|record| record.desired.serial == ControlSerial::Exhausted)
+        {
+            return Ok(()); // Exact terminal action already retained; allocate nothing.
+        }
         let generation = self
             .generation
             .upgrade()
             .ok_or("exploration runtime generation owner unavailable")?;
-        let next = generation
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-                value.checked_add(1)
-            })
-            .map_err(|_| "exploration generation exhausted".to_string())?
-            + 1;
-        let serial = inner.compute.next_lifecycle()?;
+        let identifiers = (|| {
+            let next = generation
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| "exploration generation exhausted".to_string())?
+                + 1;
+            Ok::<_, String>((
+                next,
+                ControlSerial::Counted(inner.compute.next_lifecycle()?),
+            ))
+        })();
+        let (next, serial, reason, message) = match identifiers {
+            Ok((next, serial)) => (next, serial, reason, message),
+            Err(error) => {
+                // No new session can ever be admitted after exhaustion. Retain one
+                // distinct terminal token, never wrap or reuse a counted action ID.
+                inner.compute.fault.get_or_insert(error.clone());
+                inner.logical_active = false;
+                inner.compute.start_reservation = None;
+                inner.compute.start_abandoned = None;
+                if let Some(owner) = &inner.compute.owner {
+                    owner.stop_admission();
+                }
+                if inner
+                    .compute
+                    .control_stop
+                    .as_ref()
+                    .is_some_and(|record| record.desired.serial == ControlSerial::Exhausted)
+                {
+                    return Ok(()); // Join the exact already retained terminal action.
+                }
+                (
+                    generation.load(Ordering::SeqCst),
+                    ControlSerial::Exhausted,
+                    ExplorationStopReason::ConsecutiveFailuresExceeded,
+                    format!("{error}; {message}"),
+                )
+            }
+        };
         let action = ComputeStopAction {
             serial,
             generation: next,
@@ -112,9 +153,15 @@ impl WeakRuntimeContext {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlSerial {
+    Counted(u64),
+    Exhausted,
+}
+
 #[derive(Clone)]
 pub(super) struct ComputeStopAction {
-    serial: u64,
+    serial: ControlSerial,
     pub generation: u64,
     pub parent: String,
     pub session_generation: u64,
@@ -136,8 +183,8 @@ impl ComputeStopAction {
 }
 struct ComputeControlRecord {
     desired: ComputeStopAction,
-    running: Option<u64>,
-    settled: Option<u64>,
+    running: Option<ControlSerial>,
+    settled: Option<ControlSerial>,
 }
 impl ComputeControlRecord {
     fn pending(&self) -> bool {
@@ -168,6 +215,9 @@ impl ComputeService {
         runtime: &ExploreRuntimeHandle,
         state: &mut ComputeState,
     ) -> Result<(), String> {
+        if state.shutdown {
+            return Err("exploration compute service is shut down".into());
+        }
         if let Some(error) = &state.fault {
             return Err(error.clone());
         }
@@ -245,7 +295,6 @@ pub(super) struct ComputeBasis {
     committed_map: Option<schema::CommittedMapIdentity>,
     input: ComputeInput,
     pose_receipt: u64,
-    sampled_instant: Instant,
     return_on_completion: bool,
     mission_present: bool,
     no_frontier_timeout: Duration,
@@ -310,6 +359,7 @@ fn input_frame(inner: &ExploreRuntimeInner) -> i64 {
 }
 
 pub(super) struct JobRecord {
+    terminal_action: Option<ControlSerial>,
     id: exchange::Id,
     basis: ComputeBasis,
     abandoned: Arc<AtomicBool>,
@@ -337,9 +387,6 @@ impl Drop for JobTicket {
     }
 }
 impl JobTicket {
-    pub(super) fn sampled_instant(&self) -> Instant {
-        self.basis.sampled_instant
-    }
     pub(super) fn current(&self, inner: &ExploreRuntimeInner) -> bool {
         self.basis.current(inner)
     }
@@ -512,6 +559,10 @@ impl Default for ComputeState {
 }
 impl ComputeState {
     #[cfg(test)]
+    pub(super) fn lifecycle_counter_for_tests(&self) -> u64 {
+        self.lifecycle_sequence
+    }
+    #[cfg(test)]
     pub(super) fn status(&self) -> Option<exchange::Status> {
         self.owner.as_ref().map(Owner::status)
     }
@@ -558,6 +609,9 @@ impl ExploreRuntimeInner {
         if let Some(owner) = &self.compute.owner {
             owner.stop_admission();
         }
+        if self.compute.shutdown || self.compute.owner.is_none() {
+            return; // Final closure cannot admit a new lifecycle against an exited owner.
+        }
         match self.compute.next_lifecycle() {
             Ok(sequence) => self.compute.desired_stop = Some((sequence, reason)),
             Err(error) => self.compute.fault = Some(error),
@@ -576,6 +630,30 @@ impl Drop for StartTicket {
     }
 }
 impl ExploreRuntimeHandle {
+    #[cfg(test)]
+    pub(super) async fn inject_compute_control_stop_for_tests(
+        &self,
+        generation_exhausted: bool,
+        lifecycle_exhausted: bool,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().await;
+        if generation_exhausted {
+            self.generation.store(u64::MAX, Ordering::SeqCst);
+        }
+        if lifecycle_exhausted {
+            inner.compute.lifecycle_sequence = u64::MAX;
+        }
+        WeakRuntimeContext::capture(self).retain_stop(
+            &mut inner,
+            ExplorationStopReason::ConsecutiveFailuresExceeded,
+            "injected counter-boundary control stop".into(),
+        )?;
+        drop(inner);
+        self.compute_service.wake.notify_one();
+        self.compute_service.changed.notify_waiters();
+        Ok(())
+    }
+
     pub(super) fn capture_compute_context(
         &self,
         inner: &ExploreRuntimeInner,
@@ -674,7 +752,6 @@ impl ExploreRuntimeHandle {
             committed_map: inner.committed_map.clone(),
             input: context.input.clone(),
             pose_receipt: pose.received_monotonic_ns,
-            sampled_instant: Instant::now(),
             return_on_completion: context.config.return_policy.return_on_completion,
             mission_present: matches!(
                 &request,
@@ -695,6 +772,7 @@ impl ExploreRuntimeHandle {
         let id = owner.submit(request).map_err(|error| error.to_string())?;
         let abandoned = Arc::new(AtomicBool::new(false));
         inner.compute.job = Some(JobRecord {
+            terminal_action: None,
             id,
             basis: basis.clone(),
             abandoned: abandoned.clone(),
@@ -735,7 +813,18 @@ impl ExploreRuntimeHandle {
                     .filter(|job| job.id == ticket.id)
                     .ok_or("exploration compute transaction retired")?;
                 if let Some(result) = &job.result {
-                    return result.clone();
+                    let waiting_for_exact_terminal = job.terminal_action.is_some_and(|serial| {
+                        guard.compute.control_stop.as_ref().is_some_and(|record| {
+                            record.desired.serial == serial
+                                && record.desired.generation == guard.generation
+                                && record.desired.parent == guard.last_request_id
+                                && record.desired.session_generation == guard.session_generation
+                                && record.settled != Some(serial)
+                        })
+                    });
+                    if !waiting_for_exact_terminal {
+                        return result.clone();
+                    }
                 }
             }
             notified.await;
@@ -1124,15 +1213,20 @@ impl ExploreRuntimeHandle {
         self.open_compute_locked(&mut guard)
     }
     pub(super) async fn request_compute_shutdown(&self) {
-        {
+        let ownerless = {
             let mut guard = self.inner.lock().await;
-            if guard.compute.owner.is_none() {
-                return;
+            if !guard.compute.shutdown {
+                // Admit the one final Stop before closing the lifecycle gate.
+                guard.request_compute_stop(ExplorationStopReason::UserCancelled);
+                guard.compute.shutdown = true;
             }
-            guard.request_compute_stop(ExplorationStopReason::UserCancelled);
-            guard.compute.shutdown = true;
-            self.compute_service.wake.notify_one();
+            guard.compute.owner.is_none()
+        };
+        if ownerless {
+            self.compute_service.terminal.send_replace(Some(Ok(())));
         }
+        self.compute_service.wake.notify_one();
+        self.compute_service.changed.notify_waiters();
     }
 }
 
@@ -1572,9 +1666,14 @@ fn drain_locked(
         }
         let output = job.result.as_ref()?.as_ref().ok()?.clone();
         job.output_bookkept = true;
-        Some((job.basis.clone(), output))
+        Some((job.id, job.basis.clone(), output))
     });
-    if let Some((basis, output)) = accepted_output {
+    if let Some((job_id, basis, output)) = accepted_output {
+        let previous_control = inner
+            .compute
+            .control_stop
+            .as_ref()
+            .map(|record| record.desired.serial);
         // Accept is immutable. A later soft source refresh does not undo source
         // end/history; only a newer outer session/lifecycle supersedes this work.
         if inner.logical_active
@@ -1617,8 +1716,7 @@ fn drain_locked(
                         }
                         Ok(ExplorationPoll::NoFrontier) => {
                             inner.last_poll = Some(ExplorationPoll::NoFrontier);
-                            let first =
-                                *inner.no_frontier_since.get_or_insert(basis.sampled_instant);
+                            let first = *inner.no_frontier_since.get_or_insert_with(Instant::now);
                             if first.elapsed() >= basis.no_frontier_timeout {
                                 if basis.return_on_completion && basis.mission_present {
                                     inner.return_reason =
@@ -1647,6 +1745,16 @@ fn drain_locked(
                         Ok(ExplorationPoll::Goal(_)) => {}
                     }
                 }
+            }
+        }
+        let current_control = inner
+            .compute
+            .control_stop
+            .as_ref()
+            .map(|record| record.desired.serial);
+        if current_control != previous_control {
+            if let Some(job) = inner.compute.job.as_mut().filter(|job| job.id == job_id) {
+                job.terminal_action = current_control;
             }
         }
     }

@@ -3650,7 +3650,6 @@ impl ExploreRuntimeHandle {
             Ok(ticket) => ticket,
             Err(error) => { let snapshot = guard.snapshot(STATUS_PENDING, error); drop(guard); return self.store_snapshot(snapshot); }
         };
-        let sampled_instant = selection_ticket.sampled_instant();
         drop(guard);
         let finalized = self.await_compute(&selection_ticket).await;
         guard = self.inner.lock().await;
@@ -3817,31 +3816,13 @@ impl ExploreRuntimeHandle {
             }
             Ok(ExplorationPoll::NoFrontier) => {
                 selection_ticket.finish(&mut guard);
-                let first_no_frontier = *guard.no_frontier_since.get_or_insert(sampled_instant);
-                guard.last_poll = Some(ExplorationPoll::NoFrontier);
-                let limit_ms = guard
-                    .active_config
-                    .as_ref()
-                    .and_then(|config| config.stop_conditions.no_frontier_timeout_ms)
-                    .unwrap_or(DEFAULT_NO_FRONTIER_STABILITY.as_millis() as u64);
-                if first_no_frontier.elapsed() >= Duration::from_millis(limit_ms) {
-                    if mission_policy.return_on_completion && guard.mission.is_some() {
-                        guard.return_reason=Some(ExplorationStopReason::NoFrontierTimeout);
-                        guard.mission.as_mut().expect("已检查进度").returning=true;
-                        let snapshot=guard.snapshot(STATUS_PENDING,"探索前沿已稳定结束，准备返航");
-                        drop(guard);self.publish_frontiers(frontier_update);return self.store_snapshot(snapshot);
-                    }
-                    drop(guard);
-                    self.publish_frontiers(frontier_update);
-                    return self
-                        .finish_session(
-                            None,
-                            ExplorationStopReason::NoFrontierTimeout,
-                            "no frontier timeout reached".to_string(),
-                        )
-                        .await;
-                }
-                let snapshot = guard.snapshot(STATUS_PENDING, "no frontier available yet");
+                // The retained driver decided the stability timeout exactly once
+                // at committed-result delivery, even if this waiter was delayed.
+                let message = if guard.return_reason == Some(ExplorationStopReason::NoFrontierTimeout)
+                    && guard.mission.as_ref().is_some_and(|progress| progress.returning) {
+                    "探索前沿已稳定结束，准备返航"
+                } else { "no frontier available yet" };
+                let snapshot = guard.snapshot(STATUS_PENDING, message);
                 drop(guard);
                 self.publish_frontiers(frontier_update);
                 self.store_snapshot(snapshot)
@@ -8447,6 +8428,7 @@ mod tests {
     }
 
     include!("explore_compute_runtime_tests.rs");
+    include!("explore_compute_surface_tests.rs");
 
     // These fixtures never dispatch a goal or compute a legacy identity.
     async fn hashfree_checkpoint_fixture() -> (String, ExploreStartConfig) {

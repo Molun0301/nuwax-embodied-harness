@@ -159,3 +159,22 @@ Both stationary exact-input warm repeats have 120 plane-cache hits and zero miss
 Initial logs: `body-query-default-reference-v1.log`, `body-query-profiler-tests-v1.log` (seven tests), and `body-query-profiled-entry-v1.log` (one checkpoint). Domain construction and ordering are the next measured targets; the 62 current checks remain required.
 
 Final instrumentation qualification: feature-on MLS suite **228 passed / 3 ignored** (`body-query-profiled-mls-v1.log`), and a freshly compiled feature-off captured-entry probe **1 passed** (`body-query-feature-off-entry-v1.log`). The latter preserves the same command, progress and 62-check counts without the MLS profiling feature.
+
+## Ordered dense contact-domain emission
+
+The dense-domain builder now emits the completed BFS visited set in existing lexicographic grid order. Selection, seed ranking, directed connectivity, queue traversal and visited marking are unchanged. Point coordinates, low bounds and weights use the original arithmetic; every positive-weight visited point is retained. Sparse fallback and the consumer's existing sort/fit remain intact. This changes private emission order, not the actual sorted fitting input. No new map cache, permission, lock or sampling limit is introduced.
+
+The frozen pre-change dense reference compares complete sorted point tuples and fit outputs by raw bits, with exact error equality. Coverage includes twelve terrain patterns, both evidence models, layers/ties/directed steps, disconnected components, negative coordinates, zero/one-ULP weight edges, masked current-body views, the existing dense-capacity boundary and untouched sparse fallback. Six focused tests pass. Ordinary sparse/dense tests canonicalize their owned results for equality. The recorded benchmark canonicalizes copies, retaining its original unsorted vectors for measured sort/fit work.
+
+The same cold captured checkpoint retains its exact command/index/progress, 62 projection and sweep checks, 43 plane misses and 165,560 points:
+
+| Measured stage | Prior BFS emission | Ordered emission |
+|---|---:|---:|
+| Whole step | 412.04 ms | 363.16 ms |
+| Contact-domain collection | 193.94 ms | 207.56 ms |
+| Existing contact-point sort | 63.24 ms | 3.08 ms |
+| Contact-plane fit | 31.65 ms | 31.25 ms |
+
+The removed sorting work has a visible tradeoff: the new emission scans all slots in the existing dense allocation, even when few cells are reachable. The bounded microbenchmark uses independent query-cache owners and alternates old/new collection order, with pass 0 using fresh owners and later passes reusing those owners. Individual regressions remain in the log: a 289-point cold pair totals about 14.61→16.16 ms, and a 4,225-point second warm pair about 17.72→18.94 ms. Other pairs improve, but three rounds are too few and noisy for a universal benefit claim. The dense checkpoint pair is an observed debug measurement, not a controlled deployed-runtime percentage or a 20 Hz guarantee.
+
+Qualification so far: focused **6 passed / 1 ignored**, microbenchmark **1 passed**, captured profiled checkpoint **1 passed**, feature-on MLS **233 passed / 4 ignored**, ordinary feature-off runtime **156 passed / 43 ignored / 5 documented UDS exclusions**. Logs: `dense-order-differential-v1.log`, `dense-order-micro-v1.log`, `dense-order-profiled-entry-v1.log`, `dense-order-mls-v1.log`, `dense-order-runtime-v1.log`. Ordinary factory OFF/ON and held-planning checks also pass (`dense-order-factory-v1.log`, `dense-order-held-v1.log`). OFF reaches the configured goal in 21.70 s with 325 nonzero commands, 0.938528 m travel and position/yaw errors 0.061472 m / 0.132796 rad. ON takes 21.25 s with 315 nonzero commands, 0.854186 m travel and errors 0.145814 m / 0.143162 rad. Both retain the 0.15 m / 0.15 rad goal region and deliver zero negatives. Held planning produces six fresh held commands and later admission, zero negatives, 1.080557 m travel, and a sampled control maximum of 33.04 ms. These are backend-plus-ideal-plant checks in the debug build; no physical deployment or hard deadline is inferred.

@@ -1922,14 +1922,9 @@ impl SurfaceSnapshot {
         }
         let seed=seed.ok_or(SurfaceError::MissingSupport)?.0;
         let mut queue=VecDeque::from([seed]);let mut visited=vec![false;count];visited[seed]=true;
-        let mut points=Vec::new();
         while let Some(index)=queue.pop_front() {
             let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
             let band=selected[index].expect("只有已选真实带进入队列");
-            let point=[(f64::from(x)+0.5)*size,(f64::from(y)+0.5)*size,band[1]];
-            let distance2=(point[0]-origin[0]).powi(2)+(point[1]-origin[1]).powi(2);
-            let weight=(1.0-distance2/(radius*radius)).max(0.0).powi(2);
-            if weight>0.0 {points.push((point,band[0],weight));}
             for dx in -1..=1 {for dy in -1..=1 {
                 if dx==0&&dy==0 {continue;}
                 let(mut nx,mut ny)=(x,y);
@@ -1946,6 +1941,18 @@ impl SurfaceSnapshot {
                     break;
                 }
             }}
+        }
+        // 只改变私有输出顺序：仍仅发出原 BFS 访问过的真实列，点与权重算式不变。
+        // 网格按 X 再 Y 排列，让 body_contact_frame 保留的排序直接接收有序输入。
+        let mut points=Vec::new();
+        for (index,seen) in visited.into_iter().enumerate() {
+            if !seen {continue;}
+            let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
+            let band=selected[index].expect("只有已选真实带被访问");
+            let point=[(f64::from(x)+0.5)*size,(f64::from(y)+0.5)*size,band[1]];
+            let distance2=(point[0]-origin[0]).powi(2)+(point[1]-origin[1]).powi(2);
+            let weight=(1.0-distance2/(radius*radius)).max(0.0).powi(2);
+            if weight>0.0 {points.push((point,band[0],weight));}
         }
         Ok(points)
     }
@@ -3393,6 +3400,304 @@ mod tests {
         envelope.z_bounds_m=[-0.15,0.15];envelope.body_to_support_z_m=0.35;
         SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap()
             .with_observations(Some(Arc::new(observations)))
+    }
+
+
+    /// 私有域输出现在是字典序；实际拟合输入必须逐位保持原 BFS 经排序后的结果。
+    mod dense_contact_ordering {
+        use super::*;
+
+        type ContactPoint=([f64;3],f64,f64);
+
+        // 冻结变更前的稠密算法，不调用新的域构建器或共享遍历/发点实现。
+        fn reference_bfs(map:&SurfaceSnapshot,origin:[f64;3],radius:f64)
+            ->Result<Vec<([f64;3],f64,f64)>,SurfaceError> {
+            let observations=map.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
+            let model=map.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+            let size=f64::from(observations.size_m);
+            let enumeration=radius+std::f64::consts::SQRT_2*size;
+            let low:[i32;2]=std::array::from_fn(|i|((origin[i]-enumeration)/size).floor() as i32);
+            let high:[i32;2]=std::array::from_fn(|i|((origin[i]+enumeration)/size).floor() as i32);
+            let nx=i64::from(high[0])-i64::from(low[0])+1;
+            let ny=i64::from(high[1])-i64::from(low[1])+1;
+            // 仅限制局部稠密临时表的容量；特殊大域继续原稀疏算法，不改变许可或拟合域。
+            let Some(count)=nx.checked_mul(ny).filter(|n|nx>0&&ny>0&&*n<=16_384) else {
+                return map.fine_contact_domain_sparse(origin,radius);
+            };
+            let stride=ny as usize;let count=count as usize;
+            let mut in_domain=vec![false;count];
+            let mut bands=vec![None;count];
+            // 同一不可变来源的带缓存一次批量读取，避免每个实测细列分别取锁。
+            {
+                let cache=map.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+                for x in low[0]..=high[0] {for y in low[1]..=high[1] {
+                    let dx=(f64::from(x)+0.5)*size-origin[0];let dy=(f64::from(y)+0.5)*size-origin[1];
+                    if dx*dx+dy*dy>enumeration*enumeration {continue;}
+                    let index=(i64::from(x)-i64::from(low[0])) as usize*stride+(i64::from(y)-i64::from(low[1])) as usize;
+                    in_domain[index]=true;bands[index]=cache.fine_bands.get(&(x,y)).cloned();
+                }}
+            }
+            let distance=|band:[f64;2]|(band[0]-origin[2]).max(origin[2]-band[1]).max(0.0);
+            let mut selected=vec![None;count];let mut seed:Option<(usize,(i32,i32),[f64;4])>=None;
+            for (index,inside) in in_domain.iter().copied().enumerate() {
+                if !inside {continue;}
+                let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
+                let values=bands[index].take().unwrap_or_else(||map.fine_contact_bands(x,y));
+                let Some(&band)=values.iter().min_by(|a,b|distance(**a).total_cmp(&distance(**b))
+                    .then_with(||(a[1]-origin[2]).abs().total_cmp(&(b[1]-origin[2]).abs()))
+                    .then_with(||a[1].total_cmp(&b[1]))) else {continue;};
+                selected[index]=Some(band);let rise=band[1]-origin[2];
+                if rise>model.max_step_up_m+size+1e-6 || -rise>model.max_step_down_m+size+1e-6 {continue;}
+                let dx=(f64::from(x)+0.5)*size-origin[0];let dy=(f64::from(y)+0.5)*size-origin[1];
+                let rank=[dx*dx+dy*dy,distance(band),rise.abs(),band[1]];
+                let earlier=seed.as_ref().is_none_or(|&(_,old,previous)| {
+                    rank.iter().zip(previous).map(|(a,b)|a.total_cmp(&b)).find(|v|!v.is_eq())
+                        .unwrap_or_else(||(x,y).cmp(&old)).is_lt()
+                });
+                if earlier {seed=Some((index,(x,y),rank));}
+            }
+            let seed=seed.ok_or(SurfaceError::MissingSupport)?.0;
+            let mut queue=VecDeque::from([seed]);let mut visited=vec![false;count];visited[seed]=true;
+            let mut points=Vec::new();
+            while let Some(index)=queue.pop_front() {
+                let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
+                let band=selected[index].expect("只有已选真实带进入队列");
+                let point=[(f64::from(x)+0.5)*size,(f64::from(y)+0.5)*size,band[1]];
+                let distance2=(point[0]-origin[0]).powi(2)+(point[1]-origin[1]).powi(2);
+                let weight=(1.0-distance2/(radius*radius)).max(0.0).powi(2);
+                if weight>0.0 {points.push((point,band[0],weight));}
+                for dx in -1..=1 {for dy in -1..=1 {
+                    if dx==0&&dy==0 {continue;}
+                    let(mut nx,mut ny)=(x,y);
+                    loop {
+                        let(Some(next_x),Some(next_y))=(nx.checked_add(dx),ny.checked_add(dy)) else {break;};
+                        nx=next_x;ny=next_y;
+                        if nx<low[0]||nx>high[0]||ny<low[1]||ny>high[1] {break;}
+                        let next_index=(i64::from(nx)-i64::from(low[0])) as usize*stride+(i64::from(ny)-i64::from(low[1])) as usize;
+                        if !in_domain[next_index] {break;}
+                        let Some(next)=selected[next_index] else {continue;};
+                        let rise=next[1]-band[1];
+                        if rise<=model.max_step_up_m+size+1e-6 && -rise<=model.max_step_down_m+size+1e-6
+                            && !visited[next_index] {visited[next_index]=true;queue.push_back(next_index);}
+                        break;
+                    }
+                }}
+            }
+            Ok(points)
+        }
+        fn sort(points:&mut [ContactPoint]) {
+            points.sort_by(|a,b|a.0[0].total_cmp(&b.0[0]).then_with(||a.0[1].total_cmp(&b.0[1])));
+        }
+
+        fn point_bits(point:&ContactPoint)->[u64;5] {
+            [point.0[0],point.0[1],point.0[2],point.1,point.2].map(f64::to_bits)
+        }
+
+        fn plane_bits(plane:Option<(f64,f64,f64)>)->Option<[u64;3]> {
+            plane.map(|(a,b,z)|[a,b,z].map(f64::to_bits))
+        }
+
+        fn compare(map:&SurfaceSnapshot,keys:&std::collections::BTreeSet<[i32;3]>,
+            origin:[f64;3],radius:f64)->Result<Vec<ContactPoint>,SurfaceError> {
+            let expected=reference_bfs(map,origin,radius);
+            let actual=map.fine_contact_domain(origin,radius);
+            match (expected,actual) {
+                (Ok(mut expected),Ok(mut actual))=> {
+                    assert_eq!(expected.len(),actual.len(),"point count: {origin:?}, {radius}");
+                    assert!(actual.windows(2).all(|pair|pair[0].0[0].total_cmp(&pair[1].0[0])
+                        .then_with(||pair[0].0[1].total_cmp(&pair[1].0[1])).is_lt()),
+                        "dense output must be strictly XY ordered, without duplicate columns");
+                    sort(&mut expected);sort(&mut actual);
+                    assert_eq!(expected.iter().map(point_bits).collect::<Vec<_>>(),
+                        actual.iter().map(point_bits).collect::<Vec<_>>(),"exact input: {origin:?}, {radius}");
+                    assert_eq!(plane_bits(fit_contact_plane(&expected,origin)),
+                        plane_bits(fit_contact_plane(&actual,origin)),"exact fit: {origin:?}, {radius}");
+                    let size=f64::from(map.observations.as_ref().unwrap().size_m);
+                    for &(point,low,weight) in &actual {
+                        let x=(point[0]/size).floor() as i32;let y=(point[1]/size).floor() as i32;
+                        let top=(point[2]/size).round() as i32-1;
+                        assert!(keys.contains(&[x,y,top]),"emitted top must be observed");
+                        assert!(!keys.contains(&[x,y,top+1]),"emitted top must terminate a real band");
+                        let mut bottom=top;
+                        while keys.contains(&[x,y,bottom-1]) {bottom-=1;}
+                        let expected_low=if map.ground_evidence==GroundEvidence::OccupiedVolume {top}else{bottom};
+                        assert_eq!(point.map(f64::to_bits),[(f64::from(x)+0.5)*size,
+                            (f64::from(y)+0.5)*size,(f64::from(top)+1.0)*size].map(f64::to_bits));
+                        assert_eq!(low.to_bits(),((f64::from(expected_low)+1.0)*size).to_bits());
+                        let distance2=(point[0]-origin[0]).powi(2)+(point[1]-origin[1]).powi(2);
+                        assert_eq!(weight.to_bits(),(1.0-distance2/(radius*radius)).max(0.0).powi(2).to_bits());
+                        assert!(weight>0.0,"no zero-weight or synthetic support");
+                    }
+                    Ok(actual)
+                },
+                (Err(expected),Err(actual))=> {assert_eq!(expected,actual);Err(actual)},
+                (expected,actual)=>panic!("domain result changed at {origin:?}, {radius}: {expected:?} / {actual:?}"),
+            }
+        }
+
+        fn make(keys:Vec<[i32;3]>)->(SurfaceSnapshot,std::collections::BTreeSet<[i32;3]>) {
+            let mut envelope=model();envelope.max_step_up_m=0.15;envelope.max_step_down_m=0.1;
+            let observed=keys.iter().copied().collect();
+            (sparse_contact_scene(keys,envelope),observed)
+        }
+
+        #[test]
+        fn exact_sorted_points_and_fits_match_frozen_dense_bfs_matrix() {
+            let grid=|levels:fn(i32,i32)->Vec<i32>|->Vec<[i32;3]> {
+                (-10_i32..=10).flat_map(|x|(-10_i32..=10).flat_map(move |y|
+                    levels(x,y).into_iter().map(move |z|[x,y,z]))).collect()
+            };
+            let scenes=[
+                ("flat",grid(|_,_|vec![-1])),
+                ("quantized slope",grid(|x,y|vec![(x+2*y).div_euclid(4)-1])),
+                ("gaps",grid(|x,y|if (x+y).rem_euclid(5)==0 || (x==1&&y<5) {vec![]}else{vec![-1]})),
+                ("directed steps",grid(|x,_|vec![if x<0 {-1}else{3}])),
+                ("blocking wall",grid(|x,_|if x==0 {(-1..15).collect()}else{vec![-1]})),
+                ("separate layers",grid(|_,_|vec![-1,19])),
+                ("overlapping height intervals",grid(|x,y|((x+y).rem_euclid(3)-4..=(x-y).rem_euclid(3)).collect())),
+                ("equal band distances",grid(|_,_|vec![-3,1])),
+                ("nearest high band cannot seed",grid(|_,_|std::iter::once(-3).chain(-1..8).collect())),
+                ("disconnected islands",vec![[-4,-4,-1],[-4,-3,-1],[-3,-4,-1],[4,1,-1],[4,2,-1],[5,1,-1]]),
+                ("diagonal rank loss",(-10..=10).map(|i|[i,i,-1]).collect()),
+                ("single column rank loss",(-10..=10).map(|y|[0,y,-1]).collect()),
+            ];
+            let fine=f64::from(0.05_f32);
+            let edge=2.0_f64.sqrt()*fine*0.5;
+            let radii=[fine*0.25,f64::from_bits(edge.to_bits()-1),edge,
+                f64::from_bits(edge.to_bits()+1),0.3,0.55];
+            let origins=[[0.0,0.0,0.0],[-1.5*fine,0.5*fine,0.0],[1.5*fine,0.5*fine,4.0*fine],
+                [-3.5*fine,-3.5*fine,0.0],[-0.173,-0.117,-0.1],[0.0,0.0,20.0*fine],[0.0,0.0,2.0]];
+            let (mut successful,mut rejected,mut fitted,mut degenerate)=(0,0,0,0);
+            for (name,keys) in scenes {
+                let (base,observed)=make(keys);
+                for evidence in [GroundEvidence::MeasuredSurface,GroundEvidence::OccupiedVolume] {
+                    let map=base.clone().with_ground_evidence(evidence);
+                    for origin in origins {for radius in radii {
+                        let result=compare(&map,&observed,origin,radius);
+                        // Both variants share the unchanged snapshot; the reference runs first and warms its cache.
+                        let repeated=compare(&map,&observed,origin,radius);
+                        assert_eq!(result.as_ref().map(|v|v.iter().map(point_bits).collect::<Vec<_>>()),
+                            repeated.as_ref().map(|v|v.iter().map(point_bits).collect::<Vec<_>>()),"{name}, {evidence:?}");
+                        match result {
+                            Ok(points)=> {successful+=1;if fit_contact_plane(&points,origin).is_some() {fitted+=1;}else{degenerate+=1;}},
+                            Err(SurfaceError::MissingSupport)=>rejected+=1,
+                            Err(error)=>panic!("unexpected {name} error: {error:?}"),
+                        }
+                    }}
+                }
+            }
+            assert!(successful>0 && rejected>0 && fitted>0 && degenerate>0);
+        }
+
+        #[test]
+        fn exact_membership_direction_ties_and_missing_support_are_retained() {
+            let fine=f64::from(0.05_f32);
+            let stairs=(-6..=6).flat_map(|x|(-6..=6).map(move |y|[x,y,if x<0 {-1}else{3}])).collect();
+            let (map,keys)=make(stairs);
+            let up=compare(&map,&keys,[-1.5*fine,0.5*fine,0.0],0.3).unwrap();
+            assert!(up.iter().any(|p|p.0[0]>0.0));
+            let down=compare(&map,&keys,[1.5*fine,0.5*fine,4.0*fine],0.3).unwrap();
+            assert!(down.iter().all(|p|p.0[0]>0.0));
+            let (islands,keys)=make(vec![[-4,-4,-1],[-4,-3,-1],[-3,-4,-1],[4,1,-1],[4,2,-1],[5,1,-1]]);
+            let points=compare(&islands,&keys,[-3.5*fine,-3.5*fine,0.0],0.6).unwrap();
+            assert_eq!(points.len(),3);assert!(points.iter().all(|p|p.0[0]<0.0));
+            let tied=(-3..=3).flat_map(|x|(-3..=3).flat_map(move |y|[-3,1].map(|z|[x,y,z]))).collect();
+            let (ties,keys)=make(tied);
+            assert!(compare(&ties,&keys,[0.0;3],0.3).unwrap().iter().all(|p|p.0[2]<0.0));
+            assert_eq!(compare(&ties,&keys,[0.0,0.0,4.0],0.3),Err(SurfaceError::MissingSupport));
+            let missing=ties.with_observations(None);
+            assert_eq!(reference_bfs(&missing,[0.0;3],0.3),Err(SurfaceError::MissingSupport));
+            assert_eq!(missing.fine_contact_domain([0.0;3],0.3),Err(SurfaceError::MissingSupport));
+            let no_model=SurfaceSnapshot::from_points(&[(0.025,0.025,-0.025)],ties.config().clone(),0.05)
+                .unwrap().with_observations(ties.observations.clone());
+            assert_eq!(reference_bfs(&no_model,[0.0;3],0.3),Err(SurfaceError::InvalidPose));
+            assert_eq!(no_model.fine_contact_domain([0.0;3],0.3),Err(SurfaceError::InvalidPose));
+        }
+
+        #[test]
+        fn masked_current_view_never_emits_inferred_support() {
+            let mut keys:Vec<_>=(-10_i32..=10).flat_map(|x|(-10_i32..=10)
+                .filter(move |y|x.abs()>=2 || y.abs()>=2).map(move |y|[x,y,-1])).collect();
+            keys.push([0,0,6]); // A body echo forces a real private clearing view around the gap.
+            let (base,keys)=make(keys);
+            for evidence in [GroundEvidence::MeasuredSurface,GroundEvidence::OccupiedVolume] {
+                let map=base.clone().with_ground_evidence(evidence);
+                let view=map.with_current_body_support([0.0,0.0,0.35],[0.0,0.0,0.0,1.0]).unwrap();
+                assert!(view.current_body_support.is_some());
+                for origin in [[0.0;3],[-0.075,-0.025,0.0],[0.1,0.075,0.0]] {
+                    let original=compare(&map,&keys,origin,0.3).unwrap();
+                    let masked=compare(&view,&keys,origin,0.3).unwrap();
+                    assert_eq!(original.iter().map(point_bits).collect::<Vec<_>>(),
+                        masked.iter().map(point_bits).collect::<Vec<_>>());
+                }
+            }
+        }
+
+        #[test]
+        fn dense_limit_keeps_isolated_seed_and_sparse_in_dense_membership() {
+            let fine=f64::from(0.05_f32);let origin=[0.5*fine,0.5*fine,0.0];
+            let radius=(63.5-std::f64::consts::SQRT_2)*fine;
+            let enumeration=radius+std::f64::consts::SQRT_2*fine;
+            let low=((origin[0]-enumeration)/fine).floor() as i32;
+            let high=((origin[0]+enumeration)/fine).floor() as i32;
+            assert_eq!((high-low+1).pow(2),16_384,"exercise the unchanged dense capacity boundary");
+            for keys in [vec![[0,0,-1]],vec![[0,0,-1],[-4,0,-1],[0,4,-1],[4,4,-1]],
+                (-8..=8).flat_map(|x|(-8..=8).filter(move |y|(x+y)%3!=0).map(move |y|[x,y,-1])).collect()] {
+                let count=keys.len();let (map,observed)=make(keys);
+                assert_eq!(compare(&map,&observed,origin,radius).unwrap().len(),count);
+            }
+        }
+
+        #[test]
+        #[ignore = "bounded opt-in dense emission benchmark; reports collection, sort and fit separately"]
+        fn dense_order_reachable_fraction_microbenchmark() {
+            let fine=f64::from(0.05_f32);let origin=[0.5*fine,0.5*fine,0.0];
+            let radius=(63.5-std::f64::consts::SQRT_2)*fine;
+            for half in [0,2,8,32,63] {
+                let keys=(-half..=half).flat_map(|x|(-half..=half).map(move |y|[x,y,-1])).collect();
+                let (base,_)=make(keys);let old=base.fork_for_planning();let new=base.fork_for_planning();
+                for pass in 0..3 {
+                    // Independent caches; alternate collection order rather than always favoring one variant.
+                    let (mut expected,old_domain,mut actual,new_domain)=if pass%2==0 {
+                        let start=std::time::Instant::now();let expected=reference_bfs(&old,origin,radius).unwrap();
+                        let old_domain=start.elapsed();
+                        let start=std::time::Instant::now();let actual=new.fine_contact_domain(origin,radius).unwrap();
+                        (expected,old_domain,actual,start.elapsed())
+                    } else {
+                        let start=std::time::Instant::now();let actual=new.fine_contact_domain(origin,radius).unwrap();
+                        let new_domain=start.elapsed();
+                        let start=std::time::Instant::now();let expected=reference_bfs(&old,origin,radius).unwrap();
+                        (expected,start.elapsed(),actual,new_domain)
+                    };
+                    let start=std::time::Instant::now();sort(&mut expected);let old_sort=start.elapsed();
+                    let start=std::time::Instant::now();sort(&mut actual);let new_sort=start.elapsed();
+                    assert_eq!(expected.iter().map(point_bits).collect::<Vec<_>>(),actual.iter().map(point_bits).collect::<Vec<_>>());
+                    let start=std::time::Instant::now();let expected_plane=fit_contact_plane(&expected,origin);let old_fit=start.elapsed();
+                    let start=std::time::Instant::now();let actual_plane=fit_contact_plane(&actual,origin);let new_fit=start.elapsed();
+                    assert_eq!(plane_bits(expected_plane),plane_bits(actual_plane));
+                    eprintln!("half={half} pass={pass} points={} dense_slots=16384 old_domain={old_domain:?} new_domain={new_domain:?} old_sort={old_sort:?} new_sort={new_sort:?} old_fit={old_fit:?} new_fit={new_fit:?}",actual.len());
+                }
+            }
+        }
+
+        #[test]
+        fn radius_edges_keep_empty_degenerate_and_sparse_fallback_results() {
+            let fine=f64::from(0.05_f32);
+            let (map,keys)=make((-2..=2).flat_map(|x|(-2..=2).map(move |y|[x,y,-1])).collect());
+            let origin=[0.5*fine,0.5*fine,0.0];
+            assert!(compare(&map,&keys,origin,0.0).unwrap().is_empty());
+            assert_eq!(compare(&map,&keys,origin,fine*0.25).unwrap().len(),1);
+            for radius in [f64::from_bits(fine.to_bits()-1),fine,f64::from_bits(fine.to_bits()+1)] {
+                compare(&map,&keys,origin,radius).unwrap();
+            }
+            // This exceeds the existing dense-table limit; preserve the untouched sparse order too.
+            let radius=4.0;
+            let actual=map.fine_contact_domain(origin,radius).unwrap();
+            let sparse=map.fine_contact_domain_sparse(origin,radius).unwrap();
+            assert_eq!(actual.iter().map(point_bits).collect::<Vec<_>>(),
+                sparse.iter().map(point_bits).collect::<Vec<_>>());
+            assert_eq!(plane_bits(fit_contact_plane(&actual,origin)),plane_bits(fit_contact_plane(&sparse,origin)));
+        }
     }
 
     #[test]

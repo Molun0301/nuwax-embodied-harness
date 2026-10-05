@@ -1600,6 +1600,7 @@ impl SurfaceSnapshot {
         };
         #[cfg(feature = "body-query-profile")] let cells_profile=query_profile::guard(QueryStage::ObservationFootprintCells);
         let polygon_query=PolygonQuery::new(&polygon);
+        let mut observation_lookup=crate::surface::observations::ObservationBlockLookup::new(observations);
         #[cfg(feature = "body-query-profile")] let mut height_counts=ObservationHeightCounts::default();
         let mut cells = std::collections::BTreeSet::new();
         for x in min[0]..=max[0] {
@@ -1622,7 +1623,7 @@ impl SurfaceSnapshot {
                 #[cfg(feature = "body-query-profile")] {height_counts.columns+=1;}
                 let z = (bottom..=top).rev().find(|&z| {
                     #[cfg(feature = "body-query-profile")] {height_counts.probes+=1;}
-                    if observations.get([x,y,z]).is_none() {
+                    if observation_lookup.get([x,y,z]).is_none() {
                         #[cfg(feature = "body-query-profile")] {height_counts.absent+=1;}
                         return false;
                     }
@@ -1634,6 +1635,7 @@ impl SurfaceSnapshot {
                 cells.insert([x, y, z]);
             }
         }
+        drop(observation_lookup);
         #[cfg(feature = "body-query-profile")] drop(height_counts);
         drop(polygon_query);
         #[cfg(feature = "body-query-profile")] {
@@ -2680,7 +2682,7 @@ mod tests {
             pose, pose, &none, u64::MAX, 100, &[]));
     }
 
-    // Test-only full-footprint borrowed-block comparison; production lookup is unchanged.
+    // Frozen direct-lookup specialization and borrowed-lookup full-footprint comparator.
     fn measured_footprint_block_probe<const BORROWED:bool>(
         map: &SurfaceSnapshot, pose: ([f64; 3], [f64; 4]),
     ) -> Result<std::collections::BTreeSet<[i32; 3]>, SurfaceError> {
@@ -2689,7 +2691,7 @@ mod tests {
         if observations.size_m.to_bits() != map.source_voxel_size_m().to_bits() {
             return Err(SurfaceError::InvalidConfig("观察精度与几何来源不一致".into()));
         }
-        let mut block_probe=crate::surface::observations::BorrowedBlockProbe::new(observations);
+        let mut block_probe=crate::surface::observations::ObservationBlockLookup::new(observations);
         let model = map.body_envelope().ok_or(SurfaceError::InvalidPose)?;
         let centre = {
             #[cfg(feature = "body-query-profile")] let _support_profile=query_profile::guard(QueryStage::ObservationFootprintSupport);
@@ -2761,6 +2763,35 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_block_footprint_preserves_a_genuinely_derived_current_view() {
+        use std::collections::BTreeMap;
+        let mut groups=BTreeMap::<_,BTreeMap<_,_>>::new();
+        for x in -30_i32..30 {for y in -30_i32..30 {
+            if x==4&&y==0 {continue;}
+            let key=[x,y,0];groups.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,
+                SurfaceObservation{observed_ns:10_000_000_000,hits:2});
+        }}
+        let mut observations=SurfaceObservations::new(0.1,32).unwrap();
+        for (block,values) in groups{observations.replace_block(block,values).unwrap();}
+        let map=scene(&[],true).with_observations(Some(Arc::new(observations)));
+        let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+        assert!(map.validate_body_pose(pose.0,pose.1).is_err());
+        let view=map.with_current_body_support(pose.0,pose.1).unwrap();
+        assert!(view.current_body_support.is_some(),"must actually derive the current occupied view");
+        let expected=measured_footprint_block_probe::<false>(&view,pose).unwrap();
+        let actual=view.body_observation_footprint(pose).unwrap();
+        assert_eq!(actual,expected);
+        assert!(actual.contains(&[4,0,0]),"missing real evidence retains its fallback footprint key");
+        assert!(view.observations.as_ref().unwrap().get([4,0,0]).is_none(),"view must not fabricate evidence");
+        let occupied=std::collections::BTreeSet::new();
+        let raw=view.validate_observed_body_motion(pose,pose,&occupied,10_100_000_000,1_000_000_000);
+        assert!(matches!(raw,Err(SurfaceError::NearFieldObservation{cell:[4,0,0],..})),
+            "borrowed geometry lookup cannot authorize the unsupported cell: {raw:?}");
+        let mut checker=view.observed_body_motion_checker(&occupied,1_000_000_000,&[]);
+        assert_eq!(checker(pose,pose,10_100_000_000),raw);
+    }
+
+    #[test]
     fn full_footprint_block_probe_matches_direct_queries() {
         let mut successes=0;let mut failures=0;
         for size in [0.05,0.01] {for hole in [false,true] {
@@ -2785,7 +2816,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore="matched complete raw-footprint accessor prototype; production remains direct"]
+    #[ignore="matched complete raw-footprint direct versus borrowed accessor comparison"]
     fn benchmark_full_footprint_block_probe() {
         use std::{hint::black_box,time::Instant};
         for size in [0.05,0.01] {
@@ -2919,6 +2950,8 @@ mod tests {
             let expected=measured_footprint_level_selection::<false,false>(&map,&mut counts,pose);
             query_profile::begin();let actual=map.body_observation_footprint(pose);let record=query_profile::end();
             assert_eq!(actual,expected);assert!(actual.is_ok());
+            assert!(record.counters[QueryCounter::ObservationBlockRootResolutions as usize]>0);
+            assert!(record.counters[QueryCounter::ObservationBlockRootResolutions as usize]<=counts[1]);
             for (counter,count) in [QueryCounter::ObservationHeightColumns,QueryCounter::ObservationHeightProbes,QueryCounter::ObservationHeightAbsent].into_iter().zip(counts) {
                 assert_eq!(record.counters[counter as usize],count);
             }

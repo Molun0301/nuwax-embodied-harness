@@ -182,26 +182,33 @@ impl SurfaceObservations {
     }
 }
 
-// Measurement-only borrowed lookup; production SurfaceObservations::get is unchanged.
-#[cfg(test)]
-pub(super) struct BorrowedBlockProbe<'a> {
+// One borrowed block per lookup scope. Exact evidence stays owned by this immutable
+// observation root; the entry cannot be reused with a different owner and stores no permission.
+pub(super) struct ObservationBlockLookup<'a> {
     owner:&'a SurfaceObservations,
     last:Option<([i32;3],Option<&'a AHashMap<[i32;3],SurfaceObservation>>)>,
+    #[cfg(any(test,feature="body-query-profile"))]
     roots:u64,
 }
-#[cfg(test)]
-impl<'a> BorrowedBlockProbe<'a> {
-    pub(super) fn new(owner:&'a SurfaceObservations)->Self{Self{owner,last:None,roots:0}}
+impl<'a> ObservationBlockLookup<'a> {
+    pub(super) fn new(owner:&'a SurfaceObservations)->Self{Self{owner,last:None,#[cfg(any(test,feature="body-query-profile"))] roots:0}}
     pub(super) fn get(&mut self,key:[i32;3])->Option<SurfaceObservation> {
         let block=key.map(|v|v.div_euclid(self.owner.block_edge));
         if self.last.as_ref().is_none_or(|(old,_)|*old!=block) {
-            self.roots+=1;
+            #[cfg(any(test,feature="body-query-profile"))] {self.roots+=1;}
             self.last=Some((block,self.owner.blocks.get(&block).map(|values|values.as_ref())));
         }
         self.last.as_ref().and_then(|(_,values)|*values).and_then(|values|values.get(&key)).copied()
     }
 }
 
+
+#[cfg(feature="body-query-profile")]
+impl Drop for ObservationBlockLookup<'_> {
+    fn drop(&mut self) {
+        crate::body_query_profile::add(crate::body_query_profile::Counter::ObservationBlockRootResolutions,self.roots);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -223,7 +230,7 @@ mod tests {
         original.replace_block([0,0,0],BTreeMap::from([([0,0,0],SurfaceObservation{observed_ns:999,hits:7})])).unwrap();
         original.replace_block([-2,-1,-1],BTreeMap::new()).unwrap();
         for owner in [&retained,&metadata_only,&original] {
-            let mut probe=BorrowedBlockProbe::new(owner);
+            let mut probe=ObservationBlockLookup::new(owner);
             for _ in 0..3 {for key in [[-33,-1,-1],[-32,0,0],[-1,31,31],[0,0,0],[0,0,1],[0,0,2],[32,32,32],[64,0,0],[64,1,0],[0,0,0]] {
                 assert_eq!(probe.get(key),owner.get(key));
             }}
@@ -244,7 +251,7 @@ mod tests {
             for &key in &keys {groups.entry(key.map(|v|v.div_euclid(edge))).or_default().insert(key,
                 SurfaceObservation{observed_ns:123,hits:2});}
             for (block,values) in groups {owner.replace_block(block,values).unwrap();}
-            let mut probe=BorrowedBlockProbe::new(&owner);
+            let mut probe=ObservationBlockLookup::new(&owner);
             for key in keys.into_iter().chain([[7,7,7],[-7,-7,-7],[0,0,0]]) {
                 assert_eq!(probe.get(key),owner.get(key),"edge={edge} key={key:?}");
             }
@@ -252,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore="static lookup/set-construction attribution; production lookup is unchanged"]
+    #[ignore="static lookup/set-construction attribution; direct get remains available"]
     fn benchmark_observation_lookup_and_ordered_set_construction() {
         use std::{hint::black_box,time::Instant};
         let mut groups=BTreeMap::<_,BTreeMap<_,_>>::new();
@@ -266,13 +273,13 @@ mod tests {
         for (label,keys) in [("ordered_rectangle",&rectangle),("missing_keys_present_blocks",&absent_keys),
             ("missing_blocks",&absent_blocks),("alternating_far_blocks",&alternating)] {
             let expected:Vec<_>=keys.iter().map(|&k|owner.get(k)).collect();
-            let mut probe=BorrowedBlockProbe::new(&owner);let actual:Vec<_>=keys.iter().map(|&k|probe.get(k)).collect();
+            let mut probe=ObservationBlockLookup::new(&owner);let actual:Vec<_>=keys.iter().map(|&k|probe.get(k)).collect();
             assert_eq!(actual,expected);let roots=probe.roots;
             let mut direct_ms=Vec::new();let mut borrowed_ms=Vec::new();
             for round in 0..6 {for borrowed in if round%2==0{[false,true]}else{[true,false]} {
                 let started=Instant::now();
                 for _ in 0..100 {
-                    let mut probe=BorrowedBlockProbe::new(black_box(&owner));
+                    let mut probe=ObservationBlockLookup::new(black_box(&owner));
                     for (key,expected) in keys.iter().zip(&expected) {
                         let actual=if borrowed{probe.get(black_box(*key))}else{black_box(&owner).get(black_box(*key))};
                         assert_eq!(black_box(actual),*expected);

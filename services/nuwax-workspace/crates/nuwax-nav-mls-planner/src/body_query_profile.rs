@@ -180,11 +180,13 @@ pub enum Counter {
     ObservationHeightProbes,
     /// Height probes whose exact fine observation key is absent.
     ObservationHeightAbsent,
+    /// Persistent observation block-root lookups by short-lived borrowed accessors.
+    ObservationBlockRootResolutions,
 }
 
 impl Counter {
     /// Number of fixed counter categories.
-    pub const COUNT: usize = 21;
+    pub const COUNT: usize = 22;
     /// Every counter category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::PlaneCacheHits,
@@ -208,6 +210,7 @@ impl Counter {
         Self::ObservationHeightColumns,
         Self::ObservationHeightProbes,
         Self::ObservationHeightAbsent,
+        Self::ObservationBlockRootResolutions,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -234,6 +237,7 @@ impl Counter {
             Self::ObservationHeightColumns => "observation_height_columns",
             Self::ObservationHeightProbes => "observation_height_probes",
             Self::ObservationHeightAbsent => "observation_height_absent",
+            Self::ObservationBlockRootResolutions => "observation_block_root_resolutions",
 
         }
     }

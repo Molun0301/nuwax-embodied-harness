@@ -65,3 +65,37 @@ The bounded records retain the first 1,216 compute steps and omit 15 later steps
 There are 18,302 footprint-cache hits, 28,143 misses and 28,356,199 cells returned by successful raw builds. The evidence loop visits 44,840,929 cells but only 643,046 (about 1.43%) are non-exempt evidence checks. These are repeated encounters, not unique cells. Source inspection shows a BTreeSet membership search for each visited cell, making ordered set-difference iteration a justified next exact-equivalence experiment. The separate footprint loop also reconstructs PolygonQuery for every fine cell; hoisting that immutable query is a smaller independent candidate, not yet applied.
 
 Scopes are inclusive and not a complete additive partition: raw footprint stages include direct initial-footprint calls outside the checker; evidence timing excludes footprint construction but includes final aggregate counter updates; raw total includes local cleanup, while returned cell-set retirement/cache replacement occurs outside it. The same mixed build profile and timing perturbation caveats apply. No algorithm change or performance gain is claimed by this instrumentation checkpoint.
+
+## Ordered occupied-exemption difference
+
+The observed checker now borrows `cells.difference(occupied)` rather than searching the occupied BTreeSet once for every footprint cell. Both immutable sets use complete integer XYZ ordering, so the resulting non-exempt sequence and its first-error order are identical. Every evidence lookup, hit/future/age check and minimum-expiry update remains unchanged. The independent raw validator retains its original contains loop. This adds no permission cache, new allocation, hash or lock.
+
+Profiling meanings are explicit: `observation_input_cells` counts the full footprint cardinality presented to a callback, even if evidence later fails early. `observation_visited_cells` now counts difference outputs entering the evidence loop, not the old contains-loop visited prefix or the difference iterator's internal comparisons. Full geometry construction remains measured separately; fewer evidence-loop outputs do not mean fewer geometric samples.
+
+Validation:
+- `sorted-difference-parity-v1.log`: test-only ambiguous integer annotation compile error, retained
+- `sorted-difference-parity-v2.log`: exact XYZ/order, wrong-height exemption, separated multiple failures, finite/MAX expiry test passes
+- `sorted-difference-mls-all-v1.log`: 242 passed / 5 ignored
+- `sorted-difference-runtime-query-v1.log`: 22 passed, including selected replay/current-stop dependency parity
+- `sorted-difference-runtime-all-v1.log`: 182 passed / 45 ignored / five known UDS tests excluded
+- `sorted-difference-feature-off-check-v1.log`: default-feature runtime library check passes
+
+The static captured-clock microbenchmark (`sorted-difference-micro-v1.log`) compares identical evidence inputs with alternating order. Each value below is the median of five later rounds, in milliseconds per 100 iterations over 961 cells; the initial round follows untimed parity checks and is not claimed cold:
+
+| Exemption shape | Contains/filter | Difference |
+|---|---:|---:|
+| All exempt | 1.655 | .379 |
+| Near-complete overlap | 1.584 | .495 |
+| Half overlap | 3.047 | 2.113 |
+| Empty exemption | 3.357 | 3.519 |
+| Separated disjoint ranges | 3.503 | 3.262 |
+| Interleaved same-XY/different-Z | 4.659 | 3.693 |
+| Interleaved low overlap | 4.750 | 3.650 |
+
+The empty-exemption median regresses about 4.8%; one half-overlap difference round is 3.891 ms versus 3.197 ms for its paired reference. All raw rounds are retained. This is an MLS-opt3 static iterator/evidence microbenchmark, not a complete guard or live throughput result, and no universal speedup follows.
+
+The prepared full-coverage 1 cm OFF/ON runs now both reach the unchanged configured position-plus-final-yaw goals and complete every edge/receipt-tail oracle in 23.350/27.900 s, with 333 delivered nonzero commands each and zero delivered negatives or dispatch expiry observations. OFF ends with .065823 m position error and .137245 rad yaw error; ON with .149022 m/.128502 rad, within the original .15 m/.15 rad tolerances. However both tests in `sorted-difference-prepared-moving-v1.log` remain **FAILED** on the unchanged maximum 50 ms control-step criterion: maxima are 70.838/112.639 ms, medians 22.174/21.122 ms. Goal completion must not be mislabeled a complete timing pass.
+
+Observed evidence-loop medians are 8.435/8.544 ms and footprint-cell construction medians 9.994/10.076 ms. These whole runs traverse different later yaw states and finish earlier than the baseline, so their medians are not identical-work speedup ratios. The matched microbenchmark supports the iterator cost claim; moving runs establish functional progress with all checks retained. Guard/receipt state mismatch counts remain 216/212, preserving the delayed-activation caveat.
+
+Ordinary original-source 5 cm regressions pass: `sorted-difference-5cm-factory-v1.log` has both full goals, and `sorted-difference-5cm-held-v1.log` has six fresh held commands plus later admission, 213 moving receipts and 1.080909 m travel. All have zero delivered negatives/expiry observations and all oracles pass. Held current-step median/p95/max is 2.298/3.460/4.928 ms in this sampled mixed-profile run. The production build, hardware behavior and hard 20 Hz deadline remain unqualified. PolygonQuery hoisting is still a separate, unapplied candidate.

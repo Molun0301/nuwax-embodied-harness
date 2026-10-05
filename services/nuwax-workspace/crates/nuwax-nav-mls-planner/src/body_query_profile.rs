@@ -167,15 +167,18 @@ pub enum Counter {
     ObservationFootprintCacheMisses,
     /// Fine cells returned by successful raw footprint constructions, repeated encounters.
     ObservationFootprintCellsBuilt,
-    /// Cells visited by actual observed checker calls, including occupied exemptions.
+    /// Keys entering the evidence loop; ordered difference has already removed exemptions.
     ObservationVisitedCells,
     /// Non-exempt cells whose evidence is checked, including a failing last cell.
     ObservationCheckedCells,
+    /// Exact footprint cardinality supplied to each evidence callback, including
+    /// exempt cells and cells after a possible early evidence error.
+    ObservationInputCells,
 }
 
 impl Counter {
     /// Number of fixed counter categories.
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 18;
     /// Every counter category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::PlaneCacheHits,
@@ -195,6 +198,7 @@ impl Counter {
         Self::ObservationFootprintCellsBuilt,
         Self::ObservationVisitedCells,
         Self::ObservationCheckedCells,
+        Self::ObservationInputCells,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -217,6 +221,7 @@ impl Counter {
             Self::ObservationFootprintCellsBuilt => "observation_footprint_cells_built",
             Self::ObservationVisitedCells => "observation_visited_cells",
             Self::ObservationCheckedCells => "observation_checked_cells",
+            Self::ObservationInputCells => "observation_input_cells",
 
         }
     }

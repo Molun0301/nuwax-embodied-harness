@@ -1694,9 +1694,11 @@ impl SurfaceSnapshot {
                 let cells=footprints.cells(pose)?;
                 #[cfg(feature = "body-query-profile")] let _evidence_profile=query_profile::guard(QueryStage::ObservationEvidence);
                 #[cfg(feature = "body-query-profile")] let mut counts=ObservationEvidenceCounts::default();
-                for &cell in cells {
+                #[cfg(feature = "body-query-profile")] query_profile::add(QueryCounter::ObservationInputCells,cells.len() as u64);
+                // Both sets use exact integer-cell ordering. Difference yields
+                // precisely the old loop's non-exempt keys in the same order.
+                for &cell in cells.difference(occupied) {
                     #[cfg(feature = "body-query-profile")] {counts.visited+=1;}
-                    if occupied.contains(&cell) { continue; }
                     #[cfg(feature = "body-query-profile")] {counts.checked+=1;}
                     let evidence = observations.get(cell).unwrap_or(SurfaceObservation {observed_ns:0,hits:0});
                     let reason = if evidence.observed_ns == 0 {Some("缺少真实观察")}
@@ -2657,6 +2659,113 @@ mod tests {
             pose, pose, &none, u64::MAX, 100, &[]));
     }
 
+    #[test]
+    fn ordered_observation_difference_preserves_full_xyz_order_and_failure_dependencies() {
+        use std::collections::BTreeSet;
+        for count in [0,1,7,63,257] {
+            let cells:BTreeSet<_>=(0..count).map(|i|[i%17-8,i/17-8,i%3-1]).collect();
+            for mode in 0..5 {
+                let occupied:BTreeSet<_>=cells.iter().enumerate().filter_map(|(i,&cell)|match mode {
+                    0=>None,1=>Some(cell),2=>(i%2==0).then_some(cell),
+                    3=>Some([cell[0],cell[1],cell[2]+7]),_=>Some([cell[0]+100,cell[1],cell[2]]),
+                }).collect();
+                let old:Vec<_>=cells.iter().filter(|cell|!occupied.contains(*cell)).copied().collect();
+                let new:Vec<_>=cells.difference(&occupied).copied().collect();
+                assert_eq!(new,old,"fullXYZ ordered difference mode={mode} count={count}");
+            }
+        }
+        let base=scene(&[],false);let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+        let original=base.with_observations(Some(observation_grid(|_|{})));
+        let cells:Vec<_>=original.body_observation_footprint(pose).unwrap().into_iter().collect();
+        assert!(cells.len()>=3);
+        let map=base.with_observations(Some(observation_grid(|values| {
+            values.get_mut(&cells[0]).unwrap().hits=1;
+            values.get_mut(&cells[1]).unwrap().observed_ns=0;
+            values.get_mut(&cells[2]).unwrap().observed_ns=0;
+        })));
+        for occupied in [BTreeSet::from([cells[1]]),BTreeSet::from([cells[0],cells[1]])] {
+            let expected=map.validate_observed_body_motion_in_boundary(pose,pose,&occupied,10_500_000_000,1_000_000_000,&[]);
+            let mut checker=map.observed_body_motion_checker_with_expiry(&occupied,1_000_000_000,&[]);
+            assert_eq!(checker(pose,pose,10_500_000_000).map(|_|()),expected);
+            let first=if occupied.contains(&cells[0]) {cells[2]}else{cells[0]};
+            assert!(matches!(expected,Err(SurfaceError::NearFieldObservation{cell,..}) if cell==first));
+        }
+        let wrong_height:BTreeSet<_>=cells.iter().map(|cell|[cell[0],cell[1],cell[2]+1]).collect();
+        let mut checker=original.observed_body_motion_checker_with_expiry(&wrong_height,1_000_000_000,&[]);
+        let expected=original.validate_observed_body_motion_in_boundary(pose,pose,&wrong_height,12_000_000_000,1_000_000_000,&[]);
+        assert_eq!(checker(pose,pose,12_000_000_000).map(|_|()),expected);
+        assert!(matches!(expected,Err(SurfaceError::NearFieldObservation{cell,..}) if cell==cells[0]));
+        let map=base.with_observations(Some(observation_grid(|values| {
+            values.get_mut(&cells[0]).unwrap().observed_ns=500;
+            values.get_mut(&cells[1]).unwrap().observed_ns=0;
+            values.get_mut(&cells[2]).unwrap().observed_ns=1000;
+        })));
+        let occupied=BTreeSet::from([cells[1]]);
+        let max_age=u64::MAX-1000;
+        let mut checker=map.observed_body_motion_checker_with_expiry(&occupied,max_age,&[]);
+        assert_eq!(checker(pose,pose,10_500_000_000).unwrap(),Some(u64::MAX-500));
+        assert!(map.validate_observed_body_motion_in_boundary(pose,pose,&occupied,10_500_000_000,max_age,&[]).is_ok());
+        let occupied=BTreeSet::from([cells[0],cells[1]]);
+        let mut checker=map.observed_body_motion_checker_with_expiry(&occupied,max_age,&[]);
+        assert_eq!(checker(pose,pose,10_500_000_000).unwrap(),None,"exactMAX and overflow stay unbounded");
+    }
+
+    #[test]
+    #[ignore="matched static evidence-iteration microbenchmark; no motion or throughput qualification"]
+    fn benchmark_ordered_observation_difference() {
+        use std::{collections::{BTreeMap,BTreeSet},hint::black_box,time::{Instant,SystemTime,UNIX_EPOCH}};
+        fn check<'a>(cells:impl Iterator<Item=&'a [i32;3]>,observations:&SurfaceObservations,checked_ns:u64)->Result<Option<u64>,SurfaceError> {
+            let mut minimum=None;
+            for &cell in cells {
+                let evidence=observations.get(cell).unwrap_or(SurfaceObservation{observed_ns:0,hits:0});
+                let reason=if evidence.observed_ns==0 {Some("缺少真实观察")}
+                    else if evidence.hits<2 {Some("独立采样命中不足")}
+                    else if evidence.observed_ns>checked_ns.saturating_add(50_000_000) {Some("采样时间在未来")}
+                    else if checked_ns.saturating_sub(evidence.observed_ns)>1_000_000_000 {Some("观察已过期")}
+                    else {None};
+                if let Some(reason)=reason {return Err(SurfaceError::NearFieldObservation{cell,reason,observed_ns:evidence.observed_ns,checked_ns});}
+                if let Some(expiry)=evidence.observed_ns.checked_add(1_000_000_000).filter(|&expiry|expiry<u64::MAX) {
+                    minimum=Some(minimum.map_or(expiry,|old:u64|old.min(expiry)));
+                }
+            }
+            Ok(minimum)
+        }
+        let cells:BTreeSet<[i32;3]>=(-15..=15).flat_map(|x|(-15..=15).map(move|y|[x,y,9])).collect();
+        let sample_ns=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let mut blocks=BTreeMap::<_,BTreeMap<_,_>>::new();
+        for &cell in &cells {blocks.entry(cell.map(|v|v.div_euclid(32))).or_default()
+            .insert(cell,SurfaceObservation{observed_ns:sample_ns,hits:2});}
+        let mut observations=SurfaceObservations::new(0.01,32).unwrap();
+        for (block,values) in blocks {observations.replace_block(block,values).unwrap();}
+        for (case,occupied) in [
+            ("all_exempt",cells.clone()),
+            ("near_complete_overlap",cells.iter().copied().filter(|cell|cell[0]<15).collect()),
+            ("half_overlap",cells.iter().copied().filter(|cell|cell[0]<0).collect()),
+            ("empty_exemption",BTreeSet::new()),
+            ("large_disjoint_exemption",cells.iter().map(|cell|[cell[0]+100,cell[1],cell[2]]).collect()),
+            ("interleaved_wrong_height",cells.iter().map(|cell|[cell[0],cell[1],cell[2]+1]).collect()),
+            ("interleaved_low_overlap",cells.iter().enumerate().map(|(i,cell)|[cell[0],cell[1],cell[2]+i32::from(i%31!=0)]).collect()),
+        ] {
+            let expected=check(cells.iter().filter(|cell|!occupied.contains(*cell)),&observations,sample_ns).unwrap();
+            assert_eq!(check(cells.difference(&occupied),&observations,sample_ns).unwrap(),expected);
+            let mut old_ms=Vec::new();let mut new_ms=Vec::new();
+            for round in 0..6 {
+                for difference in if round%2==0 {[false,true]}else{[true,false]} {
+                    let started=Instant::now();
+                    for _ in 0..100 {
+                        let (cells,occupied,observations)=black_box((&cells,&occupied,&observations));
+                        let result=if difference {check(cells.difference(occupied),observations,sample_ns)}
+                            else {check(cells.iter().filter(|cell|!occupied.contains(*cell)),observations,sample_ns)};
+                        assert_eq!(black_box(result).unwrap(),expected);
+                    }
+                    let elapsed=started.elapsed().as_secs_f64()*1e3;
+                    if difference {new_ms.push(elapsed);}else{old_ms.push(elapsed);}
+                }
+            }
+            eprintln!("ORDERED_OBSERVATION case={case} cells={} exempt={} nonexempt={} loops_per_round=100 first_round=initial_after_parity_check later_rounds=alternating_order static_captured_anchor_ns={sample_ns} not_live_motion=true old_ms={old_ms:?} difference_ms={new_ms:?}",cells.len(),occupied.len(),cells.difference(&occupied).count());
+        }
+    }
+
     #[cfg(feature = "body-query-profile")]
     #[test]
     fn observed_profile_separates_cached_geometry_exempt_cells_and_failure_prefix() {
@@ -2676,7 +2785,8 @@ mod tests {
         query_profile::begin();
         assert_eq!(exempt(pose,pose,12_000_000_000).unwrap(),None);
         let exempt=query_profile::end();
-        assert!(exempt.counters[QueryCounter::ObservationVisitedCells as usize]>0);
+        assert!(exempt.counters[QueryCounter::ObservationInputCells as usize]>0);
+        assert_eq!(exempt.counters[QueryCounter::ObservationVisitedCells as usize],0);
         assert_eq!(exempt.counters[QueryCounter::ObservationCheckedCells as usize],0);
         let none=std::collections::BTreeSet::new();
         let mut expired=map.observed_body_motion_checker_with_expiry(&none,1_000_000_000,&[]);

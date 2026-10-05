@@ -7394,12 +7394,25 @@ mod preflight_only_contract {
         }
     }
 
-    struct RelocalizationLedgerRecord {
+    struct RelocalizationLedgerAdmissionMetadata {
         request: crate::proto::RelocalizeRequest,
-        identity_sha256: [u8; 32],
         admission_ordinal: u64,
         logical_deadline: Instant,
         claim_phase: RelocalizationClaimPhase,
+    }
+
+    #[allow(clippy::large_enum_variant)]
+    enum RelocalizationLedgerOrigin {
+        Admitted(RelocalizationLedgerAdmissionMetadata),
+        // Durable V1 terminals do not retain the original request or a
+        // process-local Instant. Never reconstruct either from a retry.
+        RestoredTerminal,
+    }
+
+    struct RelocalizationLedgerRecord {
+        origin: RelocalizationLedgerOrigin,
+        identity_sha256: [u8; 32],
+        activation_identity_sha256: [u8; 32],
         waiter_ids: HashSet<u64>,
         terminal: Option<StoredRelocalizationResult>,
         conflicts: HashMap<[u8; 32], StoredRelocalizationResult>,
@@ -7461,6 +7474,35 @@ mod preflight_only_contract {
     }
 
     impl RelocalizationCommandLedger {
+        fn from_terminal_store(store: &RelocalizationTerminalStore) -> Self {
+            let mut ledger = Self::default();
+            // open_at has already verified canonical bytes, exact bindings,
+            // uniqueness, and the existing command-record retention bound.
+            // Restore into the same bounded ledger before any admission can
+            // activate the mode fence, including conflict-first retries.
+            ledger.records = store
+                .state
+                .lock()
+                .terminals
+                .iter()
+                .map(|(request_id, durable)| {
+                    (
+                        request_id.clone(),
+                        RelocalizationLedgerRecord {
+                            origin: RelocalizationLedgerOrigin::RestoredTerminal,
+                            identity_sha256: durable.request_identity_sha256,
+                            activation_identity_sha256: durable.activation_identity_sha256,
+                            waiter_ids: HashSet::new(),
+                            terminal: Some(durable.terminal.clone()),
+                            conflicts: HashMap::new(),
+                            conflict_overflow: None,
+                        },
+                    )
+                })
+                .collect();
+            ledger
+        }
+
         fn admit<F>(
             &mut self,
             request: &ValidatedRelocalizeRequest,
@@ -7475,12 +7517,17 @@ mod preflight_only_contract {
                 return Err("RELOCALIZATION_WAITER_ID_INVALID");
             }
             if let Some(record) = self.records.get(&request.request.request_id) {
-                if record.identity_sha256 == request.identity_sha256 {
+                if record.identity_sha256 == request.identity_sha256
+                    && record.activation_identity_sha256 == request.activation_identity_sha256
+                {
                     if let Some(terminal) = &record.terminal {
                         return Ok(RelocalizationLedgerAdmission::Replay(terminal.clone()));
                     }
-                    let admission_ordinal = record.admission_ordinal;
-                    let logical_deadline = record.logical_deadline;
+                    let RelocalizationLedgerOrigin::Admitted(metadata) = &record.origin else {
+                        return Err("RELOCALIZATION_RESTORED_TERMINAL_MISSING");
+                    };
+                    let admission_ordinal = metadata.admission_ordinal;
+                    let logical_deadline = metadata.logical_deadline;
                     let record = self
                         .records
                         .get_mut(&request.request.request_id)
@@ -7548,11 +7595,16 @@ mod preflight_only_contract {
             self.records.insert(
                 request.request.request_id.clone(),
                 RelocalizationLedgerRecord {
-                    request: request.request.clone(),
+                    origin: RelocalizationLedgerOrigin::Admitted(
+                        RelocalizationLedgerAdmissionMetadata {
+                            request: request.request.clone(),
+                            admission_ordinal,
+                            logical_deadline,
+                            claim_phase: RelocalizationClaimPhase::Preclaim,
+                        },
+                    ),
                     identity_sha256: request.identity_sha256,
-                    admission_ordinal,
-                    logical_deadline,
-                    claim_phase: RelocalizationClaimPhase::Preclaim,
+                    activation_identity_sha256: request.activation_identity_sha256,
                     waiter_ids: HashSet::from([waiter_id]),
                     terminal: None,
                     conflicts: HashMap::new(),
@@ -7587,11 +7639,16 @@ mod preflight_only_contract {
             self.records.insert(
                 request.request.request_id.clone(),
                 RelocalizationLedgerRecord {
-                    request: request.request.clone(),
+                    origin: RelocalizationLedgerOrigin::Admitted(
+                        RelocalizationLedgerAdmissionMetadata {
+                            request: request.request.clone(),
+                            admission_ordinal: 0,
+                            logical_deadline: now,
+                            claim_phase: RelocalizationClaimPhase::Preclaim,
+                        },
+                    ),
                     identity_sha256: request.identity_sha256,
-                    admission_ordinal: 0,
-                    logical_deadline: now,
-                    claim_phase: RelocalizationClaimPhase::Preclaim,
+                    activation_identity_sha256: request.activation_identity_sha256,
                     waiter_ids: HashSet::new(),
                     terminal: Some(terminal),
                     conflicts: HashMap::new(),
@@ -7614,12 +7671,15 @@ mod preflight_only_contract {
             if record.identity_sha256 != identity_sha256 || record.terminal.is_some() {
                 return Err("RELOCALIZATION_LEDGER_IDENTITY_MISMATCH");
             }
-            if record.claim_phase == RelocalizationClaimPhase::Preclaim {
+            let RelocalizationLedgerOrigin::Admitted(metadata) = &mut record.origin else {
+                return Err("RELOCALIZATION_RESTORED_TERMINAL_MISSING");
+            };
+            if metadata.claim_phase == RelocalizationClaimPhase::Preclaim {
                 self.claimed_command_count = self
                     .claimed_command_count
                     .checked_add(1)
                     .ok_or("RELOCALIZATION_CLAIMED_COMMAND_COUNT_EXHAUSTED")?;
-                record.claim_phase = RelocalizationClaimPhase::Postclaim;
+                metadata.claim_phase = RelocalizationClaimPhase::Postclaim;
             }
             Ok(())
         }
@@ -7637,9 +7697,12 @@ mod preflight_only_contract {
             if record.identity_sha256 != identity_sha256 || record.terminal.is_some() {
                 return Err("RELOCALIZATION_LEDGER_IDENTITY_MISMATCH");
             }
+            let RelocalizationLedgerOrigin::Admitted(metadata) = &record.origin else {
+                return Err("RELOCALIZATION_RESTORED_TERMINAL_MISSING");
+            };
             record.waiter_ids.remove(&waiter_id);
             Ok(record.waiter_ids.is_empty()
-                && record.claim_phase == RelocalizationClaimPhase::Preclaim)
+                && metadata.claim_phase == RelocalizationClaimPhase::Preclaim)
         }
 
         fn settle_terminal(
@@ -7680,9 +7743,14 @@ mod preflight_only_contract {
         fn observation(
             &self,
         ) -> Result<crate::proto::RelocalizationLedgerObservation, &'static str> {
+            // Observation counters describe this actor generation. Restored
+            // terminals still consume ledger capacity, but cannot count as
+            // newly admitted or claimed commands (nor their terminal records).
             let terminal_record_count =
                 self.records.values().try_fold(0_u64, |count, record| {
-                    if record.terminal.is_some() {
+                    if matches!(&record.origin, RelocalizationLedgerOrigin::Admitted(_))
+                        && record.terminal.is_some()
+                    {
                         count
                             .checked_add(1)
                             .ok_or("RELOCALIZATION_TERMINAL_RECORD_COUNT_EXHAUSTED")
@@ -7691,7 +7759,9 @@ mod preflight_only_contract {
                     }
                 })?;
             let pending_record_count = self.records.values().try_fold(0_u64, |count, record| {
-                if record.terminal.is_none() {
+                if matches!(&record.origin, RelocalizationLedgerOrigin::Admitted(_))
+                    && record.terminal.is_none()
+                {
                     count
                         .checked_add(1)
                         .ok_or("RELOCALIZATION_PENDING_RECORD_COUNT_EXHAUSTED")
@@ -7706,8 +7776,15 @@ mod preflight_only_contract {
                     .checked_add(record_waiters)
                     .ok_or("RELOCALIZATION_ACTIVE_WAITER_COUNT_EXHAUSTED")
             })?;
-            let record_count = u64::try_from(self.records.len())
-                .map_err(|_| "RELOCALIZATION_RECORD_COUNT_EXHAUSTED")?;
+            let record_count = u64::try_from(
+                self.records
+                    .values()
+                    .filter(|record| {
+                        matches!(&record.origin, RelocalizationLedgerOrigin::Admitted(_))
+                    })
+                    .count(),
+            )
+            .map_err(|_| "RELOCALIZATION_RECORD_COUNT_EXHAUSTED")?;
             if terminal_record_count
                 .checked_add(pending_record_count)
                 .ok_or("RELOCALIZATION_RECORD_COUNT_EXHAUSTED")?
@@ -7734,7 +7811,10 @@ mod preflight_only_contract {
         }
 
         fn request(&self, request_id: &str) -> Option<&crate::proto::RelocalizeRequest> {
-            self.records.get(request_id).map(|record| &record.request)
+            match &self.records.get(request_id)?.origin {
+                RelocalizationLedgerOrigin::Admitted(metadata) => Some(&metadata.request),
+                RelocalizationLedgerOrigin::RestoredTerminal => None,
+            }
         }
 
         fn active_identity(
@@ -7742,12 +7822,15 @@ mod preflight_only_contract {
         ) -> Option<(String, [u8; 32], u64, Instant, RelocalizationClaimPhase)> {
             let request_id = self.active_request_id.as_ref()?;
             let record = self.records.get(request_id)?;
+            let RelocalizationLedgerOrigin::Admitted(metadata) = &record.origin else {
+                return None;
+            };
             Some((
                 request_id.clone(),
                 record.identity_sha256,
-                record.admission_ordinal,
-                record.logical_deadline,
-                record.claim_phase,
+                metadata.admission_ordinal,
+                metadata.logical_deadline,
+                metadata.claim_phase,
             ))
         }
     }
@@ -8025,7 +8108,7 @@ mod preflight_only_contract {
         ) -> Self {
             Self {
                 planar_pending:None,planar_inflight:false,
-                ledger: RelocalizationCommandLedger::default(),
+                ledger: RelocalizationCommandLedger::from_terminal_store(&terminal_store),
                 waiter_responses: HashMap::new(),
                 waiter_requests: HashMap::new(),
                 next_waiter_id: 0,
@@ -8394,7 +8477,7 @@ mod preflight_only_contract {
                 }
             };
             if (self.execution.is_some() || self.planar_inflight)
-                && self.ledger.request(&request.request.request_id).is_none()
+                && !self.ledger.records.contains_key(&request.request.request_id)
             {
                 let waiter = Self::immediate_waiter(
                     waiter_id,
@@ -8473,7 +8556,12 @@ mod preflight_only_contract {
                             .ledger
                             .records
                             .get(&request.request.request_id)
-                            .map(|record| record.admission_ordinal)
+                            .and_then(|record| match &record.origin {
+                                RelocalizationLedgerOrigin::Admitted(metadata) => {
+                                    Some(metadata.admission_ordinal)
+                                }
+                                RelocalizationLedgerOrigin::RestoredTerminal => None,
+                            })
                             .ok_or_else(|| {
                                 CorrectionRuntimeError::Apply(
                                     "relocalization waiter capacity record missing".to_owned(),
@@ -13858,6 +13946,563 @@ mod preflight_only_contract {
                 "odom".to_owned(),
                 "base_link".to_owned(),
             )
+        }
+
+        #[test]
+        fn relocalization_restored_ledger_preserves_binding_conflicts_overflow_and_capacity() {
+            let root = RelocalizationTerminalTestRoot::new();
+            let request = validate_relocalize_request(relocalization_command_request(
+                "req-restored-bounds",
+                7,
+            ))
+            .unwrap();
+            let terminal = relocalization_command_terminal(
+                &request,
+                crate::proto::RelocalizeDisposition::Cancelled,
+                "RELOCALIZATION_CANCELLED",
+            );
+            {
+                let store =
+                    RelocalizationTerminalStore::open_at(root.path().to_path_buf()).unwrap();
+                store
+                    .persist_terminal(
+                        &request.request.request_id,
+                        request.identity_sha256,
+                        request.activation_identity_sha256,
+                        &terminal,
+                    )
+                    .unwrap();
+            }
+            let store = RelocalizationTerminalStore::open_at(root.path().to_path_buf()).unwrap();
+            let mut ledger = RelocalizationCommandLedger::from_terminal_store(&store);
+            let before = ledger.observation().unwrap();
+            let mode_before = ledger.relocalization_mode.snapshot();
+            assert!(ledger.request(&request.request.request_id).is_none());
+            assert!(ledger.active_identity().is_none());
+            assert!(matches!(
+                &ledger.records[&request.request.request_id].origin,
+                RelocalizationLedgerOrigin::RestoredTerminal
+            ));
+            assert_eq!(before.admitted_command_count, 0);
+            assert_eq!(before.claimed_command_count, 0);
+            assert_eq!(before.terminal_record_count, 0);
+            assert!(ledger
+                .mark_postclaim(&request.request.request_id, request.identity_sha256)
+                .is_err());
+            assert!(ledger
+                .detach_waiter(&request.request.request_id, request.identity_sha256, 1)
+                .is_err());
+
+            for index in 0..RELOCALIZATION_MAX_CONFLICTS_PER_RECORD {
+                let changed = validate_relocalize_request(relocalization_command_request(
+                    &request.request.request_id,
+                    index as u64 + 8,
+                ))
+                .unwrap();
+                let conflict = relocalization_command_terminal(
+                    &changed,
+                    crate::proto::RelocalizeDisposition::ReplayConflict,
+                    "RELOCALIZATION_REPLAY_CONFLICT",
+                );
+                let first = ledger
+                    .admit(&changed, index as u64 + 1, Instant::now(), || {
+                        conflict.clone()
+                    })
+                    .unwrap();
+                let repeat = ledger
+                    .admit(&changed, index as u64 + 1, Instant::now(), || {
+                        panic!("restored conflict must be retained")
+                    })
+                    .unwrap();
+                match (first, repeat) {
+                    (
+                        RelocalizationLedgerAdmission::Conflict(first),
+                        RelocalizationLedgerAdmission::Conflict(repeat),
+                    ) => {
+                        assert_eq!(first.encoded, conflict.encoded);
+                        assert_eq!(repeat.encoded, first.encoded);
+                    }
+                    _ => panic!("restored binding must retain each bounded conflict"),
+                }
+            }
+            let overflow = validate_relocalize_request(relocalization_command_request(
+                &request.request.request_id,
+                RELOCALIZATION_MAX_CONFLICTS_PER_RECORD as u64 + 8,
+            ))
+            .unwrap();
+            let overflow_terminal = relocalization_command_terminal(
+                &overflow,
+                crate::proto::RelocalizeDisposition::ReplayConflict,
+                "RELOCALIZATION_REPLAY_CONFLICT",
+            );
+            assert!(matches!(
+                ledger
+                    .admit(&overflow, 100, Instant::now(), || overflow_terminal.clone())
+                    .unwrap(),
+                RelocalizationLedgerAdmission::ConflictOverflow(_)
+            ));
+            match ledger
+                .admit(&overflow, 101, Instant::now(), || {
+                    panic!("overflow must replay")
+                })
+                .unwrap()
+            {
+                RelocalizationLedgerAdmission::Conflict(replayed) => {
+                    assert_eq!(replayed.encoded, overflow_terminal.encoded)
+                }
+                _ => panic!("restored overflow identity must remain permanent"),
+            }
+            let next_conflict = validate_relocalize_request(relocalization_command_request(
+                &request.request.request_id,
+                RELOCALIZATION_MAX_CONFLICTS_PER_RECORD as u64 + 9,
+            ))
+            .unwrap();
+            assert!(matches!(
+                ledger
+                    .admit(&next_conflict, 102, Instant::now(), || panic!(
+                        "overflow is bounded"
+                    ))
+                    .unwrap(),
+                RelocalizationLedgerAdmission::CapacityExceeded(
+                    "RELOCALIZATION_COMMAND_CONFLICT_OVERFLOW_CLOSED"
+                )
+            ));
+            for waiter_id in [103, 104] {
+                match ledger
+                    .admit(&request, waiter_id, Instant::now(), || {
+                        panic!("exact retry is not a conflict")
+                    })
+                    .unwrap()
+                {
+                    RelocalizationLedgerAdmission::Replay(replayed) => {
+                        assert_eq!(replayed.encoded, terminal.encoded)
+                    }
+                    _ => panic!("exact restored terminal survives conflict overflow"),
+                }
+            }
+            assert_eq!(
+                ledger.observation().unwrap().encode_to_vec(),
+                before.encode_to_vec()
+            );
+            assert_eq!(ledger.relocalization_mode.snapshot(), mode_before);
+            assert_eq!(ledger.next_admission_ordinal, 0);
+            assert_eq!(
+                ledger.records[&request.request.request_id].conflicts.len(),
+                RELOCALIZATION_MAX_CONFLICTS_PER_RECORD
+            );
+
+            // The store binds both identities. Even if a caller presents an
+            // equal request digest, it cannot substitute the activation binding.
+            let mut activation_ledger = RelocalizationCommandLedger::from_terminal_store(&store);
+            let mut changed_activation = request.clone();
+            changed_activation.activation_identity_sha256[0] ^= 1;
+            assert!(matches!(
+                activation_ledger
+                    .admit(&changed_activation, 1, Instant::now(), || terminal.clone())
+                    .unwrap(),
+                RelocalizationLedgerAdmission::Conflict(_)
+            ));
+            assert_eq!(activation_ledger.admitted_command_count, 0);
+            assert_eq!(activation_ledger.claimed_command_count, 0);
+
+            // One restored record consumes one existing slot; only the first
+            // genuinely new command consumes ordinal 1 and a fresh deadline.
+            let mut bounded = RelocalizationCommandLedger::from_terminal_store(&store);
+            for index in 0..RELOCALIZATION_MAX_COMMAND_RECORDS.saturating_sub(2) {
+                let new_request = validate_relocalize_request(relocalization_command_request(
+                    &format!("req-restored-cap-{index}"),
+                    7,
+                ))
+                .unwrap();
+                let now = Instant::now();
+                let (ordinal, deadline) = match bounded
+                    .admit(&new_request, index as u64 + 1, now, || unreachable!())
+                    .unwrap()
+                {
+                    RelocalizationLedgerAdmission::Started {
+                        admission_ordinal,
+                        logical_deadline,
+                    } => (admission_ordinal, logical_deadline),
+                    _ => panic!("remaining bounded slot must admit"),
+                };
+                assert_eq!(ordinal, index as u64 + 1);
+                assert_eq!(deadline, now + Duration::from_secs(1));
+                assert!(
+                    matches!(bounded.admit(&new_request, index as u64 + 2, now + Duration::from_millis(900), || unreachable!()).unwrap(),
+                    RelocalizationLedgerAdmission::Joined { admission_ordinal, logical_deadline }
+                    if admission_ordinal == ordinal && logical_deadline == deadline)
+                );
+                bounded
+                    .settle_terminal(
+                        &new_request.request.request_id,
+                        new_request.identity_sha256,
+                        relocalization_command_terminal(
+                            &new_request,
+                            crate::proto::RelocalizeDisposition::Cancelled,
+                            "RELOCALIZATION_CANCELLED",
+                        ),
+                    )
+                    .unwrap();
+            }
+            let at_capacity = bounded.next_admission_ordinal;
+            let capacity_request = validate_relocalize_request(relocalization_command_request(
+                "req-restored-capacity",
+                7,
+            ))
+            .unwrap();
+            assert!(matches!(
+                bounded
+                    .admit(&capacity_request, 10_000, Instant::now(), || unreachable!())
+                    .unwrap(),
+                RelocalizationLedgerAdmission::CapacityExceeded(
+                    "RELOCALIZATION_COMMAND_LEDGER_CAPACITY_EXCEEDED"
+                )
+            ));
+            let capacity_terminal = relocalization_command_terminal(
+                &capacity_request,
+                crate::proto::RelocalizeDisposition::OwnerFailed,
+                "RELOCALIZATION_COMMAND_LEDGER_CAPACITY_EXCEEDED",
+            );
+            bounded
+                .store_capacity_terminal(
+                    &capacity_request,
+                    Instant::now(),
+                    capacity_terminal.clone(),
+                )
+                .unwrap();
+            assert_eq!(bounded.records.len(), RELOCALIZATION_MAX_COMMAND_RECORDS);
+            assert_eq!(bounded.next_admission_ordinal, at_capacity);
+            assert_eq!(
+                bounded.admitted_command_count,
+                RELOCALIZATION_MAX_COMMAND_RECORDS as u64 - 1
+            );
+            assert_eq!(bounded.claimed_command_count, 0);
+            let observation = bounded.observation().unwrap();
+            assert_eq!(observation.terminal_record_count, observation.admitted_command_count);
+            assert_eq!(observation.pending_record_count, 0);
+            for (request, expected) in [
+                (&request, &terminal),
+                (&capacity_request, &capacity_terminal),
+            ] {
+                match bounded
+                    .admit(request, 10_001, Instant::now(), || unreachable!())
+                    .unwrap()
+                {
+                    RelocalizationLedgerAdmission::Replay(replayed) => {
+                        assert_eq!(replayed.encoded, expected.encoded)
+                    }
+                    _ => panic!("full ledger must still replay existing terminals"),
+                }
+            }
+        }
+
+        fn relocalization_restart_request(request_id: &str) -> crate::proto::RelocalizeRequest {
+            let mut request = relocalization_command_request(request_id, 0);
+            request.target_kind = "planar_graph".to_owned();
+            request.target_cloud_sha256.clear();
+            request.target_graph_sha256 = vec![11; 32];
+            request.planar_seed = Some(crate::proto::PlanarSeed {
+                x: 1.0,
+                y: 2.0,
+                yaw: 0.25,
+            });
+            request.source_policy_sha256 = planar_source_policy_sha256().to_vec();
+            request.algorithm_options_sha256 = planar_algorithm_policy_sha256().to_vec();
+            request.logical_timeout_ms = RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS;
+            request
+        }
+
+        fn relocalization_restart_supervisor(
+            phase_a: CorrectionPhaseAControl,
+            root: &Path,
+        ) -> RelocalizationOwnerSupervisor {
+            RelocalizationOwnerSupervisor::start_inner(
+                phase_a,
+                owner_identity(),
+                "map".to_owned(),
+                "odom".to_owned(),
+                "base_link".to_owned(),
+                None,
+                Some(RelocalizationTerminalStore::open_at(root.to_path_buf()).unwrap()),
+            )
+        }
+
+        fn relocalization_restart_work(
+            compute_calls: Arc<AtomicU64>,
+            sink: Arc<RelocalizationAppliedSink>,
+        ) -> PlanarCommandWork {
+            Box::new(move |context| {
+                Box::pin(async move {
+                    compute_calls.fetch_add(1, Ordering::AcqRel);
+                    assert!(
+                        context.claim().await,
+                        "fixture must claim before publication"
+                    );
+                    sink.apply_candidate(
+                        sample_candidate(1, 200),
+                        CorrectionRequestCancellation::new(),
+                    )
+                    .await
+                    .expect("fixture publication");
+                    PlanarCommandOutcome {
+                        disposition: crate::proto::RelocalizeDisposition::Applied,
+                        detail: "RELOCALIZATION_RESTART_FIXTURE_APPLIED".to_owned(),
+                        correction_revision: 1,
+                        evidence: b"relocalization-restart-fixture".to_vec(),
+                    }
+                })
+            })
+        }
+
+        async fn relocalization_restart_submit(
+            ingress: &RelocalizationCommandIngress,
+            request: crate::proto::RelocalizeRequest,
+            compute_calls: &Arc<AtomicU64>,
+            sink: &Arc<RelocalizationAppliedSink>,
+        ) -> crate::proto::RelocalizeResult {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                ingress
+                    .admit_planar(
+                        request,
+                        Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                        relocalization_restart_work(Arc::clone(compute_calls), Arc::clone(sink)),
+                    )
+                    .await
+                    .expect("restart ingress admission")
+                    .wait()
+                    .await
+                    .expect("restart ingress terminal")
+            })
+            .await
+            .expect("stored terminal must not wait for execution")
+        }
+
+        async fn relocalization_restart_observation(
+            ingress: &RelocalizationCommandIngress,
+            request: &ValidatedRelocalizeRequest,
+        ) -> crate::proto::RelocalizationLedgerObservation {
+            let snapshot = ingress
+                .terminal_snapshot(
+                    &request.request.request_id,
+                    request.identity_sha256,
+                    request.activation_identity_sha256,
+                )
+                .await
+                .expect("actor terminal query");
+            assert!(matches!(
+                snapshot.terminal,
+                RelocalizationTerminalSnapshot::Terminal(_)
+            ));
+            snapshot.ledger_observation
+        }
+
+        #[tokio::test]
+        async fn relocalization_actor_restart_replays_before_conflict_busy_and_side_effects() {
+            let root = RelocalizationTerminalTestRoot::new();
+            let request = relocalization_restart_request("req-actor-restart");
+            let validated = validate_relocalize_request(request.clone()).unwrap();
+            let first_compute = Arc::new(AtomicU64::new(0));
+            let first_sink = Arc::new(RelocalizationAppliedSink::default());
+            let first_result = {
+                let phase_a = CorrectionPhaseAControl::for_tests();
+                let mut supervisor =
+                    relocalization_restart_supervisor(phase_a.clone(), root.path());
+                let ingress = supervisor.ingress();
+                let result = relocalization_restart_submit(
+                    &ingress,
+                    request.clone(),
+                    &first_compute,
+                    &first_sink,
+                )
+                .await;
+                assert_eq!(
+                    result.disposition,
+                    crate::proto::RelocalizeDisposition::Applied as i32
+                );
+                let observation = relocalization_restart_observation(&ingress, &validated).await;
+                assert_eq!(observation.admitted_command_count, 1);
+                assert_eq!(observation.claimed_command_count, 1);
+                assert_eq!(first_compute.load(Ordering::Acquire), 1);
+                assert_eq!(first_sink.applied.load(Ordering::Acquire), 1);
+                phase_a.begin();
+                supervisor.shutdown().await.expect("first actor stops");
+                result
+            };
+            // All references to the first store and actor have been dropped.
+            // The second supervisor really reopens and validates the JSON file.
+            let terminal_path = root.path().join(format!(
+                "{}.json",
+                encode_hex(&sha256_bytes(request.request_id.as_bytes())),
+            ));
+            let persisted_bytes = fs::read(&terminal_path).expect("first actor persisted terminal");
+            let phase_a = CorrectionPhaseAControl::for_tests();
+            let mut supervisor = relocalization_restart_supervisor(phase_a.clone(), root.path());
+            let ingress = supervisor.ingress();
+            let replay_compute = Arc::new(AtomicU64::new(0));
+            let replay_sink = Arc::new(RelocalizationAppliedSink::default());
+            let mode_before = phase_a.relocalization_mode().snapshot();
+            let restored = relocalization_restart_observation(&ingress, &validated).await;
+            assert_eq!(restored.admitted_command_count, 0);
+            assert_eq!(restored.claimed_command_count, 0);
+            assert_eq!(restored.terminal_record_count, 0);
+            assert_eq!(restored.pending_record_count, 0);
+            assert_eq!(restored.active_waiter_count, 0);
+
+            // Conflict arrives before the original request. It must not replace
+            // the durable binding, start work, or transiently activate the mode.
+            let mut changed = request.clone();
+            changed.activation_identity_sha256[0] ^= 1;
+            let conflict = relocalization_restart_submit(
+                &ingress,
+                changed.clone(),
+                &replay_compute,
+                &replay_sink,
+            )
+            .await;
+            assert_eq!(
+                conflict.disposition,
+                crate::proto::RelocalizeDisposition::ReplayConflict as i32
+            );
+            let repeated_conflict = relocalization_restart_submit(
+                &ingress,
+                changed.clone(),
+                &replay_compute,
+                &replay_sink,
+            )
+            .await;
+            assert_eq!(repeated_conflict.encode_to_vec(), conflict.encode_to_vec());
+            let changed = validate_relocalize_request(changed).unwrap();
+            assert!(matches!(
+                ingress
+                    .terminal_snapshot(
+                        &changed.request.request_id,
+                        changed.identity_sha256,
+                        changed.activation_identity_sha256,
+                    )
+                    .await
+                    .unwrap()
+                    .terminal,
+                RelocalizationTerminalSnapshot::IdentityConflict
+            ));
+            for _ in 0..2 {
+                let replay = relocalization_restart_submit(
+                    &ingress,
+                    request.clone(),
+                    &replay_compute,
+                    &replay_sink,
+                )
+                .await;
+                assert_eq!(replay.encode_to_vec(), first_result.encode_to_vec());
+            }
+            assert_eq!(phase_a.relocalization_mode().snapshot(), mode_before);
+            assert_eq!(
+                relocalization_restart_observation(&ingress, &validated)
+                    .await
+                    .encode_to_vec(),
+                restored.encode_to_vec(),
+            );
+            assert_eq!(replay_compute.load(Ordering::Acquire), 0);
+            assert_eq!(replay_sink.staged.load(Ordering::Acquire), 0);
+            assert_eq!(replay_sink.applied.load(Ordering::Acquire), 0);
+
+            // Exercise the actor's execution-busy guard, not only ledger Busy.
+            let busy_request = relocalization_restart_request("req-actor-restart-busy");
+            let busy_validated = validate_relocalize_request(busy_request.clone()).unwrap();
+            let (busy_started, busy_started_rx) = oneshot::channel();
+            let (release_busy, busy_release_rx) = oneshot::channel();
+            let busy_work: PlanarCommandWork = Box::new(move |_| {
+                Box::pin(async move {
+                    let _ = busy_started.send(());
+                    busy_release_rx.await.expect("release unrelated operation");
+                    PlanarCommandOutcome {
+                        disposition: crate::proto::RelocalizeDisposition::Rejected,
+                        detail: "RELOCALIZATION_RESTART_BUSY_FIXTURE".to_owned(),
+                        correction_revision: 0,
+                        evidence: Vec::new(),
+                    }
+                })
+            });
+            let busy_waiter = ingress
+                .admit_planar(
+                    busy_request,
+                    Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                    busy_work,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), busy_started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let busy_mode = phase_a.relocalization_mode().snapshot();
+            assert!(busy_mode.active);
+            let busy_observation = relocalization_restart_observation(&ingress, &validated).await;
+            assert_eq!(busy_observation.admitted_command_count, 1);
+            assert_eq!(busy_observation.claimed_command_count, 0);
+            assert_eq!(busy_observation.pending_record_count, 1);
+            assert_eq!(busy_observation.active_waiter_count, 1);
+            assert!(matches!(
+                ingress
+                    .terminal_snapshot(
+                        &busy_validated.request.request_id,
+                        busy_validated.identity_sha256,
+                        busy_validated.activation_identity_sha256,
+                    )
+                    .await
+                    .unwrap()
+                    .terminal,
+                RelocalizationTerminalSnapshot::Pending
+            ));
+
+            let mut busy_conflict = request.clone();
+            busy_conflict.target_graph_sha256[0] ^= 1;
+            let conflict = relocalization_restart_submit(
+                &ingress,
+                busy_conflict.clone(),
+                &replay_compute,
+                &replay_sink,
+            )
+            .await;
+            assert_eq!(
+                conflict.disposition,
+                crate::proto::RelocalizeDisposition::ReplayConflict as i32
+            );
+            let repeated = relocalization_restart_submit(
+                &ingress,
+                busy_conflict,
+                &replay_compute,
+                &replay_sink,
+            )
+            .await;
+            assert_eq!(repeated.encode_to_vec(), conflict.encode_to_vec());
+            for _ in 0..2 {
+                let replay = relocalization_restart_submit(
+                    &ingress,
+                    request.clone(),
+                    &replay_compute,
+                    &replay_sink,
+                )
+                .await;
+                assert_eq!(replay.encode_to_vec(), first_result.encode_to_vec());
+            }
+            assert_eq!(phase_a.relocalization_mode().snapshot(), busy_mode);
+            assert_eq!(
+                relocalization_restart_observation(&ingress, &validated)
+                    .await
+                    .encode_to_vec(),
+                busy_observation.encode_to_vec(),
+            );
+            assert_eq!(replay_compute.load(Ordering::Acquire), 0);
+            assert_eq!(replay_sink.staged.load(Ordering::Acquire), 0);
+            assert_eq!(replay_sink.applied.load(Ordering::Acquire), 0);
+            assert_eq!(fs::read(&terminal_path).unwrap(), persisted_bytes);
+            release_busy.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), busy_waiter.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            phase_a.begin();
+            supervisor.shutdown().await.expect("restarted actor stops");
         }
 
         #[tokio::test]

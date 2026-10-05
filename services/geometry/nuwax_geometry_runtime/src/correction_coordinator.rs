@@ -9550,9 +9550,27 @@ mod preflight_only_contract {
     }
 
     async fn wait_until_optional_instant(deadline: Option<Instant>) {
+        wait_until_optional_instant_with_clock(deadline, Instant::now).await
+    }
+
+    // Observe the same existing monotonic clock on every poll. A blocked
+    // executor may resume a pending timer before its wheel has refreshed,
+    // while a frame is already queued. No deadline or post-compute gate changes.
+    async fn wait_until_optional_instant_with_clock(
+        deadline: Option<Instant>,
+        mut clock: impl FnMut() -> Instant,
+    ) {
         match deadline {
             Some(deadline) => {
-                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+                tokio::pin!(sleep);
+                std::future::poll_fn(|context| {
+                    if clock() >= deadline {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::future::Future::poll(sleep.as_mut(), context)
+                    }
+                }).await;
             }
             None => std::future::pending::<()>().await,
         }
@@ -13099,6 +13117,55 @@ mod preflight_only_contract {
 
         #[tokio::test]
         async fn relocalization_timer_preempts_simultaneously_ready_cutoff_frame() {
+            // Deterministic readiness boundaries, with no timer-wheel update:
+            // the observation is at the deadline or one nanosecond before it.
+            // The actual timer is far in the future so only this observed
+            // boundary and the already-ready frame decide the selection.
+            let boundary = Instant::now() + Duration::from_secs(3_600);
+            let frame_admissions = AtomicU64::new(0);
+            let compute_starts = AtomicU64::new(0);
+            let selected = tokio::select! {
+                biased;
+                _ = wait_until_optional_instant_with_clock(Some(boundary), || boundary) => "deadline",
+                _ = async {
+                    frame_admissions.fetch_add(1, Ordering::Relaxed);
+                    compute_starts.fetch_add(1, Ordering::Relaxed);
+                } => "frame",
+            };
+            assert_eq!(selected, "deadline");
+            assert_eq!(frame_admissions.load(Ordering::Relaxed), 0);
+            assert_eq!(compute_starts.load(Ordering::Relaxed), 0);
+            // Re-poll the same previously pending future after the observed
+            // deadline, without waking or advancing Tokio's timer wheel.
+            let observed = std::cell::Cell::new(boundary - Duration::from_nanos(1));
+            let waiting = wait_until_optional_instant_with_clock(Some(boundary), || observed.get());
+            tokio::pin!(waiting);
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            observed.set(boundary);
+            let selected = tokio::select! {
+                biased;
+                _ = waiting.as_mut() => "deadline",
+                _ = async {
+                    frame_admissions.fetch_add(1, Ordering::Relaxed);
+                    compute_starts.fetch_add(1, Ordering::Relaxed);
+                } => "frame",
+            };
+            assert_eq!(selected, "deadline");
+            assert_eq!(frame_admissions.load(Ordering::Relaxed), 0);
+            assert_eq!(compute_starts.load(Ordering::Relaxed), 0);
+
+            let selected = tokio::select! {
+                biased;
+                _ = wait_until_optional_instant_with_clock(Some(boundary), || boundary - Duration::from_nanos(1)) => "deadline",
+                _ = async {
+                    frame_admissions.fetch_add(1, Ordering::Relaxed);
+                    compute_starts.fetch_add(1, Ordering::Relaxed);
+                } => "frame",
+            };
+            assert_eq!(selected, "frame");
+            assert_eq!(frame_admissions.load(Ordering::Relaxed), 1);
+            assert_eq!(compute_starts.load(Ordering::Relaxed), 1);
+
             let owner_identity = CorrectionOwnerRuntimeIdentity {
                 runtime_generation: 2,
                 backend_generation: 99,
@@ -13160,6 +13227,9 @@ mod preflight_only_contract {
                 crate::proto::RelocalizeDisposition::DeadlineExceeded as i32
             );
             assert_eq!(relocalization_terminal_candidate_sequence(&terminal), 0);
+            let evidence = relocalization_terminal_body(&terminal).evidence.as_ref().unwrap();
+            assert!(evidence.source_frames.is_empty());
+            assert!(evidence.algorithm.is_none());
             assert_eq!(sink.staged.load(Ordering::Acquire), 0);
             let released =
                 tokio::time::timeout(Duration::from_secs(1), Arc::clone(&lifecycle).lock_owned())

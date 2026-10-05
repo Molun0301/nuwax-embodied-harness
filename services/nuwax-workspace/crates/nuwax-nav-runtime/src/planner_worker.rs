@@ -22,6 +22,8 @@ struct Inputs {
     applied: Twist2,
     applied_version: u64,
     result: Option<(std::time::Instant, PlannerStep)>,
+    #[cfg(test)]
+    result_proof: Option<crate::command_proof_trace::PublishedCommandContext>,
     result_pose_version: u64,
     result_applied_version: u64,
     result_map_version: u64,
@@ -69,10 +71,16 @@ pub(crate) struct PlannerWorker {
     wait_reason: Option<String>,
     #[cfg(test)]
     delivered_command_deadline: Option<std::time::Instant>,
+    #[cfg(test)]
+    delivered_command_context: Option<crate::command_proof_trace::DeliveredCommandContext>,
 }
 impl PlannerWorker {
     #[cfg(test)]
     pub(crate) fn delivered_command_deadline_for_test(&self)->Option<std::time::Instant> {self.delivered_command_deadline}
+    #[cfg(test)]
+    pub(crate) fn delivered_command_context_for_test(&self)->Option<&crate::command_proof_trace::DeliveredCommandContext> {
+        self.delivered_command_context.as_ref()
+    }
     pub(crate) fn new(mut planner: impl NavPlanner) -> Result<Self, RuntimeError> {
         let shared = Arc::new((Mutex::new(Inputs::default()), Condvar::new()));
         let worker = Arc::clone(&shared);
@@ -85,6 +93,7 @@ impl PlannerWorker {
                 let mut map_version = 0;
                 let mut boundary_version = u64::MAX;
                 let mut slow_log_at: Option<std::time::Instant> = None;
+                #[cfg(test)] let mut result_id=0_u64;
                 loop {
                     let (
                         version,
@@ -141,6 +150,17 @@ impl PlannerWorker {
                         )
                     };
                     let started = std::time::Instant::now();
+                    #[cfg(test)] let compute_trace=width.map(|_| {
+                        result_id=result_id.checked_add(1).expect("test worker result ID exhausted");
+                        crate::command_proof_trace::ComputeScope::begin(crate::command_proof_trace::ComputeInputTrace {
+                            result_id,
+                            pose:pose.as_ref().map(crate::command_proof_trace::PoseTrace::capture),
+                            applied_bits:crate::command_proof_trace::command_bits(applied),
+                            epoch:version,goal_version:goal_seq,path_version:path_seq,map_version:map_seq,
+                            boundary_version:boundary_seq,pose_version:pose_seq,applied_version:applied_seq,
+                            compute_started:started,compute_start_unix_ns:crate::command_proof_trace::unix_ns(),
+                        })
+                    });
                     let span=tracing::info_span!("navigation.local",goal_id=%goal_id);
                     let _entered=span.enter();
                     let computed = (|| -> Result<PlannerStep, RuntimeError> {
@@ -183,6 +203,7 @@ impl PlannerWorker {
                         Ok(width.map_or(PlannerStep::Pending(Vec::new()),|width|planner.step(width)))
                     })()
                     .unwrap_or_else(|error| PlannerStep::ReplanRequired(error.to_string()));
+                    #[cfg(test)] let computed_proof=compute_trace.and_then(|trace|trace.finish(&computed));
                     if width.is_none() {continue;}
                     let wait_reason = if matches!(computed, PlannerStep::Pending(_))
                         || matches!(computed, PlannerStep::Command(command) if command == Twist2::ZERO) {
@@ -206,6 +227,7 @@ impl PlannerWorker {
                     // 换目标、换路径、取消或来源撤销后的迟到结果一律退休。
                     if current {
                         input.result = Some((started, computed));
+                        #[cfg(test)] {input.result_proof=computed_proof.map(|proof|proof.published());}
                         input.result_pose_version = pose_seq;
                         input.result_applied_version = applied_seq;
                         input.result_map_version = map_seq;
@@ -231,6 +253,8 @@ impl PlannerWorker {
             wait_reason: None,
             #[cfg(test)]
             delivered_command_deadline: None,
+            #[cfg(test)]
+            delivered_command_context: None,
         })
     }
 }
@@ -259,6 +283,7 @@ impl NavPlanner for PlannerWorker {
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
+        #[cfg(test)] {input.result_proof=None;}
         input.display_path.clear();
         input.path = None;
         input.goal_version += 1;
@@ -280,6 +305,7 @@ impl NavPlanner for PlannerWorker {
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
+        #[cfg(test)] {input.result_proof=None;}
         input.display_path.clear();
         input.path_version += 1;
         input.path = Some(Arc::new((path, yaws, goal)));
@@ -328,6 +354,7 @@ impl NavPlanner for PlannerWorker {
         self.shared.1.notify_one();
     }
     fn step(&mut self, width: f64) -> PlannerStep {
+        #[cfg(test)] {self.delivered_command_context=None;}
         let mut input = self.shared.0.lock().unwrap();
         if self
             .thread
@@ -376,6 +403,16 @@ impl NavPlanner for PlannerWorker {
         { self.delivered_command_deadline=if matches!(&ready,Some(PlannerStep::Command(_))) {
             input.result.as_ref().map(|(started,_)|*started+DEFAULT_CONTROL_HORIZON)
         } else {None}; }
+        // Select diagnostic context under the same lock as the exact result,
+        // before its existing one-shot consumption. Never query TLS here or
+        // infer provenance from a nearby result/time/guard invocation.
+        #[cfg(test)] {
+            self.delivered_command_context=match (&ready,&input.result,&input.result_proof) {
+                (Some(PlannerStep::Command(command)),Some((started,_)),Some(proof)) =>
+                    proof.retrieved(*started,*command),
+                _ => None,
+            };
+        }
         self.wait_reason = if ready.is_some() { input.result_wait_reason.clone() } else if arrival_changed {
             Some("位姿已更新，保持零速并重新核对到达状态".into())
         } else if terminal_changed {
@@ -393,6 +430,7 @@ impl NavPlanner for PlannerWorker {
             // feedback (or a later step seeing no result) requests that compute;
             // selecting this candidate is not an actuator receipt.
             input.result = None;
+            #[cfg(test)] {input.result_proof=None;}
         }
         ready.unwrap_or(PlannerStep::Pending(Vec::new()))
     }
@@ -405,10 +443,11 @@ impl NavPlanner for PlannerWorker {
     fn stop(&mut self) {
         self.wait_reason = None;
         #[cfg(test)]
-        {self.delivered_command_deadline=None;}
+        {self.delivered_command_deadline=None;self.delivered_command_context=None;}
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
+        #[cfg(test)] {input.result_proof=None;}
         input.display_path.clear();
         input.result_wait_reason = None;
         input.path = None;
@@ -429,6 +468,7 @@ impl Drop for PlannerWorker {
             let mut input = self.shared.0.lock().unwrap();
             input.closed = true;
             input.result = None;
+            #[cfg(test)] {input.result_proof=None;}
             input.display_path.clear();
             self.shared.1.notify_one();
         }
@@ -822,6 +862,124 @@ mod tests {
             std::thread::yield_now();
         }
     }
+
+    // Synthetic selections isolate the diagnostic handoff; they assert no
+    // geometry permission. Real guard selection is traced only at its callsite.
+    struct TraceProbe {
+        started: std::sync::mpsc::Sender<()>,
+        finish: std::sync::mpsc::Receiver<(PlannerStep, Option<u64>)>,
+        pose: Option<PoseStamped>,
+        applied: Twist2,
+    }
+    impl NavPlanner for TraceProbe {
+        fn replace_path(&mut self, _: Path2D) {}
+        fn update_odometry(&mut self, pose: PoseStamped) { self.pose=Some(pose); }
+        fn update_costmap(&mut self, _: CostMap2D) {}
+        fn observe_applied_command(&mut self, applied: Twist2) { self.applied=applied; }
+        fn step(&mut self, _: f64) -> PlannerStep {
+            let _=self.started.send(());
+            let (outcome,anchor)=self.finish.recv_timeout(Duration::from_secs(5))
+                .unwrap_or((PlannerStep::Pending(Vec::new()),None));
+            if let (PlannerStep::Command(command),Some(anchor))=(&outcome,anchor) {
+                let guard=crate::command_proof_trace::GuardScope::begin();
+                guard.record_basis(self.pose.as_ref().unwrap(),self.applied,Some((anchor,1_000_000_000)));
+                crate::command_proof_trace::record_selected(*command);
+            }
+            outcome
+        }
+        fn stop(&mut self) {}
+    }
+    fn traced_worker()->(PlannerWorker,std::sync::mpsc::Receiver<()>,std::sync::mpsc::Sender<(PlannerStep,Option<u64>)>) {
+        let (started,receive)=std::sync::mpsc::channel();
+        let (finish,wait)=std::sync::mpsc::channel();
+        let worker=PlannerWorker::new(TraceProbe {started,finish:wait,pose:None,applied:Twist2::ZERO}).unwrap();
+        (worker,receive,finish)
+    }
+
+    #[test]
+    fn exact_proof_follows_stored_result_once_and_never_same_valued_next_result() {
+        let (mut worker,started,finish)=traced_worker();
+        let original_pose=route_pose(0.5,0);
+        let command=Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.05,0.0),angular_z:0.0};
+        worker.update_odometry(original_pose.clone());
+        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        // A real first delivery still uses the original worker pose, even if
+        // newer odometry arrived while that exact computation was finishing.
+        worker.update_odometry(route_pose(0.500001,1));
+        finish.send((PlannerStep::Command(command),Some(101))).unwrap();
+        wait_for_source_result(&worker);
+        let published_id=worker.shared.0.lock().unwrap().result_proof.as_ref().unwrap().proof.input.result_id;
+        assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+        let delivered=worker.delivered_command_context_for_test().unwrap().clone();
+        assert_eq!(delivered.proof.input.result_id,published_id);
+        assert_eq!(delivered.proof.input.pose,Some(crate::command_proof_trace::PoseTrace::capture(&original_pose)));
+        assert_eq!(delivered.proof.guard.observation_anchor_ns,Some(101));
+        assert!(delivered.proof.worker_guard_pose_bits_equal && delivered.proof.worker_guard_applied_bits_equal);
+        {
+            let input=worker.shared.0.lock().unwrap();
+            assert!(input.result.is_none() && input.result_proof.is_none());
+        }
+        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        assert!(worker.delivered_command_context_for_test().is_none());
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Same command value, no scoped proof: diagnostics must be absent.
+        finish.send((PlannerStep::Command(command),None)).unwrap();
+        wait_for_source_result(&worker);
+        assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+        assert!(worker.delivered_command_context_for_test().is_none());
+        worker.step(0.3);
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        finish.send((PlannerStep::Command(command),Some(303))).unwrap();
+        wait_for_source_result(&worker);
+        assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+        let latest=worker.delivered_command_context_for_test().unwrap();
+        assert!(latest.proof.input.result_id>published_id);
+        assert_eq!(latest.proof.guard.observation_anchor_ns,Some(303));
+        worker.stop();
+        assert!(worker.delivered_command_context_for_test().is_none());
+        assert!(worker.shared.0.lock().unwrap().result_proof.is_none());
+    }
+
+    #[test]
+    fn source_fence_expiry_and_zero_never_deliver_stored_diagnostic_proof() {
+        for changed_source in [false,true] {
+            let (mut worker,started,finish)=traced_worker();
+            let command=Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.05,0.0),angular_z:0.0};
+            worker.update_odometry(route_pose(0.5,0));
+            worker.step(0.3);
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            finish.send((PlannerStep::Command(command),Some(101))).unwrap();
+            wait_for_source_result(&worker);
+            {
+                let mut input=worker.shared.0.lock().unwrap();
+                assert!(input.result_proof.is_some());
+                if changed_source {input.map_version+=1;}
+                else {input.result.as_mut().unwrap().0=std::time::Instant::now()-DEFAULT_CONTROL_HORIZON-Duration::from_millis(1);}
+            }
+            assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+            assert!(worker.delivered_command_context_for_test().is_none());
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            finish.send((PlannerStep::Command(Twist2::ZERO),Some(202))).unwrap();
+            // The rejected positive result remains stored until replacement.
+            // Wait for this released zero publication, not merely any Some.
+            let deadline=std::time::Instant::now()+Duration::from_secs(1);
+            loop {
+                let input=worker.shared.0.lock().unwrap();
+                if matches!(&input.result,Some((_,PlannerStep::Command(command))) if *command==Twist2::ZERO)
+                    && input.result_map_version==input.map_version
+                    && input.result_boundary_version==input.boundary_version {break;}
+                drop(input);
+                assert!(std::time::Instant::now()<deadline,"released zero result was not published");
+                std::thread::yield_now();
+            }
+            assert_eq!(worker.step(0.3),PlannerStep::Command(Twist2::ZERO));
+            assert!(worker.delivered_command_context_for_test().is_none());
+            assert!(worker.shared.0.lock().unwrap().result_proof.is_none());
+            worker.stop();
+        }
+    }
+
     #[test]
     fn stored_positive_command_is_rejected_after_blocking_map_update() {
         let (mut worker, start, release) = source_worker();

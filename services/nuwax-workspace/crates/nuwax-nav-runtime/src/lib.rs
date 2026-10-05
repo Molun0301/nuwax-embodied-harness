@@ -37,6 +37,8 @@ mod route_planning;
 mod route_moving_worker_tests;
 #[cfg(test)]
 mod control_profile;
+#[cfg(test)]
+mod command_proof_trace;
 pub use route_follower::RouteFollower;
 
 /// 局部执行保留路径维度，三维路径不能通过默认适配静默丢弃高度。

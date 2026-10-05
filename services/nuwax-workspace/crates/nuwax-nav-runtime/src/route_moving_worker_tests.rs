@@ -80,7 +80,7 @@ fn fixture(enabled:bool, resolution:f32, length:f32)->(SurfaceFollowerConfig,Arc
     (config,map,Arc::new(keys))
 }
 
-struct Frame {map:Arc<SurfaceSnapshot>,sample_ns:u64,sequence:u16}
+struct Frame {map:Arc<SurfaceSnapshot>,sample_ns:u64,ready_ns:u64,sequence:u16}
 struct Sensor {receive:mpsc::Receiver<Frame>,stop:Arc<AtomicBool>,join:Option<std::thread::JoinHandle<()>>,dropped:Arc<AtomicUsize>}
 impl Sensor {
     fn new(base:Arc<SurfaceSnapshot>,keys:Arc<Vec<[i32;3]>>)->Self {
@@ -103,7 +103,8 @@ impl Sensor {
                 observations.set_source_timestamp_ns(sample_ns);observations.mark_complete_geometry_source();
                 // Clone the previous persistent observation roots before replacing
                 // blocks: same occupied columns retain their actual identity.
-                let frame=Frame{map:Arc::new(base.with_observations(Some(Arc::new(observations.clone())))),sample_ns,sequence};
+                let map=Arc::new(base.with_observations(Some(Arc::new(observations.clone()))));
+                let frame=Frame{map,sample_ns,ready_ns:unix_ns(),sequence};
                 match send.try_send(frame){Ok(())=>{},Err(mpsc::TrySendError::Full(_))=>{skipped.fetch_add(1,Ordering::Relaxed);},Err(mpsc::TrySendError::Disconnected(_))=>break}
                 deadline+=SENSOR_PERIOD;
                 if deadline<Instant::now(){deadline=Instant::now()+SENSOR_PERIOD;} // missed samples are dropped, never backfilled
@@ -113,6 +114,10 @@ impl Sensor {
     }
 }
 impl Drop for Sensor {fn drop(&mut self){self.stop.store(true,Ordering::Release);if let Some(t)=self.join.take(){t.join().unwrap();}}}
+
+// No source payloads or query views are retained by these diagnostic records.
+struct SourceFrameSample {sample_ns:u64,ready_ns:u64,delivered_ns:u64}
+struct SourceInstallSample {source_view_seq:u64,sample_ns:Option<u64>,completed_ns:u64}
 
 struct ControlStepSample {
     step_seq: u64,
@@ -124,6 +129,11 @@ struct ControlStepSample {
     source_present: bool,
     first_after_view_change: bool,
     pose_stamp_ns: Option<i64>,
+    source_sample_ns: Option<u64>,
+    step_entry_ns: u64,
+    step_exit_ns: u64,
+    outcome_reason: Option<PlannerStep>,
+    pending_wait_reason: Option<String>,
     submitted_before: u64,
     submitted_after: u64,
     admitted_before: u64,
@@ -142,6 +152,8 @@ struct Probe {
     control_ms:Vec<f64>,map_update_ms:Vec<f64>,submitted:u64,admitted:u64,
     negative:usize,pending:usize,endpoints:Vec<[f64;3]>,
     control_samples:Vec<ControlStepSample>,control_sample_limit:usize,control_sample_overflow:usize,
+    source_frames:Vec<SourceFrameSample>,source_frame_overflow:usize,
+    source_installs:Vec<SourceInstallSample>,source_install_overflow:usize,
 }
 impl Probe {
     fn with_control_sample_budget(max_ticks: usize) -> Self {
@@ -149,24 +161,32 @@ impl Probe {
         Self {
             control_ms: Vec::with_capacity(MAX_TICKS * 2),
             control_samples: Vec::with_capacity(limit),
+            source_frames: Vec::with_capacity(limit),
+            source_installs: Vec::with_capacity(limit),
             control_sample_limit: limit,
             ..Self::default()
         }
+    }
+    fn record_frame(&mut self,frame:&Frame,delivered_ns:u64) {
+        if self.source_frames.len()<self.control_sample_limit {
+            self.source_frames.push(SourceFrameSample{sample_ns:frame.sample_ns,ready_ns:frame.ready_ns,delivered_ns});
+        }else{self.source_frame_overflow=self.source_frame_overflow.saturating_add(1);}
     }
 }
 
 struct Measured {
     inner:RouteFollower,probe:Arc<Mutex<Probe>>,
     source:Option<Weak<SurfaceSnapshot>>,source_view_seq:u64,first_after_view_change:bool,
-    pose_stamp_ns:Option<i64>,step_seq:u64,
+    pose_stamp_ns:Option<i64>,source_sample_ns:Option<u64>,step_seq:u64,
     jobs:Arc<AtomicUsize>,held:Arc<AtomicBool>,held_phase:Arc<AtomicUsize>,
 }
 impl Measured {
     fn new(inner:RouteFollower,probe:Arc<Mutex<Probe>>,jobs:Arc<AtomicUsize>,held:Arc<AtomicBool>,held_phase:Arc<AtomicUsize>)->Self {
         Self {inner,probe,source:None,source_view_seq:0,first_after_view_change:false,
-            pose_stamp_ns:None,step_seq:0,jobs,held,held_phase}
+            pose_stamp_ns:None,source_sample_ns:None,step_seq:0,jobs,held,held_phase}
     }
     fn clear_source_marker(&mut self) {
+        self.source_sample_ns=None;
         if self.source.take().is_some() {
             self.source_view_seq=self.source_view_seq.saturating_add(1);
             self.first_after_view_change=true;
@@ -187,20 +207,33 @@ impl NavPlanner for Measured {
         // A weak marker does not pin prior source payloads or their query
         // caches. Its temporary upgrade is dropped before the inner update;
         // if the source is already gone, conservatively mark a new view.
-        let (source,changed)=match &m {
+        let (source,changed,sample_ns)=match &m {
             ExecutionMap::Surface(next)=>{
                 let changed=self.source.as_ref().and_then(Weak::upgrade)
                     .is_none_or(|old|!old.same_body_query_view(next));
-                (Some(Arc::downgrade(next)),changed)
+                // All fixture observations share the actual frame timestamp.
+                // One sentinel lookup at installation; no per-step map lookup,
+                // source-timestamp API, source pinning, or timestamp rewriting.
+                let key=[0,0,(0.1/next.source_voxel_size_m()).round()as i32-1];
+                let sample_ns=next.observations().and_then(|observations|observations.get(key))
+                    .map(|observation|observation.observed_ns).filter(|&ns|ns!=0);
+                (Some(Arc::downgrade(next)),changed,sample_ns)
             },
-            ExecutionMap::Planar(_)=>(None,false),
+            ExecutionMap::Planar(_)=>(None,false,None),
         };
         let t=Instant::now();let result=self.inner.update_execution_map(m);let ms=t.elapsed().as_secs_f64()*1e3;
+        let completed_ns=unix_ns();
         if result.is_ok() {
             if changed {self.source_view_seq=self.source_view_seq.saturating_add(1);self.first_after_view_change=true;}
-            self.source=source;
+            self.source=source;self.source_sample_ns=sample_ns;
         }
-        self.probe.lock().unwrap().map_update_ms.push(ms);result
+        let mut p=self.probe.lock().unwrap();p.map_update_ms.push(ms);
+        if result.is_ok() {
+            if p.source_installs.len()<p.control_sample_limit {
+                p.source_installs.push(SourceInstallSample{source_view_seq:self.source_view_seq,sample_ns,completed_ns});
+            }else{p.source_install_overflow=p.source_install_overflow.saturating_add(1);}
+        }
+        result
     }
     fn invalidate_execution_map(&mut self){self.inner.invalidate_execution_map();self.clear_source_marker();}
     fn observe_applied_command(&mut self,c:Twist2){self.inner.observe_applied_command(c)}
@@ -217,18 +250,21 @@ impl NavPlanner for Measured {
         // map installation, or the independent post-run safety oracles.
         #[cfg(feature="body-query-profile")]
         body_query_profile::begin();
+        let step_entry_ns=unix_ns();
         let t=Instant::now();let result=self.inner.step(w);let ms=t.elapsed().as_secs_f64()*1e3;
+        let step_exit_ns=unix_ns();
         let stages=control_profile::end();
         #[cfg(feature="body-query-profile")]
         let body_queries=body_query_profile::end();
         let submitted_after=self.inner.local_planning_calls();let admitted_after=self.inner.local_plans();
         let jobs_after=self.jobs.load(Ordering::Acquire);let held_phase_after=self.held_phase.load(Ordering::Acquire);
         let held_after=self.held.load(Ordering::Acquire);
-        let sample=ControlStepSample {step_seq:self.step_seq,control_ms:ms,stages,
+        let mut sample=ControlStepSample {step_seq:self.step_seq,control_ms:ms,stages,
             #[cfg(feature="body-query-profile")]
             body_queries,
             source_view_seq:self.source_view_seq,source_present:self.source.is_some(),
             first_after_view_change:std::mem::take(&mut self.first_after_view_change),pose_stamp_ns:self.pose_stamp_ns,
+            source_sample_ns:self.source_sample_ns,step_entry_ns,step_exit_ns,outcome_reason:None,pending_wait_reason:None,
             submitted_before,submitted_after,admitted_before,admitted_after,jobs_before,jobs_after,
             held_before,held_after,held_phase_before,held_phase_after,
             outcome:match &result {PlannerStep::Command(v)=>if nonzero(*v){"command_nonzero"}else{"command_zero"},
@@ -237,7 +273,16 @@ impl NavPlanner for Measured {
         // One existing stats lock after the measured step. New records never
         // reallocate; overflow is visible and cannot silently qualify a run.
         let mut p=self.probe.lock().unwrap();p.control_ms.push(ms);p.submitted=submitted_after;
-        if p.control_samples.len()<p.control_sample_limit {p.control_samples.push(sample);}
+        if p.control_samples.len()<p.control_sample_limit {
+            // Clone only retained non-command outcomes after timing. The record
+            // count is bounded; fixed-fixture reason payload bytes are not capped.
+            // Format after drain and never infer a TTL cause from this text.
+            if matches!(&result,PlannerStep::Pending(_)|PlannerStep::ReplanRequired(_)|PlannerStep::Failed(_)) {
+                sample.outcome_reason=Some(result.clone());
+                if matches!(&result,PlannerStep::Pending(_)){sample.pending_wait_reason=self.inner.execution_wait_reason();}
+            }
+            p.control_samples.push(sample);
+        }
         else {p.control_sample_overflow=p.control_sample_overflow.saturating_add(1);}
         if admitted_after>p.admitted {if let Some(end)=self.inner.local_path().and_then(|path|path.poses.last()){let v=end.pose.position;p.endpoints.push([v.x,v.y,v.z]);}}
         p.admitted=admitted_after;
@@ -250,15 +295,112 @@ impl NavPlanner for Measured {
 #[derive(Clone,Copy,Debug,PartialEq)]
 enum Scenario {Goal,HoldFirst,HoldSecond,HoldSecondContinuity,ReplaceGoal,ReplacePath,ReplaceBoundary,ReplaceGeometry,Cancel}
 struct RawReceipt {map:Arc<SurfaceSnapshot>,boundary:Arc<Vec<[f64;2]>>,pose:PlanarPose,before:Twist2,command:Twist2,ns:u64,
-    source_sample_ns:u64,source_sequence:u16,pose_stamp_ns:i64,worker_result_age_ms:f64,worker_remaining_ms:f64}
+    source_sample_ns:u64,source_sequence:u16,pose_stamp_ns:i64,worker_result_age_ms:f64,worker_remaining_ms:f64,
+    receipt_pose:crate::command_proof_trace::PoseTrace,proof_context:Option<crate::command_proof_trace::DeliveredCommandContext>}
 struct RawSegment {map:Arc<SurfaceSnapshot>,boundary:Arc<Vec<[f64;2]>>,from:PlanarPose,to:PlanarPose,ns:u64,dt:f64}
+// Diagnostic replay only: the actual receipt oracle below remains unchanged.
+fn receipt_oracle_at(r:&RawReceipt,resolution:f32,anchor_ns:u64)->bool {
+    let Ok(occupied)=r.map.body_observation_footprint(body(r.pose)) else{return false;};
+    let make_check=|| |a:PlanarPose,b:PlanarPose,elapsed:f64| {
+        r.map.validate_observed_body_motion_in_boundary(body(a),body(b),&occupied,
+            anchor_ns+(elapsed*1e9)as u64,(OBS_AGE*1e9)as u64,&r.boundary)
+            .and_then(|_|r.map.body_query_with_current_support(body(a).0,body(a).1)
+                .and_then(|view|view.validate_body_motion(body(a),body(b),&r.boundary))).is_ok()
+    };
+    nuwax_nav_control::check_stopping_trajectory_with_period_check(r.pose,r.before,r.command,&limits(),
+        PERIOD.as_secs_f64(),f64::from(resolution)*0.5,r.map.body_envelope().unwrap().radius(),make_check(),make_check()).is_some()
+}
+fn report_proof_receipts(receipts:&[RawReceipt]) {
+    let mut guard_age=Vec::new();let mut guard_delay=Vec::new();let mut compute_delay=Vec::new();let mut publication_delay=Vec::new();
+    let mut missing=0;let mut state_mismatch=0;let mut worker_guard_mismatch=0;let mut clock_invalid=0;let mut previous_id=None;
+    for receipt in receipts {
+        let Some(context)=&receipt.proof_context else {missing+=1;continue;};
+        assert_eq!(context.proof.guard.selected_command_bits,crate::command_proof_trace::command_bits(receipt.command));
+        assert!(previous_id.is_none_or(|previous|context.proof.input.result_id>previous),"one result must never be delivered twice");
+        previous_id=Some(context.proof.input.result_id);
+        let guard=&context.proof.guard;
+        worker_guard_mismatch+=usize::from(!context.proof.worker_guard_pose_bits_equal
+            || !context.proof.worker_guard_pose_stamp_equal || !context.proof.worker_guard_pose_frame_equal
+            || !context.proof.worker_guard_applied_bits_equal);
+        state_mismatch+=usize::from(guard.pose.bits!=receipt.receipt_pose.bits
+            || guard.pose.frame_id!=receipt.receipt_pose.frame_id
+            || guard.applied_bits!=crate::command_proof_trace::command_bits(receipt.before));
+        if let Some(anchor)=guard.observation_anchor_ns {
+            if let (Some(age),Some(delay))=(anchor.checked_sub(receipt.source_sample_ns),receipt.ns.checked_sub(anchor)) {
+                guard_age.push(age as f64/1e6);guard_delay.push(delay as f64/1e6);
+            }else{clock_invalid+=1;}
+        }
+        if let Some(delay)=context.proof.compute_completion_unix_ns.checked_sub(context.proof.input.compute_start_unix_ns){compute_delay.push(delay as f64/1e6);}else{clock_invalid+=1;}
+        if let Some(delay)=context.retrieval_unix_ns.checked_sub(context.publication_unix_ns){publication_delay.push(delay as f64/1e6);}else{clock_invalid+=1;}
+    }
+    eprintln!("PROOF_RECEIPTS receipts={} traced={} missing={missing} worker_guard_basis_mismatches={worker_guard_mismatch} guard_receipt_state_mismatches={state_mismatch} invalid_clock_pairs={clock_invalid} source_age_at_selected_guard_ms={} guard_to_receipt_ms={} compute_ms={} publication_to_retrieval_ms={} result_identity=exact_stored_publication no_motion_authority_from_diagnostics=true",
+        receipts.len(),receipts.len()-missing,measured_distribution(&guard_age),measured_distribution(&guard_delay),measured_distribution(&compute_delay),measured_distribution(&publication_delay));
+}
 fn distribution(values:&[f64])->(f64,f64,f64) {let mut v=values.to_vec();v.sort_by(f64::total_cmp);if v.is_empty(){return (0.0,0.0,0.0);} (v[v.len()/2],v[((v.len()-1)as f64*0.95).ceil()as usize],*v.last().unwrap())}
 fn measured_distribution(values:&[f64])->String {
     if values.is_empty(){"unavailable".into()}else{format!("{:?}",distribution(values))}
 }
 
+fn source_age_ms(sample_ns:Option<u64>,at_ns:u64)->Result<f64,&'static str> {
+    let sample_ns=sample_ns.filter(|&ns|ns!=0).ok_or("unknown")?;
+    at_ns.checked_sub(sample_ns).map(|age|age as f64/1e6).ok_or("future")
+}
+
+fn report_source_ages(p:&Probe,factory:bool,context:&str) {
+    // All diagnostics are printed after worker drain. Clock regressions and
+    // unknown timestamps remain visible; neither is clamped to fresh age zero.
+    let report_ages=|metric:&str,pairs:Vec<(Option<u64>,u64)>,omitted:usize| {
+        let mut values=Vec::with_capacity(pairs.len());let mut unknown=0;let mut future=0;
+        for (sample,at) in pairs {
+            match sample.filter(|&ns|ns!=0) {
+                None=>unknown+=1,
+                Some(sample)=>match at.checked_sub(sample) {
+                    Some(age)=>values.push(age as f64/1e6),None=>future+=1,
+                },
+            }
+        }
+        let age_ge_ttl=values.iter().filter(|&&age|age>=OBS_AGE*1e3).count();
+        eprintln!("MOVING_SOURCE_AGE {context} metric={metric} known={} unknown={unknown} future={future} omitted={omitted} age_ms_median_p95_max={} initial_source_age_ge_ttl={age_ge_ttl} ttl_ms={} age_ge_ttl_is_not_actual_rejection=true",
+            values.len(),measured_distribution(&values),OBS_AGE*1e3);
+    };
+    let mut spacing=Vec::with_capacity(p.source_frames.len());let mut nonincreasing=0;
+    for pair in p.source_frames.windows(2) {
+        match pair[1].sample_ns.checked_sub(pair[0].sample_ns) {
+            Some(ns) if ns>0=>spacing.push(ns as f64/1e6),_=>nonincreasing+=1,
+        }
+    }
+    eprintln!("MOVING_SOURCE_CADENCE {context} scope=consumer_delivered_frames_including_priming retained_frames={} record_limit={} omitted_frames={} delivered_frame_sample_spacing_ms_median_p95_max={} nonincreasing_sample_pairs={nonincreasing} configured_sensor_period_ms={} configured_period_is_not_achieved_cadence=true dropped_frame_samples_excluded=true producer_drop_count=MOVING_summary",
+        p.source_frames.len(),p.control_sample_limit,p.source_frame_overflow,measured_distribution(&spacing),SENSOR_PERIOD.as_secs_f64()*1e3);
+    report_ages("source_at_frame_ready",p.source_frames.iter().map(|frame|(Some(frame.sample_ns),frame.ready_ns)).collect(),p.source_frame_overflow);
+    report_ages("source_at_consumer_delivery",p.source_frames.iter().map(|frame|(Some(frame.sample_ns),frame.delivered_ns)).collect(),p.source_frame_overflow);
+    if factory {
+        eprintln!("MOVING_SOURCE_OWNER {context} available=false reason=unprobed_factory");return;
+    }
+    eprintln!("MOVING_SOURCE_OWNER {context} available=true source_stamp=actual_installed_map_fixture_sentinel successful_installs={} omitted_installs={} retained_steps={} omitted_steps={} step_entry_is_not_selected_guard_entry=true actual_selected_guard_entry=unavailable_in_step_record available_when_exact_receipt_trace_present=true rejection_cause=exact_result_and_wait_only reason_storage=bounded_step_count_payload_bytes_not_capped",
+        p.source_installs.len(),p.source_install_overflow,p.control_samples.len(),p.control_sample_overflow);
+    report_ages("source_at_compute_owner_install_completion",p.source_installs.iter().map(|sample|(sample.sample_ns,sample.completed_ns)).collect(),p.source_install_overflow);
+    report_ages("installed_source_at_compute_step_entry",p.control_samples.iter().map(|sample|(sample.source_sample_ns,sample.step_entry_ns)).collect(),p.control_sample_overflow);
+    report_ages("installed_source_at_compute_step_exit",p.control_samples.iter().map(|sample|(sample.source_sample_ns,sample.step_exit_ns)).collect(),p.control_sample_overflow);
+    for outcome in ["command_nonzero","command_zero","pending","replan_required","failed","succeeded"] {
+        report_ages(&format!("installed_source_at_compute_step_entry_{outcome}"),p.control_samples.iter().filter(|sample|sample.outcome==outcome).map(|sample|(sample.source_sample_ns,sample.step_entry_ns)).collect(),p.control_sample_overflow);
+    }
+    for outcome in ["pending","replan_required","failed"] {
+        let count=p.control_samples.iter().filter(|sample|sample.outcome==outcome).count();
+        eprintln!("MOVING_STEP_REASON_SCOPE {context} outcome={outcome} retained_steps={count} printed_steps={} omitted_examples={} omitted_unrecorded_steps={} selection=first_two_and_last_three_retained_steps exact_payload=true ttl_cause_not_inferred=true",
+            count.min(5),count.saturating_sub(5),p.control_sample_overflow);
+        for (index,sample) in p.control_samples.iter().filter(|sample|sample.outcome==outcome).enumerate() {
+            if index>=2&&index+3<count {continue;}
+            let source_install=p.source_installs.iter().rev().find(|install|install.source_view_seq==sample.source_view_seq&&install.completed_ns<=sample.step_entry_ns);
+            let stage_ms_calls=Stage::ALL.map(|stage|{let index=stage as usize;(stage.label(),sample.stages.wall_nanos[index]as f64/1e6,sample.stages.calls[index])});
+            eprintln!("MOVING_STEP_REASON {context} step_seq={} outcome={outcome} reason={:?} pending_wait={:?} source_view_seq={} source_sample_ns={:?} source_install_completion_ns={:?} step_entry_ns={} step_exit_ns={} step_entry_source_age_ms={:?} step_exit_source_age_ms={:?} control_wall_ms={} inclusive_stage_ms_calls={stage_ms_calls:?}",
+                sample.step_seq,sample.outcome_reason,sample.pending_wait_reason,sample.source_view_seq,sample.source_sample_ns,source_install.map(|install|install.completed_ns),sample.step_entry_ns,sample.step_exit_ns,source_age_ms(sample.source_sample_ns,sample.step_entry_ns),source_age_ms(sample.source_sample_ns,sample.step_exit_ns),sample.control_ms);
+        }
+    }
+}
+
 fn report_control_stages(p:&Probe,factory:bool,scenario:Scenario,enabled:bool,resolution:f32,startup:&str) {
     let context=format!("scenario={scenario:?} enabled={enabled} source_cm={} startup={startup}",resolution*100.0);
+    report_source_ages(p,factory,&context);
     if factory {
         eprintln!("CONTROL_STAGE_SCOPE {context} available=false reason=unprobed_factory wall_not_thread_cpu=true");
         eprintln!("BODY_QUERY_SCOPE {context} available=false reason=unprobed_factory wall_not_thread_cpu=true");
@@ -310,9 +452,10 @@ fn report_control_stages(p:&Probe,factory:bool,scenario:Scenario,enabled:bool,re
             (stage.label(),sample.stages.wall_nanos[index]as f64/1e6,sample.stages.calls[index])
         });
         let counter_counts=Counter::ALL.map(|counter|(counter.label(),sample.stages.counters[counter as usize]));
-        eprintln!("CONTROL_SLOW_STEP {context} sample_scope={sample_scope} rank={} step_seq={} control_wall_ms={:.6} source_view_seq={} source_present={} first_after_view_change={} pose_stamp_ns={:?} submitted_before={} submitted_after={} admitted_before={} admitted_after={} jobs_before={} jobs_after={} held_before={} held_after={} held_phase_before={} held_phase_after={} outcome={} inclusive_stage_ms_calls={stage_ms_calls:?} counter_counts={counter_counts:?}",
+        eprintln!("CONTROL_SLOW_STEP {context} sample_scope={sample_scope} rank={} step_seq={} control_wall_ms={:.6} source_view_seq={} source_present={} first_after_view_change={} pose_stamp_ns={:?} source_sample_ns={:?} step_entry_ns={} step_exit_ns={} step_entry_source_age_ms={:?} step_exit_source_age_ms={:?} submitted_before={} submitted_after={} admitted_before={} admitted_after={} jobs_before={} jobs_after={} held_before={} held_after={} held_phase_before={} held_phase_after={} outcome={} inclusive_stage_ms_calls={stage_ms_calls:?} counter_counts={counter_counts:?}",
             rank+1,sample.step_seq,sample.control_ms,sample.source_view_seq,sample.source_present,
-            sample.first_after_view_change,sample.pose_stamp_ns,sample.submitted_before,sample.submitted_after,
+            sample.first_after_view_change,sample.pose_stamp_ns,sample.source_sample_ns,sample.step_entry_ns,sample.step_exit_ns,
+            source_age_ms(sample.source_sample_ns,sample.step_entry_ns),source_age_ms(sample.source_sample_ns,sample.step_exit_ns),sample.submitted_before,sample.submitted_after,
             sample.admitted_before,sample.admitted_after,sample.jobs_before,sample.jobs_after,
             sample.held_before,sample.held_after,sample.held_phase_before,sample.held_phase_after,sample.outcome);
         #[cfg(feature="body-query-profile")]
@@ -400,9 +543,10 @@ fn report_body_query_slow_step(context:&str,sample_scope:&str,ranking:&str,rank:
     });
     let counter_counts=BodyCounter::ALL.map(|counter|(counter.label(),sample.body_queries.counters[counter as usize]));
     let dense_initial_table_payload_bytes=dense_initial_table_payload_bytes(&sample.body_queries);
-    eprintln!("BODY_QUERY_SLOW_STEP {context} sample_scope={sample_scope} ranking={ranking} rank={rank} step_seq={} control_wall_ms={:.6} source_view_seq={} source_present={} first_after_view_change={} pose_stamp_ns={:?} submitted_before={} submitted_after={} admitted_before={} admitted_after={} jobs_before={} jobs_after={} held_before={} held_after={} held_phase_before={} held_phase_after={} outcome={} inclusive_stage_ms_calls={stage_ms_calls:?} counter_counts={counter_counts:?} dense_initial_table_payload_bytes={dense_initial_table_payload_bytes}",
+    eprintln!("BODY_QUERY_SLOW_STEP {context} sample_scope={sample_scope} ranking={ranking} rank={rank} step_seq={} control_wall_ms={:.6} source_view_seq={} source_present={} first_after_view_change={} pose_stamp_ns={:?} source_sample_ns={:?} step_entry_ns={} step_exit_ns={} step_entry_source_age_ms={:?} step_exit_source_age_ms={:?} submitted_before={} submitted_after={} admitted_before={} admitted_after={} jobs_before={} jobs_after={} held_before={} held_after={} held_phase_before={} held_phase_after={} outcome={} inclusive_stage_ms_calls={stage_ms_calls:?} counter_counts={counter_counts:?} dense_initial_table_payload_bytes={dense_initial_table_payload_bytes}",
         sample.step_seq,sample.control_ms,sample.source_view_seq,sample.source_present,
-        sample.first_after_view_change,sample.pose_stamp_ns,sample.submitted_before,sample.submitted_after,
+        sample.first_after_view_change,sample.pose_stamp_ns,sample.source_sample_ns,sample.step_entry_ns,sample.step_exit_ns,
+            source_age_ms(sample.source_sample_ns,sample.step_entry_ns),source_age_ms(sample.source_sample_ns,sample.step_exit_ns),sample.submitted_before,sample.submitted_after,
         sample.admitted_before,sample.admitted_after,sample.jobs_before,sample.jobs_after,
         sample.held_before,sample.held_after,sample.held_phase_before,sample.held_phase_after,sample.outcome);
 }
@@ -461,6 +605,7 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
         // or timestamps. The producer continues normally after priming.
         for _ in 0..2 {
             let frame=sensor.receive.recv_timeout(Duration::from_secs(5)).expect("two real priming frames");
+            let delivered_ns=unix_ns();probe.lock().unwrap().record_frame(&frame,delivered_ns);
             assert!(frame.sample_ns<=unix_ns());
             if let Some(previous)=previous_frame {
                 assert!(frame.sample_ns>previous);
@@ -503,6 +648,7 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
         if now>=command_deadline {command=Twist2::ZERO;}
         last_tick=now;current.stamp=stamp();
         if let Ok(frame)=sensor.receive.try_recv(){
+            let delivered_ns=unix_ns();probe.lock().unwrap().record_frame(&frame,delivered_ns);
             assert!(frame.sample_ns<=unix_ns());
             if let Some(previous)=previous_frame {assert!(frame.sample_ns>previous);let previous_map=previous_source.as_ref().unwrap();assert!(nuwax_nav_pct::same_source_geometry(previous_map,&frame.map));assert!(!previous_map.same_body_query_view(&frame.map));}
             previous_frame=Some(frame.sample_ns);previous_source=Some(frame.map.clone());sequence=frame.sequence;frames+=1;
@@ -550,7 +696,8 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
         command_at=receipt_at;command_deadline=permitted_until;segment_ns=unix_ns();
         if nonzero(command){receipts.push(RawReceipt{map:map.clone(),boundary:boundary.clone(),pose:planar(&current),before,command,ns:segment_ns,source_sample_ns:installed_sample_ns,source_sequence:sequence,pose_stamp_ns:current.stamp.nanos,
             worker_result_age_ms:DEFAULT_CONTROL_HORIZON.saturating_sub(original_deadline.saturating_duration_since(receipt_at)).as_secs_f64()*1e3,
-            worker_remaining_ms:original_deadline.saturating_duration_since(receipt_at).as_secs_f64()*1e3});}
+            worker_remaining_ms:original_deadline.saturating_duration_since(receipt_at).as_secs_f64()*1e3,
+            receipt_pose:crate::command_proof_trace::PoseTrace::capture(&current),proof_context:worker.delivered_command_context_for_test().cloned()});}
         worker.observe_applied_command(command);
         if scenario==Scenario::HoldSecondContinuity&&held_nonzero>=2&&released_at.is_some()
             &&!held.load(Ordering::Acquire)&&probe.lock().unwrap().admitted>hold_admitted_count {
@@ -578,6 +725,7 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
     // Report CPU raw /proc values; no false per-thread CPU attribution. Factory
     // runs deliberately have no inner probe: consumer latency is NOT control CPU.
     drop(p);drop(sensor);
+    report_proof_receipts(&receipts);
     // Run expensive independent oracles after wall-timed control. Retained immutable
     // snapshots preserve hits, observation source stamp and actual receipt time.
     for (i,s) in segments.iter().enumerate(){
@@ -619,8 +767,17 @@ fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,pr
             let current_body_result=r.map.validate_body_pose(body(r.pose).0,body(r.pose).1);
             let current_view_same=r.map.with_current_body_support(body(r.pose).0,body(r.pose).1).map(|view|view.same_body_query_view(&r.map));
             let footprint_evidence:Vec<_>=occupied.iter().take(4).map(|key|(*key,r.map.observations().and_then(|o|o.get(*key)))).collect();
-            eprintln!("BRAKING_ORACLE_FAILURE receipt={i} source_cm={} receipt_ns={} pose_stamp_ns={} source_sample_ns={} source_sequence={} source_age_at_receipt_ms={:.6} worker_result_age_ms={:.6} worker_remaining_ms={:.6} actual_guard_entry_time=unavailable computed_pose_applied_context=unavailable pose={:?} before={:?} command={:?} initial_footprint_cells={} footprint_evidence_first4={footprint_evidence:?} current_body={current_body_result:?} current_view_same={current_view_same:?} first_failure={:?}",
-                resolution*100.0,r.ns,r.pose_stamp_ns,r.source_sample_ns,r.source_sequence,r.ns.saturating_sub(r.source_sample_ns)as f64/1e6,r.worker_result_age_ms,r.worker_remaining_ms,r.pose,r.before,r.command,occupied.len(),first_failure.borrow());
+            if let Some(context)=&r.proof_context {
+                let guard=&context.proof.guard;
+                let same_pose=guard.pose.bits==r.receipt_pose.bits && guard.pose.frame_id==r.receipt_pose.frame_id;
+                let same_applied=guard.applied_bits==crate::command_proof_trace::command_bits(r.before);
+                let historical=guard.observation_anchor_ns.map(|anchor|receipt_oracle_at(r,resolution,anchor));
+                eprintln!("PROOF_TIME_REPLAY receipt={i} result_id={} guard_pose_equals_receipt={same_pose} guard_applied_equals_receipt={same_applied} guard_anchor_receipt_basis_pass={historical:?} original_receipt_basis_pass=false original_ttl_ns={:?} fixture_ttl_ns={} historical_anchor_is_captured_not_fabricated=true",
+                    context.proof.input.result_id,guard.observation_max_age_ns,(OBS_AGE*1e9)as u64);
+            }
+
+            eprintln!("BRAKING_ORACLE_FAILURE receipt={i} source_cm={} receipt_ns={} pose_stamp_ns={} source_sample_ns={} source_sequence={} source_age_at_receipt_ms={:.6} worker_result_age_ms={:.6} worker_remaining_ms={:.6} selected_proof_context={:?} receipt_pose_raw={:?} pose={:?} before={:?} command={:?} initial_footprint_cells={} footprint_evidence_first4={footprint_evidence:?} current_body={current_body_result:?} current_view_same={current_view_same:?} first_failure={:?}",
+                resolution*100.0,r.ns,r.pose_stamp_ns,r.source_sample_ns,r.source_sequence,r.ns.saturating_sub(r.source_sample_ns)as f64/1e6,r.worker_result_age_ms,r.worker_remaining_ms,r.proof_context,r.receipt_pose,r.pose,r.before,r.command,occupied.len(),first_failure.borrow());
         }
         assert!(choice.is_some(),"receipt {i} independent full braking oracle rejected: {:?}",first_failure.into_inner());
     }

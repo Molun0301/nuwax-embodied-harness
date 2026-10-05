@@ -779,6 +779,7 @@ impl SurfaceFollower {
         &mut dyn FnMut(PlanarPose, PlanarPose, f64) -> bool,
         &std::cell::RefCell<Option<nuwax_nav_mls_planner::surface::SurfaceError>>,
     ) -> R) -> Result<R, String> {
+        #[cfg(test)] let proof_scope=crate::command_proof_trace::GuardScope::begin();
         #[cfg(test)] let profile_setup=crate::control_profile::guard(crate::control_profile::Stage::GuardSetup);
         let map=self.map.as_ref().ok_or("缺少表面地图")?;
         let pose=self.odometry.as_ref().ok_or("缺少实际位姿")?;
@@ -790,6 +791,8 @@ impl SurfaceFollower {
                 .map(|d| d.as_nanos().min(u128::from(u64::MAX)) as u64).unwrap_or(0);
             Some((occupied, now, (age * 1e9) as u64))
         } else { None };
+        #[cfg(test)] proof_scope.record_basis(pose,self.last_command,
+            observation_check.as_ref().map(|(_,now,age)|(*now,*age)));
         let last_failure = std::cell::RefCell::new(None);
         let source_map=self.source_map.as_ref().unwrap_or(map);
         let motion_queries = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -920,6 +923,7 @@ impl SurfaceFollower {
     }
 
     pub(super) fn bounded_body_command(&mut self, preferred: Twist2, speed_limit:Option<f64>) -> PlannerStep {
+        #[cfg(test)] crate::command_proof_trace::invalidate_selection();
         #[cfg(test)] let profile_setup=crate::control_profile::guard(crate::control_profile::Stage::GuardSetup);
         let (Some(map), Some(pose), Some(physical_limits)) = (
             self.map.as_ref(),
@@ -1006,6 +1010,9 @@ impl SurfaceFollower {
             clear,
             period_clear,
         );
+        #[cfg(test)] if let Some(choice)=&result {
+            crate::command_proof_trace::record_selected(choice.command);
+        }
         (result,last_failure.take())
         });
         #[cfg(test)] {

@@ -6601,6 +6601,39 @@ class GeometryRuntimeProvider:
         }
 
     # === Localization ===
+    def capture_localization_sample(self):
+        """Read pose/TF through one checked Python connection interval.
+
+        This is not an atomic native snapshot or evidence of native activation
+        ownership. Never hold map locks across RPCs or retry on a new stub.
+        """
+        with self._map_state_lock:
+            stub = self._stub
+            if (self._stopping or not self._connected or stub is None
+                    or self._mapping_transition_inflight):
+                return None, None
+            token = self._map_delivery_token_locked()
+            static_edges = tuple(self._static_extrinsic_edges)
+        tree_reader = getattr(stub, "GetFrameTree", None)
+        pose_reader = getattr(stub, "GetCurrentPose", None)
+        if not callable(tree_reader) or not callable(pose_reader):
+            return None, None
+        try:
+            tree_response = tree_reader(pb2.Empty(), timeout=_pose_deadline_sec())
+            pose_response = pose_reader(pb2.PoseRequest(), timeout=_pose_deadline_sec())
+            frame_tree = _merge_static_edges(
+                _build_frame_tree(tree_response.transforms), static_edges)
+            pose = _build_pose(pose_response)
+        except grpc.RpcError as error:
+            _log_rpc_error("capture_localization_sample", error)
+            return None, None
+        with self._map_state_lock:
+            if (self._stopping or not self._connected
+                    or self._mapping_transition_inflight or self._stub is not stub
+                    or self._map_delivery_token_locked() != token):
+                return None, None
+        return pose, frame_tree
+
     def get_current_pose(
         self,
         *,

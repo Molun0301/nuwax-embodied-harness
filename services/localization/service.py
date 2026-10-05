@@ -1877,6 +1877,10 @@ class LocalizationService:
         return provider
 
     def _capture_provider_data(self, provider: LocalizationProvider):
+        capture = getattr(provider, "capture_localization_sample", None)
+        if callable(capture):
+            # A rejected composite must not be retried as unrelated unary reads.
+            return capture()
         # 坐标树读取可能阻塞；结束后再领取最新位姿，不让早先位姿跟随树查询等待。
         frame_tree = provider.get_frame_tree()
         return provider.get_current_pose(), frame_tree

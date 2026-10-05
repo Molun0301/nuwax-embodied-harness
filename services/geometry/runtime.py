@@ -10963,6 +10963,41 @@ class PlatformGeometryProviderBundle(
             available = _remote_is_connected(backend)
         return available and not self._map_asset_activation_recovery_pending()
 
+    def capture_localization_sample(self):
+        """Pin the backend and installation for one pose/TF sampling interval.
+
+        Provider/plugin calls stay outside runtime locks. The returned values
+        do not attest native owner freshness or later publication currentness.
+        """
+        if not self._is_geometry_profile_enabled():
+            return None, None
+        backend = self.runtime._resolve_localization_backend()
+        if backend is None:
+            return None, None
+        with self.runtime._runtime_state_lock:
+            if (getattr(self.runtime, "_provider_attach_stopping", False)
+                    or getattr(self.runtime, "_map_asset_activation_fence", None) is not None):
+                return None, None
+            attach_epoch = self.runtime._provider_attach_epoch
+            snapshot = self.runtime._map_activation_snapshot_locked()
+        capture = getattr(backend, "capture_localization_sample", None)
+        if callable(capture):
+            pose, frame_tree = capture()
+        else:
+            frame_tree = backend.get_frame_tree()
+            pose = backend.get_current_pose()
+        # Resolving an alternate/provider backend can execute plugin code.
+        current_backend = self.runtime._resolve_localization_backend()
+        enabled = self._is_geometry_profile_enabled()
+        with self.runtime._runtime_state_lock:
+            if (not enabled or current_backend is not backend
+                    or getattr(self.runtime, "_provider_attach_stopping", False)
+                    or self.runtime._provider_attach_epoch != attach_epoch
+                    or self.runtime._map_activation_snapshot_locked() is not snapshot
+                    or getattr(self.runtime, "_map_asset_activation_fence", None) is not None):
+                return None, None
+        return pose, frame_tree
+
     def get_current_pose(self):
         if (
             not self._is_geometry_profile_enabled()

@@ -144,13 +144,145 @@ pub(crate) struct PreparedRegisteredCloud {
     pub(crate) envelope_sha256: [u8; 32],
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct AcceptedRegisteredCloud {
-    pub(crate) envelope: LioCloudEnvelope,
-    pub(crate) map_points: Vec<Point3<f64>>,
-    pub(crate) adapter_timestamp_ns: i64,
-    pub(crate) binding: RegistrationBinding,
+    envelope: LioCloudEnvelope,
+    map_points: Vec<Point3<f64>>,
+    adapter_timestamp_ns: i64,
+    binding: RegistrationBinding,
+    scan: OnceLock<AdmittedRegisteredScan>,
 }
+
+impl PartialEq for AcceptedRegisteredCloud {
+    fn eq(&self, other: &Self) -> bool {
+        // The lazy capture cache is not part of admission identity.
+        self.envelope == other.envelope && self.map_points.len() == other.map_points.len()
+            && self.map_points.iter().zip(&other.map_points).all(|(a, b)|
+                a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits() && a.z.to_bits() == b.z.to_bits())
+            && self.adapter_timestamp_ns == other.adapter_timestamp_ns
+            && self.binding.exact_eq(&other.binding)
+    }
+}
+
+impl AcceptedRegisteredCloud {
+    pub(crate) fn scan(&self) -> &AdmittedRegisteredScan {
+        self.scan.get_or_init(|| AdmittedRegisteredScan::from_map_points(
+            SourceIdentity::from_cloud(&self.envelope),
+            [self.envelope.sensor_frame_id.clone(), self.envelope.body_frame_id.clone(),
+                self.envelope.odom_frame_id.clone(), self.envelope.map_frame_id.clone()],
+            self.envelope.source_point_count, self.binding.clone(), &self.map_points))
+    }
+    pub(crate) fn binding(&self) -> &RegistrationBinding { &self.binding }
+    pub(crate) fn map_points(&self) -> &[Point3<f64>] { &self.map_points }
+    pub(crate) fn point_step(&self) -> u32 { self.envelope.cloud.point_step as u32 }
+    pub(crate) fn adapter_timestamp_ns(&self) -> u64 { self.adapter_timestamp_ns as u64 }
+    pub(crate) fn source_timestamp_ns(&self) -> u64 { self.envelope.source_timestamp_ns as u64 }
+    pub(crate) fn map_frame_id(&self) -> &str { &self.envelope.map_frame_id }
+    pub(crate) fn body_frame_id(&self) -> &str { &self.envelope.body_frame_id }
+
+    // Only validated admission constructs this pair in production. The map
+    // allocation is transient; lazy body capture runs only for a real consumer.
+    // Archived scans retain only the shared body data and frozen metadata.
+    fn admitted(envelope: LioCloudEnvelope, pending: PendingRegistration, adapter_timestamp_ns: i64) -> Self {
+        Self { envelope, map_points: pending.map_points, adapter_timestamp_ns,
+            binding: pending.binding, scan: OnceLock::new() }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn body_points_captured_for_test(&self) -> bool { self.scan.get().is_some() }
+
+    #[cfg(test)]
+    pub(crate) fn from_map_points_for_test(
+        points: Vec<Point3<f64>>, adapter_timestamp_ns: u64, source_timestamp_ns: u64,
+        map_frame: &str, body_frame: &str, binding: RegistrationBinding,
+    ) -> Self {
+        let identity = SourceIdentity {
+            backend: LIO_BACKEND_DEVICE, runtime_generation: binding.runtime_generation,
+            source_sequence: binding.cloud_source_sequence, source_timestamp_ns: source_timestamp_ns.try_into().unwrap(),
+        };
+        let envelope = LioCloudEnvelope {
+            schema_version: LIO_SCHEMA_VERSION_V1, backend: identity.backend,
+            runtime_generation: identity.runtime_generation, source_sequence: identity.source_sequence,
+            source_timestamp_ns: identity.source_timestamp_ns,
+            correlated_odometry_source_sequence: binding.correlated_odometry.source_sequence,
+            correlated_odometry_source_timestamp_ns: binding.correlated_odometry.source_timestamp_ns,
+            sensor_frame_id: "sensor".into(), body_frame_id: body_frame.into(), odom_frame_id: "odom".into(), map_frame_id: map_frame.into(),
+            registration_state: LIO_REGISTRATION_REGISTERED_MAP,
+            source_point_count: points.len() as i64, emitted_point_count: points.len() as i64,
+            cloud: rebuild_xyz_cloud(&points, source_header(identity, map_frame).unwrap()).unwrap(),
+        };
+        Self::admitted(envelope, PendingRegistration { binding, map_points: points }, adapter_timestamp_ns.try_into().unwrap())
+    }
+}
+
+/// A private admission capability. Metadata and points cannot be replaced or
+/// paired independently after the public registration permit has been consumed.
+#[derive(Debug, Clone)]
+pub(crate) struct AdmittedRegisteredScan(Arc<AdmittedRegisteredScanData>);
+
+/// Static selection may identify a live scan without extending its payload lifetime.
+#[derive(Debug, Clone)]
+pub(crate) struct WeakAdmittedRegisteredScan(std::sync::Weak<AdmittedRegisteredScanData>);
+
+impl WeakAdmittedRegisteredScan {
+    pub(crate) fn matches(&self, source: &AdmittedRegisteredScan) -> bool {
+        self.0.upgrade().is_some_and(|retained| AdmittedRegisteredScan(retained) == *source)
+    }
+}
+
+#[derive(Debug)]
+struct AdmittedRegisteredScanData {
+    source: SourceIdentity,
+    frames: [String; 4],
+    source_point_count: i64,
+    binding: RegistrationBinding,
+    body_points: crate::correction_points::CorrectionPoints,
+}
+
+impl AdmittedRegisteredScan {
+    fn from_map_points(source: SourceIdentity, frames: [String; 4], source_point_count: i64,
+        binding: RegistrationBinding, map_points: &[Point3<f64>]) -> Self {
+        let body_from_map = (binding.registration_map_from_odom * binding.frozen_odom_from_body).inverse();
+        let body_points = map_points.iter().map(|point| body_from_map.transform_point(point)).collect::<Vec<_>>();
+        Self(Arc::new(AdmittedRegisteredScanData {
+            source, frames, source_point_count, binding, body_points: body_points.into(),
+        }))
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakAdmittedRegisteredScan {
+        WeakAdmittedRegisteredScan(Arc::downgrade(&self.0))
+    }
+    pub(crate) fn binding(&self) -> &RegistrationBinding { &self.0.binding }
+    pub(crate) fn source_timestamp_ns(&self) -> u64 { self.0.source.source_timestamp_ns as u64 }
+    pub(crate) fn map_frame_id(&self) -> &str { &self.0.frames[3] }
+    pub(crate) fn body_frame_id(&self) -> &str { &self.0.frames[1] }
+    pub(crate) fn body_points(&self) -> &crate::correction_points::CorrectionPoints { &self.0.body_points }
+
+    #[cfg(test)]
+    pub(crate) fn from_map_points_for_test(source_timestamp_ns: u64, binding: RegistrationBinding, points: &[Point3<f64>]) -> Self {
+        Self::from_map_points(SourceIdentity { backend: LIO_BACKEND_DEVICE,
+            runtime_generation: binding.runtime_generation, source_sequence: binding.cloud_source_sequence,
+            source_timestamp_ns: source_timestamp_ns.try_into().unwrap() },
+            ["sensor".into(), "base_link".into(), "odom".into(), "map".into()], points.len() as i64, binding, points)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retention_probe_for_test(&self) -> impl Fn() -> bool {
+        let weak = Arc::downgrade(&self.0);
+        move || weak.upgrade().is_some()
+    }
+}
+
+impl PartialEq for AdmittedRegisteredScan {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || (
+            self.0.source == other.0.source && self.0.frames == other.0.frames
+                && self.0.source_point_count == other.0.source_point_count
+                && self.0.binding.exact_eq(&other.0.binding)
+                && self.0.body_points == other.0.body_points)
+    }
+}
+impl Eq for AdmittedRegisteredScan {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RegistrationBinding {
@@ -170,6 +302,186 @@ pub(crate) struct RegistrationBinding {
     /// Epoch observed when this registered cloud becomes an admitted
     /// correction source. `None` means it has not crossed that boundary.
     pub(crate) frame_capture_relocalization_epoch: Option<u64>,
+}
+
+impl RegistrationBinding {
+    fn exact_eq(&self, other: &Self) -> bool {
+        fn pose_eq(a: &Isometry3<f64>, b: &Isometry3<f64>) -> bool {
+            a.translation.vector.iter().chain(a.rotation.coords.iter())
+                .zip(b.translation.vector.iter().chain(b.rotation.coords.iter()))
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        }
+        self.runtime_generation == other.runtime_generation
+            && self.cloud_source_sequence == other.cloud_source_sequence
+            && self.correlated_odometry == other.correlated_odometry
+            && self.mapping_session_id == other.mapping_session_id
+            && self.mapping_session_generation == other.mapping_session_generation
+            && self.map_frame_generation == other.map_frame_generation
+            && self.envelope_sha256 == other.envelope_sha256
+            && pose_eq(&self.frozen_odom_from_body, &other.frozen_odom_from_body)
+            && pose_eq(&self.base_anchor_map_from_odom, &other.base_anchor_map_from_odom)
+            && pose_eq(&self.registration_map_from_odom, &other.registration_map_from_odom)
+            && self.registration_correction_revision == other.registration_correction_revision
+            && self.sensor_origin_map.map(|p| p.map(f64::to_bits)) == other.sensor_origin_map.map(|p| p.map(f64::to_bits))
+            && self.frame_capture_relocalization_epoch == other.frame_capture_relocalization_epoch
+    }
+}
+
+#[cfg(test)]
+mod registered_scan_ownership_tests {
+    use super::*;
+
+    fn binding() -> RegistrationBinding {
+        RegistrationBinding {
+            runtime_generation: 7, cloud_source_sequence: 3,
+            correlated_odometry: CorrelatedOdometry { source_sequence: 2, source_timestamp_ns: 9 },
+            mapping_session_id: "owned-scan".into(), mapping_session_generation: 11,
+            map_frame_generation: 13, envelope_sha256: [0x5a; 32],
+            frozen_odom_from_body: Isometry3::identity(),
+            base_anchor_map_from_odom: Isometry3::identity(),
+            registration_map_from_odom: Isometry3::identity(), registration_correction_revision: 17,
+            sensor_origin_map: Some([0.0; 3]), frame_capture_relocalization_epoch: Some(19),
+        }
+    }
+
+    fn owner(points: Vec<Point3<f64>>) -> AdmittedRegisteredScan {
+        AdmittedRegisteredScan(Arc::new(AdmittedRegisteredScanData {
+            source: SourceIdentity { backend: LIO_BACKEND_DEVICE, runtime_generation: 7,
+                source_sequence: 3, source_timestamp_ns: 10 },
+            frames: ["sensor".into(), "body".into(), "odom".into(), "map".into()],
+            source_point_count: points.len() as i64, binding: binding(), body_points: points.into(),
+        }))
+    }
+
+    fn edited(source: &AdmittedRegisteredScan, edit: impl FnOnce(&mut AdmittedRegisteredScanData)) -> AdmittedRegisteredScan {
+        let mut data = AdmittedRegisteredScanData {
+            source: source.0.source, frames: source.0.frames.clone(), source_point_count: source.0.source_point_count,
+            binding: source.0.binding.clone(), body_points: source.0.body_points.clone(),
+        };
+        edit(&mut data);
+        AdmittedRegisteredScan(Arc::new(data))
+    }
+
+    #[test]
+    fn original_body_allocation_moves_into_immutable_admission_and_shares_on_clone() {
+        let points = vec![Point3::new(1.0, 2.0, 3.0); 100];
+        let allocation = points.as_ptr();
+        let admitted = owner(points);
+        assert_eq!(admitted.body_points().as_ptr(), allocation);
+        let copy = admitted.clone();
+        let correction_points = admitted.body_points().clone();
+        assert!(Arc::ptr_eq(&admitted.0, &copy.0));
+        assert_eq!(copy.body_points().as_ptr(), allocation);
+        assert_eq!(correction_points.as_ptr(), allocation);
+        let retained = admitted.retention_probe_for_test();
+        drop(admitted);
+        assert!(retained());
+        drop(copy);
+        assert!(!retained());
+        assert_eq!(correction_points.as_ptr(), allocation);
+        assert_eq!(correction_points.len(), 100);
+    }
+
+    #[test]
+    fn accepted_metadata_and_non_correction_mapping_access_are_lazy_and_capture_once() {
+        let map_points = vec![Point3::new(4.0, 5.0, 6.0)];
+        let allocation = map_points.as_ptr();
+        let mut original_binding = binding();
+        let accepted = AcceptedRegisteredCloud::from_map_points_for_test(
+            map_points, 11, 10, "map", "body", original_binding.clone());
+        original_binding.frozen_odom_from_body.translation.vector.x = 999.0;
+        original_binding.mapping_session_id = "replacement".into();
+        let undemanded = AcceptedRegisteredCloud::from_map_points_for_test(
+            vec![Point3::new(4.0, 5.0, 6.0)], 11, 10, "map", "body", binding());
+        assert!(!accepted.body_points_captured_for_test());
+        assert_eq!(accepted, undemanded);
+        assert_eq!(accepted.map_points().as_ptr(), allocation);
+        assert_eq!(accepted.point_step(), 12);
+        assert_eq!(accepted.adapter_timestamp_ns(), 11);
+        assert_eq!(accepted.source_timestamp_ns(), 10);
+        assert_eq!(accepted.map_frame_id(), "map");
+        assert_eq!(accepted.body_frame_id(), "body");
+        assert_eq!(accepted.binding().mapping_session_id, "owned-scan");
+        assert_eq!(accepted.binding().frozen_odom_from_body, Isometry3::identity());
+        assert!(!accepted.body_points_captured_for_test(), "ordinary mapping metadata must not transform the cloud");
+        assert_eq!(accepted.scan().source_timestamp_ns(), 10);
+        assert_eq!(accepted.scan().body_frame_id(), "body");
+        assert_eq!(accepted.scan().body_points()[0], Point3::new(4.0, 5.0, 6.0));
+        assert!(std::ptr::eq(accepted.scan(), accepted.scan()), "all consumers reuse one capture");
+        assert!(!undemanded.body_points_captured_for_test());
+        assert_eq!(accepted, undemanded, "capture cache state is not admission identity");
+        let source = accepted.scan().clone();
+        let body_allocation = source.body_points().as_ptr();
+        assert_eq!(accepted.scan().body_points().as_ptr(), body_allocation);
+        drop(accepted); // An archive owner outlives the transient accepted map allocation.
+        assert_eq!(source.body_points().as_ptr(), body_allocation);
+        assert_eq!(source.body_points()[0], Point3::new(4.0, 5.0, 6.0));
+    }
+
+    #[test]
+    fn independent_admission_checks_every_source_frame_and_registration_metadata_field() {
+        let source = owner(vec![Point3::new(1.0, 2.0, 3.0)]);
+        let independent = owner(vec![Point3::new(1.0, 2.0, 3.0)]);
+        assert!(!Arc::ptr_eq(&source.0, &independent.0));
+        assert_eq!(source, independent);
+        let edits: &[fn(&mut AdmittedRegisteredScanData)] = &[
+            |s| s.source.backend += 1,
+            |s| s.source.runtime_generation += 1,
+            |s| s.source.source_sequence += 1,
+            |s| s.source.source_timestamp_ns += 1,
+            |s| s.source_point_count += 1,
+            |s| s.binding.runtime_generation += 1,
+            |s| s.binding.cloud_source_sequence += 1,
+            |s| s.binding.correlated_odometry.source_sequence += 1,
+            |s| s.binding.correlated_odometry.source_timestamp_ns += 1,
+            |s| s.binding.mapping_session_id.push('x'),
+            |s| s.binding.mapping_session_generation += 1,
+            |s| s.binding.map_frame_generation += 1,
+            |s| s.binding.envelope_sha256[0] ^= 1,
+            |s| s.binding.registration_correction_revision += 1,
+            |s| s.binding.frame_capture_relocalization_epoch = None,
+            |s| s.binding.frame_capture_relocalization_epoch = Some(20),
+            |s| s.binding.sensor_origin_map = None,
+            |s| s.body_points = vec![Point3::new(1.0, 2.0, 4.0)].into(),
+            |s| s.body_points = vec![Point3::new(1.0, 2.0, 3.0); 2].into(),
+        ];
+        for edit in edits { assert_ne!(source, edited(&source, edit)); }
+        for index in 0..4 {
+            assert_ne!(source, edited(&source, |s| s.frames[index].push('x')));
+        }
+        for index in 0..3 {
+            assert_ne!(source, edited(&source, |s| s.binding.sensor_origin_map.as_mut().unwrap()[index] = -0.0));
+        }
+    }
+
+    #[test]
+    fn every_frozen_pose_and_transform_component_is_bit_exact() {
+        let source = owner(vec![Point3::new(1.0, 2.0, 3.0)]);
+        for pose_index in 0..3 {
+            for component in 0..7 {
+                let conflict = edited(&source, |s| {
+                    let pose = match pose_index {
+                        0 => &mut s.binding.frozen_odom_from_body,
+                        1 => &mut s.binding.base_anchor_map_from_odom,
+                        _ => &mut s.binding.registration_map_from_odom,
+                    };
+                    if component < 3 {
+                        let value = &mut pose.translation.vector[component];
+                        *value = f64::from_bits(value.to_bits() ^ (1_u64 << 63));
+                    } else {
+                        let mut q = *pose.rotation.quaternion();
+                        let value = &mut q.coords[component - 3];
+                        *value = f64::from_bits(value.to_bits() ^ (1_u64 << 63));
+                        pose.rotation = UnitQuaternion::new_unchecked(q);
+                    }
+                });
+                assert_ne!(source, conflict, "pose {pose_index}, component {component}");
+            }
+        }
+        let zero = owner(vec![Point3::new(0.0, 1.0, 2.0), Point3::new(3.0, 4.0, 5.0)]);
+        assert_ne!(zero, edited(&zero, |s| s.body_points = s.body_points.edited_for_test(|p| p[0].x = -0.0)));
+        assert_ne!(zero, edited(&zero, |s| s.body_points = s.body_points.edited_for_test(|p| p.swap(0, 1))));
+    }
 }
 
 /// Immutable mode provenance captured when a raw cloud first enters the
@@ -1363,12 +1675,10 @@ impl CommonLioIngress {
             });
         state.cloud.commit(identity);
         state.latest_adapter_timestamp_ns = Some(adapter_timestamp_ns);
-        Ok(AcceptedRegisteredCloud {
-            envelope,
-            map_points: pending.map_points,
-            adapter_timestamp_ns,
-            binding: pending.binding,
-        })
+        // Admission/cursor ownership is secured. Lazy map→body capture happens
+        // only at a consumer, after releasing the shared ingress critical section.
+        drop(state);
+        Ok(AcceptedRegisteredCloud::admitted(envelope, pending, adapter_timestamp_ns))
     }
 
     pub(crate) fn revoke_prepared_cloud(
@@ -2949,8 +3259,8 @@ impl LioIngressSink for CommonLioIngress {
                 .as_ref()
                 .ok_or_else(|| "mapping adapter is unavailable".to_string())?;
             let adapter = adapter.lock();
-            if adapter.snapshot().session_generation != accepted.binding.mapping_session_generation
-                || adapter.global_frame_generation() != accepted.binding.map_frame_generation
+            if adapter.snapshot().session_generation != accepted.binding().mapping_session_generation
+                || adapter.global_frame_generation() != accepted.binding().map_frame_generation
             {
                 return Err("registration permit mapping generation is stale".to_string());
             }
@@ -2965,9 +3275,9 @@ impl LioIngressSink for CommonLioIngress {
             u64::try_from(accepted.envelope.source_timestamp_ns)
                 .map_err(|_| "source timestamp is negative".to_string())?,
             &accepted.envelope.map_frame_id,
-            accepted.binding.mapping_session_generation,
-            accepted.binding.map_frame_generation,
-            accepted.binding.sensor_origin_map,
+            accepted.binding().mapping_session_generation,
+            accepted.binding().map_frame_generation,
+            accepted.binding().sensor_origin_map,
         )
         .await?;
         if !committed {
@@ -3235,9 +3545,9 @@ async fn accept_public_cloud_replay_with_correction(
             .ok_or_else(|| "mapping adapter is unavailable".to_owned())?;
         let adapter = adapter.lock();
         if !adapter.snapshot().active
-            || adapter.snapshot().session_id != accepted.binding.mapping_session_id
-            || adapter.snapshot().session_generation != accepted.binding.mapping_session_generation
-            || adapter.global_frame_generation() != accepted.binding.map_frame_generation
+            || adapter.snapshot().session_id != accepted.binding().mapping_session_id
+            || adapter.snapshot().session_generation != accepted.binding().mapping_session_generation
+            || adapter.global_frame_generation() != accepted.binding().map_frame_generation
         {
             return Err("deferred registration permit mapping generation is stale".to_owned());
         }
@@ -3247,15 +3557,7 @@ async fn accept_public_cloud_replay_with_correction(
     };
     let committed = handoff_registered_lio_cloud_replay_with_correction(
         &runtime.handle,
-        &accepted.map_points,
-        XYZ_POINT_STEP as u32,
-        u64::try_from(accepted.adapter_timestamp_ns)
-            .map_err(|_| "adapter timestamp is negative".to_owned())?,
-        u64::try_from(accepted.envelope.source_timestamp_ns)
-            .map_err(|_| "source timestamp is negative".to_owned())?,
-        &accepted.envelope.map_frame_id,
-        &accepted.envelope.body_frame_id,
-        &accepted.binding,
+        &accepted,
         correction,
     )
     .await?;
@@ -3424,9 +3726,9 @@ async fn accept_public_cloud_with_correction(
             .as_ref()
             .ok_or_else(|| "mapping adapter is unavailable".to_owned())?;
         let adapter = adapter.lock();
-        if adapter.snapshot().session_id != accepted.binding.mapping_session_id
-            || adapter.snapshot().session_generation != accepted.binding.mapping_session_generation
-            || adapter.global_frame_generation() != accepted.binding.map_frame_generation
+        if adapter.snapshot().session_id != accepted.binding().mapping_session_id
+            || adapter.snapshot().session_generation != accepted.binding().mapping_session_generation
+            || adapter.global_frame_generation() != accepted.binding().map_frame_generation
         {
             return Err("registration permit mapping generation is stale".to_owned());
         }
@@ -3434,15 +3736,7 @@ async fn accept_public_cloud_with_correction(
     };
     let committed = handoff_registered_lio_cloud_with_correction(
         &runtime.handle,
-        &accepted.map_points,
-        XYZ_POINT_STEP as u32,
-        u64::try_from(accepted.adapter_timestamp_ns)
-            .map_err(|_| "adapter timestamp is negative".to_owned())?,
-        u64::try_from(accepted.envelope.source_timestamp_ns)
-            .map_err(|_| "source timestamp is negative".to_owned())?,
-        &accepted.envelope.map_frame_id,
-        &accepted.envelope.body_frame_id,
-        &accepted.binding,
+        &accepted,
         correction,
     )
     .await?;
@@ -3457,13 +3751,13 @@ async fn accept_public_cloud_with_correction(
                     .map_odom_transform_snapshot()
                     .is_some_and(|transform| {
                         transform.correction_revision
-                            != accepted.binding.registration_correction_revision
+                            != accepted.binding().registration_correction_revision
                     })
             });
         if stale {
             tracing::debug!(
                 event = "lio.cloud.retired_correction",
-                source_sequence = accepted.binding.cloud_source_sequence,
+                source_sequence = accepted.binding().cloud_source_sequence,
                 "丢弃旧校正版本下注册的迟到扫描"
             );
             return Ok(());
@@ -6056,18 +6350,18 @@ mod tests {
             .accept_public_cloud(envelope.clone(), &encoded, 10)
             .expect("consume matching permit");
         assert_eq!(
-            accepted.binding.correlated_odometry,
+            accepted.binding().correlated_odometry,
             CorrelatedOdometry {
                 source_sequence: 1,
                 source_timestamp_ns: 0,
             }
         );
         assert_eq!(
-            accepted.binding.mapping_session_generation,
+            accepted.binding().mapping_session_generation,
             adapter.snapshot().session_generation
         );
         assert_eq!(
-            accepted.binding.map_frame_generation,
+            accepted.binding().map_frame_generation,
             adapter.global_frame_generation()
         );
         assert_eq!(accepted.adapter_timestamp_ns, 11);
@@ -6243,7 +6537,7 @@ mod tests {
         let accepted = ingress
             .accept_public_cloud(prepared.envelope.clone(), &encoded, 12)
             .expect("immutable cloud N permit survives odometry N+1");
-        assert_eq!(accepted.binding.correlated_odometry.source_sequence, 1);
+        assert_eq!(accepted.binding().correlated_odometry.source_sequence, 1);
         assert!(ingress.state.lock().pending_registrations.is_empty());
         assert!(matches!(
             ingress.accept_public_cloud(prepared.envelope, &encoded, 13),
@@ -6283,7 +6577,7 @@ mod tests {
             assert_eq!(prepared.envelope.emitted_point_count, 3);
             let encoded = encode_lio_cloud_envelope(&prepared.envelope).unwrap();
             let accepted = ingress.accept_public_cloud(prepared.envelope, &encoded, 13).unwrap();
-            assert_eq!(accepted.binding.frozen_odom_from_body, pose);
+            assert_eq!(accepted.binding().frozen_odom_from_body, pose);
             assert_eq!(accepted.map_points.len(), 3);
             let expected = adapter.register_odom_cloud_to_map(&external, "odom").unwrap();
             for (actual, expected) in accepted.map_points.iter().zip(expected.points) {
@@ -6343,12 +6637,12 @@ mod tests {
         let accepted = ingress
             .accept_public_cloud(prepared.envelope, &encoded, 13)
             .expect("cloud N consumes its original registration binding");
-        assert_eq!(accepted.binding.correlated_odometry.source_sequence, 1);
-        assert_eq!(accepted.binding.frozen_odom_from_body, frozen_n);
-        assert_ne!(accepted.binding.frozen_odom_from_body, frozen_later);
+        assert_eq!(accepted.binding().correlated_odometry.source_sequence, 1);
+        assert_eq!(accepted.binding().frozen_odom_from_body, frozen_n);
+        assert_ne!(accepted.binding().frozen_odom_from_body, frozen_later);
         assert_eq!(
             crate::correction_coordinator::odom_pose_sha256(
-                &accepted.binding.frozen_odom_from_body
+                &accepted.binding().frozen_odom_from_body
             )
             .expect("frozen pose proof"),
             crate::correction_coordinator::odom_pose_sha256(&frozen_n)
@@ -6387,7 +6681,7 @@ mod tests {
         assert_eq!(accepted.envelope.map_frame_id, "robot/map");
         assert_eq!(accepted.envelope.cloud.header.frame_id, "robot/map");
         assert_eq!(
-            accepted.binding.map_frame_generation,
+            accepted.binding().map_frame_generation,
             adapter.global_frame_generation()
         );
     }

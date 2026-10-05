@@ -2479,11 +2479,9 @@ impl MappingAdapter {
 
     pub(crate) fn record_pgo_scan(
         &mut self,
-        binding: &crate::lio_ingress::RegistrationBinding,
-        points: &[Point3<f64>],
-        source_timestamp_ns: u64,
-        received_at_ns: u64,
+        accepted: &crate::lio_ingress::AcceptedRegisteredCloud,
     ) -> Result<(), String> {
+        let binding = accepted.binding();
         if self.pgo_history.is_none() {
             return Ok(());
         }
@@ -2499,16 +2497,13 @@ impl MappingAdapter {
         {
             return Err("PGO扫描归档来源已过期".into());
         }
-        self.pgo_history.as_mut().unwrap().record(
-            source_timestamp_ns,
-            received_at_ns,
-            binding,
-            points,
-        )
+        // Disabled or stale history must return before lazy body capture. This
+        // preserves the original archive transform's adapter-guard ordering.
+        self.pgo_history.as_mut().unwrap().record(accepted.scan(), accepted.adapter_timestamp_ns())
     }
 
-    pub(crate) fn pgo_static_point_indices(&self, timestamp_ns: u64, digest: [u8; 32], count: usize) -> Result<Option<Arc<[u32]>>, String> {
-        self.pgo_history.as_ref().map(|history| history.static_point_indices(timestamp_ns, digest, count)).transpose()
+    pub(crate) fn pgo_static_point_indices(&self, source: &crate::lio_ingress::AdmittedRegisteredScan) -> Result<Option<Arc<[u32]>>, String> {
+        self.pgo_history.as_ref().map(|history| history.static_point_indices(source)).transpose()
     }
 
     pub(crate) fn pgo_rebuild_input(

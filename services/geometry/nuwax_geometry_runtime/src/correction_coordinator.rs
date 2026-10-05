@@ -290,460 +290,592 @@ mod preflight_only_contract {
         }
     }
 
-    #[derive(Clone, Debug, PartialEq)]
-    pub(crate) struct CorrectionCandidate {
-        pub(crate) identity: CorrectionCandidateIdentity,
-        pub(crate) transform: CorrectionTransform,
-        pub(crate) trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
-        pub(crate) payload_sha256: [u8; 32],
-    }
+    // 私有拥有方只在校验完成后接收整份候选；克隆共享原有轨迹分配。
+    mod candidate_ownership {
+        use super::*;
 
-    impl CorrectionCandidate {
-        pub(crate) fn seal(
-            identity: CorrectionCandidateIdentity,
-            transform: CorrectionTransform,
-        ) -> Result<Self, CorrectionRejectReason> {
-            Self::seal_with_trajectory(identity, transform, Vec::new())
+        #[derive(Clone, Debug)]
+        pub(crate) struct CorrectionCandidate(Arc<CorrectionCandidateData>);
+
+        // 仅用于只读 Deref；不提供 Clone、DerefMut 或生产环境的可变拥有方入口。
+        #[derive(Debug)]
+        pub(crate) struct CorrectionCandidateData {
+            pub(super) identity: CorrectionCandidateIdentity,
+            pub(super) transform: CorrectionTransform,
+            pub(super) trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
+            pub(super) payload_sha256: [u8; 32],
         }
 
-        pub(crate) fn seal_with_trajectory(
-            identity: CorrectionCandidateIdentity,
-            transform: CorrectionTransform,
-            trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
-        ) -> Result<Self, CorrectionRejectReason> {
-            let mut candidate = Self {
-                identity,
-                transform,
-                trajectory,
-                payload_sha256: [0; 32],
-            };
-            candidate.validate_fields()?;
-            candidate.payload_sha256 = candidate.expected_payload_sha256()?;
-            Ok(candidate)
+        impl std::ops::Deref for CorrectionCandidate {
+            type Target = CorrectionCandidateData;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
         }
 
-        fn expected_payload_sha256(&self) -> Result<[u8; 32], CorrectionRejectReason> {
-            Ok(sha256_bytes(&self.encode_body_prefix()?))
+        impl PartialEq for CorrectionCandidate {
+            fn eq(&self, other: &Self) -> bool {
+                Arc::ptr_eq(&self.0, &other.0) || self.0.exactly_matches(&other.0)
+            }
         }
 
-        fn validate_integrity(&self) -> Result<(), CorrectionRejectReason> {
-            self.validate_fields()?;
-            if self.payload_sha256 != self.expected_payload_sha256()? {
-                return Err(CorrectionRejectReason::PayloadHashMismatch);
+        impl CorrectionCandidate {
+            pub(crate) fn seal(
+                identity: CorrectionCandidateIdentity,
+                transform: CorrectionTransform,
+            ) -> Result<Self, CorrectionRejectReason> {
+                Self::seal_with_trajectory(identity, transform, Vec::new())
             }
-            Ok(())
-        }
 
-        fn validate_fields(&self) -> Result<(), CorrectionRejectReason> {
-            let identity = &self.identity;
-            if identity.runtime_generation == 0 {
-                return Err(CorrectionRejectReason::InvalidIdentity(
-                    "runtime_generation must be positive",
-                ));
+            pub(crate) fn seal_with_trajectory(
+                identity: CorrectionCandidateIdentity,
+                transform: CorrectionTransform,
+                trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
+            ) -> Result<Self, CorrectionRejectReason> {
+                let mut candidate = CorrectionCandidateData {
+                    identity,
+                    transform,
+                    trajectory,
+                    payload_sha256: [0; 32],
+                };
+                candidate.validate_fields()?;
+                candidate.payload_sha256 = candidate.expected_payload_sha256()?;
+                Ok(Self(Arc::new(candidate)))
             }
-            if identity.backend_generation == 0 {
-                return Err(CorrectionRejectReason::InvalidIdentity(
-                    "backend_generation must be positive",
-                ));
+
+            #[cfg(test)]
+            pub(super) fn owner_for_test(&self) -> &Arc<CorrectionCandidateData> {
+                &self.0
             }
-            if identity.candidate_sequence == 0 {
-                return Err(CorrectionRejectReason::InvalidIdentity(
-                    "candidate_sequence must be positive",
-                ));
+
+            #[cfg(test)]
+            pub(super) fn from_unvalidated_test_parts(
+                identity: CorrectionCandidateIdentity,
+                transform: CorrectionTransform,
+                trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
+                payload_sha256: [u8; 32],
+            ) -> Self {
+                Self(Arc::new(CorrectionCandidateData {
+                    identity,
+                    transform,
+                    trajectory,
+                    payload_sha256,
+                }))
             }
-            validate_identity_string("mapping_session_id", &identity.mapping_session_id)?;
-            if identity.mapping_session_generation == 0 {
-                return Err(CorrectionRejectReason::InvalidIdentity(
-                    "mapping_session_generation must be positive",
-                ));
+
+            // 反例必须建立新的拥有方，不能修改已经发布或共享的候选。
+            #[cfg(test)]
+            pub(super) fn edited_for_test(
+                &self,
+                edit: impl FnOnce(&mut CorrectionCandidateData),
+            ) -> Self {
+                let mut data = CorrectionCandidateData {
+                    identity: self.identity.clone(),
+                    transform: self.transform,
+                    trajectory: self.trajectory.clone(),
+                    payload_sha256: self.payload_sha256,
+                };
+                edit(&mut data);
+                Self(Arc::new(data))
             }
-            if identity.map_frame_generation == 0 {
-                return Err(CorrectionRejectReason::InvalidIdentity(
-                    "map_frame_generation must be positive",
-                ));
-            }
-            if identity.mapping_commit_id.boot_nonce == 0
-                || identity.mapping_commit_id.sequence == 0
-            {
-                return Err(CorrectionRejectReason::InvalidIdentity(
-                    "mapping commit identity must be complete",
-                ));
-            }
-            if identity.occupancy_revision == 0 || identity.cloud_revision == 0 {
-                return Err(CorrectionRejectReason::InvalidIdentity(
-                    "occupancy and cloud revisions must be independently positive",
-                ));
-            }
-            let cloud = identity.registered_cloud;
-            if cloud.source_sequence == 0
-                || cloud.point_count == 0
-                || cloud.point_count > MAX_REGISTERED_CLOUD_POINTS
-                || !digest_is_present(&cloud.envelope_sha256)
-                || !digest_is_present(&cloud.body_points_sha256)
-            {
-                return Err(CorrectionRejectReason::InvalidRegisteredCloudProof);
-            }
-            let odom = identity.correlated_odom;
-            if odom.source_sequence == 0
-                || odom.source_timestamp_ns > cloud.source_timestamp_ns
-                || !digest_is_present(&odom.pose_sha256)
-            {
-                return Err(CorrectionRejectReason::InvalidCorrelatedOdomProof);
-            }
-            let map = identity.committed_map;
-            let map_timestamp_is_valid = match identity.backend {
-                CorrectionCandidateBackend::Relocalization => {
-                    map.source_timestamp_ns <= cloud.source_timestamp_ns
+
+            /// Encode the generated LCM body without its top-level fingerprint.
+            ///
+            /// This is the only encoding accepted by `RawLcmFrameBuilder::payload`;
+            /// `nuwax-transport` prepends the registered fingerprint exactly once.
+            pub(crate) fn encode_body(&self) -> Result<Vec<u8>, CorrectionWireError> {
+                self.validate_integrity()
+                    .map_err(|reason| CorrectionWireError::Invalid(reason.to_string()))?;
+                let mut out = self
+                    .encode_body_prefix()
+                    .map_err(|reason| CorrectionWireError::Invalid(reason.to_string()))?;
+                out.extend_from_slice(&self.payload_sha256);
+                if out.len() > MAX_WIRE_PAYLOAD_BYTES - CORRECTION_CANDIDATE_FINGERPRINT_V2.len() {
+                    return Err(CorrectionWireError::Invalid(
+                        "correction candidate exceeds wire size bound".into(),
+                    ));
                 }
-                CorrectionCandidateBackend::LibraryPgo | CorrectionCandidateBackend::NativePgo => {
-                    map.source_timestamp_ns == cloud.source_timestamp_ns
+                Ok(out)
+            }
+
+            /// Encode a complete generated LCM message: one fingerprint plus body.
+            pub(crate) fn encode_wire(&self) -> Result<Vec<u8>, CorrectionWireError> {
+                let body = self.encode_body()?;
+                let mut out =
+                    Vec::with_capacity(CORRECTION_CANDIDATE_FINGERPRINT_V2.len() + body.len());
+                out.extend_from_slice(&CORRECTION_CANDIDATE_FINGERPRINT_V2);
+                out.extend_from_slice(&body);
+                Ok(out)
+            }
+
+            pub(crate) fn decode_wire(encoded: &[u8]) -> Result<Self, CorrectionWireError> {
+                if encoded.len() > MAX_WIRE_PAYLOAD_BYTES {
+                    return Err(CorrectionWireError::Invalid(
+                        "correction candidate exceeds wire size bound".into(),
+                    ));
                 }
-            };
-            if !map_timestamp_is_valid
-                || map.width == 0
-                || map.height == 0
-                || map.width > u64::from(u32::MAX)
-                || map.height > u64::from(u32::MAX)
-                || map.width.checked_mul(map.height).is_none()
-                || !map.resolution_m.is_finite()
-                || map.resolution_m <= 0.0
-                || !map.origin_x_m.is_finite()
-                || !map.origin_y_m.is_finite()
-                || !digest_is_present(&map.payload_sha256)
-                || !digest_is_present(&map.boundary_sha256)
-            {
-                return Err(CorrectionRejectReason::InvalidCommittedMapProof);
-            }
-            if identity.source_timestamp_ns != cloud.source_timestamp_ns {
-                return Err(CorrectionRejectReason::InvalidRegisteredCloudProof);
-            }
-            validate_identity_string("map_frame_id", &identity.map_frame_id)?;
-            validate_identity_string("odom_frame_id", &identity.odom_frame_id)?;
-            validate_identity_string("body_frame_id", &identity.body_frame_id)?;
-            validate_identity_string("points_frame_id", &identity.points_frame_id)?;
-            if identity.map_frame_id == identity.odom_frame_id
-                || identity.map_frame_id == identity.body_frame_id
-                || identity.odom_frame_id == identity.body_frame_id
-            {
-                return Err(CorrectionRejectReason::InvalidIdentity(
-                    "map, odom, and body frames must be distinct",
-                ));
-            }
-            if identity.points_frame_id != identity.body_frame_id {
-                return Err(CorrectionRejectReason::UnsupportedPointsFrame);
-            }
-            if map.boundary_sha256 != expected_map_boundary_sha256(&identity.map_frame_id, &map)? {
-                return Err(CorrectionRejectReason::MapBoundaryHashMismatch);
-            }
-            if identity.correction_lease.boot_nonce == 0
-                || identity.correction_lease.generation == 0
-            {
-                return Err(CorrectionRejectReason::InvalidIdentity(
-                    "correction lease identity must be complete",
-                ));
-            }
-            if identity.runtime_generation > i64::MAX as u64
-                || identity.backend_generation > i64::MAX as u64
-                || identity.candidate_sequence > i64::MAX as u64
-                || identity.mapping_session_generation > i64::MAX as u64
-                || identity.map_frame_generation > i64::MAX as u64
-                || identity.mapping_commit_id.sequence > i64::MAX as u64
-                || identity.occupancy_revision > i64::MAX as u64
-                || identity.cloud_revision > i64::MAX as u64
-                || cloud.source_sequence > i64::MAX as u64
-                || cloud.source_timestamp_ns > i64::MAX as u64
-                || cloud.point_count > i64::MAX as u64
-                || odom.source_sequence > i64::MAX as u64
-                || odom.source_timestamp_ns > i64::MAX as u64
-                || map.source_timestamp_ns > i64::MAX as u64
-                || map.width > i64::MAX as u64
-                || map.height > i64::MAX as u64
-                || identity.source_timestamp_ns > i64::MAX as u64
-                || identity.correction_lease.generation > i64::MAX as u64
-            {
-                return Err(CorrectionRejectReason::InvalidIdentity(
-                    "candidate integer exceeds positive int64 wire range",
-                ));
+                let (fingerprint, body) = encoded
+                    .split_at_checked(CORRECTION_CANDIDATE_FINGERPRINT_V2.len())
+                    .ok_or(CorrectionWireError::Truncated {
+                        need: CORRECTION_CANDIDATE_FINGERPRINT_V2.len(),
+                        have: encoded.len(),
+                    })?;
+                if fingerprint != CORRECTION_CANDIDATE_FINGERPRINT_V2 {
+                    return Err(CorrectionWireError::Invalid(
+                        "correction candidate fingerprint mismatch".into(),
+                    ));
+                }
+                Self::decode_body(body)
             }
 
-            if self
-                .transform
-                .translation_m
-                .iter()
-                .chain(self.transform.rotation_xyzw.iter())
-                .any(|value| !value.is_finite())
-            {
-                return Err(CorrectionRejectReason::NonFiniteTransform);
-            }
-            if self
-                .transform
-                .translation_m
-                .iter()
-                .any(|value| value.abs() > MAX_TRANSLATION_ABS_METERS)
-            {
-                return Err(CorrectionRejectReason::TranslationOutOfBounds);
-            }
-            let norm_squared = self
-                .transform
-                .rotation_xyzw
-                .iter()
-                .map(|value| value * value)
-                .sum::<f64>();
-            if (norm_squared - 1.0).abs() > QUATERNION_NORM_TOLERANCE {
-                return Err(CorrectionRejectReason::InvalidRotation);
-            }
-            native_pgo_codec::validate_optimized_keyframes(&self.trajectory).map_err(|_| {
-                CorrectionRejectReason::InvalidIdentity("invalid optimized trajectory")
-            })?;
-            if self.identity.backend == CorrectionCandidateBackend::Relocalization
-                && !self.trajectory.is_empty()
-            {
-                return Err(CorrectionRejectReason::InvalidIdentity(
-                    "relocalization cannot rebuild mapping trajectory",
-                ));
-            }
-            if self.trajectory.last().is_some_and(|frame| {
-                frame.source_timestamp_ns as u64 != self.identity.source_timestamp_ns
-            }) {
-                return Err(CorrectionRejectReason::InvalidIdentity(
-                    "trajectory does not end at source frame",
-                ));
-            }
-            Ok(())
-        }
-
-        fn encode_body_prefix(&self) -> Result<Vec<u8>, CorrectionRejectReason> {
-            let identity = &self.identity;
-            let mut out = Vec::with_capacity(512);
-            out.extend_from_slice(&CORRECTION_SCHEMA_VERSION_V2.to_be_bytes());
-            out.extend_from_slice(&identity.backend.wire_code().to_be_bytes());
-            out.extend_from_slice(&identity.transform_semantics.wire_code().to_be_bytes());
-            encode_positive_i64(identity.runtime_generation, &mut out)?;
-            encode_positive_i64(identity.backend_generation, &mut out)?;
-            encode_positive_i64(identity.candidate_sequence, &mut out)?;
-            encode_lcm_string(&identity.mapping_session_id, &mut out)?;
-            encode_positive_i64(identity.mapping_session_generation, &mut out)?;
-            encode_positive_i64(identity.map_frame_generation, &mut out)?;
-            out.extend_from_slice(&identity.mapping_commit_id.boot_nonce.to_be_bytes());
-            encode_positive_i64(identity.mapping_commit_id.sequence, &mut out)?;
-            encode_positive_i64(identity.occupancy_revision, &mut out)?;
-            encode_positive_i64(identity.cloud_revision, &mut out)?;
-            encode_nonnegative_i64(identity.committed_map.source_timestamp_ns, &mut out)?;
-            encode_positive_i64(identity.registered_cloud.source_sequence, &mut out)?;
-            encode_nonnegative_i64(identity.registered_cloud.source_timestamp_ns, &mut out)?;
-            encode_positive_i64(identity.registered_cloud.point_count, &mut out)?;
-            out.extend_from_slice(&identity.registered_cloud.envelope_sha256);
-            out.extend_from_slice(&identity.registered_cloud.body_points_sha256);
-            encode_positive_i64(identity.correlated_odom.source_sequence, &mut out)?;
-            encode_nonnegative_i64(identity.correlated_odom.source_timestamp_ns, &mut out)?;
-            out.extend_from_slice(&identity.correlated_odom.pose_sha256);
-            encode_positive_i64(identity.committed_map.width, &mut out)?;
-            encode_positive_i64(identity.committed_map.height, &mut out)?;
-            out.extend_from_slice(&identity.committed_map.resolution_m.to_be_bytes());
-            out.extend_from_slice(&identity.committed_map.origin_x_m.to_be_bytes());
-            out.extend_from_slice(&identity.committed_map.origin_y_m.to_be_bytes());
-            out.extend_from_slice(&identity.committed_map.payload_sha256);
-            out.extend_from_slice(&identity.committed_map.boundary_sha256);
-            encode_nonnegative_i64(identity.source_timestamp_ns, &mut out)?;
-            encode_lcm_string(&identity.map_frame_id, &mut out)?;
-            encode_lcm_string(&identity.odom_frame_id, &mut out)?;
-            encode_lcm_string(&identity.body_frame_id, &mut out)?;
-            encode_lcm_string(&identity.points_frame_id, &mut out)?;
-            out.extend_from_slice(&identity.correction_lease.boot_nonce.to_be_bytes());
-            encode_positive_i64(identity.correction_lease.generation, &mut out)?;
-            for value in self.transform.translation_m {
-                out.extend_from_slice(&value.to_be_bytes());
-            }
-            for value in self.transform.rotation_xyzw {
-                out.extend_from_slice(&value.to_be_bytes());
-            }
-            out.extend_from_slice(
-                &native_pgo_codec::encode_optimized_keyframes(&self.trajectory).map_err(|_| {
-                    CorrectionRejectReason::InvalidIdentity("invalid optimized trajectory")
-                })?,
-            );
-            Ok(out)
-        }
-
-        /// Encode the generated LCM body without its top-level fingerprint.
-        ///
-        /// This is the only encoding accepted by `RawLcmFrameBuilder::payload`;
-        /// `nuwax-transport` prepends the registered fingerprint exactly once.
-        pub(crate) fn encode_body(&self) -> Result<Vec<u8>, CorrectionWireError> {
-            self.validate_integrity()
-                .map_err(|reason| CorrectionWireError::Invalid(reason.to_string()))?;
-            let mut out = self
-                .encode_body_prefix()
-                .map_err(|reason| CorrectionWireError::Invalid(reason.to_string()))?;
-            out.extend_from_slice(&self.payload_sha256);
-            if out.len() > MAX_WIRE_PAYLOAD_BYTES - CORRECTION_CANDIDATE_FINGERPRINT_V2.len() {
-                return Err(CorrectionWireError::Invalid(
-                    "correction candidate exceeds wire size bound".into(),
-                ));
-            }
-            Ok(out)
-        }
-
-        /// Encode a complete generated LCM message: one fingerprint plus body.
-        pub(crate) fn encode_wire(&self) -> Result<Vec<u8>, CorrectionWireError> {
-            let body = self.encode_body()?;
-            let mut out =
-                Vec::with_capacity(CORRECTION_CANDIDATE_FINGERPRINT_V2.len() + body.len());
-            out.extend_from_slice(&CORRECTION_CANDIDATE_FINGERPRINT_V2);
-            out.extend_from_slice(&body);
-            Ok(out)
-        }
-
-        pub(crate) fn decode_wire(encoded: &[u8]) -> Result<Self, CorrectionWireError> {
-            if encoded.len() > MAX_WIRE_PAYLOAD_BYTES {
-                return Err(CorrectionWireError::Invalid(
-                    "correction candidate exceeds wire size bound".into(),
-                ));
-            }
-            let (fingerprint, body) = encoded
-                .split_at_checked(CORRECTION_CANDIDATE_FINGERPRINT_V2.len())
-                .ok_or(CorrectionWireError::Truncated {
-                    need: CORRECTION_CANDIDATE_FINGERPRINT_V2.len(),
-                    have: encoded.len(),
-                })?;
-            if fingerprint != CORRECTION_CANDIDATE_FINGERPRINT_V2 {
-                return Err(CorrectionWireError::Invalid(
-                    "correction candidate fingerprint mismatch".into(),
-                ));
-            }
-            Self::decode_body(body)
-        }
-
-        /// Decode a generated LCM body after the transport checked and stripped
-        /// the single top-level fingerprint.
-        pub(crate) fn decode_body(encoded: &[u8]) -> Result<Self, CorrectionWireError> {
-            if encoded.len() > MAX_WIRE_PAYLOAD_BYTES - CORRECTION_CANDIDATE_FINGERPRINT_V2.len() {
-                return Err(CorrectionWireError::Invalid(
-                    "correction candidate exceeds wire size bound".into(),
-                ));
-            }
-            let mut cursor = WireCursor::new(encoded);
-            let schema_version = cursor.read_i32()?;
-            if schema_version != CORRECTION_SCHEMA_VERSION_V2 {
-                return Err(CorrectionWireError::Invalid(format!(
-                    "unsupported correction schema version {schema_version}"
-                )));
-            }
-            let backend = CorrectionCandidateBackend::from_wire_code(cursor.read_i32()?)?;
-            let transform_semantics =
-                CorrectionTransformSemantics::from_wire_code(cursor.read_i32()?)?;
-            let runtime_generation = cursor.read_positive_u64("runtime_generation")?;
-            let backend_generation = cursor.read_positive_u64("backend_generation")?;
-            let candidate_sequence = cursor.read_positive_u64("candidate_sequence")?;
-            let mapping_session_id = cursor.read_lcm_string("mapping_session_id")?;
-            let mapping_session_generation =
-                cursor.read_positive_u64("mapping_session_generation")?;
-            let map_frame_generation = cursor.read_positive_u64("map_frame_generation")?;
-            let mapping_commit_id = MappingCommitId {
-                boot_nonce: u128::from_be_bytes(cursor.read_array::<16>()?),
-                sequence: cursor.read_positive_u64("mapping_commit_sequence")?,
-            };
-            let occupancy_revision = cursor.read_positive_u64("occupancy_revision")?;
-            let cloud_revision = cursor.read_positive_u64("cloud_revision")?;
-            let committed_map_source_timestamp_ns =
-                cursor.read_nonnegative_u64("committed_map_source_timestamp_ns")?;
-            let registered_cloud = RegisteredCloudProof {
-                source_sequence: cursor.read_positive_u64("registered_cloud_source_sequence")?,
-                source_timestamp_ns: cursor
-                    .read_nonnegative_u64("registered_cloud_source_timestamp_ns")?,
-                point_count: cursor.read_positive_u64("registered_cloud_point_count")?,
-                envelope_sha256: cursor.read_array::<32>()?,
-                body_points_sha256: cursor.read_array::<32>()?,
-            };
-            let correlated_odom = CorrelatedOdomProof {
-                source_sequence: cursor.read_positive_u64("correlated_odom_source_sequence")?,
-                source_timestamp_ns: cursor
-                    .read_nonnegative_u64("correlated_odom_source_timestamp_ns")?,
-                pose_sha256: cursor.read_array::<32>()?,
-            };
-            let committed_map = CommittedMapProof {
-                source_timestamp_ns: committed_map_source_timestamp_ns,
-                width: cursor.read_positive_u64("committed_map_width")?,
-                height: cursor.read_positive_u64("committed_map_height")?,
-                resolution_m: cursor.read_f64()?,
-                origin_x_m: cursor.read_f64()?,
-                origin_y_m: cursor.read_f64()?,
-                payload_sha256: cursor.read_array::<32>()?,
-                boundary_sha256: cursor.read_array::<32>()?,
-            };
-            let source_timestamp_ns = cursor.read_nonnegative_u64("source_timestamp_ns")?;
-            let map_frame_id = cursor.read_lcm_string("map_frame_id")?;
-            let odom_frame_id = cursor.read_lcm_string("odom_frame_id")?;
-            let body_frame_id = cursor.read_lcm_string("body_frame_id")?;
-            let points_frame_id = cursor.read_lcm_string("points_frame_id")?;
-            let correction_lease = CorrectionLeaseId {
-                boot_nonce: u128::from_be_bytes(cursor.read_array::<16>()?),
-                generation: cursor.read_positive_u64("correction_lease_generation")?,
-            };
-            let mut translation_m = [0.0; 3];
-            for value in &mut translation_m {
-                *value = cursor.read_f64()?;
-            }
-            let mut rotation_xyzw = [0.0; 4];
-            for value in &mut rotation_xyzw {
-                *value = cursor.read_f64()?;
-            }
-            let trajectory_start = cursor.offset;
-            let trajectory_count = cursor.read_i32()?;
-            if !(0..=2000).contains(&trajectory_count) {
-                return Err(CorrectionWireError::Invalid(
-                    "invalid trajectory count".into(),
-                ));
-            }
-            let trajectory_end = cursor.offset + trajectory_count as usize * 64;
-            let trajectory = native_pgo_codec::decode_optimized_keyframes(
-                cursor.bytes.get(trajectory_start..trajectory_end).ok_or(
-                    CorrectionWireError::Truncated {
-                        need: trajectory_end,
-                        have: cursor.bytes.len(),
+            /// Decode a generated LCM body after the transport checked and stripped
+            /// the single top-level fingerprint.
+            pub(crate) fn decode_body(encoded: &[u8]) -> Result<Self, CorrectionWireError> {
+                if encoded.len()
+                    > MAX_WIRE_PAYLOAD_BYTES - CORRECTION_CANDIDATE_FINGERPRINT_V2.len()
+                {
+                    return Err(CorrectionWireError::Invalid(
+                        "correction candidate exceeds wire size bound".into(),
+                    ));
+                }
+                let mut cursor = WireCursor::new(encoded);
+                let schema_version = cursor.read_i32()?;
+                if schema_version != CORRECTION_SCHEMA_VERSION_V2 {
+                    return Err(CorrectionWireError::Invalid(format!(
+                        "unsupported correction schema version {schema_version}"
+                    )));
+                }
+                let backend = CorrectionCandidateBackend::from_wire_code(cursor.read_i32()?)?;
+                let transform_semantics =
+                    CorrectionTransformSemantics::from_wire_code(cursor.read_i32()?)?;
+                let runtime_generation = cursor.read_positive_u64("runtime_generation")?;
+                let backend_generation = cursor.read_positive_u64("backend_generation")?;
+                let candidate_sequence = cursor.read_positive_u64("candidate_sequence")?;
+                let mapping_session_id = cursor.read_lcm_string("mapping_session_id")?;
+                let mapping_session_generation =
+                    cursor.read_positive_u64("mapping_session_generation")?;
+                let map_frame_generation = cursor.read_positive_u64("map_frame_generation")?;
+                let mapping_commit_id = MappingCommitId {
+                    boot_nonce: u128::from_be_bytes(cursor.read_array::<16>()?),
+                    sequence: cursor.read_positive_u64("mapping_commit_sequence")?,
+                };
+                let occupancy_revision = cursor.read_positive_u64("occupancy_revision")?;
+                let cloud_revision = cursor.read_positive_u64("cloud_revision")?;
+                let committed_map_source_timestamp_ns =
+                    cursor.read_nonnegative_u64("committed_map_source_timestamp_ns")?;
+                let registered_cloud = RegisteredCloudProof {
+                    source_sequence: cursor
+                        .read_positive_u64("registered_cloud_source_sequence")?,
+                    source_timestamp_ns: cursor
+                        .read_nonnegative_u64("registered_cloud_source_timestamp_ns")?,
+                    point_count: cursor.read_positive_u64("registered_cloud_point_count")?,
+                    envelope_sha256: cursor.read_array::<32>()?,
+                    body_points_sha256: cursor.read_array::<32>()?,
+                };
+                let correlated_odom = CorrelatedOdomProof {
+                    source_sequence: cursor.read_positive_u64("correlated_odom_source_sequence")?,
+                    source_timestamp_ns: cursor
+                        .read_nonnegative_u64("correlated_odom_source_timestamp_ns")?,
+                    pose_sha256: cursor.read_array::<32>()?,
+                };
+                let committed_map = CommittedMapProof {
+                    source_timestamp_ns: committed_map_source_timestamp_ns,
+                    width: cursor.read_positive_u64("committed_map_width")?,
+                    height: cursor.read_positive_u64("committed_map_height")?,
+                    resolution_m: cursor.read_f64()?,
+                    origin_x_m: cursor.read_f64()?,
+                    origin_y_m: cursor.read_f64()?,
+                    payload_sha256: cursor.read_array::<32>()?,
+                    boundary_sha256: cursor.read_array::<32>()?,
+                };
+                let source_timestamp_ns = cursor.read_nonnegative_u64("source_timestamp_ns")?;
+                let map_frame_id = cursor.read_lcm_string("map_frame_id")?;
+                let odom_frame_id = cursor.read_lcm_string("odom_frame_id")?;
+                let body_frame_id = cursor.read_lcm_string("body_frame_id")?;
+                let points_frame_id = cursor.read_lcm_string("points_frame_id")?;
+                let correction_lease = CorrectionLeaseId {
+                    boot_nonce: u128::from_be_bytes(cursor.read_array::<16>()?),
+                    generation: cursor.read_positive_u64("correction_lease_generation")?,
+                };
+                let mut translation_m = [0.0; 3];
+                for value in &mut translation_m {
+                    *value = cursor.read_f64()?;
+                }
+                let mut rotation_xyzw = [0.0; 4];
+                for value in &mut rotation_xyzw {
+                    *value = cursor.read_f64()?;
+                }
+                let trajectory_start = cursor.offset;
+                let trajectory_count = cursor.read_i32()?;
+                if !(0..=2000).contains(&trajectory_count) {
+                    return Err(CorrectionWireError::Invalid(
+                        "invalid trajectory count".into(),
+                    ));
+                }
+                let trajectory_end = cursor.offset + trajectory_count as usize * 64;
+                let trajectory = native_pgo_codec::decode_optimized_keyframes(
+                    cursor.bytes.get(trajectory_start..trajectory_end).ok_or(
+                        CorrectionWireError::Truncated {
+                            need: trajectory_end,
+                            have: cursor.bytes.len(),
+                        },
+                    )?,
+                )
+                .map_err(|error| CorrectionWireError::Invalid(error.to_string()))?;
+                cursor.offset = trajectory_end;
+                let payload_sha256 = cursor.read_array::<32>()?;
+                cursor.finish()?;
+                let candidate = CorrectionCandidateData {
+                    identity: CorrectionCandidateIdentity {
+                        backend,
+                        transform_semantics,
+                        runtime_generation,
+                        backend_generation,
+                        candidate_sequence,
+                        mapping_session_id,
+                        mapping_session_generation,
+                        map_frame_generation,
+                        mapping_commit_id,
+                        occupancy_revision,
+                        cloud_revision,
+                        registered_cloud,
+                        correlated_odom,
+                        committed_map,
+                        source_timestamp_ns,
+                        map_frame_id,
+                        odom_frame_id,
+                        body_frame_id,
+                        points_frame_id,
+                        correction_lease,
                     },
-                )?,
-            )
-            .map_err(|error| CorrectionWireError::Invalid(error.to_string()))?;
-            cursor.offset = trajectory_end;
-            let payload_sha256 = cursor.read_array::<32>()?;
-            cursor.finish()?;
-            let candidate = Self {
-                identity: CorrectionCandidateIdentity {
-                    backend,
-                    transform_semantics,
-                    runtime_generation,
-                    backend_generation,
-                    candidate_sequence,
-                    mapping_session_id,
-                    mapping_session_generation,
-                    map_frame_generation,
-                    mapping_commit_id,
-                    occupancy_revision,
-                    cloud_revision,
-                    registered_cloud,
-                    correlated_odom,
-                    committed_map,
-                    source_timestamp_ns,
-                    map_frame_id,
-                    odom_frame_id,
-                    body_frame_id,
-                    points_frame_id,
-                    correction_lease,
-                },
-                transform: CorrectionTransform {
-                    translation_m,
-                    rotation_xyzw,
-                },
-                trajectory,
-                payload_sha256,
-            };
-            candidate
-                .validate_integrity()
-                .map_err(|reason| CorrectionWireError::Invalid(reason.to_string()))?;
-            Ok(candidate)
+                    transform: CorrectionTransform {
+                        translation_m,
+                        rotation_xyzw,
+                    },
+                    trajectory,
+                    payload_sha256,
+                };
+                candidate
+                    .validate_integrity()
+                    .map_err(|reason| CorrectionWireError::Invalid(reason.to_string()))?;
+                Ok(Self(Arc::new(candidate)))
+            }
+        }
+
+        impl CorrectionCandidateData {
+            fn exactly_matches(&self, other: &Self) -> bool {
+                let left = &self.identity;
+                let right = &other.identity;
+                left.backend == right.backend
+                    && left.transform_semantics == right.transform_semantics
+                    && left.runtime_generation == right.runtime_generation
+                    && left.backend_generation == right.backend_generation
+                    && left.candidate_sequence == right.candidate_sequence
+                    && left.mapping_session_id == right.mapping_session_id
+                    && left.mapping_session_generation == right.mapping_session_generation
+                    && left.map_frame_generation == right.map_frame_generation
+                    && left.mapping_commit_id == right.mapping_commit_id
+                    && left.occupancy_revision == right.occupancy_revision
+                    && left.cloud_revision == right.cloud_revision
+                    && left.registered_cloud == right.registered_cloud
+                    && left.correlated_odom == right.correlated_odom
+                    && left.committed_map.source_timestamp_ns
+                        == right.committed_map.source_timestamp_ns
+                    && left.committed_map.width == right.committed_map.width
+                    && left.committed_map.height == right.committed_map.height
+                    && left.committed_map.resolution_m.to_bits()
+                        == right.committed_map.resolution_m.to_bits()
+                    && left.committed_map.origin_x_m.to_bits()
+                        == right.committed_map.origin_x_m.to_bits()
+                    && left.committed_map.origin_y_m.to_bits()
+                        == right.committed_map.origin_y_m.to_bits()
+                    && left.committed_map.payload_sha256 == right.committed_map.payload_sha256
+                    && left.committed_map.boundary_sha256 == right.committed_map.boundary_sha256
+                    && left.source_timestamp_ns == right.source_timestamp_ns
+                    && left.map_frame_id == right.map_frame_id
+                    && left.odom_frame_id == right.odom_frame_id
+                    && left.body_frame_id == right.body_frame_id
+                    && left.points_frame_id == right.points_frame_id
+                    && left.correction_lease == right.correction_lease
+                    && same_float_bits(
+                        &self.transform.translation_m,
+                        &other.transform.translation_m,
+                    )
+                    && same_float_bits(
+                        &self.transform.rotation_xyzw,
+                        &other.transform.rotation_xyzw,
+                    )
+                    && self.trajectory.len() == other.trajectory.len()
+                    && self
+                        .trajectory
+                        .iter()
+                        .zip(&other.trajectory)
+                        .all(|(left, right)| {
+                            left.source_timestamp_ns == right.source_timestamp_ns
+                                && same_float_bits(&left.translation_m, &right.translation_m)
+                                && same_float_bits(&left.rotation_xyzw, &right.rotation_xyzw)
+                        })
+                    && self.payload_sha256 == other.payload_sha256
+            }
+
+            pub(super) fn expected_payload_sha256(
+                &self,
+            ) -> Result<[u8; 32], CorrectionRejectReason> {
+                Ok(sha256_bytes(&self.encode_body_prefix()?))
+            }
+
+            pub(super) fn validate_integrity(&self) -> Result<(), CorrectionRejectReason> {
+                self.validate_fields()?;
+                if self.payload_sha256 != self.expected_payload_sha256()? {
+                    return Err(CorrectionRejectReason::PayloadHashMismatch);
+                }
+                Ok(())
+            }
+
+            fn validate_fields(&self) -> Result<(), CorrectionRejectReason> {
+                let identity = &self.identity;
+                if identity.runtime_generation == 0 {
+                    return Err(CorrectionRejectReason::InvalidIdentity(
+                        "runtime_generation must be positive",
+                    ));
+                }
+                if identity.backend_generation == 0 {
+                    return Err(CorrectionRejectReason::InvalidIdentity(
+                        "backend_generation must be positive",
+                    ));
+                }
+                if identity.candidate_sequence == 0 {
+                    return Err(CorrectionRejectReason::InvalidIdentity(
+                        "candidate_sequence must be positive",
+                    ));
+                }
+                validate_identity_string("mapping_session_id", &identity.mapping_session_id)?;
+                if identity.mapping_session_generation == 0 {
+                    return Err(CorrectionRejectReason::InvalidIdentity(
+                        "mapping_session_generation must be positive",
+                    ));
+                }
+                if identity.map_frame_generation == 0 {
+                    return Err(CorrectionRejectReason::InvalidIdentity(
+                        "map_frame_generation must be positive",
+                    ));
+                }
+                if identity.mapping_commit_id.boot_nonce == 0
+                    || identity.mapping_commit_id.sequence == 0
+                {
+                    return Err(CorrectionRejectReason::InvalidIdentity(
+                        "mapping commit identity must be complete",
+                    ));
+                }
+                if identity.occupancy_revision == 0 || identity.cloud_revision == 0 {
+                    return Err(CorrectionRejectReason::InvalidIdentity(
+                        "occupancy and cloud revisions must be independently positive",
+                    ));
+                }
+                let cloud = identity.registered_cloud;
+                if cloud.source_sequence == 0
+                    || cloud.point_count == 0
+                    || cloud.point_count > MAX_REGISTERED_CLOUD_POINTS
+                    || !digest_is_present(&cloud.envelope_sha256)
+                    || !digest_is_present(&cloud.body_points_sha256)
+                {
+                    return Err(CorrectionRejectReason::InvalidRegisteredCloudProof);
+                }
+                let odom = identity.correlated_odom;
+                if odom.source_sequence == 0
+                    || odom.source_timestamp_ns > cloud.source_timestamp_ns
+                    || !digest_is_present(&odom.pose_sha256)
+                {
+                    return Err(CorrectionRejectReason::InvalidCorrelatedOdomProof);
+                }
+                let map = identity.committed_map;
+                let map_timestamp_is_valid = match identity.backend {
+                    CorrectionCandidateBackend::Relocalization => {
+                        map.source_timestamp_ns <= cloud.source_timestamp_ns
+                    }
+                    CorrectionCandidateBackend::LibraryPgo
+                    | CorrectionCandidateBackend::NativePgo => {
+                        map.source_timestamp_ns == cloud.source_timestamp_ns
+                    }
+                };
+                if !map_timestamp_is_valid
+                    || map.width == 0
+                    || map.height == 0
+                    || map.width > u64::from(u32::MAX)
+                    || map.height > u64::from(u32::MAX)
+                    || map.width.checked_mul(map.height).is_none()
+                    || !map.resolution_m.is_finite()
+                    || map.resolution_m <= 0.0
+                    || !map.origin_x_m.is_finite()
+                    || !map.origin_y_m.is_finite()
+                    || !digest_is_present(&map.payload_sha256)
+                    || !digest_is_present(&map.boundary_sha256)
+                {
+                    return Err(CorrectionRejectReason::InvalidCommittedMapProof);
+                }
+                if identity.source_timestamp_ns != cloud.source_timestamp_ns {
+                    return Err(CorrectionRejectReason::InvalidRegisteredCloudProof);
+                }
+                validate_identity_string("map_frame_id", &identity.map_frame_id)?;
+                validate_identity_string("odom_frame_id", &identity.odom_frame_id)?;
+                validate_identity_string("body_frame_id", &identity.body_frame_id)?;
+                validate_identity_string("points_frame_id", &identity.points_frame_id)?;
+                if identity.map_frame_id == identity.odom_frame_id
+                    || identity.map_frame_id == identity.body_frame_id
+                    || identity.odom_frame_id == identity.body_frame_id
+                {
+                    return Err(CorrectionRejectReason::InvalidIdentity(
+                        "map, odom, and body frames must be distinct",
+                    ));
+                }
+                if identity.points_frame_id != identity.body_frame_id {
+                    return Err(CorrectionRejectReason::UnsupportedPointsFrame);
+                }
+                if map.boundary_sha256
+                    != expected_map_boundary_sha256(&identity.map_frame_id, &map)?
+                {
+                    return Err(CorrectionRejectReason::MapBoundaryHashMismatch);
+                }
+                if identity.correction_lease.boot_nonce == 0
+                    || identity.correction_lease.generation == 0
+                {
+                    return Err(CorrectionRejectReason::InvalidIdentity(
+                        "correction lease identity must be complete",
+                    ));
+                }
+                if identity.runtime_generation > i64::MAX as u64
+                    || identity.backend_generation > i64::MAX as u64
+                    || identity.candidate_sequence > i64::MAX as u64
+                    || identity.mapping_session_generation > i64::MAX as u64
+                    || identity.map_frame_generation > i64::MAX as u64
+                    || identity.mapping_commit_id.sequence > i64::MAX as u64
+                    || identity.occupancy_revision > i64::MAX as u64
+                    || identity.cloud_revision > i64::MAX as u64
+                    || cloud.source_sequence > i64::MAX as u64
+                    || cloud.source_timestamp_ns > i64::MAX as u64
+                    || cloud.point_count > i64::MAX as u64
+                    || odom.source_sequence > i64::MAX as u64
+                    || odom.source_timestamp_ns > i64::MAX as u64
+                    || map.source_timestamp_ns > i64::MAX as u64
+                    || map.width > i64::MAX as u64
+                    || map.height > i64::MAX as u64
+                    || identity.source_timestamp_ns > i64::MAX as u64
+                    || identity.correction_lease.generation > i64::MAX as u64
+                {
+                    return Err(CorrectionRejectReason::InvalidIdentity(
+                        "candidate integer exceeds positive int64 wire range",
+                    ));
+                }
+
+                if self
+                    .transform
+                    .translation_m
+                    .iter()
+                    .chain(self.transform.rotation_xyzw.iter())
+                    .any(|value| !value.is_finite())
+                {
+                    return Err(CorrectionRejectReason::NonFiniteTransform);
+                }
+                if self
+                    .transform
+                    .translation_m
+                    .iter()
+                    .any(|value| value.abs() > MAX_TRANSLATION_ABS_METERS)
+                {
+                    return Err(CorrectionRejectReason::TranslationOutOfBounds);
+                }
+                let norm_squared = self
+                    .transform
+                    .rotation_xyzw
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f64>();
+                if (norm_squared - 1.0).abs() > QUATERNION_NORM_TOLERANCE {
+                    return Err(CorrectionRejectReason::InvalidRotation);
+                }
+                native_pgo_codec::validate_optimized_keyframes(&self.trajectory).map_err(|_| {
+                    CorrectionRejectReason::InvalidIdentity("invalid optimized trajectory")
+                })?;
+                if self.identity.backend == CorrectionCandidateBackend::Relocalization
+                    && !self.trajectory.is_empty()
+                {
+                    return Err(CorrectionRejectReason::InvalidIdentity(
+                        "relocalization cannot rebuild mapping trajectory",
+                    ));
+                }
+                if self.trajectory.last().is_some_and(|frame| {
+                    frame.source_timestamp_ns as u64 != self.identity.source_timestamp_ns
+                }) {
+                    return Err(CorrectionRejectReason::InvalidIdentity(
+                        "trajectory does not end at source frame",
+                    ));
+                }
+                Ok(())
+            }
+
+            pub(super) fn encode_body_prefix(&self) -> Result<Vec<u8>, CorrectionRejectReason> {
+                let identity = &self.identity;
+                let mut out = Vec::with_capacity(512);
+                out.extend_from_slice(&CORRECTION_SCHEMA_VERSION_V2.to_be_bytes());
+                out.extend_from_slice(&identity.backend.wire_code().to_be_bytes());
+                out.extend_from_slice(&identity.transform_semantics.wire_code().to_be_bytes());
+                encode_positive_i64(identity.runtime_generation, &mut out)?;
+                encode_positive_i64(identity.backend_generation, &mut out)?;
+                encode_positive_i64(identity.candidate_sequence, &mut out)?;
+                encode_lcm_string(&identity.mapping_session_id, &mut out)?;
+                encode_positive_i64(identity.mapping_session_generation, &mut out)?;
+                encode_positive_i64(identity.map_frame_generation, &mut out)?;
+                out.extend_from_slice(&identity.mapping_commit_id.boot_nonce.to_be_bytes());
+                encode_positive_i64(identity.mapping_commit_id.sequence, &mut out)?;
+                encode_positive_i64(identity.occupancy_revision, &mut out)?;
+                encode_positive_i64(identity.cloud_revision, &mut out)?;
+                encode_nonnegative_i64(identity.committed_map.source_timestamp_ns, &mut out)?;
+                encode_positive_i64(identity.registered_cloud.source_sequence, &mut out)?;
+                encode_nonnegative_i64(identity.registered_cloud.source_timestamp_ns, &mut out)?;
+                encode_positive_i64(identity.registered_cloud.point_count, &mut out)?;
+                out.extend_from_slice(&identity.registered_cloud.envelope_sha256);
+                out.extend_from_slice(&identity.registered_cloud.body_points_sha256);
+                encode_positive_i64(identity.correlated_odom.source_sequence, &mut out)?;
+                encode_nonnegative_i64(identity.correlated_odom.source_timestamp_ns, &mut out)?;
+                out.extend_from_slice(&identity.correlated_odom.pose_sha256);
+                encode_positive_i64(identity.committed_map.width, &mut out)?;
+                encode_positive_i64(identity.committed_map.height, &mut out)?;
+                out.extend_from_slice(&identity.committed_map.resolution_m.to_be_bytes());
+                out.extend_from_slice(&identity.committed_map.origin_x_m.to_be_bytes());
+                out.extend_from_slice(&identity.committed_map.origin_y_m.to_be_bytes());
+                out.extend_from_slice(&identity.committed_map.payload_sha256);
+                out.extend_from_slice(&identity.committed_map.boundary_sha256);
+                encode_nonnegative_i64(identity.source_timestamp_ns, &mut out)?;
+                encode_lcm_string(&identity.map_frame_id, &mut out)?;
+                encode_lcm_string(&identity.odom_frame_id, &mut out)?;
+                encode_lcm_string(&identity.body_frame_id, &mut out)?;
+                encode_lcm_string(&identity.points_frame_id, &mut out)?;
+                out.extend_from_slice(&identity.correction_lease.boot_nonce.to_be_bytes());
+                encode_positive_i64(identity.correction_lease.generation, &mut out)?;
+                for value in self.transform.translation_m {
+                    out.extend_from_slice(&value.to_be_bytes());
+                }
+                for value in self.transform.rotation_xyzw {
+                    out.extend_from_slice(&value.to_be_bytes());
+                }
+                out.extend_from_slice(
+                    &native_pgo_codec::encode_optimized_keyframes(&self.trajectory).map_err(
+                        |_| CorrectionRejectReason::InvalidIdentity("invalid optimized trajectory"),
+                    )?,
+                );
+                Ok(out)
+            }
+        }
+
+        fn same_float_bits<const N: usize>(left: &[f64; N], right: &[f64; N]) -> bool {
+            left.iter()
+                .zip(right)
+                .all(|(left, right)| left.to_bits() == right.to_bits())
         }
     }
+
+    pub(crate) use candidate_ownership::CorrectionCandidate;
 
     fn validate_identity_string(
         field: &'static str,
@@ -13133,9 +13265,8 @@ mod preflight_only_contract {
                 fitness: 0.75,
             };
             let correction = Isometry3::translation(-1.0, -2.0, -3.0);
-            let candidate = CorrectionCandidate {
-                trajectory: Vec::new(),
-                identity: CorrectionCandidateIdentity {
+            let candidate = CorrectionCandidate::from_unvalidated_test_parts(
+                CorrectionCandidateIdentity {
                     backend: CorrectionCandidateBackend::Relocalization,
                     transform_semantics: CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
                     runtime_generation: 2,
@@ -13163,9 +13294,10 @@ mod preflight_only_contract {
                         generation: 28,
                     },
                 },
-                transform: CorrectionTransform::from_isometry(&correction),
-                payload_sha256: [0x48; 32],
-            };
+                CorrectionTransform::from_isometry(&correction),
+                Vec::new(),
+                [0x48; 32],
+            );
             let source_bytes = [0xaa, 0xbb, 0xcc];
             let evidence = RelocalizationEvidenceV1 {
                 request_identity_sha256: [0x21; 32],
@@ -18281,6 +18413,313 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             .expect("valid candidate")
         }
 
+        fn candidate_owner_test_trajectory() -> Vec<native_pgo_codec::OptimizedKeyframe> {
+            vec![
+                native_pgo_codec::OptimizedKeyframe {
+                    source_timestamp_ns: 99,
+                    translation_m: [0.0, 1.0, 2.0],
+                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                },
+                native_pgo_codec::OptimizedKeyframe {
+                    source_timestamp_ns: 100,
+                    translation_m: [3.0, 4.0, 5.0],
+                    rotation_xyzw: [0.5, 0.5, 0.5, 0.5],
+                },
+            ]
+        }
+
+        fn candidate_owner_test_candidate() -> CorrectionCandidate {
+            let sample = sample_candidate(1, 100);
+            CorrectionCandidate::seal_with_trajectory(
+                sample.identity.clone(),
+                sample.transform,
+                candidate_owner_test_trajectory(),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn candidate_owner_moves_identity_and_trajectory_storage_without_copy() {
+            let sample = sample_candidate(1, 100);
+            let identity = sample.identity.clone();
+            let session_storage = identity.mapping_session_id.as_ptr();
+            let mut trajectory = Vec::with_capacity(32);
+            trajectory.extend(candidate_owner_test_trajectory());
+            let trajectory_storage = trajectory.as_ptr();
+            let trajectory_capacity = trajectory.capacity();
+            let candidate =
+                CorrectionCandidate::seal_with_trajectory(identity, sample.transform, trajectory)
+                    .unwrap();
+
+            assert_eq!(
+                candidate.identity.mapping_session_id.as_ptr(),
+                session_storage
+            );
+            assert_eq!(candidate.trajectory.as_ptr(), trajectory_storage);
+            assert_eq!(candidate.trajectory.capacity(), trajectory_capacity);
+            assert_eq!(Arc::strong_count(candidate.owner_for_test()), 1);
+        }
+
+        #[test]
+        fn candidate_owner_clones_share_complete_payload_and_release_last_owner() {
+            let candidate = candidate_owner_test_candidate();
+            let weak = Arc::downgrade(candidate.owner_for_test());
+            let clones: Vec<_> = (0..8).map(|_| candidate.clone()).collect();
+            assert_eq!(Arc::strong_count(candidate.owner_for_test()), 9);
+            for clone in &clones {
+                assert!(Arc::ptr_eq(
+                    candidate.owner_for_test(),
+                    clone.owner_for_test()
+                ));
+                assert!(std::ptr::eq(&candidate.identity, &clone.identity));
+                assert!(std::ptr::eq(&candidate.transform, &clone.transform));
+                assert_eq!(candidate.trajectory.as_ptr(), clone.trajectory.as_ptr());
+            }
+            drop(candidate);
+            assert!(weak.upgrade().is_some());
+            assert_eq!(Arc::strong_count(clones[0].owner_for_test()), 8);
+            drop(clones);
+            assert!(weak.upgrade().is_none());
+        }
+
+        #[test]
+        fn candidate_owner_independent_and_decoded_replays_are_exact() {
+            let candidate = candidate_owner_test_candidate();
+            let independent = candidate_owner_test_candidate();
+            let wire = candidate.encode_wire().unwrap();
+            let decoded = CorrectionCandidate::decode_wire(&wire).unwrap();
+            for replay in [&independent, &decoded] {
+                assert!(!Arc::ptr_eq(
+                    candidate.owner_for_test(),
+                    replay.owner_for_test()
+                ));
+                assert_ne!(candidate.trajectory.as_ptr(), replay.trajectory.as_ptr());
+                assert_eq!(&candidate, replay);
+                assert_eq!(replay.encode_wire().unwrap(), wire);
+            }
+            let mut coordinator = CorrectionCoordinator::default();
+            let exact = boundary(&candidate);
+            let prepared = coordinator.prepare(&candidate, &exact);
+            assert_eq!(prepared.disposition, CorrectionDisposition::Prepared);
+            assert_eq!(
+                coordinator.prepare(&independent, &exact).disposition,
+                CorrectionDisposition::Prepared,
+            );
+            coordinator.commit_applied(&prepared).unwrap();
+            assert_eq!(
+                coordinator.prepare(&decoded, &exact).disposition,
+                CorrectionDisposition::AlreadyApplied,
+            );
+        }
+
+        #[test]
+        fn candidate_owner_exact_comparison_checks_each_identity_field_without_digest_help() {
+            type Edit = fn(&mut candidate_ownership::CorrectionCandidateData);
+            let edits: &[(&str, Edit)] = &[
+                ("backend", |data| {
+                    data.identity.backend = CorrectionCandidateBackend::NativePgo
+                }),
+                ("runtime_generation", |data| {
+                    data.identity.runtime_generation += 1
+                }),
+                ("backend_generation", |data| {
+                    data.identity.backend_generation += 1
+                }),
+                ("candidate_sequence", |data| {
+                    data.identity.candidate_sequence += 1
+                }),
+                ("mapping_session_id", |data| {
+                    data.identity.mapping_session_id.push('x')
+                }),
+                ("mapping_session_generation", |data| {
+                    data.identity.mapping_session_generation += 1
+                }),
+                ("map_frame_generation", |data| {
+                    data.identity.map_frame_generation += 1
+                }),
+                ("mapping_commit_boot_nonce", |data| {
+                    data.identity.mapping_commit_id.boot_nonce += 1
+                }),
+                ("mapping_commit_sequence", |data| {
+                    data.identity.mapping_commit_id.sequence += 1
+                }),
+                ("occupancy_revision", |data| {
+                    data.identity.occupancy_revision += 1
+                }),
+                ("cloud_revision", |data| data.identity.cloud_revision += 1),
+                ("cloud_source_sequence", |data| {
+                    data.identity.registered_cloud.source_sequence += 1
+                }),
+                ("cloud_source_timestamp", |data| {
+                    data.identity.registered_cloud.source_timestamp_ns += 1
+                }),
+                ("cloud_point_count", |data| {
+                    data.identity.registered_cloud.point_count += 1
+                }),
+                ("cloud_envelope_digest", |data| {
+                    data.identity.registered_cloud.envelope_sha256[0] ^= 1
+                }),
+                ("cloud_points_digest", |data| {
+                    data.identity.registered_cloud.body_points_sha256[0] ^= 1
+                }),
+                ("odom_source_sequence", |data| {
+                    data.identity.correlated_odom.source_sequence += 1
+                }),
+                ("odom_source_timestamp", |data| {
+                    data.identity.correlated_odom.source_timestamp_ns += 1
+                }),
+                ("odom_pose_digest", |data| {
+                    data.identity.correlated_odom.pose_sha256[0] ^= 1
+                }),
+                ("map_source_timestamp", |data| {
+                    data.identity.committed_map.source_timestamp_ns += 1
+                }),
+                ("map_width", |data| data.identity.committed_map.width += 1),
+                ("map_height", |data| data.identity.committed_map.height += 1),
+                ("map_payload_digest", |data| {
+                    data.identity.committed_map.payload_sha256[0] ^= 1
+                }),
+                ("map_boundary_digest", |data| {
+                    data.identity.committed_map.boundary_sha256[0] ^= 1
+                }),
+                ("source_timestamp", |data| {
+                    data.identity.source_timestamp_ns += 1
+                }),
+                ("map_frame_id", |data| data.identity.map_frame_id.push('x')),
+                ("odom_frame_id", |data| {
+                    data.identity.odom_frame_id.push('x')
+                }),
+                ("body_frame_id", |data| {
+                    data.identity.body_frame_id.push('x')
+                }),
+                ("points_frame_id", |data| {
+                    data.identity.points_frame_id.push('x')
+                }),
+                ("lease_boot_nonce", |data| {
+                    data.identity.correction_lease.boot_nonce += 1
+                }),
+                ("lease_generation", |data| {
+                    data.identity.correction_lease.generation += 1
+                }),
+            ];
+            let candidate = candidate_owner_test_candidate();
+            let clone = candidate.clone();
+            let original_wire = candidate.encode_wire().unwrap();
+            for (field, edit) in edits {
+                let changed = candidate.edited_for_test(edit);
+                assert_eq!(candidate.payload_sha256, changed.payload_sha256);
+                assert_ne!(candidate, changed, "{field}");
+                assert_eq!(candidate, clone, "{field}");
+                assert!(!Arc::ptr_eq(
+                    candidate.owner_for_test(),
+                    changed.owner_for_test()
+                ));
+            }
+            assert_eq!(candidate.encode_wire().unwrap(), original_wire);
+            let changed_digest = candidate.edited_for_test(|data| data.payload_sha256[0] ^= 1);
+            assert_ne!(candidate, changed_digest);
+        }
+
+        #[test]
+        fn candidate_owner_exact_comparison_checks_every_float_bit() {
+            let candidate = candidate_owner_test_candidate();
+            // 覆盖变换七个、地图三个，以及每个有序轨迹点的七个浮点字段。
+            for index in 0..10 + candidate.trajectory.len() * 7 {
+                let changed = candidate.edited_for_test(|data| {
+                    let value = match index {
+                        0..=2 => &mut data.transform.translation_m[index],
+                        3..=6 => &mut data.transform.rotation_xyzw[index - 3],
+                        7 => &mut data.identity.committed_map.resolution_m,
+                        8 => &mut data.identity.committed_map.origin_x_m,
+                        9 => &mut data.identity.committed_map.origin_y_m,
+                        _ => {
+                            let frame = &mut data.trajectory[(index - 10) / 7];
+                            let component = (index - 10) % 7;
+                            if component < 3 {
+                                &mut frame.translation_m[component]
+                            } else {
+                                &mut frame.rotation_xyzw[component - 3]
+                            }
+                        }
+                    };
+                    *value = f64::from_bits(value.to_bits() ^ 1);
+                });
+                assert_eq!(candidate.payload_sha256, changed.payload_sha256);
+                assert_ne!(candidate, changed, "float field {index}");
+            }
+        }
+
+        #[test]
+        fn candidate_owner_exact_comparison_preserves_signed_zero_and_nan_bits() {
+            let candidate = candidate_owner_test_candidate().edited_for_test(|data| {
+                data.transform.translation_m[0] = 0.0;
+                data.identity.committed_map.origin_x_m = 0.0;
+            });
+            for index in 0..3 {
+                let negative_zero = candidate.edited_for_test(|data| match index {
+                    0 => data.transform.translation_m[0] = -0.0,
+                    1 => data.identity.committed_map.origin_x_m = -0.0,
+                    _ => data.trajectory[0].translation_m[0] = -0.0,
+                });
+                assert_ne!(candidate, negative_zero);
+            }
+            let nan = candidate.edited_for_test(|data| {
+                data.transform.translation_m[0] = f64::from_bits(0x7ff8_0000_0000_0001);
+                data.identity.committed_map.origin_x_m = f64::from_bits(0x7ff8_0000_0000_0002);
+                data.trajectory[0].translation_m[0] = f64::from_bits(0x7ff8_0000_0000_0003);
+            });
+            let exact_nan = nan.edited_for_test(|_| {});
+            assert!(!Arc::ptr_eq(
+                nan.owner_for_test(),
+                exact_nan.owner_for_test()
+            ));
+            assert_eq!(nan, exact_nan);
+            let changed_nan = nan.edited_for_test(|data| {
+                data.trajectory[0].translation_m[0] = f64::from_bits(0x7ff8_0000_0000_0004);
+            });
+            assert_ne!(nan, changed_nan);
+            assert_eq!(
+                nan.validate_integrity(),
+                Err(CorrectionRejectReason::InvalidCommittedMapProof)
+            );
+        }
+
+        #[test]
+        fn candidate_owner_exact_comparison_checks_trajectory_count_order_and_timestamps() {
+            let candidate = candidate_owner_test_candidate();
+            let changed_count = candidate.edited_for_test(|data| {
+                data.trajectory.pop();
+            });
+            let changed_order = candidate.edited_for_test(|data| data.trajectory.swap(0, 1));
+            let changed_timestamp = candidate.edited_for_test(|data| {
+                data.trajectory[0].source_timestamp_ns -= 1;
+            });
+            for changed in [changed_count, changed_order, changed_timestamp] {
+                assert_eq!(candidate.payload_sha256, changed.payload_sha256);
+                assert_ne!(candidate, changed);
+            }
+        }
+
+        #[test]
+        fn candidate_owner_decode_still_rejects_forged_hash_and_invalid_fields() {
+            let candidate = candidate_owner_test_candidate();
+            let mut bad_hash = candidate.encode_wire().unwrap();
+            *bad_hash.last_mut().unwrap() ^= 1;
+            assert!(matches!(
+                CorrectionCandidate::decode_wire(&bad_hash),
+                Err(CorrectionWireError::Invalid(detail)) if detail == "PayloadHashMismatch"
+            ));
+            let invalid = candidate.edited_for_test(|data| {
+                data.transform.rotation_xyzw = [0.0; 4];
+            });
+            let mut invalid_body = invalid.encode_body_prefix().unwrap();
+            invalid_body.extend_from_slice(&sha256_bytes(&invalid_body));
+            assert!(matches!(
+                CorrectionCandidate::decode_body(&invalid_body),
+                Err(CorrectionWireError::Invalid(detail)) if detail == "InvalidRotation"
+            ));
+        }
+
         #[test]
         fn candidate_finalization_event_format_is_exact_for_typed_outcomes() {
             let candidate = sample_candidate(1, 100);
@@ -18714,9 +19153,11 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 "an exact replay after APPLIED is idempotent"
             );
 
-            let mut conflicting = candidate.clone();
-            conflicting.transform.translation_m[0] += 0.25;
-            conflicting.payload_sha256 = conflicting.expected_payload_sha256().unwrap();
+            let mut conflicting_transform = candidate.transform;
+            conflicting_transform.translation_m[0] += 0.25;
+            let conflicting =
+                CorrectionCandidate::seal(candidate.identity.clone(), conflicting_transform)
+                    .unwrap();
             assert_eq!(
                 coordinator.prepare(&conflicting, &exact).disposition,
                 CorrectionDisposition::Rejected(CorrectionRejectReason::ReplayConflict)
@@ -18889,8 +19330,9 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let candidate = sample_candidate(1, 100);
             let exact = boundary(&candidate);
 
-            let mut bad_hash = candidate.clone();
-            bad_hash.payload_sha256[0] ^= 1;
+            let bad_hash = candidate.edited_for_test(|data| {
+                data.payload_sha256[0] ^= 1;
+            });
             assert_eq!(
                 CorrectionCoordinator::default()
                     .prepare(&bad_hash, &exact)
@@ -18898,8 +19340,9 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 CorrectionDisposition::Rejected(CorrectionRejectReason::PayloadHashMismatch)
             );
 
-            let mut non_finite = candidate.clone();
-            non_finite.transform.translation_m[0] = f64::NAN;
+            let non_finite = candidate.edited_for_test(|data| {
+                data.transform.translation_m[0] = f64::NAN;
+            });
             assert_eq!(
                 CorrectionCoordinator::default()
                     .prepare(&non_finite, &exact)
@@ -18907,8 +19350,9 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 CorrectionDisposition::Rejected(CorrectionRejectReason::NonFiniteTransform)
             );
 
-            let mut bad_rotation = candidate.clone();
-            bad_rotation.transform.rotation_xyzw = [0.0; 4];
+            let bad_rotation = candidate.edited_for_test(|data| {
+                data.transform.rotation_xyzw = [0.0; 4];
+            });
             assert_eq!(
                 CorrectionCoordinator::default()
                     .prepare(&bad_rotation, &exact)
@@ -19072,13 +19516,13 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     registration_correction_revision: sequence,
                     sensor_origin_map: Some(origin_map.coords.into()), frame_capture_relocalization_epoch: Some(0),
                 };
-                history.record(sequence * 100_000_000, sequence * 100_000_000, &binding, &map_points).unwrap();
-                let body_from_map = (anchor * binding.frozen_odom_from_body).inverse();
-                input.body_points = map_points.iter().map(|point| body_from_map * point).collect();
+                let source = crate::lio_ingress::AdmittedRegisteredScan::from_map_points_for_test(
+                    sequence * 100_000_000, binding.clone(), &map_points);
+                history.record(&source, sequence * 100_000_000).unwrap();
+                input.body_points = source.body_points().clone();
                 input.registered_cloud.point_count = input.body_points.len() as u64;
                 input.registered_cloud.body_points_sha256 = body_points_sha256(&input.body_points).unwrap();
-                input.static_point_indices = Some(history.static_point_indices(sequence * 100_000_000,
-                    binding.envelope_sha256, input.body_points.len()).unwrap());
+                input.static_point_indices = Some(history.static_point_indices(&source).unwrap());
                 if sequence == 7 {
                     let indices = input.static_point_indices.as_ref().unwrap();
                     let retained_people = indices.iter().filter(|i| labels[**i as usize]).count();
@@ -19097,7 +19541,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                         input.pgo_points().unwrap().iter().flat_map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>());
                     assert_ne!(decoded.identity.registered_cloud.body_points_sha256, raw_digest);
                     assert_eq!(input.registered_cloud.body_points_sha256, raw_digest);
-                    static_input = Some((indices.clone(), raw_digest));
+                    static_input = Some((indices.clone(), raw_digest, source.clone()));
                 }
                 assert!(library.submit_frame(input).unwrap().is_none());
             }
@@ -19105,9 +19549,14 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             // 前六帧已真实建关键帧；人体扫描过滤后低于准入点数，证明过滤发生在协调器之前。
             assert_eq!(owner.coordinator.graph().nodes.len(), 6);
             assert!(static_input.is_some());
-            assert!(history.static_point_indices(700_000_000, [0; 32], people_scan.len()).is_err());
+            let last_source = static_input.unwrap().2;
+            let mut wrong_binding = last_source.binding().clone();
+            wrong_binding.envelope_sha256 = [0; 32];
+            let wrong_source = crate::lio_ingress::AdmittedRegisteredScan::from_map_points_for_test(
+                700_000_000, wrong_binding, &people_scan);
+            assert!(history.static_point_indices(&wrong_source).is_err());
             history.clear();
-            assert!(history.static_point_indices(700_000_000, [7; 32], people_scan.len()).is_err());
+            assert!(history.static_point_indices(&last_source).is_err());
         }
 
         #[test]

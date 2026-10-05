@@ -1,7 +1,7 @@
 //! PGO扫描归档与私有地图重建；同一地图拥有方负责归档、提交和后续有效变换。
 
 use crate::{
-    lio_ingress::RegistrationBinding,
+    lio_ingress::AdmittedRegisteredScan,
     mapping_backend::{
         self, MappingBackendComputeConfig, MappingBackendInput,
         MappingBackendSpec, MappingComputeToken,
@@ -58,8 +58,8 @@ pub(crate) struct ArchivedScan {
     pub received_at_ns: u64,
     pub odom_from_body: Isometry3<f64>,
     pub sensor_origin_body: Point3<f64>,
-    pub body_points: Arc<[Point3<f64>]>,
-    envelope_sha256: [u8; 32],
+    pub body_points: crate::correction_points::CorrectionPoints,
+    source: AdmittedRegisteredScan,
 }
 
 #[derive(Default)]
@@ -68,7 +68,7 @@ pub(crate) struct ScanHistory {
     point_count: usize,
     incomplete: bool,
     dynamic_scene: crate::dynamic_scene::DynamicScene,
-    latest_static_scan: Option<(u64, [u8; 32], usize, Arc<[u32]>)>,
+    latest_static_scan: Option<(u64, usize, crate::lio_ingress::WeakAdmittedRegisteredScan, Arc<[u32]>)>,
 }
 
 impl ScanHistory {
@@ -82,27 +82,24 @@ impl ScanHistory {
 
     pub fn record(
         &mut self,
-        source_timestamp_ns: u64,
+        source: &AdmittedRegisteredScan,
         received_at_ns: u64,
-        binding: &RegistrationBinding,
-        points: &[Point3<f64>],
     ) -> Result<(), String> {
+        let source_timestamp_ns = source.source_timestamp_ns();
+        let binding = source.binding();
         if let Some(existing) = self.scans.get(&source_timestamp_ns) {
-            return if existing.envelope_sha256 == binding.envelope_sha256 { Ok(()) }
+            return if existing.source == *source { Ok(()) }
                 else { Err("PGO历史扫描来源冲突".into()) };
         }
-        if let Some((stamp, digest, _, _)) = &self.latest_static_scan {
+        if let Some((stamp, count, latest, _)) = &self.latest_static_scan {
             if source_timestamp_ns <= *stamp {
-                return if source_timestamp_ns == *stamp && *digest == binding.envelope_sha256 {
-                    Ok(())
-                } else {
-                    Err("PGO扫描来源倒序或冲突".into())
-                };
+                return if source_timestamp_ns == *stamp && source.body_points().len() == *count && latest.matches(source) { Ok(()) }
+                    else { Err("PGO扫描来源倒序或冲突".into()) };
             }
         }
+        let body_points = source.body_points();
         let body_from_map =
             (binding.registration_map_from_odom * binding.frozen_odom_from_body).inverse();
-        let body_points: Vec<_> = points.iter().map(|point| body_from_map * point).collect();
         let sensor_origin = binding.sensor_origin_map.map(|p| body_from_map * Point3::from(p));
         self.dynamic_scene.clear_frame();
         if let Some(origin) = sensor_origin {
@@ -115,11 +112,11 @@ impl ScanHistory {
             let p = binding.frozen_odom_from_body * point;
             (!self.dynamic_scene.is_dynamic([p.x, p.y, p.z])).then_some(index as u32)
         }).collect::<Vec<_>>();
-        self.latest_static_scan = Some((source_timestamp_ns, binding.envelope_sha256, points.len(), static_indices.into()));
+        self.latest_static_scan = Some((source_timestamp_ns, body_points.len(), source.downgrade(), static_indices.into()));
         if self.incomplete { return Ok(()); }
-        if self.point_count.saturating_add(points.len()) > MAX_ARCHIVED_POINTS {
+        if self.point_count.saturating_add(body_points.len()) > MAX_ARCHIVED_POINTS {
             tracing::warn!(event = "pgo.history.exhausted", archived_points = self.point_count,
-                incoming_points = points.len(), "PGO归档容量耗尽，本会话停止完整历史校正，正常建图继续");
+                incoming_points = body_points.len(), "PGO归档容量耗尽，本会话停止完整历史校正，正常建图继续");
             self.scans.clear();
             self.point_count = 0;
             self.incomplete = true;
@@ -134,17 +131,17 @@ impl ScanHistory {
                 received_at_ns,
                 odom_from_body: binding.frozen_odom_from_body,
                 sensor_origin_body,
-                body_points: body_points.into(),
-                envelope_sha256: binding.envelope_sha256,
+                body_points: body_points.clone(),
+                source: source.clone(),
             },
         );
         Ok(())
     }
 
-    pub(crate) fn static_point_indices(&self, timestamp_ns: u64, digest: [u8; 32], count: usize) -> Result<Arc<[u32]>, String> {
-        let (stamp, source_digest, source_count, indices) = self.latest_static_scan.as_ref()
+    pub(crate) fn static_point_indices(&self, source: &AdmittedRegisteredScan) -> Result<Arc<[u32]>, String> {
+        let (stamp, count, latest, indices) = self.latest_static_scan.as_ref()
             .ok_or("PGO静态扫描尚未准备")?;
-        if (*stamp, *source_digest, *source_count) != (timestamp_ns, digest, count) {
+        if source.source_timestamp_ns() != *stamp || source.body_points().len() != *count || !latest.matches(source) {
             return Err("PGO静态扫描与当前来源不一致".into());
         }
         Ok(Arc::clone(indices))
@@ -798,6 +795,7 @@ pub(crate) fn rebuild(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lio_ingress::RegistrationBinding;
 
     #[test]
     fn planar_scan_replay_observes_each_frame_and_materialization_does_not_vote_again() {
@@ -827,9 +825,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn archive_capacity_disables_only_complete_history_and_resets_with_session() {
-        let binding = RegistrationBinding {
+    fn test_binding() -> RegistrationBinding {
+        RegistrationBinding {
             runtime_generation: 1,
             cloud_source_sequence: 1,
             correlated_odometry: crate::lio_ingress::CorrelatedOdometry {
@@ -846,28 +843,122 @@ mod tests {
             registration_correction_revision: 0,
             sensor_origin_map: Some([0.0; 3]),
             frame_capture_relocalization_epoch: None,
-        };
+        }
+    }
+
+    #[test]
+    fn archive_capacity_disables_only_complete_history_and_resets_with_session() {
+        let binding = test_binding();
         let mut history = ScanHistory::default();
         let points = [Point3::new(1.0, 2.0, 3.0)];
-        history.record(1, 1, &binding, &points).unwrap();
+        history.record(&AdmittedRegisteredScan::from_map_points_for_test(1, binding.clone(), &points), 1).unwrap();
         assert_eq!(history.snapshot().unwrap().len(), 1);
         // 只注入容量计数，避免为边界回归分配数百兆字节数据。
         history.point_count = MAX_ARCHIVED_POINTS;
-        history.record(2, 2, &binding, &points).unwrap();
+        history.record(&AdmittedRegisteredScan::from_map_points_for_test(2, binding.clone(), &points), 2).unwrap();
         assert!(matches!(
             history.snapshot(),
             Err(RebuildError::HistoryUnavailable)
         ));
         assert_eq!(history.point_count, 0);
         assert!(history.scans.is_empty());
-        history.record(3, 3, &binding, &points).unwrap();
+        history.record(&AdmittedRegisteredScan::from_map_points_for_test(3, binding.clone(), &points), 3).unwrap();
         assert!(matches!(
             history.snapshot(),
             Err(RebuildError::HistoryUnavailable)
         ));
         history.clear();
-        history.record(4, 4, &binding, &points).unwrap();
+        history.record(&AdmittedRegisteredScan::from_map_points_for_test(4, binding.clone(), &points), 4).unwrap();
         assert_eq!(history.snapshot().unwrap()[0].source_timestamp_ns, 4);
+    }
+
+    #[test]
+    fn archive_and_correction_share_owner_points_until_their_last_retirement() {
+        let source = AdmittedRegisteredScan::from_map_points_for_test(10, test_binding(), &[Point3::new(1.0, 2.0, 3.0)]);
+        let retained = source.retention_probe_for_test();
+        let points = source.body_points().clone();
+        let allocation = points.as_ptr();
+        let mut history = ScanHistory::default();
+        history.record(&source, 11).unwrap();
+        let replay = history.snapshot().unwrap();
+        assert_eq!(replay[0].body_points.as_ptr(), allocation);
+        assert_eq!(replay[0].source.body_points().as_ptr(), allocation);
+        let correction_points = source.body_points().clone();
+        assert_eq!(correction_points.as_ptr(), allocation);
+        drop(source);
+        history.clear();
+        assert!(retained(), "an active replay still owns the admitted source");
+        drop(replay);
+        assert!(!retained(), "cleared history and finished replay release source metadata");
+        assert_eq!(correction_points.as_ptr(), allocation);
+        assert_eq!(correction_points[0], Point3::new(1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn archive_duplicate_and_static_selection_require_the_complete_admitted_owner() {
+        let binding = test_binding();
+        let points = [Point3::new(1.0, 2.0, 3.0)];
+        let source = AdmittedRegisteredScan::from_map_points_for_test(10, binding.clone(), &points);
+        let independent = AdmittedRegisteredScan::from_map_points_for_test(10, binding.clone(), &points);
+        let mut history = ScanHistory::default();
+        history.record(&source, 11).unwrap();
+        let indices = history.static_point_indices(&source).unwrap();
+        history.record(&independent, 12).unwrap();
+        assert_eq!(history.point_count, 1);
+        assert_eq!(history.snapshot().unwrap()[0].received_at_ns, 11);
+        assert!(Arc::ptr_eq(&indices, &history.static_point_indices(&independent).unwrap()));
+        let mut conflicts = Vec::new();
+        let mut changed = binding.clone(); changed.cloud_source_sequence += 1;
+        conflicts.push(AdmittedRegisteredScan::from_map_points_for_test(10, changed, &points));
+        let mut changed = binding.clone(); changed.base_anchor_map_from_odom.translation.vector.x = -0.0;
+        conflicts.push(AdmittedRegisteredScan::from_map_points_for_test(10, changed, &points));
+        conflicts.push(AdmittedRegisteredScan::from_map_points_for_test(10, binding.clone(), &[Point3::new(2.0, 2.0, 3.0)]));
+        for conflict in conflicts {
+            assert!(history.record(&conflict, 12).is_err());
+            assert!(history.static_point_indices(&conflict).is_err());
+            assert_eq!(history.point_count, 1);
+            assert!(Arc::ptr_eq(&indices, &history.static_point_indices(&source).unwrap()));
+        }
+        let newer = AdmittedRegisteredScan::from_map_points_for_test(20, binding.clone(), &points);
+        history.record(&newer, 21).unwrap();
+        history.record(&source, 22).unwrap(); // archived exact duplicate remains idempotent
+        assert!(history.static_point_indices(&source).is_err());
+        assert_eq!(&*indices, &[0]); // already issued static selections remain immutable
+        let stale = AdmittedRegisteredScan::from_map_points_for_test(9, binding, &points);
+        assert!(history.record(&stale, 22).is_err());
+    }
+
+    #[test]
+    fn exhausted_history_retires_sources_without_static_selection_pinning_payload() {
+        let points = [Point3::new(1.0, 2.0, 3.0)];
+        let source = AdmittedRegisteredScan::from_map_points_for_test(10, test_binding(), &points);
+        let source_retained = source.retention_probe_for_test();
+        let mut history = ScanHistory::default();
+        history.record(&source, 11).unwrap();
+        drop(source);
+        history.point_count = MAX_ARCHIVED_POINTS;
+        let next = AdmittedRegisteredScan::from_map_points_for_test(20, test_binding(), &points);
+        let next_retained = next.retention_probe_for_test();
+        history.record(&next, 21).unwrap();
+        assert!(!source_retained());
+        assert!(history.snapshot().is_err());
+        history.record(&next, 22).unwrap();
+        assert_eq!(&*history.static_point_indices(&next).unwrap(), &[0]);
+        let indices = history.static_point_indices(&next).unwrap();
+        drop(next);
+        assert!(!next_retained());
+        let expired = AdmittedRegisteredScan::from_map_points_for_test(20, test_binding(), &points);
+        assert!(history.record(&expired, 22).is_err());
+        assert!(history.static_point_indices(&expired).is_err());
+        assert_eq!(&*indices, &[0]);
+        let latest = AdmittedRegisteredScan::from_map_points_for_test(30, test_binding(), &points);
+        let latest_retained = latest.retention_probe_for_test();
+        history.record(&latest, 31).unwrap();
+        assert!(!next_retained());
+        drop(latest);
+        assert!(!latest_retained());
+        history.clear();
+        assert!(!latest_retained());
     }
 
     #[test]
@@ -911,17 +1002,17 @@ mod tests {
         let scans = (0..frame_count as u64)
             .map(|i| {
                 let pose = Isometry3::translation(i as f64 / 150.0, 0.0, 0.0);
+                let source_timestamp_ns = 1_000_000_000 + i * 100_000_000;
+                let mut binding = test_binding();
+                binding.frozen_odom_from_body = pose;
+                let source = AdmittedRegisteredScan::from_map_points_for_test(source_timestamp_ns, binding, &world);
                 ArchivedScan {
-                    source_timestamp_ns: 1_000_000_000 + i * 100_000_000,
+                    source_timestamp_ns,
                     received_at_ns: 1 + i * 150_000_000,
                     odom_from_body: pose,
                     sensor_origin_body: Point3::origin(),
-                    body_points: world
-                        .iter()
-                        .map(|p| pose.inverse() * p)
-                        .collect::<Vec<_>>()
-                        .into(),
-                    envelope_sha256: [1; 32],
+                    body_points: source.body_points().clone(),
+                    source,
                 }
             })
             .collect::<Vec<_>>();
@@ -1136,10 +1227,12 @@ mod tests {
     async fn pgo_fixed_dynamic_stage_benchmark() {
         let (mut scans, trajectory) = scale_input(320);
         for (frame, scan) in scans.iter_mut().enumerate() {
-            for (index, point) in Arc::make_mut(&mut scan.body_points).iter_mut().enumerate() {
-                point.x += 0.08 * (frame as f64 * 0.19 + index as f64 * 0.03).sin();
-                point.z += 0.08 * (frame as f64 * 0.17 + index as f64 * 0.02).cos();
-            }
+            scan.body_points = scan.body_points.edited_for_test(|points| {
+                for (index, point) in points.iter_mut().enumerate() {
+                    point.x += 0.08 * (frame as f64 * 0.19 + index as f64 * 0.03).sin();
+                    point.z += 0.08 * (frame as f64 * 0.17 + index as f64 * 0.02).cos();
+                }
+            });
         }
         let scans: Arc<[ArchivedScan]> = scans.into();
         let config = MappingBackendComputeConfig {

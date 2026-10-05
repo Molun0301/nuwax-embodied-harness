@@ -25,3 +25,22 @@ This source inspection is against `8c52574`, not C1's off-tree revision/wire mig
 - Producer `services/geometry/nuwax_geometry_runtime/src/fine_cloud.rs`, `accumulate_inner`, converts actual incoming scan hits and calls `nuwax_map_chunks::Writer::observe`; `Writer::observe/load_dirty/flush/seal` in `crates/nuwax-map-chunks/src/writer.rs` modifies scanned-hit blocks and seals dirty blocks rather than regrouping every known voxel on each source refresh
 
 Thus the measured complete-plane outer regrouping is not shared production code. Production still materializes changed per-block evidence maps and runs exact membership validation; its costs require separate actual delta workloads. A static pre-grouped fixture can isolate controller throughput under fresh dense evidence but cannot demonstrate a production receiver speedup. No changes to these production paths are included in this instrumentation phase.
+
+## Separate prepared-layout fixture experiment
+
+The original entrypoints still call the original whole-plane builder. Two separately named ignored experiments use a fixture-only PreparedEvidenceLayout: one retained immutable key Arc plus per-block sorted integer indices. It stores no evidence or permission and copies no pointcloud. Every actual sample still materializes all cells with that sample's timestamp and hit sequence, then calls the same block replacement and snapshot operations. Preparation happens before the first acquisition and is included in reported priming time. A different key owner is rejected, including copy-on-write membership changes; rebuilding the layout then matches the frozen reference. This is materialization/rebuild coverage, not a live changing-geometry stream test. Index storage scales with the input and is not a fixed byte bound.
+
+`prepared-source-parity-v1.log` passes the exact complete-map comparison for empty, negative, multiblock and duplicate keys, zero/MAX evidence, changed owners, deletion/addition and preservation of the original immutable owner. The duplicate-key result is exact because every occurrence receives the same per-frame evidence. No production scan or receiver code changes.
+
+Both original 60-second goal criteria remain **FAILED** in the named prepared arms, after all actual-edge and receipt-tail oracles pass:
+
+| Trial | Actual motion and final pose error | Remaining failure |
+|---|---|---|
+| `prepared-source-1cm-off-v1.log` | 488 nonzero commands, .931770 m travel, position error .068230 m, yaw .839039 rad | Final yaw error .731757 rad exceeds .15 rad |
+| `prepared-source-1cm-on-v1.log` | 467 nonzero commands, .852505 m travel, position error .147495 m, yaw .893877 rad | Final yaw error .676919 rad exceeds .15 rad |
+
+Each delivers 301 real samples, with median spacing 200.000 ms and maximum 200.129 ms OFF / 201.594 ms ON, no dropped frames, and every frame retaining 180,000 cells in 190 blocks. One-time layout construction is 167.37/173.48 ms. Per-frame evidence materialization medians are 30.506/30.493 ms, block replacement 19.814/19.783 ms, metadata/snapshot construction .00628/.00643 ms. This demonstrates fresh full-coverage fixture acquisition at the configured 5 Hz in these runs; the raw cadence label is clarified in source to say the configured period alone is not evidence of achieved cadence.
+
+There are zero delivered negatives or observation-dispatch expiry observations in either prepared run. All 488/467 delivered tails pass; guard-versus-receipt state differences remain 55/59, so the existing delayed-activation limitation is unchanged. Goal timeout cannot be relabeled success just because fresh evidence and useful motion are now available.
+
+Current-step median/p95/max remains 34.513/72.635/108.157 ms OFF and 34.528/72.078/113.480 ms ON. In OFF, observed-sweep time is 31.323/69.921/105.704 ms versus projection 2.708/3.723/7.322 ms, measured over the same called steps with inclusive timers. This points to observation-sweep construction/checking as the next controller measurement target. It does not justify dropping samples or evidence checks. The prepared fixture's source improvement is not a production runtime speedup, full-goal qualification, or hard 20 Hz guarantee.

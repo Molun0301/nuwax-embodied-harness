@@ -80,17 +80,50 @@ fn fixture(enabled:bool, resolution:f32, length:f32)->(SurfaceFollowerConfig,Arc
     (config,map,Arc::new(keys))
 }
 
+type EvidenceBlocks=BTreeMap<[i32;3],BTreeMap<[i32;3],SurfaceObservation>>;
+// Frozen whole-plane builder remains the default and independent reference.
+fn whole_plane_evidence(keys:&[[i32;3]],sample_ns:u64,hits:u16)->EvidenceBlocks {
+    let mut blocks=EvidenceBlocks::new();
+    for &key in keys {blocks.entry(key.map(|v|v.div_euclid(32))).or_default()
+        .insert(key,SurfaceObservation{observed_ns:sample_ns,hits});}
+    blocks
+}
+// Fixture-only layout: integer indices into one immutable key owner, no evidence
+// or permission. Membership changes require a new owner and a rebuilt layout.
+struct PreparedEvidenceLayout {
+    keys:Arc<Vec<[i32;3]>>,
+    blocks:Vec<([i32;3],Vec<usize>)>,
+}
+impl PreparedEvidenceLayout {
+    fn new(keys:Arc<Vec<[i32;3]>>)->Self {
+        let mut blocks=BTreeMap::<[i32;3],Vec<usize>>::new();
+        for (index,key) in keys.iter().enumerate() {blocks.entry(key.map(|v|v.div_euclid(32))).or_default().push(index);}
+        for indices in blocks.values_mut() {indices.sort_unstable_by_key(|&index|keys[index]);}
+        Self {keys,blocks:blocks.into_iter().collect()}
+    }
+    fn materialize(&self,keys:&Arc<Vec<[i32;3]>>,sample_ns:u64,hits:u16)->Option<EvidenceBlocks> {
+        if !Arc::ptr_eq(&self.keys,keys) {return None;}
+        let evidence=SurfaceObservation{observed_ns:sample_ns,hits};
+        Some(self.blocks.iter().map(|(block,indices)|(*block,
+            indices.iter().map(|&index|(self.keys[index],evidence)).collect())).collect())
+    }
+}
+
 #[derive(Clone,Copy,Debug)]
-struct SourceAssembly {group_ns:u64,replace_ns:u64,snapshot_ns:u64,cells:usize,blocks:usize}
+struct SourceAssembly {group_ns:u64,replace_ns:u64,snapshot_ns:u64,cells:usize,blocks:usize,prepared:bool,layout_setup_ns:u64}
 struct Frame {map:Arc<SurfaceSnapshot>,sample_ns:u64,ready_ns:u64,sequence:u16,assembly:SourceAssembly}
 struct Sensor {receive:mpsc::Receiver<Frame>,stop:Arc<AtomicBool>,join:Option<std::thread::JoinHandle<()>>,dropped:Arc<AtomicUsize>}
 impl Sensor {
-    fn new(base:Arc<SurfaceSnapshot>,keys:Arc<Vec<[i32;3]>>)->Self {
+    fn new(base:Arc<SurfaceSnapshot>,keys:Arc<Vec<[i32;3]>>)->Self {Self::with_prepared_layout(base,keys,false)}
+    fn with_prepared_layout(base:Arc<SurfaceSnapshot>,keys:Arc<Vec<[i32;3]>>,prepared:bool)->Self {
         let (send,receive)=mpsc::sync_channel(1); // exactly one producer / one queued frame
         let stop=Arc::new(AtomicBool::new(false));let done=stop.clone();
         let dropped=Arc::new(AtomicUsize::new(0));let skipped=dropped.clone();
         let join=std::thread::spawn(move|| {
             let mut observations=SurfaceObservations::new(base.source_voxel_size_m(),32).unwrap();
+            let layout_started=Instant::now();
+            let layout=prepared.then(||PreparedEvidenceLayout::new(keys.clone()));
+            let layout_setup_ns=if prepared {layout_started.elapsed().as_nanos() as u64}else{0};
             let mut sequence=0u16;
             let mut deadline=Instant::now();
             while !done.load(Ordering::Acquire) {
@@ -100,8 +133,10 @@ impl Sensor {
                 // pre-dated frames; hits count distinct wall-spaced acquisitions.
                 let sample_ns=unix_ns();sequence=sequence.saturating_add(1);
                 let grouping=Instant::now();
-                let mut blocks=BTreeMap::<[i32;3],BTreeMap<[i32;3],SurfaceObservation>>::new();
-                for &key in keys.iter(){blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:sample_ns,hits:sequence});}
+                let blocks=match &layout {
+                    Some(layout)=>layout.materialize(&keys,sample_ns,sequence).expect("immutable fixture key owner changed"),
+                    None=>whole_plane_evidence(&keys,sample_ns,sequence),
+                };
                 let group_ns=grouping.elapsed().as_nanos() as u64;
                 let block_count=blocks.len();let replacement=Instant::now();
                 for (key,block) in blocks {observations.replace_block(key,block).unwrap();}
@@ -113,7 +148,7 @@ impl Sensor {
                 let map=Arc::new(base.with_observations(Some(Arc::new(observations.clone()))));
                 let snapshot_ns=snapshot.elapsed().as_nanos() as u64;
                 let frame=Frame{map,sample_ns,ready_ns:unix_ns(),sequence,
-                    assembly:SourceAssembly{group_ns,replace_ns,snapshot_ns,cells:keys.len(),blocks:block_count}};
+                    assembly:SourceAssembly{group_ns,replace_ns,snapshot_ns,cells:keys.len(),blocks:block_count,prepared,layout_setup_ns}};
                 match send.try_send(frame){Ok(())=>{},Err(mpsc::TrySendError::Full(_))=>{skipped.fetch_add(1,Ordering::Relaxed);},Err(mpsc::TrySendError::Disconnected(_))=>break}
                 deadline+=SENSOR_PERIOD;
                 if deadline<Instant::now(){deadline=Instant::now()+SENSOR_PERIOD;} // missed samples are dropped, never backfilled
@@ -379,9 +414,11 @@ fn report_source_ages(p:&Probe,factory:bool,context:&str) {
             Some(ns) if ns>0=>spacing.push(ns as f64/1e6),_=>nonincreasing+=1,
         }
     }
-    eprintln!("MOVING_SOURCE_CADENCE {context} scope=consumer_delivered_frames_including_priming retained_frames={} record_limit={} omitted_frames={} delivered_frame_sample_spacing_ms_median_p95_max={} nonincreasing_sample_pairs={nonincreasing} configured_sensor_period_ms={} configured_period_is_not_achieved_cadence=true dropped_frame_samples_excluded=true producer_drop_count=MOVING_summary",
+    eprintln!("MOVING_SOURCE_CADENCE {context} scope=consumer_delivered_frames_including_priming retained_frames={} record_limit={} omitted_frames={} delivered_frame_sample_spacing_ms_median_p95_max={} nonincreasing_sample_pairs={nonincreasing} configured_sensor_period_ms={} configured_period_is_not_cadence_evidence=true dropped_frame_samples_excluded=true producer_drop_count=MOVING_summary",
         p.source_frames.len(),p.control_sample_limit,p.source_frame_overflow,measured_distribution(&spacing),SENSOR_PERIOD.as_secs_f64()*1e3);
-    for (label,field) in [("full_plane_evidence_grouping",0),("observation_block_replacement",1),("metadata_stamp_and_snapshot_construction",2)] {
+    eprintln!("SOURCE_LAYOUT {context} prepared_fixture_layout={:?} initial_layout_setup_ms={:?} setup_before_first_acquisition=true source_membership=fixed_immutable_key_owner evidence=all_cells_refreshed_each_actual_sample production_delta_path_unchanged=true",
+        p.source_frames.first().map(|f|f.assembly.prepared),p.source_frames.first().map(|f|f.assembly.layout_setup_ns as f64/1e6));
+    for (label,field) in [("full_coverage_evidence_materialization",0),("observation_block_replacement",1),("metadata_stamp_and_snapshot_construction",2)] {
         let values:Vec<_>=p.source_frames.iter().map(|frame|match field {
             0=>frame.assembly.group_ns,1=>frame.assembly.replace_ns,_=>frame.assembly.snapshot_ns,
         }as f64/1e6).collect();
@@ -598,10 +635,13 @@ fn run_startup(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,primed
     run_with_budget(enabled,resolution,scenario,factory,primed,MAX_TICKS);
 }
 fn run_with_budget(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,primed:bool,max_ticks:usize) {
+    run_with_source_layout(enabled,resolution,scenario,factory,primed,max_ticks,false);
+}
+fn run_with_source_layout(enabled:bool,resolution:f32,scenario:Scenario,factory:bool,primed:bool,max_ticks:usize,prepared:bool) {
     let (config,base,keys)=fixture(enabled,resolution,if matches!(scenario,Scenario::HoldSecond|Scenario::HoldSecondContinuity){10.0}else{6.0});
-    eprintln!("MOVING_POLICY compiled_default=translation_advice");
+    eprintln!("MOVING_POLICY compiled_default=translation_advice prepared_fixture_layout={prepared}");
     let priming_started=Instant::now();
-    let sensor=Sensor::new(base.clone(),keys);
+    let sensor=Sensor::with_prepared_layout(base.clone(),keys,prepared);
     let probe=Arc::new(Mutex::new(Probe::with_control_sample_budget(max_ticks)));
     let jobs=Arc::new(AtomicUsize::new(0));let held=Arc::new(AtomicBool::new(false));
     // Test-hook phase only: one selected job is held in each existing scenario.
@@ -1160,3 +1200,29 @@ async fn dispatch_real_observed_backends_preserve_bound_to_scheduler() {
         crate::tests::assert_real_bound_reaches_scheduler(worker,step).await;
     }
 }
+
+#[test]
+fn prepared_fixture_layout_preserves_exact_evidence_and_rejects_changed_membership_owner() {
+    let scenes=[vec![],vec![[0,0,0]],vec![[-33,0,-1],[-32,-1,32],[31,32,0],[32,31,0],[31,32,0]],
+        (0..120).rev().map(|i|[i-60,(i%17)-8,(i%3)-1]).collect()];
+    for keys in scenes {
+        let keys=Arc::new(keys);let layout=PreparedEvidenceLayout::new(keys.clone());
+        for (sample,hits) in [(0,0),(1,1),(2,2),(u64::MAX,u16::MAX)] {
+            assert_eq!(layout.materialize(&keys,sample,hits).unwrap(),whole_plane_evidence(&keys,sample,hits));
+        }
+        let identical_new_owner=Arc::new(keys.as_ref().clone());
+        assert!(layout.materialize(&identical_new_owner,3,3).is_none());
+        let mut changed=keys.clone();let values=Arc::make_mut(&mut changed);
+        if !values.is_empty(){values.remove(0);}values.push([65,-65,33]);
+        assert!(layout.materialize(&changed,3,3).is_none(),"old coverage cannot survive a different key owner");
+        let rebuilt=PreparedEvidenceLayout::new(changed.clone());
+        assert_eq!(rebuilt.materialize(&changed,3,3).unwrap(),whole_plane_evidence(&changed,3,3));
+        assert_eq!(layout.materialize(&keys,4,4).unwrap(),whole_plane_evidence(&keys,4,4),"old immutable owner remains exact");
+    }
+}
+#[test]
+#[ignore="separate fixed-coverage prepared-source experiment; original full-plane arm retained"]
+fn moving_prepared_source_1cm_primed_off_full_goal(){run_with_source_layout(false,0.01,Scenario::Goal,false,true,MAX_TICKS,true);}
+#[test]
+#[ignore="separate fixed-coverage prepared-source experiment; original full-plane arm retained"]
+fn moving_prepared_source_1cm_primed_on_full_goal(){run_with_source_layout(true,0.01,Scenario::Goal,false,true,MAX_TICKS,true);}

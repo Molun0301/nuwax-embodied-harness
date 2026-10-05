@@ -393,6 +393,10 @@ pub struct ExplorationStateSnapshot<'a> {
     pub robot_pose: PoseStamped,
     /// 全局 costmap(若有)
     pub global_costmap: Option<&'a OccupancyGrid2D>,
+    /// Optional immutable source/query pair captured before asynchronous work.
+    /// Surface sources must not read their live input receiver when supplied.
+    #[cfg(feature = "surface")]
+    pub frozen_surface_input: Option<&'a FrozenSurfacePlanningInput>,
     /// controller 当前已发布但尚未到达的 navigation goal
     pub active_goal: Option<nuwax_nav_types_messages::goal::NavigationGoal>,
     /// 最近选出的 frontier goal(用于 cancel / dedup)
@@ -408,6 +412,8 @@ impl<'a> ExplorationStateSnapshot<'a> {
         Self {
             robot_pose,
             global_costmap: None,
+            #[cfg(feature = "surface")]
+            frozen_surface_input: None,
             active_goal: None,
             latest_frontier_goal: None,
             now,

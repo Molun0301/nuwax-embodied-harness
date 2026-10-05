@@ -511,6 +511,8 @@ mod tests {
         ExplorationStateSnapshot {
             robot_pose: pose,
             global_costmap: costmap,
+            #[cfg(feature = "surface")]
+            frozen_surface_input: None,
             active_goal: None,
             latest_frontier_goal: None,
             now,

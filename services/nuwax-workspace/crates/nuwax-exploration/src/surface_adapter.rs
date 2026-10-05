@@ -163,6 +163,11 @@ impl FrozenSurfacePlanningInput {
     pub fn original_input(&self) -> &FrozenSurfaceInput {
         &self.original
     }
+
+    /// Read the same private query owner used for selection, for related route advice.
+    pub fn query_snapshot(&self) -> Option<&Arc<SurfaceSnapshot>> {
+        self.query_view.as_ref()
+    }
 }
 
 // A field is absent when the old sequential poll would not have touched it.
@@ -903,6 +908,9 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         if self.selected.is_some() {
             return Ok(self.stage_poll(Ok(ExplorationPoll::Pending), SurfacePollDelta::default()));
         }
+        if let Some(input) = state.frozen_surface_input {
+            return self.prepare_poll_with_planning_input(state, input);
+        }
         match self.receiver.freeze() {
             Ok(input) => self.prepare_poll_with_input(state, &input),
             // Input read failures are algorithm outcomes, not transactional API errors.
@@ -1400,6 +1408,71 @@ mod tests {
             .unwrap();
         assert!(matches!(
             source.poll_goal(&state(0.4, 2)).unwrap(),
+            ExplorationPoll::SourceUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn controller_prepare_preserves_captured_absence_when_live_source_arrives() {
+        let receiver = SurfaceInputReceiver::new();
+        let captured = receiver.freeze().unwrap().fork_for_planning();
+        receiver.observe(map()).unwrap();
+        let mut controller =
+            ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
+        controller.add_source(source(receiver, 1));
+        controller.begin_exploration().unwrap();
+        let original = state(0.4, 1);
+        let mut sampled = ExplorationStateSnapshot::new(original.robot_pose, original.now);
+        sampled.frozen_surface_input = Some(&captured);
+        assert!(matches!(
+            controller
+                .prepare_poll_with_deferred_stop(&sampled, false)
+                .unwrap()
+                .outcome(),
+            Ok(ExplorationPoll::SourceUnavailable(_))
+        ));
+        assert!(matches!(
+            controller.commit_prepared_poll().unwrap(),
+            ExplorationPoll::SourceUnavailable(_)
+        ));
+        assert!(matches!(
+            controller.poll_next_goal(&state(0.4, 2)).unwrap(),
+            ExplorationPoll::Goal(_)
+        ));
+    }
+
+    #[test]
+    fn controller_prepare_uses_frozen_source_after_live_receiver_changes() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let captured = receiver.freeze().unwrap().fork_for_planning();
+        let mut expected_source = source(receiver.clone(), 1);
+        let expected = expected_source.legacy_poll_goal(&state(0.4, 1)).unwrap();
+        let mut controller =
+            ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
+        controller.add_source(source(receiver.clone(), 1));
+        controller.begin_exploration().unwrap();
+        let before = serde_json::to_value(controller.checkpoint().unwrap()).unwrap();
+        receiver.clear().unwrap();
+        let original = state(0.4, 1);
+        let mut sampled = ExplorationStateSnapshot::new(original.robot_pose, original.now);
+        sampled.frozen_surface_input = Some(&captured);
+        let prepared = controller
+            .prepare_poll_with_deferred_stop(&sampled, false)
+            .unwrap();
+        assert_eq!(prepared.outcome().as_ref().unwrap(), &expected);
+        controller.discard_prepared_poll().unwrap();
+        assert_eq!(serde_json::to_value(controller.checkpoint().unwrap()).unwrap(), before);
+        controller
+            .prepare_poll_with_deferred_stop(&sampled, false)
+            .unwrap();
+        let accepted = controller.commit_prepared_poll().unwrap();
+        assert_eq!(accepted, expected);
+        controller
+            .report_goal_feedback(&goal(accepted).id, ExplorationGoalFeedback::Cancelled)
+            .unwrap();
+        assert!(matches!(
+            controller.poll_next_goal(&state(0.4, 2)).unwrap(),
             ExplorationPoll::SourceUnavailable(_)
         ));
     }

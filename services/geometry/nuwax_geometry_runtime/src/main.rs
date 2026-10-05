@@ -21,6 +21,9 @@
 // Phase 4: `pub` 而非私有 —— 兄弟模块(lcm_runtime/server)需要 `crate::channel_registry::*`。
 pub mod channel_registry;
 mod correction_coordinator;
+// Reusable compute protocol; runtime activation is qualified separately.
+#[allow(dead_code)]
+mod explore_compute_owner;
 mod explore_runtime;
 mod explore_mission;
 mod forbidden_zones;

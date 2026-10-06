@@ -1,12 +1,68 @@
 //! 三维机体凸柱包络、支撑接触与方向性地形约束。
 use super::*;
 use std::collections::VecDeque;
+#[cfg(feature = "body-query-profile")]
+use crate::body_query_profile::{self as query_profile, Counter as QueryCounter, Stage as QueryStage};
 #[path = "body_translation.rs"]
 mod translation;
 #[path = "body_contact.rs"]
 mod contact;
 pub(super) type CacheSlot =
     std::sync::Mutex<AHashMap<(VoxelKey, u64, u64), Arc<AHashMap<(i32, i32), VoxelKey>>>>;
+
+/// 只复用同一不可变视图的一个精确足迹；不保存观察许可或失败。
+struct ObservationFootprintCache<'a> {
+    snapshot: &'a SurfaceSnapshot,
+    entry: Option<([u64; 7], std::collections::BTreeSet<[i32; 3]>)>,
+    #[cfg(test)]
+    builds: usize,
+}
+
+impl<'a> ObservationFootprintCache<'a> {
+    fn new(snapshot: &'a SurfaceSnapshot) -> Self {
+        Self { snapshot, entry: None, #[cfg(test)] builds: 0 }
+    }
+
+    fn cells(&mut self, pose: ([f64; 3], [f64; 4]))
+        -> Result<&std::collections::BTreeSet<[i32; 3]>, SurfaceError> {
+        let key = [pose.0[0], pose.0[1], pose.0[2],
+            pose.1[0], pose.1[1], pose.1[2], pose.1[3]].map(f64::to_bits);
+        if self.entry.as_ref().is_none_or(|(cached, _)| *cached != key) {
+            #[cfg(feature = "body-query-profile")] query_profile::count(QueryCounter::ObservationFootprintCacheMisses);
+            #[cfg(test)] { self.builds += 1; }
+            let cells = self.snapshot.body_observation_footprint(pose)?;
+            self.entry = Some((key, cells));
+        } else {
+            #[cfg(feature = "body-query-profile")] query_profile::count(QueryCounter::ObservationFootprintCacheHits);
+        }
+        Ok(&self.entry.as_ref().expect("successful footprint entry").1)
+    }
+}
+
+// Aggregate only after the cell loop, including early-error exits. These fixed
+// counters add no per-cell TLS updates and never affect evidence decisions.
+#[cfg(feature = "body-query-profile")]
+#[derive(Default)]
+struct ObservationEvidenceCounts {visited:u64,checked:u64}
+#[cfg(feature = "body-query-profile")]
+impl Drop for ObservationEvidenceCounts {
+    fn drop(&mut self) {
+        query_profile::add(QueryCounter::ObservationVisitedCells,self.visited);
+        query_profile::add(QueryCounter::ObservationCheckedCells,self.checked);
+    }
+}
+
+#[cfg(feature = "body-query-profile")]
+#[derive(Default)]
+struct ObservationHeightCounts {columns:u64,probes:u64,absent:u64}
+#[cfg(feature = "body-query-profile")]
+impl Drop for ObservationHeightCounts {
+    fn drop(&mut self) {
+        query_profile::add(QueryCounter::ObservationHeightColumns,self.columns);
+        query_profile::add(QueryCounter::ObservationHeightProbes,self.probes);
+        query_profile::add(QueryCounter::ObservationHeightAbsent,self.absent);
+    }
+}
 
 /// 当前占据只证明精确足迹内的支撑，原始快照用于下一次位姿重新派生。
 pub(super) struct CurrentBodySupport {
@@ -1357,6 +1413,8 @@ impl SurfaceSnapshot {
         xy: [f64; 2],
         yaw: f64,
     ) -> Result<([f64; 3], [f64; 4]), SurfaceError> {
+        #[cfg(feature = "body-query-profile")]
+        let _motion_profile = query_profile::guard(QueryStage::MotionTotal);
         if !from.0.into_iter().chain(xy).chain([yaw]).all(f64::is_finite) {
             return Err(SurfaceError::InvalidPose);
         }
@@ -1367,19 +1425,35 @@ impl SurfaceSnapshot {
         let yaw_delta = (yaw-current_yaw+std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
             - std::f64::consts::PI;
         if xy == [from.0[0],from.0[1]] && yaw_delta.abs() < 1e-12 {
+            #[cfg(feature = "body-query-profile")]
+            let validation_profile = query_profile::guard(QueryStage::FinalBodyValidation);
             self.validate_body_pose(from.0,from.1)?;
+            #[cfg(feature = "body-query-profile")]
+            drop(validation_profile);
             return Ok(from);
         }
+        #[cfg(feature = "body-query-profile")]
+        let current_support_profile = query_profile::guard(QueryStage::CurrentSupportLookup);
         let start = self.locate_support_from_body(from.0,from.1,model.body_to_support_z_m)?;
+        #[cfg(feature = "body-query-profile")]
+        drop(current_support_profile);
         if actual_rotation[2][2]<=0.0 {return Err(SurfaceError::InvalidPose);}
         // 拟合查询在机体中心XY；名义接触平面在这里的高度是z-d/n_z，
         // 不能把位于旋转支撑点XY的z-d*n_z直接当作中心参考。
         let initial_height=from.0[2]-model.body_to_support_z_m/actual_rotation[2][2];
         let normal_tolerance=f64::from(self.config().step_threshold_m+self.config().voxel_size);
+        #[cfg(feature = "body-query-profile")]
+        let base_support_profile = query_profile::guard(QueryStage::BaseNearSupportLookup);
         let base_projection=self.locate_near_support(
             [from.0[0],from.0[1],initial_height],normal_tolerance)?;
+        #[cfg(feature = "body-query-profile")]
+        drop(base_support_profile);
+        #[cfg(feature = "body-query-profile")]
+        let next_support_profile = query_profile::guard(QueryStage::NextNearSupportLookup);
         let projected=self.locate_near_support(
             [xy[0],xy[1],base_projection.surface_xyz[2]],normal_tolerance)?;
+        #[cfg(feature = "body-query-profile")]
+        drop(next_support_profile);
         let (base_height,base_attitude)=self.body_contact_frame(base_projection,initial_height,current_yaw)?;
         let (next_height,next_attitude)=self.body_contact_frame(projected,initial_height,yaw)?;
         let base_rotation=rotation(base_attitude)?;
@@ -1415,23 +1489,39 @@ impl SurfaceSnapshot {
         let height_delta=centre_height_delta+(after_contact-before_contact);
         // 只改变朝向时没有地面平移，实际机体中心不应因标定偏移自行升降。
         let body_z=if xy==[from.0[0],from.0[1]] {from.0[2]} else {from.0[2]+height_delta};
+        #[cfg(feature = "body-query-profile")]
+        let segment_profile = query_profile::guard(QueryStage::SegmentSupport);
         let _destination = match self.sample_segment_support(start.support_xyz,
             [xy[0]+offset[0],xy[1]+offset[1],projected.surface_xyz[2]],1.0) {
-            Ok(destination)=>destination,
+            Ok(destination)=> {
+                #[cfg(feature = "body-query-profile")]
+                drop(segment_profile);
+                destination
+            }
             Err(error)=> {
+                #[cfg(feature = "body-query-profile")]
+                drop(segment_profile);
                 let flat=([xy[0],xy[1],body_z],q);
                 tracing::debug!(?error, ?from, ?flat, start=?start.support_xyz, projected=?projected.surface_xyz,
                     offset=?offset, "实际机体推进的支撑参考连段被拒绝");
                 if matches!(error,SurfaceError::UntraversableSegment)
                     && self.fine_contact_support_samples(from,flat).is_some() {
+                    #[cfg(feature = "body-query-profile")]
+                    let validation_profile = query_profile::guard(QueryStage::FinalBodyValidation);
                     self.validate_body_pose(flat.0,flat.1)?;
+                    #[cfg(feature = "body-query-profile")]
+                    drop(validation_profile);
                     return Ok(flat);
                 }
                 return Err(error);
             }
         };
         let body = [xy[0],xy[1],body_z];
+        #[cfg(feature = "body-query-profile")]
+        let validation_profile = query_profile::guard(QueryStage::FinalBodyValidation);
         self.validate_body_pose(body,q)?;
+        #[cfg(feature = "body-query-profile")]
+        drop(validation_profile);
         Ok((body,q))
     }
 
@@ -1478,12 +1568,17 @@ impl SurfaceSnapshot {
     pub fn body_observation_footprint(
         &self, pose: ([f64; 3], [f64; 4]),
     ) -> Result<std::collections::BTreeSet<[i32; 3]>, SurfaceError> {
+        #[cfg(feature = "body-query-profile")] let _footprint_profile=query_profile::guard(QueryStage::ObservationFootprint);
         let observations = self.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
         if observations.size_m.to_bits() != self.source_voxel_size_m().to_bits() {
             return Err(SurfaceError::InvalidConfig("观察精度与几何来源不一致".into()));
         }
         let model = self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
-        let centre = self.locate_support_from_body(pose.0, pose.1, model.body_to_support_z_m)?;
+        let centre = {
+            #[cfg(feature = "body-query-profile")] let _support_profile=query_profile::guard(QueryStage::ObservationFootprintSupport);
+            self.locate_support_from_body(pose.0, pose.1, model.body_to_support_z_m)?
+        };
+        #[cfg(feature = "body-query-profile")] let shape_profile=query_profile::guard(QueryStage::ObservationFootprintShape);
         let r = rotation(pose.1)?;
         let vertices: Vec<_> = model.footprint_xy_m.iter()
             .flat_map(|p| model.z_bounds_m.map(|z| world(r, pose.0, [p[0], p[1], z])))
@@ -1498,11 +1593,19 @@ impl SurfaceSnapshot {
         }
         let radius = model.radius() + model.z_bounds_m[0].abs().max(model.z_bounds_m[1].abs())
             + model.body_to_support_z_m + planner_size * 2.0;
-        let patch = self.ground_patch(centre, radius);
+        #[cfg(feature = "body-query-profile")] drop(shape_profile);
+        let patch = {
+            #[cfg(feature = "body-query-profile")] let _patch_profile=query_profile::guard(QueryStage::ObservationFootprintPatch);
+            self.ground_patch(centre, radius)
+        };
+        #[cfg(feature = "body-query-profile")] let cells_profile=query_profile::guard(QueryStage::ObservationFootprintCells);
+        let polygon_query=PolygonQuery::new(&polygon);
+        let mut observation_lookup=crate::surface::observations::ObservationBlockLookup::new(observations);
+        #[cfg(feature = "body-query-profile")] let mut height_counts=ObservationHeightCounts::default();
         let mut cells = std::collections::BTreeSet::new();
         for x in min[0]..=max[0] {
             for y in min[1]..=max[1] {
-                if !polygon_intersects_cell(&polygon, x, y, size) { continue; }
+                if !polygon_query.intersects(x, y, size) { continue; }
                 let column = (((x as f64 + 0.5) * size / planner_size).floor() as i32,
                     ((y as f64 + 0.5) * size / planner_size).floor() as i32);
                 let ground = *patch.get(&column).ok_or(SurfaceError::MissingSupport)?;
@@ -1517,8 +1620,13 @@ impl SurfaceSnapshot {
                     + size + model.support_uncertainty_m;
                 let count = (height_span / size).ceil().min(128.0) as i32;
                 let bottom = top.saturating_sub(count);
+                #[cfg(feature = "body-query-profile")] {height_counts.columns+=1;}
                 let z = (bottom..=top).rev().find(|&z| {
-                    if observations.get([x,y,z]).is_none() { return false; }
+                    #[cfg(feature = "body-query-profile")] {height_counts.probes+=1;}
+                    if observation_lookup.get([x,y,z]).is_none() {
+                        #[cfg(feature = "body-query-profile")] {height_counts.absent+=1;}
+                        return false;
+                    }
                     let centre = (z as f64 + 0.5) * size;
                     let coarse_z = (centre / planner_size).floor() as i32;
                     self.data.occupied_columns.get(&column)
@@ -1526,6 +1634,13 @@ impl SurfaceSnapshot {
                 }).unwrap_or(top);
                 cells.insert([x, y, z]);
             }
+        }
+        drop(observation_lookup);
+        #[cfg(feature = "body-query-profile")] drop(height_counts);
+        drop(polygon_query);
+        #[cfg(feature = "body-query-profile")] {
+            drop(cells_profile);
+            query_profile::add(QueryCounter::ObservationFootprintCellsBuilt,cells.len() as u64);
         }
         Ok(cells)
     }
@@ -1565,6 +1680,71 @@ impl SurfaceSnapshot {
             }
             Ok(())
         })
+    }
+
+    /// 本次近场检查复用一个精确足迹，仍逐次核对完整扫掠与当前检查时刻。
+    /// 缓存仅保存足迹单元几何，不保存新鲜度、观察许可或失败结果。
+    /// 返回值借用原视图、足下豁免和边界，不能跨观察源或机体视图复用许可。
+    pub fn observed_body_motion_checker<'a>(
+        &'a self,
+        occupied: &'a std::collections::BTreeSet<[i32; 3]>,
+        max_age_ns: u64,
+        boundary: &'a [[f64; 2]],
+    ) -> impl FnMut(([f64; 3], [f64; 4]), ([f64; 3], [f64; 4]), u64)
+        -> Result<(), SurfaceError> + 'a {
+        let mut checker = self.observed_body_motion_checker_with_expiry(occupied, max_age_ns, boundary);
+        move |from, to, checked_ns| checker(from, to, checked_ns).map(|_| ())
+    }
+
+    /// 在同一次完整扫掠成功后，返回实际检查的非豁免单元中最早的观察到期时刻。
+    /// 到期时刻仍可通过检查；只有超过该时刻才过期。每次调用重新累计，失败不返回凭据。
+    /// `None` 仅表示成功检查没有有限的时效上界：全部豁免，或时间加法达到/超过
+    /// `u64::MAX`；它不豁免几何、观察来源、采样命中或未来时间检查。
+    /// 与单位返回值入口共享精确足迹缓存和借用范围，不缓存观察许可。
+    pub fn observed_body_motion_checker_with_expiry<'a>(
+        &'a self,
+        occupied: &'a std::collections::BTreeSet<[i32; 3]>,
+        max_age_ns: u64,
+        boundary: &'a [[f64; 2]],
+    ) -> impl FnMut(([f64; 3], [f64; 4]), ([f64; 3], [f64; 4]), u64)
+        -> Result<Option<u64>, SurfaceError> + 'a {
+        let mut footprints = ObservationFootprintCache::new(self);
+        move |from, to, checked_ns| {
+            let observations = self.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
+            if checked_ns == 0 || max_age_ns == 0 { return Err(SurfaceError::MissingSupport); }
+            let mut earliest_expiry: Option<u64> = None;
+            self.validate_body_motion_checked(from, to, boundary, |pose| {
+                let cells=footprints.cells(pose)?;
+                #[cfg(feature = "body-query-profile")] let _evidence_profile=query_profile::guard(QueryStage::ObservationEvidence);
+                #[cfg(feature = "body-query-profile")] let mut counts=ObservationEvidenceCounts::default();
+                #[cfg(feature = "body-query-profile")] query_profile::add(QueryCounter::ObservationInputCells,cells.len() as u64);
+                // Both sets use exact integer-cell ordering. Difference yields
+                // precisely the old loop's non-exempt keys in the same order.
+                for &cell in cells.difference(occupied) {
+                    #[cfg(feature = "body-query-profile")] {counts.visited+=1;}
+                    #[cfg(feature = "body-query-profile")] {counts.checked+=1;}
+                    let evidence = observations.get(cell).unwrap_or(SurfaceObservation {observed_ns:0,hits:0});
+                    let reason = if evidence.observed_ns == 0 {Some("缺少真实观察")}
+                        else if evidence.hits < 2 {Some("独立采样命中不足")}
+                        else if evidence.observed_ns > checked_ns.saturating_add(50_000_000) {Some("采样时间在未来")}
+                        else if checked_ns.saturating_sub(evidence.observed_ns) > max_age_ns {Some("观察已过期")}
+                        else {None};
+                    if let Some(reason) = reason {
+                        return Err(SurfaceError::NearFieldObservation {
+                            cell, reason, observed_ns:evidence.observed_ns, checked_ns,
+                        });
+                    }
+                    // 饱和年龄判定在可表示时钟内不会越过 MAX；不能把 MAX 作为
+                    // 有限期限交给上层减去执行耗时，否则会凭空提前限制许可。
+                    if let Some(expiry) = evidence.observed_ns.checked_add(max_age_ns)
+                        .filter(|&expiry| expiry < u64::MAX) {
+                        earliest_expiry = Some(earliest_expiry.map_or(expiry, |old| old.min(expiry)));
+                    }
+                }
+                Ok(())
+            })?;
+            Ok(earliest_expiry)
+        }
     }
 
     /// 粗列中心连段失真时，仅由实际参考经过的共同真实占据带补证。
@@ -1647,7 +1827,7 @@ impl SurfaceSnapshot {
         from: ([f64; 3], [f64; 4]),
         to: ([f64; 3], [f64; 4]),
         boundary: &[[f64; 2]],
-        check_observations: impl Fn(([f64; 3], [f64; 4])) -> Result<(), SurfaceError>,
+        mut check_observations: impl FnMut(([f64; 3], [f64; 4])) -> Result<(), SurfaceError>,
     ) -> Result<(), SurfaceError> {
         validate_boundary(boundary)?;
         let model = self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
@@ -1790,21 +1970,49 @@ impl SurfaceSnapshot {
         let Some(count)=nx.checked_mul(ny).filter(|n|nx>0&&ny>0&&*n<=16_384) else {
             return self.fine_contact_domain_sparse(origin,radius);
         };
+        #[cfg(feature = "body-query-profile")]
+        query_profile::count(QueryCounter::DenseDomainCalls);
         let stride=ny as usize;let count=count as usize;
         let mut in_domain=vec![false;count];
         let mut bands=vec![None;count];
+        // 子阶段不移动生产临时值：表/队列初始化及保留缓冲清理仍只计入外层收集。
+        #[cfg(feature = "body-query-profile")]
+        let (mut cache_present_columns,mut cache_absent_columns,mut cache_single_band_columns)=(0_u64,0_u64,0_u64);
+        #[cfg(feature = "body-query-profile")]
+        let cache_profile=query_profile::guard(QueryStage::DenseBandCacheRead);
         // 同一不可变来源的带缓存一次批量读取，避免每个实测细列分别取锁。
         {
+            #[cfg(feature = "body-query-profile")]
+            let acquire_profile=query_profile::guard(QueryStage::DenseBandCacheAcquire);
             let cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+            #[cfg(feature = "body-query-profile")]
+            drop(acquire_profile);
             for x in low[0]..=high[0] {for y in low[1]..=high[1] {
                 let dx=(f64::from(x)+0.5)*size-origin[0];let dy=(f64::from(y)+0.5)*size-origin[1];
                 if dx*dx+dy*dy>enumeration*enumeration {continue;}
                 let index=(i64::from(x)-i64::from(low[0])) as usize*stride+(i64::from(y)-i64::from(low[1])) as usize;
                 in_domain[index]=true;bands[index]=cache.fine_bands.get(&(x,y)).cloned();
+                #[cfg(feature = "body-query-profile")]
+                if let Some(values)=&bands[index] {
+                    cache_present_columns+=1;
+                    if values.len()==1 {cache_single_band_columns+=1;}
+                }else{cache_absent_columns+=1;}
             }}
+        }
+        #[cfg(feature = "body-query-profile")]
+        {
+            drop(cache_profile);
+            query_profile::add(QueryCounter::DenseAllocatedSlots,count as u64);
+            query_profile::add(QueryCounter::DenseCachePresentColumns,cache_present_columns);
+            query_profile::add(QueryCounter::DenseCacheAbsentColumns,cache_absent_columns);
+            query_profile::add(QueryCounter::DenseCacheSingleBandColumns,cache_single_band_columns);
         }
         let distance=|band:[f64;2]|(band[0]-origin[2]).max(origin[2]-band[1]).max(0.0);
         let mut selected=vec![None;count];let mut seed:Option<(usize,(i32,i32),[f64;4])>=None;
+        #[cfg(feature = "body-query-profile")]
+        let mut selected_columns=0_u64;
+        #[cfg(feature = "body-query-profile")]
+        let selection_profile=query_profile::guard(QueryStage::DenseBandSelectionSeed);
         for (index,inside) in in_domain.iter().copied().enumerate() {
             if !inside {continue;}
             let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
@@ -1813,6 +2021,8 @@ impl SurfaceSnapshot {
                 .then_with(||(a[1]-origin[2]).abs().total_cmp(&(b[1]-origin[2]).abs()))
                 .then_with(||a[1].total_cmp(&b[1]))) else {continue;};
             selected[index]=Some(band);let rise=band[1]-origin[2];
+            #[cfg(feature = "body-query-profile")]
+            {selected_columns+=1;}
             if rise>model.max_step_up_m+size+1e-6 || -rise>model.max_step_down_m+size+1e-6 {continue;}
             let dx=(f64::from(x)+0.5)*size-origin[0];let dy=(f64::from(y)+0.5)*size-origin[1];
             let rank=[dx*dx+dy*dy,distance(band),rise.abs(),band[1]];
@@ -1822,16 +2032,24 @@ impl SurfaceSnapshot {
             });
             if earlier {seed=Some((index,(x,y),rank));}
         }
+        #[cfg(feature = "body-query-profile")]
+        {
+            drop(selection_profile);
+            query_profile::add(QueryCounter::DenseSelectedColumns,selected_columns);
+        }
         let seed=seed.ok_or(SurfaceError::MissingSupport)?.0;
         let mut queue=VecDeque::from([seed]);let mut visited=vec![false;count];visited[seed]=true;
-        let mut points=Vec::new();
+        #[cfg(feature = "body-query-profile")]
+        query_profile::add(QueryCounter::DenseVisitedTableSlots,count as u64);
+        #[cfg(feature = "body-query-profile")]
+        let mut visited_columns=0_u64;
+        #[cfg(feature = "body-query-profile")]
+        let connectivity_profile=query_profile::guard(QueryStage::DenseConnectivityBfs);
         while let Some(index)=queue.pop_front() {
+            #[cfg(feature = "body-query-profile")]
+            {visited_columns+=1;}
             let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
             let band=selected[index].expect("只有已选真实带进入队列");
-            let point=[(f64::from(x)+0.5)*size,(f64::from(y)+0.5)*size,band[1]];
-            let distance2=(point[0]-origin[0]).powi(2)+(point[1]-origin[1]).powi(2);
-            let weight=(1.0-distance2/(radius*radius)).max(0.0).powi(2);
-            if weight>0.0 {points.push((point,band[0],weight));}
             for dx in -1..=1 {for dy in -1..=1 {
                 if dx==0&&dy==0 {continue;}
                 let(mut nx,mut ny)=(x,y);
@@ -1849,12 +2067,35 @@ impl SurfaceSnapshot {
                 }
             }}
         }
+        #[cfg(feature = "body-query-profile")]
+        {
+            drop(connectivity_profile);
+            query_profile::add(QueryCounter::DenseVisitedColumns,visited_columns);
+        }
+        // 只改变私有输出顺序：仍仅发出原 BFS 访问过的真实列，点与权重算式不变。
+        // 网格按 X 再 Y 排列，让 body_contact_frame 保留的排序直接接收有序输入。
+        #[cfg(feature = "body-query-profile")]
+        let emission_profile=query_profile::guard(QueryStage::DenseOrderedEmission);
+        let mut points=Vec::new();
+        for (index,seen) in visited.into_iter().enumerate() {
+            if !seen {continue;}
+            let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
+            let band=selected[index].expect("只有已选真实带被访问");
+            let point=[(f64::from(x)+0.5)*size,(f64::from(y)+0.5)*size,band[1]];
+            let distance2=(point[0]-origin[0]).powi(2)+(point[1]-origin[1]).powi(2);
+            let weight=(1.0-distance2/(radius*radius)).max(0.0).powi(2);
+            if weight>0.0 {points.push((point,band[0],weight));}
+        }
+        #[cfg(feature = "body-query-profile")]
+        drop(emission_profile);
         Ok(points)
     }
 
     /// 从真实细带独立构建接触响应域；粗图不决定拟合输入，仍核验全部实际机体许可。
     fn fine_contact_domain_sparse(&self,origin:[f64;3],radius:f64)
         ->Result<Vec<([f64;3],f64,f64)>,SurfaceError> {
+        #[cfg(feature = "body-query-profile")]
+        query_profile::count(QueryCounter::SparseDomainCalls);
         let observations=self.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
         let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
         let size=f64::from(observations.size_m);
@@ -1918,12 +2159,26 @@ impl SurfaceSnapshot {
     /// 在连续足迹邻域上共同拟合接触高度和法向；连续厚带保留实测参考允许的区间。
     fn body_contact_frame(&self,centre:SurfaceLocation,height:f64,yaw:f64)
         -> Result<(f64,[f64;4]),SurfaceError> {
+        #[cfg(feature = "body-query-profile")]
+        let _frame_profile = query_profile::guard(QueryStage::ContactFrame);
         let model=self.body_envelope()
             .ok_or_else(||SurfaceError::InvalidConfig("body envelope is unavailable".into()))?;
         let support=[centre.support_xyz[0],centre.support_xyz[1],height];
         let key=(centre.cell,support.map(f64::to_bits));
+        #[cfg(feature = "body-query-profile")]
+        let cache_profile = query_profile::guard(QueryStage::PlaneCacheLookup);
         let cached=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).planes.get(&key).copied();
-        let (a,b,z)=if let Some(plane)=cached {plane} else {
+        #[cfg(feature = "body-query-profile")]
+        drop(cache_profile);
+        let (a,b,z)=if let Some(plane)=cached {
+            #[cfg(feature = "body-query-profile")]
+            query_profile::count(QueryCounter::PlaneCacheHits);
+            plane
+        } else {
+            #[cfg(feature = "body-query-profile")]
+            query_profile::count(QueryCounter::PlaneCacheMisses);
+            #[cfg(feature = "body-query-profile")]
+            let domain_profile = query_profile::guard(QueryStage::ContactDomainCollection);
             // 足迹外包半径加实际接触样本间距；有精细观察时不随规划格改变。
             // 缺少精细观察时只保留粗格中心，不能用已丢失的细XY缩窄量化覆盖。
             let spacing=self.observations.as_ref().map_or(self.config().voxel_size,|o|o.size_m);
@@ -1944,12 +2199,26 @@ impl SurfaceSnapshot {
                 }
                 points
             };
+            #[cfg(feature = "body-query-profile")]
+            drop(domain_profile);
+            #[cfg(feature = "body-query-profile")]
+            query_profile::add(QueryCounter::ContactPoints, u64::try_from(points.len()).unwrap_or(u64::MAX));
+            #[cfg(feature = "body-query-profile")]
+            let sort_profile = query_profile::guard(QueryStage::ContactPointSort);
             points.sort_by(|a,b|a.0[0].total_cmp(&b.0[0]).then_with(||a.0[1].total_cmp(&b.0[1])));
+            #[cfg(feature = "body-query-profile")]
+            drop(sort_profile);
+            #[cfg(feature = "body-query-profile")]
+            let fit_profile = query_profile::guard(QueryStage::ContactPlaneFit);
             let plane=fit_contact_plane(&points,support).ok_or(SurfaceError::MissingSupport)?;
+            #[cfg(feature = "body-query-profile")]
+            drop(fit_profile);
             let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
             if cache.planes.len()>=8192 {cache.planes.clear();}
             cache.planes.insert(key,plane);plane
         };
+        #[cfg(feature = "body-query-profile")]
+        let _algebra_profile = query_profile::guard(QueryStage::ContactFrameAlgebra);
         let normal=normalize([-a,-b,1.0]);
         let forward=normalize([yaw.cos(),yaw.sin(),a*yaw.cos()+b*yaw.sin()]);
         let left=cross(normal,forward);
@@ -2254,6 +2523,961 @@ mod tests {
         // 当前实际占据区域仍需通过几何检查，但可以从旧足下证据开始停稳。
         map.validate_observed_body_motion(from, from, &occupied, 12_000_000_000, 1_000_000_000).unwrap();
     }
+
+    fn assert_observation_checker_matches(
+        map: &SurfaceSnapshot,
+        occupied: &std::collections::BTreeSet<[i32; 3]>,
+        max_age_ns: u64,
+        boundary: &[[f64; 2]],
+        queries: &[(([f64; 3], [f64; 4]), ([f64; 3], [f64; 4]), u64)],
+    ) {
+        let mut cached = map.observed_body_motion_checker(occupied, max_age_ns, boundary);
+        let mut with_expiry = map.observed_body_motion_checker_with_expiry(occupied, max_age_ns, boundary);
+        for &(from, to, checked_ns) in queries {
+            let expected = map.validate_observed_body_motion_in_boundary(
+                from, to, occupied, checked_ns, max_age_ns, boundary);
+            assert_eq!(cached(from, to, checked_ns), expected,
+                "足迹复用必须保留完整结果、首个错误及时间字段: {from:?} -> {to:?}, {checked_ns}");
+            assert_eq!(with_expiry(from, to, checked_ns).map(|_| ()), expected,
+                "到期凭据必须保留独立原始检查的完整结果和首个错误: {from:?} -> {to:?}, {checked_ns}");
+        }
+    }
+
+    #[test]
+    fn observed_motion_expiry_uses_only_checked_nonexempt_cells_and_resets_each_sweep() {
+        let map = scene(&[], false).with_observations(Some(observation_grid(|cells| {
+            cells.get_mut(&[-4, 0, 0]).unwrap().observed_ns = 1;
+            cells.get_mut(&[-20, 0, 0]).unwrap().observed_ns = 1;
+            cells.get_mut(&[8, 0, 0]).unwrap().observed_ns = 9_900_000_000;
+            cells.get_mut(&[10, 0, 0]).unwrap().observed_ns = 9_500_000_000;
+            cells.get_mut(&[18, 0, 0]).unwrap().observed_ns = 9_700_000_000;
+        })));
+        let from = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let to = ([1.85, 0.05, 0.5], from.1);
+        let occupied = map.body_observation_footprint(from).unwrap();
+        let destination = map.body_observation_footprint(to).unwrap();
+        assert!(occupied.contains(&[-4, 0, 0]));
+        assert!(!occupied.contains(&[10, 0, 0]) && !destination.contains(&[10, 0, 0]),
+            "最早到期证据仅出现在中间扫掠，不能只累计端点");
+        let mut checker = map.observed_body_motion_checker_with_expiry(&occupied, 1_000_000_000, &[]);
+        assert_eq!(checker(from, to, 10_100_000_000), Ok(Some(10_500_000_000)));
+        assert_eq!(checker(to, to, 10_100_000_000), Ok(Some(10_700_000_000)),
+            "下一次扫掠不能继承前次中间单元的最小值");
+        assert_eq!(checker(from, from, 12_000_000_000), Ok(None),
+            "全部位于实际足下时没有时效上界，过期足下证据不能约束新运动");
+        assert_eq!(checker(from, to, 10_500_000_000), Ok(Some(10_500_000_000)));
+        let expired = checker(from, to, 10_500_000_001);
+        assert_eq!(expired.as_ref().map(|_| ()), map.validate_observed_body_motion_in_boundary(
+            from, to, &occupied, 10_500_000_001, 1_000_000_000, &[]).as_ref().map(|_| ()));
+        assert_eq!(expired, Err(SurfaceError::NearFieldObservation {
+            cell: [10, 0, 0], reason: "观察已过期", observed_ns: 9_500_000_000,
+            checked_ns: 10_500_000_001,
+        }));
+    }
+
+    #[test]
+    fn observed_motion_expiry_rechecks_cached_footprint_at_exact_expiry_and_one_ns_later() {
+        let map = scene(&[], false).with_observations(Some(observation_grid(|_| {})));
+        let pose = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let none = Default::default();
+        let mut checker = map.observed_body_motion_checker_with_expiry(&none, 1_000_000_000, &[]);
+        assert_eq!(checker(pose, pose, 10_100_000_000), Ok(Some(11_000_000_000)));
+        assert_eq!(checker(pose, pose, 11_000_000_000), Ok(Some(11_000_000_000)));
+        let expected = map.validate_observed_body_motion_in_boundary(
+            pose, pose, &none, 11_000_000_001, 1_000_000_000, &[]).unwrap_err();
+        assert!(matches!(expected, SurfaceError::NearFieldObservation {
+            reason: "观察已过期", observed_ns: 10_000_000_000, checked_ns: 11_000_000_001, ..
+        }));
+        assert_eq!(checker(pose, pose, 11_000_000_001), Err(expected));
+        assert_eq!(checker(pose, pose, 10_100_000_000), Ok(Some(11_000_000_000)),
+            "相同足迹命中仍重查时刻，不能缓存成功或失败许可");
+    }
+
+    #[test]
+    fn observed_motion_expiry_returns_no_certificate_for_failure_and_keeps_first_error() {
+        let map = scene(&[], false).with_observations(Some(observation_grid(|cells| {
+            cells.get_mut(&[-4, 0, 0]).unwrap().observed_ns = 9_500_000_000;
+            let first_error = cells.get_mut(&[8, 0, 0]).unwrap();
+            first_error.observed_ns = 11_000_000_000;
+            first_error.hits = 1;
+            cells.remove(&[9, 0, 0]);
+        })));
+        let from = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let to = ([0.45, 0.05, 0.5], from.1);
+        let later = ([1.65, 0.05, 0.5], from.1);
+        let none = Default::default();
+        let mut checker = map.observed_body_motion_checker_with_expiry(&none, 1_000_000_000, &[]);
+        assert_eq!(checker(from, from, 10_100_000_000), Ok(Some(10_500_000_000)));
+        let expected = map.validate_observed_body_motion_in_boundary(
+            from, to, &none, 10_100_000_000, 1_000_000_000, &[]).unwrap_err();
+        assert_eq!(expected, SurfaceError::NearFieldObservation {
+            cell: [8, 0, 0], reason: "独立采样命中不足", observed_ns: 11_000_000_000,
+            checked_ns: 10_100_000_000,
+        });
+        assert_eq!(checker(from, to, 10_100_000_000), Err(expected.clone()));
+        assert_eq!(checker(from, to, 10_100_000_000), Err(expected));
+        assert_eq!(checker(later, later, 10_100_000_000), Ok(Some(11_000_000_000)),
+            "失败前累计的更早期限不能泄漏到后续成功检查");
+    }
+
+    #[test]
+    fn observed_motion_expiry_without_nonexempt_cells_still_checks_geometry_and_source() {
+        let base = scene(&[], false);
+        let map = base.with_observations(Some(observation_grid(|cells| {
+            for evidence in cells.values_mut() { *evidence = SurfaceObservation { observed_ns: 1, hits: 0 }; }
+        })));
+        let pose = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let occupied = map.body_observation_footprint(pose).unwrap();
+        let mut checker = map.observed_body_motion_checker_with_expiry(&occupied, 1_000_000_000, &[]);
+        assert_eq!(checker(pose, pose, 12_000_000_000), Ok(None));
+        assert_eq!(checker(pose, pose, 0), Err(SurfaceError::MissingSupport));
+        let invalid = (pose.0, [0.0; 4]);
+        assert_eq!(checker(invalid, pose, 12_000_000_000).map(|_| ()),
+            map.validate_observed_body_motion_in_boundary(invalid, pose, &occupied,
+                12_000_000_000, 1_000_000_000, &[]));
+        assert!(checker(invalid, pose, 12_000_000_000).is_err());
+        let boundary = [[2.0, 2.0], [3.0, 2.0], [3.0, 3.0], [2.0, 3.0]];
+        let mut bounded = map.observed_body_motion_checker_with_expiry(&occupied, 1_000_000_000, &boundary);
+        assert_eq!(bounded(pose, pose, 12_000_000_000), Err(SurfaceError::InvalidBoundary));
+        let mut missing = base.observed_body_motion_checker_with_expiry(&occupied, 1_000_000_000, &[]);
+        assert_eq!(missing(pose, pose, 12_000_000_000), Err(SurfaceError::MissingSupport));
+    }
+
+    #[test]
+    fn observed_motion_expiry_does_not_turn_clock_saturation_into_a_finite_bound() {
+        let base = scene(&[], false);
+        let pose = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let none = Default::default();
+        for (observed_ns, max_age_ns, checked_ns, expiry) in [
+            (u64::MAX - 100, 99, u64::MAX - 1, Some(u64::MAX - 1)),
+            (u64::MAX - 100, 100, u64::MAX, None),
+            (u64::MAX - 100, 101, u64::MAX, None),
+            (u64::MAX, 1, u64::MAX, None),
+            (u64::MAX, u64::MAX, u64::MAX, None),
+        ] {
+            let map = base.with_observations(Some(observation_grid(|cells| {
+                for evidence in cells.values_mut() { evidence.observed_ns = observed_ns; }
+            })));
+            let mut checker = map.observed_body_motion_checker_with_expiry(&none, max_age_ns, &[]);
+            assert_eq!(checker(pose, pose, checked_ns), Ok(expiry));
+            assert_observation_checker_matches(&map, &none, max_age_ns, &[], &[
+                (pose, pose, checked_ns), (pose, pose, u64::MAX),
+                (pose, pose, observed_ns.saturating_sub(50_000_001)),
+            ]);
+        }
+        let mixed = base.with_observations(Some(observation_grid(|cells| {
+            for evidence in cells.values_mut() { evidence.observed_ns = u64::MAX - 50; }
+            cells.get_mut(&[0, 0, 0]).unwrap().observed_ns = u64::MAX - 101;
+            cells.get_mut(&[1, 0, 0]).unwrap().observed_ns = u64::MAX - 100;
+        })));
+        let mut checker = mixed.observed_body_motion_checker_with_expiry(&none, 100, &[]);
+        assert_eq!(checker(pose, pose, u64::MAX - 1), Ok(Some(u64::MAX - 1)),
+            "有限单元仍约束混合了溢出和恰好 MAX 的成功扫掠");
+        let expired = checker(pose, pose, u64::MAX);
+        assert_eq!(expired, Err(SurfaceError::NearFieldObservation {
+            cell: [0, 0, 0], reason: "观察已过期", observed_ns: u64::MAX - 101,
+            checked_ns: u64::MAX,
+        }));
+        assert_eq!(expired.map(|_| ()), mixed.validate_observed_body_motion_in_boundary(
+            pose, pose, &none, u64::MAX, 100, &[]));
+    }
+
+    // Frozen direct-lookup specialization and borrowed-lookup full-footprint comparator.
+    fn measured_footprint_block_probe<const BORROWED:bool>(
+        map: &SurfaceSnapshot, pose: ([f64; 3], [f64; 4]),
+    ) -> Result<std::collections::BTreeSet<[i32; 3]>, SurfaceError> {
+        #[cfg(feature = "body-query-profile")] let _footprint_profile=query_profile::guard(QueryStage::ObservationFootprint);
+        let observations = map.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
+        if observations.size_m.to_bits() != map.source_voxel_size_m().to_bits() {
+            return Err(SurfaceError::InvalidConfig("观察精度与几何来源不一致".into()));
+        }
+        let mut block_probe=crate::surface::observations::ObservationBlockLookup::new(observations);
+        let model = map.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        let centre = {
+            #[cfg(feature = "body-query-profile")] let _support_profile=query_profile::guard(QueryStage::ObservationFootprintSupport);
+            map.locate_support_from_body(pose.0, pose.1, model.body_to_support_z_m)?
+        };
+        #[cfg(feature = "body-query-profile")] let shape_profile=query_profile::guard(QueryStage::ObservationFootprintShape);
+        let r = rotation(pose.1)?;
+        let vertices: Vec<_> = model.footprint_xy_m.iter()
+            .flat_map(|p| model.z_bounds_m.map(|z| world(r, pose.0, [p[0], p[1], z])))
+            .collect();
+        let polygon = hull(vertices.iter().map(|p| [p[0], p[1]]).collect());
+        let size = f64::from(observations.size_m);
+        let planner_size = f64::from(map.config().voxel_size);
+        let min: [i32; 2] = std::array::from_fn(|i| (vertices.iter().map(|p| p[i]).fold(f64::INFINITY, f64::min) / size).floor() as i32);
+        let max: [i32; 2] = std::array::from_fn(|i| (vertices.iter().map(|p| p[i]).fold(f64::NEG_INFINITY, f64::max) / size).floor() as i32);
+        if (i64::from(max[0]) - i64::from(min[0]) + 1) * (i64::from(max[1]) - i64::from(min[1]) + 1) > 16_384 {
+            return Err(SurfaceError::InvalidConfig("近场精细支撑查询超过预算".into()));
+        }
+        let radius = model.radius() + model.z_bounds_m[0].abs().max(model.z_bounds_m[1].abs())
+            + model.body_to_support_z_m + planner_size * 2.0;
+        #[cfg(feature = "body-query-profile")] drop(shape_profile);
+        let patch = {
+            #[cfg(feature = "body-query-profile")] let _patch_profile=query_profile::guard(QueryStage::ObservationFootprintPatch);
+            map.ground_patch(centre, radius)
+        };
+        #[cfg(feature = "body-query-profile")] let cells_profile=query_profile::guard(QueryStage::ObservationFootprintCells);
+        let polygon_query=PolygonQuery::new(&polygon);
+        #[cfg(feature = "body-query-profile")] let mut height_counts=ObservationHeightCounts::default();
+        let mut cells = std::collections::BTreeSet::new();
+        for x in min[0]..=max[0] {
+            for y in min[1]..=max[1] {
+                if !polygon_query.intersects(x, y, size) { continue; }
+                let column = (((x as f64 + 0.5) * size / planner_size).floor() as i32,
+                    ((y as f64 + 0.5) * size / planner_size).floor() as i32);
+                let ground = *patch.get(&column).ok_or(SurfaceError::MissingSupport)?;
+                let height = map.cell_position(ground)[2];
+                // 粗格跨坡面/阶边时，低侧真实细格可以属于同列较低的占据粗格。
+                // 查询范围由一格内允许的坡差/阶差限制，并要求候选确在规范物理占据内。
+                // 始终先选实际最高回波再查时效，旧顶部不能被新低面替代。
+                let top = ((height / size).round() - 1.0) as i32;
+                let height_span = (planner_size * std::f64::consts::SQRT_2
+                    * f64::from(map.config().max_slope_deg).to_radians().tan())
+                    .max(model.max_step_up_m).max(model.max_step_down_m)
+                    + size + model.support_uncertainty_m;
+                let count = (height_span / size).ceil().min(128.0) as i32;
+                let bottom = top.saturating_sub(count);
+                #[cfg(feature = "body-query-profile")] {height_counts.columns+=1;}
+                let z = (bottom..=top).rev().find(|&z| {
+                    #[cfg(feature = "body-query-profile")] {height_counts.probes+=1;}
+                    if (if BORROWED{block_probe.get([x,y,z])}else{observations.get([x,y,z])}).is_none() {
+                        #[cfg(feature = "body-query-profile")] {height_counts.absent+=1;}
+                        return false;
+                    }
+                    let centre = (z as f64 + 0.5) * size;
+                    let coarse_z = (centre / planner_size).floor() as i32;
+                    map.data.occupied_columns.get(&column)
+                        .is_some_and(|zs| zs.binary_search(&coarse_z).is_ok())
+                }).unwrap_or(top);
+                cells.insert([x, y, z]);
+            }
+        }
+        #[cfg(feature = "body-query-profile")] drop(height_counts);
+        drop(polygon_query);
+        #[cfg(feature = "body-query-profile")] {
+            drop(cells_profile);
+            query_profile::add(QueryCounter::ObservationFootprintCellsBuilt,cells.len() as u64);
+        }
+        Ok(cells)
+    }
+
+    #[test]
+    fn borrowed_block_footprint_preserves_a_genuinely_derived_current_view() {
+        use std::collections::BTreeMap;
+        let mut groups=BTreeMap::<_,BTreeMap<_,_>>::new();
+        for x in -30_i32..30 {for y in -30_i32..30 {
+            if x==4&&y==0 {continue;}
+            let key=[x,y,0];groups.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,
+                SurfaceObservation{observed_ns:10_000_000_000,hits:2});
+        }}
+        let mut observations=SurfaceObservations::new(0.1,32).unwrap();
+        for (block,values) in groups{observations.replace_block(block,values).unwrap();}
+        let map=scene(&[],true).with_observations(Some(Arc::new(observations)));
+        let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+        assert!(map.validate_body_pose(pose.0,pose.1).is_err());
+        let view=map.with_current_body_support(pose.0,pose.1).unwrap();
+        assert!(view.current_body_support.is_some(),"must actually derive the current occupied view");
+        let expected=measured_footprint_block_probe::<false>(&view,pose).unwrap();
+        let actual=view.body_observation_footprint(pose).unwrap();
+        assert_eq!(actual,expected);
+        assert!(actual.contains(&[4,0,0]),"missing real evidence retains its fallback footprint key");
+        assert!(view.observations.as_ref().unwrap().get([4,0,0]).is_none(),"view must not fabricate evidence");
+        let occupied=std::collections::BTreeSet::new();
+        let raw=view.validate_observed_body_motion(pose,pose,&occupied,10_100_000_000,1_000_000_000);
+        assert!(matches!(raw,Err(SurfaceError::NearFieldObservation{cell:[4,0,0],..})),
+            "borrowed geometry lookup cannot authorize the unsupported cell: {raw:?}");
+        let mut checker=view.observed_body_motion_checker(&occupied,1_000_000_000,&[]);
+        assert_eq!(checker(pose,pose,10_100_000_000),raw);
+    }
+
+    #[test]
+    fn full_footprint_block_probe_matches_direct_queries() {
+        let mut successes=0;let mut failures=0;
+        for size in [0.05,0.01] {for hole in [false,true] {
+            let map=polygon_footprint_fixture(size,hole);
+            for x in [-0.1,0.05,2.0] {for yaw in [0.0_f64,0.37,-1.1] {
+                let pose=([x,-0.05,0.5],[0.0,0.0,(yaw/2.0).sin(),(yaw/2.0).cos()]);
+                let old=map.body_observation_footprint(pose);
+                assert_eq!(measured_footprint_block_probe::<false>(&map,pose),old);
+                assert_eq!(measured_footprint_block_probe::<true>(&map,pose),old);
+                if old.is_ok(){successes+=1}else{failures+=1}
+                if let Ok(view)=map.with_current_body_support(pose.0,pose.1) {
+                    assert_eq!(measured_footprint_block_probe::<true>(&view,pose),view.body_observation_footprint(pose));
+                }
+            }}
+            let empty=map.with_observations(Some(Arc::new(SurfaceObservations::new(size,32).unwrap())));
+            let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+            assert_eq!(measured_footprint_block_probe::<true>(&empty,pose),empty.body_observation_footprint(pose));
+            let missing=map.with_observations(None);
+            assert_eq!(measured_footprint_block_probe::<true>(&missing,pose),missing.body_observation_footprint(pose));
+        }}
+        assert!(successes>=12&&failures>0);
+    }
+
+    #[test]
+    #[ignore="matched complete raw-footprint direct versus borrowed accessor comparison"]
+    fn benchmark_full_footprint_block_probe() {
+        use std::{hint::black_box,time::Instant};
+        for size in [0.05,0.01] {
+            let source=polygon_footprint_fixture(size,false);
+            for rounded in [false,true] {
+                let mut envelope=model();if rounded{envelope.footprint_xy_m=(0..24).map(|i|{let a=i as f64*std::f64::consts::TAU/24.0;[0.3*a.cos(),0.16*a.sin()]}).collect();}
+                let map=source.with_body_envelope(envelope).unwrap();
+                for yaw in [0.0_f64,0.37] {
+                    let pose=([0.05,0.05,0.5],[0.0,0.0,(yaw/2.0).sin(),(yaw/2.0).cos()]);
+                    let expected=map.body_observation_footprint(pose).unwrap();
+                    assert_eq!(measured_footprint_block_probe::<true>(&map,pose).unwrap(),expected);
+                    let mut direct_ms=Vec::new();let mut borrowed_ms=Vec::new();
+                    for round in 0..6 {for borrowed in if round%2==0{[false,true]}else{[true,false]} {
+                        let started=Instant::now();for _ in 0..30 {
+                            let map=black_box(&map);let pose=black_box(pose);
+                            let actual=if borrowed{measured_footprint_block_probe::<true>(map,pose)}else{measured_footprint_block_probe::<false>(map,pose)}.unwrap();
+                            assert_eq!(black_box(&actual),&expected);
+                        }
+                        let ms=started.elapsed().as_secs_f64()*1e3;if borrowed{borrowed_ms.push(ms)}else{direct_ms.push(ms)}
+                    }}
+                    eprintln!("FULL_FOOTPRINT_BLOCK_PROBE size={size} rounded={rounded} yaw={yaw} cells={} loops=30 warmed_by_parity=true includes=full_raw_footprint_equality_retirement direct_ms={direct_ms:?} borrowed_ms={borrowed_ms:?}",expected.len());
+                }
+            }
+        }
+    }
+
+    // Test-only level-index work-count prototype; production selection remains unchanged.
+    fn measured_footprint_level_selection<const INDEXED:bool,const TOP_FIRST:bool>(
+        map: &SurfaceSnapshot, counters: &mut [u64;3], pose: ([f64; 3], [f64; 4]),
+    ) -> Result<std::collections::BTreeSet<[i32; 3]>, SurfaceError> {
+        #[cfg(feature = "body-query-profile")] let _footprint_profile=query_profile::guard(QueryStage::ObservationFootprint);
+        let observations = map.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
+        if observations.size_m.to_bits() != map.source_voxel_size_m().to_bits() {
+            return Err(SurfaceError::InvalidConfig("观察精度与几何来源不一致".into()));
+        }
+        let model = map.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        let centre = {
+            #[cfg(feature = "body-query-profile")] let _support_profile=query_profile::guard(QueryStage::ObservationFootprintSupport);
+            map.locate_support_from_body(pose.0, pose.1, model.body_to_support_z_m)?
+        };
+        #[cfg(feature = "body-query-profile")] let shape_profile=query_profile::guard(QueryStage::ObservationFootprintShape);
+        let r = rotation(pose.1)?;
+        let vertices: Vec<_> = model.footprint_xy_m.iter()
+            .flat_map(|p| model.z_bounds_m.map(|z| world(r, pose.0, [p[0], p[1], z])))
+            .collect();
+        let polygon = hull(vertices.iter().map(|p| [p[0], p[1]]).collect());
+        let size = f64::from(observations.size_m);
+        let planner_size = f64::from(map.config().voxel_size);
+        let min: [i32; 2] = std::array::from_fn(|i| (vertices.iter().map(|p| p[i]).fold(f64::INFINITY, f64::min) / size).floor() as i32);
+        let max: [i32; 2] = std::array::from_fn(|i| (vertices.iter().map(|p| p[i]).fold(f64::NEG_INFINITY, f64::max) / size).floor() as i32);
+        if (i64::from(max[0]) - i64::from(min[0]) + 1) * (i64::from(max[1]) - i64::from(min[1]) + 1) > 16_384 {
+            return Err(SurfaceError::InvalidConfig("近场精细支撑查询超过预算".into()));
+        }
+        let radius = model.radius() + model.z_bounds_m[0].abs().max(model.z_bounds_m[1].abs())
+            + model.body_to_support_z_m + planner_size * 2.0;
+        #[cfg(feature = "body-query-profile")] drop(shape_profile);
+        let patch = {
+            #[cfg(feature = "body-query-profile")] let _patch_profile=query_profile::guard(QueryStage::ObservationFootprintPatch);
+            map.ground_patch(centre, radius)
+        };
+        #[cfg(feature = "body-query-profile")] let cells_profile=query_profile::guard(QueryStage::ObservationFootprintCells);
+        let polygon_query=PolygonQuery::new(&polygon);
+        let mut cells = std::collections::BTreeSet::new();
+        for x in min[0]..=max[0] {
+            for y in min[1]..=max[1] {
+                if !polygon_query.intersects(x, y, size) { continue; }
+                let column = (((x as f64 + 0.5) * size / planner_size).floor() as i32,
+                    ((y as f64 + 0.5) * size / planner_size).floor() as i32);
+                let ground = *patch.get(&column).ok_or(SurfaceError::MissingSupport)?;
+                let height = map.cell_position(ground)[2];
+                // 粗格跨坡面/阶边时，低侧真实细格可以属于同列较低的占据粗格。
+                // 查询范围由一格内允许的坡差/阶差限制，并要求候选确在规范物理占据内。
+                // 始终先选实际最高回波再查时效，旧顶部不能被新低面替代。
+                let top = ((height / size).round() - 1.0) as i32;
+                let height_span = (planner_size * std::f64::consts::SQRT_2
+                    * f64::from(map.config().max_slope_deg).to_radians().tan())
+                    .max(model.max_step_up_m).max(model.max_step_down_m)
+                    + size + model.support_uncertainty_m;
+                let count = (height_span / size).ceil().min(128.0) as i32;
+                let bottom = top.saturating_sub(count);
+                counters[0]+=1;
+                let mut accepts=|z:i32| {
+                    counters[1]+=1;
+                    if observations.get([x,y,z]).is_none() { counters[2]+=1;return false; }
+                    let centre = (z as f64 + 0.5) * size;
+                    let coarse_z = (centre / planner_size).floor() as i32;
+                    map.data.occupied_columns.get(&column)
+                        .is_some_and(|zs| zs.binary_search(&coarse_z).is_ok())
+                };
+                let z=if TOP_FIRST && accepts(top) {Some(top)}else if INDEXED {
+                    let levels=observations.column_levels(x,y).unwrap_or(&[]);
+                    let end=levels.partition_point(|&z|if TOP_FIRST{z<top}else{z<=top});
+                    levels[..end].iter().rev().copied().take_while(|&z|z>=bottom)
+                        .find(|&z|accepts(z))
+                }else{(bottom..=top).rev().find(|&z|accepts(z))}.unwrap_or(top);
+                cells.insert([x, y, z]);
+            }
+        }
+        drop(polygon_query);
+        #[cfg(feature = "body-query-profile")] {
+            drop(cells_profile);
+            query_profile::add(QueryCounter::ObservationFootprintCellsBuilt,cells.len() as u64);
+        }
+        Ok(cells)
+    }
+    fn level_selection_fixture(size:f32,geometry_z:i32,observed_layers:&[i32])->SurfaceSnapshot {
+        use std::collections::BTreeMap;
+        let n=(0.7/f64::from(size)).ceil() as i32;
+        let points:Vec<_>=(-n..n).flat_map(|x|(-n..n).map(move|y|
+            ((x as f32+0.5)*size,(y as f32+0.5)*size,(geometry_z as f32+0.5)*size))).collect();
+        let base=scene(&[],false);
+        let map=SurfaceSnapshot::from_points(&points,base.config().clone(),size).unwrap().with_body_envelope(model()).unwrap();
+        let mut blocks=BTreeMap::<_,BTreeMap<_,_>>::new();
+        for x in -n..n {for y in -n..n {for &z in observed_layers {
+            let key=[x,y,z]; blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,
+                SurfaceObservation{observed_ns:10_000_000_000,hits:2});
+        }}}
+        let mut observations=SurfaceObservations::new(size,32).unwrap();
+        for (block,values) in blocks {observations.replace_block(block,values).unwrap();}
+        observations.set_source_timestamp_ns(10_000_000_000);
+        map.with_observations(Some(Arc::new(observations)))
+    }
+
+    #[test]
+    #[cfg(feature = "body-query-profile")]
+    fn observation_height_profile_matches_counted_original_scan() {
+        for layers in [vec![0],vec![],vec![-1,20]] {
+            let map=level_selection_fixture(0.01,0,&layers);
+            let pose=([0.05,0.05,0.41],[0.0,0.0,0.0,1.0]);
+            let mut counts=[0;3];
+            let expected=measured_footprint_level_selection::<false,false>(&map,&mut counts,pose);
+            query_profile::begin();let actual=map.body_observation_footprint(pose);let record=query_profile::end();
+            assert_eq!(actual,expected);assert!(actual.is_ok());
+            assert!(record.counters[QueryCounter::ObservationBlockRootResolutions as usize]>0);
+            assert!(record.counters[QueryCounter::ObservationBlockRootResolutions as usize]<=counts[1]);
+            for (counter,count) in [QueryCounter::ObservationHeightColumns,QueryCounter::ObservationHeightProbes,QueryCounter::ObservationHeightAbsent].into_iter().zip(counts) {
+                assert_eq!(record.counters[counter as usize],count);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_level_selection_prototype_matches_full_integer_scan() {
+        let cases=[(0,vec![0]),(0,vec![9]),(0,(0..=9).collect()),(0,vec![-1,0,9,20,31,32]),
+            (0,vec![]),(0,vec![-1,20]),(-10,vec![-10]),(-10,vec![-11,-10,-1,0])];
+        let mut successes=0;
+        for (geometry_z,layers) in cases {
+            let map=level_selection_fixture(0.01,geometry_z,&layers);
+            for x in [-0.1,0.05] {for yaw in [0.0_f64,0.37] {
+                let body_z=0.4+(geometry_z as f64+1.0)*0.01;
+                let pose=([x,0.05,body_z],[0.0,0.0,(yaw/2.0).sin(),(yaw/2.0).cos()]);
+                let mut old_counts=[0;3];let mut new_counts=[0;3];
+                let old=measured_footprint_level_selection::<false,false>(&map,&mut old_counts,pose);
+                let new=measured_footprint_level_selection::<true,false>(&map,&mut new_counts,pose);
+                let hybrid=measured_footprint_level_selection::<true,true>(&map,&mut [0;3],pose);
+                assert_eq!(old,map.body_observation_footprint(pose));assert_eq!(new,old);assert_eq!(hybrid,old);
+                if old.is_ok(){successes+=1;assert_eq!(old_counts[0],new_counts[0]);}
+                eprintln!("LEVEL_SELECTION geometry_z={geometry_z} layers={layers:?} pose={pose:?} old_column_probe_absent={old_counts:?} indexed_column_probe_absent={new_counts:?} success={}",old.is_ok());
+            }}
+        }
+        assert!(successes>=24,"must exercise successful XYZ output, not only errors");
+    }
+
+    #[test]
+    #[ignore="static work-count and alternating prototype microbenchmark, no live throughput claim"]
+    fn benchmark_indexed_level_selection_prototype() {
+        use std::{hint::black_box,time::Instant};
+        for (label,geometry_z,layers) in [("low_fine_floor",0,vec![0]),("above_top_only",0,vec![9]),
+            ("dense_levels",0,(0..=9).collect()),("no_evidence",0,vec![]),
+            ("incompatible_layers",0,vec![-1,20]),("negative_low_floor",-10,vec![-10])] {
+            let map=level_selection_fixture(0.01,geometry_z,&layers);
+            let pose=([0.05,0.05,0.4+(geometry_z as f64+1.0)*0.01],[0.0,0.0,0.0,1.0]);
+            let mut counts=[0;3];let expected=map.body_observation_footprint(pose).unwrap();
+            assert_eq!(measured_footprint_level_selection::<true,false>(&map,&mut counts,pose).unwrap(),expected);
+            let mut old_ms=Vec::new();let mut new_ms=Vec::new();let mut hybrid_ms=Vec::new();
+            for round in 0..6 {for variant in if round%2==0{[0,1,2]}else{[2,1,0]} {
+                let mut counts=[0;3];let started=Instant::now();
+                for _ in 0..30 {
+                    let map=black_box(&map);let pose=black_box(pose);
+                    let actual=match variant {1=>measured_footprint_level_selection::<true,false>(map,&mut counts,pose),
+                        2=>measured_footprint_level_selection::<true,true>(map,&mut counts,pose),
+                        _=>measured_footprint_level_selection::<false,false>(map,&mut counts,pose)}.unwrap();
+                    assert_eq!(black_box(&actual),&expected);
+                }
+                let ms=started.elapsed().as_secs_f64()*1e3;
+                match variant {1=>new_ms.push(ms),2=>hybrid_ms.push(ms),_=>old_ms.push(ms)}
+            }}
+            eprintln!("LEVEL_SELECTION_MICRO label={label} cells={} loops=30 includes=counting_output_equality_retirement warmed_by_parity=true old_ms={old_ms:?} indexed_ms={new_ms:?} hybrid_ms={hybrid_ms:?}",expected.len());
+        }
+    }
+
+    // Frozen pre-hoist method; only the receiver and function name differ.
+    fn reference_observation_footprint_rebuilding_polygon(
+        map: &SurfaceSnapshot, pose: ([f64; 3], [f64; 4]),
+    ) -> Result<std::collections::BTreeSet<[i32; 3]>, SurfaceError> {
+        #[cfg(feature = "body-query-profile")] let _footprint_profile=query_profile::guard(QueryStage::ObservationFootprint);
+        let observations = map.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
+        if observations.size_m.to_bits() != map.source_voxel_size_m().to_bits() {
+            return Err(SurfaceError::InvalidConfig("观察精度与几何来源不一致".into()));
+        }
+        let model = map.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        let centre = {
+            #[cfg(feature = "body-query-profile")] let _support_profile=query_profile::guard(QueryStage::ObservationFootprintSupport);
+            map.locate_support_from_body(pose.0, pose.1, model.body_to_support_z_m)?
+        };
+        #[cfg(feature = "body-query-profile")] let shape_profile=query_profile::guard(QueryStage::ObservationFootprintShape);
+        let r = rotation(pose.1)?;
+        let vertices: Vec<_> = model.footprint_xy_m.iter()
+            .flat_map(|p| model.z_bounds_m.map(|z| world(r, pose.0, [p[0], p[1], z])))
+            .collect();
+        let polygon = hull(vertices.iter().map(|p| [p[0], p[1]]).collect());
+        let size = f64::from(observations.size_m);
+        let planner_size = f64::from(map.config().voxel_size);
+        let min: [i32; 2] = std::array::from_fn(|i| (vertices.iter().map(|p| p[i]).fold(f64::INFINITY, f64::min) / size).floor() as i32);
+        let max: [i32; 2] = std::array::from_fn(|i| (vertices.iter().map(|p| p[i]).fold(f64::NEG_INFINITY, f64::max) / size).floor() as i32);
+        if (i64::from(max[0]) - i64::from(min[0]) + 1) * (i64::from(max[1]) - i64::from(min[1]) + 1) > 16_384 {
+            return Err(SurfaceError::InvalidConfig("近场精细支撑查询超过预算".into()));
+        }
+        let radius = model.radius() + model.z_bounds_m[0].abs().max(model.z_bounds_m[1].abs())
+            + model.body_to_support_z_m + planner_size * 2.0;
+        #[cfg(feature = "body-query-profile")] drop(shape_profile);
+        let patch = {
+            #[cfg(feature = "body-query-profile")] let _patch_profile=query_profile::guard(QueryStage::ObservationFootprintPatch);
+            map.ground_patch(centre, radius)
+        };
+        #[cfg(feature = "body-query-profile")] let cells_profile=query_profile::guard(QueryStage::ObservationFootprintCells);
+        let mut cells = std::collections::BTreeSet::new();
+        for x in min[0]..=max[0] {
+            for y in min[1]..=max[1] {
+                if !polygon_intersects_cell(&polygon, x, y, size) { continue; }
+                let column = (((x as f64 + 0.5) * size / planner_size).floor() as i32,
+                    ((y as f64 + 0.5) * size / planner_size).floor() as i32);
+                let ground = *patch.get(&column).ok_or(SurfaceError::MissingSupport)?;
+                let height = map.cell_position(ground)[2];
+                // 粗格跨坡面/阶边时，低侧真实细格可以属于同列较低的占据粗格。
+                // 查询范围由一格内允许的坡差/阶差限制，并要求候选确在规范物理占据内。
+                // 始终先选实际最高回波再查时效，旧顶部不能被新低面替代。
+                let top = ((height / size).round() - 1.0) as i32;
+                let height_span = (planner_size * std::f64::consts::SQRT_2
+                    * f64::from(map.config().max_slope_deg).to_radians().tan())
+                    .max(model.max_step_up_m).max(model.max_step_down_m)
+                    + size + model.support_uncertainty_m;
+                let count = (height_span / size).ceil().min(128.0) as i32;
+                let bottom = top.saturating_sub(count);
+                let z = (bottom..=top).rev().find(|&z| {
+                    if observations.get([x,y,z]).is_none() { return false; }
+                    let centre = (z as f64 + 0.5) * size;
+                    let coarse_z = (centre / planner_size).floor() as i32;
+                    map.data.occupied_columns.get(&column)
+                        .is_some_and(|zs| zs.binary_search(&coarse_z).is_ok())
+                }).unwrap_or(top);
+                cells.insert([x, y, z]);
+            }
+        }
+        #[cfg(feature = "body-query-profile")] {
+            drop(cells_profile);
+            query_profile::add(QueryCounter::ObservationFootprintCellsBuilt,cells.len() as u64);
+        }
+        Ok(cells)
+    }
+
+
+    fn polygon_footprint_fixture(size:f32,hole:bool)->SurfaceSnapshot {
+        use std::collections::BTreeMap;
+        let n=(1.2/f64::from(size)).ceil() as i32;
+        let z=(0.1/f64::from(size)).round() as i32-1;
+        let keys:Vec<_>=(-n..n).flat_map(|x|(-n..n).map(move|y|[x,y,z]))
+            .filter(|key|!hole || !(key[0]==0&&key[1]==0)).collect();
+        let points:Vec<_>=keys.iter().map(|key|((key[0]as f32+0.5)*size,(key[1]as f32+0.5)*size,(key[2]as f32+0.5)*size)).collect();
+        let base=scene(&[],false);
+        let map=SurfaceSnapshot::from_points(&points,base.config().clone(),size).unwrap().with_body_envelope(model()).unwrap();
+        let mut blocks=BTreeMap::<_,BTreeMap<_,_>>::new();
+        for key in keys {blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,
+            SurfaceObservation{observed_ns:10_000_000_000,hits:2});}
+        let mut observations=SurfaceObservations::new(size,32).unwrap();
+        for (block,values) in blocks {observations.replace_block(block,values).unwrap();}
+        observations.set_source_timestamp_ns(10_000_000_000);observations.mark_complete_geometry_source();
+        map.with_observations(Some(Arc::new(observations)))
+    }
+
+    #[test]
+    fn observation_polygon_once_matches_frozen_full_footprint_and_error_order() {
+        let mut success=0;let mut failures=0;
+        for size in [0.1,0.025,0.01] {
+            for hole in [false,true] {
+                let source=polygon_footprint_fixture(size,hole);
+                for rounded in [false,true] {
+                    let mut envelope=model();
+                    if rounded {envelope.footprint_xy_m=(0..24).map(|i| {
+                        let angle=i as f64*std::f64::consts::TAU/24.0;[0.3*angle.cos(),0.16*angle.sin()]
+                    }).collect();}
+                    let map=source.with_body_envelope(envelope).unwrap();
+                    for x in [-0.1,0.05,f64::from_bits(0.1_f64.to_bits()-1),0.1,f64::from_bits(0.1_f64.to_bits()+1),2.0] {
+                        for (yaw,pitch) in [(0.0_f64,0.0_f64),(0.37,0.0),(std::f64::consts::FRAC_PI_4,0.05),(-1.1,-0.04)] {
+                            let q=[-(yaw/2.0).sin()*(pitch/2.0).sin(),(yaw/2.0).cos()*(pitch/2.0).sin(),
+                                (yaw/2.0).sin()*(pitch/2.0).cos(),(yaw/2.0).cos()*(pitch/2.0).cos()];
+                            let pose=([x,-0.05,0.5],q);
+                            let old=reference_observation_footprint_rebuilding_polygon(&map,pose);
+                            let new=map.body_observation_footprint(pose);
+                            assert_eq!(new,old,"size={size} hole={hole} rounded={rounded} pose={pose:?}");
+                            if new.is_ok(){success+=1;}else{failures+=1;}
+                        }
+                    }
+                    let current=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+                    if let Ok(view)=map.with_current_body_support(current.0,current.1) {
+                        assert_eq!(view.body_observation_footprint(current),reference_observation_footprint_rebuilding_polygon(&view,current));
+                    }
+                    for pose in [([0.05,0.05,0.5],[0.0;4]),([f64::NAN,0.0,0.5],[0.0,0.0,0.0,1.0])] {
+                        assert_eq!(map.body_observation_footprint(pose),reference_observation_footprint_rebuilding_polygon(&map,pose));
+                    }
+                }
+            }
+        }
+        assert!(success>100 && failures>0,"matrix must exercise successful complete cell sets and errors");
+        let map=polygon_footprint_fixture(0.01,false);let mut huge=model();
+        huge.footprint_xy_m=vec![[-2.0,-2.0],[2.0,-2.0],[2.0,2.0],[-2.0,2.0]];
+        let huge=map.with_body_envelope(huge).unwrap();let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+        let old=reference_observation_footprint_rebuilding_polygon(&huge,pose);
+        assert!(matches!(old,Err(SurfaceError::InvalidConfig(_))));
+        assert_eq!(huge.body_observation_footprint(pose),old);
+        let wrong=map.with_observations(Some(Arc::new(SurfaceObservations::new(0.02,32).unwrap())));
+        assert_eq!(wrong.body_observation_footprint(pose),reference_observation_footprint_rebuilding_polygon(&wrong,pose));
+    }
+
+    #[test]
+    #[ignore="matched warmed raw-footprint microbenchmark; no live control claim"]
+    fn benchmark_observation_polygon_once() {
+        use std::{hint::black_box,time::Instant};
+        for size in [0.05,0.01] {
+            let source=polygon_footprint_fixture(size,false);
+            for rounded in [false,true] {
+                let mut envelope=model();
+                if rounded {envelope.footprint_xy_m=(0..24).map(|i| {let a=i as f64*std::f64::consts::TAU/24.0;[0.3*a.cos(),0.16*a.sin()]}).collect();}
+                let map=source.with_body_envelope(envelope).unwrap();
+                for yaw in [0.0_f64,0.37] {
+                    let pose=([0.05,0.05,0.5],[0.0,0.0,(yaw/2.0).sin(),(yaw/2.0).cos()]);
+                    let expected=reference_observation_footprint_rebuilding_polygon(&map,pose).unwrap();
+                    assert_eq!(map.body_observation_footprint(pose).unwrap(),expected);
+                    let mut old_ms=Vec::new();let mut new_ms=Vec::new();
+                    for round in 0..6 {
+                        for hoisted in if round%2==0 {[false,true]}else{[true,false]} {
+                            let started=Instant::now();
+                            for _ in 0..30 {
+                                let map=black_box(&map);let pose=black_box(pose);
+                                let cells=if hoisted {map.body_observation_footprint(pose)}else{reference_observation_footprint_rebuilding_polygon(map,pose)}.unwrap();
+                                assert_eq!(black_box(&cells),&expected);
+                            }
+                            let elapsed=started.elapsed().as_secs_f64()*1e3;
+                            if hoisted {new_ms.push(elapsed);}else{old_ms.push(elapsed);}
+                        }
+                    }
+                    eprintln!("FOOTPRINT_POLYGON size={size} rounded={rounded} yaw={yaw} cells={} loops_per_round=30 warmed_by_parity_check=true alternating=true includes=full_raw_footprint_output_equality_and_retirement old_ms={old_ms:?} hoisted_ms={new_ms:?}",expected.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_observation_difference_preserves_full_xyz_order_and_failure_dependencies() {
+        use std::collections::BTreeSet;
+        for count in [0,1,7,63,257] {
+            let cells:BTreeSet<_>=(0..count).map(|i|[i%17-8,i/17-8,i%3-1]).collect();
+            for mode in 0..5 {
+                let occupied:BTreeSet<_>=cells.iter().enumerate().filter_map(|(i,&cell)|match mode {
+                    0=>None,1=>Some(cell),2=>(i%2==0).then_some(cell),
+                    3=>Some([cell[0],cell[1],cell[2]+7]),_=>Some([cell[0]+100,cell[1],cell[2]]),
+                }).collect();
+                let old:Vec<_>=cells.iter().filter(|cell|!occupied.contains(*cell)).copied().collect();
+                let new:Vec<_>=cells.difference(&occupied).copied().collect();
+                assert_eq!(new,old,"fullXYZ ordered difference mode={mode} count={count}");
+            }
+        }
+        let base=scene(&[],false);let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+        let original=base.with_observations(Some(observation_grid(|_|{})));
+        let cells:Vec<_>=original.body_observation_footprint(pose).unwrap().into_iter().collect();
+        assert!(cells.len()>=3);
+        let map=base.with_observations(Some(observation_grid(|values| {
+            values.get_mut(&cells[0]).unwrap().hits=1;
+            values.get_mut(&cells[1]).unwrap().observed_ns=0;
+            values.get_mut(&cells[2]).unwrap().observed_ns=0;
+        })));
+        for occupied in [BTreeSet::from([cells[1]]),BTreeSet::from([cells[0],cells[1]])] {
+            let expected=map.validate_observed_body_motion_in_boundary(pose,pose,&occupied,10_500_000_000,1_000_000_000,&[]);
+            let mut checker=map.observed_body_motion_checker_with_expiry(&occupied,1_000_000_000,&[]);
+            assert_eq!(checker(pose,pose,10_500_000_000).map(|_|()),expected);
+            let first=if occupied.contains(&cells[0]) {cells[2]}else{cells[0]};
+            assert!(matches!(expected,Err(SurfaceError::NearFieldObservation{cell,..}) if cell==first));
+        }
+        let wrong_height:BTreeSet<_>=cells.iter().map(|cell|[cell[0],cell[1],cell[2]+1]).collect();
+        let mut checker=original.observed_body_motion_checker_with_expiry(&wrong_height,1_000_000_000,&[]);
+        let expected=original.validate_observed_body_motion_in_boundary(pose,pose,&wrong_height,12_000_000_000,1_000_000_000,&[]);
+        assert_eq!(checker(pose,pose,12_000_000_000).map(|_|()),expected);
+        assert!(matches!(expected,Err(SurfaceError::NearFieldObservation{cell,..}) if cell==cells[0]));
+        let map=base.with_observations(Some(observation_grid(|values| {
+            values.get_mut(&cells[0]).unwrap().observed_ns=500;
+            values.get_mut(&cells[1]).unwrap().observed_ns=0;
+            values.get_mut(&cells[2]).unwrap().observed_ns=1000;
+        })));
+        let occupied=BTreeSet::from([cells[1]]);
+        let max_age=u64::MAX-1000;
+        let mut checker=map.observed_body_motion_checker_with_expiry(&occupied,max_age,&[]);
+        assert_eq!(checker(pose,pose,10_500_000_000).unwrap(),Some(u64::MAX-500));
+        assert!(map.validate_observed_body_motion_in_boundary(pose,pose,&occupied,10_500_000_000,max_age,&[]).is_ok());
+        let occupied=BTreeSet::from([cells[0],cells[1]]);
+        let mut checker=map.observed_body_motion_checker_with_expiry(&occupied,max_age,&[]);
+        assert_eq!(checker(pose,pose,10_500_000_000).unwrap(),None,"exactMAX and overflow stay unbounded");
+    }
+
+    #[test]
+    #[ignore="matched static evidence-iteration microbenchmark; no motion or throughput qualification"]
+    fn benchmark_ordered_observation_difference() {
+        use std::{collections::{BTreeMap,BTreeSet},hint::black_box,time::{Instant,SystemTime,UNIX_EPOCH}};
+        fn check<'a>(cells:impl Iterator<Item=&'a [i32;3]>,observations:&SurfaceObservations,checked_ns:u64)->Result<Option<u64>,SurfaceError> {
+            let mut minimum=None;
+            for &cell in cells {
+                let evidence=observations.get(cell).unwrap_or(SurfaceObservation{observed_ns:0,hits:0});
+                let reason=if evidence.observed_ns==0 {Some("缺少真实观察")}
+                    else if evidence.hits<2 {Some("独立采样命中不足")}
+                    else if evidence.observed_ns>checked_ns.saturating_add(50_000_000) {Some("采样时间在未来")}
+                    else if checked_ns.saturating_sub(evidence.observed_ns)>1_000_000_000 {Some("观察已过期")}
+                    else {None};
+                if let Some(reason)=reason {return Err(SurfaceError::NearFieldObservation{cell,reason,observed_ns:evidence.observed_ns,checked_ns});}
+                if let Some(expiry)=evidence.observed_ns.checked_add(1_000_000_000).filter(|&expiry|expiry<u64::MAX) {
+                    minimum=Some(minimum.map_or(expiry,|old:u64|old.min(expiry)));
+                }
+            }
+            Ok(minimum)
+        }
+        let cells:BTreeSet<[i32;3]>=(-15..=15).flat_map(|x|(-15..=15).map(move|y|[x,y,9])).collect();
+        let sample_ns=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let mut blocks=BTreeMap::<_,BTreeMap<_,_>>::new();
+        for &cell in &cells {blocks.entry(cell.map(|v|v.div_euclid(32))).or_default()
+            .insert(cell,SurfaceObservation{observed_ns:sample_ns,hits:2});}
+        let mut observations=SurfaceObservations::new(0.01,32).unwrap();
+        for (block,values) in blocks {observations.replace_block(block,values).unwrap();}
+        for (case,occupied) in [
+            ("all_exempt",cells.clone()),
+            ("near_complete_overlap",cells.iter().copied().filter(|cell|cell[0]<15).collect()),
+            ("half_overlap",cells.iter().copied().filter(|cell|cell[0]<0).collect()),
+            ("empty_exemption",BTreeSet::new()),
+            ("large_disjoint_exemption",cells.iter().map(|cell|[cell[0]+100,cell[1],cell[2]]).collect()),
+            ("interleaved_wrong_height",cells.iter().map(|cell|[cell[0],cell[1],cell[2]+1]).collect()),
+            ("interleaved_low_overlap",cells.iter().enumerate().map(|(i,cell)|[cell[0],cell[1],cell[2]+i32::from(i%31!=0)]).collect()),
+        ] {
+            let expected=check(cells.iter().filter(|cell|!occupied.contains(*cell)),&observations,sample_ns).unwrap();
+            assert_eq!(check(cells.difference(&occupied),&observations,sample_ns).unwrap(),expected);
+            let mut old_ms=Vec::new();let mut new_ms=Vec::new();
+            for round in 0..6 {
+                for difference in if round%2==0 {[false,true]}else{[true,false]} {
+                    let started=Instant::now();
+                    for _ in 0..100 {
+                        let (cells,occupied,observations)=black_box((&cells,&occupied,&observations));
+                        let result=if difference {check(cells.difference(occupied),observations,sample_ns)}
+                            else {check(cells.iter().filter(|cell|!occupied.contains(*cell)),observations,sample_ns)};
+                        assert_eq!(black_box(result).unwrap(),expected);
+                    }
+                    let elapsed=started.elapsed().as_secs_f64()*1e3;
+                    if difference {new_ms.push(elapsed);}else{old_ms.push(elapsed);}
+                }
+            }
+            eprintln!("ORDERED_OBSERVATION case={case} cells={} exempt={} nonexempt={} loops_per_round=100 first_round=initial_after_parity_check later_rounds=alternating_order static_captured_anchor_ns={sample_ns} not_live_motion=true old_ms={old_ms:?} difference_ms={new_ms:?}",cells.len(),occupied.len(),cells.difference(&occupied).count());
+        }
+    }
+
+    #[cfg(feature = "body-query-profile")]
+    #[test]
+    fn observed_profile_separates_cached_geometry_exempt_cells_and_failure_prefix() {
+        let map=scene(&[],false).with_observations(Some(observation_grid(|_|{})));
+        let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+        let occupied=map.body_observation_footprint(pose).unwrap();
+        let mut cache=ObservationFootprintCache::new(&map);
+        query_profile::begin();
+        assert_eq!(cache.cells(pose).unwrap(),&occupied);
+        assert_eq!(cache.cells(pose).unwrap(),&occupied);
+        let geometry=query_profile::end();
+        assert_eq!(geometry.counters[QueryCounter::ObservationFootprintCacheMisses as usize],1);
+        assert_eq!(geometry.counters[QueryCounter::ObservationFootprintCacheHits as usize],1);
+        assert_eq!(geometry.counters[QueryCounter::ObservationFootprintCellsBuilt as usize],occupied.len() as u64);
+        assert_eq!(geometry.calls[QueryStage::ObservationFootprint as usize],1);
+        let mut exempt=map.observed_body_motion_checker_with_expiry(&occupied,1_000_000_000,&[]);
+        query_profile::begin();
+        assert_eq!(exempt(pose,pose,12_000_000_000).unwrap(),None);
+        let exempt=query_profile::end();
+        assert!(exempt.counters[QueryCounter::ObservationInputCells as usize]>0);
+        assert_eq!(exempt.counters[QueryCounter::ObservationVisitedCells as usize],0);
+        assert_eq!(exempt.counters[QueryCounter::ObservationCheckedCells as usize],0);
+        let none=std::collections::BTreeSet::new();
+        let mut expired=map.observed_body_motion_checker_with_expiry(&none,1_000_000_000,&[]);
+        query_profile::begin();
+        assert!(matches!(expired(pose,pose,12_000_000_000),Err(SurfaceError::NearFieldObservation{..})));
+        let failure=query_profile::end();
+        assert_eq!(failure.counters[QueryCounter::ObservationVisitedCells as usize],1);
+        assert_eq!(failure.counters[QueryCounter::ObservationCheckedCells as usize],1);
+        assert_eq!(failure.calls[QueryStage::ObservationEvidence as usize],1);
+    }
+
+    #[test]
+    fn observation_footprint_cache_is_exact_single_entry_and_borrows_hits() {
+        let map = scene(&[], false).with_observations(Some(observation_grid(|_| {})));
+        let pose = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let mut cache = ObservationFootprintCache::new(&map);
+        let first = cache.cells(pose).unwrap().first().unwrap() as *const [i32; 3];
+        assert_eq!(cache.builds, 1);
+        let repeated = cache.cells(pose).unwrap().first().unwrap() as *const [i32; 3];
+        assert_eq!(first, repeated, "命中必须借用原集合中的同一元素，不能克隆足迹");
+        assert_eq!(cache.builds, 1);
+        let words = [pose.0[0], pose.0[1], pose.0[2], pose.1[0], pose.1[1], pose.1[2], pose.1[3]];
+        for index in 0..7 {
+            let mut changed = words;
+            changed[index] = if changed[index] == 0.0 { -0.0 }
+                else { f64::from_bits(changed[index].to_bits() + 1) };
+            let other = ([changed[0], changed[1], changed[2]],
+                [changed[3], changed[4], changed[5], changed[6]]);
+            assert_eq!(cache.cells(other).unwrap(), &map.body_observation_footprint(other).unwrap());
+            assert_eq!(cache.builds, 2 + index * 2, "全部七个输入位模式均属于键");
+            cache.cells(other).unwrap();
+            assert_eq!(cache.builds, 2 + index * 2);
+            cache.cells(pose).unwrap();
+            assert_eq!(cache.builds, 3 + index * 2, "另一位姿必须淘汰唯一旧项");
+        }
+        let missing = ([100.0, 100.0, 0.5], pose.1);
+        let before = cache.builds;
+        assert!(cache.cells(missing).is_err());
+        assert!(cache.cells(missing).is_err());
+        assert_eq!(cache.builds, before + 2, "失败不能进入缓存");
+        cache.cells(pose).unwrap();
+        assert_eq!(cache.builds, before + 2, "失败不替换最后一个成功足迹");
+    }
+
+    #[test]
+    fn observation_footprint_cache_reuses_adjacent_engine_samples() {
+        let map = scene(&[], false).with_observations(Some(observation_grid(|_| {})));
+        let poses: Vec<_> = (0..8).map(|index| (
+            [0.051 + f64::from(index) * 0.005, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0],
+        )).collect();
+        let mut cache = ObservationFootprintCache::new(&map);
+        let mut queries = 0;
+        for pair in poses.windows(2) {
+            map.validate_body_motion_checked(pair[0], pair[1], &[], |pose| {
+                queries += 1;
+                assert_eq!(cache.cells(pose)?, &map.body_observation_footprint(pose)?);
+                Ok(())
+            }).unwrap();
+        }
+        // 只计原采样顺序下的几何构建量；不作为耗时或观察许可的资格证明。
+        eprintln!("observation footprint geometry work: queries={queries} builds={} hits={}",
+            cache.builds, queries - cache.builds);
+        assert!(queries >= 2 * (poses.len() - 1));
+        assert!(cache.builds < queries, "邻段共享的真实端点应复用同一个精确足迹");
+    }
+
+    #[test]
+    fn observed_motion_checker_rechecks_time_and_preserves_evidence_error_fields() {
+        let base = scene(&[], false);
+        let from = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let to = ([0.45, 0.05, 0.5], from.1);
+        let good = base.with_observations(Some(observation_grid(|_| {})));
+        let occupied = good.body_observation_footprint(from).unwrap();
+        let mut checker = good.observed_body_motion_checker(&occupied, 1_000_000_000, &[]);
+        checker(to, to, 10_100_000_000).unwrap();
+        let expired = checker(to, to, 12_000_000_000);
+        assert_eq!(expired, good.validate_observed_body_motion_in_boundary(
+            to, to, &occupied, 12_000_000_000, 1_000_000_000, &[]));
+        assert!(matches!(expired, Err(SurfaceError::NearFieldObservation {
+            reason: "观察已过期", observed_ns: 10_000_000_000, checked_ns: 12_000_000_000, ..
+        })));
+        checker(to, to, 10_100_000_000).unwrap();
+        checker(from, from, 12_000_000_000).unwrap();
+        for kind in 0..8 {
+            let map = base.with_observations(Some(observation_grid(|cells| {
+                let evidence = cells.get_mut(&[8, 0, 0]).unwrap();
+                match kind {
+                    0 => {},
+                    1 => evidence.hits = 0,
+                    2 => evidence.hits = 1,
+                    3 => evidence.observed_ns = 0,
+                    4 => evidence.observed_ns = 1,
+                    5 => evidence.observed_ns = 11_000_000_000,
+                    6 => { cells.remove(&[8, 0, 0]); },
+                    _ => {
+                        evidence.observed_ns = 1;
+                        cells.insert([8, 0, -1], SurfaceObservation { observed_ns: 10_000_000_000, hits: 3 });
+                    },
+                }
+            })));
+            assert_observation_checker_matches(&map, &occupied, 1_000_000_000, &[], &[
+                (to, to, 10_100_000_000), (to, to, 10_100_000_001),
+                (from, to, 10_100_000_000), (to, from, 12_000_000_000),
+                (from, from, 12_000_000_000), (to, to, u64::MAX),
+            ]);
+        }
+        // 未来容差和年龄边界均在同一足迹命中时重新计算。
+        let none = Default::default();
+        assert_observation_checker_matches(&good, &none, 1_000_000_000, &[], &[
+            (to, to, 9_949_999_999), (to, to, 9_950_000_000),
+            (to, to, 11_000_000_000), (to, to, 11_000_000_001),
+        ]);
+    }
+
+    #[test]
+    fn observed_motion_checker_preserves_missing_source_zero_time_and_first_error_order() {
+        let base = scene(&[], false);
+        let good = base.with_observations(Some(observation_grid(|_| {})));
+        let wrong_resolution = base.with_observations(Some(Arc::new(SurfaceObservations::new(0.05, 32).unwrap())));
+        let pose = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let invalid = (pose.0, [0.0; 4]);
+        let occupied = good.body_observation_footprint(pose).unwrap();
+        for map in [&base, &good, &wrong_resolution] {
+            for max_age in [0, 1_000_000_000] {
+                for boundary in [vec![], vec![[0.0, 0.0], [1.0, 0.0]]] {
+                    assert_observation_checker_matches(map, &occupied, max_age, &boundary, &[
+                        (pose, pose, 0), (invalid, pose, 0),
+                        (pose, pose, 10_100_000_000), (invalid, pose, 10_100_000_000),
+                        (pose, invalid, 10_100_000_000),
+                    ]);
+                }
+            }
+        }
+        let stale = base.with_observations(Some(observation_grid(|cells| {
+            cells.get_mut(&[-4, 0, 0]).unwrap().observed_ns = 1;
+            cells.get_mut(&[8, 0, 0]).unwrap().hits = 1;
+        })));
+        let none = Default::default();
+        let to = ([0.45, 0.05, 0.5], pose.1);
+        for boundary in [vec![], vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]]] {
+            assert_observation_checker_matches(&stale, &none, 1_000_000_000, &boundary, &[
+                (pose, to, 10_100_000_000), (to, pose, 10_100_000_000),
+                (pose, to, 12_000_000_000),
+            ]);
+        }
+    }
+
+    #[test]
+    fn observed_motion_checker_keeps_geometry_rotation_boundary_and_view_contexts() {
+        let from = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let to = ([0.45, 0.05, 0.5], from.1);
+        let turn = (from.0, [0.0, 0.0, std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2]);
+        let map = scene(&[], false).with_observations(Some(observation_grid(|_| {})));
+        let occupied = map.body_observation_footprint(from).unwrap();
+        let view = map.with_current_body_support(from.0, from.1).unwrap();
+        let fork = map.fork_for_planning();
+        let obstacle = scene(&[(0.85, 0.05, 0.4)], false).with_observations(Some(observation_grid(|_| {})));
+        let blocked = map.with_virtual_obstacles([-4.0, -4.0], 0.1, 80, 80, &vec![true; 6400]).unwrap();
+        for context in [&map, &view, &fork, &obstacle, &blocked] {
+            for boundary in [vec![], vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]]] {
+                assert_observation_checker_matches(context, &occupied, 1_000_000_000, &boundary, &[
+                    (from, to, 10_100_000_000), (to, to, 10_100_000_000),
+                    (from, turn, 10_100_000_000), (turn, to, 10_100_000_000),
+                    (to, from, 12_000_000_000), (from, from, 12_000_000_000),
+                ]);
+            }
+        }
+        // 相同输入位姿的不同观察源不能共享几何选择或许可。
+        let missing = scene(&[], false).with_observations(Some(observation_grid(|cells| { cells.remove(&[8,0,0]); })));
+        let mut fresh_checker = map.observed_body_motion_checker(&occupied, 1_000_000_000, &[]);
+        let mut missing_checker = missing.observed_body_motion_checker(&occupied, 1_000_000_000, &[]);
+        fresh_checker(to, to, 10_100_000_000).unwrap();
+        assert!(missing_checker(to, to, 10_100_000_000).is_err());
+        fresh_checker(to, to, 10_100_000_000).unwrap();
+    }
+
     #[test]
     fn observed_body_motion_checks_intermediate_sweep_and_new_rotation_space() {
         let map = scene(&[], false).with_observations(Some(observation_grid(|cells| {
@@ -2301,6 +3525,10 @@ mod tests {
         let occupied = map.body_observation_footprint(from).unwrap();
         map.validate_body_motion(from,to,&[]).unwrap();
         map.validate_observed_body_motion(from,to,&occupied,10_100_000_000,1_000_000_000).unwrap();
+        assert_observation_checker_matches(&map, &occupied, 1_000_000_000, &[], &[
+            (from, to, 10_100_000_000), (to, to, 10_100_000_000),
+            (to, to, 12_000_000_000), (to, from, 10_100_000_000),
+        ]);
     }
     #[test]
     fn observed_ramp_crossing_coarse_height_boundary_uses_actual_fine_support() {
@@ -2356,6 +3584,22 @@ mod tests {
             map.validate_body_motion(pair[0],pair[1],&[]).unwrap();
             map.validate_body_motion(pair[1],pair[0],&[]).unwrap();
         }
+        let mut blocks: std::collections::BTreeMap<_, std::collections::BTreeMap<_, _>> = Default::default();
+        let fine = 0.025_f32;
+        for &(x,y,z) in &points {
+            let key = [x,y,z].map(|v| (f64::from(v) / f64::from(fine)).floor() as i32);
+            blocks.entry(key.map(|v| v.div_euclid(32))).or_default().insert(key,
+                SurfaceObservation { observed_ns: 10_000_000_000, hits: 2 });
+        }
+        let mut observations = SurfaceObservations::new(fine, 32).unwrap();
+        for (key, block) in blocks { observations.replace_block(key, block).unwrap(); }
+        let observed = map.with_observations(Some(Arc::new(observations)));
+        let occupied = observed.body_observation_footprint(poses[25]).unwrap();
+        let queries: Vec<_> = poses[25..=65].windows(2).step_by(5).flat_map(|pair| [
+            (pair[0], pair[1], 10_100_000_000), (pair[1], pair[1], 10_100_000_000),
+            (pair[1], pair[0], 12_000_000_000),
+        ]).collect();
+        assert_observation_checker_matches(&observed, &occupied, 1_000_000_000, &[], &queries);
         let floating=([-0.8,0.0,0.55],[0.0,0.0,0.0,1.0]);
         assert!(map.validate_body_pose(floating.0,floating.1).is_err());
         let missing:Vec<_>=points.into_iter().filter(|p|!(p.0>0.0&&p.0<0.15)).collect();
@@ -3063,6 +4307,339 @@ mod tests {
         envelope.z_bounds_m=[-0.15,0.15];envelope.body_to_support_z_m=0.35;
         SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap()
             .with_observations(Some(Arc::new(observations)))
+    }
+
+
+    /// 私有域输出现在是字典序；实际拟合输入必须逐位保持原 BFS 经排序后的结果。
+    mod dense_contact_ordering {
+        use super::*;
+
+        type ContactPoint=([f64;3],f64,f64);
+
+        // 冻结变更前的稠密算法，不调用新的域构建器或共享遍历/发点实现。
+        fn reference_bfs(map:&SurfaceSnapshot,origin:[f64;3],radius:f64)
+            ->Result<Vec<([f64;3],f64,f64)>,SurfaceError> {
+            let observations=map.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
+            let model=map.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+            let size=f64::from(observations.size_m);
+            let enumeration=radius+std::f64::consts::SQRT_2*size;
+            let low:[i32;2]=std::array::from_fn(|i|((origin[i]-enumeration)/size).floor() as i32);
+            let high:[i32;2]=std::array::from_fn(|i|((origin[i]+enumeration)/size).floor() as i32);
+            let nx=i64::from(high[0])-i64::from(low[0])+1;
+            let ny=i64::from(high[1])-i64::from(low[1])+1;
+            // 仅限制局部稠密临时表的容量；特殊大域继续原稀疏算法，不改变许可或拟合域。
+            let Some(count)=nx.checked_mul(ny).filter(|n|nx>0&&ny>0&&*n<=16_384) else {
+                return map.fine_contact_domain_sparse(origin,radius);
+            };
+            let stride=ny as usize;let count=count as usize;
+            let mut in_domain=vec![false;count];
+            let mut bands=vec![None;count];
+            // 同一不可变来源的带缓存一次批量读取，避免每个实测细列分别取锁。
+            {
+                let cache=map.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+                for x in low[0]..=high[0] {for y in low[1]..=high[1] {
+                    let dx=(f64::from(x)+0.5)*size-origin[0];let dy=(f64::from(y)+0.5)*size-origin[1];
+                    if dx*dx+dy*dy>enumeration*enumeration {continue;}
+                    let index=(i64::from(x)-i64::from(low[0])) as usize*stride+(i64::from(y)-i64::from(low[1])) as usize;
+                    in_domain[index]=true;bands[index]=cache.fine_bands.get(&(x,y)).cloned();
+                }}
+            }
+            let distance=|band:[f64;2]|(band[0]-origin[2]).max(origin[2]-band[1]).max(0.0);
+            let mut selected=vec![None;count];let mut seed:Option<(usize,(i32,i32),[f64;4])>=None;
+            for (index,inside) in in_domain.iter().copied().enumerate() {
+                if !inside {continue;}
+                let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
+                let values=bands[index].take().unwrap_or_else(||map.fine_contact_bands(x,y));
+                let Some(&band)=values.iter().min_by(|a,b|distance(**a).total_cmp(&distance(**b))
+                    .then_with(||(a[1]-origin[2]).abs().total_cmp(&(b[1]-origin[2]).abs()))
+                    .then_with(||a[1].total_cmp(&b[1]))) else {continue;};
+                selected[index]=Some(band);let rise=band[1]-origin[2];
+                if rise>model.max_step_up_m+size+1e-6 || -rise>model.max_step_down_m+size+1e-6 {continue;}
+                let dx=(f64::from(x)+0.5)*size-origin[0];let dy=(f64::from(y)+0.5)*size-origin[1];
+                let rank=[dx*dx+dy*dy,distance(band),rise.abs(),band[1]];
+                let earlier=seed.as_ref().is_none_or(|&(_,old,previous)| {
+                    rank.iter().zip(previous).map(|(a,b)|a.total_cmp(&b)).find(|v|!v.is_eq())
+                        .unwrap_or_else(||(x,y).cmp(&old)).is_lt()
+                });
+                if earlier {seed=Some((index,(x,y),rank));}
+            }
+            let seed=seed.ok_or(SurfaceError::MissingSupport)?.0;
+            let mut queue=VecDeque::from([seed]);let mut visited=vec![false;count];visited[seed]=true;
+            let mut points=Vec::new();
+            while let Some(index)=queue.pop_front() {
+                let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
+                let band=selected[index].expect("只有已选真实带进入队列");
+                let point=[(f64::from(x)+0.5)*size,(f64::from(y)+0.5)*size,band[1]];
+                let distance2=(point[0]-origin[0]).powi(2)+(point[1]-origin[1]).powi(2);
+                let weight=(1.0-distance2/(radius*radius)).max(0.0).powi(2);
+                if weight>0.0 {points.push((point,band[0],weight));}
+                for dx in -1..=1 {for dy in -1..=1 {
+                    if dx==0&&dy==0 {continue;}
+                    let(mut nx,mut ny)=(x,y);
+                    loop {
+                        let(Some(next_x),Some(next_y))=(nx.checked_add(dx),ny.checked_add(dy)) else {break;};
+                        nx=next_x;ny=next_y;
+                        if nx<low[0]||nx>high[0]||ny<low[1]||ny>high[1] {break;}
+                        let next_index=(i64::from(nx)-i64::from(low[0])) as usize*stride+(i64::from(ny)-i64::from(low[1])) as usize;
+                        if !in_domain[next_index] {break;}
+                        let Some(next)=selected[next_index] else {continue;};
+                        let rise=next[1]-band[1];
+                        if rise<=model.max_step_up_m+size+1e-6 && -rise<=model.max_step_down_m+size+1e-6
+                            && !visited[next_index] {visited[next_index]=true;queue.push_back(next_index);}
+                        break;
+                    }
+                }}
+            }
+            Ok(points)
+        }
+        fn sort(points:&mut [ContactPoint]) {
+            points.sort_by(|a,b|a.0[0].total_cmp(&b.0[0]).then_with(||a.0[1].total_cmp(&b.0[1])));
+        }
+
+        fn point_bits(point:&ContactPoint)->[u64;5] {
+            [point.0[0],point.0[1],point.0[2],point.1,point.2].map(f64::to_bits)
+        }
+
+        fn plane_bits(plane:Option<(f64,f64,f64)>)->Option<[u64;3]> {
+            plane.map(|(a,b,z)|[a,b,z].map(f64::to_bits))
+        }
+
+        fn compare(map:&SurfaceSnapshot,keys:&std::collections::BTreeSet<[i32;3]>,
+            origin:[f64;3],radius:f64)->Result<Vec<ContactPoint>,SurfaceError> {
+            let expected=reference_bfs(map,origin,radius);
+            let actual=map.fine_contact_domain(origin,radius);
+            match (expected,actual) {
+                (Ok(mut expected),Ok(mut actual))=> {
+                    assert_eq!(expected.len(),actual.len(),"point count: {origin:?}, {radius}");
+                    assert!(actual.windows(2).all(|pair|pair[0].0[0].total_cmp(&pair[1].0[0])
+                        .then_with(||pair[0].0[1].total_cmp(&pair[1].0[1])).is_lt()),
+                        "dense output must be strictly XY ordered, without duplicate columns");
+                    sort(&mut expected);sort(&mut actual);
+                    assert_eq!(expected.iter().map(point_bits).collect::<Vec<_>>(),
+                        actual.iter().map(point_bits).collect::<Vec<_>>(),"exact input: {origin:?}, {radius}");
+                    assert_eq!(plane_bits(fit_contact_plane(&expected,origin)),
+                        plane_bits(fit_contact_plane(&actual,origin)),"exact fit: {origin:?}, {radius}");
+                    let size=f64::from(map.observations.as_ref().unwrap().size_m);
+                    for &(point,low,weight) in &actual {
+                        let x=(point[0]/size).floor() as i32;let y=(point[1]/size).floor() as i32;
+                        let top=(point[2]/size).round() as i32-1;
+                        assert!(keys.contains(&[x,y,top]),"emitted top must be observed");
+                        assert!(!keys.contains(&[x,y,top+1]),"emitted top must terminate a real band");
+                        let mut bottom=top;
+                        while keys.contains(&[x,y,bottom-1]) {bottom-=1;}
+                        let expected_low=if map.ground_evidence==GroundEvidence::OccupiedVolume {top}else{bottom};
+                        assert_eq!(point.map(f64::to_bits),[(f64::from(x)+0.5)*size,
+                            (f64::from(y)+0.5)*size,(f64::from(top)+1.0)*size].map(f64::to_bits));
+                        assert_eq!(low.to_bits(),((f64::from(expected_low)+1.0)*size).to_bits());
+                        let distance2=(point[0]-origin[0]).powi(2)+(point[1]-origin[1]).powi(2);
+                        assert_eq!(weight.to_bits(),(1.0-distance2/(radius*radius)).max(0.0).powi(2).to_bits());
+                        assert!(weight>0.0,"no zero-weight or synthetic support");
+                    }
+                    Ok(actual)
+                },
+                (Err(expected),Err(actual))=> {assert_eq!(expected,actual);Err(actual)},
+                (expected,actual)=>panic!("domain result changed at {origin:?}, {radius}: {expected:?} / {actual:?}"),
+            }
+        }
+
+        fn make(keys:Vec<[i32;3]>)->(SurfaceSnapshot,std::collections::BTreeSet<[i32;3]>) {
+            let mut envelope=model();envelope.max_step_up_m=0.15;envelope.max_step_down_m=0.1;
+            let observed=keys.iter().copied().collect();
+            (sparse_contact_scene(keys,envelope),observed)
+        }
+
+        #[test]
+        fn exact_sorted_points_and_fits_match_frozen_dense_bfs_matrix() {
+            let grid=|levels:fn(i32,i32)->Vec<i32>|->Vec<[i32;3]> {
+                (-10_i32..=10).flat_map(|x|(-10_i32..=10).flat_map(move |y|
+                    levels(x,y).into_iter().map(move |z|[x,y,z]))).collect()
+            };
+            let scenes=[
+                ("flat",grid(|_,_|vec![-1])),
+                ("quantized slope",grid(|x,y|vec![(x+2*y).div_euclid(4)-1])),
+                ("gaps",grid(|x,y|if (x+y).rem_euclid(5)==0 || (x==1&&y<5) {vec![]}else{vec![-1]})),
+                ("directed steps",grid(|x,_|vec![if x<0 {-1}else{3}])),
+                ("blocking wall",grid(|x,_|if x==0 {(-1..15).collect()}else{vec![-1]})),
+                ("separate layers",grid(|_,_|vec![-1,19])),
+                ("overlapping height intervals",grid(|x,y|((x+y).rem_euclid(3)-4..=(x-y).rem_euclid(3)).collect())),
+                ("equal band distances",grid(|_,_|vec![-3,1])),
+                ("nearest high band cannot seed",grid(|_,_|std::iter::once(-3).chain(-1..8).collect())),
+                ("disconnected islands",vec![[-4,-4,-1],[-4,-3,-1],[-3,-4,-1],[4,1,-1],[4,2,-1],[5,1,-1]]),
+                ("diagonal rank loss",(-10..=10).map(|i|[i,i,-1]).collect()),
+                ("single column rank loss",(-10..=10).map(|y|[0,y,-1]).collect()),
+            ];
+            let fine=f64::from(0.05_f32);
+            let edge=2.0_f64.sqrt()*fine*0.5;
+            let radii=[fine*0.25,f64::from_bits(edge.to_bits()-1),edge,
+                f64::from_bits(edge.to_bits()+1),0.3,0.55];
+            let origins=[[0.0,0.0,0.0],[-1.5*fine,0.5*fine,0.0],[1.5*fine,0.5*fine,4.0*fine],
+                [-3.5*fine,-3.5*fine,0.0],[-0.173,-0.117,-0.1],[0.0,0.0,20.0*fine],[0.0,0.0,2.0]];
+            let (mut successful,mut rejected,mut fitted,mut degenerate)=(0,0,0,0);
+            for (name,keys) in scenes {
+                let (base,observed)=make(keys);
+                for evidence in [GroundEvidence::MeasuredSurface,GroundEvidence::OccupiedVolume] {
+                    let map=base.clone().with_ground_evidence(evidence);
+                    for origin in origins {for radius in radii {
+                        let result=compare(&map,&observed,origin,radius);
+                        // Both variants share the unchanged snapshot; the reference runs first and warms its cache.
+                        let repeated=compare(&map,&observed,origin,radius);
+                        assert_eq!(result.as_ref().map(|v|v.iter().map(point_bits).collect::<Vec<_>>()),
+                            repeated.as_ref().map(|v|v.iter().map(point_bits).collect::<Vec<_>>()),"{name}, {evidence:?}");
+                        match result {
+                            Ok(points)=> {successful+=1;if fit_contact_plane(&points,origin).is_some() {fitted+=1;}else{degenerate+=1;}},
+                            Err(SurfaceError::MissingSupport)=>rejected+=1,
+                            Err(error)=>panic!("unexpected {name} error: {error:?}"),
+                        }
+                    }}
+                }
+            }
+            assert!(successful>0 && rejected>0 && fitted>0 && degenerate>0);
+        }
+
+        #[test]
+        fn exact_membership_direction_ties_and_missing_support_are_retained() {
+            let fine=f64::from(0.05_f32);
+            let stairs=(-6..=6).flat_map(|x|(-6..=6).map(move |y|[x,y,if x<0 {-1}else{3}])).collect();
+            let (map,keys)=make(stairs);
+            let up=compare(&map,&keys,[-1.5*fine,0.5*fine,0.0],0.3).unwrap();
+            assert!(up.iter().any(|p|p.0[0]>0.0));
+            let down=compare(&map,&keys,[1.5*fine,0.5*fine,4.0*fine],0.3).unwrap();
+            assert!(down.iter().all(|p|p.0[0]>0.0));
+            let (islands,keys)=make(vec![[-4,-4,-1],[-4,-3,-1],[-3,-4,-1],[4,1,-1],[4,2,-1],[5,1,-1]]);
+            let points=compare(&islands,&keys,[-3.5*fine,-3.5*fine,0.0],0.6).unwrap();
+            assert_eq!(points.len(),3);assert!(points.iter().all(|p|p.0[0]<0.0));
+            let tied=(-3..=3).flat_map(|x|(-3..=3).flat_map(move |y|[-3,1].map(|z|[x,y,z]))).collect();
+            let (ties,keys)=make(tied);
+            assert!(compare(&ties,&keys,[0.0;3],0.3).unwrap().iter().all(|p|p.0[2]<0.0));
+            assert_eq!(compare(&ties,&keys,[0.0,0.0,4.0],0.3),Err(SurfaceError::MissingSupport));
+            let missing=ties.with_observations(None);
+            assert_eq!(reference_bfs(&missing,[0.0;3],0.3),Err(SurfaceError::MissingSupport));
+            assert_eq!(missing.fine_contact_domain([0.0;3],0.3),Err(SurfaceError::MissingSupport));
+            let no_model=SurfaceSnapshot::from_points(&[(0.025,0.025,-0.025)],ties.config().clone(),0.05)
+                .unwrap().with_observations(ties.observations.clone());
+            assert_eq!(reference_bfs(&no_model,[0.0;3],0.3),Err(SurfaceError::InvalidPose));
+            assert_eq!(no_model.fine_contact_domain([0.0;3],0.3),Err(SurfaceError::InvalidPose));
+        }
+
+        #[test]
+        fn visited_incompatible_column_still_stops_ray_before_far_layer() {
+            let fine=f64::from(0.05_f32);
+            for stride in [1,2] {
+                // The low seed reaches +0.2 m, but cannot reach the far +0.4 m.
+                // From +0.2 m, the already-visited low column blocks the ray even
+                // though descending to it is incompatible. Empty columns may be
+                // scanned through; visited real columns may never be skipped.
+                let (map,keys)=make(vec![[-stride,0,7],[0,0,-1],[stride,0,3]]);
+                let points=compare(&map,&keys,[0.5*fine,0.5*fine,0.0],0.3).unwrap();
+                assert_eq!(points.len(),2);
+                assert!(points.iter().all(|point|point.0[0]>=0.5*fine));
+            }
+        }
+
+        #[cfg(feature="body-query-profile")]
+        #[test]
+        fn dense_payload_counter_counts_visited_table_only_after_seed() {
+            let keys=(-2..=2).flat_map(|x|(-2..=2).map(move |y|[x,y,-1])).collect();
+            let (map,_)=make(keys);
+            query_profile::begin();
+            let absent=map.fine_contact_domain([0.0,0.0,4.0],0.3);
+            let record=query_profile::end();
+            assert_eq!(absent,Err(SurfaceError::MissingSupport));
+            assert!(record.counters[QueryCounter::DenseAllocatedSlots as usize]>0);
+            assert_eq!(record.counters[QueryCounter::DenseVisitedTableSlots as usize],0);
+            query_profile::begin();
+            let present=map.fine_contact_domain([0.0;3],0.3);
+            let record=query_profile::end();
+            assert!(present.is_ok());
+            assert_eq!(record.counters[QueryCounter::DenseVisitedTableSlots as usize],
+                record.counters[QueryCounter::DenseAllocatedSlots as usize]);
+            assert!(record.counters[QueryCounter::DenseVisitedColumns as usize]>0);
+        }
+
+        #[test]
+        fn masked_current_view_never_emits_inferred_support() {
+            let mut keys:Vec<_>=(-10_i32..=10).flat_map(|x|(-10_i32..=10)
+                .filter(move |y|x.abs()>=2 || y.abs()>=2).map(move |y|[x,y,-1])).collect();
+            keys.push([0,0,6]); // A body echo forces a real private clearing view around the gap.
+            let (base,keys)=make(keys);
+            for evidence in [GroundEvidence::MeasuredSurface,GroundEvidence::OccupiedVolume] {
+                let map=base.clone().with_ground_evidence(evidence);
+                let view=map.with_current_body_support([0.0,0.0,0.35],[0.0,0.0,0.0,1.0]).unwrap();
+                assert!(view.current_body_support.is_some());
+                for origin in [[0.0;3],[-0.075,-0.025,0.0],[0.1,0.075,0.0]] {
+                    let original=compare(&map,&keys,origin,0.3).unwrap();
+                    let masked=compare(&view,&keys,origin,0.3).unwrap();
+                    assert_eq!(original.iter().map(point_bits).collect::<Vec<_>>(),
+                        masked.iter().map(point_bits).collect::<Vec<_>>());
+                }
+            }
+        }
+
+        #[test]
+        fn dense_limit_keeps_isolated_seed_and_sparse_in_dense_membership() {
+            let fine=f64::from(0.05_f32);let origin=[0.5*fine,0.5*fine,0.0];
+            let radius=(63.5-std::f64::consts::SQRT_2)*fine;
+            let enumeration=radius+std::f64::consts::SQRT_2*fine;
+            let low=((origin[0]-enumeration)/fine).floor() as i32;
+            let high=((origin[0]+enumeration)/fine).floor() as i32;
+            assert_eq!((high-low+1).pow(2),16_384,"exercise the unchanged dense capacity boundary");
+            for keys in [vec![[0,0,-1]],vec![[0,0,-1],[-4,0,-1],[0,4,-1],[4,4,-1]],
+                (-8..=8).flat_map(|x|(-8..=8).filter(move |y|(x+y)%3!=0).map(move |y|[x,y,-1])).collect()] {
+                let count=keys.len();let (map,observed)=make(keys);
+                assert_eq!(compare(&map,&observed,origin,radius).unwrap().len(),count);
+            }
+        }
+
+        #[test]
+        #[ignore = "bounded opt-in dense emission benchmark; reports collection, sort and fit separately"]
+        fn dense_order_reachable_fraction_microbenchmark() {
+            let fine=f64::from(0.05_f32);let origin=[0.5*fine,0.5*fine,0.0];
+            let radius=(63.5-std::f64::consts::SQRT_2)*fine;
+            for half in [0,2,8,32,63] {
+                let keys=(-half..=half).flat_map(|x|(-half..=half).map(move |y|[x,y,-1])).collect();
+                let (base,_)=make(keys);let old=base.fork_for_planning();let new=base.fork_for_planning();
+                for pass in 0..3 {
+                    // Independent caches; alternate collection order rather than always favoring one variant.
+                    let (mut expected,old_domain,mut actual,new_domain)=if pass%2==0 {
+                        let start=std::time::Instant::now();let expected=reference_bfs(&old,origin,radius).unwrap();
+                        let old_domain=start.elapsed();
+                        let start=std::time::Instant::now();let actual=new.fine_contact_domain(origin,radius).unwrap();
+                        (expected,old_domain,actual,start.elapsed())
+                    } else {
+                        let start=std::time::Instant::now();let actual=new.fine_contact_domain(origin,radius).unwrap();
+                        let new_domain=start.elapsed();
+                        let start=std::time::Instant::now();let expected=reference_bfs(&old,origin,radius).unwrap();
+                        (expected,start.elapsed(),actual,new_domain)
+                    };
+                    let start=std::time::Instant::now();sort(&mut expected);let old_sort=start.elapsed();
+                    let start=std::time::Instant::now();sort(&mut actual);let new_sort=start.elapsed();
+                    assert_eq!(expected.iter().map(point_bits).collect::<Vec<_>>(),actual.iter().map(point_bits).collect::<Vec<_>>());
+                    let start=std::time::Instant::now();let expected_plane=fit_contact_plane(&expected,origin);let old_fit=start.elapsed();
+                    let start=std::time::Instant::now();let actual_plane=fit_contact_plane(&actual,origin);let new_fit=start.elapsed();
+                    assert_eq!(plane_bits(expected_plane),plane_bits(actual_plane));
+                    eprintln!("half={half} pass={pass} points={} dense_slots=16384 old_domain={old_domain:?} new_domain={new_domain:?} old_sort={old_sort:?} new_sort={new_sort:?} old_fit={old_fit:?} new_fit={new_fit:?}",actual.len());
+                }
+            }
+        }
+
+        #[test]
+        fn radius_edges_keep_empty_degenerate_and_sparse_fallback_results() {
+            let fine=f64::from(0.05_f32);
+            let (map,keys)=make((-2..=2).flat_map(|x|(-2..=2).map(move |y|[x,y,-1])).collect());
+            let origin=[0.5*fine,0.5*fine,0.0];
+            assert!(compare(&map,&keys,origin,0.0).unwrap().is_empty());
+            assert_eq!(compare(&map,&keys,origin,fine*0.25).unwrap().len(),1);
+            for radius in [f64::from_bits(fine.to_bits()-1),fine,f64::from_bits(fine.to_bits()+1)] {
+                compare(&map,&keys,origin,radius).unwrap();
+            }
+            // This exceeds the existing dense-table limit; preserve the untouched sparse order too.
+            let radius=4.0;
+            let actual=map.fine_contact_domain(origin,radius).unwrap();
+            let sparse=map.fine_contact_domain_sparse(origin,radius).unwrap();
+            assert_eq!(actual.iter().map(point_bits).collect::<Vec<_>>(),
+                sparse.iter().map(point_bits).collect::<Vec<_>>());
+            assert_eq!(plane_bits(fit_contact_plane(&actual,origin)),plane_bits(fit_contact_plane(&sparse,origin)));
+        }
     }
 
     #[test]
@@ -3855,7 +5432,14 @@ mod tests {
         let occupied = view.body_observation_footprint(start).unwrap();
         view.validate_observed_body_motion(start,target,&occupied,10_100_000_000,1_000_000_000).unwrap();
         assert!(view.validate_observed_body_motion(start,target,&occupied,12_000_000_000,1_000_000_000).is_err());
+        assert_observation_checker_matches(&view, &occupied, 1_000_000_000, &[], &[
+            (start, target, 10_100_000_000), (target, target, 10_100_000_000),
+            (target, target, 12_000_000_000), (start, start, 12_000_000_000),
+        ]);
         let advanced = view.with_current_body_support(target.0,target.1).unwrap();
+        assert_observation_checker_matches(&advanced, &occupied, 1_000_000_000, &[], &[
+            (start, target, 10_100_000_000), (target, target, 10_100_000_000),
+        ]);
         assert!(advanced.validate_body_pose(start.0,start.1).is_err(), "新查询不能保留旧足迹的补足");
         assert!(base.validate_body_pose(start.0,start.1).is_err());
         assert!(observations.get([0,0,0]).is_none(), "不能伪造盲区的观察时间");

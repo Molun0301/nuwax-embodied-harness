@@ -22,6 +22,9 @@ struct Inputs {
     applied: Twist2,
     applied_version: u64,
     result: Option<(std::time::Instant, PlannerStep)>,
+    result_dispatch_bound: Option<CommandDispatchBound>,
+    #[cfg(test)]
+    result_proof: Option<crate::command_proof_trace::PublishedCommandContext>,
     result_pose_version: u64,
     result_applied_version: u64,
     result_map_version: u64,
@@ -67,12 +70,19 @@ pub(crate) struct PlannerWorker {
     shared: Arc<(Mutex<Inputs>, Condvar)>,
     thread: Option<std::thread::JoinHandle<()>>,
     wait_reason: Option<String>,
+    delivered_dispatch_bound: Option<CommandDispatchBound>,
     #[cfg(test)]
     delivered_command_deadline: Option<std::time::Instant>,
+    #[cfg(test)]
+    delivered_command_context: Option<crate::command_proof_trace::DeliveredCommandContext>,
 }
 impl PlannerWorker {
     #[cfg(test)]
     pub(crate) fn delivered_command_deadline_for_test(&self)->Option<std::time::Instant> {self.delivered_command_deadline}
+    #[cfg(test)]
+    pub(crate) fn delivered_command_context_for_test(&self)->Option<&crate::command_proof_trace::DeliveredCommandContext> {
+        self.delivered_command_context.as_ref()
+    }
     pub(crate) fn new(mut planner: impl NavPlanner) -> Result<Self, RuntimeError> {
         let shared = Arc::new((Mutex::new(Inputs::default()), Condvar::new()));
         let worker = Arc::clone(&shared);
@@ -85,6 +95,7 @@ impl PlannerWorker {
                 let mut map_version = 0;
                 let mut boundary_version = u64::MAX;
                 let mut slow_log_at: Option<std::time::Instant> = None;
+                #[cfg(test)] let mut result_id=0_u64;
                 loop {
                     let (
                         version,
@@ -141,6 +152,17 @@ impl PlannerWorker {
                         )
                     };
                     let started = std::time::Instant::now();
+                    #[cfg(test)] let compute_trace=width.map(|_| {
+                        result_id=result_id.checked_add(1).expect("test worker result ID exhausted");
+                        crate::command_proof_trace::ComputeScope::begin(crate::command_proof_trace::ComputeInputTrace {
+                            result_id,
+                            pose:pose.as_ref().map(crate::command_proof_trace::PoseTrace::capture),
+                            applied_bits:crate::command_proof_trace::command_bits(applied),
+                            epoch:version,goal_version:goal_seq,path_version:path_seq,map_version:map_seq,
+                            boundary_version:boundary_seq,pose_version:pose_seq,applied_version:applied_seq,
+                            compute_started:started,compute_start_unix_ns:crate::command_proof_trace::unix_ns(),
+                        })
+                    });
                     let span=tracing::info_span!("navigation.local",goal_id=%goal_id);
                     let _entered=span.enter();
                     let computed = (|| -> Result<PlannerStep, RuntimeError> {
@@ -183,8 +205,13 @@ impl PlannerWorker {
                         Ok(width.map_or(PlannerStep::Pending(Vec::new()),|width|planner.step(width)))
                     })()
                     .unwrap_or_else(|error| PlannerStep::ReplanRequired(error.to_string()));
+                    #[cfg(test)] let computed_proof=compute_trace.and_then(|trace|trace.finish(&computed));
+                    // Consume metadata with this exact completed computation, even
+                    // when the outcome cannot issue a nonzero command.
+                    let candidate_bound=planner.take_command_dispatch_bound();
+                    let mut dispatch_bound=if matches!(&computed,PlannerStep::Command(v) if *v!=Twist2::ZERO) {candidate_bound}else{None};
                     if width.is_none() {continue;}
-                    let wait_reason = if matches!(computed, PlannerStep::Pending(_))
+                    let mut wait_reason = if matches!(computed, PlannerStep::Pending(_))
                         || matches!(computed, PlannerStep::Command(command) if command == Twist2::ZERO) {
                         planner.execution_wait_reason()
                     } else { None };
@@ -205,7 +232,14 @@ impl PlannerWorker {
                         && !input.closed;
                     // 换目标、换路径、取消或来源撤销后的迟到结果一律退休。
                     if current {
+                        let computed=if dispatch_bound.is_some_and(CommandDispatchBound::expired_now) {
+                            dispatch_bound=None;
+                            wait_reason=Some("观察扫掠凭据在发布前已过期，保持零速并重新计算".into());
+                            PlannerStep::Pending(Vec::new())
+                        }else{computed};
+                        input.result_dispatch_bound=dispatch_bound;
                         input.result = Some((started, computed));
+                        #[cfg(test)] {input.result_proof=if matches!(input.result.as_ref(),Some((_,PlannerStep::Command(_)))) {computed_proof.map(|proof|proof.published())}else{None};}
                         input.result_pose_version = pose_seq;
                         input.result_applied_version = applied_seq;
                         input.result_map_version = map_seq;
@@ -229,8 +263,11 @@ impl PlannerWorker {
             shared,
             thread: Some(thread),
             wait_reason: None,
+            delivered_dispatch_bound: None,
             #[cfg(test)]
             delivered_command_deadline: None,
+            #[cfg(test)]
+            delivered_command_context: None,
         })
     }
 }
@@ -239,6 +276,7 @@ impl NavPlanner for PlannerWorker {
         self.shared.0.lock().unwrap().goal_id=goal_id.to_owned();
     }
     fn configure_boundary(&mut self, boundary: &[[f64;2]]) {
+        self.delivered_dispatch_bound=None;
         let mut input=self.shared.0.lock().unwrap();
         input.boundary=boundary.to_vec();
         input.boundary_version += 1;
@@ -253,12 +291,15 @@ impl NavPlanner for PlannerWorker {
         goal: &PoseStamped,
         options: nuwax_nav_types_messages::GoalOptions,
     ) -> Result<(), RuntimeError> {
+        self.delivered_dispatch_bound=None;
         options.validate().map_err(RuntimeError::Planner)?;
         // 自主导航授权按前向策略收窄；旧目标允许倒退不能导致误拒或恢复倒退。
         let options=nuwax_nav_types_messages::GoalOptions {allow_reverse:false,..options};
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
+        input.result_dispatch_bound=None;
+        #[cfg(test)] {input.result_proof=None;}
         input.display_path.clear();
         input.path = None;
         input.goal_version += 1;
@@ -277,9 +318,12 @@ impl NavPlanner for PlannerWorker {
         yaws: Option<Vec<f64>>,
         goal: PoseStamped,
     ) -> Result<(), RuntimeError> {
+        self.delivered_dispatch_bound=None;
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
+        input.result_dispatch_bound=None;
+        #[cfg(test)] {input.result_proof=None;}
         input.display_path.clear();
         input.path_version += 1;
         input.path = Some(Arc::new((path, yaws, goal)));
@@ -288,6 +332,7 @@ impl NavPlanner for PlannerWorker {
         Ok(())
     }
     fn update_odometry(&mut self, pose: PoseStamped) {
+        self.delivered_dispatch_bound=None;
         let mut input = self.shared.0.lock().unwrap();
         if input.pose.as_ref().is_none_or(|previous|
             !same_pose(previous, &pose))
@@ -300,6 +345,7 @@ impl NavPlanner for PlannerWorker {
         let _ = self.update_execution_map(ExecutionMap::Planar(map));
     }
     fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
+        self.delivered_dispatch_bound=None;
         let mut input = self.shared.0.lock().unwrap();
         input.map = Some(map);
         input.map_version += 1;
@@ -317,6 +363,7 @@ impl NavPlanner for PlannerWorker {
         input.map_version += 1;
     }
     fn observe_applied_command(&mut self, command: Twist2) {
+        self.delivered_dispatch_bound=None;
         let mut input = self.shared.0.lock().unwrap();
         if input.applied != command {
             input.applied_version += 1;
@@ -327,7 +374,10 @@ impl NavPlanner for PlannerWorker {
         input.requested = input.control_width;
         self.shared.1.notify_one();
     }
+    fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {self.delivered_dispatch_bound.take()}
     fn step(&mut self, width: f64) -> PlannerStep {
+        self.delivered_dispatch_bound=None;
+        #[cfg(test)] {self.delivered_command_context=None;}
         let mut input = self.shared.0.lock().unwrap();
         if self
             .thread
@@ -339,6 +389,7 @@ impl NavPlanner for PlannerWorker {
         input.control_width = Some(width);
         let expired = input.result.as_ref().is_some_and(|(started, step)|
             matches!(step, PlannerStep::Command(_)) && started.elapsed() > DEFAULT_CONTROL_HORIZON);
+        let dispatch_expired=input.result_dispatch_bound.is_some_and(CommandDispatchBound::expired_now);
         let arrival_changed = input.result.as_ref().is_some_and(|(_, step)|
             matches!(step, PlannerStep::Succeeded) && input.result_pose_version != input.pose_version
                 && !arrival_event_still_in_goal(&input));
@@ -351,7 +402,7 @@ impl NavPlanner for PlannerWorker {
         let source_changed = input.result.is_some()
             && (input.result_map_version != input.map_version
                 || input.result_boundary_version != input.boundary_version);
-        if input.result.is_none() || input.result.as_ref().is_some_and(|(_,s)|matches!(s,PlannerStep::Pending(_))) || expired || arrival_changed || terminal_changed || source_changed {
+        if input.result.is_none() || input.result.as_ref().is_some_and(|(_,s)|matches!(s,PlannerStep::Pending(_))) || expired || dispatch_expired || arrival_changed || terminal_changed || source_changed {
             input.requested = Some(width);
             self.shared.1.notify_one();
         }
@@ -361,7 +412,7 @@ impl NavPlanner for PlannerWorker {
         let ready = input
             .result
             .as_ref()
-            .filter(|_| !source_changed && !terminal_changed)
+            .filter(|_| !source_changed && !terminal_changed && !dispatch_expired)
             .filter(|(started, step)| {
                 // 时效窗约束速度许可；失败、重规划及到达只触发原调度器归零，
                 // 不能因计算慢而把这些结论吞成永远运行中的零速度。
@@ -376,12 +427,25 @@ impl NavPlanner for PlannerWorker {
         { self.delivered_command_deadline=if matches!(&ready,Some(PlannerStep::Command(_))) {
             input.result.as_ref().map(|(started,_)|*started+DEFAULT_CONTROL_HORIZON)
         } else {None}; }
+        // Select diagnostic context under the same lock as the exact result,
+        // before its existing one-shot consumption. Never query TLS here or
+        // infer provenance from a nearby result/time/guard invocation.
+        #[cfg(test)] {
+            self.delivered_command_context=match (&ready,&input.result,&input.result_proof) {
+                (Some(PlannerStep::Command(command)),Some((started,_)),Some(proof)) =>
+                    proof.retrieved(*started,*command),
+                _ => None,
+            };
+        }
+        self.delivered_dispatch_bound=if matches!(&ready,Some(PlannerStep::Command(v)) if *v!=Twist2::ZERO) {input.result_dispatch_bound}else{None};
         self.wait_reason = if ready.is_some() { input.result_wait_reason.clone() } else if arrival_changed {
             Some("位姿已更新，保持零速并重新核对到达状态".into())
         } else if terminal_changed {
             Some("位姿或执行回执已更新，保持零速并重新计算".into())
         } else if source_changed {
             Some("地图或边界已更新，保持零速并重新计算".into())
+        } else if dispatch_expired {
+            Some("观察扫掠凭据在交付前已过期，保持零速并重新计算".into())
         } else if expired {
             Some("局部速度计算结果已过期，保持零速并重新计算".into())
         } else {
@@ -393,6 +457,8 @@ impl NavPlanner for PlannerWorker {
             // feedback (or a later step seeing no result) requests that compute;
             // selecting this candidate is not an actuator receipt.
             input.result = None;
+            input.result_dispatch_bound=None;
+            #[cfg(test)] {input.result_proof=None;}
         }
         ready.unwrap_or(PlannerStep::Pending(Vec::new()))
     }
@@ -403,12 +469,15 @@ impl NavPlanner for PlannerWorker {
         self.wait_reason.clone()
     }
     fn stop(&mut self) {
+        self.delivered_dispatch_bound=None;
         self.wait_reason = None;
         #[cfg(test)]
-        {self.delivered_command_deadline=None;}
+        {self.delivered_command_deadline=None;self.delivered_command_context=None;}
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
+        input.result_dispatch_bound=None;
+        #[cfg(test)] {input.result_proof=None;}
         input.display_path.clear();
         input.result_wait_reason = None;
         input.path = None;
@@ -429,6 +498,8 @@ impl Drop for PlannerWorker {
             let mut input = self.shared.0.lock().unwrap();
             input.closed = true;
             input.result = None;
+            input.result_dispatch_bound=None;
+            #[cfg(test)] {input.result_proof=None;}
             input.display_path.clear();
             self.shared.1.notify_one();
         }
@@ -471,6 +542,7 @@ mod tests {
         path_updates: u64,
     }
     impl NavPlanner for GatedRouteFollower {
+        fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {self.inner.take_command_dispatch_bound()}
         fn configure_goal(&mut self, goal: &PoseStamped, options: GoalOptions) -> Result<(), RuntimeError> {
             self.inner.configure_goal(goal, options)?;
             self.goal_updates += 1;
@@ -822,6 +894,124 @@ mod tests {
             std::thread::yield_now();
         }
     }
+
+    // Synthetic selections isolate the diagnostic handoff; they assert no
+    // geometry permission. Real guard selection is traced only at its callsite.
+    struct TraceProbe {
+        started: std::sync::mpsc::Sender<()>,
+        finish: std::sync::mpsc::Receiver<(PlannerStep, Option<u64>)>,
+        pose: Option<PoseStamped>,
+        applied: Twist2,
+    }
+    impl NavPlanner for TraceProbe {
+        fn replace_path(&mut self, _: Path2D) {}
+        fn update_odometry(&mut self, pose: PoseStamped) { self.pose=Some(pose); }
+        fn update_costmap(&mut self, _: CostMap2D) {}
+        fn observe_applied_command(&mut self, applied: Twist2) { self.applied=applied; }
+        fn step(&mut self, _: f64) -> PlannerStep {
+            let _=self.started.send(());
+            let (outcome,anchor)=self.finish.recv_timeout(Duration::from_secs(5))
+                .unwrap_or((PlannerStep::Pending(Vec::new()),None));
+            if let (PlannerStep::Command(command),Some(anchor))=(&outcome,anchor) {
+                let guard=crate::command_proof_trace::GuardScope::begin();
+                guard.record_basis(self.pose.as_ref().unwrap(),self.applied,Some((anchor,1_000_000_000)));
+                crate::command_proof_trace::record_selected(*command);
+            }
+            outcome
+        }
+        fn stop(&mut self) {}
+    }
+    fn traced_worker()->(PlannerWorker,std::sync::mpsc::Receiver<()>,std::sync::mpsc::Sender<(PlannerStep,Option<u64>)>) {
+        let (started,receive)=std::sync::mpsc::channel();
+        let (finish,wait)=std::sync::mpsc::channel();
+        let worker=PlannerWorker::new(TraceProbe {started,finish:wait,pose:None,applied:Twist2::ZERO}).unwrap();
+        (worker,receive,finish)
+    }
+
+    #[test]
+    fn exact_proof_follows_stored_result_once_and_never_same_valued_next_result() {
+        let (mut worker,started,finish)=traced_worker();
+        let original_pose=route_pose(0.5,0);
+        let command=Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.05,0.0),angular_z:0.0};
+        worker.update_odometry(original_pose.clone());
+        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        // A real first delivery still uses the original worker pose, even if
+        // newer odometry arrived while that exact computation was finishing.
+        worker.update_odometry(route_pose(0.500001,1));
+        finish.send((PlannerStep::Command(command),Some(101))).unwrap();
+        wait_for_source_result(&worker);
+        let published_id=worker.shared.0.lock().unwrap().result_proof.as_ref().unwrap().proof.input.result_id;
+        assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+        let delivered=worker.delivered_command_context_for_test().unwrap().clone();
+        assert_eq!(delivered.proof.input.result_id,published_id);
+        assert_eq!(delivered.proof.input.pose,Some(crate::command_proof_trace::PoseTrace::capture(&original_pose)));
+        assert_eq!(delivered.proof.guard.observation_anchor_ns,Some(101));
+        assert!(delivered.proof.worker_guard_pose_bits_equal && delivered.proof.worker_guard_applied_bits_equal);
+        {
+            let input=worker.shared.0.lock().unwrap();
+            assert!(input.result.is_none() && input.result_proof.is_none());
+        }
+        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        assert!(worker.delivered_command_context_for_test().is_none());
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Same command value, no scoped proof: diagnostics must be absent.
+        finish.send((PlannerStep::Command(command),None)).unwrap();
+        wait_for_source_result(&worker);
+        assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+        assert!(worker.delivered_command_context_for_test().is_none());
+        worker.step(0.3);
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        finish.send((PlannerStep::Command(command),Some(303))).unwrap();
+        wait_for_source_result(&worker);
+        assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+        let latest=worker.delivered_command_context_for_test().unwrap();
+        assert!(latest.proof.input.result_id>published_id);
+        assert_eq!(latest.proof.guard.observation_anchor_ns,Some(303));
+        worker.stop();
+        assert!(worker.delivered_command_context_for_test().is_none());
+        assert!(worker.shared.0.lock().unwrap().result_proof.is_none());
+    }
+
+    #[test]
+    fn source_fence_expiry_and_zero_never_deliver_stored_diagnostic_proof() {
+        for changed_source in [false,true] {
+            let (mut worker,started,finish)=traced_worker();
+            let command=Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.05,0.0),angular_z:0.0};
+            worker.update_odometry(route_pose(0.5,0));
+            worker.step(0.3);
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            finish.send((PlannerStep::Command(command),Some(101))).unwrap();
+            wait_for_source_result(&worker);
+            {
+                let mut input=worker.shared.0.lock().unwrap();
+                assert!(input.result_proof.is_some());
+                if changed_source {input.map_version+=1;}
+                else {input.result.as_mut().unwrap().0=std::time::Instant::now()-DEFAULT_CONTROL_HORIZON-Duration::from_millis(1);}
+            }
+            assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+            assert!(worker.delivered_command_context_for_test().is_none());
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            finish.send((PlannerStep::Command(Twist2::ZERO),Some(202))).unwrap();
+            // The rejected positive result remains stored until replacement.
+            // Wait for this released zero publication, not merely any Some.
+            let deadline=std::time::Instant::now()+Duration::from_secs(1);
+            loop {
+                let input=worker.shared.0.lock().unwrap();
+                if matches!(&input.result,Some((_,PlannerStep::Command(command))) if *command==Twist2::ZERO)
+                    && input.result_map_version==input.map_version
+                    && input.result_boundary_version==input.boundary_version {break;}
+                drop(input);
+                assert!(std::time::Instant::now()<deadline,"released zero result was not published");
+                std::thread::yield_now();
+            }
+            assert_eq!(worker.step(0.3),PlannerStep::Command(Twist2::ZERO));
+            assert!(worker.delivered_command_context_for_test().is_none());
+            assert!(worker.shared.0.lock().unwrap().result_proof.is_none());
+            worker.stop();
+        }
+    }
+
     #[test]
     fn stored_positive_command_is_rejected_after_blocking_map_update() {
         let (mut worker, start, release) = source_worker();
@@ -1552,5 +1742,97 @@ mod tests {
     #[test]
     #[ignore="real-clock geometry regression with unchanged actual applied velocity"]
     fn retained_steady_command_replay_requires_current_full_braking_permission() {run_replay_proof_falsifier(0.1);}
+
+    struct DispatchProbe {
+        started:std::sync::mpsc::Sender<()>,
+        finish:std::sync::mpsc::Receiver<(PlannerStep,Option<CommandDispatchBound>)>,
+        bound:Option<CommandDispatchBound>,
+    }
+    impl NavPlanner for DispatchProbe {
+        fn replace_path(&mut self,_:Path2D) {}
+        fn update_odometry(&mut self,_:PoseStamped) {}
+        fn update_costmap(&mut self,_:CostMap2D) {}
+        fn step(&mut self,_:f64)->PlannerStep {
+            self.bound=None;let _=self.started.send(());
+            let (step,bound)=self.finish.recv_timeout(Duration::from_secs(2)).unwrap_or((PlannerStep::Pending(Vec::new()),None));
+            self.bound=bound;step
+        }
+        fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {self.bound.take()}
+        fn stop(&mut self) {self.bound=None;}
+    }
+    fn dispatch_worker()->(PlannerWorker,std::sync::mpsc::Receiver<()>,std::sync::mpsc::Sender<(PlannerStep,Option<CommandDispatchBound>)>) {
+        let (started,receive)=std::sync::mpsc::channel();let (finish,wait)=std::sync::mpsc::channel();
+        (PlannerWorker::new(DispatchProbe{started,finish:wait,bound:None}).unwrap(),receive,finish)
+    }
+    fn dispatch_test_bound(remaining_ns:u64)->CommandDispatchBound {
+        let anchor=crate::command_dispatch::ObservationClockAnchor::capture();
+        CommandDispatchBound::from_anchor(anchor,anchor.unix_ns+remaining_ns)
+    }
+    #[test]
+    fn dispatch_expiry_during_compute_becomes_pending_without_route_penalty() {
+        let (mut worker,started,finish)=dispatch_worker();
+        let command=Twist2{linear:nuwax_nav_types_messages::Point2::new(0.05,0.0),angular_z:0.0};
+        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let bound=dispatch_test_bound(0);
+        assert!(bound.expired_now());
+        finish.send((PlannerStep::Command(command),Some(bound))).unwrap();
+        wait_for_source_result(&worker);
+        assert!(matches!(worker.shared.0.lock().unwrap().result.as_ref().unwrap().1,PlannerStep::Pending(_)));
+        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        assert!(worker.execution_wait_reason().unwrap().contains("发布前"));
+        assert!(worker.take_command_dispatch_bound().is_none());
+        // A genuinely new computation with the same numeric command can recover.
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        {worker.shared.0.lock().unwrap().result=None;}
+        let fresh=dispatch_test_bound(1_000_000_000);
+        finish.send((PlannerStep::Command(command),Some(fresh))).unwrap();
+        wait_for_source_result(&worker);
+        assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+        assert_eq!(worker.take_command_dispatch_bound(),Some(fresh));
+        assert!(worker.take_command_dispatch_bound().is_none());
+        worker.stop();let _=finish.send((PlannerStep::Pending(Vec::new()),None));
+    }
+    #[test]
+    fn dispatch_bound_rejects_delayed_first_retrieval_without_extending_hold_lease() {
+        let (mut worker,started,finish)=dispatch_worker();
+        let command=Twist2{linear:nuwax_nav_types_messages::Point2::new(0.05,0.0),angular_z:0.0};
+        worker.step(0.3);started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let fresh=dispatch_test_bound(1_000_000_000);
+        finish.send((PlannerStep::Command(command),Some(fresh))).unwrap();wait_for_source_result(&worker);
+        {
+            let mut input=worker.shared.0.lock().unwrap();
+            assert!(matches!(input.result.as_ref().unwrap().1,PlannerStep::Command(_)));
+            input.result_dispatch_bound=Some(dispatch_test_bound(0));
+            assert!(input.result.as_ref().unwrap().0.elapsed()<DEFAULT_CONTROL_HORIZON);
+        }
+        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        assert!(worker.execution_wait_reason().unwrap().contains("交付前"));
+        assert!(worker.take_command_dispatch_bound().is_none());
+        worker.stop();let _=finish.send((PlannerStep::Pending(Vec::new()),None));
+    }
+    #[test]
+    fn dispatch_taken_result_metadata_is_retired_by_input_and_lifecycle_changes() {
+        let command=Twist2{linear:nuwax_nav_types_messages::Point2::new(0.05,0.0),angular_z:0.0};
+        for change in 0..7 {
+            let (mut worker,started,finish)=dispatch_worker();
+            worker.step(0.3);started.recv_timeout(Duration::from_secs(1)).unwrap();
+            finish.send((PlannerStep::Command(command),Some(dispatch_test_bound(1_000_000_000)))).unwrap();
+            wait_for_source_result(&worker);assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+            assert!(worker.delivered_dispatch_bound.is_some());
+            let goal=route_pose(2.0,0);
+            match change {
+                0=>worker.configure_goal(&goal,GoalOptions::default()).unwrap(),
+                1=>worker.replace_execution_path(ExecutionPath::Surface(Path3D{poses:vec![route_pose(0.5,0),goal.clone()]}),None,goal).unwrap(),
+                2=>worker.configure_boundary(&[[0.0,0.0],[3.0,0.0],[3.0,3.0],[0.0,3.0]]),
+                3=>worker.stop(),
+                4=>worker.update_costmap(CostMap2D::new_all_free("map",2,2,0.1)),
+                5=>worker.update_odometry(route_pose(0.51,1)),
+                _=>worker.observe_applied_command(command),
+            }
+            assert!(worker.take_command_dispatch_bound().is_none(),"stale taken metadata survived change {change}");
+            worker.stop();let _=finish.send((PlannerStep::Pending(Vec::new()),None));
+        }
+    }
 
 }

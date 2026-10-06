@@ -1,0 +1,48 @@
+<!doctype html><meta charset="utf-8"><style>body{margin:0;font:14px system-ui}#view{width:480px;height:320px}p{margin:4px}</style><p id="state">Ready</p><div id="view"></div>
+<script type="module">
+class OfflineSocket extends EventTarget {static OPEN=1;constructor(){super();this.readyState=0}send(){}close(){this.readyState=3}}
+window.WebSocket=OfflineSocket;
+const metrics={createBuffer:0,deleteBuffer:0,bufferData:0,bufferDataBytes:0,bufferSubData:0,bufferSubDataBytes:0,renderCalls:0};
+if(typeof WebGL2RenderingContext!=='undefined')for(const name of ['createBuffer','deleteBuffer','bufferData','bufferSubData']){
+ const original=WebGL2RenderingContext.prototype[name];
+ WebGL2RenderingContext.prototype[name]=function(...args){metrics[name]++;if(name==='bufferData')metrics.bufferDataBytes+=typeof args[1]==='number'?args[1]:args[1]?.byteLength||0;if(name==='bufferSubData'){const data=args[2];metrics.bufferSubDataBytes+=(args[4]??(data.length-(args[3]||0)))*(data.BYTES_PER_ELEMENT||1)}return original.apply(this,args)};
+}
+let ready=false;
+window.addEventListener('message',async event=>{
+ if(event.origin!==location.origin||event.source!==parent||event.data.type!=='run'||ready)return;ready=true;
+ const result={stages:[],images:[]};
+ try{
+ if(typeof WebGL2RenderingContext==='undefined')throw Error('WebGL2 unavailable');
+ await import('./pointcloud3d.js');const v=window.pointcloud3d;
+ // Explicit synchronous frame requests isolate resource work from RAF cadence.
+ v._requestRender=()=>{};v.init(document.querySelector('#view'));v._controls.enableDamping=false;v._hasUserCameraInput=true;
+ const renderer=v._renderer,gl=renderer.getContext(),ext=gl.getExtension('WEBGL_debug_renderer_info');
+ result.backend={userAgent:navigator.userAgent,version:gl.getParameter(gl.VERSION),renderer:gl.getParameter(gl.RENDERER),unmaskedRenderer:ext?gl.getParameter(ext.UNMASKED_RENDERER_WEBGL):null,unmaskedVendor:ext?gl.getParameter(ext.UNMASKED_VENDOR_WEBGL):null,width:gl.drawingBufferWidth,height:gl.drawingBufferHeight,devicePixelRatio:devicePixelRatio};
+ const originalRender=renderer.render.bind(renderer);renderer.render=(...args)=>{metrics.renderCalls++;return originalRender(...args)};
+ const rect=(id,mode='inside',enabled=true)=>({id,shape:'rectangle',mode,enabled,vertices:[{x:-2,y:-2},{x:2,y:2}]});
+ let revision=0,generation=0;
+ const cloud=extent=>{const xyz=new Float32Array(1024*3);for(let i=0;i<1024;i++){xyz[i*3]=(i%32)/8-2;xyz[i*3+1]=Math.floor(i/32)/8-2;xyz[i*3+2]=0.1}xyz.set([-extent,-extent,0]);xyz.set([extent,extent,0],3);v._acceptCloudPageBatch({header:{source:'live',source_epoch:'generic-source',frame_id:'map',stream_generation:'1',layout_generation:'1',revision_ordinal:String(++revision),revision:`cloud:${revision}`,source_timestamp_ns:'1',source_incremental:true,point_count:1024,chunk_size_points:1024,changed_chunk_count:1,reset:revision===1},chunks:[{chunk_index:0,xyz}]})};
+ const zones=(items,map='map-a',allow=false)=>v.updateForbiddenZones({map_name:map,generation:++generation,zones:items},allow);
+ const draw=()=>{v._renderLoop();const error=gl.getError();if(error!==gl.NO_ERROR)throw Error(`WebGL error ${error}`)};
+ const difference=before=>Object.fromEntries(Object.keys(metrics).map(key=>[key,metrics[key]-before[key]]));
+ const stage=async(name,action,capture=false)=>{const before={...metrics};action();draw();const pixels=new Uint8Array(gl.drawingBufferWidth*gl.drawingBufferHeight*4);gl.readPixels(0,0,gl.drawingBufferWidth,gl.drawingBufferHeight,gl.RGBA,gl.UNSIGNED_BYTE,pixels);const colors=new Set();for(let i=0;i<pixels.length;i+=4)colors.add(`${pixels[i]},${pixels[i+1]},${pixels[i+2]},${pixels[i+3]}`);if(colors.size<3||renderer.info.render.points!==1024||renderer.info.render.calls<2)throw Error(`Incomplete rendered scene: ${colors.size} colors, ${renderer.info.render.points} points, ${renderer.info.render.calls} calls`);const screenshot=capture?renderer.domElement.toDataURL():null;const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',pixels))).map(x=>x.toString(16).padStart(2,'0')).join('');result.stages.push({name,pixelHash:hash,distinctColors:colors.size,metrics:difference(before),memory:{...renderer.info.memory},draw:{...renderer.info.render},overlayMeshes:v._forbiddenZoneGroup.children.length});if(capture)result.images.push({name,image:screenshot})};
+ const inside=rect('inside'),outside=rect('outside','outside');
+ await stage('bootstrap',()=>{zones([outside,inside]);cloud(2)},true);
+ const before={...metrics};for(let i=0;i<20;i++){cloud(2);draw()}result.steady=difference(before);
+ await stage('steady',()=>cloud(2));
+ await stage('outside-bounds',()=>cloud(8),true);
+ await stage('earlier-zone-disable',()=>zones([{...outside,enabled:false},inside]),true);
+ await stage('earlier-zone-edit',()=>zones([{...outside,stroke_width_m:0.6},inside]),true);
+ await stage('earlier-zone-delete',()=>zones([inside]));
+ const second=rect('second');await stage('add-second',()=>zones([inside,second]));
+ await stage('reorder-coincident',()=>zones([second,inside]),true);
+ await stage('map-switch',()=>zones([outside,inside],'map-b',true));
+ await stage('camera-move',()=>{v._camera.position.set(5,-7,6);v._controls.target.set(0,0,0);v._controls.update()},true);
+ await stage('hidden-reveal',()=>{v.setVisible(false);cloud(8);v.setVisible(true)});
+ const final={...metrics};v.dispose();result.disposal=difference(final);result.finalMemory={...renderer.info.memory};
+ document.querySelector('#state').textContent='Completed';
+ }catch(error){result.error=String(error.stack||error);document.querySelector('#state').textContent=result.error}
+ parent.postMessage({type:'result',result},location.origin);
+});
+parent.postMessage({type:'ready'},location.origin);
+</script>

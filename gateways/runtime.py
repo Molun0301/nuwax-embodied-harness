@@ -4800,7 +4800,7 @@ class GatewayRuntime:
             "latest_exploration": self._health_exploration_summary(exploration_context),
             "perception_runtime": self._health_perception_summary(perception_runtime),
             "active_map_workspace": self._health_workspace_summary(active_workspace),
-            "audio_state": self.audio_service.get_volume_state(),
+            "audio_state": self.audio_service.get_cached_volume_state(),
             "active_task_count": len(self.task_manager.list_active_tasks()),
             "latest_event_cursor": self.event_bus.latest_cursor(),
             "latest_stream_cursor": self.stream_bus.latest_cursor(),

@@ -27,6 +27,9 @@ mod relocalization_identity;
 mod relocalization_terminal_v2;
 mod correction_coordinator;
 mod correction_points;
+// Reusable compute protocol; runtime activation is qualified separately.
+#[allow(dead_code)]
+mod explore_compute_owner;
 mod explore_runtime;
 mod explore_mission;
 mod forbidden_zones;

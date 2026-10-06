@@ -446,3 +446,158 @@ These samples therefore point next to route connectors/waypoint/turn/lookahead
 work and candidate sweeps, not to optimizing the small admission stage. They do
 not reproduce or explain every earlier 83/163 ms tail, and do not justify claiming
 planner separation guarantees a hard control deadline.
+
+### Finer connector/candidate attribution on the new observation baseline
+
+`stage-profile-fine-held-baseline.log` explicitly integrates the fused observation
+optimization later committed as `9688ed0`; it is a new baseline, not a matched
+before/after claim about that optimization. Five profiler isolation/reset tests
+passed. Seven finer stages and twelve fixed counters add no query changes;
+candidate eligibility calls are not mislabeled as generated-candidate counts.
+
+The held-continuity run passed its experiment assertions: six fresh held commands,
+subsequent admission, zero delivered negatives, 1.076357 m travel, control
+median/p95/max 24.97/39.78/46.34 ms and consumer maximum 0.061 ms. These remain
+single-run debug wall measurements, not a hard deadline guarantee.
+
+Across 296 controller steps, exactly 592 forward-arc probes ran. Lookahead
+selection (the first probe) had median 9.20 ms; total forward-arc time for both
+probes was 9.45 ms. Their roughly 0.25 ms difference is an estimate from aggregate
+medians (lookahead also includes scalar selection), not a directly timed duplicate.
+Paired slow-step rows independently show about 0.23–0.32 ms residual. Removing
+the identical warm second probe is a small exact-reuse opportunity, not the main
+bottleneck.
+Support/goal and waypoint progress were tiny (maxima 0.190/0.090 ms). Candidate
+ranking/sweeps had median/p95/max 19.25/28.56/33.90 ms. The slowest step counted one
+candidate eligibility check, 22 score evaluations, 27 motion-memo misses and six
+hits, six future-view constructions, and 38 forward-arc substeps. These counters
+identify query families, not internal MLS contact-plane cache misses. Next work
+should retain the objective and every guard check while identifying repeated
+projection/evidence work within the first arc and selected-candidate sweeps.
+
+`stage-profile-fine-surface-tests.log`: all 41 affected surface-follower tests passed
+after the finer instrumentation; no query/guard behavior changes are included.
+
+## Exact within-step lookahead-probe reuse
+
+The follower now keeps a local boolean only when the lookahead loop actually
+accepts its selected target with `forward_arc_connects`. The immediately repeated
+query has the same immutable map, source body pose and target; it can reuse that
+boolean. Falling back to the current path index or using an alignment target still
+runs the original required query, and rotation retains its original short circuit.
+No permission survives the call, and current selected-command body/braking checks
+and scoring are unchanged. The helper reads geometry and benign query caches;
+it has no observation-clock predicate.
+
+`arc-reuse-surface-tests.log` passed all 42 affected tests. The added differential
+reference retains the old repeated-probe implementation through a test-only-used
+false const specialization. Eighteen cases across differential, omnidirectional
+and Ackermann models compare exact command/status, path progress/index, target,
+applied state and selected-guard query counts. Cases include moved starts, turns,
+alignment, a restrictive boundary and failed-lookahead/missing-ground fallback.
+Clear successful lookahead removes exactly one query; the fallback cases preserve
+all required checks. This unit matrix checks calibrated geometry/stopping without
+an observation-age configuration; observed-evidence guard coverage comes from
+the unchanged moving fixture and its independent postrun oracles.
+
+`arc-reuse-held-continuity.log` confirms 295 arc calls for 295 controller steps,
+compared with 592/296 before reuse. Six fresh held commands and the later admission
+still occurred, with zero delivered negatives and 1.086228 m modeled travel. The
+run remains **FAILED** its strict 50 ms criterion: control median/p95/max was
+24.82/40.10/51.95 ms. The worst step spent 42.87 ms in selected ranking/sweeps and
+8.51 ms in its one arc probe. A prior median of 24.97 ms versus 24.82 ms here is
+not a demonstrated throughput improvement; the verified result is removal of an
+identical query and its traversal. First-arc work and selected-guard projection,
+observation sweeps and future-view construction remain the meaningful targets.
+
+The additional terminal-aware factory ON/OFF goal run also passed
+(`arc-reuse-moving-factory.log`): OFF 21.70 s, 322 nonzero commands, 0.938143 m
+travel, position/yaw errors 0.061857 m / 0.142211 rad; ON 20.90 s, 309 commands,
+0.853475 m travel, errors 0.146525 m / 0.147476 rad. Both are inside the unchanged
+0.15 m / 0.15 rad goal region, with zero delivered negatives. This retains useful
+motion in the backend-plus-ideal-plant fixture; it does not turn the separate
+51.95 ms held-run deadline failure into a pass or establish an optimization speedup.
+
+### Query-family attribution after exact arc reuse
+
+`query-family-profile-compile.log` passed five profiler tests. Six additional
+cfg(test) scopes split connector projection/sweep, guard projection/observed
+sweep/geometry sweep, and future-view construction, without changing any query.
+`query-family-held-baseline.log` retained six fresh held commands, later admission,
+zero delivered negatives and 1.078333 m travel. Its sampled control maximum was
+46.95 ms (median/p95 26.22/40.40 ms); this successful run does not erase the prior
+51.95 ms failure or establish a hard deadline.
+
+Measured per-called-step wall median/p95/max, in milliseconds:
+
+| Query family | Median | p95 | Maximum |
+| --- | ---: | ---: | ---: |
+| First-arc/connector projection | 6.05 | 8.14 | 10.47 |
+| Connector geometry sweep | 2.99 | 3.89 | 5.89 |
+| Selected-guard projection | 4.82 | 7.42 | 9.33 |
+| Selected observed-motion sweep | 14.44 | 21.28 | 27.61 |
+| Future-view construction | 0.014 | 0.024 | 0.389 |
+
+Future-view construction is not the useful target in this fixture. The observed
+sweep includes full geometry as well as footprint/evidence work; timing this
+family alone does not attribute every millisecond to footprint construction.
+Source inspection identifies a candidate to test: adjacent motion segments visit
+identical endpoint poses, while body_observation_footprint rebuilds time-independent
+cell geometry. A one-entry exact-pose cache bound to the immutable map could reuse
+those cells while still checking every cell's current hits, future/expiry limits,
+original occupied exemption, and the complete geometry/boundary sweep. No such
+cache or relaxed guard is included in this instrumentation change.
+
+## One-entry footprint-cell geometry reuse
+
+The observed-motion checker now offers a borrowed context tied to one immutable
+surface snapshot, original occupied-cell exemption, boundary and age policy.
+It retains only the last successful footprint **cell set**, keyed by the exact
+seven floating-point bit patterns of position and quaternion. A hit returns a
+borrowed BTreeSet: no cell-set clone, new hash, lock or copied point cloud. A miss
+replaces that one entry; failed footprint construction is not cached. There is
+one context for the geometric callback and one for the period callback, hence
+**two one-entry contexts per control selection**, both dropped before returning.
+Intermediate/contact samples can evict an endpoint; sampling is never reordered
+to improve the hit rate.
+
+Only time-independent footprint geometry is reused by this new context. Whenever
+the pre-existing exact-time motion memoization invokes the observation checker,
+full geometric/boundary checks and all non-exempt cells' current `now + elapsed`,
+hit, future-tolerance and age checks still execute. This new footprint cache stores
+no permission/failure results; the existing outer motion-result memoization is
+unchanged, and the exemption never grows.
+The prior `validate_observed_body_motion_in_boundary` method remains the unchanged,
+uncached independent oracle. No input domain, dynamics, horizon or publication
+fence changes are part of this optimization.
+
+Validation and evidence:
+
+- Focused checker/cache tests: 4 passed, including exact first-error parity,
+  same-pose TTL crossing, future-time boundaries, hits, invalid inputs, rotation,
+  boundary and separate map/view contexts, bit-exact keys and one-entry eviction
+- Full MLS regression: 220 passed, 3 opt-in ignored (`footprint-mls-full.log`)
+- A subsequent test-only adjacent-engine-sample case passed: **14 footprint
+  queries, 8 builds, 6 hits**, with every returned cell set equal to uncached
+  construction (`footprint-work-count.log`). This is geometry-work evidence,
+  not a timing or permission-qualification result
+- Runtime surface tests: 42 passed
+- Held continuity: six fresh nonzero held commands plus later admission, zero
+  delivered negatives, 1.081196 m travel; all independent postrun oracles passed
+- Factory OFF/ON: both reached the unchanged 0.15 m / 0.15 rad goal region with
+  zero delivered negatives. OFF 22.05 s, 326 nonzero commands, 0.940063 m travel,
+  position/yaw errors 0.059937 m / 0.137495 rad. ON 20.90 s, 310 commands,
+  0.855063 m travel, errors 0.144937 m / 0.137515 rad
+
+In the matched unoptimized + debuginfo held experiments, observed-sweep wall
+median/p95 changed from 14.44/21.28 to 10.32/15.11 ms. Overall control
+median/p95/max changed from 26.22/40.40/46.95 to 24.81/32.06/39.65 ms. These are
+sampled run comparisons, not hard bounds or deployed-hardware capacity claims;
+the earlier failed deadline experiments remain recorded. Future-view construction
+was already small and was not changed. Delayed first issuance, predecessor
+activation and downstream expiry remain the independent open limitations.
+
+
+## Dense doorway intent correction
+
+The complete original downstream doorway regression now passes with the shared translation-advice default. Long future-route connector checks no longer veto calibrated nonrotation intent before the unchanged current-state body/observation/boundary/reaction/braking guard can evaluate a command. Scalar corner/reversal/rotation bounds, pivot progress, speed limits and strict arrival remain. See [the captured failure, failed trials and final qualification](navigation-dense-doorway-diagnostics.md). The final runtime suite has 146 passes (five previously documented sandbox UDS exclusions), ordinary factory ON/OFF and held-planning trials pass, and the original downstream test passes with all existing variants. This is a functional correction and removal of repeated lookahead work; dense control costs and delayed first-issuance/downstream expiry limitations remain explicitly open.

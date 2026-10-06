@@ -456,6 +456,7 @@ mod tests {
     #[test]
     fn complete_fine_manifest_resolves_a_real_door_across_storage_blocks() {
         use nuwax_nav_mls_planner::{SurfaceMapBuilder,SurfaceBodyEnvelope,mls_planner::Config};
+        let capture=std::env::var("NEH_DOOR_CAPTURE_PATH").ok();
         let repository=Repository::temporary().unwrap();let mut reader=reader(repository.clone());
         let fine=f64::from(0.01_f32);let width=32.0*fine;
         let config=Config {world_frame:"map".into(),voxel_size:0.1,robot_height:0.1,
@@ -523,14 +524,68 @@ mod tests {
                     follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
                     follower.update_odometry(stamped(current,time));
                     follower.replace_execution_path(ExecutionPath::Surface(Path3D {
-                        poses:route.into_iter().map(|p|stamped(p,time)).collect()}),None,stamped(goal,time)).unwrap();
+                        poses:route.iter().copied().map(|p|stamped(p,time)).collect()}),None,stamped(goal,time)).unwrap();
                     let mut applied=Twist2::ZERO;let mut reached=false;
-                    for _ in 0..240 {
+                    let mut inputs=Vec::new();
+                    for tick in 0..240 {
+                        if capture.is_some() {inputs.push((current,[applied.linear.x,applied.linear.y,applied.angular_z],time));}
                         let mut arriving=false;
                         let command=match follower.step(0.32) {
                             PlannerStep::Command(command)=>command,
                             PlannerStep::Succeeded=>{arriving=true;Twist2::ZERO},
-                            other=>panic!("真实窄门闭环不能卡住：角度{heading} {other:?} {current:?}"),
+                            other=>{
+                                if let Some(destination)=&capture {
+                                    let envelope=map.body_envelope().unwrap();
+                                    let cfg=map.config();
+                                    let body_bits=|p:([f64;3],[f64;4])|(p.0.map(f64::to_bits),p.1.map(f64::to_bits));
+                                    let config_json=serde_json::json!({
+                                        "world_frame":cfg.world_frame,"voxel_size":cfg.voxel_size,
+                                        "robot_height":cfg.robot_height,"surface_closing_radius":cfg.surface_closing_radius,
+                                        "node_spacing_m":cfg.node_spacing_m,"wall_clearance_m":cfg.wall_clearance_m,
+                                        "wall_buffer_m":cfg.wall_buffer_m,"wall_buffer_weight":cfg.wall_buffer_weight,
+                                        "max_slope_deg":cfg.max_slope_deg,"step_threshold_m":cfg.step_threshold_m,
+                                        "min_step_tread_depth_m":cfg.min_step_tread_depth_m,
+                                        "step_penalty_weight":cfg.step_penalty_weight,"goal_tolerance":cfg.goal_tolerance,
+                                        "viz_publish_hz":cfg.viz_publish_hz});
+                                    let config_bits=serde_json::json!({
+                                        "voxel_size":cfg.voxel_size.to_bits(),"robot_height":cfg.robot_height.to_bits(),
+                                        "surface_closing_radius":cfg.surface_closing_radius.to_bits(),
+                                        "node_spacing_m":cfg.node_spacing_m.to_bits(),"wall_clearance_m":cfg.wall_clearance_m.to_bits(),
+                                        "wall_buffer_m":cfg.wall_buffer_m.to_bits(),"wall_buffer_weight":cfg.wall_buffer_weight.to_bits(),
+                                        "max_slope_deg":cfg.max_slope_deg.to_bits(),"step_threshold_m":cfg.step_threshold_m.to_bits(),
+                                        "min_step_tread_depth_m":cfg.min_step_tread_depth_m.to_bits(),
+                                        "step_penalty_weight":cfg.step_penalty_weight.to_bits(),"goal_tolerance":cfg.goal_tolerance.to_bits(),
+                                        "viz_publish_hz":cfg.viz_publish_hz.to_bits()});
+                                    let body_scalars=[envelope.z_bounds_m[0],envelope.z_bounds_m[1],
+                                        envelope.body_to_support_z_m,envelope.max_step_up_m,envelope.max_step_down_m,
+                                        envelope.max_cross_slope_deg,envelope.support_uncertainty_m];
+                                    let recipe=serde_json::json!({"gap":gap,"revision":revision,
+                                        "fine_resolution_bits":map.source_voxel_size_m().to_bits(),"keys_count":keys.len(),
+                                        "config":config_json,"config_float_bits":config_bits,
+                                        "footprint_xy_m":&envelope.footprint_xy_m,
+                                        "footprint_xy_bits":envelope.footprint_xy_m.iter().map(|p|p.map(f64::to_bits)).collect::<Vec<_>>(),
+                                        "body_scalars":body_scalars,"body_scalar_bits":body_scalars.map(f64::to_bits)});
+                                    let mut record=serde_json::json!({
+                                        "schema":"dense-doorway-input-trace-v1", "heading":heading,
+                                        "aligned":aligned,"tick":tick,"time_ns":time,
+                                        "current":current,"applied":[applied.linear.x,applied.linear.y,applied.angular_z],
+                                        "goal":goal,"progress_m":follower.progress_m(),"outcome":format!("{other:?}"),
+                                        "simulation":true,"control_frequency":20.0,"speed":0.3,
+                                        "allow_reverse":options.allow_reverse,
+                                        "position_tolerance_m":options.position_tolerance_m,
+                                        "yaw_tolerance_rad":options.yaw_tolerance_rad,"source_recipe":recipe});
+                                    record["route"]=serde_json::to_value(&route).unwrap();
+                                    record["inputs"]=serde_json::to_value(&inputs).unwrap();
+                                    record["current_bits"]=serde_json::to_value(body_bits(current)).unwrap();
+                                    record["goal_bits"]=serde_json::to_value(body_bits(goal)).unwrap();
+                                    record["applied_bits"]=serde_json::to_value([applied.linear.x,applied.linear.y,applied.angular_z].map(f64::to_bits)).unwrap();
+                                    record["route_bits"]=serde_json::to_value(route.iter().map(|p|body_bits(*p)).collect::<Vec<_>>()).unwrap();
+                                    record["input_bits"]=serde_json::to_value(inputs.iter().map(|(p,a,t)|(body_bits(*p),(*a).map(f64::to_bits),*t)).collect::<Vec<_>>()).unwrap();
+                                    std::fs::write(destination,serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+                                    eprintln!("DOOR_CAPTURE path={destination} aligned={aligned} heading={heading:?} tick={tick} route_len={}",route.len());
+                                }
+                                panic!("真实窄门闭环不能卡住：角度{heading} aligned={aligned} tick={tick} {other:?} {current:?}");
+                            },
                         };
                         assert!(command.linear.x>=0.0 && command.linear.y==0.0,"窄门也不能横走倒退");
                         let next_applied=Twist2 {linear:Point2::new(applied.linear.x+(command.linear.x-applied.linear.x).clamp(-0.05,0.05),0.0),
@@ -574,6 +629,8 @@ mod tests {
         }
         assert_eq!(reads, vec![257, 257, 257]);
     }
+include!("surface_chunks_doorway_diagnostics.rs");
+
 }
 
 #[cfg(test)]

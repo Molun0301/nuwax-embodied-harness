@@ -46,5 +46,7 @@ approx = { workspace = true }
 
 [features]
 default = []
+# Opt-in fixed-size, thread-local wall-time attribution for body queries.
+body-query-profile = []
 # 占位 feature:不再实际启用 pyo3,保留以兼容 stack 的 feature 约定
 python-bindings = []

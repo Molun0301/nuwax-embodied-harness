@@ -26,6 +26,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
+mod command_dispatch;
+pub use command_dispatch::CommandDispatchBound;
 mod planner_worker;
 pub mod surface_follower;
 pub use nuwax_nav_mls_planner::SurfaceSnapshot;
@@ -37,6 +39,8 @@ mod route_planning;
 mod route_moving_worker_tests;
 #[cfg(test)]
 mod control_profile;
+#[cfg(test)]
+mod command_proof_trace;
 pub use route_follower::RouteFollower;
 
 /// 局部执行保留路径维度，三维路径不能通过默认适配静默丢弃高度。
@@ -503,6 +507,15 @@ pub struct FenceProof {
     pub lease: FenceLeaseState,
 }
 
+/// Result of bounded receiving admission; expiry never claims the lease is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedTwistOutcome {
+    /// The exact request was acknowledged as applied.
+    Applied(AppliedProof),
+    /// No new command was applied because its observation issue bound expired.
+    ExpiredNotApplied,
+}
+
 /// Mutable motion boundary owned by exactly one scheduler task.
 #[async_trait]
 pub trait NavMotionPort: Send + 'static {
@@ -522,6 +535,16 @@ pub trait NavMotionPort: Send + 'static {
         operation_id: &str,
         twist: Twist2,
     ) -> Result<AppliedProof, MotionPortError>;
+    /// Submit with the original observation issue bound enforced at receiving admission.
+    /// Legacy ports must explicitly implement finite bounds rather than ignoring them.
+    async fn submit_twist_bounded(
+        &mut self, operation_id: &str, twist: Twist2, bound: Option<CommandDispatchBound>,
+    ) -> Result<BoundedTwistOutcome, MotionPortError> {
+        if bound.is_some() {
+            return Err(MotionPortError::new("motion port does not support observation dispatch deadlines"));
+        }
+        self.submit_twist(operation_id,twist).await.map(BoundedTwistOutcome::Applied)
+    }
     /// Revoke the lease, apply zero, and return terminal fence proof.
     async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<FenceProof, MotionPortError>;
     /// Preempt an ordinary exchange and fence over an independent priority path.
@@ -591,6 +614,27 @@ impl NavMotionPort for MotionGuardClient {
             operation_id: confirmation.operation_id,
             applied_monotonic_ns: confirmation.applied_monotonic_ns,
         })
+    }
+
+    async fn submit_twist_bounded(
+        &mut self, operation_id:&str, twist:Twist2, bound:Option<CommandDispatchBound>,
+    )->Result<BoundedTwistOutcome,MotionPortError> {
+        let Some(bound)=bound else {
+            return <Self as NavMotionPort>::submit_twist(self,operation_id,twist).await.map(BoundedTwistOutcome::Applied);
+        };
+        if bound.expired_now() {return Ok(BoundedTwistOutcome::ExpiredNotApplied);}
+        let Some(deadline)=bound.monotonic_deadline() else {return Ok(BoundedTwistOutcome::ExpiredNotApplied);};
+        let result=self.submit_twist_before(operation_id,TwistCommand {
+            linear_x_mps:twist.linear.x,linear_y_mps:twist.linear.y,angular_z_rps:twist.angular_z,
+        },deadline).await;
+        match result {
+            Ok(proof)=>Ok(BoundedTwistOutcome::Applied(AppliedProof {
+                operation_id:proof.operation_id,applied_monotonic_ns:proof.applied_monotonic_ns,
+            })),
+            Err(MotionGuardClientError::DispatchExpired{..})=>Ok(BoundedTwistOutcome::ExpiredNotApplied),
+            Err(MotionGuardClientError::Remote{code,..}) if code=="DEADLINE_EXCEEDED"=>Ok(BoundedTwistOutcome::ExpiredNotApplied),
+            Err(error)=>Err(error.into()),
+        }
     }
 
     async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<FenceProof, MotionPortError> {
@@ -693,6 +737,14 @@ impl NavMotionPort for ProductionNavMotionPort {
         .await
     }
 
+    async fn submit_twist_bounded(
+        &mut self, operation_id:&str, twist:Twist2, bound:Option<CommandDispatchBound>,
+    )->Result<BoundedTwistOutcome,MotionPortError> {
+        // Preserve the absolute bound across a possible connection await.
+        <MotionGuardClient as NavMotionPort>::submit_twist_bounded(
+            self.normal_client().await?,operation_id,twist,bound).await
+    }
+
     async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<FenceProof, MotionPortError> {
         self.priority_revoke_and_zero(operation_id).await
     }
@@ -762,6 +814,7 @@ struct LocalExecutionCommandIntent {
     sequence: u64,
     owner_runtime_generation: u64,
     payload: LocalExecutionPayload,
+    dispatch_bound: Option<CommandDispatchBound>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -775,6 +828,9 @@ enum LocalExecutionPayload {
 
 /// Synchronous deterministic planner boundary.
 pub trait NavPlanner: Send + 'static {
+    /// Take observation timing metadata belonging only to the immediately returned command.
+    /// None means that this result has no finite observation-time dependency.
+    fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {None}
     /// 传递既有导航会话标识用于计算线程日志，不参与运动准入。
     fn set_goal_log_context(&mut self, _goal_id: &str) {}
     /// 接续局部路线时保留已受理任务边界；无局部重规划的后端可沿原全局路径。
@@ -1569,7 +1625,10 @@ where
         match intent.payload {
             LocalExecutionPayload::Command(twist) => {
                 let wait_reason = self.planner.execution_wait_reason();
-                self.apply_controller_twist(status_tx, twist).await?;
+                if !self.apply_controller_twist_with_bound(status_tx, twist, intent.dispatch_bound).await? {
+                    self.path_wait_started_at.get_or_insert_with(Instant::now);
+                    return self.check_path_wait_timeout(status_tx).await;
+                }
                 if twist == Twist2::ZERO {
                     if let Some(reason) = wait_reason {
                         self.status.message = reason;
@@ -1619,41 +1678,50 @@ where
 
     /// 运动和等待重规划的零速共用同一提交与回执校验路径。
     async fn apply_controller_twist(
-        &mut self,
-        status_tx: &watch::Sender<SchedulerStatus>,
-        twist: Twist2,
-    ) -> Result<(), RuntimeError> {
-        if let Err(error) = validate_twist(twist) {
-            return Err(self.fail_closed(status_tx, error).await);
+        &mut self, status_tx:&watch::Sender<SchedulerStatus>, twist:Twist2,
+    )->Result<(),RuntimeError> {
+        self.apply_controller_twist_with_bound(status_tx,twist,None).await.map(|_|())
+    }
+
+    // False means the selected command expired and an ordinary zero was confirmed.
+    async fn apply_controller_twist_with_bound(
+        &mut self, status_tx:&watch::Sender<SchedulerStatus>, twist:Twist2,
+        mut bound:Option<CommandDispatchBound>,
+    )->Result<bool,RuntimeError> {
+        if let Err(error)=validate_twist(twist) {return Err(self.fail_closed(status_tx,error).await);}
+        if self.motion.renewal_due_at().is_some_and(|due|Instant::now()>=due) {
+            if let Err(error)=self.renew().await {return Err(self.fail_closed(status_tx,error).await);}
         }
-        // 控制步骤可能跨过续租时刻；在进入下一次有界通信前再核对一次。
-        if self.motion.renewal_due_at().is_some_and(|due| Instant::now() >= due) {
-            if let Err(error) = self.renew().await {
-                return Err(self.fail_closed(status_tx, error).await);
+        let mut applied_twist=twist;
+        let mut expired=false;
+        loop {
+            // This check is after renewal. The concrete port also checks after
+            // any connection await and caps the receiver's existing deadline.
+            if bound.is_some_and(CommandDispatchBound::expired_now) {
+                applied_twist=Twist2::ZERO;bound=None;expired=true;
             }
-        }
-        let operation_id = self.next_operation_id("twist")?;
-        let proof = match self.motion.submit_twist(&operation_id, twist).await {
-            Ok(proof) => proof,
-            Err(error) => {
-                let error = RuntimeError::Motion(error.message);
-                return Err(self.fail_closed(status_tx, error).await);
+            let operation_id=self.next_operation_id("twist")?;
+            let proof=match self.motion.submit_twist_bounded(&operation_id,applied_twist,bound).await {
+                Ok(BoundedTwistOutcome::Applied(proof))=>proof,
+                Ok(BoundedTwistOutcome::ExpiredNotApplied) if bound.is_some()=>{
+                    applied_twist=Twist2::ZERO;bound=None;expired=true;continue;
+                },
+                Ok(BoundedTwistOutcome::ExpiredNotApplied)=>{
+                    return Err(self.fail_closed(status_tx,RuntimeError::Motion("unbounded zero submission reported observation expiry".into())).await);
+                },
+                Err(error)=>return Err(self.fail_closed(status_tx,RuntimeError::Motion(error.message)).await),
+            };
+            if proof.operation_id!=operation_id || proof.applied_monotonic_ns==0 {
+                let reason=format!("expected operation_id={operation_id}, got {} at {}",proof.operation_id,proof.applied_monotonic_ns);
+                return Err(self.fail_closed(status_tx,RuntimeError::InvalidApplied(reason)).await);
             }
-        };
-        if proof.operation_id != operation_id || proof.applied_monotonic_ns == 0 {
-            let reason = format!(
-                "expected operation_id={operation_id}, got {} at {}",
-                proof.operation_id, proof.applied_monotonic_ns
-            );
-            let error = RuntimeError::InvalidApplied(reason);
-            return Err(self.fail_closed(status_tx, error).await);
+            self.status.applied_commands=self.status.applied_commands.saturating_add(1);
+            self.status.last_applied_twist=Some(applied_twist);
+            self.planner.observe_applied_command(applied_twist);
+            self.status.message=if expired {"观察扫掠凭据在下发前已过期，零速已执行，等待重新计算".into()}else{"twist APPLIED".into()};
+            self.publish_status(status_tx);
+            return Ok(!expired);
         }
-        self.status.applied_commands = self.status.applied_commands.saturating_add(1);
-        self.status.last_applied_twist = Some(twist);
-        self.planner.observe_applied_command(twist);
-        self.status.message = "twist APPLIED".into();
-        self.publish_status(status_tx);
-        Ok(())
     }
 
     fn wrap_local_intent(
@@ -1676,6 +1744,8 @@ where
                     "local planner produced an intent without an active session".into(),
                 )
             })?;
+        let candidate_bound=self.planner.take_command_dispatch_bound();
+        let dispatch_bound=if matches!(&step,PlannerStep::Command(v) if *v!=Twist2::ZERO) {candidate_bound}else{None};
         let payload = match step {
             PlannerStep::Command(twist) => LocalExecutionPayload::Command(twist),
             PlannerStep::Pending(failures) => LocalExecutionPayload::Pending(failures),
@@ -1688,6 +1758,7 @@ where
             sequence: self.local_intent_sequence,
             owner_runtime_generation,
             payload,
+            dispatch_bound,
         })
     }
 
@@ -4816,4 +4887,6 @@ mod tests {
             collect_real_uds_cancel_latencies(DelayedOperation::FenceResponse).await,
         );
     }
+    include!("dispatch_handoff_tests.rs");
+
 }

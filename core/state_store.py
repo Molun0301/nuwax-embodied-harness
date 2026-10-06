@@ -72,6 +72,14 @@ class StateStore:
             latest = self._latest_by_namespace[namespace]
             if latest is None or entry.updated_at >= latest.updated_at:
                 self._latest_by_namespace[namespace] = entry
+            elif latest.key == key:
+                # Replacing the cached entry with an older timestamp invalidates
+                # that entry. Scan only this exceptional path; prefer the new
+                # write on an equal timestamp, as on the normal path above.
+                self._latest_by_namespace[namespace] = max(
+                    self._store[namespace].values(),
+                    key=lambda candidate: (candidate.updated_at, candidate is entry),
+                )
         return entry
 
     def write_from_provider(

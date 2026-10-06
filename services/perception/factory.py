@@ -37,6 +37,7 @@ def build_platform_perception_components(config: "NuwaxRobotBridgeConfig") -> Di
                 class_aliases=config.perception.yolo_world.class_aliases,
                 dynamic_class_metadata_keys=config.perception.yolo_world.dynamic_class_metadata_keys,
                 use_worker_process=config.perception.yolo_world.use_worker_process,
+                worker_retry_backoff_sec=config.perception.stream_runtime.failure_backoff_sec,
             ),
         )
 

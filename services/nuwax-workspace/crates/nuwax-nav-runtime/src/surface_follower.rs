@@ -143,6 +143,7 @@ pub struct SurfaceFollower {
     alignment_target_index: Option<usize>,
     options: nuwax_nav_types_messages::GoalOptions,
     last_command: Twist2,
+    last_command_dispatch_bound: Option<crate::CommandDispatchBound>,
     braking_deadline: Option<std::time::Instant>,
     simulation_braking_deadline_ns: Option<i64>,
     control_target: Option<nuwax_nav_control::PlanarPose>,
@@ -173,11 +174,18 @@ impl SurfaceFollower {
             alignment_target_index: None,
             options:Default::default(),
             last_command:Twist2::ZERO,
+            last_command_dispatch_bound:None,
             braking_deadline:None,
             simulation_braking_deadline_ns:None,
             control_target:None,
             body_view_dirty: true,
         })
+    }
+
+    /// Consume only the most recent successful nonzero step's observation-time
+    /// qualification. This neither validates a newer pose nor grants a lease.
+    pub(crate) fn take_command_dispatch_bound(&mut self) -> Option<crate::CommandDispatchBound> {
+        self.last_command_dispatch_bound.take()
     }
 
     /// 当前累计三维进度，供状态诊断与行为回归使用。
@@ -221,6 +229,7 @@ impl SurfaceFollower {
     }
 
     fn admit_path(&mut self, path: Path3D, goal: PoseStamped) -> Result<(), RuntimeError> {
+        self.last_command_dispatch_bound = None;
         self.refresh_current_body_view();
         if path.poses.is_empty() {
             return Err(rejected("三维路径为空"));
@@ -618,8 +627,13 @@ impl SurfaceFollower {
 }
 
 impl NavPlanner for SurfaceFollower {
-    fn configure_boundary(&mut self,boundary:&[[f64;2]]) {self.boundary=boundary.to_vec();}
+    fn take_command_dispatch_bound(&mut self)->Option<crate::CommandDispatchBound> {SurfaceFollower::take_command_dispatch_bound(self)}
+    fn configure_boundary(&mut self,boundary:&[[f64;2]]) {
+        self.last_command_dispatch_bound = None;
+        self.boundary=boundary.to_vec();
+    }
     fn configure_goal(&mut self, _goal:&PoseStamped, options:nuwax_nav_types_messages::GoalOptions)->Result<(),RuntimeError> {
+        self.last_command_dispatch_bound = None;
         options.validate().map_err(|reason|RuntimeError::InvalidInput {field:"goal_options",reason})?;
         // 新目标执行仍须取得守卫准入；旧规划器内部状态不能代替该证明。
         self.braking_deadline = None;
@@ -642,6 +656,7 @@ impl NavPlanner for SurfaceFollower {
         yaws: Option<Vec<f64>>,
         goal: PoseStamped,
     ) -> Result<(), RuntimeError> {
+        self.last_command_dispatch_bound = None;
         match path {
             ExecutionPath::Surface(path) if yaws.is_none() => self.admit_path(path, goal),
             _ => Err(rejected(
@@ -651,6 +666,7 @@ impl NavPlanner for SurfaceFollower {
     }
 
     fn update_odometry(&mut self, odometry: PoseStamped) {
+        self.last_command_dispatch_bound = None;
         // 新时间戳仍交给观察时效检查；几何完全相同的重复位姿不重建足迹。
         if self.odometry.as_ref().is_none_or(|previous|
             previous.pose != odometry.pose || previous.frame_id != odometry.frame_id)
@@ -661,12 +677,14 @@ impl NavPlanner for SurfaceFollower {
     }
 
     fn update_costmap(&mut self, _costmap: CostMap2D) {
+        self.last_command_dispatch_bound = None;
         self.map = None;
         self.source_map = None;
         self.invalid_input = Some("三维后端拒绝二维占据图".into());
     }
 
     fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
+        self.last_command_dispatch_bound = None;
         match map {
             ExecutionMap::Surface(map) => {
                 if map.config().world_frame != "map" {
@@ -690,10 +708,12 @@ impl NavPlanner for SurfaceFollower {
     }
 
     fn observe_applied_command(&mut self, command:Twist2) {
+        self.last_command_dispatch_bound = None;
         self.last_command=command;
     }
 
     fn step(&mut self, robot_width_m: f64) -> PlannerStep {
+        self.last_command_dispatch_bound = None;
         self.refresh_current_body_view();
         self.follow_step(robot_width_m)
     }
@@ -908,6 +928,33 @@ mod tests {
         }).unwrap();
         follower.replace_execution_path(ExecutionPath::Surface(Path3D{poses}),None,goal).unwrap();
         (follower,map)
+    }
+
+    #[test]
+    fn observation_dispatch_bound_is_single_use_and_lifecycle_scoped() {
+        let anchor=crate::command_dispatch::ObservationClockAnchor {
+            monotonic:std::time::Instant::now(),unix_ns:100,
+        };
+        let bound=crate::CommandDispatchBound::from_anchor(anchor,200);
+        let mut follower=SurfaceFollower::new(SurfaceFollowerConfig::new(0.3)).unwrap();
+        follower.last_command_dispatch_bound=Some(bound);
+        assert_eq!(follower.take_command_dispatch_bound(),Some(bound));
+        assert_eq!(follower.take_command_dispatch_bound(),None);
+        let pose=body_pose([1.0,1.0,0.4],Quaternion::IDENTITY,0);
+        for operation in 0..8 {
+            follower.last_command_dispatch_bound=Some(bound);
+            match operation {
+                0=>follower.configure_boundary(&[]),
+                1=>{follower.configure_goal(&pose,GoalOptions::default()).unwrap();},
+                2=>follower.update_odometry(pose.clone()),
+                3=>follower.observe_applied_command(Twist2::ZERO),
+                4=>{follower.update_execution_map(ExecutionMap::Surface(test_snapshot(0.0,false))).unwrap();},
+                5=>{assert!(follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:vec![]}),None,pose.clone()).is_err());},
+                6=>follower.stop(),
+                _=>{let _=follower.step(0.2);},
+            }
+            assert_eq!(follower.take_command_dispatch_bound(),None,"lifecycle operation {operation}");
+        }
     }
 
     #[test]

@@ -75,6 +75,16 @@ pub struct ExplorationSession {
     blacklisted_goals: Vec<BlacklistedGoal>,
 }
 
+/// The three scalar changes produced by an information-gain check.
+/// It contains no goal history; dropping it leaves the session unchanged.
+#[derive(Debug)]
+#[must_use = "commit this delta only when accepting its prepared selection"]
+pub struct InformationGainDelta {
+    last_information_count: Option<u64>,
+    last_information_completed_goals: usize,
+    no_gain_counter: u32,
+}
+
 impl ExplorationSession {
     /// 恢复只接纳有界、有限且自洽的确认历史；动态地图缓存不进入此载荷。
     pub fn validate_checkpoint(&self)->Result<(),String> {
@@ -265,14 +275,33 @@ impl ExplorationSession {
         grid: &nuwax_nav_types_messages::grid::OccupancyGrid2D,
         cfg: &WavefrontConfig,
     ) -> Option<crate::frontier_goal::StopReason> {
+        let (reason, delta) = self.prepare_information_gain(grid, cfg);
+        self.commit_information_gain(delta);
+        reason
+    }
+
+    /// Evaluate information gain using borrowed history and return a narrow scalar delta.
+    /// Resolve it before changing completed-goal history or preparing another selection.
+    #[must_use]
+    pub fn prepare_information_gain(
+        &self,
+        grid: &nuwax_nav_types_messages::grid::OccupancyGrid2D,
+        cfg: &WavefrontConfig,
+    ) -> (
+        Option<crate::frontier_goal::StopReason>,
+        InformationGainDelta,
+    ) {
         let current_info = self.information_count(grid, cfg);
         let last = self.last_information_count;
         let completed_goals = self.explored_goals.len();
         let has_new_completed_goal = completed_goals > self.last_information_completed_goals;
-        self.last_information_completed_goals = completed_goals;
+        let mut delta = InformationGainDelta {
+            last_information_count: Some(current_info),
+            last_information_completed_goals: completed_goals,
+            no_gain_counter: self.no_gain_counter,
+        };
         if last.is_none() {
-            self.last_information_count = Some(current_info);
-            return None;
+            return (None, delta);
         }
         let last = last.expect("checked is_some above");
         let stop_reason = if has_new_completed_goal
@@ -281,22 +310,28 @@ impl ExplorationSession {
         {
             let gain_ratio = (current_info as f64 - last as f64) / (last as f64);
             if gain_ratio < cfg.info_gain_threshold_ratio {
-                self.no_gain_counter = self.no_gain_counter.saturating_add(1);
-                if self.no_gain_counter >= cfg.num_no_gain_attempts {
-                    self.no_gain_counter = 0;
+                delta.no_gain_counter = delta.no_gain_counter.saturating_add(1);
+                if delta.no_gain_counter >= cfg.num_no_gain_attempts {
+                    delta.no_gain_counter = 0;
                     Some(crate::frontier_goal::StopReason::NoInformationGain)
                 } else {
                     None
                 }
             } else {
-                self.no_gain_counter = 0;
+                delta.no_gain_counter = 0;
                 None
             }
         } else {
             None
         };
-        self.last_information_count = Some(current_info);
-        stop_reason
+        (stop_reason, delta)
+    }
+
+    /// Accept the three information-gain scalar changes from a prepared selection.
+    pub fn commit_information_gain(&mut self, delta: InformationGainDelta) {
+        self.last_information_count = delta.last_information_count;
+        self.last_information_completed_goals = delta.last_information_completed_goals;
+        self.no_gain_counter = delta.no_gain_counter;
     }
 
     /// Keep confirmed world positions and publication counts, not old planning/retry decisions.
@@ -341,6 +376,104 @@ fn point_distance(a: Point2, b: Point2) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    fn frozen_information_gain(
+        session: &mut ExplorationSession,
+        grid: &OccupancyGrid2D,
+        cfg: &WavefrontConfig,
+    ) -> Option<crate::frontier_goal::StopReason> {
+        let current_info = session.information_count(grid, cfg);
+        let last = session.last_information_count;
+        let completed_goals = session.explored_goals.len();
+        let has_new_completed_goal = completed_goals > session.last_information_completed_goals;
+        session.last_information_completed_goals = completed_goals;
+        if last.is_none() {
+            session.last_information_count = Some(current_info);
+            return None;
+        }
+        let last = last.expect("checked is_some above");
+        let stop_reason = if has_new_completed_goal
+            && completed_goals as u32 > cfg.min_goals_before_no_gain_check
+            && last > 0
+        {
+            let gain_ratio = (current_info as f64 - last as f64) / (last as f64);
+            if gain_ratio < cfg.info_gain_threshold_ratio {
+                session.no_gain_counter = session.no_gain_counter.saturating_add(1);
+                if session.no_gain_counter >= cfg.num_no_gain_attempts {
+                    session.no_gain_counter = 0;
+                    Some(crate::frontier_goal::StopReason::NoInformationGain)
+                } else {
+                    None
+                }
+            } else {
+                session.no_gain_counter = 0;
+                None
+            }
+        } else {
+            None
+        };
+        session.last_information_count = Some(current_info);
+        stop_reason
+    }
+
+    #[test]
+    fn prepared_information_matches_frozen_scalars_and_discard_preserves_history() {
+        let cfg = WavefrontConfig {
+            min_goals_before_no_gain_check: 0,
+            num_no_gain_attempts: 2,
+            ..WavefrontConfig::default()
+        };
+        let mut direct = ExplorationSession::new();
+        let mut prepared = ExplorationSession::new();
+        let mut grid = empty_grid(10, 10);
+        for step in 0..12 {
+            grid.cells[..(20 + step * 3)].fill(OccupancyCell::Free);
+            if step % 3 != 0 {
+                let goal = Point2::new(step as f64, 0.0);
+                direct.record_goal_reached(goal);
+                prepared.record_goal_reached(goal);
+            }
+            let before = serde_json::to_value(&prepared).unwrap();
+            let (_, discarded) = prepared.prepare_information_gain(&grid, &cfg);
+            drop(discarded);
+            assert_eq!(before, serde_json::to_value(&prepared).unwrap());
+            let expected = frozen_information_gain(&mut direct, &grid, &cfg);
+            let (actual, delta) = prepared.prepare_information_gain(&grid, &cfg);
+            assert_eq!(actual, expected);
+            prepared.commit_information_gain(delta);
+            assert_eq!(
+                serde_json::to_value(&direct).unwrap(),
+                serde_json::to_value(&prepared).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn discarded_no_gain_stop_does_not_consume_completed_goal_or_reset_counter() {
+        let cfg = WavefrontConfig {
+            min_goals_before_no_gain_check: 0,
+            num_no_gain_attempts: 1,
+            ..WavefrontConfig::default()
+        };
+        let mut grid = empty_grid(4, 4);
+        grid.cells.fill(OccupancyCell::Free);
+        let mut session = ExplorationSession::new();
+        session.check_information_gain(&grid, &cfg);
+        session.record_goal_reached(Point2::new(1.0, 1.0));
+        let before = serde_json::to_value(&session).unwrap();
+        let (reason, discarded) = session.prepare_information_gain(&grid, &cfg);
+        assert_eq!(
+            reason,
+            Some(crate::frontier_goal::StopReason::NoInformationGain)
+        );
+        drop(discarded);
+        assert_eq!(before, serde_json::to_value(&session).unwrap());
+        let (again, accepted) = session.prepare_information_gain(&grid, &cfg);
+        assert_eq!(again, reason);
+        session.commit_information_gain(accepted);
+        assert_eq!(session.last_information_completed_goals, 1);
+        assert_eq!(session.no_gain_counter, 0);
+    }
+
     #[test]
     fn legacy_replan_keeps_confirmed_world_history_and_resets_derived_state() {
         let mut session = super::ExplorationSession::new();

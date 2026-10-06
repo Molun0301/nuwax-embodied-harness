@@ -5,7 +5,7 @@
 pub mod observation;
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 /// 一次图查询得到的可达候选。代价使用同一安全图的路径长度（米）。
 #[derive(Clone, Debug)]
@@ -131,6 +131,15 @@ pub struct RegionalSchedule {
     round: u64,
     last_served: BTreeMap<[i64; 3], u64>,
 }
+/// Deferred membership update for one regional query; dropping it leaves history unchanged.
+/// Resolve before recording feedback or preparing from a different committed history.
+#[derive(Debug)]
+#[must_use = "commit this presence delta only when accepting the prepared selection"]
+pub struct RegionalPresenceDelta {
+    present: Option<BTreeSet<[i64; 3]>>,
+    first_seen_round: u64,
+}
+
 // JSON对象键不能表示三维数组，持久账本使用有界键值列表并检查重复。
 impl serde::Serialize for RegionalSchedule {
     fn serialize<S:serde::Serializer>(&self,serializer:S)->Result<S::Ok,S::Error> {
@@ -183,22 +192,42 @@ impl RegionalSchedule {
         observations: Option<&[std::collections::BTreeSet<[i32; 3]>]>,
         costs: impl FnMut(usize, &[usize]) -> Vec<f64>,
     ) -> Option<Selection> {
+        let (selection, delta) = self.prepare_select_observed(candidates, observations, costs);
+        self.commit_selection(delta);
+        selection
+    }
+
+    /// Compute regional order without changing the waiting ledger or cloning its history.
+    /// An invalid observation-vector length yields a no-op delta; an empty valid query
+    /// clears membership when accepted, just like `select_observed`.
+    pub fn prepare_select_observed(
+        &self,
+        candidates: &[Candidate],
+        observations: Option<&[BTreeSet<[i32; 3]>]>,
+        costs: impl FnMut(usize, &[usize]) -> Vec<f64>,
+    ) -> (Option<Selection>, RegionalPresenceDelta) {
         if observations.is_some_and(|sets| sets.len() != candidates.len()) {
-            return None;
+            return (
+                None,
+                RegionalPresenceDelta {
+                    present: None,
+                    first_seen_round: self.round,
+                },
+            );
         }
-        let present: std::collections::BTreeSet<_> = candidates
+        let present: BTreeSet<_> = candidates
             .iter()
             .filter(|c| valid_candidate(c))
             .map(|c| region_key(c.position))
             .collect();
-        self.last_served.retain(|key, _| present.contains(key));
-        for key in present {
-            self.last_served.entry(key).or_insert(self.round);
-        }
+        // Newly present keys would be initialized at the current round, so cannot
+        // yet have waiting priority. Read old entries only if still present.
         let priority = self
             .last_served
             .iter()
-            .filter(|(_, served)| self.round.saturating_sub(**served) >= 8)
+            .filter(|(key, served)| {
+                present.contains(*key) && self.round.saturating_sub(**served) >= 8
+            })
             .min_by_key(|(key, served)| (**served, **key))
             .map(|(&key, &served)| (key, self.round.saturating_sub(served)));
         let mut result = select_with_priority(
@@ -206,13 +235,33 @@ impl RegionalSchedule {
             priority.map(|(key, _)| key),
             observations,
             costs,
-        )?;
-        if let Some((key, wait)) = priority {
+        );
+        if let (Some(result), Some((key, wait))) = (&mut result, priority) {
             if region_key(candidates[result.index].position) == key {
                 result.priority_wait_rounds = wait;
             }
         }
-        Some(result)
+        (
+            result,
+            RegionalPresenceDelta {
+                present: Some(present),
+                first_seen_round: self.round,
+            },
+        )
+    }
+
+    /// Accept a prepared query's membership changes without copying the history map.
+    /// The owner must resolve preparations before applying intervening feedback.
+    pub fn commit_selection(&mut self, delta: RegionalPresenceDelta) {
+        let Some(present) = delta.present else {
+            return;
+        };
+        self.last_served.retain(|key, _| present.contains(key));
+        for key in present {
+            self.last_served
+                .entry(key)
+                .or_insert(delta.first_seen_round);
+        }
     }
 }
 
@@ -410,6 +459,151 @@ fn select_with_priority(
 
 #[cfg(test)]
 mod tests {
+    fn frozen_select_observed(
+        schedule: &mut RegionalSchedule,
+        candidates: &[Candidate],
+        observations: Option<&[BTreeSet<[i32; 3]>]>,
+        costs: impl FnMut(usize, &[usize]) -> Vec<f64>,
+    ) -> Option<Selection> {
+        if observations.is_some_and(|sets| sets.len() != candidates.len()) {
+            return None;
+        }
+        let present: std::collections::BTreeSet<_> = candidates
+            .iter()
+            .filter(|c| valid_candidate(c))
+            .map(|c| region_key(c.position))
+            .collect();
+        schedule.last_served.retain(|key, _| present.contains(key));
+        for key in present {
+            schedule.last_served.entry(key).or_insert(schedule.round);
+        }
+        let priority = schedule
+            .last_served
+            .iter()
+            .filter(|(_, served)| schedule.round.saturating_sub(**served) >= 8)
+            .min_by_key(|(key, served)| (**served, **key))
+            .map(|(&key, &served)| (key, schedule.round.saturating_sub(served)));
+        let mut result = select_with_priority(
+            candidates,
+            priority.map(|(key, _)| key),
+            observations,
+            costs,
+        )?;
+        if let Some((key, wait)) = priority {
+            if region_key(candidates[result.index].position) == key {
+                result.priority_wait_rounds = wait;
+            }
+        }
+        Some(result)
+    }
+
+    fn assert_selection_eq(left: Option<Selection>, right: Option<Selection>) {
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                assert_eq!(left.index, right.index);
+                assert_eq!(left.priority_wait_rounds, right.priority_wait_rounds);
+                assert_eq!(left.regional_order, right.regional_order);
+                assert_eq!(left.route_cost, right.route_cost);
+                assert_eq!(left.region_count, right.region_count);
+            }
+            (None, None) => {}
+            pair => panic!("regional selection mismatch: {pair:?}"),
+        }
+    }
+
+    #[test]
+    fn prepared_regional_selection_matches_frozen_mutation_with_ties_and_disappearance() {
+        let candidates: Vec<_> = (0..11)
+            .map(|i| Candidate {
+                position: [i as f64 * 4.0, 0.0, 0.0],
+                gain: 1.0,
+                travel_cost: 1.0,
+            })
+            .collect();
+        let views: Vec<_> = (0..11)
+            .map(|i| BTreeSet::from([[i, 0, 0], [0, 0, 0]]))
+            .collect();
+        let mut direct = RegionalSchedule::default();
+        let mut prepared = RegionalSchedule::default();
+        for round in 0..24 {
+            let end = if round == 11 {
+                0
+            } else if round == 12 {
+                5
+            } else {
+                11
+            };
+            let observation_sets = (round % 2 == 0).then_some(&views[..end]);
+            let expected = frozen_select_observed(
+                &mut direct,
+                &candidates[..end],
+                observation_sets,
+                |_, targets| vec![1.0; targets.len()],
+            );
+            let (actual, delta) = prepared.prepare_select_observed(
+                &candidates[..end],
+                observation_sets,
+                |_, targets| vec![1.0; targets.len()],
+            );
+            assert_selection_eq(expected, actual);
+            prepared.commit_selection(delta);
+            assert_eq!(direct.last_served, prepared.last_served);
+            assert_eq!(direct.round, prepared.round);
+            direct.record_outcome(candidates[10].position);
+            prepared.record_outcome(candidates[10].position);
+        }
+    }
+
+    #[test]
+    fn discarded_disappearance_preserves_age_and_invalid_observations_never_clear_it() {
+        let candidates: Vec<_> = (0..2)
+            .map(|i| Candidate {
+                position: [i as f64 * 4.0, 0.0, 0.0],
+                gain: 1.0,
+                travel_cost: 1.0,
+            })
+            .collect();
+        let mut schedule = RegionalSchedule::default();
+        schedule
+            .select(&candidates, |_, targets| vec![1.0; targets.len()])
+            .unwrap();
+        for _ in 0..8 {
+            schedule.record_outcome(candidates[1].position);
+        }
+        let (absent, discarded) = schedule.prepare_select_observed(&[], None, |_, _| vec![]);
+        assert!(absent.is_none());
+        drop(discarded);
+        assert_eq!(
+            schedule
+                .last_served
+                .get(&region_key(candidates[0].position)),
+            Some(&0)
+        );
+        let (invalid, no_op) = schedule.prepare_select_observed(&candidates, Some(&[]), |_, _| {
+            panic!("invalid observation vector must not issue a route query")
+        });
+        assert!(invalid.is_none());
+        schedule.commit_selection(no_op);
+        assert_eq!(schedule.last_served.len(), 2);
+        let (selected, retained) =
+            schedule
+                .prepare_select_observed(&candidates, None, |_, targets| vec![1.0; targets.len()]);
+        let selected = selected.unwrap();
+        assert_eq!(
+            selected.index, 0,
+            "equal-gain candidates retain the oldest first tie"
+        );
+        assert_eq!(selected.priority_wait_rounds, 8);
+        drop(retained);
+        let (_, clear) = schedule.prepare_select_observed(&[], None, |_, _| vec![]);
+        schedule.commit_selection(clear);
+        assert!(schedule.last_served.is_empty());
+        let reappeared = schedule
+            .select(&candidates, |_, targets| vec![1.0; targets.len()])
+            .unwrap();
+        assert_eq!(reappeared.priority_wait_rounds, 0);
+    }
+
     #[test]
     fn overlapping_viewpoints_do_not_require_visiting_the_same_information_twice() {
         use std::collections::BTreeSet;

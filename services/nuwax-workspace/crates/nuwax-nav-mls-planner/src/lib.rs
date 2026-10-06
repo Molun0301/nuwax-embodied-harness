@@ -41,6 +41,8 @@
 
 // 内部模块:仅在本 crate 内可见,集成测试通过 `crate::xxx` 引用
 pub mod adjacency;
+#[cfg(feature = "body-query-profile")]
+pub mod body_query_profile;
 pub mod debug_events;
 pub mod dijkstra;
 pub mod edges;

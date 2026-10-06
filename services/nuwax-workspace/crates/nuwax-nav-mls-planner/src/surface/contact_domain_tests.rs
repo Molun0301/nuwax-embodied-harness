@@ -18,6 +18,9 @@ fn make(points:&[(f32,f32,f32)],footprint:Vec<[f64;2]>,bounds:[f64;2])->SurfaceS
         .with_observations(Some(Arc::new(observations)))
 }
 fn sort(points:&mut Vec<([f64;3],f64,f64)>) {points.sort_by(|a,b|a.0[0].total_cmp(&b.0[0]).then_with(||a.0[1].total_cmp(&b.0[1])));}
+fn bits(points:&[([f64;3],f64,f64)])->Vec<[u64;5]> {
+    points.iter().map(|&(p,low,w)|[p[0],p[1],p[2],low,w].map(f64::to_bits)).collect()
+}
 
 #[test]
 fn dense_contact_domain_preserves_sparse_holes_layers_seed_and_directional_connection() {
@@ -32,8 +35,16 @@ fn dense_contact_domain_preserves_sparse_holes_layers_seed_and_directional_conne
     for height in [-0.12,0.0,0.04,0.3,0.65,2.0] {for step in -10..=10 {
         let origin=[step as f64*0.019,step as f64*-0.013,height];let radius=0.39;
         let old=map.fine_contact_domain_sparse(origin,radius);let new=map.fine_contact_domain(origin,radius);
-        assert_eq!(old,new,"种子排序、连通域、遍历顺序与权重均须相同：{origin:?}");
-        if let (Ok(mut old),Ok(mut new))=(old,new) {sort(&mut old);sort(&mut new);assert_eq!(fit_contact_plane(&old,origin),fit_contact_plane(&new,origin));}
+        // 私有输出不再保证 BFS 遍历顺序；实际消费者原有排序后的逐位输入契约不变。
+        match (old,new) {
+            (Ok(mut old),Ok(mut new))=> {
+                sort(&mut old);sort(&mut new);
+                assert_eq!(bits(&old),bits(&new),"种子、连通域、全部真实点及权重须相同：{origin:?}");
+                assert_eq!(fit_contact_plane(&old,origin),fit_contact_plane(&new,origin));
+            },
+            (Err(old),Err(new))=>assert_eq!(old,new),
+            (old,new)=>panic!("接触域结果不同：{origin:?}: {old:?} / {new:?}"),
+        }
     }}
 }
 
@@ -54,7 +65,19 @@ fn recorded_contact_domain_and_fit_exact_differential_benchmark() {
     let started=std::time::Instant::now();let actual:Vec<_>=origins.iter().map(|&origin|new.fine_contact_domain(origin,radius)).collect();
     let new_ms=started.elapsed().as_secs_f64()*1000.;
     let mut expected_planes=Vec::new();let mut actual_planes=Vec::new();let mut failures=0;
-    assert_eq!(reference,actual,"真实样本及附近微小查询的整个原始拟合输入必须逐项相同");
+    // 不再要求私有 BFS 发点顺序一致；只比较真实消费者排序后的完整输入。
+    // 单独克隆排序，保留域构建计时和下方原有排序+拟合计时的含义。
+    for (expected,actual) in reference.iter().zip(&actual) {
+        match (expected,actual) {
+            (Ok(expected),Ok(actual))=> {
+                let mut expected=expected.clone();let mut actual=actual.clone();
+                sort(&mut expected);sort(&mut actual);
+                assert_eq!(bits(&expected),bits(&actual),"真实样本及权重必须逐位相同");
+            },
+            (Err(expected),Err(actual))=>assert_eq!(expected,actual),
+            (expected,actual)=>panic!("接触域结果不同：{expected:?} / {actual:?}"),
+        }
+    }
     let started=std::time::Instant::now();
     for (origin,points) in origins.iter().zip(reference) {
         let plane=points.ok().and_then(|mut points| {sort(&mut points);fit_contact_plane(&points,*origin)});

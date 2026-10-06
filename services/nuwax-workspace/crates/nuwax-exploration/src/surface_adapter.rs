@@ -11,6 +11,7 @@ use nuwax_nav_types_messages::visual::FrontierGoal;
 use crate::{
     ExplorationBoundary, ExplorationGoalFeedback, ExplorationGoalSource, ExplorationPoll,
     ExplorationSourceDiagnostics, ExplorationStateSnapshot, ExploreError, ExploreResult,
+    PreparedExplorationPoll,
 };
 
 /// 根拥有方注入的几何引用；地图身份、真实时效及域切换仍由注入方负责。
@@ -69,12 +70,17 @@ impl SurfaceInputReceiver {
 
     /// 获取一次不可变引用，不更新时间或推进目标。
     pub fn snapshot(&self) -> ExploreResult<Option<Arc<SurfaceSnapshot>>> {
-        self.observation().map(|(snapshot, _)| snapshot)
+        self.freeze().map(|input| input.snapshot)
     }
 
-    fn observation(&self) -> ExploreResult<(Option<Arc<SurfaceSnapshot>>, u64)> {
+    /// Freeze the original source and its exact notification atomically. Keep this
+    /// value for planning and qualification rather than re-reading the receiver.
+    pub fn freeze(&self) -> ExploreResult<FrozenSurfaceInput> {
         let current = self.current.read().map_err(|_| input_lock_error())?;
-        Ok((current.clone(), self.notifications.load(Ordering::Acquire)))
+        Ok(FrozenSurfaceInput {
+            snapshot: current.clone(),
+            notification: self.notifications.load(Ordering::Acquire),
+        })
     }
 
     /// 撤销输入，不能保留上一次表面冒充当前地图。
@@ -85,6 +91,150 @@ impl SurfaceInputReceiver {
 
 fn input_lock_error() -> ExploreError {
     ExploreError::SourceError("shared surface input lock is poisoned".into())
+}
+
+/// Original source and notification sampled under one receiver read lock.
+/// Cloning this value does not refresh source time or consume an observation.
+#[derive(Clone, Debug)]
+pub struct FrozenSurfaceInput {
+    snapshot: Option<Arc<SurfaceSnapshot>>,
+    notification: u64,
+}
+
+impl FrozenSurfaceInput {
+    /// The original immutable input, never a private planning fork.
+    pub fn snapshot(&self) -> Option<&Arc<SurfaceSnapshot>> {
+        self.snapshot.as_ref()
+    }
+
+    /// Exact captured observation counter, retained until the proposal is resolved.
+    pub fn notification(&self) -> u64 {
+        self.notification
+    }
+
+    /// Bind this exact source/notification pair to a private planning-cache fork.
+    /// No arbitrary query snapshot can be substituted into the resulting input.
+    pub fn fork_for_planning(&self) -> FrozenSurfacePlanningInput {
+        FrozenSurfacePlanningInput {
+            original: self.clone(),
+            query_view: self
+                .snapshot
+                .as_ref()
+                .map(|snapshot| Arc::new(snapshot.fork_for_planning())),
+        }
+    }
+
+    /// Compare original source evidence without confusing a receipt refresh with
+    /// changed geometry, observations, current-body support, or ground evidence.
+    pub fn same_source_view(&self, other: &Self) -> bool {
+        match (&self.snapshot, &other.snapshot) {
+            (Some(left), Some(right)) => left.same_body_query_view(right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+/// An opaque original-input/private-query pair for one captured observation.
+/// Construct only through [`FrozenSurfaceInput::fork_for_planning`]; its private
+/// fields prevent attaching unrelated geometry to a trusted original source.
+///
+/// ```
+/// use nuwax_exploration::surface_adapter::{FrozenSurfacePlanningInput, SurfaceInputReceiver};
+/// let original = SurfaceInputReceiver::new().freeze().unwrap();
+/// let planning: FrozenSurfacePlanningInput = original.fork_for_planning();
+/// assert_eq!(planning.original_input().notification(), original.notification());
+/// ```
+///
+/// ```compile_fail
+/// use nuwax_exploration::surface_adapter::{FrozenSurfacePlanningInput, SurfaceInputReceiver};
+/// let original = SurfaceInputReceiver::new().freeze().unwrap();
+/// let forged = FrozenSurfacePlanningInput { original, query_view: None };
+/// ```
+#[derive(Clone, Debug)]
+pub struct FrozenSurfacePlanningInput {
+    original: FrozenSurfaceInput,
+    query_view: Option<Arc<SurfaceSnapshot>>,
+}
+
+impl FrozenSurfacePlanningInput {
+    /// Qualify against the captured ORIGINAL source, never the private query fork.
+    /// This borrow cannot change the source or captured notification.
+    pub fn original_input(&self) -> &FrozenSurfaceInput {
+        &self.original
+    }
+
+    /// Read the same private query owner used for selection, for related route advice.
+    pub fn query_snapshot(&self) -> Option<&Arc<SurfaceSnapshot>> {
+        self.query_view.as_ref()
+    }
+}
+
+// A field is absent when the old sequential poll would not have touched it.
+// History and regional service rounds are feedback-only and are never cloned.
+#[derive(Default)]
+struct SurfacePollDelta {
+    next_goal_id: Option<u64>,
+    selected: Option<Option<SelectedGoal>>,
+    last_snapshot: Option<Option<Weak<SurfaceSnapshot>>>,
+    last_notification: Option<Option<u64>>,
+    last_query_body: Option<Option<[f64; 3]>>,
+    last_query_orientation: Option<Option<[f64; 4]>>,
+    last_no_frontier: Option<bool>,
+    retry_support: Option<Option<[f64; 3]>>,
+    last_frontiers: Option<Vec<FrontierGoal>>,
+    last_error: Option<Option<String>>,
+    regional: Option<nuwax_explore_routing::RegionalPresenceDelta>,
+}
+
+impl SurfacePollDelta {
+    fn unavailable(&mut self, reason: impl Into<String>) -> ExplorationPoll {
+        let reason = reason.into();
+        self.last_error = Some(Some(reason.clone()));
+        self.last_frontiers = Some(Vec::new());
+        ExplorationPoll::SourceUnavailable(reason)
+    }
+
+    fn commit(self, source: &mut SurfaceGoalSourceAdapter) {
+        if let Some(value) = self.next_goal_id {
+            source.next_goal_id = value;
+        }
+        if let Some(value) = self.selected {
+            source.selected = value;
+        }
+        if let Some(value) = self.last_snapshot {
+            source.last_snapshot = value;
+        }
+        if let Some(value) = self.last_notification {
+            source.last_notification = value;
+        }
+        if let Some(value) = self.last_query_body {
+            source.last_query_body = value;
+        }
+        if let Some(value) = self.last_query_orientation {
+            source.last_query_orientation = value;
+        }
+        if let Some(value) = self.last_no_frontier {
+            source.last_no_frontier = value;
+        }
+        if let Some(value) = self.retry_support {
+            source.retry_support = value;
+        }
+        if let Some(value) = self.last_frontiers {
+            source.last_frontiers = value;
+        }
+        if let Some(value) = self.last_error {
+            source.last_error = value;
+        }
+        if let Some(delta) = self.regional {
+            source.regional_schedule.commit_selection(delta);
+        }
+    }
+}
+
+struct PendingSurfacePoll {
+    outcome: ExploreResult<ExplorationPoll>,
+    delta: SurfacePollDelta,
 }
 
 #[derive(serde::Serialize,serde::Deserialize)]
@@ -131,6 +281,7 @@ pub struct SurfaceGoalSourceAdapter {
     retry_support: Option<[f64; 3]>,
     last_frontiers: Vec<FrontierGoal>,
     last_error: Option<String>,
+    prepared_poll: Option<PendingSurfacePoll>,
 }
 
 impl SurfaceGoalSourceAdapter {
@@ -169,6 +320,7 @@ impl SurfaceGoalSourceAdapter {
             retry_support: None,
             last_frontiers: Vec::new(),
             last_error: None,
+            prepared_poll: None,
         })
     }
 
@@ -177,6 +329,7 @@ impl SurfaceGoalSourceAdapter {
         &mut self,
         model: nuwax_nav_types_messages::ObservationModel,
     ) -> ExploreResult<()> {
+        self.ensure_no_prepared_poll()?;
         model.validate().map_err(ExploreError::SourceError)?;
         if model.kind != nuwax_nav_types_messages::ObservationKind::Volume {
             return Err(ExploreError::SourceError("三维源要求空间观察标定".into()));
@@ -194,6 +347,7 @@ impl SurfaceGoalSourceAdapter {
         max_navigation_retries: u32,
         blacklist_radius_m: f64,
     ) -> ExploreResult<()> {
+        self.ensure_no_prepared_poll()?;
         if !blacklist_radius_m.is_finite() || blacklist_radius_m < 0.0 {
             return Err(ExploreError::SourceError(
                 "surface blacklist radius must be finite and nonnegative".into(),
@@ -210,137 +364,91 @@ impl SurfaceGoalSourceAdapter {
         Ok(())
     }
 
-    fn unavailable(&mut self, reason: impl Into<String>) -> ExplorationPoll {
-        let reason = reason.into();
-        self.last_error = Some(reason.clone());
-        self.last_frontiers.clear();
-        ExplorationPoll::SourceUnavailable(reason)
-    }
-
-    fn excluded(&self, point: [f64; 3], vertical_radius: f64) -> bool {
-        self.history.iter().any(|history| {
-            history.contains(point, self.blacklist_radius_m, vertical_radius)
-                && (history.reached || history.failures > u64::from(self.max_navigation_retries))
-        })
-    }
-
-    fn record_feedback(&mut self, point: [f64; 3], vertical_radius: f64, reached: bool) -> u64 {
-        let index = self
-            .history
-            .iter()
-            .position(|entry| entry.contains(point, self.blacklist_radius_m, vertical_radius));
-        let entry = if let Some(index) = index {
-            &mut self.history[index]
+    fn ensure_no_prepared_poll(&self) -> ExploreResult<()> {
+        if self.prepared_poll.is_some() {
+            Err(ExploreError::PreparedPollBusy)
         } else {
-            self.history.push(GoalHistory {
-                support_xyz: point,
-                vertical_radius_m: vertical_radius,
-                reached: false,
-                failures: 0,
-            });
-            self.history.last_mut().expect("history was just inserted")
-        };
-        entry.vertical_radius_m = entry.vertical_radius_m.min(vertical_radius);
-        if reached {
-            entry.reached = true;
-            entry.failures = 0;
-        } else {
-            entry.failures = entry.failures.saturating_add(1);
+            Ok(())
         }
-        entry.failures
-    }
-}
-
-impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
-    fn checkpoint(&self)->ExploreResult<String> {
-        if self.history.len()>65536{return Err(ExploreError::SourceError("三维探索历史超过持久容量".into()));}
-        serde_json::to_string(&(1_u32,&self.history,&self.regional_schedule)).map_err(|e|ExploreError::SourceError(e.to_string()))
-    }
-    fn restore_checkpoint(&mut self,payload:&str)->ExploreResult<()> {
-        if self.selected.is_some() || payload.len()>1_048_576{return Err(ExploreError::SourceError("三维探索恢复时已有目标或载荷过大".into()));}
-        let (version,history,schedule):(u32,Vec<GoalHistory>,nuwax_explore_routing::RegionalSchedule)=serde_json::from_str(payload).map_err(|e|ExploreError::SourceError(e.to_string()))?;
-        if version!=1 || history.len()>65536 || history.iter().any(|h|h.support_xyz.iter().any(|v|!v.is_finite() || v.abs()>1e9) || !h.vertical_radius_m.is_finite() || !(0.0..=1e6).contains(&h.vertical_radius_m)) {
-            return Err(ExploreError::SourceError("三维探索进度无效或版本不支持".into()));
-        }
-        self.history=history;self.regional_schedule=schedule;self.last_snapshot=None;self.last_notification=None;self.retry_support=None;self.last_frontiers.clear();Ok(())
-    }
-    fn restore_checkpoint_for_replan(&mut self, payload: &str) -> ExploreResult<()> {
-        self.restore_checkpoint(payload)?;
-        self.history.retain(|entry| entry.reached);
-        for entry in &mut self.history {
-            entry.failures = 0;
-            // The old vertical neighborhood depended on its surface configuration.
-            // Preserve the reached world point, not an inferred band under new settings.
-            entry.vertical_radius_m = 0.0;
-        }
-        self.regional_schedule.reset();
-        Ok(())
-    }
-    fn source_name(&self) -> Cow<'static, str> {
-        self.name.clone()
     }
 
-    fn begin(&mut self) -> ExploreResult<()> {
-        self.active = true;
-        self.selected = None;
-        self.history.clear();
-        self.regional_schedule.reset();
-        self.last_snapshot = None;
-        self.last_notification = None;
-        self.last_query_body = None;
-        self.last_query_orientation = None;
-        self.last_no_frontier = false;
-        self.retry_support = None;
-        self.last_frontiers.clear();
-        self.last_error = None;
-        // 保留派发计数，避免同一对象重启后旧反馈命中新目标标识。
-        Ok(())
-    }
-
-    fn end(&mut self) -> ExploreResult<()> {
-        self.active = false;
-        self.selected = None;
-        self.retry_support = None;
-        self.last_snapshot = None;
-        self.last_notification = None;
-        self.last_query_body = None;
-        self.last_frontiers.clear();
-        Ok(())
-    }
-
-    fn poll_goal(
+    /// Evaluate only this atomically frozen source/notification pair. The live
+    /// receiver is never consulted again, including at commit.
+    pub fn prepare_poll_with_input(
         &mut self,
         state: &ExplorationStateSnapshot<'_>,
+        input: &FrozenSurfaceInput,
+    ) -> ExploreResult<PreparedExplorationPoll> {
+        self.ensure_no_prepared_poll()?;
+        let mut delta = SurfacePollDelta::default();
+        let outcome = self.evaluate_poll(state, input, None, &mut delta);
+        Ok(self.stage_poll(outcome, delta))
+    }
+
+    fn stage_poll(
+        &mut self,
+        outcome: ExploreResult<ExplorationPoll>,
+        delta: SurfacePollDelta,
+    ) -> PreparedExplorationPoll {
+        let preview = PreparedExplorationPoll::new(outcome.clone());
+        self.prepared_poll = Some(PendingSurfacePoll { outcome, delta });
+        preview
+    }
+
+    /// Evaluate a private fork bound to its original source and exact notification.
+    /// The opaque input prevents accidental injection of an unrelated query map;
+    /// current-source qualification must use its `original_input()` accessor.
+    pub fn prepare_poll_with_planning_input(
+        &mut self,
+        state: &ExplorationStateSnapshot<'_>,
+        input: &FrozenSurfacePlanningInput,
+    ) -> ExploreResult<PreparedExplorationPoll> {
+        self.ensure_no_prepared_poll()?;
+        let mut delta = SurfacePollDelta::default();
+        let outcome = self.evaluate_poll(
+            state,
+            &input.original,
+            input.query_view.as_ref(),
+            &mut delta,
+        );
+        Ok(self.stage_poll(outcome, delta))
+    }
+
+    fn evaluate_poll(
+        &self,
+        state: &ExplorationStateSnapshot<'_>,
+        input: &FrozenSurfaceInput,
+        query_view: Option<&Arc<SurfaceSnapshot>>,
+        delta: &mut SurfacePollDelta,
     ) -> ExploreResult<ExplorationPoll> {
         if !self.active {
-            return Ok(self.unavailable("surface source is not active"));
+            return Ok(delta.unavailable("surface source is not active"));
         }
         // 精确导航反馈之前不能另派目标，输入撤销由根拥有方取消该子导航。
         if self.selected.is_some() {
             return Ok(ExplorationPoll::Pending);
         }
-        let (snapshot, notification) = self.receiver.observation()?;
-        let Some(snapshot) = snapshot else {
-            return Ok(self.unavailable("surface map input is unavailable"));
+        let notification = input.notification;
+        let Some(source_snapshot) = input.snapshot.as_ref() else {
+            return Ok(delta.unavailable("surface map input is unavailable"));
         };
-        if state.robot_pose.frame_id.as_str() != snapshot.config().world_frame {
-            return Ok(self.unavailable("body pose frame does not match surface map frame"));
+        if state.robot_pose.frame_id.as_str() != source_snapshot.config().world_frame {
+            return Ok(delta.unavailable("body pose frame does not match surface map frame"));
         }
         let position = state.robot_pose.pose.position;
         let orientation = state.robot_pose.pose.orientation;
         let quaternion = [orientation.x, orientation.y, orientation.z, orientation.w];
-        let source_snapshot = Arc::clone(&snapshot);
         let same_geometry = self
             .last_snapshot
             .as_ref()
-            .is_some_and(|previous| Weak::ptr_eq(previous, &Arc::downgrade(&source_snapshot)));
+            .is_some_and(|previous| Weak::ptr_eq(previous, &Arc::downgrade(source_snapshot)));
         // 当前占据区依赖实际机体高度；层内接触可能关联同一层顶，缓存不能
         // 因此合并不同的真实位置、姿态或仅比较所在格。
         let same_query = self.last_query_body == Some([position.x, position.y, position.z])
             && self.last_query_orientation == Some(quaternion);
         if same_geometry && same_query && self.last_no_frontier {
-            self.last_notification = Some(notification);
-            self.last_error = None;
+            delta.last_notification = Some(Some(notification));
+            delta.last_error = Some(None);
             return Ok(ExplorationPoll::NoFrontier);
         }
         let new_snapshot = self.last_notification != Some(notification) || !same_geometry;
@@ -354,15 +462,17 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                 .map(|point| [point.x, point.y])
                 .collect()
         });
-        // 几何索引留在环境快照上，供下一次机体视图和地图增量继承。
-        // 未变化的等待查询在上述通知检查处返回，不重建当前足迹。
+        // Existing synchronous callers retain their cache behavior. A compute owner
+        // may supply private caches, but all identity tests and consumption stamps
+        // still refer to the original frozen source, never its planning fork.
+        let snapshot = query_view.unwrap_or(source_snapshot);
         snapshot.prepare_frontier_geometry(&boundary)
             .map_err(|error| ExploreError::SourceError(error.to_string()))?;
         let snapshot = match snapshot.with_current_body_support(
             [position.x, position.y, position.z], quaternion,
         ) {
             Ok(view) => Arc::new(view),
-            Err(error) => return Ok(self.unavailable(format!("current body support evidence: {error}"))),
+            Err(error) => return Ok(delta.unavailable(format!("current body support evidence: {error}"))),
         };
         let robot = match snapshot.locate_support_from_body(
             [position.x, position.y, position.z],
@@ -372,7 +482,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
             Ok(location) => location,
             Err(error) => {
                 return Ok(
-                    self.unavailable(format!("body pose has no valid surface support: {error}"))
+                    delta.unavailable(format!("body pose has no valid surface support: {error}"))
                 )
             }
         };
@@ -383,15 +493,15 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
             Ok(candidates) => candidates,
             Err(error) => {
                 return Ok(
-                    self.unavailable(format!("surface frontier query is unavailable: {error}"))
+                    delta.unavailable(format!("surface frontier query is unavailable: {error}"))
                 )
             }
         };
-        self.last_snapshot = Some(Arc::downgrade(&source_snapshot));
-        self.last_notification = Some(notification);
-        self.last_query_body = Some([position.x, position.y, position.z]);
-        self.last_query_orientation = Some(quaternion);
-        self.last_frontiers.clear();
+        delta.last_snapshot = Some(Some(Arc::downgrade(source_snapshot)));
+        delta.last_notification = Some(Some(notification));
+        delta.last_query_body = Some(Some([position.x, position.y, position.z]));
+        delta.last_query_orientation = Some(Some(quaternion));
+        delta.last_frontiers = Some(Vec::new());
         let minimum_distance = f64::from(
             snapshot
                 .config()
@@ -533,7 +643,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                 })
             });
             if admissible.is_empty() {
-                self.last_no_frontier = false;
+                delta.last_no_frontier = Some(false);
                 return Ok(ExplorationPoll::Pending);
             }
         }
@@ -560,7 +670,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
             })
             .collect();
         let selection = if retry_index.is_none() {
-            self.regional_schedule.select_observed(
+            let (selection, regional_delta) = self.regional_schedule.prepare_select_observed(
                 &routing_candidates,
                 self.observation_model.as_ref().map(|_| observed.as_slice()),
                 |source, goals| {
@@ -576,7 +686,9 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                         )
                         .unwrap_or_else(|_| vec![f64::INFINITY; targets.len()])
                 },
-            )
+            );
+            delta.regional = Some(regional_delta);
+            selection
         } else {
             None
         };
@@ -585,20 +697,21 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         let Some((candidate, (body, candidate_quaternion), view)) =
             selected_index.and_then(|index| admissible.get(index))
         else {
-            self.retry_support = None;
-            self.last_no_frontier = true;
-            self.last_error = None;
+            delta.retry_support = Some(None);
+            delta.last_no_frontier = Some(true);
+            delta.last_error = Some(None);
             return Ok(ExplorationPoll::NoFrontier);
         };
-        self.retry_support = None;
-        self.next_goal_id = self.next_goal_id.checked_add(1).ok_or_else(|| {
+        delta.retry_support = Some(None);
+        let next_goal_id = self.next_goal_id.checked_add(1).ok_or_else(|| {
             ExploreError::SourceError("surface frontier goal identifier exhausted".into())
         })?;
+        delta.next_goal_id = Some(next_goal_id);
         let travel = candidate.travel_cost;
         let mut goal = FrontierGoal::new(
             format!(
                 "{}-surface-{:016x}-{}",
-                self.name, state.now.nanos, self.next_goal_id
+                self.name, state.now.nanos, next_goal_id
             ),
             PoseStamped {
                 frame_id: state.robot_pose.frame_id.clone(),
@@ -663,15 +776,162 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                 .insert("route_cost_m".into(), selection.route_cost.to_string());
         }
         goal.stamp = state.now;
-        self.last_frontiers = vec![goal.clone()];
-        self.selected = Some(SelectedGoal {
+        delta.last_frontiers = Some(vec![goal.clone()]);
+        delta.selected = Some(Some(SelectedGoal {
             goal: goal.clone(),
             support_xyz: candidate.support_xyz,
             vertical_radius_m: vertical_radius,
-        });
-        self.last_no_frontier = false;
-        self.last_error = None;
+        }));
+        delta.last_no_frontier = Some(false);
+        delta.last_error = Some(None);
         Ok(ExplorationPoll::Goal(goal))
+    }
+
+    fn excluded(&self, point: [f64; 3], vertical_radius: f64) -> bool {
+        self.history.iter().any(|history| {
+            history.contains(point, self.blacklist_radius_m, vertical_radius)
+                && (history.reached || history.failures > u64::from(self.max_navigation_retries))
+        })
+    }
+
+    fn record_feedback(&mut self, point: [f64; 3], vertical_radius: f64, reached: bool) -> u64 {
+        let index = self
+            .history
+            .iter()
+            .position(|entry| entry.contains(point, self.blacklist_radius_m, vertical_radius));
+        let entry = if let Some(index) = index {
+            &mut self.history[index]
+        } else {
+            self.history.push(GoalHistory {
+                support_xyz: point,
+                vertical_radius_m: vertical_radius,
+                reached: false,
+                failures: 0,
+            });
+            self.history.last_mut().expect("history was just inserted")
+        };
+        entry.vertical_radius_m = entry.vertical_radius_m.min(vertical_radius);
+        if reached {
+            entry.reached = true;
+            entry.failures = 0;
+        } else {
+            entry.failures = entry.failures.saturating_add(1);
+        }
+        entry.failures
+    }
+}
+
+impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
+    fn checkpoint(&self)->ExploreResult<String> {
+        if self.history.len()>65536{return Err(ExploreError::SourceError("三维探索历史超过持久容量".into()));}
+        serde_json::to_string(&(1_u32,&self.history,&self.regional_schedule)).map_err(|e|ExploreError::SourceError(e.to_string()))
+    }
+    fn restore_checkpoint(&mut self,payload:&str)->ExploreResult<()> {
+        self.ensure_no_prepared_poll()?;
+        if self.selected.is_some() || payload.len()>1_048_576{return Err(ExploreError::SourceError("三维探索恢复时已有目标或载荷过大".into()));}
+        let (version,history,schedule):(u32,Vec<GoalHistory>,nuwax_explore_routing::RegionalSchedule)=serde_json::from_str(payload).map_err(|e|ExploreError::SourceError(e.to_string()))?;
+        if version!=1 || history.len()>65536 || history.iter().any(|h|h.support_xyz.iter().any(|v|!v.is_finite() || v.abs()>1e9) || !h.vertical_radius_m.is_finite() || !(0.0..=1e6).contains(&h.vertical_radius_m)) {
+            return Err(ExploreError::SourceError("三维探索进度无效或版本不支持".into()));
+        }
+        self.history=history;self.regional_schedule=schedule;self.last_snapshot=None;self.last_notification=None;self.retry_support=None;self.last_frontiers.clear();Ok(())
+    }
+    fn restore_checkpoint_for_replan(&mut self, payload: &str) -> ExploreResult<()> {
+        self.restore_checkpoint(payload)?;
+        self.history.retain(|entry| entry.reached);
+        for entry in &mut self.history {
+            entry.failures = 0;
+            // The old vertical neighborhood depended on its surface configuration.
+            // Preserve the reached world point, not an inferred band under new settings.
+            entry.vertical_radius_m = 0.0;
+        }
+        self.regional_schedule.reset();
+        Ok(())
+    }
+    fn source_name(&self) -> Cow<'static, str> {
+        self.name.clone()
+    }
+
+    fn begin(&mut self) -> ExploreResult<()> {
+        self.ensure_no_prepared_poll()?;
+        self.active = true;
+        self.selected = None;
+        self.history.clear();
+        self.regional_schedule.reset();
+        self.last_snapshot = None;
+        self.last_notification = None;
+        self.last_query_body = None;
+        self.last_query_orientation = None;
+        self.last_no_frontier = false;
+        self.retry_support = None;
+        self.last_frontiers.clear();
+        self.last_error = None;
+        // 保留派发计数，避免同一对象重启后旧反馈命中新目标标识。
+        Ok(())
+    }
+
+    fn end(&mut self) -> ExploreResult<()> {
+        self.ensure_no_prepared_poll()?;
+        self.active = false;
+        self.selected = None;
+        self.retry_support = None;
+        self.last_snapshot = None;
+        self.last_notification = None;
+        self.last_query_body = None;
+        self.last_frontiers.clear();
+        Ok(())
+    }
+
+    fn poll_goal(
+        &mut self,
+        state: &ExplorationStateSnapshot<'_>,
+    ) -> ExploreResult<ExplorationPoll> {
+        self.prepare_poll(state)?;
+        self.commit_prepared_poll()
+    }
+
+    fn supports_prepared_poll(&self) -> bool {
+        true
+    }
+
+    fn prepare_poll(
+        &mut self,
+        state: &ExplorationStateSnapshot<'_>,
+    ) -> ExploreResult<PreparedExplorationPoll> {
+        self.ensure_no_prepared_poll()?;
+        // Match the old short-circuit order, including a poisoned/unavailable input
+        // receiver while inactive or while awaiting exact goal feedback.
+        if !self.active {
+            let mut delta = SurfacePollDelta::default();
+            let outcome = Ok(delta.unavailable("surface source is not active"));
+            return Ok(self.stage_poll(outcome, delta));
+        }
+        if self.selected.is_some() {
+            return Ok(self.stage_poll(Ok(ExplorationPoll::Pending), SurfacePollDelta::default()));
+        }
+        if let Some(input) = state.frozen_surface_input {
+            return self.prepare_poll_with_planning_input(state, input);
+        }
+        match self.receiver.freeze() {
+            Ok(input) => self.prepare_poll_with_input(state, &input),
+            // Input read failures are algorithm outcomes, not transactional API errors.
+            Err(error) => Ok(self.stage_poll(Err(error), SurfacePollDelta::default())),
+        }
+    }
+
+    fn commit_prepared_poll(&mut self) -> ExploreResult<ExplorationPoll> {
+        let pending = self
+            .prepared_poll
+            .take()
+            .ok_or(ExploreError::NoPreparedPoll)?;
+        pending.delta.commit(self);
+        pending.outcome
+    }
+
+    fn discard_prepared_poll(&mut self) -> ExploreResult<()> {
+        self.prepared_poll
+            .take()
+            .ok_or(ExploreError::NoPreparedPoll)?;
+        Ok(())
     }
 
     fn report_goal_feedback(
@@ -679,6 +939,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         goal_id: &str,
         feedback: ExplorationGoalFeedback,
     ) -> ExploreResult<()> {
+        self.ensure_no_prepared_poll()?;
         if self
             .selected
             .as_ref()
@@ -828,6 +1089,665 @@ mod tests {
             panic!("预期三维前沿目标，实际{poll:?}");
         };
         goal
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CommittedSurfaceState {
+        checkpoint: String,
+        diagnostics: ExplorationSourceDiagnostics,
+        next_goal_id: u64,
+        selected: Option<(FrontierGoal, [f64; 3], f64)>,
+        source_anchor: Option<*const SurfaceSnapshot>,
+        notification: Option<u64>,
+        body: Option<[f64; 3]>,
+        orientation: Option<[f64; 4]>,
+        no_frontier: bool,
+        retry: Option<[f64; 3]>,
+        frontiers: Vec<FrontierGoal>,
+    }
+
+    fn committed(source: &SurfaceGoalSourceAdapter) -> CommittedSurfaceState {
+        CommittedSurfaceState {
+            checkpoint: source.checkpoint().unwrap(),
+            diagnostics: source.diagnostics(),
+            next_goal_id: source.next_goal_id,
+            selected: source.selected.as_ref().map(|selected| {
+                (
+                    selected.goal.clone(),
+                    selected.support_xyz,
+                    selected.vertical_radius_m,
+                )
+            }),
+            source_anchor: source.last_snapshot.as_ref().map(Weak::as_ptr),
+            notification: source.last_notification,
+            body: source.last_query_body,
+            orientation: source.last_query_orientation,
+            no_frontier: source.last_no_frontier,
+            retry: source.retry_support,
+            frontiers: source.frontier_snapshot(),
+        }
+    }
+
+    fn volume_model() -> nuwax_nav_types_messages::ObservationModel {
+        nuwax_nav_types_messages::ObservationModel {
+            kind: nuwax_nav_types_messages::ObservationKind::Volume,
+            min_range_m: 0.05,
+            max_range_m: 2.0,
+            horizontal_fov_rad: std::f64::consts::TAU,
+            vertical_min_rad: -std::f64::consts::FRAC_PI_2,
+            vertical_max_rad: 0.0,
+            sensor_translation_body_m: [0.0; 3],
+            sensor_rotation_body_xyzw: [0.0, 0.0, 0.0, 1.0],
+            max_rays: 16,
+        }
+    }
+
+    #[test]
+    fn prepared_goal_discard_preserves_history_stamps_and_identifier() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let mut source = source(receiver, 1);
+        source.record_feedback([30.0, 30.0, 0.1], 0.3, true);
+        source.regional_schedule.record_outcome([30.0, 30.0, 0.1]);
+        let before = committed(&source);
+        let state = state(0.4, 11);
+        let preview = source.prepare_poll(&state).unwrap();
+        let expected = preview.outcome().as_ref().unwrap().clone();
+        assert!(matches!(expected, ExplorationPoll::Goal(_)));
+        assert_eq!(committed(&source), before);
+        source.discard_prepared_poll().unwrap();
+        assert_eq!(committed(&source), before);
+        assert!(matches!(
+            source.commit_prepared_poll(),
+            Err(ExploreError::NoPreparedPoll)
+        ));
+        // Identical source, pose, timestamp and notification must still produce its goal.
+        assert_eq!(source.poll_goal(&state).unwrap(), expected);
+        assert_eq!(source.next_goal_id, 1);
+        assert_eq!(source.history.len(), 1);
+        assert!(source.history[0].reached);
+        assert_eq!(source.regional_schedule.completed_rounds(), 1);
+    }
+
+    #[test]
+    fn prepared_accept_matches_immediate_poll_and_feedback_history() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let mut prepared = source(receiver.clone(), 1);
+        let mut immediate = source(receiver, 1);
+        for source in [&mut prepared, &mut immediate] {
+            source.record_feedback([30.0, 30.0, 0.1], 0.3, false);
+            source.regional_schedule.record_outcome([30.0, 30.0, 0.1]);
+        }
+        let current = state(0.4, 12);
+        let expected = immediate.poll_goal(&current).unwrap();
+        let before = committed(&prepared);
+        let preview = prepared.prepare_poll(&current).unwrap();
+        assert_eq!(preview.outcome().as_ref().unwrap(), &expected);
+        assert_eq!(committed(&prepared), before);
+        let accepted = prepared.commit_prepared_poll().unwrap();
+        assert_eq!(accepted, expected);
+        assert_eq!(committed(&prepared), committed(&immediate));
+        let selected = goal(accepted);
+        for source in [&mut prepared, &mut immediate] {
+            source
+                .report_goal_feedback(&selected.id, ExplorationGoalFeedback::Reached)
+                .unwrap();
+        }
+        assert_eq!(committed(&prepared), committed(&immediate));
+    }
+
+    #[test]
+    fn prepared_no_frontier_and_unavailable_have_no_effect_until_commit() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let mut source = source(receiver.clone(), 1);
+        let boundary = ExplorationBoundary::from_vertices(vec![
+            Point2::new(0.5, 0.5),
+            Point2::new(1.5, 0.5),
+            Point2::new(1.5, 1.5),
+            Point2::new(0.5, 1.5),
+        ])
+        .unwrap();
+        source
+            .configure_constraints(Some(boundary), 1, 0.3)
+            .unwrap();
+        source.regional_schedule.record_outcome([30.0, 30.0, 0.1]);
+        source.last_error = Some("previous failure".into());
+        source.retry_support = Some([30.0, 30.0, 0.1]);
+        let before = committed(&source);
+        assert!(matches!(
+            source.prepare_poll(&state(0.4, 1)).unwrap().outcome(),
+            Ok(ExplorationPoll::NoFrontier)
+        ));
+        assert_eq!(committed(&source), before);
+        source.discard_prepared_poll().unwrap();
+        assert_eq!(committed(&source), before);
+        source.prepare_poll(&state(0.4, 1)).unwrap();
+        assert_eq!(
+            source.commit_prepared_poll().unwrap(),
+            ExplorationPoll::NoFrontier
+        );
+        assert!(source.last_no_frontier);
+        assert_eq!(source.retry_support, None);
+        assert_eq!(source.last_error, None);
+        assert_ne!(source.checkpoint().unwrap(), before.checkpoint);
+        assert_eq!(source.regional_schedule.completed_rounds(), 1);
+
+        receiver.clear().unwrap();
+        let no_frontier = committed(&source);
+        assert!(matches!(
+            source.prepare_poll(&state(0.4, 2)).unwrap().outcome(),
+            Ok(ExplorationPoll::SourceUnavailable(_))
+        ));
+        assert_eq!(committed(&source), no_frontier);
+        source.discard_prepared_poll().unwrap();
+        assert_eq!(committed(&source), no_frontier);
+        source.prepare_poll(&state(0.4, 2)).unwrap();
+        assert!(matches!(
+            source.commit_prepared_poll().unwrap(),
+            ExplorationPoll::SourceUnavailable(_)
+        ));
+        assert!(source.last_error.is_some());
+        assert!(source.active);
+        assert_eq!(source.next_goal_id, 0);
+    }
+
+    #[test]
+    fn prepared_error_retains_accepted_partial_query_and_regional_effects() {
+        let receiver = SurfaceInputReceiver::new();
+        let snapshot = map();
+        receiver.observe(snapshot.clone()).unwrap();
+        let notification = receiver.freeze().unwrap().notification();
+        let mut source = source(receiver, 1);
+        source.next_goal_id = u64::MAX;
+        source.retry_support = Some([30.0, 30.0, 0.1]);
+        source.last_error = Some("original error".into());
+        source.record_feedback([30.0, 30.0, 0.1], 0.3, true);
+        source.regional_schedule.record_outcome([30.0, 30.0, 0.1]);
+        let before = committed(&source);
+        let current = state(0.4, 9);
+        let preview = source.prepare_poll(&current).unwrap();
+        assert!(
+            matches!(preview.outcome(), Err(ExploreError::SourceError(message))
+            if message.contains("identifier exhausted"))
+        );
+        assert_eq!(committed(&source), before);
+        source.discard_prepared_poll().unwrap();
+        assert_eq!(committed(&source), before);
+        source.prepare_poll(&current).unwrap();
+        assert!(
+            matches!(source.commit_prepared_poll(), Err(ExploreError::SourceError(message))
+            if message.contains("identifier exhausted"))
+        );
+        assert_eq!(source.next_goal_id, u64::MAX);
+        assert_eq!(source.last_notification, Some(notification));
+        assert_eq!(source.last_query_body, Some([1.05, 1.05, 0.4]));
+        assert!(Weak::ptr_eq(
+            source.last_snapshot.as_ref().unwrap(),
+            &Arc::downgrade(&snapshot)
+        ));
+        assert_eq!(source.retry_support, None);
+        assert_eq!(source.last_error, Some("original error".into()));
+        assert!(source.last_frontiers.is_empty());
+        assert!(source.selected.is_none());
+        assert_eq!(source.history.len(), 1);
+        assert!(source.history[0].reached);
+        assert_ne!(source.checkpoint().unwrap(), before.checkpoint);
+        assert_eq!(
+            source.poll_goal(&current).unwrap(),
+            ExplorationPoll::Pending
+        );
+    }
+
+    #[test]
+    fn pending_poll_rejects_feedback_lifecycle_configuration_and_restore() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let mut source = source(receiver, 1);
+        let selected = goal(source.poll_goal(&state(0.4, 1)).unwrap());
+        let before = committed(&source);
+        assert!(matches!(
+            source.prepare_poll(&state(0.4, 2)).unwrap().outcome(),
+            Ok(ExplorationPoll::Pending)
+        ));
+        assert!(matches!(
+            source.prepare_poll(&state(0.4, 2)),
+            Err(ExploreError::PreparedPollBusy)
+        ));
+        assert!(matches!(
+            source.poll_goal(&state(0.4, 2)),
+            Err(ExploreError::PreparedPollBusy)
+        ));
+        assert!(matches!(
+            source.report_goal_feedback(&selected.id, ExplorationGoalFeedback::Reached),
+            Err(ExploreError::PreparedPollBusy)
+        ));
+        assert!(matches!(source.end(), Err(ExploreError::PreparedPollBusy)));
+        assert!(matches!(
+            source.begin(),
+            Err(ExploreError::PreparedPollBusy)
+        ));
+        assert!(matches!(
+            source.configure_constraints(None, 0, 0.1),
+            Err(ExploreError::PreparedPollBusy)
+        ));
+        assert!(matches!(
+            source.set_observation_model(volume_model()),
+            Err(ExploreError::PreparedPollBusy)
+        ));
+        assert!(matches!(
+            source.restore_checkpoint(&before.checkpoint),
+            Err(ExploreError::PreparedPollBusy)
+        ));
+        assert!(matches!(
+            source.restore_checkpoint_for_replan(&before.checkpoint),
+            Err(ExploreError::PreparedPollBusy)
+        ));
+        assert_eq!(committed(&source), before);
+        source.discard_prepared_poll().unwrap();
+        assert_eq!(committed(&source), before);
+        source
+            .report_goal_feedback(&selected.id, ExplorationGoalFeedback::Reached)
+            .unwrap();
+        assert_eq!(source.history.len(), 1);
+        assert_eq!(source.regional_schedule.completed_rounds(), 1);
+    }
+
+    #[test]
+    fn frozen_poll_keeps_original_time_and_leaves_new_observation_unconsumed() {
+        let receiver = SurfaceInputReceiver::new();
+        let snapshot = map();
+        receiver.observe(snapshot.clone()).unwrap();
+        let frozen = receiver.freeze().unwrap();
+        let mut source = source(receiver.clone(), 1);
+        source
+            .prepare_poll_with_input(&state(0.4, 1), &frozen)
+            .unwrap();
+        receiver.observe(snapshot.clone()).unwrap();
+        let refreshed = receiver.freeze().unwrap();
+        assert!(frozen.same_source_view(&refreshed));
+        assert_ne!(frozen.notification(), refreshed.notification());
+        let selected = goal(source.commit_prepared_poll().unwrap());
+        assert_eq!(selected.stamp, Timestamp::from_unix(1, 0));
+        assert_eq!(selected.pose.stamp, Timestamp::from_unix(1, 0));
+        assert_eq!(source.last_notification, Some(frozen.notification()));
+        assert_eq!(source.last_query_body, Some([1.05, 1.05, 0.4]));
+        source
+            .report_goal_feedback(&selected.id, ExplorationGoalFeedback::Reached)
+            .unwrap();
+        assert!(matches!(
+            source.poll_goal(&state(0.4, 3)).unwrap(),
+            ExplorationPoll::Goal(_)
+        ));
+        assert_eq!(source.last_notification, Some(refreshed.notification()));
+    }
+
+    #[test]
+    fn frozen_input_is_not_retargeted_to_the_live_receiver() {
+        let receiver = SurfaceInputReceiver::new();
+        let snapshot = map();
+        receiver.observe(snapshot.clone()).unwrap();
+        let frozen = receiver.freeze().unwrap();
+        let mut source = source(receiver.clone(), 1);
+        receiver.clear().unwrap();
+        assert!(receiver.freeze().unwrap().snapshot().is_none());
+        assert!(Arc::ptr_eq(frozen.snapshot().unwrap(), &snapshot));
+        let prepared = source
+            .prepare_poll_with_input(&state(0.4, 1), &frozen)
+            .unwrap();
+        assert!(matches!(prepared.outcome(), Ok(ExplorationPoll::Goal(_))));
+        let selected = goal(source.commit_prepared_poll().unwrap());
+        assert_eq!(source.last_notification, Some(frozen.notification()));
+        assert!(Weak::ptr_eq(
+            source.last_snapshot.as_ref().unwrap(),
+            &Arc::downgrade(&snapshot)
+        ));
+        source
+            .report_goal_feedback(&selected.id, ExplorationGoalFeedback::Cancelled)
+            .unwrap();
+        assert!(matches!(
+            source.poll_goal(&state(0.4, 2)).unwrap(),
+            ExplorationPoll::SourceUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn controller_prepare_preserves_captured_absence_when_live_source_arrives() {
+        let receiver = SurfaceInputReceiver::new();
+        let captured = receiver.freeze().unwrap().fork_for_planning();
+        receiver.observe(map()).unwrap();
+        let mut controller =
+            ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
+        controller.add_source(source(receiver, 1));
+        controller.begin_exploration().unwrap();
+        let original = state(0.4, 1);
+        let mut sampled = ExplorationStateSnapshot::new(original.robot_pose, original.now);
+        sampled.frozen_surface_input = Some(&captured);
+        assert!(matches!(
+            controller
+                .prepare_poll_with_deferred_stop(&sampled, false)
+                .unwrap()
+                .outcome(),
+            Ok(ExplorationPoll::SourceUnavailable(_))
+        ));
+        assert!(matches!(
+            controller.commit_prepared_poll().unwrap(),
+            ExplorationPoll::SourceUnavailable(_)
+        ));
+        assert!(matches!(
+            controller.poll_next_goal(&state(0.4, 2)).unwrap(),
+            ExplorationPoll::Goal(_)
+        ));
+    }
+
+    #[test]
+    fn controller_prepare_uses_frozen_source_after_live_receiver_changes() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let captured = receiver.freeze().unwrap().fork_for_planning();
+        let mut expected_source = source(receiver.clone(), 1);
+        let expected = expected_source.legacy_poll_goal(&state(0.4, 1)).unwrap();
+        let mut controller =
+            ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
+        controller.add_source(source(receiver.clone(), 1));
+        controller.begin_exploration().unwrap();
+        let before = serde_json::to_value(controller.checkpoint().unwrap()).unwrap();
+        receiver.clear().unwrap();
+        let original = state(0.4, 1);
+        let mut sampled = ExplorationStateSnapshot::new(original.robot_pose, original.now);
+        sampled.frozen_surface_input = Some(&captured);
+        let prepared = controller
+            .prepare_poll_with_deferred_stop(&sampled, false)
+            .unwrap();
+        assert_eq!(prepared.outcome().as_ref().unwrap(), &expected);
+        controller.discard_prepared_poll().unwrap();
+        assert_eq!(serde_json::to_value(controller.checkpoint().unwrap()).unwrap(), before);
+        controller
+            .prepare_poll_with_deferred_stop(&sampled, false)
+            .unwrap();
+        let accepted = controller.commit_prepared_poll().unwrap();
+        assert_eq!(accepted, expected);
+        controller
+            .report_goal_feedback(&goal(accepted).id, ExplorationGoalFeedback::Cancelled)
+            .unwrap();
+        assert!(matches!(
+            controller.poll_next_goal(&state(0.4, 2)).unwrap(),
+            ExplorationPoll::SourceUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn private_query_fork_preserves_original_anchor_and_same_source_retry() {
+        let receiver = SurfaceInputReceiver::new();
+        let snapshot = map();
+        receiver.observe(snapshot.clone()).unwrap();
+        let frozen = receiver.freeze().unwrap();
+        let planning_input = frozen.fork_for_planning();
+        let query_view = planning_input.query_view.as_ref().unwrap();
+        assert!(!query_view.same_body_query_view(&snapshot));
+        assert!(Arc::ptr_eq(
+            planning_input.original_input().snapshot().unwrap(),
+            &snapshot
+        ));
+        assert_eq!(
+            planning_input.original_input().notification(),
+            frozen.notification()
+        );
+        let mut source = source(receiver.clone(), 1);
+        let expected = {
+            let mut direct = super::tests::source(receiver.clone(), 1);
+            direct.legacy_poll_goal(&state(0.4, 1)).unwrap()
+        };
+        let prepared = source
+            .prepare_poll_with_planning_input(&state(0.4, 1), &planning_input)
+            .unwrap();
+        assert_eq!(prepared.outcome().as_ref().unwrap(), &expected);
+        let selected = goal(source.commit_prepared_poll().unwrap());
+        assert!(Weak::ptr_eq(
+            source.last_snapshot.as_ref().unwrap(),
+            &Arc::downgrade(&snapshot)
+        ));
+        assert!(!Weak::ptr_eq(
+            source.last_snapshot.as_ref().unwrap(),
+            &Arc::downgrade(query_view)
+        ));
+        source
+            .report_goal_feedback(
+                &selected.id,
+                ExplorationGoalFeedback::Failed("retry".into()),
+            )
+            .unwrap();
+        let before_retry = committed(&source);
+        let retry = source
+            .prepare_poll_with_planning_input(&state(0.4, 2), &planning_input)
+            .unwrap();
+        let retry = goal(retry.outcome().as_ref().unwrap().clone());
+        assert_eq!(retry.pose.pose.position, selected.pose.pose.position);
+        assert_eq!(
+            retry.metadata.get("selection_method").map(String::as_str),
+            Some("navigation_retry")
+        );
+        source.discard_prepared_poll().unwrap();
+        assert_eq!(committed(&source), before_retry);
+        source
+            .prepare_poll_with_planning_input(&state(0.4, 2), &planning_input)
+            .unwrap();
+        assert_eq!(
+            source.commit_prepared_poll().unwrap(),
+            ExplorationPoll::Goal(retry.clone())
+        );
+        source
+            .report_goal_feedback(&retry.id, ExplorationGoalFeedback::Cancelled)
+            .unwrap();
+        assert_eq!(
+            source.poll_goal(&state(0.4, 3)).unwrap(),
+            ExplorationPoll::Pending
+        );
+        receiver.observe(snapshot).unwrap();
+        assert!(matches!(
+            source.poll_goal(&state(0.4, 4)).unwrap(),
+            ExplorationPoll::Goal(_)
+        ));
+    }
+
+    #[test]
+    fn paired_planning_input_cannot_retarget_source_or_notification() {
+        let receiver = SurfaceInputReceiver::new();
+        let snapshot = map();
+        receiver.observe(snapshot.clone()).unwrap();
+        let captured = receiver.freeze().unwrap();
+        let planning = captured.fork_for_planning();
+        let mut adapter = source(receiver.clone(), 1);
+        let expected = {
+            let mut direct = source(receiver.clone(), 1);
+            direct.legacy_poll_goal(&state(0.4, 1)).unwrap()
+        };
+        receiver.observe(map()).unwrap();
+        let unrelated = receiver.freeze().unwrap();
+        assert!(!planning.original_input().same_source_view(&unrelated));
+        assert!(planning.original_input().same_source_view(&captured));
+        assert_eq!(
+            planning.original_input().notification(),
+            captured.notification()
+        );
+        assert_ne!(
+            planning.original_input().notification(),
+            unrelated.notification()
+        );
+        // Even a cloned opaque pair retains the same source and exact notification.
+        let retained = planning.clone();
+        receiver.clear().unwrap();
+        let preview = adapter
+            .prepare_poll_with_planning_input(&state(0.4, 1), &retained)
+            .unwrap();
+        assert_eq!(preview.outcome().as_ref().unwrap(), &expected);
+        assert_eq!(adapter.commit_prepared_poll().unwrap(), expected);
+        assert_eq!(adapter.last_notification, Some(captured.notification()));
+        assert!(Weak::ptr_eq(
+            adapter.last_snapshot.as_ref().unwrap(),
+            &Arc::downgrade(&snapshot)
+        ));
+
+        let absent = receiver.freeze().unwrap().fork_for_planning();
+        assert!(absent.original_input().snapshot().is_none());
+        assert!(absent.query_view.is_none());
+        let selected = adapter.selected.as_ref().unwrap().goal.id.clone();
+        adapter
+            .report_goal_feedback(&selected, ExplorationGoalFeedback::Cancelled)
+            .unwrap();
+        assert!(matches!(
+            adapter
+                .prepare_poll_with_planning_input(&state(0.4, 2), &absent)
+                .unwrap()
+                .outcome(),
+            Ok(ExplorationPoll::SourceUnavailable(_))
+        ));
+        adapter.discard_prepared_poll().unwrap();
+    }
+
+    #[test]
+    fn frozen_source_comparison_rejects_truthful_observation_metadata_change() {
+        use nuwax_nav_mls_planner::{SurfaceObservation, SurfaceObservations};
+        use std::collections::BTreeMap;
+        let original = map();
+        let mut observations = SurfaceObservations::new(0.1, 32).unwrap();
+        observations
+            .replace_block(
+                [0, 0, 0],
+                BTreeMap::from([(
+                    [10, 10, 0],
+                    SurfaceObservation {
+                        observed_ns: 1,
+                        hits: 1,
+                    },
+                )]),
+            )
+            .unwrap();
+        let old = Arc::new(original.with_observations(Some(Arc::new(observations.clone()))));
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(old.clone()).unwrap();
+        let captured = receiver.freeze().unwrap();
+        receiver.observe(old).unwrap();
+        assert!(captured.same_source_view(&receiver.freeze().unwrap()));
+        observations
+            .replace_block(
+                [0, 0, 0],
+                BTreeMap::from([(
+                    [10, 10, 0],
+                    SurfaceObservation {
+                        observed_ns: 2,
+                        hits: 2,
+                    },
+                )]),
+            )
+            .unwrap();
+        receiver
+            .observe(Arc::new(
+                original.with_observations(Some(Arc::new(observations))),
+            ))
+            .unwrap();
+        let current = receiver.freeze().unwrap();
+        assert!(!captured.same_source_view(&current));
+        assert_ne!(captured.notification(), current.notification());
+    }
+
+    #[test]
+    fn discard_a_b_a_preserves_ties_regional_order_and_calibrated_ray_budget() {
+        fn tied_map() -> Arc<SurfaceSnapshot> {
+            let points: Vec<_> = [0.0_f32, 3.0]
+                .into_iter()
+                .flat_map(|level| {
+                    (-10..10).flat_map(move |x| {
+                        (-10..10).map(move |y| {
+                            ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, level + 0.05)
+                        })
+                    })
+                })
+                .collect();
+            Arc::new(SurfaceSnapshot::from_points(&points, map().config().clone(), 0.1).unwrap())
+        }
+        let mut current = state(0.4, 1);
+        current.robot_pose.pose.position.x = 0.05;
+        current.robot_pose.pose.position.y = 0.05;
+        let mut other_floor = current.clone();
+        other_floor.robot_pose.pose.position.z = 3.4;
+        other_floor.now = Timestamp::from_unix(2, 0);
+        for calibrated in [false, true] {
+            let receiver = SurfaceInputReceiver::new();
+            let a = tied_map();
+            receiver.observe(a.clone()).unwrap();
+            let frozen_a = receiver.freeze().unwrap();
+            let mut source = source(receiver.clone(), 1);
+            let mut direct = super::tests::source(receiver.clone(), 1);
+            for adapter in [&mut source, &mut direct] {
+                // Give an old reachable region priority while leaving the symmetric
+                // map's first-candidate ties and regional representatives intact.
+                adapter
+                    .regional_schedule
+                    .record_outcome([-0.95, -0.95, 0.1]);
+                for _ in 0..8 {
+                    adapter.regional_schedule.record_outcome([30.0, 30.0, 0.1]);
+                }
+                if calibrated {
+                    adapter.set_observation_model(volume_model()).unwrap();
+                }
+            }
+            let before = committed(&source);
+            let expected = direct.poll_goal(&current).unwrap();
+            let expected_goal = goal(expected.clone());
+            assert!(
+                expected_goal.metadata["available_regions"]
+                    .parse::<usize>()
+                    .unwrap()
+                    >= 2
+            );
+            let first = source.prepare_poll_with_input(&current, &frozen_a).unwrap();
+            assert_eq!(first.outcome().as_ref().unwrap(), &expected);
+            source.discard_prepared_poll().unwrap();
+            receiver.observe(tied_map()).unwrap();
+            source.prepare_poll(&other_floor).unwrap();
+            source.discard_prepared_poll().unwrap();
+            assert_eq!(committed(&source), before);
+            let last = source.prepare_poll_with_input(&current, &frozen_a).unwrap();
+            assert_eq!(last.outcome().as_ref().unwrap(), &expected);
+            assert_eq!(source.commit_prepared_poll().unwrap(), expected);
+            assert_eq!(committed(&source), committed(&direct));
+            if calibrated {
+                let selected = source.selected.as_ref().unwrap();
+                let rays: usize = selected.goal.metadata["visibility_rays"].parse().unwrap();
+                assert!(rays <= volume_model().max_rays);
+            }
+        }
+    }
+
+    #[test]
+    fn input_read_error_is_prepared_and_legacy_short_circuits_are_preserved() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let mut source = source(receiver.clone(), 1);
+        let before = committed(&source);
+        let shared = receiver.current.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = shared.write().unwrap();
+            panic!("poison input for transactional error test");
+        })
+        .join();
+        let preview = source.prepare_poll(&state(0.4, 1)).unwrap();
+        assert!(
+            matches!(preview.outcome(), Err(ExploreError::SourceError(message)) if message.contains("poisoned"))
+        );
+        assert_eq!(committed(&source), before);
+        assert!(matches!(
+            source.commit_prepared_poll(),
+            Err(ExploreError::SourceError(_))
+        ));
+        assert_eq!(committed(&source), before);
+        source.end().unwrap();
+        assert!(matches!(
+            source.poll_goal(&state(0.4, 2)).unwrap(),
+            ExplorationPoll::SourceUnavailable(_)
+        ));
     }
 
     #[test]
@@ -1468,4 +2388,6 @@ mod tests {
             ExplorationPoll::SourceUnavailable(_)
         ));
     }
+
+    include!("surface_prepared_reference_tests.rs");
 }

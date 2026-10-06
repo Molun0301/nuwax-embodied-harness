@@ -82,6 +82,20 @@ class StateStore:
                 )
         return entry
 
+    def discard_if_value(self, namespace: StateNamespace, key: str, expected_value: Any) -> bool:
+        """仅撤销已被后继拥有方取代的原对象；不递归触发 write 扩展回调。"""
+        with self._locks[namespace]:
+            current = self._store[namespace].get(key)
+            if current is None or current.value is not expected_value:
+                return False
+            remaining = dict(self._store[namespace])
+            del remaining[key]
+            self._store[namespace] = remaining
+            if self._latest_by_namespace[namespace] is current:
+                self._latest_by_namespace[namespace] = max(
+                    remaining.values(), key=lambda entry: entry.updated_at, default=None)
+            return True
+
     def write_from_provider(
         self,
         provider_name: str,

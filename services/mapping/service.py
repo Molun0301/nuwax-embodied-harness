@@ -67,6 +67,14 @@ def _snapshot_content_identity(metadata):
     return (metadata.get("content_identity"), metadata.get("layer_content_identities"))
 
 
+def _assigned_installation_identity(metadata):
+    # 保存内容的 source epoch/receipt 不变；显示快照的安装拥有方另行比较。
+    if metadata.get("identity_schema_version") != 2:
+        return None
+    return (metadata.get("asset_identity"), metadata.get("activation_receipt_v2"),
+            metadata.get("map_activation_generation"))
+
+
 class MappingService:
     """统一运行态地图快照服务。"""
 
@@ -116,6 +124,7 @@ class MappingService:
                         and latest.update_sequence == runtime_snapshot.update_sequence
                         and latest.frame_id == runtime_snapshot.frame_id
                         and _snapshot_content_identity(latest.metadata) == _snapshot_content_identity(runtime_snapshot.metadata)
+                        and _assigned_installation_identity(latest.metadata) == _assigned_installation_identity(runtime_snapshot.metadata)
                         and latest.metadata.get("semantic_reference_identity") == runtime_snapshot.metadata.get("semantic_reference_identity")
                     ):
                         self._require_current_snapshot_source(runtime_snapshot.map_name, runtime_snapshot.metadata)
@@ -444,7 +453,9 @@ class MappingService:
                             display_unchanged = (stream_occupancy_grid is None or self._stream_bus is None
                                 or (stream_occupancy_key is not None
                                     and self._stream_occupancy_key_by_source.get(source_name) == stream_occupancy_key))
-                            if display_unchanged and latest.metadata.get("semantic_reference_identity") == snapshot_metadata.get("semantic_reference_identity"):
+                            if (display_unchanged
+                                    and latest.metadata.get("semantic_reference_identity") == snapshot_metadata.get("semantic_reference_identity")
+                                    and _assigned_installation_identity(latest.metadata) == _assigned_installation_identity(snapshot_metadata)):
                                 return latest
                         if update_sequence < previous_sequence and source_metadata.get("source_kind") != "map_asset_bundle":
                             raise GatewayError("地图更新早于当前已接受修订。", error_code="map_snapshot_stale_revision", http_status=409)

@@ -856,6 +856,26 @@ def _assigned_activation_ack(response, *, activation_request, stored_checkpoint)
     return payload
 
 
+_ASSIGNED_PREDECESSOR_FIELDS = (
+    "session_id", "map_name", "session_generation", "runtime_generation",
+    "mapping_backend_kind",
+)
+
+
+def _assigned_mapping_predecessor(value):
+    """Retain only the stable native owner descriptor, never mutable revisions."""
+    if not isinstance(value, Mapping):
+        raise ValueError("assigned predecessor requires mapping state")
+    result = {name: value.get(name) for name in _ASSIGNED_PREDECESSOR_FIELDS}
+    if (any(not isinstance(result[name], str) or not result[name]
+            for name in ("session_id", "map_name"))
+            or any(type(result[name]) is not int or result[name] <= 0
+                   for name in ("session_generation", "runtime_generation"))
+            or result["mapping_backend_kind"] not in _SUPPORTED_MAPPING_BACKEND_KINDS):
+        raise ValueError("assigned predecessor descriptor is incomplete")
+    return result
+
+
 def _canonical_string_bytes(value: str) -> bytes:
     encoded = str(value).encode("utf-8")
     return struct.pack(">I", len(encoded)) + encoded
@@ -4640,21 +4660,24 @@ class GeometryRuntimeProvider:
         if not self._bridge.is_running:
             LOGGER.error("子进程未启动，无法连接")
             return False
+        staged_channel = None
         try:
             self._raise_if_map_delivery_reentry_locked("connect")
             message_limit = _grpc_message_limit_bytes()
-            self._channel = grpc.insecure_channel(
+            staged_channel = grpc.insecure_channel(
                 self._bridge.grpc_target,
                 options=(
                     ("grpc.max_receive_message_length", message_limit),
                     ("grpc.max_send_message_length", message_limit),
                 ),
             )
-            self._stub = pb2_grpc.GeometryRuntimeStub(self._channel)
-            resp = self._stub.GetStatus(pb2.Empty(), timeout=_read_deadline_sec())
+            staged_stub = pb2_grpc.GeometryRuntimeStub(staged_channel)
+            resp = staged_stub.GetStatus(pb2.Empty(), timeout=_read_deadline_sec())
             LOGGER.info("gRPC 连接成功: phase=%s, rss=%dKB", resp.phase, resp.rss_kb)
             with self._map_delivery_lock:
                 with self._map_state_lock:
+                    self._channel = staged_channel
+                    self._stub = staged_stub
                     retired_attempt = self._invalidate_map_connection_locked()
                 self._invalidate_map_delivery_tickets_locked()
             del retired_attempt
@@ -4666,6 +4689,11 @@ class GeometryRuntimeProvider:
             return True
         except Exception as exc:
             LOGGER.error("gRPC 连接失败: %s", exc)
+            if staged_channel is not None and staged_channel is not self._channel:
+                try:
+                    staged_channel.close()
+                except Exception:
+                    LOGGER.exception("关闭未提交的 gRPC channel 异常。")
             try:
                 self._cleanup_after_failed_connect()
             except Exception:
@@ -4676,10 +4704,11 @@ class GeometryRuntimeProvider:
                         channel.close()
                     except Exception:
                         LOGGER.exception("强制关闭失败的 gRPC channel 异常。")
-                self._channel = None
-                self._stub = None
-                self._connected = False
-                self._stopping = True
+                with self._map_state_lock:
+                    self._channel = None
+                    self._stub = None
+                    self._connected = False
+                    self._stopping = True
                 try:
                     self._bridge.disconnect()
                 except Exception:
@@ -4690,11 +4719,11 @@ class GeometryRuntimeProvider:
         """connect 失败时释放已建 channel/stub 并强制 bridge 进入未启动状态。"""
         self._raise_if_map_delivery_reentry_locked("failed-connect cleanup")
         with self._map_delivery_lock:
-            self._stopping = True
-            channel = self._channel
-            self._channel = None
-            self._stub = None
             with self._map_state_lock:
+                self._stopping = True
+                channel = self._channel
+                self._channel = None
+                self._stub = None
                 retired_attempt = self._invalidate_map_connection_locked()
             self._invalidate_map_delivery_tickets_locked()
         del retired_attempt
@@ -4727,11 +4756,11 @@ class GeometryRuntimeProvider:
             if exploration_stop_event is not None:
                 exploration_stop_event.set()
         with self._map_delivery_lock:
-            self._stopping = True
-            channel = self._channel
-            self._channel = None
-            self._stub = None
             with self._map_state_lock:
+                self._stopping = True
+                channel = self._channel
+                self._channel = None
+                self._stub = None
                 retired_attempt = self._invalidate_map_connection_locked()
             self._invalidate_map_delivery_tickets_locked()
         del retired_attempt
@@ -5430,6 +5459,7 @@ class GeometryRuntimeProvider:
 
     def activate_assigned_platform_map(
         self, *, activation_request, stored_checkpoint: StoredMappingBackendCheckpoint,
+        expected_origin=None,
     ) -> Dict[str, Any]:
         """显式加载 schema-2；调用方保留原六字段请求，不改写代际或自动重执行。
 
@@ -5454,6 +5484,9 @@ class GeometryRuntimeProvider:
             if not self._connected or self._stub is None or self._stopping:
                 raise RuntimeError("Geometry runtime 未连接。")
             origin = (self._stub, self._map_connection_epoch)
+            if expected_origin is not None and (
+                    origin[0] is not expected_origin[0] or origin[1] != expected_origin[1]):
+                raise RuntimeError("assigned activation connection changed before dispatch")
             pending = self._assigned_activation_attempt
         stub = origin[0]
         transition = self._begin_mapping_transition()
@@ -5557,6 +5590,7 @@ class GeometryRuntimeProvider:
                     error = GeometryRuntimeMapActivationAppliedError(
                         "Assigned activation was acknowledged, but local adoption failed: %s" % exc)
                     error.activation_receipt_v2 = acknowledged["activation_receipt_v2"]
+                    error.activation_evidence = acknowledged
                 else:
                     with self._map_state_lock:
                         if (self._stub is stub and self._map_connection_epoch == origin[1]
@@ -6597,6 +6631,126 @@ class GeometryRuntimeProvider:
             "terminal": terminal,
             "ledger_observation": ledger_observation,
         }
+
+    def capture_assigned_activation_origin(self):
+        with self._map_state_lock:
+            if not self._connected or self._stub is None or self._stopping:
+                raise RuntimeError("assigned activation provider is disconnected")
+            return self._stub, self._map_connection_epoch
+
+    def require_assigned_activation_origin(self, expected_origin) -> None:
+        with self.assigned_activation_origin_guard(expected_origin):
+            pass
+
+    @contextmanager
+    def assigned_activation_origin_guard(self, expected_origin):
+        """Fence connection metadata for a short callback-free local commit.
+
+        Runtime uses R→provider-state→localization S→publication P. No RPC,
+        delivery drain, or callback may execute while this existing lock is held.
+        """
+        with self._map_state_lock:
+            if (not self._connected or self._stopping
+                    or self._stub is not expected_origin[0]
+                    or self._map_connection_epoch != expected_origin[1]):
+                raise RuntimeError("assigned activation provider connection changed")
+            yield
+
+    def capture_assigned_mapping_state(self, *, expected_origin) -> Dict[str, Any]:
+        with self.assigned_activation_origin_guard(expected_origin):
+            if self._mapping_transition_inflight:
+                raise RuntimeError("assigned mapping state is unavailable during a transition")
+            pending = self._assigned_activation_attempt
+            transition = self._mapping_transition_epoch
+        response = expected_origin[0].GetMappingState(pb2.Empty(), timeout=_read_deadline_sec())
+        payload = self._mapping_state_payload(response)
+        settled = False
+        if pending is not None and (pending.stub is expected_origin[0]
+                                    and pending.connection_epoch == expected_origin[1]):
+            retained_request = dict(zip(("activation_request_id", "session_id", "map_name",
+                                        "checkpoint_id", "expected_runtime_generation"), pending.request_key[:5]))
+            retained_request["asset_identity"] = {"asset_id": pending.request_key[5]}
+            try:
+                # Only this actual pinned RPC response can settle the pending
+                # owner. Journal dictionaries and caller receipt claims cannot.
+                _assigned_activation_ack(response, activation_request=retained_request,
+                                         stored_checkpoint=pending.stored_checkpoint)
+                settled = True
+            except ValueError:
+                # Partial, nonmatching, or nonsealed state remains diagnostic;
+                # it never turns an unresolved dispatch into a settled owner.
+                pass
+        with self.assigned_activation_origin_guard(expected_origin):
+            if (self._mapping_transition_inflight or self._mapping_transition_epoch != transition
+                    or self._assigned_activation_attempt is not pending):
+                raise RuntimeError("assigned mapping state ownership changed during capture")
+            if settled:
+                self._assigned_activation_attempt = None
+        # `pending` owns the retired payload references until after lock exit.
+        return payload
+
+    def stop_assigned_mapping_predecessor(self, *, predecessor, expected_origin) -> Dict[str, Any]:
+        """Stop only the journaled owner; every ambiguous dispatch remains UNKNOWN.
+
+        The existing transition reservation drains deliveries and prevents a
+        concurrent local StartMapping. Native StopMapping retains its own
+        exploration safety ownership checks. No lock spans either RPC.
+        """
+        expected = _assigned_mapping_predecessor(predecessor)
+        self.require_assigned_activation_origin(expected_origin)
+        transition = self._begin_mapping_transition()
+        dispatched = False
+
+        def require_origin():
+            with self._map_state_lock:
+                if (not self._connected or self._stopping
+                        or self._stub is not expected_origin[0]
+                        or self._map_connection_epoch != expected_origin[1]
+                        or self._mapping_transition_epoch != transition
+                        or not self._mapping_transition_inflight):
+                    raise RuntimeError("assigned predecessor stop ownership changed")
+
+        try:
+            require_origin()
+            state = self._mapping_state_payload(expected_origin[0].GetMappingState(
+                pb2.Empty(), timeout=_read_deadline_sec()))
+            require_origin()
+            if (state.get("success") is not True
+                    or _assigned_mapping_predecessor(state) != expected
+                    or state.get("phase") not in {"ACTIVE", "STOPPED"}
+                    or state.get("active") is not (state.get("phase") == "ACTIVE")):
+                raise ValueError("assigned predecessor differs from the captured owner")
+            if state["phase"] == "ACTIVE":
+                dispatched = True
+                state = self._mapping_state_payload(expected_origin[0].StopMapping(
+                    pb2.StopMappingRequest(session_id=expected["session_id"],
+                                           reason="assigned map activation predecessor"),
+                    timeout=_read_deadline_sec()))
+            require_origin()
+            if (state.get("success") is not True or state.get("phase") != "STOPPED"
+                    or state.get("active") is not False
+                    or _assigned_mapping_predecessor(state) != expected):
+                raise ValueError("assigned predecessor stop lacks exact STOPPED evidence")
+            if not self._finish_mapping_transition(
+                    transition, identity=self._mapping_identity_from_payload(state),
+                    input_active=False, expected_origin=expected_origin):
+                raise RuntimeError("assigned predecessor stop outlived its connection")
+            return state
+        except BaseException as exc:
+            if dispatched:
+                error = GeometryRuntimeMapActivationOutcomeUnknown(
+                    "Assigned predecessor StopMapping outcome is unresolved: %s" % exc)
+                error.backend_activation_disposition = "unknown"
+                error.backend_stop_confirmed = False
+                error.backend_changed = True
+                error.predecessor = expected
+                raise error from exc
+            raise
+        finally:
+            try:
+                self._finish_mapping_transition(transition)
+            except BaseException:
+                LOGGER.exception("Assigned predecessor transition release failed.")
 
     def stop_mapping(self, *, session_id: str, reason: str = "") -> Dict[str, Any]:
         self._raise_if_stopping("stop_mapping")

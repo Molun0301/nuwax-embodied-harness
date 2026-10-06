@@ -68,9 +68,12 @@ from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
 from services.geometry.geometry_runtime_provider import (
     GeometryRuntimeProvider,
     GeometryRuntimeRpcError,
+    GeometryRuntimeMapActivationAppliedError,
+    GeometryRuntimeMapActivationOutcomeUnknown,
     MappingBackendCheckpointExportBundle,
     _exploration_child_lease_fingerprint,
     _LEGACY_ACTIVATION_IDENTITY_FIELDS,
+    _assigned_mapping_predecessor,
 )
 from services.geometry.loop_closure_state import read_loop_closure_from_db
 from services.geometry.checkpoint_payload import payload_chunks
@@ -226,6 +229,39 @@ class _MapActivationSnapshot:
 
 
 @dataclass(frozen=True, init=False)
+class _PreparedAssignedMapActivation:
+    """Opaque process-local preparation sharing the admitted immutable bodies."""
+
+    _owner: object = field(repr=False)
+    bundle: MapAssetBundle = field(repr=False)
+    bundle_root: Path
+    stored_checkpoint: object = field(repr=False)
+    _provider: object = field(repr=False)
+    _provider_origin: tuple = field(repr=False)
+    _attach_epoch: int
+    prior_snapshot: _MapActivationSnapshot = field(repr=False)
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError("assigned preparations must come from the runtime owner")
+
+    @property
+    def map_name(self):
+        return self.bundle.map_name
+
+    @property
+    def asset_identity(self):
+        return self.bundle.asset_identity
+
+    @property
+    def checkpoint_id(self):
+        return self.stored_checkpoint.checkpoint.checkpoint_id
+
+    @property
+    def backend_kind(self):
+        return self.stored_checkpoint.checkpoint.backend_kind
+
+
+@dataclass(frozen=True, init=False)
 class _AssignedMapActivationTarget:
     """Process-local handle to an actual captured installation, never a receipt claim."""
 
@@ -242,6 +278,10 @@ class _AssignedMapActivationTarget:
     @property
     def map_name(self) -> str:
         return self.activation_receipt.map_name
+
+    @property
+    def installation_generation(self) -> int:
+        return self._snapshot.generation
 
     @property
     def relocalization_policy(self) -> Dict[str, object]:
@@ -2087,7 +2127,8 @@ class PlatformGeometryRuntime:
                             provider=remote_provider,
                         )
                     )
-                self._remote_provider = None
+                with self._runtime_state_lock:
+                    self._remote_provider = None
                 exploration_subscription_id = (
                     self._remote_exploration_subscription_id
                 )
@@ -2275,11 +2316,11 @@ class PlatformGeometryRuntime:
                         )
                     )
                     if self._remote_provider is provider:
-                        self._remote_provider = None
-                        self._remote_exploration_subscription_id = None
-                        self._remote_localization_subscription_handles = {}
-                        self._remote_map_subscription_handles = {}
                         with self._runtime_state_lock:
+                            self._remote_provider = None
+                            self._remote_exploration_subscription_id = None
+                            self._remote_localization_subscription_handles = {}
+                            self._remote_map_subscription_handles = {}
                             self._remote_navigation_subscription_ids = {}
         except Exception:
             LOGGER.exception("回滚 geometry provider owner 引用失败，继续强制断连。")
@@ -2618,11 +2659,11 @@ class PlatformGeometryRuntime:
                     return False
 
                 with self._exploration_loop_lock:
-                    self._remote_provider = provider
-                    self._remote_exploration_subscription_id = (
-                        staged_exploration_id
-                    )
                     with self._runtime_state_lock:
+                        self._remote_provider = provider
+                        self._remote_exploration_subscription_id = (
+                            staged_exploration_id
+                        )
                         self._remote_navigation_subscription_ids = dict(
                             staged_navigation_ids
                         )
@@ -2663,11 +2704,11 @@ class PlatformGeometryRuntime:
                         with provider_attach_lock:
                             with self._exploration_loop_lock:
                                 if self._remote_provider is provider:
-                                    self._remote_provider = None
-                                    self._remote_exploration_subscription_id = None
-                                    self._remote_localization_subscription_handles = {}
-                                    self._remote_map_subscription_handles = {}
                                     with self._runtime_state_lock:
+                                        self._remote_provider = None
+                                        self._remote_exploration_subscription_id = None
+                                        self._remote_localization_subscription_handles = {}
+                                        self._remote_map_subscription_handles = {}
                                         self._remote_navigation_subscription_ids = {}
                     except Exception:
                         LOGGER.exception("强制清除半提交 geometry provider owner 失败。")
@@ -3807,6 +3848,9 @@ class PlatformGeometryRuntime:
             raise TypeError("assigned operation requires a runtime-captured target")
         if self._map_activation_snapshot_locked() is not expected_target._snapshot:
             raise RuntimeError("assigned activation installation changed")
+        installed_origin = getattr(self, "_assigned_map_installation_origin", None)
+        if installed_origin is not None and installed_origin[0] is expected_target._snapshot:
+            self._require_prepared_assigned_origin_locked(installed_origin[1])
         activation = self._activation_result_from_snapshot(expected_target._snapshot)
         if request is not None:
             if (request.asset_identity != expected_target.asset_identity
@@ -4743,8 +4787,11 @@ class PlatformGeometryRuntime:
     @staticmethod
     def _map_asset_activation_fence_identity(
         fence: object,
-    ) -> Tuple[str, str, str]:
+    ) -> tuple:
         payload = fence if isinstance(fence, dict) else {}
+        if "assigned_activation_request" in payload:
+            request = _assigned_activation_request(payload["assigned_activation_request"])
+            return ("assigned_v2", json.dumps(request, sort_keys=True, separators=(",", ":")))
         return (
             str(payload.get("map_name") or "").strip(),
             str(payload.get("asset_manifest_sha256") or "").strip().lower(),
@@ -4766,7 +4813,12 @@ class PlatformGeometryRuntime:
         else:
             with state_lock:
                 fence = getattr(self, "_map_asset_activation_fence", None)
-        return dict(fence) if isinstance(fence, dict) else None
+        if not isinstance(fence, dict):
+            return None
+        result = dict(fence)
+        if "assigned_activation_request" in result:
+            result["assigned_activation_request"] = _assigned_activation_request(result["assigned_activation_request"])
+        return result
 
     def is_map_asset_activation_recovery_pending(self) -> bool:
         return self._map_asset_activation_fence_snapshot() is not None
@@ -4938,6 +4990,50 @@ class PlatformGeometryRuntime:
             return complete_if_matching()
         with state_lock:
             return complete_if_matching()
+
+    def arm_assigned_map_activation_fence(
+        self, *, activation_request, reason: str = "activation_recovery_pending",
+    ) -> bool:
+        """Arm the existing delivery fence with the entire schema-2 request.
+
+        The caller holds no execution/catalog guard while this method drains
+        already-published deliveries. There is no parallel assigned gate.
+        """
+        request = _assigned_activation_request(activation_request)
+        fence = {"assigned_activation_request": request, "map_name": request["map_name"],
+                 "activation_request_id": request["activation_request_id"], "reason": reason}
+        identity = self._map_asset_activation_fence_identity(fence)
+        self._ensure_mapping_lifecycle_fields()
+        self._ensure_subscription_delivery_state()
+        with self._mapping_lifecycle_lock:
+            with self._runtime_state_lock:
+                existing = getattr(self, "_map_asset_activation_fence", None)
+                if existing is not None and self._map_asset_activation_fence_identity(existing) != identity:
+                    return False
+                self._map_asset_activation_fence = fence
+                deliveries = self._map_asset_activation_delivery_tickets_snapshot()
+        self._wait_for_subscription_deliveries(deliveries)
+        return True
+
+    def complete_assigned_map_activation(self, *, activation_request, expected_target=None) -> bool:
+        request = _assigned_activation_request(activation_request)
+        identity = self._map_asset_activation_fence_identity({"assigned_activation_request": request})
+        if expected_target is not None and expected_target.activation_receipt.to_dict()["request"] != request:
+            return False
+
+        def complete_locked():
+            fence = getattr(self, "_map_asset_activation_fence", None)
+            if fence is None:
+                return True
+            if self._map_asset_activation_fence_identity(fence) != identity:
+                return False
+            self._map_asset_activation_fence = None
+            return True
+        if expected_target is not None:
+            with self.assigned_map_installation_guard(expected_target=expected_target):
+                return complete_locked()
+        with self._runtime_state_lock:
+            return complete_locked()
 
     @contextmanager
     def _map_asset_activation_snapshot_read_guard(self) -> Iterator[None]:
@@ -5556,6 +5652,276 @@ class PlatformGeometryRuntime:
             expected_checkpoint_id=request["checkpoint_id"],
         )
         return activate(activation_request=request, stored_checkpoint=stored)
+
+    def _require_prepared_assigned_origin_locked(self, prepared) -> None:
+        if not isinstance(prepared, _PreparedAssignedMapActivation) or prepared._owner is not self:
+            raise TypeError("assigned activation requires this runtime's preparation")
+        if (getattr(self, "_remote_provider", None) is not prepared._provider
+                or getattr(self, "_provider_attach_epoch", 0) != prepared._attach_epoch
+                or getattr(self, "_provider_attach_stopping", False)):
+            raise RuntimeError("assigned activation runtime provider ownership changed")
+        prepared._provider.require_assigned_activation_origin(prepared._provider_origin)
+
+    def prepare_assigned_map_activation(
+        self, bundle: MapAssetBundle, *, bundle_root: Path,
+    ) -> _PreparedAssignedMapActivation:
+        """Admit an already-finalized owner and open its retained checkpoint once.
+
+        Storage reads and descriptor preparation are outside runtime locks. No
+        legacy manifest validation, digest, PCD rebuild, or payload clone occurs.
+        """
+        if (not isinstance(bundle, MapAssetBundle) or bundle.identity_schema_version != 2
+                or bundle.asset_state != "finalized" or bundle.manifest_sha256 is not None
+                or not isinstance(bundle.asset_identity, AssetIdentityV2)):
+            raise ValueError("assigned activation requires a finalized schema-2 bundle")
+        geometry = bundle.geometry_asset
+        checkpoint_metadata = geometry.metadata.get("mapping_backend_checkpoint") if geometry is not None else None
+        if (not isinstance(checkpoint_metadata, dict)
+                or type(checkpoint_metadata.get("schema_version")) is not int
+                or checkpoint_metadata["schema_version"] != 2
+                or checkpoint_metadata.get("backend_kind") not in {"voxel", "raytracing"}):
+            raise ValueError("assigned activation requires its schema-2 cloud checkpoint")
+        root = self._require_bundle_root(bundle_root)
+        with self._runtime_state_lock:
+            provider = getattr(self, "_remote_provider", None)
+            if provider is None or getattr(self, "_provider_attach_stopping", False):
+                raise RuntimeError("assigned activation provider is unavailable")
+            origin = provider.capture_assigned_activation_origin()
+            attach_epoch = getattr(self, "_provider_attach_epoch", 0)
+            prior = self._map_activation_snapshot_locked()
+        from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore
+        stored = MappingBackendCheckpointStore(root).load(
+            checkpoint_metadata["backend_kind"], schema_version=2,
+            expected_checkpoint_id=checkpoint_metadata.get("checkpoint_id"))
+        if (stored.checkpoint.schema_version != 2
+                or stored.checkpoint.checkpoint_id != checkpoint_metadata.get("checkpoint_id")
+                or stored.checkpoint.backend_kind != checkpoint_metadata["backend_kind"]):
+            raise ValueError("assigned checkpoint differs from finalized bundle ownership")
+        prepared = object.__new__(_PreparedAssignedMapActivation)
+        for name, value in {
+            "_owner": self, "bundle": bundle.model_copy(), "bundle_root": root,
+            "stored_checkpoint": stored, "_provider": provider, "_provider_origin": origin,
+            "_attach_epoch": attach_epoch, "prior_snapshot": prior,
+        }.items():
+            object.__setattr__(prepared, name, value)
+        with self._runtime_state_lock:
+            self._require_prepared_assigned_origin_locked(prepared)
+            if not self._map_activation_snapshot_still_current_locked(prior):
+                raise RuntimeError("assigned activation installation changed during preparation")
+        return prepared
+
+    def capture_assigned_mapping_state(self, prepared) -> Dict[str, object]:
+        with self._runtime_state_lock:
+            self._require_prepared_assigned_origin_locked(prepared)
+        state = prepared._provider.capture_assigned_mapping_state(expected_origin=prepared._provider_origin)
+        with self._runtime_state_lock:
+            self._require_prepared_assigned_origin_locked(prepared)
+        if (not isinstance(state, dict) or state.get("success") is not True
+                or state.get("phase") not in {"IDLE", "ACTIVE", "STOPPED"}
+                or state.get("active") is not (state.get("phase") == "ACTIVE")
+                or type(state.get("runtime_generation")) is not int
+                or state["runtime_generation"] <= 0
+                or state.get("mapping_backend_kind") != prepared.backend_kind):
+            raise ValueError("assigned activation mapping state is not authoritative")
+        if state["phase"] != "IDLE":
+            _assigned_mapping_predecessor(state)
+        return state
+
+    def stop_assigned_mapping_predecessor(self, prepared, predecessor) -> Dict[str, object]:
+        expected = _assigned_mapping_predecessor(predecessor)
+        with self._runtime_state_lock:
+            self._require_prepared_assigned_origin_locked(prepared)
+        state = prepared._provider.stop_assigned_mapping_predecessor(
+            predecessor=expected, expected_origin=prepared._provider_origin)
+        try:
+            if (state.get("success") is not True or state.get("phase") != "STOPPED"
+                    or state.get("active") is not False
+                    or _assigned_mapping_predecessor(state) != expected):
+                raise ValueError("assigned predecessor stop lacks exact STOPPED evidence")
+            context = dict(state)
+            self._ensure_mapping_lifecycle_fields()
+            with self._mapping_lifecycle_lock:
+                with self._runtime_state_lock:
+                    self._require_prepared_assigned_origin_locked(prepared)
+                    with prepared._provider.assigned_activation_origin_guard(prepared._provider_origin):
+                        self._mapping_session_context = context
+                        self._mapping_session_provider_attach_epoch = prepared._attach_epoch
+        except Exception as exc:
+            error = GeometryRuntimeMapActivationOutcomeUnknown(
+                "Assigned predecessor stop lost runtime ownership: %s" % exc)
+            error.backend_activation_disposition = "unknown"
+            error.backend_stop_confirmed = False
+            error.backend_changed = True
+            error.predecessor = expected
+            raise error from exc
+        return state
+
+    @staticmethod
+    def _prepared_assigned_activation_request(prepared, activation_request):
+        request = _assigned_activation_request(activation_request)
+        if (request["map_name"] != prepared.map_name
+                or request["asset_identity"] != prepared.asset_identity.model_dump()
+                or request["checkpoint_id"] != prepared.checkpoint_id):
+            raise ValueError("assigned activation request differs from the prepared asset")
+        return request
+
+    def dispatch_prepared_assigned_map(self, prepared, activation_request) -> Dict[str, object]:
+        with self._runtime_state_lock:
+            self._require_prepared_assigned_origin_locked(prepared)
+        request = self._prepared_assigned_activation_request(prepared, activation_request)
+        result = prepared._provider.activate_assigned_platform_map(
+            activation_request=request, stored_checkpoint=prepared.stored_checkpoint,
+            expected_origin=prepared._provider_origin)
+        try:
+            with self._runtime_state_lock:
+                self._require_prepared_assigned_origin_locked(prepared)
+        except Exception as exc:
+            error = GeometryRuntimeMapActivationAppliedError(
+                "Assigned activation ACK outlived its runtime provider owner")
+            error.activation_request = request
+            error.activation_receipt_v2 = result.get("activation_receipt_v2")
+            error.activation_evidence = result
+            raise error from exc
+        return result
+
+    def _admit_prepared_assigned_map_evidence(
+        self, prepared, *, activation_request, activation_evidence,
+    ):
+        """Validate bounded native metadata without installing runtime state."""
+        with self._runtime_state_lock:
+            self._require_prepared_assigned_origin_locked(prepared)
+        request = self._prepared_assigned_activation_request(prepared, activation_request)
+        if not isinstance(activation_evidence, Mapping):
+            raise ValueError("assigned installation requires current native metadata")
+        evidence = dict(activation_evidence)
+        if any(name in evidence for name in _LEGACY_ACTIVATION_IDENTITY_FIELDS + ("cloud_source_sha256",)):
+            raise ValueError("assigned installation evidence mixes legacy metadata")
+        receipt = AssignedActivationReceipt.admit(evidence.get("activation_receipt_v2"))
+        document = receipt.to_dict()
+        installed = document["activation"]
+        from services.geometry.mapping_backend_checkpoint_store import _identity_document
+        source = _identity_document(prepared.stored_checkpoint.checkpoint.cloud_identity)
+        if (document["request"] != request or document["target"]["source_cloud_member"] != source
+                or installed["backend_kind"] != prepared.backend_kind):
+            raise ValueError("assigned installation differs from request or checkpoint source")
+        exact = {
+            "success": True, "phase": "ACTIVE", "active": True,
+            "activation_receipt_schema_version": 2, "legacy_checkpoint_reconstructed": False,
+            "map_name": request["map_name"], "session_id": request["session_id"],
+            "activation_request_id": request["activation_request_id"],
+            "runtime_generation": installed["runtime_generation"],
+            "session_generation": installed["session_generation"],
+            "mapping_backend_kind": installed["backend_kind"],
+            "backend_generation": installed["backend_generation"],
+            "revision": document["target"]["occupancy_receipt"]["occupancy_revision"],
+        }
+        if any(type(evidence.get(name)) is not type(value) or evidence[name] != value
+               for name, value in exact.items()):
+            raise ValueError("assigned installation requires exact current native state")
+        disposition = evidence.get("activation_receipt_disposition")
+        if (type(disposition) is not int or disposition not in {2, 3}
+                or type(evidence.get("relocalization_target_available")) is not bool
+                or evidence.get("idempotent_replay") is not (disposition == 3)):
+            raise ValueError("assigned installation requires sealed native evidence")
+        policy = evidence.get("relocalization_policy_v2")
+        if isinstance(policy, dict):
+            policy = dict(policy)
+        expected_policy = current_assigned_relocalization_policy()
+        if (not isinstance(policy, dict) or set(policy) != set(expected_policy)
+                or any(type(policy[name]) is not type(value) or policy[name] != value
+                       for name, value in expected_policy.items())):
+            raise ValueError("assigned installation omitted or changed actual native policy")
+        result = {**exact, "activation_receipt_disposition": disposition,
+                  "idempotent_replay": evidence["idempotent_replay"],
+                  "activation_receipt_v2": document,
+                  "relocalization_target_available": evidence["relocalization_target_available"],
+                  "relocalization_policy_v2": policy}
+        with self._runtime_state_lock:
+            self._require_prepared_assigned_origin_locked(prepared)
+        return receipt, result, source
+
+    def validate_prepared_assigned_map_evidence(
+        self, prepared, *, activation_request, activation_evidence,
+    ) -> AssignedActivationReceipt:
+        """Admit current evidence before the caller's durable journal write."""
+        receipt, _, _ = self._admit_prepared_assigned_map_evidence(
+            prepared, activation_request=activation_request, activation_evidence=activation_evidence)
+        return receipt
+
+    def install_prepared_assigned_map(
+        self, prepared, *, activation_request, activation_evidence,
+    ) -> Tuple[_AssignedMapActivationTarget, MapSnapshot]:
+        """Adopt current evidence under R CAS; source and installed receipts differ.
+
+        Historical receipt-only journal metadata cannot establish installation.
+        All views and serialized metadata are prepared before the short CAS.
+        """
+        receipt, result, source = self._admit_prepared_assigned_map_evidence(
+            prepared, activation_request=activation_request, activation_evidence=activation_evidence)
+        document = receipt.to_dict()
+        request, policy = document["request"], result["relocalization_policy_v2"]
+        result_json = json.dumps(result, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        # Detached small views retain the sealed tuple/packed payload owners.
+        snapshot = prepared.bundle.snapshot
+        metadata = {**snapshot.metadata, "identity_schema_version": 2,
+                    "asset_identity": request["asset_identity"],
+                    "activation_receipt_v2": document,
+                    "source_occupancy_receipt": source["occupancy_receipt"],
+                    "source_cloud_receipt": source["cloud_receipt"],
+                    "source_kind": "map_asset_bundle", "map_snapshot_kind": "offline_checkpoint",
+                    "live_streaming_ready": False, "mapping_live_streaming_ready": False,
+                    "backend_snapshot_correlated": False}
+        context = json.loads(result_json)
+        self._ensure_mapping_lifecycle_fields()
+        with self._mapping_lifecycle_lock:
+            with self._runtime_state_lock:
+                self._require_prepared_assigned_origin_locked(prepared)
+                with prepared._provider.assigned_activation_origin_guard(prepared._provider_origin):
+                    current = self._map_activation_snapshot_locked()
+                    current_state = self._activation_result_from_snapshot(current)
+                    same_receipt = (
+                        current.bundle is not None and current.bundle.identity_schema_version == 2
+                        and current.bundle.asset_identity == prepared.asset_identity
+                        and current.bundle.map_name == prepared.map_name
+                        and current_state.get("activation_receipt_v2") == document
+                        and current_state.get("relocalization_policy_v2") == policy)
+                    same_installation = (same_receipt and
+                        current_state.get("relocalization_target_available") is result["relocalization_target_available"])
+                    if not same_installation:
+                        if not self._map_activation_snapshot_still_current_locked(prepared.prior_snapshot):
+                            raise RuntimeError("assigned activation installation changed before adoption")
+                        current = _MapActivationSnapshot(
+                            prepared.bundle, prepared.bundle_root, result_json, current.generation + 1)
+                        self._map_activation_snapshot = current
+                        self._workspace_map_name = prepared.map_name
+                    # Current evidence can reconcile a connection without native
+                    # reinstall. Changed availability is new immutable metadata.
+                    self._assigned_map_installation_origin = (current, prepared)
+                    self._mapping_session_context = context
+                    self._mapping_session_provider_attach_epoch = prepared._attach_epoch
+                    target = object.__new__(_AssignedMapActivationTarget)
+                    object.__setattr__(target, "_snapshot", current)
+                    object.__setattr__(target, "activation_receipt", receipt)
+                    generation = current.generation
+        return target, snapshot.model_copy(update={"metadata": {
+            **metadata, "map_activation_generation": generation}}, deep=False)
+
+    @contextmanager
+    def assigned_map_installation_guard(self, *, expected_target) -> Iterator[AssignedActivationReceipt]:
+        """Hold R for a metadata-only R→S→P localization commit.
+
+        No I/O, callbacks, map copies, or durable journal operations may run in
+        this scope. Availability remains the actual native installation value.
+        """
+        with self._runtime_state_lock:
+            self._require_assigned_map_activation_target_locked(expected_target)
+            installed_origin = getattr(self, "_assigned_map_installation_origin", None)
+            if installed_origin is None or installed_origin[0] is not expected_target._snapshot:
+                yield expected_target.activation_receipt
+            else:
+                prepared = installed_origin[1]
+                with prepared._provider.assigned_activation_origin_guard(prepared._provider_origin):
+                    yield expected_target.activation_receipt
 
     def activate_map_asset_bundle(
         self,
@@ -9707,6 +10073,9 @@ class PlatformGeometryRuntime:
             raise RuntimeError("nuwax-geometry-runtime gRPC 未连接，无法停止建图。")
         self._ensure_mapping_lifecycle_fields()
         with self._mapping_lifecycle_lock:
+            fence = self._map_asset_activation_fence_snapshot()
+            if isinstance(fence, dict) and "assigned_activation_request" in fence:
+                raise RuntimeError("assigned map activation is pending; ordinary StopMapping is fenced")
             context = self._mapping_session_context
             if not isinstance(context, dict) or not str(context.get("session_id") or ""):
                 state_reader = getattr(provider, "get_mapping_state", None)

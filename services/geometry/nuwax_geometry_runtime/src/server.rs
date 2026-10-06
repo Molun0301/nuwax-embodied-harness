@@ -1052,6 +1052,13 @@ impl GeometryRuntimeService {
         _mapping_transition: tokio::sync::OwnedMutexGuard<()>,
         mut cancellation_rx: watch::Receiver<bool>,
     ) -> Result<Response<MappingSessionState>, Status> {
+        // This retained transition still owns L. Clear predecessor localization
+        // before replay/publication or a successful reply, without holding the
+        // shared-state lock across backend creation or retirement.
+        {
+            let mut shared = self.bridge.state.write().await;
+            crate::lcm_runtime::reset_canonical_localization_locked(&mut shared, None);
+        }
         self.bridge
             .revoke_committed_map_projection_locked(&mut projection_guard)
             .map_err(Status::unavailable)?;
@@ -2896,6 +2903,12 @@ async fn activate_map_r1(
             );
         }
     };
+    // activate_map_r1 runs in the existing retained task with L still held.
+    // Reset only after a genuinely new session starts; replay returned above.
+    {
+        let mut shared = bridge.state.write().await;
+        crate::lcm_runtime::reset_canonical_localization_locked(&mut shared, None);
+    }
     macro_rules! settle_started_failure {
         ($disposition:expr, $detail:expr) => {{
             let mut detail = $detail;
@@ -5478,11 +5491,8 @@ impl GeometryRuntimeService {
                 .map_err(Status::unavailable)?;
             let mut state = self.bridge.state.write().await;
             state.map = Default::default();
-            state.pose = Default::default();
-            state.transforms.clear();
-            state.tf_tree = Arc::new(nuwax_tf::TfTree::new());
-            binding.install_sensor_edge(&mut state);
-            state.pose_changed.send_replace(());
+            crate::lcm_runtime::reset_canonical_localization_locked(
+                &mut state, binding.sensor_edge().as_ref());
             drop(state);
             *self.bridge.occupancy_shm_current.write().await = None;
             snapshot
@@ -11463,6 +11473,183 @@ mod lifecycle_tests {
                 .is_err()
         );
         drop(held_lifecycle);
+    }
+
+    // These fixtures construct only the injected in-process transport. The
+    // capability flag admits its implemented publish path, not a real LCM link.
+    struct CanonicalResetFixture {
+        service: GeometryRuntimeService,
+        handle: GeometryRuntimeHandle,
+        tasks: crate::lcm_runtime::GeometryTestTaskOwner,
+        task_owner: crate::lcm_runtime::GeometryRuntimeTaskOwner,
+    }
+
+    impl CanonicalResetFixture {
+        async fn new() -> Self {
+            let transport = LcmTransport::new(Arc::new(CheckpointPublishBackend::default()));
+            let (mut handle, tasks) = crate::lcm_runtime::build_handle_for_tests_with_unit_transport(
+                true, Some(crate::mapping_backend::MappingBackendSpec::Voxel), transport,
+            ).await.expect("in-process reset fixture");
+            handle.lcm_backend_available = true;
+            let owned = crate::lcm_runtime::attach_root_task_owner_for_tests(handle);
+            let service = GeometryRuntimeService::new(owned.handle.clone());
+            Self { service, handle: owned.handle, tasks, task_owner: owned.task_owner }
+        }
+
+        async fn finish(mut self) {
+            // The retained transition owns this mutex until all its work exits.
+            let transition = self.service.mapping_transition.clone().lock_owned().await;
+            let outcome = self.task_owner.shutdown().await;
+            assert!(outcome.producers_settled(), "reset fixture registered producers joined");
+            outcome.result.expect("reset fixture producer shutdown");
+            let mapping = self.handle.mapping_adapter.as_ref().unwrap().clone();
+            let retirement = {
+                let _lifecycle = self.handle.mapping_lifecycle_lock.lock().await;
+                let mut adapter = mapping.lock();
+                let current = adapter.snapshot();
+                if current.active {
+                    adapter.stop_session_detached(&current.session_id)
+                        .expect("reset fixture stop").retirement
+                } else { None }
+            };
+            finish_backend_retirement(&mapping, &self.handle.mapping_lifecycle_lock, retirement)
+                .await.expect("reset fixture worker joined");
+            drop(transition);
+            drop(mapping);
+            drop(self.service);
+            drop(self.handle);
+            drop(self.task_owner);
+            self.tasks.finish().await.expect("reset fixture fanout joined and files released");
+        }
+    }
+
+    async fn seed_canonical_reset_pose(handle: &GeometryRuntimeHandle, timestamp_ns: u64) {
+        let mut shared = handle.state.write().await;
+        shared.pose = crate::lcm_runtime::PoseState {
+            x: 8.0, qw: 1.0, frame_id: "map".into(), timestamp_ns,
+            ..Default::default()
+        };
+        crate::lcm_runtime::apply_sensor_extrinsic_locked(&mut shared, &crate::lcm_runtime::TransformEntry {
+            parent: "map".into(), child: "odom".into(), tx: 8.0, rw: 1.0,
+            stamp_ns: timestamp_ns, ..Default::default()
+        });
+        shared.pose_changed.send_replace(());
+    }
+
+    async fn assert_canonical_reset_visible(service: &GeometryRuntimeService) {
+        let pose = GeometryRuntime::get_current_pose(service, Request::new(PoseRequest::default()))
+            .await.unwrap().into_inner();
+        assert!(pose.frame_id.is_empty());
+        assert_eq!(pose.timestamp_ns, 0);
+        let tree = GeometryRuntime::get_frame_tree(service, Request::new(Empty {}))
+            .await.unwrap().into_inner();
+        assert!(tree.transforms.is_empty());
+        assert!(service.bridge.state.read().await.transforms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonical_reset_new_start_clears_pose_but_replay_and_rejection_preserve_it() {
+        let fixture = CanonicalResetFixture::new().await;
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            seed_canonical_reset_pose(&fixture.handle, 41).await;
+            let mut changed = fixture.handle.state.read().await.pose_changed.subscribe();
+            let started = start_mapping_session(&fixture.service, "reset-new", "room").await;
+            assert!(started.active);
+            assert!(changed.has_changed().unwrap());
+            changed.borrow_and_update();
+            assert_canonical_reset_visible(&fixture.service).await;
+            seed_canonical_reset_pose(&fixture.handle, 42).await;
+            changed.borrow_and_update();
+            let replay = start_mapping_session(&fixture.service, "reset-new", "room").await;
+            assert!(replay.idempotent_replay);
+            let rejected = GeometryRuntime::start_mapping(&fixture.service, Request::new(StartMappingRequest {
+                session_id: "other".into(), map_name: "other".into(),
+            })).await;
+            assert!(rejected.is_err());
+            assert_eq!(fixture.handle.state.read().await.pose.timestamp_ns, 42);
+            assert!(!fixture.handle.state.read().await.latest_transform_entries().is_empty());
+            assert!(!changed.has_changed().unwrap());
+        })).await;
+        fixture.finish().await;
+        if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
+    }
+
+    #[tokio::test]
+    async fn canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it() {
+        let fixture = CanonicalResetFixture::new().await;
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            seed_canonical_reset_pose(&fixture.handle, 51).await;
+            let xyz = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+                .into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+            let request = cloud_activation_request(xyz);
+            let activated = GeometryRuntime::activate_map(&fixture.service, Request::new(request.clone()))
+                .await.expect("in-process cloud activation").into_inner();
+            assert!(activated.success);
+            assert_canonical_reset_visible(&fixture.service).await;
+            seed_canonical_reset_pose(&fixture.handle, 52).await;
+            let replay = GeometryRuntime::activate_map(&fixture.service, Request::new(request.clone()))
+                .await.unwrap().into_inner();
+            assert!(replay.idempotent_replay);
+            let mut malformed = request;
+            malformed.session_id.clear();
+            assert!(GeometryRuntime::activate_map(&fixture.service, Request::new(malformed)).await.is_err());
+            assert_eq!(fixture.handle.state.read().await.pose.timestamp_ns, 52);
+            assert!(!fixture.handle.state.read().await.latest_transform_entries().is_empty());
+        })).await;
+        fixture.finish().await;
+        if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
+    }
+
+    async fn exercise_canonical_reset_retained_after_caller_cancel(cloud_activation: bool) {
+        let fixture = CanonicalResetFixture::new().await;
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            seed_canonical_reset_pose(&fixture.handle, 61).await;
+            let shared = fixture.handle.state.write().await;
+            let service = fixture.service.clone();
+            let caller = tokio::spawn(async move {
+                if cloud_activation {
+                    let xyz = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+                        .into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+                    GeometryRuntime::activate_map(&service, Request::new(cloud_activation_request(xyz))).await
+                } else {
+                    GeometryRuntime::start_mapping(&service, Request::new(StartMappingRequest {
+                        session_id: "reset-held".into(), map_name: "room".into(),
+                    })).await
+                }
+            });
+            // Holding SharedState blocks the actual post-start reset. Adapter
+            // admission proves the call has passed the no-effect/replay paths.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if fixture.handle.mapping_adapter.as_ref().unwrap().lock().is_active() { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("new session reaches retained reset");
+            assert!(!caller.is_finished());
+            assert!(fixture.handle.mapping_lifecycle_lock.try_lock().is_err());
+            assert_eq!(shared.pose.timestamp_ns, 61); // allowed unfinished-transition observation
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            assert!(fixture.handle.mapping_lifecycle_lock.try_lock().is_err());
+            drop(shared);
+            let transition = tokio::time::timeout(Duration::from_secs(5),
+                fixture.service.mapping_transition.clone().lock_owned()).await
+                .expect("retained transition completes after reset");
+            drop(transition);
+            assert_canonical_reset_visible(&fixture.service).await;
+        })).await;
+        fixture.finish().await;
+        if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
+    }
+
+    #[tokio::test]
+    async fn canonical_reset_start_retains_lifecycle_until_reset_after_caller_cancel() {
+        exercise_canonical_reset_retained_after_caller_cancel(false).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_reset_activation_retains_lifecycle_until_reset_after_caller_cancel() {
+        exercise_canonical_reset_retained_after_caller_cancel(true).await;
     }
 
     fn activation_request(session_id: &str, map_name: &str) -> ActivateMapRequest {

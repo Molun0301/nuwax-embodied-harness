@@ -3587,6 +3587,23 @@ pub(crate) fn apply_sensor_extrinsic_locked(state:&mut SharedState,entry:&Transf
     } else {state.transforms.push(entry.clone());}
 }
 
+/// Retire every canonical localization sample at a new-session boundary.
+/// The caller holds the mapping lifecycle fence and the SharedState write lock.
+/// Only the explicitly supplied sensor descriptor belongs to the new session;
+/// a zero timestamp on an old edge does not establish descriptor ownership.
+pub(crate) fn reset_canonical_localization_locked(
+    state: &mut SharedState,
+    sensor_edge: Option<&TransformEntry>,
+) {
+    state.pose = PoseState::default();
+    state.tf_tree = Arc::new(TfTree::new());
+    state.transforms.clear();
+    if let Some(sensor_edge) = sensor_edge {
+        apply_sensor_extrinsic_locked(state, sensor_edge);
+    }
+    state.pose_changed.send_replace(());
+}
+
 fn transform_to_entry(transform: TransformStamped) -> Option<TransformEntry> {
     let stamp_secs = u64::try_from(transform.stamp_secs).ok()?;
     let stamp_ns = stamp_secs
@@ -12215,12 +12232,114 @@ async fn build_handle_for_tests_with_cloud_writer(
     build_test_handle_parts(with_cloud_writer, backend_override, None).await
 }
 
+/// Custody of the existing fanout tasks and files for injected unit fixtures.
+/// Callers retire their own mapping/correction workers and drop runtime handle
+/// clones before finishing this owner. Drop aborts tasks during unwinding but
+/// deliberately leaves files alone until an explicit finish has joined them.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct GeometryTestTaskOwner {
+    fanout_tasks: Vec<JoinHandle<()>>,
+    fixture_root: Option<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+impl GeometryTestTaskOwner {
+    pub(crate) async fn finish(mut self) -> Result<(), String> {
+        for task in &self.fanout_tasks {
+            task.abort();
+        }
+        let mut failures = Vec::new();
+        // Keep every handle in the owner across awaits so cancellation of
+        // finish still runs its abort-on-drop guard for all remaining tasks.
+        for task in &mut self.fanout_tasks {
+            if let Err(error) = task.await {
+                if !error.is_cancelled() {
+                    failures.push(format!("unit fixture fanout task failed: {error}"));
+                }
+            }
+        }
+        self.fanout_tasks.clear();
+        if let Some(root) = self.fixture_root.take() {
+            if let Err(error) = std::fs::remove_dir_all(&root) {
+                failures.push(format!(
+                    "unit fixture cleanup failed at {}: {error}",
+                    root.display()
+                ));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for GeometryTestTaskOwner {
+    fn drop(&mut self) {
+        for task in &self.fanout_tasks {
+            task.abort();
+        }
+    }
+}
+
+/// Explicit in-process unit fixture; never selects or claims a real-LCM backend.
+#[cfg(test)]
+pub(crate) async fn build_handle_for_tests_with_unit_transport(
+    with_cloud_writer: bool,
+    backend_override: Option<crate::mapping_backend::MappingBackendSpec>,
+    unit_transport: LcmTransport,
+) -> Result<(GeometryRuntimeHandle, GeometryTestTaskOwner), RealLcmBackendUnavailable> {
+    let mut task_owner = GeometryTestTaskOwner::default();
+    let result = std::panic::AssertUnwindSafe(build_test_handle_parts_owned(
+        with_cloud_writer,
+        backend_override,
+        Some(unit_transport),
+        Some(&mut task_owner),
+    ))
+    .catch_unwind()
+    .await;
+    match result {
+        Ok(Ok(handle)) => Ok((handle, task_owner)),
+        Ok(Err(error)) => {
+            if let Err(cleanup_error) = task_owner.finish().await {
+                warn!(%cleanup_error, "failed unit fixture construction cleanup");
+            }
+            Err(error)
+        }
+        Err(panic) => {
+            if let Err(cleanup_error) = task_owner.finish().await {
+                warn!(%cleanup_error, "panicked unit fixture construction cleanup");
+            }
+            std::panic::resume_unwind(panic)
+        }
+    }
+}
+
 // The optional transport is exclusively for separately named in-process unit
 // tests. Existing real-LCM integration constructors always pass None.
 async fn build_test_handle_parts(
     with_cloud_writer: bool,
     backend_override: Option<crate::mapping_backend::MappingBackendSpec>,
     unit_transport: Option<LcmTransport>,
+) -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
+    #[cfg(test)]
+    {
+        build_test_handle_parts_owned(with_cloud_writer, backend_override, unit_transport, None).await
+    }
+    #[cfg(not(test))]
+    {
+        build_test_handle_parts_owned(with_cloud_writer, backend_override, unit_transport).await
+    }
+}
+
+async fn build_test_handle_parts_owned(
+    with_cloud_writer: bool,
+    backend_override: Option<crate::mapping_backend::MappingBackendSpec>,
+    unit_transport: Option<LcmTransport>,
+    #[cfg(test)] mut task_owner: Option<&mut GeometryTestTaskOwner>,
 ) -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
     let in_process_unit_transport = unit_transport.is_some();
     let (cloud_map_tx, _) = broadcast::channel::<CloudMapNotification>(4);
@@ -12238,6 +12357,10 @@ async fn build_test_handle_parts(
     let fixture_id = uuid::Uuid::new_v4().simple().to_string();
     let fixture_root = std::env::temp_dir().join(format!("nuwax-geometry-test-{fixture_id}"));
     std::fs::create_dir(&fixture_root).expect("test fixture directory must be new and writable");
+    #[cfg(test)]
+    if let Some(owner) = task_owner.as_mut() {
+        owner.fixture_root = Some(fixture_root.clone());
+    }
     let sequence_state_path = fixture_root.join("sequence_state.json");
     let sequence_store = Arc::new(
         SequenceStateStore::open(&sequence_state_path)
@@ -12275,7 +12398,7 @@ async fn build_test_handle_parts(
     let occupancy_shm_current = Arc::new(RwLock::new(None));
     let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
     let mapping_lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
-    spawn_map_revision_fanout(
+    let fanout_tasks = spawn_map_revision_fanout(
         map_revision_fanout_rx,
         map_revision_latest_tx.clone(),
         committed_map_authority.clone(),
@@ -12294,6 +12417,12 @@ async fn build_test_handle_parts(
             .clone(),
         mapping_lifecycle_lock.clone(),
     );
+    #[cfg(test)]
+    if let Some(owner) = task_owner {
+        owner.fanout_tasks = fanout_tasks;
+    }
+    #[cfg(not(test))]
+    drop(fanout_tasks);
     let nav = crate::nav_runtime::NavRuntimeState::try_from_sequence_store(sequence_store.as_ref())
         .expect("test producer generation reservation");
     let cloud_map_writer = if with_cloud_writer {
@@ -12359,6 +12488,174 @@ mod tf_tree_tests {
             rw: 1.0,
             stamp_ns,
         }
+    }
+
+    fn localization_state_with_history() -> SharedState {
+        let mut state = SharedState {
+            pose: PoseState {
+                x: 90.0,
+                y: 91.0,
+                z: 92.0,
+                qw: 1.0,
+                frame_id: "map".into(),
+                timestamp_ns: 2_000_000_000,
+                ..PoseState::default()
+            },
+            ..SharedState::default()
+        };
+        for stamp_ns in [0, 1_000_000_000, 2_000_000_000] {
+            for (parent, child) in [("map", "odom"), ("odom", "base_link")] {
+                let transform = TransformEntry {
+                    parent: parent.into(),
+                    child: child.into(),
+                    ..entry(stamp_ns, 90.0)
+                };
+                state.tf_tree.set(entry_to_transform(&transform).unwrap());
+                if stamp_ns == 2_000_000_000 {
+                    state.transforms.push(transform);
+                }
+            }
+        }
+        // Neither a zero stamp nor a sensor-shaped child establishes ownership.
+        for child in ["retired_camera", "laser"] {
+            let transform = TransformEntry {
+                parent: "base_link".into(),
+                child: child.into(),
+                ..entry(0, 99.0)
+            };
+            state.tf_tree.set(entry_to_transform(&transform).unwrap());
+            state.transforms.push(transform);
+        }
+        state
+    }
+
+    #[test]
+    fn canonical_localization_reset_clears_pose_full_history_and_mirror() {
+        let mut state = localization_state_with_history();
+        assert_eq!(state.tf_tree.history_len("odom"), 3);
+        assert_eq!(state.tf_tree.history_len("base_link"), 3);
+        assert!(state.tf_tree.lookup_at("base_link", 0.0, 0.0).is_ok());
+
+        reset_canonical_localization_locked(&mut state, None);
+
+        assert!(state.pose.frame_id.is_empty());
+        assert_eq!(state.pose.timestamp_ns, 0);
+        assert_eq!(
+            (
+                state.pose.x, state.pose.y, state.pose.z,
+                state.pose.qx, state.pose.qy, state.pose.qz, state.pose.qw,
+            ),
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        );
+        assert!(state.transforms.is_empty());
+        assert!(state.latest_transform_entries().is_empty());
+        assert!(state.tf_tree.frames().is_empty());
+        for child in ["odom", "base_link", "retired_camera", "laser"] {
+            assert_eq!(state.tf_tree.history_len(child), 0);
+            assert!(state.tf_tree.lookup(child).is_err());
+            assert!(state.tf_tree.lookup_at(child, 0.0, 0.0).is_err());
+            assert!(state.tf_tree.lookup_at(child, 1.0, 0.0).is_err());
+        }
+    }
+
+    #[test]
+    fn canonical_localization_reset_notifies_even_when_pose_is_already_missing() {
+        let mut state = SharedState::default();
+        let mut changes = state.pose_changed.subscribe();
+        assert!(!changes.has_changed().unwrap());
+
+        reset_canonical_localization_locked(&mut state, None);
+
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        reset_canonical_localization_locked(&mut state, None);
+        assert!(changes.has_changed().unwrap());
+        assert!(state.pose.frame_id.is_empty());
+    }
+
+    #[test]
+    fn canonical_localization_reset_reinstalls_only_explicit_sensor_descriptor() {
+        let mut state = localization_state_with_history();
+        let sensor_edge = TransformEntry {
+            parent: "base_link".into(),
+            child: "laser".into(),
+            tx: 0.25,
+            ty: -0.5,
+            tz: 0.75,
+            rw: 1.0,
+            ..TransformEntry::default()
+        };
+
+        reset_canonical_localization_locked(&mut state, Some(&sensor_edge));
+
+        assert!(state.pose.frame_id.is_empty());
+        let latest = state.latest_transform_entries();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].parent, "base_link");
+        assert_eq!(latest[0].child, "laser");
+        assert_eq!((latest[0].tx, latest[0].ty, latest[0].tz), (0.25, -0.5, 0.75));
+        assert_eq!(latest[0].stamp_ns, 0);
+        assert_eq!(state.tf_tree.history_len("laser"), 1);
+        assert_eq!(state.transforms.len(), 1);
+        assert_eq!(state.transforms[0].child, "laser");
+        assert_eq!(state.transforms[0].tx, sensor_edge.tx);
+        for child in ["odom", "base_link", "retired_camera"] {
+            assert_eq!(state.tf_tree.history_len(child), 0);
+            assert!(state.tf_tree.lookup_at(child, 0.0, 0.0).is_err());
+        }
+    }
+
+    #[test]
+    fn canonical_localization_reset_accepts_new_canonical_observation() {
+        let mut state = localization_state_with_history();
+        let sensor_edge = TransformEntry {
+            parent: "base_link".into(),
+            child: "laser".into(),
+            tx: 0.25,
+            rw: 1.0,
+            ..TransformEntry::default()
+        };
+        reset_canonical_localization_locked(&mut state, Some(&sensor_edge));
+        let changes = state.pose_changed.subscribe();
+        let observation = canonical_mapping_observation_from_isometry(
+            "map",
+            "odom",
+            1,
+            &nalgebra::Isometry3::translation(10.0, 0.0, 0.0),
+            &PoseState {
+                x: 2.0,
+                y: 3.0,
+                z: 4.0,
+                qw: 1.0,
+                frame_id: "odom".into(),
+                timestamp_ns: 3_000_000_000,
+                ..PoseState::default()
+            },
+            "base_link",
+        )
+        .expect("new-session canonical observation");
+
+        apply_canonical_mapping_observation_locked(&mut state, &observation);
+
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(state.pose.frame_id, "map");
+        assert_eq!(state.pose.timestamp_ns, 3_000_000_000);
+        assert_eq!((state.pose.x, state.pose.y, state.pose.z), (12.0, 3.0, 4.0));
+        let pose = resolve_map_pose_tree(&state.tf_tree, "map", &["base_link"])
+            .expect("new-session canonical TF chain");
+        assert_eq!((pose.0, pose.1, pose.2), (12.0, 3.0, 4.0));
+        for child in ["odom", "base_link"] {
+            assert_eq!(state.tf_tree.history_len(child), 1);
+            assert!(state.tf_tree.lookup_at(child, 1.0, 0.0).is_err());
+            assert!(state.tf_tree.lookup_at(child, 3.0, 0.0).is_ok());
+        }
+        assert_eq!(
+            state.tf_tree.lookup("laser").unwrap().transform.translation.x,
+            0.25
+        );
+        assert!(state.tf_tree.lookup("retired_camera").is_err());
+        assert_eq!(state.latest_transform_entries().len(), 3);
+        assert_eq!(state.transforms.len(), 3);
     }
 
     #[test]

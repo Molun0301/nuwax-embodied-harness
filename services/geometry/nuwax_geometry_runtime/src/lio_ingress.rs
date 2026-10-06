@@ -2548,23 +2548,6 @@ impl NativeDeferredReplayControl {
             *self.phase.lock() = NativeDeferredReplayPhase::Closed;
             return Err("native deferred replay stopped before irreversible output".to_owned());
         }
-        let identity_matches = {
-            let mut phase = self.phase.lock();
-            match &mut *phase {
-                NativeDeferredReplayPhase::CloudReplaying(identity, irreversible)
-                    if *identity == claimed.identity =>
-                {
-                    *irreversible = true;
-                    true
-                }
-                _ => false,
-            }
-        };
-        if !identity_matches {
-            return Err(self.poison_after_irreversible(
-                "deferred Mapping identity changed before canonical output".to_owned(),
-            ));
-        }
         let pose = match pose_state_from_startup_pair(&claimed.pair) {
             Ok(pose) => pose,
             Err(error) => return Err(self.poison_after_irreversible(error)),
@@ -2573,26 +2556,80 @@ impl NativeDeferredReplayControl {
             Some(runtime) => runtime,
             None => return Err(self.poison_after_irreversible(runtime_not_bound())),
         };
-        match handoff_lio_odometry_with_correction(
-            &runtime.handle,
-            &pose,
-            &claimed.pair.odometry.body_frame_id,
-            &runtime.tf,
-            self.correction_applier.as_ref(),
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(self.poison_after_irreversible(
+        let odometry_handoff = async {
+            let _lifecycle_guard = runtime.handle.mapping_lifecycle_lock.lock().await;
+            if self.stop_requested.load(Ordering::Acquire)
+                || self.gate.is_closed()
+                || !self.correction_ingress.is_open()
+            {
+                return Ok(None);
+            }
+            self.ingress
+                .common
+                .validate_registration_mode_token(registration_mode_token)
+                .map_err(|error| format!(
+                    "deferred replay rejected stale cloud mode provenance: {error}"
+                ))?;
+            let mapping = runtime.handle.mapping_adapter.as_ref()
+                .ok_or_else(|| "mapping adapter is unavailable".to_owned())?;
+            let current_identity_matches = {
+                let adapter = mapping.lock();
+                let snapshot = adapter.snapshot();
+                snapshot.active
+                    && snapshot.session_id == claimed.identity.session_id
+                    && snapshot.map_name == claimed.identity.map_name
+                    && snapshot.session_generation == claimed.identity.session_generation
+                    && adapter.global_frame_generation() == claimed.identity.map_frame_generation
+            };
+            if !current_identity_matches {
+                return Err(
+                    "deferred Mapping identity changed before canonical odometry".to_owned(),
+                );
+            }
+            let identity_matches = {
+                let mut phase = self.phase.lock();
+                match &mut *phase {
+                    NativeDeferredReplayPhase::CloudReplaying(identity, irreversible)
+                        if *identity == claimed.identity =>
+                    {
+                        *irreversible = true;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if !identity_matches {
+                return Err(
+                    "deferred Mapping identity changed before canonical output".to_owned(),
+                );
+            }
+            // 精确会话与模式校验、位姿提交和 TF 发布共用现有生命周期围栏。
+            // 在后续点云注册重新获取围栏前释放，避免重入同一把锁。
+            match handoff_lio_odometry_with_correction(
+                &runtime.handle,
+                &pose,
+                &claimed.pair.odometry.body_frame_id,
+                &runtime.tf,
+                self.correction_applier.as_ref(),
+            )
+            .await
+            {
+                Ok(true) => Ok(Some(())),
+                Ok(false) => Err(
                     "deferred canonical odometry committed no observation".to_owned(),
-                ))
-            }
-            Err(error) => {
-                return Err(self.poison_after_irreversible(format!(
+                ),
+                Err(error) => Err(format!(
                     "deferred canonical odometry/TF outcome is unknown: {error}"
-                )))
+                )),
             }
+        }.await;
+        match odometry_handoff {
+            Ok(Some(())) => {}
+            Ok(None) => {
+                *self.phase.lock() = NativeDeferredReplayPhase::Closed;
+                return Err("native deferred replay stopped before irreversible output".to_owned());
+            }
+            Err(error) => return Err(self.poison_after_irreversible(error)),
         }
         let correlated_odometry = CorrelatedOdometry {
             source_sequence: claimed.pair.odometry_identity.source_sequence,
@@ -4126,6 +4163,7 @@ mod tests {
     use super::*;
     use crate::mapping_adapter::{MappingAdapterConfig, MappingSessionSnapshot};
     use async_trait::async_trait;
+    use futures::FutureExt;
     use nuwax_transport::{LcmBackend, LcmFrameStream, LcmTransport, TransportResult};
     use std::sync::Arc;
     use std::time::Duration;
@@ -4188,6 +4226,7 @@ mod tests {
         published: Arc<std::sync::Mutex<Vec<RawLcmFrame>>>,
         frame_tx: tokio::sync::mpsc::UnboundedSender<RawLcmFrame>,
         fail_message_type: Arc<std::sync::Mutex<Option<String>>>,
+        blocked_message_type: Arc<Mutex<Option<(String, Arc<Notify>)>>>,
     }
 
     impl ReplayTransportBackend {
@@ -4198,6 +4237,7 @@ mod tests {
                     published: Arc::new(std::sync::Mutex::new(Vec::new())),
                     frame_tx,
                     fail_message_type: Arc::new(std::sync::Mutex::new(None)),
+                    blocked_message_type: Arc::new(Mutex::new(None)),
                 },
                 frame_rx,
             )
@@ -4217,6 +4257,12 @@ mod tests {
                 .fail_message_type
                 .lock()
                 .expect("replay failure injection") = Some(message_type.to_owned());
+        }
+
+        fn block_message_type(&self, message_type: &str) -> Arc<Notify> {
+            let release = Arc::new(Notify::new());
+            *self.blocked_message_type.lock() = Some((message_type.to_owned(), release.clone()));
+            release
         }
     }
 
@@ -4239,6 +4285,12 @@ mod tests {
                     "injected {} publication failure",
                     frame.msg_type.fqn()
                 )));
+            }
+            let release = self.blocked_message_type.lock().as_ref()
+                .filter(|(message_type, _)| message_type == frame.msg_type.fqn())
+                .map(|(_, release)| release.clone());
+            if let Some(release) = release {
+                release.notified().await;
             }
             Ok(())
         }
@@ -4304,10 +4356,19 @@ mod tests {
         correction_owner: Option<crate::correction_coordinator::CorrectionTransportOwner>,
         correction_phase_a: crate::correction_coordinator::CorrectionPhaseAControl,
         cloud_path: std::path::PathBuf,
+        unit_tasks: Option<crate::lcm_runtime::GeometryTestTaskOwner>,
     }
 
     impl DeferredReplayFixture {
         async fn new() -> Self {
+            Self::new_with_transport(false).await
+        }
+
+        async fn new_in_process() -> Self {
+            Self::new_with_transport(true).await
+        }
+
+        async fn new_with_transport(in_process: bool) -> Self {
             let native_spec = DeviceLioIngressSpec::new_for_backend(
                 LIO_BACKEND_FASTLIO2,
                 7,
@@ -4384,9 +4445,20 @@ mod tests {
                 "bound raw probe must retain immutable E0 provenance",
             );
 
-            let mut handle = crate::lcm_runtime::build_handle_for_tests()
-                .await
-                .expect("replay Geometry handle");
+            let (backend, frame_rx) = ReplayTransportBackend::new();
+            let (mut handle, unit_tasks) = if in_process {
+                let (handle, tasks) = crate::lcm_runtime::build_handle_for_tests_with_unit_transport(
+                    false,
+                    Some(crate::mapping_backend::MappingBackendSpec::Voxel),
+                    LcmTransport::new(Arc::new(backend.clone())),
+                ).await.expect("in-process replay Geometry handle");
+                assert_eq!(handle.transport_backend_name, "in-process-unit");
+                assert!(!handle.lcm_backend_available);
+                (handle, Some(tasks))
+            } else {
+                (crate::lcm_runtime::build_handle_for_tests()
+                    .await.expect("replay Geometry handle"), None)
+            };
             handle.mapping_adapter = Some(Arc::new(parking_lot::Mutex::new(
                 MappingAdapter::new_with_frames(mapping_config(), "map", "odom"),
             )));
@@ -4399,7 +4471,6 @@ mod tests {
                 crate::pointcloud::CloudMapShmWriter::new(&cloud_path)
                     .expect("deferred replay cloud-map writer"),
             );
-            let (backend, frame_rx) = ReplayTransportBackend::new();
             handle.transport = LcmTransport::new(Arc::new(backend.clone()));
             let public_odometry = binding(
                 "/test/lio/deferred/odometry",
@@ -4497,6 +4568,7 @@ mod tests {
                 correction_owner: Some(correction_owner),
                 correction_phase_a,
                 cloud_path,
+                unit_tasks,
             }
         }
 
@@ -4667,6 +4739,19 @@ mod tests {
 
         async fn complete_startup_odometry(&mut self) {
             let replay = self.replay.clone();
+            if self.unit_tasks.is_some() {
+                let mut publication = Box::pin(replay.publish_startup_odometry());
+                let binding = self.public_odometry.clone();
+                let frame = tokio::select! {
+                    result = &mut publication => panic!("startup replay finished before ACK: {result:?}"),
+                    frame = self.next_frame(&binding) => frame,
+                };
+                let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+                LioIngressSink::accept_public_odometry(self.gate.as_ref(), frame, &mut shutdown_rx)
+                    .await.expect("in-process startup public odometry handler");
+                publication.await.expect("in-process startup odometry post-handler ACK");
+                return;
+            }
             let publication = tokio::spawn(async move { replay.publish_startup_odometry().await });
             let binding = self.public_odometry.clone();
             let frame = self.next_frame(&binding).await;
@@ -4690,8 +4775,26 @@ mod tests {
                     .await
                     .expect("deferred replay correction shutdown");
             }
+            if self.unit_tasks.is_some() {
+                let _lifecycle_guard = self.handle.mapping_lifecycle_lock.lock().await;
+                let mut adapter = self.handle.mapping_adapter.as_ref()
+                    .expect("in-process replay mapping adapter").lock();
+                let snapshot = adapter.snapshot();
+                if snapshot.active {
+                    adapter.stop_session(&snapshot.session_id)
+                        .expect("retire and join in-process replay mapping worker");
+                }
+            }
             *self.handle.cloud_map_writer.lock() = None;
-            let _ = std::fs::remove_file(&self.cloud_path);
+            let cloud_path = self.cloud_path.clone();
+            let unit_tasks = self.unit_tasks.take();
+            drop(self);
+            if let Some(tasks) = unit_tasks {
+                tasks.finish().await.expect("join replay fanout and remove fixture files");
+                std::fs::remove_file(cloud_path).expect("remove in-process replay cloud file");
+            } else {
+                let _ = std::fs::remove_file(cloud_path);
+            }
         }
     }
 
@@ -4737,6 +4840,188 @@ mod tests {
             DeferredSessionClaim::Claimed
         ));
         (snapshot, map_frame_generation)
+    }
+
+    async fn replay_pose_snapshot(handle: &GeometryRuntimeHandle)
+        -> ([u64; 7], String, u64, usize, usize, u64, u64)
+    {
+        let shared = handle.state.read().await;
+        let pose = &shared.pose;
+        (
+            [pose.x, pose.y, pose.z, pose.qx, pose.qy, pose.qz, pose.qw].map(f64::to_bits),
+            pose.frame_id.clone(), pose.timestamp_ns,
+            shared.transforms.len(), shared.tf_tree.history_len("base_link"),
+            shared.map.revision, shared.cloud_map_revision,
+        )
+    }
+
+    #[tokio::test]
+    async fn in_process_deferred_replay_rechecks_admission_after_lifecycle_wait() {
+        #[derive(Clone, Copy, Debug)]
+        enum Change { Successor, Frame, Inactive, Stop, Gate, Correction, Mode }
+
+        for change in [Change::Successor, Change::Frame, Change::Inactive, Change::Stop,
+            Change::Gate, Change::Correction, Change::Mode]
+        {
+            let mut fixture = DeferredReplayFixture::new_in_process().await;
+            let result = std::panic::AssertUnwindSafe(async {
+                fixture.complete_startup_odometry().await;
+                claim_fresh_mapping_session(&fixture, "claimed-session", "claimed-map", false).await;
+                let lifecycle = fixture.handle.mapping_lifecycle_lock.clone();
+                let lifecycle_guard = lifecycle.lock().await;
+                fixture.handle.state.write().await.pose = PoseState {
+                    x: 42.0, y: -43.0, z: 44.0, qw: 1.0,
+                    frame_id: "map".to_owned(), timestamp_ns: 123,
+                    ..PoseState::default()
+                };
+                let before_pose = replay_pose_snapshot(&fixture.handle).await;
+                let replay_control = fixture.replay.clone();
+                let mut replay = Box::pin(replay_control.replay_claimed());
+                assert!(futures::poll!(replay.as_mut()).is_pending(), "{change:?}");
+                assert!(matches!(&*fixture.replay.phase.lock(),
+                    NativeDeferredReplayPhase::CloudReplaying(_, false)),
+                    "{change:?}: waiting for L must not mark output irreversible");
+                assert_eq!(replay_pose_snapshot(&fixture.handle).await, before_pose,
+                    "{change:?}: a held lifecycle lock must prevent pose mutation");
+                let mapping = fixture.handle.mapping_adapter.as_ref().unwrap().clone();
+                match change {
+                    Change::Successor => {
+                        let mut adapter = mapping.lock();
+                        adapter.stop_session("claimed-session").expect("retire old worker");
+                        adapter.start_session("successor-session", "successor-map")
+                            .expect("start successor worker");
+                    }
+                    Change::Frame => {
+                        mapping.lock().feed_pose_in_frame(10.0, 11.0, 12.0, 0.0, "odom")
+                            .expect("establish a newer frame under L");
+                    }
+                    Change::Inactive => {
+                        mapping.lock().stop_session("claimed-session").expect("retire claimed worker");
+                    }
+                    Change::Stop => fixture.replay.begin_phase_a(),
+                    Change::Gate => LioIngressSink::close(fixture.gate.as_ref()),
+                    Change::Correction => fixture.correction_phase_a.begin(),
+                    Change::Mode => {
+                        fixture.correction_ingress.relocalization_mode_fence().activate_for_tests();
+                    }
+                }
+                let before_adapter = adapter_registration_state(&mapping.lock());
+                drop(lifecycle_guard);
+                let error = replay.await.expect_err("stale replay must reject before odometry");
+                let stopped = matches!(change, Change::Stop | Change::Gate | Change::Correction);
+                let expected = if stopped {
+                    "stopped before irreversible output"
+                } else if matches!(change, Change::Mode) {
+                    "stale cloud mode provenance"
+                } else {
+                    "Mapping identity changed before canonical odometry"
+                };
+                assert!(error.contains(expected), "{change:?}: {error}");
+                assert_eq!(fixture.replay.poison_detail().is_none(), stopped, "{change:?}");
+                assert_eq!(replay_pose_snapshot(&fixture.handle).await, before_pose, "{change:?}");
+                assert_eq!(adapter_registration_state(&mapping.lock()), before_adapter, "{change:?}");
+                assert_eq!(fixture.backend.published_count("tf2_msgs.TFMessage"), 0, "{change:?}");
+                assert_eq!(fixture.backend.published_count("nuwax_msgs.LioCloudEnvelope"), 0, "{change:?}");
+                assert_eq!(fixture.correction_sink.staged.load(Ordering::Acquire), 0, "{change:?}");
+                assert!(fixture.ingress.common.state.lock().pending_registrations.is_empty());
+                drop(replay_control);
+                drop(mapping);
+                drop(lifecycle);
+            }).catch_unwind().await;
+            fixture.shutdown().await;
+            if let Err(panic) = result { std::panic::resume_unwind(panic); }
+        }
+    }
+
+    #[tokio::test]
+    async fn in_process_deferred_replay_checks_each_exact_claim_component() {
+        for component in 0..4 {
+            let mut fixture = DeferredReplayFixture::new_in_process().await;
+            let result = std::panic::AssertUnwindSafe(async {
+                fixture.complete_startup_odometry().await;
+                claim_fresh_mapping_session(&fixture, "exact-session", "exact-map", false).await;
+                {
+                    let mut phase = fixture.replay.phase.lock();
+                    let NativeDeferredReplayPhase::Claimed(Some(claimed)) = &mut *phase else {
+                        panic!("fixture must hold one claimed source pair");
+                    };
+                    match component {
+                        0 => claimed.identity.session_id.push_str("-retired"),
+                        1 => claimed.identity.map_name.push_str("-retired"),
+                        2 => claimed.identity.session_generation += 1,
+                        _ => claimed.identity.map_frame_generation += 1,
+                    }
+                }
+                let before_pose = replay_pose_snapshot(&fixture.handle).await;
+                let before_adapter = adapter_registration_state(
+                    &fixture.handle.mapping_adapter.as_ref().unwrap().lock());
+                let error = fixture.replay.replay_claimed().await
+                    .expect_err("every claimed identity component must match current Mapping");
+                assert!(error.contains("Mapping identity changed before canonical odometry"));
+                assert_eq!(replay_pose_snapshot(&fixture.handle).await, before_pose, "component {component}");
+                assert_eq!(adapter_registration_state(
+                    &fixture.handle.mapping_adapter.as_ref().unwrap().lock()), before_adapter);
+                assert_eq!(fixture.backend.published_count("tf2_msgs.TFMessage"), 0);
+                assert_eq!(fixture.backend.published_count("nuwax_msgs.LioCloudEnvelope"), 0);
+            }).catch_unwind().await;
+            fixture.shutdown().await;
+            if let Err(panic) = result { std::panic::resume_unwind(panic); }
+        }
+    }
+
+    #[tokio::test]
+    async fn in_process_deferred_replay_holds_lifecycle_through_odometry_handoff() {
+        let mut fixture = DeferredReplayFixture::new_in_process().await;
+        let result = std::panic::AssertUnwindSafe(async {
+            fixture.complete_startup_odometry().await;
+            let (snapshot, _) = claim_fresh_mapping_session(
+                &fixture, "current-session", "current-map", false).await;
+            {
+                let _lifecycle_guard = fixture.handle.mapping_lifecycle_lock.lock().await;
+                // 仅准备测试会话；实际规范位姿、点云提交和公开回调仍走真实重放入口。
+                fixture.handle.cloud_map_writer.lock().as_mut().unwrap()
+                    .begin_session(snapshot.session_generation).expect("initialize replay writer session");
+            }
+            let release_tf = fixture.backend.block_message_type("tf2_msgs.TFMessage");
+            let lifecycle = fixture.handle.mapping_lifecycle_lock.clone();
+            let lifecycle_guard = lifecycle.lock().await;
+            let replay_control = fixture.replay.clone();
+            let mut replay = Box::pin(replay_control.replay_claimed());
+            assert!(futures::poll!(replay.as_mut()).is_pending());
+            assert_eq!(fixture.backend.published_count("tf2_msgs.TFMessage"), 0);
+            drop(lifecycle_guard);
+            assert!(futures::poll!(replay.as_mut()).is_pending());
+            assert_eq!(fixture.backend.published_count("tf2_msgs.TFMessage"), 1);
+            assert!(lifecycle.try_lock().is_err(), "TF publication must retain L after the pose commit");
+            assert_eq!(fixture.handle.state.read().await.pose.timestamp_ns, 1_000_000_000);
+            release_tf.notify_one();
+            let cloud_binding = fixture.public_cloud.clone();
+            let cloud = tokio::select! {
+                result = &mut replay => panic!("replay finished before public cloud ACK: {result:?}"),
+                cloud = fixture.next_frame(&cloud_binding) => cloud,
+            };
+            assert!(lifecycle.try_lock().is_ok(), "cloud ACK must not retain odometry's L guard");
+            let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+            LioIngressSink::accept_public_cloud(fixture.gate.as_ref(), cloud, &mut shutdown_rx)
+                .await.expect("actual current public cloud post-handler ACK");
+            replay.await.expect("exact-current replay completes");
+            assert!(fixture.gate.is_open());
+            {
+                let adapter = fixture.handle.mapping_adapter.as_ref().unwrap().lock();
+                assert!(fixture.replay.is_complete_for("current-session", "current-map",
+                    snapshot.session_generation, adapter.global_frame_generation()));
+                assert_eq!(adapter.odom_count(), 1);
+                assert_eq!(adapter.pointcloud_count(), 1);
+            }
+            fixture.replay.replay_claimed().await.expect("completed replay is one-shot");
+            assert_eq!(fixture.backend.published_count("tf2_msgs.TFMessage"), 1);
+            assert_eq!(fixture.backend.published_count("nuwax_msgs.LioCloudEnvelope"), 1);
+            assert_eq!(fixture.correction_sink.staged.load(Ordering::Acquire), 1);
+            drop(replay_control);
+            drop(lifecycle);
+        }).catch_unwind().await;
+        fixture.shutdown().await;
+        if let Err(panic) = result { std::panic::resume_unwind(panic); }
     }
 
     #[tokio::test]

@@ -5210,12 +5210,16 @@ mod preflight_only_contract {
                     } else {
                         Vec::new()
                     };
-                    state.target_receipt_sha256 = record
-                        .target_receipt
-                        .as_ref()
-                        .and_then(TargetReceipt::legacy_digest)
-                        .map(|value| value.to_vec())
-                        .unwrap_or_default();
+                    state.target_receipt_sha256 = if record.seed.modern {
+                        record
+                            .target_receipt
+                            .as_ref()
+                            .and_then(TargetReceipt::legacy_digest)
+                            .map(|value| value.to_vec())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     state.relocalization_target_available = target_available;
                     if let Some(target) = record.seed.planar_target.as_ref() {
                         state.target_kind = "planar_graph".into();
@@ -16279,6 +16283,135 @@ mod preflight_only_contract {
                     assert!(sealed.target_receipt_sha256.is_empty());
                 }
             }
+        }
+
+        #[test]
+        fn activation_ledger_legacy_cloud_seals_exact_proof_without_public_binding() {
+            let control = ActivatedTargetReceiptControl::new(7);
+            let mut seed = activation_seed_with_target("legacy-cloud", 1, 1);
+            seed.modern = false;
+            let token = match control.stage_or_replay(seed, activation_base_state(), true) {
+                ActivationLedgerAdmission::Execute(token) => token,
+                _ => panic!("first admission must execute"),
+            };
+            let token = control.reserve_backend_generation(&token, 13).unwrap();
+            let token = control
+                .bind_activation_identity(&token, [4; 32], 11)
+                .unwrap();
+            let weak = control
+                .with_staged_record(&token, |record| {
+                    Arc::downgrade(record.immutable_target.as_ref().unwrap())
+                })
+                .unwrap();
+            let proof = activation_publication_proof([5; 32], 1, 11);
+            assert!(control.store_publication_proof(&token, proof.clone()));
+            assert_eq!(control.retained_immutable_target_bytes(), 12);
+            assert!(control.current_sealed_target_snapshot().is_none());
+
+            let mut stale = activation_base_state();
+            stale.activation_identity_sha256 = vec![9; 32];
+            stale.target_receipt_sha256 = vec![9; 32];
+            stale.activation_receipt_v2 = Some(Default::default());
+            stale.relocalization_target_available = true;
+            let sealed = control
+                .seal(&token, Some(proof.target_receipt.clone()), stale.clone())
+                .expect("legacy cloud seal must retain its exact internal receipt");
+            let mut queried = stale;
+            control.decorate_current_state(&mut queried);
+            for state in [&sealed, &queried] {
+                assert!(state.success);
+                assert_eq!(
+                    state.activation_receipt_disposition,
+                    crate::proto::ActivationReceiptDisposition::LegacyUnbound as i32
+                );
+                assert!(state.activation_identity_sha256.is_empty());
+                assert!(state.target_receipt_sha256.is_empty());
+                assert!(state.activation_receipt_v2.is_none());
+                assert!(!state.relocalization_target_available);
+            }
+            assert!(!control.validate_token(&token));
+            assert!(control.current_sealed_target_snapshot().is_none());
+            assert!(control.current_sealed_assigned_target_snapshot().is_none());
+            assert_eq!(control.retained_immutable_target_bytes(), 0);
+            assert!(weak.upgrade().is_none());
+            let ledger = control.inner.ledger.lock();
+            let record = ledger.records.get("legacy-cloud").unwrap();
+            assert_eq!(record.state, PermanentActivationState::Sealed);
+            assert_eq!(record.target_receipt.as_ref(), Some(&proof.target_receipt));
+            assert!(record
+                .publication_proof
+                .as_ref()
+                .unwrap()
+                .same_descriptors(&proof));
+            assert!(!ActivatedTargetReceiptControl::has_complete_target_proof(
+                record
+            ));
+            assert!(record.immutable_target.is_none());
+            assert!(record.checkpoint_owner.is_none());
+            assert!(record.seed.immutable_target.is_none());
+            assert!(record.seed.checkpoint_owner.is_none());
+            assert!(record.seed.planar_target.is_none());
+            assert!(record
+                .terminal
+                .as_ref()
+                .unwrap()
+                .target_receipt_sha256
+                .is_empty());
+        }
+
+        #[test]
+        fn activation_ledger_legacy_cloud_rejects_missing_changed_and_cross_schema_receipts() {
+            let control = ActivatedTargetReceiptControl::new(7);
+            let mut seed = activation_seed_with_target("legacy-cloud", 1, 1);
+            seed.modern = false;
+            let token = match control.stage_or_replay(seed, activation_base_state(), true) {
+                ActivationLedgerAdmission::Execute(token) => token,
+                _ => panic!("first admission must execute"),
+            };
+            let token = control.reserve_backend_generation(&token, 13).unwrap();
+            let token = control
+                .bind_activation_identity(&token, [4; 32], 11)
+                .unwrap();
+            let assigned_control = ActivatedTargetReceiptControl::new(17);
+            let assigned_token =
+                assigned_bound_token(&assigned_control, assigned_request(assigned_wire_request()));
+            let assigned_receipt = assigned_proof(&assigned_control, &assigned_token).target_receipt;
+            assert!(control
+                .seal(
+                    &token,
+                    Some(assigned_receipt.clone()),
+                    activation_base_state(),
+                )
+                .is_none());
+            assert!(control.validate_token(&token));
+            assert!(control.publication_proof(&token).is_none());
+
+            let proof = activation_publication_proof([5; 32], 1, 11);
+            assert!(control.store_publication_proof(&token, proof.clone()));
+            for receipt in [
+                None,
+                Some(TargetReceipt::LegacyDigest([6; 32])),
+                Some(assigned_receipt),
+            ] {
+                assert!(control
+                    .seal(&token, receipt, activation_base_state())
+                    .is_none());
+                assert!(control.validate_token(&token));
+                assert_eq!(control.retained_immutable_target_bytes(), 12);
+                assert!(control
+                    .publication_proof(&token)
+                    .unwrap()
+                    .same_descriptors(&proof));
+                let ledger = control.inner.ledger.lock();
+                let record = ledger.records.get("legacy-cloud").unwrap();
+                assert_eq!(record.state, PermanentActivationState::Staged);
+                assert_eq!(record.target_receipt.as_ref(), Some(&proof.target_receipt));
+                assert!(record.terminal.is_none());
+            }
+            assert!(control
+                .seal(&token, Some(proof.target_receipt), activation_base_state())
+                .is_some());
+            assert_eq!(control.retained_immutable_target_bytes(), 0);
         }
 
         #[test]

@@ -926,6 +926,12 @@ impl CloudMapShmWriter {
         Some(snapshot.clone())
     }
 
+    /// Retain an already materialized payload without exporting or copying it.
+    /// Descriptor validation remains the caller's responsibility.
+    pub(crate) fn materialized_committed_snapshot(&self) -> Option<CommittedCloudMapSnapshot<Arc<[u8]>>> {
+        self.committed_snapshot_cache.get().cloned()
+    }
+
     pub(crate) fn last_cloud_receipt(&self) -> Option<CloudCommitReceipt> {
         self.last_cloud_receipt.clone()
     }
@@ -1617,6 +1623,40 @@ mod tests {
         assert_eq!(read_u32(&writer.mmap, 160), 256);
         assert_eq!(&writer.mmap[164..420], receipt.session_id.as_bytes());
         assert!(!writer.full_snapshot_materialized());
+    }
+
+    #[test]
+    fn materialized_snapshot_retains_existing_payload_without_exporting_and_commit_invalidates_cache() {
+        let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
+        assert!(writer.materialized_committed_snapshot().is_none());
+        assert!(!writer.full_snapshot_materialized());
+        assert!(writer.accumulate_mapping_frame(1, &[Point3::new(1.0, 0.0, 0.0)]));
+        writer.commit_accumulated().unwrap();
+        assert!(writer.committed_metadata().is_some());
+        assert!(writer.materialized_committed_snapshot().is_none());
+        assert!(!writer.full_snapshot_materialized());
+
+        let exported = writer.shared_committed_snapshot().unwrap();
+        let retained = writer.materialized_committed_snapshot().unwrap();
+        assert!(writer.full_snapshot_materialized());
+        assert!(Arc::ptr_eq(&exported.xyz_f32_le, &retained.xyz_f32_le));
+        assert_eq!(retained.revision, exported.revision);
+        let original = retained.xyz_f32_le.to_vec();
+
+        assert!(writer.accumulate_mapping_frame(1, &[Point3::new(2.0, 0.0, 0.0)]));
+        writer.commit_accumulated().unwrap();
+        assert!(writer.committed_metadata().unwrap().revision > retained.revision);
+        assert!(writer.materialized_committed_snapshot().is_none());
+        assert!(!writer.full_snapshot_materialized());
+        assert!(Arc::ptr_eq(&exported.xyz_f32_le, &retained.xyz_f32_le));
+        assert_eq!(retained.xyz_f32_le.as_ref(), original.as_slice());
+
+        let next = writer.shared_committed_snapshot().unwrap();
+        assert_eq!(next.point_count, 2);
+        assert!(!Arc::ptr_eq(&retained.xyz_f32_le, &next.xyz_f32_le));
+        assert!(Arc::ptr_eq(&next.xyz_f32_le,
+            &writer.materialized_committed_snapshot().unwrap().xyz_f32_le));
+        assert_eq!(retained.xyz_f32_le.as_ref(), original.as_slice());
     }
 
     #[test]

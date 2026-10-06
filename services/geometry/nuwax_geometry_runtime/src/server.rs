@@ -138,7 +138,6 @@ impl RetainedActivationGlobalMap {
         activation_request_key: impl Into<ActivationRequestKey>,
         map_frame_id: &str,
         committed: &CommittedMappingCloudMap,
-        xyz_f32_le: &[u8],
     ) -> Result<Self, String> {
         let activation_request_key = activation_request_key.into();
         Ok(Self {
@@ -147,10 +146,54 @@ impl RetainedActivationGlobalMap {
             installed_cloud_revision: committed.notification.revision,
             cloud_metadata: committed.metadata,
             cloud_receipt: committed.receipt.clone(),
-            legacy_frame: if matches!(activation_request_key, ActivationRequestKey::LegacyDigest(_)) {
-                Some(build_committed_global_map_frame_in_frame(committed, xyz_f32_le, map_frame_id)?)
-            } else { None },
+            // The request bytes may be non-center coordinates. Retain only
+            // metadata until a failed publication exposes its canonical cache.
+            legacy_frame: None,
         })
+    }
+
+    fn capture_materialized_legacy_frame(
+        &mut self,
+        writer: &Arc<parking_lot::Mutex<Option<crate::pointcloud::CloudMapShmWriter>>>,
+        committed: &CommittedMappingCloudMap,
+    ) -> Result<(), String> {
+        if self.legacy_frame.is_some()
+            || !matches!(self.activation_request_key, ActivationRequestKey::LegacyDigest(_))
+        {
+            return Ok(());
+        }
+        self.validate_replay(self.activation_request_key.clone(), &self.map_frame_id, committed)?;
+        let snapshot = {
+            let guard = writer.lock();
+            let owner = guard.as_ref().ok_or("retained publication writer is unavailable")?;
+            let metadata = owner.committed_metadata()
+                .ok_or("retained publication metadata is unavailable")?;
+            if !crate::lcm_runtime::same_cloud_metadata(&metadata, &self.cloud_metadata)
+                || owner.last_cloud_receipt().as_ref() != Some(&self.cloud_receipt)
+            {
+                return Err("retained publication current metadata/receipt changed".into());
+            }
+            // Never initialize the full export cache here. When no legacy
+            // payload was exported, retry through the canonical sequencer.
+            let Some(snapshot) = owner.materialized_committed_snapshot() else {
+                return Ok(());
+            };
+            let cached_metadata = crate::pointcloud::CommittedCloudMapMetadata {
+                revision: snapshot.revision, point_count: snapshot.point_count,
+                voxel_size: snapshot.voxel_size, session_generation: snapshot.session_generation,
+                producer_epoch: snapshot.producer_epoch, layout_generation: snapshot.layout_generation,
+            };
+            if !crate::lcm_runtime::same_cloud_metadata(&cached_metadata, &self.cloud_metadata) {
+                return Err("retained publication cached metadata changed".into());
+            }
+            snapshot
+        };
+        // The existing encoded retention buffer is built from the already
+        // shared actual publication bytes, outside the writer lock, only once.
+        self.legacy_frame = Some(build_committed_global_map_frame_in_frame(
+            committed, &snapshot.xyz_f32_le, &self.map_frame_id,
+        )?);
+        Ok(())
     }
 
     fn validate_replay(
@@ -2606,7 +2649,7 @@ async fn activate_map_r1(
                 receipt: proof.cloud_receipt.clone(),
             };
             let replaying_retained_publication = retained_global_map.is_some();
-            let retained_publication = match retained_global_map.take() {
+            let mut retained_publication = match retained_global_map.take() {
                 Some(retained) => {
                     if let Err(error) = retained.validate_replay(
                         activation_request_key.clone(),
@@ -2640,7 +2683,6 @@ async fn activate_map_r1(
                     activation_request_key.clone(),
                     &expected_map_frame_id,
                     &committed,
-                    target.xyz_f32_le(),
                 ) {
                     Ok(retained) => retained,
                     Err(error) => {
@@ -2656,9 +2698,14 @@ async fn activate_map_r1(
                 _ => publish_committed_global_map_in_frame(&bridge, &committed, &expected_map_frame_id).await,
             };
             if let Err(error) = publish_result {
-                let detail = format!(
+                let mut detail = format!(
                     "cloud-map checkpoint installed but typed /global_map publication failed: {error}"
                 );
+                if let Err(capture_error) = retained_publication.capture_materialized_legacy_frame(
+                    &bridge.cloud_map_writer, &committed,
+                ) {
+                    detail.push_str(&format!("; canonical retention failed: {capture_error}"));
+                }
                 match service.retain_activation_lifecycle_fence(
                     identity_class.request_id(),
                     activation_request_key.clone(),
@@ -2707,9 +2754,9 @@ async fn activate_map_r1(
         let mut replay = current.clone();
         replay.idempotent_replay = true;
         let state = mapping_session_state(replay, "map checkpoint publication resumed");
-        let target_receipt = identity_class
-            .is_modern()
-            .then_some(proof.target_receipt.clone());
+        // Seal against the actual publication proof even for an unbound
+        // compatibility request. Public eligibility is projected by the ledger.
+        let target_receipt = Some(proof.target_receipt.clone());
         let sealed = match service
             .activation_receipts
             .seal(&token, target_receipt, state)
@@ -3419,11 +3466,10 @@ async fn activate_map_r1(
                     "ACTIVATE_MAP_CLOUD_EVENT_JOURNAL_CAS_FAILED".to_owned()
                 );
             }
-            let retained_publication = match RetainedActivationGlobalMap::from_committed(
+            let mut retained_publication = match RetainedActivationGlobalMap::from_committed(
                 activation_request_key.clone(),
                 &expected_map_frame_id,
                 &committed,
-                immutable_target.as_ref().expect("cloud commit requires immutable activation target").xyz_f32_le(),
             ) {
                 Ok(retained) => retained,
                 Err(error) => {
@@ -3437,9 +3483,14 @@ async fn activate_map_r1(
                 publish_committed_global_map_in_frame(&bridge, &committed, &expected_map_frame_id)
                     .await;
             if let Err(error) = publish_result {
-                let detail = format!(
-                "cloud-map checkpoint installed but typed /global_map publication failed: {error}"
-            );
+                let mut detail = format!(
+                    "cloud-map checkpoint installed but typed /global_map publication failed: {error}"
+                );
+                if let Err(capture_error) = retained_publication.capture_materialized_legacy_frame(
+                    &bridge.cloud_map_writer, &committed,
+                ) {
+                    detail.push_str(&format!("; canonical retention failed: {capture_error}"));
+                }
                 match service.retain_activation_lifecycle_fence(
                     identity_class.request_id(),
                     activation_request_key.clone(),
@@ -3530,10 +3581,6 @@ async fn activate_map_r1(
         "map checkpoint activated; legacy_checkpoint_reconstructed=true"
     };
     let state = mapping_session_state(snapshot, activation_message);
-    let target_receipt = identity_class
-        .is_modern()
-        .then_some(target_receipt)
-        .flatten();
     let sealed = match service
         .activation_receipts
         .seal(&token, target_receipt, state)
@@ -10858,6 +10905,7 @@ mod lifecycle_tests {
     struct CheckpointPublishBackend {
         fail: std::sync::atomic::AtomicBool,
         fail_after_observe: std::sync::atomic::AtomicBool,
+        fail_after_pointcloud_observe: std::sync::atomic::AtomicBool,
         published: StdMutex<Vec<RawLcmFrame>>,
     }
 
@@ -10912,13 +10960,15 @@ mod lifecycle_tests {
                     "injected checkpoint publication failure".to_string(),
                 ));
             }
+            let fail_pointcloud = frame.msg_type.fqn() == "sensor_msgs.PointCloud2"
+                && self.fail_after_pointcloud_observe.load(std::sync::atomic::Ordering::Acquire);
             self.published
                 .lock()
                 .expect("checkpoint published frames")
                 .push(frame);
             if self
                 .fail_after_observe
-                .load(std::sync::atomic::Ordering::Acquire)
+                .load(std::sync::atomic::Ordering::Acquire) || fail_pointcloud
             {
                 return Err(TransportError::LcmBackend(
                     "injected post-observation checkpoint publication failure".to_owned(),
@@ -11478,6 +11528,7 @@ mod lifecycle_tests {
     // These fixtures construct only the injected in-process transport. The
     // capability flag admits its implemented publish path, not a real LCM link.
     struct CanonicalResetFixture {
+        backend: Arc<CheckpointPublishBackend>,
         service: GeometryRuntimeService,
         handle: GeometryRuntimeHandle,
         tasks: crate::lcm_runtime::GeometryTestTaskOwner,
@@ -11486,19 +11537,23 @@ mod lifecycle_tests {
 
     impl CanonicalResetFixture {
         async fn new() -> Self {
-            let transport = LcmTransport::new(Arc::new(CheckpointPublishBackend::default()));
+            let backend = Arc::new(CheckpointPublishBackend::default());
+            let transport = LcmTransport::new(backend.clone());
             let (mut handle, tasks) = crate::lcm_runtime::build_handle_for_tests_with_unit_transport(
                 true, Some(crate::mapping_backend::MappingBackendSpec::Voxel), transport,
             ).await.expect("in-process reset fixture");
             handle.lcm_backend_available = true;
             let owned = crate::lcm_runtime::attach_root_task_owner_for_tests(handle);
             let service = GeometryRuntimeService::new(owned.handle.clone());
-            Self { service, handle: owned.handle, tasks, task_owner: owned.task_owner }
+            Self { backend, service, handle: owned.handle, tasks, task_owner: owned.task_owner }
         }
 
         async fn finish(mut self) {
             // The retained transition owns this mutex until all its work exits.
             let transition = self.service.mapping_transition.clone().lock_owned().await;
+            // A failed publication may intentionally retain L. Release this
+            // fixture's exact slot before shutting down its remaining tasks.
+            drop(self.service.take_activation_lifecycle_fence().expect("fixture retained fence"));
             let outcome = self.task_owner.shutdown().await;
             assert!(outcome.producers_settled(), "reset fixture registered producers joined");
             outcome.result.expect("reset fixture producer shutdown");
@@ -11598,6 +11653,154 @@ mod lifecycle_tests {
             assert!(GeometryRuntime::activate_map(&fixture.service, Request::new(malformed)).await.is_err());
             assert_eq!(fixture.handle.state.read().await.pose.timestamp_ns, 52);
             assert!(!fixture.handle.state.read().await.latest_transform_entries().is_empty());
+        })).await;
+        fixture.finish().await;
+        if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
+    }
+
+    fn assert_legacy_cloud_unbound(state: &MappingSessionState, disposition: ActivationReceiptDisposition) {
+        assert!(state.success && state.active, "legacy activation: {state:?}");
+        assert_eq!(state.activation_receipt_disposition, disposition as i32);
+        assert!(!state.relocalization_target_available);
+        assert!(state.activation_identity_sha256.is_empty());
+        assert!(state.target_receipt_sha256.is_empty());
+        assert!(state.asset_manifest_sha256.is_empty());
+        assert!(state.asset_bundle_sha256.is_empty());
+        assert!(state.activation_receipt_v2.is_none());
+    }
+
+    fn recorded_legacy_clouds(backend: &CheckpointPublishBackend) -> Vec<RawLcmFrame> {
+        backend.published.lock().unwrap().iter()
+            .filter(|frame| frame.msg_type.fqn() == "sensor_msgs.PointCloud2")
+            .cloned().collect()
+    }
+
+    #[tokio::test]
+    async fn legacy_cloud_seals_unbound_and_replays_without_republication() {
+        let fixture = CanonicalResetFixture::new().await;
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            let xyz = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+                .into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+            let request = cloud_activation_request(xyz);
+            let activated = GeometryRuntime::activate_map(&fixture.service, Request::new(request.clone()))
+                .await.unwrap().into_inner();
+            assert_legacy_cloud_unbound(&activated, ActivationReceiptDisposition::LegacyUnbound);
+            assert_eq!(fixture.service.activation_receipts.retained_immutable_target_bytes(), 0);
+            assert!(fixture.service.activation_receipts.current_sealed_target_snapshot().is_none());
+            let clouds = recorded_legacy_clouds(&fixture.backend);
+            assert_eq!(clouds.len(), 1);
+            let replay = GeometryRuntime::activate_map(&fixture.service, Request::new(request))
+                .await.unwrap().into_inner();
+            assert_legacy_cloud_unbound(&replay, ActivationReceiptDisposition::SealedReplay);
+            assert!(replay.idempotent_replay);
+            assert_eq!((replay.session_generation, replay.backend_generation, replay.revision),
+                (activated.session_generation, activated.backend_generation, activated.revision));
+            assert_eq!(recorded_legacy_clouds(&fixture.backend).len(), 1);
+            let queried = GeometryRuntime::get_mapping_state(&fixture.service, Request::new(Empty {}))
+                .await.unwrap().into_inner();
+            assert_legacy_cloud_unbound(&queried, ActivationReceiptDisposition::LegacyUnbound);
+            assert_eq!(fixture.service.activation_receipts.retained_immutable_target_bytes(), 0);
+            assert!(fixture.service.activation_receipts.current_sealed_target_snapshot().is_none());
+        })).await;
+        fixture.finish().await;
+        if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
+    }
+
+    #[tokio::test]
+    async fn legacy_cloud_resumes_exact_retained_publication_unbound() {
+        let fixture = CanonicalResetFixture::new().await;
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            let xyz = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+                .into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+            let source_bytes = xyz.len();
+            let request = cloud_activation_request(xyz);
+            fixture.backend.fail_after_pointcloud_observe.store(true, Ordering::Release);
+            let failure = GeometryRuntime::activate_map(&fixture.service, Request::new(request.clone()))
+                .await.expect_err("observed publication failure must remain pending");
+            assert!(failure.message().contains("publication failed"));
+            assert!(fixture.service.has_activation_lifecycle_fence());
+            assert!(fixture.handle.mapping_lifecycle_lock.try_lock().is_err());
+            assert_eq!(fixture.service.activation_receipts.retained_immutable_target_bytes(), source_bytes);
+            let before = fixture.handle.mapping_adapter.as_ref().unwrap().lock().snapshot();
+            let first_clouds = recorded_legacy_clouds(&fixture.backend);
+            assert_eq!(first_clouds.len(), 1);
+            fixture.backend.fail_after_pointcloud_observe.store(false, Ordering::Release);
+            let resumed = GeometryRuntime::activate_map(&fixture.service, Request::new(request.clone()))
+                .await.unwrap().into_inner();
+            assert_legacy_cloud_unbound(&resumed, ActivationReceiptDisposition::LegacyUnbound);
+            assert!(resumed.idempotent_replay);
+            assert_eq!((resumed.session_generation, resumed.revision),
+                (before.session_generation, before.revision));
+            assert!(!fixture.service.has_activation_lifecycle_fence());
+            assert!(fixture.handle.mapping_lifecycle_lock.try_lock().is_ok());
+            let clouds = recorded_legacy_clouds(&fixture.backend);
+            assert_eq!(clouds.len(), 2);
+            assert_eq!(clouds[0].header, clouds[1].header);
+            assert_eq!(clouds[0].topic, clouds[1].topic);
+            assert_eq!(clouds[0].msg_type, clouds[1].msg_type);
+            assert_eq!(clouds[0].payload, clouds[1].payload);
+            assert_eq!(fixture.service.activation_receipts.retained_immutable_target_bytes(), 0);
+            let queried = GeometryRuntime::get_mapping_state(&fixture.service, Request::new(Empty {}))
+                .await.unwrap().into_inner();
+            assert_legacy_cloud_unbound(&queried, ActivationReceiptDisposition::LegacyUnbound);
+            let replay = GeometryRuntime::activate_map(&fixture.service, Request::new(request))
+                .await.unwrap().into_inner();
+            assert_legacy_cloud_unbound(&replay, ActivationReceiptDisposition::SealedReplay);
+            assert_eq!(recorded_legacy_clouds(&fixture.backend).len(), 2);
+        })).await;
+        fixture.finish().await;
+        if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
+    }
+
+    #[tokio::test]
+    async fn retained_legacy_frame_checks_current_receipt_and_never_replaces_capture() {
+        let fixture = CanonicalResetFixture::new().await;
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            let xyz = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+                .into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+            let activated = GeometryRuntime::activate_map(&fixture.service,
+                Request::new(cloud_activation_request(xyz))).await.unwrap().into_inner();
+            assert_legacy_cloud_unbound(&activated, ActivationReceiptDisposition::LegacyUnbound);
+            let key: [u8; 32] = activated.activation_request_identity_sha256.try_into().unwrap();
+            let _lifecycle = fixture.handle.mapping_lifecycle_lock.lock().await;
+            let (metadata, receipt, cached) = {
+                let writer = fixture.handle.cloud_map_writer.lock();
+                let writer = writer.as_ref().unwrap();
+                (writer.committed_metadata().unwrap(), writer.last_cloud_receipt().unwrap(),
+                    writer.materialized_committed_snapshot().unwrap())
+            };
+            let committed = CommittedMappingCloudMap {
+                notification: CloudMapNotification { revision: metadata.revision,
+                    point_count: metadata.point_count, voxel_size: metadata.voxel_size,
+                    session_generation: metadata.session_generation },
+                source_timestamp_ns: receipt.source_timestamp_ns, metadata, receipt: receipt.clone(),
+            };
+            let mut foreign = CommittedMappingCloudMap {
+                notification: committed.notification.clone(), source_timestamp_ns: committed.source_timestamp_ns,
+                metadata, receipt: receipt.clone(),
+            };
+            foreign.receipt.commit_id.sequence += 1;
+            let mut rejected = RetainedActivationGlobalMap::from_committed(key, "map", &foreign).unwrap();
+            let error = rejected.capture_materialized_legacy_frame(&fixture.handle.cloud_map_writer, &foreign)
+                .expect_err("matching metadata cannot substitute a different current receipt");
+            assert!(error.contains("metadata/receipt changed"));
+            assert!(rejected.legacy_frame.is_none());
+            let after = fixture.handle.cloud_map_writer.lock().as_ref().unwrap()
+                .materialized_committed_snapshot().unwrap();
+            assert!(Arc::ptr_eq(&cached.xyz_f32_le, &after.xyz_f32_le));
+            let mut retained = RetainedActivationGlobalMap::from_committed(key, "map", &committed).unwrap();
+            retained.capture_materialized_legacy_frame(&fixture.handle.cloud_map_writer, &committed).unwrap();
+            let first = recorded_legacy_clouds(&fixture.backend);
+            assert_eq!(retained.legacy_frame.as_ref().unwrap().payload, first[0].payload);
+            let original_payload = retained.legacy_frame.as_ref().unwrap().payload.as_ptr();
+            fixture.handle.cloud_map_writer.lock().as_mut().unwrap()
+                .begin_session(metadata.session_generation + 1).unwrap();
+            assert!(fixture.handle.cloud_map_writer.lock().as_ref().unwrap()
+                .materialized_committed_snapshot().is_none());
+            retained.capture_materialized_legacy_frame(&fixture.handle.cloud_map_writer, &committed).unwrap();
+            assert_eq!(retained.legacy_frame.as_ref().unwrap().payload.as_ptr(), original_payload);
+            assert_eq!(retained.legacy_frame.as_ref().unwrap().payload, first[0].payload);
+            assert_eq!(recorded_legacy_clouds(&fixture.backend).len(), 1);
         })).await;
         fixture.finish().await;
         if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
@@ -18487,7 +18690,9 @@ mod assigned_activation_boundary_tests {
             receipt,
         };
         // No XYZ body is supplied: a typed fence must not eagerly encode one.
-        let retained = RetainedActivationGlobalMap::from_committed(key.clone(), "map", &committed, &[]).unwrap();
+        let mut retained = RetainedActivationGlobalMap::from_committed(key.clone(), "map", &committed).unwrap();
+        assert!(retained.legacy_frame.is_none());
+        retained.capture_materialized_legacy_frame(&Arc::new(parking_lot::Mutex::new(None)), &committed).unwrap();
         assert!(retained.legacy_frame.is_none());
         retained.validate_replay(key.clone(), "map", &committed).unwrap();
         assert!(retained.validate_replay(key, "odom", &committed).is_err());

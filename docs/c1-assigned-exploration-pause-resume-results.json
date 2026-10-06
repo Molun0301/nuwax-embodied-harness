@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "qualified_at_utc": "2026-10-06T12:47:00Z",
+  "branch": "fix/v3-legacy-cloud-seal-20261006",
+  "remote_parent": "c0a996858ef6bf4bedad36cfba076ffc91810de0",
+  "baseline_tree": "00e1e496f32d3988314d282be1bbe354b41c38ea",
+  "local_baseline": "4d727671d1341d4ea75b295b9c9c7d3ff36d9152",
+  "scope": "Assigned exploration public pause/save/resume and exact cloud current replacement",
+  "python_passed_unique": 83,
+  "python_failed_final": 0,
+  "new_tests": 57,
+  "directly_affected_existing_tests": 26,
+  "test_runs": [
+    {
+      "suite": "assigned cloud exchange + checkpoint store + affected asset storage",
+      "command": "PYTHONPATH=.:tests <testenv>/bin/python -m unittest -v test_assigned_cloud_exchange test_assigned_exploration_checkpoint_store test_assigned_asset_storage",
+      "count": 56,
+      "seconds": 1.852,
+      "log": "store-tests.log"
+    },
+    {
+      "suite": "public exploration cycle",
+      "command": "PYTHONPATH=.:tests <testenv>/bin/python -m unittest test_assigned_exploration_cycle -q",
+      "count": 20,
+      "seconds": 6.067,
+      "log": "public-exploration-cycle-20-final.log"
+    },
+    {
+      "suite": "legacy/affected checkpoint compatibility",
+      "command_prefix": "PYTHONPATH=.:tests:scripts <testenv>/bin/python -m unittest -v",
+      "selectors": [
+        "test_literal_schema_one_current_public_get_and_save_preserve_original_bytes_and_digest (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_literal_schema_one_current_public_get_and_save_preserve_original_bytes_and_digest)",
+        "test_legacy_files_keep_paths_ids_and_bytes_on_read_and_restart (check_navigation_file_identity.FileIdentityChecks.test_legacy_files_keep_paths_ids_and_bytes_on_read_and_restart)",
+        "test_checkpoint_new_wrapper_and_old_same_value_save_preserve_native_payload (check_navigation_file_identity.FileIdentityChecks.test_checkpoint_new_wrapper_and_old_same_value_save_preserve_native_payload)",
+        "test_native_v2_actual_payload_roundtrips_opaque_through_store (check_navigation_file_identity.FileIdentityChecks.test_native_v2_actual_payload_roundtrips_opaque_through_store)",
+        "test_checkpoint_listing_parses_only_selected_new_records_and_detects_hidden_conflict (check_navigation_file_identity.FileIdentityChecks.test_checkpoint_listing_parses_only_selected_new_records_and_detects_hidden_conflict)",
+        "test_concurrent_building_revision_and_immutable_checkpoint_writes (check_navigation_file_identity.FileIdentityChecks.test_concurrent_building_revision_and_immutable_checkpoint_writes)",
+        "test_shutdown_shaped_checkpoint_save_never_acquires_runtime_lifecycle_lock (check_navigation_file_identity.FileIdentityChecks.test_shutdown_shaped_checkpoint_save_never_acquires_runtime_lifecycle_lock)"
+      ],
+      "count": 7,
+      "seconds": 0.115,
+      "log": "compatibility-tests.log"
+    }
+  ],
+  "testenv": "/workspace/scratch/71cdb9d17732/nuwax-embodied-harness/.nuwax-test-env",
+  "new_selectors": [
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_exchange_retains_predecessor_until_catalog_adoption",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_same_candidate_is_exact_body_idempotent_before_and_after_settle",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_pre_exchange_failure_rolls_back_only_owned_candidate",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_directory_fsync_failure_keeps_new_current_and_old_catalog_proof",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_post_exchange_cancellation_preserves_retired_owner",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_exchange_syscall_unknown_result_preserves_exact_new_owner",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_competing_predecessor_exchanges_leave_one_exact_owner",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_pre_exchange_staging_replacement_is_not_published_or_deleted",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_journal_window_staging_replacement_is_not_exchanged_or_deleted",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_candidate_catalog_with_old_current_is_not_repaired_by_exchange",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_journal_window_new_transaction_fences_exchange",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_replaced_retired_directory_is_preserved",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_changed_catalog_creation_owner_cannot_adopt_or_settle",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_changed_expected_owner_and_reused_checkpoint_are_rejected",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_legacy_and_planar_sources_never_enter_exchange",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_full_validation_fsync_and_cleanup_run_outside_catalog_guard",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_snapshot_exposes_inner_source_and_currentness_reads_only_metadata",
+    "test_assigned_cloud_exchange.AssignedCloudExchangeTests.test_journal_clear_fsync_failure_restores_exact_proof",
+    "test_assigned_exploration_checkpoint_store.ExplorationCheckpointIdentityTests.test_identity_generations_roundtrip_without_aliases_or_receipt_duplication",
+    "test_assigned_exploration_checkpoint_store.ExplorationCheckpointIdentityTests.test_missing_mixed_and_unsupported_identity_generations_are_rejected",
+    "test_assigned_exploration_checkpoint_store.ExplorationCheckpointIdentityTests.test_assigned_source_keys_require_strict_nonempty_identity_and_positive_generations",
+    "test_assigned_exploration_checkpoint_store.ExplorationCheckpointIdentityTests.test_progress_shape_version_request_and_seed_must_match",
+    "test_assigned_exploration_checkpoint_store.ExplorationCheckpointIdentityTests.test_legacy_digest_and_native_v1_v2_bytes_remain_opaque",
+    "test_assigned_exploration_checkpoint_store.AssignedExplorationCheckpointStoreTests.test_save_reopen_list_and_source_projection_preserve_opaque_progress",
+    "test_assigned_exploration_checkpoint_store.AssignedExplorationCheckpointStoreTests.test_wrong_source_session_generation_frame_or_checkpoint_is_rejected",
+    "test_assigned_exploration_checkpoint_store.AssignedExplorationCheckpointStoreTests.test_missing_source_projection_and_wrong_member_role_fail_closed",
+    "test_assigned_exploration_checkpoint_store.AssignedExplorationCheckpointStoreTests.test_changed_asset_identity_never_reuses_exploration_alias",
+    "test_assigned_exploration_checkpoint_store.AssignedExplorationCheckpointStoreTests.test_changed_progress_request_seed_or_created_at_cannot_rebind_alias",
+    "test_assigned_exploration_checkpoint_store.AssignedExplorationCheckpointStoreTests.test_changed_finalized_body_fails_without_rebinding_record",
+    "test_assigned_exploration_checkpoint_store.AssignedExplorationCheckpointStoreTests.test_full_snapshot_and_checkpoint_parsing_stay_outside_both_write_guards",
+    "test_assigned_exploration_checkpoint_store.AssignedExplorationCheckpointStoreTests.test_catalog_and_current_mutation_between_admission_and_guard_abort_write",
+    "test_assigned_exploration_checkpoint_store.AssignedExplorationCheckpointStoreTests.test_record_mutation_after_preflight_does_not_get_accepted_as_exact_retry",
+    "test_assigned_exploration_checkpoint_store.AssignedExplorationCheckpointStoreTests.test_rename_visible_fsync_failure_retries_exact_bytes_without_rewrite",
+    "test_assigned_exploration_checkpoint_store.AssignedExplorationCheckpointStoreTests.test_equal_retry_propagates_another_directory_fsync_failure",
+    "test_assigned_exploration_checkpoint_store.AssignedExplorationCheckpointStoreTests.test_save_revalidates_forged_and_nested_mutated_record_before_any_write",
+    "test_assigned_exploration_checkpoint_store.LegacyExplorationCheckpointStoreTests.test_literal_legacy_wrapper_payload_and_filename_survive_equal_retry",
+    "test_assigned_exploration_checkpoint_store.LegacyExplorationCheckpointStoreTests.test_bad_envelope_version_or_identity_alias_is_rejected",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_public_pause_saves_exact_source_then_resume_requires_actual_assigned_ready",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_second_pause_exports_new_checkpoint_and_asset_in_same_resumed_session",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_lost_reply_resume_retry_retains_request_timeout_and_reads_current_sample",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_pause_rejects_native_source_skew_without_publishing_record",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_resume_rejects_wrong_record_asset_checkpoint_or_source_before_activation",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_record_rename_fsync_failure_retry_keeps_exact_record_and_export_identity",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_second_exchange_fsync_failure_retry_uses_retained_candidate_without_reexport",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_second_catalog_fsync_failure_retry_keeps_new_asset_and_checkpoint",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_stale_native_sample_cannot_complete_resume",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_current_session_disappearing_after_ready_rejects_resume",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_equal_runtime_reinstallation_after_ready_rejects_resume",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_current_catalog_asset_replacement_after_ready_rejects_resume",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_current_session_downgraded_after_ready_rejects_resume",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_current_terminal_removal_after_ready_rejects_resume",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_repeated_pause_and_save_retry_reuse_exact_original_record",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_missing_native_sample_cannot_complete_resume",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_ordinary_completion_exports_advanced_current_and_retries_exact_operation",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_prepared_fsync_failure_retry_dispatches_original_request_once",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_recovery_cannot_adopt_another_ready_request_on_the_same_activation",
+    "test_assigned_exploration_cycle.AssignedExplorationCycleTests.test_asset_body_reads_and_native_rpcs_stay_outside_runtime_and_catalog_guards"
+  ],
+  "independent_review": {
+    "result": "approved; no blocking findings",
+    "fixed_findings": [
+      "Require actual READY terminal request ID/timeout and exact captured pending request, including same-installation successors",
+      "Prepared-but-undispatched retry continues the original public request without reactivation; postdispatch phases query only"
+    ],
+    "regression_quality": "Same-installation successor regression mutation-qualified in memory: removing only three retained-request guards causes an expected rejection assertion to fail. No production files mutated by this check."
+  },
+  "static_checks": {
+    "critical_ruff": 0,
+    "new_tests_ruff": 0,
+    "py_compile": 0,
+    "pep604": 0,
+    "layering_hard_rules": 0,
+    "git_diff_check": 0,
+    "initial_pep604_failure": "Existing str | Path parameter annotation in touched checkpoint store failed compatibility gate; changed annotation only to Union[str, Path], compiled and gate passed; failure log preserved."
+  },
+  "native": {
+    "run_this_stage": false,
+    "reason": "No native/protobuf changes. Python native RPC fixtures simulated; prior-stage native results not counted again."
+  },
+  "limits": [
+    "No hardware, real exploration stop barrier, complete native exploration cycle, LCM or end-to-end robot motion qualification",
+    "Only new and directly affected Python cases run; no broad project suite",
+    "Saved dense cloud/display and mapping-cloud/place authority remain separate open consumers",
+    "Historical exploration checkpoint becomes unavailable once its exact current asset is replaced"
+  ],
+  "source_files": {
+    "gateways/exploration_checkpoint.py": {
+      "sha256": "13793694881ee76c14e5b4e5405bacdcd81e9dfe9d0ea29374e47c30176de91b",
+      "bytes": 15117
+    },
+    "gateways/runtime.py": {
+      "sha256": "c63a43050d7770398c89df09d976a542ff394f8a0f21532d2d910a89539f55c6",
+      "bytes": 739557
+    },
+    "services/mapping/asset_store.py": {
+      "sha256": "f0295cc478ae14f53cfeeb071e2d471e94430c95ca50abc8fc3aeb4b8098300c",
+      "bytes": 139584
+    },
+    "services/navigation/exploration_checkpoint.py": {
+      "sha256": "16c7eb0f8ab031e36b69efd8307db56db499db809dafbd4db0fbd70dc0b98b74",
+      "bytes": 13547
+    },
+    "skills/assigned_map_save.py": {
+      "sha256": "3ed0a847525066d892129e1a967ea464a2b7685f7518c01520704d78f03268b6",
+      "bytes": 11211
+    },
+    "skills/map_workspace.py": {
+      "sha256": "08b38d8b936a2b276c47cfebbfdb0777514873d6f651c904bf8b62f7149600fb",
+      "bytes": 176899
+    },
+    "tests/test_assigned_asset_storage.py": {
+      "sha256": "4686b802d1828de0cde59b71cb6b556f022e4bd6d731911bf74ffda2f85272b2",
+      "bytes": 28450
+    },
+    "tests/test_assigned_cloud_exchange.py": {
+      "sha256": "cfb679637acf7d08d4a49b795ab502725d3df466660d4819a3138db58a61a8b5",
+      "bytes": 20134
+    },
+    "tests/test_assigned_exploration_checkpoint_store.py": {
+      "sha256": "f7e9fbbe05134c06dc1de205f07a0875f04c2d17ecf260689ef9b27a98b57467",
+      "bytes": 22713
+    },
+    "tests/test_assigned_exploration_cycle.py": {
+      "sha256": "d6dfb0f5778dfc37bee7e1aed10a9172402cc26a1ca768b25e93ce05bc46209f",
+      "bytes": 42772
+    }
+  },
+  "logs": {
+    "compatibility-tests.log": {
+      "path": "/workspace/shared/neh-assigned-exploration-qualification-20261006/compatibility-tests.log",
+      "sha256": "135cea8b8e966187f67042434e9c532ddc0616043dae2938036fe8c8cd7657a6"
+    },
+    "compile.log": {
+      "path": "/workspace/shared/neh-assigned-exploration-qualification-20261006/compile.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "critical-ruff.log": {
+      "path": "/workspace/shared/neh-assigned-exploration-qualification-20261006/critical-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "diff-check.log": {
+      "path": "/workspace/shared/neh-assigned-exploration-qualification-20261006/diff-check.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "layering.log": {
+      "path": "/workspace/shared/neh-assigned-exploration-qualification-20261006/layering.log",
+      "sha256": "02e544b1baa53970618417d7f565fcf413f7f17b68e28d0e7d4fcf3ff6f79efe"
+    },
+    "new-tests-ruff.log": {
+      "path": "/workspace/shared/neh-assigned-exploration-qualification-20261006/new-tests-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "pep604-initial-existing-annotation.log": {
+      "path": "/workspace/shared/neh-assigned-exploration-qualification-20261006/pep604-initial-existing-annotation.log",
+      "sha256": "6e64e75e11933a84dde08084bba85c866edc17133ec8912464432c4a376adbe8"
+    },
+    "pep604.log": {
+      "path": "/workspace/shared/neh-assigned-exploration-qualification-20261006/pep604.log",
+      "sha256": "ccceedecc6ecb959a7c43d011070f3681484d44df7d0a962cf2e1e9bd1626ac9"
+    },
+    "public-exploration-cycle-20-final.log": {
+      "path": "/workspace/shared/neh-assigned-exploration-qualification-20261006/public-exploration-cycle-20-final.log",
+      "sha256": "2d065ffc18106a053ac216bb5ddf008776bf5dcf5a4e1e09de627218085f27fb"
+    },
+    "store-tests.log": {
+      "path": "/workspace/shared/neh-assigned-exploration-qualification-20261006/store-tests.log",
+      "sha256": "aad7f314385fa77c0c10e370a613abdb05db7d1bb02be87784017ccf4298dde2"
+    }
+  }
+}

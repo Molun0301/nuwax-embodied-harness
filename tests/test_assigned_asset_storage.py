@@ -379,9 +379,9 @@ class AssignedAssetStorageTests(unittest.TestCase):
         with self.assertRaises(MapAssetBundleValidationError):
             self.repository.validate_map_asset_bundle_snapshot_identity(MAP_NAME, captured)
 
-    def test_assigned_previous_identity_and_legacy_writer_are_explicitly_gated(self):
+    def test_assigned_previous_identity_requires_catalog_owner_and_legacy_writer_is_gated(self):
         stage = stage_fixture(self.repository)
-        with self.assertRaisesRegex(MapAssetBundleValidationError, 'D2'):
+        with self.assertRaisesRegex(MapAssetBundleValidationError, 'finalized catalog owner'):
             self.repository.finalize_assigned_map_asset_bundle(bundle_fixture(), staging_dir=stage,
                 asset_identity=ASSET_ID, expected_previous_identity=ASSET_ID)
         with self.assertRaisesRegex(MapAssetBundleValidationError, 'explicit assigned'):

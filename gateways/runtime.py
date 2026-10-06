@@ -14802,6 +14802,11 @@ class GatewayRuntime:
                 "session_generation": asset_metadata.get("session_generation"),
                 "error": finalize_error,
             }
+            if getattr(finalized_map_asset, "identity_schema_version", 1) == 2:
+                receipt.pop("manifest_sha256")
+                receipt.update(identity_schema_version=2,
+                    asset_identity=finalized_map_asset.asset_identity.model_dump(),
+                    mapping_checkpoint_id=finalized_map_asset.geometry_asset.metadata["mapping_backend_checkpoint"]["checkpoint_id"])
             self.task_manager.update_task_metadata(task_id, {"map_asset_finalize": receipt})
             result["map_asset_finalize"] = receipt
         return result
@@ -14814,6 +14819,20 @@ class GatewayRuntime:
         exploration_request_id: Optional[str] = None,
         task_id: Optional[str] = None,
     ):
+        metadata = {"source": "task_finalize"}
+        if exploration_request_id:
+            metadata["exploration_request_id"] = exploration_request_id
+        if task_id:
+            metadata["task_id"] = task_id
+        if task_id and self.config.geometry.pipeline == "lio_3d":
+            spec = self.task_manager.get_task_spec(task_id)
+            operation = (spec.metadata.get("pause_checkpoint_id") if trigger == "explore_pause_checkpoint"
+                else f"explore-finalize:{task_id}")
+            if operation:
+                # 每个真实探索保存操作导出新内容；原操作重试复用已发布身份。
+                # 目录交换后尚未本地安装新 current 时，不能被旧 workspace 空视图吞掉。
+                return self.map_workspace_service.finalize_active_map(map_name=map_name,
+                    reason=trigger, metadata=metadata, _save_operation_id=operation)
         active_workspace = self.map_workspace_service.get_active_workspace()
         if active_workspace is None or active_workspace.active_map_name != map_name:
             return None
@@ -14834,11 +14853,6 @@ class GatewayRuntime:
                 trigger,
             )
             return None
-        metadata = {"source": "task_finalize"}
-        if exploration_request_id:
-            metadata["exploration_request_id"] = exploration_request_id
-        if task_id:
-            metadata["task_id"] = task_id
         return self.map_workspace_service.finalize_active_map(
             map_name=map_name,
             reason=trigger,

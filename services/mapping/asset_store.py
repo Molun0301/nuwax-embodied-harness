@@ -11,7 +11,7 @@ import stat
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import quote
 
 from contracts.map_workspace import (
@@ -25,11 +25,15 @@ from contracts.map_workspace import (
 )
 from contracts.naming import build_safe_dir_segment
 
+if TYPE_CHECKING:
+    from services.geometry.mapping_backend_checkpoint_store import CheckpointMemberIdentity
+
 _BUNDLE_FILE_NAME = "bundle.json"
 _MANIFEST_FILE_NAME = "manifest.json"
 _MANIFEST_SCHEMA_VERSION = 1
 _STAGING_PREFIX = ".current.tmp-"
 _PLANAR_EXCHANGE_JOURNAL = ".planar-exchange-v1.json"
+_ASSIGNED_EXCHANGE_JOURNAL = ".assigned-exchange-v1.json"
 _MAX_GEOREFERENCE_JSON_BYTES = 64 * 1024
 _MAX_MANIFEST_JSON_BYTES = 4 * 1024 * 1024
 _MAX_BUNDLE_JSON_BYTES = 64 * 1024 * 1024
@@ -94,6 +98,18 @@ class ValidatedMapAssetBundleSnapshot:
     repository_inode: int
     repository_fingerprint: str
     repository_observations: tuple = ()
+    assigned_source_cloud_member: Optional[CheckpointMemberIdentity] = None
+
+
+@dataclass(frozen=True)
+class AssignedMapAssetExchange:
+    """Retained predecessor proof; catalog adoption must precede settlement."""
+
+    previous_identity: AssetIdentityV2
+    candidate_identity: AssetIdentityV2
+    committed: bool
+    catalog_created_at: str
+    map_directory: Tuple[int, int]
 
 
 class MapAssetBundleRepository:
@@ -236,10 +252,13 @@ class MapAssetBundleRepository:
             if bundle.identity_schema_version == 2:
                 georeference_bytes = (tree.require_file(bundle.georeference.relative_path, "georeference")
                     .read(_MAX_GEOREFERENCE_JSON_BYTES) if bundle.georeference is not None else b"")
+                source = self._assigned_checkpoint_source(tree, bundle.geometry_asset)
+                checkpoint, _occupancy, _cloud, _members = self._validate_assigned_source_document(source)
                 tree.verify_all()
                 repository_stat = os.fstat(tree.root.descriptor)
                 return ValidatedMapAssetBundleSnapshot(bundle, georeference_bytes,
-                    repository_stat.st_dev, repository_stat.st_ino, "", _assigned_observations(tree))
+                    repository_stat.st_dev, repository_stat.st_ino, "", _assigned_observations(tree),
+                    checkpoint.cloud_identity)
             georeference_bytes = b""
             if bundle.georeference is not None:
                 georeference_bytes, _size, georeference_sha256 = tree.require_file(
@@ -261,12 +280,14 @@ class MapAssetBundleRepository:
                 validated_bundle,
                 georeference_bytes,
             )
+            repository_observations = _assigned_observations(tree)
         return ValidatedMapAssetBundleSnapshot(
             bundle=validated_bundle,
             georeference_bytes=georeference_bytes,
             repository_device=repository_stat.st_dev,
             repository_inode=repository_stat.st_ino,
             repository_fingerprint=repository_fingerprint,
+            repository_observations=repository_observations,
         )
 
     def validate_map_asset_bundle_snapshot_identity(
@@ -289,6 +310,19 @@ class MapAssetBundleRepository:
             same = refreshed is not None and refreshed == snapshot
         if not same:
             raise MapAssetBundleValidationError("finalized 地图 repository snapshot 已被替换。")
+
+    def map_asset_bundle_snapshot_is_current(self, map_name, snapshot) -> bool:
+        """Check an admitted snapshot using only bounded inode metadata."""
+        if snapshot.bundle.map_name != map_name or not snapshot.repository_observations:
+            return False
+        try:
+            with _StableDirectoryTree(self._current_dir(map_name)) as tree:
+                current = os.fstat(tree.root.descriptor)
+                return ((current.st_dev, current.st_ino) ==
+                    (snapshot.repository_device, snapshot.repository_inode)
+                    and _assigned_observations(tree) == snapshot.repository_observations)
+        except (OSError, MapAssetBundleValidationError):
+            return False
 
     def finalize_map_asset_bundle(
         self,
@@ -371,11 +405,12 @@ class MapAssetBundleRepository:
         """
         _require_typed_asset_identity(asset_identity)
         _require_typed_asset_identity(expected_previous_identity, optional=True)
-        if expected_previous_identity is not None:
-            raise MapAssetBundleValidationError("assigned planar replacement requires the paired D2 producer")
         if (bundle.identity_schema_version != 2 or bundle.asset_identity != asset_identity
                 or bundle.asset_state not in {"candidate", "finalized"}):
             raise MapAssetBundleValidationError("candidate does not own the exact assigned asset identity")
+        if expected_previous_identity is not None:
+            return self._replace_assigned_cloud_bundle(bundle, staging_dir=staging_dir,
+                asset_identity=asset_identity, expected_previous_identity=expected_previous_identity)
         map_name = bundle.map_name
         staging = self._require_staging_directory(map_name, staging_dir, must_exist=True)
         owner = self._staging_owners[staging]
@@ -435,6 +470,260 @@ class MapAssetBundleRepository:
             # to restart/catalog reconciliation. Only this original staging inode
             # may be removed; a replacement directory belongs to somebody else.
             self._discard_owned_staging(map_name, staging, owner)
+
+    @staticmethod
+    def _assigned_catalog_owner(asset):
+        if asset is None or asset.identity_schema_version != 2 or not asset.finalized:
+            raise MapAssetBundleValidationError("assigned replacement requires its finalized catalog owner")
+        return (asset.map_name, asset.created_at.isoformat(), asset.asset_identity)
+
+    @staticmethod
+    def _assigned_directory_owner(path):
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise MapAssetBundleValidationError("assigned exchange directory was replaced")
+        return [metadata.st_dev, metadata.st_ino]
+
+    def _read_assigned_exchange(self, map_name):
+        path = self._map_dir(map_name) / _ASSIGNED_EXCHANGE_JOURNAL
+        if not path.exists() and not path.is_symlink():
+            return None
+        record = _parse_json_object(_read_regular_file(path, "assigned exchange journal",
+            maximum_bytes=8192), "assigned exchange journal")
+        fields = {"schema_version", "map_name", "previous_identity", "candidate_identity", "staging",
+            "previous_directory", "candidate_directory", "map_directory", "catalog_created_at"}
+        if (set(record) != fields or type(record["schema_version"]) is not int
+                or record["schema_version"] != 1 or record["map_name"] != map_name
+                or not isinstance(record["catalog_created_at"], str)):
+            raise MapAssetBundleValidationError("invalid assigned exchange journal")
+        for name in ("previous_directory", "candidate_directory", "map_directory"):
+            value = record[name]
+            if not isinstance(value, list) or len(value) != 2 or any(type(v) is not int or v < 0 for v in value):
+                raise MapAssetBundleValidationError("invalid assigned exchange directory owner")
+        try:
+            previous = AssetIdentityV2.model_validate(record["previous_identity"])
+            candidate = AssetIdentityV2.model_validate(record["candidate_identity"])
+        except Exception as exc:
+            raise MapAssetBundleValidationError("invalid assigned exchange identity") from exc
+        if previous == candidate or record["previous_directory"] == record["candidate_directory"]:
+            raise MapAssetBundleValidationError("assigned replacement requires distinct owners")
+        staging = self._require_staging_directory(map_name, path.parent / str(record["staging"]), must_exist=False)
+        if staging.name != record["staging"]:
+            raise MapAssetBundleValidationError("invalid assigned exchange staging name")
+        return record
+
+    def _inspect_assigned_exchange(self, map_name, record, catalog):
+        map_dir = self._map_dir(map_name)
+        if self._assigned_directory_owner(map_dir) != record["map_directory"]:
+            raise MapAssetBundleValidationError("assigned exchange map creation directory changed")
+        asset = catalog.get_map_asset(map_name)
+        owner = self._assigned_catalog_owner(asset)
+        if owner[:2] != (map_name, record["catalog_created_at"]):
+            raise MapAssetBundleValidationError("assigned exchange catalog creation owner changed")
+        previous = AssetIdentityV2.model_validate(record["previous_identity"])
+        candidate = AssetIdentityV2.model_validate(record["candidate_identity"])
+        current = self._current_dir(map_name)
+        current_owner = self._assigned_directory_owner(current)
+        committed = current_owner == record["candidate_directory"]
+        if current_owner != record["candidate_directory" if committed else "previous_directory"]:
+            raise MapAssetBundleValidationError("assigned exchange current directory changed")
+        identity = candidate if committed else previous
+        manifest = _parse_json_object(_read_regular_file(current / _MANIFEST_FILE_NAME,
+            "assigned exchange current manifest", maximum_bytes=_MAX_MANIFEST_JSON_BYTES),
+            "assigned exchange current manifest")
+        if (type(manifest.get("schema_version")) is not int or manifest.get("schema_version") != 2
+                or manifest.get("map_name") != map_name
+                or manifest.get("asset_identity") != identity.model_dump()
+                or self._assigned_directory_owner(current) != current_owner):
+            raise MapAssetBundleValidationError("assigned exchange current identity changed")
+        if owner[2] not in ((previous, candidate) if committed else (previous,)):
+            raise MapAssetBundleValidationError("assigned exchange catalog asset owner changed")
+        staging = map_dir / record["staging"]
+        if staging.exists() or staging.is_symlink():
+            retired = record["previous_directory" if committed else "candidate_directory"]
+            if self._assigned_directory_owner(staging) != retired:
+                raise MapAssetBundleValidationError("assigned exchange staging directory was replaced; refusing unowned cleanup")
+        return AssignedMapAssetExchange(previous, candidate, committed, record["catalog_created_at"],
+            tuple(record["map_directory"]))
+
+    def get_assigned_map_asset_exchange(self, map_name) -> Optional[AssignedMapAssetExchange]:
+        """Read exact predecessor proof without clearing it or relaxing getters."""
+        from services.mapping.catalog import MapCatalogRepository
+        catalog = MapCatalogRepository(str(self._root_dir))
+        with catalog.map_activation_guard():
+            record = self._read_assigned_exchange(map_name)
+            return None if record is None else self._inspect_assigned_exchange(map_name, record, catalog)
+
+    def settle_assigned_map_asset_exchange(self, map_name, *, expected_previous_identity, asset_identity):
+        """Release a committed/aborted exchange only after its catalog is durable."""
+        from services.mapping.catalog import MapCatalogRepository
+        _require_typed_asset_identity(expected_previous_identity)
+        _require_typed_asset_identity(asset_identity)
+        catalog = MapCatalogRepository(str(self._root_dir))
+        map_dir = self._map_dir(map_name)
+        with catalog.map_activation_guard():
+            record = self._read_assigned_exchange(map_name)
+            if record is None:
+                return
+            proof = self._inspect_assigned_exchange(map_name, record, catalog)
+            if (proof.previous_identity != expected_previous_identity or proof.candidate_identity != asset_identity):
+                raise MapAssetBundleValidationError("assigned exchange settlement identity changed")
+            wanted = proof.candidate_identity if proof.committed else proof.previous_identity
+            if catalog.get_map_asset(map_name).asset_identity != wanted:
+                raise MapAssetBundleValidationError("assigned exchange catalog adoption is not complete")
+            # A previous metadata rename may have succeeded before fsync failed.
+            descriptor, _size = _open_regular_file(map_dir / "metadata.json", "assigned catalog metadata")
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            _fsync_directory(map_dir)
+        staging = map_dir / record["staging"]
+        retired = record["previous_directory" if proof.committed else "candidate_directory"]
+        self._discard_owned_staging(map_name, staging, retired)
+        with catalog.map_activation_guard():
+            latest = self._read_assigned_exchange(map_name)
+            if latest is None:
+                return
+            if latest != record or self._inspect_assigned_exchange(map_name, latest, catalog) != proof:
+                raise MapAssetBundleValidationError("assigned exchange changed during settlement")
+            if catalog.get_map_asset(map_name).asset_identity != wanted:
+                raise MapAssetBundleValidationError("assigned exchange catalog changed during settlement")
+            journal = map_dir / _ASSIGNED_EXCHANGE_JOURNAL
+            tombstone = map_dir / (".assigned-exchange-cleared-" + uuid.uuid4().hex)
+            try:
+                self._inject_fault("before_assigned_journal_clear")
+                os.replace(journal, tombstone)
+                _fsync_directory(map_dir)
+            except BaseException:
+                # Preserve the only predecessor proof if journal removal did not
+                # durably finish. link never overwrites a newly owned journal.
+                try:
+                    if not journal.exists() and tombstone.exists():
+                        os.link(tombstone, journal, follow_symlinks=False)
+                        tombstone.unlink()
+                        _fsync_directory(map_dir)
+                except BaseException:  # noqa: BLE001, S110 - retain the original failed durable-clear result
+                    pass
+                raise
+        tombstone.unlink(missing_ok=True)
+        _fsync_directory(map_dir)
+
+    def _replace_assigned_cloud_bundle(self, bundle, *, staging_dir, asset_identity, expected_previous_identity):
+        from services.mapping.catalog import MapCatalogRepository
+        map_name = bundle.map_name
+        staging = self._require_staging_directory(map_name, staging_dir, must_exist=True)
+        owner = self._staging_owners[staging]
+        current = self._current_dir(map_name)
+        catalog = MapCatalogRepository(str(self._root_dir))
+        preserve_staging = False
+        try:
+            captured = self._assigned_catalog_owner(catalog.get_map_asset(map_name))
+            map_owner = self._assigned_directory_owner(current.parent)
+            if captured[2] not in (expected_previous_identity, asset_identity):
+                raise AssignedMapAlreadyFinalizedError(map_name, captured[2], asset_identity)
+            pending = self._read_assigned_exchange(map_name)
+            if pending is not None and pending["staging"] == staging.name:
+                preserve_staging = True
+                raise MapAssetCommitUncertainError("retained assigned exchange must be reconciled before reusing its staging")
+            finalized = bundle.model_copy(update={"asset_state": "finalized"})
+            with _StableDirectoryTree(staging) as tree:
+                source = self._assigned_checkpoint_source(tree, finalized.geometry_asset)
+                tree.verify_all()
+            self._write_assigned_candidate_bundle(finalized, staging)
+            self._write_assigned_manifest(finalized, staging, source)
+            with _StableDirectoryTree(staging) as candidate_tree, _StableDirectoryTree(current) as previous_tree:
+                _unused, validated = self._validate_open_directory(map_name, candidate_tree,
+                    expected_asset_identity=asset_identity)
+                header = _parse_json_object(previous_tree.require_file(_MANIFEST_FILE_NAME,
+                    "assigned previous manifest").read(_MAX_MANIFEST_JSON_BYTES), "assigned previous manifest")
+                if type(header.get("schema_version")) is int and header["schema_version"] == 1:
+                    raise AssignedMapAlreadyFinalizedError(map_name, None, asset_identity, existing_kind="legacy")
+                try:
+                    old_identity = AssetIdentityV2.model_validate(header.get("asset_identity"))
+                except Exception as exc:
+                    raise MapAssetBundleValidationError("invalid assigned previous identity") from exc
+                if old_identity not in (expected_previous_identity, asset_identity):
+                    raise AssignedMapAlreadyFinalizedError(map_name, old_identity, asset_identity)
+                if old_identity != asset_identity and captured[2] != expected_previous_identity:
+                    raise MapAssetBundleValidationError("assigned predecessor differs from the catalog owner")
+                _unused, previous = self._validate_open_directory(map_name, previous_tree,
+                    expected_asset_identity=old_identity)
+                # Both source generations must be explicitly admitted cloud-v2.
+                old_source = self._assigned_checkpoint_source(previous_tree, previous.geometry_asset)
+                if old_identity == asset_identity:
+                    if set(previous_tree.files) != set(candidate_tree.files):
+                        raise MapAssetBundleValidationError("assigned asset ID reused with different inventory")
+                    for relative, candidate_file in candidate_tree.files.items():
+                        if not candidate_file.streaming_equals(previous_tree.files[relative]):
+                            raise MapAssetBundleValidationError(f"assigned asset ID reused with different body: {relative}")
+                elif (asset_identity == expected_previous_identity
+                        or source["manifest"]["checkpoint_id"] == old_source["manifest"]["checkpoint_id"]):
+                    raise MapAssetBundleValidationError("assigned replacement requires a fresh asset and checkpoint owner")
+                _fsync_tree(candidate_tree)
+                candidate_tree.verify_all()
+                previous_tree.verify_all()
+                with catalog.map_activation_guard():
+                    if (self._assigned_catalog_owner(catalog.get_map_asset(map_name)) != captured
+                            or self._assigned_directory_owner(current.parent) != map_owner
+                            or [os.fstat(candidate_tree.parent_descriptor).st_dev,
+                                os.fstat(candidate_tree.parent_descriptor).st_ino] != map_owner
+                            or [os.fstat(previous_tree.parent_descriptor).st_dev,
+                                os.fstat(previous_tree.parent_descriptor).st_ino] != map_owner):
+                        raise MapAssetBundleValidationError("assigned replacement catalog creation owner changed")
+                    if catalog.get_map_activation() is not None or catalog.get_relocalization_intent() is not None:
+                        raise MapAssetBundleValidationError("activation or relocalization fences assigned exchange")
+                    candidate_tree.verify_all()
+                    previous_tree.verify_all()
+                    pending = self._read_assigned_exchange(map_name)
+                    if pending is not None:
+                        proof = self._inspect_assigned_exchange(map_name, pending, catalog)
+                        if (not proof.committed or proof.previous_identity != expected_previous_identity
+                                or proof.candidate_identity != asset_identity or old_identity != asset_identity):
+                            raise MapAssetCommitUncertainError("another assigned exchange requires catalog reconciliation")
+                    if old_identity == asset_identity:
+                        return previous
+                    self._inject_fault("before_assigned_exchange")
+                    candidate_tree.verify_all()
+                    previous_tree.verify_all()
+                    if (self._assigned_catalog_owner(catalog.get_map_asset(map_name)) != captured
+                            or self._assigned_directory_owner(current.parent) != map_owner):
+                        raise MapAssetBundleValidationError("assigned replacement catalog creation owner changed")
+                    old_stat = os.fstat(previous_tree.root.descriptor)
+                    new_stat = os.fstat(candidate_tree.root.descriptor)
+                    record = {"schema_version": 1, "map_name": map_name,
+                        "previous_identity": expected_previous_identity.model_dump(),
+                        "candidate_identity": asset_identity.model_dump(), "staging": staging.name,
+                        "previous_directory": [old_stat.st_dev, old_stat.st_ino],
+                        "candidate_directory": [new_stat.st_dev, new_stat.st_ino],
+                        "map_directory": map_owner, "catalog_created_at": captured[1]}
+                    preserve_staging = True
+                    _atomic_write_relative(current.parent, _ASSIGNED_EXCHANGE_JOURNAL, _canonical_json_bytes(record))
+                    self._inject_fault("after_assigned_exchange_journal")
+                    candidate_tree.verify_all()
+                    previous_tree.verify_all()
+                    if (self._assigned_catalog_owner(catalog.get_map_asset(map_name)) != captured
+                            or self._assigned_directory_owner(current.parent) != map_owner):
+                        raise MapAssetBundleValidationError("assigned replacement catalog creation owner changed")
+                    if catalog.get_map_activation() is not None or catalog.get_relocalization_intent() is not None:
+                        raise MapAssetBundleValidationError("activation or relocalization fences assigned exchange")
+                    _exchange_directories(candidate_tree.parent_descriptor, staging.name, current.name)
+                    candidate_tree.rebind_root_after_rename(current.name)
+                    previous_tree.rebind_root_after_rename(staging.name)
+                    self._inject_fault("before_assigned_directory_fsync")
+                    os.fsync(candidate_tree.parent_descriptor)
+                    self._inject_fault("after_assigned_exchange")
+                return validated
+        except BaseException as exc:
+            if preserve_staging:
+                if not isinstance(exc, Exception):
+                    exc.preserve_staging = True
+                    raise
+                raise MapAssetCommitUncertainError(f"assigned exchange requires exact journal reconciliation: {exc}") from exc
+            raise
+        finally:
+            if not preserve_staging:
+                self._discard_owned_staging(map_name, staging, owner)
 
     def _write_assigned_candidate_bundle(self, bundle, staging):
         if bundle.georeference is not None:

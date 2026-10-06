@@ -40,7 +40,8 @@ def require_catalog_owner(owner, asset, captured):
     return current
 
 
-def reconcile_assigned_current(owner, asset, bundle, *, captured, reason=None, metadata=None, confirm_durable=False):
+def reconcile_assigned_current(owner, asset, bundle, *, captured, reason=None, metadata=None,
+                               confirm_durable=False, expected_previous_identity=None):
     """重启读取只采用已经持久的精确 current；不会重导出或重新分配 ID。"""
     if (bundle.identity_schema_version != 2 or bundle.asset_state != "finalized"
             or bundle.manifest_sha256 is not None):
@@ -56,8 +57,14 @@ def reconcile_assigned_current(owner, asset, bundle, *, captured, reason=None, m
     with owner._repository.map_activation_guard():
         current = require_catalog_owner(owner, asset, captured)
         if current.identity_schema_version == 2 and current.asset_identity != bundle.asset_identity:
-            raise _problem("分配式目录与 current 身份不一致。", "map_asset_bundle_invalid")
+            proof = owner._asset_repository.get_assigned_map_asset_exchange(asset.map_name)
+            if (expected_previous_identity != current.asset_identity or proof is None or not proof.committed
+                    or proof.previous_identity != current.asset_identity or proof.candidate_identity != bundle.asset_identity
+                    or proof.catalog_created_at != current.created_at.isoformat()
+                    or proof.map_directory != captured[:2]):
+                raise _problem("分配式目录与 current 身份不一致。", "map_asset_bundle_invalid")
         if (current.identity_schema_version == 2 and current.finalized
+                and current.asset_identity == bundle.asset_identity
                 and current.frame_id == bundle.frame_id and current.finalized_at is not None):
             if confirm_durable:
                 owner._repository.save_map_asset(current)
@@ -67,7 +74,9 @@ def reconcile_assigned_current(owner, asset, bundle, *, captured, reason=None, m
         updated = current.model_copy(update={
             "identity_schema_version": 2, "asset_identity": bundle.asset_identity,
             "asset_manifest_sha256": None, "finalized": True,
-            "finalized_at": current.finalized_at or bundle.timestamp, "frame_id": bundle.frame_id,
+            "finalized_at": (current.finalized_at or bundle.timestamp)
+                if current.asset_identity == bundle.asset_identity else bundle.timestamp,
+            "frame_id": bundle.frame_id,
             "active": is_active, "localization_ready": False,
             "status": MapAssetStatus.MAPPING if is_active else MapAssetStatus.READY,
             "updated_at": now,
@@ -89,10 +98,13 @@ def reconcile_assigned_current(owner, asset, bundle, *, captured, reason=None, m
     return updated
 
 
-def finalize_assigned_cloud_map(owner, asset, *, context, reason, metadata, georeference):
+def finalize_assigned_cloud_map(owner, asset, *, context, reason, metadata, georeference,
+                                save_operation_id=None, expected_previous_identity=None):
     name = asset.map_name
+    metadata = dict(owner._sanitize_map_metadata(metadata) or {})
+    metadata.pop("save_operation_id", None)  # 仅私有逻辑保存入口可写入该关联字段。
     captured = catalog_owner(owner, asset)
-    if asset.finalized:
+    if asset.finalized and expected_previous_identity != asset.asset_identity:
         raise _problem("地图元数据标记为 finalized，但 current 资产包不存在。", "map_asset_bundle_missing")
     if context.get("active") is not True or context.get("map_name") != name:
         raise _problem("分配式保存要求目标地图的活动原生建图会话。")
@@ -121,7 +133,8 @@ def finalize_assigned_cloud_map(owner, asset, *, context, reason, metadata, geor
             "mapping_session_id": snapshot_metadata.get("mapping_session_id") or snapshot_metadata.get("session_id"),
             "session_generation": snapshot_metadata.get("session_generation"),
             "content_revision": snapshot_metadata.get("content_revision"),
-            **(owner._sanitize_map_metadata(metadata) or {})})
+            **metadata,
+            **({"save_operation_id": save_operation_id} if save_operation_id is not None else {})})
     staging = owner._asset_repository.create_staging_directory(name)
     try:
         prepared = owner._geometry_runtime.prepare_map_asset_bundle(
@@ -138,15 +151,26 @@ def finalize_assigned_cloud_map(owner, asset, *, context, reason, metadata, geor
                       asset_state="candidate", manifest_sha256=None)
         candidate = MapAssetBundle(**values)
         owner._asset_repository.finalize_assigned_map_asset_bundle(
-            candidate, staging_dir=staging, asset_identity=identity)
+            candidate, staging_dir=staging, asset_identity=identity,
+            expected_previous_identity=expected_previous_identity)
         finalized = owner._asset_repository.get_map_asset_bundle(name, migrate_legacy=False,
             expected_asset_identity=identity)
         if finalized is None:
             raise _problem("提交后的精确 current 资产不可读取。")
         committed = reconcile_assigned_current(owner, asset, finalized, captured=captured,
-            reason=reason, metadata=metadata, confirm_durable=True)
+            reason=reason, metadata=metadata, confirm_durable=True,
+            expected_previous_identity=expected_previous_identity)
+        if expected_previous_identity is not None:
+            owner._asset_repository.settle_assigned_map_asset_exchange(name,
+                expected_previous_identity=expected_previous_identity, asset_identity=identity)
     except BaseException as exc:
-        if (staging.exists() or staging.is_symlink()) and not getattr(exc, "preserve_staging", False):
+        preserve = getattr(exc, "preserve_staging", False)
+        if expected_previous_identity is not None:
+            try:
+                preserve = preserve or owner._asset_repository.get_assigned_map_asset_exchange(name) is not None
+            except Exception:
+                preserve = True  # 无法证明交换位置时，资源继续归原事务所有。
+        if (staging.exists() or staging.is_symlink()) and not preserve:
             try:
                 owner._asset_repository.discard_staging_directory(name, staging)
             except BaseException:

@@ -11581,10 +11581,13 @@ mod lifecycle_tests {
             seed_canonical_reset_pose(&fixture.handle, 51).await;
             let xyz = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
                 .into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
-            let request = cloud_activation_request(xyz);
+            let request = modern_activation_request(
+                cloud_activation_request(xyz), "reset-modern",
+                fixture.service.activation_receipts.runtime_generation(),
+            );
             let activated = GeometryRuntime::activate_map(&fixture.service, Request::new(request.clone()))
                 .await.expect("in-process cloud activation").into_inner();
-            assert!(activated.success);
+            assert!(activated.success, "in-process activation outcome: {activated:?}");
             assert_canonical_reset_visible(&fixture.service).await;
             seed_canonical_reset_pose(&fixture.handle, 52).await;
             let replay = GeometryRuntime::activate_map(&fixture.service, Request::new(request.clone()))

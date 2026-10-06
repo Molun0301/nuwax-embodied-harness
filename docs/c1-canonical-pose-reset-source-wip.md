@@ -1,4 +1,7 @@
-# Canonical pose reset: source-only WIP checkpoint
+# Canonical pose reset: historical source-only WIP checkpoint
+
+This records the original unqualified checkpoint. Subsequent bounded results are
+in `c1-canonical-pose-reset-qualification.md` and `c1-canonical-pose-reset-results.json`.
 
 Status: **UNQUALIFIED — NOT COMPILED OR EXECUTED** (2026-10-05 UTC).
 This isolated branch checkpoint preserves reviewed source while the native

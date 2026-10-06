@@ -4467,10 +4467,15 @@ mod tests {
                 std::process::id(),
                 uuid::Uuid::new_v4()
             ));
-            *handle.cloud_map_writer.lock() = Some(
-                crate::pointcloud::CloudMapShmWriter::new(&cloud_path)
-                    .expect("deferred replay cloud-map writer"),
-            );
+            let mut cloud_writer = crate::pointcloud::CloudMapShmWriter::new(&cloud_path)
+                .expect("deferred replay cloud-map writer");
+            if in_process {
+                cloud_writer.bind_fine_map_owner(
+                    handle.mapping_adapter.as_ref().unwrap().lock().global_frame_generation(),
+                    handle.nav.producer_runtime_generation(),
+                ).expect("in-process replay writer binds the actual runtime/frame owner");
+            }
+            *handle.cloud_map_writer.lock() = Some(cloud_writer);
             handle.transport = LcmTransport::new(Arc::new(backend.clone()));
             let public_odometry = binding(
                 "/test/lio/deferred/odometry",
@@ -4990,7 +4995,8 @@ mod tests {
             assert!(futures::poll!(replay.as_mut()).is_pending());
             assert_eq!(fixture.backend.published_count("tf2_msgs.TFMessage"), 0);
             drop(lifecycle_guard);
-            assert!(futures::poll!(replay.as_mut()).is_pending());
+            let after_lifecycle = futures::poll!(replay.as_mut());
+            assert!(after_lifecycle.is_pending(), "unexpected replay completion: {after_lifecycle:?}");
             assert_eq!(fixture.backend.published_count("tf2_msgs.TFMessage"), 1);
             assert!(lifecycle.try_lock().is_err(), "TF publication must retain L after the pose commit");
             assert_eq!(fixture.handle.state.read().await.pose.timestamp_ns, 1_000_000_000);

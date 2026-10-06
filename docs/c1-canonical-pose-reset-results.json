@@ -1,0 +1,344 @@
+{
+  "status": "component-qualified",
+  "date_utc": "2026-10-05",
+  "source_wip_commit": "e0496ea1d823e3c22d3bb81c54309023656ed50b",
+  "source_wip_tree": "acd8d6eefcbff386404bd107da10952cb981b50e",
+  "compiled_base_commit": "9334c2aae80651c832b0864c49080af8ffdc9243",
+  "compiled_base_tree": "fa4c24311a5d87bf09cd103ff66d3f4f2edf8269",
+  "source_files_sha256": {
+    "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs": "7ec60f6145a25cdceea92af493a5d3d450855f2409a4e2093c39509b37ce82de",
+    "services/geometry/nuwax_geometry_runtime/src/lio_ingress.rs": "a6ee07731629d40ac387a0a8fbb644b18a94875fab93bd388f04c7d041465b98",
+    "services/geometry/nuwax_geometry_runtime/src/server.rs": "2c1b0b872a2ae8a9e5dc7379ab68a6d1fd914fdd307c3f3ce86279b5b7072c39"
+  },
+  "exact14_sha256": "5ada43d540345cd282b164705ca9e4546799dd40bc5c91ada98e6075468b540e",
+  "fixture_correction_sha256": "dc46e3c3e1fa3fa281fed51da75931f35a33087523bc1f0ea9d2c8d4599ced9d",
+  "compiler": {
+    "rustc": "1.88.0",
+    "cargo": "1.88.0",
+    "lcm_gen": "1.5.2",
+    "cargo_jobs": 2,
+    "cmake_jobs": 1,
+    "dev_test_debug": 0
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "compile_exit": 0,
+      "compile_elapsed_sec": 74.97653341200021,
+      "binary_sha256": "47b594876988a6e15c185d99468f437c6a30987fe549ae8601cf67a6154c5a62",
+      "tested_overlay_tree": "d1cf7aa3fe6700168deba147150c64cf67772dd9",
+      "baseline_restored_bytes": true,
+      "baseline_git_status": "",
+      "native_cmake_caches_unchanged": true,
+      "passed": 12,
+      "total": 14,
+      "tests": [
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_clears_pose_full_history_and_mirror",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.01621999499911908
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_notifies_even_when_pose_is_already_missing",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.015870499999437016
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_reinstalls_only_explicit_sensor_descriptor",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.015825711998331826
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_accepts_new_canonical_observation",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.015793743999893195
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_tree_retains_history_and_drives_latest_inventory",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.015788236998560023
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_tree_resolves_base_to_map_and_rejects_invalid_quaternion",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.0076190139989193995
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::semantic_base_candidates_accept_aliases_and_reject_foreign_namespaces",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.016592263998973067
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_new_start_clears_pose_but_replay_and_rejection_preserve_it",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.03212153099957504
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it",
+          "exit_code": 101,
+          "passed": false,
+          "elapsed_sec": 0.03331848600100784
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_start_retains_lifecycle_until_reset_after_caller_cancel",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.03248693000023195
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_activation_retains_lifecycle_until_reset_after_caller_cancel",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.032427472000563284
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_rechecks_admission_after_lifecycle_wait",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.11458541299907665
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_checks_each_exact_claim_component",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.11562956299894722
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_holds_lifecycle_through_odometry_handoff",
+          "exit_code": 101,
+          "passed": false,
+          "elapsed_sec": 0.03233442099917738
+        }
+      ],
+      "failures": [
+        {
+          "name": "server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it",
+          "output": "\nrunning 1 test\ntest server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it ... \nthread 'server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it' panicked at src/server.rs:11587:13:\nassertion failed: activated.success\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1157 filtered out; finished in 0.01s\n\n"
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_holds_lifecycle_through_odometry_handoff",
+          "output": "\nrunning 1 test\ntest lio_ingress::tests::in_process_deferred_replay_holds_lifecycle_through_odometry_handoff ... \nthread 'lio_ingress::tests::in_process_deferred_replay_holds_lifecycle_through_odometry_handoff' panicked at src/lio_ingress.rs:4993:13:\nassertion failed: futures::poll!(replay.as_mut()).is_pending()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    lio_ingress::tests::in_process_deferred_replay_holds_lifecycle_through_odometry_handoff\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1157 filtered out; finished in 0.01s\n\n"
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "compile_exit": 0,
+      "compile_elapsed_sec": 28.732803041000807,
+      "binary_sha256": "ed1498f9c4c775c600d5d0be6def41b437ca3dd532fc035440ce0be3e024725f",
+      "tested_overlay_tree": "40e9055f309d1337d0a8c3968fe8b4e1f6bdc9ba",
+      "baseline_restored_bytes": true,
+      "baseline_git_status": "",
+      "native_cmake_caches_unchanged": true,
+      "passed": 13,
+      "total": 14,
+      "tests": [
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_clears_pose_full_history_and_mirror",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.007719698000073549
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_notifies_even_when_pose_is_already_missing",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.007740349001323921
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_reinstalls_only_explicit_sensor_descriptor",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.007725436000328045
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_accepts_new_canonical_observation",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.015836271999432938
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_tree_retains_history_and_drives_latest_inventory",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.007878816999436822
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_tree_resolves_base_to_map_and_rejects_invalid_quaternion",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.007644444000106887
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::semantic_base_candidates_accept_aliases_and_reject_foreign_namespaces",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.008355993999430211
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_new_start_clears_pose_but_replay_and_rejection_preserve_it",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.032136155999978655
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it",
+          "exit_code": 101,
+          "passed": false,
+          "elapsed_sec": 0.03203947600013635
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_start_retains_lifecycle_until_reset_after_caller_cancel",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.03201756799899158
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_activation_retains_lifecycle_until_reset_after_caller_cancel",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.03199582000161172
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_rechecks_admission_after_lifecycle_wait",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.11425882399998954
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_checks_each_exact_claim_component",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.06430555299994012
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_holds_lifecycle_through_odometry_handoff",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.032126145999427536
+        }
+      ],
+      "failures": [
+        {
+          "name": "server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it",
+          "output": "\nrunning 1 test\ntest server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it ... \nthread 'server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it' panicked at src/server.rs:11587:13:\nin-process activation outcome: MappingSessionState { success: false, phase: \"ACTIVE\", message: \"ACTIVATE_MAP_SEAL_CAS_FAILED\", session_id: \"mapload:one\", map_name: \"warehouse\", session_generation: 1, revision: 1, active: true, idempotent_replay: false, legacy_checkpoint_reconstructed: true, mapping_backend_kind: \"voxel\", activation_receipt_schema_version: 1, activation_receipt_disposition: InvalidatedPostcommit, runtime_generation: 1, backend_generation: 1, activation_request_id: \"mapload:one\", activation_request_identity_sha256: [87, 2, 11, 9, 145, 175, 138, 81, 231, 15, 27, 93, 229, 150, 89, 64, 196, 111, 40, 152, 178, 222, 101, 53, 185, 19, 233, 163, 118, 101, 159, 154], activation_identity_sha256: [], target_receipt_sha256: [61, 8, 170, 97, 79, 101, 255, 131, 125, 175, 187, 137, 220, 201, 84, 76, 231, 81, 209, 138, 141, 108, 98, 87, 168, 202, 64, 0, 198, 204, 249, 69], asset_manifest_sha256: [], asset_bundle_sha256: [], relocalization_target_available: false, source_policy_version: 3, source_policy_sha256: [234, 230, 117, 98, 237, 166, 138, 215, 29, 252, 111, 46, 132, 202, 32, 12, 185, 242, 128, 174, 227, 243, 141, 238, 95, 164, 70, 125, 91, 34, 229, 189], deadline_policy_version: 1, deadline_policy_sha256: [207, 39, 147, 8, 86, 86, 239, 129, 250, 223, 18, 168, 15, 177, 20, 121, 115, 236, 113, 167, 119, 53, 164, 163, 230, 0, 172, 19, 69, 181, 156, 112], algorithm_options_version: 2, algorithm_options_sha256: [162, 205, 61, 149, 147, 127, 136, 172, 21, 146, 178, 73, 79, 25, 81, 132, 19, 11, 29, 253, 32, 137, 51, 142, 167, 188, 31, 146, 110, 140, 126, 13], target_kind: \"\", target_graph_sha256: [], planar_mode: \"\", activation_receipt_v2: None, relocalization_policy_v2: None }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1157 filtered out; finished in 0.01s\n\n"
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "compile_exit": 0,
+      "compile_elapsed_sec": 23.565510430998984,
+      "binary_sha256": "38ff5c85274b4964dd5cec262073b9334eff2e083fdf41789b45e336d537de80",
+      "tested_overlay_tree": "ba255fd8b304337ae85ef6044bcefd0fad3bfd30",
+      "baseline_restored_bytes": true,
+      "baseline_git_status": "",
+      "native_cmake_caches_unchanged": true,
+      "passed": 14,
+      "total": 14,
+      "tests": [
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_clears_pose_full_history_and_mirror",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.015882230998613522
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_notifies_even_when_pose_is_already_missing",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.016161431000000448
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_reinstalls_only_explicit_sensor_descriptor",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.01599022899972624
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_accepts_new_canonical_observation",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.016583345999606536
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_tree_retains_history_and_drives_latest_inventory",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.01623690499945951
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_tree_resolves_base_to_map_and_rejects_invalid_quaternion",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.016040721000535996
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::semantic_base_candidates_accept_aliases_and_reject_foreign_namespaces",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.016015687000617618
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_new_start_clears_pose_but_replay_and_rejection_preserve_it",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.032418205999420024
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.03219172500030254
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_start_retains_lifecycle_until_reset_after_caller_cancel",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.03218783999909647
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_activation_retains_lifecycle_until_reset_after_caller_cancel",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.0321254049995332
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_rechecks_admission_after_lifecycle_wait",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.11455119799938984
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_checks_each_exact_claim_component",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.06452337699920463
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_holds_lifecycle_through_odometry_handoff",
+          "exit_code": 0,
+          "passed": true,
+          "elapsed_sec": 0.032239212001513806
+        }
+      ],
+      "failures": []
+    }
+  ],
+  "limitations": [
+    "No real LCM/network, robot, sidecar process, or hardware execution",
+    "Raw native getters during unfinished transition can observe predecessor state until reset commits",
+    "Existing startup replay poison can revoke readiness; rejection tests prove pose/TF/registration non-mutation only",
+    "Legacy activation contract0 cloud seal mismatch remains unresolved; successful cloud activation/replay test uses contract1",
+    "Activation caller-cancellation fixture uses contract0 through the pre-seal reset boundary and does not claim successful contract0 activation",
+    "No default assigned activation switch or application-identity completion"
+  ]
+}

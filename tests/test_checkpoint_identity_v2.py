@@ -6,6 +6,7 @@ import os
 import struct
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import ExitStack
 from dataclasses import replace
@@ -113,6 +114,9 @@ def runtime(stub):
     instance = provider.GeometryRuntimeProvider.__new__(provider.GeometryRuntimeProvider)
     instance._connected = True
     instance._stub = stub
+    instance._map_state_lock = threading.Lock()
+    instance._stopping = False
+    instance._map_connection_epoch = 1
     instance._raise_if_stopping = lambda *args: None
     return instance
 
@@ -385,7 +389,11 @@ class IdentityV2Tests(unittest.TestCase):
             return exported
         instance._is_nuwax_mapping_active = lambda: True
         instance.get_mapping_session_context = lambda: dict(context)
-        instance._resolve_mapping_backend = lambda: SimpleNamespace(export_mapping_backend_checkpoint=export)
+        instance._runtime_state_lock = threading.RLock()
+        instance._remote_provider = runtime(TransferStub(self.response))
+        instance._remote_provider.export_mapping_backend_checkpoint = export
+        instance._provider_attach_epoch = 1
+        instance._resolve_mapping_backend = lambda: instance._remote_provider
         instance._managed_processes = {}
         instance._external_process_name = lambda: 'geometry'
         instance._locate_live_mapping_database = lambda: None

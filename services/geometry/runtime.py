@@ -25,6 +25,7 @@ import grpc
 
 from contracts.geometry import Pose, Vector3
 from contracts.maps import OccupancyGrid
+from contracts.occupancy_cells import PackedOccupancyCells
 from core.errors import GatewayError
 from core.logging_utils import JsonLineFormatter
 from contracts.map_activation import AssignedActivationReceipt, _request as _assigned_activation_request
@@ -5097,6 +5098,8 @@ class PlatformGeometryRuntime:
         """Install the exported canonical occupancy into the candidate bundle."""
 
         if checkpoint_bundle.checkpoint.schema_version == 2:
+            if map_bundle.identity_schema_version != 1 or map_bundle.manifest_sha256 is not None:
+                raise TypeError("assigned checkpoint preparation requires an unsealed legacy draft")
             descriptor = checkpoint_bundle.occupancy_asset
             meta = SimpleNamespace(
                 width=descriptor["width"], height=descriptor["height"],
@@ -5118,12 +5121,24 @@ class PlatformGeometryRuntime:
             raise RuntimeError(
                 "canonical mapping checkpoint occupancy dimensions do not match payload"
             )
-        values = [value if value <= 100 else value - 256
-                  for chunk in payload_chunks(raw_data) for value in chunk]
-        if any(value < -1 or value > 100 for value in values):
-            raise RuntimeError(
-                "canonical mapping checkpoint occupancy contains invalid values"
-            )
+        if checkpoint_bundle.checkpoint.schema_version == 2:
+            try:
+                # Exported bytes already have immutable ownership. Reopened mmap
+                # members need one compact byte capture, never a cell list.
+                values = PackedOccupancyCells(
+                    raw_data if isinstance(raw_data, bytes) else raw_data[:]
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "canonical mapping checkpoint occupancy contains invalid values"
+                ) from exc
+        else:
+            values = [value if value <= 100 else value - 256
+                      for chunk in payload_chunks(raw_data) for value in chunk]
+            if any(value < -1 or value > 100 for value in values):
+                raise RuntimeError(
+                    "canonical mapping checkpoint occupancy contains invalid values"
+                )
         timestamp_ns = int(meta.timestamp_ns)
         timestamp = self._checkpoint_datetime(timestamp_ns)
         occupancy_grid = OccupancyGrid(
@@ -5156,33 +5171,43 @@ class PlatformGeometryRuntime:
             checkpoint_metadata["checkpoint_id"] = checkpoint_bundle.checkpoint.checkpoint_id
         else:
             checkpoint_metadata["content_sha256"] = checkpoint_bundle.checkpoint.content_sha256.hex()
-        snapshot = map_bundle.snapshot.model_copy(
-            update={
-                "frame_id": frame_id,
-                "occupancy_grid": occupancy_grid,
-                "source_epoch": json.dumps(["checkpoint-v2", map_bundle.snapshot_identity, checkpoint_bundle.backend_kind,
-                    checkpoint_bundle.checkpoint.source_session_id,
-                    checkpoint_bundle.checkpoint.source_session_generation], separators=(",", ":")),
-                "update_sequence": max(1, int(meta.revision)),
-                "metadata": {
-                    **dict(map_bundle.snapshot.metadata),
-                    "mapping_backend_checkpoint": checkpoint_metadata,
-                    "saved_occupancy_layer": "canonical_physical_raw",
-                },
+        snapshot_changes = {
+            "frame_id": frame_id,
+            "occupancy_grid": occupancy_grid,
+            "source_epoch": json.dumps(["checkpoint-v2", map_bundle.snapshot_identity, checkpoint_bundle.backend_kind,
+                checkpoint_bundle.checkpoint.source_session_id,
+                checkpoint_bundle.checkpoint.source_session_generation], separators=(",", ":")),
+            "update_sequence": max(1, int(meta.revision)),
+            "metadata": {
+                **dict(map_bundle.snapshot.metadata),
+                "mapping_backend_checkpoint": checkpoint_metadata,
+                "saved_occupancy_layer": "canonical_physical_raw",
             },
-            deep=True,
-        )
-        return map_bundle.model_copy(
-            update={
-                "frame_id": frame_id,
-                "snapshot": snapshot,
-                "metadata": {
-                    **dict(map_bundle.metadata),
-                    "mapping_backend_checkpoint": checkpoint_metadata,
-                },
+        }
+        if checkpoint_bundle.checkpoint.schema_version == 2:
+            source_snapshot = map_bundle.snapshot
+            snapshot = type(source_snapshot)(**{
+                **{name: getattr(source_snapshot, name) for name in type(source_snapshot).model_fields},
+                **snapshot_changes,
+            })
+        else:
+            snapshot = map_bundle.snapshot.model_copy(update=snapshot_changes, deep=True)
+        bundle_changes = {
+            "frame_id": frame_id,
+            "snapshot": snapshot,
+            "metadata": {
+                **dict(map_bundle.metadata),
+                "mapping_backend_checkpoint": checkpoint_metadata,
             },
-            deep=True,
-        )
+        }
+        if checkpoint_bundle.checkpoint.schema_version == 2:
+            # This is still a mutable draft. The caller captures its assigned
+            # owner once, after all preparation and identity allocation.
+            return type(map_bundle)(**{
+                **{name: getattr(map_bundle, name) for name in type(map_bundle).model_fields},
+                **bundle_changes,
+            })
+        return map_bundle.model_copy(update=bundle_changes, deep=True)
 
     def _validate_checkpoint_mapping_identity(
         self,
@@ -5262,6 +5287,10 @@ class PlatformGeometryRuntime:
         resolved_bundle_root = self._require_bundle_root(bundle_root)
         if type(checkpoint_schema_version) is not int or checkpoint_schema_version not in (1, 2):
             raise ValueError("unsupported finalized checkpoint schema")
+        assigned_cloud_export = export_backend_checkpoint and checkpoint_schema_version == 2
+        if assigned_cloud_export and (
+                bundle.identity_schema_version != 1 or bundle.manifest_sha256 is not None):
+            raise TypeError("assigned checkpoint preparation requires an unsealed legacy draft")
         if export_backend_checkpoint:
             if skip_pcd_export:
                 raise RuntimeError(
@@ -5274,9 +5303,32 @@ class PlatformGeometryRuntime:
 
         checkpoint_bundle = None
         checkpoint_mapping_context: Optional[Dict[str, object]] = None
+        if assigned_cloud_export:
+            with self._runtime_state_lock:
+                export_provider = getattr(self, "_remote_provider", None)
+                if export_provider is None or getattr(self, "_provider_attach_stopping", False):
+                    raise RuntimeError("assigned checkpoint provider is unavailable")
+                export_origin = export_provider.capture_assigned_activation_origin()
+                export_attach_epoch = getattr(self, "_provider_attach_epoch", 0)
+
+            def require_export_origin():
+                with self._runtime_state_lock:
+                    if (getattr(self, "_remote_provider", None) is not export_provider
+                            or getattr(self, "_provider_attach_epoch", 0) != export_attach_epoch
+                            or getattr(self, "_provider_attach_stopping", False)):
+                        raise RuntimeError("assigned checkpoint runtime provider ownership changed")
+                    export_provider.require_assigned_activation_origin(export_origin)
+
         if export_backend_checkpoint:
             mapping_context_before = self.get_mapping_session_context()
             mapping_backend = self._resolve_mapping_backend()
+            if assigned_cloud_export:
+                require_export_origin()
+                if mapping_backend is not export_provider:
+                    raise RuntimeError("assigned checkpoint mapping backend provider changed")
+                if (not isinstance(mapping_context_before, dict)
+                        or mapping_context_before.get("mapping_backend_kind") not in {"voxel", "raytracing"}):
+                    raise RuntimeError("assigned checkpoint export requires an active cloud backend")
             exporter = getattr(
                 mapping_backend,
                 "export_mapping_backend_checkpoint",
@@ -5286,12 +5338,14 @@ class PlatformGeometryRuntime:
                 raise RuntimeError(
                     "active native mapping backend does not support checkpoint export"
                 )
-            # Keep the default envelope paired with activation-v1. Explicit v2
-            # prepares hash-free immutable members; its activation is gated below.
+            # Low-level callers retain the legacy default. Public cloud saves
+            # explicitly select the paired, hash-free schema-2 checkpoint.
             checkpoint_bundle = (
                 exporter() if checkpoint_schema_version == 1
                 else exporter(checkpoint_schema_version=checkpoint_schema_version)
             )
+            if assigned_cloud_export:
+                require_export_origin()
             if not isinstance(
                 checkpoint_bundle,
                 MappingBackendCheckpointExportBundle,
@@ -5302,6 +5356,16 @@ class PlatformGeometryRuntime:
             if checkpoint_bundle.checkpoint.schema_version != checkpoint_schema_version:
                 raise RuntimeError("mapping backend checkpoint export changed the requested schema")
             mapping_context_after = self.get_mapping_session_context()
+            if assigned_cloud_export and (
+                    not isinstance(mapping_context_after, dict)
+                    or checkpoint_bundle.backend_kind not in {"voxel", "raytracing"}
+                    or checkpoint_bundle.backend_kind != mapping_context_before.get("mapping_backend_kind")
+                    or checkpoint_bundle.backend_kind != mapping_context_after.get("mapping_backend_kind")):
+                raise RuntimeError("assigned checkpoint cloud backend changed during export")
+            if assigned_cloud_export and any(
+                    mapping_context_before.get(field) != mapping_context_after.get(field)
+                    for field in ("runtime_generation", "backend_generation")):
+                raise RuntimeError("assigned checkpoint mapping owner changed during export")
             if (
                 _mapping_context_snapshot_token(mapping_context_before)
                 != _mapping_context_snapshot_token(mapping_context_after)
@@ -5352,6 +5416,16 @@ class PlatformGeometryRuntime:
         if planar_graph:
             database_metadata = {"database_present": True, "database_source_kind": "planar_graph",
                 "database_target_path": str(mapping_database_path), "payload_size": checkpoint_bundle.checkpoint.payload_size}
+        elif assigned_cloud_export:
+            database_metadata = self._materialize_native_bundle_database(
+                mapping_database_path,
+                bundle=bundle,
+                checkpoint_bundle=checkpoint_bundle,
+                mapping_context=checkpoint_mapping_context,
+            )
+            if (not bool(database_metadata.get("database_present"))
+                    or not self._is_usable_mapping_db_file(mapping_database_path)):
+                raise RuntimeError("finalized 地图资产包缺少可用的建图数据库")
         else:
             database_metadata = self._materialize_backend_state(mapping_database_path)
             if checkpoint_bundle is not None and (
@@ -5572,35 +5646,40 @@ class PlatformGeometryRuntime:
             geometry_asset.model_dump_json(indent=2),
             encoding="utf-8",
         )
-        return bundle.model_copy(
-            update={
-                "geometry_asset": geometry_asset,
-                "metadata": {
-                    **dict(bundle.metadata),
-                    "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset),
-                    "backend_session_id": backend_run.get("session_id"),
-                    "backend_run_id": backend_run.get("run_id"),
-                    "mapping_database_path": mapping_database_relative,
-                    "backend_streaming_ready": quality_metrics.get("live_streaming_ready"),
-                    "mapping_session_id": backend_run.get("session_id"),
-                    "mapping_run_id": backend_run.get("run_id"),
-                    "mapping_live_streaming_ready": quality_metrics.get("live_streaming_ready"),
-                    "map_asset_source_mode": quality_metrics.get("source_mode"),
-                    "checkpoint_ready": quality_metrics.get("checkpoint_ready"),
-                    "mapping_backend_checkpoint": self._clone_metadata(
-                        backend_checkpoint_metadata
-                    ) if backend_checkpoint_metadata is not None else dict(
-                        bundle.metadata.get("mapping_backend_checkpoint") or {}
-                    ) or None,
-                    "mapping_backend_checkpoint_ready": (
-                        backend_checkpoint_metadata is not None
-                    ),
-                    "navigation_map_yaml_path": persisted_nav2_metadata.get("yaml_path"),
-                    "navigation_map_ready": nav2_map_metadata.get("present"),
-                },
+        bundle_changes = {
+            "geometry_asset": geometry_asset,
+            "metadata": {
+                **dict(bundle.metadata),
+                "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset),
+                "backend_session_id": backend_run.get("session_id"),
+                "backend_run_id": backend_run.get("run_id"),
+                "mapping_database_path": mapping_database_relative,
+                "backend_streaming_ready": quality_metrics.get("live_streaming_ready"),
+                "mapping_session_id": backend_run.get("session_id"),
+                "mapping_run_id": backend_run.get("run_id"),
+                "mapping_live_streaming_ready": quality_metrics.get("live_streaming_ready"),
+                "map_asset_source_mode": quality_metrics.get("source_mode"),
+                "checkpoint_ready": quality_metrics.get("checkpoint_ready"),
+                "mapping_backend_checkpoint": self._clone_metadata(
+                    backend_checkpoint_metadata
+                ) if backend_checkpoint_metadata is not None else dict(
+                    bundle.metadata.get("mapping_backend_checkpoint") or {}
+                ) or None,
+                "mapping_backend_checkpoint_ready": (
+                    backend_checkpoint_metadata is not None
+                ),
+                "navigation_map_yaml_path": persisted_nav2_metadata.get("yaml_path"),
+                "navigation_map_ready": nav2_map_metadata.get("present"),
             },
-            deep=True,
-        )
+        }
+        if assigned_cloud_export:
+            prepared = type(bundle)(**{
+                **{name: getattr(bundle, name) for name in type(bundle).model_fields},
+                **bundle_changes,
+            })
+            require_export_origin()
+            return prepared
+        return bundle.model_copy(update=bundle_changes, deep=True)
 
     def _bundle_db_ready_for_activation(
         self,
@@ -7234,7 +7313,13 @@ class PlatformGeometryRuntime:
             }
         width = int(occupancy_grid.width)
         height = int(occupancy_grid.height)
-        data = list(occupancy_grid.data)
+        checkpoint_metadata = bundle.metadata.get("mapping_backend_checkpoint") or {}
+        packed_assigned = (
+            checkpoint_metadata.get("schema_version") == 2
+            and type(occupancy_grid.data) is PackedOccupancyCells
+        )
+        data = (memoryview(occupancy_grid.data.raw).cast("b") if packed_assigned
+                else list(occupancy_grid.data))
         if len(data) != width * height:
             return {
                 "present": False,

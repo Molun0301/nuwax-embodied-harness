@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "date_utc": "2026-10-06",
+  "scope": "ordinary cloud schema-2 save paired with public assigned workspace activation; focused Python qualification",
+  "branch": "fix/v3-legacy-cloud-seal-20261006",
+  "real_remote_parent": "5b4afa1939e4af043c48fd6cac1d559352677836",
+  "base_tree": "3d33a73c6d1f5972c8dbcae68e06297cf5bfaed1",
+  "local_source_base": "27e9389aa10445bfbbb0ad24e02ec2250f9526b3",
+  "local_base_is_not_remote_ancestry": true,
+  "focused_passed": 46,
+  "focused_failed": 0,
+  "focused_ignored": 0,
+  "new_behavior_cases": 40,
+  "directly_affected_prior_cases": 6,
+  "elapsed_test_seconds": 1.706,
+  "tests": [
+    "test_active_saved_asset_uses_actual_active_name_and_does_not_claim_localization_ready (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_active_saved_asset_uses_actual_active_name_and_does_not_claim_localization_ready)",
+    "test_cancellation_after_preparation_cleans_only_its_unpublished_staging (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_cancellation_after_preparation_cleans_only_its_unpublished_staging)",
+    "test_cancellation_after_rename_preserves_durable_owner_for_restart (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_cancellation_after_rename_preserves_durable_owner_for_restart)",
+    "test_catalog_identity_conflict_fails_before_reexport_or_activation (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_catalog_identity_conflict_fails_before_reexport_or_activation)",
+    "test_changed_checkpoint_body_is_not_repaired_by_an_ordinary_save_retry (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_changed_checkpoint_body_is_not_repaired_by_an_ordinary_save_retry)",
+    "test_delete_recreate_same_name_during_preparation_rejects_old_save_owner (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_delete_recreate_same_name_during_preparation_rejects_old_save_owner)",
+    "test_existing_save_cannot_adopt_old_bundle_after_getter_replaces_same_name_owner (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_existing_save_cannot_adopt_old_bundle_after_getter_replaces_same_name_owner)",
+    "test_finalized_event_cancellation_clears_only_own_cache_and_keeps_durable_owner (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_finalized_event_cancellation_clears_only_own_cache_and_keeps_durable_owner)",
+    "test_finalized_event_replacement_preserves_the_new_catalog_and_cache (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_finalized_event_replacement_preserves_the_new_catalog_and_cache)",
+    "test_finalized_retry_reuses_exact_owner_without_export (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_finalized_retry_reuses_exact_owner_without_export)",
+    "test_literal_schema_one_current_public_get_and_save_preserve_original_bytes_and_digest (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_literal_schema_one_current_public_get_and_save_preserve_original_bytes_and_digest)",
+    "test_low_level_prepare_default_keeps_explicit_legacy_export_contract (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_low_level_prepare_default_keeps_explicit_legacy_export_contract)",
+    "test_metadata_rename_visible_fsync_failure_requires_durable_exact_retry (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_metadata_rename_visible_fsync_failure_requires_durable_exact_retry)",
+    "test_newly_saved_owner_lost_activation_reply_restores_exact_request_without_redispatch (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_newly_saved_owner_lost_activation_reply_restores_exact_request_without_redispatch)",
+    "test_ordinary_cloud_save_reopens_and_public_load_installs_same_assigned_owner (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_ordinary_cloud_save_reopens_and_public_load_installs_same_assigned_owner)",
+    "test_planar_public_save_preserves_legacy_export_selection (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_planar_public_save_preserves_legacy_export_selection)",
+    "test_planar_selection_cannot_publish_a_cloud_preparation_through_legacy_finalizer (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_planar_selection_cannot_publish_a_cloud_preparation_through_legacy_finalizer)",
+    "test_raytracing_ordinary_save_selects_checkpoint_two_and_assigned_asset (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_raytracing_ordinary_save_selects_checkpoint_two_and_assigned_asset)",
+    "test_reentrant_publication_cannot_replace_a_new_same_name_catalog_owner (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_reentrant_publication_cannot_replace_a_new_same_name_catalog_owner)",
+    "test_restart_recovers_catalog_failure_from_same_durable_current (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_restart_recovers_catalog_failure_from_same_durable_current)",
+    "test_restart_recovers_durable_current_after_rename_without_reexport_or_new_identity (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_restart_recovers_durable_current_after_rename_without_reexport_or_new_identity)",
+    "test_rpc_asset_io_and_publication_callbacks_run_outside_catalog_runtime_locks (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_rpc_asset_io_and_publication_callbacks_run_outside_catalog_runtime_locks)",
+    "test_saved_but_unloaded_assigned_asset_does_not_install_legacy_localization (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_saved_but_unloaded_assigned_asset_does_not_install_legacy_localization)",
+    "test_session_change_during_export_cannot_publish_an_assigned_current (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_session_change_during_export_cannot_publish_an_assigned_current)",
+    "test_unknown_live_backend_never_falls_back_to_legacy_save (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_unknown_live_backend_never_falls_back_to_legacy_save)",
+    "test_download_and_release_remain_on_export_stub_after_replacement (test_runtime_assigned_save_preparation.AssignedCheckpointExportOriginTests.test_download_and_release_remain_on_export_stub_after_replacement)",
+    "test_export_rejects_planar_or_unknown_reply_before_download (test_runtime_assigned_save_preparation.AssignedCheckpointExportOriginTests.test_export_rejects_planar_or_unknown_reply_before_download)",
+    "test_export_rejects_replacement_before_artifact_reads (test_runtime_assigned_save_preparation.AssignedCheckpointExportOriginTests.test_export_rejects_replacement_before_artifact_reads)",
+    "test_failed_download_preserves_cancellation_and_releases_remaining_leases (test_runtime_assigned_save_preparation.AssignedCheckpointExportOriginTests.test_failed_download_preserves_cancellation_and_releases_remaining_leases)",
+    "test_invalid_artifact_is_never_released_using_an_unadmitted_reference (test_runtime_assigned_save_preparation.AssignedCheckpointExportOriginTests.test_invalid_artifact_is_never_released_using_an_unadmitted_reference)",
+    "test_successful_download_reports_cleanup_failure_after_all_releases (test_runtime_assigned_save_preparation.AssignedCheckpointExportOriginTests.test_successful_download_reports_cleanup_failure_after_all_releases)",
+    "test_schema1_preserves_list_and_independent_snapshot_copy (test_runtime_assigned_save_preparation.RuntimeAssignedSavePreparationTests.test_schema1_preserves_list_and_independent_snapshot_copy)",
+    "test_v2_cannot_rewrite_an_assigned_or_sealed_owner (test_runtime_assigned_save_preparation.RuntimeAssignedSavePreparationTests.test_v2_cannot_rewrite_an_assigned_or_sealed_owner)",
+    "test_v2_keeps_packed_owner_without_whole_model_or_cloud_copies (test_runtime_assigned_save_preparation.RuntimeAssignedSavePreparationTests.test_v2_keeps_packed_owner_without_whole_model_or_cloud_copies)",
+    "test_v2_rejects_export_backend_and_session_drift (test_runtime_assigned_save_preparation.RuntimeAssignedSavePreparationTests.test_v2_rejects_export_backend_and_session_drift)",
+    "test_v2_rejects_invalid_occupancy_and_layer_identity (test_runtime_assigned_save_preparation.RuntimeAssignedSavePreparationTests.test_v2_rejects_invalid_occupancy_and_layer_identity)",
+    "test_v2_rejects_missing_context_before_or_after_export (test_runtime_assigned_save_preparation.RuntimeAssignedSavePreparationTests.test_v2_rejects_missing_context_before_or_after_export)",
+    "test_v2_rejects_noncloud_backend_before_export (test_runtime_assigned_save_preparation.RuntimeAssignedSavePreparationTests.test_v2_rejects_noncloud_backend_before_export)",
+    "test_v2_rejects_runtime_and_provider_origin_drift_before_return (test_runtime_assigned_save_preparation.RuntimeAssignedSavePreparationTests.test_v2_rejects_runtime_and_provider_origin_drift_before_return)",
+    "test_v2_reopened_occupancy_uses_one_compact_byte_capture (test_runtime_assigned_save_preparation.RuntimeAssignedSavePreparationTests.test_v2_reopened_occupancy_uses_one_compact_byte_capture)",
+    "test_actual_proto_export_store_restart_reopen_reupload (test_checkpoint_identity_v2.IdentityV2Tests.test_actual_proto_export_store_restart_reopen_reupload)",
+    "test_public_export_rejects_missing_member_before_artifact_download (test_checkpoint_identity_v2.IdentityV2Tests.test_public_export_rejects_missing_member_before_artifact_download)",
+    "test_explicit_v2_preparation_keeps_assigned_metadata_and_exact_members (test_checkpoint_identity_v2.IdentityV2Tests.test_explicit_v2_preparation_keeps_assigned_metadata_and_exact_members)",
+    "test_actual_v2_preparation_finalizes_and_reopens_assigned_asset (test_checkpoint_identity_v2.IdentityV2Tests.test_actual_v2_preparation_finalizes_and_reopens_assigned_asset)",
+    "test_finalization_default_stays_legacy_until_activation_contract_is_paired (test_checkpoint_identity_v2.IdentityV2Tests.test_finalization_default_stays_legacy_until_activation_contract_is_paired)",
+    "test_default_export_remains_explicitly_legacy (test_checkpoint_identity_v2.IdentityV2Tests.test_default_export_remains_explicitly_legacy)"
+  ],
+  "source_sha256": {
+    "skills/assigned_map_save.py": "b70c68478e6cecde7acabd3667c1668a018d803b32ba4217364dcc5cb85acfdb",
+    "skills/map_workspace.py": "28c97335ea4addb3465b9b7fc40598c1f2a322d03857dd9519d5f7d2246e3a7b",
+    "services/geometry/runtime.py": "6fc21c3729463503e13cba34e43081887f356e22821bdfd35e14a1ad139c7e97",
+    "services/geometry/geometry_runtime_provider.py": "c46b9cebf9cc5ea38dd4fdabecc67ad352e9beb09d59cebd608a726648c8cc90"
+  },
+  "test_sha256": {
+    "tests/test_assigned_workspace_save.py": "93a4162d606eff8ca36caafbda2094384778beb76bd1b63f85dd86539e86a3de",
+    "tests/test_runtime_assigned_save_preparation.py": "e896d811d3c43c6462a3f60c8a82f9daa45bcb8c60cc765ccb15f8d039694fd0",
+    "tests/test_checkpoint_identity_v2.py": "6cdf9438844606e2cb43fdee29f03a005314c73356910d9f8dc7d5bf98882bfc"
+  },
+  "logs": {
+    "compile.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "path": "/workspace/shared/neh-paired-save-qualification-20261006/compile.log"
+    },
+    "critical-ruff.log": {
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "path": "/workspace/shared/neh-paired-save-qualification-20261006/critical-ruff.log"
+    },
+    "diff-check.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "path": "/workspace/shared/neh-paired-save-qualification-20261006/diff-check.log"
+    },
+    "focused-46.log": {
+      "sha256": "66ed6c70a55050cc2acc576d22e953ec976fdc645ca69095b859bf21fad48c79",
+      "path": "/workspace/shared/neh-paired-save-qualification-20261006/focused-46.log"
+    },
+    "layering.log": {
+      "sha256": "aea0990f8ce37c458a2699e216b7cb0e32e0d98223f5d1f8ff67f14a0f51e2ec",
+      "path": "/workspace/shared/neh-paired-save-qualification-20261006/layering.log"
+    },
+    "new-files-ruff.log": {
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "path": "/workspace/shared/neh-paired-save-qualification-20261006/new-files-ruff.log"
+    },
+    "pep604.log": {
+      "sha256": "ccceedecc6ecb959a7c43d011070f3681484d44df7d0a962cf2e1e9bd1626ac9",
+      "path": "/workspace/shared/neh-paired-save-qualification-20261006/pep604.log"
+    }
+  },
+  "final_exit_codes": {
+    "focused": 0,
+    "ruff": 0,
+    "critical_ruff": 0,
+    "compile": 0,
+    "pep604": 0,
+    "layering": 0,
+    "diffcheck": 0
+  },
+  "test_command": "PYTHONPATH=.:tests /workspace/scratch/71cdb9d17732/nuwax-embodied-harness/.nuwax-test-env/bin/python -m unittest -v test_assigned_workspace_save test_runtime_assigned_save_preparation test_checkpoint_identity_v2.IdentityV2Tests.test_actual_proto_export_store_restart_reopen_reupload test_checkpoint_identity_v2.IdentityV2Tests.test_public_export_rejects_missing_member_before_artifact_download test_checkpoint_identity_v2.IdentityV2Tests.test_explicit_v2_preparation_keeps_assigned_metadata_and_exact_members test_checkpoint_identity_v2.IdentityV2Tests.test_actual_v2_preparation_finalizes_and_reopens_assigned_asset test_checkpoint_identity_v2.IdentityV2Tests.test_finalization_default_stays_legacy_until_activation_contract_is_paired test_checkpoint_identity_v2.IdentityV2Tests.test_default_export_remains_explicitly_legacy",
+  "independent_review": "source cleared; final outcomes separately verified by integration owner",
+  "limitations": [
+    "No full suite, new native compilation, live gRPC network, or hardware qualification",
+    "Assigned installation remains LOCALIZING; no real relocalization target or READY claim",
+    "Exploration checkpoint, building-floor, finalized-navigation-authority and saved-dense-cloud legacy digest consumers remain unpaired",
+    "No guessed restart redispatch or fabricated IDs/generations",
+    "Planar/legacy internal locking behavior is not globally refactored"
+  ]
+}

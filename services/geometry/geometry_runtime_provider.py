@@ -5308,14 +5308,16 @@ class GeometryRuntimeProvider:
             raise RuntimeError("二维图传输回执身份冲突")
         return response
 
-    def _download_graph_artifact(self, reference, maximum_bytes=MAX_PLANAR_ARCHIVE_BYTES, *, validate_structure=True):
+    def _download_graph_artifact(self, reference, maximum_bytes=MAX_PLANAR_ARCHIVE_BYTES, *, validate_structure=True,
+                                 _stub_override=None, _release_on_completion=True):
         retained = _artifact_reference_from_proto(reference, maximum_bytes)
         if retained.identity_schema_version == 2 and retained.member_identity.role not in ("fine_map", "dense_cloud"):
             raise ValueError("unpaired assigned artifact role")
+        transfer_options = {"stub": _stub_override} if _stub_override is not None else {}
         def chunks():
             offset = 0
             while offset < reference.size:
-                response = self._graph_transfer(4, reference, offset=offset)
+                response = self._graph_transfer(4, reference, offset=offset, **transfer_options)
                 data = bytes(response.data)
                 if response.offset != reference.size or not response.sealed or not data or len(data) > min(1024 * 1024, reference.size - offset):
                     raise RuntimeError("二维图下载分块非法")
@@ -5342,7 +5344,8 @@ class GeometryRuntimeProvider:
             # Legacy aliases remain opaque on read after capture too.
             return payload
         finally:
-            self._graph_transfer(5, reference)
+            if _release_on_completion:
+                self._graph_transfer(5, reference, **transfer_options)
 
     def _upload_graph_artifact(self, checkpoint, *, payload=None, reference=None, transfer=None):
         transfer = self._graph_transfer if transfer is None else transfer
@@ -5402,14 +5405,16 @@ class GeometryRuntimeProvider:
     def export_mapping_backend_checkpoint(
         self, *, checkpoint_schema_version: int = 1,
     ) -> MappingBackendCheckpointExportBundle:
-        """Export one frozen bundle; schema 2 is explicit until activation is paired."""
+        """Retain the legacy default; workspace saves opt into paired cloud v2."""
 
         if type(checkpoint_schema_version) is not int or checkpoint_schema_version not in (1, 2):
             raise ValueError("unsupported requested checkpoint envelope schema")
         self._raise_if_stopping("export_mapping_backend_checkpoint")
         if not self._connected or not self._stub:
             raise RuntimeError("Geometry runtime 未连接。")
-        rpc = getattr(self._stub, "ExportMappingBackendCheckpoint", None)
+        origin = self.capture_assigned_activation_origin() if checkpoint_schema_version == 2 else None
+        origin_stub = origin[0] if origin is not None else self._stub
+        rpc = getattr(origin_stub, "ExportMappingBackendCheckpoint", None)
         if not callable(rpc):
             raise RuntimeError("Geometry runtime 不支持 backend checkpoint 导出。")
         try:
@@ -5421,10 +5426,59 @@ class GeometryRuntimeProvider:
             ) from exc
         if response.schema_version != checkpoint_schema_version:
             raise ValueError("server returned a different checkpoint schema; downgrade is forbidden")
+        if origin is not None and response.backend_kind not in {"voxel", "raytracing"}:
+            raise ValueError("assigned checkpoint export requires a cloud backend")
         _validate_checkpoint_identity_envelope(response)
+        if origin is not None:
+            # The export owns all returned leases. Pin reads and cleanup to its
+            # origin even if this provider is replaced before the first read.
+            references = {}
+            completed = False
+            cleanup_error = None
+            try:
+                for field_name, role, maximum in (
+                    ("fine_map_artifact", "fine_map", MAX_FINE_ARCHIVE_BYTES),
+                    ("dense_cloud_artifact", "dense_cloud", MAX_DENSE_ARCHIVE_BYTES),
+                ):
+                    if response.HasField(field_name):
+                        reference = getattr(response, field_name)
+                        retained = _artifact_reference_from_proto(reference, maximum)
+                        if (retained.identity_schema_version != 2
+                                or retained.member_identity.checkpoint_id != response.checkpoint_id
+                                or retained.member_identity.role != role):
+                            raise ValueError("assigned export artifact differs from its checkpoint role")
+                        if any(reference.id == previous.id for previous in references.values()):
+                            raise ValueError("distinct checkpoint members cannot reuse one artifact ID")
+                        references[field_name] = reference
+                self.require_assigned_activation_origin(origin)
+                fine_payload = self._download_graph_artifact(
+                    references["fine_map_artifact"], MAX_FINE_ARCHIVE_BYTES,
+                    validate_structure=False, _stub_override=origin_stub, _release_on_completion=False,
+                ) if "fine_map_artifact" in references else None
+                self.require_assigned_activation_origin(origin)
+                dense_payload = self._download_graph_artifact(
+                    references["dense_cloud_artifact"], MAX_DENSE_ARCHIVE_BYTES,
+                    validate_structure=False, _stub_override=origin_stub, _release_on_completion=False,
+                ) if "dense_cloud_artifact" in references else None
+                self.require_assigned_activation_origin(origin)
+                exported = _checkpoint_export_bundle_from_proto(response, None, fine_payload, dense_payload)
+                self.require_assigned_activation_origin(origin)
+                completed = True
+            finally:
+                for reference in references.values():
+                    try:
+                        self._graph_transfer(5, reference, stub=origin_stub)
+                    except BaseException as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
+                        LOGGER.exception("Assigned export artifact release failed.")
+                if completed and cleanup_error is not None:
+                    raise cleanup_error
+            self.require_assigned_activation_origin(origin)
+            return exported
         payload = self._download_graph_artifact(_require_proto_message_field(response, "graph_artifact")) if response.backend_kind == "slam_toolbox" else None
-        fine_payload = self._download_graph_artifact(response.fine_map_artifact, MAX_FINE_ARCHIVE_BYTES, validate_structure=checkpoint_schema_version != 2) if response.HasField("fine_map_artifact") else None
-        dense_payload = self._download_graph_artifact(response.dense_cloud_artifact, MAX_DENSE_ARCHIVE_BYTES, validate_structure=checkpoint_schema_version != 2) if response.HasField("dense_cloud_artifact") else None
+        fine_payload = self._download_graph_artifact(response.fine_map_artifact, MAX_FINE_ARCHIVE_BYTES) if response.HasField("fine_map_artifact") else None
+        dense_payload = self._download_graph_artifact(response.dense_cloud_artifact, MAX_DENSE_ARCHIVE_BYTES) if response.HasField("dense_cloud_artifact") else None
         return _checkpoint_export_bundle_from_proto(response, payload, fine_payload, dense_payload)
 
     def get_dense_cloud_chunk(self, *, expected_epoch="", offset_points=0, allow_delta=False):

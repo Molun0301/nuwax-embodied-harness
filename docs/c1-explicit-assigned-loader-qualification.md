@@ -3,8 +3,10 @@
 日期：2026-10-06 UTC。
 
 本阶段增加可执行的 Python provider/runtime 显式加载入口，继续使用现有原生
-ActivateMap 的 activation_contract_version=2 分支。Python 回归已通过；同一提交
-包含经过源码审查的原生集成测试，**原生测试尚未编译、尚未执行**，等待 SDK 恢复。
+ActivateMap 的 activation_contract_version=2 分支。最终有界结果：**Python 299/299，
+原生精确选择器 27/27，新增原生两例各重复 10 次共 20/20 通过**，无忽略或跳过。
+初始源码检查点 6d93b7f 保存时原生尚未编译；本后续提交记录 SDK 恢复后的真实结果及
+一个经过独立审查的测试断言修正，不改写该检查点。生产代码没有因此改动。
 这不是完整用户地图切换、默认保存/加载配对完成、实机验证或发布就绪声明。
 
 ## 本阶段能力与边界
@@ -61,7 +63,7 @@ ActivateMap 已 dispatch 而没有可信 ACK 时返回 UNKNOWN；不会查询状
 这些是 Python 组件回归，包含真实 protobuf 和 checkpoint 存储、假 RPC；不等于
 真实 gRPC 服务、原生运行时、硬件或整个平台端到端通过。
 
-## 待执行的原生测试
+## 已完成的原生有界验证
 
 同一源码检查点新增以下精确选择器：
 
@@ -73,6 +75,31 @@ AR2/DC1 分块传输/封存、显式前驱停止和 version-2 ActivateMap；检�
 释放临时制品后的重放、owner/body 冲突拒绝、不重复安装/发布、前驱 pose/TF 清空及
 新会话 pose 保留。assigned 重定位可用性仍应为 false。
 
-**当前仅源码审查通过。尚无原生编译或执行结果。** SDK 就绪后需在指定独占构建 lane
-编译，核对二进制测试清单，再逐个 exact 运行并记录结果；可能仍需修正测试或源码。
-继续保持默认与工作区门控，直到完整调用方配对与原生证据到位。
+SDK 就绪后，先独立审查源码及选择器，再在独占 lane 以 Cargo 2/CMake 1 编译。
+两个原生 CMake 消费者均在 disconnected preflight 解析到已安装的 GTSAM 静态库；
+没有 _deps 回退或 SDK 重编译。空 Cargo cache 仅通过官方 registry 按 lockfile 恢复，
+之后 metadata、编译均为 offline/locked，未改动 lockfile。
+
+- 第一轮：编译 5 分 25 秒通过；27 个精确选择器中 26 通过、1 失败
+- 失败仅在新增 ray 测试：导出保留增量槽序，安装从体素集合重建排序，三条 12 字节
+  XYZ 记录完全相同但次序不同。原始输入和失败诊断完整保留
+- 独立审查确认槽位不是点身份；只把此断言改为完整记录的精确多重集比较，并保留
+  长度/整记录约束。没有近似浮点比较，没有调整请求字节或放宽 body 冲突拒绝
+- 第二轮：仅 Geometry Rust 目标增量重编译 35.61 秒；精确 27/27 通过
+- 新增 voxel/ray 用例另外各启新进程重复 10 次，20/20 通过
+- 两轮前后 11 个 SDK CMake cache/静态库大小和 mtime 签名均不变
+
+选择器完整列表见 c1-explicit-assigned-loader-exact27.txt。每个选择器均在编译后的
+主 unit-test binary 清单确认存在，再以 --exact --nocapture --test-threads=1
+单独执行，断言实际 1 passed、0 failed、0 ignored。并非完整 Rust 测试套件通过。
+实际通过范围包含新的两个 backend handler 测试和上一阶段 25 个 pose/reset、
+legacy publication/retention、assigned ledger、缓存与回执回归。
+
+c1-explicit-assigned-loader-results.json 保存原失败、两轮逐例结果、源码/选择器及
+二进制摘要、重复运行记录。最终二进制 SHA-256：
+e2a3d3fcdc2bc9712f7a0d8e3283fdc0efa6e86598fc5d51b8f5fbfc8e376000。
+这些摘要仅标识验证产物，未引入运行时应用身份摘要。
+
+继续保持默认与工作区门控，直到完整调用方配对及对应资格验证完成；原生新分支的
+跨重启恢复、真实网络响应丢失、完整普通 save→restart→load→display 与 assigned
+重定位/导航可用性均未由这组有界测试证明。

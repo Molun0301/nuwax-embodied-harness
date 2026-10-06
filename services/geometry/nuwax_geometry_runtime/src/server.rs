@@ -11836,7 +11836,15 @@ mod lifecycle_tests {
                 let writer = destination.handle.cloud_map_writer.lock();
                 let writer = writer.as_ref().unwrap();
                 let installed = writer.committed_snapshot().unwrap();
-                assert_eq!(installed.xyz_f32_le, cloud.xyz_f32_le);
+                // 存储槽位不是点身份：安装从体素集合重建排序，增量导出可采用不同槽序。
+                // 逐个 12 字节记录精确比较多重集；不近似坐标，也不改变请求原字节。
+                assert_eq!(installed.xyz_f32_le.len(), cloud.xyz_f32_le.len());
+                assert_eq!(installed.xyz_f32_le.len() % 12, 0);
+                let mut installed_points = installed.xyz_f32_le.chunks_exact(12).collect::<Vec<_>>();
+                let mut source_points = cloud.xyz_f32_le.chunks_exact(12).collect::<Vec<_>>();
+                installed_points.sort_unstable();
+                source_points.sort_unstable();
+                assert_eq!(installed_points, source_points);
                 assert_eq!(installed.point_count, cloud.point_count);
                 assert_eq!(installed.voxel_size.to_bits(), cloud.voxel_size.to_bits());
                 let dense = writer.committed_dense_cloud().unwrap().unwrap();

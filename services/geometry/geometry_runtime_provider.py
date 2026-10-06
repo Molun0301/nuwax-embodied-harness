@@ -58,6 +58,7 @@ from services.geometry.mapping_backend_checkpoint_store import (
     MappingBackendCheckpointNotFoundError,
     MappingBackendCheckpointStore,
     StoredMappingBackendCheckpoint,
+    _identity_document,
 )
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.geometry_runtime_provider")
@@ -221,6 +222,39 @@ class GeometryRuntimeMapActivationOutcomeUnknown(RuntimeError):
     """ActivateMap crossed the RPC dispatch boundary without a trusted ACK."""
 
     backend_activation_outcome_unknown = True
+
+
+class GeometryRuntimeMapActivationAppliedError(RuntimeError):
+    """An exact native ACK survived, but local adoption could not complete."""
+
+    backend_activation_applied = True
+    backend_switch_applied = True
+    backend_activation_disposition = "applied"
+
+
+@dataclass(frozen=True)
+class _AssignedActivationAttempt:
+    """同连接内的未决 dispatch 证据；只保留已接纳的不可变载荷引用。"""
+    request_key: tuple
+    stored_checkpoint: StoredMappingBackendCheckpoint
+    stub: object
+    connection_epoch: int
+
+    def matches(self, request_key, stored_checkpoint, origin):
+        if (self.request_key != request_key or self.stub is not origin[0]
+                or self.connection_epoch != origin[1]):
+            return False
+        original = self.stored_checkpoint
+        # 重开文件只比较原生请求的实际成员；分块精确比较在状态锁外完成，不引入摘要。
+        return original is stored_checkpoint or (
+            original.checkpoint == stored_checkpoint.checkpoint
+            and original.occupancy_asset == stored_checkpoint.occupancy_asset
+            and original.cloud_asset == stored_checkpoint.cloud_asset
+            and all(struct.pack(fmt, original.occupancy_asset[name])
+                    == struct.pack(fmt, stored_checkpoint.occupancy_asset[name])
+                    for name, fmt in (("resolution", ">f"), ("origin_x", ">d"), ("origin_y", ">d")))
+            and struct.pack(">f", original.cloud_asset["voxel_size"])
+                == struct.pack(">f", stored_checkpoint.cloud_asset["voxel_size"]))
 
 
 class GeometryRuntimeMapActivationStaleRequest(RuntimeError):
@@ -771,7 +805,7 @@ def _populate_mapping_backend_checkpoint_v2(message, stored):
 
 def _assigned_activation_request_proto(stored, *, asset_identity, session_id, map_name,
                                        activation_request_id, expected_runtime_generation):
-    """Construct explicit v2 wire ownership; this does not enable the activation endpoint."""
+    """Construct explicit v2 wire ownership without enabling default callers."""
     from contracts.map_workspace import AssetIdentityV2
     if not isinstance(asset_identity, AssetIdentityV2):
         raise ValueError("activation requires an admitted typed asset identity")
@@ -796,6 +830,30 @@ def _assigned_activation_request_proto(stored, *, asset_identity, session_id, ma
         activation_contract_version=2, asset_identity=pb2.AssetIdentityV2(asset_id=asset_identity.asset_id))
     _populate_mapping_backend_checkpoint_v2(message.mapping_backend_checkpoint, stored)
     return message
+
+
+def _assigned_activation_ack(response, *, activation_request, stored_checkpoint):
+    """仅接纳原请求及原 checkpoint 成员的完整原生回执。"""
+    payload = GeometryRuntimeProvider._mapping_state_payload(response)
+    if (payload["activation_receipt_schema_version"] != 2
+            or payload["activation_receipt_disposition"] not in {2, 3}
+            or not payload["success"] or payload["phase"] != "ACTIVE"
+            or not payload["active"] or payload["revision"] <= 0
+            or payload["legacy_checkpoint_reconstructed"]):
+        raise ValueError("ActivateMap did not acknowledge a sealed assigned installation")
+    receipt = AssignedActivationReceipt.admit(payload["activation_receipt_v2"])
+    actual = receipt.to_dict()
+    checkpoint = stored_checkpoint.checkpoint
+    if (actual["request"] != activation_request
+            or payload["revision"] != actual["target"]["occupancy_receipt"]["occupancy_revision"]
+            or actual["activation"]["backend_kind"] != checkpoint.backend_kind
+            or actual["target"]["source_cloud_member"] != _identity_document(checkpoint.cloud_identity)):
+        raise ValueError("ActivateMap receipt differs from the retained request/checkpoint owner")
+    if payload["relocalization_policy_v2"] != current_assigned_relocalization_policy():
+        raise ValueError("ActivateMap omitted the exact assigned relocalization policy")
+    if payload["idempotent_replay"] != (payload["activation_receipt_disposition"] == 3):
+        raise ValueError("ActivateMap replay disposition differs from its acknowledgement")
+    return payload
 
 
 def _canonical_string_bytes(value: str) -> bytes:
@@ -4077,6 +4135,7 @@ class GeometryRuntimeProvider:
         self._map_connection_epoch = 0
         self._mapping_transition_epoch = 0
         self._mapping_transition_inflight = False
+        self._assigned_activation_attempt: Optional[_AssignedActivationAttempt] = None
         self._map_delivery_owner_thread_id: Optional[int] = None
         self._map_delivery_in_progress = False
         self._stream_handle_lock = threading.Lock()
@@ -4596,8 +4655,9 @@ class GeometryRuntimeProvider:
             LOGGER.info("gRPC 连接成功: phase=%s, rss=%dKB", resp.phase, resp.rss_kb)
             with self._map_delivery_lock:
                 with self._map_state_lock:
-                    self._invalidate_map_connection_locked()
+                    retired_attempt = self._invalidate_map_connection_locked()
                 self._invalidate_map_delivery_tickets_locked()
+            del retired_attempt
             self._wait_for_map_deliveries()
             self._transition_navigation_connection(
                 connected=True,
@@ -4635,8 +4695,9 @@ class GeometryRuntimeProvider:
             self._channel = None
             self._stub = None
             with self._map_state_lock:
-                self._invalidate_map_connection_locked()
+                retired_attempt = self._invalidate_map_connection_locked()
             self._invalidate_map_delivery_tickets_locked()
+        del retired_attempt
         if channel is not None:
             try:
                 channel.close()
@@ -4671,8 +4732,9 @@ class GeometryRuntimeProvider:
             self._channel = None
             self._stub = None
             with self._map_state_lock:
-                self._invalidate_map_connection_locked()
+                retired_attempt = self._invalidate_map_connection_locked()
             self._invalidate_map_delivery_tickets_locked()
+        del retired_attempt
         if channel is not None:
             channel.close()
         self._cancel_data_stream_handles()
@@ -4990,11 +5052,13 @@ class GeometryRuntimeProvider:
             self._wait_for_map_deliveries(
                 deadline_monotonic=deadline_monotonic,
             )
-        except Exception:
-            self._finish_mapping_transition(
-                transition_epoch,
-                deadline_monotonic=deadline_monotonic,
-            )
+        except BaseException:
+            try:
+                self._finish_mapping_transition(
+                    transition_epoch, deadline_monotonic=deadline_monotonic,
+                )
+            except BaseException:
+                LOGGER.exception("Mapping transition release failed after interruption.")
             raise
         return transition_epoch
 
@@ -5006,6 +5070,7 @@ class GeometryRuntimeProvider:
         input_active: Optional[bool] = None,
         checkpoint_provenance: Optional[_MappingCheckpointProvenance] = None,
         preserve_checkpoint_provenance: bool = False,
+        expected_origin=None,
         deadline_monotonic: Optional[float] = None,
     ) -> bool:
         with _cooperative_post_rpc_lock(
@@ -5022,6 +5087,11 @@ class GeometryRuntimeProvider:
                     self._stopping
                     or transition_epoch != self._mapping_transition_epoch
                     or not self._mapping_transition_inflight
+                    or (expected_origin is not None and (
+                        self._stub is not expected_origin[0]
+                        or self._map_connection_epoch != expected_origin[1]
+                        or not self._connected
+                    ))
                 ):
                     return False
                 if identity is not None:
@@ -5036,7 +5106,10 @@ class GeometryRuntimeProvider:
                 self._mapping_transition_inflight = False
                 return True
 
-    def _invalidate_map_connection_locked(self) -> None:
+    def _invalidate_map_connection_locked(self) -> Optional[_AssignedActivationAttempt]:
+        # 调用方在两个锁外释放旧载荷；断连撤销重试资格，UNKNOWN 不因此变成未执行。
+        retired_attempt = getattr(self, "_assigned_activation_attempt", None)
+        self._assigned_activation_attempt = None
         self._map_connection_epoch += 1
         self._mapping_transition_epoch += 1
         self._mapping_transition_inflight = False
@@ -5045,6 +5118,7 @@ class GeometryRuntimeProvider:
         self._mapping_checkpoint_provenance = None
         self._last_occupancy_grid = None
         self._last_occupancy_grid_identity = None
+        return retired_attempt
 
     def _raise_if_map_delivery_reentry_locked(self, operation: str) -> None:
         thread_id = threading.get_ident()
@@ -5189,11 +5263,13 @@ class GeometryRuntimeProvider:
             )
         return payload
 
-    def _graph_transfer(self, action, reference, *, offset=0, data=b""):
+    def _graph_transfer(self, action, reference, *, offset=0, data=b"", stub=None):
         request = pb2.GraphArtifactTransferRequest(action=action, artifact=reference, offset=offset, data=data)
+        origin_stub = self._stub if stub is None else stub
         for attempt in range(3):
             try:
-                response = self._stub.TransferGraphArtifact(request, timeout=_heavy_deadline_sec())
+                response = origin_stub.TransferGraphArtifact(
+                    request, timeout=_heavy_deadline_sec())
                 break
             except grpc.RpcError as error:
                 if attempt == 2 or error.code() not in {grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE}:
@@ -5239,7 +5315,8 @@ class GeometryRuntimeProvider:
         finally:
             self._graph_transfer(5, reference)
 
-    def _upload_graph_artifact(self, checkpoint, *, payload=None, reference=None):
+    def _upload_graph_artifact(self, checkpoint, *, payload=None, reference=None, transfer=None):
+        transfer = self._graph_transfer if transfer is None else transfer
         payload = checkpoint.payload if payload is None else payload
         if checkpoint.schema_version == 2:
             if reference is None:
@@ -5266,14 +5343,14 @@ class GeometryRuntimeProvider:
             # Explicit residual legacy writer, retired with activation-v1.
             reference = pb2.GraphArtifactRef(id=uuid.uuid4().hex, size=len(payload), sha256=payload_digest(payload))
         try:
-            admitted = self._graph_transfer(1, reference)
+            admitted = transfer(1, reference)
             frontier = int(admitted.offset)
             sealed = bool(admitted.sealed)
             if not 0 <= frontier <= reference.size or (sealed and frontier != reference.size):
                 raise RuntimeError("artifact initialization frontier is invalid")
             offset = 0
             for data in payload_chunks(payload):
-                response = self._graph_transfer(2, reference, offset=offset, data=data)
+                response = transfer(2, reference, offset=offset, data=data)
                 offset += len(data)
                 # Retained frontier can lead the current replayed chunk.
                 if (not max(frontier, offset) <= response.offset <= reference.size
@@ -5282,12 +5359,15 @@ class GeometryRuntimeProvider:
                     raise RuntimeError("二维图上传位置回执不一致")
                 frontier = int(response.offset)
                 sealed = bool(response.sealed)
-            complete = self._graph_transfer(3, reference)
+            complete = transfer(3, reference)
             if not complete.sealed or complete.offset != reference.size:
                 raise RuntimeError("二维图上传未封存")
             return reference
-        except Exception:
-            self._graph_transfer(5, reference)
+        except BaseException:
+            try:
+                transfer(5, reference)
+            except BaseException:
+                LOGGER.exception("Graph artifact release failed after upload failure.")
             raise
 
     def export_mapping_backend_checkpoint(
@@ -5347,6 +5427,160 @@ class GeometryRuntimeProvider:
                 % (backend_kind or "<empty>")
             )
         return state
+
+    def activate_assigned_platform_map(
+        self, *, activation_request, stored_checkpoint: StoredMappingBackendCheckpoint,
+    ) -> Dict[str, Any]:
+        """显式加载 schema-2；调用方保留原六字段请求，不改写代际或自动重执行。
+
+        仅接纳已停止/空闲后端或同会话精确重放；切换活跃地图必须由调用方先显式停止。
+        """
+        self._raise_if_stopping("activate_assigned_platform_map")
+        retained = _admit_assigned_activation_request(activation_request)
+        if not isinstance(stored_checkpoint, StoredMappingBackendCheckpoint):
+            raise TypeError("assigned activation requires a stored checkpoint owner")
+        checkpoint = stored_checkpoint.checkpoint
+        request_key = tuple(retained[name] for name in (
+            "activation_request_id", "session_id", "map_name", "checkpoint_id", "expected_runtime_generation")) + (
+                retained["asset_identity"]["asset_id"],)
+        if checkpoint.checkpoint_id != retained["checkpoint_id"]:
+            raise ValueError("assigned activation checkpoint differs from the retained request")
+        from contracts.map_identity import AssetIdentityV2
+        request = _assigned_activation_request_proto(
+            stored_checkpoint, asset_identity=AssetIdentityV2(**retained["asset_identity"]),
+            **{name: retained[name] for name in ("session_id", "map_name", "activation_request_id", "expected_runtime_generation")},
+        )
+        with self._map_state_lock:
+            if not self._connected or self._stub is None or self._stopping:
+                raise RuntimeError("Geometry runtime 未连接。")
+            origin = (self._stub, self._map_connection_epoch)
+            pending = self._assigned_activation_attempt
+        stub = origin[0]
+        transition = self._begin_mapping_transition()
+        dispatched = False
+        acknowledged = None
+        attempted_artifacts = []
+
+        def require_origin():
+            with self._map_state_lock:
+                if (self._stub is not stub or self._map_connection_epoch != origin[1]
+                        or not self._connected or self._stopping
+                        or self._mapping_transition_epoch != transition
+                        or not self._mapping_transition_inflight
+                        or self._assigned_activation_attempt is not pending):
+                    raise RuntimeError("assigned activation connection or transition changed")
+
+        def transfer(action, reference, **kwargs):
+            require_origin()
+            return self._graph_transfer(action, reference, stub=stub, **kwargs)
+
+        def release_artifacts():
+            # 保持 transition 预约直到租用清理结束，避免删除后继重放刚上传的同名制品。
+            while attempted_artifacts:
+                reference = attempted_artifacts.pop()
+                try:
+                    self._graph_transfer(5, reference, stub=stub)
+                except BaseException:
+                    LOGGER.exception("Assigned activation artifact release failed.")
+
+        def invalidate_identity():
+            with self._map_state_lock:
+                if (self._mapping_transition_epoch == transition
+                        and self._stub is stub and self._map_connection_epoch == origin[1]):
+                    self._mapping_identity = None
+                    self._mapping_checkpoint_provenance = None
+                    self._last_occupancy_grid = None
+                    self._last_occupancy_grid_identity = None
+                    self._planar_input_active = False
+
+        try:
+            require_origin()
+            if pending is not None:
+                if not pending.matches(request_key, stored_checkpoint, origin):
+                    raise ValueError("unresolved assigned activation requires the exact retained request/checkpoint and connection")
+                # 只有本连接已 dispatch 的原请求允许略过状态读；原生未决 fence 可能占有状态读锁。
+                # 这是调用方本次显式重试，不是丢失回复后的自动重执行。
+            else:
+                state = self._mapping_state_payload(stub.GetMappingState(pb2.Empty(), timeout=_read_deadline_sec()))
+                require_origin()
+                if (not state["success"] or state["phase"] not in {"IDLE", "ACTIVE", "STOPPED"}
+                        or state["active"] != (state["phase"] == "ACTIVE")
+                        or state["mapping_backend_kind"] != checkpoint.backend_kind
+                        or state["runtime_generation"] != retained["expected_runtime_generation"]):
+                    raise ValueError("assigned activation preflight differs from the retained runtime/backend")
+                if state["session_id"] == retained["session_id"] and (
+                        state["phase"] == "STOPPED" or state["map_name"] != retained["map_name"]):
+                    raise GeometryRuntimeMapActivationStaleRequest(
+                        activation_request_id=retained["activation_request_id"], map_name=retained["map_name"],
+                        current_phase=state["phase"], current_map_name=state["map_name"],
+                    )
+                if state["active"]:
+                    self._mapping_identity_from_payload(state)
+                    if state["session_id"] != retained["session_id"]:
+                        raise RuntimeError("assigned activation requires an explicit predecessor stop")
+                    if state["activation_receipt_schema_version"] != 2:
+                        raise ValueError("active assigned replay requires its retained request owner")
+                    current = state["activation_receipt_v2"]
+                    if (current["request"] != retained or (current["target"] is not None
+                            and current["target"]["source_cloud_member"] != _identity_document(checkpoint.cloud_identity))):
+                        raise ValueError("active assigned replay differs from its retained request/source owner")
+                    # STAGED 没有完整 target 时也只发送调用方原请求，由原生账本裁定显式重放。
+            require_origin()
+            # 只重放原始制品身份及不可变字节；不生成摘要或替代 ID。
+            for archive, reference in ((checkpoint.fine_archive, checkpoint.fine_reference),
+                                       (checkpoint.dense_archive, checkpoint.dense_reference)):
+                if reference is not None:
+                    attempted_artifacts.append(_artifact_reference_proto(reference))
+                    self._upload_graph_artifact(checkpoint, payload=archive, reference=reference, transfer=transfer)
+            require_origin()
+            dispatched = True
+            response = stub.ActivateMap(request, timeout=_heavy_deadline_sec())
+            acknowledged = _assigned_activation_ack(
+                response, activation_request=retained, stored_checkpoint=stored_checkpoint,
+            )
+            with self._map_state_lock:
+                if (self._stub is stub and self._map_connection_epoch == origin[1]
+                        and self._mapping_transition_epoch == transition
+                        and self._assigned_activation_attempt is pending):
+                    self._assigned_activation_attempt = None
+            release_artifacts()
+            if not self._finish_mapping_transition(
+                    transition, identity=self._mapping_identity_from_payload(acknowledged),
+                    input_active=False, expected_origin=origin):
+                raise RuntimeError("assigned activation acknowledgement outlived its local connection")
+            return {**acknowledged, "backend_switch_applied": True,
+                    "backend_activation_disposition": "applied"}
+        except BaseException as exc:
+            if dispatched:
+                invalidate_identity()
+                if acknowledged is not None:
+                    error = GeometryRuntimeMapActivationAppliedError(
+                        "Assigned activation was acknowledged, but local adoption failed: %s" % exc)
+                    error.activation_receipt_v2 = acknowledged["activation_receipt_v2"]
+                else:
+                    with self._map_state_lock:
+                        if (self._stub is stub and self._map_connection_epoch == origin[1]
+                                and self._mapping_transition_epoch == transition
+                                and self._assigned_activation_attempt is pending):
+                            self._assigned_activation_attempt = _AssignedActivationAttempt(
+                                request_key, stored_checkpoint, stub, origin[1])
+                    error = GeometryRuntimeMapActivationOutcomeUnknown(
+                        "Assigned activation dispatch or acknowledgement is unresolved: %s" % exc)
+                    error.backend_activation_disposition = "unknown"
+                error.activation_request = retained
+                error.activation_request_id = retained["activation_request_id"]
+                error.map_name = retained["map_name"]
+                error.backend_changed = True
+                error.backend_stop_confirmed = False
+                raise error from exc
+            raise
+        finally:
+            # 清理始终发往原连接；清理失败不能覆盖 ACK、UNKNOWN 或原始异常。
+            release_artifacts()
+            try:
+                self._finish_mapping_transition(transition)
+            except BaseException:
+                LOGGER.exception("Assigned activation transition release failed.")
 
     def activate_platform_map(
         self,

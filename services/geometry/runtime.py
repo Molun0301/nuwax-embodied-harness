@@ -27,7 +27,7 @@ from contracts.geometry import Pose, Vector3
 from contracts.maps import OccupancyGrid
 from core.errors import GatewayError
 from core.logging_utils import JsonLineFormatter
-from contracts.map_activation import AssignedActivationReceipt
+from contracts.map_activation import AssignedActivationReceipt, _request as _assigned_activation_request
 from contracts.map_relocalization import (
     AssignedRelocalizationQuery,
     AssignedRelocalizationRequest,
@@ -5522,6 +5522,40 @@ class PlatformGeometryRuntime:
             bundle_root=bundle_root,
         )
         return db_path is not None and self._is_usable_mapping_db_file(db_path)
+
+    def activate_assigned_backend_checkpoint(
+        self,
+        *,
+        activation_request: Mapping[str, object],
+        bundle_root: Path,
+        backend_kind: str,
+    ) -> Dict[str, object]:
+        """Explicitly dispatch an exact assigned checkpoint to the backend only.
+
+        Retain the caller's six-field request before storage I/O. Its assigned
+        ID and expected runtime generation are never inferred or refreshed.
+        This entry does not install a Python activation snapshot, seed a pose,
+        or enable the workspace/default activation path. Ambiguous outcomes
+        propagate unchanged so the caller can explicitly replay the same request.
+        A different active owner must be explicitly stopped by the caller first.
+        """
+        request = _assigned_activation_request(activation_request)
+        if not isinstance(backend_kind, str) or backend_kind not in {"voxel", "raytracing"}:
+            raise ValueError("assigned backend activation requires voxel or raytracing")
+        provider = self.get_geometry_runtime_provider()
+        activate = getattr(provider, "activate_assigned_platform_map", None)
+        if not callable(activate):
+            raise RuntimeError("Geometry runtime does not support assigned backend activation")
+
+        from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore
+
+        # The store admits exact schema-2 ownership; never reconstruct or fall
+        # back to a legacy checkpoint. Neither I/O nor RPC holds the state lock.
+        stored = MappingBackendCheckpointStore(bundle_root).load(
+            backend_kind, schema_version=2,
+            expected_checkpoint_id=request["checkpoint_id"],
+        )
+        return activate(activation_request=request, stored_checkpoint=stored)
 
     def activate_map_asset_bundle(
         self,

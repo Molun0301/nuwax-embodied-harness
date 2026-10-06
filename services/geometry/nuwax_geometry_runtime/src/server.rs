@@ -11537,10 +11537,14 @@ mod lifecycle_tests {
 
     impl CanonicalResetFixture {
         async fn new() -> Self {
+            Self::with_backend(crate::mapping_backend::MappingBackendSpec::Voxel).await
+        }
+
+        async fn with_backend(spec: crate::mapping_backend::MappingBackendSpec) -> Self {
             let backend = Arc::new(CheckpointPublishBackend::default());
             let transport = LcmTransport::new(backend.clone());
             let (mut handle, tasks) = crate::lcm_runtime::build_handle_for_tests_with_unit_transport(
-                true, Some(crate::mapping_backend::MappingBackendSpec::Voxel), transport,
+                true, Some(spec), transport,
             ).await.expect("in-process reset fixture");
             handle.lcm_backend_available = true;
             let owned = crate::lcm_runtime::attach_root_task_owner_for_tests(handle);
@@ -11656,6 +11660,299 @@ mod lifecycle_tests {
         })).await;
         fixture.finish().await;
         if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
+    }
+
+    fn assigned_wire_roundtrip<T: Message + Default>(message: &T) -> T {
+        T::decode(message.encode_to_vec().as_slice()).expect("assigned endpoint protobuf roundtrip")
+    }
+
+    async fn assigned_artifact_request(
+        service: &GeometryRuntimeService,
+        reference: &GraphArtifactRef,
+        action: u32,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<GraphArtifactTransferResponse, Status> {
+        let request = GraphArtifactTransferRequest {
+            action, artifact: Some(reference.clone()), offset, data,
+        };
+        GeometryRuntime::transfer_graph_artifact(service, Request::new(assigned_wire_roundtrip(&request)))
+            .await.map(|response| assigned_wire_roundtrip(&response.into_inner()))
+    }
+
+    async fn transfer_assigned_checkpoint_member(
+        source: &GeometryRuntimeService,
+        destination: &GeometryRuntimeService,
+        reference: &GraphArtifactRef,
+        magic: &[u8; 8],
+    ) {
+        assert_eq!(reference.identity_schema_version, 2);
+        assert!(reference.sha256.is_empty());
+        let begun = assigned_artifact_request(destination, reference, 1, 0, Vec::new()).await.unwrap();
+        assert_eq!(begun.artifact.as_ref(), Some(reference));
+        assert!(!begun.sealed);
+        let mut offset = 0;
+        while offset < reference.size {
+            let chunk = assigned_artifact_request(source, reference, 4, offset, Vec::new()).await.unwrap();
+            assert_eq!(chunk.artifact.as_ref(), Some(reference));
+            assert!(!chunk.data.is_empty());
+            if offset == 0 { assert_eq!(&chunk.data[..8], magic); }
+            let length = chunk.data.len() as u64;
+            let written = assigned_artifact_request(destination, reference, 2, offset, chunk.data.clone()).await.unwrap();
+            assert_eq!(written.offset, offset + length);
+            // Exact chunk retry is idempotent, while a different body under the
+            // same member/offset cannot overwrite the accepted bytes.
+            let replay = assigned_artifact_request(destination, reference, 2, offset, chunk.data.clone()).await.unwrap();
+            assert_eq!(replay.offset, written.offset);
+            let mut changed = chunk.data;
+            changed[0] ^= 1;
+            let error = assigned_artifact_request(destination, reference, 2, offset, changed).await.unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            offset += length;
+        }
+        assert_eq!(offset, reference.size);
+        let sealed = assigned_artifact_request(destination, reference, 3, 0, Vec::new()).await.unwrap();
+        assert!(sealed.sealed);
+        assert_eq!(sealed.artifact.as_ref(), Some(reference));
+        // The destination must own its own sealed bytes, independent of the exporter.
+        assigned_artifact_request(source, reference, 5, 0, Vec::new()).await.unwrap();
+    }
+
+    async fn assigned_export_transfer_activation(spec: crate::mapping_backend::MappingBackendSpec) {
+        const SOURCE_NS: u64 = 1_700_000_000_123_456_789;
+        let source = CanonicalResetFixture::with_backend(spec).await;
+        let destination = CanonicalResetFixture::with_backend(spec).await;
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            assert!(start_mapping_session(&source.service, "assigned-source", "warehouse").await.active);
+            commit_checkpoint_frame_test_pose(&source.handle, SOURCE_NS - 1).await;
+            let points = [
+                Point3::new(0.25, 0.25, 0.5),
+                Point3::new(0.26, 0.26, 0.51),
+                Point3::new(1.25, 0.5, 1.0),
+            ];
+            for sequence in 0..3 {
+                let timestamp = SOURCE_NS + sequence * 1_000_000_000;
+                assert!(crate::lcm_runtime::handoff_registered_lio_cloud(
+                    &source.handle, &points, 12, timestamp, timestamp, "map",
+                ).await.expect("native source cloud commit"));
+            }
+            // This is the actual runtime exporter and backend worker, not a
+            // hand-authored checkpoint or an assembly/classification fixture.
+            let checkpoint = GeometryRuntime::export_mapping_backend_checkpoint(
+                &source.service,
+                Request::new(assigned_wire_roundtrip(&ExportMappingBackendCheckpointRequest {
+                    checkpoint_schema_version: 2,
+                })),
+            ).await.expect("native schema-2 export").into_inner();
+            let checkpoint = assigned_wire_roundtrip(&checkpoint);
+            assert_eq!(checkpoint.schema_version, 2);
+            assert!(!checkpoint.payload.is_empty());
+            assert!(checkpoint.content_sha256.is_empty());
+            let cloud = checkpoint.canonical_cloud_checkpoint.as_ref().unwrap();
+            assert_eq!(cloud.payload_schema_version, 2);
+            assert!(cloud.xyz_sha256.is_empty());
+            let fine_reference = checkpoint.fine_map_artifact.as_ref().expect("native AR2 fine export");
+            let dense_reference = checkpoint.dense_cloud_artifact.as_ref().expect("native dense export");
+            let source_dense = source.handle.cloud_map_writer.lock().as_ref().unwrap()
+                .committed_dense_cloud().unwrap().unwrap();
+            assert!(source_dense.point_count > 0);
+
+            // Switching maps requires an explicit caller-owned stop. The loader
+            // itself only admits an idle/stopped owner or an exact sealed replay.
+            assert!(start_mapping_session(&destination.service, "assigned-predecessor", "old-map").await.active);
+            commit_checkpoint_frame_test_pose(&destination.handle, 90).await;
+            seed_canonical_reset_pose(&destination.handle, 91).await;
+            let stopped = GeometryRuntime::stop_mapping(&destination.service, Request::new(StopMappingRequest {
+                session_id: "assigned-predecessor".into(), reason: "explicit map switch".into(),
+            })).await.expect("caller explicitly stops the predecessor").into_inner();
+            assert!(stopped.success && !stopped.active);
+            assert_eq!(stopped.phase, "STOPPED");
+
+            let request = ActivateMapRequest {
+                activation_contract_version: 2,
+                activation_request_id: "assigned-export-load".into(),
+                session_id: "assigned-loaded".into(),
+                map_name: "warehouse".into(),
+                expected_runtime_generation: destination.service.activation_receipts.runtime_generation(),
+                asset_identity: Some(AssetIdentityV2 { asset_id: "a".repeat(32) }),
+                mapping_backend_checkpoint: Some(checkpoint.clone()),
+                ..Default::default()
+            };
+            let untransferred = GeometryRuntime::activate_map(
+                &destination.service, Request::new(assigned_wire_roundtrip(&request)),
+            ).await.expect_err("missing archive owners reject before lifecycle mutation");
+            assert_eq!(untransferred.code(), tonic::Code::InvalidArgument);
+            assert!(!destination.handle.mapping_adapter.as_ref().unwrap().lock().is_active());
+            assert_eq!(destination.handle.state.read().await.pose.timestamp_ns, 91);
+
+            transfer_assigned_checkpoint_member(
+                &source.service, &destination.service, fine_reference, b"NUWAXAR2",
+            ).await;
+            transfer_assigned_checkpoint_member(
+                &source.service, &destination.service, dense_reference, b"NUWAXDC1",
+            ).await;
+            let mut map_events = destination.handle.map_revision_tx.subscribe();
+            let mut cloud_events = destination.handle.cloud_map_tx.subscribe();
+            let publications_before_activation = recorded_legacy_clouds(&destination.backend).len();
+            let activated = GeometryRuntime::activate_map(
+                &destination.service, Request::new(assigned_wire_roundtrip(&request)),
+            ).await.expect("existing ActivateMap endpoint accepts explicit version 2").into_inner();
+            let activated = assigned_wire_roundtrip(&activated);
+            assert!(activated.success && activated.active, "assigned activation: {activated:?}");
+            assert!(!activated.idempotent_replay);
+            assert!(!activated.legacy_checkpoint_reconstructed);
+            assert_eq!(activated.activation_receipt_schema_version, 2);
+            assert_eq!(activated.activation_receipt_disposition, ActivationReceiptDisposition::Sealed as i32);
+            // Assigned installation is supported, but its public relocalization
+            // availability remains gated until that paired consumer is enabled.
+            assert!(!activated.relocalization_target_available);
+            assert!(destination.service.activation_receipts.current_sealed_target_snapshot().is_none());
+            assert!(activated.activation_request_identity_sha256.is_empty());
+            assert!(activated.activation_identity_sha256.is_empty());
+            assert!(activated.target_receipt_sha256.is_empty());
+            assert!(activated.asset_manifest_sha256.is_empty());
+            assert!(activated.asset_bundle_sha256.is_empty());
+            let receipt = activated.activation_receipt_v2.as_ref().unwrap();
+            assert_eq!(receipt.request.as_ref().unwrap().checkpoint_id, checkpoint.checkpoint_id);
+            assert_eq!(receipt.request.as_ref().unwrap().asset_identity, request.asset_identity);
+            assert_eq!(receipt.target.as_ref().unwrap().source_cloud_member, cloud.member_identity);
+            assert_ne!(receipt.target.as_ref().unwrap().occupancy_receipt.as_ref().unwrap().commit_id,
+                checkpoint.occupancy_receipt.as_ref().unwrap().commit_id,
+                "the installation allocates its own commit domain");
+            assert_canonical_reset_visible(&destination.service).await;
+            {
+                let adapter = destination.handle.mapping_adapter.as_ref().unwrap().lock();
+                assert!(adapter.checkpoint_localization_required);
+                assert!(adapter.map_odom_transform_snapshot().is_none(), "predecessor pose must not anchor the loaded map");
+            }
+            assert_eq!(map_events.try_recv().unwrap().revision, activated.revision);
+            assert_eq!(cloud_events.try_recv().unwrap().session_generation, activated.session_generation);
+            while let Ok(event) = cloud_events.try_recv() {
+                assert_eq!(event.session_generation, activated.session_generation);
+            }
+            assert_eq!(recorded_legacy_clouds(&destination.backend).len(), publications_before_activation + 1);
+
+            let (installed_cloud_receipt, installed_dense) = {
+                let writer = destination.handle.cloud_map_writer.lock();
+                let writer = writer.as_ref().unwrap();
+                let installed = writer.committed_snapshot().unwrap();
+                assert_eq!(installed.xyz_f32_le, cloud.xyz_f32_le);
+                assert_eq!(installed.point_count, cloud.point_count);
+                assert_eq!(installed.voxel_size.to_bits(), cloud.voxel_size.to_bits());
+                let dense = writer.committed_dense_cloud().unwrap().unwrap();
+                assert_eq!(dense.point_count, source_dense.point_count);
+                assert_eq!(dense.read(0, dense.point_count.try_into().unwrap()).unwrap(),
+                    source_dense.read(0, source_dense.point_count.try_into().unwrap()).unwrap());
+                (writer.last_cloud_receipt().unwrap(), dense)
+            };
+            // A later real pose belongs to the new session. Replays and conflicts
+            // must preserve it, without installing another backend/map/cloud.
+            commit_checkpoint_frame_test_pose(&destination.handle, SOURCE_NS + 4_000_000_000).await;
+            let installed_session = destination.handle.mapping_adapter.as_ref().unwrap().lock().snapshot();
+            let installed_occupancy = destination.handle.mapping_adapter.as_ref().unwrap().lock()
+                .latest_occupancy_commit_receipt().unwrap();
+            let installed_fine = destination.handle.cloud_map_writer.lock().as_ref().unwrap()
+                .committed_fine_cloud().unwrap();
+            let current_pose = GeometryRuntime::get_current_pose(&destination.service, Request::new(PoseRequest::default()))
+                .await.unwrap().into_inner();
+            assert_eq!(current_pose.timestamp_ns, SOURCE_NS + 4_000_000_000);
+            assert_ne!(current_pose.position.as_ref().unwrap().x, 8.0, "the predecessor's map pose is never reused");
+            // Establishing the first real frame may republish the same cloud
+            // with its rehomed fine root. It is not another map installation.
+            let published_clouds = recorded_legacy_clouds(&destination.backend).len();
+            while let Ok(event) = cloud_events.try_recv() {
+                assert_eq!(event.session_generation, activated.session_generation);
+                assert_eq!(event.revision, installed_cloud_receipt.cloud_revision);
+            }
+
+            // Live immutable owners, rather than temporary transfer leases, own replay.
+            for reference in [fine_reference, dense_reference] {
+                assigned_artifact_request(&destination.service, reference, 5, 0, Vec::new()).await.unwrap();
+            }
+            for _ in 0..2 {
+                let replay = GeometryRuntime::activate_map(
+                    &destination.service, Request::new(assigned_wire_roundtrip(&request)),
+                ).await.unwrap().into_inner();
+                assert!(replay.success && replay.idempotent_replay);
+                assert!(!replay.relocalization_target_available);
+                assert_eq!(replay.activation_receipt_disposition, ActivationReceiptDisposition::SealedReplay as i32);
+                assert_eq!(replay.activation_receipt_v2, activated.activation_receipt_v2);
+                assert_eq!((replay.session_generation, replay.backend_generation, replay.revision),
+                    (activated.session_generation, activated.backend_generation, activated.revision));
+            }
+            for mutation in 0..3 {
+                let mut changed = request.clone();
+                match mutation {
+                    0 => changed.asset_identity.as_mut().unwrap().asset_id = "b".repeat(32),
+                    1 => changed.session_id = "different-owner".into(),
+                    _ => changed.mapping_backend_checkpoint.as_mut().unwrap().checkpoint_id = "c".repeat(32),
+                }
+                let conflict = GeometryRuntime::activate_map(
+                    &destination.service, Request::new(assigned_wire_roundtrip(&changed)),
+                ).await.unwrap().into_inner();
+                assert!(!conflict.success, "changed owner {mutation} must reject");
+                assert_eq!(conflict.activation_receipt_disposition, ActivationReceiptDisposition::Conflict as i32);
+            }
+            for mutation in 0..4 {
+                let mut changed = request.clone();
+                let checkpoint = changed.mapping_backend_checkpoint.as_mut().unwrap();
+                match mutation {
+                    0 => *checkpoint.payload.last_mut().unwrap() ^= 1,
+                    1 => {
+                        let cell = &mut checkpoint.canonical_occupancy_checkpoint.as_mut().unwrap().data[0];
+                        *cell = if *cell == 100 { 0 } else { 100 };
+                    }
+                    2 => {
+                        let xyz = &mut checkpoint.canonical_cloud_checkpoint.as_mut().unwrap().xyz_f32_le;
+                        let changed_x = f32::from_le_bytes(xyz[..4].try_into().unwrap()) + 1.0;
+                        xyz[..4].copy_from_slice(&changed_x.to_le_bytes());
+                    }
+                    _ => checkpoint.fine_map_artifact.as_mut().unwrap().id = "d".repeat(32),
+                }
+                let error = GeometryRuntime::activate_map(
+                    &destination.service, Request::new(assigned_wire_roundtrip(&changed)),
+                ).await.expect_err("changed checkpoint owner/body cannot reuse its assigned identity");
+                assert_eq!(error.code(), tonic::Code::InvalidArgument);
+                assert!(error.message().contains("replay conflict"), "mutation {mutation}: {error}");
+            }
+            let after_conflicts = GeometryRuntime::activate_map(
+                &destination.service, Request::new(assigned_wire_roundtrip(&request)),
+            ).await.unwrap().into_inner();
+            assert!(after_conflicts.success && after_conflicts.idempotent_replay);
+            assert_eq!(after_conflicts.activation_receipt_v2, activated.activation_receipt_v2);
+            assert_eq!(destination.handle.mapping_adapter.as_ref().unwrap().lock().snapshot(), installed_session);
+            assert_eq!(destination.handle.mapping_adapter.as_ref().unwrap().lock()
+                .latest_occupancy_commit_receipt().unwrap(), installed_occupancy);
+            {
+                let writer = destination.handle.cloud_map_writer.lock();
+                let writer = writer.as_ref().unwrap();
+                assert_eq!(writer.last_cloud_receipt().unwrap(), installed_cloud_receipt);
+                assert!(Arc::ptr_eq(&writer.committed_fine_cloud().unwrap(), &installed_fine));
+                assert_eq!(writer.committed_dense_cloud().unwrap().unwrap().epoch, installed_dense.epoch);
+            }
+            let pose = GeometryRuntime::get_current_pose(&destination.service, Request::new(PoseRequest::default()))
+                .await.unwrap().into_inner();
+            assert_eq!(pose, current_pose);
+            assert!(!destination.handle.state.read().await.latest_transform_entries().is_empty());
+            assert_eq!(recorded_legacy_clouds(&destination.backend).len(), published_clouds);
+            assert!(matches!(map_events.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+            assert!(matches!(cloud_events.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+        })).await;
+        destination.finish().await;
+        source.finish().await;
+        if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
+    }
+
+    // Native server/backend integration with injected transport only: no real
+    // LCM context, socket, sensor process or actuator resource is constructed.
+    #[tokio::test]
+    async fn assigned_v2_voxel_export_transfer_activate_replay_and_conflicts() {
+        assigned_export_transfer_activation(crate::mapping_backend::MappingBackendSpec::Voxel).await;
+    }
+
+    #[tokio::test]
+    async fn assigned_v2_ray_export_transfer_activate_replay_and_conflicts() {
+        assigned_export_transfer_activation(crate::mapping_backend::MappingBackendSpec::raytracing_defaults()).await;
     }
 
     fn assert_legacy_cloud_unbound(state: &MappingSessionState, disposition: ActivationReceiptDisposition) {

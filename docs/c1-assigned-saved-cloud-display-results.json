@@ -1,0 +1,331 @@
+{
+  "schema_version": 1,
+  "qualified_at_utc": "2026-10-06T13:57:00Z",
+  "branch": "fix/v3-legacy-cloud-seal-20261006",
+  "remote_parent": "61d529f11e848ee39cbad938bb737de365e534b6",
+  "local_baseline": "80e31a03e01144d3cd36008558c86b5a037eb8ab",
+  "baseline_tree": "a3a21ccf8f57de0b73b525ffcd758ca8b28b5e25",
+  "scope": "Retained assigned saved canonical pages, dense chunks and matching browser display lifecycle",
+  "python_unique_final_passed": 55,
+  "python_new_passed": 39,
+  "python_affected_compatibility_passed": 16,
+  "python_failed_final": 0,
+  "python_runs": [
+    {
+      "count": 38,
+      "seconds": 2.354,
+      "command": "PYTHONPATH=.:tests NEH_POINTCLOUD_FIXTURE_DIR=<qualification>/fixtures <testenv>/bin/python -m unittest -v test_assigned_saved_cloud_sources test_assigned_saved_display_gateway",
+      "log": "assigned-python-final.log"
+    },
+    {
+      "count": 1,
+      "seconds": 0.029,
+      "command": "PYTHONPATH=.:tests <testenv>/bin/python -m unittest -v test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_gateway_preserves_explicit_display_budget_error",
+      "log": "budget-error-final.log"
+    },
+    {
+      "count": 10,
+      "seconds": 0.155,
+      "command": "PYTHONPATH=.:tests:scripts <testenv>/bin/python scripts/check_pointcloud_incremental_transport.py",
+      "log": "transport-compatibility-final.log"
+    },
+    {
+      "count": 6,
+      "seconds": 0.126,
+      "command": "PYTHONPATH=.:tests:scripts NEH_POINTCLOUD_FIXTURE_DIR=<qualification>/fixtures <testenv>/bin/python scripts/check_pointcloud_incremental_integration.py",
+      "log": "publication-compatibility-final.log"
+    }
+  ],
+  "python_new_selectors": [
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_capture_is_frozen_opaque_body_independent_and_retains_exact_owner",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_canonical_pages_are_retained_readonly_exact_and_reused_without_slicing_bytes",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_capture_summary_and_dense_do_not_require_ready_or_connected_provider",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_fence_missing_origin_and_stale_snapshot_never_fall_back",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_same_asset_reinstall_and_asset_switch_invalidate_old_handles",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_equal_wire_identity_new_prepared_owner_rebuilds_dense_and_canonical",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_source_switch_delivers_new_exact_owner_when_wire_identity_is_equal",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_dense_reads_exact_chunk_tail_and_end_outside_locks_without_rescan",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_dense_rejects_bad_offset_epoch_missing_member_and_close",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_missing_canonical_or_wrong_frame_cannot_advertise_a_legacy_source",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_fence_installed_during_canonical_view_discards_snapshot",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_source_change_during_dense_slice_rejects_returned_body",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_close_completes_while_dense_body_is_blocked_and_discards_result",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_display_budget_rejects_without_touching_body",
+    "test_assigned_saved_cloud_sources.AssignedSavedCloudTests.test_cancel_and_close_during_page_view_discard_snapshot",
+    "test_assigned_saved_cloud_sources.LegacySavedCloudTests.test_legacy_dense_keeps_manifest_reload_and_digest_epoch",
+    "test_assigned_saved_cloud_sources.LegacySavedCloudTests.test_legacy_switch_suppresses_equal_revision_and_advances_on_source_change",
+    "test_assigned_saved_cloud_sources.FrozenPayloadViewTests.test_readonly_view_bounds_and_retention",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_initial_dense_response_matches_display_owner_and_original_archive_source",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_missing_or_wrong_initial_display_identity_rejects_before_slice",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_cached_snapshot_retired_by_reinstallation_cannot_authorize_dense",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_owner_changes_during_dense_read_discard_the_chunk",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_configured_pcd_display_cannot_read_an_assigned_dense_owner",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_closed_gateway_and_activation_fence_reject",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_display_stays_offline_without_provider_ready",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_saved_gateway_delegate_bypasses_pcd_and_reuses_exact_pages",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_gateway_preserves_explicit_display_budget_error",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_assigned_summary_without_retained_owner_never_uses_pcd",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_stale_live_shm_falls_back_but_current_live_session_remains_preferred",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_assigned_legacy_adapter_is_bounded_unavailable_without_materialization",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_assigned_transport_is_full_reset_with_exact_typed_identity",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_legacy_cached_saved_and_missing_origin_live_are_not_displayed",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_same_live_source_revision_during_dense_rpc_remains_usable",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_publication_callback_replacement_stops_old_followup_topics",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_real_assigned_wire_fixture",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_http_await_boundary_rechecks_exact_retained_owner",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_http_matching_first_chunk_returns_typed_header_and_bounded_body",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_assigned_socket_aborts_owner_replaced_between_packets",
+    "test_assigned_saved_display_gateway.AssignedSavedDisplayGatewayTests.test_assigned_socket_rechecks_owner_after_packet_encoding"
+  ],
+  "testenv": "/workspace/scratch/71cdb9d17732/nuwax-embodied-harness/.nuwax-test-env",
+  "qualification": "/workspace/shared/neh-assigned-saved-display-qualification-20261006",
+  "javascript": {
+    "assigned_checks": 23,
+    "resource_checks": 21,
+    "wire_checks": 12,
+    "voxel_checks": 27,
+    "additional_scripts_passed": [
+      "check_pointcloud_native_wire.mjs (Python mmap fixture only)",
+      "check_pointcloud_viewer_integration.mjs",
+      "check_forbidden_overlay_reuse.mjs"
+    ],
+    "scope": "CPU/Three module integration, not browser or WebGL",
+    "command_environment": "NEH_POINTCLOUD_FIXTURE_DIR=/workspace/shared/neh-assigned-saved-display-qualification-20261006/fixtures",
+    "assigned_command": "node scripts/check_assigned_pointcloud_pairing.mjs"
+  },
+  "independent_review": {
+    "result": "approved; no remaining findings",
+    "source_only_final": true,
+    "additional_review_test": "Reviewer ran22 generated-fixture JS checks before no-repeat instruction; excluded from final totals"
+  },
+  "browser": {
+    "status": "UNVERIFIED_NAVIGATION_AND_SERVER_STARTUP",
+    "browser": "dot cloud Chromium, new isolated QA tab 4; existing tab 1 untouched",
+    "requested_url": "http://127.0.0.1:8898/",
+    "first_browser_result": "Browser Use cannot open http://127.0.0.1:8898 in tab 4. Browser reported: net::ERR_BLOCKED_BY_CLIENT",
+    "failed_page_inspection": "Browser Use rejected this action due to browser security policy. Reason: The browser URL policy blocks this action. Cloud browser cannot visit the requested page. The requested URL protocol is not allowed. Allowed protocols: \"http:\", \"https:\".",
+    "independent_server_check": "curl: (7) Failed to connect to 127.0.0.1 port 8898: Connection refused; exec reported a running session but no matching server process was found",
+    "followup": "Stopped per parent instruction; no alternate URL, network path, browser control mechanism, or security workaround attempted. Only own temporary exec session was interrupted.",
+    "passed": [
+      "Cloud browser inventory available",
+      "Separate QA tab created",
+      "Real repo modules and real Python fixture harness prepared",
+      "Python fixture server syntax compilation"
+    ],
+    "unverified": [
+      "Actual WebGL context creation",
+      "Rendered saved pointcloud pixels",
+      "Browser style/visibility/robot-height ownership retention",
+      "Saved dense browser render",
+      "Stale response rejection in browser"
+    ],
+    "screenshots": [],
+    "screenshot_note": "No success screenshot exists because page navigation failed before renderer execution. Exact returned errors preserved instead.",
+    "files": {
+      "html": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/browser/index.html",
+      "server": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/browser/server.py",
+      "canonical_fixture": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/fixtures/assigned_saved_wire.json",
+      "visual_fixture": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/fixtures/assigned_saved_visual_wire.json"
+    }
+  },
+  "static_checks": {
+    "new_files_ruff": 0,
+    "critical_ruff": 0,
+    "py_compile": 0,
+    "pep604": 0,
+    "layering_hard_rules": 0,
+    "diff_check": 0
+  },
+  "native": {
+    "run": false,
+    "reason": "No native/protobuf source changes. Prior native qualification not counted again."
+  },
+  "limits": [
+    "Existing32MiB canonical display budget retained",
+    "Assigned legacy WS/SSE whole-map adapter explicitly unavailable; use dedicated page stream",
+    "Inherited SourceSwitch routing RLock unchanged; assigned body checks demonstrate runtime/provider/cache/source guard scope only",
+    "CPU simulated-native fixtures do not qualify real robot/hardware/local planner performance"
+  ],
+  "initial_failures": [
+    "Initial gateway fixture lacked dense_archive; replaced with real dense admitted fixture; original failure log preserved",
+    "New-test Ruff import/callback binding/style findings fixed; final static checks passed"
+  ],
+  "source_files": {
+    "gateways/http/api.py": {
+      "sha256": "5a1c5551d65cda1268a857d94900b5459f0cd2aa9d745ada6c1e466d565fe469",
+      "bytes": 48441
+    },
+    "gateways/http/static/console.html": {
+      "sha256": "5cd1fe308771772449fa3e6692ae391e629440a07768d2c8794f9f67229e16e8",
+      "bytes": 48031
+    },
+    "gateways/http/static/js/dense-pointcloud.js": {
+      "sha256": "fb83eb36087a44db021fb01bf2f29e8a426ef76c1fee2ad8a5bb48edf05ac3d6",
+      "bytes": 14139
+    },
+    "gateways/http/static/js/pointcloud-incremental.js": {
+      "sha256": "caf3f2bc4a370b3d26d794e17f01773f296e66b9d418cf2009265f2a54858cf3",
+      "bytes": 16580
+    },
+    "gateways/http/static/js/pointcloud3d.js": {
+      "sha256": "4dfd88d0ddaf64d9cb86d9f8eeecd2b23a52dc971a68b7af23e525bd76e9638e",
+      "bytes": 121720
+    },
+    "gateways/runtime.py": {
+      "sha256": "aec38ca2fb0243ddf59797db83685041a9b00188380724b17eb35b4448c02b62",
+      "bytes": 745681
+    },
+    "gateways/ws/data_streams.py": {
+      "sha256": "4781feb775d79a27a92cc9e998c162a9a00be95ab8b4253fd5f824134b9c377a",
+      "bytes": 72791
+    },
+    "gateways/ws/pointcloud_stream.py": {
+      "sha256": "7bb1007d4c61fb0ecbe88f57c97f5f22895cc6d5e6e978ca59cc0c2513a7a71a",
+      "bytes": 12948
+    },
+    "scripts/check_pointcloud_incremental_integration.py": {
+      "sha256": "d104b35b87a47558e00bef54e8cac6bba01a77ac2e875208d85fc3b8247bd352",
+      "bytes": 8903
+    },
+    "scripts/check_assigned_pointcloud_pairing.mjs": {
+      "sha256": "47a91d8dd82b89e662f594e1ebdd3ffcf9924f582a1387f4dd47a8817c84c41c",
+      "bytes": 42041
+    },
+    "services/geometry/checkpoint_payload.py": {
+      "sha256": "3f77c2eea94d5eaaa8e9f2fab0741af3b9e20d915ba1a3703da160910072c775",
+      "bytes": 2419
+    },
+    "services/geometry/dense_cloud.py": {
+      "sha256": "5caad32825044a771749ec4c47a24021307f141fd8938c25e5af91ec142575ef",
+      "bytes": 13596
+    },
+    "services/geometry/pointcloud_map.py": {
+      "sha256": "229202f51b3af26e21410f327f0e2c4fb4ba8740f1a1f9ca78d13b695e78ca87",
+      "bytes": 67229
+    },
+    "services/geometry/runtime.py": {
+      "sha256": "e9bd2886440ebbb837d987ad97e3c17a35a6b27988cab24cec35104530200242",
+      "bytes": 604107
+    },
+    "services/geometry/assigned_saved_cloud.py": {
+      "sha256": "8147b9c38d38100d99cea30344822d40e41d3f07190b22293c3cb40517c25ac1",
+      "bytes": 5018
+    },
+    "tests/test_assigned_saved_cloud_sources.py": {
+      "sha256": "fc75d283708a69fc233f469c8f4c176aefce878a21e9e667911a9f3392af1e26",
+      "bytes": 24815
+    },
+    "tests/test_assigned_saved_display_gateway.py": {
+      "sha256": "64a7bd3a2529c85e18984af819ad8b4d0eec3adb045a8ffe2266ef75185d73c9",
+      "bytes": 17470
+    }
+  },
+  "logs": {
+    "assigned-python-final.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/assigned-python-final.log",
+      "sha256": "7641814e8fd0a8f5f80498ed54894e35fc4921d2dd0a66039023769e11492d26"
+    },
+    "budget-error-final.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/budget-error-final.log",
+      "sha256": "77ac171c87021c2534d3f9a8316a96d7ff7816f3af00906ba788760095191908"
+    },
+    "compile.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/compile.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "critical-ruff.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/critical-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "diff-check.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/diff-check.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "frontend-assigned-pairing.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/frontend-assigned-pairing.log",
+      "sha256": "4ddf4f1078877a8f35cbb79a95b5ba282ebda1a711b0a38ffdf5f7c977f6f097"
+    },
+    "frontend-incremental-wire.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/frontend-incremental-wire.log",
+      "sha256": "2172f981e8c66d4d90b1cf4fa6efba27f255988ba1f5394929f9092fd65574d5"
+    },
+    "frontend-legacy-viewer.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/frontend-legacy-viewer.log",
+      "sha256": "62b9f517e158062980112ff0fc097bba85d298f8f8a04ec3cbc89a7e94da77be"
+    },
+    "frontend-native-wire.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/frontend-native-wire.log",
+      "sha256": "6f27b9e250178536aac2dbd53dd8d8bf0bcb17c1ea1a2a754286e01b14c45bb2"
+    },
+    "frontend-overlay-reuse.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/frontend-overlay-reuse.log",
+      "sha256": "0f37500d5012dc42042742572de8eef7ae8895d09744636496e9aab91b935e0b"
+    },
+    "frontend-page-resources.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/frontend-page-resources.log",
+      "sha256": "ebffa90c0ccb275257caecb32f92c961adda264283abd1e2b3ab2d01c6eefede"
+    },
+    "frontend-voxel-identity.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/frontend-voxel-identity.log",
+      "sha256": "a1d3de6fec52a927f6171901d9c6bbea1088372e849edcd0ee9cb6f08f196f64"
+    },
+    "gateway-fourth.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/gateway-fourth.log",
+      "sha256": "794ffbbd2d951caf5178a8aad39a6a22b021fc3bfcf31ea113634bebdea5a6cc"
+    },
+    "gateway-initial.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/gateway-initial.log",
+      "sha256": "ff053572563167ce9bfc6aacb9dfcb608ecf1f3edae56394c487d2a1c2acdc27"
+    },
+    "gateway-second.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/gateway-second.log",
+      "sha256": "d4a2b737911deb2c78bf418043a0e36b924f05100df42ca443ce9b4ab424f62a"
+    },
+    "gateway-third.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/gateway-third.log",
+      "sha256": "f51e0684b6fbba746f9eacfda3c3098e0ec96b2f92d796d9fb1eff3476409a76"
+    },
+    "layering.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/layering.log",
+      "sha256": "02e544b1baa53970618417d7f565fcf413f7f17b68e28d0e7d4fcf3ff6f79efe"
+    },
+    "new-files-ruff-initial.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/new-files-ruff-initial.log",
+      "sha256": "2fbe5f0b0119c18260d005f50ca8aa07b77c2caf0822e67a9e06587aa20d7306"
+    },
+    "new-files-ruff.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/new-files-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "pep604.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/pep604.log",
+      "sha256": "ccceedecc6ecb959a7c43d011070f3681484d44df7d0a962cf2e1e9bd1626ac9"
+    },
+    "publication-compatibility-final.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/publication-compatibility-final.log",
+      "sha256": "82d7dc3ea333c250623c25b5b3232c4007e8ce2eeae65f656ee2a93746e44fba"
+    },
+    "publication-compatibility.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/publication-compatibility.log",
+      "sha256": "94b77cef267cef3cd5806cab25698add986055d87c9e90523ad5322f269289c5"
+    },
+    "transport-compatibility-final.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/transport-compatibility-final.log",
+      "sha256": "6b416e99d4d9e7a7bc75a636ec0fe203f1af5f459ea1cb718567e18b75dd769d"
+    },
+    "transport-compatibility.log": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/transport-compatibility.log",
+      "sha256": "0774c6b3e52924ee1a0111fe69b9f042089a8d0a4af2b88001b4b9a416ef4b6d"
+    }
+  },
+  "fixtures": {
+    "assigned_saved_visual_wire.json": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/fixtures/assigned_saved_visual_wire.json",
+      "sha256": "49c8529b6928013995b79b87a426662b64cf7837944348775764328f8ae07ab2"
+    },
+    "assigned_saved_wire.json": {
+      "path": "/workspace/shared/neh-assigned-saved-display-qualification-20261006/fixtures/assigned_saved_wire.json",
+      "sha256": "865557bc7422a937aeba74184994888b4ced406caa8dab82c774ddef709dcea0"
+    }
+  }
+}

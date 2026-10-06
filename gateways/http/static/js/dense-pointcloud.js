@@ -1,4 +1,5 @@
 import * as THREE from './three.module.min.js';
+import { assignedSourceEpoch, pointCloudAssignedSourceEpoch } from './pointcloud-incremental.js?v=20261006-assigned-pages';
 
 const CHUNK_POINTS = 65_536;
 const GEOMETRY_POINTS = CHUNK_POINTS * 4;
@@ -10,8 +11,21 @@ function countValue(value) {
   return count;
 }
 
-export function decodeDenseChunk(metadata, buffer, epoch, offset) {
+function validateDisplaySource(metadata, expected) {
+  const assigned = metadata.assigned_source === undefined ? '' : assignedSourceEpoch(metadata.assigned_source);
+  if (assigned !== (expected?.assigned_source ? assignedSourceEpoch(expected.assigned_source) : '')
+      || (assigned && (metadata.epoch !== assigned || metadata.base_epoch !== undefined))
+      || (expected && metadata.frame_id !== expected.frame_id)
+      || (expected?.assigned_source && metadata.display_source_epoch !== expected.source_epoch)
+      || (expected && metadata.display_source_epoch !== undefined && metadata.display_source_epoch !== expected.source_epoch)) {
+    throw new Error('完整点云与当前显示来源不一致');
+  }
+}
+
+export function decodeDenseChunk(metadata, buffer, epoch, offset, expectedDisplaySource = null) {
   if (!metadata || typeof metadata !== 'object') throw new Error('完整点云缺少分块元数据');
+  // 第一块尚无 dense epoch，也必须先核对已显示快照的完整资产身份。
+  validateDisplaySource(metadata, expectedDisplaySource);
   const ranges = [];
   let removed = 0;
   let rangeBytes = 0;
@@ -79,6 +93,7 @@ export class DensePointCloudLayer {
   constructor({ size = 1.25, onChange = () => {}, fetchChunk = (...args) => fetch(...args) } = {}) {
     this.group = new THREE.Group();
     this.group.name = 'complete-scan-pointcloud';
+    this.group.visible = false;
     this.material = createMaterial(size);
     this.onChange = onChange;
     this.fetchChunk = fetchChunk;
@@ -87,6 +102,7 @@ export class DensePointCloudLayer {
     this.epoch = null;
     this.metadata = null;
     this.bounds = null;
+    this.displaySource = null;
     this._active = false;
     this._serial = 0;
     this._timer = null;
@@ -94,6 +110,7 @@ export class DensePointCloudLayer {
   }
 
   append({ positions, total, metadata, ranges = [] }) {
+    validateDisplaySource(metadata, this.displaySource);
     const delta = this.epoch && metadata.base_epoch === this.epoch && countValue(metadata.base_offset_points) === this.count;
     if (this.epoch && ((!delta && (metadata.epoch !== this.epoch || total < this.total))
         || metadata.frame_id !== this.metadata.frame_id || metadata.session_id !== this.metadata.session_id
@@ -175,6 +192,27 @@ export class DensePointCloudLayer {
     this.epoch = this.metadata = this.bounds = null;
   }
 
+  setDisplaySource(header, { reset = false } = {}) {
+    let next = null;
+    if (header) {
+      if (typeof header.source_epoch !== 'string' || !header.source_epoch
+          || typeof header.frame_id !== 'string' || !header.frame_id) throw new Error('完整点云缺少显示来源');
+      pointCloudAssignedSourceEpoch(header);
+      const assigned = header.assigned_source;
+      next = Object.freeze({ source: header.source, source_epoch: header.source_epoch,
+        frame_id: header.frame_id, stream_generation: header.stream_generation,
+        ...(assigned ? { assigned_source: Object.freeze({ identity_schema_version: 2,
+          asset_identity: Object.freeze({ asset_id: assigned.asset_identity.asset_id }),
+          checkpoint_id: assigned.checkpoint_id, installation_generation: assigned.installation_generation }) } : {}) });
+    }
+    const same = next && this.displaySource && ['source', 'source_epoch', 'frame_id', 'stream_generation']
+      .every(key => next[key] === this.displaySource[key]);
+    if (same && !reset) return;
+    if (!next && !this.displaySource && !reset) return;
+    this.displaySource = next;
+    this.reset();
+  }
+
   reset() {
     const active = this._active;
     this.stop();
@@ -184,7 +222,7 @@ export class DensePointCloudLayer {
   }
 
   start() {
-    if (this._active) return;
+    if (this._active || !this.displaySource) return;
     this._active = true;
     this.group.visible = true;
     this.onChange({ count: this.count, total: this.total, metadata: this.metadata, bounds: this.bounds, loading: !this.metadata || this.count < this.total });
@@ -207,23 +245,26 @@ export class DensePointCloudLayer {
     this._abort = controller;
     const timeout = setTimeout(() => controller.abort(), 15000);
     let delay = 500;
+    const expectedDisplaySource = this.displaySource;
     try {
-      const query = new URLSearchParams({ epoch: this.epoch || '', offset: String(this.count), delta: '1' });
+      const query = new URLSearchParams({ epoch: this.epoch || '', offset: String(this.count), delta: expectedDisplaySource.assigned_source ? '0' : '1',
+        source_epoch: expectedDisplaySource.source_epoch });
       const response = await this.fetchChunk(`/api/pointcloud/dense?${query}`, { signal: controller.signal, cache: 'no-store' });
       if (!this._active || serial !== this._serial) return;
       if (response.status === 409) {
         this.clear();
         this.onChange({ count: 0, total: 0, loading: true });
-        delay = 0;
+        delay = expectedDisplaySource.assigned_source ? 500 : 0;
       } else if (!response.ok) {
         const body = await response.json().catch(() => ({}));
+        if (!this._active || serial !== this._serial) return;
         this.clear();
         throw new Error(body.error?.message || body.message || `完整点云读取失败（${response.status}）`);
       } else {
         const metadata = JSON.parse(response.headers.get('X-Nuwax-Pointcloud') || 'null');
         const buffer = await response.arrayBuffer();
         if (!this._active || serial !== this._serial) return;
-        this.append(decodeDenseChunk(metadata, buffer, this.epoch, this.count));
+        this.append(decodeDenseChunk(metadata, buffer, this.epoch, this.count, expectedDisplaySource));
         delay = this.count < this.total ? 0 : 500;
       }
     } catch (error) {

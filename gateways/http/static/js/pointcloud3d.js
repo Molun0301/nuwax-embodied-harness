@@ -3,9 +3,9 @@ import { SemanticRegionLayer } from './semantic-regions3d.js?v=20260922-semantic
 import { SceneGraphLayer } from './scene-graph3d.js?v=20260922-scene-graph';
 import { OrbitControls } from './OrbitControls.js';
 import { PointCloudProcessor } from './pointcloud-processing.js?v=20260918-dense-pointcloud';
-import { IncrementalPointCloudConnection, mappingEpochFromMap } from './pointcloud-incremental.js?v=20261002-pages';
+import { IncrementalPointCloudConnection, mappingEpochFromMap, pointCloudAssignedSourceEpoch } from './pointcloud-incremental.js?v=20261006-assigned-pages';
 import { IncrementalPointCloudLayer } from './pointcloud-pages.js?v=20261002-pages';
-import { DensePointCloudLayer } from './dense-pointcloud.js?v=20260918-dense-pointcloud';
+import { DensePointCloudLayer } from './dense-pointcloud.js?v=20261006-assigned-pages';
 
 const COLORS = {
   robot: 0xfbbf24,
@@ -290,6 +290,7 @@ export function parsePointCloudMapBinaryEnvelope(buffer) {
   }
   if (!['live', 'saved'].includes(header.source)) throw new Error('点云 source 非法');
   if (typeof header.source_epoch !== 'string' || !header.source_epoch) throw new Error('点云 source_epoch 缺失');
+  if (pointCloudAssignedSourceEpoch(header)) throw new Error('指定点云资产必须使用分页协议');
   if (typeof header.revision !== 'string' || !header.revision) throw new Error('点云 revision 缺失');
   if (typeof header.frame_id !== 'string' || !header.frame_id) throw new Error('点云 frame_id 缺失');
   if (header.format !== 'float32-xyz-le') throw new Error('点云 format 非法');
@@ -398,6 +399,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._controls = null;
     this._pointsMesh = null;
     this._denseCloud = null;
+    this._denseSourceSuspended = false;
     this._incrementalCloud = null;
     this._incrementalConnection = null;
     this._incrementalReady = false;
@@ -471,10 +473,41 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._assetCloudUrl = null;
     this._assetCloudSourceKey = null;
     this._assetCloudLoadingUrl = null;
+    this._assignedMapEpoch = '';
+    this._assignedContextCleared = false;
   }
 
   setMapContext(snapshot) {
-    this._incrementalConnection?.setMapEpoch(mappingEpochFromMap(snapshot));
+    const epoch = mappingEpochFromMap(snapshot);
+    if (!epoch && (this._assignedMapEpoch || pointCloudAssignedSourceEpoch(this._pointCloudMapWatermark?.header)
+        || pointCloudAssignedSourceEpoch(this._incrementalConnection?.assembler.pending?.header))) {
+      this._assignedContextCleared = true;
+      this._invalidateCloudSource();
+    } else if (epoch) this._assignedContextCleared = false;
+    this._assignedMapEpoch = epoch.startsWith('assigned:') ? epoch : '';
+    // 元数据可先于首个页面到达；同时撤销尚未完成的无身份文件读取。
+    if (this._assignedMapEpoch && this._pointCloudMapWatermark?.header.source_epoch !== epoch
+        && (this._hasPointCloudSnapshot || this._assetCloudLoadingUrl)) this._invalidateCloudSource();
+    this._incrementalConnection?.setMapEpoch(epoch);
+  }
+
+  _invalidateCloudSource() {
+    this._invalidatePointCloudWork(); this._cloudLoadToken++;
+    if (this._pointsMesh) this._pointsMesh.visible = false;
+    if (this._allPositions.length) this._allPositions = new Float32Array(0);
+    this._renderedPointCloudSourcePoints = 0;
+    this._pointCloudSourcePoints = 0;
+    this._lastCloudMapRevision = null;
+    this._cloudSourceKey = null;
+    this._incrementalCloud?.setVisible(false);
+    this._incrementalActive = false;
+    this._hasPointCloudSnapshot = false;
+    this._pointCloudMapWatermark = null;
+    this._pointCloudBounds = null;
+    this._displayedPointCount = 0;
+    this._denseSourceSuspended = true;
+    this._denseCloud?.setDisplaySource(null);
+    this._emitPointCount(); this._requestRender();
   }
 
   _startIncrementalCloud() {
@@ -484,37 +517,31 @@ class PointCloud3DViewer extends PointCloudProcessor {
       onState: state => {
         if (state === 'ready') {
           this._incrementalReady = true;
+          this._denseSourceSuspended = false;
           window.dispatchEvent(new CustomEvent('stream:pointcloud_map.incremental-ready'));
+          if (this._pointStyle === 'full' && this._visible) this._rebuildPointCloud();
+        }
+        if (state === 'disconnected' || state === 'resync') {
+          this._denseSourceSuspended = true;
+          this._denseCloud?.setDisplaySource(null);
         }
         window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', {detail: {pointcloudPageConnection: state}}));
       },
       onError: error => this._pointCloudComputeError(String(error?.message || error)),
-      onInvalidate: () => {
-        this._invalidatePointCloudWork(); this._cloudLoadToken++;
-        if (this._pointsMesh) this._pointsMesh.visible = false;
-        if (this._allPositions.length) this._allPositions = new Float32Array(0);
-        this._renderedPointCloudSourcePoints = 0;
-        this._pointCloudSourcePoints = 0;
-        this._lastCloudMapRevision = null;
-        this._cloudSourceKey = null;
-        this._incrementalCloud?.setVisible(false);
-        this._incrementalActive = false;
-        this._hasPointCloudSnapshot = false;
-        this._pointCloudMapWatermark = null;
-        this._pointCloudBounds = null;
-        this._displayedPointCount = 0;
-        this._denseCloud?.reset();
-        this._emitPointCount(); this._requestRender();
-      },
+      onInvalidate: () => this._invalidateCloudSource(),
     });
     this._incrementalConnection.connect();
   }
 
   _acceptCloudPageBatch(batch) {
     if (this._cloudDisposed) return;
-    if (batch.header.source === 'saved') {
-      // 保存资产为明确的不可变全快照来源；保留原有 LOD/楼层样式语义。
-      // 只有来源修订变化时组装一次，不进入实时 v3 增量路径。
+    const assigned = pointCloudAssignedSourceEpoch(batch.header);
+    if (this._assignedContextCleared && assigned) throw new Error('指定地图已清除');
+    if (this._assignedMapEpoch && assigned !== this._assignedMapEpoch) throw new Error('点云不属于当前指定地图');
+    if (assigned && (!batch.header.reset || batch.header.source_incremental !== false
+        || batch.header.mapping_source_epoch !== assigned)) throw new Error('指定保存资产必须是同安装来源的不可变完整快照');
+    if (batch.header.source === 'saved' && !assigned) {
+      // 明确的旧保存资产路径保留原有 LOD/楼层样式语义。
       const positions = new Float32Array(batch.header.point_count * 3);
       for (const chunk of batch.chunks) positions.set(chunk.xyz, chunk.chunk_index * batch.header.chunk_size_points * 3);
       this._incrementalActive = false;
@@ -546,8 +573,6 @@ class PointCloud3DViewer extends PointCloudProcessor {
       this._incrementalCloud.apply(batch);
     } finally { this._cloudPagesApplying = false; }
     const header = batch.header;
-    const previous = this._pointCloudMapWatermark?.header;
-    if (!previous || ['source', 'source_epoch', 'frame_id', 'stream_generation'].some(key => previous[key] !== header[key]) || header.point_count === 0) this._denseCloud?.reset();
     this._invalidatePointCloudWork(); this._cloudLoadToken++;
     this._assetCloudUrl = null;
     this._incrementalActive = true;
@@ -559,19 +584,23 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._hasPointCloudSnapshot = true;
     this._isLiveCloudMapSnapshot = header.source === 'live';
     this._pointCloudSourcePoints = header.point_count;
+    this._denseSourceSuspended = false;
+    this._denseCloud?.setDisplaySource(header, {reset: header.reset || header.point_count === 0});
     // 旧完整缓冲只属于明确的旧协议/资产路径，新页面不重新拼装它。
     if (this._allPositions.length) this._allPositions = new Float32Array(0);
     if (this._pointsMesh) this._pointsMesh.visible = false;
     this._incrementalCloud.setVisible(this._visible && this._pointStyle !== 'full');
     this._applyCloudPageState();
+    if (this._pointStyle === 'full') this._rebuildPointCloud();
     window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', {detail: {
-      pointcloudDecision: 'accepted_pages', pointcloudAcceptedPoints: header.point_count,
+      pointcloudDecision: assigned ? 'assigned_saved_pages' : 'accepted_pages', pointcloudAcceptedPoints: header.point_count,
       pointcloudAcceptedRevision: header.revision, pointcloudAcceptedGeneration: header.stream_generation,
       pointcloudAcceptedSourceEpoch: header.source_epoch, pointcloudSourceIncremental: header.source_incremental,
       pointcloudChangedPages: header.changed_chunk_count,
+      pointcloudSnapshotMaterializedBytes: 0,
     }}));
     window.dispatchEvent(new CustomEvent('pointcloud3d:map-frame', {detail: {
-      source: header.source, sourceTime: Number(BigInt(header.source_timestamp_ns) / 1000000n),
+      source: header.source, sourceTime: header.source === 'saved' ? null : Number(BigInt(header.source_timestamp_ns) / 1000000n),
       frameKey: `${header.stream_generation}:${header.revision_ordinal}:${header.revision}`,
       sourceKey: this._cloudSourceKey,
     }}));
@@ -1301,6 +1330,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
         });
         this._scene.add(this._denseCloud.group);
       }
+      this._denseCloud.setDisplaySource(this._denseSourceSuspended ? null : this._pointCloudMapWatermark?.header || null);
       if (this._visible) this._denseCloud.start();
       return;
     }
@@ -1355,6 +1385,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   async loadPointCloud(url, lod = 'preview') {
     if (this._cloudDisposed) return;
+    // 指定资产只能由带完整身份的页面接纳，不能回退到通用配置 PCD。
+    if (this._assignedMapEpoch || this._assignedContextCleared || pointCloudAssignedSourceEpoch(this._pointCloudMapWatermark?.header)) return;
     // 制品标识对应不可变内容，视图切换重放同一元数据时复用已有点云。
     if (String(url).includes('/artifacts/') && this._assetCloudUrl === url && this._hasPointCloudSnapshot
         && this._cloudSourceKey === this._assetCloudSourceKey) {
@@ -1371,10 +1403,13 @@ class PointCloud3DViewer extends PointCloudProcessor {
       const resp = await fetch(url);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const buf = await resp.arrayBuffer();
-      if (this._cloudDisposed || token !== this._cloudLoadToken) return;
+      if (this._cloudDisposed || token !== this._cloudLoadToken || this._assignedMapEpoch || this._assignedContextCleared
+          || pointCloudAssignedSourceEpoch(this._pointCloudMapWatermark?.header)) return;
       if (buf.byteLength > MAX_BUFFER_BYTES || buf.byteLength % 12 !== 0) throw new Error('点云文件超过容量或XYZ长度不完整');
       this._cloudSourceKey = JSON.stringify(['asset', url, token]);
       this._lastCloudMapRevision = null;
+      this._pointCloudMapWatermark = null;
+      this._denseCloud?.setDisplaySource(null);
       this._allPositions = new Float32Array(buf);
       this._assetCloudUrl = url;
       this._assetCloudSourceKey = this._cloudSourceKey;
@@ -1395,12 +1430,15 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   appendPoints(float32Array) {
     if (this._cloudDisposed) return;
+    if (this._assignedMapEpoch || this._assignedContextCleared || pointCloudAssignedSourceEpoch(this._pointCloudMapWatermark?.header)) throw new Error('指定点云资产不接受无身份追加');
     if (float32Array.length % 3 !== 0 || this._allPositions.byteLength + float32Array.byteLength > MAX_BUFFER_BYTES) {
       throw new Error('追加点云超过显示容量或XYZ长度不完整');
     }
     this._cloudLoadToken += 1;
     this._cloudSourceKey = 'legacy-append';
     this._lastCloudMapRevision = null;
+    this._pointCloudMapWatermark = null;
+    this._denseCloud?.setDisplaySource(null);
     const merged = new Float32Array(this._allPositions.length + float32Array.length);
     merged.set(this._allPositions);
     merged.set(float32Array, this._allPositions.length);
@@ -1415,15 +1453,15 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._assetCloudUrl = null;
     if (this._cloudDisposed) return;
     this._cloudLoadToken += 1;
-    const previousSourceKey = this._cloudSourceKey;
     this._cloudSourceKey = JSON.stringify([identity.header.source, identity.header.source_epoch,
       identity.header.frame_id, String(identity.streamGeneration ?? '')]);
-    if (previousSourceKey !== this._cloudSourceKey || xyzArray.length === 0) this._denseCloud?.reset();
     this._lastCloudMapRevision = identity.header.revision;
     this._pointCloudMapWatermark = identity;
     this._hasPointCloudSnapshot = true;
     this._isLiveCloudMapSnapshot = identity.header.source === 'live';
     this._pointCloudSourcePoints = Math.floor(xyzArray.length / 3);
+    this._denseSourceSuspended = false;
+    this._denseCloud?.setDisplaySource(identity.header, {reset: identity.header.reset || xyzArray.length === 0});
 
     this._allPositions = xyzArray;
     this._rebuildPointCloud();
@@ -2673,6 +2711,7 @@ window.addEventListener('stream:pointcloud_map.meta', (e) => {
 window.addEventListener('stream:pointcloud_map.binary', (e) => {
   if (!window.pointcloud3d || window.pointcloud3d._cloudDisposed) return;
   if (window.pointcloud3d._incrementalReady) return;
+  if (window.pointcloud3d._assignedMapEpoch || window.pointcloud3d._assignedContextCleared) return;
   const buffer = e.detail?.buffer;
   let envelope;
   try {
@@ -2727,7 +2766,8 @@ window.addEventListener('stream:pointcloud_map.reset', () => {
   window.pointcloud3d._invalidatePointCloudWork();
   window.pointcloud3d._cloudLoadToken += 1;
   window.pointcloud3d._pointCloudMapWatermark = null;
-  window.pointcloud3d._denseCloud?.reset();
+  window.pointcloud3d._denseSourceSuspended = true;
+  window.pointcloud3d._denseCloud?.setDisplaySource(null);
 });
 
 // 二进制消费者已注册与三维画布已初始化是两个不同阶段。

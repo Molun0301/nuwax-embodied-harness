@@ -1095,6 +1095,12 @@ def _encode_ws_frame(frame: StreamFrame, *, map_binary_version=3) -> Union[str, 
 
 def _legacy_pointcloud_frame(frame, snapshot):
     """只有明确订阅旧快照通道的连接要求完整兼容载荷。"""
+    if snapshot.provenance.get("assigned_source") is not None:
+        # 新保存来源只走有界页面；不能在旧适配器重新拼接整图或创建摘要别名。
+        return frame.model_copy(update={"payload_kind": StreamPayloadKind.JSON,
+            "status": "unavailable", "payload": {"reason": "assigned_saved_requires_page_stream",
+                "stream_path": "/streams/pointcloud/ws"},
+            "metadata": {"source": "saved", "assigned_source": snapshot.provenance["assigned_source"]}})
     metadata = {**frame.metadata, "source": snapshot.source, "source_epoch": snapshot.source_epoch,
                 "revision": snapshot.revision, "revision_ordinal": snapshot.revision_ordinal,
                 "frame_id": snapshot.frame_id, "source_timestamp_ns": snapshot.source_timestamp_ns,

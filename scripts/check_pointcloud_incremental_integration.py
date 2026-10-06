@@ -48,6 +48,10 @@ class Sink:
 class Publication(unittest.TestCase):
     def fake(self):
         owner=NS(_pointcloud_map_stream_stop=threading.Event(),_lock=threading.RLock(),stream_bus=Sink())
+        owner.platform_geometry_runtime=NS(is_map_asset_activation_recovery_pending=lambda:False,
+            is_assigned_saved_cloud_selected=lambda:False,
+            capture_assigned_saved_cloud_source=lambda:None)
+        owner._require_pointcloud_source_current=MethodType(runtime.GatewayRuntime._require_pointcloud_source_current,owner)
         owner._publish_pointcloud_map_compatibility=MethodType(runtime.GatewayRuntime._publish_pointcloud_map_compatibility,owner)
         return owner
     def test_native_publication_has_no_full_bytes_or_compat_payload(self):
@@ -66,7 +70,7 @@ class Publication(unittest.TestCase):
         self.assertIs(owner.stream_bus.frames[0][1]['payload'],source.xyz_bytes)
         self.assertEqual(owner.stream_bus.frames[-1][1]['payload'],{'legacy_pointcloud_topic':True})
     def test_getter_returns_same_current_snapshot_without_materialization(self):
-        source=snapshot();owner=NS(_lock=threading.RLock(),_pointcloud_map_current_snapshot=source)
+        source=snapshot();owner=self.fake();owner._pointcloud_map_current_snapshot=source
         self.assertIs(runtime.GatewayRuntime.get_pointcloud_map_snapshot(owner),source)
 
 class Compatibility(unittest.IsolatedAsyncioTestCase):

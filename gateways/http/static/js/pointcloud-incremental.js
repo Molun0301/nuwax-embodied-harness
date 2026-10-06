@@ -16,6 +16,30 @@ function count(value, maximum, name) {
   if (!Number.isSafeInteger(value) || value < 0 || value > maximum) throw new Error(`非法点云数量 ${name}`);
   return value;
 }
+function exactFields(value, fields) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === fields.length && fields.every(key => Object.hasOwn(value, key));
+}
+export function assignedSourceEpoch(source) {
+  if (!exactFields(source, ['identity_schema_version', 'asset_identity', 'checkpoint_id', 'installation_generation'])
+      || source.identity_schema_version !== 2 || !exactFields(source.asset_identity, ['asset_id'])
+      || ![source.asset_identity.asset_id, source.checkpoint_id].every(id =>
+        typeof id === 'string' && /^[0-9a-f]{32}$/.test(id) && /[1-9a-f]/.test(id))) {
+    throw new Error('指定点云资产身份非法');
+  }
+  const generation = integer(source.installation_generation, 'installation_generation');
+  if (generation === '0') throw new Error('指定点云安装代次非法');
+  return `assigned:${source.asset_identity.asset_id}:${source.checkpoint_id}:${generation}`;
+}
+export function pointCloudAssignedSourceEpoch(header) {
+  if (header?.assigned_source === undefined) {
+    if (header?.source_epoch?.startsWith('assigned:')) throw new Error('指定点云缺少资产身份');
+    return '';
+  }
+  const epoch = assignedSourceEpoch(header.assigned_source);
+  if (header.source !== 'saved' || header.source_epoch !== epoch) throw new Error('指定点云来源身份不一致');
+  return epoch;
+}
 export function pointCloudBase(header) {
   return Object.fromEntries([...IDENTITY_FIELDS, 'revision_ordinal'].map(key => [key, header[key]]));
 }
@@ -35,6 +59,9 @@ export function parsePointCloudPagePacket(buffer) {
   }
   if (!['live', 'saved'].includes(header.source) || typeof header.mapping_source_epoch !== 'string'
     || typeof header.reset !== 'boolean' || typeof header.source_incremental !== 'boolean') throw new Error('分页点云来源非法');
+  const assignedEpoch = pointCloudAssignedSourceEpoch(header);
+  if (assignedEpoch && (!header.reset || header.source_incremental || header.mapping_source_epoch !== assignedEpoch)) throw new Error('指定保存资产必须是同安装来源的不可变完整快照');
+  if (!assignedEpoch && header.mapping_source_epoch.startsWith('assigned:')) throw new Error('指定地图不接受无身份点云页面');
   for (const key of ['stream_generation', 'layout_generation', 'revision_ordinal', 'base_revision_ordinal', 'source_timestamp_ns']) integer(header[key], key);
   count(header.point_count, POINTCLOUD_MAX_POINTS, 'point_count');
   if (header.chunk_size_points !== POINTCLOUD_PAGE_POINTS) throw new Error('不支持的点云页面大小');
@@ -71,13 +98,19 @@ export function parsePointCloudPagePacket(buffer) {
 }
 
 export class PointCloudPageAssembler {
-  constructor() { this.base = null; this.pointCount = 0; this.pending = null; this.mapEpoch = ''; this.connectionFresh = true; }
+  constructor() { this.base = null; this.pointCount = 0; this.pending = null; this.mapEpoch = ''; this.connectionFresh = true; this.assignedContextCleared = false; }
   beginConnection() { this.pending = null; this.connectionFresh = true; }
   discardPending() { this.pending = null; }
   invalidate() { this.pending = null; this.base = null; this.pointCount = 0; }
   setMapEpoch(epoch) {
     const next = typeof epoch === 'string' ? epoch : '';
-    if (!next || next === this.mapEpoch) return false;
+    if (!next) {
+      if (!this.mapEpoch.startsWith('assigned:') && !this.base?.source_epoch.startsWith('assigned:')
+          && !this.pending?.header.source_epoch.startsWith('assigned:')) return false;
+      this.mapEpoch = ''; this.assignedContextCleared = true; this.invalidate(); return true;
+    }
+    this.assignedContextCleared = false;
+    if (next === this.mapEpoch) return false;
     const previous = this.mapEpoch;
     this.mapEpoch = next;
     if (this.base && ((this.acceptedMapEpoch && this.acceptedMapEpoch !== next)
@@ -88,6 +121,11 @@ export class PointCloudPageAssembler {
   push(buffer) {
     const packet = parsePointCloudPagePacket(buffer);
     const header = packet.header;
+    if (this.assignedContextCleared && pointCloudAssignedSourceEpoch(header)) throw new Error('指定地图已清除');
+    if (this.mapEpoch.startsWith('assigned:') && pointCloudAssignedSourceEpoch(header) !== this.mapEpoch) {
+      this.pending = null;
+      throw new Error('点云不属于当前指定地图');
+    }
     if (this.mapEpoch && header.mapping_source_epoch && this.mapEpoch !== header.mapping_source_epoch) {
       this.pending = null;
       throw new Error('点云所属地图已失效');
@@ -103,7 +141,8 @@ export class PointCloudPageAssembler {
       this.pending = {header, chunks: [], seen: new Set(), next: 0, bytes: 0};
     }
     const pending = this.pending;
-    if (!pending || header.packet_index !== pending.next || !TRANSACTION_FIELDS.every(key => header[key] === pending.header[key])) throw new Error('点云事务片段不连续');
+    if (!pending || header.packet_index !== pending.next || !TRANSACTION_FIELDS.every(key => header[key] === pending.header[key])
+        || pointCloudAssignedSourceEpoch(header) !== pointCloudAssignedSourceEpoch(pending.header)) throw new Error('点云事务片段不连续');
     for (const chunk of packet.chunks) {
       if (pending.seen.has(chunk.chunk_index)) throw new Error('点云事务重复页面');
       pending.seen.add(chunk.chunk_index); pending.chunks.push(chunk); pending.bytes += chunk.xyz.byteLength;
@@ -130,6 +169,14 @@ export class PointCloudPageAssembler {
 
 export function mappingEpochFromMap(snapshot) {
   const metadata = snapshot?.metadata || {};
+  if (metadata.identity_schema_version === 2) {
+    const generation = metadata.map_activation_generation;
+    const exactGeneration = typeof generation === 'number' && Number.isSafeInteger(generation) && generation > 0
+      ? String(generation) : generation;
+    return assignedSourceEpoch({ identity_schema_version: 2, asset_identity: metadata.asset_identity,
+      checkpoint_id: metadata.activation_receipt_v2?.request?.checkpoint_id,
+      installation_generation: exactGeneration });
+  }
   const session = metadata.mapping_session_id;
   const generation = metadata.session_generation;
   const exactGeneration = (typeof generation === 'number' && Number.isSafeInteger(generation) && generation >= 0)
@@ -169,6 +216,8 @@ export class IncrementalPointCloudConnection {
           if (message.type === 'pointcloud.ready' && message.version === 2) this.onState('ready');
           return;
         }
+        // 清除地图后不把延迟的完整重发当成新选择，也不反复请求同一过期资产。
+        if (this.assembler.assignedContextCleared && pointCloudAssignedSourceEpoch(parsePointCloudPagePacket(event.data).header)) return;
         if (this.awaitingReset) {
           const packet = parsePointCloudPagePacket(event.data);
           if (!packet.header.reset || packet.header.packet_index !== 0) return;
@@ -196,6 +245,7 @@ export class IncrementalPointCloudConnection {
     this.assembler.discardPending();
     if (this.awaitingReset) return;
     this.awaitingReset = true;
+    this.onState('resync');
     if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({type: 'pointcloud.resync', mapping_source_epoch: this.assembler.mapEpoch}));
   }
   setMapEpoch(epoch) {

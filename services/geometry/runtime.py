@@ -8268,12 +8268,56 @@ class PlatformGeometryRuntime:
             "process_running": process.is_running() if process is not None else False,
         }
 
-    def get_saved_dense_cloud_source(self) -> Optional[Dict[str, object]]:
+    def is_assigned_saved_cloud_selected(self) -> bool:
+        """Identify the explicit lane even when its retained owner is fenced/missing."""
+        with self._runtime_state_lock:
+            bundle = self._map_activation_snapshot_locked().bundle
+            return bundle is not None and bundle.identity_schema_version == 2
+
+    def capture_assigned_saved_cloud_source(self):
+        """Retain admitted saved bodies under a short metadata-only fence.
+
+        Display does not require a READY localization target or a connected
+        native provider. It does require the exact current local installation.
+        """
+        from services.geometry.assigned_saved_cloud import _capture_assigned_saved_cloud_handle
+
+        with self._runtime_state_lock:
+            snapshot = self._map_activation_snapshot_locked()
+            bundle = snapshot.bundle
+            if (bundle is None or bundle.identity_schema_version != 2
+                    or isinstance(getattr(self, "_map_asset_activation_fence", None), dict)):
+                return None
+            origin = getattr(self, "_assigned_map_installation_origin", None)
+            if origin is None or origin[0] is not snapshot:
+                return None
+            prepared = origin[1]
+            if not isinstance(prepared, _PreparedAssignedMapActivation) or prepared._owner is not self:
+                return None
+            return _capture_assigned_saved_cloud_handle(self, snapshot, prepared)
+
+    def require_assigned_saved_cloud_source(self, source) -> None:
+        """Check retained owner identity only; never access or compare bodies."""
+        from services.geometry.assigned_saved_cloud import AssignedSavedCloudHandle
+
+        if not isinstance(source, AssignedSavedCloudHandle) or source._owner is not self:
+            raise TypeError("assigned saved source requires this runtime's captured handle")
+        with self._runtime_state_lock:
+            origin = getattr(self, "_assigned_map_installation_origin", None)
+            if (self._map_activation_snapshot_locked() is not source._snapshot
+                    or origin is None or origin[0] is not source._snapshot
+                    or origin[1] is not source._prepared
+                    or isinstance(getattr(self, "_map_asset_activation_fence", None), dict)):
+                raise RuntimeError("ASSIGNED_SAVED_CLOUD_SOURCE_CHANGED")
+
+    def get_saved_dense_cloud_source(self):
         """只返回当前活动资产的权威检查点身份，不打开完整点云文件。"""
         if self.is_map_asset_activation_recovery_pending():
             return None
         snapshot = self._map_activation_snapshot_read()
         bundle = snapshot.bundle
+        if bundle is not None and bundle.identity_schema_version == 2:
+            return self.capture_assigned_saved_cloud_source()
         if bundle is None or bundle.geometry_asset is None or snapshot.bundle_root is None:
             return None
         reference = bundle.geometry_asset.metadata.get("mapping_backend_checkpoint") or {}
@@ -8286,10 +8330,10 @@ class PlatformGeometryRuntime:
         }
 
     def get_live_pointcloud_map_asset_summary(self) -> Dict[str, object]:
-        """返回当前累计点云地图 PCD 资产候选，不读取扫描帧。"""
+        """返回活动规范点云来源摘要，不读取点云体。"""
 
         def activation_fence_summary(activation_fence):
-            return {
+            summary = {
                 "available": False,
                 "status": "unavailable",
                 "source_kind": "map_asset_activation_fence",
@@ -8307,6 +8351,13 @@ class PlatformGeometryRuntime:
                 "not_fallback_to_sensor_scan": True,
             }
 
+            snapshot = self._map_activation_snapshot_read()
+            if snapshot.bundle is not None and snapshot.bundle.identity_schema_version == 2:
+                summary.pop("asset_manifest_sha256", None)
+                summary.update(identity_schema_version=2,
+                               asset_identity=snapshot.bundle.asset_identity.model_dump())
+            return summary
+
         def finalize(summary):
             activation_fence = self._map_asset_activation_fence_snapshot()
             if activation_fence is not None:
@@ -8319,6 +8370,26 @@ class PlatformGeometryRuntime:
         activation_snapshot = self._map_activation_snapshot_read()
         active_bundle = activation_snapshot.bundle
         active_root = activation_snapshot.bundle_root
+        if active_bundle is not None and active_bundle.identity_schema_version == 2:
+            summary = {
+                "available": False, "status": "unavailable",
+                "identity_schema_version": 2, "source_kind": "assigned_checkpoint_canonical_cloud",
+                "map_name": active_bundle.map_name, "frame_id": active_bundle.frame_id,
+                "asset_identity": active_bundle.asset_identity.model_dump(),
+                "pcd_path": None, "path": None, "not_fallback_to_sensor_scan": True,
+                "reason": "assigned_saved_cloud_unavailable",
+            }
+            try:
+                source = self.capture_assigned_saved_cloud_source()
+                if source is not None and source._snapshot is activation_snapshot:
+                    source.require_current()
+                    summary.update(available=True, status="available", reason=None,
+                                   assigned_source=source.assigned_source, source_epoch=source.source_epoch,
+                                   frame_id=source.frame_id, point_count=source.point_count,
+                                   source_incremental=False)
+            except (ValueError, RuntimeError):
+                pass
+            return finalize(summary)
         if (
             active_bundle is not None
             and active_bundle.geometry_asset is not None

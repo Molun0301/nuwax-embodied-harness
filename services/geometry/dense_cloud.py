@@ -131,13 +131,72 @@ class SavedDenseCloudCache:
         self._offset = 0
         self._epoch = None
         self._closed = False
+        self._assigned_source = None
 
     def close(self):
         with self._lock:
             self._closed = True
-            self._key = self._payload = self._metadata = self._epoch = None
+            self._key = self._payload = self._metadata = self._epoch = self._assigned_source = None
+
+    def _read_assigned(self, source, *, expected_epoch, offset_points):
+        source.require_current()
+        key = ("assigned",) + source.owner_key
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("完整点云读取已关闭")
+            cached = ((self._payload, self._metadata, self._offset, self._epoch)
+                      if self._key == key else None)
+        if cached is None:
+            payload, reference = source.dense_archive, source.dense_reference
+            if payload is None or reference is None:
+                raise RuntimeError("当前地图没有完整扫描数据；旧体素地图无法还原全部扫描点")
+            # Admission already validated the complete immutable body. Only
+            # the bounded archive header is decoded; no reload/hash/rescan.
+            metadata, offset = read_dense_metadata(payload)
+            checkpoint = source._prepared.stored_checkpoint.checkpoint
+            if (reference.identity_schema_version != 2 or reference.member_identity is None
+                    or reference.member_identity.checkpoint_id != source.checkpoint_id
+                    or reference.member_identity.frame_id != source.frame_id
+                    or reference.size != len(payload) or metadata["frame_id"] != source.frame_id
+                    or metadata["session_id"] != checkpoint.source_session_id
+                    or metadata["session_generation"] != checkpoint.source_session_generation
+                    or metadata["cloud_revision"] != checkpoint.cloud_receipt["cloud_revision"]
+                    or metadata["source_timestamp_ns"] != checkpoint.cloud_receipt["source_timestamp_ns"]):
+                raise ValueError("完整点云与已接纳 assigned 检查点不一致")
+            epoch = source.source_epoch
+            source.require_current()
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("完整点云读取已关闭")
+                self._key, self._payload, self._metadata, self._offset = key, payload, metadata, offset
+                self._epoch, self._assigned_source = epoch, source
+        else:
+            payload, metadata, offset, epoch = cached
+        if expected_epoch and expected_epoch != epoch:
+            raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
+        if type(offset_points) is not int or not 0 <= offset_points <= metadata["point_count"]:
+            raise ValueError("完整点云分块位置非法")
+        count = min(DENSE_CHUNK_POINTS, metadata["point_count"] - offset_points)
+        start = offset + offset_points * 12
+        source.require_current()
+        data = payload[start:start + count * 12]
+        source.require_current()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("完整点云读取已关闭")
+        return {
+            "epoch": epoch, "assigned_source": source.assigned_source,
+            "frame_id": metadata["frame_id"], "session_id": metadata["session_id"],
+            "session_generation": str(metadata["session_generation"]), "revision": str(metadata["cloud_revision"]),
+            "source_timestamp_ns": str(metadata["source_timestamp_ns"]), "total_points": str(metadata["point_count"]),
+            "offset_points": str(offset_points), "point_count": count,
+            "bounds_min": list(metadata["bounds_min"]), "bounds_max": list(metadata["bounds_max"]),
+        }, data
 
     def read(self, source, *, expected_epoch="", offset_points=0):
+        from services.geometry.assigned_saved_cloud import AssignedSavedCloudHandle
+        if isinstance(source, AssignedSavedCloudHandle):
+            return self._read_assigned(source, expected_epoch=expected_epoch, offset_points=offset_points)
         from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore
 
         key = (str(source["bundle_root"]), source["backend_kind"], source["manifest_sha256"], source["frame_id"])
@@ -145,7 +204,7 @@ class SavedDenseCloudCache:
             if self._closed:
                 raise RuntimeError("完整点云读取已关闭")
             if key != self._key:
-                self._key = self._payload = self._metadata = self._epoch = None
+                self._key = self._payload = self._metadata = self._epoch = self._assigned_source = None
                 stored = MappingBackendCheckpointStore(source["bundle_root"]).load(source["backend_kind"])
                 if stored.manifest_sha256 != source["manifest_sha256"]:
                     raise ValueError("完整点云检查点与活动资产不一致")

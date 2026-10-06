@@ -540,13 +540,16 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_dense_pointcloud(
         request: Request,
         epoch: str = Query(default="", max_length=128),
+        source_epoch: str = Query(default="", max_length=4096),
         offset: int = Query(default=0, ge=0, le=2 ** 53 - 1),
         delta: bool = False,
     ) -> Response:
         try:
-            metadata, data = await run_in_threadpool(
-                lambda: runtime.get_dense_cloud_chunk(expected_epoch=epoch, offset_points=offset, **({"allow_delta": True} if delta else {})),
+            metadata, data, owner = await run_in_threadpool(
+                lambda: runtime.capture_dense_cloud_delivery(expected_epoch=epoch, offset_points=offset,
+                    expected_source_epoch=source_epoch, **({"allow_delta": True} if delta else {})),
             )
+            runtime.require_dense_cloud_delivery_current(owner)
         except Exception as error:
             changed = "DENSE_CLOUD_SOURCE_CHANGED" in str(error)
             message = getattr(error, "grpc_details", None) or str(error)

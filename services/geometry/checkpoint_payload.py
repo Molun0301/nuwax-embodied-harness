@@ -33,6 +33,13 @@ class FrozenPayload:
     def __getitem__(self, key):
         return self._data[key]
 
+    def view(self, start=0, stop=None):
+        """Return a retained read-only view without copying any payload bytes."""
+        stop = self._size if stop is None else stop
+        if type(start) is not int or type(stop) is not int or not 0 <= start <= stop <= self._size:
+            raise ValueError("payload view bounds are invalid")
+        return memoryview(self._data)[start:stop]
+
     def chunks(self):
         for offset in range(0, self._size, CHUNK_BYTES):
             yield self._data[offset:offset + CHUNK_BYTES]

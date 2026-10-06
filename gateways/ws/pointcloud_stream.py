@@ -66,7 +66,10 @@ class PointCloudTransfer:
     def __init__(self, snapshot, base, transfer_id):
         self.snapshot = snapshot
         self.identity = snapshot_identity(snapshot)
-        self.reset = base is None or any(base.get(key) != self.identity[key] for key in _IDENTITY_FIELDS)
+        assigned = snapshot.provenance.get('assigned_source')
+        self.assigned_source = ({**assigned, 'asset_identity': dict(assigned['asset_identity'])}
+                                if assigned is not None else None)
+        self.reset = self.assigned_source is not None or base is None or any(base.get(key) != self.identity[key] for key in _IDENTITY_FIELDS)
         if not self.reset and int(base['revision_ordinal']) > snapshot.revision_ordinal:
             self.reset = True
         self.base_revision = '0' if self.reset else base['revision_ordinal']
@@ -110,11 +113,13 @@ class PointCloudTransfer:
                   'chunk_size_points': self.page_points, 'base_revision_ordinal': self.base_revision,
                   'reset': self.reset, 'transfer_id': self.transfer_id,
                   'packet_index': packet_index, 'packet_count': self.packet_count,
-                  'changed_chunk_count': len(self.chunks), 'source_incremental': self.chunked,
+                  'changed_chunk_count': len(self.chunks), 'source_incremental': self.chunked and self.assigned_source is None,
                   'mapping_source_epoch': str(snapshot.provenance.get('mapping_source_epoch') or ''),
                   'chunks': [{'chunk_index': item.chunk_index, 'revision_ordinal': _u64(item.revision_ordinal),
                               'point_count': item.point_count} for item in chunks],
                   'payload_length': sum(len(item.xyz_bytes) for item in chunks)}
+        if self.assigned_source is not None:
+            header['assigned_source'] = self.assigned_source
         encoded = json.dumps(header, ensure_ascii=False, separators=(',', ':')).encode('utf8')
         # 头部尾随 JSON 空白允许浏览器直接创建对齐 Float32Array 视图。
         encoded += b' ' * (-(len(encoded) + _PREFIX.size) % 4)
@@ -219,12 +224,21 @@ def install_pointcloud_stream(router, runtime):
                     snapshot = runtime.get_pointcloud_map_snapshot()
                     ready = False
                     source_map = '' if snapshot is None else str(snapshot.provenance.get('mapping_source_epoch') or '')
-                    map_matches = not required_map_epoch or not source_map or required_map_epoch == source_map
+                    assigned = snapshot is not None and snapshot.provenance.get('assigned_source') is not None
+                    map_matches = ((bool(source_map) and (not required_map_epoch or required_map_epoch == source_map))
+                                   if assigned else not required_map_epoch or not source_map or required_map_epoch == source_map)
                     if snapshot is not None and map_matches and snapshot_identity(snapshot) != base:
                         serial += 1
                         transfer = PointCloudTransfer(snapshot, base, serial)
                 if transfer is not None and not transfer.complete:
-                    await websocket.send_bytes(transfer.next_packet())
+                    if transfer.assigned_source is not None and runtime.get_pointcloud_map_snapshot() is not transfer.snapshot:
+                        transfer, ready = None, True
+                        continue
+                    packet = transfer.next_packet()
+                    if transfer.assigned_source is not None and runtime.get_pointcloud_map_snapshot() is not transfer.snapshot:
+                        transfer, ready = None, True
+                        continue
+                    await websocket.send_bytes(packet)
                     # 即使 ASGI 立即返回，也在有界页面间让出事件循环。
                     await asyncio.sleep(0)
                     continue

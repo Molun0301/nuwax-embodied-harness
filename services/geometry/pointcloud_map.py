@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import ctypes
@@ -115,12 +115,12 @@ def _cloud_map_read_fence() -> None:
 
 @dataclass(frozen=True)
 class PointCloudMapChunk:
-    """Owned immutable XYZ for one producer-addressed page; unchanged pages are shared."""
+    """Retained immutable XYZ for one addressed page; unchanged pages are shared."""
 
     chunk_index: int
     revision_ordinal: int
     point_count: int
-    xyz_bytes: bytes
+    xyz_bytes: object
 
     def __post_init__(self) -> None:
         if self.chunk_index < 0 or self.revision_ordinal <= 0 or self.point_count <= 0:
@@ -150,6 +150,7 @@ class PointCloudMapSnapshot:
     chunk_size_points: int = 0
     base_revision_ordinal: int = 0
     reset: bool = False
+    assigned_source_owner: object = field(default=None, repr=False, compare=False)
 
     @property
     def chunked(self) -> bool:
@@ -1287,6 +1288,97 @@ class LivePointCloudMapSource(PointCloudMapSource):
         self._reader.close()
 
 
+class AssignedSavedPointCloudMapSource(PointCloudMapSource):
+    """Page the installed canonical checkpoint without PCD, hashing or a copy."""
+
+    source = "saved"
+    CHUNK_SIZE_POINTS = 1024
+    MAX_DISPLAY_BYTES = 32 * 1024 * 1024
+
+    def __init__(self, handle):
+        from services.geometry.assigned_saved_cloud import AssignedSavedCloudHandle
+        if not isinstance(handle, AssignedSavedCloudHandle):
+            raise TypeError("assigned saved pointcloud requires a runtime-captured handle")
+        self._handle = handle
+        self._lock = threading.Lock()
+        self._snapshot = None
+        self._opened = False
+        self._cancelled = False
+        self._closed = False
+
+    def open(self) -> None:
+        with self._lock:
+            if not self._closed and not self._opened:
+                self._opened = True
+
+    def _require_current(self, handle):
+        try:
+            handle.require_current()
+        except (RuntimeError, ValueError) as exc:
+            raise PointCloudMapSourceError(
+                "saved_source_changed", str(exc), source=self.source, retryable=True,
+            ) from exc
+
+    def read(self, cancel_event=None):
+        with self._lock:
+            if self._closed or self._cancelled or (cancel_event is not None and cancel_event.is_set()):
+                return None
+            handle, snapshot = self._handle, self._snapshot
+            self._opened = True
+        self._require_current(handle)
+        if snapshot is None:
+            if handle.point_count * 12 > self.MAX_DISPLAY_BYTES:
+                raise PointCloudMapSourceError(
+                    "saved_display_budget_exceeded", "assigned canonical cloud exceeds the 32 MiB display budget",
+                    source=self.source, terminal=True,
+                )
+            from services.geometry.checkpoint_payload import FrozenPayload
+            payload = handle.canonical_cloud_xyz
+            pages = []
+            for index, start in enumerate(range(0, handle.point_count, self.CHUNK_SIZE_POINTS)):
+                if self._closed or self._cancelled or (cancel_event is not None and cancel_event.is_set()):
+                    return None
+                count = min(self.CHUNK_SIZE_POINTS, handle.point_count - start)
+                # Each page is a read-only retained buffer view. Neither the
+                # runtime nor this source lock is held while accessing bodies.
+                view = (payload.view(start * 12, (start + count) * 12) if isinstance(payload, FrozenPayload)
+                        else memoryview(payload)[start * 12:(start + count) * 12])
+                pages.append(PointCloudMapChunk(index, handle.revision_ordinal, count, view))
+            snapshot = PointCloudMapSnapshot(
+                source=self.source, source_epoch=handle.source_epoch, revision=handle.source_epoch,
+                revision_ordinal=handle.revision_ordinal, frame_id=handle.frame_id,
+                source_timestamp_ns=handle.source_timestamp_ns, point_count=handle.point_count,
+                format="float32-xyz-le", xyz_bytes=b"", stream_generation=0,
+                chunks=tuple(pages), layout_generation=handle.installation_generation,
+                chunk_size_points=self.CHUNK_SIZE_POINTS, reset=True, assigned_source_owner=handle,
+                provenance={"canonical_owner": "nuwax_geometry_runtime", "canonical_revision": True,
+                            "identity_schema_version": 2, "assigned_source": handle.assigned_source,
+                            "revision_kind": "assigned_checkpoint", "map_name": handle.map_name,
+                            "source_kind": "assigned_checkpoint_canonical_cloud", "source_incremental": False,
+                            "mapping_source_epoch": handle.source_epoch,
+                            "installed_mapping_source_epoch": handle.installed_mapping_source_epoch,
+                            "asset_point_count": handle.point_count, "display_point_count": handle.point_count,
+                            "display_sampled": False, "display_sampling": "none"},
+            )
+        self._require_current(handle)
+        with self._lock:
+            if self._closed or self._cancelled or (cancel_event is not None and cancel_event.is_set()):
+                return None
+            if self._snapshot is None:
+                self._snapshot = snapshot
+            return self._snapshot
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = self._cancelled = True
+            self._opened = False
+            self._handle = self._snapshot = None
+
+
 class SavedPointCloudMapSource(PointCloudMapSource):
     """把 Geometry 保存的 PCD/PLY 资产适配为统一只读来源。"""
 
@@ -1463,6 +1555,7 @@ class PointCloudMapSourceSwitch:
         self._saved_source = saved_source
         self._active_source: Optional[str] = None
         self._active_epoch: Optional[str] = None
+        self._active_assigned_owner_key = None
         self._stream_generation = 0
         self._watermarks: Dict[Tuple[str, str], int] = {}
         self._opened = False
@@ -1516,6 +1609,7 @@ class PointCloudMapSourceSwitch:
             if self._active_source == source.source:
                 self._active_source = None
                 self._active_epoch = None
+                self._active_assigned_owner_key = None
             if not exc.retryable:
                 raise
             return None, False
@@ -1523,6 +1617,9 @@ class PointCloudMapSourceSwitch:
     def _accept(self, snapshot: PointCloudMapSnapshot) -> Optional[PointCloudMapSnapshot]:
         key = (snapshot.source, snapshot.source_epoch)
         previous = self._watermarks.get(key)
+        owner = snapshot.assigned_source_owner
+        owner_key = owner.owner_key if owner is not None else None
+        owner_changed = owner_key != self._active_assigned_owner_key
         source_changed = (
             self._active_source != snapshot.source
             or self._active_epoch != snapshot.source_epoch
@@ -1530,12 +1627,13 @@ class PointCloudMapSourceSwitch:
         if previous is not None:
             if snapshot.revision_ordinal < previous:
                 return None
-            if snapshot.revision_ordinal == previous and not source_changed:
+            if snapshot.revision_ordinal == previous and not source_changed and not owner_changed:
                 return None
         if source_changed:
             self._stream_generation += 1
             self._active_source = snapshot.source
             self._active_epoch = snapshot.source_epoch
+        self._active_assigned_owner_key = owner_key
         self._watermarks[key] = snapshot.revision_ordinal
         return replace(snapshot, stream_generation=self._stream_generation)
 
@@ -1558,3 +1656,4 @@ class PointCloudMapSourceSwitch:
             self._saved_source.close()
             self._active_source = None
             self._active_epoch = None
+            self._active_assigned_owner_key = None

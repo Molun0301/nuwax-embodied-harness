@@ -114,6 +114,7 @@ from services.geometry.pointcloud_map import (
     PointCloudMapSourceError,
     PointCloudMapSourceSwitch,
     SavedPointCloudMapSource,
+    AssignedSavedPointCloudMapSource,
 )
 from services.localization import LocalizationService
 from services.mapping import MappingService
@@ -840,11 +841,13 @@ class _GatewaySavedPointCloudMapSource(PointCloudMapSource):
         *,
         cache: PointCloudMapCache,
         default_frame_id: str,
+        assigned_source_provider=None,
     ) -> None:
         self._summary_provider = summary_provider
         self._cache = cache
         self._default_frame_id = str(default_frame_id or DEFAULT_MAP_FRAME)
-        self._delegate: Optional[SavedPointCloudMapSource] = None
+        self._assigned_source_provider = assigned_source_provider
+        self._delegate: Optional[PointCloudMapSource] = None
         self._delegate_key: Optional[Tuple[object, ...]] = None
         self._opened = False
         self._cancelled = False
@@ -861,7 +864,15 @@ class _GatewaySavedPointCloudMapSource(PointCloudMapSource):
             return None
         self.open()
         try:
+            assigned = self._assigned_source_provider() if self._assigned_source_provider else None
+            if assigned is not None:
+                key = ("assigned", assigned.owner_key)
+                if self._delegate is None or self._delegate_key != key:
+                    self._replace_delegate(AssignedSavedPointCloudMapSource(assigned), key)
+                return self._delegate.read(cancel_event)
             summary = dict(self._summary_provider() or {})
+        except PointCloudMapSourceError:
+            raise
         except Exception as exc:
             raise PointCloudMapSourceError(
                 "saved_summary_failed",
@@ -869,6 +880,10 @@ class _GatewaySavedPointCloudMapSource(PointCloudMapSource):
                 source=self.source,
                 retryable=True,
             ) from exc
+        if summary.get("identity_schema_version") == 2:
+            self._replace_delegate(None, None)
+            raise PointCloudMapSourceError("saved_assigned_unavailable",
+                "分配式保存点云缺少当前已准入拥有方。", source=self.source, retryable=True)
         path_value = summary.get("pcd_path") or summary.get("path")
         if not path_value or not bool(summary.get("available")):
             self._replace_delegate(None, None)
@@ -913,7 +928,7 @@ class _GatewaySavedPointCloudMapSource(PointCloudMapSource):
 
     def _replace_delegate(
         self,
-        delegate: Optional[SavedPointCloudMapSource],
+        delegate: Optional[PointCloudMapSource],
         delegate_key: Optional[Tuple[object, ...]],
     ) -> None:
         previous = self._delegate
@@ -945,17 +960,26 @@ class _GatewayObservedPointCloudMapSource(PointCloudMapSource):
         self,
         source: PointCloudMapSource,
         error_observer: Callable[[PointCloudMapSourceError], None],
+        snapshot_validator=None,
     ) -> None:
         self._source = source
         self.source = source.source
         self._error_observer = error_observer
+        self._snapshot_validator = snapshot_validator
+        self._last_snapshot = None
 
     def open(self) -> None:
         self._source.open()
 
     def read(self, cancel_event: Optional[threading.Event] = None) -> Optional[PointCloudMapSnapshot]:
         try:
-            return self._source.read(cancel_event)
+            snapshot = self._source.read(cancel_event)
+            candidate = snapshot if snapshot is not None else self._last_snapshot
+            if candidate is not None and self._snapshot_validator is not None:
+                self._snapshot_validator(candidate)
+            if snapshot is not None:
+                self._last_snapshot = snapshot
+            return snapshot
         except PointCloudMapSourceError as exc:
             self._error_observer(exc)
             raise
@@ -964,6 +988,7 @@ class _GatewayObservedPointCloudMapSource(PointCloudMapSource):
         self._source.cancel()
 
     def close(self) -> None:
+        self._last_snapshot = None
         self._source.close()
 
 
@@ -2094,33 +2119,91 @@ class GatewayRuntime:
     _POINTCLOUD_MAP_ERROR_BACKOFF_MAX_SEC = 2.0
     _POINTCLOUD_MAP_STOP_JOIN_TIMEOUT_SEC = 5.0
 
-    def get_dense_cloud_chunk(self, *, expected_epoch: str = "", offset_points: int = 0, allow_delta: bool = False):
-        """按当前显示来源读取完整点云，换图后的旧请求不能继续交付。"""
+    def get_dense_cloud_chunk(self, *, expected_epoch: str = "", offset_points: int = 0,
+                              allow_delta: bool = False, expected_source_epoch: str = ""):
+        """分块绑定当前显示来源；首块也不能把另一安装当作当前保存地图。"""
         if self._closed:
             raise RuntimeError("网关已关闭")
         platform = self.platform_geometry_runtime
         if platform.is_map_asset_activation_recovery_pending():
-            raise RuntimeError("地图正在激活，完整点云暂不可用")
-
-        def source_identity():
-            with self._lock:
-                snapshot = self._pointcloud_map_current_snapshot
-                return (snapshot.source, snapshot.source_epoch, snapshot.stream_generation) if snapshot is not None else None
-
-        before = source_identity()
+            raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
+        before = self.get_pointcloud_map_snapshot()
+        if expected_source_epoch and (before is None or before.source_epoch != expected_source_epoch):
+            raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
+        assigned = getattr(before, "assigned_source_owner", None)
+        if assigned is not None and expected_source_epoch != assigned.source_epoch:
+            raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
         provider = platform.get_geometry_runtime_provider()
-        if provider is not None and (before is None or before[0] == "live"):
-            result = provider.get_dense_cloud_chunk(expected_epoch=expected_epoch, offset_points=offset_points, **({"allow_delta": True} if allow_delta else {}))
+        if provider is not None and (before is None or before.source == "live"):
+            # 没有已显示快照时，不能绕过已安装 assigned 保存来源去请求其它 live 数据。
+            if before is None and platform.is_assigned_saved_cloud_selected():
+                raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
+            result = provider.get_dense_cloud_chunk(expected_epoch=expected_epoch, offset_points=offset_points,
+                **({"allow_delta": True} if allow_delta else {}))
         else:
             source = platform.get_saved_dense_cloud_source()
             if source is None:
                 raise RuntimeError("当前地图没有可读取的完整扫描数据")
-            result = self._saved_dense_cloud_cache.read(source, expected_epoch=expected_epoch, offset_points=offset_points)
-            if source != platform.get_saved_dense_cloud_source():
+            if assigned is not None:
+                if (getattr(source, "owner_key", None) != assigned.owner_key
+                        or before.source_epoch != assigned.source_epoch
+                        or before.frame_id != assigned.frame_id):
+                    raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
+                assigned.require_current()
+            elif not isinstance(source, dict):
+                # 配置 PCD/旧显示快照不能授权读取另一个 assigned 资产的 dense 数据。
                 raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
-        if self._closed or before != source_identity() or platform.is_map_asset_activation_recovery_pending():
+            result = self._saved_dense_cloud_cache.read(source, expected_epoch=expected_epoch, offset_points=offset_points)
+            if assigned is not None:
+                assigned.require_current()
+            elif source != platform.get_saved_dense_cloud_source():
+                raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
+        after = self.get_pointcloud_map_snapshot()
+        def display_identity(value):
+            return (value.source, value.source_epoch, value.stream_generation) if value is not None else None
+        changed = before is not after if assigned is not None else display_identity(before) != display_identity(after)
+        if (self._closed or changed
+                or platform.is_map_asset_activation_recovery_pending()):
             raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
-        return result
+        metadata, payload = result
+        return {**metadata, "display_source_epoch": before.source_epoch if before is not None else ""}, payload
+
+    def capture_dense_cloud_delivery(self, **arguments):
+        """保留跨 HTTP 工作线程 await 的小型 assigned 拥有方令牌。"""
+        snapshot = self.get_pointcloud_map_snapshot()
+        metadata, payload = self.get_dense_cloud_chunk(**arguments)
+        owner = snapshot if getattr(snapshot, "assigned_source_owner", None) is not None else None
+        if metadata.get("assigned_source") is not None and (owner is None
+                or metadata["assigned_source"] != owner.assigned_source_owner.assigned_source):
+            raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
+        self.require_dense_cloud_delivery_current(owner)
+        return metadata, payload, owner
+
+    def require_dense_cloud_delivery_current(self, owner):
+        if self._closed or owner is not None and self.get_pointcloud_map_snapshot() is not owner:
+            raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
+
+    def _require_pointcloud_source_current(self, snapshot):
+        platform = self.platform_geometry_runtime
+        if platform.is_map_asset_activation_recovery_pending():
+            raise PointCloudMapSourceError("activation_recovery_pending", "地图激活期间暂停点云交付。",
+                source=snapshot.source, retryable=True)
+        assigned = getattr(snapshot, "assigned_source_owner", None)
+        try:
+            if assigned is not None:
+                assigned.require_current()
+                if (snapshot.source != "saved" or snapshot.source_epoch != assigned.source_epoch
+                        or snapshot.frame_id != assigned.frame_id
+                        or snapshot.provenance.get("assigned_source") != assigned.assigned_source):
+                    raise ValueError("assigned 保存点云显示身份不一致")
+            elif platform.is_assigned_saved_cloud_selected():
+                current = platform.capture_assigned_saved_cloud_source()
+                if (snapshot.source != "live" or current is None
+                        or snapshot.provenance.get("mapping_source_epoch") != current.installed_mapping_source_epoch):
+                    raise ValueError("旧点云来源不属于当前 assigned 安装")
+        except (ValueError, RuntimeError) as error:
+            raise PointCloudMapSourceError("pointcloud_source_changed", str(error),
+                source=snapshot.source, retryable=True) from error
 
     def _observe_pointcloud_map_source_error(self, exc: PointCloudMapSourceError) -> None:
         with self._lock:
@@ -2137,14 +2220,17 @@ class GatewayRuntime:
                 frame_id=self.config.geometry.frames.map_frame,
             ),
             self._observe_pointcloud_map_source_error,
+            snapshot_validator=self._require_pointcloud_source_current,
         )
         saved_source = _GatewayObservedPointCloudMapSource(
             _GatewaySavedPointCloudMapSource(
                 self.platform_geometry_runtime.get_live_pointcloud_map_asset_summary,
                 cache=self._pointcloud_map_cache,
                 default_frame_id=self.config.geometry.frames.map_frame,
+                assigned_source_provider=self.platform_geometry_runtime.capture_assigned_saved_cloud_source,
             ),
             self._observe_pointcloud_map_source_error,
+            snapshot_validator=self._require_pointcloud_source_current,
         )
         return PointCloudMapSourceSwitch(live_source, saved_source)
 
@@ -2398,7 +2484,15 @@ class GatewayRuntime:
     def get_pointcloud_map_snapshot(self) -> Optional[PointCloudMapSnapshot]:
         """领取已经发布来源的不可变页面引用，不读取 SHM 或拼装 XYZ。"""
         with self._lock:
-            return self._pointcloud_map_current_snapshot
+            snapshot = self._pointcloud_map_current_snapshot
+        if snapshot is None:
+            return None
+        try:
+            self._require_pointcloud_source_current(snapshot)
+        except PointCloudMapSourceError:
+            return None
+        with self._lock:
+            return snapshot if self._pointcloud_map_current_snapshot is snapshot else None
 
     def _publish_pointcloud_map_snapshot(
         self,
@@ -2408,6 +2502,7 @@ class GatewayRuntime:
     ) -> None:
         if self._pointcloud_map_stream_stop.is_set():
             return
+        self._require_pointcloud_source_current(snapshot)
         identity_metadata = {
             "source": snapshot.source,
             "source_epoch": snapshot.source_epoch,
@@ -2442,6 +2537,7 @@ class GatewayRuntime:
         )
         if self._pointcloud_map_stream_stop.is_set():
             return
+        self._require_pointcloud_source_current(snapshot)
         self._publish_pointcloud_map_compatibility(snapshot, identity_metadata)
         with self._lock:
             self._pointcloud_map_last_publish_at = time.monotonic()
@@ -2453,6 +2549,7 @@ class GatewayRuntime:
     ) -> None:
         # 历史主题只发布轻量通知。完整前缀/base64 在实际旧 WS 消费者发送时才生成。
         metadata = {**identity_metadata, "legacy_pointcloud_topic": True}
+        self._require_pointcloud_source_current(snapshot)
         if snapshot.source == "saved":
             self.stream_bus.publish(
                 "pointcloud_map.meta", source="pointcloud_map_source_switch",
@@ -2469,6 +2566,7 @@ class GatewayRuntime:
                 frame_id=snapshot.frame_id, sequence=snapshot.revision_ordinal,
                 revision=snapshot.revision, status="available", metadata=dict(identity_metadata),
             )
+        self._require_pointcloud_source_current(snapshot)
         self.stream_bus.publish(
             "pointcloud_map.live_chunk" if snapshot.source == "live" else "pointcloud_map.chunk",
             source="pointcloud_map_source_switch", payload={"legacy_pointcloud_topic": True},

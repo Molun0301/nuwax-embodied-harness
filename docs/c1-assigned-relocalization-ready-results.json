@@ -1,0 +1,230 @@
+{
+  "schema_version": 1,
+  "date_utc": "2026-10-06",
+  "scope": "assigned Relocalize to canonical-owner-bound pose, public READY and coordinate-goal admission",
+  "branch": "fix/v3-legacy-cloud-seal-20261006",
+  "real_remote_parent": "8ef3c92a6a60bb4685897ee0c35e0a2a08ad88f6",
+  "base_tree": "5047fe546a151a8344c368fca38e7ccaaeef83e4",
+  "local_source_base": "ffda055c71d92108ce5c930257a08ce640701a11",
+  "local_base_is_not_remote_ancestry": true,
+  "python_passed": 74,
+  "python_failed": 0,
+  "python_results": [
+    {
+      "log": "focused-new-43.log",
+      "passed": 43,
+      "cases": [
+        "test_applied_old_request_retires_against_actual_durable_sealed_replacement (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_applied_old_request_retires_against_actual_durable_sealed_replacement)",
+        "test_authoritative_negative_query_clears_only_exact_pending_without_ready (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_authoritative_negative_query_clears_only_exact_pending_without_ready)",
+        "test_changed_correction_owner_revision_or_frame_generation_cannot_publish_ready (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_changed_correction_owner_revision_or_frame_generation_cannot_publish_ready)",
+        "test_changed_exact_terminal_in_sample_cannot_upgrade_the_durable_receipt (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_changed_exact_terminal_in_sample_cannot_upgrade_the_durable_receipt)",
+        "test_cold_restore_adopts_actual_sealed_activation_readonly_before_native_sample (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_cold_restore_adopts_actual_sealed_activation_readonly_before_native_sample)",
+        "test_cold_start_not_found_keeps_journal_and_never_activates_or_returns_pose (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_cold_start_not_found_keeps_journal_and_never_activates_or_returns_pose)",
+        "test_current_provider_mapping_owner_changed_during_sample_cannot_publish_ready (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_current_provider_mapping_owner_changed_during_sample_cannot_publish_ready)",
+        "test_dispatch_cancellation_keeps_type_and_original_request_for_exact_query (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_dispatch_cancellation_keeps_type_and_original_request_for_exact_query)",
+        "test_dispatch_phase_fsync_failure_never_dispatches_and_keeps_original_journal (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_dispatch_phase_fsync_failure_never_dispatches_and_keeps_original_journal)",
+        "test_exact_completed_request_retry_uses_retained_terminal_without_redispatch (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_exact_completed_request_retry_uses_retained_terminal_without_redispatch)",
+        "test_exact_terminal_request_source_and_ids_are_detached_and_immutable (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_exact_terminal_request_source_and_ids_are_detached_and_immutable)",
+        "test_lost_reply_exact_query_recovers_without_redispatch_or_request_rotation (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_lost_reply_exact_query_recovers_without_redispatch_or_request_rotation)",
+        "test_navigation_pose_getter_rechecks_native_sample_and_rejects_new_staleness (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_navigation_pose_getter_rechecks_native_sample_and_rejects_new_staleness)",
+        "test_pending_and_completed_request_metadata_conflicts_fail_before_any_rpc (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_pending_and_completed_request_metadata_conflicts_fail_before_any_rpc)",
+        "test_pending_not_found_and_identity_conflict_queries_keep_unknown_original_owner (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_pending_not_found_and_identity_conflict_queries_keep_unknown_original_owner)",
+        "test_prepared_caller_cannot_demote_same_request_completed_before_pending_session (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_prepared_caller_cannot_demote_same_request_completed_before_pending_session)",
+        "test_provider_replacement_during_sample_cannot_publish_ready (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_provider_replacement_during_sample_cannot_publish_ready)",
+        "test_query_same_id_with_changed_whole_request_never_releases_original_unknown (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_query_same_id_with_changed_whole_request_never_releases_original_unknown)",
+        "test_ready_publication_callback_supersession_prevents_stale_success_return (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_ready_publication_callback_supersession_prevents_stale_success_return)",
+        "test_receipt_fsync_failure_keeps_journal_and_never_reports_unproved_success (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_receipt_fsync_failure_keeps_journal_and_never_reports_unproved_success)",
+        "test_save_load_one_durable_exact_dispatch_then_native_sample_publishes_ready (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_save_load_one_durable_exact_dispatch_then_native_sample_publishes_ready)",
+        "test_session_token_captured_before_sample_prevents_late_ready_overwrite (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_session_token_captured_before_sample_prevents_late_ready_overwrite)",
+        "test_settlement_rename_cancellation_restores_exact_journal_without_overwriting_successor (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_settlement_rename_cancellation_restores_exact_journal_without_overwriting_successor)",
+        "test_shutdown_unknown_owner_queries_exactly_without_rotation_or_dispatch (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_shutdown_unknown_owner_queries_exactly_without_rotation_or_dispatch)",
+        "test_stale_same_frame_pose_never_publishes_ready_or_navigation_pose (test_assigned_workspace_relocalization.AssignedWorkspaceRelocalizationTests.test_stale_same_frame_pose_never_publishes_ready_or_navigation_pose)",
+        "test_connection_and_transition_changes_discard_sample (test_assigned_localization_sample.AssignedSampleProviderTests.test_connection_and_transition_changes_discard_sample)",
+        "test_exact_request_and_source_clock_survive_newer_current_odometry (test_assigned_localization_sample.AssignedSampleProviderTests.test_exact_request_and_source_clock_survive_newer_current_odometry)",
+        "test_foreign_provider_cannot_guard_an_admitted_native_sample (test_assigned_localization_sample.AssignedSampleProviderTests.test_foreign_provider_cannot_guard_an_admitted_native_sample)",
+        "test_missing_rpc_and_rpc_failure_do_not_use_generic_pose (test_assigned_localization_sample.AssignedSampleProviderTests.test_missing_rpc_and_rpc_failure_do_not_use_generic_pose)",
+        "test_missing_schema_geometry_and_unknown_fields_are_rejected (test_assigned_localization_sample.AssignedSampleProviderTests.test_missing_schema_geometry_and_unknown_fields_are_rejected)",
+        "test_nonfinite_and_nonunit_geometry_are_rejected (test_assigned_localization_sample.AssignedSampleProviderTests.test_nonfinite_and_nonunit_geometry_are_rejected)",
+        "test_stale_same_frame_time_and_frame_aliases_are_rejected (test_assigned_localization_sample.AssignedSampleProviderTests.test_stale_same_frame_time_and_frame_aliases_are_rejected)",
+        "test_terminal_and_correction_owner_changes_are_rejected (test_assigned_localization_sample.AssignedSampleProviderTests.test_terminal_and_correction_owner_changes_are_rejected)",
+        "test_unapplied_or_foreign_terminal_never_dispatches (test_assigned_localization_sample.AssignedSampleProviderTests.test_unapplied_or_foreign_terminal_never_dispatches)",
+        "test_admitted_sample_installs_ready_without_any_generic_provider_capture (test_assigned_localization_sample.AssignedSampleRuntimeSessionTests.test_admitted_sample_installs_ready_without_any_generic_provider_capture)",
+        "test_equal_reinstall_and_provider_replacement_after_prepare_reject (test_assigned_localization_sample.AssignedSampleRuntimeSessionTests.test_equal_reinstall_and_provider_replacement_after_prepare_reject)",
+        "test_lost_dispatch_reply_uses_same_queried_terminal_for_real_sample (test_assigned_localization_sample.AssignedSampleRuntimeSessionTests.test_lost_dispatch_reply_uses_same_queried_terminal_for_real_sample)",
+        "test_new_session_during_capture_preserves_original_cas_token (test_assigned_localization_sample.AssignedSampleRuntimeSessionTests.test_new_session_during_capture_preserves_original_cas_token)",
+        "test_provider_transition_after_prepare_rejects_guard_before_session_write (test_assigned_localization_sample.AssignedSampleRuntimeSessionTests.test_provider_transition_after_prepare_rejects_guard_before_session_write)",
+        "test_publication_callback_can_install_newer_sample_without_old_overwrite (test_assigned_localization_sample.AssignedSampleRuntimeSessionTests.test_publication_callback_can_install_newer_sample_without_old_overwrite)",
+        "test_runtime_reinstall_provider_swap_and_attach_epoch_during_rpc_reject (test_assigned_localization_sample.AssignedSampleRuntimeSessionTests.test_runtime_reinstall_provider_swap_and_attach_epoch_during_rpc_reject)",
+        "test_runtime_rejects_native_sample_returned_by_foreign_provider (test_assigned_localization_sample.AssignedSampleRuntimeSessionTests.test_runtime_rejects_native_sample_returned_by_foreign_provider)",
+        "test_same_receipts_from_different_sample_cannot_satisfy_prepared_cas (test_assigned_localization_sample.AssignedSampleRuntimeSessionTests.test_same_receipts_from_different_sample_cannot_satisfy_prepared_cas)"
+      ],
+      "sha256": "5492f7bbcec13dd14851a606a14ee7fad7aae4b22d4e13e5109790b394646f78"
+    },
+    {
+      "log": "focused-existing-journal-workspace.log",
+      "passed": 31,
+      "cases": [
+        "test_activation_retirement_fences_mutation_but_keeps_query_identity (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_activation_retirement_fences_mutation_but_keeps_query_identity)",
+        "test_applied_query_retirement_requires_actual_replacement_and_keeps_receipt (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_applied_query_retirement_requires_actual_replacement_and_keeps_receipt)",
+        "test_assigned_records_reject_legacy_mutators_and_mixed_schema (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_assigned_records_reject_legacy_mutators_and_mixed_schema)",
+        "test_atomic_write_failure_removes_temporary_file_and_preserves_prior_state (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_atomic_write_failure_removes_temporary_file_and_preserves_prior_state)",
+        "test_concurrent_activation_transition_fences_settlement (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_concurrent_activation_transition_fences_settlement)",
+        "test_concurrent_exact_begin_has_one_owner_across_threads_and_processes (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_concurrent_exact_begin_has_one_owner_across_threads_and_processes)",
+        "test_concurrent_phase_update_uses_same_guard_without_lost_terminal (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_concurrent_phase_update_uses_same_guard_without_lost_terminal)",
+        "test_dispatch_abort_requires_exact_rejection_and_unknown_owner_stays (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_dispatch_abort_requires_exact_rejection_and_unknown_owner_stays)",
+        "test_exact_and_conflicting_retry_never_redispatches_settled_request (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_exact_and_conflicting_retry_never_redispatches_settled_request)",
+        "test_legacy_pending_without_request_digest_is_readable_never_adopted (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_legacy_pending_without_request_digest_is_readable_never_adopted)",
+        "test_legacy_replacement_never_enters_digest_reconstructing_loader (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_legacy_replacement_never_enters_digest_reconstructing_loader)",
+        "test_negative_query_cannot_discard_retained_applied_terminal (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_negative_query_cannot_discard_retained_applied_terminal)",
+        "test_new_request_replaces_only_after_terminal_is_durable (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_new_request_replaces_only_after_terminal_is_durable)",
+        "test_no_parallel_journal_hash_adapter_or_source_payload_duplication (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_no_parallel_journal_hash_adapter_or_source_payload_duplication)",
+        "test_owner_validation_precedes_every_durable_mutation (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_owner_validation_precedes_every_durable_mutation)",
+        "test_partial_receipt_save_failure_keeps_applied_owner_and_retries (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_partial_receipt_save_failure_keeps_applied_owner_and_retries)",
+        "test_post_asset_replacement_and_deletion_reject_admission (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_post_asset_replacement_and_deletion_reject_admission)",
+        "test_post_replace_fsync_failure_never_authorizes_second_dispatch (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_post_replace_fsync_failure_never_authorizes_second_dispatch)",
+        "test_provider_convenience_fields_require_explicit_canonical_projection (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_provider_convenience_fields_require_explicit_canonical_projection)",
+        "test_query_misses_and_mismatched_requests_never_release_unknown (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_query_misses_and_mismatched_requests_never_release_unknown)",
+        "test_release_cleanup_failure_does_not_reopen_a_committed_tombstone (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_release_cleanup_failure_does_not_reopen_a_committed_tombstone)",
+        "test_release_fsync_rollback_preserves_both_records_then_retries (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_release_fsync_rollback_preserves_both_records_then_retries)",
+        "test_restart_reopens_exact_request_in_every_phase_and_settles (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_restart_reopens_exact_request_in_every_phase_and_settles)",
+        "test_retired_query_never_overwrites_a_newer_successful_receipt (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_retired_query_never_overwrites_a_newer_successful_receipt)",
+        "test_terminal_exactness_includes_bits_disposition_and_detail (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_terminal_exactness_includes_bits_disposition_and_detail)",
+        "test_terminal_query_release_fsync_failure_rolls_back_exact_owner (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_terminal_query_release_fsync_failure_rolls_back_exact_owner)",
+        "test_unknown_exact_negative_query_releases_without_live_owner (test_assigned_relocalization_catalog.AssignedRelocalizationCatalogTests.test_unknown_exact_negative_query_releases_without_live_owner)",
+        "test_constructor_preserves_assigned_relocalization_intent_without_legacy_abort_or_rpc (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_constructor_preserves_assigned_relocalization_intent_without_legacy_abort_or_rpc)",
+        "test_completed_restart_restore_observes_state_but_never_dispatches (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_completed_restart_restore_observes_state_but_never_dispatches)",
+        "test_public_getters_never_dispatch_refresh_or_use_legacy_session_cas (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_public_getters_never_dispatch_refresh_or_use_legacy_session_cas)",
+        "test_newly_saved_owner_lost_activation_reply_restores_exact_request_without_redispatch (test_assigned_workspace_save.AssignedWorkspaceSaveTests.test_newly_saved_owner_lost_activation_reply_restores_exact_request_without_redispatch)"
+      ],
+      "sha256": "af40ca93395be79fcd1399ceb77b5774f3de77b7a4f6fd7aa1e27f6feedaad74"
+    }
+  ],
+  "native_passed": 5,
+  "native_failed": 0,
+  "native_results": [
+    {
+      "test": "server::lifecycle_tests::assigned_v2_voxel_real_rpc_relocalizes_samples_and_admits_coordinate_goal",
+      "exit_code": 0,
+      "elapsed_seconds": 3.63,
+      "log": "/workspace/shared/neh-assigned-ready-qualification-20261006/native-new-1.log",
+      "sha256": "7ddb337951c50879fb38a7e8d02f9921e4dfd7424ca598143b87213e88d4b71d"
+    },
+    {
+      "test": "server::lifecycle_tests::assigned_v2_ray_real_rpc_relocalizes_samples_and_admits_coordinate_goal",
+      "exit_code": 0,
+      "elapsed_seconds": 3.832,
+      "log": "/workspace/shared/neh-assigned-ready-qualification-20261006/native-new-2.log",
+      "sha256": "20f377340a086daec3c97eb565818c75690d32dd351613678a8a0814b26e91e3"
+    },
+    {
+      "test": "server::lifecycle_tests::assigned_v2_voxel_export_transfer_activate_replay_and_conflicts",
+      "exit_code": 0,
+      "elapsed_seconds": 0.966,
+      "log": "/workspace/shared/neh-assigned-ready-qualification-20261006/native-prior-1.log",
+      "sha256": "4be7b2d23eaa7244941fc549c6a17ec7be073f0e273fcb0b80211b267ca09935"
+    },
+    {
+      "test": "server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts",
+      "exit_code": 0,
+      "elapsed_seconds": 0.267,
+      "log": "/workspace/shared/neh-assigned-ready-qualification-20261006/native-prior-2.log",
+      "sha256": "4a70f3d7185d4be73ec1e20c89ecd786001894e2b4bef30306fd26e31e94bf3b"
+    },
+    {
+      "test": "correction_coordinator::preflight_only_contract::tests::relocalization_postclaim_phase_a_and_response_loss_do_not_downgrade",
+      "exit_code": 0,
+      "elapsed_seconds": 5.702,
+      "log": "/workspace/shared/neh-assigned-ready-qualification-20261006/native-prior-3.log",
+      "sha256": "2376966a37c1cc19c62ca6fbff3a366bef455fde2f7a1b9806c6f92cfeedd00c"
+    }
+  ],
+  "binary_sha256": "1d3e89a919b75301394a6e326d4ae1aac5d82d83b32997e76795fe1bf279d4b2",
+  "binary_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_geometry_runtime-f475ac35a4f46ecf",
+  "source_test_sha256": {
+    "services/geometry/geometry_runtime_provider.py": "936dbfb28f2d4f95ea760c62be8e26032145e0d27bd39c030024d9bf694722d0",
+    "services/geometry/nuwax_geometry_runtime/proto/geometry_runtime.proto": "eeb0616f825d0ce6a4417509b192c2b81d05c1fb9c93d0e7304cdea06c13762c",
+    "services/geometry/nuwax_geometry_runtime/src/correction_coordinator.rs": "e219aa2eab0475f23bf9d1cdb77e91378299500b57bc02e4d34a7ea5e6e70dcd",
+    "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs": "c71c6ea19ef5fa2ba75e29f10425ab62bbaaf94cab7bdca3b09431f472bdab90",
+    "services/geometry/nuwax_geometry_runtime/src/main.rs": "1ab0e94ab3da334d37ad7cf595f3ca2c0436962cc7402bef9a89e2df4f178d98",
+    "services/geometry/nuwax_geometry_runtime/src/relocalization_identity.rs": "7fdcb6eefe8bb0c5dedcb930ea0d993e56bc742bf03ae256e3d8a22c8a9c9f9e",
+    "services/geometry/nuwax_geometry_runtime/src/rpc_runtime.rs": "75b769c93fb3e8235eec8b4ca24239e31c4ca7d60b35060038978fcee9d26d94",
+    "services/geometry/nuwax_geometry_runtime/src/server.rs": "7e92afa2f0b80f50fb8f8d33ddef1419cc453963f47f848d8a4a7e06ae373d67",
+    "services/geometry/proto_gen/geometry_runtime_pb2.py": "48939c5c53fb590be30f2e43fdb705a9cbc88b5eceae0da34c2a2cd12ff9de26",
+    "services/geometry/proto_gen/geometry_runtime_pb2_grpc.py": "65b4c60db734a54601d981102e41ed0b24456cb221bd226f85e6590d9544a9d8",
+    "services/geometry/runtime.py": "2a6644ddccde8895f4944d66ee646486533cd86eb6b9687aa35c4b69c3b3b94a",
+    "services/localization/service.py": "acdc8171ef4a734269745e2c02f5f74d9b4fea44e0bfa548757b050b00dea350",
+    "services/mapping/catalog.py": "da2f86cf403b10a9f612bffd1248e86ee82052288a3160b955ee09764ad40763",
+    "skills/assigned_map_activation.py": "b2cb9b8fd295c6e415fc107861862513ebbcd50a5996b512abdd804c2fce7895",
+    "skills/assigned_map_relocalization.py": "e3951fc08addf20eab5962d9ccd047e78a24c5e5598b4d027fabcca6d5a8922d",
+    "skills/map_workspace.py": "4a5940b9f3f23ac8c331081ee0ff4d375d45302bb6aeb795a409ee693f66f968",
+    "tests/test_assigned_localization_sample.py": "2243a9f85ed233b83fb407d1c62fdf357581849b817766fe8dac019db0882762",
+    "tests/test_assigned_workspace_relocalization.py": "9c23e0e98ee2e11368b2ad4a5ee3e751fa5a0fc8b61a5198c195db38c1da24ef"
+  },
+  "static_exit_codes": {
+    "ruff": 0,
+    "critical_ruff": 0,
+    "compile": 0,
+    "pep604": 0,
+    "layering": 0,
+    "proto": 0,
+    "diffcheck": 0
+  },
+  "static_logs": {
+    "new-files-ruff.log": {
+      "path": "/workspace/shared/neh-assigned-ready-qualification-20261006/new-files-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "critical-ruff.log": {
+      "path": "/workspace/shared/neh-assigned-ready-qualification-20261006/critical-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "compile.log": {
+      "path": "/workspace/shared/neh-assigned-ready-qualification-20261006/compile.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "pep604.log": {
+      "path": "/workspace/shared/neh-assigned-ready-qualification-20261006/pep604.log",
+      "sha256": "ccceedecc6ecb959a7c43d011070f3681484d44df7d0a962cf2e1e9bd1626ac9"
+    },
+    "layering.log": {
+      "path": "/workspace/shared/neh-assigned-ready-qualification-20261006/layering.log",
+      "sha256": "ba1570c87fc2f96b338a82375dc15a38871bf2e02d3018d21683e4259061836d"
+    },
+    "proto-check.log": {
+      "path": "/workspace/shared/neh-assigned-ready-qualification-20261006/proto-check.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff-check.log": {
+      "path": "/workspace/shared/neh-assigned-ready-qualification-20261006/diff-check.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "builds": [
+    {
+      "log": "native-build-1.log",
+      "result": "core compile passed",
+      "duration": "6m15s"
+    },
+    {
+      "log": "native-build-2.log",
+      "result": "fixture write-guard dereference compile failure retained",
+      "diagnostics": "native-build-2.jsonl"
+    },
+    {
+      "log": "native-build-3.log",
+      "result": "final compile passed",
+      "duration": "2m08s"
+    }
+  ],
+  "native_build_command": "source /workspace/shared/neh-native-20261006/project-env.sh; export REPO=\"$PWD\"; cargo test --locked --offline --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml --bin nuwax-geometry-runtime --no-run --message-format=json",
+  "sdk_rebuilt": false,
+  "independent_source_review": "cleared",
+  "limitations": [
+    "Python public tests use simulated native RPC endpoints",
+    "Native tests use real loopback tonic and real correction sink/applier but injected LCM/readiness",
+    "No robot, full navigation-stack execution, obstacle-avoidance outcome, or full-suite qualification",
+    "Coordinate goal admission is proven, not physical travel completion",
+    "PGO without explicit cloud relocalization owner stays unavailable; planar assigned activation not enabled",
+    "Mapping-cloud/place authority, exploration/floor identity and saved dense-cloud display still have unpaired legacy consumers"
+  ]
+}

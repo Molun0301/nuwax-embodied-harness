@@ -3728,6 +3728,7 @@ mod preflight_only_contract {
 
     struct ActivatedTargetReceiptInner {
         runtime_generation: u64,
+        assigned_actor_admission: std::sync::OnceLock<Arc<AtomicBool>>,
         lifecycle_epoch: AtomicU64,
         phase_a_retired: AtomicBool,
         retired_epoch: AtomicU64,
@@ -3760,6 +3761,7 @@ mod preflight_only_contract {
             Self {
                 inner: Arc::new(ActivatedTargetReceiptInner {
                     runtime_generation,
+                    assigned_actor_admission: std::sync::OnceLock::new(),
                     lifecycle_epoch: AtomicU64::new(1),
                     phase_a_retired: AtomicBool::new(false),
                     retired_epoch: AtomicU64::new(0),
@@ -3776,6 +3778,12 @@ mod preflight_only_contract {
 
         pub(crate) fn runtime_generation(&self) -> u64 {
             self.inner.runtime_generation
+        }
+
+        pub(crate) fn assigned_actor_available(&self) -> bool {
+            self.inner.assigned_actor_admission.get()
+                .is_some_and(|admission| admission.load(Ordering::Acquire))
+                && !self.inner.phase_a_retired.load(Ordering::Acquire)
         }
 
         pub(crate) fn lifecycle_epoch(&self) -> u64 {
@@ -3938,8 +3946,8 @@ mod preflight_only_contract {
         }
 
         fn sealed_target_available(record: &PermanentActivationRecord) -> bool {
-            // Relocalization has not migrated to assigned identities yet. Keep its legacy snapshot
-            // and wire proof surface closed even when a schema-2 activation has sealed correctly.
+            // Keep the legacy digest/snapshot surface closed for assigned targets.
+            // Schema 2 uses its own exact owner plus the live cloud actor capability.
             matches!(
                 record.seed.request_key,
                 ActivationRequestKey::LegacyDigest(_)
@@ -5243,6 +5251,12 @@ mod preflight_only_contract {
                         Some(TargetReceipt::Assigned(value)) => Some(value.to_wire()),
                         _ => None,
                     };
+                    state.relocalization_target_available = self.assigned_actor_available()
+                        && matches!(disposition, crate::proto::ActivationReceiptDisposition::Sealed
+                            | crate::proto::ActivationReceiptDisposition::SealedReplay)
+                        && record.epoch == self.lifecycle_epoch()
+                        && record.state == PermanentActivationState::Sealed
+                        && Self::has_complete_target_proof(record);
                 }
             }
         }
@@ -9771,7 +9785,7 @@ mod preflight_only_contract {
         Ok(transform)
     }
 
-    fn assigned_pose_isometry(pose: Option<&crate::proto::RelocalizationPoseBitsV2>) -> Result<Isometry3<f64>, String> {
+    pub(crate) fn assigned_pose_isometry(pose: Option<&crate::proto::RelocalizationPoseBitsV2>) -> Result<Isometry3<f64>, String> {
         let transform = assigned_pose_transform(pose)?;
         let [x, y, z, w] = transform.rotation_xyzw;
         let [tx, ty, tz] = transform.translation_m;
@@ -10443,6 +10457,12 @@ mod preflight_only_contract {
                     )
                 }
             };
+            if relocalization.is_some() && !planar_only {
+                // Reuse the actual cloud actor's admission state, not a second
+                // capability flag that could outlive its owner.
+                let _ = phase_a.activated_target_receipts().inner.assigned_actor_admission
+                    .set(Arc::clone(&admission_open));
+            }
             let (subscriber_shutdown_tx, subscriber_worker) = match subscription {
                 Some(subscription) => {
                     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -21680,6 +21700,7 @@ pub(crate) use preflight_only_contract::{
     relocalization_source_policy_sha256_v1, validate_relocalization_request_id,
     relocalization_source_policy_preimage_v1, relocalization_deadline_policy_preimage_v1,
     relocalization_algorithm_options_preimage_v1, normalize_relocalization_logical_timeout_ms,
+    assigned_pose_isometry, CorrectionCandidate,
     ActivatedTargetReceiptControl, ActivationJournalEntry, ActivationJournalStatus,
     ActivationJournalStep, ActivationLedgerAdmission, ActivationPublicationProof,
     ActivationReceiptSeed, ActivationToken, CanonicalCorrectionApplier,
@@ -21697,5 +21718,5 @@ pub(crate) use preflight_only_contract::{
 
 #[cfg(test)]
 pub(crate) use preflight_only_contract::{
-    CorrectionCandidate, CorrectionCandidateIdentity, CorrectionTransform, CorrectionTransformSemantics, CorrectionCandidateSink, CorrectionDisposition,
+    CorrectionCandidateIdentity, CorrectionTransform, CorrectionTransformSemantics, CorrectionCandidateSink, CorrectionDisposition,
 };

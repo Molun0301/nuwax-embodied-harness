@@ -79,6 +79,7 @@ pub struct GeometryRuntimeService {
     deferred_replay: Option<Arc<crate::lio_ingress::NativeDeferredReplayControl>>,
     activation_receipts: crate::correction_coordinator::ActivatedTargetReceiptControl,
     relocalization_ingress: Option<crate::correction_coordinator::RelocalizationCommandIngress>,
+    canonical_correction: Option<Arc<crate::lcm_runtime::GeometryCanonicalCorrectionApplier>>,
     mapping_cloud_owner: Arc<MappingCloudOwner>,
     activation_lifecycle_fence: Arc<parking_lot::Mutex<Option<ActivationLifecycleFenceSlot>>>,
     activation_checkpoint_owners: Arc<crate::activation_request::CheckpointOwnerInternerV2>,
@@ -795,6 +796,7 @@ impl GeometryRuntimeService {
                 1,
             ),
             relocalization_ingress: None,
+            canonical_correction: None,
             mapping_cloud_owner,
             activation_lifecycle_fence: Arc::new(parking_lot::Mutex::new(None)),
             activation_checkpoint_owners: Arc::new(crate::activation_request::CheckpointOwnerInternerV2::default()),
@@ -827,6 +829,13 @@ impl GeometryRuntimeService {
         let mut service = Self::new(bridge);
         service.point_cloud_binding = None;
         service
+    }
+
+    pub(crate) fn with_canonical_correction(
+        mut self, applier: Arc<crate::lcm_runtime::GeometryCanonicalCorrectionApplier>,
+    ) -> Self {
+        self.canonical_correction = Some(applier);
+        self
     }
 
     pub(crate) fn new_with_shutdown_and_point_cloud_binding(
@@ -864,6 +873,7 @@ impl GeometryRuntimeService {
             shutdown: Some(shutdown),
             activation_receipts,
             relocalization_ingress,
+            canonical_correction: None,
             mapping_cloud_owner,
             activation_lifecycle_fence: Arc::new(parking_lot::Mutex::new(None)),
             activation_checkpoint_owners: Arc::new(crate::activation_request::CheckpointOwnerInternerV2::default()),
@@ -6589,8 +6599,7 @@ impl GeometryRuntime for GeometryRuntimeService {
         &self,
         req: Request<RelocalizeRequest>,
     ) -> Result<Response<RelocalizeResult>, Status> {
-        // D2a only defines/adopts the metadata contract. Until the source,
-        // actor and terminal chain is paired, reject before legacy hashing.
+        // Schema 2 is admitted by the exact typed actor, never legacy hashing.
         crate::relocalization_identity::validate_live_request_boundary(req.get_ref())
             .map_err(Status::failed_precondition)?;
         let ingress = self
@@ -6626,6 +6635,45 @@ impl GeometryRuntime for GeometryRuntimeService {
             .await
             .map(Response::new)
             .map_err(relocalization_command_status)
+    }
+
+    async fn get_assigned_localization_sample(
+        &self, req: Request<RelocalizeRequest>,
+    ) -> Result<Response<AssignedLocalizationSampleV2>, Status> {
+        self.ensure_running_admission("GetAssignedLocalizationSample").await?;
+        let request = crate::relocalization_identity::AssignedCloudRelocalizeRequestIdentityV2::admit(req.into_inner())
+            .map_err(Status::invalid_argument)?;
+        let ingress = self.relocalization_ingress.as_ref()
+            .ok_or_else(|| Status::failed_precondition("RELOCALIZATION_OWNER_NOT_SELECTED"))?;
+        let applier = self.canonical_correction.as_ref()
+            .ok_or_else(|| Status::failed_precondition("ASSIGNED_SAMPLE_CANONICAL_OWNER_ABSENT"))?;
+        let query = crate::relocalization_terminal_v2::AssignedRelocalizationTerminalQueryV2::admit(
+            GetRelocalizationTerminalRequest {schema_version:2, request_id:request.request_id().into(),
+                assigned_request_v2:Some(request.to_wire()), ..Default::default()})
+            .map_err(Status::invalid_argument)?;
+        // The retained actor query must finish before taking its lifecycle fence.
+        let terminal = match ingress.terminal_snapshot_assigned(&query).await
+            .map_err(Status::failed_precondition)?.terminal {
+            crate::correction_coordinator::RelocalizationTerminalSnapshot::AssignedTerminal(terminal) => terminal,
+            _ => return Err(Status::failed_precondition("ASSIGNED_SAMPLE_TERMINAL_UNAVAILABLE")),
+        };
+        let _lifecycle = self.bridge.mapping_lifecycle_lock.lock().await;
+        self.ensure_running_admission("GetAssignedLocalizationSample").await?;
+        let target = self.activation_receipts.current_sealed_assigned_target_snapshot()
+            .filter(|snapshot| request.matches_target(&snapshot.target_receipt)
+                && self.activation_receipts.assigned_actor_available())
+            .ok_or_else(|| Status::failed_precondition("ASSIGNED_SAMPLE_ACTIVATION_REPLACED"))?;
+        let sample = applier.assigned_localization_sample(&terminal).await
+            .map_err(Status::failed_precondition)?;
+        // Phase A can close independently of the mapping lifecycle lock.
+        if !self.activation_receipts.assigned_actor_available()
+            || !self.activation_receipts.current_sealed_assigned_target_snapshot()
+                .is_some_and(|current| current.activation_identity == target.activation_identity
+                    && current.target_receipt == target.target_receipt
+                    && current.checkpoint_owner.shares_source_with(&target.checkpoint_owner)) {
+            return Err(Status::failed_precondition("ASSIGNED_SAMPLE_ACTIVATION_REPLACED"));
+        }
+        Ok(Response::new(sample))
     }
 
     async fn get_relocalization_terminal(
@@ -11718,10 +11766,229 @@ mod lifecycle_tests {
         assigned_artifact_request(source, reference, 5, 0, Vec::new()).await.unwrap();
     }
 
-    async fn assigned_export_transfer_activation(spec: crate::mapping_backend::MappingBackendSpec) {
+    async fn assigned_navigation_readiness(handle: &GeometryRuntimeHandle) {
+        let revision = handle.state.read().await.map.revision;
+        handle.nav.observe_stack_state(crate::lcm_runtime::NavState {
+            status:"IDLE".into(), timestamp_ns:now_ns(), ..Default::default()
+        }).await;
+        handle.nav.observe_tf_chain(crate::nav_runtime::TfChainObservation {
+            generation:1, map_frame:"map".into(), odom_frame:"odom".into(), base_frame:"base_link".into(),
+            map_to_odom:true, odom_to_base:true,
+        }).unwrap();
+        handle.nav.observe_planner_input(crate::nav_runtime::PlannerInputObservation {
+            generation:1, map_revision:revision, map_frame:"map".into(), pose_frame:"map".into(), ready:true,
+        }).unwrap();
+        handle.nav.observe_motion_sink(crate::nav_runtime::MotionSinkObservation {generation:1,ready:true}).unwrap();
+    }
+
+    async fn assigned_relocalization_navigation_slice(
+        fixture: &CanonicalResetFixture, activated: &MappingSessionState,
+        owner: &crate::correction_coordinator::CorrectionTransportOwner,
+        applier: &Arc<crate::lcm_runtime::GeometryCanonicalCorrectionApplier>,
+    ) {
+        use crate::proto::geometry_runtime_client::GeometryRuntimeClient;
+        use crate::proto::geometry_runtime_server::GeometryRuntimeServer;
+        // Exercise the generated client and tonic server over loopback. Only
+        // the LCM publisher and readiness observations are injected; the actor,
+        // source admission, sink, registration, canonical applier and goal
+        // admission are the actual production implementations.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(stream,_)|stream), listener))
+        });
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let service = fixture.service.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder().add_service(GeometryRuntimeServer::new(service))
+                .serve_with_incoming_shutdown(incoming, async {let _ = stopped.await;}).await
+        });
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            let mut client = GeometryRuntimeClient::connect(format!("http://{address}")).await.unwrap();
+            let request = RelocalizeRequest {schema_version:2, request_id:"assigned-live-first".into(),
+                assigned_target:Some(relocalize_request::AssignedTarget::AssignedCloudV2(AssignedCloudRelocalizeRequestV2 {
+                    target:activated.activation_receipt_v2.as_ref().unwrap().target.clone(),
+                    policy:activated.relocalization_policy_v2.clone(), logical_timeout_ms:30_000,
+                })), ..Default::default()};
+            let common = crate::lio_ingress::CommonLioIngress::new(
+                crate::lio_ingress::DeviceLioIngressSpec::new(1,"sensor","base_link","odom","map").unwrap());
+            common.bind_relocalization_mode_fence(owner.ingress().relocalization_mode_fence()).unwrap();
+            assert_eq!(client.get_assigned_localization_sample(request.clone()).await.unwrap_err().code(),
+                tonic::Code::FailedPrecondition, "same-frame pre-apply pose cannot establish ownership");
+            assigned_navigation_readiness(&fixture.handle).await;
+            let coordinate_goal = |id: &str, pose: Pose| NavigationGoal {
+                pose:Some(pose), frame_id:"map".into(), goal_id:id.into(),
+                motion_guard_generation:7, motion_guard_boot_nonce:vec![7;16], motion_stop_generation:1,
+                ..Default::default()
+            };
+            let unlocalized_pose = client.get_current_pose(PoseRequest::default()).await.unwrap().into_inner();
+            let blocked = client.set_navigation_goal(coordinate_goal("assigned-before-apply", unlocalized_pose)).await.unwrap().into_inner();
+            assert_eq!(blocked.status,"FAILED");
+            assert!(blocked.message.contains("等待真实定位"), "{blocked:?}");
+
+            let retained = assigned_rpc_relocalize(&mut client, fixture, owner, applier, &common, request.clone(), 1).await;
+            assert_eq!(retained.assigned_cloud_v2.as_ref().unwrap().correction_revision,1);
+            let sample = client.get_assigned_localization_sample(request.clone()).await.unwrap().into_inner();
+            assert_eq!(sample.terminal.as_ref(),Some(&retained));
+            assert_eq!(sample.schema_version,2);
+            assert_eq!(sample.correction_revision,1);
+            assert!(!fixture.handle.mapping_adapter.as_ref().unwrap().lock().checkpoint_localization_required);
+            // A lost response is settled by exact query/replay, without another apply.
+            let replay = client.relocalize(request.clone()).await.unwrap().into_inner();
+            assert_eq!(replay.encode_to_vec(),retained.encode_to_vec());
+            assert_eq!(applier.snapshot().unwrap().correction_revision,1);
+
+            let sample_pose = sample.pose.as_ref().unwrap();
+            let next_stamp = sample_pose.timestamp_ns + 1_000_000_000;
+            let moved = PoseState{x:5.0,y:2.0,z:1.0,qw:1.0,frame_id:"odom".into(),timestamp_ns:next_stamp,..Default::default()};
+            {
+                let _lifecycle = fixture.handle.mapping_lifecycle_lock.lock().await;
+                assert!(crate::lcm_runtime::handoff_lio_odometry_with_correction(&fixture.handle,&moved,"base_link",
+                    &(LcmTopic::new("/test/assigned/moving-tf").unwrap(),LcmMessageType::new("tf2_msgs.TFMessage").unwrap()),applier).await.unwrap());
+            }
+            let moving = client.get_assigned_localization_sample(request.clone()).await.unwrap().into_inner();
+            assert_eq!(moving.pose.as_ref().unwrap().timestamp_ns,next_stamp);
+            assert!((moving.pose.as_ref().unwrap().position.as_ref().unwrap().x - sample_pose.position.as_ref().unwrap().x - 1.0).abs()<1e-8);
+            assert_eq!(moving.map_from_odom.as_ref().unwrap().timestamp_ns,next_stamp);
+            assert_eq!(moving.odom_from_body.as_ref().unwrap().timestamp_ns,next_stamp);
+            // Same frame and a fresh timestamp cannot excuse inconsistent TF.
+            let saved_pose = fixture.handle.state.read().await.pose.clone();
+            fixture.handle.state.write().await.pose.x += 7.0;
+            assert_eq!(client.get_assigned_localization_sample(request.clone()).await.unwrap_err().code(),tonic::Code::FailedPrecondition);
+            fixture.handle.state.write().await.pose = saved_pose.clone();
+            fixture.handle.state.write().await.pose.timestamp_ns = sample_pose.timestamp_ns - 1;
+            assert_eq!(client.get_assigned_localization_sample(request.clone()).await.unwrap_err().code(),tonic::Code::FailedPrecondition);
+            fixture.handle.state.write().await.pose = saved_pose;
+            let saved_edge = {
+                let mut state = fixture.handle.state.write().await;
+                let saved = state.transforms.iter().find(|edge|edge.child=="odom").unwrap().clone();
+                let mut corrupt = saved.clone();corrupt.tx += 3.0;
+                crate::lcm_runtime::apply_sensor_extrinsic_locked(&mut state,&corrupt);
+                saved
+            };
+            assert_eq!(client.get_assigned_localization_sample(request.clone()).await.unwrap_err().code(),tonic::Code::FailedPrecondition);
+            {
+                let mut state = fixture.handle.state.write().await;
+                crate::lcm_runtime::apply_sensor_extrinsic_locked(&mut state,&saved_edge);
+            }
+            assert!(client.get_assigned_localization_sample(request.clone()).await.is_ok());
+
+            let mut second = request.clone();second.request_id="assigned-live-second".into();
+            let second_terminal = assigned_rpc_relocalize(&mut client, fixture, owner, applier, &common, second.clone(), 2).await;
+            assert_eq!(second_terminal.assigned_cloud_v2.as_ref().unwrap().correction_revision,2);
+            assert_eq!(client.get_assigned_localization_sample(request.clone()).await.unwrap_err().code(),tonic::Code::FailedPrecondition);
+            let correction_receipt = applier.snapshot().unwrap();
+            assert!(crate::lcm_runtime::handoff_registered_lio_cloud(&fixture.handle,
+                &[Point3::new(2.25, 1.25, 0.8)],12,next_stamp+1_000_000_000,next_stamp+1_000_000_000,"map")
+                .await.unwrap(), "ordinary mapping resumes after the real registration commit");
+            assert!(fixture.handle.state.read().await.map.revision > correction_receipt.occupancy_revision);
+            let latest = client.get_assigned_localization_sample(second.clone()).await.unwrap().into_inner();
+            assert_eq!(latest.correction_revision,2,"map advancement retains the same correction owner");
+            assigned_navigation_readiness(&fixture.handle).await;
+            let admitted = client.set_navigation_goal(coordinate_goal("assigned-coordinate-goal",latest.pose.unwrap())).await.unwrap().into_inner();
+            assert_eq!(admitted.status,"ACCEPTED","{admitted:?}");
+            {
+                let published=fixture.backend.published.lock().unwrap();
+                let frame=published.iter().find(|frame|frame.msg_type.fqn()=="nuwax_msgs.GoalEnvelope")
+                    .expect("coordinate admission publishes the existing typed goal envelope");
+                let goal=schema::decode_goal_envelope_body(&frame.payload).unwrap();
+                assert_eq!(goal.motion_guard_generation,7);
+                assert_eq!(goal.motion_guard_boot_nonce,[7;16]);
+                assert_eq!(goal.motion_stop_generation,1);
+                assert_eq!(goal.goal.header.frame_id,"map");
+                assert!(!published.iter().any(|frame|frame.msg_type.fqn()=="geometry_msgs.Twist"),
+                    "geometry admission cannot bypass the motion guard with a direct velocity");
+            }
+            // Stop retires the installed activation. Historical settlement is
+            // still readable but cannot authorize a new live sample.
+            fixture.service.activation_receipts.retire_for_mapping_change().unwrap();
+            assert_eq!(client.get_assigned_localization_sample(second).await.unwrap_err().code(),tonic::Code::FailedPrecondition);
+            let state = client.get_mapping_state(Empty {}).await.unwrap().into_inner();
+            assert!(!state.relocalization_target_available);
+        })).await;
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+        if let Err(panic)=outcome {std::panic::resume_unwind(panic);}
+    }
+
+    async fn assigned_rpc_relocalize(
+        client: &mut crate::proto::geometry_runtime_client::GeometryRuntimeClient<tonic::transport::Channel>,
+        fixture: &CanonicalResetFixture, owner: &crate::correction_coordinator::CorrectionTransportOwner,
+        applier: &Arc<crate::lcm_runtime::GeometryCanonicalCorrectionApplier>,
+        common: &crate::lio_ingress::CommonLioIngress, request:RelocalizeRequest, sequence:u64,
+    ) -> RelocalizeResult {
+        let mut request_client=client.clone();let command=request.clone();
+        let reply=tokio::spawn(async move {request_client.relocalize(command).await});
+        tokio::time::timeout(Duration::from_secs(3),async {
+            while !owner.ingress().relocalization_mode_snapshot().active {tokio::task::yield_now().await;}
+        }).await.expect("real RPC admits into actor");
+        let pose=fixture.handle.state.read().await.pose.clone();
+        let odom_stamp=pose.timestamp_ns;
+        let source_stamp=odom_stamp+1;
+        let mut odometry=schema::Odometry::default();
+        odometry.header.frame_id="odom".into();odometry.child_frame_id="base_link".into();
+        odometry.pose.position=if sequence==1 {[4.0,2.0,1.0]} else {[5.0,2.0,1.0]};
+        odometry.pose.orientation_xyzw=[0.0,0.0,0.0,1.0];
+        let envelope=common.prepare_legacy_odometry(odom_stamp.try_into().unwrap(),odometry).unwrap();
+        let identity=crate::lio_ingress::SourceIdentity {backend:envelope.backend,runtime_generation:envelope.runtime_generation,
+            source_sequence:(sequence+100).try_into().unwrap(),source_timestamp_ns:source_stamp.try_into().unwrap()};
+        let correlated=crate::lio_ingress::CorrelatedOdometry {source_sequence:envelope.source_sequence,
+            source_timestamp_ns:envelope.source_timestamp_ns};
+        common.accept_public_odometry(envelope,sequence as i64*10).unwrap();
+        let target=fixture.handle.cloud_map_writer.lock().as_ref().unwrap().committed_snapshot().unwrap();
+        let pattern=target.xyz_f32_le.chunks_exact(12).map(|p|Point3::new(
+            f32::from_le_bytes(p[0..4].try_into().unwrap()) as f64+4.0,
+            f32::from_le_bytes(p[4..8].try_into().unwrap()) as f64+2.0,
+            f32::from_le_bytes(p[8..12].try_into().unwrap()) as f64+1.0)).collect::<Vec<_>>();
+        let points=pattern.iter().cycle().take(50_000).copied().collect::<Vec<_>>();
+        let prepared=common.register_odom_points(identity,correlated,sequence as i64*10+1,points.len(),points,
+            &fixture.handle.mapping_adapter.as_ref().unwrap().lock()).unwrap();
+        let accepted=common.accept_public_cloud(prepared.encoded_for_test().as_ref(),sequence as i64*10+2).unwrap();
+        crate::lcm_runtime::handoff_registered_lio_cloud_with_correction(&fixture.handle,&accepted,&owner.ingress())
+            .await.expect("actual admitted scan reaches real sink and canonical applier");
+        // Intentionally discard the RPC response to model an unknown client
+        // outcome; recovery below only uses the exact retained terminal query.
+        drop(tokio::time::timeout(Duration::from_secs(20),reply).await.expect("real RPC settles").unwrap().unwrap());
+        let query=GetRelocalizationTerminalRequest {schema_version:2,request_id:request.request_id.clone(),
+            assigned_request_v2:Some(request),..Default::default()};
+        let recovered=client.get_relocalization_terminal(query).await.unwrap().into_inner();
+        assert_eq!(recovered.status,RelocalizationTerminalStatus::Terminal as i32,"{recovered:?}");
+        let terminal=recovered.terminal.unwrap();
+        assert_eq!(terminal.assigned_cloud_v2.as_ref().unwrap().disposition,RelocalizeDisposition::Applied as i32,"{terminal:?}");
+        assert_eq!(applier.snapshot().unwrap().correction_revision,sequence);
+        terminal
+    }
+
+    async fn assigned_export_transfer_activation(spec: crate::mapping_backend::MappingBackendSpec, paired: bool) {
         const SOURCE_NS: u64 = 1_700_000_000_123_456_789;
         let source = CanonicalResetFixture::with_backend(spec).await;
-        let destination = CanonicalResetFixture::with_backend(spec).await;
+        let mut destination = CanonicalResetFixture::with_backend(spec).await;
+        let correction = if paired {
+            let identity = crate::correction_coordinator::CorrectionOwnerRuntimeIdentity {
+                runtime_generation: 1, backend_generation: 1,
+                correction_lease: crate::correction_coordinator::CorrectionLeaseId {
+                    boot_nonce: uuid::Uuid::new_v4().as_u128(), generation: 1,
+                },
+            };
+            let spec = crate::correction_coordinator::CorrectionOwnerSpec::Relocalization {
+                map_frame_id:"map".into(), odom_frame_id:"odom".into(), body_frame_id:"base_link".into(),
+            };
+            let applier = Arc::new(crate::lcm_runtime::GeometryCanonicalCorrectionApplier::new(
+                identity.clone(), "map", "odom", "base_link", destination.handle.state.clone(),
+                destination.handle.transport.clone(),
+                (LcmTopic::new("/test/assigned/canonical-tf").unwrap(), LcmMessageType::new("tf2_msgs.TFMessage").unwrap()),
+            ).unwrap());
+            applier.bind_relocalization_mapping(&destination.handle).unwrap();
+            let sink = Arc::new(crate::correction_coordinator::GeometryCorrectionSink::new_for_spec(
+                identity.clone(), &spec, "map", "odom", "base_link", applier.clone(),
+            ).unwrap());
+            let owner = crate::correction_coordinator::CorrectionTransportOwner::start(spec, identity, "", sink)
+                .await.unwrap();
+            destination.service.activation_receipts = owner.phase_a_control().activated_target_receipts();
+            destination.service.relocalization_ingress = owner.relocalization_ingress();
+            destination.service.canonical_correction = Some(applier.clone());
+            Some((owner, applier))
+        } else { None };
         let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
             assert!(start_mapping_session(&source.service, "assigned-source", "warehouse").await.active);
             commit_checkpoint_frame_test_pose(&source.handle, SOURCE_NS - 1).await;
@@ -11729,6 +11996,9 @@ mod lifecycle_tests {
                 Point3::new(0.25, 0.25, 0.5),
                 Point3::new(0.26, 0.26, 0.51),
                 Point3::new(1.25, 0.5, 1.0),
+                Point3::new(0.5, 1.75, 0.75),
+                Point3::new(1.5, 1.5, 1.5),
+                Point3::new(-0.75, 0.5, 0.6),
             ];
             for sequence in 0..3 {
                 let timestamp = SOURCE_NS + sequence * 1_000_000_000;
@@ -11803,9 +12073,11 @@ mod lifecycle_tests {
             assert!(!activated.legacy_checkpoint_reconstructed);
             assert_eq!(activated.activation_receipt_schema_version, 2);
             assert_eq!(activated.activation_receipt_disposition, ActivationReceiptDisposition::Sealed as i32);
-            // Assigned installation is supported, but its public relocalization
-            // availability remains gated until that paired consumer is enabled.
-            assert!(!activated.relocalization_target_available);
+            assert_eq!(activated.relocalization_target_available, paired,
+                "availability requires the actual cloud relocalization actor");
+            let current = GeometryRuntime::get_mapping_state(&destination.service, Request::new(Empty {}))
+                .await.unwrap().into_inner();
+            assert_eq!(current.relocalization_target_available, paired);
             assert!(destination.service.activation_receipts.current_sealed_target_snapshot().is_none());
             assert!(activated.activation_request_identity_sha256.is_empty());
             assert!(activated.activation_identity_sha256.is_empty());
@@ -11882,7 +12154,7 @@ mod lifecycle_tests {
                     &destination.service, Request::new(assigned_wire_roundtrip(&request)),
                 ).await.unwrap().into_inner();
                 assert!(replay.success && replay.idempotent_replay);
-                assert!(!replay.relocalization_target_available);
+                assert_eq!(replay.relocalization_target_available, paired);
                 assert_eq!(replay.activation_receipt_disposition, ActivationReceiptDisposition::SealedReplay as i32);
                 assert_eq!(replay.activation_receipt_v2, activated.activation_receipt_v2);
                 assert_eq!((replay.session_generation, replay.backend_generation, replay.revision),
@@ -11945,22 +12217,37 @@ mod lifecycle_tests {
             assert_eq!(recorded_legacy_clouds(&destination.backend).len(), published_clouds);
             assert!(matches!(map_events.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
             assert!(matches!(cloud_events.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+            if let Some((owner, applier)) = correction.as_ref() {
+                assigned_relocalization_navigation_slice(&destination, &activated, owner, applier).await;
+            }
         })).await;
+        if let Some((owner, _)) = correction { owner.shutdown().await.expect("real correction owner joins"); }
         destination.finish().await;
         source.finish().await;
         if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
     }
 
-    // Native server/backend integration with injected transport only: no real
-    // LCM context, socket, sensor process or actuator resource is constructed.
+    // Native server/backend integration uses injected LCM/readiness. Paired
+    // cases additionally exercise the real generated tonic client over loopback;
+    // no real LCM context, sensor process or actuator resource is constructed.
     #[tokio::test]
     async fn assigned_v2_voxel_export_transfer_activate_replay_and_conflicts() {
-        assigned_export_transfer_activation(crate::mapping_backend::MappingBackendSpec::Voxel).await;
+        assigned_export_transfer_activation(crate::mapping_backend::MappingBackendSpec::Voxel, false).await;
     }
 
     #[tokio::test]
     async fn assigned_v2_ray_export_transfer_activate_replay_and_conflicts() {
-        assigned_export_transfer_activation(crate::mapping_backend::MappingBackendSpec::raytracing_defaults()).await;
+        assigned_export_transfer_activation(crate::mapping_backend::MappingBackendSpec::raytracing_defaults(), false).await;
+    }
+
+    #[tokio::test]
+    async fn assigned_v2_voxel_real_rpc_relocalizes_samples_and_admits_coordinate_goal() {
+        assigned_export_transfer_activation(crate::mapping_backend::MappingBackendSpec::Voxel, true).await;
+    }
+
+    #[tokio::test]
+    async fn assigned_v2_ray_real_rpc_relocalizes_samples_and_admits_coordinate_goal() {
+        assigned_export_transfer_activation(crate::mapping_backend::MappingBackendSpec::raytracing_defaults(), true).await;
     }
 
     fn assert_legacy_cloud_unbound(state: &MappingSessionState, disposition: ActivationReceiptDisposition) {

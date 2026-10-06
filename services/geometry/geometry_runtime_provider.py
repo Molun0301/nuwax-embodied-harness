@@ -44,6 +44,8 @@ from contracts.map_relocalization import (
     AssignedRelocalizationQuery,
     current_assigned_relocalization_policy,
     _project_proto as _project_assigned_proto,
+    _pose as _validate_assigned_pose_bits,
+    MAX_TERMINAL_BYTES,
 )
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
 from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
@@ -255,6 +257,110 @@ class _AssignedActivationAttempt:
                     for name, fmt in (("resolution", ">f"), ("origin_x", ">d"), ("origin_y", ">d")))
             and struct.pack(">f", original.cloud_asset["voxel_size"])
                 == struct.pack(">f", stored_checkpoint.cloud_asset["voxel_size"]))
+
+
+@dataclass(frozen=True, init=False)
+class _AssignedNativeLocalizationSample:
+    """Bounded native observation; never a generic GetCurrentPose result."""
+
+    _provider: object
+    _origin: tuple
+    _delivery_token: tuple
+    terminal: AssignedRelocalizationTerminal
+    source_timestamp_ns: int
+    correction_revision: int
+    map_frame_generation: int
+    _pose_json: str
+    _frame_tree_json: str
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError("assigned samples must come from the native observation RPC")
+
+    @property
+    def current_pose(self) -> Pose:
+        return Pose.model_validate_json(self._pose_json)
+
+    @property
+    def frame_tree(self) -> FrameTree:
+        return FrameTree.model_validate_json(self._frame_tree_json)
+
+
+def _admit_assigned_localization_sample(response, *, request, expected_terminal,
+                                        provider, origin, delivery_token):
+    """Validate only bounded wire metadata, preserving the native source clock.
+
+    The native RPC verifies current sealed target, canonical correction/source
+    lineage and pose/TF composition under its existing ownership boundaries.
+    Python does not recreate that native observation from historical evidence.
+    """
+    if type(response) is not pb2.AssignedLocalizationSampleV2:
+        raise ValueError("assigned localization sample has an unsupported protobuf type")
+    if response.ByteSize() > MAX_TERMINAL_BYTES + 4096:
+        raise ValueError("assigned localization sample exceeds its metadata budget")
+    clean = type(response)()
+    clean.CopyFrom(response)
+    clean.DiscardUnknownFields()
+    if clean.SerializeToString(deterministic=True) != response.SerializeToString(deterministic=True):
+        raise ValueError("assigned localization sample contains unknown fields")
+    if response.schema_version != 2 or any(not response.HasField(name) for name in (
+            "terminal", "pose", "map_from_odom", "odom_from_body", "correction_owner")):
+        raise ValueError("assigned localization sample is missing its native owners or geometry")
+    terminal = AssignedRelocalizationTerminal.from_proto(response.terminal)
+    if (not request.exact_replay_of(terminal.request)
+            or not expected_terminal.exact_replay_of(terminal)
+            or terminal.disposition not in _RELOCALIZE_SUCCESS_DISPOSITIONS):
+        raise ValueError("assigned localization sample differs from the retained applied terminal")
+    evidence = terminal.to_dict()["assigned_cloud_v2"]["evidence"]
+    owner, source = evidence["owner"], evidence["source_frames"][-1]
+    if (_project_assigned_proto(response.correction_owner, "owner") != owner
+            or response.correction_revision != terminal.correction_revision
+            or response.map_frame_generation != source["map_frame_generation"]):
+        raise ValueError("assigned localization sample correction owner or frame lineage differs")
+    pose, map_edge, odom_edge = response.pose, response.map_from_odom, response.odom_from_body
+    if (pose.frame_id != owner["map_frame_id"]
+            or (map_edge.parent_frame, map_edge.child_frame) != (owner["map_frame_id"], owner["odom_frame_id"])
+            or (odom_edge.parent_frame, odom_edge.child_frame) != (owner["odom_frame_id"], owner["body_frame_id"])):
+        raise ValueError("assigned localization sample frame IDs differ from the retained owner")
+    stamp = pose.timestamp_ns
+    if (not stamp or stamp != map_edge.timestamp_ns or stamp != odom_edge.timestamp_ns
+            or stamp < source["correlated_odom_source_timestamp_ns"]):
+        raise ValueError("assigned localization sample source timestamp is stale or inconsistent")
+    for geometry, position, orientation in ((pose, "position", "orientation"),
+                                            (map_edge, "translation", "rotation"),
+                                            (odom_edge, "translation", "rotation")):
+        if not geometry.HasField(position) or not geometry.HasField(orientation):
+            raise ValueError("assigned localization sample geometry is incomplete")
+        vector, quaternion = getattr(geometry, position), getattr(geometry, orientation)
+        def bits(value):
+            return struct.unpack(">Q", struct.pack(">d", value))[0]
+
+        _validate_assigned_pose_bits({
+            "translation_m_bits": [bits(getattr(vector, axis)) for axis in "xyz"],
+            "rotation_xyzw_bits": [bits(getattr(quaternion, axis)) for axis in "xyzw"],
+        }, candidate=True)
+    current_pose = _build_pose(pose)
+    if current_pose is None:
+        raise ValueError("assigned localization sample pose cannot be represented")
+    # Generic TF decoding invents receipt-time timestamps. Preserve this exact
+    # observed source time on both canonical edges and on the detached tree.
+    transforms = [Transform(
+        timestamp=current_pose.timestamp, parent_frame_id=edge.parent_frame,
+        child_frame_id=edge.child_frame,
+        translation=Vector3(x=edge.translation.x, y=edge.translation.y, z=edge.translation.z),
+        rotation=Quaternion(x=edge.rotation.x, y=edge.rotation.y, z=edge.rotation.z, w=edge.rotation.w),
+        authority="geometry_runtime_assigned",
+    ) for edge in (map_edge, odom_edge)]
+    tree = FrameTree(timestamp=current_pose.timestamp, root_frame_id=owner["map_frame_id"], transforms=transforms)
+    sample = object.__new__(_AssignedNativeLocalizationSample)
+    for name, value in {
+        "_provider": provider, "_origin": origin, "_delivery_token": delivery_token,
+        "terminal": terminal, "source_timestamp_ns": stamp,
+        "correction_revision": response.correction_revision,
+        "map_frame_generation": response.map_frame_generation,
+        "_pose_json": current_pose.model_dump_json(), "_frame_tree_json": tree.model_dump_json(),
+    }.items():
+        object.__setattr__(sample, name, value)
+    return sample
 
 
 class GeometryRuntimeMapActivationStaleRequest(RuntimeError):
@@ -7043,6 +7149,48 @@ class GeometryRuntimeProvider:
         }
 
     # === Localization ===
+    def capture_assigned_localization_sample(
+        self, *, assigned_request_v2, expected_terminal, expected_origin,
+    ) -> _AssignedNativeLocalizationSample:
+        """Read one exact-owner native pose/TF sample through a pinned stub.
+
+        No state lock spans the RPC and no alternate connection is retried.
+        Missing/unavailable samples remain failures, never raw-pose fallbacks.
+        """
+        request = (assigned_request_v2 if type(assigned_request_v2) is AssignedRelocalizationRequest
+                   else AssignedRelocalizationRequest.from_dict(assigned_request_v2))
+        if (type(expected_terminal) is not AssignedRelocalizationTerminal
+                or not request.exact_replay_of(expected_terminal.request)
+                or expected_terminal.disposition not in _RELOCALIZE_SUCCESS_DISPOSITIONS):
+            raise ValueError("assigned sample capture requires the retained applied terminal")
+        with self.assigned_activation_origin_guard(expected_origin):
+            if self._mapping_transition_inflight:
+                raise RuntimeError("assigned localization sample is unavailable during a transition")
+            token = self._map_delivery_token_locked()
+        rpc = getattr(expected_origin[0], "GetAssignedLocalizationSample", None)
+        if not callable(rpc):
+            raise RuntimeError("Geometry runtime does not support assigned localization samples")
+        try:
+            response = rpc(request.to_proto(pb2.RelocalizeRequest), timeout=_pose_deadline_sec())
+        except grpc.RpcError as exc:
+            raise GeometryRuntimeRpcError.from_rpc_error("GetAssignedLocalizationSample", exc) from exc
+        sample = _admit_assigned_localization_sample(
+            response, request=request, expected_terminal=expected_terminal,
+            provider=self, origin=expected_origin, delivery_token=token,
+        )
+        with self.assigned_localization_sample_guard(sample):
+            return sample
+
+    @contextmanager
+    def assigned_localization_sample_guard(self, sample):
+        """Existing provider-state fence; callers use R → provider → S → P."""
+        if type(sample) is not _AssignedNativeLocalizationSample or sample._provider is not self:
+            raise ValueError("assigned localization sample belongs to another provider")
+        with self.assigned_activation_origin_guard(sample._origin):
+            if self._mapping_transition_inflight or self._map_delivery_token_locked() != sample._delivery_token:
+                raise RuntimeError("assigned localization sample mapping ownership changed")
+            yield
+
     def capture_localization_sample(self):
         """Read pose/TF through one checked Python connection interval.
 

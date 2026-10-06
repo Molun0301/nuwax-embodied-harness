@@ -615,6 +615,20 @@ message RelocalizeResult {
   AssignedCloudRelocalizeResultV2 assigned_cloud_v2 = 33;
 }
 
+// A live canonical observation bound to the exact retained applied command.
+// All three timestamps come from the same current odometry observation; source
+// payloads and new identity domains are deliberately absent.
+message AssignedLocalizationSampleV2 {
+  uint32 schema_version = 1;
+  RelocalizeResult terminal = 2;
+  Pose pose = 3;
+  Transform map_from_odom = 4;
+  Transform odom_from_body = 5;
+  RelocalizationOwnerReceiptV2 correction_owner = 6;
+  uint64 correction_revision = 7;
+  uint64 map_frame_generation = 8;
+}
+
 // === 视频帧共享内存 ===
 message VideoFrameShmRef {
   string shm_path = 1;
@@ -1084,6 +1098,7 @@ service GeometryRuntime {
   rpc ActivateMap(ActivateMapRequest) returns (MappingSessionState);
   rpc Relocalize(RelocalizeRequest) returns (RelocalizeResult);
   rpc GetRelocalizationTerminal(GetRelocalizationTerminalRequest) returns (GetRelocalizationTerminalResponse);
+  rpc GetAssignedLocalizationSample(RelocalizeRequest) returns (AssignedLocalizationSampleV2);
 
   // 导航兼容（与 nuwax-nav-stack LCM channel 接口对应）
   rpc SetNavigationGoal(NavigationGoal) returns (NavigationState);

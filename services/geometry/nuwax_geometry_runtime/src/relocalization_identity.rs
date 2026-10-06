@@ -1,4 +1,4 @@
-//! Exact assigned relocalization metadata. The live actor remains gated until D2 closure.
+//! Exact assigned relocalization metadata for the paired production actor.
 //! This module never owns point/cloud payloads, allocates request IDs, or hashes content.
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -9,17 +9,16 @@ use crate::activation_request::ActivationRequestMetadataV2;
 use crate::mapping_backend::MappingBackendKind;
 use crate::proto;
 
-/// Keep live execution unavailable until the actor/source/terminal chain is paired.
-/// Called before ingress lookup so unsupported requests cannot enter legacy hashing.
-pub(crate) fn validate_live_request_boundary(request: &proto::RelocalizeRequest) -> Result<(), &'static str> {
+/// Validate the assigned boundary before ingress lookup or any legacy hashing.
+pub(crate) fn validate_live_request_boundary(request: &proto::RelocalizeRequest) -> Result<(), String> {
     if request.schema_version == 2 {
-        return Err("ASSIGNED_RELOCALIZATION_CHAIN_NOT_PAIRED");
+        return AssignedCloudRelocalizeRequestIdentityV2::admit(request.clone()).map(|_| ());
     }
     if request.schema_version != 1 {
-        return Err("RELOCALIZATION_SCHEMA_VERSION_UNSUPPORTED");
+        return Err("RELOCALIZATION_SCHEMA_VERSION_UNSUPPORTED".into());
     }
     if request.assigned_target.is_some() {
-        return Err("RELOCALIZATION_ASSIGNED_FIELDS_MIXED_WITH_LEGACY");
+        return Err("RELOCALIZATION_ASSIGNED_FIELDS_MIXED_WITH_LEGACY".into());
     }
     Ok(())
 }
@@ -217,15 +216,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn live_boundary_keeps_assigned_and_mixed_requests_out_of_legacy_actor() {
+    fn live_boundary_admits_exact_assigned_and_rejects_mixed_requests() {
         let mut request = wire();
-        assert_eq!(validate_live_request_boundary(&request), Err("ASSIGNED_RELOCALIZATION_CHAIN_NOT_PAIRED"));
+        assert_eq!(validate_live_request_boundary(&request), Ok(()));
         request.schema_version = 1;
-        assert_eq!(validate_live_request_boundary(&request), Err("RELOCALIZATION_ASSIGNED_FIELDS_MIXED_WITH_LEGACY"));
+        assert_eq!(validate_live_request_boundary(&request), Err("RELOCALIZATION_ASSIGNED_FIELDS_MIXED_WITH_LEGACY".into()));
         request.assigned_target = None;
         assert_eq!(validate_live_request_boundary(&request), Ok(()));
         request.schema_version = 3;
-        assert_eq!(validate_live_request_boundary(&request), Err("RELOCALIZATION_SCHEMA_VERSION_UNSUPPORTED"));
+        assert_eq!(validate_live_request_boundary(&request), Err("RELOCALIZATION_SCHEMA_VERSION_UNSUPPORTED".into()));
     }
 
     #[test]

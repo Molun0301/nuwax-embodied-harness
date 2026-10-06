@@ -109,7 +109,8 @@ def assigned_asset_status(owner, asset, *, is_active):
     recovering = pending is not None and pending.get('target_map_name') == asset.map_name
     values = current_components(owner, asset.model_copy(update={'active': is_active}), allow_pending=False)
     ready = bool(values and values[2].status == LocalizationSessionStatus.READY
-                 and values[2].relocalization_terminal_v2 is not None)
+                 and values[2].relocalization_terminal_v2 is not None
+                 and owner._repository.get_relocalization_intent() is None)
     metadata = dict(asset.metadata)
     metadata.pop('activation_target_manifest_sha256', None)
     metadata.update(activation_recovery_pending=recovering)
@@ -127,7 +128,8 @@ def build_assigned_workspace(owner, asset, *, publish=True):
     if values is None:
         return None
     target, snapshot, session, epoch = values
-    ready = session.status == LocalizationSessionStatus.READY and session.relocalization_terminal_v2 is not None
+    ready = (session.status == LocalizationSessionStatus.READY and session.relocalization_terminal_v2 is not None
+             and owner._repository.get_relocalization_intent() is None)
     workspace = MapWorkspace(active_map_name=asset.map_name,
         active_memory_library_name=owner._memory_service.get_active_library_name(),
         map_asset=assigned_asset_status(owner, asset, is_active=True), map_loaded=True,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import logging
 import threading
@@ -56,6 +56,7 @@ class _PreparedAssignedSessionUpdate:
     diagnostics_json: Optional[str]
     pose_json: Optional[str]
     frame_tree_json: Optional[str]
+    localization_sample: Optional[object] = None
 
 
 @dataclass(frozen=True)
@@ -243,6 +244,43 @@ class LocalizationService:
             session, refresh, force_relocalize, diagnostics_json, pose_json, frame_tree_json,
         )
 
+    def prepare_assigned_localization_update(
+        self, *, sample, expected_session: Optional[LocalizationSession],
+        expected_mutation_epoch: int, metadata: Optional[Dict[str, object]] = None,
+        geometry_asset: Optional[Dict[str, object]] = None, force_relocalize: bool = False,
+    ) -> _PreparedAssignedSessionUpdate:
+        """Prepare READY inputs only from the runtime-admitted native sample.
+
+        No generic localization-provider capture is permitted in this path.
+        Retain the caller's original session token across the sample RPC and
+        preparation; the existing short guarded CAS decides whether to install.
+        """
+        from services.geometry.runtime import _AssignedLocalizationSample
+
+        if type(sample) is not _AssignedLocalizationSample:
+            raise ValueError("assigned localization preparation requires a runtime-admitted sample")
+        pose, tree = sample.current_pose, sample.frame_tree
+        prepared = self.prepare_assigned_session_update(
+            expected_session=expected_session, expected_mutation_epoch=expected_mutation_epoch,
+            activation_receipt_v2=sample.activation_receipt,
+            relocalization_terminal_v2=sample.terminal, frame_id=pose.frame_id,
+            metadata=metadata, geometry_asset=geometry_asset, force_relocalize=force_relocalize,
+        )
+        # These facts come from the native sample's current target/correction
+        # checks. Algorithm fitness is not an invented tracking-quality score.
+        diagnostics = self._build_assigned_diagnostics(
+            provider_name="geometry_runtime_assigned", backend_type="mapping_backend",
+            current_pose=pose, session_frame_id=pose.frame_id,
+            backend_state={"tracking_state": "tracking", "map_loaded": True,
+                           "source_timestamp_ns": sample.source_timestamp_ns,
+                           "correction_revision": sample.terminal.correction_revision},
+        )
+        return replace(
+            prepared, refresh=True, localization_sample=sample,
+            pose_json=pose.model_dump_json(), frame_tree_json=tree.model_dump_json(),
+            diagnostics_json=json.dumps(_copy_assigned_session_descriptor(diagnostics.to_dict()), allow_nan=False),
+        )
+
     @staticmethod
     def _build_assigned_diagnostics(*, provider_name, backend_type, current_pose, session_frame_id, backend_state):
         from adapters.localization.geometry_state_adapter import BackendLocalizationState, compute_tracking_quality
@@ -273,6 +311,7 @@ class LocalizationService:
         guarded_activation_receipt_v2: AssignedActivationReceipt,
         guarded_relocalization_terminal_v2: Optional[AssignedRelocalizationTerminal],
         publication_scope: _AssignedSessionPublicationScope,
+        guarded_localization_sample=None,
     ) -> _AssignedSessionCommit:
         """Private R -> S -> P metadata commit; never provider/RPC/I/O/callbacks.
 
@@ -294,6 +333,7 @@ class LocalizationService:
                         or current.relocalization_terminal_v2 is not prepared.expected_terminal))
                     or type(guarded_activation_receipt_v2) is not AssignedActivationReceipt
                     or not prepared.session.activation_receipt_v2.exact_replay_of(guarded_activation_receipt_v2)
+                    or prepared.localization_sample is not guarded_localization_sample
                     or not self._same_assigned_terminal(prepared.session.relocalization_terminal_v2, guarded_relocalization_terminal_v2)):
                 return _AssignedSessionCommit(False, current, self._session_mutation_epoch, self)
             if type(self._state_machine) is not LocalizationStateMachine:

@@ -1533,12 +1533,13 @@ class MapCatalogRepository:
             if intent is None:
                 if existing != receipt:
                     raise ValueError("assigned relocalization intent/receipt is absent or differs")
+                _atomic_write_text(self._relocalization_receipt_path, json.dumps(receipt, ensure_ascii=False, indent=2))
                 return existing
             intent = self._require_assigned_relocalization_intent(request)
             if intent["phase"] != "backend_applied_pending_receipt" or intent["terminal_receipt"] != receipt:
                 raise ValueError("assigned terminal is not retained by its pending intent")
-            if existing != receipt:
-                _atomic_write_text(self._relocalization_receipt_path, json.dumps(receipt, ensure_ascii=False, indent=2))
+            # 相同可见内容也需重新确认持久化：前次 rename 后目录 fsync 可能失败。
+            _atomic_write_text(self._relocalization_receipt_path, json.dumps(receipt, ensure_ascii=False, indent=2))
             durable = self.get_last_successful_relocalization_receipt()
             if durable != receipt:
                 raise ValueError("assigned terminal receipt changed after durable write")
@@ -2154,14 +2155,21 @@ class MapCatalogRepository:
         tombstone = self._relocalization_intent_path.with_name(
             ".map_relocalization.cleared.%s" % payload["request_id"].replace(":", "_")
         )
-        os.replace(self._relocalization_intent_path, tombstone)
         try:
+            os.replace(self._relocalization_intent_path, tombstone)
             _fsync_directory(self._relocalization_intent_path.parent)
-        except Exception:
-            os.replace(tombstone, self._relocalization_intent_path)
+        except BaseException:
+            # rename 本身也可能已完成后被取消。只恢复精确原内容，link 的
+            # no-replace 语义不会覆盖并发写入的其它拥有方。
             try:
-                _fsync_directory(self._relocalization_intent_path.parent)
-            except Exception:
+                if (not self._relocalization_intent_path.exists()
+                        and not self._relocalization_intent_path.is_symlink()
+                        and tombstone.is_file() and not tombstone.is_symlink()
+                        and json.loads(tombstone.read_text(encoding="utf-8")) == payload):
+                    os.link(tombstone, self._relocalization_intent_path, follow_symlinks=False)
+                    tombstone.unlink()
+                    _fsync_directory(self._relocalization_intent_path.parent)
+            except BaseException:
                 pass
             raise
         try:

@@ -1989,7 +1989,7 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
         rpc_native_ack_binding,
         Some(lio_bindings.sensor_frame.clone()),
         relocalization_ingress,
-    );
+    ).with_canonical_correction(correction_applier);
     let mapping_cloud_owner = service.mapping_cloud_owner();
     runtime_owner = runtime_owner.with_mapping_cloud_owner(mapping_cloud_owner);
     let readiness_service = service.clone();

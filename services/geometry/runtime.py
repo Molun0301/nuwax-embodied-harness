@@ -75,6 +75,7 @@ from services.geometry.geometry_runtime_provider import (
     _exploration_child_lease_fingerprint,
     _LEGACY_ACTIVATION_IDENTITY_FIELDS,
     _assigned_mapping_predecessor,
+    _AssignedNativeLocalizationSample,
 )
 from services.geometry.loop_closure_state import read_loop_closure_from_db
 from services.geometry.checkpoint_payload import payload_chunks
@@ -313,6 +314,39 @@ class _AssignedRelocalizationQueryResult:
     def to_dict(self) -> Dict[str, object]:
         """Complete canonical response, including the whole durable request echo."""
         return json.loads(self._response_json)
+
+
+@dataclass(frozen=True, init=False)
+class _AssignedLocalizationSample:
+    """One native observation pinned to this runtime's exact installation."""
+
+    _owner: object = field(repr=False)
+    _target: _AssignedMapActivationTarget = field(repr=False)
+    _native: _AssignedNativeLocalizationSample = field(repr=False)
+    _attach_epoch: int = field(repr=False)
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError("assigned localization samples must be captured from the runtime owner")
+
+    @property
+    def terminal(self) -> AssignedRelocalizationTerminal:
+        return self._native.terminal
+
+    @property
+    def activation_receipt(self) -> AssignedActivationReceipt:
+        return self._target.activation_receipt
+
+    @property
+    def current_pose(self) -> Pose:
+        return self._native.current_pose
+
+    @property
+    def frame_tree(self):
+        return self._native.frame_tree
+
+    @property
+    def source_timestamp_ns(self) -> int:
+        return self._native.source_timestamp_ns
 
 
 def _retained_assigned_request(value) -> AssignedRelocalizationRequest:
@@ -3875,13 +3909,15 @@ class PlatformGeometryRuntime:
     def _assigned_relocalization_result_guard(
         self, result, *, assigned_request_v2,
         expected_target: _AssignedMapActivationTarget,
+        localization_sample=None,
     ) -> Iterator[Dict[str, object]]:
-        """Private future integration fence for a short metadata-only install.
+        """Private exact-installation fence for a short metadata-only install.
 
         Validate metadata before taking the existing runtime lock. The caller
         must establish localization/session lock ordering before wiring this
         primitive. While held: no RPC, asset/body I/O, map serialization,
-        callbacks, or arbitrary user work. No default caller uses this yet.
+        callbacks, or arbitrary user work. An admitted sample additionally
+        fences provider connection/transition ownership through the local CAS.
         """
         request = _retained_assigned_request(assigned_request_v2)
         terminal = _assigned_terminal_from_result(result, request)
@@ -3889,7 +3925,61 @@ class PlatformGeometryRuntime:
         with self._runtime_state_lock:
             self._require_assigned_map_activation_target_locked(
                 expected_target, request, require_available=True)
-            yield receipt
+            if localization_sample is None:
+                yield receipt
+            else:
+                self._require_assigned_localization_sample_locked(
+                    localization_sample, expected_target=expected_target, expected_terminal=terminal)
+                with localization_sample._native._provider.assigned_localization_sample_guard(localization_sample._native):
+                    yield receipt
+
+    def _require_assigned_localization_sample_locked(self, sample, *, expected_target, expected_terminal):
+        if (type(sample) is not _AssignedLocalizationSample or sample._owner is not self
+                or sample._target._snapshot is not expected_target._snapshot
+                or not sample.terminal.exact_replay_of(expected_terminal)):
+            raise ValueError("assigned localization sample differs from the exact target or terminal")
+        if (getattr(self, "_remote_provider", None) is not sample._native._provider
+                or getattr(self, "_provider_attach_epoch", 0) != sample._attach_epoch
+                or getattr(self, "_provider_attach_stopping", False)):
+            raise RuntimeError("assigned localization sample runtime provider ownership changed")
+
+    def capture_assigned_localization_sample(
+        self, *, assigned_request_v2, expected_target: _AssignedMapActivationTarget,
+        expected_terminal: AssignedRelocalizationTerminal,
+    ) -> _AssignedLocalizationSample:
+        """Capture an actual current canonical pose, not a terminal-derived pose.
+
+        The native read runs outside R. Equal reinstallations, provider swaps,
+        reconnects and mapping transitions invalidate the resulting local owner.
+        Each public pose retrieval must capture again; this is an observation,
+        not a lease on future native correction or odometry state.
+        """
+        request = _retained_assigned_request(assigned_request_v2)
+        terminal = _assigned_terminal_from_result(expected_terminal, request)
+        if terminal.disposition not in {1, 2}:
+            raise ValueError("assigned sample requires an applied relocalization terminal")
+        with self._runtime_state_lock:
+            self._require_assigned_map_activation_target_locked(expected_target, request, require_available=True)
+            provider = getattr(self, "_remote_provider", None)
+            if provider is None or getattr(self, "_provider_attach_stopping", False):
+                raise RuntimeError("assigned localization provider is unavailable")
+            origin = provider.capture_assigned_activation_origin()
+            attach_epoch = getattr(self, "_provider_attach_epoch", 0)
+        native = provider.capture_assigned_localization_sample(
+            assigned_request_v2=request, expected_terminal=terminal, expected_origin=origin)
+        if (type(native) is not _AssignedNativeLocalizationSample or native._provider is not provider
+                or native._origin[0] is not origin[0] or native._origin[1] != origin[1]
+                or not native.terminal.exact_replay_of(terminal)):
+            raise ValueError("assigned localization provider returned a foreign sample")
+        sample = object.__new__(_AssignedLocalizationSample)
+        for name, value in {"_owner": self, "_target": expected_target,
+                            "_native": native, "_attach_epoch": attach_epoch}.items():
+            object.__setattr__(sample, name, value)
+        with self._assigned_relocalization_result_guard(
+            terminal, assigned_request_v2=request, expected_target=expected_target,
+            localization_sample=sample,
+        ):
+            return sample
 
     def get_validated_assigned_relocalization_receipt(
         self, result, *, assigned_request_v2,
@@ -3897,8 +3987,8 @@ class PlatformGeometryRuntime:
     ) -> Dict[str, object]:
         """Canonical projection with an instantaneous exact-current check.
 
-        This alone does not fence a later write. A future metadata-only session
-        installation must use the private result guard after lock-order review.
+        This alone does not fence a later write. A sample-backed session
+        installation uses the private result guard and the same admitted sample.
         """
         with self._assigned_relocalization_result_guard(
             result, assigned_request_v2=assigned_request_v2,

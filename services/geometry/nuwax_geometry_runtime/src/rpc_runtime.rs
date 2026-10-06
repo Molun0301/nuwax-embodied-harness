@@ -25,6 +25,9 @@ enum GeometryRpcMethod {
     GetStatus,
     HealthCheck,
     GetCurrentPose,
+    Relocalize,
+    GetRelocalizationTerminal,
+    GetAssignedLocalizationSample,
     GetFrameTree,
     GetOccupancyGrid,
     GetOccupancyGridData,
@@ -57,6 +60,9 @@ const RPC_METHODS: &[GeometryRpcMethod] = &[
     GeometryRpcMethod::GetStatus,
     GeometryRpcMethod::HealthCheck,
     GeometryRpcMethod::GetCurrentPose,
+    GeometryRpcMethod::Relocalize,
+    GeometryRpcMethod::GetRelocalizationTerminal,
+    GeometryRpcMethod::GetAssignedLocalizationSample,
     GeometryRpcMethod::GetFrameTree,
     GeometryRpcMethod::GetOccupancyGrid,
     GeometryRpcMethod::GetOccupancyGridData,
@@ -91,6 +97,9 @@ impl GeometryRpcMethod {
             Self::GetStatus => "get_status",
             Self::HealthCheck => "health_check",
             Self::GetCurrentPose => "get_current_pose",
+            Self::Relocalize => "relocalize",
+            Self::GetRelocalizationTerminal => "get_relocalization_terminal",
+            Self::GetAssignedLocalizationSample => "get_assigned_localization_sample",
             Self::GetFrameTree => "get_frame_tree",
             Self::GetOccupancyGrid => "get_occupancy_grid",
             Self::GetOccupancyGridData => "get_occupancy_grid_data",
@@ -209,6 +218,9 @@ impl GeometryRpcHandler {
             GeometryRpcMethod::GetStatus => call_unary!(Empty, get_status),
             GeometryRpcMethod::HealthCheck => call_unary!(HealthCheckRequest, health_check),
             GeometryRpcMethod::GetCurrentPose => call_unary!(PoseRequest, get_current_pose),
+            GeometryRpcMethod::Relocalize => call_unary!(RelocalizeRequest, relocalize),
+            GeometryRpcMethod::GetRelocalizationTerminal => call_unary!(GetRelocalizationTerminalRequest, get_relocalization_terminal),
+            GeometryRpcMethod::GetAssignedLocalizationSample => call_unary!(RelocalizeRequest, get_assigned_localization_sample),
             GeometryRpcMethod::GetFrameTree => call_unary!(Empty, get_frame_tree),
             GeometryRpcMethod::GetOccupancyGrid => call_unary!(Empty, get_occupancy_grid),
             GeometryRpcMethod::GetOccupancyGridData => {
@@ -322,7 +334,8 @@ mod tests {
             .copied()
             .map(GeometryRpcMethod::rpc_name)
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 29);
+        assert_eq!(names.len(), 32);
+        assert!(names.contains(&"GeometryRuntimeService/get_assigned_localization_sample".to_string()));
         assert!(names.contains(&"GeometryRuntimeService/report_native_input_failure".to_string()));
         assert!(names.contains(&"GeometryRuntimeService/health_check".to_string()));
         assert!(names.contains(&"GeometryRuntimeService/stop".to_string()));

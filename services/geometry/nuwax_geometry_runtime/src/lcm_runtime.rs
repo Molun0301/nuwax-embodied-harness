@@ -4299,6 +4299,7 @@ pub(crate) fn apply_canonical_mapping_observation_locked(
 
 #[derive(Clone, Debug)]
 pub(crate) struct CanonicalCorrectionSnapshot {
+    pub(crate) candidate_sequence: u64,
     pub(crate) runtime_generation: u64,
     pub(crate) backend_generation: u64,
     pub(crate) backend: crate::correction_coordinator::CorrectionCandidateBackend,
@@ -4414,6 +4415,132 @@ impl GeometryCanonicalCorrectionApplier {
 
     pub(crate) fn snapshot(&self) -> Option<CanonicalCorrectionSnapshot> {
         self.current.read().clone()
+    }
+
+    /// Caller owns the existing mapping lifecycle fence. The shared-state read
+    /// precedes the correction snapshot, matching apply_transaction's commit
+    /// order. No pose is reconstructed from a historical terminal.
+    pub(crate) async fn assigned_localization_sample(
+        &self,
+        terminal: &crate::relocalization_terminal_v2::AssignedRelocalizationTerminalV2,
+    ) -> Result<crate::proto::AssignedLocalizationSampleV2, String> {
+        use crate::correction_coordinator::{assigned_pose_isometry, CorrectionCandidate, CorrectionCandidateBackend};
+        use crate::proto::{RelocalizeDisposition, Transform, Vec3, Quat, Pose};
+        let body = terminal.body();
+        if !matches!(RelocalizeDisposition::try_from(body.disposition),
+            Ok(RelocalizeDisposition::Applied | RelocalizeDisposition::AlreadyApplied)) {
+            return Err("ASSIGNED_SAMPLE_TERMINAL_NOT_APPLIED".into());
+        }
+        let candidate = CorrectionCandidate::decode_body(&body.candidate_payload_v3)
+            .map_err(|error| error.to_string())?;
+        let identity = candidate.identity();
+        let evidence = body.evidence.as_ref().ok_or("ASSIGNED_SAMPLE_EVIDENCE_ABSENT")?;
+        let owner = evidence.owner.as_ref().ok_or("ASSIGNED_SAMPLE_OWNER_ABSENT")?;
+        let source = evidence.source_frames.last().ok_or("ASSIGNED_SAMPLE_SOURCE_ABSENT")?;
+        let algorithm = evidence.algorithm.as_ref().ok_or("ASSIGNED_SAMPLE_ALGORITHM_ABSENT")?;
+        let effective = assigned_pose_isometry(source.base_anchor_map_from_odom.as_ref())?
+            * assigned_pose_isometry(algorithm.proposed_correction.as_ref())?;
+        let shared = self.state.read().await;
+        let snapshot = self.snapshot().ok_or("ASSIGNED_SAMPLE_CORRECTION_ABSENT")?;
+        if snapshot.backend != CorrectionCandidateBackend::Relocalization
+            || snapshot.runtime_generation != self.expected_identity.runtime_generation
+            || snapshot.backend_generation != self.expected_identity.backend_generation
+            || snapshot.correction_lease != self.expected_identity.correction_lease
+            || snapshot.candidate_sequence != identity.candidate_sequence
+            || snapshot.runtime_generation != identity.runtime_generation
+            || snapshot.backend_generation != identity.backend_generation
+            || snapshot.correction_lease != identity.correction_lease
+            || snapshot.mapping_session_id != identity.mapping_session_id
+            || snapshot.mapping_session_generation != identity.mapping_session_generation
+            || snapshot.map_frame_generation != identity.map_frame_generation
+            || snapshot.mapping_commit_id != identity.mapping_commit_id
+            || snapshot.occupancy_revision != identity.occupancy_revision
+            || snapshot.cloud_revision != identity.cloud_revision
+            || snapshot.source_timestamp_ns != identity.source_timestamp_ns
+            || snapshot.committed_map_source_timestamp_ns != identity.committed_map.source_timestamp_ns
+            || snapshot.map_frame_id != identity.map_frame_id
+            || snapshot.odom_frame_id != identity.odom_frame_id
+            || snapshot.body_frame_id != identity.body_frame_id
+            || snapshot.correction_revision == 0
+            || snapshot.correction_revision != body.correction_revision
+            || !canonical_isometry_near(&snapshot.effective_map_from_odom, &effective) {
+            return Err("ASSIGNED_SAMPLE_CORRECTION_REPLACED".into());
+        }
+        let mapping = self.relocalization_mapping.get().ok_or("ASSIGNED_SAMPLE_MAPPING_ABSENT")?;
+        {
+            let mapping = mapping.lock();
+            let session = mapping.snapshot();
+            let registration = mapping.map_odom_transform_snapshot()
+                .ok_or("ASSIGNED_SAMPLE_REGISTRATION_ABSENT")?;
+            let activation = &terminal.request().target().activation;
+            let receipt = mapping.latest_occupancy_commit_receipt()
+                .ok_or("ASSIGNED_SAMPLE_MAP_RECEIPT_ABSENT")?;
+            if !session.active || mapping.checkpoint_localization_required
+                || session.session_id != snapshot.mapping_session_id
+                || session.session_id != activation.request.session_id()
+                || session.map_name != activation.request.map_name()
+                || session.session_generation != snapshot.mapping_session_generation
+                || session.session_generation != activation.session_generation
+                || mapping.backend_kind() != activation.backend_kind
+                || receipt.backend_generation != activation.backend_generation
+                || mapping.global_frame_generation() != snapshot.map_frame_generation
+                || registration.generation != snapshot.map_frame_generation
+                || registration.map_frame_id != snapshot.map_frame_id
+                || registration.odom_frame_id != snapshot.odom_frame_id
+                || registration.correction_revision != snapshot.correction_revision
+                || !canonical_isometry_near(&registration.effective_isometry(), &snapshot.effective_map_from_odom) {
+                return Err("ASSIGNED_SAMPLE_MAPPING_OWNER_REPLACED".into());
+            }
+        }
+        let map_edge = shared.tf_tree.lookup(&snapshot.odom_frame_id).ok()
+            .and_then(transform_to_entry).ok_or("ASSIGNED_SAMPLE_MAP_TF_ABSENT")?;
+        let odom_edge = shared.tf_tree.lookup(&snapshot.body_frame_id).ok()
+            .and_then(transform_to_entry).ok_or("ASSIGNED_SAMPLE_ODOM_TF_ABSENT")?;
+        let pose = &shared.pose;
+        if pose.timestamp_ns == 0 || pose.timestamp_ns < identity.correlated_odom.source_timestamp_ns
+            || shared.map.frame_id != snapshot.map_frame_id
+            || pose.frame_id != snapshot.map_frame_id
+            || map_edge.parent != snapshot.map_frame_id || map_edge.child != snapshot.odom_frame_id
+            || odom_edge.parent != snapshot.odom_frame_id || odom_edge.child != snapshot.body_frame_id
+            || map_edge.stamp_ns != pose.timestamp_ns || odom_edge.stamp_ns != pose.timestamp_ns {
+            return Err("ASSIGNED_SAMPLE_POSE_OR_TF_STALE".into());
+        }
+        let isometry = |p: [f64; 3], q: [f64; 4]| -> Result<nalgebra::Isometry3<f64>, String> {
+            let norm = q.iter().map(|v| v * v).sum::<f64>();
+            if !p.into_iter().chain(q).all(f64::is_finite) || (norm - 1.0).abs() > 1e-6 {
+                return Err("ASSIGNED_SAMPLE_POSE_OR_TF_INVALID".into());
+            }
+            Ok(nalgebra::Isometry3::from_parts(nalgebra::Translation3::from(nalgebra::Vector3::from(p)),
+                nalgebra::UnitQuaternion::new_normalize(nalgebra::Quaternion::new(q[3],q[0],q[1],q[2]))))
+        };
+        let edge_isometry = |e: &TransformEntry| isometry([e.tx,e.ty,e.tz],[e.rx,e.ry,e.rz,e.rw]);
+        let map_from_odom = edge_isometry(&map_edge)?;
+        let odom_from_body = edge_isometry(&odom_edge)?;
+        let map_from_body = isometry([pose.x,pose.y,pose.z],[pose.qx,pose.qy,pose.qz,pose.qw])?;
+        if !canonical_isometry_near(&map_from_odom, &snapshot.effective_map_from_odom)
+            || !canonical_isometry_near(&map_from_body, &(map_from_odom * odom_from_body)) {
+            return Err("ASSIGNED_SAMPLE_POSE_OR_TF_INCOHERENT".into());
+        }
+        let transform = |e: TransformEntry| Transform {
+            parent_frame:e.parent, child_frame:e.child,
+            translation:Some(Vec3{x:e.tx,y:e.ty,z:e.tz}),
+            rotation:Some(Quat{x:e.rx,y:e.ry,z:e.rz,w:e.rw}), timestamp_ns:e.stamp_ns,
+        };
+        Ok(crate::proto::AssignedLocalizationSampleV2 {
+            schema_version:2, terminal:Some(terminal.to_wire()),
+            pose:Some(Pose {position:Some(Vec3{x:pose.x,y:pose.y,z:pose.z}),
+                orientation:Some(Quat{x:pose.qx,y:pose.qy,z:pose.qz,w:pose.qw}),
+                frame_id:pose.frame_id.clone(), timestamp_ns:pose.timestamp_ns}),
+            map_from_odom:Some(transform(map_edge)), odom_from_body:Some(transform(odom_edge)),
+            correction_owner:Some(crate::proto::RelocalizationOwnerReceiptV2 {
+                runtime_generation:snapshot.runtime_generation,
+                correction_backend_generation:snapshot.backend_generation,
+                correction_lease_boot_nonce:snapshot.correction_lease.boot_nonce.to_be_bytes().to_vec(),
+                correction_lease_generation:snapshot.correction_lease.generation,
+                map_frame_id:snapshot.map_frame_id, odom_frame_id:snapshot.odom_frame_id,
+                body_frame_id:snapshot.body_frame_id, relocalization_epoch:owner.relocalization_epoch,
+            }), correction_revision:snapshot.correction_revision, map_frame_generation:snapshot.map_frame_generation,
+        })
     }
 
     async fn prepare_background_pgo(
@@ -5026,6 +5153,7 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
         }
         apply_canonical_mapping_observation_locked(&mut shared, &observation);
         *self.current.write() = Some(CanonicalCorrectionSnapshot {
+            candidate_sequence: transaction.candidate_sequence,
             runtime_generation: transaction.runtime_generation,
             backend_generation: transaction.backend_generation,
             backend: transaction.backend,
@@ -16655,6 +16783,7 @@ mod mapping_feed_tests {
         );
         let old_effective = nalgebra::Isometry3::translation(2.0, 0.0, 0.0);
         *applier.current.write() = Some(CanonicalCorrectionSnapshot {
+            candidate_sequence: 1,
             runtime_generation: identity.runtime_generation,
             backend_generation: identity.backend_generation,
             backend: crate::correction_coordinator::CorrectionCandidateBackend::Relocalization,

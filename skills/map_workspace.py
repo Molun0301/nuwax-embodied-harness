@@ -141,8 +141,18 @@ class MapWorkspaceService:
         )
         pending_relocalization = self._repository.get_relocalization_intent()
         if pending_relocalization is not None and pending_relocalization.get("schema_version") == 2:
-            startup_recovery = _RelocalizationRecoveryOutcome(settled=False, state="assigned_pending",
-                request_id=pending_relocalization["request_id"], pending=pending_relocalization)
+            from skills.assigned_map_relocalization import recover_assigned_relocalization
+            try:
+                recovered = recover_assigned_relocalization(self)
+                startup_recovery = _RelocalizationRecoveryOutcome(settled=True, state="assigned_recovered",
+                    request_id=pending_relocalization["request_id"],
+                    session=recovered[0] if recovered else None, workspace=recovered[1] if recovered else None,
+                    receipt=self._repository.get_last_successful_relocalization_receipt())
+            except Exception:
+                remaining = self._repository.get_relocalization_intent()
+                startup_recovery = _RelocalizationRecoveryOutcome(settled=remaining is None,
+                    state="assigned_pending" if remaining else "assigned_terminal_rejected",
+                    request_id=pending_relocalization["request_id"], pending=remaining)
         else:
             with self._repository.map_activation_executor_guard():
                 startup_recovery = self._recover_relocalization_owner_complete_core(
@@ -1528,6 +1538,10 @@ class MapWorkspaceService:
 
     def get_relocalized_pose(self, map_name: str):
         """按当前激活结果读取功能拥有方位姿，不等待显示聚合刷新。"""
+        asset = self._repository.get_map_asset(map_name)
+        if asset is not None and asset.identity_schema_version == 2:
+            from skills.assigned_map_relocalization import get_assigned_relocalized_pose
+            return get_assigned_relocalized_pose(self, map_name)
         receipt = self._repository.get_last_successful_relocalization_receipt()
         activation = self._repository.get_last_successful_map_activation_receipt()
         if not receipt or not activation or receipt.get("map_name") != map_name:
@@ -1567,6 +1581,8 @@ class MapWorkspaceService:
         name = self._repository.get_active_map_name()
         asset = self._repository.get_map_asset(name) if name else None
         if asset is not None and asset.identity_schema_version == 2:
+            if self._repository.get_relocalization_intent() is not None:
+                return None
             from skills.assigned_map_activation import current_components
             values = current_components(self, asset)
             return values[2] if values is not None else None
@@ -2042,6 +2058,12 @@ class MapWorkspaceService:
         retained = self._retained_relocalization_terminal
         if pending is None:
             return None
+        if pending.get("schema_version") == 2:
+            from contracts.map_relocalization import AssignedRelocalizationRequest
+            request = AssignedRelocalizationRequest.from_dict(pending["assigned_request_v2"])
+            return {"schema_version": 2, "request_id": request.request_id, "phase": pending["phase"],
+                "target_map_name": request.activation_receipt.map_name,
+                "target_asset_identity": request.asset_identity.model_dump()}
         terminal = retained if retained is not None else pending.get("terminal_receipt")
         phase = (
             "backend_applied_pending_receipt"
@@ -2466,8 +2488,18 @@ class MapWorkspaceService:
             require_existing=require_existing,
         )
 
-    @_serialized_map_activation_execution
     def recover_relocalization_receipt(self) -> Optional[Dict[str, object]]:
+        pending = self._repository.get_relocalization_intent()
+        receipt = self._repository.get_last_successful_relocalization_receipt()
+        if (pending is not None and pending.get("schema_version") == 2
+                or pending is None and receipt is not None and receipt.get("schema_version") == 2):
+            from skills.assigned_map_relocalization import recover_assigned_relocalization
+            recovered = recover_assigned_relocalization(self)
+            return self._repository.get_last_successful_relocalization_receipt() if recovered else None
+        return self._recover_legacy_relocalization_receipt()
+
+    @_serialized_map_activation_execution
+    def _recover_legacy_relocalization_receipt(self) -> Optional[Dict[str, object]]:
         """完整恢复 retained owner，并返回 canonical receipt。"""
 
         outcome = self._recover_relocalization_owner_complete_core(
@@ -2483,8 +2515,18 @@ class MapWorkspaceService:
                 )
         return dict(outcome.receipt) if outcome.receipt is not None else None
 
-    @_serialized_map_activation_execution
     def shutdown_relocalization_owner(self) -> Dict[str, object]:
+        pending = self._repository.get_relocalization_intent()
+        if pending is not None and pending.get("schema_version") == 2:
+            try:
+                self.recover_relocalization_receipt()
+            except Exception:
+                return {"settled": False, "pending": self.get_relocalization_recovery_status()}
+            return {"settled": True, "pending": None}
+        return self._shutdown_legacy_relocalization_owner()
+
+    @_serialized_map_activation_execution
+    def _shutdown_legacy_relocalization_owner(self) -> Dict[str, object]:
         """关闭前通过统一 owner core 尝试完整收敛。"""
 
         try:
@@ -2506,8 +2548,18 @@ class MapWorkspaceService:
 
         return self.shutdown_relocalization_owner()
 
-    @_serialized_map_activation_execution
     def relocalize_active_map(
+        self, *, map_name: Optional[str] = None, metadata: Optional[Dict[str, object]] = None,
+    ) -> Tuple[LocalizationSession, MapWorkspace]:
+        name = self._require_map_name(map_name or self._repository.get_active_map_name() or "")
+        asset = self._repository.get_map_asset(name)
+        if asset is not None and asset.identity_schema_version == 2:
+            from skills.assigned_map_relocalization import relocalize_assigned_workspace
+            return relocalize_assigned_workspace(self, map_name=name, metadata=metadata)
+        return self._relocalize_legacy_active_map(map_name=map_name, metadata=metadata)
+
+    @_serialized_map_activation_execution
+    def _relocalize_legacy_active_map(
         self,
         *,
         map_name: Optional[str] = None,
@@ -2858,8 +2910,11 @@ class MapWorkspaceService:
             if bundle is None:
                 return None
             from skills.assigned_map_activation import activate_assigned_workspace
-            return activate_assigned_workspace(self, bundle, load_memory_history=load_memory_history,
-                                               allow_dispatch=False)
+            workspace = activate_assigned_workspace(self, bundle, load_memory_history=load_memory_history,
+                                                    allow_dispatch=False)
+            from skills.assigned_map_relocalization import recover_assigned_relocalization
+            recovered = recover_assigned_relocalization(self)
+            return recovered[1] if recovered is not None else workspace
         return self._restore_legacy_active_workspace(load_memory_history=load_memory_history)
 
     @_serialized_map_activation_execution

@@ -1261,7 +1261,10 @@ class InstanceAssociationService:
             return None
         return int(parsed)
 
-    def _mark_stale(self, instance: SemanticInstance, *, now: datetime) -> SemanticInstance:
+    def _lifecycle_values(
+        self, instance: SemanticInstance, *, now: datetime,
+    ) -> Tuple[InstanceLifecycleState, float, float, float]:
+        """只计算老化状态与本次阈值；展示读取不必复制整个实例。"""
         age_sec = max(0.0, (now - instance.last_seen_ts).total_seconds())
         lifecycle_state = InstanceLifecycleState.ACTIVE
         removed_after_sec = self._REMOVED_AFTER_SEC.get(instance.movability, 7 * 24 * 3600.0)
@@ -1277,6 +1280,12 @@ class InstanceAssociationService:
         if (instance.metadata or {}).get("pending_localization") is True:
             if lifecycle_state == InstanceLifecycleState.ACTIVE:
                 lifecycle_state = InstanceLifecycleState.UNCERTAIN
+        return lifecycle_state, uncertain_after_sec, stale_after_sec, removed_after_sec
+
+    def _mark_stale(self, instance: SemanticInstance, *, now: datetime) -> SemanticInstance:
+        lifecycle_state, uncertain_after_sec, stale_after_sec, removed_after_sec = self._lifecycle_values(
+            instance, now=now,
+        )
         if lifecycle_state == instance.lifecycle_state:
             return instance
         return instance.model_copy(

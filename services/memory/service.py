@@ -3283,10 +3283,10 @@ class MemoryService(SceneMappingMemoryMixin):
                 lifecycle_source = inst.model_copy(
                     update={"last_seen_ts": inst.last_seen_ts.replace(tzinfo=resolved_now.tzinfo)},
                 )
-            aged_instance = self._instance_association_service._mark_stale(lifecycle_source, now=resolved_now)
+            aged_state = self._instance_association_service._lifecycle_values(lifecycle_source, now=resolved_now)[0]
             # 展示时复用关联老化规则，只读派生；不能重新激活已明确失效的记录。
             lifecycle_state = max(
-                (inst.lifecycle_state, aged_instance.lifecycle_state), key=lifecycle_order.__getitem__,
+                (inst.lifecycle_state, aged_state), key=lifecycle_order.__getitem__,
             ).value
             navigable = (
                 self._coerce_optional_bool(metadata.get("navigable")) is True

@@ -829,6 +829,13 @@ class TaskManager:
             event_count = len(event_log)
         return _copy_task_value(tuple(islice(event_log, event_count)))
 
+    def get_latest_task_event(self, task_id: str) -> Optional[TaskEvent]:
+        """只复制末事件，保持完整事件读取的可见性与复制策略。"""
+        with self._lock:
+            events = self._records[task_id].events
+            event = events[-1] if events else None
+        return _copy_task_value(event)
+
     def get_task_result(self, task_id: str) -> Any:
         """获取独立任务结果。"""
         with self._lock:
@@ -1074,10 +1081,23 @@ class TaskManager:
     def list_history(self, limit: Optional[int] = None) -> Tuple[TaskStatus, ...]:
         """列出历史任务。"""
 
+        if isinstance(limit, int) and limit == 0:
+            return ()
         with self._lock:
-            history = [self._records[task_id].status for task_id in self._history_order if task_id in self._records]
-        if limit is not None:
-            history = history[-limit:]
+            if isinstance(limit, int) and limit > 0:
+                history = []
+                for task_id in reversed(self._history_order):
+                    record = self._records.get(task_id)
+                    if record is not None:
+                        history.append(record.status)
+                        if len(history) >= limit:
+                            break
+                history.reverse()
+            else:
+                history = [self._records[task_id].status for task_id in self._history_order if task_id in self._records]
+                # 保留 None 的完整读取和直接负数调用原有的前缀排除语义。
+                if limit is not None:
+                    history = history[-limit:]
         return deepcopy(tuple(history))
 
     def is_cancel_requested(self, task_id: str) -> bool:
@@ -1179,6 +1199,7 @@ class TaskManager:
                 stage="cancel_requested",
                 message=requested_message,
                 event_type="task.cancel_requested",
+                interrupt_record=record,
             )
             return True
 
@@ -1188,6 +1209,7 @@ class TaskManager:
             TaskState.CANCELLED,
             message or "任务已取消。",
             release_resources=can_release_resources,
+            interrupt_record=record,
         )
         return True
 
@@ -1217,6 +1239,38 @@ class TaskManager:
         except FutureTimeoutError as exc:
             raise TimeoutError(f"等待任务 {task_id} 超时。") from exc
 
+    @staticmethod
+    def _history_record_reclaimable(record: TaskRecord) -> bool:
+        """终态不代表运行器已退出；资源释放失败也必须保留恢复拥有方。"""
+        return (
+            record.status.state in _TERMINAL_STATES
+            and record.future is not None
+            and record.future.done()
+            and record.resources_released
+            and not record.resource_quarantined
+        )
+
+    def _transition_record_locked(
+        self, task_id: str, interrupt_record: Optional[TaskRecord],
+    ) -> Optional[TaskRecord]:
+        """仅接受原中断调用捕获的同一记录；已安全清理的迟到中断为空操作。"""
+        current = self._records.get(task_id)
+        if current is not None:
+            if interrupt_record is not None and current is not interrupt_record:
+                raise KeyError(task_id)
+            return current
+        # cancel/timeout 已在锁内捕获此对象，不以 task-id 相等接受替换记录。
+        # 普通运行器调用、未结束或未释放的原记录丢失仍是明确的错误。
+        # 显式清理同时移除历史索引；孤立索引不能冒充合法退休。
+        if (
+            interrupt_record is not None
+            and interrupt_record.spec.task_id == task_id
+            and self._history_record_reclaimable(interrupt_record)
+            and task_id not in self._history_order
+        ):
+            return None
+        raise KeyError(task_id)
+
     def cleanup_history(self, *, retain: Optional[int] = None) -> None:
         """清理超出保留数量的历史任务。"""
 
@@ -1232,15 +1286,16 @@ class TaskManager:
                 if (
                     overflow > 0
                     and record is not None
-                    and not record.resource_quarantined
+                    and self._history_record_reclaimable(record)
                 ):
                     expired.append(task_id)
                     overflow -= 1
                 else:
                     retained_order.append(task_id)
-            self._history_order = retained_order
-            for task_id in expired:
-                self._records.pop(task_id, None)
+            if expired:
+                self._history_order = retained_order
+                for task_id in expired:
+                    self._records.pop(task_id, None)
 
     def shutdown(self, *, wait: bool = True) -> None:
         """关闭任务管理器。
@@ -1634,10 +1689,11 @@ class TaskManager:
         stage: str,
         message: str,
         event_type: str,
+        interrupt_record: Optional[TaskRecord] = None,
     ) -> None:
         with self._lock:
-            record = self._records[task_id]
-            if record.status.state in _TERMINAL_STATES:
+            record = self._transition_record_locked(task_id, interrupt_record)
+            if record is None or record.status.state in _TERMINAL_STATES:
                 return
             record.status = record.status.model_copy(
                 update={
@@ -1659,6 +1715,7 @@ class TaskManager:
         error: Optional[str] = None,
         error_payload: Optional[MetadataDict] = None,
         release_resources: bool = True,
+        interrupt_record: Optional[TaskRecord] = None,
     ) -> None:
         owned_error_payload, error_issue = _own_task_payload(error_payload or {})
         terminal_error_payload = dict(owned_error_payload)
@@ -1669,8 +1726,8 @@ class TaskManager:
         if error_category is not None:
             terminal_error_payload.setdefault("error_category", error_category)
         with self._lock:
-            record = self._records[task_id]
-            if record.status.state in _TERMINAL_STATES:
+            record = self._transition_record_locked(task_id, interrupt_record)
+            if record is None or record.status.state in _TERMINAL_STATES:
                 return
             now = utc_now()
             record.status = record.status.model_copy(
@@ -1824,6 +1881,7 @@ class TaskManager:
                 stage="timeout_pending_stop",
                 message="任务已超时，等待任务确认安全停止。",
                 event_type="task.timeout_requested",
+                interrupt_record=record,
             )
             return
         can_release_resources = cancelled_before_start or bool(future and future.done())
@@ -1832,6 +1890,7 @@ class TaskManager:
             TaskState.TIMEOUT,
             "任务执行超时。",
             release_resources=can_release_resources,
+            interrupt_record=record,
         )
 
     def _release_resources(

@@ -438,9 +438,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._navigationLocalPath = [];
     this._navigationGoal = null;
     this._semanticInstances = [];
-    this._semanticRenderKey = null;
+    this._semanticRecords = [];
     this._semanticInstancesVisible = true;
-    this._semanticOwnedResources = [];
     this._semanticMarkerGeometry = null;
     this._semanticPreciseMaterial = null;
     this._semanticFallbackMaterial = null;
@@ -1621,16 +1620,25 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._requestRender();
   }
 
-  _trackSemanticResource(resource) {
-    if (resource) this._semanticOwnedResources.push(resource);
-    return resource;
+  _disposeSemanticLabel(label) {
+    if (!label) return;
+    label.material.map?.dispose();
+    label.material.dispose();
+  }
+
+  _disposeSemanticRecord(record) {
+    record.marker.removeFromParent();
+    record.stem?.removeFromParent();
+    record.stem?.geometry.dispose();
+    record.stem?.material.dispose();
+    record.label?.removeFromParent();
+    this._disposeSemanticLabel(record.label);
   }
 
   _clearSemanticInstances() {
     this._semanticGroup?.clear();
-    for (const resource of this._semanticOwnedResources) resource.dispose?.();
-    this._semanticOwnedResources = [];
-    this._semanticRenderKey = null;
+    for (const record of this._semanticRecords) this._disposeSemanticRecord(record);
+    this._semanticRecords = [];
   }
 
   _syncSemanticGroupVisibility(distance = this._cameraDistance()) {
@@ -1717,11 +1725,13 @@ class PointCloud3DViewer extends PointCloudProcessor {
     ctx.closePath();
   }
 
-  _createSemanticLabelSprite(instance, fallback, z) {
-    if (typeof document === 'undefined') return null;
+  _semanticLabelName(instance) {
     const name = String(instance.display_name || instance.label || '物品').trim() || '物品';
-    const shortName = name.length > 12 ? `${name.slice(0, 11)}…` : name;
-    const label = `${shortName} · z ${z.toFixed(2)}m`;
+    return name.length > 12 ? `${name.slice(0, 11)}…` : name;
+  }
+
+  _createSemanticLabelSprite(label, fallback) {
+    if (typeof document === 'undefined') return null;
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     if (!ctx) return null;
@@ -1741,13 +1751,13 @@ class PointCloud3DViewer extends PointCloudProcessor {
     ctx.textBaseline = 'middle';
     ctx.fillText(label, canvas.width / 2, canvas.height / 2 + 1);
 
-    const texture = this._trackSemanticResource(new THREE.CanvasTexture(canvas));
+    const texture = new THREE.CanvasTexture(canvas);
     if ('colorSpace' in texture) texture.colorSpace = THREE.SRGBColorSpace;
-    const material = this._trackSemanticResource(new THREE.SpriteMaterial({
+    const material = new THREE.SpriteMaterial({
       map: texture,
       transparent: true,
       depthTest: false,
-    }));
+    });
     const sprite = new THREE.Sprite(material);
     const width = THREE.MathUtils.clamp(canvas.width / 150, 1.25, 2.8);
     sprite.scale.set(width, 0.36, 1);
@@ -1757,21 +1767,35 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   _rebuildSemanticInstances() {
     if (!this._semanticGroup) return;
-    const renderKey = JSON.stringify(this._semanticInstances.map(instance => [
-      instance.instance_id, instance.pose, instance.display_name, instance.label,
-      instance.frame_id, instance.is_fallback, instance.observation_only, instance.projection_method,
-    ]));
-    if (renderKey === this._semanticRenderKey) {
-      // 观察次数、时间及置信度更新只替换选择数据，复用几何和标签纹理。
-      const byId = new Map(this._semanticInstances.map(instance => [instance.instance_id, instance]));
-      for (const child of this._semanticGroup.children) {
-        if (child.userData.semanticInstance) child.userData.semanticInstance = byId.get(child.userData.semanticInstance.instance_id);
+    // New observation objects usually change only metadata. Compare the saved
+    // display primitives before allocating ID buckets or formatting every z.
+    if (this._semanticRecords.length === this._semanticInstances.length) {
+      let unchanged = true;
+      for (let index = 0; index < this._semanticRecords.length; index++) {
+        const record = this._semanticRecords[index];
+        const instance = this._semanticInstances[index];
+        const pose = instance?.pose;
+        if (!pose || record.id !== instance.instance_id
+          || record.x !== pose.x || record.y !== pose.y || record.z !== pose.z
+          || instance.observation_only || instance.projection_method === 'current_pose_fallback'
+          || record.fallback !== (Boolean(instance.is_fallback) || String(instance.frame_id || 'map') !== 'map')
+          || record.labelName !== this._semanticLabelName(instance)) {
+          unchanged = false;
+          break;
+        }
+        record.marker.userData.semanticInstance = instance;
+        if (record.label) record.label.userData.semanticInstance = instance;
       }
-      return;
+      if (unchanged) return;
     }
-    this._clearSemanticInstances();
-    this._semanticRenderKey = renderKey;
-    this._syncSemanticGroupVisibility();
+    const available = new Map();
+    for (const record of this._semanticRecords) {
+      let bucket = available.get(record.id);
+      if (!bucket) available.set(record.id, bucket = { records: [], used: 0 });
+      bucket.records.push(record);
+    }
+    const next = [];
+    let changed = false;
     for (const instance of this._semanticInstances) {
       const pose = instance?.pose;
       // 坐标必须来自完整地图位置，空值不能经 Number(null) 变成原点。
@@ -1779,39 +1803,121 @@ class PointCloud3DViewer extends PointCloudProcessor {
       const { x, y, z } = pose;
       if (instance.observation_only || instance.projection_method === 'current_pose_fallback') continue;
       const fallback = Boolean(instance.is_fallback) || String(instance.frame_id || 'map') !== 'map';
-      const marker = new THREE.Mesh(
-        this._semanticMarkerGeometry,
-        fallback ? this._semanticFallbackMaterial : this._semanticPreciseMaterial,
-      );
-      marker.position.set(x, y, z + 0.16);
-      marker.userData.semanticInstance = instance;
-      marker.userData.semanticMarker = true;
-      marker.userData.semanticSelectable = true;
-      this._semanticGroup.add(marker);
+      const labelName = this._semanticLabelName(instance);
+      const labelText = `${labelName} · z ${z.toFixed(2)}m`;
+      const bucket = available.get(instance.instance_id);
+      let record = bucket?.records[bucket.used++];
+      if (!record) {
+        const marker = new THREE.Mesh(this._semanticMarkerGeometry,
+          fallback ? this._semanticFallbackMaterial : this._semanticPreciseMaterial);
+        marker.userData.semanticMarker = true;
+        marker.userData.semanticSelectable = true;
+        this._semanticGroup.add(marker);
+        record = { id: instance.instance_id, marker, stem: null, label: null };
+        changed = true;
+      }
+      const moved = record.x !== x || record.y !== y || record.z !== z;
+      const restyled = record.fallback !== fallback;
+      if (moved) record.marker.position.set(x, y, z + 0.16);
+      if (restyled) record.marker.material = fallback ? this._semanticFallbackMaterial : this._semanticPreciseMaterial;
+      record.marker.userData.semanticInstance = instance;
 
       if (z > 0.05) {
-        const stemGeometry = this._trackSemanticResource(
-          new THREE.BufferGeometry().setFromPoints([
-            new THREE.Vector3(x, y, 0.02),
-            new THREE.Vector3(x, y, z),
-          ]),
-        );
-        const stemMaterial = this._trackSemanticResource(new THREE.LineBasicMaterial({
-          color: fallback ? COLORS.semanticFallback : COLORS.semantic,
-          transparent: true,
-          opacity: fallback ? 0.45 : 0.72,
-        }));
-        this._semanticGroup.add(new THREE.Line(stemGeometry, stemMaterial));
+        if (!record.stem) {
+          record.stem = new THREE.Line(new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(x, y, 0.02), new THREE.Vector3(x, y, z),
+          ]), new THREE.LineBasicMaterial({
+            color: fallback ? COLORS.semanticFallback : COLORS.semantic,
+            transparent: true, opacity: fallback ? 0.45 : 0.72,
+          }));
+          this._semanticGroup.add(record.stem);
+        } else {
+          if (moved) {
+            const geometry = record.stem.geometry;
+            geometry.attributes.position.setXYZ(0, x, y, 0.02);
+            geometry.attributes.position.setXYZ(1, x, y, z);
+            geometry.attributes.position.needsUpdate = true;
+            geometry.computeBoundingSphere();
+            if (geometry.boundingBox) geometry.computeBoundingBox();
+          }
+          if (restyled) {
+            record.stem.material.color.set(fallback ? COLORS.semanticFallback : COLORS.semantic);
+            record.stem.material.opacity = fallback ? 0.45 : 0.72;
+          }
+        }
+      } else if (record.stem) {
+        record.stem.removeFromParent();
+        record.stem.geometry.dispose();
+        record.stem.material.dispose();
+        record.stem = null;
       }
-
-      const label = this._createSemanticLabelSprite(instance, fallback, z);
-      if (label) {
-        label.position.set(x, y, z + 0.48);
-        label.userData.semanticInstance = instance;
-        label.userData.semanticSelectable = true;
-        this._semanticGroup.add(label);
+      if (record.labelText !== labelText || restyled || (moved && !record.label)) {
+        const label = this._createSemanticLabelSprite(labelText, fallback);
+        this._disposeSemanticLabel(record.label);
+        if (record.label && label) {
+          // Keep sprite identity (and equal-depth sort order) for a text-only edit.
+          record.label.material = label.material;
+          record.label.scale.copy(label.scale);
+        } else {
+          record.label?.removeFromParent();
+          record.label = label;
+          if (label) this._semanticGroup.add(label);
+        }
+        changed = true;
+      }
+      if (record.label) {
+        record.label.position.set(x, y, z + 0.48);
+        record.label.userData.semanticInstance = instance;
+        record.label.userData.semanticSelectable = true;
+      }
+      changed ||= moved || restyled || this._semanticRecords[next.length] !== record;
+      Object.assign(record, { x, y, z, fallback, labelName, labelText });
+      next.push(record);
+    }
+    for (const bucket of available.values()) {
+      for (let index = bucket.used; index < bucket.records.length; index++) {
+        this._disposeSemanticRecord(bucket.records[index]);
+        changed = true;
       }
     }
+    this._semanticRecords = next;
+    if (!changed) return; // Selection data is current even on metadata-only updates.
+
+    // Three breaks equal-depth ties with immutable Object3D IDs. Restore the
+    // original input order only when IDs invert, retaining every GPU resource.
+    const cohorts = new Map();
+    for (const record of next) for (const key of ['marker', 'stem', 'label']) {
+      const object = record[key];
+      if (!object) continue;
+      let cohort = cohorts.get(object.renderOrder);
+      if (!cohort) cohorts.set(object.renderOrder, cohort = []);
+      cohort.push({ record, key, object });
+    }
+    let rewrapped = false;
+    for (const cohort of cohorts.values()) {
+      if (!cohort.some((entry, index) => index && cohort[index - 1].object.id > entry.object.id)) continue;
+      for (const { record, key, object } of cohort) {
+        const replacement = key === 'label' ? new THREE.Sprite(object.material)
+          : key === 'stem' ? new THREE.Line(object.geometry, object.material)
+            : new THREE.Mesh(object.geometry, object.material);
+        replacement.position.copy(object.position);
+        replacement.scale.copy(object.scale);
+        replacement.quaternion.copy(object.quaternion);
+        replacement.renderOrder = object.renderOrder;
+        // Object3D.copy JSON-clones userData; selection metadata must stay opaque.
+        replacement.userData = { ...object.userData };
+        record[key] = replacement;
+        rewrapped = true;
+      }
+    }
+    if (rewrapped) this._semanticGroup.clear();
+    let index = 0;
+    for (const record of next) for (const object of [record.marker, record.stem, record.label]) {
+      if (!object) continue;
+      if (rewrapped) this._semanticGroup.add(object);
+      else this._semanticGroup.children[index++] = object;
+    }
+    this._syncSemanticGroupVisibility();
     this._requestRender();
   }
 

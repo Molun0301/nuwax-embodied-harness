@@ -736,9 +736,9 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
                 error_payload=error_payload,
             )
             if task_id:
-                events = runtime.task_manager.get_task_events(task_id)
-                if events:
-                    summary["feedback"] = build_task_feedback(runtime, events[-1])
+                event = runtime.task_manager.get_latest_task_event(task_id)
+                if event is not None:
+                    summary["feedback"] = build_task_feedback(runtime, event)
                     summary["summary"] = summary["feedback"]["message"]
             return summary
 

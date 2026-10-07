@@ -9,6 +9,63 @@ pub struct PctPlanner {
     cached: Mutex<Option<(SurfaceSnapshot, Arc<Tomogram>)>>,
     local_costs: Mutex<Vec<RoutePenalty>>,
 }
+
+#[cfg(test)]
+mod body_route_cancellation_tests {
+    use super::*;
+    use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
+    use nuwax_nav_types_messages::GoalOptions;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn source() -> SurfaceSnapshot {
+        crate::sampling_tests::sampled_room(true, false).with_body_envelope(SurfaceBodyEnvelope {
+            footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+            z_bounds_m: [-0.05,0.2], body_to_support_z_m: 0.4,
+            max_step_up_m: 0.15, max_step_down_m: 0.15,
+            max_cross_slope_deg: 18.0, support_uncertainty_m: 0.0,
+        }).unwrap()
+    }
+
+    #[test]
+    fn already_cancelled_near_and_distant_goals_do_not_build_or_replace_cache() {
+        let source = source();
+        let cancelled = AtomicBool::new(true);
+        let start = ([-0.5,0.0,0.45], [0.0,0.0,0.0,1.0]);
+        for x in [-0.49, 0.5] {
+            let planner = PctPlanner::default();
+            let goal = ([x,0.0,0.45], start.1);
+            let error = planner.body_route(&source, start, goal, GoalOptions::default(), &[], Some(&cancelled)).unwrap_err();
+            assert_eq!(error, "层析规划已取消");
+            assert!(planner.cached.lock().unwrap().is_none());
+            let cached = planner.map(&source).unwrap();
+            assert!(planner.body_route(&source, start, goal, GoalOptions::default(), &[], Some(&cancelled)).is_err());
+            assert!(Arc::ptr_eq(&cached, &planner.cached.lock().unwrap().as_ref().unwrap().1));
+        }
+    }
+
+    #[test]
+    fn flag_cancelled_during_build_rejects_route_after_preserving_complete_cache() {
+        let source = source();
+        let planner = PctPlanner::default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flip = cancelled.clone();
+        // Entry, map and source checks precede the countdown's tenth point;
+        // it fires while from_columns_with_evidence consumes actual columns.
+        let result = crate::cancellation::after_checkpoint_action(10,
+            move || flip.store(true, Ordering::Release), ||
+            planner.body_route(&source, ([-0.5,0.0,0.45],[0.0,0.0,0.0,1.0]),
+                ([0.5,0.0,0.45],[0.0,0.0,0.0,1.0]), GoalOptions::default(), &[], Some(&cancelled)));
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(result.unwrap_err(), "层析规划已取消");
+        // Existing limitation: AtomicBool does not interrupt tomogram construction.
+        let cached = planner.cached.lock().unwrap().as_ref().unwrap().1.clone();
+        assert!(!cached.cells.is_empty());
+        assert!(Arc::ptr_eq(&cached, &planner.map(&source).unwrap()));
+        cancelled.store(false, Ordering::Release);
+        assert!(planner.body_route(&source, ([-0.5,0.0,0.45],[0.0,0.0,0.0,1.0]),
+            ([0.5,0.0,0.45],[0.0,0.0,0.0,1.0]), GoalOptions::default(), &[], Some(&cancelled)).is_ok());
+    }
+}
 impl std::fmt::Debug for PctPlanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PctPlanner")

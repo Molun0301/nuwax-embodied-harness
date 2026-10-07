@@ -36,7 +36,7 @@ impl Ord for Queue {
             .then_with(|| other.order.cmp(&self.order))
     }
 }
-fn checkpoint(cancelled: Option<&AtomicBool>) -> Result<(), String> {
+pub(crate) fn checkpoint(cancelled: Option<&AtomicBool>) -> Result<(), String> {
     if cancelled.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
         return Err("层析规划已取消".into());
     }

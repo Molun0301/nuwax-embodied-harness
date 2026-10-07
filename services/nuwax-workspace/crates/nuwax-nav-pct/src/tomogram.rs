@@ -316,21 +316,39 @@ impl Tomogram {
             checkpoint()?;
             let [x, y] = self.cells[id].column;
             let mut neighbors = Vec::with_capacity(8);
+            // One cell's cardinal choices also serve its diagonal corner checks.
+            // Lazy stack slots preserve the first lookup and short-circuit order.
+            let mut cardinal = [None; 4];
+            let mut cardinal_neighbor = |dx, dy, distance| {
+                let index = match (dx, dy) {
+                    (-1, 0) => 0,
+                    (0, -1) => 1,
+                    (0, 1) => 2,
+                    (1, 0) => 3,
+                    _ => unreachable!("cardinal direction"),
+                };
+                *cardinal[index].get_or_insert_with(|| {
+                    self.neighbor_in(id, [x + dx, y + dy], distance)
+                })
+            };
             for dx in -1..=1 {
                 for dy in -1..=1 {
                     if dx == 0 && dy == 0 {
                         continue;
                     }
                     let distance = self.resolution * f64::from(dx * dx + dy * dy).sqrt();
-                    let Some(next) = self.neighbor_in(id, [x + dx, y + dy], distance) else {
-                        continue;
+                    let next = if dx == 0 || dy == 0 {
+                        cardinal_neighbor(dx, dy, distance)
+                    } else {
+                        self.neighbor_in(id, [x + dx, y + dy], distance)
                     };
+                    let Some(next) = next else { continue; };
                     if dx != 0 && dy != 0 {
                         // 对角连接不能穿过两面相接的墙角或落差。
-                        let Some(a) = self.neighbor_in(id, [x + dx, y], self.resolution) else {
+                        let Some(a) = cardinal_neighbor(dx, 0, self.resolution) else {
                             continue;
                         };
-                        let Some(b) = self.neighbor_in(id, [x, y + dy], self.resolution) else {
+                        let Some(b) = cardinal_neighbor(0, dy, self.resolution) else {
                             continue;
                         };
                         if !self.compatible(a, next, self.resolution)
@@ -631,3 +649,7 @@ mod allocation_benchmark_tests {
 #[cfg(all(test, feature = "mls-adapter"))]
 #[path = "tomogram_masked_tests.rs"]
 mod masked_surface_tests;
+
+#[cfg(test)]
+#[path = "tomogram_connect_tests.rs"]
+mod connect_trial_tests;

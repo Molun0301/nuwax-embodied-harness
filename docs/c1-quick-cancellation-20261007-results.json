@@ -1,0 +1,3625 @@
+{
+  "local_base_commit": "eefd52a329b7976038697a4b1047a23a76692c62",
+  "local_base_tree": "5debe8ec346e711d9d05f3cda15972df281dc7a9",
+  "git_state": "uncommitted source delta; no new branch,commit,or push",
+  "production_delta": "body_route entry reuses existing AtomicBool+epoch checkpoint before any tomogram work; helper visibility pub(crate)",
+  "source_files": [
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-pct/src/body_route.rs",
+      "bytes": 2721,
+      "sha256": "fbf795b2728aa593920a609414a9758b90fc2b720fa4238776b631e5d4c314ab"
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-pct/src/search.rs",
+      "bytes": 20319,
+      "sha256": "2f370ab3939535fa10a8551b4a449ef7101938121a8a255fb5c52baa659961d2"
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-pct/src/cancellation.rs",
+      "bytes": 5105,
+      "sha256": "b2e8330cc1796104dce02606fcb6a6ddf6bb4501d8e4e4060fd48631291945e7"
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-pct/src/surface_adapter.rs",
+      "bytes": 6138,
+      "sha256": "a657b3f14704cec54a54e4169ed3d86f00bce3d384c2d3dd00e8864dbecb6eb2"
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_dataflow.rs",
+      "bytes": 149271,
+      "sha256": "01f427af3acc5e05416ed5d0cb6190f2090fd35e585c7523b0ed47bb9d0bf9b9"
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_quick_budget_tests.rs",
+      "bytes": 6729,
+      "sha256": "766afa8b736508f3bd281975be05ec48dfc234699b7a31750340614456a34064"
+    }
+  ],
+  "qualification": {
+    "focused_distinct_tests_passed": 8,
+    "manual_distinct_selectors": 1,
+    "matched_pairs": 3,
+    "matched_process_runs": 6,
+    "all_matched_runs_passed": true,
+    "full_path_comparisons": [
+      {
+        "pair": 1,
+        "case": "direct",
+        "budget": 0,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 1,
+        "case": "direct",
+        "budget": 30000,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 1,
+        "case": "detour",
+        "budget": 0,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 1,
+        "case": "detour",
+        "budget": 30000,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 1,
+        "case": "penalty",
+        "budget": 0,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 1,
+        "case": "penalty",
+        "budget": 30000,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 2,
+        "case": "direct",
+        "budget": 0,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 2,
+        "case": "direct",
+        "budget": 30000,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 2,
+        "case": "detour",
+        "budget": 0,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 2,
+        "case": "detour",
+        "budget": 30000,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 2,
+        "case": "penalty",
+        "budget": 0,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 2,
+        "case": "penalty",
+        "budget": 30000,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 3,
+        "case": "direct",
+        "budget": 0,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 3,
+        "case": "direct",
+        "budget": 30000,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 3,
+        "case": "detour",
+        "budget": 0,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 3,
+        "case": "detour",
+        "budget": 30000,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 3,
+        "case": "penalty",
+        "budget": 0,
+        "equal_full_path": true,
+        "poses": 4
+      },
+      {
+        "pair": 3,
+        "case": "penalty",
+        "budget": 30000,
+        "equal_full_path": true,
+        "poses": 4
+      }
+    ]
+  },
+  "timings": [
+    {
+      "case": "direct",
+      "budget": 0,
+      "arms": {
+        "baseline-paths": {
+          "samples": 3,
+          "cold_median_ms": 49.523144,
+          "repeat_median_ms": 0.910311
+        },
+        "candidate": {
+          "samples": 3,
+          "cold_median_ms": 44.289922,
+          "repeat_median_ms": 0.85384
+        }
+      }
+    },
+    {
+      "case": "direct",
+      "budget": 30000,
+      "arms": {
+        "baseline-paths": {
+          "samples": 3,
+          "cold_median_ms": 52.44459,
+          "repeat_median_ms": 1.088033
+        },
+        "candidate": {
+          "samples": 3,
+          "cold_median_ms": 48.001194,
+          "repeat_median_ms": 1.00623
+        }
+      }
+    },
+    {
+      "case": "detour",
+      "budget": 0,
+      "arms": {
+        "baseline-paths": {
+          "samples": 3,
+          "cold_median_ms": 54.327481,
+          "repeat_median_ms": 7.723923
+        },
+        "candidate": {
+          "samples": 3,
+          "cold_median_ms": 53.786804,
+          "repeat_median_ms": 7.678044
+        }
+      }
+    },
+    {
+      "case": "detour",
+      "budget": 30000,
+      "arms": {
+        "baseline-paths": {
+          "samples": 3,
+          "cold_median_ms": 64.33931,
+          "repeat_median_ms": 7.964616
+        },
+        "candidate": {
+          "samples": 3,
+          "cold_median_ms": 52.12751,
+          "repeat_median_ms": 7.125856
+        }
+      }
+    },
+    {
+      "case": "penalty",
+      "budget": 0,
+      "arms": {
+        "baseline-paths": {
+          "samples": 3,
+          "cold_median_ms": 48.610442,
+          "repeat_median_ms": 3.624739
+        },
+        "candidate": {
+          "samples": 3,
+          "cold_median_ms": 47.984351,
+          "repeat_median_ms": 4.132165
+        }
+      }
+    },
+    {
+      "case": "penalty",
+      "budget": 30000,
+      "arms": {
+        "baseline-paths": {
+          "samples": 3,
+          "cold_median_ms": 49.875407,
+          "repeat_median_ms": 4.303353
+        },
+        "candidate": {
+          "samples": 3,
+          "cold_median_ms": 49.42321,
+          "repeat_median_ms": 3.622552
+        }
+      }
+    },
+    {
+      "case": "pre_cancelled",
+      "budget": 0,
+      "arms": {
+        "baseline-paths": {
+          "samples": 3,
+          "cold_median_ms": 52.038969,
+          "repeat_median_ms": 0.020178
+        },
+        "candidate": {
+          "samples": 3,
+          "cold_median_ms": 0.027395,
+          "repeat_median_ms": 0.000987
+        }
+      }
+    },
+    {
+      "case": "pre_cancelled",
+      "budget": 30000,
+      "arms": {
+        "baseline-paths": {
+          "samples": 3,
+          "cold_median_ms": 51.087432,
+          "repeat_median_ms": 0.017809
+        },
+        "candidate": {
+          "samples": 3,
+          "cold_median_ms": 0.002281,
+          "repeat_median_ms": 0.000736
+        }
+      }
+    }
+  ],
+  "process_runs": [
+    {
+      "pair": 1,
+      "arm": "baseline-paths",
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/baseline-paths/nuwax-nav-stack-test",
+        "lcm_dataflow::surface_dataflow::tests::quick_budget_tests::calibrated_quick_and_full_budget_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "reverse_budgets": false,
+      "exit_code": 0,
+      "wall_s": 1.2670601300051203,
+      "user_s": 1.230905,
+      "system_s": 0.055576,
+      "maxrss_kib": 25488,
+      "records": [
+        {
+          "budget": 0,
+          "case": "direct",
+          "cold_ns": 64100055,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "max_lateral_deviation_m": 0.04999995604157448,
+            "poses": 4
+          },
+          "warm_ns": 818666
+        },
+        {
+          "budget": 30000,
+          "case": "direct",
+          "cold_ns": 62240996,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "max_lateral_deviation_m": 0.04999995604157448,
+            "poses": 4
+          },
+          "warm_ns": 1221379
+        },
+        {
+          "case": "direct",
+          "cells": 4800,
+          "chord_clear": true,
+          "expanded": 176,
+          "map_only_ns": 54327255,
+          "search_and_reduce_ms": 0.81124,
+          "stage_probe": true
+        },
+        {
+          "budget": 0,
+          "case": "detour",
+          "cold_ns": 92977887,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4614050408334098432,
+                4617371813041668096,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4595304210800185679,
+                4607050822977800684
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4617709583018754048,
+                4616808863079858176,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13821081830158930894,
+                4606925620708999946
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13823676674248649099,
+                4606549609565181421
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 7.51670465532424,
+            "max_lateral_deviation_m": 2.050000075250864,
+            "poses": 4
+          },
+          "warm_ns": 7723923
+        },
+        {
+          "budget": 30000,
+          "case": "detour",
+          "cold_ns": 64339310,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4614050408334098432,
+                4617371813041668096,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4595304210800185679,
+                4607050822977800684
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4617709583018754048,
+                4616808863079858176,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13821081830158930894,
+                4606925620708999946
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13823676674248649099,
+                4606549609565181421
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 7.51670465532424,
+            "max_lateral_deviation_m": 2.050000075250864,
+            "poses": 4
+          },
+          "warm_ns": 7964616
+        },
+        {
+          "case": "detour",
+          "cells": 4800,
+          "chord_clear": false,
+          "expanded": 2128,
+          "map_only_ns": 58547270,
+          "search_and_reduce_ms": 11.146014,
+          "stage_probe": true
+        },
+        {
+          "budget": 0,
+          "case": "penalty",
+          "cold_ns": 60074540,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4615626668227166208,
+                4611798608486858752,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13805515999199334328,
+                4607180137468570249
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619060662927097856,
+                4613374868379926528,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594273794909424350,
+                4607091515301414502
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4598190375404003213,
+                4606894442597178637
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.310422730805769,
+            "max_lateral_deviation_m": 0.9499999694526196,
+            "poses": 4
+          },
+          "warm_ns": 4685911
+        },
+        {
+          "budget": 30000,
+          "case": "penalty",
+          "cold_ns": 68472903,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4615626668227166208,
+                4611798608486858752,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13805515999199334328,
+                4607180137468570249
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619060662927097856,
+                4613374868379926528,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594273794909424350,
+                4607091515301414502
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4598190375404003213,
+                4606894442597178637
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.310422730805769,
+            "max_lateral_deviation_m": 0.9499999694526196,
+            "poses": 4
+          },
+          "warm_ns": 5705380
+        },
+        {
+          "case": "penalty",
+          "cells": 4800,
+          "chord_clear": true,
+          "expanded": 1237,
+          "map_only_ns": 54075095,
+          "search_and_reduce_ms": 3.969385,
+          "stage_probe": true
+        },
+        {
+          "budget": 0,
+          "case": "pre_cancelled",
+          "cold_ns": 57845793,
+          "warm_ns": 128927
+        },
+        {
+          "budget": 30000,
+          "case": "pre_cancelled",
+          "cold_ns": 61448648,
+          "warm_ns": 13419
+        }
+      ]
+    },
+    {
+      "pair": 1,
+      "arm": "candidate",
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/candidate/nuwax-nav-stack-test",
+        "lcm_dataflow::surface_dataflow::tests::quick_budget_tests::calibrated_quick_and_full_budget_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "reverse_budgets": false,
+      "exit_code": 0,
+      "wall_s": 0.9028122540039476,
+      "user_s": 0.8885679999999999,
+      "system_s": 0.028813,
+      "maxrss_kib": 25628,
+      "records": [
+        {
+          "budget": 0,
+          "case": "direct",
+          "cold_ns": 44161412,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "max_lateral_deviation_m": 0.04999995604157448,
+            "poses": 4
+          },
+          "warm_ns": 983414
+        },
+        {
+          "budget": 30000,
+          "case": "direct",
+          "cold_ns": 51784153,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "max_lateral_deviation_m": 0.04999995604157448,
+            "poses": 4
+          },
+          "warm_ns": 1105965
+        },
+        {
+          "case": "direct",
+          "cells": 4800,
+          "chord_clear": true,
+          "expanded": 176,
+          "map_only_ns": 44823228,
+          "search_and_reduce_ms": 0.708604,
+          "stage_probe": true
+        },
+        {
+          "budget": 0,
+          "case": "detour",
+          "cold_ns": 59162468,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4614050408334098432,
+                4617371813041668096,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4595304210800185679,
+                4607050822977800684
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4617709583018754048,
+                4616808863079858176,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13821081830158930894,
+                4606925620708999946
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13823676674248649099,
+                4606549609565181421
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 7.51670465532424,
+            "max_lateral_deviation_m": 2.050000075250864,
+            "poses": 4
+          },
+          "warm_ns": 8198170
+        },
+        {
+          "budget": 30000,
+          "case": "detour",
+          "cold_ns": 61802346,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4614050408334098432,
+                4617371813041668096,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4595304210800185679,
+                4607050822977800684
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4617709583018754048,
+                4616808863079858176,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13821081830158930894,
+                4606925620708999946
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13823676674248649099,
+                4606549609565181421
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 7.51670465532424,
+            "max_lateral_deviation_m": 2.050000075250864,
+            "poses": 4
+          },
+          "warm_ns": 7156714
+        },
+        {
+          "case": "detour",
+          "cells": 4800,
+          "chord_clear": false,
+          "expanded": 2128,
+          "map_only_ns": 45332166,
+          "search_and_reduce_ms": 6.843305,
+          "stage_probe": true
+        },
+        {
+          "budget": 0,
+          "case": "penalty",
+          "cold_ns": 53325801,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4615626668227166208,
+                4611798608486858752,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13805515999199334328,
+                4607180137468570249
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619060662927097856,
+                4613374868379926528,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594273794909424350,
+                4607091515301414502
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4598190375404003213,
+                4606894442597178637
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.310422730805769,
+            "max_lateral_deviation_m": 0.9499999694526196,
+            "poses": 4
+          },
+          "warm_ns": 4533428
+        },
+        {
+          "budget": 30000,
+          "case": "penalty",
+          "cold_ns": 50688562,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4615626668227166208,
+                4611798608486858752,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13805515999199334328,
+                4607180137468570249
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619060662927097856,
+                4613374868379926528,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594273794909424350,
+                4607091515301414502
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4598190375404003213,
+                4606894442597178637
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.310422730805769,
+            "max_lateral_deviation_m": 0.9499999694526196,
+            "poses": 4
+          },
+          "warm_ns": 3498649
+        },
+        {
+          "case": "penalty",
+          "cells": 4800,
+          "chord_clear": true,
+          "expanded": 1237,
+          "map_only_ns": 44270409,
+          "search_and_reduce_ms": 4.155213,
+          "stage_probe": true
+        },
+        {
+          "budget": 0,
+          "case": "pre_cancelled",
+          "cold_ns": 27395,
+          "warm_ns": 987
+        },
+        {
+          "budget": 30000,
+          "case": "pre_cancelled",
+          "cold_ns": 973,
+          "warm_ns": 395
+        }
+      ]
+    },
+    {
+      "pair": 2,
+      "arm": "candidate",
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/candidate/nuwax-nav-stack-test",
+        "lcm_dataflow::surface_dataflow::tests::quick_budget_tests::calibrated_quick_and_full_budget_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "reverse_budgets": true,
+      "exit_code": 0,
+      "wall_s": 0.8968245319993002,
+      "user_s": 0.8865,
+      "system_s": 0.030008,
+      "maxrss_kib": 25208,
+      "records": [
+        {
+          "budget": 30000,
+          "case": "direct",
+          "cold_ns": 48001194,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "max_lateral_deviation_m": 0.04999995604157448,
+            "poses": 4
+          },
+          "warm_ns": 1006230
+        },
+        {
+          "budget": 0,
+          "case": "direct",
+          "cold_ns": 44289922,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "max_lateral_deviation_m": 0.04999995604157448,
+            "poses": 4
+          },
+          "warm_ns": 707962
+        },
+        {
+          "case": "direct",
+          "cells": 4800,
+          "chord_clear": true,
+          "expanded": 176,
+          "map_only_ns": 50625944,
+          "search_and_reduce_ms": 0.99455,
+          "stage_probe": true
+        },
+        {
+          "budget": 30000,
+          "case": "detour",
+          "cold_ns": 52127510,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4614050408334098432,
+                4617371813041668096,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4595304210800185679,
+                4607050822977800684
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4617709583018754048,
+                4616808863079858176,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13821081830158930894,
+                4606925620708999946
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13823676674248649099,
+                4606549609565181421
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 7.51670465532424,
+            "max_lateral_deviation_m": 2.050000075250864,
+            "poses": 4
+          },
+          "warm_ns": 7125856
+        },
+        {
+          "budget": 0,
+          "case": "detour",
+          "cold_ns": 53603672,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4614050408334098432,
+                4617371813041668096,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4595304210800185679,
+                4607050822977800684
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4617709583018754048,
+                4616808863079858176,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13821081830158930894,
+                4606925620708999946
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13823676674248649099,
+                4606549609565181421
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 7.51670465532424,
+            "max_lateral_deviation_m": 2.050000075250864,
+            "poses": 4
+          },
+          "warm_ns": 6887006
+        },
+        {
+          "case": "detour",
+          "cells": 4800,
+          "chord_clear": false,
+          "expanded": 2128,
+          "map_only_ns": 45175732,
+          "search_and_reduce_ms": 7.923533999999999,
+          "stage_probe": true
+        },
+        {
+          "budget": 30000,
+          "case": "penalty",
+          "cold_ns": 49423210,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4615626668227166208,
+                4611798608486858752,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13805515999199334328,
+                4607180137468570249
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619060662927097856,
+                4613374868379926528,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594273794909424350,
+                4607091515301414502
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4598190375404003213,
+                4606894442597178637
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.310422730805769,
+            "max_lateral_deviation_m": 0.9499999694526196,
+            "poses": 4
+          },
+          "warm_ns": 3622552
+        },
+        {
+          "budget": 0,
+          "case": "penalty",
+          "cold_ns": 45446560,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4615626668227166208,
+                4611798608486858752,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13805515999199334328,
+                4607180137468570249
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619060662927097856,
+                4613374868379926528,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594273794909424350,
+                4607091515301414502
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4598190375404003213,
+                4606894442597178637
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.310422730805769,
+            "max_lateral_deviation_m": 0.9499999694526196,
+            "poses": 4
+          },
+          "warm_ns": 3776087
+        },
+        {
+          "case": "penalty",
+          "cells": 4800,
+          "chord_clear": true,
+          "expanded": 1237,
+          "map_only_ns": 48064388,
+          "search_and_reduce_ms": 5.9559690000000005,
+          "stage_probe": true
+        },
+        {
+          "budget": 30000,
+          "case": "pre_cancelled",
+          "cold_ns": 25678,
+          "warm_ns": 1047
+        },
+        {
+          "budget": 0,
+          "case": "pre_cancelled",
+          "cold_ns": 777,
+          "warm_ns": 514
+        }
+      ]
+    },
+    {
+      "pair": 2,
+      "arm": "baseline-paths",
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/baseline-paths/nuwax-nav-stack-test",
+        "lcm_dataflow::surface_dataflow::tests::quick_budget_tests::calibrated_quick_and_full_budget_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "reverse_budgets": true,
+      "exit_code": 0,
+      "wall_s": 1.0535780009959126,
+      "user_s": 1.038658,
+      "system_s": 0.03658,
+      "maxrss_kib": 25728,
+      "records": [
+        {
+          "budget": 30000,
+          "case": "direct",
+          "cold_ns": 52444590,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "max_lateral_deviation_m": 0.04999995604157448,
+            "poses": 4
+          },
+          "warm_ns": 1088033
+        },
+        {
+          "budget": 0,
+          "case": "direct",
+          "cold_ns": 49523144,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "max_lateral_deviation_m": 0.04999995604157448,
+            "poses": 4
+          },
+          "warm_ns": 1075533
+        },
+        {
+          "case": "direct",
+          "cells": 4800,
+          "chord_clear": true,
+          "expanded": 176,
+          "map_only_ns": 43356099,
+          "search_and_reduce_ms": 1.033604,
+          "stage_probe": true
+        },
+        {
+          "budget": 30000,
+          "case": "detour",
+          "cold_ns": 68076179,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4614050408334098432,
+                4617371813041668096,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4595304210800185679,
+                4607050822977800684
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4617709583018754048,
+                4616808863079858176,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13821081830158930894,
+                4606925620708999946
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13823676674248649099,
+                4606549609565181421
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 7.51670465532424,
+            "max_lateral_deviation_m": 2.050000075250864,
+            "poses": 4
+          },
+          "warm_ns": 9159930
+        },
+        {
+          "budget": 0,
+          "case": "detour",
+          "cold_ns": 53692805,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4614050408334098432,
+                4617371813041668096,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4595304210800185679,
+                4607050822977800684
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4617709583018754048,
+                4616808863079858176,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13821081830158930894,
+                4606925620708999946
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13823676674248649099,
+                4606549609565181421
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 7.51670465532424,
+            "max_lateral_deviation_m": 2.050000075250864,
+            "poses": 4
+          },
+          "warm_ns": 7046770
+        },
+        {
+          "case": "detour",
+          "cells": 4800,
+          "chord_clear": false,
+          "expanded": 2128,
+          "map_only_ns": 46598262,
+          "search_and_reduce_ms": 7.464937,
+          "stage_probe": true
+        },
+        {
+          "budget": 30000,
+          "case": "penalty",
+          "cold_ns": 49829850,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4615626668227166208,
+                4611798608486858752,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13805515999199334328,
+                4607180137468570249
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619060662927097856,
+                4613374868379926528,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594273794909424350,
+                4607091515301414502
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4598190375404003213,
+                4606894442597178637
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.310422730805769,
+            "max_lateral_deviation_m": 0.9499999694526196,
+            "poses": 4
+          },
+          "warm_ns": 4051103
+        },
+        {
+          "budget": 0,
+          "case": "penalty",
+          "cold_ns": 48610442,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4615626668227166208,
+                4611798608486858752,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13805515999199334328,
+                4607180137468570249
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619060662927097856,
+                4613374868379926528,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594273794909424350,
+                4607091515301414502
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4598190375404003213,
+                4606894442597178637
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.310422730805769,
+            "max_lateral_deviation_m": 0.9499999694526196,
+            "poses": 4
+          },
+          "warm_ns": 3422859
+        },
+        {
+          "case": "penalty",
+          "cells": 4800,
+          "chord_clear": true,
+          "expanded": 1237,
+          "map_only_ns": 50863000,
+          "search_and_reduce_ms": 3.865121,
+          "stage_probe": true
+        },
+        {
+          "budget": 30000,
+          "case": "pre_cancelled",
+          "cold_ns": 51087432,
+          "warm_ns": 17809
+        },
+        {
+          "budget": 0,
+          "case": "pre_cancelled",
+          "cold_ns": 52038969,
+          "warm_ns": 15979
+        }
+      ]
+    },
+    {
+      "pair": 3,
+      "arm": "baseline-paths",
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/baseline-paths/nuwax-nav-stack-test",
+        "lcm_dataflow::surface_dataflow::tests::quick_budget_tests::calibrated_quick_and_full_budget_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "reverse_budgets": false,
+      "exit_code": 0,
+      "wall_s": 0.9943847079994157,
+      "user_s": 0.9760129999999999,
+      "system_s": 0.037843,
+      "maxrss_kib": 25324,
+      "records": [
+        {
+          "budget": 0,
+          "case": "direct",
+          "cold_ns": 46623051,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "max_lateral_deviation_m": 0.04999995604157448,
+            "poses": 4
+          },
+          "warm_ns": 910311
+        },
+        {
+          "budget": 30000,
+          "case": "direct",
+          "cold_ns": 45783090,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "max_lateral_deviation_m": 0.04999995604157448,
+            "poses": 4
+          },
+          "warm_ns": 701868
+        },
+        {
+          "case": "direct",
+          "cells": 4800,
+          "chord_clear": true,
+          "expanded": 176,
+          "map_only_ns": 48989762,
+          "search_and_reduce_ms": 0.839726,
+          "stage_probe": true
+        },
+        {
+          "budget": 0,
+          "case": "detour",
+          "cold_ns": 54327481,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4614050408334098432,
+                4617371813041668096,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4595304210800185679,
+                4607050822977800684
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4617709583018754048,
+                4616808863079858176,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13821081830158930894,
+                4606925620708999946
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13823676674248649099,
+                4606549609565181421
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 7.51670465532424,
+            "max_lateral_deviation_m": 2.050000075250864,
+            "poses": 4
+          },
+          "warm_ns": 10479879
+        },
+        {
+          "budget": 30000,
+          "case": "detour",
+          "cold_ns": 53249897,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4614050408334098432,
+                4617371813041668096,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4595304210800185679,
+                4607050822977800684
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4617709583018754048,
+                4616808863079858176,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13821081830158930894,
+                4606925620708999946
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13823676674248649099,
+                4606549609565181421
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 7.51670465532424,
+            "max_lateral_deviation_m": 2.050000075250864,
+            "poses": 4
+          },
+          "warm_ns": 7547285
+        },
+        {
+          "case": "detour",
+          "cells": 4800,
+          "chord_clear": false,
+          "expanded": 2128,
+          "map_only_ns": 46804973,
+          "search_and_reduce_ms": 8.103950000000001,
+          "stage_probe": true
+        },
+        {
+          "budget": 0,
+          "case": "penalty",
+          "cold_ns": 46999525,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4615626668227166208,
+                4611798608486858752,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13805515999199334328,
+                4607180137468570249
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619060662927097856,
+                4613374868379926528,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594273794909424350,
+                4607091515301414502
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4598190375404003213,
+                4606894442597178637
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.310422730805769,
+            "max_lateral_deviation_m": 0.9499999694526196,
+            "poses": 4
+          },
+          "warm_ns": 3624739
+        },
+        {
+          "budget": 30000,
+          "case": "penalty",
+          "cold_ns": 49875407,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4615626668227166208,
+                4611798608486858752,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13805515999199334328,
+                4607180137468570249
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619060662927097856,
+                4613374868379926528,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594273794909424350,
+                4607091515301414502
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4598190375404003213,
+                4606894442597178637
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.310422730805769,
+            "max_lateral_deviation_m": 0.9499999694526196,
+            "poses": 4
+          },
+          "warm_ns": 4303353
+        },
+        {
+          "case": "penalty",
+          "cells": 4800,
+          "chord_clear": true,
+          "expanded": 1237,
+          "map_only_ns": 44077337,
+          "search_and_reduce_ms": 3.9409579999999997,
+          "stage_probe": true
+        },
+        {
+          "budget": 0,
+          "case": "pre_cancelled",
+          "cold_ns": 45159631,
+          "warm_ns": 20178
+        },
+        {
+          "budget": 30000,
+          "case": "pre_cancelled",
+          "cold_ns": 43231000,
+          "warm_ns": 115951
+        }
+      ]
+    },
+    {
+      "pair": 3,
+      "arm": "candidate",
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/candidate/nuwax-nav-stack-test",
+        "lcm_dataflow::surface_dataflow::tests::quick_budget_tests::calibrated_quick_and_full_budget_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "reverse_budgets": false,
+      "exit_code": 0,
+      "wall_s": 0.8954919399984647,
+      "user_s": 0.885421,
+      "system_s": 0.023745,
+      "maxrss_kib": 25592,
+      "records": [
+        {
+          "budget": 0,
+          "case": "direct",
+          "cold_ns": 51701225,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "max_lateral_deviation_m": 0.04999995604157448,
+            "poses": 4
+          },
+          "warm_ns": 853840
+        },
+        {
+          "budget": 30000,
+          "case": "direct",
+          "cold_ns": 45052930,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "max_lateral_deviation_m": 0.04999995604157448,
+            "poses": 4
+          },
+          "warm_ns": 786974
+        },
+        {
+          "case": "direct",
+          "cells": 4800,
+          "chord_clear": true,
+          "expanded": 176,
+          "map_only_ns": 46781314,
+          "search_and_reduce_ms": 0.743495,
+          "stage_probe": true
+        },
+        {
+          "budget": 0,
+          "case": "detour",
+          "cold_ns": 53786804,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4614050408334098432,
+                4617371813041668096,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4595304210800185679,
+                4607050822977800684
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4617709583018754048,
+                4616808863079858176,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13821081830158930894,
+                4606925620708999946
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13823676674248649099,
+                4606549609565181421
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 7.51670465532424,
+            "max_lateral_deviation_m": 2.050000075250864,
+            "poses": 4
+          },
+          "warm_ns": 7678044
+        },
+        {
+          "budget": 30000,
+          "case": "detour",
+          "cold_ns": 51776465,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4614050408334098432,
+                4617371813041668096,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4595304210800185679,
+                4607050822977800684
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4617709583018754048,
+                4616808863079858176,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13821081830158930894,
+                4606925620708999946
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13823676674248649099,
+                4606549609565181421
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 7.51670465532424,
+            "max_lateral_deviation_m": 2.050000075250864,
+            "poses": 4
+          },
+          "warm_ns": 6219721
+        },
+        {
+          "case": "detour",
+          "cells": 4800,
+          "chord_clear": false,
+          "expanded": 2128,
+          "map_only_ns": 44468906,
+          "search_and_reduce_ms": 6.543588000000001,
+          "stage_probe": true
+        },
+        {
+          "budget": 0,
+          "case": "penalty",
+          "cold_ns": 47984351,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4615626668227166208,
+                4611798608486858752,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13805515999199334328,
+                4607180137468570249
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619060662927097856,
+                4613374868379926528,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594273794909424350,
+                4607091515301414502
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4598190375404003213,
+                4606894442597178637
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.310422730805769,
+            "max_lateral_deviation_m": 0.9499999694526196,
+            "poses": 4
+          },
+          "warm_ns": 4132165
+        },
+        {
+          "budget": 30000,
+          "case": "penalty",
+          "cold_ns": 47134651,
+          "path_evidence": [
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4615626668227166208,
+                4611798608486858752,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                13805515999199334328,
+                4607180137468570249
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619060662927097856,
+                4613374868379926528,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4594273794909424350,
+                4607091515301414502
+              ],
+              "stamp_ns": 1000000000
+            },
+            {
+              "clock": "Unix",
+              "frame": "Map",
+              "position_bits": [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              "quaternion_bits": [
+                0,
+                0,
+                4598190375404003213,
+                4606894442597178637
+              ],
+              "stamp_ns": 1000000000
+            }
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.310422730805769,
+            "max_lateral_deviation_m": 0.9499999694526196,
+            "poses": 4
+          },
+          "warm_ns": 4152917
+        },
+        {
+          "case": "penalty",
+          "cells": 4800,
+          "chord_clear": true,
+          "expanded": 1237,
+          "map_only_ns": 42726855,
+          "search_and_reduce_ms": 3.452592,
+          "stage_probe": true
+        },
+        {
+          "budget": 0,
+          "case": "pre_cancelled",
+          "cold_ns": 95325,
+          "warm_ns": 2051
+        },
+        {
+          "budget": 30000,
+          "case": "pre_cancelled",
+          "cold_ns": 2281,
+          "warm_ns": 736
+        }
+      ]
+    }
+  ],
+  "focused_commands": [
+    {
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/candidate/nuwax-nav-pct-test",
+        "cancellation::tests::cancellation_scopes_restore_after_nested_calls_and_unwind",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "log": "focused-1.log"
+    },
+    {
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/candidate/nuwax-nav-pct-test",
+        "cancellation::tests::checkpoint_actions_restore_after_nested_unwind_and_allow_reentry",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "log": "focused-2.log"
+    },
+    {
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/candidate/nuwax-nav-pct-test",
+        "search::tests::epoch_cancellation_interrupts_search_and_reduction_without_changing_the_map",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "log": "focused-3.log"
+    },
+    {
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/candidate/nuwax-nav-pct-test",
+        "search::tests::missing_ground_is_not_interpolated_and_cancellation_is_observed",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "log": "focused-4.log"
+    },
+    {
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/candidate/nuwax-nav-pct-test",
+        "surface_adapter::body_route_cancellation_tests::already_cancelled_near_and_distant_goals_do_not_build_or_replace_cache",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "log": "focused-5.log"
+    },
+    {
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/candidate/nuwax-nav-pct-test",
+        "surface_adapter::body_route_cancellation_tests::flag_cancelled_during_build_rejects_route_after_preserving_complete_cache",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "log": "focused-6.log"
+    },
+    {
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/candidate/nuwax-nav-pct-test",
+        "tomogram::cancellation_tests::cancellation_abandons_connect_and_cost_passes_without_returning_a_partial_map",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "log": "focused-7.log"
+    },
+    {
+      "command": [
+        "/workspace/shared/neh-quick-budget-20261007/candidate/nuwax-nav-pct-test",
+        "tomogram::cancellation_tests::cancellation_stops_column_input_before_collecting_the_whole_map",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "log": "focused-8.log"
+    }
+  ],
+  "identical_stack_dependency_profile_records": 278,
+  "binary_identities": {
+    "baseline-paths": {
+      "path": "/workspace/shared/neh-quick-budget-20261007/baseline-paths/nuwax-nav-stack-test",
+      "sha256": "111fbd77b944e199e27157cb853567fb6dcd664d10946095db4a1ae42bb51ae1",
+      "bytes": 28308000,
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "features": [
+        "click-goal",
+        "default",
+        "foundation",
+        "guard-runtime",
+        "lcm-runtime",
+        "mls"
+      ]
+    },
+    "candidate": {
+      "path": "/workspace/shared/neh-quick-budget-20261007/candidate/nuwax-nav-stack-test",
+      "sha256": "7926bb4d5f3bc0dbb1e6dd49ec7120446577e343c677cb656a6e811826bf44ac",
+      "bytes": 28308000,
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "features": [
+        "click-goal",
+        "default",
+        "foundation",
+        "guard-runtime",
+        "lcm-runtime",
+        "mls"
+      ]
+    }
+  },
+  "pct_binary_identity": {
+    "path": "/workspace/shared/neh-quick-budget-20261007/candidate/nuwax-nav-pct-test",
+    "sha256": "210d6f999e7bc11429b9af8beab9a71ade4fffdaba2fd10571141d05285e1bbf",
+    "bytes": 4472944,
+    "profile": {
+      "opt_level": "0",
+      "debuginfo": 0,
+      "debug_assertions": true,
+      "overflow_checks": true,
+      "test": true
+    },
+    "features": [
+      "default",
+      "mls-adapter"
+    ]
+  },
+  "limits": [
+    "Mixed test profile: MLS/runtime opt3; PCT/stack opt0; debug0 with assertions/overflow checks; not release",
+    "Three pairs only; no normal-route performance improvement inferred",
+    "AtomicBool cancellation during tomogram construction still completes and caches build before rejection",
+    "Zero budget still performs full planning; no bounded-search claim",
+    "No owner,LCM,MotionGuard,actuator,cadence or real-hardware qualification",
+    "No modification to generic/raw content fingerprint API",
+    "Candidate repeated pre-cancelled calls are repeated empty-cache rejections, not warm-cache calls"
+  ]
+}

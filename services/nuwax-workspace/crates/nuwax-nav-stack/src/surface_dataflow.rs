@@ -952,6 +952,10 @@ async fn run_surface_planner_with_computer(
 
 #[cfg(test)]
 mod tests {
+    mod quick_budget_tests {
+        include!("surface_quick_budget_tests.rs");
+    }
+
     use super::super::guarded_tests::RecordingMotion;
     use super::*;
     use nuwax_nav_runtime::{NavSchedulerHandle, SchedulerPhase, TerminalOutcome};

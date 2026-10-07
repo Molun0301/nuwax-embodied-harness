@@ -44,37 +44,63 @@ pub fn planning_cancelled() -> bool {
 }
 pub(crate) fn checkpoint() -> Result<(), String> {
     #[cfg(test)]
-    TEST_CANCEL.with(|state| {
+    let action = TEST_CANCEL.with(|state| {
         let mut state = state.borrow_mut();
-        if let Some((remaining, epoch)) = state.as_mut() {
+        if let Some((remaining, _)) = state.as_mut() {
             if *remaining == 0 {
-                epoch.fetch_add(1, Ordering::Release);
-                *state = None;
+                return state.take().map(|(_, action)| action);
             } else { *remaining -= 1; }
         }
+        None
     });
+    #[cfg(test)]
+    if let Some(action) = action { action(); }
     if planning_cancelled() { Err("层析规划已取消".into()) } else { Ok(()) }
 }
 
 #[cfg(test)]
 thread_local! {
-    static TEST_CANCEL: RefCell<Option<(usize, Arc<AtomicU64>)>> = const { RefCell::new(None) };
+    static TEST_CANCEL: RefCell<Option<(usize, Box<dyn FnOnce()>)>> = const { RefCell::new(None) };
 }
 #[cfg(test)]
-pub(crate) fn after_checkpoints<T>(count: usize, operation: impl FnOnce() -> T) -> T {
-    struct Reset(Option<(usize, Arc<AtomicU64>)>);
+pub(crate) fn after_checkpoint_action<T>(count: usize, action: impl FnOnce() + 'static,
+    operation: impl FnOnce() -> T) -> T {
+    struct Reset(Option<(usize, Box<dyn FnOnce()>)>);
     impl Drop for Reset {
         fn drop(&mut self) { TEST_CANCEL.with(|state| *state.borrow_mut() = self.0.take()); }
     }
+    let _reset = Reset(TEST_CANCEL.with(|state| state.replace(Some((count, Box::new(action))))));
+    operation()
+}
+#[cfg(test)]
+pub(crate) fn after_checkpoints<T>(count: usize, operation: impl FnOnce() -> T) -> T {
     let epoch = Arc::new(AtomicU64::new(0));
     let token = PlanningCancellation::new(epoch.clone(), 0);
-    let _reset = Reset(TEST_CANCEL.with(|state| state.replace(Some((count, epoch)))));
-    with_planning_cancellation(&token, operation)
+    after_checkpoint_action(count, move || { epoch.fetch_add(1, Ordering::Release); }, ||
+        with_planning_cancellation(&token, operation))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checkpoint_actions_restore_after_nested_unwind_and_allow_reentry() {
+        let calls = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let outer = calls.clone();
+        after_checkpoint_action(1, move || outer.borrow_mut().push("outer"), || {
+            checkpoint().unwrap();
+            let inner = calls.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                after_checkpoint_action(0, move || {
+                    checkpoint().unwrap();
+                    inner.borrow_mut().push("inner");
+                }, || { checkpoint().unwrap(); panic!("test countdown restoration"); })));
+            assert!(result.is_err());
+            checkpoint().unwrap();
+        });
+        assert_eq!(*calls.borrow(), ["inner", "outer"]);
+        checkpoint().unwrap();
+    }
     #[test]
     fn cancellation_scopes_restore_after_nested_calls_and_unwind() {
         let epoch = Arc::new(AtomicU64::new(3));

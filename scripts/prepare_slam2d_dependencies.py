@@ -20,6 +20,7 @@ SOURCES = {
     "oneTBB": ("https://github.com/oneapi-src/oneTBB.git", "8b829acc65569019edb896c5150d427f288e8aba"),
     "ceres": ("https://github.com/ceres-solver/ceres-solver.git", "85331393dc0dff09f6fb9903ab0c4bfa3e134b01"),
 }
+SOURCE_ROLES = {"oneTBB": "slam2d-onetbb", "ceres": "slam2d-ceres"}
 
 
 BOOST_URL = "https://archives.boost.io/release/1.83.0/source/boost_1_83_0.tar.bz2"
@@ -76,7 +77,7 @@ def build_dependencies(prefix, cache, *, jobs=2, toolchain=None, run=None):
         common.append("-DCMAKE_TOOLCHAIN_FILE=" + str(Path(toolchain).resolve(strict=True)))
     source_roots = []
     for name, source in SOURCES.items():
-        source_root = _checkout(cache, source, run)
+        source_root = _checkout(cache, source, run, role=SOURCE_ROLES[name])
         source_roots.append(source_root)
         build_root = cache / "build" / name
         options = ["-DTBB_TEST=OFF", "-DTBB_STRICT=OFF", "-DTBB_EXAMPLES=OFF"] if name == "oneTBB" else [

@@ -43,7 +43,9 @@ _LIVOX_SOURCE = (
     "https://github.com/Livox-SDK/Livox-SDK2.git",
     "6a940156dd7151c3ab6a52442d86bc83613bd11b",
 )
-_SOURCE_ROLES = frozenset(("fastlio2-algorithm", "pointlio-algorithm", "dimos-lcm", "livox-sdk2"))
+_SOURCE_ROLES = frozenset((
+    "fastlio2-algorithm", "pointlio-algorithm", "dimos-lcm", "livox-sdk2", "slam2d-onetbb", "slam2d-ceres",
+))
 _TARGET_ROLES = {_WORKSPACE: "nuwax-workspace", _RUST_BUILDS["geometry"][0]: "geometry-runtime"}
 _LEGACY_SOURCE = re.compile(r"[0-9a-f]{12}-([0-9a-f]{40})")
 _ASSIGNED_SOURCE = re.compile(r"(?:" + "|".join(sorted(_SOURCE_ROLES)) + r")-[0-9a-f]{32}")

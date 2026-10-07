@@ -14,7 +14,9 @@ impl PctPlanner {
         boundary: &[[f64; 2]],
         cancelled: Option<&AtomicBool>,
     ) -> Result<Vec<BodyPose>, String> {
-        crate::cancellation::checkpoint()?;
+        // The owner's flag must reject obsolete work before deriving a tomogram,
+        // including the near-goal return. Reuse the search's existing semantics.
+        crate::search::checkpoint(cancelled)?;
         let model = map
             .body_envelope()
             .ok_or("层析规划需要机器人外形和支撑标定")?;

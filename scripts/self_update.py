@@ -339,13 +339,13 @@ def cleanup_cache(home):
     cache = home / "cache"
     if cache.is_symlink():
         raise RuntimeError("缓存根为符号链接，拒绝清理")
-    # 仅删除安装器产生的可重建缓存；保留设备wheel、工具链、配置、模型、地图和日志。
-    for relative in ("build", "sources", "downloads", "slam2d-dependencies"):
-        path = cache / relative
-        if path.is_symlink():
-            path.unlink()
-        elif path.is_dir():
-            shutil.rmtree(path)
+    # 构建产物、固定源码及依赖供后续增量构建复用；退出模块由安装器按选择清理。
+    # 更新验证后只回收临时下载，不清空可复用缓存或其路径/所有者记录。
+    path = cache / "downloads"
+    if path.is_symlink():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
 
 
 def mark_generation(prefix, revision):
@@ -466,13 +466,13 @@ apply(request,hardware)
                 cleanup_cache(home)
                 prune_generations(root, home, {old_prefix, Path(new["prefix"])})
             except (OSError, RuntimeError, ValueError):
-                warning = "更新成功，但部分构建缓存清理失败，请查看日志"
+                warning = "更新成功，但部分临时下载或旧代际清理失败，请查看日志"
             # 保留一代恢复环境，不属于临时缓存；避免删去配置引用的旧文件。
             phase(
                 root,
                 status,
                 "succeeded",
-                warning or "更新完成，构建缓存已清理",
+                warning or "更新完成，临时下载已清理，增量构建缓存已保留",
                 cleanup_warning=warning,
                 rollback_prefix=str(old_prefix),
             )

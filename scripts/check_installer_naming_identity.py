@@ -22,6 +22,11 @@ sys.path.insert(0, str(ROOT))
 SPEC = importlib.util.spec_from_file_location("_installer_cache_under_test", SOURCE_ROOT / "scripts/module_installer/builds.py")
 builds = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(builds)
+SLAM_SPEC = importlib.util.spec_from_file_location(
+    "_slam_dependencies_under_test", SOURCE_ROOT / "scripts/prepare_slam2d_dependencies.py"
+)
+slam = importlib.util.module_from_spec(SLAM_SPEC)
+SLAM_SPEC.loader.exec_module(slam)
 PIN = "a" * 40
 OTHER_PIN = "b" * 40
 URL = "https://github.com/example/source.git"
@@ -530,6 +535,117 @@ class CacheIdentityChecks(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "fake cargo"):
                     builds.build_modules(source, self.root / "prefix", self.cache, ("navigation",), 2, fail)
         self.assertEqual(seen[0], seen[1])
+
+    def build_slam_fixture(self, prefix):
+        cache = self.cache / "slam2d-dependencies"
+
+        def run(argv, **kwargs):
+            if argv[0] == "git":
+                self.fake_run(argv, **kwargs)
+                if "checkout" in argv:
+                    (Path(argv[2]) / "LICENSE").write_text(argv[-1])
+                return
+            self.assertEqual(argv[0], "cmake", "Only fake Git/CMake commands are accepted")
+            self.commands.append(tuple(argv))
+            if argv[1] == "-S":
+                build = Path(argv[argv.index("-B") + 1])
+                compiler = build / "CMakeFiles/fixture/CMakeCXXCompiler.cmake"
+                compiler.parent.mkdir(parents=True, exist_ok=True)
+                compiler.write_text('set(CMAKE_CXX_COMPILER "/fixture/c++")\n')
+                self.assertIn("-DCMAKE_INSTALL_PREFIX=" + str(prefix), argv)
+            elif argv[1] == "--build":
+                self.assertEqual(argv[-2:], ["--parallel", "2"])
+            else:
+                self.assertEqual(argv[1], "--install")
+                library = prefix / "lib" / ("fixture-" + Path(argv[2]).name + ".so")
+                library.parent.mkdir(parents=True, exist_ok=True)
+                library.write_text("fixture installed library")
+
+        def boost(destination, build_cache, compiler, jobs, runner):
+            self.assertEqual((destination, build_cache, compiler, jobs), (prefix, cache, "/fixture/c++", 2))
+            self.assertIs(runner, run)
+            source = cache / "fixture-boost"
+            source.mkdir(exist_ok=True)
+            (source / "LICENSE").write_text("fixture Boost license")
+            return source
+
+        with patch.object(slam, "_checkout", builds._checkout), patch.object(slam, "_boost", side_effect=boost):
+            self.assertEqual(slam.build_dependencies(prefix, cache, jobs=2, run=run), prefix)
+        return cache
+
+    def test_slam_dependency_orchestration_assigns_and_reuses_two_source_roles(self):
+        first = self.root / "generation-1"
+        cache = self.build_slam_fixture(first)
+        record = cache / "sources/source-paths-v1.json"
+        before = record.read_bytes()
+        payload = json.loads(before)
+        self.assertEqual(payload["version"], 1)
+        slots = payload["slots"]
+        self.assertEqual(set(slots), {"slam2d-onetbb", "slam2d-ceres"})
+        self.assertEqual(len({entry["path"] for entry in slots.values()}), 2)
+        for name, role in (("oneTBB", "slam2d-onetbb"), ("ceres", "slam2d-ceres")):
+            entry = slots[role]
+            self.assertEqual((entry["url"], entry["revision"]), slam.SOURCES[name])
+            self.assertRegex(entry["path"], "^" + role + r"-[0-9a-f]{32}$")
+            self.assertEqual((cache / "sources" / entry["path"] / "fixture-head").read_text(), entry["revision"])
+        git_before = [command for command in self.commands if command[0] == "git"]
+        self.assertEqual(sum("fetch" in command for command in git_before), 2)
+        second = self.root / "generation-2"
+        with patch.object(uuid, "uuid4", side_effect=AssertionError("source reallocation")), patch.object(
+            builds, "_legacy_source", side_effect=AssertionError("source rescan")
+        ):
+            self.build_slam_fixture(second)
+        self.assertEqual(record.read_bytes(), before)
+        self.assertEqual([command for command in self.commands if command[0] == "git"], git_before)
+        for prefix in (first, second):
+            for name in slam.SOURCES:
+                self.assertEqual((prefix / "lib" / ("fixture-" + name + ".so")).read_text(),
+                                 "fixture installed library")
+            notices = prefix / "share/nuwax-slam2d"
+            self.assertEqual((notices / "0-LICENSE").read_text(), slam.SOURCES["oneTBB"][1])
+            self.assertEqual((notices / "1-LICENSE").read_text(), "fixture Boost license")
+            self.assertEqual((notices / "2-LICENSE").read_text(), slam.SOURCES["ceres"][1])
+            self.assertEqual(json.loads((notices / "来源.json").read_text())["sources"],
+                             {name: list(source) for name, source in slam.SOURCES.items()})
+
+    def test_slam_dirty_source_fails_before_any_build_or_fetch(self):
+        cache = self.build_slam_fixture(self.root / "generation-1")
+        record = cache / "sources/source-paths-v1.json"
+        before = record.read_bytes()
+        target = cache / "sources" / json.loads(before)["slots"]["slam2d-onetbb"]["path"]
+        (target / "fixture-dirty").write_text("local changes")
+        commands = list(self.commands)
+        with self.assertRaisesRegex(RuntimeError, "源码缓存被修改"):
+            self.build_slam_fixture(self.root / "generation-2")
+        self.assertEqual(self.commands, commands)
+        self.assertEqual(record.read_bytes(), before)
+        self.assertEqual((target / "fixture-dirty").read_text(), "local changes")
+
+    def test_slam_changed_pin_rebinds_only_its_role_and_retains_old_source(self):
+        cache = self.build_slam_fixture(self.root / "generation-1")
+        record = cache / "sources/source-paths-v1.json"
+        before = json.loads(record.read_text())["slots"]
+        old = cache / "sources" / before["slam2d-ceres"]["path"]
+        updated = {**slam.SOURCES, "ceres": (slam.SOURCES["ceres"][0], "c" * 40)}
+        with patch.object(slam, "SOURCES", updated):
+            self.build_slam_fixture(self.root / "generation-2")
+        after = json.loads(record.read_text())["slots"]
+        self.assertEqual(after["slam2d-onetbb"], before["slam2d-onetbb"])
+        self.assertNotEqual(after["slam2d-ceres"]["path"], before["slam2d-ceres"]["path"])
+        self.assertEqual(after["slam2d-ceres"]["revision"], "c" * 40)
+        self.assertEqual((old / "fixture-head").read_text(), before["slam2d-ceres"]["revision"])
+        self.assertEqual((old / "LICENSE").read_text(), before["slam2d-ceres"]["revision"])
+        self.assertEqual(sum(command[0] == "git" and "fetch" in command for command in self.commands), 3)
+
+    def test_production_checkout_callers_supply_explicit_role(self):
+        callers = []
+        for relative in ("scripts/module_installer/builds.py", "scripts/prepare_slam2d_dependencies.py"):
+            tree = ast.parse((SOURCE_ROOT / relative).read_text(), feature_version=(3, 8))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_checkout":
+                    self.assertIn("role", {keyword.arg for keyword in node.keywords}, (relative, node.lineno))
+                    callers.append((relative, node.lineno))
+        self.assertEqual(len(callers), 4)
 
     def test_only_toolchain_download_hash_root_remains_in_builds(self):
         tree = ast.parse((SOURCE_ROOT / "scripts/module_installer/builds.py").read_text(), feature_version=(3, 8))

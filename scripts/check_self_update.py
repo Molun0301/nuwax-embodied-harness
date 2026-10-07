@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from gateways.updates import UpdateMaintenanceMiddleware, UpdateService, build_update_router
 from scripts import self_update as u
-from scripts.module_installer import lifecycle
+from scripts.module_installer import builds, lifecycle
 
 
 def run(*argv, cwd=None):
@@ -256,25 +256,156 @@ class ServiceTests(unittest.TestCase):
 
 
 class CleanupTests(unittest.TestCase):
-    def test_only_managed_cache(self):
+    def test_only_transient_downloads_are_removed(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            for name in [
+            retained = [
                 "cache/build",
                 "cache/sources",
-                "cache/downloads",
+                "cache/slam2d-dependencies",
                 "cache/device-wheels",
                 "cache/rustup",
+                "cache/cargo",
+                "cache/unknown",
                 "generations/previous",
                 "models",
                 "maps",
-            ]:
+            ]
+            for name in [*retained, "cache/downloads"]:
                 (home / name).mkdir(parents=True)
                 (home / name / "keep").write_text("x")
             u.cleanup_cache(home)
-            self.assertFalse((home / "cache/build").exists())
-            for name in ["cache/device-wheels", "cache/rustup", "generations/previous", "models", "maps"]:
+            self.assertFalse((home / "cache/downloads").exists())
+            for name in retained:
                 self.assertTrue((home / name / "keep").exists())
+
+    def test_fake_cargo_reuses_targets_and_artifacts_after_update_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root, cache = home / "source", home / "cache"
+            for manifest in builds._TARGET_ROLES:
+                path = root / manifest
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture manifest")
+                path.with_name("Cargo.lock").write_text("fixture lock")
+            cargo = home / "fake-cargo"
+            calls = []
+
+            def run_cargo(argv, **kwargs):
+                self.assertEqual(argv[0], str(cargo))
+                self.assertEqual(argv[1], "build")
+                target = Path(argv[argv.index("--target-dir") + 1])
+                binary = argv[argv.index("--bin") + 1]
+                artifact = target / "release" / binary
+                reused = artifact.exists()
+                if not reused:
+                    artifact.parent.mkdir(exist_ok=True)
+                    artifact.write_bytes(b"\x7fELFfixture")
+                    artifact.chmod(0o755)
+                calls.append((target, binary, reused))
+
+            selected = ("geometry", "navigation", "follow")
+            with patch.object(builds.os, "geteuid", return_value=1000), patch.object(
+                builds, "_rust_toolchain", return_value=(cargo, {})
+            ):
+                first = builds.build_modules(root, home / "generation-1", cache, selected, 2, run_cargo)
+                preserved = {
+                    path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
+                    for path in (cache / "build/rust").rglob("*") if path.is_file()
+                }
+                self.assertEqual(len(calls), 4)
+                self.assertEqual(len({target for target, _, _ in calls}), 2)
+                self.assertTrue(all(not reused for _, _, reused in calls))
+                u.cleanup_cache(home)
+                for path, expected in preserved.items():
+                    self.assertTrue(path.is_file(), str(path))
+                    self.assertEqual((path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns), expected)
+                with patch.object(builds.uuid, "uuid4", side_effect=AssertionError("target reallocation")):
+                    second = builds.build_modules(root, home / "generation-2", cache, selected, 2, run_cargo)
+            self.assertEqual(set(first), set(second))
+            self.assertEqual([(target, binary) for target, binary, _ in calls[:4]],
+                             [(target, binary) for target, binary, _ in calls[4:]])
+            self.assertTrue(all(reused for _, _, reused in calls[4:]))
+            for binary, installed in second.items():
+                self.assertEqual(Path(installed).read_bytes(), Path(first[binary]).read_bytes())
+
+    def test_reusable_links_are_retained_and_download_link_target_is_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cache = home / "cache"
+            cache.mkdir()
+            for name in ("build", "sources", "slam2d-dependencies", "downloads"):
+                external = home / (name + "-storage")
+                external.mkdir()
+                (external / "keep").write_text(name)
+                (cache / name).symlink_to(external, target_is_directory=True)
+            u.cleanup_cache(home)
+            self.assertFalse((cache / "downloads").is_symlink())
+            for name in ("build", "sources", "slam2d-dependencies", "downloads"):
+                self.assertEqual((home / (name + "-storage") / "keep").read_text(), name)
+                if name != "downloads":
+                    self.assertTrue((cache / name).is_symlink())
+
+    def test_source_assignment_and_payload_survive_update_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cache = home / "cache"
+            source = ("https://example.invalid/pinned-source.git", "a" * 40)
+            destination, admitted = builds._source_destination(cache, "livox-sdk2", source)
+            self.assertFalse(admitted)
+            destination.mkdir()
+            (destination / "payload").write_text("pinned source fixture")
+            record = cache / "sources/source-paths-v1.json"
+            before = record.read_bytes()
+            u.cleanup_cache(home)
+            self.assertEqual(record.read_bytes(), before)
+            self.assertEqual((destination / "payload").read_text(), "pinned source fixture")
+            run = Mock(side_effect=AssertionError("unnecessary source fetch"))
+            with patch.object(builds, "_clean_source", return_value=True) as clean, patch.object(
+                builds, "_legacy_source", side_effect=AssertionError("source rescan")
+            ), patch.object(builds.uuid, "uuid4", side_effect=AssertionError("source reallocation")):
+                self.assertEqual(builds._checkout(cache, source, run, role="livox-sdk2"), destination)
+            clean.assert_called_once_with(destination, source[1])
+            run.assert_not_called()
+
+    def test_nested_download_link_target_is_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            downloads = home / "cache/downloads"
+            downloads.mkdir(parents=True)
+            external = home / "external"
+            external.mkdir()
+            (external / "keep").write_text("keep")
+            (downloads / "link").symlink_to(external, target_is_directory=True)
+            u.cleanup_cache(home)
+            self.assertFalse(downloads.exists())
+            self.assertEqual((external / "keep").read_text(), "keep")
+
+    def test_absent_cache_remains_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            u.cleanup_cache(home)
+            self.assertFalse((home / "cache").exists())
+
+    def test_removed_module_pruning_still_reclaims_obsolete_caches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cache = home / "cache"
+            paths = ("build/native/fastlio2", "build/native/pointlio", "build/native/livox",
+                     "build/rust", "build/slamtec", "sources", "slam2d-dependencies", "cargo")
+            for name in paths:
+                (cache / name).mkdir(parents=True)
+                (cache / name / "keep").write_text(name)
+            builds.prune_build_cache(cache, ("pointlio", "slam2d"), ("fastlio2", "navigation"))
+            u.cleanup_cache(home)
+            for name in ("build/native/pointlio", "build/slamtec", "slam2d-dependencies"):
+                self.assertFalse((cache / name).exists())
+            for name in ("build/native/fastlio2", "build/native/livox", "build/rust", "sources", "cargo"):
+                self.assertEqual((cache / name / "keep").read_text(), name)
+            builds.prune_build_cache(cache, ("fastlio2", "navigation"), ("core",))
+            for name in ("build/native", "build/rust", "sources"):
+                self.assertFalse((cache / name).exists())
+            self.assertEqual((cache / "cargo/keep").read_text(), "cargo")
 
     def test_symlink_root_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

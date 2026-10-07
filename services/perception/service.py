@@ -26,8 +26,11 @@ from contracts.events import RuntimeEventCategory
 from contracts.naming import build_observation_id
 from contracts.perception import Detection2D, Observation, SegmentationMask2D, Track, TrackState
 from contracts.runtime_views import PerceptionContext, SceneObjectSummary, SceneSummary
+from contracts.streams import StreamFrame
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from core.errors import GatewayError
+from core.event_bus import PreparedEventPublication
+from core.stream_bus import PreparedStreamPublication
 from providers import LocalizationProvider, PointCloudProvider
 from services.artifact_service import ArtifactService
 from services.perception.base import (
@@ -196,9 +199,26 @@ class PerceptionService:
             with self._context_condition:
                 self._ensure_open()
             acquired_at = perf_counter()
-            return self._process_image_locked(
+            context, scene_publication = self._process_image_locked(
                 image_frame, camera_info, lock_wait_ms=(acquired_at - requested_at) * 1000.0, **kwargs,
             )
+        # 场景事件在完整分析锁内预留顺序；同步订阅不延长模型串行区。
+        if scene_publication is not None:
+            try:
+                self._event_bus.dispatch_prepared(scene_publication)
+            except BaseException:
+                self._event_bus.abandon_prepared(scene_publication)
+                raise
+        # 完整结果也能在场景通知期间更新；身份检查与游标预留必须相对槽位替换原子化。
+        overlay_publication = None
+        with self._pipeline_lock, self._context_condition:
+            if self._latest_by_camera.get(context.camera_id) is context:
+                overlay_publication = self._prepare_detection_overlay_frame(context)
+        # 游标在检测顺序锁内预留；此处在两个管线锁外完成同步分发。
+        # 调用方仍持有操作及制品拥有方，关闭不能提前回收正在分发的结果。
+        if overlay_publication is not None:
+            self._stream_bus.dispatch_prepared(overlay_publication)
+        return context
 
     def _process_image_locked(
         self,
@@ -213,7 +233,7 @@ class PerceptionService:
         open_vocabulary_classes: Optional[Iterable[str]] = None,
         lock_wait_ms: Optional[float] = None,
         artifact_hold=None,
-    ) -> PerceptionContext:
+    ) -> Tuple[PerceptionContext, Optional[PreparedEventPublication]]:
         """完整分析的实现；调用方持有完整分析锁，检测/跟踪独立加锁。"""
 
         from contracts.artifacts import ArtifactRef
@@ -398,8 +418,9 @@ class PerceptionService:
             context, image_frame=image_frame, source=source_name or detector_spec.name,
             kind="latest_perception", hold=artifact_hold, full=True,
         )
+        scene_publication = None
         if self._event_bus is not None:
-            self._event_bus.publish(
+            scene_publication = self._event_bus.prepare(
                 self._event_bus.build_event(
                     "perception.scene_ready",
                     category=RuntimeEventCategory.PERCEPTION,
@@ -431,10 +452,7 @@ class PerceptionService:
                     },
                 )
             )
-        with self._pipeline_lock:
-            if self.get_latest_perception(context.camera_id) is context:
-                self._publish_detection_overlay_frame(context)
-        return context
+        return context, scene_publication
 
     def perceive_current_scene(
         self,
@@ -576,7 +594,7 @@ class PerceptionService:
                 with self._context_condition:
                     self._ensure_open()
                 acquired_at = perf_counter()
-                return self._process_image_fast_locked(
+                context, overlay_publication = self._process_image_fast_locked(
                     image_frame,
                     camera_info,
                     requested_by=requested_by,
@@ -586,6 +604,9 @@ class PerceptionService:
                     open_vocabulary_classes=open_vocabulary_classes,
                     lock_wait_ms=(acquired_at - requested_at) * 1000.0,
                 )
+            if overlay_publication is not None:
+                self._stream_bus.dispatch_prepared(overlay_publication)
+            return context
 
     def _process_image_fast_locked(
         self,
@@ -598,7 +619,7 @@ class PerceptionService:
         detection_metadata: Optional[Dict[str, object]] = None,
         open_vocabulary_classes: Optional[Iterable[str]] = None,
         lock_wait_ms: Optional[float] = None,
-    ) -> PerceptionContext:
+    ) -> Tuple[PerceptionContext, Optional[PreparedStreamPublication]]:
         """process_image_fast 的实际实现，调用方须已持有 _pipeline_lock。"""
 
         from contracts.image import CameraInfo, ImageFrame
@@ -618,7 +639,7 @@ class PerceptionService:
             cacheable and cached is not None and cached[0] is source_frame
             and cached[1] == input_signature and cached[2] == cache_key
         ):
-            return cached[3]
+            return cached[3], None
 
         image_frame = self._apply_detection_metadata(
             image_frame,
@@ -751,8 +772,7 @@ class PerceptionService:
             self._fast_frame_cache[context.camera_id] = (source_frame, input_signature, cache_key, context)
             if len(self._fast_frame_cache) > 8:
                 self._fast_frame_cache.pop(next(iter(self._fast_frame_cache)))
-        self._publish_detection_overlay_frame(context)
-        return context
+        return context, self._prepare_detection_overlay_frame(context)
 
     @staticmethod
     def _fast_input_signature(image_frame, camera_info):
@@ -1285,9 +1305,12 @@ class PerceptionService:
             },
         )
 
-    def _publish_detection_overlay_frame(self, context: PerceptionContext) -> None:
+    def _prepare_detection_overlay_frame(
+        self, context: PerceptionContext,
+    ) -> Optional[PreparedStreamPublication]:
+        """在检测顺序锁内记录叠加帧；调用方须在管线锁外完成同步分发。"""
         if self._stream_bus is None:
-            return
+            return None
         observation = context.observation
         detection_count = len(observation.detections_2d)
         detections = tuple(self._serialize_detection_overlay(detection) for detection in observation.detections_2d[:64])
@@ -1336,8 +1359,8 @@ class PerceptionService:
             "pipeline_lock_wait_ms": context.metadata.get("pipeline_lock_wait_ms"),
             "source_timestamp_ns": context.metadata.get("source_timestamp_ns"),
         }
-        self._stream_bus.publish(
-            "video.detections",
+        return self._stream_bus.prepare_publication(StreamFrame(
+            topic="video.detections",
             source="perception_service",
             payload=payload,
             frame_id=observation.frame_id,
@@ -1349,7 +1372,7 @@ class PerceptionService:
                 "overlay_phase": overlay_phase,
                 "publish_interval_ms": publish_interval_ms,
             },
-        )
+        ))
 
     @staticmethod
     def _serialize_detection_overlay(detection: Detection2D) -> Dict[str, Any]:

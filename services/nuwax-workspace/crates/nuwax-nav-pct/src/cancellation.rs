@@ -1,19 +1,30 @@
 //! Cooperative planning cancellation. This never mutates a source map or its evidence.
-use std::{cell::RefCell, sync::{Arc, atomic::{AtomicU64, Ordering}}};
+use std::{cell::RefCell, sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}}};
 
-/// A planning request remains current only while the owner's epoch equals this value.
-/// Advancing the owner's epoch cancels all older tokens without resetting a shared flag.
+/// A request-owned cancellation source shared with synchronous planning checkpoints.
+/// Epoch tokens retire on owner advancement; flag tokens use the existing job flag.
 #[derive(Clone, Debug)]
 pub struct PlanningCancellation {
-    epoch: Arc<AtomicU64>,
-    expected_epoch: u64,
+    source: CancellationSource,
+}
+#[derive(Clone, Debug)]
+enum CancellationSource {
+    Epoch { epoch: Arc<AtomicU64>, expected_epoch: u64 },
+    Flag(Arc<AtomicBool>),
 }
 impl PlanningCancellation {
     pub fn new(epoch: Arc<AtomicU64>, expected_epoch: u64) -> Self {
-        Self { epoch, expected_epoch }
+        Self { source: CancellationSource::Epoch { epoch, expected_epoch } }
+    }
+    /// Share the existing request-owned flag with construction checkpoints.
+    pub fn from_flag(flag: Arc<AtomicBool>) -> Self {
+        Self { source: CancellationSource::Flag(flag) }
     }
     pub fn is_cancelled(&self) -> bool {
-        self.epoch.load(Ordering::Acquire) != self.expected_epoch
+        match &self.source {
+            CancellationSource::Epoch { epoch, expected_epoch } => epoch.load(Ordering::Acquire) != *expected_epoch,
+            CancellationSource::Flag(flag) => flag.load(Ordering::Acquire),
+        }
     }
 }
 thread_local! {
@@ -83,6 +94,65 @@ pub(crate) fn after_checkpoints<T>(count: usize, operation: impl FnOnce() -> T) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owned_flags_preserve_mixed_epoch_scopes_and_unwind() {
+        let epoch = Arc::new(AtomicU64::new(7));
+        let current = PlanningCancellation::new(epoch.clone(), 7);
+        let flag = Arc::new(AtomicBool::new(false));
+        let token = PlanningCancellation::from_flag(flag.clone());
+        with_planning_cancellation(&current, || {
+            assert!(!planning_cancelled());
+            with_planning_cancellation(&token, || {
+                assert!(!planning_cancelled());
+                flag.store(true, Ordering::Release);
+                assert!(planning_cancelled());
+                with_planning_cancellation(&current, || assert!(planning_cancelled()));
+            });
+            assert!(!planning_cancelled(), "the retired flag must leave its outer epoch intact");
+            let unwind = std::panic::catch_unwind(|| with_planning_cancellation(&token, || {
+                assert!(planning_cancelled());
+                panic!("exercise owned-flag restoration");
+            }));
+            assert!(unwind.is_err());
+            assert!(!planning_cancelled());
+            epoch.store(8, Ordering::Release);
+            let fresh = PlanningCancellation::from_flag(Arc::new(AtomicBool::new(false)));
+            with_planning_cancellation(&fresh, || assert!(planning_cancelled()));
+        });
+        assert!(!planning_cancelled());
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn owned_flag_scope_is_thread_local_and_fresh_requests_are_independent() {
+        let retired = PlanningCancellation::from_flag(Arc::new(AtomicBool::new(true)));
+        let flag = Arc::new(AtomicBool::new(false));
+        let current = PlanningCancellation::from_flag(flag.clone());
+        let (ready, entered) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        with_planning_cancellation(&retired, || {
+            let worker = std::thread::spawn(move || {
+                assert!(!planning_cancelled(), "parent TLS must not enter a spawned worker");
+                with_planning_cancellation(&current, || {
+                    assert!(!planning_cancelled(), "the new request has its own flag");
+                    ready.send(()).unwrap();
+                    resume.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+                    assert!(planning_cancelled(), "the worker must share the owner's actual flag");
+                });
+                assert!(!planning_cancelled());
+            });
+            entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            assert!(planning_cancelled());
+            flag.store(true, Ordering::Release);
+            release.send(()).unwrap();
+            worker.join().unwrap();
+            assert!(planning_cancelled(), "worker restoration cannot change parent TLS");
+        });
+        let fresh = PlanningCancellation::from_flag(Arc::new(AtomicBool::new(false)));
+        with_planning_cancellation(&fresh, || assert!(!planning_cancelled()));
+        assert!(!planning_cancelled());
+    }
+
     #[test]
     fn checkpoint_actions_restore_after_nested_unwind_and_allow_reentry() {
         let calls = std::rc::Rc::new(RefCell::new(Vec::new()));

@@ -448,10 +448,14 @@ fn body_path_with_budget(
         let p=start.pose.position;
         let boundary:Vec<_>=goal.boundary_points.iter().map(|p|[p[0],p[1]]).collect();
         let _ = search_budget;
-        let route=config.follower.pct.body_route(surface,([p.x,p.y,p.z],start_quat),
+        let plan=|| config.follower.pct.body_route(surface,([p.x,p.y,p.z],start_quat),
             (goal.goal.pose.position,goal.goal.pose.orientation_xyzw),goal.options,
-            &boundary,config.planning_cancelled.as_deref())
-            .map_err(|e|module_error("pct global planning",e))?;
+            &boundary,None);
+        let route=match config.planning_cancelled.as_ref() {
+            Some(flag) => nuwax_nav_pct::with_planning_cancellation(
+                &nuwax_nav_pct::PlanningCancellation::from_flag(Arc::clone(flag)), plan),
+            None => plan(),
+        }.map_err(|e|module_error("pct global planning",e))?;
         return Ok(Path3D{poses:route.into_iter().map(|(p,q)|PoseStamped {frame_id:start.frame_id.clone(),stamp:start.stamp,pose:Pose3 {position:Point3::new(p[0],p[1],p[2]),orientation:Quaternion{x:q[0],y:q[1],z:q[2],w:q[3]}}}).collect()});
     }
     let start_support = surface

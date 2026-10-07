@@ -493,6 +493,42 @@ impl Tomogram {
 mod cancellation_tests {
     use super::*;
     #[test]
+    fn owned_flag_stops_column_ingestion_and_abandons_connect_and_costs() {
+        use std::{cell::Cell, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+        let flag = Arc::new(AtomicBool::new(false));
+        let token = crate::PlanningCancellation::from_flag(flag.clone());
+        let visited = Cell::new(0);
+        let columns = (0..10_000).map(|x| {
+            visited.set(visited.get() + 1);
+            if x == 7 { flag.store(true, Ordering::Release); }
+            ([x, 0], vec![[-0.1, 0.0]])
+        });
+        let error = crate::with_planning_cancellation(&token, ||
+            Tomogram::from_columns(0.1, columns, 0.5, 0.15, 0.2, 0.2, 20.0)).unwrap_err();
+        assert_eq!(error, "层析规划已取消");
+        assert_eq!(visited.get(), 8, "the remaining 9,992 columns must not be consumed");
+        // Entry + three checkpoints per column + post-input = 302.
+        // Connect consumes checkpoints 302..=402; 450 is inside compute_costs.
+        for (phase, count) in [("connect", 302), ("costs", 450)] {
+            let flag = Arc::new(AtomicBool::new(false));
+            let flip = flag.clone();
+            let token = crate::PlanningCancellation::from_flag(flag.clone());
+            let consumed = Cell::new(0);
+            let result = crate::cancellation::after_checkpoint_action(count,
+                move || flip.store(true, Ordering::Release), ||
+                crate::with_planning_cancellation(&token, ||
+                    Tomogram::from_columns(0.1, (0..100).map(|x| {
+                        consumed.set(consumed.get() + 1);
+                        ([x, 0], vec![[-0.1, 0.0]])
+                    }), 0.5, 0.15, 0.2, 0.2, 20.0)));
+            assert!(flag.load(Ordering::Acquire), "{phase} checkpoint was not reached");
+            assert_eq!(consumed.get(), 100, "{phase} must run after ingestion");
+            assert_eq!(result.unwrap_err(), "层析规划已取消", "{phase}");
+        }
+        assert!(!crate::planning_cancelled());
+    }
+
+    #[test]
     fn cancellation_stops_column_input_before_collecting_the_whole_map() {
         use std::{cell::Cell, sync::{Arc, atomic::{AtomicU64, Ordering}}};
         let epoch = Arc::new(AtomicU64::new(4));

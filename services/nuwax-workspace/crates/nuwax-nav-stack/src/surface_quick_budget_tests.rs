@@ -2,6 +2,114 @@
 use super::*;
 use std::sync::atomic::AtomicBool;
 
+// A thread-scoped observer uses an existing production event immediately before
+// PCT's cache-publication checkpoint. No public test hook or transport substitute.
+struct MapBuiltObserver {
+    cancel: Option<Arc<AtomicBool>>,
+    builds: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl tracing::Subscriber for MapBuiltObserver {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool { true }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct EventName(bool);
+        impl tracing::field::Visit for EventName {
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0 |= field.name() == "event" && value == "navigation.pct.map";
+            }
+        }
+        let mut name = EventName(false);
+        event.record(&mut name);
+        if name.0 {
+            self.builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(flag) = &self.cancel {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[test]
+fn owned_flag_body_path_binding_rejects_preinstall_and_preserves_prior_cache() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (surface, start, goal) = fixture(false);
+    let previous = surface.clone().with_ground_evidence(
+        nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume);
+    assert!(!nuwax_nav_pct::same_source_geometry(&surface, &previous));
+    for budget in [0, 30_000] {
+        for populated in [false, true] {
+            let mut config = calibrated_config(false);
+            let old = populated.then(|| config.follower.pct.map(&previous).unwrap());
+            let cancelled = Arc::new(AtomicBool::new(false));
+            config.planning_cancelled = Some(cancelled.clone());
+            let builds = Arc::new(AtomicUsize::new(0));
+            let result = tracing::subscriber::with_default(MapBuiltObserver {
+                cancel: Some(cancelled.clone()), builds: builds.clone(),
+            }, || body_path_with_budget(&surface, &start, &goal, &config, budget));
+            assert_eq!(builds.load(Ordering::Relaxed), 1, "the actual map-built event must fire");
+            assert!(cancelled.load(Ordering::Acquire));
+            assert!(result.unwrap_err().to_string().contains("层析规划已取消"));
+            assert!(!nuwax_nav_pct::planning_cancelled(), "body_path must restore worker TLS");
+            let fresh = Arc::new(AtomicBool::new(false));
+            config.planning_cancelled = Some(fresh);
+            tracing::subscriber::with_default(MapBuiltObserver {
+                cancel: None, builds: builds.clone(),
+            }, || {
+                if let Some(old) = old {
+                    assert!(Arc::ptr_eq(&old, &config.follower.pct.map(&previous).unwrap()));
+                    assert_eq!(builds.load(Ordering::Relaxed), 1, "the old cache must survive");
+                }
+                let retry = body_path_with_budget(&surface, &start, &goal, &config, budget).unwrap();
+                assert!(!retry.poses.is_empty());
+                assert_eq!(builds.load(Ordering::Relaxed), 2, "cancelled construction must not install its map");
+                let repeated = body_path_with_budget(&surface, &start, &goal, &config, budget).unwrap();
+                assert_eq!(retry, repeated);
+                assert_eq!(builds.load(Ordering::Relaxed), 2, "a successful complete map must remain reusable");
+            });
+            assert!(cancelled.load(Ordering::Acquire), "a fresh request must not reset the old flag");
+        }
+    }
+}
+
+#[test]
+fn owned_flag_preserves_uncancelled_direct_detour_and_penalty_path_bits() {
+    let mut paths = Vec::new();
+    for (name, detour, penalty) in [("direct", false, false), ("detour", true, false), ("penalty", false, true)] {
+        let (surface, start, goal) = fixture(detour);
+        let bits = |path: &Path3D| path.poses.iter().map(|pose| {
+            let p = pose.pose.position;
+            let q = pose.pose.orientation;
+            ([p.x.to_bits(), p.y.to_bits(), p.z.to_bits()],
+                [q.x.to_bits(), q.y.to_bits(), q.z.to_bits(), q.w.to_bits()],
+                pose.frame_id.clone(), pose.stamp)
+        }).collect::<Vec<_>>();
+        let baseline = body_path_with_budget(&surface, &start, &goal, &calibrated_config(penalty), 30_000).unwrap();
+        let expected = bits(&baseline);
+        for budget in [0, 30_000] {
+            let mut configured = calibrated_config(penalty);
+            configured.planning_cancelled = Some(Arc::new(AtomicBool::new(false)));
+            let cold = body_path_with_budget(&surface, &start, &goal, &configured, budget).unwrap();
+            let warm = body_path_with_budget(&surface, &start, &goal, &configured, budget).unwrap();
+            assert_eq!(bits(&cold), expected, "{name} cold budget {budget}");
+            assert_eq!(bits(&warm), expected, "{name} warm budget {budget}");
+            assert!(!nuwax_nav_pct::planning_cancelled());
+        }
+        let quality = metrics(&baseline, &goal);
+        if detour { assert!(quality["max_lateral_deviation_m"].as_f64().unwrap() > 1.4); }
+        if penalty { assert!(quality["max_lateral_deviation_m"].as_f64().unwrap() > 0.3); }
+        paths.push(expected);
+    }
+    assert_ne!(paths[0], paths[1], "the physical detour must remain meaningful");
+    assert_ne!(paths[0], paths[2], "the local penalty must still affect the route");
+}
+
 fn calibrated_config(penalty: bool) -> SurfaceNavigationConfig {
     let mut config = SurfaceNavigationConfig::new(
         "map".into(), 0.4, 0.3, 0.6, 0.1, 0.15, 18.0, 0.2,

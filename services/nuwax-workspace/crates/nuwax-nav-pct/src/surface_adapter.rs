@@ -65,6 +65,88 @@ mod body_route_cancellation_tests {
         assert!(planner.body_route(&source, ([-0.5,0.0,0.45],[0.0,0.0,0.0,1.0]),
             ([0.5,0.0,0.45],[0.0,0.0,0.0,1.0]), GoalOptions::default(), &[], Some(&cancelled)).is_ok());
     }
+
+    #[test]
+    fn scoped_owned_flag_aborts_real_columns_without_replacing_complete_cache() {
+        let source = source();
+        let previous = source.clone().with_ground_evidence(
+            nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume);
+        assert!(!same_source_geometry(&source, &previous));
+        for populated in [false, true] {
+            let planner = PctPlanner::default();
+            let old = populated.then(|| planner.map(&previous).unwrap());
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let flip = cancelled.clone();
+            let token = crate::PlanningCancellation::from_flag(cancelled.clone());
+            // Same real column checkpoint as the legacy limitation test above.
+            let result = crate::cancellation::after_checkpoint_action(10,
+                move || flip.store(true, Ordering::Release), ||
+                crate::with_planning_cancellation(&token, ||
+                    planner.body_route(&source, ([-0.5,0.0,0.45],[0.0,0.0,0.0,1.0]),
+                        ([0.5,0.0,0.45],[0.0,0.0,0.0,1.0]), GoalOptions::default(), &[], None)));
+            assert!(cancelled.load(Ordering::Acquire));
+            assert_eq!(result.unwrap_err(), "层析规划已取消");
+            let cached = planner.cached.lock().unwrap();
+            match old.as_ref() {
+                Some(old) => {
+                    let (retained_source, retained_map) = cached.as_ref().unwrap();
+                    assert!(same_source_geometry(retained_source, &previous));
+                    assert!(Arc::ptr_eq(old, retained_map));
+                }
+                None => assert!(cached.is_none()),
+            }
+            drop(cached);
+            let fresh = crate::PlanningCancellation::from_flag(Arc::new(AtomicBool::new(false)));
+            let rebuilt = crate::with_planning_cancellation(&fresh, || planner.map(&source)).unwrap();
+            assert!(!rebuilt.cells.is_empty());
+            assert!(Arc::ptr_eq(&rebuilt, &planner.map(&source).unwrap()));
+            assert!(!crate::planning_cancelled());
+        }
+    }
+
+    #[test]
+    fn scoped_owned_flag_aborts_connect_and_costs_without_cache_publication() {
+        let source = source();
+        let previous = source.clone().with_ground_evidence(
+            nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume);
+        // Freeze the fixture's exact checkpoint layout, without adding production probes.
+        let (_, columns) = source.navigation_source_columns(None);
+        let input_checks: usize = columns.map(|(_, mut bands)| {
+            bands.sort_unstable_by(|a, b| a[0].total_cmp(&b[0]));
+            assert!(bands.iter().all(|b| b[0].is_finite() && b[1].is_finite() && b[0] < b[1]));
+            assert!(bands.windows(2).all(|p| p[1][0] > p[0][1] + 1e-6));
+            1 + 2 * bands.len()
+        }).sum();
+        let cells = Tomogram::from_surface(&source).unwrap().cells.len();
+        assert!(cells > 17);
+        // map entry, three surface checks, from_columns entry, post-input precede connect.
+        let connect = 6 + input_checks;
+        let costs = connect + cells + 1;
+        for (phase, count) in [("connect", connect + 17), ("costs", costs + 17)] {
+            for populated in [false, true] {
+                let planner = PctPlanner::default();
+                let old = populated.then(|| planner.map(&previous).unwrap());
+                let flag = Arc::new(AtomicBool::new(false));
+                let flip = flag.clone();
+                let token = crate::PlanningCancellation::from_flag(flag.clone());
+                let result = crate::cancellation::after_checkpoint_action(count,
+                    move || flip.store(true, Ordering::Release), ||
+                    crate::with_planning_cancellation(&token, || planner.map(&source)));
+                assert!(flag.load(Ordering::Acquire), "{phase} checkpoint was not reached");
+                assert_eq!(result.unwrap_err(), "层析规划已取消", "{phase}");
+                let cached = planner.cached.lock().unwrap();
+                match old.as_ref() {
+                    Some(old) => {
+                        let (retained_source, retained_map) = cached.as_ref().unwrap();
+                        assert!(same_source_geometry(retained_source, &previous));
+                        assert!(Arc::ptr_eq(old, retained_map), "{phase}");
+                    }
+                    None => assert!(cached.is_none(), "{phase}"),
+                }
+                assert!(!crate::planning_cancelled());
+            }
+        }
+    }
 }
 impl std::fmt::Debug for PctPlanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

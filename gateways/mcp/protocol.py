@@ -719,7 +719,8 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
             if method == "tools/list":
                 tools = await run_in_threadpool(lambda: _build_collection_tools(runtime))
                 response_payload = _jsonrpc_result(request_id, {"tools": tools})
-                if _json_bytes(response_payload) > MCP_RESULT_MAX_BYTES:
+                response = JSONResponse(response_payload)
+                if len(response.body) > MCP_RESULT_MAX_BYTES:
                     raise GatewayError(
                         "MCP 工具目录响应超过安全大小限制。",
                         error_code="mcp_response_too_large",
@@ -727,7 +728,7 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                         jsonrpc_code=-32603,
                         details={"tool_count": len(tools)},
                     )
-                return JSONResponse(response_payload)
+                return response
 
             if method == "tools/call":
                 name = str(params.get("name", "")).strip()
@@ -825,14 +826,15 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                         lambda: build_mcp_tool_result(structured, max_total_bytes=result_budget)
                     ),
                 )
-                if _json_bytes(response_payload) > MCP_RESULT_MAX_BYTES:
+                response = JSONResponse(response_payload)
+                if len(response.body) > MCP_RESULT_MAX_BYTES:
                     raise GatewayError(
                         "MCP 工具结果响应超过安全大小限制。",
                         error_code="mcp_response_too_large",
                         http_status=500,
                         jsonrpc_code=-32603,
                     )
-                return JSONResponse(response_payload)
+                return response
             raise GatewayError(
                 "不支持的 MCP 方法。",
                 error_code="unsupported_mcp_method",

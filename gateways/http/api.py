@@ -608,7 +608,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         root = config_io._CORE_ENV.parent
         location = await call_settings(configuration_location, root=root, robot=payload.get("robot"), profile=payload.get("profile"))
         if location:
-            if not settings_application._is_active(location):
+            if not await run_in_threadpool(settings_application._is_active, location):
                 raise GatewayError("请先应用所选配置方案", error_code="configuration_not_active", http_status=409)
             await call_settings(check_revision, location, payload.get("revision"), root=root,
                                 revision_owner=settings_application.revision_owner)

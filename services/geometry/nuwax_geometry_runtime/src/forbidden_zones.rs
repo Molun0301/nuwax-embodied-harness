@@ -451,6 +451,19 @@ pub fn compose_effective_map(
     raw: &MapState,
     loaded: &LoadedForbiddenZones,
 ) -> Result<MapState, String> {
+    validate_map_layout(raw)?;
+    Ok(rasterize_effective_map(raw.clone(), loaded))
+}
+
+pub(crate) fn compose_effective_map_owned(
+    effective: MapState,
+    loaded: &LoadedForbiddenZones,
+) -> Result<MapState, String> {
+    validate_map_layout(&effective)?;
+    Ok(rasterize_effective_map(effective, loaded))
+}
+
+fn validate_map_layout(raw: &MapState) -> Result<(), String> {
     let expected = raw.width as usize * raw.height as usize;
     if raw.width == 0
         || raw.height == 0
@@ -460,14 +473,20 @@ pub fn compose_effective_map(
     {
         return Err("raw occupancy layout is invalid".to_string());
     }
-    let mut effective = raw.clone();
+    Ok(())
+}
+
+fn rasterize_effective_map(
+    mut effective: MapState,
+    loaded: &LoadedForbiddenZones,
+) -> MapState {
     if matches!(loaded.status, ZoneLoadStatus::FailClosed(_)) {
         effective.data.fill(100);
-        return Ok(effective);
+        return effective;
     }
     let enabled: Vec<&ForbiddenZone> = loaded.zones.iter().filter(|zone| zone.enabled).collect();
     if enabled.is_empty() {
-        return Ok(effective);
+        return effective;
     }
 
     let cell_count = effective.data.len();
@@ -478,14 +497,14 @@ pub fn compose_effective_map(
         .filter(|zone| zone.mode == ZoneMode::Outside)
         .collect();
     if !outside_zones.is_empty() {
-        for row in 0..raw.height {
-            for col in 0..raw.width {
-                let rect = cell_rect(raw, col, row);
+        for row in 0..effective.height {
+            for col in 0..effective.width {
+                let rect = cell_rect(&effective, col, row);
                 let allowed = outside_zones
                     .iter()
-                    .all(|zone| cell_fully_inside_closed_shape(rect, zone, raw.resolution as f64));
+                    .all(|zone| cell_fully_inside_closed_shape(rect, zone, effective.resolution as f64));
                 if !allowed {
-                    forbidden[cell_index(raw, col, row)] = true;
+                    forbidden[cell_index(&effective, col, row)] = true;
                 }
             }
         }
@@ -495,11 +514,53 @@ pub fn compose_effective_map(
         if zone.mode == ZoneMode::Outside {
             continue;
         }
-        for row in 0..raw.height {
-            for col in 0..raw.width {
-                let rect = cell_rect(raw, col, row);
-                if cell_forbidden_by_inside_zone(rect, zone, raw.resolution as f64) {
-                    forbidden[cell_index(raw, col, row)] = true;
+        if zone.shape == ZoneShape::Rectangle {
+            let shape = rectangle_from_corners(zone.vertices[0], zone.vertices[1]);
+            let expanded = expand_rect(
+                shape,
+                boundary_half_width(zone, effective.resolution as f64),
+            );
+            let first_true = |len: u32, predicate: &dyn Fn(u32) -> bool| {
+                let (mut lo, mut hi) = (0, len);
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if predicate(mid) {
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
+                    }
+                }
+                lo
+            };
+            // Keep actual rounded bounds: (origin + i * r) + r can differ
+            // from origin + (i + 1) * r at large origins.
+            let col_start = first_true(effective.width, &|col| {
+                cell_rect(&effective, col, 0).max_x >= expanded.min_x - GEOMETRY_EPSILON
+            });
+            // Negating <= also makes a NaN upper threshold yield no cells.
+            let col_end = first_true(effective.width, &|col| {
+                !(cell_rect(&effective, col, 0).min_x <= expanded.max_x + GEOMETRY_EPSILON)
+            });
+            let row_start = first_true(effective.height, &|row| {
+                cell_rect(&effective, 0, row).max_y >= expanded.min_y - GEOMETRY_EPSILON
+            });
+            let row_end = first_true(effective.height, &|row| {
+                !(cell_rect(&effective, 0, row).min_y <= expanded.max_y + GEOMETRY_EPSILON)
+            });
+            if col_start >= col_end || row_start >= row_end {
+                continue;
+            }
+            for row in row_start..row_end {
+                let offset = row as usize * effective.width as usize;
+                forbidden[offset + col_start as usize..offset + col_end as usize].fill(true);
+            }
+            continue;
+        }
+        for row in 0..effective.height {
+            for col in 0..effective.width {
+                let rect = cell_rect(&effective, col, row);
+                if cell_forbidden_by_inside_zone(rect, zone, effective.resolution as f64) {
+                    forbidden[cell_index(&effective, col, row)] = true;
                 }
             }
         }
@@ -510,7 +571,7 @@ pub fn compose_effective_map(
             effective.data[index] = 100;
         }
     }
-    Ok(effective)
+    effective
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -826,6 +887,14 @@ fn squared_distance(a: ZonePoint, b: ZonePoint) -> f64 {
     let dy = a.y - b.y;
     dx * dx + dy * dy
 }
+
+#[cfg(test)]
+#[path = "forbidden_zones_copy_trial_reference.rs"]
+pub(crate) mod copy_trial_reference;
+
+#[cfg(test)]
+#[path = "forbidden_zones_rectangle_scan_tests.rs"]
+pub(crate) mod rectangle_scan_tests;
 
 #[cfg(test)]
 mod tests {

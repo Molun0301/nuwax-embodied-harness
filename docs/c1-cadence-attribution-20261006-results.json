@@ -1,0 +1,2657 @@
+{
+  "local_base": "2bf54cc108a63dfa728a486fefd4de8ce8331620",
+  "base_tree": "1fabe2eac417c4fecde21552148f22b2b93dbe72",
+  "remote_base": "410290dbc45c20db10bf2782556b555a0175bcc4",
+  "execution": {
+    "source": {
+      "path": "/workspace/shared/neh-cadence-ramp-20261006/nuwax-nav-runtime-test",
+      "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_runtime-6a3cde7862e97042",
+      "sha256": "c4aa36e4969c2da1f496a3b2e5a1bb057340a6d47bc065e41ea5f06f562e819f",
+      "bytes": 12778016,
+      "features": [
+        "body-query-profile",
+        "default"
+      ],
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "source_hashes": "924423230141fab36d4e2d4713d8b41bb62e1c0e9f078a13815440f8f6d92f4a  crates/nuwax-nav-runtime/src/route_moving_worker_tests.rs\n687f02f528e11dd8542591388e8d644d78d97fa9e8d591ea39146d3a416c8048  crates/nuwax-nav-runtime/src/route_moving_cadence_trace.rs\n894a21d5e12723aa9413d454c14dcee6524deb6f2e7af2c1875484a600aa5862  crates/nuwax-nav-runtime/src/surface_follower.rs\n5c1622546dc922566197b72797c8271029d6c31144836b629e17363bd6be2305  crates/nuwax-nav-mls-planner/src/surface/body.rs\n",
+      "note": "Mixed test profile: MLS/runtime opt3, other crates ordinarytest, debug0, body-query-profile; diagnostic overhead inclusive; not release or hardware"
+    },
+    "results": [
+      {
+        "label": "trace-unit-tests",
+        "command": [
+          "/workspace/shared/neh-cadence-ramp-20261006/nuwax-nav-runtime-test",
+          "route_moving_worker_tests::cadence_trace::",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_seconds": 0.052892747000441886,
+        "user_cpu_seconds": 0.015087999999999999,
+        "system_cpu_seconds": 0.015189999999999999,
+        "launch_peak_rss_kib": 24652,
+        "voluntary_context_switches": 4,
+        "involuntary_context_switches": 1
+      },
+      {
+        "label": "calibrated-ramp",
+        "command": [
+          "/workspace/shared/neh-cadence-ramp-20261006/nuwax-nav-runtime-test",
+          "surface_follower::tests::calibrated_body_closes_real_ramp_route",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_seconds": 1.135383491004177,
+        "user_cpu_seconds": 1.045151,
+        "system_cpu_seconds": 0.054008,
+        "launch_peak_rss_kib": 24652,
+        "voluntary_context_switches": 32,
+        "involuntary_context_switches": 289
+      },
+      {
+        "label": "moving-off",
+        "command": [
+          "/workspace/shared/neh-cadence-ramp-20261006/nuwax-nav-runtime-test",
+          "route_moving_worker_tests::moving_measured_5cm_primed_off_full_goal",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 101,
+        "timeout": false,
+        "wall_seconds": 24.546605250005086,
+        "user_cpu_seconds": 2.1801719999999998,
+        "system_cpu_seconds": 0.6390549999999999,
+        "launch_peak_rss_kib": 71644,
+        "voluntary_context_switches": 1224,
+        "involuntary_context_switches": 403
+      },
+      {
+        "label": "moving-on",
+        "command": [
+          "/workspace/shared/neh-cadence-ramp-20261006/nuwax-nav-runtime-test",
+          "route_moving_worker_tests::moving_measured_5cm_primed_on_full_goal",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_seconds": 21.298595159001707,
+        "user_cpu_seconds": 1.459443,
+        "system_cpu_seconds": 0.107139,
+        "launch_peak_rss_kib": 66612,
+        "voluntary_context_switches": 1387,
+        "involuntary_context_switches": 558
+      },
+      {
+        "label": "moving-held",
+        "command": [
+          "/workspace/shared/neh-cadence-ramp-20261006/nuwax-nav-runtime-test",
+          "route_moving_worker_tests::moving_5cm_primed_held_planning_continuity_only",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_seconds": 15.174715246001142,
+        "user_cpu_seconds": 1.363664,
+        "system_cpu_seconds": 0.119546,
+        "launch_peak_rss_kib": 76676,
+        "voluntary_context_switches": 992,
+        "involuntary_context_switches": 547
+      }
+    ]
+  },
+  "normal_feature_build": {
+    "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_runtime-491c625e8fa61771",
+    "sha256": "26f1541242dc3bcd5ad4f6539eb2b412f003709672d939b7823e27eb22b03085",
+    "bytes": 12780464,
+    "features": [
+      "default"
+    ],
+    "profile": {
+      "opt_level": "3",
+      "debuginfo": 0,
+      "debug_assertions": true,
+      "overflow_checks": true,
+      "test": true
+    },
+    "scope": "compiled only; no duplicate execution",
+    "source_hashes": "924423230141fab36d4e2d4713d8b41bb62e1c0e9f078a13815440f8f6d92f4a  crates/nuwax-nav-runtime/src/route_moving_worker_tests.rs\n687f02f528e11dd8542591388e8d644d78d97fa9e8d591ea39146d3a416c8048  crates/nuwax-nav-runtime/src/route_moving_cadence_trace.rs\n894a21d5e12723aa9413d454c14dcee6524deb6f2e7af2c1875484a600aa5862  crates/nuwax-nav-runtime/src/surface_follower.rs\n5c1622546dc922566197b72797c8271029d6c31144836b629e17363bd6be2305  crates/nuwax-nav-mls-planner/src/surface/body.rs\n"
+  },
+  "independent_outlier_audit": [
+    {
+      "tick": 122,
+      "previous_tick": 121,
+      "gap_ms": 127.273239,
+      "requested_sleep_ms": 49.469975,
+      "oversleep_ms": 77.452822,
+      "reconstructs": true,
+      "ticks": {
+        "121": {
+          "start_ms": 6050.179583,
+          "before_sleep_ms": 6000.512476,
+          "body_end_ms": 6050.521637,
+          "phases_ms": [
+            0.16111599999999998,
+            0.09169,
+            0.0062380000000000005,
+            0.0019010000000000001,
+            0.027315,
+            0.051366,
+            5.3e-05,
+            0.002375
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  85658137,
+                  16758271,
+                  134
+                ],
+                [
+                  85921268,
+                  16758271,
+                  135
+                ],
+                [
+                  263131,
+                  0,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                6000.51144,
+                6000.51242
+              ],
+              "after_window_ms": [
+                6050.1964450000005,
+                6050.2421269999995
+              ],
+              "read_cost_ms": [
+                0.00098,
+                0.045682
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  85921268,
+                  16758271,
+                  135
+                ],
+                [
+                  85921268,
+                  16758271,
+                  135
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                6050.1964450000005,
+                6050.2421269999995
+              ],
+              "after_window_ms": [
+                6050.521681,
+                6050.523399000001
+              ],
+              "read_cost_ms": [
+                0.045682,
+                0.001718
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "unavailable": "no_accepted_nonzero_receipt"
+          }
+        },
+        "122": {
+          "start_ms": 6177.452822,
+          "before_sleep_ms": 6050.530025,
+          "body_end_ms": 6177.607784,
+          "phases_ms": [
+            0.021854000000000002,
+            0.0030819999999999997,
+            0.035745,
+            0.000558,
+            0.05016,
+            0.042829,
+            7.7e-05,
+            0.000657
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  85921268,
+                  16758271,
+                  135
+                ],
+                [
+                  86361324,
+                  18974670,
+                  136
+                ],
+                [
+                  440056,
+                  2216399,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                6050.529019,
+                6050.529969
+              ],
+              "after_window_ms": [
+                6177.454235,
+                6177.47013
+              ],
+              "read_cost_ms": [
+                0.00095,
+                0.015895
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  86361324,
+                  18974670,
+                  136
+                ],
+                [
+                  86361324,
+                  18974670,
+                  136
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                6177.454235,
+                6177.47013
+              ],
+              "after_window_ms": [
+                6177.60787,
+                6177.610243
+              ],
+              "read_cost_ms": [
+                0.015895,
+                0.002373
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "tick": 122,
+            "result_id": 124,
+            "compute_start_ns": 1791304430562087221,
+            "compute_completion_ns": 1791304430562576724,
+            "publication_ns": 1791304430562577885,
+            "retrieval_ns": 1791304430685259075,
+            "actual_receipt_oracle_ns": 1791304430685263281,
+            "derived_chain_ms": [
+              0.489503,
+              0.001161,
+              122.68119,
+              0.004206
+            ],
+            "clock_chain_valid": true
+          }
+        }
+      },
+      "compute": [
+        {
+          "compute_step_seq": 123.0,
+          "control_ms": 3.687666,
+          "profile_begin_ms": 0.018218,
+          "profile_end_ms": 0.000433,
+          "probe_lock_wait_ms": 0.000152,
+          "sched": {
+            "counter_triplets": [
+              [
+                279113163,
+                4487305,
+                200
+              ],
+              [
+                282413027,
+                4508564,
+                201
+              ],
+              [
+                3299864,
+                21259,
+                1
+              ]
+            ],
+            "before_window_ms": [
+              6050.656418,
+              6050.680775
+            ],
+            "after_window_ms": [
+              6054.369194000001,
+              6054.375157
+            ],
+            "read_cost_ms": [
+              0.024357,
+              0.005963
+            ],
+            "error": false
+          }
+        },
+        {
+          "compute_step_seq": 124.0,
+          "control_ms": 0.442013,
+          "profile_begin_ms": 0.000166,
+          "profile_end_ms": 0.000246,
+          "probe_lock_wait_ms": 3.5000000000000004e-05,
+          "sched": {
+            "counter_triplets": [
+              [
+                282413027,
+                4508564,
+                201
+              ],
+              [
+                282413027,
+                4508564,
+                201
+              ],
+              [
+                0,
+                0,
+                0
+              ]
+            ],
+            "before_window_ms": [
+              6054.390160999999,
+              6054.3913219999995
+            ],
+            "after_window_ms": [
+              6054.833576,
+              6054.834965
+            ],
+            "read_cost_ms": [
+              0.001161,
+              0.001389
+            ],
+            "error": false
+          }
+        }
+      ],
+      "other_sched": [
+        {
+          "counter_triplets": [
+            [
+              85921268,
+              16758271,
+              135
+            ],
+            [
+              85921268,
+              16758271,
+              135
+            ],
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "before_window_ms": [
+            6050.521681,
+            6050.523399000001
+          ],
+          "after_window_ms": [
+            6050.529019,
+            6050.529969
+          ],
+          "read_cost_ms": [
+            0.001718,
+            0.00095
+          ],
+          "error": false
+        }
+      ],
+      "parts_ms": [
+        0.342054,
+        0.008388,
+        126.922797
+      ]
+    },
+    {
+      "tick": 127,
+      "previous_tick": 126,
+      "gap_ms": 123.70550800000001,
+      "requested_sleep_ms": 36.399825,
+      "oversleep_ms": 84.511721,
+      "reconstructs": true,
+      "ticks": {
+        "126": {
+          "start_ms": 6338.413949,
+          "before_sleep_ms": 6279.773802000001,
+          "body_end_ms": 6338.768194,
+          "phases_ms": [
+            0.029,
+            0.003211,
+            0.0020700000000000002,
+            0.00031600000000000004,
+            0.004043,
+            0.31499499999999997,
+            5.7e-05,
+            0.000553
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  86628491,
+                  19002885,
+                  138
+                ],
+                [
+                  86719629,
+                  27533339,
+                  139
+                ],
+                [
+                  91138,
+                  8530454,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                6279.7728130000005,
+                6279.773746
+              ],
+              "after_window_ms": [
+                6338.415174,
+                6338.426466999999
+              ],
+              "read_cost_ms": [
+                0.000933,
+                0.011293000000000001
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  86719629,
+                  27533339,
+                  139
+                ],
+                [
+                  86719629,
+                  27533339,
+                  139
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                6338.415174,
+                6338.426466999999
+              ],
+              "after_window_ms": [
+                6338.768233,
+                6338.769716
+              ],
+              "read_cost_ms": [
+                0.011293000000000001,
+                0.001483
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "tick": 126,
+            "result_id": 127,
+            "compute_start_ns": 1791304430787492843,
+            "compute_completion_ns": 1791304430788364950,
+            "publication_ns": 1791304430788367056,
+            "retrieval_ns": 1791304430846149678,
+            "actual_receipt_oracle_ns": 1791304430846151450,
+            "derived_chain_ms": [
+              0.872107,
+              0.002106,
+              57.782622,
+              0.001772
+            ],
+            "clock_chain_valid": true
+          }
+        },
+        "127": {
+          "start_ms": 6462.119457,
+          "before_sleep_ms": 6341.2079109999995,
+          "body_end_ms": 6462.177312,
+          "phases_ms": [
+            0.030272,
+            0.003219,
+            0.0021100000000000003,
+            0.000442,
+            0.004587,
+            0.016672,
+            8e-05,
+            0.000473
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  87887071,
+                  27533339,
+                  139
+                ],
+                [
+                  89973727,
+                  28138392,
+                  140
+                ],
+                [
+                  2086656,
+                  605053,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                6341.202032,
+                6341.207847
+              ],
+              "after_window_ms": [
+                6462.120706000001,
+                6462.133739999999
+              ],
+              "read_cost_ms": [
+                0.005815,
+                0.013033999999999999
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  89973727,
+                  28138392,
+                  140
+                ],
+                [
+                  89973727,
+                  28138392,
+                  140
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                6462.120706000001,
+                6462.133739999999
+              ],
+              "after_window_ms": [
+                6462.177363000001,
+                6462.178999
+              ],
+              "read_cost_ms": [
+                0.013033999999999999,
+                0.001636
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "tick": 127,
+            "result_id": 128,
+            "compute_start_ns": 1791304430847059155,
+            "compute_completion_ns": 1791304430852023201,
+            "publication_ns": 1791304430852026153,
+            "retrieval_ns": 1791304430969857151,
+            "actual_receipt_oracle_ns": 1791304430969859159,
+            "derived_chain_ms": [
+              4.964046,
+              0.002952,
+              117.830998,
+              0.002008
+            ],
+            "clock_chain_valid": true
+          }
+        }
+      },
+      "compute": [
+        {
+          "compute_step_seq": 128.0,
+          "control_ms": 4.934088,
+          "profile_begin_ms": 0.001381,
+          "profile_end_ms": 0.000378,
+          "probe_lock_wait_ms": 0.000409,
+          "sched": {
+            "counter_triplets": [
+              [
+                287085914,
+                5111288,
+                205
+              ],
+              [
+                291516419,
+                5257003,
+                206
+              ],
+              [
+                4430505,
+                145715,
+                1
+              ]
+            ],
+            "before_window_ms": [
+              6339.367845,
+              6339.376682
+            ],
+            "after_window_ms": [
+              6344.311326999999,
+              6344.318228
+            ],
+            "read_cost_ms": [
+              0.008837000000000001,
+              0.006901
+            ],
+            "error": false
+          }
+        }
+      ],
+      "other_sched": [
+        {
+          "counter_triplets": [
+            [
+              86719629,
+              27533339,
+              139
+            ],
+            [
+              87887071,
+              27533339,
+              139
+            ],
+            [
+              1167442,
+              0,
+              0
+            ]
+          ],
+          "before_window_ms": [
+            6338.768233,
+            6338.769716
+          ],
+          "after_window_ms": [
+            6341.202032,
+            6341.207847
+          ],
+          "read_cost_ms": [
+            0.001483,
+            0.005815
+          ],
+          "error": false
+        }
+      ],
+      "parts_ms": [
+        0.354245,
+        2.439717,
+        120.911546
+      ]
+    },
+    {
+      "tick": 134,
+      "previous_tick": 133,
+      "gap_ms": 85.156656,
+      "requested_sleep_ms": 49.47682,
+      "oversleep_ms": 35.613451,
+      "reconstructs": true,
+      "ticks": {
+        "133": {
+          "start_ms": 6712.634052,
+          "before_sleep_ms": 6662.344593,
+          "body_end_ms": 6712.687907,
+          "phases_ms": [
+            0.029057999999999997,
+            0.0025069999999999997,
+            0.00204,
+            0.00039200000000000004,
+            0.003807,
+            0.015620999999999998,
+            5.7e-05,
+            0.000373
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  90275314,
+                  28138392,
+                  144
+                ],
+                [
+                  90358538,
+                  28509902,
+                  145
+                ],
+                [
+                  83224,
+                  371510,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                6662.343750999999,
+                6662.344547
+              ],
+              "after_window_ms": [
+                6712.635197,
+                6712.646429
+              ],
+              "read_cost_ms": [
+                0.0007959999999999999,
+                0.011232
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  90358538,
+                  28509902,
+                  145
+                ],
+                [
+                  90358538,
+                  28509902,
+                  145
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                6712.635197,
+                6712.646429
+              ],
+              "after_window_ms": [
+                6712.6879500000005,
+                6712.689203
+              ],
+              "read_cost_ms": [
+                0.011232,
+                0.001253
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "tick": 133,
+            "result_id": 133,
+            "compute_start_ns": 1791304431170510430,
+            "compute_completion_ns": 1791304431171446581,
+            "publication_ns": 1791304431171448651,
+            "retrieval_ns": 1791304431220369047,
+            "actual_receipt_oracle_ns": 1791304431220370629,
+            "derived_chain_ms": [
+              0.936151,
+              0.00207,
+              48.920396,
+              0.001582
+            ],
+            "clock_chain_valid": true
+          }
+        },
+        "134": {
+          "start_ms": 6797.7907079999995,
+          "before_sleep_ms": 6712.7004369999995,
+          "body_end_ms": 6797.875362,
+          "phases_ms": [
+            0.032032,
+            0.0023929999999999997,
+            0.002592,
+            0.000402,
+            0.020860999999999998,
+            0.025945,
+            5.7e-05,
+            0.000372
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  90358538,
+                  28509902,
+                  145
+                ],
+                [
+                  90440624,
+                  28667364,
+                  146
+                ],
+                [
+                  82086,
+                  157462,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                6712.699619,
+                6712.700387
+              ],
+              "after_window_ms": [
+                6797.7919010000005,
+                6797.805977
+              ],
+              "read_cost_ms": [
+                0.000768,
+                0.014076
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  90440624,
+                  28667364,
+                  146
+                ],
+                [
+                  90504370,
+                  28667364,
+                  146
+                ],
+                [
+                  63746,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                6797.7919010000005,
+                6797.805977
+              ],
+              "after_window_ms": [
+                6797.875400999999,
+                6797.876728
+              ],
+              "read_cost_ms": [
+                0.014076,
+                0.001327
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "tick": 134,
+            "result_id": 134,
+            "compute_start_ns": 1791304431220425092,
+            "compute_completion_ns": 1791304431221709221,
+            "publication_ns": 1791304431221711804,
+            "retrieval_ns": 1791304431305546063,
+            "actual_receipt_oracle_ns": 1791304431305547746,
+            "derived_chain_ms": [
+              1.284129,
+              0.002583,
+              83.834259,
+              0.001683
+            ],
+            "clock_chain_valid": true
+          }
+        }
+      },
+      "compute": [
+        {
+          "compute_step_seq": 134.0,
+          "control_ms": 1.262145,
+          "profile_begin_ms": 0.001049,
+          "profile_end_ms": 0.00033099999999999997,
+          "probe_lock_wait_ms": 0.000332,
+          "sched": {
+            "counter_triplets": [
+              [
+                296893105,
+                5468540,
+                212
+              ],
+              [
+                297492050,
+                5468540,
+                212
+              ],
+              [
+                598945,
+                0,
+                0
+              ]
+            ],
+            "before_window_ms": [
+              6712.733065,
+              6712.742020000001
+            ],
+            "after_window_ms": [
+              6714.004613,
+              6714.007649
+            ],
+            "read_cost_ms": [
+              0.008955,
+              0.0030359999999999996
+            ],
+            "error": false
+          }
+        }
+      ],
+      "other_sched": [
+        {
+          "counter_triplets": [
+            [
+              90358538,
+              28509902,
+              145
+            ],
+            [
+              90358538,
+              28509902,
+              145
+            ],
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "before_window_ms": [
+            6712.6879500000005,
+            6712.689203
+          ],
+          "after_window_ms": [
+            6712.699619,
+            6712.700387
+          ],
+          "read_cost_ms": [
+            0.001253,
+            0.000768
+          ],
+          "error": false
+        }
+      ],
+      "parts_ms": [
+        0.053855,
+        0.01253,
+        85.090271
+      ]
+    },
+    {
+      "tick": 154,
+      "previous_tick": 153,
+      "gap_ms": 86.44934599999999,
+      "requested_sleep_ms": 49.842782,
+      "oversleep_ms": 36.548258,
+      "reconstructs": true,
+      "ticks": {
+        "153": {
+          "start_ms": 7712.276169,
+          "before_sleep_ms": 7662.330421,
+          "body_end_ms": 7712.331763,
+          "phases_ms": [
+            0.029789,
+            0.0025210000000000002,
+            0.00213,
+            0.000235,
+            0.004382,
+            0.016103000000000003,
+            5.7e-05,
+            0.000377
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  108725187,
+                  29226985,
+                  167
+                ],
+                [
+                  108809981,
+                  29226985,
+                  168
+                ],
+                [
+                  84794,
+                  0,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                7662.329571,
+                7662.330374
+              ],
+              "after_window_ms": [
+                7712.277378999999,
+                7712.289811
+              ],
+              "read_cost_ms": [
+                0.000803,
+                0.012432
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  108809981,
+                  29226985,
+                  168
+                ],
+                [
+                  108809981,
+                  29226985,
+                  168
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                7712.277378999999,
+                7712.289811
+              ],
+              "after_window_ms": [
+                7712.331801,
+                7712.332989
+              ],
+              "read_cost_ms": [
+                0.012432,
+                0.001188
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "tick": 153,
+            "result_id": 153,
+            "compute_start_ns": 1791304432170139971,
+            "compute_completion_ns": 1791304432171504205,
+            "publication_ns": 1791304432171506860,
+            "retrieval_ns": 1791304432220012307,
+            "actual_receipt_oracle_ns": 1791304432220013938,
+            "derived_chain_ms": [
+              1.364234,
+              0.002655,
+              48.505447,
+              0.001631
+            ],
+            "clock_chain_valid": true
+          }
+        },
+        "154": {
+          "start_ms": 7798.725515,
+          "before_sleep_ms": 7712.334475000001,
+          "body_end_ms": 7798.787318000001,
+          "phases_ms": [
+            0.030972,
+            0.0025689999999999997,
+            0.002041,
+            0.00043099999999999996,
+            0.004705,
+            0.020523,
+            6.3e-05,
+            0.000499
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  108809981,
+                  29226985,
+                  168
+                ],
+                [
+                  108887362,
+                  29305055,
+                  169
+                ],
+                [
+                  77381,
+                  78070,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                7712.3336150000005,
+                7712.334426
+              ],
+              "after_window_ms": [
+                7798.7268380000005,
+                7798.74039
+              ],
+              "read_cost_ms": [
+                0.0008110000000000001,
+                0.013552
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  108887362,
+                  29305055,
+                  169
+                ],
+                [
+                  108887362,
+                  29305055,
+                  169
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                7798.7268380000005,
+                7798.74039
+              ],
+              "after_window_ms": [
+                7798.787373,
+                7798.7888889999995
+              ],
+              "read_cost_ms": [
+                0.013552,
+                0.001516
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "tick": 154,
+            "result_id": 154,
+            "compute_start_ns": 1791304432220066102,
+            "compute_completion_ns": 1791304432221379031,
+            "publication_ns": 1791304432221381118,
+            "retrieval_ns": 1791304432306462991,
+            "actual_receipt_oracle_ns": 1791304432306465340,
+            "derived_chain_ms": [
+              1.312929,
+              0.002087,
+              85.081873,
+              0.002349
+            ],
+            "clock_chain_valid": true
+          }
+        }
+      },
+      "compute": [
+        {
+          "compute_step_seq": 154.0,
+          "control_ms": 1.289613,
+          "profile_begin_ms": 0.001526,
+          "profile_end_ms": 0.000382,
+          "probe_lock_wait_ms": 0.000381,
+          "sched": {
+            "counter_triplets": [
+              [
+                331171330,
+                5664576,
+                241
+              ],
+              [
+                331171330,
+                5664576,
+                241
+              ],
+              [
+                0,
+                0,
+                0
+              ]
+            ],
+            "before_window_ms": [
+              7712.374523,
+              7712.384455
+            ],
+            "after_window_ms": [
+              7713.674642,
+              7713.677600999999
+            ],
+            "read_cost_ms": [
+              0.009932000000000002,
+              0.002959
+            ],
+            "error": false
+          }
+        }
+      ],
+      "other_sched": [
+        {
+          "counter_triplets": [
+            [
+              108809981,
+              29226985,
+              168
+            ],
+            [
+              108809981,
+              29226985,
+              168
+            ],
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "before_window_ms": [
+            7712.331801,
+            7712.332989
+          ],
+          "after_window_ms": [
+            7712.3336150000005,
+            7712.334426
+          ],
+          "read_cost_ms": [
+            0.001188,
+            0.0008110000000000001
+          ],
+          "error": false
+        }
+      ],
+      "parts_ms": [
+        0.055594000000000005,
+        0.002712,
+        86.39104
+      ]
+    },
+    {
+      "tick": 212,
+      "previous_tick": 211,
+      "gap_ms": 144.668208,
+      "requested_sleep_ms": 49.521678,
+      "oversleep_ms": 94.827935,
+      "reconstructs": true,
+      "ticks": {
+        "211": {
+          "start_ms": 10612.336984000001,
+          "before_sleep_ms": 10562.38521,
+          "body_end_ms": 10612.645293,
+          "phases_ms": [
+            0.213291,
+            0.065593,
+            0.005678,
+            0.00234,
+            0.013856,
+            0.004749,
+            0.000106,
+            0.002696
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  124121288,
+                  33970243,
+                  225
+                ],
+                [
+                  124233329,
+                  33970243,
+                  226
+                ],
+                [
+                  112041,
+                  0,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                10562.384339999999,
+                10562.385161
+              ],
+              "after_window_ms": [
+                10612.347906,
+                10612.439347000001
+              ],
+              "read_cost_ms": [
+                0.000821,
+                0.091441
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  124233329,
+                  33970243,
+                  226
+                ],
+                [
+                  124233329,
+                  33970243,
+                  226
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                10612.347906,
+                10612.439347000001
+              ],
+              "after_window_ms": [
+                10612.645338,
+                10612.647842999999
+              ],
+              "read_cost_ms": [
+                0.091441,
+                0.0025050000000000003
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "unavailable": "no_accepted_nonzero_receipt"
+          }
+        },
+        "212": {
+          "start_ms": 10757.005191999999,
+          "before_sleep_ms": 10612.655579,
+          "body_end_ms": 10757.134391,
+          "phases_ms": [
+            0.026455,
+            0.003722,
+            0.002395,
+            0.000408,
+            0.053643,
+            0.042015,
+            6.3e-05,
+            0.0004980000000000001
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  124233329,
+                  33970243,
+                  226
+                ],
+                [
+                  124596085,
+                  33972898,
+                  227
+                ],
+                [
+                  362756,
+                  2655,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                10612.654295,
+                10612.655517000001
+              ],
+              "after_window_ms": [
+                10757.007117000001,
+                10757.026917
+              ],
+              "read_cost_ms": [
+                0.001222,
+                0.0198
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  124596085,
+                  33972898,
+                  227
+                ],
+                [
+                  124596085,
+                  33972898,
+                  227
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                10757.007117000001,
+                10757.026917
+              ],
+              "after_window_ms": [
+                10757.134516,
+                10757.136248
+              ],
+              "read_cost_ms": [
+                0.0198,
+                0.001732
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "tick": 212,
+            "result_id": 213,
+            "compute_start_ns": 1791304435120564283,
+            "compute_completion_ns": 1791304435123608288,
+            "publication_ns": 1791304435123610265,
+            "retrieval_ns": 1791304435264785675,
+            "actual_receipt_oracle_ns": 1791304435264791173,
+            "derived_chain_ms": [
+              3.044005,
+              0.001977,
+              141.17541,
+              0.005498
+            ],
+            "clock_chain_valid": true
+          }
+        }
+      },
+      "compute": [
+        {
+          "compute_step_seq": 213.0,
+          "control_ms": 2.8592589999999998,
+          "profile_begin_ms": 0.018329,
+          "profile_end_ms": 0.000368,
+          "probe_lock_wait_ms": 0.000298,
+          "sched": {
+            "counter_triplets": [
+              [
+                505871371,
+                8888353,
+                347
+              ],
+              [
+                508002980,
+                8888353,
+                347
+              ],
+              [
+                2131609,
+                0,
+                0
+              ]
+            ],
+            "before_window_ms": [
+              10612.984531,
+              10613.030163
+            ],
+            "after_window_ms": [
+              10615.889925,
+              10615.897071
+            ],
+            "read_cost_ms": [
+              0.045632,
+              0.007146
+            ],
+            "error": false
+          }
+        }
+      ],
+      "other_sched": [
+        {
+          "counter_triplets": [
+            [
+              124233329,
+              33970243,
+              226
+            ],
+            [
+              124233329,
+              33970243,
+              226
+            ],
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "before_window_ms": [
+            10612.645338,
+            10612.647842999999
+          ],
+          "after_window_ms": [
+            10612.654295,
+            10612.655517000001
+          ],
+          "read_cost_ms": [
+            0.0025050000000000003,
+            0.001222
+          ],
+          "error": false
+        }
+      ],
+      "parts_ms": [
+        0.308309,
+        0.010286,
+        144.34961299999998
+      ]
+    },
+    {
+      "tick": 214,
+      "previous_tick": 213,
+      "gap_ms": 214.090731,
+      "requested_sleep_ms": 49.760525,
+      "oversleep_ms": 164.316766,
+      "reconstructs": true,
+      "ticks": {
+        "213": {
+          "start_ms": 10757.360382,
+          "before_sleep_ms": 10757.360117999999,
+          "body_end_ms": 10757.371626999999,
+          "phases_ms": [
+            0.006108,
+            0.00023799999999999998,
+            0.00039799999999999997,
+            6.2e-05,
+            0.002405,
+            0.001856,
+            4.1e-05,
+            0.000137
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  124596085,
+                  33972898,
+                  227
+                ],
+                [
+                  124596085,
+                  33972898,
+                  227
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                10757.358202000001,
+                10757.360068
+              ],
+              "after_window_ms": [
+                10757.360674,
+                10757.361552999999
+              ],
+              "read_cost_ms": [
+                0.001866,
+                0.000879
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  124596085,
+                  33972898,
+                  227
+                ],
+                [
+                  124596085,
+                  33972898,
+                  227
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                10757.360674,
+                10757.361552999999
+              ],
+              "after_window_ms": [
+                10757.371655,
+                10757.372632999999
+              ],
+              "read_cost_ms": [
+                0.000879,
+                0.000978
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "unavailable": "no_accepted_nonzero_receipt"
+          }
+        },
+        "214": {
+          "start_ms": 10971.451113000001,
+          "before_sleep_ms": 10757.373822,
+          "body_end_ms": 10971.547691,
+          "phases_ms": [
+            0.02118,
+            0.003125,
+            0.002206,
+            0.00039499999999999995,
+            0.039743,
+            0.029324,
+            6.599999999999999e-05,
+            0.0005390000000000001
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  124596085,
+                  33972898,
+                  227
+                ],
+                [
+                  124996544,
+                  144450882,
+                  228
+                ],
+                [
+                  400459,
+                  110477984,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                10757.372873999999,
+                10757.373779
+              ],
+              "after_window_ms": [
+                10971.45284,
+                10971.467878
+              ],
+              "read_cost_ms": [
+                0.000905,
+                0.015038000000000001
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  124996544,
+                  144450882,
+                  228
+                ],
+                [
+                  124996544,
+                  144450882,
+                  228
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                10971.45284,
+                10971.467878
+              ],
+              "after_window_ms": [
+                10971.547729999998,
+                10971.549497
+              ],
+              "read_cost_ms": [
+                0.015038000000000001,
+                0.001767
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "tick": 214,
+            "result_id": 214,
+            "compute_start_ns": 1791304435270448999,
+            "compute_completion_ns": 1791304435271712541,
+            "publication_ns": 1791304435271714996,
+            "retrieval_ns": 1791304435479212351,
+            "actual_receipt_oracle_ns": 1791304435479216830,
+            "derived_chain_ms": [
+              1.263542,
+              0.002455,
+              207.497355,
+              0.004479
+            ],
+            "clock_chain_valid": true
+          }
+        }
+      },
+      "compute": [
+        {
+          "compute_step_seq": 214.0,
+          "control_ms": 1.177929,
+          "profile_begin_ms": 0.002084,
+          "profile_end_ms": 0.000378,
+          "probe_lock_wait_ms": 0.000414,
+          "sched": {
+            "counter_triplets": [
+              [
+                508985442,
+                8888353,
+                348
+              ],
+              [
+                509154306,
+                8888353,
+                348
+              ],
+              [
+                168864,
+                0,
+                0
+              ]
+            ],
+            "before_window_ms": [
+              10762.761021999999,
+              10762.777189999999
+            ],
+            "after_window_ms": [
+              10763.955694,
+              10763.961529999999
+            ],
+            "read_cost_ms": [
+              0.016168,
+              0.005836
+            ],
+            "error": false
+          }
+        }
+      ],
+      "other_sched": [
+        {
+          "counter_triplets": [
+            [
+              124596085,
+              33972898,
+              227
+            ],
+            [
+              124596085,
+              33972898,
+              227
+            ],
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "before_window_ms": [
+            10757.371655,
+            10757.372632999999
+          ],
+          "after_window_ms": [
+            10757.372873999999,
+            10757.373779
+          ],
+          "read_cost_ms": [
+            0.000978,
+            0.000905
+          ],
+          "error": false
+        }
+      ],
+      "parts_ms": [
+        0.011245,
+        0.0021950000000000003,
+        214.077291
+      ]
+    },
+    {
+      "tick": 261,
+      "previous_tick": 260,
+      "gap_ms": 153.052586,
+      "requested_sleep_ms": 49.036418999999995,
+      "oversleep_ms": 103.510294,
+      "reconstructs": true,
+      "ticks": {
+        "260": {
+          "start_ms": 13222.005367,
+          "before_sleep_ms": 13173.855554,
+          "body_end_ms": 13222.475742,
+          "phases_ms": [
+            0.27791,
+            0.123609,
+            0.020628,
+            0.002162,
+            0.035958,
+            0.007734,
+            4.9000000000000005e-05,
+            0.0023250000000000002
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  139387869,
+                  148523508,
+                  272
+                ],
+                [
+                  139605939,
+                  148523508,
+                  273
+                ],
+                [
+                  218070,
+                  0,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                13173.854391,
+                13173.855508
+              ],
+              "after_window_ms": [
+                13222.025184,
+                13222.155351
+              ],
+              "read_cost_ms": [
+                0.0011170000000000002,
+                0.13016699999999998
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  139605939,
+                  148523508,
+                  273
+                ],
+                [
+                  139605939,
+                  148523508,
+                  273
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                13222.025184,
+                13222.155351
+              ],
+              "after_window_ms": [
+                13222.475784,
+                13222.478038000001
+              ],
+              "read_cost_ms": [
+                0.13016699999999998,
+                0.002254
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "unavailable": "no_accepted_nonzero_receipt"
+          }
+        },
+        "261": {
+          "start_ms": 13375.057953000001,
+          "before_sleep_ms": 13222.51124,
+          "body_end_ms": 13377.458599000001,
+          "phases_ms": [
+            0.023573,
+            0.00404,
+            0.002427,
+            0.00043,
+            0.049871,
+            2.31977,
+            7.4e-05,
+            0.00046100000000000004
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  139605939,
+                  148523508,
+                  273
+                ],
+                [
+                  140326473,
+                  148627668,
+                  274
+                ],
+                [
+                  720534,
+                  104160,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                13222.509865999999,
+                13222.511181
+              ],
+              "after_window_ms": [
+                13375.059796,
+                13375.076702
+              ],
+              "read_cost_ms": [
+                0.001315,
+                0.016906
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  140326473,
+                  148627668,
+                  274
+                ],
+                [
+                  140326473,
+                  148627668,
+                  274
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                13375.059796,
+                13375.076702
+              ],
+              "after_window_ms": [
+                13377.458746,
+                13377.468322
+              ],
+              "read_cost_ms": [
+                0.016906,
+                0.009576
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "tick": 261,
+            "result_id": 260,
+            "compute_start_ns": 1791304437730223174,
+            "compute_completion_ns": 1791304437736259583,
+            "publication_ns": 1791304437736264814,
+            "retrieval_ns": 1791304437882832262,
+            "actual_receipt_oracle_ns": 1791304437882837386,
+            "derived_chain_ms": [
+              6.036409,
+              0.005231,
+              146.567448,
+              0.005124
+            ],
+            "clock_chain_valid": true
+          }
+        }
+      },
+      "compute": [
+        {
+          "compute_step_seq": 260.0,
+          "control_ms": 5.7589809999999995,
+          "profile_begin_ms": 0.005677,
+          "profile_end_ms": 0.0005,
+          "probe_lock_wait_ms": 0.000152,
+          "sched": {
+            "counter_triplets": [
+              [
+                655291709,
+                26321906,
+                419
+              ],
+              [
+                660167428,
+                27098398,
+                420
+              ],
+              [
+                4875719,
+                776492,
+                1
+              ]
+            ],
+            "before_window_ms": [
+              13222.671954000001,
+              13222.710164
+            ],
+            "after_window_ms": [
+              13228.469824,
+              13228.476784
+            ],
+            "read_cost_ms": [
+              0.03821,
+              0.00696
+            ],
+            "error": false
+          }
+        }
+      ],
+      "other_sched": [
+        {
+          "counter_triplets": [
+            [
+              139605939,
+              148523508,
+              273
+            ],
+            [
+              139605939,
+              148523508,
+              273
+            ],
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "before_window_ms": [
+            13222.475784,
+            13222.478038000001
+          ],
+          "after_window_ms": [
+            13222.509865999999,
+            13222.511181
+          ],
+          "read_cost_ms": [
+            0.002254,
+            0.001315
+          ],
+          "error": false
+        }
+      ],
+      "parts_ms": [
+        0.470375,
+        0.035497999999999995,
+        152.546713
+      ]
+    },
+    {
+      "tick": 271,
+      "previous_tick": 270,
+      "gap_ms": 205.39735000000002,
+      "requested_sleep_ms": 49.691964,
+      "oversleep_ms": 155.63067,
+      "reconstructs": true,
+      "ticks": {
+        "270": {
+          "start_ms": 13777.691885,
+          "before_sleep_ms": 13727.622665,
+          "body_end_ms": 13777.763904000001,
+          "phases_ms": [
+            0.03321,
+            0.002428,
+            0.002375,
+            0.000391,
+            0.003971,
+            0.029216,
+            5.8e-05,
+            0.00037
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  143340582,
+                  148642175,
+                  281
+                ],
+                [
+                  143429377,
+                  148642175,
+                  282
+                ],
+                [
+                  88795,
+                  0,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                13727.62188,
+                13727.622613
+              ],
+              "after_window_ms": [
+                13777.693335,
+                13777.707532999999
+              ],
+              "read_cost_ms": [
+                0.000733,
+                0.014198
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  143429377,
+                  148642175,
+                  282
+                ],
+                [
+                  143429377,
+                  148642175,
+                  282
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                13777.693335,
+                13777.707532999999
+              ],
+              "after_window_ms": [
+                13777.763943,
+                13777.765132
+              ],
+              "read_cost_ms": [
+                0.014198,
+                0.001189
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "tick": 270,
+            "result_id": 268,
+            "compute_start_ns": 1791304438235351705,
+            "compute_completion_ns": 1791304438236506873,
+            "publication_ns": 1791304438236509044,
+            "retrieval_ns": 1791304438285431514,
+            "actual_receipt_oracle_ns": 1791304438285433043,
+            "derived_chain_ms": [
+              1.155168,
+              0.002171,
+              48.92247,
+              0.001529
+            ],
+            "clock_chain_valid": true
+          }
+        },
+        "271": {
+          "start_ms": 13983.089235,
+          "before_sleep_ms": 13777.766601,
+          "body_end_ms": 13983.522954,
+          "phases_ms": [
+            0.215005,
+            0.14201,
+            0.019253,
+            0.000439,
+            0.052875,
+            0.00349,
+            6.3e-05,
+            0.000584
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  143429377,
+                  148642175,
+                  282
+                ],
+                [
+                  282599340,
+                  162734436,
+                  285
+                ],
+                [
+                  139169963,
+                  14092261,
+                  3
+                ]
+              ],
+              "before_window_ms": [
+                13777.765753000001,
+                13777.766552
+              ],
+              "after_window_ms": [
+                13983.122313999998,
+                13983.175129
+              ],
+              "read_cost_ms": [
+                0.000799,
+                0.052815
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  282599340,
+                  162734436,
+                  285
+                ],
+                [
+                  282599340,
+                  162734436,
+                  285
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                13983.122313999998,
+                13983.175129
+              ],
+              "after_window_ms": [
+                13983.523039,
+                13983.525898
+              ],
+              "read_cost_ms": [
+                0.052815,
+                0.002859
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "unavailable": "no_accepted_nonzero_receipt"
+          }
+        }
+      },
+      "compute": [
+        {
+          "compute_step_seq": 269.0,
+          "control_ms": 3.667213,
+          "profile_begin_ms": 0.001443,
+          "profile_end_ms": 0.00046199999999999995,
+          "probe_lock_wait_ms": 0.000301,
+          "sched": {
+            "counter_triplets": [
+              [
+                675551231,
+                29728589,
+                430
+              ],
+              [
+                676665046,
+                29728589,
+                430
+              ],
+              [
+                1113815,
+                0,
+                0
+              ]
+            ],
+            "before_window_ms": [
+              13778.321929,
+              13778.363598
+            ],
+            "after_window_ms": [
+              13782.031631,
+              13782.040641
+            ],
+            "read_cost_ms": [
+              0.041669,
+              0.00901
+            ],
+            "error": false
+          }
+        }
+      ],
+      "other_sched": [
+        {
+          "counter_triplets": [
+            [
+              143429377,
+              148642175,
+              282
+            ],
+            [
+              143429377,
+              148642175,
+              282
+            ],
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "before_window_ms": [
+            13777.763943,
+            13777.765132
+          ],
+          "after_window_ms": [
+            13777.765753000001,
+            13777.766552
+          ],
+          "read_cost_ms": [
+            0.001189,
+            0.000799
+          ],
+          "error": false
+        }
+      ],
+      "parts_ms": [
+        0.072019,
+        0.002697,
+        205.322634
+      ]
+    },
+    {
+      "tick": 274,
+      "previous_tick": 273,
+      "gap_ms": 107.230357,
+      "requested_sleep_ms": 49.485704999999996,
+      "oversleep_ms": 57.683454000000005,
+      "reconstructs": true,
+      "ticks": {
+        "273": {
+          "start_ms": 14033.976014,
+          "before_sleep_ms": 13983.534931,
+          "body_end_ms": 14034.033214000001,
+          "phases_ms": [
+            0.016816,
+            0.030429,
+            0.001547,
+            0.00043,
+            0.00436,
+            0.003031,
+            6.5e-05,
+            0.000522
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  282599340,
+                  162734436,
+                  285
+                ],
+                [
+                  283055585,
+                  162734436,
+                  286
+                ],
+                [
+                  456245,
+                  0,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                13983.533964,
+                13983.534888999999
+              ],
+              "after_window_ms": [
+                14033.977125,
+                14033.98989
+              ],
+              "read_cost_ms": [
+                0.000925,
+                0.012765
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  283055585,
+                  162734436,
+                  286
+                ],
+                [
+                  283055585,
+                  162734436,
+                  286
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                14033.977125,
+                14033.98989
+              ],
+              "after_window_ms": [
+                14034.033260999999,
+                14034.034765
+              ],
+              "read_cost_ms": [
+                0.012765,
+                0.001504
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "unavailable": "no_accepted_nonzero_receipt"
+          }
+        },
+        "274": {
+          "start_ms": 14141.206370999998,
+          "before_sleep_ms": 14034.037212,
+          "body_end_ms": 14141.275823999998,
+          "phases_ms": [
+            0.022331,
+            0.003445,
+            0.002619,
+            0.000599,
+            0.009233,
+            0.030659,
+            6.3e-05,
+            0.000504
+          ],
+          "sched": {
+            "consumer_before_sleep_to_after_wake": {
+              "counter_triplets": [
+                [
+                  283055585,
+                  162734436,
+                  286
+                ],
+                [
+                  283150187,
+                  162845727,
+                  287
+                ],
+                [
+                  94602,
+                  111291,
+                  1
+                ]
+              ],
+              "before_window_ms": [
+                14034.036042,
+                14034.03716
+              ],
+              "after_window_ms": [
+                14141.208526,
+                14141.224280999999
+              ],
+              "read_cost_ms": [
+                0.0011179999999999999,
+                0.015755
+              ],
+              "error": false
+            },
+            "consumer_after_wake_to_body_end": {
+              "counter_triplets": [
+                [
+                  283150187,
+                  162845727,
+                  287
+                ],
+                [
+                  283150187,
+                  162845727,
+                  287
+                ],
+                [
+                  0,
+                  0,
+                  0
+                ]
+              ],
+              "before_window_ms": [
+                14141.208526,
+                14141.224280999999
+              ],
+              "after_window_ms": [
+                14141.275908000001,
+                14141.277606
+              ],
+              "read_cost_ms": [
+                0.015755,
+                0.001698
+              ],
+              "error": false
+            }
+          },
+          "receipt": {
+            "tick": 274,
+            "result_id": 271,
+            "compute_start_ns": 1791304438541745877,
+            "compute_completion_ns": 1791304438542898489,
+            "publication_ns": 1791304438542900816,
+            "retrieval_ns": 1791304438648938331,
+            "actual_receipt_oracle_ns": 1791304438648943579,
+            "derived_chain_ms": [
+              1.152612,
+              0.002327,
+              106.037515,
+              0.005248
+            ],
+            "clock_chain_valid": true
+          }
+        }
+      },
+      "compute": [
+        {
+          "compute_step_seq": 271.0,
+          "control_ms": 1.059829,
+          "profile_begin_ms": 0.001214,
+          "profile_end_ms": 0.000329,
+          "probe_lock_wait_ms": 0.0009689999999999999,
+          "sched": {
+            "counter_triplets": [
+              [
+                706365861,
+                29882269,
+                435
+              ],
+              [
+                707184857,
+                29882269,
+                435
+              ],
+              [
+                818996,
+                0,
+                0
+              ]
+            ],
+            "before_window_ms": [
+              14034.121529,
+              14034.131447
+            ],
+            "after_window_ms": [
+              14035.191638,
+              14035.196509000001
+            ],
+            "read_cost_ms": [
+              0.009918,
+              0.0048709999999999995
+            ],
+            "error": false
+          }
+        }
+      ],
+      "other_sched": [
+        {
+          "counter_triplets": [
+            [
+              283055585,
+              162734436,
+              286
+            ],
+            [
+              283055585,
+              162734436,
+              286
+            ],
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "before_window_ms": [
+            14034.033260999999,
+            14034.034765
+          ],
+          "after_window_ms": [
+            14034.036042,
+            14034.03716
+          ],
+          "read_cost_ms": [
+            0.001504,
+            0.0011179999999999999
+          ],
+          "error": false
+        }
+      ],
+      "parts_ms": [
+        0.0572,
+        0.003998,
+        107.169159
+      ]
+    }
+  ],
+  "qualification": "6 passed, 1 failed; OFF remains cadence failure. ON/held single-run passes do not establish strict50ms or replace historical failures. No production change after reviewed cold optimization."
+}

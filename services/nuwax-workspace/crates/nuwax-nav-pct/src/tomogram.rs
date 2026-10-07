@@ -79,14 +79,13 @@ impl Tomogram {
         checkpoint()?;
         let (resolution, columns) = source.navigation_source_columns(window);
         checkpoint()?;
-        let mut blocked = AHashSet::new();
-        let mut result = Self::from_columns_with_evidence(
+        let result = Self::from_columns_with_evidence(
             resolution,
             f64::from(source.source_voxel_size_m()),
-            columns.take_while(|_| !crate::planning_cancelled()).filter(|(column, _)| {
-                let allowed = source.navigation_column_allowed(*column, resolution);
-                if !allowed { blocked.insert(*column); }
-                allowed
+            columns.take_while(|_| !crate::planning_cancelled()).map(|(column, mut bands)| {
+                let allowed = source.navigation_column_allowed(column, resolution);
+                if !allowed { bands.clear(); }
+                (column, bands)
             }),
             required_height,
             half_width,
@@ -96,13 +95,6 @@ impl Tomogram {
             body.map_or(half_width, |body| body.radius()),
             source.ground_evidence()==nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume,
         )?;
-        if !blocked.is_empty() {
-            for column in blocked {
-                checkpoint()?;
-                result.known_columns.insert(column);
-            }
-            result.compute_costs()?;
-        }
         checkpoint()?;
         Ok(result)
     }
@@ -509,3 +501,133 @@ mod cancellation_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod allocation_benchmark_tests {
+    use super::*;
+    use std::{fmt::Write as _, hint::black_box, time::{Duration, Instant}};
+
+    fn columns() -> Vec<([i32; 2], Vec<[f64; 2]>)> {
+        let mut columns = Vec::new();
+        for x in 0..80 {
+            for y in 0..64 {
+                // 缺测带只留远端开口；已知高墙的门洞位于另一侧。
+                if (52..54).contains(&x) && !(42..52).contains(&y) {
+                    continue;
+                }
+                let ground = f64::from((x / 10 + y / 8) % 4) * 0.015;
+                let mut bands = if x == 27 && !(20..30).contains(&y) {
+                    vec![[-0.1, 2.0]]
+                } else {
+                    vec![[ground - 0.1, ground]]
+                };
+                // 局部上层与下层重叠；上层的两个测量带还需要合并。
+                if (8..24).contains(&x) && (8..24).contains(&y) {
+                    bands.extend([[1.4, 1.5], [1.45, 1.55]]);
+                }
+                columns.push(([x, y], bands));
+            }
+        }
+        columns
+    }
+
+    fn construct(columns: Vec<([i32; 2], Vec<[f64; 2]>)>) -> Tomogram {
+        Tomogram::from_columns(0.1, columns, 0.5, 0.2, 0.15, 0.15, 20.0).unwrap()
+    }
+
+    fn exact_output(map: &Tomogram) -> String {
+        let mut output = String::from("tomogram-allocation-v1; route elapsed_ms excluded\n");
+        writeln!(output, "parameters_bits {:?}", [map.resolution, map.body_height,
+            map.half_width, map.step_up, map.step_down, map.slope, map.clearance_radius]
+            .map(f64::to_bits)).unwrap();
+        for (id, cell) in map.cells.iter().enumerate() {
+            writeln!(output, "cell {id} column {:?} layer {} bits {:?} neighbors {:?}",
+                cell.column, cell.layer,
+                [cell.ground, cell.ground_interval[0], cell.ground_interval[1],
+                    cell.ceiling, cell.clearance, cell.support_clearance, cell.cost]
+                    .map(f64::to_bits), cell.neighbors).unwrap();
+        }
+        // 只排序哈希容器的键；单元、同列索引、邻接与路线顺序原样保留。
+        let mut columns: Vec<_> = map.columns.iter().collect();
+        columns.sort_unstable_by_key(|(column, _)| **column);
+        for (column, ids) in columns {
+            writeln!(output, "column {column:?} ids {ids:?}").unwrap();
+        }
+        let mut known: Vec<_> = map.known_columns.iter().copied().collect();
+        known.sort_unstable();
+        writeln!(output, "known_columns {known:?}").unwrap();
+        for (name, start, goal) in [
+            ("ground", [0.45, 0.65, 0.0], [7.45, 5.85, 0.03]),
+            ("upper", [0.95, 0.95, 1.525], [2.25, 2.25, 1.525]),
+        ] {
+            let route = map.plan(start, goal, 0.01, &[], None).unwrap();
+            writeln!(output, "route {name} start_bits {:?} goal_bits {:?} expanded {} cells {} points {}",
+                start.map(f64::to_bits), goal.map(f64::to_bits),
+                route.stats.expanded, route.stats.cells, route.points.len()).unwrap();
+            for point in route.points {
+                writeln!(output, "point_bits {:?}", point.map(f64::to_bits)).unwrap();
+            }
+        }
+        output
+    }
+
+    #[test]
+    #[ignore = "固定输入的手动性能基线；用 --ignored --nocapture 单独运行"]
+    fn tomogram_allocation_frozen_baseline() {
+        use std::io::Write as _;
+        const WARMUPS: usize = 4;
+        const CONSTRUCT_REPS: usize = 32;
+        const COST_REPS: usize = 128;
+        // 输入生成、参考输出、校验和文件写入都在计时之外。
+        let columns = columns();
+        let bands: usize = columns.iter().map(|(_, bands)| bands.len()).sum();
+        assert_eq!((columns.len(), bands), (5_012, 5_524));
+        let mut map = construct(columns.clone());
+        assert_eq!((map.cells.len(), map.known_columns.len()), (5_268, 5_012));
+        let edges: usize = map.cells.iter().map(|cell| cell.neighbors.len()).sum();
+        let expected = exact_output(&map);
+
+        for _ in 0..WARMUPS {
+            drop(black_box(construct(black_box(columns.clone()))));
+        }
+        let mut construction = Duration::ZERO;
+        for _ in 0..CONSTRUCT_REPS {
+            let began = Instant::now();
+            let built = construct(black_box(columns.clone()));
+            black_box(&built);
+            construction += began.elapsed();
+            // 返回地图的析构不计时；消耗输入时的释放仍属于构建成本。
+            drop(built);
+        }
+
+        for _ in 0..WARMUPS {
+            black_box(map.compute_costs()).unwrap();
+            black_box(&map);
+        }
+        // 复用同一精确地图，只计代价重算，不克隆输入或重建邻接。
+        let began = Instant::now();
+        for _ in 0..COST_REPS {
+            black_box(map.compute_costs()).unwrap();
+            black_box(&map);
+        }
+        let costs = began.elapsed();
+        let actual = exact_output(&map);
+        assert_eq!(actual, expected, "重复代价重算必须逐字节保持输出");
+        if let Some(path) = std::env::var_os("NEH_TOMOGRAM_ALLOC_DUMP") {
+            // create_new 防止覆盖冻结基线；输出不含任何计时结果。
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+                .open(path).expect("精确输出文件必须是新路径");
+            file.write_all(actual.as_bytes()).unwrap();
+        }
+        println!("tomogram_allocation fixture=mixed_80x64 input_columns={} input_bands={} cells={} directed_edges={} warmups={} construct_reps={} cost_reps={}",
+            columns.len(), bands, map.cells.len(), edges, WARMUPS, CONSTRUCT_REPS, COST_REPS);
+        println!("tomogram_allocation construct_input_clone=included returned_map_destruction=excluded consumed_input_destruction=included direct_compute=existing_exact_map final_map_destruction=excluded");
+        println!("tomogram_allocation construct_total_ns={} construct_ns_per_iter={:.3} compute_total_ns={} compute_ns_per_iter={:.3}",
+            construction.as_nanos(), construction.as_secs_f64() * 1e9 / CONSTRUCT_REPS as f64,
+            costs.as_nanos(), costs.as_secs_f64() * 1e9 / COST_REPS as f64);
+    }
+}
+
+#[cfg(all(test, feature = "mls-adapter"))]
+#[path = "tomogram_masked_tests.rs"]
+mod masked_surface_tests;

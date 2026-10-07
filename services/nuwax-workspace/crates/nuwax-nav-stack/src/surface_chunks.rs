@@ -1,12 +1,11 @@
 //! 原表面构建任务拥有的块接收、可靠补取和有界磁盘缓存。
 use nuwax_codec::lcm::schema;
-use nuwax_map_chunks::{Manifest, Receiver, RegionReader, Repository, MAX_BLOCK_BYTES};
+use nuwax_map_chunks::{Manifest, Receiver, Repository, MAX_BLOCK_BYTES};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(super) struct FineMapReader {
     receiver: Receiver,
-    reader: RegionReader,
     client: Option<nuwax_rpc::RpcClient>,
     lcm_url: String,
 }
@@ -35,7 +34,7 @@ impl FineMapReader {
         }
         for reference in &root.blocks {
             if old.get(&reference.key).is_some_and(|old| old.block_revision == reference.block_revision) { continue; }
-            let block = self.reader.block(reference)?;
+            let block = self.receiver.block(reference)?;
             let mut values = BTreeMap::new();
             for (&local, evidence) in block.iter() {
                 if evidence.observed_ns > root.source_timestamp_ns { return Err("精细观察晚于提交根".into()); }
@@ -53,8 +52,7 @@ impl FineMapReader {
     pub(super) fn new(lcm_url: String) -> Result<Self, String> {
         let repository = Repository::temporary()?;
         Ok(Self {
-            receiver: Receiver::new(repository.clone()),
-            reader: RegionReader::new(repository, 32 * 1024 * 1024),
+            receiver: Receiver::with_cache_budget(repository, 32 * 1024 * 1024),
             client: None,
             lcm_url,
         })
@@ -142,7 +140,7 @@ impl FineMapReader {
             {
                 continue;
             }
-            let block = self.reader.block(reference)?;
+            let block = self.receiver.block(reference)?;
             read_points += block.len();
             for (&local, evidence) in block.iter() {
                 if evidence.observed_ns > root.source_timestamp_ns {
@@ -281,8 +279,7 @@ mod tests {
     }
     fn reader(repository: Repository) -> FineMapReader {
         FineMapReader {
-            receiver: Receiver::new(repository.clone()),
-            reader: RegionReader::new(repository, 1024 * 1024),
+            receiver: Receiver::with_cache_budget(repository, 1024 * 1024),
             client: None,
             lcm_url: String::new(),
         }
@@ -325,25 +322,110 @@ mod tests {
     }
 
     #[test]
+    fn observations_and_columns_reuse_admitted_block_arcs() {
+        let repository = Repository::temporary().unwrap();
+        let cells: BTreeSet<_> = (0..64).flat_map(|x| (0..64).map(move |y| [x, y, 0])).collect();
+        let root = install_revisioned(&repository, &cells, 0.05, 1, None);
+        let message = transfer_message(&repository, &root);
+        let mut reader = FineMapReader::new(String::new()).unwrap();
+        let admitted = reader.receive(&message).unwrap();
+        // 与计时测试分开，避免额外缓存访问改变其操作顺序。
+        let blocks: Vec<_> = admitted.blocks.iter()
+            .map(|reference| reader.receiver.block(reference).unwrap()).collect();
+        let observations = reader.observations(&admitted, None).unwrap();
+        let (updates, count) = reader.columns(&admitted, None, 0.1).unwrap();
+        assert_eq!(count, cells.len());
+        assert_columns(&updates, &cells, 0.05, 0.1);
+        for &cell in &cells {
+            assert_eq!(observations.get(cell).unwrap().observed_ns, 1);
+            assert_eq!(observations.get(cell).unwrap().hits, 1);
+        }
+        let repeated = reader.receive(&message).unwrap();
+        assert!(Arc::ptr_eq(&admitted, &repeated));
+        for (reference, block) in admitted.blocks.iter().zip(&blocks) {
+            assert!(Arc::ptr_eq(block, &reader.receiver.block(reference).unwrap()));
+        }
+        assert!(reader.client.is_none());
+    }
+
+    #[test]
     fn evidence_revision_refreshes_observations_without_dirtying_geometry() {
         let repository = Repository::temporary().unwrap();
-        let cells = BTreeSet::from([[0, 0, 0], [35, 1, 2]]);
+        let cells: BTreeSet<_> = (0..64).flat_map(|x| (0..64).map(move |y| [x, y, 0])).collect();
         let first = install_revisioned(&repository, &cells, 0.05, 1, None);
         let second = install_revisioned(&repository, &cells, 0.05, 2, Some(&first));
-        let mut reader = reader(repository);
+        let first_message = transfer_message(&repository, &first);
+        let second_message = transfer_message(&repository, &second);
+        let mut included_bytes = Vec::new();
+        for (revision, root, message) in [(1, &first, &first_message), (2, &second, &second_message)] {
+            let transfer = message.fine.as_ref().unwrap();
+            assert_eq!(root.revision, revision);
+            assert_eq!(root.source_timestamp_ns, revision);
+            assert_eq!(root.points(), 4096);
+            assert_eq!(root.blocks.len(), 4);
+            assert!(root.blocks.iter().all(|b| matches!(b.object, ObjectIdentity::Assigned(_))));
+            let objects: BTreeSet<_> = root.blocks.iter().map(|b| b.object).collect();
+            assert_eq!(objects.len(), root.blocks.len());
+            assert_eq!(objects, transfer.included.keys().copied().collect::<BTreeSet<_>>());
+            let bytes: usize = transfer.included.values().map(Vec::len).sum();
+            assert_eq!(bytes, 49_216);
+            assert!(bytes <= 128 * 1024);
+            included_bytes.push(bytes);
+        }
+        let mut reader = FineMapReader::new(String::new()).unwrap();
+        assert!(reader.client.is_none());
+        let mut timings_us = Vec::new();
+        let start = Instant::now();
+        let first = reader.receive(&first_message).unwrap();
+        timings_us.push(start.elapsed().as_micros());
+        assert!(reader.client.is_none());
+        let start = Instant::now();
         let old = reader.observations(&first, None).unwrap();
+        timings_us.push(start.elapsed().as_micros());
+        assert!(reader.client.is_none());
+        let start = Instant::now();
+        let (initial_updates, initial_count) = reader.columns(&first, None, 0.1).unwrap();
+        timings_us.push(start.elapsed().as_micros());
+        assert!(reader.client.is_none());
+        assert_eq!(initial_count, cells.len());
+        assert!(!initial_updates.is_empty());
+        assert_columns(&initial_updates, &cells, 0.05, 0.1);
+        let start = Instant::now();
+        let second = reader.receive(&second_message).unwrap();
+        timings_us.push(start.elapsed().as_micros());
+        assert!(reader.client.is_none());
+        let start = Instant::now();
         let next = reader.observations(&second, Some((&first, &old))).unwrap();
+        timings_us.push(start.elapsed().as_micros());
+        assert!(reader.client.is_none());
         assert_eq!(first.geometry_revision, second.geometry_revision);
         assert!(first.blocks.iter().zip(&second.blocks).all(|(a, b)|
             a.block_revision < b.block_revision && a.geometry_revision == b.geometry_revision));
+        let start = Instant::now();
         let (updates, count) = reader.columns(&second, Some(&first), 0.1).unwrap();
+        timings_us.push(start.elapsed().as_micros());
+        assert!(reader.client.is_none());
         assert!(updates.is_empty());
         assert_eq!(count, 0);
-        assert_eq!(old.get([0, 0, 0]).unwrap().observed_ns, 1);
-        assert_eq!(next.get([0, 0, 0]).unwrap().observed_ns, 2);
-        assert_eq!(next.get([0, 0, 0]).unwrap().hits, 2);
+        for &cell in &cells {
+            assert_eq!(old.get(cell).unwrap().observed_ns, 1);
+            assert_eq!(old.get(cell).unwrap().hits, 1);
+            assert_eq!(next.get(cell).unwrap().observed_ns, 2);
+            assert_eq!(next.get(cell).unwrap().hits, 2);
+        }
         assert!(!Arc::ptr_eq(&old, &next));
-        assert!(Arc::ptr_eq(&next, &reader.observations(&second, Some((&second, &next))).unwrap()));
+        let start = Instant::now();
+        let repeated = reader.receive(&second_message).unwrap();
+        timings_us.push(start.elapsed().as_micros());
+        assert!(reader.client.is_none());
+        assert!(Arc::ptr_eq(&second, &repeated));
+        let start = Instant::now();
+        let repeated_observations = reader.observations(&repeated, Some((&second, &next))).unwrap();
+        timings_us.push(start.elapsed().as_micros());
+        assert!(reader.client.is_none());
+        assert!(Arc::ptr_eq(&next, &repeated_observations));
+        eprintln!("inline fine cells={} blocks={} included_bytes={included_bytes:?} stages=receive1,observations1,columns1,receive2,observations2,columns2,repeat_receive2,repeat_observations2 operation_us={timings_us:?} columns_read_points=[{initial_count},{count}] client_initialized={}",
+            cells.len(), second.blocks.len(), reader.client.is_some());
     }
 
     #[test]

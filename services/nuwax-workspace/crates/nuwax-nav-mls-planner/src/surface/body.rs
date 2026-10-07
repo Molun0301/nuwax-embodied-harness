@@ -1975,6 +1975,7 @@ impl SurfaceSnapshot {
         let stride=ny as usize;let count=count as usize;
         let mut in_domain=vec![false;count];
         let mut bands=vec![None;count];
+        let mut selected=vec![None;count];
         // 子阶段不移动生产临时值：表/队列初始化及保留缓冲清理仍只计入外层收集。
         #[cfg(feature = "body-query-profile")]
         let (mut cache_present_columns,mut cache_absent_columns,mut cache_single_band_columns)=(0_u64,0_u64,0_u64);
@@ -1991,12 +1992,21 @@ impl SurfaceSnapshot {
                 let dx=(f64::from(x)+0.5)*size-origin[0];let dy=(f64::from(y)+0.5)*size-origin[1];
                 if dx*dx+dy*dy>enumeration*enumeration {continue;}
                 let index=(i64::from(x)-i64::from(low[0])) as usize*stride+(i64::from(y)-i64::from(low[1])) as usize;
-                in_domain[index]=true;bands[index]=cache.fine_bands.get(&(x,y)).cloned();
-                #[cfg(feature = "body-query-profile")]
-                if let Some(values)=&bands[index] {
-                    cache_present_columns+=1;
-                    if values.len()==1 {cache_single_band_columns+=1;}
-                }else{cache_absent_columns+=1;}
+                in_domain[index]=true;
+                if let Some(values)=cache.fine_bands.get(&(x,y)) {
+                    // 单带的选择与参考高度无关，直接写入原有选择表，省去临时 Arc 增减。
+                    // 空带与多带仍保留原缓存读取/选择路径，不跨观察拥有方复用结果。
+                    if values.len()==1 {selected[index]=Some(values[0]);}
+                    else {bands[index]=Some(Arc::clone(values));}
+                    #[cfg(feature = "body-query-profile")]
+                    {
+                        cache_present_columns+=1;
+                        if values.len()==1 {cache_single_band_columns+=1;}
+                    }
+                } else {
+                    #[cfg(feature = "body-query-profile")]
+                    {cache_absent_columns+=1;}
+                }
             }}
         }
         #[cfg(feature = "body-query-profile")]
@@ -2008,7 +2018,7 @@ impl SurfaceSnapshot {
             query_profile::add(QueryCounter::DenseCacheSingleBandColumns,cache_single_band_columns);
         }
         let distance=|band:[f64;2]|(band[0]-origin[2]).max(origin[2]-band[1]).max(0.0);
-        let mut selected=vec![None;count];let mut seed:Option<(usize,(i32,i32),[f64;4])>=None;
+        let mut seed:Option<(usize,(i32,i32),[f64;4])>=None;
         #[cfg(feature = "body-query-profile")]
         let mut selected_columns=0_u64;
         #[cfg(feature = "body-query-profile")]
@@ -2016,10 +2026,13 @@ impl SurfaceSnapshot {
         for (index,inside) in in_domain.iter().copied().enumerate() {
             if !inside {continue;}
             let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
-            let values=bands[index].take().unwrap_or_else(||self.fine_contact_bands(x,y));
-            let Some(&band)=values.iter().min_by(|a,b|distance(**a).total_cmp(&distance(**b))
-                .then_with(||(a[1]-origin[2]).abs().total_cmp(&(b[1]-origin[2]).abs()))
-                .then_with(||a[1].total_cmp(&b[1]))) else {continue;};
+            let band=if let Some(band)=selected[index] {band} else {
+                let values=bands[index].take().unwrap_or_else(||self.fine_contact_bands(x,y));
+                let Some(&band)=values.iter().min_by(|a,b|distance(**a).total_cmp(&distance(**b))
+                    .then_with(||(a[1]-origin[2]).abs().total_cmp(&(b[1]-origin[2]).abs()))
+                    .then_with(||a[1].total_cmp(&b[1]))) else {continue;};
+                band
+            };
             selected[index]=Some(band);let rise=band[1]-origin[2];
             #[cfg(feature = "body-query-profile")]
             {selected_columns+=1;}
@@ -2048,21 +2061,26 @@ impl SurfaceSnapshot {
         while let Some(index)=queue.pop_front() {
             #[cfg(feature = "body-query-profile")]
             {visited_columns+=1;}
-            let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
+            let row=index/stride;let column=index%stride;
             let band=selected[index].expect("只有已选真实带进入队列");
-            for dx in -1..=1 {for dy in -1..=1 {
+            for dx in -1_isize..=1 {for dy in -1_isize..=1 {
                 if dx==0&&dy==0 {continue;}
-                let(mut nx,mut ny)=(x,y);
-                loop {
-                    let(Some(next_x),Some(next_y))=(nx.checked_add(dx),ny.checked_add(dy)) else {break;};
-                    nx=next_x;ny=next_y;
-                    if nx<low[0]||nx>high[0]||ny<low[1]||ny>high[1] {break;}
-                    let next_index=(i64::from(nx)-i64::from(low[0])) as usize*stride+(i64::from(ny)-i64::from(low[1])) as usize;
+                let rows=match dx {-1=>row,0=>usize::MAX,_=>nx as usize-1-row};
+                let columns=match dy {-1=>column,0=>usize::MAX,_=>stride-1-column};
+                // 到矩形边界的步数恰好保留原 checked_add/边界检查允许的格。
+                // 每步仍为 (row+dx*k)*stride+column+dy*k，不会绕到邻行；
+                // 局部表最多 16_384 格，有符号索引在 i32 极值附近也不做世界坐标加法。
+                let offset=dx*stride as isize+dy;let mut next_index=index as isize;
+                for _ in 0..rows.min(columns) {
+                    next_index+=offset;let next_index=next_index as usize;
                     if !in_domain[next_index] {break;}
                     let Some(next)=selected[next_index] else {continue;};
-                    let rise=next[1]-band[1];
-                    if rise<=model.max_step_up_m+size+1e-6 && -rise<=model.max_step_down_m+size+1e-6
-                        && !visited[next_index] {visited[next_index]=true;queue.push_back(next_index);}
+                    if !visited[next_index] {
+                        let rise=next[1]-band[1];
+                        if rise<=model.max_step_up_m+size+1e-6 && -rise<=model.max_step_down_m+size+1e-6
+                            {visited[next_index]=true;queue.push_back(next_index);}
+                    }
+                    // 第一真实列始终终止射线；已访问或高度不相容也不能跳过。
                     break;
                 }
             }}
@@ -4446,6 +4464,106 @@ mod tests {
             let mut envelope=model();envelope.max_step_up_m=0.15;envelope.max_step_down_m=0.1;
             let observed=keys.iter().copied().collect();
             (sparse_contact_scene(keys,envelope),observed)
+        }
+
+        fn result_bits(result:Result<Vec<ContactPoint>,SurfaceError>,origin:[f64;3])
+            ->Result<(Vec<[u64;5]>,Option<[u64;3]>),SurfaceError> {
+            result.map(|mut points| {
+                sort(&mut points);
+                (points.iter().map(point_bits).collect(),plane_bits(fit_contact_plane(&points,origin)))
+            })
+        }
+
+        #[test]
+        fn cold_and_mixed_cached_bands_match_both_references_after_cache_clear() {
+            let keys=(-8_i32..=8).flat_map(|x|(-8_i32..=8).flat_map(move |y| {
+                let levels:Vec<i32>=match (x+2*y).rem_euclid(6) {
+                    0=>vec![],1=>vec![-1],2=>(-3..=-1).collect(),3=>vec![-1,3],
+                    4=>vec![-4,0,4],_=>vec![if x<0 {-1}else{3}],
+                };
+                levels.into_iter().map(move |z|[x,y,z])
+            })).collect();
+            let (base,_)=make(keys);
+            for evidence in [GroundEvidence::MeasuredSurface,GroundEvidence::OccupiedVolume] {
+                for height in [-0.1,0.0,0.1,4.0] {for cache_mode in 0..3 {
+                    let map=base.fork_for_planning().with_ground_evidence(evidence);
+                    let reference=map.fork_for_planning();let sparse=map.fork_for_planning();
+                    assert!(map.body_query_cache.lock().unwrap().fine_bands.is_empty());
+                    if cache_mode>0 {
+                        // 混合命中包含空带、单带与多带；未预热的列仍走原缺失路径。
+                        for x in -8..=8 {for y in -8..=8 {
+                            if (x+y)%2==0 {map.fine_contact_bands(x,y);}
+                        }}
+                    }
+                    if cache_mode==2 {
+                        // 远处列确实没有观察。填满已有缓存，让域内第一次缺失清空缓存；
+                        // 已抄入选择表的单带与已借持 Arc 的多带仍须给出相同结果。
+                        let mut cache=map.body_query_cache.lock().unwrap();
+                        let empty=Arc::new(Vec::new());
+                        for index in cache.fine_bands.len()..8192 {
+                            cache.fine_bands.insert((1_000_000+index as i32,0),Arc::clone(&empty));
+                        }
+                    }
+                    let origin=[0.025,0.025,height];let radius=0.39;
+                    // 被测实现先执行，参考实现用独立缓存，不能先预热候选路径。
+                    let actual=result_bits(map.fine_contact_domain(origin,radius),origin);
+                    if cache_mode==2 {assert!(map.body_query_cache.lock().unwrap().fine_bands.len()<8192);}
+                    assert_eq!(actual,result_bits(reference_bfs(&reference,origin,radius),origin));
+                    assert_eq!(actual,result_bits(sparse.fine_contact_domain_sparse(origin,radius),origin));
+                    assert_eq!(actual,result_bits(map.fine_contact_domain(origin,radius),origin));
+                }}
+            }
+        }
+
+        #[test]
+        fn rectangular_and_single_axis_domains_match_at_i32_coordinate_edges() {
+            let fine=f64::from(0.05_f32);let radius=0.3;
+            let enumeration=radius+std::f64::consts::SQRT_2*fine;
+            let (base,_)=make(vec![[0,0,-1]]);
+            for (ax,sx) in [(i32::MIN,1),(i32::MAX,-1)] {
+                for (ay,sy) in [(i32::MIN,1),(i32::MAX,-1)] {
+                    let keys:Vec<_>=(0..=16).flat_map(|x|(0..=16).map(move |y|[ax+sx*x,ay+sy*y,-1])).collect();
+                    let mut blocks=std::collections::BTreeMap::<[i32;3],
+                        std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+                    for &key in &keys {blocks.entry(key.map(|v|v.div_euclid(32))).or_default()
+                        .insert(key,SurfaceObservation{observed_ns:0,hits:0});}
+                    let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+                    for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+                    // 精确细观察直接挂接，不借助 f32 粗点云表达 i32 极值列。
+                    let map=base.with_observations(Some(Arc::new(observations)));
+                    for shape in 0..3 {
+                        let mut origin=[(f64::from(ax)+0.5+f64::from(sx)*3.0)*fine,
+                            (f64::from(ay)+0.5+f64::from(sy)*5.0)*fine,0.0];
+                        if shape==1 {origin[0]=(f64::from(ax)+0.5-f64::from(sx)*(enumeration/fine-0.25))*fine;}
+                        if shape==2 {origin[1]=(f64::from(ay)+0.5-f64::from(sy)*(enumeration/fine-0.25))*fine;}
+                        let low:[i32;2]=std::array::from_fn(|i|((origin[i]-enumeration)/fine).floor() as i32);
+                        let high:[i32;2]=std::array::from_fn(|i|((origin[i]+enumeration)/fine).floor() as i32);
+                        if shape==1 {assert_eq!(low[0],high[0]);assert!(low[1]<high[1]);}
+                        if shape==2 {assert_eq!(low[1],high[1]);assert!(low[0]<high[0]);}
+                        let candidate=map.fork_for_planning();
+                        #[cfg(feature="body-query-profile")]
+                        query_profile::begin();
+                        let actual=candidate.fine_contact_domain(origin,radius);
+                        #[cfg(feature="body-query-profile")]
+                        {
+                            let record=query_profile::end();
+                            let expected=keys.iter().filter(|key| {
+                                let dx=(f64::from(key[0])+0.5)*fine-origin[0];
+                                let dy=(f64::from(key[1])+0.5)*fine-origin[1];
+                                dx*dx+dy*dy<=enumeration*enumeration
+                            }).count();
+                            // 单轴域虽可没有正权重点，也须确实走遍其相连真实列。
+                            assert!(expected>1);
+                            assert_eq!(record.counters[QueryCounter::DenseVisitedColumns as usize],expected as u64);
+                        }
+                        let actual=result_bits(actual,origin);
+                        assert!(actual.is_ok());
+                        assert_eq!(actual,result_bits(reference_bfs(&map.fork_for_planning(),origin,radius),origin));
+                        assert_eq!(actual,result_bits(map.fork_for_planning().fine_contact_domain_sparse(origin,radius),origin));
+                        assert_eq!(actual,result_bits(candidate.fine_contact_domain(origin,radius),origin));
+                    }
+                }
+            }
         }
 
         #[test]

@@ -794,8 +794,8 @@ pub fn validate_navigation_map_3d(message: &NavigationMap3D) -> Result<(), Strin
             total = total.checked_add(bytes.len()).ok_or("精细块大小溢出")?;
             if total > NAVIGATION_MAP_MAX_INCLUDED_BYTES { return Err("携带精细块超预算".into()); }
             let reference = blocks.get(object).ok_or("携带精细块不属于根清单")?;
-            let decoded = nuwax_map_chunks::decode_block(bytes)?;
-            if decoded.len() != reference.points as usize || decoded.values().any(|e| e.observed_ns > root.source_timestamp_ns) {
+            let (points, latest) = nuwax_map_chunks::block_summary(bytes)?;
+            if points != reference.points || latest > root.source_timestamp_ns {
                 return Err("携带精细块证据与根不符".into());
             }
         }
@@ -2917,6 +2917,106 @@ mod navigation_map_3d_tests {
         message
     }
 
+    fn warmed_codec_elapsed_ns(mut operation: impl FnMut()) -> u128 {
+        for _ in 0..8 {
+            operation();
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..128 {
+            operation();
+        }
+        started.elapsed().as_nanos()
+    }
+
+    #[test]
+    #[ignore = "warmed codec components only; run explicitly with --ignored --nocapture"]
+    fn warmed_fine_map_codec_baseline() {
+        use nuwax_map_chunks::{Block, BlockRef, Evidence, Manifest, ObjectId, ObjectIdentity,
+            Transfer, decode_block, encode_block, global_key};
+        use std::{collections::{BTreeMap, BTreeSet}, hint::black_box, io::Write};
+
+        let mut message = fine_map(ObjectIdentity::Assigned(ObjectId([1; 16])));
+        message.source_voxel_size = 0.05;
+        let block: Block = (0_u16..1024).map(|local| (local, Evidence {
+            observed_ns: message.source_timestamp_ns as u64, hits: 2,
+        })).collect();
+        let keys = [[0, 0, 0], [0, 1, 0], [1, 0, 0], [1, 1, 0]];
+        let mut included = BTreeMap::new();
+        let blocks = keys.into_iter().enumerate().map(|(index, key)| {
+            let object = ObjectIdentity::Assigned(ObjectId([index as u8 + 1; 16]));
+            included.insert(object, encode_block(&block).unwrap());
+            BlockRef { key, object, block_revision: 12, geometry_revision: 9, points: 1024 }
+        }).collect();
+        let root = Manifest {
+            version: 2, domain: navigation_map_3d_domain(&message),
+            revision: message.cloud_revision as u64, geometry_revision: 9,
+            source_timestamp_ns: message.source_timestamp_ns as u64,
+            voxel_size_m: message.source_voxel_size, blocks,
+        };
+        message.fine = Some(Transfer { root: root.encode().unwrap(), included });
+        let message = message;
+        let fine = message.fine.as_ref().unwrap();
+        let objects: BTreeSet<_> = root.blocks.iter().map(|reference| reference.object).collect();
+        let positions: BTreeSet<_> = root.blocks.iter().flat_map(|reference| {
+            block.keys().map(move |&local| global_key(reference.key, local).unwrap())
+        }).collect();
+        assert_eq!(root.points(), 4096);
+        assert_eq!(positions.len(), 4096);
+        assert!(positions.iter().all(|&[x, y, z]| {
+            (0..64).contains(&x) && (0..64).contains(&y) && z == 0
+        }));
+        assert_eq!(root.blocks.len(), 4);
+        assert_eq!(objects.len(), 4);
+        assert_eq!(fine.included.len(), 4);
+        assert!(objects.iter().all(|object| fine.included.contains_key(object)));
+        let included_bytes: usize = fine.included.values().map(Vec::len).sum();
+        assert_eq!(included_bytes, 49_216);
+        for bytes in fine.included.values() {
+            assert_eq!(bytes.len(), 12_304);
+            let decoded = decode_block(bytes).unwrap();
+            assert_eq!(decoded, block);
+            assert_eq!(encode_block(&decoded).unwrap(), *bytes);
+        }
+        validate_navigation_map_3d(&message).unwrap();
+        let wire = encode_navigation_map_3d(&message).unwrap();
+        assert!(wire.len() <= 131_072);
+        assert_eq!(&wire[..8], &NAVIGATION_MAP_3D_FINGERPRINT);
+        let decoded = decode_navigation_map_3d(&wire).unwrap();
+        assert_eq!(decoded, message);
+        assert_eq!(encode_navigation_map_3d(&decoded).unwrap(), wire);
+        drop(decoded);
+        if let Some(path) = std::env::var_os("NUWAX_CODEC_BENCH_WIRE_OUT") {
+            // Optional bounded output, once outside timing; never overwrite an existing file.
+            std::fs::OpenOptions::new().write(true).create_new(true).open(path).unwrap()
+                .write_all(&wire).unwrap();
+        }
+
+        // Each stage warms immediately before its own timer. Owned results are dropped inside.
+        let validate_ns = warmed_codec_elapsed_ns(|| {
+            black_box(validate_navigation_map_3d(black_box(&message))).unwrap();
+        });
+        let encode_ns = warmed_codec_elapsed_ns(|| {
+            drop(black_box(encode_navigation_map_3d(black_box(&message))).unwrap());
+        });
+        let decode_ns = warmed_codec_elapsed_ns(|| {
+            drop(black_box(decode_navigation_map_3d(black_box(&wire))).unwrap());
+        });
+        let direct_decode_4blocks_ns = warmed_codec_elapsed_ns(|| {
+            for bytes in black_box(&fine.included).values() {
+                drop(black_box(decode_block(black_box(bytes))).unwrap());
+            }
+        });
+        println!(concat!(
+            "warmed_codec_components_only warmups=8 iterations=128 stages=4 ",
+            "debug_assertions={} blocks={} unique_objects={} included_blocks={} points={} ",
+            "included_bytes={} wire_bytes={} validate_elapsed_ns={} encode_elapsed_ns={} ",
+            "decode_elapsed_ns={} direct_decode_4blocks_elapsed_ns={} ",
+            "direct_decode_blocks_per_iteration=4"
+        ), cfg!(debug_assertions), root.blocks.len(), objects.len(), fine.included.len(),
+            root.points(), included_bytes, wire.len(), validate_ns, encode_ns, decode_ns,
+            direct_decode_4blocks_ns);
+    }
+
     #[test]
     fn composite_receipt_keeps_retained_cloud_time_and_current_mask_time_distinct() {
         let mut message = fine_map(nuwax_map_chunks::ObjectIdentity::Assigned(
@@ -3217,6 +3317,122 @@ mod navigation_map_3d_tests {
             missing.fine.as_mut().unwrap().included.clear();
             assert_eq!(decode_navigation_map_3d(&encode_navigation_map_3d(&missing).unwrap()).unwrap(), missing);
         }
+    }
+
+    fn assert_fine_validation_error(message: &NavigationMap3D, expected: &str) {
+        assert_eq!(validate_navigation_map_3d(message).unwrap_err(), expected);
+        match encode_navigation_map_3d(message).unwrap_err() {
+            CodecError::LcmEncode(error) => assert_eq!(error, expected),
+            other => panic!("unexpected encode error: {other:?}"),
+        }
+    }
+
+    fn assert_fine_wire_error(valid: &NavigationMap3D, invalid: &NavigationMap3D, expected: &str) {
+        assert_fine_validation_error(invalid, expected);
+        let fine = valid.fine.as_ref().unwrap();
+        let cloud = encode_point_cloud2_body(&valid.cloud).unwrap();
+        let mut wire = encode_navigation_map_3d(valid).unwrap();
+        let tail_len = 4 + fine.root.len() + 4
+            + fine.included.values().map(|bytes| 49 + 4 + bytes.len()).sum::<usize>();
+        // 保留已验证包头，只替换精细根和块；非法消息不能通过生产编码器。
+        wire.truncate(wire.len() - cloud.len() - tail_len);
+        let fine = invalid.fine.as_ref().unwrap();
+        wire.extend_from_slice(&(fine.root.len() as i32).to_be_bytes());
+        wire.extend_from_slice(&fine.root);
+        wire.extend_from_slice(&(fine.included.len() as i32).to_be_bytes());
+        for (object, bytes) in &fine.included {
+            encode_navigation_map_object_identity(*object, &mut wire);
+            wire.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            wire.extend_from_slice(bytes);
+        }
+        wire.extend_from_slice(&cloud);
+        for error in [decode_navigation_map_3d(&wire).unwrap_err(),
+            decode_navigation_map_3d_body(&wire[8..]).unwrap_err()] {
+            match error {
+                CodecError::LcmDecode(error) => assert_eq!(error, expected),
+                other => panic!("unexpected decode error: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fine_block_summary_preserves_bounds_and_full_parse_error_precedence() {
+        use nuwax_map_chunks::{Block, Evidence, LegacyAlias, Manifest, ObjectId, ObjectIdentity, encode_block};
+        for object in [ObjectIdentity::Assigned(ObjectId([0x51; 16])),
+            ObjectIdentity::Legacy(LegacyAlias([0x72; 32]))] {
+            let mut valid = fine_map(object);
+            let bound = valid.source_timestamp_ns as u64;
+            let block = Block::from([(0, Evidence { observed_ns: bound, hits: 1 }),
+                (1, Evidence { observed_ns: 1, hits: 1 })]);
+            let fine = valid.fine.as_mut().unwrap();
+            let mut root = Manifest::decode(&fine.root).unwrap();
+            root.blocks[0].points = 2;
+            fine.root = root.encode().unwrap();
+            fine.included.insert(object, encode_block(&block).unwrap());
+            let wire = encode_navigation_map_3d(&valid).unwrap();
+            assert_eq!(decode_navigation_map_3d(&wire).unwrap(), valid);
+            assert_eq!(encode_navigation_map_3d(&decode_navigation_map_3d(&wire).unwrap()).unwrap(), wire);
+
+            let mut zero = valid.clone();
+            zero.fine.as_mut().unwrap().included.insert(object, encode_block(&Block::from([
+                (0, Evidence { observed_ns: 0, hits: 0 }), (1, Evidence { observed_ns: 0, hits: 0 }),
+            ])).unwrap());
+            assert_eq!(decode_navigation_map_3d(&encode_navigation_map_3d(&zero).unwrap()).unwrap(), zero);
+
+            let mut future = valid.clone();
+            future.fine.as_mut().unwrap().included.get_mut(&object).unwrap()[18..26]
+                .copy_from_slice(&(bound + 1).to_le_bytes());
+            assert_fine_wire_error(&valid, &future, "携带精细块证据与根不符");
+            let mut wrong_count = valid.clone();
+            root.blocks[0].points = 1;
+            wrong_count.fine.as_mut().unwrap().root = root.encode().unwrap();
+            assert_fine_wire_error(&valid, &wrong_count, "携带精细块证据与根不符");
+
+            // 首条记录超时且根数量错误，后续重复键仍须先报块格式错误。
+            let mut compound = future;
+            let fine = compound.fine.as_mut().unwrap();
+            fine.root = root.encode().unwrap();
+            fine.included.get_mut(&object).unwrap()[28..30].copy_from_slice(&0_u16.to_le_bytes());
+            assert_fine_wire_error(&valid, &compound, "精细块重复、无序或无效证据");
+
+            for mutate in [
+                (|root: &mut Manifest| root.domain.frame_generation += 1) as fn(&mut Manifest),
+                |root| root.revision += 1,
+                |root| root.voxel_size_m *= 2.0,
+                |root| root.source_timestamp_ns += 1,
+                |root| root.blocks.clear(),
+            ] {
+                let mut mismatched = compound.clone();
+                let fine = mismatched.fine.as_mut().unwrap();
+                let mut root = Manifest::decode(&fine.root).unwrap();
+                mutate(&mut root);
+                fine.root = root.encode().unwrap();
+                assert_fine_wire_error(&valid, &mismatched, "精细根与三维规范提交不一致");
+            }
+
+            let mut outside = compound;
+            let fine = outside.fine.as_mut().unwrap();
+            let bytes = fine.included.remove(&object).unwrap();
+            fine.included.insert(ObjectIdentity::Assigned(ObjectId([0x99; 16])), bytes);
+            assert_fine_wire_error(&valid, &outside, "携带精细块不属于根清单");
+        }
+    }
+
+    #[test]
+    fn fine_inclusion_budgets_precede_membership_and_body_errors() {
+        use nuwax_map_chunks::{ObjectId, ObjectIdentity};
+        let object = ObjectIdentity::Assigned(ObjectId([0x51; 16]));
+        let mut too_large = fine_map(object);
+        // 同时不属于根、块格式错误，仍先报告整个携带载荷的预算错误。
+        too_large.fine.as_mut().unwrap().included = std::collections::BTreeMap::from([
+            (ObjectIdentity::Assigned(ObjectId([0x99; 16])), vec![0; NAVIGATION_MAP_MAX_INCLUDED_BYTES + 1]),
+        ]);
+        assert_fine_validation_error(&too_large, "携带精细块超预算");
+        let mut too_many = fine_map(object);
+        too_many.fine.as_mut().unwrap().included = (1..=NAVIGATION_MAP_MAX_INCLUDED_BLOCKS + 1)
+            .map(|index| (ObjectIdentity::Assigned(ObjectId((index as u128).to_le_bytes())), Vec::new()))
+            .collect();
+        assert_fine_validation_error(&too_many, "携带精细块数量超预算");
     }
 
     #[test]

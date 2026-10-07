@@ -2885,12 +2885,22 @@ impl MappingAdapter {
         {
             return Ok(None);
         }
-        let mut free = self
+        let raw = self
             .raw_map
-            .clone()
+            .as_ref()
             .ok_or_else(|| "applied forbidden zones have no physical map geometry".to_string())?;
-        free.data.fill(0);
-        crate::forbidden_zones::compose_effective_map(&free, loaded).map(Some)
+        let free = MapState {
+            width: raw.width,
+            height: raw.height,
+            resolution: raw.resolution,
+            origin_x: raw.origin_x,
+            origin_y: raw.origin_y,
+            frame_id: raw.frame_id.clone(),
+            revision: raw.revision,
+            timestamp_ns: raw.timestamp_ns,
+            data: vec![0; raw.data.len()],
+        };
+        crate::forbidden_zones::compose_effective_map_owned(free, loaded).map(Some)
     }
 
     fn load_forbidden_zones(&self) -> crate::forbidden_zones::LoadedForbiddenZones {
@@ -4249,6 +4259,10 @@ mod tests {
     use nuwax_mapping::occupancy::types::OccupancyValue;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    include!("mapping_adapter_virtual_mask_tests.rs");
+    include!("mapping_adapter_rectangle_scan_tests.rs");
+    include!("mapping_adapter_fail_closed_isolation_tests.rs");
 
     static NEXT_SEQUENCE_TEST_PATH: AtomicU64 = AtomicU64::new(0);
 

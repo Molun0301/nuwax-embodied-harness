@@ -53,12 +53,26 @@ pub fn encode_block(block: &Block) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 pub fn decode_block(bytes: &[u8]) -> Result<Block, String> {
+    let mut out = BTreeMap::new();
+    visit_block(bytes, |key, evidence| { out.insert(key, evidence); })?;
+    Ok(out)
+}
+
+/// 完整校验块后返回体素数和最大观测时间；旧资产的全零证据返回零时间。
+/// 成功路径只累积栈上摘要，不物化块；格式错误仍返回原有错误字符串。
+/// 根的体素数和时间上界由调用方在本函数成功后另行校验。
+pub fn block_summary(bytes: &[u8]) -> Result<(u32, u64), String> {
+    let mut latest = 0;
+    let points = visit_block(bytes, |_, evidence| { latest = latest.max(evidence.observed_ns); })?;
+    Ok((points, latest))
+}
+
+fn visit_block(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Result<u32, String> {
     if bytes.len() < 16 || bytes.len() > MAX_BLOCK_BYTES || &bytes[..8] != b"NUWAXBL1" || bytes[12..16] != [0; 4] {
         return Err("精细块格式或长度无效".into());
     }
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
     if count == 0 || count > 32768 || bytes.len() != 16 + count * 12 { return Err("精细块记录数不匹配".into()); }
-    let mut out = BTreeMap::new();
     let mut previous = None;
     for record in bytes[16..].chunks_exact(12) {
         let key = u16::from_le_bytes(record[..2].try_into().unwrap());
@@ -66,9 +80,9 @@ pub fn decode_block(bytes: &[u8]) -> Result<Block, String> {
         let hits = u16::from_le_bytes(record[10..12].try_into().unwrap());
         if key >= 32768 || (observed_ns == 0) != (hits == 0) || previous.is_some_and(|p| p >= key) { return Err("精细块重复、无序或无效证据".into()); }
         previous = Some(key);
-        out.insert(key, Evidence { observed_ns, hits });
+        visit(key, Evidence { observed_ns, hits });
     }
-    Ok(out)
+    Ok(count as u32)
 }
 
 /// Assigned identity of immutable bytes, never derived from their content.
@@ -227,7 +241,16 @@ pub struct Receiver {
     collection_error: Option<String>,
 }
 impl Receiver {
-    pub fn new(repository: Repository) -> Self { Self { current: None, reader: RegionReader::new(repository.clone(), 4 * 1024 * 1024), repository, verified: BTreeMap::new(), readers: Vec::new(), collection_error: None } }
+    pub fn new(repository: Repository) -> Self { Self::with_cache_budget(repository, 4 * 1024 * 1024) }
+    /// 准入与后续读取共用同一有界解码缓存。
+    pub fn with_cache_budget(repository: Repository, budget_bytes: usize) -> Self {
+        Self { current: None, reader: RegionReader::new(repository.clone(), budget_bytes), repository, verified: BTreeMap::new(), readers: Vec::new(), collection_error: None }
+    }
+    /// 复用已准入的不可变块；读取旧根时调用方仍须持有该根的 Arc。
+    /// 返回原始证据不代表当前运动权限，根绑定与新鲜度仍由消费方检查。
+    pub fn block(&mut self, reference: &BlockRef) -> Result<Arc<Block>, String> {
+        self.reader.block(reference)
+    }
     pub fn current(&self) -> Option<Arc<Manifest>> { self.current.clone() }
     pub fn collection_error(&self) -> Option<&str> { self.collection_error.as_deref() }
     pub fn clear(&mut self) { self.current = None; self.verified.clear(); }

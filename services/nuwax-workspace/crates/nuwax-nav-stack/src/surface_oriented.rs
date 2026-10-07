@@ -6,6 +6,69 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 type BodyPose = ([f64; 3], [f64; 4]);
+
+// 仅有墙弯道测试按单次调用启用；固定槽位，不复制地图、不在计时区间输出。
+#[cfg(test)]
+mod planning_diagnostic {
+    use nuwax_nav_mls_planner::{SurfaceError, SurfaceSnapshot};
+    use std::{cell::RefCell, time::Instant};
+    #[derive(Debug, PartialEq)]
+    pub(super) struct Guide {
+        map: usize, start: [u64; 3], goal: [u64; 3], boundary: Vec<[u64; 2]>,
+        result: Result<Vec<[u64; 3]>, SurfaceError>,
+    }
+    #[derive(Debug, Default)]
+    pub(super) struct Report {
+        // raw、初次圆角、居中候选及其圆角、朝向搜索；后者包含在raw内，不能相加。
+        pub phases_ns: [u128; 4],
+        // 居中入口条件、候选连接、第二次圆角、最终比较；未执行的阶段保持零。
+        pub centered_parts_ns: [u128; 4], pub centered_entered: bool, pub centered_candidate_points: Option<usize>,
+        pub guide_ns: [u128; 2], pub guide_calls: [usize; 2], pub guides: [Option<Guide>; 2],
+        pub goal_setup_ns: u128, pub regional_targets: usize, pub search_entry_ns: u128,
+        // 即时/延后两种搜索，各记录调用次数、累计展开、累计生成。
+        pub search_work: [[usize; 3]; 2], pub search_budget_exhausted: usize,
+        pub omni_search_work: [usize; 2],
+    }
+    thread_local! { static REPORT: RefCell<Option<Report>> = const { RefCell::new(None) }; }
+    pub(super) fn record(f: impl FnOnce(&mut Report)) {
+        REPORT.with(|slot| { if let Some(report) = slot.borrow_mut().as_mut() { f(report); } });
+    }
+    pub(super) struct Capture;
+    impl Capture {
+        pub fn begin() -> Self {
+            REPORT.with(|slot| { assert!(slot.borrow().is_none()); *slot.borrow_mut() = Some(Report::default()); });
+            Self
+        }
+        pub fn finish(self) -> Report { REPORT.with(|slot| slot.borrow_mut().take().expect("单次规划诊断")) }
+    }
+    impl Drop for Capture { fn drop(&mut self) { REPORT.with(|slot| { slot.borrow_mut().take(); }); } }
+    pub(super) struct Timer(usize, Instant);
+    pub(super) fn timer(phase: usize) -> Timer { Timer(phase, Instant::now()) }
+    impl Drop for Timer {
+        fn drop(&mut self) { let elapsed = self.1.elapsed().as_nanos(); record(|report| report.phases_ns[self.0] += elapsed); }
+    }
+    pub(super) fn guide(slot: usize, started: Instant, map: &SurfaceSnapshot, start: [f64; 3],
+        goal: [f64; 3], boundary: &[[f64; 2]], result: &Result<Vec<[f64; 3]>, SurfaceError>) {
+        let elapsed = started.elapsed().as_nanos();
+        record(|report| {
+            report.guide_calls[slot] += 1; report.guide_ns[slot] += elapsed;
+            if report.guides[slot].is_none() {
+                report.guides[slot] = Some(Guide { map: map as *const SurfaceSnapshot as usize,
+                    start: start.map(f64::to_bits), goal: goal.map(f64::to_bits),
+                    boundary: boundary.iter().map(|point| point.map(f64::to_bits)).collect(),
+                    result: result.as_ref().map(|points| points.iter().map(|point| point.map(f64::to_bits)).collect())
+                        .map_err(Clone::clone) });
+            }
+        });
+    }
+    impl Report {
+        pub fn guide_equality(&self) -> Option<(bool, bool)> {
+            let [Some(a), Some(b)] = &self.guides else { return None; };
+            Some((a.map == b.map && a.start == b.start && a.goal == b.goal && a.boundary == b.boundary,
+                a.result == b.result))
+        }
+    }
+}
 // 优先较快取得可执行路线；加权启发式不承诺最短路径，碰撞/支撑检查不变。
 const SEARCH_HEURISTIC_WEIGHT: f64 = 10.0;
 fn angle(v: f64) -> f64 {
@@ -352,11 +415,7 @@ fn omnidirectional_connection(
             for index in chain.into_iter().rev() {
                 path.extend_from_slice(&nodes[index].samples);
             }
-            #[cfg(test)]
-            eprintln!(
-                "全向平移搜索：展开{expanded}个状态，生成{}个节点",
-                nodes.len()
-            );
+            #[cfg(test)] planning_diagnostic::record(|report| report.omni_search_work = [expanded, nodes.len()]);
             return Some(path);
         }
         expanded += 1;
@@ -498,19 +557,47 @@ pub fn plan_with_motion_cancellable(
     let goal_allowed=|path:&Vec<BodyPose>|path.last().is_some_and(|&end|
         position_distance(end,goal)<=options.position_tolerance_m
         && (!options.requires_orientation() || angle(planar(end).yaw-planar(goal).yaw).abs()<=options.yaw_tolerance_rad));
-    let mut path=round_forward_corners(map,&raw,limits,boundary,&stopped).filter(goal_allowed).unwrap_or(raw);
+    let mut path={
+        #[cfg(test)] let _smoothing_timer=planning_diagnostic::timer(1);
+        round_forward_corners(map,&raw,limits,boundary,&stopped).filter(goal_allowed).unwrap_or(raw)
+    };
+    #[cfg(test)] let centered_timer=planning_diagnostic::timer(2);
     // 已有可行路线后再比较居中候选，软偏好不能把唯一窄路变为无路。
-    if budget>0 && motion_soft_multiplier(map,start,&path)>1.0+1e-6 && !stopped() {
+    #[cfg(test)] let gate_started=std::time::Instant::now();
+    let try_centered=budget>0 && motion_soft_multiplier(map,start,&path)>1.0+1e-6 && !stopped();
+    #[cfg(test)] {
+        let elapsed=gate_started.elapsed().as_nanos();
+        planning_diagnostic::record(|report| {report.centered_parts_ns[0]=elapsed;report.centered_entered=try_centered;});
+    }
+    if try_centered {
         let hint=(goal.0,if options.requires_orientation(){goal.1}else{path.last().expect("完整路线终点").1});
-        if let Some(candidate)=centered_forward_candidate(map,start,hint,options,limits,boundary,&stopped) {
+        #[cfg(test)] let candidate_started=std::time::Instant::now();
+        let candidate=centered_forward_candidate(map,start,hint,options,limits,boundary,&stopped);
+        #[cfg(test)] {
+            let elapsed=candidate_started.elapsed().as_nanos();
+            planning_diagnostic::record(|report| {report.centered_parts_ns[1]=elapsed;
+                report.centered_candidate_points=candidate.as_ref().map(Vec::len);});
+        }
+        if let Some(candidate)=candidate {
+            #[cfg(test)] let rounding_started=std::time::Instant::now();
             let candidate=round_forward_corners(map,&candidate,limits,boundary,&stopped).unwrap_or(candidate);
+            #[cfg(test)] {
+                let elapsed=rounding_started.elapsed().as_nanos();
+                planning_diagnostic::record(|report| report.centered_parts_ns[2]=elapsed);
+            }
+            #[cfg(test)] let comparison_started=std::time::Instant::now();
             if candidate.last().is_some_and(|&end|position_distance(end,goal)<=options.position_tolerance_m
                 && (!options.requires_orientation() || angle(planar(end).yaw-planar(goal).yaw).abs()<=options.yaw_tolerance_rad))
                 && forward_path_cost(map,&candidate,limits)<forward_path_cost(map,&path,limits) {
                 path=candidate;
             }
+            #[cfg(test)] {
+                let elapsed=comparison_started.elapsed().as_nanos();
+                planning_diagnostic::record(|report| report.centered_parts_ns[3]=elapsed);
+            }
         }
     }
+    #[cfg(test)] drop(centered_timer);
     if stopped() {return Err("三维规划已取消".into());}
     Ok(path)
 }
@@ -716,7 +803,10 @@ fn passage_forward_candidate(
     let model=map.body_envelope()?;
     let a=map.locate_support_from_body(start.0,start.1,model.body_to_support_z_m).ok()?;
     let b=map.locate_goal_support_from_body(goal.0,goal.1,model.body_to_support_z_m).ok()?;
-    let guide=map.plan_in_boundary(a.support_xyz,b.support_xyz,boundary).ok()?;
+    #[cfg(test)] let guide_started=std::time::Instant::now();
+    let guide=map.plan_in_boundary(a.support_xyz,b.support_xyz,boundary);
+    #[cfg(test)] planning_diagnostic::guide(0,guide_started,map,a.support_xyz,b.support_xyz,boundary,&guide);
+    let guide=guide.ok()?;
     let coarse=f64::from(map.config().voxel_size);let fine=f64::from(map.source_voxel_size_m());
     let longitudinal=(coarse*1.5).max(fine*2.0);let lateral=model.radius()*2.0;
     let width=model.footprint_xy_m.iter().map(|p|p[1]).fold(f64::NEG_INFINITY,f64::max)
@@ -953,6 +1043,7 @@ fn plan_complete_body_path(
 ) -> Result<Vec<BodyPose>, String> {
     let cancelled = || cancelled.is_some_and(|flag|flag.load(std::sync::atomic::Ordering::Relaxed));
     #[cfg(test)] let diagnostic_started = std::time::Instant::now();
+    #[cfg(test)] let _raw_timer=planning_diagnostic::timer(0);
     if cancelled() { return Err("三维规划已取消".into()); }
     options.validate()?;
     if let Some(limits) = limits {
@@ -1011,7 +1102,10 @@ fn plan_complete_body_path(
     if budget == 0 {
         return Err("当前观测中没有至最终目标的完整快速连接".into());
     }
-    #[cfg(test)] eprintln!("目标区域准备 {:?}，有效落点{}", diagnostic_started.elapsed(), regional_targets.len());
+    #[cfg(test)] {
+        let elapsed=diagnostic_started.elapsed().as_nanos();
+        planning_diagnostic::record(|report| {report.goal_setup_ns=elapsed;report.regional_targets=regional_targets.len();});
+    }
     if cancelled() {return Err("三维规划已取消".into());}
     // 直连失败后，以原目标区域内真实连通的落点引导绕行，不能只追踪孤立的中心或首样本。
     // 一次有向支撑图查询覆盖全部落点；点可达仍须通过后续完整机体扫掠。
@@ -1094,7 +1188,10 @@ fn plan_complete_body_path(
         map.locate_support_from_body(start.0, start.1, model.body_to_support_z_m),
         map.locate_goal_support_from_body(goal.0, goal.1, model.body_to_support_z_m),
     ) {
-        if let Ok(guide) = map.plan_in_boundary(a.support_xyz, b.support_xyz, boundary) {
+        #[cfg(test)] let guide_started=std::time::Instant::now();
+        let guide=map.plan_in_boundary(a.support_xyz, b.support_xyz, boundary);
+        #[cfg(test)] planning_diagnostic::guide(1,guide_started,map,a.support_xyz,b.support_xyz,boundary,&guide);
+        if let Ok(guide) = guide {
             let mut path = vec![start];
             let mut valid = true;
             for (index, support) in guide.iter().enumerate().skip(1) {
@@ -1118,7 +1215,11 @@ fn plan_complete_body_path(
     // 需要最终朝向时保留原展开方式，位置目标也保留原方式作为回退。
     let search = |deferred:bool| -> Result<Vec<BodyPose>,String> {
     let resolution = f64::from(map.config().voxel_size);
-    #[cfg(test)] eprintln!("进入朝向搜索 {:?}", diagnostic_started.elapsed());
+    #[cfg(test)] let _search_timer=planning_diagnostic::timer(3);
+    #[cfg(test)] {
+        let elapsed=diagnostic_started.elapsed().as_nanos();
+        planning_diagnostic::record(|report| {report.search_entry_ns=elapsed;report.search_work[usize::from(deferred)][0]+=1;});
+    }
     let yaw_step = std::f64::consts::TAU / 32.0;
     let radius = limits
         .map_or(0.0, |m| m.minimum_turning_radius_m)
@@ -1235,7 +1336,10 @@ fn plan_complete_body_path(
         best.insert(state,(cost,index));
         expanded += 1;
         if expanded > budget || (!deferred && nodes.len()>budget*4) {
-            #[cfg(test)] eprintln!("搜索预算：展开{expanded}/{budget}，节点{}，延后{deferred}",nodes.len());
+            #[cfg(test)] planning_diagnostic::record(|report| {
+                report.search_work[usize::from(deferred)][1]+=expanded;
+                report.search_work[usize::from(deferred)][2]+=nodes.len();report.search_budget_exhausted+=1;
+            });
             return Err("三维朝向搜索预算耗尽".into());
         }
         let close = endpoint_allowed(here)
@@ -1261,7 +1365,10 @@ fn plan_complete_body_path(
                 path.extend_from_slice(&nodes[i].samples);
             }
             path.extend(tail.into_iter().skip(1));
-            #[cfg(test)] eprintln!("完整机体搜索：展开{expanded}个状态，生成{}个节点",nodes.len());
+            #[cfg(test)] planning_diagnostic::record(|report| {
+                report.search_work[usize::from(deferred)][1]+=expanded;
+                report.search_work[usize::from(deferred)][2]+=nodes.len();
+            });
             return Ok(path);
         }
         let mut actions = vec![];
@@ -1378,6 +1485,10 @@ fn plan_complete_body_path(
             queue.push(Queue(next + estimate(end) * SEARCH_HEURISTIC_WEIGHT, id));
         }
     }
+    #[cfg(test)] planning_diagnostic::record(|report| {
+        report.search_work[usize::from(deferred)][1]+=expanded;
+        report.search_work[usize::from(deferred)][2]+=nodes.len();
+    });
     Err("不存在满足完整机体与运动约束的三维路线".into())
     };
     let mut complete=search(!options.requires_orientation());
@@ -1569,6 +1680,221 @@ mod tests {
             assert!(dx*heading.cos()+dy*heading.sin()>=-1e-8,"路径不能要求倒走");
             assert!((-dx*heading.sin()+dy*heading.cos()).abs()<1e-7,"路径不能要求横移");
         }
+    }
+
+    fn wall_bounded_turn_scene() -> SurfaceSnapshot {
+        let mut config = crate::surface_config::SurfaceNavigationConfig::new(
+            "map".into(), 0.4, 0.32, 0.3, 0.05, 0.2, 20.0, 0.2,
+        ).unwrap();
+        config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+            footprint_xy_m: vec![[-0.30, -0.16], [0.30, -0.16], [0.30, 0.16], [-0.30, 0.16]],
+            z_min_m: -0.05, z_max_m: 0.20, source: "静态有墙直角弯验收".into(),
+        }), None).unwrap();
+        // 使用统一完整机体配置；墙距是有限软偏好，不另加圆盘硬膨胀。
+        assert_eq!(config.geometry.wall_clearance_m, 0.0);
+        assert!(config.geometry.wall_buffer_m.is_finite() && config.geometry.wall_buffer_m > 0.0);
+        assert!(config.geometry.wall_buffer_weight.is_finite() && config.geometry.wall_buffer_weight > 0.0);
+        let mut free = HashSet::new();
+        // 体素边界定义精确净空：横臂[-2.10,0]×[-.25,.25]、
+        // 竖臂[-.25,.25]×[0,2.10]、居中转向口袋[-.40,.40]²。
+        for x in -42..0 { for y in -5..5 { free.insert((x, y)); } }
+        for x in -5..5 { for y in 0..42 { free.insert((x, y)); } }
+        for x in -8..8 { for y in -8..8 { free.insert((x, y)); } }
+        assert_eq!(free.len(), 936, "固定净空体素并集不得扩大或缩小");
+        let mut walls = HashSet::new();
+        let mut points = Vec::new();
+        for x in -43..=8 { for y in -9..=42 {
+            let xy = ((x as f32 + 0.5) * 0.05, (y as f32 + 0.5) * 0.05);
+            if free.contains(&(x, y)) {
+                points.push((xy.0, xy.1, 0.025));
+            } else if (-1..=1).any(|dx| (-1..=1).any(|dy| free.contains(&(x + dx, y + dy)))) {
+                walls.insert((x, y));
+                // 真实占据墙柱从地面封到.80米；包括两臂端盖和对角封口。
+                for z in 0..16 { points.push((xy.0, xy.1, (z as f32 + 0.5) * 0.05)); }
+            }
+        } }
+        for cap in [(-43, 0), (0, 42), (-9, -9), (8, 8)] {
+            assert!(walls.contains(&cap), "墙柱端盖或对角封口缺失: {cap:?}");
+        }
+        assert_eq!(points.len(), free.len() + walls.len() * 16);
+        SurfaceSnapshot::from_points(&points, config.geometry, 0.05).unwrap()
+            .with_body_envelope(config.body_envelope.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn calibrated_body_plans_and_closes_wall_bounded_ninety_degree_turn() {
+        // 静态几何、合成50毫秒执行反馈；不覆盖观察TTL、Scan、后台worker、
+        // MotionGuard或硬件验收，Succeeded也不代表物理停止证据。
+        const DT: f64 = 0.05;
+        const WITNESS_LENGTH_M: f64 = 3.20;
+        const MAX_PLANNED_LENGTH_M: f64 = 4.80;
+        const MAX_ACTUAL_TRAVEL_M: f64 = 5.0;
+        let map = Arc::new(wall_bounded_turn_scene());
+        let envelope = map.body_envelope().unwrap().clone();
+        assert_eq!(envelope.footprint_xy_m,
+            vec![[-0.30, -0.16], [0.30, -0.16], [0.30, 0.16], [-0.30, 0.16]]);
+        assert_eq!(envelope.z_bounds_m, [-0.05, 0.20]);
+        assert_eq!(envelope.body_to_support_z_m, 0.4);
+        assert!((envelope.radius() - 0.34).abs() < 1e-12);
+        assert!((0.40 - envelope.radius() - 0.06).abs() < 1e-12);
+        assert!((0.25_f64 - 0.16 - 0.09).abs() < 1e-12);
+        let actual_pose = |x: f64, y: f64, yaw: f64| -> BodyPose {
+            ([x, y, 0.45], [0.0, 0.0, (yaw * 0.5).sin(), (yaw * 0.5).cos()])
+        };
+        let start = actual_pose(-1.60, 0.0, 0.0);
+        let goal = actual_pose(0.0, 1.60, std::f64::consts::FRAC_PI_2);
+        // 独立通行见证仅证明原场景可过，绝不交给规划器或跟随器作为路线。
+        let witness = [start, actual_pose(0.0, 0.0, 0.0),
+            actual_pose(0.0, 0.0, std::f64::consts::FRAC_PI_2), goal];
+        for edge in witness.windows(2) {
+            map.validate_body_motion(edge[0], edge[1], &[])
+                .expect("原地图必须容许直行、口袋居中旋转90度、再直行");
+        }
+        let witness_length: f64 = witness.windows(2).map(|p| position_distance(p[0], p[1])).sum();
+        assert!((witness_length - WITNESS_LENGTH_M).abs() < 1e-12);
+        for p in [start, goal] {
+            let support = map.locate_support_from_body(p.0, p.1, 0.4).unwrap();
+            assert!((support.support_xyz[2] - 0.05).abs() < 1e-6);
+            map.validate_body_pose(p.0, p.1).unwrap();
+        }
+        assert!(map.validate_body_motion(start, goal, &[]).is_err(),
+            "同图起终点对角扫掠必须撞墙，不能被开阔地面替代");
+        assert!(map.validate_body_motion(start,
+            actual_pose(-1.60, 0.0, std::f64::consts::FRAC_PI_2), &[]).is_err(),
+            "窄臂内90度旋转必须受墙阻挡，不能提前完成转弯");
+        let motion = MotionLimits {
+            model: MotionModel::Differential,
+            max_forward_mps: 0.20, max_reverse_mps: 0.0, max_lateral_mps: 0.0,
+            max_angular_rps: 0.55, linear_acceleration_mps2: 1.0,
+            guaranteed_braking_mps2: 1.0, angular_acceleration_rps2: 2.0,
+            guaranteed_angular_braking_rps2: 2.0, reaction_time_sec: 0.05,
+            minimum_turning_radius_m: 0.0, can_rotate_in_place: true,
+        };
+        let options = GoalOptions {
+            allow_reverse: false, position_tolerance_m: 0.12, yaw_tolerance_rad: 0.15,
+        };
+        let planning_capture=planning_diagnostic::Capture::begin();
+        let planning_started = std::time::Instant::now();
+        let route = plan(&map, start, goal, options, Some(&motion), &[], 8000)
+            .unwrap_or_else(|error| panic!("已证明可通行的有墙直角弯规划失败: {error}; plan_wall={:?}",
+                planning_started.elapsed()));
+        let plan_wall = planning_started.elapsed();
+        let planning_report=planning_capture.finish();
+        let route_bits:Vec<[u64;7]>=route.iter().map(|&(p,q)|
+            [p[0].to_bits(),p[1].to_bits(),p[2].to_bits(),q[0].to_bits(),q[1].to_bits(),q[2].to_bits(),q[3].to_bits()]).collect();
+        assert!(route.len() >= 2);
+        assert_eq!(route[0], start);
+        assert_forward_path(&route);
+        for edge in route.windows(2) {
+            map.validate_body_motion(edge[0], edge[1], &[]).unwrap();
+        }
+        let planned_length_m: f64 = route.windows(2).map(|p| position_distance(p[0], p[1])).sum();
+        assert!(planned_length_m <= MAX_PLANNED_LENGTH_M,
+            "规划路线不得以绕圈换成功: {planned_length_m}米，独立见证{WITNESS_LENGTH_M}米");
+        let end = *route.last().unwrap();
+        assert!(position_distance(end, goal) < options.position_tolerance_m);
+        assert!(angle(planar(end).yaw - planar(goal).yaw).abs() < options.yaw_tolerance_rad);
+        let mut config = SurfaceFollowerConfig::new(0.4);
+        config.controller.speed = 0.20;
+        config.controller.control_frequency = 1.0 / DT;
+        config.controller.goal_tolerance = options.position_tolerance_m;
+        config.controller.orientation_tolerance = options.yaw_tolerance_rad;
+        config.controller.simulation = true;
+        config.motion_limits = Some(motion.clone());
+        assert_eq!(config.motion_limits.as_ref(), Some(&motion));
+        assert_eq!(config.kinematics(), Some(motion.kinematics()));
+        assert_eq!(config.body_to_support_z_m, envelope.body_to_support_z_m);
+        assert!(config.max_observation_age_sec.is_none());
+        // 跨crate测试只核验公开入参和实际命令；不声称读取跟随器私有字段。
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        let mut current = start;
+        let mut now = 1_000_000_000;
+        follower.configure_goal(&stamped(goal, now), options).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+        follower.update_odometry(stamped(current, now));
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+            poses: route.into_iter().map(|p| stamped(p, now)).collect(),
+        }), None, stamped(goal, now)).unwrap();
+        let mut applied = Twist2::ZERO;
+        follower.observe_applied_command(applied);
+        let mut reached = false;
+        let mut failure = None;
+        let mut executed_steps = 0;
+        let mut actual_travel_m = 0.0;
+        let mut total_abs_yaw_rad = 0.0;
+        let mut peak_control_wall = std::time::Duration::ZERO;
+        let mut total_control_wall = std::time::Duration::ZERO;
+        for tick in 0..1200 {
+            follower.update_odometry(stamped(current, now));
+            assert_eq!(map.body_envelope(), Some(&envelope));
+            let control_started = std::time::Instant::now();
+            let result = follower.step(0.32);
+            let control_wall = control_started.elapsed();
+            peak_control_wall = peak_control_wall.max(control_wall);
+            total_control_wall += control_wall;
+            let command = match result {
+                PlannerStep::Succeeded => { reached = true; break; }
+                PlannerStep::Command(command) => command,
+                other => {
+                    failure = Some(format!("tick={tick} pose={current:?} result={other:?}"));
+                    break; // Pending、重规划和失败均失败，禁止重试或替换路线。
+                }
+            };
+            // 原始请求先验约束，再模拟执行；绝不夹紧非法命令来制造成功。
+            assert!([command.linear.x, command.linear.y, command.angular_z].into_iter().all(f64::is_finite));
+            assert!(command.linear.x >= 0.0 && command.linear.x <= motion.max_forward_mps + 1e-12,
+                "tick={tick} 前进命令越界: {command:?}");
+            assert_eq!(command.linear.y, 0.0, "差速机体不能横移");
+            assert!(command.angular_z.abs() <= motion.max_angular_rps + 1e-12);
+            let linear_rate = if command.linear.x < applied.linear.x {
+                motion.guaranteed_braking_mps2.min(motion.linear_acceleration_mps2)
+            } else { motion.linear_acceleration_mps2 };
+            let angular_rate = if command.angular_z.abs() < applied.angular_z.abs() {
+                motion.guaranteed_angular_braking_rps2
+            } else { motion.angular_acceleration_rps2 };
+            assert!((command.linear.x - applied.linear.x).abs() <= linear_rate * DT + 1e-12,
+                "tick={tick} 线加减速不可达: previous={applied:?}, requested={command:?}");
+            assert!((command.angular_z - applied.angular_z).abs() <= angular_rate * DT + 1e-12,
+                "tick={tick} 角加减速不可达: previous={applied:?}, requested={command:?}");
+            let speed = (applied.linear.x + command.linear.x) * 0.5;
+            let angular = (applied.angular_z + command.angular_z) * 0.5;
+            assert!(speed.is_finite() && speed >= 0.0 && speed <= motion.max_forward_mps + 1e-12);
+            assert!(angular.is_finite() && angular.abs() <= motion.max_angular_rps + 1e-12);
+            let yaw = planar(current).yaw;
+            let next_yaw = yaw + angular * DT;
+            // 独立SE(2)平均实际速度圆弧积分；高度恒为地面.05+标定.40。
+            // 不调用生产integrate/地形投影、不吸附路径，也不改写原地图。
+            let (dx, dy) = if angular.abs() < 1e-12 {
+                (speed * yaw.cos() * DT, speed * yaw.sin() * DT)
+            } else {
+                (speed * (next_yaw.sin() - yaw.sin()) / angular,
+                 speed * (yaw.cos() - next_yaw.cos()) / angular)
+            };
+            let next = actual_pose(current.0[0] + dx, current.0[1] + dy, next_yaw);
+            map.validate_body_motion(current, next, &[]).unwrap_or_else(|error|
+                panic!("原地图拒绝实际完整机体区间 tick={tick}: from={current:?}, to={next:?}, error={error:?}"));
+            actual_travel_m += speed * DT;
+            total_abs_yaw_rad += angular.abs() * DT;
+            assert!(actual_travel_m <= MAX_ACTUAL_TRAVEL_M, "实际行程超过预定5米上限");
+            assert!(total_abs_yaw_rad <= std::f64::consts::PI, "累计绝对转角超过预定π上限");
+            current = next;
+            applied = command;
+            follower.observe_applied_command(applied);
+            executed_steps += 1;
+            now += 50_000_000;
+        }
+        let error_m = position_distance(current, goal);
+        let yaw_error_rad = angle(planar(current).yaw - planar(goal).yaw).abs();
+        eprintln!("WALL_TURN_PLAN_DIAGNOSTIC phase_order=raw,smoothing,centered,search centered_subphase_order=gate,candidate,rounding,comparison nested_not_additive=true guide_order=passage,fallback search_order=immediate,deferred search_columns=calls,expanded,generated guide_equal_query_result={:?} report={planning_report:?} route_pose_bits={route_bits:?}",
+            planning_report.guide_equality());
+        eprintln!("静态有墙90度弯合成验收: arrived={reached}, planned_m={planned_length_m:.6}, witness_m={WITNESS_LENGTH_M:.2}, actual_m={actual_travel_m:.6}, abs_yaw_rad={total_abs_yaw_rad:.6}, error_m={error_m:.6}, yaw_error_rad={yaw_error_rad:.6}, steps={executed_steps}, plan_wall_ms={:.3}, total_control_wall_ms={:.3}, peak_control_wall_ms={:.3}, failure={failure:?}",
+            plan_wall.as_secs_f64() * 1000.0, total_control_wall.as_secs_f64() * 1000.0,
+            peak_control_wall.as_secs_f64() * 1000.0);
+        assert!(failure.is_none(), "有墙直角弯不许等待、失败或重规划: {failure:?}");
+        assert!(reached, "必须在1200拍内返回实际Succeeded");
+        assert!(error_m < 0.12 && yaw_error_rad < 0.15, "必须到达原始三维目标及方向");
+        assert!(executed_steps > 0 && executed_steps <= 1200);
+        assert_eq!(map.body_envelope(), Some(&envelope));
     }
 
     #[test]

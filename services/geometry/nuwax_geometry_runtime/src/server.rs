@@ -10021,6 +10021,9 @@ fn install_server_test_committed_map(handle: &GeometryRuntimeHandle, revision: u
 
 #[cfg(test)]
 mod lifecycle_tests {
+    mod assigned_navigation_composition {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/assigned_navigation_composition.rs"));
+    }
     use super::*;
     use crate::explore_runtime::{
         now_monotonic_nanos, now_unix_nanos, ChildNavigationCancelTicket, ChildNavigationLease,

@@ -3488,7 +3488,7 @@ class GatewayRuntime:
             _descriptor(
                 "navigate_to_pose",
                 "导航到位姿",
-                "按所选导航方案把机器人导航到目标位姿；三维方案保留地图坐标中的机体高度。",
+                "按所选导航方案导航到目标位姿；分配式 schema 2 三维地图省略 z 时，定位准备后读取同坐标系、当前拥有方验证且新鲜的机体高度，不可用时失败。旧式 schema 1 三维及二维省略时为兼容值 0，不代表拥有方高度证据；显式 z 原样保留。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
@@ -3498,7 +3498,7 @@ class GatewayRuntime:
                         "frame_id": {"type": "string"},
                         "x": {"type": "number"},
                         "y": {"type": "number"},
-                        "z": {"type": "number", "default": 0.0, "description": "地图坐标中的目标机体高度（米）；三维导航须填写实际高度。"},
+                        "z": {"type": "number", "description": "目标机体高度（米）；显式值（含 0）原样保留。分配式 schema 2 三维地图省略时，定位准备后读取同坐标系、当前拥有方验证且新鲜的机体高度；不可用时失败。旧式 schema 1 三维及二维省略时仍为兼容值 0，不代表拥有方高度证据。"},
                         "yaw_rad": {"type": "number", "description": "可选最终朝向（弧度）；省略时仅要求到达位置。"},
                         "tolerance_position_m": {"type": "number", "minimum": 0.0, "default": 0.35},
                         "tolerance_yaw_rad": {"type": "number", "minimum": 0.0, "default": 0.3},
@@ -4307,7 +4307,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="navigate_to_pose",
                 display_name="导航到位姿",
-                description="按当前建图链导航到指定二维或三维目标位姿，并确认最终位置与朝向。",
+                description="按当前建图链导航到目标位姿；分配式 schema 2 三维地图省略 z 时，在定位准备后读取同坐标系、当前拥有方验证且新鲜的机体高度，不可用时失败。旧式 schema 1 三维及二维省略时为兼容值 0，不代表拥有方高度证据；显式 z 原样保留。",
                 category=SkillCategory.TASK,
                 capability_name="navigate_to_pose",
             ),
@@ -7015,11 +7015,15 @@ class GatewayRuntime:
                 if workspace is not None and workspace.active_localization_session is not None else None
             )
 
+            prepared_goal = goal.model_copy(update={"map_name": map_name}, deep=True)
+            return self._resolve_navigation_goal_height(prepared_goal, workspace=workspace)
+
         current_localization_session_id = None
-        if not pending:
-            prepare_navigation()
         pose = self._build_pose_from_arguments(arguments)
         goal_metadata = {"requested_by": requested_by or "unknown"}
+        if "z" not in arguments and getattr(self.config.geometry, "pipeline", "lio_3d") == "lio_3d":
+            # Pose 的通用默认值仅用于暂存 XY；此标记清除前严禁派发。
+            goal_metadata["navigation_height_pending"] = True
         # 导航强制执行只使用 `force_runtime_goal` 单一 key。
         force_runtime_goal = bool(
             arguments.get("force_runtime_goal", False)
@@ -7036,6 +7040,8 @@ class GatewayRuntime:
             allow_reverse=bool(arguments.get("allow_reverse", reverse_navigation_default(runtime_value("NUWAX_NAV_CAPABILITIES_JSON", ""), runtime_value("_NUWAX_NAV_ACTUATOR_MOTION_MODEL", "")))),
             metadata=goal_metadata,
         )
+        if not pending:
+            goal = prepare_navigation()
         poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.1)
         # 选点导航持续执行到到达或取消；仅调用者显式提供期限时才启用任务超时。
         timeout_sec = (self._resolve_async_timeout("navigate_to_pose", arguments, minimum_sec=0.1)
@@ -7072,6 +7078,51 @@ class GatewayRuntime:
                 else None
             ),
         )
+
+    def _resolve_navigation_goal_height(self, goal: NavigationGoal, *, workspace) -> NavigationGoal:
+        """仅分配式三维地图补充拥有方高度；旧式三维保留数值 0 兼容语义。"""
+        if not goal.metadata.get("navigation_height_pending"):
+            return goal
+        schema_version = getattr(getattr(workspace, "map_asset", None), "identity_schema_version", None)
+        if schema_version == 1:
+            # 旧式 0 只是输入兼容值，不证明当前地图拥有方的机体高度。
+            metadata = dict(goal.metadata)
+            metadata.pop("navigation_height_pending")
+            return goal.model_copy(update={"metadata": metadata}, deep=True)
+        # 该接口核对原生终态、激活、会话和提供器身份；网关只补充选点高度的
+        # 坐标系与时间准入。此处不持有状态锁，保留 RPC 样本的原始源时间。
+        # 准备后的资产无法分类时明确失败；目录中途降级也不得回落到旧式位姿。
+        current = (self.map_workspace_service.get_relocalized_pose(goal.map_name, require_assigned=True)
+                   if schema_version == 2 else None)
+        received_at = utc_now()
+        now = utc_now()
+        reason = None
+        if current is None:
+            reason = "owned_pose_unavailable"
+        elif current.frame_id != goal.target_pose.frame_id:
+            reason = "frame_mismatch"
+        elif not all(math.isfinite(value) for value in (
+            current.position.x, current.position.y, current.position.z,
+        )):
+            reason = "position_invalid"
+        elif current.timestamp.tzinfo is None or current.timestamp.utcoffset() is None:
+            reason = "source_time_invalid"
+        # 与浏览器 currentNavigationBodyPose 的现有窗口一致，不扩展失鲜预算。
+        elif not -1.0 <= (now - current.timestamp).total_seconds() <= 2.0:
+            reason = "source_time_out_of_range"
+        elif not -1.0 <= (now - received_at).total_seconds() <= 2.0:
+            reason = "receipt_time_out_of_range"
+        if reason is not None:
+            raise GatewayError(
+                "无法获取同坐标系的当前有效机体高度，请等待定位恢复或显式填写目标 z。",
+                error_code="navigation_height_unavailable", http_status=409,
+                details={"map_name": goal.map_name, "frame_id": goal.target_pose.frame_id, "reason": reason},
+            )
+        position = goal.target_pose.position.model_copy(update={"z": current.position.z})
+        pose = goal.target_pose.model_copy(update={"position": position})
+        metadata = dict(goal.metadata)
+        metadata.pop("navigation_height_pending")
+        return goal.model_copy(update={"target_pose": pose, "metadata": metadata}, deep=True)
 
     def _handle_navigate_to_place(
         self,
@@ -12243,7 +12294,9 @@ class GatewayRuntime:
                     self._run_with_motion_admission(pending, lambda: None)
                     context.ensure_active()
                     if prepare_callback is not None:
-                        prepare_callback(context)
+                        prepared_goal = prepare_callback(context)
+                        if prepared_goal is not None:
+                            goal = prepared_goal
                     context.ensure_active()
                     goal = self._goal_with_motion_admission(goal, motion_admission)
                 self._ensure_motion_runtime_for_backend_call(
@@ -12256,6 +12309,9 @@ class GatewayRuntime:
 
                 def submit_goal():
                     nonlocal goal_dispatched
+                    if goal.metadata.get("navigation_height_pending"):
+                        raise GatewayError("导航目标高度尚未解析，不能派发。",
+                            error_code="navigation_height_unavailable", http_status=409)
                     goal_dispatched = True
                     try:
                         last_context = self.navigation_service.set_goal(
@@ -12493,6 +12549,11 @@ class GatewayRuntime:
                         context.acknowledge_interrupt_barrier({"goal_id": goal.goal_id,
                             "backend_not_active": True, "parking_confirmed": True})
 
+        input_pose = goal.target_pose.model_dump(mode="json") if goal.target_pose is not None else None
+        height_pending = bool(goal.metadata.get("navigation_height_pending"))
+        if height_pending and input_pose is not None:
+            # 受理回执保留省略语义，不能把尚未解析的高度呈现为显式零值。
+            input_pose["position"].pop("z", None)
         return self._run_with_motion_admission(
             motion_admission,
             lambda: self.task_manager.submit(
@@ -12502,7 +12563,8 @@ class GatewayRuntime:
                     "goal_id": goal.goal_id,
                     "map_name": goal.map_name,
                     "target_name": goal.target_name,
-                    "target_pose": goal.target_pose.model_dump(mode="json") if goal.target_pose is not None else None,
+                    "target_pose": input_pose,
+                    **({"target_height_pending": True} if height_pending else {}),
                     "poll_interval_sec": poll_interval_sec,
                 },
                 requested_by=requested_by,

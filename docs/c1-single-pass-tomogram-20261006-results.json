@@ -1,0 +1,736 @@
+{
+  "scope": "Seven fresh candidate processes; in each process every case alternates32 timed old/current pairs against the same snapshot after4 warmup pairs. Same-snapshot exact field/route assertions pass before and after timing. Each measurement is a mean, not per-operation quantiles; PCTopt0 test profile, not release. Whole-process CPU/RSS includes both implementations, fixtures, checks and harness, so cannot attribute resource savings to either implementation. Snapshot iteration order can vary across fresh processes.",
+  "binary_identity": {
+    "path": "/workspace/shared/neh-single-pass-tomogram-20261006/candidate/nuwax-nav-pct-test",
+    "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_pct-defcc5ecac4bca7d",
+    "sha256": "e6f16bbe54bf9db1089e9adc7c91a801c200fe268e1b1fc73f7238f6b6c4f212",
+    "bytes": 4378984,
+    "features": [
+      "default",
+      "mls-adapter"
+    ],
+    "profile": {
+      "opt_level": "0",
+      "debuginfo": 0,
+      "debug_assertions": true,
+      "overflow_checks": true,
+      "test": true
+    },
+    "source_hashes": "a0ecb96b0a4b77e4a7c03d953a90483b702c6bdcdaef781bded063ec5711acdf  crates/nuwax-nav-pct/src/tomogram.rs\n1ce5f0874db78fc5c936018e1bfa0b840543343220656d53e068a2574603409b  crates/nuwax-nav-pct/src/tomogram_masked_tests.rs\nb8d4f869e4b2b7ec8506bed6f6bc462dd2d99572708fea3594ab7c78a7f50f08  crates/nuwax-nav-pct/src/search.rs\n1dcda1cb776f6d8d99f0d24d01b554bc5435afcf74bff1ba4792953c6ef6b340  crates/nuwax-nav-pct/src/cancellation.rs\n5c1622546dc922566197b72797c8271029d6c31144836b629e17363bd6be2305  crates/nuwax-nav-mls-planner/src/surface/body.rs\n",
+    "scope": "Fixed mixed test profile; PCTopt0, MLSopt3, cfg(test) cancellation instrumentation; not release. Same-snapshot alternating frozen/current construction; source setup/checks/destruction outside timing."
+  },
+  "runs": [
+    {
+      "run": 1,
+      "command": [
+        "/workspace/shared/neh-single-pass-tomogram-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::masked_surface_tests::masked_surface_alternating_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 4.376854219000961,
+      "process_user_cpu_sec": 4.339021,
+      "process_system_cpu_sec": 0.013326999999999999,
+      "launch_peak_rss_kib": 17280,
+      "voluntary_context_switches": 40,
+      "involuntary_context_switches": 291,
+      "log": "/workspace/shared/neh-single-pass-tomogram-20261006/matched/01.log",
+      "log_sha256": "7beaf054ba0cdb6315a13d90f4a025095a6b987146e3972444753048f4135085",
+      "cases": [
+        {
+          "source": "coarse_fallback",
+          "scope": "global",
+          "resolution_bits": 4591870180174331904,
+          "cells": 448,
+          "known_columns": 298,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 216155513,
+          "current_total_ns": 156244133,
+          "frozen_ms_per_iter": 6.75485978125,
+          "current_ms_per_iter": 4.88262915625,
+          "ratio": 0.7228320519403084
+        },
+        {
+          "source": "coarse_fallback",
+          "scope": "local",
+          "resolution_bits": 4591870180174331904,
+          "cells": 396,
+          "known_columns": 238,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 192793011,
+          "current_total_ns": 150440762,
+          "frozen_ms_per_iter": 6.02478159375,
+          "current_ms_per_iter": 4.7012738125,
+          "ratio": 0.7803226954114016
+        },
+        {
+          "source": "complete_fine",
+          "scope": "global",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1792,
+          "known_columns": 1192,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 877058821,
+          "current_total_ns": 668996365,
+          "frozen_ms_per_iter": 27.40808815625,
+          "current_ms_per_iter": 20.90613640625,
+          "ratio": 0.7627725176257021
+        },
+        {
+          "source": "complete_fine",
+          "scope": "local",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1584,
+          "known_columns": 952,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 766445525,
+          "current_total_ns": 593587717,
+          "frozen_ms_per_iter": 23.95142265625,
+          "current_ms_per_iter": 18.54961615625,
+          "ratio": 0.7744682402575186
+        }
+      ]
+    },
+    {
+      "run": 2,
+      "command": [
+        "/workspace/shared/neh-single-pass-tomogram-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::masked_surface_tests::masked_surface_alternating_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 4.422361703000206,
+      "process_user_cpu_sec": 4.382756,
+      "process_system_cpu_sec": 0.012308999999999999,
+      "launch_peak_rss_kib": 17280,
+      "voluntary_context_switches": 54,
+      "involuntary_context_switches": 301,
+      "log": "/workspace/shared/neh-single-pass-tomogram-20261006/matched/02.log",
+      "log_sha256": "d8ab06768e0f19afbc71e063252a789d07e8504e47460c88b5636de997cc037e",
+      "cases": [
+        {
+          "source": "coarse_fallback",
+          "scope": "global",
+          "resolution_bits": 4591870180174331904,
+          "cells": 448,
+          "known_columns": 298,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 223956957,
+          "current_total_ns": 161001917,
+          "frozen_ms_per_iter": 6.99865490625,
+          "current_ms_per_iter": 5.03130990625,
+          "ratio": 0.718896698529441
+        },
+        {
+          "source": "coarse_fallback",
+          "scope": "local",
+          "resolution_bits": 4591870180174331904,
+          "cells": 396,
+          "known_columns": 238,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 195012504,
+          "current_total_ns": 145702578,
+          "frozen_ms_per_iter": 6.09414075,
+          "current_ms_per_iter": 4.5532055625,
+          "ratio": 0.7471447984689228
+        },
+        {
+          "source": "complete_fine",
+          "scope": "global",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1792,
+          "known_columns": 1192,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 927589205,
+          "current_total_ns": 682649018,
+          "frozen_ms_per_iter": 28.98716265625,
+          "current_ms_per_iter": 21.3327818125,
+          "ratio": 0.735938941850881
+        },
+        {
+          "source": "complete_fine",
+          "scope": "local",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1584,
+          "known_columns": 952,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 737021769,
+          "current_total_ns": 613669481,
+          "frozen_ms_per_iter": 23.03193028125,
+          "current_ms_per_iter": 19.17717128125,
+          "ratio": 0.8326341321405393
+        }
+      ]
+    },
+    {
+      "run": 3,
+      "command": [
+        "/workspace/shared/neh-single-pass-tomogram-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::masked_surface_tests::masked_surface_alternating_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 4.771928727997874,
+      "process_user_cpu_sec": 4.732925,
+      "process_system_cpu_sec": 0.039182999999999996,
+      "launch_peak_rss_kib": 17280,
+      "voluntary_context_switches": 37,
+      "involuntary_context_switches": 449,
+      "log": "/workspace/shared/neh-single-pass-tomogram-20261006/matched/03.log",
+      "log_sha256": "2e3566b642fb5c2a8b90ac4acb21f22f14fee51029e8faf05a3f9c6792a8e82c",
+      "cases": [
+        {
+          "source": "coarse_fallback",
+          "scope": "global",
+          "resolution_bits": 4591870180174331904,
+          "cells": 448,
+          "known_columns": 298,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 221977119,
+          "current_total_ns": 179718666,
+          "frozen_ms_per_iter": 6.93678496875,
+          "current_ms_per_iter": 5.6162083125,
+          "ratio": 0.8096269868247096
+        },
+        {
+          "source": "coarse_fallback",
+          "scope": "local",
+          "resolution_bits": 4591870180174331904,
+          "cells": 396,
+          "known_columns": 238,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 204223468,
+          "current_total_ns": 151980583,
+          "frozen_ms_per_iter": 6.381983375,
+          "current_ms_per_iter": 4.74939321875,
+          "ratio": 0.7441876513427927
+        },
+        {
+          "source": "complete_fine",
+          "scope": "global",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1792,
+          "known_columns": 1192,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 961968965,
+          "current_total_ns": 771496906,
+          "frozen_ms_per_iter": 30.06153015625,
+          "current_ms_per_iter": 24.1092783125,
+          "ratio": 0.8019977089385623
+        },
+        {
+          "source": "complete_fine",
+          "scope": "local",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1584,
+          "known_columns": 952,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 823675892,
+          "current_total_ns": 621290683,
+          "frozen_ms_per_iter": 25.739871625,
+          "current_ms_per_iter": 19.41533384375,
+          "ratio": 0.7542902360434752
+        }
+      ]
+    },
+    {
+      "run": 4,
+      "command": [
+        "/workspace/shared/neh-single-pass-tomogram-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::masked_surface_tests::masked_surface_alternating_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 4.524660394003149,
+      "process_user_cpu_sec": 4.487118,
+      "process_system_cpu_sec": 0.022425,
+      "launch_peak_rss_kib": 17280,
+      "voluntary_context_switches": 67,
+      "involuntary_context_switches": 517,
+      "log": "/workspace/shared/neh-single-pass-tomogram-20261006/matched/04.log",
+      "log_sha256": "ffeb15ce5423678e13eb354bcbe0ed005c861041be893c9bb55ac18b57056a8d",
+      "cases": [
+        {
+          "source": "coarse_fallback",
+          "scope": "global",
+          "resolution_bits": 4591870180174331904,
+          "cells": 448,
+          "known_columns": 298,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 235330547,
+          "current_total_ns": 188927010,
+          "frozen_ms_per_iter": 7.35407959375,
+          "current_ms_per_iter": 5.9039690625,
+          "ratio": 0.8028154967914132
+        },
+        {
+          "source": "coarse_fallback",
+          "scope": "local",
+          "resolution_bits": 4591870180174331904,
+          "cells": 396,
+          "known_columns": 238,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 194177823,
+          "current_total_ns": 155523274,
+          "frozen_ms_per_iter": 6.06805696875,
+          "current_ms_per_iter": 4.8601023125,
+          "ratio": 0.8009322156217603
+        },
+        {
+          "source": "complete_fine",
+          "scope": "global",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1792,
+          "known_columns": 1192,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 901317467,
+          "current_total_ns": 692075981,
+          "frozen_ms_per_iter": 28.16617084375,
+          "current_ms_per_iter": 21.62737440625,
+          "ratio": 0.7678492943263908
+        },
+        {
+          "source": "complete_fine",
+          "scope": "local",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1584,
+          "known_columns": 952,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 777614192,
+          "current_total_ns": 585468026,
+          "frozen_ms_per_iter": 24.3004435,
+          "current_ms_per_iter": 18.2958758125,
+          "ratio": 0.7529029588492901
+        }
+      ]
+    },
+    {
+      "run": 5,
+      "command": [
+        "/workspace/shared/neh-single-pass-tomogram-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::masked_surface_tests::masked_surface_alternating_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 5.473270148002484,
+      "process_user_cpu_sec": 5.445502,
+      "process_system_cpu_sec": 0.025483,
+      "launch_peak_rss_kib": 17280,
+      "voluntary_context_switches": 48,
+      "involuntary_context_switches": 192,
+      "log": "/workspace/shared/neh-single-pass-tomogram-20261006/matched/05.log",
+      "log_sha256": "1f1b3c98d8678ec6ed91a4dc5bfd19b217b1a419970fdd736594d391e85983c7",
+      "cases": [
+        {
+          "source": "coarse_fallback",
+          "scope": "global",
+          "resolution_bits": 4591870180174331904,
+          "cells": 448,
+          "known_columns": 298,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 269033806,
+          "current_total_ns": 214269529,
+          "frozen_ms_per_iter": 8.4073064375,
+          "current_ms_per_iter": 6.69592278125,
+          "ratio": 0.796440908991192
+        },
+        {
+          "source": "coarse_fallback",
+          "scope": "local",
+          "resolution_bits": 4591870180174331904,
+          "cells": 396,
+          "known_columns": 238,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 276966504,
+          "current_total_ns": 184036676,
+          "frozen_ms_per_iter": 8.65520325,
+          "current_ms_per_iter": 5.751146125,
+          "ratio": 0.6644726829494154
+        },
+        {
+          "source": "complete_fine",
+          "scope": "global",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1792,
+          "known_columns": 1192,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 1157292993,
+          "current_total_ns": 928278122,
+          "frozen_ms_per_iter": 36.16540603125,
+          "current_ms_per_iter": 29.0086913125,
+          "ratio": 0.8021115893855585
+        },
+        {
+          "source": "complete_fine",
+          "scope": "local",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1584,
+          "known_columns": 952,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 913489738,
+          "current_total_ns": 666428996,
+          "frozen_ms_per_iter": 28.5465543125,
+          "current_ms_per_iter": 20.825906125,
+          "ratio": 0.7295418528281267
+        }
+      ]
+    },
+    {
+      "run": 6,
+      "command": [
+        "/workspace/shared/neh-single-pass-tomogram-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::masked_surface_tests::masked_surface_alternating_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 5.284818010994059,
+      "process_user_cpu_sec": 5.246252,
+      "process_system_cpu_sec": 0.02274,
+      "launch_peak_rss_kib": 17280,
+      "voluntary_context_switches": 52,
+      "involuntary_context_switches": 409,
+      "log": "/workspace/shared/neh-single-pass-tomogram-20261006/matched/06.log",
+      "log_sha256": "9f33ed07175449efde03e7017c13f7d6eb3c8eb75d1c915f35c2b0306bf8acb7",
+      "cases": [
+        {
+          "source": "coarse_fallback",
+          "scope": "global",
+          "resolution_bits": 4591870180174331904,
+          "cells": 448,
+          "known_columns": 298,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 202650216,
+          "current_total_ns": 161300267,
+          "frozen_ms_per_iter": 6.33281925,
+          "current_ms_per_iter": 5.04063334375,
+          "ratio": 0.7959540837597725
+        },
+        {
+          "source": "coarse_fallback",
+          "scope": "local",
+          "resolution_bits": 4591870180174331904,
+          "cells": 396,
+          "known_columns": 238,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 199026466,
+          "current_total_ns": 168087464,
+          "frozen_ms_per_iter": 6.2195770625,
+          "current_ms_per_iter": 5.25273325,
+          "ratio": 0.8445483024353153
+        },
+        {
+          "source": "complete_fine",
+          "scope": "global",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1792,
+          "known_columns": 1192,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 1113014081,
+          "current_total_ns": 775050613,
+          "frozen_ms_per_iter": 34.78169003125,
+          "current_ms_per_iter": 24.22033165625,
+          "ratio": 0.69635292691324
+        },
+        {
+          "source": "complete_fine",
+          "scope": "local",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1584,
+          "known_columns": 952,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 1021443673,
+          "current_total_ns": 830225757,
+          "frozen_ms_per_iter": 31.92011478125,
+          "current_ms_per_iter": 25.94455490625,
+          "ratio": 0.8127964164304927
+        }
+      ]
+    },
+    {
+      "run": 7,
+      "command": [
+        "/workspace/shared/neh-single-pass-tomogram-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::masked_surface_tests::masked_surface_alternating_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 4.720873398000549,
+      "process_user_cpu_sec": 4.678478,
+      "process_system_cpu_sec": 0.032984,
+      "launch_peak_rss_kib": 17280,
+      "voluntary_context_switches": 60,
+      "involuntary_context_switches": 276,
+      "log": "/workspace/shared/neh-single-pass-tomogram-20261006/matched/07.log",
+      "log_sha256": "88a52b82d91b66eeb8294814694820ec77a9abfc0cbe7c72d4cf80c97993c6b8",
+      "cases": [
+        {
+          "source": "coarse_fallback",
+          "scope": "global",
+          "resolution_bits": 4591870180174331904,
+          "cells": 448,
+          "known_columns": 298,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 216210676,
+          "current_total_ns": 176239409,
+          "frozen_ms_per_iter": 6.756583625,
+          "current_ms_per_iter": 5.50748153125,
+          "ratio": 0.81512815306123
+        },
+        {
+          "source": "coarse_fallback",
+          "scope": "local",
+          "resolution_bits": 4591870180174331904,
+          "cells": 396,
+          "known_columns": 238,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 215578194,
+          "current_total_ns": 154176017,
+          "frozen_ms_per_iter": 6.7368185625,
+          "current_ms_per_iter": 4.81800053125,
+          "ratio": 0.7151744531267388
+        },
+        {
+          "source": "complete_fine",
+          "scope": "global",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1792,
+          "known_columns": 1192,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 947507434,
+          "current_total_ns": 706717791,
+          "frozen_ms_per_iter": 29.6096073125,
+          "current_ms_per_iter": 22.08493096875,
+          "ratio": 0.7458704445373249
+        },
+        {
+          "source": "complete_fine",
+          "scope": "local",
+          "resolution_bits": 4587366580546961408,
+          "cells": 1584,
+          "known_columns": 952,
+          "warmups": 4,
+          "reps": 32,
+          "frozen_total_ns": 838838253,
+          "current_total_ns": 663886212,
+          "frozen_ms_per_iter": 26.21369540625,
+          "current_ms_per_iter": 20.746444125,
+          "ratio": 0.7914353090428269
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "coarse_fallback/global": {
+      "frozen_median_ms": 6.93678496875,
+      "current_median_ms": 5.50748153125,
+      "ratio_of_medians": 0.7939530425205672,
+      "paired_median_ratio": 0.796440908991192,
+      "current_wins": 7,
+      "frozen_min_ms": 6.33281925,
+      "frozen_max_ms": 8.4073064375,
+      "current_min_ms": 4.88262915625,
+      "current_max_ms": 6.69592278125,
+      "paired_ratios": [
+        0.7228320519403084,
+        0.718896698529441,
+        0.8096269868247096,
+        0.8028154967914132,
+        0.796440908991192,
+        0.7959540837597725,
+        0.81512815306123
+      ]
+    },
+    "coarse_fallback/local": {
+      "frozen_median_ms": 6.2195770625,
+      "current_median_ms": 4.81800053125,
+      "ratio_of_medians": 0.7746508296037372,
+      "paired_median_ratio": 0.7471447984689228,
+      "current_wins": 7,
+      "frozen_min_ms": 6.02478159375,
+      "frozen_max_ms": 8.65520325,
+      "current_min_ms": 4.5532055625,
+      "current_max_ms": 5.751146125,
+      "paired_ratios": [
+        0.7803226954114016,
+        0.7471447984689228,
+        0.7441876513427927,
+        0.8009322156217603,
+        0.6644726829494154,
+        0.8445483024353153,
+        0.7151744531267388
+      ]
+    },
+    "complete_fine/global": {
+      "frozen_median_ms": 29.6096073125,
+      "current_median_ms": 22.08493096875,
+      "ratio_of_medians": 0.7458704445373249,
+      "paired_median_ratio": 0.7627725176257021,
+      "current_wins": 7,
+      "frozen_min_ms": 27.40808815625,
+      "frozen_max_ms": 36.16540603125,
+      "current_min_ms": 20.90613640625,
+      "current_max_ms": 29.0086913125,
+      "paired_ratios": [
+        0.7627725176257021,
+        0.735938941850881,
+        0.8019977089385623,
+        0.7678492943263908,
+        0.8021115893855585,
+        0.69635292691324,
+        0.7458704445373249
+      ]
+    },
+    "complete_fine/local": {
+      "frozen_median_ms": 25.739871625,
+      "current_median_ms": 19.41533384375,
+      "ratio_of_medians": 0.7542902360434752,
+      "paired_median_ratio": 0.7744682402575186,
+      "current_wins": 7,
+      "frozen_min_ms": 23.03193028125,
+      "frozen_max_ms": 31.92011478125,
+      "current_min_ms": 18.2958758125,
+      "current_max_ms": 25.94455490625,
+      "paired_ratios": [
+        0.7744682402575186,
+        0.8326341321405393,
+        0.7542902360434752,
+        0.7529029588492901,
+        0.7295418528281267,
+        0.8127964164304927,
+        0.7914353090428269
+      ]
+    }
+  },
+  "disposition": {
+    "status": "retained_after_independent_source_and_results_review",
+    "candidate_source_sha256": "a0ecb96b0a4b77e4a7c03d953a90483b702c6bdcdaef781bded063ec5711acdf",
+    "test_module_sha256": "1ce5f0874db78fc5c936018e1bfa0b840543343220656d53e068a2574603409b",
+    "frozen_wrapper_sha256": "a76a78f4c559a9872c109b75fed57f6e8505454eb2d977b08afc57df84160815",
+    "scope": "Only masked surface adapter empty-band admission and removal of discarded first cost pass. No owner/cache/freshness/obstacle/cancellation authority changes. Checkpoint count/order changes because removed computation no longer executes; real epoch cancellation checks remain."
+  },
+  "initial_runs": {
+    "baseline": {
+      "command": [
+        "/workspace/shared/neh-single-pass-tomogram-20261006/baseline/nuwax-nav-pct-test",
+        "tomogram::masked_surface_tests::masked_surface_alternating_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "wall_seconds": 5.155427762001636,
+      "user_cpu_seconds": 5.14118,
+      "system_cpu_seconds": 0.003222,
+      "launch_peak_rss_kib": 15996,
+      "voluntary_context_switches": 42,
+      "involuntary_context_switches": 305
+    },
+    "candidate": {
+      "command": [
+        "/workspace/shared/neh-single-pass-tomogram-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::masked_surface_tests::masked_surface_alternating_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "wall_seconds": 4.374010447005276,
+      "user_cpu_seconds": 4.299377,
+      "system_cpu_seconds": 0.021485999999999998,
+      "launch_peak_rss_kib": 15996,
+      "voluntary_context_switches": 48,
+      "involuntary_context_switches": 423
+    }
+  },
+  "baseline_functional_tests": {
+    "command": [
+      "/workspace/shared/neh-single-pass-tomogram-20261006/baseline/nuwax-nav-pct-test",
+      "tomogram::masked_surface_tests::",
+      "--skip",
+      "masked_surface_alternating_baseline",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "passed": 2,
+    "failed": 0,
+    "ignored": 0
+  },
+  "candidate_functional_tests": {
+    "command": [
+      "/workspace/shared/neh-single-pass-tomogram-20261006/candidate/nuwax-nav-pct-test",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "passed": 17,
+    "failed": 0,
+    "ignored": 2,
+    "log_sha256": "7b36e5803e1eac9396ee083a63f0b0a5a36b85f78295d85e2cfb55f005654b33"
+  },
+  "mapping": {
+    "local_base": "2bf54cc108a63dfa728a486fefd4de8ce8331620",
+    "base_tree": "1fabe2eac417c4fecde21552148f22b2b93dbe72",
+    "mapped_remote_base": "410290dbc45c20db10bf2782556b555a0175bcc4",
+    "committed": false
+  }
+}

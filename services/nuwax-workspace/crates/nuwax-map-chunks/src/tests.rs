@@ -29,6 +29,127 @@ fn block_roundtrip_negative_coordinates_and_evidence() {
     let mut bad=bytes.clone();bad.push(0);assert!(decode_block(&bad).is_err());
     let mut bad=bytes;bad[12]=1;assert!(decode_block(&bad).is_err());
 }
+
+// 摘要优化前的解码器原样冻结；不得改为调用共享解析器。
+fn frozen_decode_block(bytes: &[u8]) -> Result<Block, String> {
+    if bytes.len() < 16 || bytes.len() > MAX_BLOCK_BYTES || &bytes[..8] != b"NUWAXBL1" || bytes[12..16] != [0; 4] {
+        return Err("精细块格式或长度无效".into());
+    }
+    let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    if count == 0 || count > 32768 || bytes.len() != 16 + count * 12 { return Err("精细块记录数不匹配".into()); }
+    let mut out = BTreeMap::new();
+    let mut previous = None;
+    for record in bytes[16..].chunks_exact(12) {
+        let key = u16::from_le_bytes(record[..2].try_into().unwrap());
+        let observed_ns = u64::from_le_bytes(record[2..10].try_into().unwrap());
+        let hits = u16::from_le_bytes(record[10..12].try_into().unwrap());
+        if key >= 32768 || (observed_ns == 0) != (hits == 0) || previous.is_some_and(|p| p >= key) { return Err("精细块重复、无序或无效证据".into()); }
+        previous = Some(key);
+        out.insert(key, Evidence { observed_ns, hits });
+    }
+    Ok(out)
+}
+
+fn unchecked_block(records: &[(u16, u64, u16)]) -> Vec<u8> {
+    let mut bytes = b"NUWAXBL1".to_vec();
+    bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&[0; 4]);
+    for &(key, observed_ns, hits) in records {
+        bytes.extend_from_slice(&key.to_le_bytes());
+        bytes.extend_from_slice(&observed_ns.to_le_bytes());
+        bytes.extend_from_slice(&hits.to_le_bytes());
+    }
+    bytes
+}
+
+fn assert_block_oracle(name: &str, bytes: &[u8], error: Option<&str>) {
+    let expected = frozen_decode_block(bytes);
+    match error {
+        Some(error) => assert_eq!(expected.as_ref().unwrap_err(), error, "{name}"),
+        None => assert!(expected.is_ok(), "{name}: {expected:?}"),
+    }
+    assert_eq!(decode_block(bytes), expected, "{name}");
+    let summary = expected.as_ref().map(|block| (
+        block.len() as u32, block.values().map(|value| value.observed_ns).max().unwrap_or(0),
+    )).map_err(Clone::clone);
+    assert_eq!(block_summary(bytes), summary, "{name}");
+    if let Ok(block) = expected {
+        assert_eq!(encode_block(&block).unwrap(), bytes, "{name}");
+    }
+}
+
+#[test]
+fn block_summary_matches_frozen_header_count_and_error_precedence() {
+    let valid = unchecked_block(&[(0, 1, 1)]);
+    let format = Some("精细块格式或长度无效");
+    let count = Some("精细块记录数不匹配");
+    assert_block_oracle("single record", &valid, None);
+    for length in 0..16 {
+        assert_block_oracle(&format!("short header {length}"), &valid[..length], format);
+    }
+    for length in 16..valid.len() {
+        assert_block_oracle(&format!("short record {length}"), &valid[..length], count);
+    }
+    for suffix in 1..12 {
+        let mut bad = valid.clone();
+        bad.extend(vec![0; suffix]);
+        assert_block_oracle(&format!("partial trailing record {suffix}"), &bad, count);
+    }
+    let mut bad = valid.clone();
+    bad[0] ^= 1;
+    assert_block_oracle("bad magic", &bad, format);
+    for offset in 12..16 {
+        let mut bad = valid.clone();
+        bad[offset] = 1;
+        assert_block_oracle(&format!("reserved byte {offset}"), &bad, format);
+    }
+    let mut bad = valid.clone();
+    bad.resize(MAX_BLOCK_BYTES + 1, 0);
+    assert_block_oracle("over maximum size", &bad, format);
+    assert_block_oracle("empty block", &unchecked_block(&[]), count);
+    for points in [0_u32, 2, 32768, 32769, u32::MAX] {
+        let mut bad = valid.clone();
+        bad[8..12].copy_from_slice(&points.to_le_bytes());
+        assert_block_oracle(&format!("count {points}"), &bad, count);
+    }
+    let mut bad = unchecked_block(&[(u16::MAX, 0, 1)]);
+    bad[8..12].copy_from_slice(&0_u32.to_le_bytes());
+    assert_block_oracle("count before malformed record", &bad, count);
+    bad[0] ^= 1;
+    assert_block_oracle("header before count and record", &bad, format);
+}
+
+#[test]
+fn block_summary_matches_frozen_record_corpus() {
+    let invalid = Some("精细块重复、无序或无效证据");
+    let cases: &[(&str, &[(u16, u64, u16)], Option<&str>)] = &[
+        ("legacy zero evidence", &[(0, 0, 0), (32767, 0, 0)], None),
+        ("maximum evidence", &[(32767, u64::MAX, u16::MAX)], None),
+        ("ascending keys with non-final maximum", &[(0, 9, 1), (1, 2, 3), (32767, 0, 0)], None),
+        ("duplicate key", &[(0, 1, 1), (0, 2, 1)], invalid),
+        ("descending keys", &[(1, 1, 1), (0, 2, 1)], invalid),
+        ("key beyond block", &[(32768, 1, 1)], invalid),
+        ("maximum u16 key", &[(u16::MAX, 1, 1)], invalid),
+        ("missing timestamp", &[(0, 0, 1)], invalid),
+        ("missing hits", &[(0, 1, 0)], invalid),
+        ("bad record after valid prefix", &[(0, 1, 1), (1, 2, 1), (2, 0, 1)], invalid),
+        ("maximum timestamp before bad record", &[(0, u64::MAX, 1), (1, 1, 0)], invalid),
+    ];
+    for &(name, records, error) in cases {
+        assert_block_oracle(name, &unchecked_block(records), error);
+    }
+    assert_eq!(block_summary(&unchecked_block(&[(0, 0, 0)])), Ok((1, 0)));
+}
+
+#[test]
+fn block_summary_matches_frozen_maximum_valid_block() {
+    let records: Vec<_> = (0..32768_u16).map(|key| (key, u64::from(key) + 1, 1)).collect();
+    let bytes = unchecked_block(&records);
+    assert_eq!(bytes.len(), MAX_BLOCK_BYTES);
+    assert_block_oracle("maximum valid block", &bytes, None);
+    assert_eq!(block_summary(&bytes), Ok((32768, 32768)));
+}
+
 #[test]
 fn identity_json_namespace_and_no_content_dedup() {
     let (r,mut w)=writer();w.observe([[0,0,0],[32,0,0]],1).unwrap();let m=w.snapshot(domain(),1,1).unwrap();
@@ -113,6 +234,140 @@ fn legacy_alias_paths_and_shared_spatial_keys_are_retained() {
 fn cached_block_hit_does_not_reopen_or_rescan_members() {
     let (r,_,m)=one();let mut cache=RegionReader::new(r.clone(),BUDGET);let first=cache.block(&m.blocks[0]).unwrap();let counts=r.counts();
     let mut rehome=m.blocks[0].clone();rehome.key=[50,0,0];rehome.geometry_revision=99;let again=cache.block(&rehome).unwrap();assert!(Arc::ptr_eq(&first,&again));assert_eq!(counts,r.counts());
+}
+#[test]
+fn inline_admission_and_separate_reader_materialize_distinct_blocks() {
+    let source = Repository::temporary().unwrap();
+    let mut writer = Writer::new(source.clone(), 0.05, BUDGET).unwrap();
+    writer.observe((0..64).flat_map(|x| (0..64).map(move |y| [x, y, 0])), 1).unwrap();
+    let root = writer.snapshot(domain(), 1, 1).unwrap();
+    let transfer = transfer(&root, &source);
+    assert_eq!(root.blocks.len(), 4);
+    assert_eq!(transfer.included.len(), 4);
+    assert!(root.blocks.iter().all(|b| transfer.included.contains_key(&b.object)));
+    let destination = Repository::temporary().unwrap();
+    let mut receiver = Receiver::new(destination.clone());
+    // counts().0 counts read_object calls, including failed-open attempts.
+    let before = destination.counts().0;
+    let admitted = receiver.receive(&transfer, &domain(), |_, _| panic!("unexpected fetch")).unwrap();
+    assert_eq!(destination.counts().0 - before, 0);
+    let admission_blocks: Vec<_> = admitted.blocks.iter()
+        .map(|reference| receiver.reader.block(reference).unwrap()).collect();
+    assert_eq!(destination.counts().0 - before, 0);
+    // 保留旧的独立消费缓存布局，证明它会重复读取并物化同一块。
+    let mut consumer = RegionReader::new(destination.clone(), 32 * 1024 * 1024);
+    let consumer_blocks: Vec<_> = admitted.blocks.iter()
+        .map(|reference| consumer.block(reference).unwrap()).collect();
+    assert_eq!(destination.counts().0 - before, 4);
+    for (admission, consumed) in admission_blocks.iter().zip(&consumer_blocks) {
+        assert_eq!(admission.as_ref(), consumed.as_ref());
+        assert!(!Arc::ptr_eq(admission, consumed));
+    }
+    for (reference, consumed) in admitted.blocks.iter().zip(&consumer_blocks) {
+        assert!(Arc::ptr_eq(consumed, &consumer.block(reference).unwrap()));
+    }
+    assert_eq!(destination.counts().0 - before, 4);
+}
+#[test]
+fn inline_admission_and_shared_reader_reuse_blocks_without_object_reads() {
+    let source = Repository::temporary().unwrap();
+    let mut writer = Writer::new(source.clone(), 0.05, BUDGET).unwrap();
+    let cells: Vec<_> = (0..64).flat_map(|x| (0..64).map(move |y| [x, y, 0])).collect();
+    writer.observe(cells.iter().copied(), 1).unwrap();
+    let root = writer.snapshot(domain(), 1, 1).unwrap();
+    let transfer = transfer(&root, &source);
+    assert_eq!(root.blocks.len(), 4);
+    assert_eq!(transfer.included.len(), 4);
+    let destination = Repository::temporary().unwrap();
+    let mut receiver = Receiver::with_cache_budget(destination.clone(), 32 * 1024 * 1024);
+    let before = destination.counts().0;
+    let admitted = receiver.receive(&transfer, &domain(), |_, _| panic!("unexpected fetch")).unwrap();
+    assert_eq!(destination.counts().0 - before, 0);
+    let admission_blocks: Vec<_> = admitted.blocks.iter()
+        .map(|reference| receiver.reader.block(reference).unwrap()).collect();
+    for (reference, admission) in admitted.blocks.iter().zip(&admission_blocks) {
+        let consumed = receiver.block(reference).unwrap();
+        assert!(Arc::ptr_eq(admission, &consumed));
+        assert!(Arc::ptr_eq(&consumed, &receiver.block(reference).unwrap()));
+        let mut wrong_count = reference.clone();
+        wrong_count.points += 1;
+        assert!(receiver.block(&wrong_count).unwrap_err().contains("point count"));
+    }
+    assert_eq!(destination.counts().0 - before, 0);
+    assert_eq!(receiver.reader.cached_bytes(), 262_656);
+
+    writer.observe(cells, 2).unwrap();
+    let next = writer.snapshot(domain(), 2, 2).unwrap();
+    let _next_pin = receive(&mut receiver, &next, &source).unwrap();
+    for (reference, admission) in admitted.blocks.iter().zip(&admission_blocks) {
+        assert!(Arc::ptr_eq(admission, &receiver.block(reference).unwrap()));
+    }
+    assert_eq!(destination.counts().0 - before, 0);
+    assert_eq!(receiver.reader.cached_bytes(), 525_312);
+    eprintln!("shared inline cells=4096 blocks=4 consumer_object_reads=0 reused_admission_arcs=4 retained_old_arcs=4 cache_accounted_bytes={}", receiver.reader.cached_bytes());
+}
+#[test]
+fn receiver_default_budget_and_configured_working_set_remain_bounded() {
+    let block: Block = (0..32768_u16).map(|local|
+        (local, Evidence { observed_ns: 1, hits: 1 })).collect();
+    let bytes = encode_block(&block).unwrap();
+    let root = Manifest {
+        version: 2, domain: domain(), revision: 1, geometry_revision: 1,
+        source_timestamp_ns: 1, voxel_size_m: 0.05,
+        blocks: (1..=3_u8).map(|id| BlockRef {
+            key: [i32::from(id) - 1, 0, 0], object: ObjectId([id; 16]).into(),
+            block_revision: 1, geometry_revision: 1, points: 32768,
+        }).collect(),
+    };
+    let transfer = Transfer { root: root.encode().unwrap(), included: root.blocks.iter()
+        .map(|reference| (reference.object, bytes.clone())).collect() };
+    let block_bytes = block.len() * 64 + 128;
+    let destination = Repository::temporary().unwrap();
+    let mut default = Receiver::new(destination.clone());
+    default.receive(&transfer, &domain(), |_, _| panic!("unexpected fetch")).unwrap();
+    assert_eq!(destination.counts().0, 0);
+    assert_eq!(default.reader.cached_bytes(), block_bytes);
+    assert!(default.reader.cached_bytes() <= BUDGET);
+
+    let destination = Repository::temporary().unwrap();
+    let budget = 32 * 1024 * 1024;
+    let mut configured = Receiver::with_cache_budget(destination.clone(), budget);
+    let admitted = configured.receive(&transfer, &domain(), |_, _| panic!("unexpected fetch")).unwrap();
+    assert_eq!(configured.reader.cached_bytes(), 3 * block_bytes);
+    assert!(configured.reader.cached_bytes() > BUDGET);
+    assert!(configured.reader.cached_bytes() <= budget);
+    for reference in &admitted.blocks { configured.block(reference).unwrap(); }
+    assert_eq!(destination.counts().0, 0);
+}
+#[test]
+fn shared_reader_reloads_evicted_pinned_root_and_releases_it_after_gc() {
+    let (source, mut writer, root) = one();
+    let destination = Repository::temporary().unwrap();
+    let budget = 64 + 128;
+    let mut receiver = Receiver::with_cache_budget(destination.clone(), budget);
+    let pinned = receive(&mut receiver, &root, &source).unwrap();
+    let original = receiver.block(&pinned.blocks[0]).unwrap();
+    writer.observe([[0, 0, 0]], 2).unwrap();
+    let next = writer.snapshot(domain(), 2, 2).unwrap();
+    let next_pin = receive(&mut receiver, &next, &source).unwrap();
+    // 仅能容纳一个块；读新根驱逐旧块，但旧根仍由调用方持有。
+    let newer = receiver.block(&next_pin.blocks[0]).unwrap();
+    assert_eq!(receiver.reader.cached_bytes(), budget);
+    let before = destination.counts().0;
+    let reloaded = receiver.block(&pinned.blocks[0]).unwrap();
+    assert_eq!(destination.counts().0 - before, 1);
+    assert!(!Arc::ptr_eq(&original, &reloaded));
+    assert_eq!(original.as_ref(), reloaded.as_ref());
+    assert_eq!(receiver.reader.cached_bytes(), budget);
+    drop(pinned);
+    writer.remove([[0, 0, 0]]).unwrap();
+    let empty = writer.snapshot(domain(), 3, 2).unwrap();
+    receive(&mut receiver, &empty, &source).unwrap();
+    assert!(receiver.reader.cache_is_empty());
+    assert!(receiver.block(&root.blocks[0]).is_err());
+    assert_eq!(original[&0].observed_ns, 1);
+    assert_eq!(receiver.block(&next_pin.blocks[0]).unwrap().as_ref(), newer.as_ref());
+    assert_eq!(receiver.reader.cached_bytes(), budget);
 }
 #[test]
 fn duplicate_root_zero_work_and_included_conflict_is_admitted() {

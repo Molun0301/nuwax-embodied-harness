@@ -1536,12 +1536,17 @@ class MapWorkspaceService:
             },
         )
 
-    def get_relocalized_pose(self, map_name: str):
-        """按当前激活结果读取功能拥有方位姿，不等待显示聚合刷新。"""
+    def get_relocalized_pose(self, map_name: str, *, require_assigned: bool = False):
+        """分配式路径验证当前拥有方；旧式兼容读取不提供拥有方证明。
+
+        require_assigned 禁止目录缺失或降级时回落旧式路径；默认保留旧调用语义。
+        """
         asset = self._repository.get_map_asset(map_name)
         if asset is not None and asset.identity_schema_version == 2:
             from skills.assigned_map_relocalization import get_assigned_relocalized_pose
             return get_assigned_relocalized_pose(self, map_name)
+        if require_assigned:
+            return None
         receipt = self._repository.get_last_successful_relocalization_receipt()
         activation = self._repository.get_last_successful_map_activation_receipt()
         if not receipt or not activation or receipt.get("map_name") != map_name:

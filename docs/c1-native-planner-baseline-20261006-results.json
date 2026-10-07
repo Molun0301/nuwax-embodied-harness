@@ -1,0 +1,675 @@
+{
+  "baseline": {
+    "identity": {
+      "local_commit": "2bf54cc108a63dfa728a486fefd4de8ce8331620",
+      "tree": "1fabe2eac417c4fecde21552148f22b2b93dbe72",
+      "remote_commit": "410290dbc45c20db10bf2782556b555a0175bcc4",
+      "profile": "test; MLS and runtime opt3; all other Rust crates ordinary test profile; debug0; body-query-profile enabled",
+      "binaries": {
+        "nuwax_nav_stack": {
+          "path": "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_stack",
+          "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_stack-9de63e8f646d88ed",
+          "sha256": "36195a46b05ceeda3721025f35d79c4df3796ea3025278b90d7d566d242483af",
+          "bytes": 27985344,
+          "listed_tests": 230
+        },
+        "nuwax_nav_scan": {
+          "path": "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_scan",
+          "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_scan-73912fac060bcbb4",
+          "sha256": "8efed7978b5609a25fb60beed5edc34d75ff787a10d3817c359e2f37bdd9d518",
+          "bytes": 4495224,
+          "listed_tests": 34
+        },
+        "nuwax_nav_runtime": {
+          "path": "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+          "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_runtime-6a3cde7862e97042",
+          "sha256": "beb698a5cc43aa9ffa8ae9b73ca38a3bde572227b1c16b1cfcda3f51d2e08cd4",
+          "bytes": 12693320,
+          "listed_tests": 232
+        },
+        "nuwax_nav_mls_planner": {
+          "path": "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_mls_planner",
+          "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_mls_planner-962ede5026ddd8ad",
+          "sha256": "a18596a85703121add117c6629eba6a858ad63b93811ec7715726680c3eb1cc3",
+          "bytes": 8672416,
+          "listed_tests": 258
+        }
+      }
+    },
+    "results": [
+      {
+        "label": "body-passage",
+        "package": "nuwax_nav_mls_planner",
+        "selector": "surface::body::passage_tests",
+        "selected_names": [
+          "surface::body::passage_tests::complete_fine_door_geometry_is_independent_of_sparse_block_packing",
+          "surface::body::passage_tests::complete_source_fact_cannot_erase_coarse_conflicts_or_independent_boundaries",
+          "surface::body::passage_tests::fine_wall_contacts_are_not_cut_off_by_coarse_float_boundaries",
+          "surface::body::passage_tests::local_passage_candidates_resolve_subcell_windows_without_granting_motion",
+          "surface::body::passage_tests::narrow_door_keeps_equal_width_collision_alignment_and_wall_start_checks",
+          "surface::body::passage_tests::offset_start_and_goal_have_forward_s_arcs_through_fine_door_window"
+        ],
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_mls_planner",
+          "surface::body::passage_tests",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "started_at_utc": "2026-10-06T14:50:44.457029+00:00",
+        "wall_seconds": 6.886192711004696,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 6.597224,
+        "process_system_cpu_seconds": 0.24573799999999998,
+        "process_peak_rss_kib": 38476,
+        "voluntary_context_switches": 391,
+        "involuntary_context_switches": 4992,
+        "summary": {
+          "status": "ok",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 252
+        },
+        "log": "/workspace/shared/neh-planner-baseline-20261006/body-passage.log"
+      },
+      {
+        "label": "body-observations",
+        "package": "nuwax_nav_mls_planner",
+        "selector": "surface::observations::tests",
+        "selected_names": [
+          "surface::observations::tests::benchmark_evidence_only_block_refresh",
+          "surface::observations::tests::benchmark_observation_lookup_and_ordered_set_construction",
+          "surface::observations::tests::block_updates_match_rebuilding_reference_for_exact_membership",
+          "surface::observations::tests::borrowed_block_probe_matches_owner_updates_and_missing_keys",
+          "surface::observations::tests::borrowed_block_probe_uses_all_axes_and_non_power_of_two_edges",
+          "surface::observations::tests::complete_geometry_fact_is_scoped_to_the_immutable_committed_source",
+          "surface::observations::tests::evidence_refresh_reuses_geometry_but_retires_obstacle_permissions",
+          "surface::observations::tests::isolated_history_does_not_replace_current_or_confirmed_obstacles",
+          "surface::observations::tests::local_columns_follow_block_replacement_and_preserve_immutable_snapshots",
+          "surface::observations::tests::neighbor_evidence_refresh_retires_cached_cross_block_decisions",
+          "surface::observations::tests::planning_fork_shares_observation_roots_without_sharing_obstacle_cache"
+        ],
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_mls_planner",
+          "surface::observations::tests",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "started_at_utc": "2026-10-06T14:50:51.345003+00:00",
+        "wall_seconds": 0.050973782999790274,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.0,
+        "process_system_cpu_seconds": 0.00362,
+        "process_peak_rss_kib": 38476,
+        "voluntary_context_switches": 13,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 9,
+          "failed": 0,
+          "ignored": 2,
+          "measured": 0,
+          "filtered_out": 247
+        },
+        "log": "/workspace/shared/neh-planner-baseline-20261006/body-observations.log"
+      },
+      {
+        "label": "runtime-both-modes",
+        "package": "nuwax_nav_runtime",
+        "selector": "both_modes_",
+        "selected_names": [
+          "route_follower::tests::both_modes_keep_obstacle_braking_and_sparse_route_deviation_checks",
+          "route_follower::tests::both_modes_reject_changed_support_and_expired_observations"
+        ],
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+          "both_modes_",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "started_at_utc": "2026-10-06T14:50:51.396753+00:00",
+        "wall_seconds": 1.1589218909939518,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 1.114737,
+        "process_system_cpu_seconds": 0.049342,
+        "process_peak_rss_kib": 38476,
+        "voluntary_context_switches": 349,
+        "involuntary_context_switches": 3865,
+        "summary": {
+          "status": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 230
+        },
+        "log": "/workspace/shared/neh-planner-baseline-20261006/runtime-both-modes.log"
+      },
+      {
+        "label": "runtime-blocking-map",
+        "package": "nuwax_nav_runtime",
+        "selector": "stored_positive_command_is_rejected_after_blocking_map_update",
+        "selected_names": [
+          "planner_worker::tests::stored_positive_command_is_rejected_after_blocking_map_update"
+        ],
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+          "planner_worker::tests::stored_positive_command_is_rejected_after_blocking_map_update",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T14:50:52.558341+00:00",
+        "wall_seconds": 0.05252644600113854,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.010242,
+        "process_system_cpu_seconds": 0.002547,
+        "process_peak_rss_kib": 38476,
+        "voluntary_context_switches": 8,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 231
+        },
+        "log": "/workspace/shared/neh-planner-baseline-20261006/runtime-blocking-map.log"
+      },
+      {
+        "label": "runtime-dispatch",
+        "package": "nuwax_nav_runtime",
+        "selector": "dispatch_",
+        "selected_names": [
+          "planner_worker::tests::dispatch_bound_rejects_delayed_first_retrieval_without_extending_hold_lease",
+          "planner_worker::tests::dispatch_expiry_during_compute_becomes_pending_without_route_penalty",
+          "planner_worker::tests::dispatch_taken_result_metadata_is_retired_by_input_and_lifecycle_changes",
+          "route_moving_worker_tests::dispatch_real_observed_backends_preserve_bound_to_scheduler",
+          "surface_follower::tests::observation_dispatch_bound_is_single_use_and_lifecycle_scoped",
+          "tests::dispatch_ambiguous_failure_keeps_fail_closed_fence",
+          "tests::dispatch_control_tick_expiry_preserves_wait_goal_route_until_recovery_or_timeout",
+          "tests::dispatch_legacy_port_cannot_ignore_finite_bound",
+          "tests::dispatch_receiver_expiry_applies_exactly_one_zero_and_fresh_command_recovers",
+          "tests::dispatch_renewal_delay_expires_original_bound_then_confirms_only_zero"
+        ],
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+          "dispatch_",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "started_at_utc": "2026-10-06T14:50:52.611816+00:00",
+        "wall_seconds": 1.8086855060028029,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.30044899999999997,
+        "process_system_cpu_seconds": 0.014931999999999999,
+        "process_peak_rss_kib": 38476,
+        "voluntary_context_switches": 254,
+        "involuntary_context_switches": 1067,
+        "summary": {
+          "status": "ok",
+          "passed": 10,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 222
+        },
+        "log": "/workspace/shared/neh-planner-baseline-20261006/runtime-dispatch.log"
+      },
+      {
+        "label": "downstream-door",
+        "package": "nuwax_nav_stack",
+        "selector": "complete_fine_manifest_resolves_a_real_door_across_storage_blocks",
+        "selected_names": [
+          "surface_chunks::tests::complete_fine_manifest_resolves_a_real_door_across_storage_blocks"
+        ],
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::complete_fine_manifest_resolves_a_real_door_across_storage_blocks",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T14:50:54.421486+00:00",
+        "wall_seconds": 36.09526423300122,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 35.966498,
+        "process_system_cpu_seconds": 0.12296399999999999,
+        "process_peak_rss_kib": 45324,
+        "voluntary_context_switches": 29,
+        "involuntary_context_switches": 309,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 229
+        },
+        "log": "/workspace/shared/neh-planner-baseline-20261006/downstream-door.log"
+      },
+      {
+        "label": "scan-door",
+        "package": "nuwax_nav_scan",
+        "selector": "actual_thirty_three_centimeter_passage_survives_coarse_reference",
+        "selected_names": [
+          "tests::actual_thirty_three_centimeter_passage_survives_coarse_reference"
+        ],
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_scan",
+          "tests::actual_thirty_three_centimeter_passage_survives_coarse_reference",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T14:51:30.518385+00:00",
+        "wall_seconds": 26.318835120000585,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 26.22716,
+        "process_system_cpu_seconds": 0.042020999999999996,
+        "process_peak_rss_kib": 48456,
+        "voluntary_context_switches": 61,
+        "involuntary_context_switches": 412,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 33
+        },
+        "log": "/workspace/shared/neh-planner-baseline-20261006/scan-door.log"
+      },
+      {
+        "label": "moving-source-positive-negative",
+        "package": "nuwax_nav_runtime",
+        "selector": "moving_5cm_source_positive_and_expired_negative_probe",
+        "selected_names": [
+          "route_moving_worker_tests::moving_5cm_source_positive_and_expired_negative_probe"
+        ],
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+          "route_moving_worker_tests::moving_5cm_source_positive_and_expired_negative_probe",
+          "--nocapture",
+          "--test-threads=1",
+          "--ignored",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T14:51:56.838729+00:00",
+        "wall_seconds": 1.5077586350016645,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.07145599999999999,
+        "process_system_cpu_seconds": 0.022015,
+        "process_peak_rss_kib": 38476,
+        "voluntary_context_switches": 64,
+        "involuntary_context_switches": 331,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 231
+        },
+        "log": "/workspace/shared/neh-planner-baseline-20261006/moving-source-positive-negative.log"
+      },
+      {
+        "label": "moving-off-full-goal",
+        "package": "nuwax_nav_runtime",
+        "selector": "moving_measured_5cm_primed_off_full_goal",
+        "selected_names": [
+          "route_moving_worker_tests::moving_measured_5cm_primed_off_full_goal"
+        ],
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+          "route_moving_worker_tests::moving_measured_5cm_primed_off_full_goal",
+          "--nocapture",
+          "--test-threads=1",
+          "--ignored",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T14:51:58.347509+00:00",
+        "wall_seconds": 24.23396113900526,
+        "exit_code": 101,
+        "timed_out": false,
+        "process_user_cpu_seconds": 2.69778,
+        "process_system_cpu_seconds": 0.31041399999999997,
+        "process_peak_rss_kib": 70292,
+        "voluntary_context_switches": 1287,
+        "involuntary_context_switches": 568,
+        "summary": {
+          "status": "FAILED",
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 231
+        },
+        "log": "/workspace/shared/neh-planner-baseline-20261006/moving-off-full-goal.log"
+      },
+      {
+        "label": "moving-on-full-goal",
+        "package": "nuwax_nav_runtime",
+        "selector": "moving_measured_5cm_primed_on_full_goal",
+        "selected_names": [
+          "route_moving_worker_tests::moving_measured_5cm_primed_on_full_goal"
+        ],
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+          "route_moving_worker_tests::moving_measured_5cm_primed_on_full_goal",
+          "--nocapture",
+          "--test-threads=1",
+          "--ignored",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T14:52:22.584451+00:00",
+        "wall_seconds": 23.490636726004595,
+        "exit_code": 101,
+        "timed_out": false,
+        "process_user_cpu_seconds": 2.433314,
+        "process_system_cpu_seconds": 0.165525,
+        "process_peak_rss_kib": 70244,
+        "voluntary_context_switches": 1510,
+        "involuntary_context_switches": 524,
+        "summary": {
+          "status": "FAILED",
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 231
+        },
+        "log": "/workspace/shared/neh-planner-baseline-20261006/moving-on-full-goal.log"
+      },
+      {
+        "label": "moving-held-continuity",
+        "package": "nuwax_nav_runtime",
+        "selector": "moving_5cm_primed_held_planning_continuity_only",
+        "selected_names": [
+          "route_moving_worker_tests::moving_5cm_primed_held_planning_continuity_only"
+        ],
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+          "route_moving_worker_tests::moving_5cm_primed_held_planning_continuity_only",
+          "--nocapture",
+          "--test-threads=1",
+          "--ignored",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T14:52:46.077716+00:00",
+        "wall_seconds": 16.750725028003217,
+        "exit_code": 101,
+        "timed_out": false,
+        "process_user_cpu_seconds": 2.585904,
+        "process_system_cpu_seconds": 0.516542,
+        "process_peak_rss_kib": 81688,
+        "voluntary_context_switches": 1059,
+        "involuntary_context_switches": 297,
+        "summary": {
+          "status": "FAILED",
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 231
+        },
+        "log": "/workspace/shared/neh-planner-baseline-20261006/moving-held-continuity.log"
+      },
+      {
+        "label": "captured-entry",
+        "package": "nuwax_nav_runtime",
+        "selector": "measured_collinear_progress_at_captured_entry",
+        "selected_names": [
+          "surface_follower::body_control::dense_doorway_checkpoint_diagnostic::measured_collinear_progress_at_captured_entry"
+        ],
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+          "surface_follower::body_control::dense_doorway_checkpoint_diagnostic::measured_collinear_progress_at_captured_entry",
+          "--nocapture",
+          "--test-threads=1",
+          "--ignored",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T14:53:02.832282+00:00",
+        "wall_seconds": 0.3036225559990271,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.251125,
+        "process_system_cpu_seconds": 0.046237,
+        "process_peak_rss_kib": 38476,
+        "voluntary_context_switches": 42,
+        "involuntary_context_switches": 73,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 231
+        },
+        "log": "/workspace/shared/neh-planner-baseline-20261006/captured-entry.log"
+      }
+    ]
+  },
+  "attribution_runs": {
+    "binary": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+      "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_runtime-6a3cde7862e97042",
+      "sha256": "beb698a5cc43aa9ffa8ae9b73ca38a3bde572227b1c16b1cfcda3f51d2e08cd4",
+      "bytes": 12693320,
+      "listed_tests": 232
+    },
+    "runs": [
+      {
+        "label": "cold-owner-repeat-1",
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+          "surface_follower::body_control::dense_doorway_checkpoint_diagnostic::measured_collinear_progress_at_captured_entry",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "wall_seconds": 0.21833892100403318,
+        "exit_code": 0,
+        "user_cpu_seconds": 0.15631,
+        "system_cpu_seconds": 0.053349999999999995,
+        "peak_launch_rss_kib": 31244,
+        "voluntary_context_switches": 29,
+        "involuntary_context_switches": 158,
+        "log": "/workspace/shared/neh-planner-baseline-20261006/attribution/cold-owner-repeat-1.log",
+        "cgroup": "0::/\n",
+        "cpu_stat": null,
+        "cpu_max": null,
+        "sampling_interval_s": null
+      },
+      {
+        "label": "cold-owner-repeat-2",
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+          "surface_follower::body_control::dense_doorway_checkpoint_diagnostic::measured_collinear_progress_at_captured_entry",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "wall_seconds": 0.2624729599992861,
+        "exit_code": 0,
+        "user_cpu_seconds": 0.139987,
+        "system_cpu_seconds": 0.121543,
+        "peak_launch_rss_kib": 31404,
+        "voluntary_context_switches": 35,
+        "involuntary_context_switches": 135,
+        "log": "/workspace/shared/neh-planner-baseline-20261006/attribution/cold-owner-repeat-2.log",
+        "cgroup": "0::/\n",
+        "cpu_stat": null,
+        "cpu_max": null,
+        "sampling_interval_s": null
+      },
+      {
+        "label": "cold-owner-repeat-3",
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+          "surface_follower::body_control::dense_doorway_checkpoint_diagnostic::measured_collinear_progress_at_captured_entry",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "wall_seconds": 0.2056213010000647,
+        "exit_code": 0,
+        "user_cpu_seconds": 0.14795999999999998,
+        "system_cpu_seconds": 0.045162,
+        "peak_launch_rss_kib": 31640,
+        "voluntary_context_switches": 32,
+        "involuntary_context_switches": 74,
+        "log": "/workspace/shared/neh-planner-baseline-20261006/attribution/cold-owner-repeat-3.log",
+        "cgroup": "0::/\n",
+        "cpu_stat": null,
+        "cpu_max": null,
+        "sampling_interval_s": null
+      },
+      {
+        "label": "unchanged-on-scheduling",
+        "command": [
+          "/workspace/shared/neh-planner-baseline-20261006/binaries/nuwax_nav_runtime",
+          "route_moving_worker_tests::moving_measured_5cm_primed_on_full_goal",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "wall_seconds": 23.224181571000372,
+        "exit_code": 101,
+        "user_cpu_seconds": 2.365599,
+        "system_cpu_seconds": 0.41915199999999997,
+        "peak_launch_rss_kib": 70104,
+        "voluntary_context_switches": 1488,
+        "involuntary_context_switches": 767,
+        "log": "/workspace/shared/neh-planner-baseline-20261006/attribution/unchanged-on-scheduling.log",
+        "cgroup": "0::/\n",
+        "cpu_stat": null,
+        "cpu_max": null,
+        "sampling_interval_s": 0.1
+      }
+    ]
+  },
+  "host": {
+    "architecture": "x86_64",
+    "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+    "logical_cpus": 9,
+    "clock_ticks_per_second": 100,
+    "page_size_bytes": 4096,
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "cpu.max": null,
+    "memory.max": null
+  },
+  "schedule_sampling": {
+    "interval_s": 0.1,
+    "samples": 222,
+    "cgroup": "0::/\n",
+    "cpu_stat": null,
+    "cpu_max": null,
+    "caveat": "runqueue wait evidence; not complete per-tick root-cause proof; sampled stats and launch-envelope RSS only"
+  },
+  "limitations": [
+    "Three moving cadence failures preserved",
+    "No hardware/actuator/strict realtime qualification",
+    "Mixed test profile, not release",
+    "Historical documentation not a matched baseline"
+  ],
+  "logs": {
+    "attribution-progress.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/attribution-progress.log",
+      "sha256": "35bd32c0ef1b445a3bb754edba7bde75c385bffa5ee5d71fc954470fb621995b"
+    },
+    "body-observations.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/body-observations.log",
+      "sha256": "37ad2616c3b66e02f21aa5130d481bd0cf89ee4392b493868cfc385f73310a92"
+    },
+    "body-passage.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/body-passage.log",
+      "sha256": "3320e1e25ce748073bea4870b1c5fe05d036f2a260f1c16f1797bba7961a4ff1"
+    },
+    "build-network.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/build-network.log",
+      "sha256": "20d3f0daf3c8e04be7bd4894e6c5f9d48561ae0a80ae747649901ba4e51630c1"
+    },
+    "build.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/build.log",
+      "sha256": "18e1c219a2e08fbec907ae5d25a49b9211c0ce7e9de79d7cfda52e81e94446e8"
+    },
+    "captured-entry.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/captured-entry.log",
+      "sha256": "16bcfe1ddac77ce4990449c0a4252d7eb51a88c22fe175ac1310d05f285115dc"
+    },
+    "downstream-door.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/downstream-door.log",
+      "sha256": "19720015475ec180a712ab4399f2d48d044f7c6874382a9abf103f46ecc6e15e"
+    },
+    "moving-held-continuity.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/moving-held-continuity.log",
+      "sha256": "2acada4290700fb961ab05bb0c35e5dd9747bfce69eafeb9f0b5bac9b408ad8f"
+    },
+    "moving-off-full-goal.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/moving-off-full-goal.log",
+      "sha256": "a65ec6adc1c97a79ab7b7b0b28819426c6859f5399071016cf8ef03408535f89"
+    },
+    "moving-on-full-goal.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/moving-on-full-goal.log",
+      "sha256": "0d4bb5126b7d7e13c07d14c51c1a11cbea5a15e26e40cc655c3f47058e1c18f8"
+    },
+    "moving-source-positive-negative.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/moving-source-positive-negative.log",
+      "sha256": "d4672019108dd98e1209732d827be367a9e496ac47730ce12687ed1d2c357c37"
+    },
+    "run-progress.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/run-progress.log",
+      "sha256": "53285103e61883108c7502b3c36c8c18796111eeb9ae165652de3d9b20f18286"
+    },
+    "runtime-blocking-map.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/runtime-blocking-map.log",
+      "sha256": "5e970f60b8268be3d05e0e185a7da5f9e7a035b28642be81d64611ef38f3696d"
+    },
+    "runtime-both-modes.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/runtime-both-modes.log",
+      "sha256": "8c90560707ac272ce44a48b5f8cf87a1f15021167fde3ca4e361385eaf066f31"
+    },
+    "runtime-dispatch.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/runtime-dispatch.log",
+      "sha256": "cd1b888a8e638bddd1bf092bdc07efc48c922d6f15f2a4a378a6722209b41fd2"
+    },
+    "scan-door.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/scan-door.log",
+      "sha256": "f395f23c766bf8e1e6c207dece2fe68d063b993cadecde459d1f06615df363cc"
+    }
+  },
+  "attribution_logs": {
+    "cold-owner-repeat-1.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/attribution/cold-owner-repeat-1.log",
+      "sha256": "d62ba0d1002e8f3f51f8f4a5dc99acf2bfd18f783cdedef81df70d0cd8fa617d"
+    },
+    "cold-owner-repeat-2.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/attribution/cold-owner-repeat-2.log",
+      "sha256": "56d315a6b3737767274e542da655b62d77a2ecd556b54880e0fd596af7ee88e1"
+    },
+    "cold-owner-repeat-3.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/attribution/cold-owner-repeat-3.log",
+      "sha256": "38af987180be7df08c68a4c1601dab91ced3ba0059581249172d63c4644b0f3e"
+    },
+    "unchanged-on-scheduling.log": {
+      "path": "/workspace/shared/neh-planner-baseline-20261006/attribution/unchanged-on-scheduling.log",
+      "sha256": "b4fd02ea4ed1546ca8de0b1147f8d1719817d71e8c51636d774c75f0a4f76f7c"
+    }
+  }
+}

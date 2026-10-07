@@ -1,0 +1,1510 @@
+{
+  "local_base": "2bf54cc108a63dfa728a486fefd4de8ce8331620",
+  "base_tree": "1fabe2eac417c4fecde21552148f22b2b93dbe72",
+  "remote_base": "410290dbc45c20db10bf2782556b555a0175bcc4",
+  "source_review": "Production+14/-7; receive/admission/GC/fetch unchanged; same-owner boundedrawblockcache reuse only. Independent source and actual result audits recommend retain.",
+  "qualification": {
+    "identity": {
+      "local_base_commit": "2bf54cc108a63dfa728a486fefd4de8ce8331620",
+      "is_uncommitted_candidate": true,
+      "source_before_build": "2104254ba2c5a9c51e5297a7481937bc650b8b50a42107808e88328501cd5547  crates/nuwax-nav-stack/src/surface_chunks.rs\nb2705f0cf16675e2829f28685174478c000657355314c74786ba4d629c369c54  crates/nuwax-map-chunks/src/tests.rs\n2e08aaf4cbd10dba820eddabce7d86769e41d8527cf457d5d6dac91708d8cb17  crates/nuwax-map-chunks/src/lib.rs\nff8183ba4ae0032c0743b34901ad5e9cff1dd31d09ecef8a8cf929ef0bbd1670  crates/nuwax-map-chunks/src/repository.rs\n5c1622546dc922566197b72797c8271029d6c31144836b629e17363bd6be2305  crates/nuwax-nav-mls-planner/src/surface/body.rs\n",
+      "base_tree": "1fabe2eac417c4fecde21552148f22b2b93dbe72",
+      "remote_commit": "410290dbc45c20db10bf2782556b555a0175bcc4",
+      "profile": "test; MLS and runtime opt3; all other Rust crates ordinary test profile; debug0; body-query-profile enabled",
+      "binaries": {
+        "nuwax_map_chunks": {
+          "path": "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_map_chunks",
+          "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_map_chunks-dc58d85b51433c13",
+          "sha256": "be1a6fdbd1c2cbbc84ca60ef1695bede4eafb345bb7d6f0b2b63ec6fc24e986d",
+          "bytes": 5436464,
+          "listed_tests": 44
+        },
+        "nuwax_nav_stack": {
+          "path": "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_stack-9de63e8f646d88ed",
+          "sha256": "d59e7315db32c883b59fd2a078ef7b50bf87607cb9c540bed38a2f36baf5d800",
+          "bytes": 28139472,
+          "listed_tests": 232
+        },
+        "nuwax_nav_mls_planner": {
+          "path": "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_mls_planner",
+          "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_mls_planner-962ede5026ddd8ad",
+          "sha256": "e8e0546632d3c2f5e2ffe7f7b3fce35e504cd506e617ea2807302230fc6447b8",
+          "bytes": 8709120,
+          "listed_tests": 260
+        }
+      }
+    },
+    "results": [
+      {
+        "label": "receiver-regressions",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::receiver_",
+        "selected_names": [
+          "tests::receiver_default_budget_and_configured_working_set_remain_bounded",
+          "tests::receiver_fetches_once_and_keeps_intrinsic_metadata",
+          "tests::receiver_gc_releases_cached_payloads_outside_live_roots",
+          "tests::receiver_rejects_false_geometry_and_block_revision_claims",
+          "tests::receiver_rejects_future_evidence_domain_mismatch_and_extra_inclusions",
+          "tests::receiver_removal_needs_geometry_advance_and_resolution_change_is_allowed"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_map_chunks",
+          "tests::receiver_",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "started_at_utc": "2026-10-06T17:44:15.945175+00:00",
+        "wall_seconds": 0.4530512030032696,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.391739,
+        "process_system_cpu_seconds": 0.050492999999999996,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 10,
+        "involuntary_context_switches": 16,
+        "summary": {
+          "status": "ok",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 38
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/receiver-regressions.log"
+      },
+      {
+        "label": "inline-both-cache-layouts",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::inline_admission_",
+        "selected_names": [
+          "tests::inline_admission_and_separate_reader_materialize_distinct_blocks",
+          "tests::inline_admission_and_shared_reader_reuse_blocks_without_object_reads"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_map_chunks",
+          "tests::inline_admission_",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "started_at_utc": "2026-10-06T17:44:16.399418+00:00",
+        "wall_seconds": 0.10230935100116767,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.042525,
+        "process_system_cpu_seconds": 0.010535,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 5,
+        "involuntary_context_switches": 1,
+        "summary": {
+          "status": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 42
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/inline-both-cache-layouts.log"
+      },
+      {
+        "label": "pinned-eviction-gc",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::shared_reader_reloads_evicted_pinned_root_and_releases_it_after_gc",
+        "selected_names": [
+          "tests::shared_reader_reloads_evicted_pinned_root_and_releases_it_after_gc"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_map_chunks",
+          "tests::shared_reader_reloads_evicted_pinned_root_and_releases_it_after_gc",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:16.503784+00:00",
+        "wall_seconds": 0.052134215002297424,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.002934,
+        "process_system_cpu_seconds": 0.0033699999999999997,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 43
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/pinned-eviction-gc.log"
+      },
+      {
+        "label": "failed-fetch-old-reader",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::failed_fetch_preserves_current_root_and_retained_old_reader",
+        "selected_names": [
+          "tests::failed_fetch_preserves_current_root_and_retained_old_reader"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_map_chunks",
+          "tests::failed_fetch_preserves_current_root_and_retained_old_reader",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:16.556998+00:00",
+        "wall_seconds": 0.05143687799863983,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.0037059999999999997,
+        "process_system_cpu_seconds": 0.0,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 2,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 43
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/failed-fetch-old-reader.log"
+      },
+      {
+        "label": "duplicate-conflict",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::duplicate_root_zero_work_and_included_conflict_is_admitted",
+        "selected_names": [
+          "tests::duplicate_root_zero_work_and_included_conflict_is_admitted"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_map_chunks",
+          "tests::duplicate_root_zero_work_and_included_conflict_is_admitted",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:16.610076+00:00",
+        "wall_seconds": 0.05169925499649253,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.00943,
+        "process_system_cpu_seconds": 0.0,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 43
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/duplicate-conflict.log"
+      },
+      {
+        "label": "cleanup-failure",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::cleanup_failure_does_not_report_a_failed_committed_receive",
+        "selected_names": [
+          "tests::cleanup_failure_does_not_report_a_failed_committed_receive"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_map_chunks",
+          "tests::cleanup_failure_does_not_report_a_failed_committed_receive",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:16.662746+00:00",
+        "wall_seconds": 0.051367381995078176,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.0,
+        "process_system_cpu_seconds": 0.003881,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 2,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 43
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/cleanup-failure.log"
+      },
+      {
+        "label": "cache-hit",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::cached_block_hit_does_not_reopen_or_rescan_members",
+        "selected_names": [
+          "tests::cached_block_hit_does_not_reopen_or_rescan_members"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_map_chunks",
+          "tests::cached_block_hit_does_not_reopen_or_rescan_members",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:16.715309+00:00",
+        "wall_seconds": 0.050780249999661464,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.0,
+        "process_system_cpu_seconds": 0.005062,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 43
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/cache-hit.log"
+      },
+      {
+        "label": "immutable-conflict",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::immutable_install_conflict_never_overwrites",
+        "selected_names": [
+          "tests::immutable_install_conflict_never_overwrites"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_map_chunks",
+          "tests::immutable_install_conflict_never_overwrites",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:16.767423+00:00",
+        "wall_seconds": 0.053031600000394974,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.006640999999999999,
+        "process_system_cpu_seconds": 0.0,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 43
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/immutable-conflict.log"
+      },
+      {
+        "label": "legacy-spatial-alias",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::legacy_alias_paths_and_shared_spatial_keys_are_retained",
+        "selected_names": [
+          "tests::legacy_alias_paths_and_shared_spatial_keys_are_retained"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_map_chunks",
+          "tests::legacy_alias_paths_and_shared_spatial_keys_are_retained",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:16.822765+00:00",
+        "wall_seconds": 0.0515679829986766,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.0049759999999999995,
+        "process_system_cpu_seconds": 0.0,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 43
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/legacy-spatial-alias.log"
+      },
+      {
+        "label": "fine-reader-reuse",
+        "package": "nuwax_nav_stack",
+        "selector": "surface_chunks::tests::observations_and_columns_reuse_admitted_block_arcs",
+        "selected_names": [
+          "surface_chunks::tests::observations_and_columns_reuse_admitted_block_arcs"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::observations_and_columns_reuse_admitted_block_arcs",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:16.875373+00:00",
+        "wall_seconds": 0.1515290620009182,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.07660399999999999,
+        "process_system_cpu_seconds": 0.031708,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 1,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 231
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/fine-reader-reuse.log"
+      },
+      {
+        "label": "fine-evidence-refresh",
+        "package": "nuwax_nav_stack",
+        "selector": "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+        "selected_names": [
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:17.027759+00:00",
+        "wall_seconds": 0.151740676999907,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.099503,
+        "process_system_cpu_seconds": 0.017745999999999998,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 231
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/fine-evidence-refresh.log"
+      },
+      {
+        "label": "fine-duplicate-conflict",
+        "package": "nuwax_nav_stack",
+        "selector": "surface_chunks::tests::duplicate_root_still_rejects_conflicting_included_body_without_installing_it",
+        "selected_names": [
+          "surface_chunks::tests::duplicate_root_still_rejects_conflicting_included_body_without_installing_it"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::duplicate_root_still_rejects_conflicting_included_body_without_installing_it",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:17.180554+00:00",
+        "wall_seconds": 0.05108961299993098,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.006939,
+        "process_system_cpu_seconds": 0.010029,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 2,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 231
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/fine-duplicate-conflict.log"
+      },
+      {
+        "label": "fine-changed-columns",
+        "package": "nuwax_nav_stack",
+        "selector": "surface_chunks::tests::changed_blocks_merge_vertical_and_non_aligned_neighbors_and_keep_deletions",
+        "selected_names": [
+          "surface_chunks::tests::changed_blocks_merge_vertical_and_non_aligned_neighbors_and_keep_deletions"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::changed_blocks_merge_vertical_and_non_aligned_neighbors_and_keep_deletions",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:17.233592+00:00",
+        "wall_seconds": 0.5037867249993724,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.435091,
+        "process_system_cpu_seconds": 0.053876999999999994,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 25,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 231
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/fine-changed-columns.log"
+      },
+      {
+        "label": "fine-local-read-budget",
+        "package": "nuwax_nav_stack",
+        "selector": "surface_chunks::tests::fixed_dirty_region_reads_same_points_when_far_map_grows",
+        "selected_names": [
+          "surface_chunks::tests::fixed_dirty_region_reads_same_points_when_far_map_grows"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::fixed_dirty_region_reads_same_points_when_far_map_grows",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:17.739040+00:00",
+        "wall_seconds": 0.30205233699962264,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.22413999999999998,
+        "process_system_cpu_seconds": 0.030484999999999998,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 4,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 231
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/fine-local-read-budget.log"
+      },
+      {
+        "label": "fine-reply-binding",
+        "package": "nuwax_nav_stack",
+        "selector": "surface_chunks::tests::reliable_block_reply_must_echo_exact_scope_and_bounded_bytes",
+        "selected_names": [
+          "surface_chunks::tests::reliable_block_reply_must_echo_exact_scope_and_bounded_bytes"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::reliable_block_reply_must_echo_exact_scope_and_bounded_bytes",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:18.042688+00:00",
+        "wall_seconds": 0.15136501199594932,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.038447999999999996,
+        "process_system_cpu_seconds": 0.098331,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 2,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 231
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/fine-reply-binding.log"
+      },
+      {
+        "label": "fine-door-integration",
+        "package": "nuwax_nav_stack",
+        "selector": "surface_chunks::tests::complete_fine_manifest_resolves_a_real_door_across_storage_blocks",
+        "selected_names": [
+          "surface_chunks::tests::complete_fine_manifest_resolves_a_real_door_across_storage_blocks"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::complete_fine_manifest_resolves_a_real_door_across_storage_blocks",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:18.195136+00:00",
+        "wall_seconds": 41.4538573700047,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 41.16495,
+        "process_system_cpu_seconds": 0.235393,
+        "process_peak_rss_kib": 46716,
+        "voluntary_context_switches": 24,
+        "involuntary_context_switches": 228,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 231
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/fine-door-integration.log"
+      },
+      {
+        "label": "query-owner-retirement",
+        "package": "nuwax_nav_mls_planner",
+        "selector": "surface::observations::snapshot_cache_tests::identical_observation_owner_preserves_queries_but_replacement_retires_them",
+        "selected_names": [
+          "surface::observations::snapshot_cache_tests::identical_observation_owner_preserves_queries_but_replacement_retires_them"
+        ],
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_mls_planner",
+          "surface::observations::snapshot_cache_tests::identical_observation_owner_preserves_queries_but_replacement_retires_them",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T17:44:59.652478+00:00",
+        "wall_seconds": 0.05194496399781201,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.034825999999999996,
+        "process_system_cpu_seconds": 0.014846,
+        "process_peak_rss_kib": 38752,
+        "voluntary_context_switches": 60,
+        "involuntary_context_switches": 356,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 259
+        },
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/query-owner-retirement.log"
+      }
+    ]
+  },
+  "matched_operations": {
+    "scope": "Seven alternating fresh-process pairs; identical4096cells/twogenerations/eightoperations/verified outcomes; static all-inline FineMapReader component, not transport/RSS/fullpipeline timing",
+    "identities": {
+      "baseline": {
+        "path": "/workspace/shared/neh-inline-block-attribution-20261006/binaries/nuwax_nav_stack",
+        "sha256": "71ac2e634d0b4ca5748c394eaa808adfeec1968d7d055ca52dfadfb6b3a97cf9",
+        "bytes": 28111808,
+        "features": [
+          "click-goal",
+          "default",
+          "foundation",
+          "guard-runtime",
+          "lcm-runtime",
+          "mls"
+        ],
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        }
+      },
+      "candidate": {
+        "path": "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+        "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_stack-9de63e8f646d88ed",
+        "sha256": "d59e7315db32c883b59fd2a078ef7b50bf87607cb9c540bed38a2f36baf5d800",
+        "bytes": 28139472,
+        "listed_tests": 232
+      }
+    },
+    "records": [
+      {
+        "pair": 1,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-inline-block-attribution-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/01-baseline.log",
+        "exit_code": 0,
+        "process_wall_s": 0.11482176600111416,
+        "process_user_cpu_s": 0.087252,
+        "process_system_cpu_s": 0.019903,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 6,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 3552,
+          "observations1": 15227,
+          "columns1": 10141,
+          "receive2": 3859,
+          "observations2": 8223,
+          "columns2": 43,
+          "repeat_receive2": 4252,
+          "repeat_observations2": 3
+        }
+      },
+      {
+        "pair": 1,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/01-candidate.log",
+        "exit_code": 0,
+        "process_wall_s": 0.08744943700003205,
+        "process_user_cpu_s": 0.077516,
+        "process_system_cpu_s": 0.008111,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 1,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 4506,
+          "observations1": 8235,
+          "columns1": 12537,
+          "receive2": 4486,
+          "observations2": 4002,
+          "columns2": 24,
+          "repeat_receive2": 3713,
+          "repeat_observations2": 3
+        }
+      },
+      {
+        "pair": 2,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/02-candidate.log",
+        "exit_code": 0,
+        "process_wall_s": 0.11318399800074985,
+        "process_user_cpu_s": 0.08820299999999999,
+        "process_system_cpu_s": 0.020766,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 5,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 4917,
+          "observations1": 10781,
+          "columns1": 10467,
+          "receive2": 4200,
+          "observations2": 7270,
+          "columns2": 27,
+          "repeat_receive2": 3231,
+          "repeat_observations2": 2
+        }
+      },
+      {
+        "pair": 2,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-inline-block-attribution-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/02-baseline.log",
+        "exit_code": 0,
+        "process_wall_s": 0.07818243500514654,
+        "process_user_cpu_s": 0.064856,
+        "process_system_cpu_s": 0.011668999999999999,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 9,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 2827,
+          "observations1": 7796,
+          "columns1": 8322,
+          "receive2": 3577,
+          "observations2": 6806,
+          "columns2": 26,
+          "repeat_receive2": 2966,
+          "repeat_observations2": 2
+        }
+      },
+      {
+        "pair": 3,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-inline-block-attribution-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/03-baseline.log",
+        "exit_code": 0,
+        "process_wall_s": 0.1127586859947769,
+        "process_user_cpu_s": 0.099294,
+        "process_system_cpu_s": 0.006614,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 10,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 4160,
+          "observations1": 18007,
+          "columns1": 15332,
+          "receive2": 4058,
+          "observations2": 9522,
+          "columns2": 29,
+          "repeat_receive2": 3598,
+          "repeat_observations2": 3
+        }
+      },
+      {
+        "pair": 3,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/03-candidate.log",
+        "exit_code": 0,
+        "process_wall_s": 0.08355657100037206,
+        "process_user_cpu_s": 0.070713,
+        "process_system_cpu_s": 0.0070739999999999996,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 14,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 3085,
+          "observations1": 9019,
+          "columns1": 8189,
+          "receive2": 3375,
+          "observations2": 4174,
+          "columns2": 26,
+          "repeat_receive2": 3578,
+          "repeat_observations2": 3
+        }
+      },
+      {
+        "pair": 4,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/04-candidate.log",
+        "exit_code": 0,
+        "process_wall_s": 0.13391542300087167,
+        "process_user_cpu_s": 0.100412,
+        "process_system_cpu_s": 0.026726,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 2,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 3535,
+          "observations1": 11777,
+          "columns1": 18765,
+          "receive2": 9553,
+          "observations2": 6293,
+          "columns2": 79,
+          "repeat_receive2": 3720,
+          "repeat_observations2": 6
+        }
+      },
+      {
+        "pair": 4,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-inline-block-attribution-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/04-baseline.log",
+        "exit_code": 0,
+        "process_wall_s": 0.12274951099971076,
+        "process_user_cpu_s": 0.10690899999999999,
+        "process_system_cpu_s": 0.012287,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 1,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 3689,
+          "observations1": 13651,
+          "columns1": 8851,
+          "receive2": 3646,
+          "observations2": 11697,
+          "columns2": 37,
+          "repeat_receive2": 3645,
+          "repeat_observations2": 2
+        }
+      },
+      {
+        "pair": 5,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-inline-block-attribution-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/05-baseline.log",
+        "exit_code": 0,
+        "process_wall_s": 0.12607293199835112,
+        "process_user_cpu_s": 0.088462,
+        "process_system_cpu_s": 0.032410999999999995,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 87,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 4039,
+          "observations1": 16071,
+          "columns1": 11552,
+          "receive2": 7192,
+          "observations2": 11488,
+          "columns2": 71,
+          "repeat_receive2": 5414,
+          "repeat_observations2": 3
+        }
+      },
+      {
+        "pair": 5,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/05-candidate.log",
+        "exit_code": 0,
+        "process_wall_s": 0.13053203299932647,
+        "process_user_cpu_s": 0.091274,
+        "process_system_cpu_s": 0.034913,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 2,
+        "involuntary_context_switches": 17,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 3459,
+          "observations1": 8354,
+          "columns1": 9575,
+          "receive2": 5304,
+          "observations2": 4669,
+          "columns2": 27,
+          "repeat_receive2": 3270,
+          "repeat_observations2": 2
+        }
+      },
+      {
+        "pair": 6,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/06-candidate.log",
+        "exit_code": 0,
+        "process_wall_s": 0.11004013399360701,
+        "process_user_cpu_s": 0.082601,
+        "process_system_cpu_s": 0.016455,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 2,
+        "involuntary_context_switches": 50,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 5320,
+          "observations1": 10499,
+          "columns1": 10057,
+          "receive2": 4710,
+          "observations2": 4606,
+          "columns2": 29,
+          "repeat_receive2": 3662,
+          "repeat_observations2": 3
+        }
+      },
+      {
+        "pair": 6,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-inline-block-attribution-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/06-baseline.log",
+        "exit_code": 0,
+        "process_wall_s": 0.17704547400353476,
+        "process_user_cpu_s": 0.155252,
+        "process_system_cpu_s": 0.019708,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 20,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 11028,
+          "observations1": 20969,
+          "columns1": 18957,
+          "receive2": 9560,
+          "observations2": 11413,
+          "columns2": 35,
+          "repeat_receive2": 4725,
+          "repeat_observations2": 3
+        }
+      },
+      {
+        "pair": 7,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-inline-block-attribution-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/07-baseline.log",
+        "exit_code": 0,
+        "process_wall_s": 0.10982535600487608,
+        "process_user_cpu_s": 0.091252,
+        "process_system_cpu_s": 0.016949,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 4,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 2770,
+          "observations1": 10967,
+          "columns1": 13125,
+          "receive2": 7866,
+          "observations2": 9357,
+          "columns2": 31,
+          "repeat_receive2": 3651,
+          "repeat_observations2": 3
+        }
+      },
+      {
+        "pair": 7,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-admitted-block-reuse-20261006/binaries/nuwax_nav_stack",
+          "surface_chunks::tests::evidence_revision_refreshes_observations_without_dirtying_geometry",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-admitted-block-reuse-20261006/matched-operations/07-candidate.log",
+        "exit_code": 0,
+        "process_wall_s": 0.08623163599986583,
+        "process_user_cpu_s": 0.060823999999999996,
+        "process_system_cpu_s": 0.021686,
+        "launch_peak_rss_kib": 40576,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 3,
+        "signature": {
+          "cells": 4096,
+          "blocks": 4,
+          "included_bytes": [
+            49216,
+            49216
+          ],
+          "columns_read_points": [
+            4096,
+            0
+          ],
+          "client_initialized": "false",
+          "stages": [
+            "receive1",
+            "observations1",
+            "columns1",
+            "receive2",
+            "observations2",
+            "columns2",
+            "repeat_receive2",
+            "repeat_observations2"
+          ]
+        },
+        "operations_us": {
+          "receive1": 3037,
+          "observations1": 10075,
+          "columns1": 10510,
+          "receive2": 3763,
+          "observations2": 3989,
+          "columns2": 28,
+          "repeat_receive2": 3301,
+          "repeat_observations2": 3
+        }
+      }
+    ],
+    "summary": {
+      "baseline": {
+        "operations_us": {
+          "receive1": {
+            "median": 3689,
+            "min": 2770,
+            "max": 11028
+          },
+          "observations1": {
+            "median": 15227,
+            "min": 7796,
+            "max": 20969
+          },
+          "columns1": {
+            "median": 11552,
+            "min": 8322,
+            "max": 18957
+          },
+          "receive2": {
+            "median": 4058,
+            "min": 3577,
+            "max": 9560
+          },
+          "observations2": {
+            "median": 9522,
+            "min": 6806,
+            "max": 11697
+          },
+          "columns2": {
+            "median": 35,
+            "min": 26,
+            "max": 71
+          },
+          "repeat_receive2": {
+            "median": 3651,
+            "min": 2966,
+            "max": 5414
+          },
+          "repeat_observations2": {
+            "median": 3,
+            "min": 2,
+            "max": 3
+          }
+        },
+        "observations_combined_us": {
+          "median": 25348,
+          "min": 14602,
+          "max": 32382
+        },
+        "all_operations_us": {
+          "median": 47770,
+          "min": 32322,
+          "max": 76690
+        },
+        "process_cpu_s": {
+          "median": 0.10820099999999999,
+          "min": 0.076525,
+          "max": 0.17496
+        },
+        "process_wall_s": {
+          "median": 0.11482176600111416,
+          "min": 0.07818243500514654,
+          "max": 0.17704547400353476
+        },
+        "launch_peak_rss_kib": {
+          "median": 40576,
+          "min": 40576,
+          "max": 40576
+        }
+      },
+      "candidate": {
+        "operations_us": {
+          "receive1": {
+            "median": 3535,
+            "min": 3037,
+            "max": 5320
+          },
+          "observations1": {
+            "median": 10075,
+            "min": 8235,
+            "max": 11777
+          },
+          "columns1": {
+            "median": 10467,
+            "min": 8189,
+            "max": 18765
+          },
+          "receive2": {
+            "median": 4486,
+            "min": 3375,
+            "max": 9553
+          },
+          "observations2": {
+            "median": 4606,
+            "min": 3989,
+            "max": 7270
+          },
+          "columns2": {
+            "median": 27,
+            "min": 24,
+            "max": 79
+          },
+          "repeat_receive2": {
+            "median": 3578,
+            "min": 3231,
+            "max": 3720
+          },
+          "repeat_observations2": {
+            "median": 3,
+            "min": 2,
+            "max": 6
+          }
+        },
+        "observations_combined_us": {
+          "median": 14064,
+          "min": 12237,
+          "max": 18070
+        },
+        "all_operations_us": {
+          "median": 37506,
+          "min": 31449,
+          "max": 53728
+        },
+        "process_cpu_s": {
+          "median": 0.09905599999999999,
+          "min": 0.077787,
+          "max": 0.127138
+        },
+        "process_wall_s": {
+          "median": 0.11004013399360701,
+          "min": 0.08355657100037206,
+          "max": 0.13391542300087167
+        },
+        "launch_peak_rss_kib": {
+          "median": 40576,
+          "min": 40576,
+          "max": 40576
+        }
+      }
+    },
+    "same_input_operation_signature": true
+  },
+  "limits": "Component workload, mixed test profile, no RSS/release/fulltransport/realtime claim; realprocessRPC unrun dueknownAF_UNIX restriction. Observation pairs6/7improve; alloperations5/7."
+}

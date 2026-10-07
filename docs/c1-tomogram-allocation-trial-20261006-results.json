@@ -1,0 +1,539 @@
+{
+  "scope": "Seven alternating fresh-process pairs; each value is mean of32construct or128compute operations, not per-operation quantiles; warm opt0PCT test workload; exact dump comparison performed before pairing",
+  "binary_identities": {
+    "baseline": {
+      "path": "/workspace/shared/neh-tomogram-allocation-20261006/baseline/nuwax-nav-pct-test",
+      "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_pct-defcc5ecac4bca7d",
+      "sha256": "834e1a6398d1fbd49651b2dc7200c85b61130c075ee0adb0b69f15eb0ea284bd",
+      "bytes": 3775896,
+      "features": [
+        "default",
+        "mls-adapter"
+      ],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "source_hashes": "448aa791f764a812dac4c8c88804cbc44c92a5ed97acfd7a2183c063c64bc899  crates/nuwax-nav-pct/src/tomogram.rs\nb8d4f869e4b2b7ec8506bed6f6bc462dd2d99572708fea3594ab7c78a7f50f08  crates/nuwax-nav-pct/src/search.rs\n1dcda1cb776f6d8d99f0d24d01b554bc5435afcf74bff1ba4792953c6ef6b340  crates/nuwax-nav-pct/src/cancellation.rs\n5c1622546dc922566197b72797c8271029d6c31144836b629e17363bd6be2305  crates/nuwax-nav-mls-planner/src/surface/body.rs\n",
+      "scope": "Fixed mixed test profile; PCTopt0, MLSopt3, cfg(test) cancellation instrumentation; not release. Construction clones input inside timing, map destruction outside; separate warmed cost recomputation."
+    },
+    "candidate": {
+      "path": "/workspace/shared/neh-tomogram-allocation-20261006/candidate/nuwax-nav-pct-test",
+      "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_pct-defcc5ecac4bca7d",
+      "sha256": "768a5999579632620a11ee50fb8b0771d4fa421ee405a6ed0465f4d0339140ce",
+      "bytes": 3775976,
+      "features": [
+        "default",
+        "mls-adapter"
+      ],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "source_hashes": "9d277a9d32e18950ab8b214e41184930fe0943d41e4086d132f170589e7cb4f8  crates/nuwax-nav-pct/src/tomogram.rs\nb8d4f869e4b2b7ec8506bed6f6bc462dd2d99572708fea3594ab7c78a7f50f08  crates/nuwax-nav-pct/src/search.rs\n1dcda1cb776f6d8d99f0d24d01b554bc5435afcf74bff1ba4792953c6ef6b340  crates/nuwax-nav-pct/src/cancellation.rs\n5c1622546dc922566197b72797c8271029d6c31144836b629e17363bd6be2305  crates/nuwax-nav-mls-planner/src/surface/body.rs\n",
+      "scope": "Fixed mixed test profile; PCTopt0, MLSopt3, cfg(test) cancellation instrumentation; not release. Construction clones input inside timing, map destruction outside; separate warmed cost recomputation."
+    }
+  },
+  "exact_dump_bytes": 1417479,
+  "exact_dump_sha256": "774a0715e6f7d94ac5a04b3b790e542ee489551464e1e6eb246afe29b90b18b5",
+  "runs": [
+    {
+      "pair": 1,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/baseline/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 4.777596022999205,
+      "process_user_cpu_sec": 4.63705,
+      "process_system_cpu_sec": 0.076621,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 180,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/01-baseline.log",
+      "log_sha256": "bb9a603c89a83b8d9315943bea8fd45c2120b446ac7dc1eb96a2dc82ed34c612",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 1739023972,
+      "compute_total_ns": 2551183451,
+      "construct_ms_per_iter": 54.344499125,
+      "compute_ms_per_iter": 19.9311207109375
+    },
+    {
+      "pair": 1,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 5.1843949039976,
+      "process_user_cpu_sec": 5.087753,
+      "process_system_cpu_sec": 0.039934,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 81,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/01-candidate.log",
+      "log_sha256": "2dcc3242ce2f7e0695872c55516066ccdb92c486bb9dc800f91460febb4f5c50",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 1961942500,
+      "compute_total_ns": 2701362464,
+      "construct_ms_per_iter": 61.310703125,
+      "compute_ms_per_iter": 21.10439425
+    },
+    {
+      "pair": 2,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 5.5927331569982925,
+      "process_user_cpu_sec": 5.497974,
+      "process_system_cpu_sec": 0.038763,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 21,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/02-candidate.log",
+      "log_sha256": "f52584e5d31f17f34c11761895ef4a0770f0e06af74b02f8bfd478c45502e911",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 2092949004,
+      "compute_total_ns": 2943059202,
+      "construct_ms_per_iter": 65.404656375,
+      "compute_ms_per_iter": 22.992650015625
+    },
+    {
+      "pair": 2,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/baseline/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 5.33003775299585,
+      "process_user_cpu_sec": 5.229226,
+      "process_system_cpu_sec": 0.049843,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 19,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/02-baseline.log",
+      "log_sha256": "ee9ee80c8d7c8e541612a73aa1a66aee19d35ba92656b65b262fb964a7445b25",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 2043442299,
+      "compute_total_ns": 2722305514,
+      "construct_ms_per_iter": 63.85757184375,
+      "compute_ms_per_iter": 21.268011828125
+    },
+    {
+      "pair": 3,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/baseline/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 6.516838499002915,
+      "process_user_cpu_sec": 6.44517,
+      "process_system_cpu_sec": 0.044162,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 22,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/03-baseline.log",
+      "log_sha256": "919b0cc1b989bc42f96347a22b3772f44b18748f83979d0bcd7ce9c9f7869aea",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 2064961659,
+      "compute_total_ns": 3949270039,
+      "construct_ms_per_iter": 64.53005184375,
+      "compute_ms_per_iter": 30.8536721796875
+    },
+    {
+      "pair": 3,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 6.465128107003693,
+      "process_user_cpu_sec": 6.193844,
+      "process_system_cpu_sec": 0.08795399999999999,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 221,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/03-candidate.log",
+      "log_sha256": "a2a9dd7105b2fd6737dd161797113fe4f4077bf4a1bf8d9bebbd73f647eab825",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 1931503685,
+      "compute_total_ns": 3859989747,
+      "construct_ms_per_iter": 60.35949015625,
+      "compute_ms_per_iter": 30.1561698984375
+    },
+    {
+      "pair": 4,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 6.7155925540064345,
+      "process_user_cpu_sec": 6.548326,
+      "process_system_cpu_sec": 0.07466099999999999,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 101,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/04-candidate.log",
+      "log_sha256": "01ea40c69871331bdeb0548c24115d172fad908e556abfcc91271f88466971a5",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 2410435853,
+      "compute_total_ns": 3426728054,
+      "construct_ms_per_iter": 75.32612040625,
+      "compute_ms_per_iter": 26.771312921875
+    },
+    {
+      "pair": 4,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/baseline/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 6.04330583599949,
+      "process_user_cpu_sec": 5.953662,
+      "process_system_cpu_sec": 0.043746,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 21,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/04-baseline.log",
+      "log_sha256": "0b71ae0a220afbd03a223038daf31b394d1da17a764e5b6f54f3215d88459161",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 2289402243,
+      "compute_total_ns": 3037724222,
+      "construct_ms_per_iter": 71.54382009375,
+      "compute_ms_per_iter": 23.732220484375
+    },
+    {
+      "pair": 5,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/baseline/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 4.569674386999395,
+      "process_user_cpu_sec": 4.453946,
+      "process_system_cpu_sec": 0.062492,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 198,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/05-baseline.log",
+      "log_sha256": "d64792c8aff37c0d54cdc9253b9b073043452e44f77fcc0f89456524337d3d08",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 1751107104,
+      "compute_total_ns": 2340050149,
+      "construct_ms_per_iter": 54.722097,
+      "compute_ms_per_iter": 18.2816417890625
+    },
+    {
+      "pair": 5,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 4.7189242520034895,
+      "process_user_cpu_sec": 4.691961,
+      "process_system_cpu_sec": 0.013472,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 26,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/05-candidate.log",
+      "log_sha256": "6e99f9f3d8dde01f8f26aefca0c427442b94d642679d34e5da43b503600bc1cd",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 1794462638,
+      "compute_total_ns": 2466572415,
+      "construct_ms_per_iter": 56.0769574375,
+      "compute_ms_per_iter": 19.2700969921875
+    },
+    {
+      "pair": 6,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 4.777762660996814,
+      "process_user_cpu_sec": 4.73938,
+      "process_system_cpu_sec": 0.026882999999999997,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 4,
+      "involuntary_context_switches": 22,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/06-candidate.log",
+      "log_sha256": "09f79660eda9ef63d84be772e43594e4bf56b868ea160df734bf90727fdc0ae5",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 1754354017,
+      "compute_total_ns": 2552304119,
+      "construct_ms_per_iter": 54.82356303125,
+      "compute_ms_per_iter": 19.9398759296875
+    },
+    {
+      "pair": 6,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/baseline/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 5.731950142995629,
+      "process_user_cpu_sec": 5.685191,
+      "process_system_cpu_sec": 0.036157999999999996,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 23,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/06-baseline.log",
+      "log_sha256": "cc397bebde2bb9290b8b161b3967c4085d4db630623cccaceee684e1bde3d532",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 2250536208,
+      "compute_total_ns": 2931488069,
+      "construct_ms_per_iter": 70.3292565,
+      "compute_ms_per_iter": 22.9022505390625
+    },
+    {
+      "pair": 7,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/baseline/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 6.073016369999095,
+      "process_user_cpu_sec": 6.0156,
+      "process_system_cpu_sec": 0.016399999999999998,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 20,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/07-baseline.log",
+      "log_sha256": "c024acf69c75df2baee0f9644569d52d5d98886a543d1e444fc0852a084c4c0b",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 2323390267,
+      "compute_total_ns": 3132810120,
+      "construct_ms_per_iter": 72.60594584375,
+      "compute_ms_per_iter": 24.4750790625
+    },
+    {
+      "pair": 7,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 8.084256555994216,
+      "process_user_cpu_sec": 7.916425,
+      "process_system_cpu_sec": 0.101578,
+      "launch_peak_rss_kib": 19584,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 399,
+      "log": "/workspace/shared/neh-tomogram-allocation-20261006/matched/07-candidate.log",
+      "log_sha256": "165d47d90f9514e553fb3a5db3171fe28dfb44af1bfb8b37a7d13f4ef4174a8d",
+      "fixture": "tomogram_allocation fixture=mixed_80x64 input_columns=5012 input_bands=5524 cells=5268 directed_edges=40120 warmups=4 construct_reps=32 cost_reps=128",
+      "construct_total_ns": 4620088059,
+      "compute_total_ns": 2805617127,
+      "construct_ms_per_iter": 144.37775184375,
+      "compute_ms_per_iter": 21.9188838046875
+    }
+  ],
+  "summary": {
+    "construct_ms_per_iter": {
+      "baseline_median": 64.53005184375,
+      "candidate_median": 61.310703125,
+      "ratio_of_medians": 0.9501108611140562,
+      "paired_median_ratio": 1.0247589275955562,
+      "candidate_wins": 2,
+      "baseline_min": 54.344499125,
+      "baseline_max": 72.60594584375,
+      "candidate_min": 54.82356303125,
+      "candidate_max": 144.37775184375,
+      "paired_ratios": [
+        1.1281860006470343,
+        1.0242271117830082,
+        0.9353702411769573,
+        1.0528669046123582,
+        1.0247589275955562,
+        0.7795271236978029,
+        1.9885114113719404
+      ]
+    },
+    "compute_ms_per_iter": {
+      "baseline_median": 22.9022505390625,
+      "candidate_median": 21.9188838046875,
+      "ratio_of_medians": 0.9570624409728751,
+      "paired_median_ratio": 1.054068185698528,
+      "candidate_wins": 3,
+      "baseline_min": 18.2816417890625,
+      "baseline_max": 30.8536721796875,
+      "candidate_min": 19.2700969921875,
+      "candidate_max": 30.1561698984375,
+      "paired_ratios": [
+        1.058866410779332,
+        1.0810907103793934,
+        0.977393216691101,
+        1.1280576522327905,
+        1.054068185698528,
+        0.8706513753169227,
+        0.8955592645365944
+      ]
+    }
+  },
+  "disposition": {
+    "status": "rejected_no_demonstrated_matched_gain",
+    "production_restored_sha256": "448aa791f764a812dac4c8c88804cbc44c92a5ed97acfd7a2183c063c64bc899",
+    "candidate_sha256": "9d277a9d32e18950ab8b214e41184930fe0943d41e4086d132f170589e7cb4f8",
+    "independent_review": "Both production edits rejected together; no statistical slowdown or individual-effect claim. Earlier accepted source unchanged. No rerun after exact frozen baseline restoration."
+  },
+  "initial_runs": {
+    "baseline": {
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/baseline/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "wall_seconds": 4.676127623002685,
+      "user_cpu_seconds": 4.637815,
+      "system_cpu_seconds": 0.030937,
+      "launch_peak_rss_kib": 15476,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 31,
+      "exact_dump": {
+        "path": "/workspace/shared/neh-tomogram-allocation-20261006/baseline/exact-output.txt",
+        "bytes": 1417479,
+        "sha256": "774a0715e6f7d94ac5a04b3b790e542ee489551464e1e6eb246afe29b90b18b5"
+      }
+    },
+    "candidate": {
+      "command": [
+        "/workspace/shared/neh-tomogram-allocation-20261006/candidate/nuwax-nav-pct-test",
+        "tomogram::allocation_benchmark_tests::tomogram_allocation_frozen_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "wall_seconds": 5.530727114004549,
+      "user_cpu_seconds": 5.407909,
+      "system_cpu_seconds": 0.049288,
+      "launch_peak_rss_kib": 15440,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 237,
+      "exact_dump": {
+        "path": "/workspace/shared/neh-tomogram-allocation-20261006/candidate/exact-output.txt",
+        "bytes": 1417479,
+        "sha256": "774a0715e6f7d94ac5a04b3b790e542ee489551464e1e6eb246afe29b90b18b5"
+      }
+    }
+  },
+  "functional_regressions": {
+    "command": [
+      "/workspace/shared/neh-tomogram-allocation-20261006/candidate/nuwax-nav-pct-test",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "passed": 15,
+    "failed": 0,
+    "ignored": 1,
+    "log": "/workspace/shared/neh-tomogram-allocation-20261006/candidate/focused-regressions.log",
+    "log_sha256": "dd83307e9edc25c536dd27a2175ba24cce1fb8643d7c36b5144b020c14f433fb"
+  },
+  "mapping": {
+    "local_base": "2bf54cc108a63dfa728a486fefd4de8ce8331620",
+    "base_tree": "1fabe2eac417c4fecde21552148f22b2b93dbe72",
+    "mapped_remote_base": "410290dbc45c20db10bf2782556b555a0175bcc4",
+    "committed": false
+  }
+}

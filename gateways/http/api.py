@@ -70,7 +70,7 @@ class NavigationGoalRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
     goal_id: str = Field(..., min_length=1, description="客户端生成的 goal 标识。")
-    pose: Dict[str, Any] = Field(default_factory=dict, description="目标位姿字典。")
+    pose: Dict[str, Any] = Field(default_factory=dict, description="目标位姿字典，可用 x/y/z 或 position。显式 z（含 0）原样保留；分配式 schema 2 三维地图省略 z 时，在定位准备后读取同坐标系、当前拥有方验证且新鲜的机体高度，不可用时失败。旧式 schema 1 三维及二维省略时为兼容值 0，不代表拥有方高度证据。")
     frame_id: str = Field(default="map", description="位姿所在的坐标系。")
 
 
@@ -100,7 +100,7 @@ def _build_navigation_goal(goal: NavigationGoalRequest) -> NavigationGoal:
             position=Vector3(
                 x=float(pose_payload["x"]),
                 y=float(pose_payload["y"]),
-                z=float(pose_payload.get("z", 0.0)),
+                **({"z": float(pose_payload["z"])} if "z" in pose_payload else {}),
             ),
             orientation=Quaternion(z=math.sin(half_yaw), w=math.cos(half_yaw)),
         )
@@ -871,7 +871,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             arguments = {
                 "goal_id": goal.goal_id,
                 "frame_id": pose.frame_id,
-                "x": pose.position.x, "y": pose.position.y, "z": pose.position.z,
+                "x": pose.position.x, "y": pose.position.y,
+                **({"z": pose.position.z} if "z" in pose.position.model_fields_set else {}),
                 "yaw_rad": 2.0 * math.atan2(orientation.z, orientation.w),
             }
             return await run_in_threadpool(_invoke_capability, request, "navigate_to_pose", arguments)

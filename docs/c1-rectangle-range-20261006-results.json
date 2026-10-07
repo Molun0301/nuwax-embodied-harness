@@ -1,0 +1,5297 @@
+{
+  "scope": "Seven alternating fresh-process baseline/candidate pairs. PRIMARY comparison is actual production arm in copy-only baseline versus actual production arm in rectangle-range candidate, using identical frozen harness. The old frozen virtual arm includes earlier copies and is retained only as output oracle/control, never as incremental raster baseline. Each process has2 warmup pairs then16 FailClosed or4 rectangle pairs with output destruction included. Normal Geometry mainopt0 test profile, MLS/runtimeopt3. Setup/assertions excluded. Combined process CPU/RSS includes old reference, production and fixture copies, not per-version application resources. Pooled operation quantiles are finite observed samples, not realtime guarantees.",
+  "binary_identities": {
+    "baseline": {
+      "path": "/workspace/shared/neh-rectangle-range-20261006/baseline/nuwax-geometry-runtime-test",
+      "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_geometry_runtime-edd133c562540c52",
+      "sha256": "661de8d694f3b387e55414ce47a360dea431a676f59287e462153fd91bdb9a05",
+      "bytes": 124551160,
+      "features": [
+        "default",
+        "real-lcm-bridge"
+      ],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "source_hashes": "de3bc5fc239f96e82aa868a513c4ae56793e1516efd50c6ca1608660ae0b0c48  src/mapping_adapter.rs\n2e2a09d1babd442f01d3796fd6a32299d148a0044f3846de9339d6c99a8b3931  src/forbidden_zones.rs\n426bf0c68aaf7fe4701582dfb70ec05d06832796a0ee8c87897bd9b4cdcb6911  src/mapping_adapter_virtual_mask_tests.rs\n1a6393b4c01d8e380d6c06756554e4c727d786a9656d6415ba91b35256376da1  src/forbidden_zones_copy_trial_reference.rs\n5c372152d8fbae92419cd8a0039dd64021ffcc7fb1fa0b9571bca4e9d3701e55  src/forbidden_zones_rectangle_scan_tests.rs\n5b55fce15f2f0d76d296be3b5bf628093517617a76ba2be263fd388de1f839fe  src/mapping_adapter_rectangle_scan_tests.rs\nc71c6ea19ef5fa2ba75e29f10425ab62bbaaf94cab7bdca3b09431f472bdab90  src/lcm_runtime.rs\n9d0be2a30be10ef941bd8fd82045c9a48be8a4c9f1a48007abc1b0a3912c2401  Cargo.lock\na0ecb96b0a4b77e4a7c03d953a90483b702c6bdcdaef781bded063ec5711acdf  ../../nuwax-workspace/crates/nuwax-nav-pct/src/tomogram.rs\n",
+      "scope": "Normal cached Geometry mainopt0 test profile; MLS/runtimeopt3. Rectangle range trial: use actual production arm versus preserved copy-only baseline executable for incremental gains. Old virtual reference includes copy work and is only output oracle/measurement control. Result drop included; no session/socket startup; not release."
+    },
+    "candidate": {
+      "path": "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+      "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_geometry_runtime-edd133c562540c52",
+      "sha256": "97165adb5c8bfef1dd9c056adac67dd94fb111165da890374c25fb85bc3988cd",
+      "bytes": 124557344,
+      "features": [
+        "default",
+        "real-lcm-bridge"
+      ],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "source_hashes": "de3bc5fc239f96e82aa868a513c4ae56793e1516efd50c6ca1608660ae0b0c48  src/mapping_adapter.rs\n291eabe6a22cd6335c9dca2971c0b4e6aac1d1e319d4609fd80164c68cc85361  src/forbidden_zones.rs\n426bf0c68aaf7fe4701582dfb70ec05d06832796a0ee8c87897bd9b4cdcb6911  src/mapping_adapter_virtual_mask_tests.rs\n1a6393b4c01d8e380d6c06756554e4c727d786a9656d6415ba91b35256376da1  src/forbidden_zones_copy_trial_reference.rs\n5c372152d8fbae92419cd8a0039dd64021ffcc7fb1fa0b9571bca4e9d3701e55  src/forbidden_zones_rectangle_scan_tests.rs\n5b55fce15f2f0d76d296be3b5bf628093517617a76ba2be263fd388de1f839fe  src/mapping_adapter_rectangle_scan_tests.rs\nc71c6ea19ef5fa2ba75e29f10425ab62bbaaf94cab7bdca3b09431f472bdab90  src/lcm_runtime.rs\n9d0be2a30be10ef941bd8fd82045c9a48be8a4c9f1a48007abc1b0a3912c2401  Cargo.lock\na0ecb96b0a4b77e4a7c03d953a90483b702c6bdcdaef781bded063ec5711acdf  ../../nuwax-workspace/crates/nuwax-nav-pct/src/tomogram.rs\n",
+      "scope": "Normal cached Geometry mainopt0 test profile; MLS/runtimeopt3. Rectangle range trial: use actual production arm versus preserved copy-only baseline executable for incremental gains. Old virtual reference includes copy work and is only output oracle/measurement control. Result drop included; no session/socket startup; not release."
+    }
+  },
+  "runs": [
+    {
+      "pair": 1,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/baseline/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 11.207361095002852,
+      "process_user_cpu_sec": 10.929344,
+      "process_system_cpu_sec": 0.25254299999999996,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 141,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/01-baseline.log",
+      "log_sha256": "186863c513da3ab605f6809b1cde5e84f7e8d7d6e03c8c039b3e6ac9a53921c8",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                802393,
+                709014,
+                696779,
+                1044257,
+                914031,
+                725520,
+                786493,
+                1191775,
+                1500590,
+                694567,
+                759991,
+                660438,
+                643052,
+                1321238,
+                918877,
+                646612
+              ],
+              "total_ns": 14015627,
+              "mean_ms": 0.8759766875
+            },
+            "frozen": {
+              "samples_ns": [
+                1672221,
+                1551545,
+                1891644,
+                2183883,
+                1607573,
+                2276688,
+                4226720,
+                3040820,
+                2038578,
+                1799455,
+                1619678,
+                1531852,
+                1531199,
+                1644989,
+                1810328,
+                2092851
+              ],
+              "total_ns": 32520024,
+              "mean_ms": 2.0325015
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                17409037,
+                17867065,
+                17240410,
+                18431770
+              ],
+              "total_ns": 70948282,
+              "mean_ms": 17.7370705
+            },
+            "frozen": {
+              "samples_ns": [
+                18202716,
+                21873310,
+                22716097,
+                17901300
+              ],
+              "total_ns": 80693423,
+              "mean_ms": 20.17335575
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                16748984,
+                14739743,
+                13357999,
+                16766281,
+                13106285,
+                15413073,
+                12747696,
+                13957366,
+                15103452,
+                15206971,
+                13451054,
+                12236449,
+                12780162,
+                12680116,
+                13384978,
+                13240202
+              ],
+              "total_ns": 224920811,
+              "mean_ms": 14.0575506875
+            },
+            "frozen": {
+              "samples_ns": [
+                30254071,
+                29998269,
+                33205690,
+                33699523,
+                33277534,
+                34545894,
+                29086059,
+                33463190,
+                31649822,
+                33614657,
+                29006275,
+                30881770,
+                31344855,
+                30273092,
+                40292585,
+                33467676
+              ],
+              "total_ns": 518060962,
+              "mean_ms": 32.378810125
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                285840162,
+                302016734,
+                457330872,
+                277185392
+              ],
+              "total_ns": 1322373160,
+              "mean_ms": 330.59329
+            },
+            "frozen": {
+              "samples_ns": [
+                359142975,
+                436923629,
+                293340520,
+                302439718
+              ],
+              "total_ns": 1391846842,
+              "mean_ms": 347.9617105
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                60415651,
+                69430578,
+                59026670,
+                60806091,
+                76493239,
+                60801447,
+                61264121,
+                73976061,
+                63426880,
+                60949386,
+                66240693,
+                58364107,
+                58978782,
+                60511495,
+                72708989,
+                60892946
+              ],
+              "total_ns": 1024287136,
+              "mean_ms": 64.017946
+            },
+            "frozen": {
+              "samples_ns": [
+                135816958,
+                133980041,
+                144970934,
+                134794606,
+                142336500,
+                145679352,
+                146201436,
+                136034345,
+                132616111,
+                148168319,
+                128662896,
+                148784788,
+                140152111,
+                134707521,
+                139817834,
+                169522194
+              ],
+              "total_ns": 2262245946,
+              "mean_ms": 141.390371625
+            }
+          }
+        }
+      ]
+    },
+    {
+      "pair": 1,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 9.999235510993458,
+      "process_user_cpu_sec": 9.75577,
+      "process_system_cpu_sec": 0.222098,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 69,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/01-candidate.log",
+      "log_sha256": "f69150ca72c1816f4b232971d8aea12226d8f4d245f13f93f96cf6f5a43edb4b",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                771080,
+                1113581,
+                733948,
+                800485,
+                761918,
+                756910,
+                927793,
+                755657,
+                1006528,
+                834835,
+                775043,
+                757396,
+                747993,
+                758596,
+                943049,
+                2032535
+              ],
+              "total_ns": 14477347,
+              "mean_ms": 0.9048341875
+            },
+            "frozen": {
+              "samples_ns": [
+                4070017,
+                2350975,
+                2091115,
+                2046231,
+                1726760,
+                1631328,
+                1778907,
+                1643636,
+                2076474,
+                1629457,
+                1544770,
+                1585338,
+                1582299,
+                1584753,
+                1781954,
+                1646395
+              ],
+              "total_ns": 30770409,
+              "mean_ms": 1.9231505625
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                3281455,
+                2151403,
+                2525722,
+                2465282
+              ],
+              "total_ns": 10423862,
+              "mean_ms": 2.6059655
+            },
+            "frozen": {
+              "samples_ns": [
+                16759291,
+                15424241,
+                15642128,
+                19086739
+              ],
+              "total_ns": 66912399,
+              "mean_ms": 16.72809975
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                12614212,
+                14312720,
+                24598441,
+                14279454,
+                13797425,
+                13184985,
+                17103062,
+                13175512,
+                13071404,
+                19860951,
+                14571465,
+                13376186,
+                14995549,
+                15634311,
+                15214297,
+                14156522
+              ],
+              "total_ns": 243946496,
+              "mean_ms": 15.246656
+            },
+            "frozen": {
+              "samples_ns": [
+                28885059,
+                29591977,
+                44368703,
+                36219536,
+                28506362,
+                30281373,
+                33524765,
+                41193441,
+                28396240,
+                38226312,
+                28640009,
+                32836994,
+                37256501,
+                30286839,
+                29146081,
+                33212422
+              ],
+              "total_ns": 530572614,
+              "mean_ms": 33.160788375
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                59800791,
+                59141415,
+                41663181,
+                59595600
+              ],
+              "total_ns": 220200987,
+              "mean_ms": 55.05024675
+            },
+            "frozen": {
+              "samples_ns": [
+                357424694,
+                298265708,
+                285221199,
+                300744750
+              ],
+              "total_ns": 1241656351,
+              "mean_ms": 310.41408775
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                64506148,
+                79681201,
+                116778257,
+                103331440,
+                86230351,
+                97788259,
+                73361920,
+                65831737,
+                65894396,
+                92683758,
+                77149228,
+                67292960,
+                73355174,
+                66196532,
+                67207550,
+                68655194
+              ],
+              "total_ns": 1265944105,
+              "mean_ms": 79.1215065625
+            },
+            "frozen": {
+              "samples_ns": [
+                155350402,
+                139539668,
+                319110685,
+                243515743,
+                208133190,
+                202564646,
+                142766499,
+                146980312,
+                164311702,
+                148450900,
+                144271540,
+                131425561,
+                135118725,
+                145036239,
+                148152457,
+                169744733
+              ],
+              "total_ns": 2744473002,
+              "mean_ms": 171.529562625
+            }
+          }
+        }
+      ]
+    },
+    {
+      "pair": 2,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 13.517014290002408,
+      "process_user_cpu_sec": 12.908798,
+      "process_system_cpu_sec": 0.540777,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 86,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/02-candidate.log",
+      "log_sha256": "caa8f7461442e7649e5afe4c4c06b1f8ed5d667b76e163b376e69c4ade98721a",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                747451,
+                748312,
+                730458,
+                836731,
+                897394,
+                921359,
+                758811,
+                746859,
+                747392,
+                804474,
+                954646,
+                1699919,
+                919036,
+                903372,
+                746348,
+                808661
+              ],
+              "total_ns": 13971223,
+              "mean_ms": 0.8732014375
+            },
+            "frozen": {
+              "samples_ns": [
+                1639000,
+                1605786,
+                2094147,
+                2070999,
+                1540317,
+                1726227,
+                1665464,
+                1574548,
+                1571828,
+                1509600,
+                1613912,
+                1533141,
+                1575893,
+                1709603,
+                1620254,
+                2021381
+              ],
+              "total_ns": 27072100,
+              "mean_ms": 1.69200625
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                4882345,
+                2495495,
+                2624854,
+                2417174
+              ],
+              "total_ns": 12419868,
+              "mean_ms": 3.104967
+            },
+            "frozen": {
+              "samples_ns": [
+                16448054,
+                18249662,
+                17621202,
+                15569516
+              ],
+              "total_ns": 67888434,
+              "mean_ms": 16.9721085
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                13724167,
+                17031093,
+                18790120,
+                15119043,
+                15434690,
+                13542841,
+                14132208,
+                13887546,
+                20232333,
+                13737816,
+                23189222,
+                13679912,
+                14492068,
+                16480400,
+                17684509,
+                14899400
+              ],
+              "total_ns": 256057368,
+              "mean_ms": 16.0035855
+            },
+            "frozen": {
+              "samples_ns": [
+                28748210,
+                27698263,
+                34202099,
+                40343240,
+                28572714,
+                27175563,
+                29625067,
+                32373857,
+                55251362,
+                29486332,
+                32110402,
+                28229134,
+                33860102,
+                36058871,
+                32725083,
+                41756372
+              ],
+              "total_ns": 538216671,
+              "mean_ms": 33.6385419375
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                50389350,
+                59276738,
+                65006666,
+                73725140
+              ],
+              "total_ns": 248397894,
+              "mean_ms": 62.0994735
+            },
+            "frozen": {
+              "samples_ns": [
+                509263506,
+                445558630,
+                390442347,
+                406971920
+              ],
+              "total_ns": 1752236403,
+              "mean_ms": 438.05910075
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                175888582,
+                110258501,
+                75893490,
+                143653779,
+                130295730,
+                367785688,
+                79361132,
+                74367787,
+                70441539,
+                83878124,
+                72327016,
+                68963353,
+                74180994,
+                79288552,
+                81224296,
+                72687607
+              ],
+              "total_ns": 1760496170,
+              "mean_ms": 110.031010625
+            },
+            "frozen": {
+              "samples_ns": [
+                338432655,
+                280363969,
+                201371567,
+                277106755,
+                274923824,
+                745558698,
+                172007279,
+                138448814,
+                137610879,
+                152360265,
+                132787169,
+                155563192,
+                148290533,
+                152680160,
+                155744977,
+                142211709
+              ],
+              "total_ns": 3605462445,
+              "mean_ms": 225.3414028125
+            }
+          }
+        }
+      ]
+    },
+    {
+      "pair": 2,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/baseline/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 10.969746602997475,
+      "process_user_cpu_sec": 10.715197,
+      "process_system_cpu_sec": 0.20704399999999998,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 43,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/02-baseline.log",
+      "log_sha256": "78bec236211cac213e2cf439d99adadbddb8749e3edc90d64bc56a2d7390d118",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                858719,
+                766574,
+                756576,
+                892148,
+                914516,
+                644265,
+                904160,
+                674687,
+                660879,
+                849816,
+                894566,
+                671790,
+                660491,
+                809650,
+                689882,
+                676576
+              ],
+              "total_ns": 12325295,
+              "mean_ms": 0.7703309375
+            },
+            "frozen": {
+              "samples_ns": [
+                1698747,
+                2068114,
+                2319598,
+                1748401,
+                1976997,
+                1788364,
+                3272596,
+                2273179,
+                1979293,
+                2085378,
+                1538543,
+                2103622,
+                1625350,
+                1576055,
+                1527596,
+                1601856
+              ],
+              "total_ns": 31183689,
+              "mean_ms": 1.9489805625
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                16068555,
+                15903282,
+                15529763,
+                15708194
+              ],
+              "total_ns": 63209794,
+              "mean_ms": 15.8024485
+            },
+            "frozen": {
+              "samples_ns": [
+                16367677,
+                20602365,
+                17042672,
+                16086764
+              ],
+              "total_ns": 70099478,
+              "mean_ms": 17.5248695
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                18905609,
+                15103761,
+                12673697,
+                12298143,
+                14789184,
+                11876604,
+                12183045,
+                12426442,
+                13387418,
+                13725158,
+                11684051,
+                15749118,
+                20277678,
+                15416488,
+                12260306,
+                20186780
+              ],
+              "total_ns": 232943482,
+              "mean_ms": 14.558967625
+            },
+            "frozen": {
+              "samples_ns": [
+                33601259,
+                39716227,
+                29687350,
+                32338914,
+                28717779,
+                33022548,
+                36466374,
+                45209841,
+                32188906,
+                31724391,
+                37334093,
+                29124005,
+                31255601,
+                27895539,
+                31514102,
+                34650741
+              ],
+              "total_ns": 534447670,
+              "mean_ms": 33.402979375
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                305065242,
+                286795620,
+                282794941,
+                281833690
+              ],
+              "total_ns": 1156489493,
+              "mean_ms": 289.12237325
+            },
+            "frozen": {
+              "samples_ns": [
+                305597931,
+                313658236,
+                310030130,
+                309068186
+              ],
+              "total_ns": 1238354483,
+              "mean_ms": 309.58862075
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                61835915,
+                63895450,
+                64476813,
+                60419951,
+                68410879,
+                66469337,
+                64327850,
+                62819991,
+                65817616,
+                60676610,
+                61188626,
+                65720033,
+                61514422,
+                66154135,
+                61803056,
+                96401931
+              ],
+              "total_ns": 1051932615,
+              "mean_ms": 65.7457884375
+            },
+            "frozen": {
+              "samples_ns": [
+                138580314,
+                133893432,
+                134295523,
+                143441795,
+                138243759,
+                144097954,
+                144084309,
+                137704341,
+                135455877,
+                140196072,
+                145783212,
+                132191107,
+                143210010,
+                146671564,
+                137014728,
+                144062789
+              ],
+              "total_ns": 2238926786,
+              "mean_ms": 139.932924125
+            }
+          }
+        }
+      ]
+    },
+    {
+      "pair": 3,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/baseline/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 11.014292787003797,
+      "process_user_cpu_sec": 10.754546,
+      "process_system_cpu_sec": 0.205584,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 43,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/03-baseline.log",
+      "log_sha256": "9581156d664f134528476c695ae61daeb8d32cb3ed9db3be3d1406edac61ca55",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                661183,
+                756297,
+                668019,
+                786274,
+                643549,
+                829702,
+                986908,
+                751061,
+                670894,
+                1212733,
+                801719,
+                663873,
+                648050,
+                665901,
+                2103288,
+                756721
+              ],
+              "total_ns": 13606172,
+              "mean_ms": 0.85038575
+            },
+            "frozen": {
+              "samples_ns": [
+                2815124,
+                1797423,
+                2006976,
+                1800676,
+                2072263,
+                1836454,
+                1687916,
+                1581582,
+                1627998,
+                2033628,
+                1914153,
+                1888562,
+                2209489,
+                1483150,
+                1800444,
+                1851554
+              ],
+              "total_ns": 30407392,
+              "mean_ms": 1.900462
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                16751271,
+                17320563,
+                18892947,
+                16010660
+              ],
+              "total_ns": 68975441,
+              "mean_ms": 17.24386025
+            },
+            "frozen": {
+              "samples_ns": [
+                18508484,
+                18732380,
+                20106792,
+                18013930
+              ],
+              "total_ns": 75361586,
+              "mean_ms": 18.8403965
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                13934279,
+                19731500,
+                14601093,
+                12698189,
+                14041787,
+                17606038,
+                14997168,
+                14774964,
+                23827871,
+                22197744,
+                15863630,
+                14485146,
+                14166413,
+                12723027,
+                14005929,
+                12856991
+              ],
+              "total_ns": 252511769,
+              "mean_ms": 15.7819855625
+            },
+            "frozen": {
+              "samples_ns": [
+                36285884,
+                34254989,
+                33093498,
+                29079969,
+                34977132,
+                34352330,
+                40958512,
+                49438010,
+                36029706,
+                37663011,
+                34269808,
+                32058062,
+                30395690,
+                28871931,
+                33089020,
+                34435550
+              ],
+              "total_ns": 559253102,
+              "mean_ms": 34.953318875
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                293630418,
+                331425848,
+                340365934,
+                281058437
+              ],
+              "total_ns": 1246480637,
+              "mean_ms": 311.62015925
+            },
+            "frozen": {
+              "samples_ns": [
+                303548024,
+                305353216,
+                290492615,
+                298389146
+              ],
+              "total_ns": 1197783001,
+              "mean_ms": 299.44575025
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                63709685,
+                60835855,
+                67201419,
+                59947919,
+                70161854,
+                60375272,
+                63737456,
+                66075336,
+                59928022,
+                74685414,
+                61444791,
+                63705895,
+                63664201,
+                63803805,
+                54760087,
+                67419814
+              ],
+              "total_ns": 1021456825,
+              "mean_ms": 63.8410515625
+            },
+            "frozen": {
+              "samples_ns": [
+                129913749,
+                142988765,
+                144348636,
+                140122833,
+                142428441,
+                140423358,
+                139073992,
+                155669430,
+                139987637,
+                152225744,
+                135186044,
+                135414234,
+                141662971,
+                132863856,
+                140115954,
+                132227395
+              ],
+              "total_ns": 2244653039,
+              "mean_ms": 140.2908149375
+            }
+          }
+        }
+      ]
+    },
+    {
+      "pair": 3,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 9.532111253996845,
+      "process_user_cpu_sec": 9.258121,
+      "process_system_cpu_sec": 0.199235,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 84,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/03-candidate.log",
+      "log_sha256": "16d73be3342018450a8a8541de4c920975a8ee96d03c9d076fa81a0601c649f1",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                766605,
+                863342,
+                808897,
+                756926,
+                800995,
+                751573,
+                790293,
+                900856,
+                1186451,
+                832644,
+                1420355,
+                1407783,
+                784004,
+                846008,
+                792521,
+                732470
+              ],
+              "total_ns": 14441723,
+              "mean_ms": 0.9026076875
+            },
+            "frozen": {
+              "samples_ns": [
+                1694772,
+                1559049,
+                1750474,
+                1825657,
+                1599115,
+                2017930,
+                1600888,
+                1656503,
+                1791233,
+                1759896,
+                1807358,
+                2308297,
+                1655079,
+                1599242,
+                1801789,
+                2098643
+              ],
+              "total_ns": 28525925,
+              "mean_ms": 1.7828703125
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                2865988,
+                3368737,
+                2428814,
+                2755565
+              ],
+              "total_ns": 11419104,
+              "mean_ms": 2.854776
+            },
+            "frozen": {
+              "samples_ns": [
+                17413328,
+                16925801,
+                15994565,
+                17100887
+              ],
+              "total_ns": 67434581,
+              "mean_ms": 16.85864525
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                16301866,
+                14973829,
+                14706425,
+                16359208,
+                14691566,
+                15585630,
+                14843013,
+                14132501,
+                14545047,
+                13712285,
+                15106097,
+                13605723,
+                13689869,
+                14198597,
+                14549393,
+                12634816
+              ],
+              "total_ns": 233635865,
+              "mean_ms": 14.6022415625
+            },
+            "frozen": {
+              "samples_ns": [
+                29848448,
+                32595009,
+                29522001,
+                28041390,
+                32514831,
+                29667806,
+                31228998,
+                27755331,
+                32520782,
+                38797306,
+                32637163,
+                34054807,
+                30799029,
+                30413241,
+                32033415,
+                30713056
+              ],
+              "total_ns": 503142613,
+              "mean_ms": 31.4464133125
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                43379882,
+                49785030,
+                50160217,
+                46008051
+              ],
+              "total_ns": 189333180,
+              "mean_ms": 47.333295
+            },
+            "frozen": {
+              "samples_ns": [
+                283245357,
+                289681468,
+                276755699,
+                293799024
+              ],
+              "total_ns": 1143481548,
+              "mean_ms": 285.870387
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                67486038,
+                68543687,
+                81649270,
+                76051916,
+                71950890,
+                78138037,
+                65937411,
+                65827691,
+                68951789,
+                67000688,
+                65953680,
+                112447990,
+                86607302,
+                71806068,
+                65284161,
+                111787665
+              ],
+              "total_ns": 1225424283,
+              "mean_ms": 76.5890176875
+            },
+            "frozen": {
+              "samples_ns": [
+                141473635,
+                135624439,
+                138317360,
+                148806253,
+                138882620,
+                136950464,
+                143333098,
+                136513927,
+                142422173,
+                142156292,
+                218046136,
+                219868000,
+                165251488,
+                446516387,
+                271401099,
+                204709964
+              ],
+              "total_ns": 2930273335,
+              "mean_ms": 183.1420834375
+            }
+          }
+        }
+      ]
+    },
+    {
+      "pair": 4,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 13.657235949998721,
+      "process_user_cpu_sec": 13.207877,
+      "process_system_cpu_sec": 0.40125299999999997,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 73,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/04-candidate.log",
+      "log_sha256": "b7bf4f9bb5cc42e229d5bc05bb8029fe843dbfd225b82bd423bbf7d79ef8060f",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                843211,
+                799036,
+                833772,
+                770383,
+                733369,
+                901589,
+                919107,
+                730709,
+                748978,
+                938711,
+                783203,
+                955362,
+                751817,
+                746792,
+                881319,
+                935768
+              ],
+              "total_ns": 13273126,
+              "mean_ms": 0.829570375
+            },
+            "frozen": {
+              "samples_ns": [
+                1658680,
+                1669989,
+                1537301,
+                1506563,
+                1900412,
+                1529636,
+                1509532,
+                1501514,
+                1615748,
+                1537982,
+                2516115,
+                1744248,
+                1678214,
+                1623678,
+                1551218,
+                1513703
+              ],
+              "total_ns": 26594533,
+              "mean_ms": 1.6621583125
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                2430379,
+                2467456,
+                2631566,
+                3152926
+              ],
+              "total_ns": 10682327,
+              "mean_ms": 2.67058175
+            },
+            "frozen": {
+              "samples_ns": [
+                16034394,
+                16950747,
+                16199312,
+                15246931
+              ],
+              "total_ns": 64431384,
+              "mean_ms": 16.107846
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                24296064,
+                14117117,
+                14136323,
+                13347423,
+                24805666,
+                17533648,
+                16070115,
+                18044731,
+                34687215,
+                16643851,
+                14516014,
+                24230472,
+                38882003,
+                15866179,
+                19020497,
+                18964500
+              ],
+              "total_ns": 325161818,
+              "mean_ms": 20.322613625
+            },
+            "frozen": {
+              "samples_ns": [
+                40215563,
+                30229846,
+                28964775,
+                37874576,
+                53147698,
+                36995044,
+                33585124,
+                29259890,
+                83193087,
+                38683554,
+                45179131,
+                36341446,
+                55283189,
+                39172080,
+                35518935,
+                44434248
+              ],
+              "total_ns": 668078186,
+              "mean_ms": 41.754886625
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                53999355,
+                299431096,
+                94550407,
+                117583548
+              ],
+              "total_ns": 565564406,
+              "mean_ms": 141.3911015
+            },
+            "frozen": {
+              "samples_ns": [
+                380808061,
+                494653715,
+                490291428,
+                501500907
+              ],
+              "total_ns": 1867254111,
+              "mean_ms": 466.81352775
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                88263382,
+                88492334,
+                78862337,
+                83599860,
+                93163164,
+                126013997,
+                102148178,
+                79180566,
+                78342888,
+                94811346,
+                85168735,
+                126819629,
+                141775809,
+                103007324,
+                160552526,
+                99468377
+              ],
+              "total_ns": 1629670452,
+              "mean_ms": 101.85440325
+            },
+            "frozen": {
+              "samples_ns": [
+                170681748,
+                167816567,
+                185834690,
+                178506774,
+                158234643,
+                181401054,
+                173899026,
+                177633705,
+                166694302,
+                199801116,
+                166494912,
+                166083361,
+                202055181,
+                276013443,
+                197627600,
+                267107414
+              ],
+              "total_ns": 3035885536,
+              "mean_ms": 189.742846
+            }
+          }
+        }
+      ]
+    },
+    {
+      "pair": 4,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/baseline/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 11.019985670995084,
+      "process_user_cpu_sec": 10.803482,
+      "process_system_cpu_sec": 0.18109499999999998,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 44,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/04-baseline.log",
+      "log_sha256": "7521f9ac079f167495c4184424605bdcfc749ae6238a7edcd5a85b5ecfa3ec2a",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                643298,
+                644388,
+                847166,
+                645635,
+                681790,
+                1013731,
+                734678,
+                954087,
+                723177,
+                645200,
+                807478,
+                877742,
+                832260,
+                669191,
+                673506,
+                668929
+              ],
+              "total_ns": 12062256,
+              "mean_ms": 0.753891
+            },
+            "frozen": {
+              "samples_ns": [
+                1745076,
+                1666991,
+                1715242,
+                1617435,
+                1654188,
+                1900891,
+                2545813,
+                1878740,
+                1765797,
+                1675346,
+                1817177,
+                1659562,
+                3645511,
+                1871066,
+                1505576,
+                1792672
+              ],
+              "total_ns": 30457083,
+              "mean_ms": 1.9035676875
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                16227235,
+                18613118,
+                15334233,
+                18463270
+              ],
+              "total_ns": 68637856,
+              "mean_ms": 17.159464
+            },
+            "frozen": {
+              "samples_ns": [
+                17709864,
+                16056085,
+                19487446,
+                16374054
+              ],
+              "total_ns": 69627449,
+              "mean_ms": 17.40686225
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                13807483,
+                12200760,
+                19617201,
+                13251996,
+                13984069,
+                17255859,
+                13901948,
+                12043201,
+                13041537,
+                13780972,
+                12778814,
+                11819673,
+                14985144,
+                12485489,
+                12079943,
+                14249582
+              ],
+              "total_ns": 221283671,
+              "mean_ms": 13.8302294375
+            },
+            "frozen": {
+              "samples_ns": [
+                29942738,
+                34292430,
+                36694664,
+                32275242,
+                34061000,
+                32014663,
+                33255172,
+                32050017,
+                33231451,
+                26578678,
+                32524361,
+                27842294,
+                30629163,
+                29406523,
+                32057938,
+                32500769
+              ],
+              "total_ns": 509357103,
+              "mean_ms": 31.8348189375
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                285591261,
+                312462488,
+                314408004,
+                287389005
+              ],
+              "total_ns": 1199850758,
+              "mean_ms": 299.9626895
+            },
+            "frozen": {
+              "samples_ns": [
+                294905762,
+                311644530,
+                308314586,
+                314677909
+              ],
+              "total_ns": 1229542787,
+              "mean_ms": 307.38569675
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                58796512,
+                62528926,
+                64593034,
+                63671338,
+                66488715,
+                65647561,
+                60909979,
+                60108756,
+                56803173,
+                63746723,
+                58470674,
+                63211548,
+                61012820,
+                60336718,
+                61396522,
+                70058055
+              ],
+              "total_ns": 997781054,
+              "mean_ms": 62.361315875
+            },
+            "frozen": {
+              "samples_ns": [
+                141092353,
+                143595615,
+                144888496,
+                139683143,
+                137738957,
+                136275450,
+                137104225,
+                135105400,
+                138882440,
+                144202947,
+                141243949,
+                139341204,
+                131166018,
+                138168833,
+                142218161,
+                163024072
+              ],
+              "total_ns": 2253731263,
+              "mean_ms": 140.8582039375
+            }
+          }
+        }
+      ]
+    },
+    {
+      "pair": 5,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/baseline/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 10.917422176004038,
+      "process_user_cpu_sec": 10.660303,
+      "process_system_cpu_sec": 0.19644799999999998,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 108,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/05-baseline.log",
+      "log_sha256": "5c737bac71cafed9f9dc9c341641fc6958ad169dacadd80dd5950650728a0abb",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                663070,
+                662553,
+                709240,
+                681085,
+                810144,
+                802057,
+                776998,
+                666363,
+                922332,
+                668067,
+                911546,
+                666369,
+                654525,
+                729956,
+                665013,
+                662282
+              ],
+              "total_ns": 11651600,
+              "mean_ms": 0.728225
+            },
+            "frozen": {
+              "samples_ns": [
+                1664980,
+                1639282,
+                1547016,
+                1483795,
+                1726370,
+                1721514,
+                1689712,
+                1507785,
+                1672655,
+                1616297,
+                1801834,
+                1625507,
+                1777031,
+                1525085,
+                1539015,
+                1486151
+              ],
+              "total_ns": 26024029,
+              "mean_ms": 1.6265018125
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                18333102,
+                15923489,
+                16034996,
+                15272101
+              ],
+              "total_ns": 65563688,
+              "mean_ms": 16.390922
+            },
+            "frozen": {
+              "samples_ns": [
+                16871463,
+                17174379,
+                16804998,
+                18777341
+              ],
+              "total_ns": 69628181,
+              "mean_ms": 17.40704525
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                12797477,
+                14660770,
+                14728481,
+                12827589,
+                13561656,
+                17299173,
+                12244068,
+                16676017,
+                16274780,
+                15200879,
+                17616927,
+                14302369,
+                12530191,
+                19933004,
+                12152268,
+                12752145
+              ],
+              "total_ns": 235557794,
+              "mean_ms": 14.722362125
+            },
+            "frozen": {
+              "samples_ns": [
+                87730919,
+                38826194,
+                42963608,
+                35043802,
+                42210026,
+                39922538,
+                38127109,
+                37605806,
+                40644823,
+                47709701,
+                46834551,
+                43362776,
+                33840940,
+                30060736,
+                34091454,
+                26840889
+              ],
+              "total_ns": 665815872,
+              "mean_ms": 41.613492
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                265000282,
+                277080755,
+                264654759,
+                276799547
+              ],
+              "total_ns": 1083535343,
+              "mean_ms": 270.88383575
+            },
+            "frozen": {
+              "samples_ns": [
+                306541924,
+                291569230,
+                310830584,
+                287793653
+              ],
+              "total_ns": 1196735391,
+              "mean_ms": 299.18384775
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                65044921,
+                65344833,
+                69286054,
+                61097097,
+                61430764,
+                66831744,
+                66285083,
+                63334514,
+                65245401,
+                66389546,
+                61484269,
+                67302771,
+                62652847,
+                62492712,
+                64623479,
+                62061964
+              ],
+              "total_ns": 1030907999,
+              "mean_ms": 64.4317499375
+            },
+            "frozen": {
+              "samples_ns": [
+                149275684,
+                141213670,
+                149168745,
+                145699560,
+                140488927,
+                144410891,
+                136181626,
+                145448478,
+                147727646,
+                130292206,
+                227990353,
+                167266803,
+                142216846,
+                151693273,
+                144093254,
+                154944040
+              ],
+              "total_ns": 2418112002,
+              "mean_ms": 151.132000125
+            }
+          }
+        }
+      ]
+    },
+    {
+      "pair": 5,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 8.888201617999584,
+      "process_user_cpu_sec": 8.585886,
+      "process_system_cpu_sec": 0.248614,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 63,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/05-candidate.log",
+      "log_sha256": "19f0e4b5a083ff37c5e88600d66a897262fa2a558c0492b35df13dc9f8af4e97",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                736276,
+                733425,
+                1045193,
+                968884,
+                985638,
+                2226044,
+                769355,
+                878416,
+                1112880,
+                764768,
+                997027,
+                876418,
+                905919,
+                1154612,
+                748453,
+                945138
+              ],
+              "total_ns": 15848446,
+              "mean_ms": 0.990527875
+            },
+            "frozen": {
+              "samples_ns": [
+                2185847,
+                2178306,
+                1776664,
+                1747739,
+                1832449,
+                2144223,
+                1887634,
+                1638840,
+                1955476,
+                1973165,
+                1678712,
+                1937265,
+                1707860,
+                1650917,
+                2010105,
+                1587504
+              ],
+              "total_ns": 29892706,
+              "mean_ms": 1.868294125
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                2512087,
+                2239977,
+                2475823,
+                2406370
+              ],
+              "total_ns": 9634257,
+              "mean_ms": 2.40856425
+            },
+            "frozen": {
+              "samples_ns": [
+                14985876,
+                15646136,
+                14894685,
+                15941384
+              ],
+              "total_ns": 61468081,
+              "mean_ms": 15.36702025
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                15277449,
+                16213355,
+                17307562,
+                14024469,
+                13779443,
+                19978567,
+                12931537,
+                15563008,
+                14491433,
+                15816302,
+                16611563,
+                14937795,
+                13422072,
+                14560178,
+                16166216,
+                13815727
+              ],
+              "total_ns": 244896676,
+              "mean_ms": 15.30604225
+            },
+            "frozen": {
+              "samples_ns": [
+                38669577,
+                33085189,
+                30724612,
+                32635515,
+                30753233,
+                32616986,
+                29667190,
+                29419799,
+                36458487,
+                30500188,
+                39210184,
+                31330079,
+                32430365,
+                34122495,
+                27874237,
+                28089235
+              ],
+              "total_ns": 517587371,
+              "mean_ms": 32.3492106875
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                39168815,
+                58542085,
+                42839075,
+                47298708
+              ],
+              "total_ns": 187848683,
+              "mean_ms": 46.96217075
+            },
+            "frozen": {
+              "samples_ns": [
+                266509228,
+                282745576,
+                278689709,
+                276809120
+              ],
+              "total_ns": 1104753633,
+              "mean_ms": 276.18840825
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                65088004,
+                64951096,
+                128677129,
+                67686545,
+                70834951,
+                69180631,
+                67827353,
+                76476924,
+                71063603,
+                68371793,
+                73853195,
+                70721981,
+                62784531,
+                68818241,
+                71800380,
+                77041093
+              ],
+              "total_ns": 1175177450,
+              "mean_ms": 73.448590625
+            },
+            "frozen": {
+              "samples_ns": [
+                139617205,
+                141282396,
+                138137336,
+                263156910,
+                139898864,
+                146102914,
+                161839806,
+                135566721,
+                143610558,
+                139429538,
+                135425338,
+                146812862,
+                150546799,
+                148083588,
+                145663213,
+                130224731
+              ],
+              "total_ns": 2405398779,
+              "mean_ms": 150.3374236875
+            }
+          }
+        }
+      ]
+    },
+    {
+      "pair": 6,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 8.436602150999533,
+      "process_user_cpu_sec": 8.230655,
+      "process_system_cpu_sec": 0.16039399999999998,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 42,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/06-candidate.log",
+      "log_sha256": "4b9451bc14a821ff3958b8fa0b759c66fa4e31c877feb8dfa0125089963f40c1",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                1158045,
+                971220,
+                784582,
+                854862,
+                754161,
+                748885,
+                868321,
+                1432593,
+                1699332,
+                1150204,
+                860564,
+                802921,
+                746006,
+                827221,
+                753450,
+                731024
+              ],
+              "total_ns": 15143391,
+              "mean_ms": 0.9464619375
+            },
+            "frozen": {
+              "samples_ns": [
+                1786064,
+                1513131,
+                2942913,
+                2698416,
+                1522151,
+                1601848,
+                1651637,
+                1871298,
+                2382419,
+                1628798,
+                2450485,
+                1517217,
+                1690267,
+                1509561,
+                1570229,
+                1493940
+              ],
+              "total_ns": 29830374,
+              "mean_ms": 1.864398375
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                3377337,
+                2796106,
+                2348474,
+                2483982
+              ],
+              "total_ns": 11005899,
+              "mean_ms": 2.75147475
+            },
+            "frozen": {
+              "samples_ns": [
+                15385389,
+                15720145,
+                21289916,
+                16704594
+              ],
+              "total_ns": 69100044,
+              "mean_ms": 17.275011
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                13193724,
+                17525359,
+                13018143,
+                17415501,
+                15599393,
+                14635386,
+                16183012,
+                12836150,
+                13312721,
+                14006228,
+                13047522,
+                12631449,
+                12899345,
+                13085881,
+                12721632,
+                12709094
+              ],
+              "total_ns": 224820540,
+              "mean_ms": 14.05128375
+            },
+            "frozen": {
+              "samples_ns": [
+                27515109,
+                28992475,
+                27229397,
+                26254280,
+                30595052,
+                35607754,
+                28282230,
+                27077127,
+                30657769,
+                27672524,
+                40789724,
+                29451649,
+                31058636,
+                32674487,
+                27744904,
+                36850450
+              ],
+              "total_ns": 488453567,
+              "mean_ms": 30.5283479375
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                37674513,
+                42559549,
+                56176619,
+                45626501
+              ],
+              "total_ns": 182037182,
+              "mean_ms": 45.5092955
+            },
+            "frozen": {
+              "samples_ns": [
+                284451023,
+                275197367,
+                274915974,
+                283837041
+              ],
+              "total_ns": 1118401405,
+              "mean_ms": 279.60035125
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                65852862,
+                71463577,
+                62997933,
+                67276513,
+                72009634,
+                69386842,
+                66907840,
+                66314633,
+                66235979,
+                64136310,
+                74159594,
+                66279335,
+                67919860,
+                69213882,
+                62302499,
+                63390803
+              ],
+              "total_ns": 1075848096,
+              "mean_ms": 67.240506
+            },
+            "frozen": {
+              "samples_ns": [
+                148863262,
+                137662869,
+                163101579,
+                143056901,
+                130527375,
+                142813201,
+                138933012,
+                140909299,
+                144340210,
+                135946857,
+                138051533,
+                147388286,
+                136685986,
+                136158292,
+                128780595,
+                138196472
+              ],
+              "total_ns": 2251415729,
+              "mean_ms": 140.7134830625
+            }
+          }
+        }
+      ]
+    },
+    {
+      "pair": 6,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/baseline/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 10.756957311001315,
+      "process_user_cpu_sec": 10.479516,
+      "process_system_cpu_sec": 0.22622499999999998,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 47,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/06-baseline.log",
+      "log_sha256": "f7610174027e9760ba6f0c7a278c7bc6352895abaad2764d8011b9c2df8218f3",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                670887,
+                661605,
+                1783413,
+                1387818,
+                652228,
+                649783,
+                730083,
+                661030,
+                679640,
+                667386,
+                664309,
+                659338,
+                642833,
+                658711,
+                658122,
+                642246
+              ],
+              "total_ns": 12469432,
+              "mean_ms": 0.7793395
+            },
+            "frozen": {
+              "samples_ns": [
+                2867738,
+                1805603,
+                2928354,
+                3024115,
+                1814093,
+                1580840,
+                1511160,
+                1480785,
+                1539148,
+                1557683,
+                1544001,
+                1498509,
+                1494073,
+                1498240,
+                1481303,
+                1513965
+              ],
+              "total_ns": 29139610,
+              "mean_ms": 1.821225625
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                15302110,
+                18408190,
+                15359872,
+                29584537
+              ],
+              "total_ns": 78654709,
+              "mean_ms": 19.66367725
+            },
+            "frozen": {
+              "samples_ns": [
+                17241420,
+                17565386,
+                21971091,
+                19034799
+              ],
+              "total_ns": 75812696,
+              "mean_ms": 18.953174
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                14755584,
+                14425952,
+                17237295,
+                13882488,
+                12776271,
+                12399393,
+                13674249,
+                13417343,
+                14498654,
+                12417376,
+                12508446,
+                14556187,
+                14703944,
+                19431347,
+                15694329,
+                12022215
+              ],
+              "total_ns": 228401073,
+              "mean_ms": 14.2750670625
+            },
+            "frozen": {
+              "samples_ns": [
+                29497656,
+                28453641,
+                31025059,
+                34688006,
+                29098076,
+                32158795,
+                29886261,
+                39549386,
+                35996690,
+                28692735,
+                29779116,
+                34876473,
+                33987322,
+                47230559,
+                32950499,
+                26908644
+              ],
+              "total_ns": 524778918,
+              "mean_ms": 32.798682375
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                268111819,
+                283510768,
+                267344996,
+                271344533
+              ],
+              "total_ns": 1090312116,
+              "mean_ms": 272.578029
+            },
+            "frozen": {
+              "samples_ns": [
+                296403320,
+                302393420,
+                301379259,
+                292379974
+              ],
+              "total_ns": 1192555973,
+              "mean_ms": 298.13899325
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                62688114,
+                64714863,
+                67141857,
+                59325675,
+                59853870,
+                65874376,
+                61006268,
+                58907076,
+                60665266,
+                61446166,
+                58178473,
+                58088106,
+                62126622,
+                68645210,
+                59729520,
+                60473921
+              ],
+              "total_ns": 988865383,
+              "mean_ms": 61.8040864375
+            },
+            "frozen": {
+              "samples_ns": [
+                153571129,
+                134367324,
+                130311676,
+                146042644,
+                134226394,
+                133459646,
+                130855728,
+                141086235,
+                142184239,
+                144278397,
+                134404867,
+                139042798,
+                133244514,
+                217523194,
+                187407745,
+                159924905
+              ],
+              "total_ns": 2361931435,
+              "mean_ms": 147.6207146875
+            }
+          }
+        }
+      ]
+    },
+    {
+      "pair": 7,
+      "stage": "baseline",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/baseline/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 11.907867455993255,
+      "process_user_cpu_sec": 11.636068,
+      "process_system_cpu_sec": 0.252355,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 42,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/07-baseline.log",
+      "log_sha256": "df6cfce2673e7b8f014f7b663e9cf457f9dde3490cc5245eca68d1a76692e963",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                668026,
+                754969,
+                733053,
+                861588,
+                947550,
+                782257,
+                670032,
+                837900,
+                785055,
+                751151,
+                717893,
+                698827,
+                690654,
+                681924,
+                664221,
+                687879
+              ],
+              "total_ns": 11932979,
+              "mean_ms": 0.7458111875
+            },
+            "frozen": {
+              "samples_ns": [
+                2010410,
+                2212637,
+                1627851,
+                1523150,
+                1796440,
+                1790716,
+                1495792,
+                1895954,
+                2389705,
+                1764597,
+                1781055,
+                1647392,
+                1711473,
+                1521993,
+                1499672,
+                1585330
+              ],
+              "total_ns": 28254167,
+              "mean_ms": 1.7658854375
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                17397153,
+                16494184,
+                15388656,
+                18043751
+              ],
+              "total_ns": 67323744,
+              "mean_ms": 16.830936
+            },
+            "frozen": {
+              "samples_ns": [
+                19259363,
+                17630780,
+                17941572,
+                19619269
+              ],
+              "total_ns": 74450984,
+              "mean_ms": 18.612746
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                22987557,
+                28892154,
+                20401549,
+                15850499,
+                15093739,
+                17672568,
+                16165302,
+                18036678,
+                15937196,
+                13036387,
+                17030974,
+                15486497,
+                22270444,
+                20804857,
+                21725162,
+                18004848
+              ],
+              "total_ns": 299396411,
+              "mean_ms": 18.7122756875
+            },
+            "frozen": {
+              "samples_ns": [
+                44255460,
+                36986630,
+                44423143,
+                38177468,
+                35473480,
+                39865912,
+                47381733,
+                44747922,
+                45549845,
+                36951677,
+                40812283,
+                43749021,
+                48897728,
+                40606122,
+                38033081,
+                48562869
+              ],
+              "total_ns": 674474374,
+              "mean_ms": 42.154648375
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                349977511,
+                277198633,
+                277577122,
+                284438378
+              ],
+              "total_ns": 1189191644,
+              "mean_ms": 297.297911
+            },
+            "frozen": {
+              "samples_ns": [
+                303209135,
+                301922400,
+                301255702,
+                310155514
+              ],
+              "total_ns": 1216542751,
+              "mean_ms": 304.13568775
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                58692141,
+                71831116,
+                59915245,
+                73603503,
+                77220394,
+                62429808,
+                73977145,
+                60865104,
+                68758367,
+                70675597,
+                63417139,
+                60695651,
+                74263157,
+                59773798,
+                59292216,
+                77184869
+              ],
+              "total_ns": 1072595250,
+              "mean_ms": 67.037203125
+            },
+            "frozen": {
+              "samples_ns": [
+                143193072,
+                143370491,
+                152840916,
+                134368435,
+                144672082,
+                154727220,
+                148719913,
+                156062209,
+                141812887,
+                141396798,
+                136480737,
+                151761458,
+                134005421,
+                143790521,
+                141296397,
+                134854869
+              ],
+              "total_ns": 2303353426,
+              "mean_ms": 143.959589125
+            }
+          }
+        }
+      ]
+    },
+    {
+      "pair": 7,
+      "stage": "candidate",
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 8.705294318002416,
+      "process_user_cpu_sec": 8.470645,
+      "process_system_cpu_sec": 0.20904299999999998,
+      "launch_peak_rss_kib": 134816,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 111,
+      "log": "/workspace/shared/neh-rectangle-range-20261006/matched/07-candidate.log",
+      "log_sha256": "d7b58fb00fdf75880365f36b0400eb80ffc723b486465df27148824abbd3155a",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                1247320,
+                748791,
+                746940,
+                814955,
+                786461,
+                836294,
+                729806,
+                738620,
+                746574,
+                748624,
+                955827,
+                760559,
+                747336,
+                885500,
+                850789,
+                812361
+              ],
+              "total_ns": 13156757,
+              "mean_ms": 0.8222973125
+            },
+            "frozen": {
+              "samples_ns": [
+                2171246,
+                1533528,
+                2187183,
+                1631258,
+                1581585,
+                1518968,
+                1553917,
+                1698920,
+                1549701,
+                1502494,
+                1802688,
+                1660820,
+                1570699,
+                1504240,
+                1556679,
+                1893924
+              ],
+              "total_ns": 26917850,
+              "mean_ms": 1.682365625
+            }
+          }
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                2311989,
+                2305944,
+                2416626,
+                2525680
+              ],
+              "total_ns": 9560239,
+              "mean_ms": 2.39005975
+            },
+            "frozen": {
+              "samples_ns": [
+                19143004,
+                17444870,
+                16996561,
+                27156568
+              ],
+              "total_ns": 80741003,
+              "mean_ms": 20.18525075
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                14181747,
+                15165355,
+                13450988,
+                15916395,
+                13703705,
+                15807407,
+                14874039,
+                14234466,
+                13995202,
+                14305495,
+                15408843,
+                17073992,
+                14834619,
+                13058638,
+                14131641,
+                13169057
+              ],
+              "total_ns": 233311589,
+              "mean_ms": 14.5819743125
+            },
+            "frozen": {
+              "samples_ns": [
+                31108392,
+                29255587,
+                29916039,
+                29795268,
+                28923294,
+                35398124,
+                30684286,
+                27891566,
+                27017573,
+                27328106,
+                33020968,
+                32902566,
+                30568730,
+                27389040,
+                29291353,
+                28029355
+              ],
+              "total_ns": 478520247,
+              "mean_ms": 29.9075154375
+            }
+          }
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                39411489,
+                49107308,
+                44744646,
+                51955057
+              ],
+              "total_ns": 185218500,
+              "mean_ms": 46.304625
+            },
+            "frozen": {
+              "samples_ns": [
+                303795090,
+                315626078,
+                294938593,
+                297830678
+              ],
+              "total_ns": 1212190439,
+              "mean_ms": 303.04760975
+            }
+          }
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                65635524,
+                67199519,
+                69210956,
+                67958259,
+                80228659,
+                62275836,
+                63096708,
+                71305946,
+                65281375,
+                70329283,
+                73340957,
+                64988252,
+                70569332,
+                71484623,
+                62392659,
+                65864519
+              ],
+              "total_ns": 1091162407,
+              "mean_ms": 68.1976504375
+            },
+            "frozen": {
+              "samples_ns": [
+                142582381,
+                136278644,
+                180695240,
+                161438907,
+                132433183,
+                140926387,
+                135172403,
+                146263392,
+                145178816,
+                135568922,
+                131925068,
+                142323226,
+                154583096,
+                145068206,
+                128531541,
+                141762290
+              ],
+              "total_ns": 2300731702,
+              "mean_ms": 143.795731375
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "512/fail_closed": {
+      "baseline_production_median_batch_mean_ms": 0.7703309375,
+      "candidate_production_median_batch_mean_ms": 0.9026076875,
+      "ratio_of_medians": 1.1717141861513254,
+      "paired_median_ratio": 1.1025542741674146,
+      "candidate_wins": 0,
+      "baseline_batch_mean_range_ms": [
+        0.728225,
+        0.8759766875
+      ],
+      "candidate_batch_mean_range_ms": [
+        0.8222973125,
+        0.990527875
+      ],
+      "paired_ratios": [
+        1.0329432282979563,
+        1.133540657647545,
+        1.0614097043606385,
+        1.10038503576777,
+        1.3601948230285967,
+        1.2144411228995835,
+        1.1025542741674146
+      ],
+      "pooled_production_operation_samples": {
+        "baseline": {
+          "count": 112,
+          "median_ms": 0.7039205,
+          "p95_nearest_rank_ms": 1.212733,
+          "max_ms": 2.103288,
+          "min_ms": 0.642246
+        },
+        "candidate": {
+          "count": 112,
+          "median_ms": 0.8087789999999999,
+          "p95_nearest_rank_ms": 1.420355,
+          "max_ms": 2.226044,
+          "min_ms": 0.729806
+        }
+      }
+    },
+    "512/inside_rectangle": {
+      "baseline_production_median_batch_mean_ms": 17.159464,
+      "candidate_production_median_batch_mean_ms": 2.67058175,
+      "ratio_of_medians": 0.15563316837868596,
+      "paired_median_ratio": 0.14694501322134287,
+      "candidate_wins": 7,
+      "baseline_batch_mean_range_ms": [
+        15.8024485,
+        19.66367725
+      ],
+      "candidate_batch_mean_range_ms": [
+        2.39005975,
+        3.104967
+      ],
+      "paired_ratios": [
+        0.1469219790269199,
+        0.1964864495524222,
+        0.16555318580710487,
+        0.15563316837868596,
+        0.14694501322134287,
+        0.13992676522393593,
+        0.14200397113981061
+      ],
+      "pooled_production_operation_samples": {
+        "baseline": {
+          "count": 28,
+          "median_ms": 16.6227275,
+          "p95_nearest_rank_ms": 18.892947,
+          "max_ms": 29.584537,
+          "min_ms": 15.272101
+        },
+        "candidate": {
+          "count": 28,
+          "median_ms": 2.4897385,
+          "p95_nearest_rank_ms": 3.377337,
+          "max_ms": 4.882345,
+          "min_ms": 2.151403
+        }
+      }
+    },
+    "2048/fail_closed": {
+      "baseline_production_median_batch_mean_ms": 14.558967625,
+      "candidate_production_median_batch_mean_ms": 15.246656,
+      "ratio_of_medians": 1.047234693606924,
+      "paired_median_ratio": 1.0396458204223122,
+      "candidate_wins": 3,
+      "baseline_batch_mean_range_ms": [
+        13.8302294375,
+        18.7122756875
+      ],
+      "candidate_batch_mean_range_ms": [
+        14.05128375,
+        20.322613625
+      ],
+      "paired_ratios": [
+        1.0845883709711504,
+        1.099225296202965,
+        0.9252474287643995,
+        1.4694343081464876,
+        1.0396458204223122,
+        0.9843234843296905,
+        0.7792731657027111
+      ],
+      "pooled_production_operation_samples": {
+        "baseline": {
+          "count": 112,
+          "median_ms": 14.3641605,
+          "p95_nearest_rank_ms": 21.725162,
+          "max_ms": 28.892154,
+          "min_ms": 11.684051
+        },
+        "candidate": {
+          "count": 112,
+          "median_ms": 14.6034255,
+          "p95_nearest_rank_ms": 24.230472,
+          "max_ms": 38.882003,
+          "min_ms": 12.614212
+        }
+      }
+    },
+    "2048/inside_rectangle": {
+      "baseline_production_median_batch_mean_ms": 297.297911,
+      "candidate_production_median_batch_mean_ms": 47.333295,
+      "ratio_of_medians": 0.15921166361643221,
+      "paired_median_ratio": 0.16695878118628554,
+      "candidate_wins": 7,
+      "baseline_batch_mean_range_ms": [
+        270.88383575,
+        330.59329
+      ],
+      "candidate_batch_mean_range_ms": [
+        45.5092955,
+        141.3911015
+      ],
+      "paired_ratios": [
+        0.16651955262007886,
+        0.21478612257482912,
+        0.15189420066378456,
+        0.47136229420959364,
+        0.1733664565845177,
+        0.16695878118628554,
+        0.15575159894076754
+      ],
+      "pooled_production_operation_samples": {
+        "baseline": {
+          "count": 28,
+          "median_ms": 283.97457299999996,
+          "p95_nearest_rank_ms": 349.977511,
+          "max_ms": 457.330872,
+          "min_ms": 264.654759
+        },
+        "candidate": {
+          "count": 28,
+          "median_ms": 50.2747835,
+          "p95_nearest_rank_ms": 117.583548,
+          "max_ms": 299.431096,
+          "min_ms": 37.674513
+        }
+      }
+    },
+    "4096/fail_closed": {
+      "baseline_production_median_batch_mean_ms": 64.017946,
+      "candidate_production_median_batch_mean_ms": 76.5890176875,
+      "ratio_of_medians": 1.1963679323216652,
+      "paired_median_ratio": 1.1996828970230828,
+      "candidate_wins": 0,
+      "baseline_batch_mean_range_ms": [
+        61.8040864375,
+        67.037203125
+      ],
+      "candidate_batch_mean_range_ms": [
+        67.240506,
+        110.031010625
+      ],
+      "paired_ratios": [
+        1.2359269783897786,
+        1.6735826467363597,
+        1.1996828970230828,
+        1.6332946446184977,
+        1.1399440601294626,
+        1.0879621377139461,
+        1.0173104971330051
+      ],
+      "pooled_production_operation_samples": {
+        "baseline": {
+          "count": 112,
+          "median_ms": 62.7540525,
+          "p95_nearest_rank_ms": 74.263157,
+          "max_ms": 96.401931,
+          "min_ms": 54.760087
+        },
+        "candidate": {
+          "count": 112,
+          "median_ms": 71.64250150000001,
+          "p95_nearest_rank_ms": 130.29573,
+          "max_ms": 367.785688,
+          "min_ms": 62.275836
+        }
+      }
+    }
+  },
+  "disposition": {
+    "status": "retain_narrow_rectangle_range_candidate_fail_closed_general_nonregression_unproven",
+    "measured_candidate_forbidden_zones_sha256": "291eabe6a22cd6335c9dca2971c0b4e6aac1d1e319d4609fd80164c68cc85361",
+    "scope": "Exact rectangle behavior and local gain qualified. The one predefined isolated FailClosed experiment completed 28/28 runs and did not reproduce consistent slowdown. Original adverse matched controls remain evidence; isolated results do not erase them, prove general FailClosed non-regression, or establish causation. No all-path performance acceptance, release, realtime, hardware, guard or lock-contention claim.",
+    "isolation_status": "completed_retained_with_bounded_qualification",
+    "decision": "After independent review, retain only the 42-line Inside Rectangle range candidate with the documented bounded qualification and stop performance attribution experiments.",
+    "current_candidate_source_manifest_verified": true,
+    "focused_16_tests_repeated_on_isolation_binary": false
+  },
+  "initial_runs": {
+    "baseline": {
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/baseline/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "wall_seconds": 12.129147835999902,
+      "user_cpu_seconds": 11.618891,
+      "system_cpu_seconds": 0.475682,
+      "launch_peak_rss_kib": 134544,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 92
+    },
+    "candidate": {
+      "command": [
+        "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "wall_seconds": 10.211278882998158,
+      "user_cpu_seconds": 9.936835,
+      "system_cpu_seconds": 0.255951,
+      "launch_peak_rss_kib": 134668,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 72
+    }
+  },
+  "baseline_tests": {
+    "command": [
+      "/workspace/shared/neh-rectangle-range-20261006/baseline/nuwax-geometry-runtime-test",
+      "rectangle_scan",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "passed": 4,
+    "failed": 0,
+    "caught_panic_hook_reports": 32
+  },
+  "candidate_tests": {
+    "unique_passed": 16,
+    "failed": 0,
+    "records": [
+      {
+        "selector": "mapping_adapter::tests::virtual_mask_copy_trial::parity_headers_payload_and_isolation",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_copy_trial::parity_headers_payload_and_isolation",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.011023993996786885,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-01.log",
+        "log_sha256": "263db0bcdd0d8be0224e0c723ff1d6d3a8fa31e778784c68f1379afee1c71aae"
+      },
+      {
+        "selector": "mapping_adapter::tests::virtual_mask_copy_trial::gates_and_layout_errors_match_frozen",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_copy_trial::gates_and_layout_errors_match_frozen",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.015147496000281535,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-02.log",
+        "log_sha256": "927b4d35737c005c8fa58a7971b9ec6bfd962d189cbac64882d3b3a340de968c"
+      },
+      {
+        "selector": "mapping_adapter::tests::virtual_mask_copy_trial::borrowed_compose_preserves_physical_cells",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_copy_trial::borrowed_compose_preserves_physical_cells",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.009344762002001517,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-03.log",
+        "log_sha256": "dcdd6f9d3ef5be07120b5d7be57dde8f17140ef8a71dd61b6422c33f47b0b976"
+      },
+      {
+        "selector": "forbidden_zones::tests::diagonal_line_uses_conservative_supercover_cells",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::tests::diagonal_line_uses_conservative_supercover_cells",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.009591592002834659,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-04.log",
+        "log_sha256": "83b8f91c61dde9dde988c475bd2362eaf6af0b2e8fe5af04a84624a24e100d01"
+      },
+      {
+        "selector": "forbidden_zones::tests::rectangle_inside_marks_interior_and_boundary",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::tests::rectangle_inside_marks_interior_and_boundary",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.010460552002768964,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-05.log",
+        "log_sha256": "adfd61b54bde8cea45967bc308027c7ede8197154d98ea1bba5c8944f11efb54"
+      },
+      {
+        "selector": "forbidden_zones::tests::outside_zones_intersect_their_allowed_interiors",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::tests::outside_zones_intersect_their_allowed_interiors",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.009671287996752653,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-06.log",
+        "log_sha256": "aceefdb3524eb53e4a1b401d97e05a3d0e4d2762d57f4ac42cc4e5e2b8e410b8"
+      },
+      {
+        "selector": "forbidden_zones::tests::circle_outside_keeps_only_cells_fully_inside",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::tests::circle_outside_keeps_only_cells_fully_inside",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.011954517998674419,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-07.log",
+        "log_sha256": "77833ef4dc87c078765291b6c80d311eee30ed73d15d9d5d6e80e21cea503b84"
+      },
+      {
+        "selector": "forbidden_zones::tests::concave_polygon_inside_is_rasterized_without_filling_the_notch",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::tests::concave_polygon_inside_is_rasterized_without_filling_the_notch",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.009447598000406288,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-08.log",
+        "log_sha256": "f2aee2fb452c3254725ae953783deb75695d740306e688531ec5b55ecea77f5a"
+      },
+      {
+        "selector": "forbidden_zones::tests::malformed_document_fails_closed",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::tests::malformed_document_fails_closed",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.010172166003030725,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-09.log",
+        "log_sha256": "4be127353c9eaa9297558d4ba6f8386b4908a522da429124faafd15276a06cb9"
+      },
+      {
+        "selector": "mapping_adapter::tests::virtual_obstacles_use_applied_snapshot_without_physical_projection_or_future_file",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_obstacles_use_applied_snapshot_without_physical_projection_or_future_file",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.011279218997515272,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-10.log",
+        "log_sha256": "e82c675d20ce32790ade8c8a6ca62a2a67280886443ce29c53eae344785126cd"
+      },
+      {
+        "selector": "lcm_runtime::mapping_feed_tests::navigation_map_3d_virtual_obstacles_keep_commit_identity_and_block_both_floors",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "lcm_runtime::mapping_feed_tests::navigation_map_3d_virtual_obstacles_keep_commit_identity_and_block_both_floors",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.5364422420025221,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-11.log",
+        "log_sha256": "0e2a5a6fb463ea42f301c65c69782e6bac515f00e8330aee9384e13ab620b08f"
+      },
+      {
+        "selector": "lcm_runtime::mapping_feed_tests::retained_cloud_metadata_rejects_forged_receipt_root_and_frame",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "lcm_runtime::mapping_feed_tests::retained_cloud_metadata_rejects_forged_receipt_root_and_frame",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.013172927996492945,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-12.log",
+        "log_sha256": "d2578d2f3fcf70165660cce325ea1e4bcf65f00a530023f19ab518889b1fb65b"
+      },
+      {
+        "selector": "forbidden_zones::rectangle_scan_tests::rectangle_scan_borrowed_corpus_matches_frozen",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::rectangle_scan_tests::rectangle_scan_borrowed_corpus_matches_frozen",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.015315794000343885,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-13.log",
+        "log_sha256": "30c4608c7b4b9ff75ed94fa13a2a02592082ecc2597b45fad3bc03bb370687a8"
+      },
+      {
+        "selector": "forbidden_zones::rectangle_scan_tests::rectangle_scan_preserves_original_cell_max_rounding",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::rectangle_scan_tests::rectangle_scan_preserves_original_cell_max_rounding",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.01549591199727729,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-14.log",
+        "log_sha256": "8019b1e5d1c57007afb4c3d76737bda27f83e77bd320b9bcbc345f0f9dcb17b5"
+      },
+      {
+        "selector": "mapping_adapter::tests::rectangle_scan_virtual_corpus::rectangle_scan_actual_virtual_caller_matches_frozen",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::rectangle_scan_virtual_corpus::rectangle_scan_actual_virtual_caller_matches_frozen",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.016705962996638846,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-15.log",
+        "log_sha256": "e7a133daf8d39df6d570685ad8917ed557d723f846a73cceab9acc60cbd5b30e"
+      },
+      {
+        "selector": "mapping_adapter::tests::rectangle_scan_virtual_corpus::rectangle_scan_virtual_missing_map_and_no_applied_gates",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::rectangle_scan_virtual_corpus::rectangle_scan_virtual_missing_map_and_no_applied_gates",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.020465970002987888,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/candidate/focused-16.log",
+        "log_sha256": "0d01f4ddd13f61bb311c1a2362b6918a6b8f3e3f85d5bc886f55007e953db273"
+      }
+    ]
+  },
+  "read_only_attribution": {
+    "raster_stack_frame_bytes": [
+      984,
+      1384
+    ],
+    "normalized_early_path": "same data dereference, fill100,96-byte headercopy,return after relocation",
+    "normalized_fill_code_sizes_bytes": {
+      "fill": 13,
+      "SpecFill": 117,
+      "IterMut_next": 102
+    },
+    "cause": "unresolved; no added per-cell work identified; frame size alone is not causal proof"
+  },
+  "mapping": {
+    "local_base": "2bf54cc108a63dfa728a486fefd4de8ce8331620",
+    "base_tree": "1fabe2eac417c4fecde21552148f22b2b93dbe72",
+    "mapped_remote_base": "410290dbc45c20db10bf2782556b555a0175bcc4",
+    "committed": false
+  },
+  "isolation_experiment": {
+    "scope": "One predefined isolation experiment: separate fresh-process exact selector per size, seven alternating baseline/candidate pairs,2 production warmups and16 production calls only before or during timing. Reference/input/header parity checks run afterward. Each returned MapState destruction is timed. Same mixed Geometry opt0 MLS/runtime opt3 test profile, not release. Whole-process CPU/RSS includes fixture and postchecks; not attributable to measured operations. This isolated harness changes binary layout versus the original full benchmark; neither observation is erased by the other. Stop attribution after this experiment.",
+    "binary_identities": {
+      "baseline": {
+        "package_id": "path+file:///workspace/scratch/71cdb9d17732/neh-assigned-workspace-20261006/services/geometry/nuwax_geometry_runtime#nuwax-geometry-runtime@0.1.0",
+        "target": {
+          "kind": [
+            "bin"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "nuwax-geometry-runtime",
+          "src_path": "/workspace/scratch/71cdb9d17732/neh-assigned-workspace-20261006/services/geometry/nuwax_geometry_runtime/src/main.rs",
+          "edition": "2021",
+          "doc": true,
+          "doctest": false,
+          "test": true
+        },
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "features": [
+          "default",
+          "real-lcm-bridge"
+        ],
+        "executable": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_geometry_runtime-edd133c562540c52",
+        "fresh": false,
+        "frozen_path": "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+        "size": 124566120,
+        "sha256": "7cf459e3cfbf73c5825c4ce13bf658d7e278364caa6fe399fa3766835c05284c",
+        "capture_utc": "2026-10-06T21:19:51.684553+00:00",
+        "source_manifest": "cfcd64c95f722d75b7d6a2b228b4d283b0a79988a1e39379c6f54918cdbbcaee  src/mapping_adapter.rs\n2e2a09d1babd442f01d3796fd6a32299d148a0044f3846de9339d6c99a8b3931  src/forbidden_zones.rs\n426bf0c68aaf7fe4701582dfb70ec05d06832796a0ee8c87897bd9b4cdcb6911  src/mapping_adapter_virtual_mask_tests.rs\n1a6393b4c01d8e380d6c06756554e4c727d786a9656d6415ba91b35256376da1  src/forbidden_zones_copy_trial_reference.rs\n5c372152d8fbae92419cd8a0039dd64021ffcc7fb1fa0b9571bca4e9d3701e55  src/forbidden_zones_rectangle_scan_tests.rs\n5b55fce15f2f0d76d296be3b5bf628093517617a76ba2be263fd388de1f839fe  src/mapping_adapter_rectangle_scan_tests.rs\n6a9b8f487b78c2da5f3f4d6ac21593b0a90d70c2a7f92d1dbfd4194665fe112b  src/mapping_adapter_fail_closed_isolation_tests.rs\nc71c6ea19ef5fa2ba75e29f10425ab62bbaaf94cab7bdca3b09431f472bdab90  src/lcm_runtime.rs\n9d0be2a30be10ef941bd8fd82045c9a48be8a4c9f1a48007abc1b0a3912c2401  Cargo.lock\na0ecb96b0a4b77e4a7c03d953a90483b702c6bdcdaef781bded063ec5711acdf  ../../nuwax-workspace/crates/nuwax-nav-pct/src/tomogram.rs\n"
+      },
+      "candidate": {
+        "package_id": "path+file:///workspace/scratch/71cdb9d17732/neh-assigned-workspace-20261006/services/geometry/nuwax_geometry_runtime#nuwax-geometry-runtime@0.1.0",
+        "target": {
+          "kind": [
+            "bin"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "nuwax-geometry-runtime",
+          "src_path": "/workspace/scratch/71cdb9d17732/neh-assigned-workspace-20261006/services/geometry/nuwax_geometry_runtime/src/main.rs",
+          "edition": "2021",
+          "doc": true,
+          "doctest": false,
+          "test": true
+        },
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "features": [
+          "default",
+          "real-lcm-bridge"
+        ],
+        "executable": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_geometry_runtime-edd133c562540c52",
+        "fresh": false,
+        "frozen_path": "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+        "size": 124572288,
+        "sha256": "6ba5bd6475ad9c51d520f78acc96fca28d11cc4a436f8b8f436c5032ac1887c1",
+        "capture_utc": "2026-10-06T21:19:06.239123+00:00",
+        "source_manifest": "cfcd64c95f722d75b7d6a2b228b4d283b0a79988a1e39379c6f54918cdbbcaee  src/mapping_adapter.rs\n291eabe6a22cd6335c9dca2971c0b4e6aac1d1e319d4609fd80164c68cc85361  src/forbidden_zones.rs\n426bf0c68aaf7fe4701582dfb70ec05d06832796a0ee8c87897bd9b4cdcb6911  src/mapping_adapter_virtual_mask_tests.rs\n1a6393b4c01d8e380d6c06756554e4c727d786a9656d6415ba91b35256376da1  src/forbidden_zones_copy_trial_reference.rs\n5c372152d8fbae92419cd8a0039dd64021ffcc7fb1fa0b9571bca4e9d3701e55  src/forbidden_zones_rectangle_scan_tests.rs\n5b55fce15f2f0d76d296be3b5bf628093517617a76ba2be263fd388de1f839fe  src/mapping_adapter_rectangle_scan_tests.rs\n6a9b8f487b78c2da5f3f4d6ac21593b0a90d70c2a7f92d1dbfd4194665fe112b  src/mapping_adapter_fail_closed_isolation_tests.rs\nc71c6ea19ef5fa2ba75e29f10425ab62bbaaf94cab7bdca3b09431f472bdab90  src/lcm_runtime.rs\n9d0be2a30be10ef941bd8fd82045c9a48be8a4c9f1a48007abc1b0a3912c2401  Cargo.lock\na0ecb96b0a4b77e4a7c03d953a90483b702c6bdcdaef781bded063ec5711acdf  ../../nuwax-workspace/crates/nuwax-nav-pct/src/tomogram.rs\n"
+      }
+    },
+    "runs": [
+      {
+        "side": 512,
+        "pair": 1,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:08.323389+00:00",
+        "process_wall_sec": 0.052393575009773485,
+        "process_user_cpu_sec": 0.028071,
+        "process_system_cpu_sec": 0.007724,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-01-baseline.log",
+        "log_sha256": "f1ada245143da6a78f169b0bb8e510368935c5e5b168cfa912a45205ba83947e",
+        "samples_ns": [
+          931843,
+          737954,
+          1000479,
+          827729,
+          920450,
+          793287,
+          816109,
+          959151,
+          1156184,
+          967268,
+          917873,
+          679005,
+          666073,
+          813875,
+          1055060,
+          733190
+        ],
+        "total_ns": 13975530,
+        "mean_ms": 0.873470625
+      },
+      {
+        "side": 512,
+        "pair": 1,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:08.375339+00:00",
+        "process_wall_sec": 0.05108138300420251,
+        "process_user_cpu_sec": 0.022528,
+        "process_system_cpu_sec": 0.016703,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-01-candidate.log",
+        "log_sha256": "9a988e0458d9bf03284c1a0fc8e302f500433f8d5db110816140646de7238ea6",
+        "samples_ns": [
+          760349,
+          897417,
+          748565,
+          1684642,
+          1154542,
+          1237097,
+          788910,
+          1315578,
+          782807,
+          775621,
+          1109823,
+          1461738,
+          930693,
+          807496,
+          750210,
+          750273
+        ],
+        "total_ns": 15955761,
+        "mean_ms": 0.9972350625
+      },
+      {
+        "side": 512,
+        "pair": 2,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:08.427054+00:00",
+        "process_wall_sec": 0.05100617899734061,
+        "process_user_cpu_sec": 0.023336,
+        "process_system_cpu_sec": 0.007824,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-02-candidate.log",
+        "log_sha256": "96a97cd9c22221d75a5b24122cf9a0ef256021c7cff460b7d60cf4a8bf9d5f9a",
+        "samples_ns": [
+          840951,
+          804952,
+          754137,
+          729775,
+          778808,
+          764283,
+          746678,
+          729785,
+          752798,
+          781437,
+          755864,
+          1521212,
+          761171,
+          1129671,
+          799743,
+          750947
+        ],
+        "total_ns": 13402212,
+        "mean_ms": 0.83763825
+      },
+      {
+        "side": 512,
+        "pair": 2,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:08.528661+00:00",
+        "process_wall_sec": 0.10100846200657543,
+        "process_user_cpu_sec": 0.046775,
+        "process_system_cpu_sec": 0.011201,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 1,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-02-baseline.log",
+        "log_sha256": "1372526cd3c45e45242f53ce3f0557ac2de3dc49dd78e3aecce46a05d0f0d834",
+        "samples_ns": [
+          642169,
+          1387333,
+          953832,
+          1204497,
+          766466,
+          994456,
+          880892,
+          958326,
+          992284,
+          762600,
+          3201458,
+          918902,
+          1751317,
+          2307458,
+          703106,
+          2329740
+        ],
+        "total_ns": 20754836,
+        "mean_ms": 1.29717725
+      },
+      {
+        "side": 512,
+        "pair": 3,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:08.580221+00:00",
+        "process_wall_sec": 0.05084316800639499,
+        "process_user_cpu_sec": 0.041499,
+        "process_system_cpu_sec": 0.003761,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 2,
+        "involuntary_context_switches": 3,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-03-baseline.log",
+        "log_sha256": "09a1c924e66e57ad2fb64827804301d4ee3fb2710833e2835f0d59077f6626b0",
+        "samples_ns": [
+          685387,
+          851779,
+          1030129,
+          915289,
+          1311669,
+          812746,
+          928614,
+          1178213,
+          1146483,
+          1202552,
+          1653277,
+          1957774,
+          2078164,
+          1524925,
+          718503,
+          812396
+        ],
+        "total_ns": 18807900,
+        "mean_ms": 1.17549375
+      },
+      {
+        "side": 512,
+        "pair": 3,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:08.631544+00:00",
+        "process_wall_sec": 0.05086135100282263,
+        "process_user_cpu_sec": 0.02762,
+        "process_system_cpu_sec": 0.008234,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-03-candidate.log",
+        "log_sha256": "24f11309ff49b27ab26afc6372c1f981398bd7f7ece88d0445d693e06dd4c2ba",
+        "samples_ns": [
+          750668,
+          830473,
+          730177,
+          783834,
+          747173,
+          759553,
+          815125,
+          780412,
+          1019450,
+          861400,
+          923477,
+          964725,
+          1558738,
+          939327,
+          884338,
+          821477
+        ],
+        "total_ns": 14170347,
+        "mean_ms": 0.8856466875
+      },
+      {
+        "side": 512,
+        "pair": 4,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:08.682936+00:00",
+        "process_wall_sec": 0.05072917499637697,
+        "process_user_cpu_sec": 0.026795,
+        "process_system_cpu_sec": 0.008185999999999999,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-04-candidate.log",
+        "log_sha256": "44e38b73a7e89b3401067df27f248ec726a30c6164322b9b1e6f5becc145283a",
+        "samples_ns": [
+          755100,
+          1341096,
+          983074,
+          1099175,
+          1112359,
+          839525,
+          983023,
+          964559,
+          817572,
+          857604,
+          739150,
+          749109,
+          751828,
+          788010,
+          853867,
+          754992
+        ],
+        "total_ns": 14390043,
+        "mean_ms": 0.8993776875
+      },
+      {
+        "side": 512,
+        "pair": 4,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:08.734341+00:00",
+        "process_wall_sec": 0.05082390399184078,
+        "process_user_cpu_sec": 0.035723,
+        "process_system_cpu_sec": 0.0,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 1,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-04-baseline.log",
+        "log_sha256": "b2ddf31bd9f431c25b2d2c2a352f06756a1b3e51ad8627639aa2e6c6e743ff3f",
+        "samples_ns": [
+          1130630,
+          774051,
+          764660,
+          863389,
+          669690,
+          958442,
+          1017697,
+          1362412,
+          697212,
+          1033496,
+          841451,
+          660708,
+          2891623,
+          920016,
+          693804,
+          944762
+        ],
+        "total_ns": 16224043,
+        "mean_ms": 1.0140026875
+      },
+      {
+        "side": 512,
+        "pair": 5,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:08.786088+00:00",
+        "process_wall_sec": 0.051098048003041185,
+        "process_user_cpu_sec": 0.036677,
+        "process_system_cpu_sec": 0.003825,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-05-baseline.log",
+        "log_sha256": "dee4d364f4f5948b0c3388330a2198329ebf05b706e0194117e97a42b89d0d3f",
+        "samples_ns": [
+          1131294,
+          1693182,
+          975180,
+          1206686,
+          926486,
+          659876,
+          780555,
+          687324,
+          873752,
+          735597,
+          962961,
+          982925,
+          786169,
+          1019677,
+          1159567,
+          891990
+        ],
+        "total_ns": 15473221,
+        "mean_ms": 0.9670763125
+      },
+      {
+        "side": 512,
+        "pair": 5,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:08.837583+00:00",
+        "process_wall_sec": 0.05072466599813197,
+        "process_user_cpu_sec": 0.029751,
+        "process_system_cpu_sec": 0.007299,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-05-candidate.log",
+        "log_sha256": "acb75cd1760f03a63b04051d5f00751da41d5f3edbe23ea6e20de45cc3b49565",
+        "samples_ns": [
+          748846,
+          793740,
+          791100,
+          776989,
+          802683,
+          1119355,
+          765534,
+          800339,
+          788894,
+          831896,
+          808634,
+          1109050,
+          814060,
+          808875,
+          754400,
+          765436
+        ],
+        "total_ns": 13279831,
+        "mean_ms": 0.8299894375
+      },
+      {
+        "side": 512,
+        "pair": 6,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:08.889562+00:00",
+        "process_wall_sec": 0.05090578200179152,
+        "process_user_cpu_sec": 0.036594,
+        "process_system_cpu_sec": 0.0,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 1,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-06-candidate.log",
+        "log_sha256": "cc6a3ea35f30c2943a4cd739a1d7e08358a3135478d2c5741ffd6f9832a9f420",
+        "samples_ns": [
+          1147025,
+          756004,
+          746874,
+          746969,
+          777675,
+          819536,
+          759139,
+          756271,
+          867089,
+          1090538,
+          754761,
+          903104,
+          771371,
+          897801,
+          770603,
+          833523
+        ],
+        "total_ns": 13398283,
+        "mean_ms": 0.8373926875
+      },
+      {
+        "side": 512,
+        "pair": 6,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:08.940941+00:00",
+        "process_wall_sec": 0.0508031579956878,
+        "process_user_cpu_sec": 0.019466,
+        "process_system_cpu_sec": 0.009479999999999999,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-06-baseline.log",
+        "log_sha256": "ced9ae66958fb43ce149656609e77e1e70a2d8b18c8d7e7b495dfc81b10c336b",
+        "samples_ns": [
+          644565,
+          788394,
+          680931,
+          659047,
+          741974,
+          740316,
+          674012,
+          749728,
+          659095,
+          825552,
+          705617,
+          659325,
+          761161,
+          768076,
+          752493,
+          744005
+        ],
+        "total_ns": 11554291,
+        "mean_ms": 0.7221431875
+      },
+      {
+        "side": 512,
+        "pair": 7,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:08.992365+00:00",
+        "process_wall_sec": 0.05081876099575311,
+        "process_user_cpu_sec": 0.041753,
+        "process_system_cpu_sec": 0.0,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-07-baseline.log",
+        "log_sha256": "1c0f46710ad23017c1a52e19acd9f256c989e0544fd3e5f9bbd4fb9e7f2980d6",
+        "samples_ns": [
+          1003027,
+          889945,
+          678435,
+          1283001,
+          870627,
+          932044,
+          642640,
+          1080519,
+          1183298,
+          1259155,
+          837703,
+          963169,
+          750164,
+          982212,
+          747115,
+          749778
+        ],
+        "total_ns": 14852832,
+        "mean_ms": 0.928302
+      },
+      {
+        "side": 512,
+        "pair": 7,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_512",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:09.044045+00:00",
+        "process_wall_sec": 0.05099142200197093,
+        "process_user_cpu_sec": 0.026579,
+        "process_system_cpu_sec": 0.003476,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/512-07-candidate.log",
+        "log_sha256": "ec7eac2e0dd3497dd08b51cc05afe2c6cda3bd4554cde83a0ac793df1eaca482",
+        "samples_ns": [
+          872242,
+          819825,
+          760543,
+          872417,
+          755346,
+          750917,
+          729599,
+          746641,
+          891250,
+          770978,
+          730020,
+          768217,
+          1000347,
+          949407,
+          765304,
+          746097
+        ],
+        "total_ns": 12929150,
+        "mean_ms": 0.808071875
+      },
+      {
+        "side": 4096,
+        "pair": 1,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:11.459209+00:00",
+        "process_wall_sec": 2.4145322510012193,
+        "process_user_cpu_sec": 2.277614,
+        "process_system_cpu_sec": 0.091912,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 10,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-01-baseline.log",
+        "log_sha256": "09613217edfb1592c403058a5e946cca9ce794d5a40ce5cbd7be39c958a7ea8e",
+        "samples_ns": [
+          68320994,
+          62042232,
+          64448092,
+          77960740,
+          78305499,
+          79798966,
+          72140483,
+          67742415,
+          69903461,
+          63684697,
+          92080481,
+          102366537,
+          106475378,
+          101866073,
+          129936472,
+          110506051
+        ],
+        "total_ns": 1347578571,
+        "mean_ms": 84.2236606875
+      },
+      {
+        "side": 4096,
+        "pair": 1,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:13.369413+00:00",
+        "process_wall_sec": 1.9094281959987711,
+        "process_user_cpu_sec": 1.7960129999999999,
+        "process_system_cpu_sec": 0.08020999999999999,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 12,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-01-candidate.log",
+        "log_sha256": "c54556f3f673354c214fbd4e0547e292a99634355ca70e0f9541c909effcd094",
+        "samples_ns": [
+          64590031,
+          63169646,
+          69282839,
+          67396024,
+          66237751,
+          71429686,
+          74345573,
+          67604920,
+          63020400,
+          69449730,
+          59809257,
+          60731763,
+          68103349,
+          72646083,
+          59522569,
+          61294069
+        ],
+        "total_ns": 1058633690,
+        "mean_ms": 66.164605625
+      },
+      {
+        "side": 4096,
+        "pair": 2,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:15.998270+00:00",
+        "process_wall_sec": 2.625934108000365,
+        "process_user_cpu_sec": 2.297774,
+        "process_system_cpu_sec": 0.239618,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 13,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-02-candidate.log",
+        "log_sha256": "78ae6f0626948529b53cba6f116d265ac979e5303a32f0bff968abba5a02b353",
+        "samples_ns": [
+          93037663,
+          64707567,
+          68133743,
+          66175356,
+          67114983,
+          72265860,
+          97630824,
+          90410066,
+          71677660,
+          74559889,
+          73550515,
+          72639948,
+          72202695,
+          85780660,
+          75784940,
+          85522871
+        ],
+        "total_ns": 1231195240,
+        "mean_ms": 76.9497025
+      },
+      {
+        "side": 4096,
+        "pair": 2,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:18.766105+00:00",
+        "process_wall_sec": 2.766085862996988,
+        "process_user_cpu_sec": 2.547711,
+        "process_system_cpu_sec": 0.191049,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 10,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-02-baseline.log",
+        "log_sha256": "9efff26953b077b2648b12896c1006f04698cd63436c22418eda9da72ae2d01b",
+        "samples_ns": [
+          85081133,
+          79119837,
+          101946495,
+          96991804,
+          94774971,
+          80277520,
+          83844936,
+          82831239,
+          71311836,
+          103513873,
+          101079186,
+          223277118,
+          338587492,
+          66366769,
+          82048088,
+          76367300
+        ],
+        "total_ns": 1767419597,
+        "mean_ms": 110.4637248125
+      },
+      {
+        "side": 4096,
+        "pair": 3,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:21.172139+00:00",
+        "process_wall_sec": 2.405054030008614,
+        "process_user_cpu_sec": 2.137712,
+        "process_system_cpu_sec": 0.23574699999999998,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 11,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-03-baseline.log",
+        "log_sha256": "61316a1e8566954d4a1f4c0c83ff05b682e942aa868f4e2a07ee8a5f7b13e2df",
+        "samples_ns": [
+          66020446,
+          69685703,
+          64932304,
+          65350088,
+          64239030,
+          66082442,
+          81995740,
+          172275791,
+          144826671,
+          61341827,
+          68442315,
+          74296569,
+          66914641,
+          68902301,
+          72592212,
+          78359729
+        ],
+        "total_ns": 1286257809,
+        "mean_ms": 80.3911130625
+      },
+      {
+        "side": 4096,
+        "pair": 3,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:23.725175+00:00",
+        "process_wall_sec": 2.5499115209968295,
+        "process_user_cpu_sec": 2.3590809999999998,
+        "process_system_cpu_sec": 0.155391,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 12,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-03-candidate.log",
+        "log_sha256": "c32aa1708d052487964ff7c482be251469adf3bb3af5a5dd37957d829b364228",
+        "samples_ns": [
+          132463455,
+          77498078,
+          231414030,
+          120577272,
+          77806592,
+          80056835,
+          76308468,
+          79675261,
+          78184983,
+          78144273,
+          62858917,
+          93175334,
+          137832559,
+          126842672,
+          93322241,
+          80092709
+        ],
+        "total_ns": 1626253679,
+        "mean_ms": 101.6408549375
+      },
+      {
+        "side": 4096,
+        "pair": 4,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:25.843126+00:00",
+        "process_wall_sec": 2.116746353000053,
+        "process_user_cpu_sec": 1.989462,
+        "process_system_cpu_sec": 0.093581,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 7,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-04-candidate.log",
+        "log_sha256": "be15fd9b7443f61919806ea3b84b28e73f37cdefc7ad49254a38f3198ba5cbe9",
+        "samples_ns": [
+          71177380,
+          80778562,
+          70567734,
+          69408698,
+          66815910,
+          71133368,
+          73203486,
+          69127102,
+          84779892,
+          66347543,
+          115453872,
+          111819795,
+          77548172,
+          70615016,
+          77797944,
+          67540451
+        ],
+        "total_ns": 1244114925,
+        "mean_ms": 77.7571828125
+      },
+      {
+        "side": 4096,
+        "pair": 4,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:27.958212+00:00",
+        "process_wall_sec": 2.113627628001268,
+        "process_user_cpu_sec": 2.026302,
+        "process_system_cpu_sec": 0.068898,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 7,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-04-baseline.log",
+        "log_sha256": "8217377f77ac1ad3dc3328c317c73bbf9187e5148c7b9e3f117caaa8af80520d",
+        "samples_ns": [
+          71751409,
+          71080175,
+          79465205,
+          81489060,
+          69743823,
+          70485095,
+          74695747,
+          66209387,
+          78068208,
+          88651697,
+          65406607,
+          75330784,
+          78718234,
+          81132715,
+          68999153,
+          70258405
+        ],
+        "total_ns": 1191485704,
+        "mean_ms": 74.4678565
+      },
+      {
+        "side": 4096,
+        "pair": 5,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:30.379543+00:00",
+        "process_wall_sec": 2.42024973599473,
+        "process_user_cpu_sec": 2.282083,
+        "process_system_cpu_sec": 0.11284599999999999,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 10,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-05-baseline.log",
+        "log_sha256": "c36bd93e3e6214b7297fdd5f336a83eb0768f129879fd1d0fa58fce9f7500f80",
+        "samples_ns": [
+          67857953,
+          79205692,
+          62208343,
+          70832254,
+          76222942,
+          70774439,
+          64200835,
+          76759827,
+          105965641,
+          73039376,
+          81410861,
+          81803349,
+          102758250,
+          111635135,
+          94391400,
+          68848364
+        ],
+        "total_ns": 1287914661,
+        "mean_ms": 80.4946663125
+      },
+      {
+        "side": 4096,
+        "pair": 5,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:32.242002+00:00",
+        "process_wall_sec": 1.8614019679953344,
+        "process_user_cpu_sec": 1.732111,
+        "process_system_cpu_sec": 0.11069899999999999,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 10,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-05-candidate.log",
+        "log_sha256": "7a5ffd44b501ae1b65314a6d9285d0e897e4ff9167f912c32770cb73df23b1a9",
+        "samples_ns": [
+          73109884,
+          69995800,
+          63363530,
+          64313781,
+          62222051,
+          91541622,
+          73266931,
+          62206972,
+          74576710,
+          66994030,
+          64708911,
+          66777239,
+          73071645,
+          61779919,
+          65331328,
+          64542754
+        ],
+        "total_ns": 1097803107,
+        "mean_ms": 68.6126941875
+      },
+      {
+        "side": 4096,
+        "pair": 6,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:34.956907+00:00",
+        "process_wall_sec": 2.7138238890038338,
+        "process_user_cpu_sec": 2.544707,
+        "process_system_cpu_sec": 0.142588,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 47,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-06-candidate.log",
+        "log_sha256": "f8f7e2779e5a552baafd3f7049454b2fedc06bbbe017f74b0bfcaa973338bd05",
+        "samples_ns": [
+          125713240,
+          109788670,
+          90572856,
+          81595019,
+          72508831,
+          68149234,
+          73590930,
+          64503326,
+          98231699,
+          125754815,
+          150243839,
+          144776494,
+          132123263,
+          99162945,
+          73001607,
+          67211981
+        ],
+        "total_ns": 1576928749,
+        "mean_ms": 98.5580468125
+      },
+      {
+        "side": 4096,
+        "pair": 6,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:37.034382+00:00",
+        "process_wall_sec": 2.076404976003687,
+        "process_user_cpu_sec": 1.963257,
+        "process_system_cpu_sec": 0.07060999999999999,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 9,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-06-baseline.log",
+        "log_sha256": "1f51d16166823d73ed10edcb11ef8d04ff1d95877fb77a21703053d413b1d851",
+        "samples_ns": [
+          87392762,
+          69698114,
+          68828592,
+          71255063,
+          68157780,
+          72210757,
+          70708809,
+          75542168,
+          82876617,
+          70325761,
+          75945086,
+          94866770,
+          82504655,
+          78512560,
+          65210344,
+          71332649
+        ],
+        "total_ns": 1205368487,
+        "mean_ms": 75.3355304375
+      },
+      {
+        "side": 4096,
+        "pair": 7,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:40.223758+00:00",
+        "process_wall_sec": 3.187018379001529,
+        "process_user_cpu_sec": 2.980688,
+        "process_system_cpu_sec": 0.15503899999999998,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 10,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-07-baseline.log",
+        "log_sha256": "545b309f428d846591409350ad3fdedd6b301bc22f140e9b76c7a6d6caac7f80",
+        "samples_ns": [
+          69838294,
+          70367357,
+          107760895,
+          122182752,
+          85405727,
+          78299574,
+          88814870,
+          74948811,
+          69331642,
+          70559150,
+          80851244,
+          76159410,
+          75328990,
+          90511749,
+          102442550,
+          232633692
+        ],
+        "total_ns": 1495436707,
+        "mean_ms": 93.4647941875
+      },
+      {
+        "side": 4096,
+        "pair": 7,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_fail_closed_isolation::isolated_fail_closed_4096",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "completed_utc": "2026-10-06T21:20:42.614491+00:00",
+        "process_wall_sec": 2.3886857140023494,
+        "process_user_cpu_sec": 2.189048,
+        "process_system_cpu_sec": 0.162626,
+        "launch_peak_rss_kib": 134784,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 13,
+        "log": "/workspace/shared/neh-rectangle-range-20261006/isolation/matched/4096-07-candidate.log",
+        "log_sha256": "f0a18f9af430514e75da02eeef366467de09de78f6bca11d9d555eb87d043a02",
+        "samples_ns": [
+          90495698,
+          81783837,
+          97240262,
+          81495683,
+          78214490,
+          65591517,
+          66912281,
+          65005938,
+          84571362,
+          85836518,
+          85332531,
+          67516858,
+          117230804,
+          66971627,
+          71539090,
+          69896687
+        ],
+        "total_ns": 1275635183,
+        "mean_ms": 79.7271989375
+      }
+    ],
+    "summary": {
+      "512": {
+        "baseline_median_batch_mean_ms": 0.9670763125,
+        "candidate_median_batch_mean_ms": 0.83763825,
+        "ratio_of_medians": 0.8661552756210229,
+        "paired_median_ratio": 0.870483824229615,
+        "candidate_wins": 5,
+        "paired_ratios": [
+          1.141692730078931,
+          0.6457392387971651,
+          0.7534252627885091,
+          0.8869578932945381,
+          0.8582460626652977,
+          1.1595936955370088,
+          0.870483824229615
+        ],
+        "pooled_production_operation_samples": {
+          "baseline": {
+            "count": 112,
+            "median_ms": 0.8909674999999999,
+            "p95_nearest_rank_ms": 1.957774,
+            "max_ms": 3.201458,
+            "min_ms": 0.642169
+          },
+          "candidate": {
+            "count": 112,
+            "median_ms": 0.79242,
+            "p95_nearest_rank_ms": 1.315578,
+            "max_ms": 1.684642,
+            "min_ms": 0.729599
+          }
+        },
+        "whole_process_including_setup_postchecks": {
+          "baseline": {
+            "cpu_median_sec": 0.040502,
+            "peak_rss_kib_range": [
+              134784,
+              134784
+            ]
+          },
+          "candidate": {
+            "cpu_median_sec": 0.035854,
+            "peak_rss_kib_range": [
+              134784,
+              134784
+            ]
+          }
+        }
+      },
+      "4096": {
+        "baseline_median_batch_mean_ms": 80.4946663125,
+        "candidate_median_batch_mean_ms": 77.7571828125,
+        "ratio_of_medians": 0.965991740503993,
+        "paired_median_ratio": 0.8530185042461981,
+        "candidate_wins": 4,
+        "paired_ratios": [
+          0.7855821640250763,
+          0.6966060815947827,
+          1.264329489485727,
+          1.0441710889382187,
+          0.8523880814801905,
+          1.3082545014303166,
+          0.8530185042461981
+        ],
+        "pooled_production_operation_samples": {
+          "baseline": {
+            "count": 112,
+            "median_ms": 76.191176,
+            "p95_nearest_rank_ms": 129.936472,
+            "max_ms": 338.587492,
+            "min_ms": 61.341827
+          },
+          "candidate": {
+            "count": 112,
+            "median_ms": 73.03662600000001,
+            "p95_nearest_rank_ms": 132.123263,
+            "max_ms": 231.41403,
+            "min_ms": 59.522569
+          }
+        },
+        "whole_process_including_setup_postchecks": {
+          "baseline": {
+            "cpu_median_sec": 2.373459,
+            "peak_rss_kib_range": [
+              134784,
+              134784
+            ]
+          },
+          "candidate": {
+            "cpu_median_sec": 2.351674,
+            "peak_rss_kib_range": [
+              134784,
+              134784
+            ]
+          }
+        }
+      }
+    },
+    "evidence_sha256": "fbf54ee04b0f26f957353f65d429da8050d2ed0072e2916fe00866a838a8e2d3",
+    "sampling_script_sha256": "a05621b0ef7731399d726a93467cc4859dc07220d2889db1dfd7b2dba3ba61e2",
+    "orchestration": {
+      "event": "The initial baseline Cargo artifact was overwritten by the candidate before independent capture; discovered before any isolated measurement. No measurement used that overwritten baseline. Candidate was frozen first, exact unchanged baseline rebuilt once and frozen, then candidate source restored.",
+      "initial_build_and_restoration": {
+        "baseline_forbidden_sha256": "2e2a09d1babd442f01d3796fd6a32299d148a0044f3846de9339d6c99a8b3931",
+        "candidate_forbidden_sha256": "291eabe6a22cd6335c9dca2971c0b4e6aac1d1e319d4609fd80164c68cc85361",
+        "start_utc": "2026-10-06T21:12:31.374887+00:00",
+        "baseline_build_exit": 0,
+        "restored_utc": "2026-10-06T21:13:28.162429+00:00",
+        "restored_sha256": "291eabe6a22cd6335c9dca2971c0b4e6aac1d1e319d4609fd80164c68cc85361",
+        "candidate_build_exit": 0,
+        "end_utc": "2026-10-06T21:14:13.050747+00:00",
+        "final_sha256": "291eabe6a22cd6335c9dca2971c0b4e6aac1d1e319d4609fd80164c68cc85361"
+      },
+      "baseline_capture_recovery": {
+        "reason": "Original baseline executable was overwritten by candidate before capture; no isolated measurements used it. Rebuild exact baseline solely to freeze artifact.",
+        "baseline_forbidden_sha256": "2e2a09d1babd442f01d3796fd6a32299d148a0044f3846de9339d6c99a8b3931",
+        "candidate_forbidden_sha256": "291eabe6a22cd6335c9dca2971c0b4e6aac1d1e319d4609fd80164c68cc85361",
+        "start_utc": "2026-10-06T21:19:06.634158+00:00",
+        "build_exit": 0,
+        "binary_sha256": "7cf459e3cfbf73c5825c4ce13bf658d7e278364caa6fe399fa3766835c05284c",
+        "restored_utc": "2026-10-06T21:19:51.685663+00:00",
+        "restored_sha256": "291eabe6a22cd6335c9dca2971c0b4e6aac1d1e319d4609fd80164c68cc85361"
+      },
+      "baseline_identity_path": "/workspace/shared/neh-rectangle-range-20261006/isolation/baseline-rebuild/binary-identity.json",
+      "candidate_identity_path": "/workspace/shared/neh-rectangle-range-20261006/isolation/candidate/binary-identity.json"
+    },
+    "interpretation": "Distinct experiment, never replacing the original matched observations. Candidate wins5/7 at512 and4/7 at4096;4096 candidate pooled P95 is132.123263ms versus baseline129.936472ms. Candidate adverse pairs are512:[1,6] and4096:[3,4,6]. Workload history and binary layout differ from the original harness. No general non-regression or causal proof. Independent review and bounded disposition after independent review: retain the narrow rectangle candidate and stop attribution; no additional performance runs or tuning.",
+    "current_source_matches_candidate_manifest": true,
+    "focused_test_scope": "The original16 focused checks belong to Q/candidate. They were not rerun on the isolation binary. The current ten protected source files match isolation/candidate;28 isolation process tests passed across both variants."
+  }
+}

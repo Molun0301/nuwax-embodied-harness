@@ -1805,6 +1805,173 @@ mod tests {
     }
 
     #[test]
+    fn calibrated_body_closes_real_ramp_route() {
+        use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
+
+        // Static geometry acceptance with synthetic 50 ms applied feedback, not
+        // observation-TTL, MotionGuard, PlannerWorker, or hardware qualification.
+        let slope = 0.15_f64;
+        let dt = 0.05;
+        let offset = 0.4;
+        let normal_scale = (1.0 + slope * slope).sqrt();
+        let envelope = SurfaceBodyEnvelope {
+            footprint_xy_m: vec![[-0.30, -0.16], [0.30, -0.16], [0.30, 0.16], [-0.30, 0.16]],
+            z_bounds_m: [-0.05, 0.20], body_to_support_z_m: offset,
+            max_step_up_m: 0.2, max_step_down_m: 0.2,
+            max_cross_slope_deg: 18.0, support_uncertainty_m: 0.0,
+        };
+        let map = Arc::new(test_snapshot(slope, false).with_body_envelope(envelope.clone()).unwrap());
+        let limits = MotionLimits {
+            model: MotionModel::Differential,
+            max_forward_mps: 0.2, max_reverse_mps: 0.0, max_lateral_mps: 0.0,
+            max_angular_rps: 0.55, linear_acceleration_mps2: 1.0,
+            guaranteed_braking_mps2: 1.0, angular_acceleration_rps2: 2.0,
+            guaranteed_angular_braking_rps2: 2.0, reaction_time_sec: 0.05,
+            minimum_turning_radius_m: 0.0, can_rotate_in_place: true,
+        };
+        // The simulator uses the exact point-generating plane z=.05+slope*x.
+        // Voxel tops remain quantized map evidence; they never reset actual Z.
+        // Ry(-atan(slope))*Rz(theta) keeps body Z along the plane normal and
+        // chooses theta so the forward axis has the requested world XY yaw.
+        let actual_pose = |xy: [f64; 2], yaw: f64, tick: i64| {
+            let theta = (yaw.sin() / normal_scale).atan2(yaw.cos());
+            let (sp, cp) = (-slope.atan() * 0.5).sin_cos();
+            let (st, ct) = (theta * 0.5).sin_cos();
+            body_pose(
+                [xy[0], xy[1], 0.05 + slope * xy[0] + offset * normal_scale],
+                Quaternion { x: sp * st, y: sp * ct, z: cp * st, w: cp * ct },
+                tick,
+            )
+        };
+        let observed_support = |pose: &PoseStamped| {
+            let p = pose.pose.position;
+            // Independently undo offset*n, including its horizontal component.
+            let support = [p.x + offset * slope / normal_scale, p.y, p.z - offset / normal_scale];
+            assert!((support[2] - (0.05 + slope * support[0])).abs() < 1e-10);
+            let q = pose.pose.orientation;
+            // At a column edge the exact plane can lie slightly over one voxel
+            // below its top; use the existing full-body step-contact contract.
+            let observed = map.locate_support_from_body(xyz(p), [q.x, q.y, q.z, q.w], offset)
+                .expect("actual full-body ramp support must be observed");
+            let source_height = 0.05 + slope * observed.surface_xyz[0];
+            assert!(observed.surface_xyz[2] >= source_height - 1e-6);
+            assert!(observed.surface_xyz[2] - source_height
+                <= f64::from(map.source_voxel_size_m()) + 1e-6);
+        };
+        let start = map.locate_support([0.55, 1.55, 0.1 + slope * 0.55]).unwrap().surface_xyz;
+        let end = map.locate_support([4.55, 1.55, 0.1 + slope * 4.55]).unwrap().surface_xyz;
+        assert!((end[0] - start[0] - 4.0).abs() < 1e-5);
+        let support_path = map.plan(start, end).expect("the real ramp planner must provide a route");
+        let poses: Vec<_> = support_path.into_iter().map(|support| {
+            actual_pose([support[0] - offset * slope / normal_scale, support[1]], 0.0, 0)
+        }).collect();
+        assert!(poses.len() >= 2);
+        for pose in &poses { observed_support(pose); }
+        let goal = actual_pose([end[0] - offset * slope / normal_scale, end[1]], 0.0, 0);
+        let mut current = actual_pose([start[0] - offset * slope / normal_scale, start[1]], 0.0, 0);
+        assert_eq!(poses.first().unwrap().pose.position, current.pose.position);
+        assert_eq!(poses.last().unwrap().pose.position, goal.pose.position,
+            "a shortened planned route must not redefine the original goal");
+        let initial_z = current.pose.position.z;
+        let mut config = follower_config();
+        config.controller.simulation = true;
+        config.motion_limits = Some(limits.clone());
+        assert!(config.max_observation_age_sec.is_none());
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+        follower.update_odometry(current.clone());
+        follower.configure_goal(&goal, GoalOptions {
+            position_tolerance_m: 0.12, yaw_tolerance_rad: 0.15, allow_reverse: false,
+        }).unwrap();
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D { poses }), None, goal.clone()).unwrap();
+        let mut applied = Twist2::ZERO;
+        follower.observe_applied_command(applied);
+        let mut reached = false;
+        let mut failure = None;
+        let mut executed_steps = 0;
+        let mut path_length_m = 0.0;
+        let mut peak_control_wall = std::time::Duration::ZERO;
+        for tick in 0..1200 {
+            current.stamp.nanos = 1_000_000_000 + tick * 50_000_000;
+            follower.update_odometry(current.clone());
+            assert_eq!(follower.last_command, applied, "control must consume actual applied feedback");
+            assert_eq!(follower.config.motion_limits.as_ref(), Some(&limits));
+            assert_eq!(follower.map.as_ref().unwrap().body_envelope(), Some(&envelope));
+            assert_eq!(follower.source_map.as_ref().unwrap().body_envelope(), Some(&envelope));
+            let started = std::time::Instant::now();
+            let result = follower.step(0.32);
+            peak_control_wall = peak_control_wall.max(started.elapsed());
+            let command = match result {
+                PlannerStep::Succeeded => {
+                    assert!(current.pose.position.distance(goal.pose.position) < 0.12,
+                        "success must refer to the original 3D goal");
+                    reached = true;
+                    break;
+                }
+                PlannerStep::Command(command) => command,
+                other => {
+                    failure = Some(format!("tick={tick} pose={current:?} result={other:?}"));
+                    break; // A replan is a failure, never an opportunity to teleport or retry.
+                }
+            };
+            // Check the raw request before execution. No simulator clamp may
+            // sanitize a reverse, lateral, overspeed, or unreachable command.
+            assert!([command.linear.x, command.linear.y, command.angular_z].into_iter().all(f64::is_finite));
+            assert!(command.linear.x >= 0.0 && command.linear.x <= limits.max_forward_mps + 1e-12,
+                "invalid forward command at tick {tick}: {command:?}");
+            assert_eq!(command.linear.y, 0.0, "differential command must not move laterally");
+            assert!(command.angular_z.abs() <= limits.max_angular_rps + 1e-12);
+            let linear_rate = if command.linear.x < applied.linear.x {
+                limits.guaranteed_braking_mps2.min(limits.linear_acceleration_mps2)
+            } else { limits.linear_acceleration_mps2 };
+            let angular_rate = if command.angular_z.abs() < applied.angular_z.abs() {
+                limits.guaranteed_angular_braking_rps2
+            } else { limits.angular_acceleration_rps2 };
+            assert!((command.linear.x - applied.linear.x).abs() <= linear_rate * dt + 1e-12,
+                "unreachable linear command at tick {tick}: previous={applied:?}, requested={command:?}");
+            assert!((command.angular_z - applied.angular_z).abs() <= angular_rate * dt + 1e-12,
+                "unreachable angular command at tick {tick}: previous={applied:?}, requested={command:?}");
+            let speed = (applied.linear.x + command.linear.x) * 0.5;
+            let angular = (applied.angular_z + command.angular_z) * 0.5;
+            let yaw = current.pose.orientation.yaw();
+            let next_yaw = yaw + angular * dt;
+            // Independent midpoint-speed SE(2) arc integration, with no path
+            // snapping or production terrain-projection helper in the simulator.
+            let (dx, dy) = if angular.abs() < 1e-12 {
+                (speed * yaw.cos() * dt, speed * yaw.sin() * dt)
+            } else {
+                (speed * (next_yaw.sin() - yaw.sin()) / angular,
+                 speed * (yaw.cos() - next_yaw.cos()) / angular)
+            };
+            let next = actual_pose([current.pose.position.x + dx, current.pose.position.y + dy], next_yaw, tick + 1);
+            assert!((next.pose.position.z - current.pose.position.z - slope * dx).abs() < 1e-10,
+                "the simulator must not invent a height jump");
+            observed_support(&next);
+            let a = current.pose.orientation;
+            let b = next.pose.orientation;
+            map.validate_body_motion(
+                (xyz(current.pose.position), [a.x, a.y, a.z, a.w]),
+                (xyz(next.pose.position), [b.x, b.y, b.z, b.w]), &[],
+            ).unwrap_or_else(|error| panic!("actual full-body interval rejected at tick {tick}: from={current:?}, to={next:?}, error={error:?}"));
+            path_length_m += current.pose.position.distance(next.pose.position);
+            current = next;
+            applied = command;
+            follower.observe_applied_command(applied);
+            executed_steps += 1;
+        }
+        let error_m = current.pose.position.distance(goal.pose.position);
+        eprintln!("calibrated ramp: arrived={reached}, actual={:?}, goal={:?}, error_m={error_m:.6}, path_m={path_length_m:.6}, steps={executed_steps}, peak_control_wall_ms={:.3}, failure={failure:?}",
+            xyz(current.pose.position), xyz(goal.pose.position), peak_control_wall.as_secs_f64() * 1000.0);
+        assert!(failure.is_none(), "calibrated ramp must not fail or enter a replan loop: {failure:?}");
+        assert!(reached, "calibrated ramp must reach the original goal within 1200 control steps");
+        assert!(current.pose.position.z - initial_z > 0.4);
+        assert!(error_m < 0.12);
+        assert!(executed_steps > 0 && executed_steps <= 1200);
+        assert_eq!(follower.config.motion_limits.as_ref(), Some(&limits));
+        assert_eq!(follower.map.as_ref().unwrap().body_envelope(), Some(&envelope));
+    }
+
+    #[test]
     fn changed_surface_requests_replan_and_partial_endpoint_never_claims_the_goal() {
         let map = test_snapshot(0.0, false);
         let start = body_pose([0.55, 1.55, 0.5], Quaternion::IDENTITY, 0);

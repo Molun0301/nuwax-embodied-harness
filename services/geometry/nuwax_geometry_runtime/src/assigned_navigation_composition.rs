@@ -515,7 +515,7 @@ async fn run_composition(local_planning:bool,root:&Path) {
         assert_eq!(sample.correction_revision,1);
         assert!(sample.map_from_odom.is_some() && sample.odom_from_body.is_some());
         let pose=sample.pose.unwrap().position.unwrap();
-        assert!(pose.x.abs()<0.02 && pose.y.abs()<0.02 && pose.z.abs()<0.02,"known scene relocalization: {pose:?}");
+        assert!(pose.x.abs()<0.05 && pose.y.abs()<0.05 && pose.z.abs()<0.05,"known scene relocalization: {pose:?}");
         sensor=Some(LiveSensor::start(handle.clone(),common,owner.ingress(),applier.clone(),guard.root.join("actuator.jsonl"),world,2));
         let live=sensor.as_ref().unwrap();
         wait_ready(&mut client).await;

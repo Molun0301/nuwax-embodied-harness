@@ -3923,6 +3923,10 @@ fn occupancy_checkpoint_proto(map: &crate::lcm_runtime::MapState) -> OccupancyGr
     }
 }
 
+fn owned_occupancy_bytes(data: Vec<i8>) -> Vec<u8> {
+    data.into_iter().map(|value| value as u8).collect()
+}
+
 fn cloud_checkpoint_proto(
     snapshot: crate::pointcloud::CommittedCloudMapSnapshot,
     frame_id: String,
@@ -6784,7 +6788,7 @@ impl GeometryRuntime for GeometryRuntimeService {
         }
         Ok(Response::new(OccupancyGridData {
             meta: Some(occupancy_grid_meta(&map)),
-            data: map.data.iter().map(|&v| v as u8).collect(),
+            data: owned_occupancy_bytes(map.data),
         }))
     }
 
@@ -6804,7 +6808,7 @@ impl GeometryRuntime for GeometryRuntimeService {
         validate_occupancy_grid(&raw_map).map_err(OccupancyGridValidationError::into_status)?;
         Ok(Response::new(OccupancyGridData {
             meta: Some(occupancy_grid_meta(&raw_map)),
-            data: raw_map.data.iter().map(|&value| value as u8).collect(),
+            data: owned_occupancy_bytes(raw_map.data),
         }))
     }
 
@@ -19293,3 +19297,7 @@ mod assigned_activation_boundary_tests {
         assert!(retained.validate_replay(key, "odom", &committed).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "owned_occupancy_bytes_tests.rs"]
+mod owned_occupancy_bytes_tests;

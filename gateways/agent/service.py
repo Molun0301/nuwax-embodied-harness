@@ -471,7 +471,7 @@ class AgentToolService:
 
     def _task_receipt(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         spec = snapshot["task"]
-        record = self.store.find_by_task(snapshot["task_id"])
+        record = self.store.find_task_call_identity(snapshot["task_id"])
         request_id = record["request_id"] if record else spec.get("metadata", {}).get("request_id")
         return build_receipt(request_id=request_id, gateway_instance_id=self.gateway_instance_id,
                              tool_name=record["tool_name"] if record else None,

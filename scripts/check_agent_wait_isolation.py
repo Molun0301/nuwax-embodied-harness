@@ -75,7 +75,7 @@ class SyntheticStore:
         self.terminals = {}
         self.threads = []
 
-    def find_by_task(self, task_id):
+    def find_task_call_identity(self, task_id):
         self.threads.append(threading.get_ident())
 
     def save_terminal(self, task_id, snapshot):

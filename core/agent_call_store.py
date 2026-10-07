@@ -463,6 +463,17 @@ class AgentCallStore:
             ).fetchone()
         return self._decode(row) if row else None
 
+    def find_task_call_identity(self, task_id: str) -> Optional[Dict[str, str]]:
+        """查询任务回执需要的调用身份，不加载历史参数和结果。"""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT request_id,tool_name FROM agent_calls WHERE task_id=? AND (scope=? OR "
+                "(? AND scope IN (SELECT scope FROM agent_scope_bindings WHERE owner_scope=?))) "
+                "ORDER BY created_at LIMIT 1",
+                (task_id, self.scope, self._registered_scope, self.scope),
+            ).fetchone()
+        return dict(row) if row else None
+
     def terminal_versions(self, task_ids):
         """有界查询身份/版本，恢复扫描不读取或解码历史 JSON。"""
         ids = tuple(task_ids)

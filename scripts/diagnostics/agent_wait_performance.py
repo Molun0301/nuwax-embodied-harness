@@ -93,7 +93,7 @@ class SyntheticStore:
         self.lock = threading.Lock()
         self.terminals = {}
 
-    def find_by_task(self, task_id):
+    def find_task_call_identity(self, task_id):
         return None
 
     def save_terminal(self, task_id, snapshot):

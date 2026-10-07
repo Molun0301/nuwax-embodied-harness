@@ -162,7 +162,7 @@ class MemoryRepository:
         query += f" ORDER BY {order_by}"
         with self._read_snapshot() as transaction:
             rows = transaction.execute(query, params).fetchall()
-            tokens = [self._capture_loaded_token(transaction, model_type, row) for row in rows]
+            tokens = self._capture_loaded_tokens(transaction, model_type, rows)
         return [self._tag_loaded(self._load_record(model_type, row), token) for row, token in zip(rows, tokens)]
 
     def load_tagged_locations(self, *, library_name: Optional[str] = None) -> List[TaggedLocation]:
@@ -263,7 +263,7 @@ class MemoryRepository:
             params.append(int(limit))
         with self._read_snapshot() as transaction:
             rows = transaction.execute(query, tuple(params)).fetchall()
-            tokens = [self._capture_loaded_token(transaction, SceneSpace, row) for row in rows]
+            tokens = self._capture_loaded_tokens(transaction, SceneSpace, rows)
         return [self._tag_loaded(self._load_record(SceneSpace, row), token) for row, token in zip(rows, tokens)]
 
     def query_scene_spaces(
@@ -581,7 +581,7 @@ class MemoryRepository:
                 FROM semantic_memories WHERE {where}
                 ORDER BY CAST(json_extract(payload_json,'$.timestamp') AS TEXT) COLLATE NEH_SCENE_TIMESTAMP DESC,memory_id
                 LIMIT 2000""", tuple(params)).fetchall()
-            tokens = [self._capture_loaded_token(transaction, SemanticMemoryEntry, row) for row in rows]
+            tokens = self._capture_loaded_tokens(transaction, SemanticMemoryEntry, rows)
             scene_rows, scene_tokens = [], []
             if include_spaces:
                 scene_where = "library_name=? AND json_extract(payload_json,'$.metadata.scene_mapping_managed')=1"
@@ -590,7 +590,7 @@ class MemoryRepository:
                     scene_where += " AND scene_space_id IN (SELECT value FROM json_each(?))"
                     scene_params.append(json.dumps(tuple(visible_space_ids)))
                 scene_rows = transaction.execute(f"SELECT payload_json,map_name,library_name,graph_source_revision,scene_space_id AS index_record_id FROM scene_spaces WHERE {scene_where} ORDER BY scene_space_id", tuple(scene_params)).fetchall()
-                scene_tokens = [self._capture_loaded_token(transaction, SceneSpace, row) for row in scene_rows]
+                scene_tokens = self._capture_loaded_tokens(transaction, SceneSpace, scene_rows)
         records = []
         for row, token in zip(rows, tokens):
             entry = self._tag_loaded(self._load_record(SemanticMemoryEntry,row),token)
@@ -653,7 +653,7 @@ class MemoryRepository:
                     params.append(json.dumps(valid_live_ids))
                 extra = ",graph_source_revision" if table in ("semantic_instances", "scene_spaces") else ""
                 rows = transaction.execute(f"SELECT payload_json,map_name,library_name,{column} AS index_record_id{extra} FROM {table} WHERE {where} ORDER BY {order} LIMIT ?", (*params,limit)).fetchall()
-                tokens = [self._capture_loaded_token(transaction,model,row) for row in rows]
+                tokens = self._capture_loaded_tokens(transaction, model, rows)
                 captured.append((model,rows,tokens,total,selected_total))
         result = {"generations": generations, "valid_live_ids": valid_live_ids, "extra_live": extra_live}
         for name, (model, rows, tokens, total, selected_total) in zip(("spaces","entries","instances"),captured):
@@ -1145,6 +1145,34 @@ class MemoryRepository:
                     updated_at,
                 ),
             )
+
+    def _capture_loaded_tokens(self, transaction, model_type, rows):
+        """在源记录的同一事务内分批读取令牌，不搬运未使用的索引投影。"""
+        if self._index is None or not rows:
+            return [None] * len(rows)
+        from services.memory.durable_index import SOURCES
+        kind = next((key for key, value in SOURCES.items() if value[2] is model_type), None)
+        if kind is None:
+            return [None] * len(rows)
+        tokens = []
+        for offset in range(0, len(rows), 250):
+            batch = rows[offset:offset + 250]
+            ids = [row["index_record_id"] for row in batch if "index_record_id" in row.keys()]  # noqa: SIM118 - sqlite3.Row 按值判断成员
+            states = {}
+            if ids:
+                # 250 个源标识加一个类型参数；令牌只依赖记录化身与业务版本。
+                placeholders = ",".join("?" for _ in ids)
+                states = {row["external_id"]: row for row in transaction.execute(
+                    "SELECT external_id,record_incarnation,business_revision FROM memory_index_sources "
+                    f"WHERE source_kind=? AND external_id IN ({placeholders})", (kind, *ids),
+                ).fetchall()}
+            for row in batch:
+                if "index_record_id" not in row.keys():  # noqa: SIM118 - sqlite3.Row 按值判断成员
+                    tokens.append(None)
+                    continue
+                state = states.get(row["index_record_id"])
+                tokens.append(self._index.business_token(state) if state else self._index.raw_token(row))
+        return tokens
 
     def _capture_loaded_token(self, transaction, model_type, row):
         if self._index is None or "index_record_id" not in row.keys():

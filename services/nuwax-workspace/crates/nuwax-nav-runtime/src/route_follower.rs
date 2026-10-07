@@ -818,6 +818,60 @@ mod tests {
         assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(c) if c.linear.x > 0.0));
         assert_eq!(follower.local_plans(), 1);
     }
+
+    #[test]
+    fn exact_mask_reuse_preserves_held_local_work_but_mask_fine_and_owner_changes_cancel() {
+        for change in 0..4 {
+            let physical = comparison_map(false, Some(1_000_000_000));
+            let blocked = vec![false; 60 * 30];
+            let source = Arc::new(physical.with_virtual_obstacles([0.0,0.0],0.1,60,30,&blocked).unwrap());
+            let mut follower = RouteFollower::new(comparison_config(Some(true))).unwrap();
+            follower.update_execution_map(ExecutionMap::Surface(source.clone())).unwrap();
+            comparison_route(&mut follower, comparison_pose(0.5,0), comparison_pose(3.0,0));
+            let gate = install_held_candidate(&mut follower);
+            assert!(matches!(follower.step(0.3), PlannerStep::Pending(_)));
+            gate.started();
+            let epoch = follower.owner.as_ref().unwrap().epoch();
+            let calls = follower.local_planning_calls();
+            let next = match change {
+                0 => {
+                    assert!(source.matches_virtual_obstacles([0.0,0.0],0.1,60,30,blocked.iter().copied()));
+                    refresh_observation_metadata(&source, 2_000_000_000)
+                }
+                1 => {
+                    let mut changed = blocked.clone(); changed[2 * 60 + 40] = true;
+                    Arc::new(physical.with_virtual_obstacles([0.0,0.0],0.1,60,30,&changed).unwrap())
+                }
+                2 => {
+                    let mut observations = source.observations().unwrap().as_ref().clone();
+                    observations.replace_block([2,0,0], std::collections::BTreeMap::from([
+                        ([70,1,0], nuwax_nav_mls_planner::SurfaceObservation { observed_ns:2_000_000_000, hits:2 })
+                    ])).unwrap();
+                    let next = Arc::new(source.with_observations(Some(Arc::new(observations))));
+                    assert!(source.same_geometry(&next));
+                    assert!(!nuwax_nav_pct::same_source_geometry(&source,&next));
+                    next
+                }
+                _ => Arc::new(comparison_map(false,Some(2_000_000_000))
+                    .with_virtual_obstacles([0.0,0.0],0.1,60,30,&blocked).unwrap()),
+            };
+            follower.update_execution_map(ExecutionMap::Surface(next)).unwrap();
+            if change == 0 {
+                assert_eq!(follower.owner.as_ref().unwrap().epoch(), epoch);
+                assert_eq!(follower.local_planning_calls(), calls);
+                gate.release();
+                assert!(matches!(ready_step(&mut follower,0.3),PlannerStep::Command(c) if c.linear.x>0.0));
+                assert_eq!(follower.local_plans(),1);
+            } else {
+                assert!(follower.owner.as_ref().unwrap().epoch()>epoch);
+                gate.release();
+                wait_for(||follower.owner.as_ref().unwrap().is_idle_for_test());
+                follower.consume_plan();
+                assert_eq!(follower.local_plans(),0);
+                assert!(follower.local_path().is_none());
+            }
+        }
+    }
     #[test]
     fn moved_start_candidate_is_rejected_without_teleporting_or_losing_admission() {
         for committed in [false,true] {

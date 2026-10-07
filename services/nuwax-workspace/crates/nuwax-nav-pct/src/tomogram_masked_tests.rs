@@ -146,6 +146,25 @@ fn assert_exact(reference: &Tomogram, actual: &Tomogram) {
     assert_eq!(cross_floor(reference), cross_floor(actual));
 }
 
+#[test]
+fn exact_mask_reuse_matches_cold_global_and_local_fields_edges_and_routes() {
+    let size=f64::from(FINE);
+    let mut blocked=vec![false;36*26];
+    for x in 18..20 {for y in 0..16 {blocked[y*36+x]=true;}}
+    for complete_fine in [false,true] {
+        let retained=fixture(complete_fine);
+        assert!(retained.matches_virtual_obstacles([0.0,0.0],size,36,26,blocked.iter().copied()));
+        let cold=retained.with_virtual_obstacles([0.0,0.0],size,36,26,&blocked).unwrap();
+        assert!(!retained.same_geometry(&cold));
+        for window in [None,Some(LOCAL)] {
+            let retained_map=current(&retained,window).unwrap();
+            let cold_map=current(&cold,window).unwrap();
+            // 包含所有浮点字段、支撑/墙距、逐单元邻接顺序、已知列和完整跨层/绕行结果。
+            assert_exact(&cold_map,&retained_map);
+        }
+    }
+}
+
 fn assert_fixture(source: &SurfaceSnapshot, map: &Tomogram, fine: bool, local: bool) {
     let (resolution, columns) = source.navigation_source_columns(local.then_some(LOCAL));
     let columns: AHashSet<_> = columns.map(|(column, _)| column).collect();

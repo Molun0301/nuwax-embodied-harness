@@ -1038,6 +1038,50 @@ mod tests {
         worker.stop();
         release.send(()).unwrap();
     }
+
+    #[test]
+    fn identical_surface_arc_still_fences_stored_and_inflight_commands() {
+        struct SurfaceProbe {
+            started: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl NavPlanner for SurfaceProbe {
+            fn replace_path(&mut self, _: Path2D) {}
+            fn update_odometry(&mut self, _: PoseStamped) {}
+            fn update_costmap(&mut self, _: CostMap2D) {}
+            fn update_execution_map(&mut self, map: ExecutionMap)->Result<(),RuntimeError> {
+                assert!(matches!(map,ExecutionMap::Surface(_))); Ok(())
+            }
+            fn step(&mut self, _: f64)->PlannerStep {
+                let _=self.started.send(());
+                let _=self.release.recv_timeout(Duration::from_secs(3));
+                PlannerStep::Command(Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.2,0.0),angular_z:0.0})
+            }
+            fn stop(&mut self) {}
+        }
+        let (started,start)=std::sync::mpsc::channel();
+        let (release,receive)=std::sync::mpsc::channel();
+        let mut worker=PlannerWorker::new(SurfaceProbe {started,release:receive}).unwrap();
+        let surface=crate::surface_follower::test_snapshot(0.0,false);
+        worker.update_execution_map(ExecutionMap::Surface(surface.clone())).unwrap();
+        worker.step(0.3); start.recv_timeout(Duration::from_secs(1)).unwrap();
+        let old_version=worker.shared.0.lock().unwrap().map_version;
+        // 原计算仍被屏障持有；重装同一Arc也必须退休它。
+        worker.update_execution_map(ExecutionMap::Surface(surface.clone())).unwrap();
+        assert_eq!(worker.shared.0.lock().unwrap().map_version,old_version+1);
+        release.send(()).unwrap(); start.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(worker.shared.0.lock().unwrap().result.is_none());
+        release.send(()).unwrap(); wait_for_source_result(&worker);
+        worker.update_execution_map(ExecutionMap::Surface(surface)).unwrap();
+        start.recv_timeout(Duration::from_secs(1)).unwrap();
+        {
+            let mut input=worker.shared.0.lock().unwrap();
+            assert!(matches!(input.result.as_ref().unwrap().1,PlannerStep::Command(c) if c.linear.x>0.0));
+            input.result.as_mut().unwrap().0=std::time::Instant::now();
+        }
+        assert_eq!(worker.step(0.3),PlannerStep::Pending(Vec::new()));
+        worker.stop(); release.send(()).unwrap();
+    }
     #[test]
     fn map_replacement_retires_inflight_result_and_wakes_without_control_tick() {
         let (mut worker, start, release) = source_worker();

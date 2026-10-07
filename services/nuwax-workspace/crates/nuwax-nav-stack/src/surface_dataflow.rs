@@ -955,6 +955,12 @@ mod tests {
     mod quick_budget_tests {
         include!("surface_quick_budget_tests.rs");
     }
+    mod mask_reuse_tests {
+        include!("surface_mask_reuse_tests.rs");
+    }
+    mod mask_work_tests {
+        include!("surface_mask_work_tests.rs");
+    }
 
     use super::super::guarded_tests::RecordingMotion;
     use super::*;
@@ -1678,7 +1684,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_occupancy_revision_conservatively_invalidates_virtual_mask_cache() {
+    fn committed_occupancy_revision_reuses_only_exact_virtual_mask_geometry() {
         let mut cache = SurfaceGeometryCache::new(config().geometry);
         let mut first = map_message(1, "mask-revision");
         first.virtual_obstacles = Some(virtual_mask(&first, true));
@@ -1689,7 +1695,7 @@ mod tests {
         second.virtual_obstacles = Some(virtual_mask(&second, true));
         let repeated_mask = cache.build(&second).unwrap();
         assert!(Arc::ptr_eq(&physical, &cache.physical_snapshot().unwrap()));
-        assert!(!Arc::ptr_eq(&old, &repeated_mask));
+        assert!(Arc::ptr_eq(&old, &repeated_mask));
         assert!(Arc::ptr_eq(&repeated_mask, &cache.build(&second).unwrap()));
         let mut third = map_message(3, "mask-revision");
         third.committed_map.revision = 3;
@@ -2032,6 +2038,11 @@ mod tests {
         }
 
         async fn start_with_rate(computer:SurfacePathComputer,feed_period:Duration)->Self {
+            Self::start_with_config_rate(computer, feed_period, config()).await
+        }
+
+        async fn start_with_config_rate(computer:SurfacePathComputer,feed_period:Duration,
+            configured: SurfaceNavigationConfig)->Self {
             use crate::topics::{NavTopicConfig, TopicName};
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let port = socket.local_addr().unwrap().port();
@@ -2076,13 +2087,16 @@ mod tests {
             let planner_transport = LcmTransport::new_real(&url).unwrap();
             let planner_hub = hub.clone();
             let planner_spec = planner_node.clone();
+            let mut planner_config = configured.clone();
+            // 测试原来分别构造两份配置；传入标定也不能暗中合并两端PCT拥有方。
+            planner_config.follower.pct = Arc::new(nuwax_nav_pct::PctPlanner::default());
             let mut planner = boxed_owner(
                 "surface-real-lcm-test-planner",
                 Box::new(move |shutdown, ready| {
                     Box::pin(run_surface_planner_with_computer(
                         planner_spec,
                         planner_hub,
-                        config(),
+                        planner_config,
                         planner_transport,
                         shutdown,
                         ready,
@@ -2107,7 +2121,7 @@ mod tests {
                         shutdown,
                         ready,
                         async move {
-                            let local = nuwax_nav_runtime::RouteFollower::new(config().follower)?;
+                            let local = nuwax_nav_runtime::RouteFollower::new(configured.follower)?;
                             let scheduler = nuwax_nav_runtime::NavScheduler::new(
                                 RecordingMotion(motion_calls),
                                 local,

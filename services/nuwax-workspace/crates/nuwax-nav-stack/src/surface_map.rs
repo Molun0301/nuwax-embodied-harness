@@ -21,16 +21,44 @@ enum GeometryRevision {
     },
 }
 
-/// No independent virtual-mask revision exists yet. Occupancy commits invalidate it
-/// conservatively, including commits whose actual mask did not change.
+/// 修订先走常量时间快路；同域较新提交可再逐格证明虚拟几何完全未变。
 #[derive(Clone, PartialEq, Eq)]
 struct MaskRevision {
     domain: nuwax_map_chunks::Domain,
+    commit_boot_nonce: [u8; 16],
     occupancy_revision: i64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct MaskLayout {
+    resolution: u32,
+    width: i32,
+    height: i32,
+    position: [u64; 3],
+    orientation: [u64; 4],
+}
+impl MaskLayout {
+    fn new(mask: &schema::OccupancyGrid) -> Self {
+        Self {
+            resolution: mask.info.resolution.to_bits(),
+            width: mask.info.width,
+            height: mask.info.height,
+            position: mask.info.origin.position.map(f64::to_bits),
+            orientation: mask.info.origin.orientation_xyzw.map(f64::to_bits),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MaskWork {
+    pub compared_cells: usize,
+    pub derivations: usize,
 }
 
 struct DerivedSurface {
     mask_revision: Option<MaskRevision>,
+    mask_layout: Option<MaskLayout>,
     physical: Arc<SurfaceSnapshot>,
     snapshot: Arc<SurfaceSnapshot>,
 }
@@ -48,6 +76,8 @@ pub struct SurfaceMapCache {
     observation_enabled: bool,
     fine_observed_root: Option<Arc<nuwax_map_chunks::Manifest>>,
     observations: Option<Arc<nuwax_nav_mls_planner::SurfaceObservations>>,
+    #[cfg(test)]
+    mask_work: MaskWork,
 }
 
 impl SurfaceMapCache {
@@ -64,6 +94,8 @@ impl SurfaceMapCache {
             observation_enabled: false,
             fine_observed_root: None,
             observations: None,
+            #[cfg(test)]
+            mask_work: MaskWork::default(),
             lcm_url: std::env::var("NUWAX_LCM_URL")
                 .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=0".into()),
         }
@@ -102,6 +134,9 @@ impl SurfaceMapCache {
             .as_ref()
             .map(|(_, snapshot)| Arc::clone(snapshot))
     }
+
+    #[cfg(test)]
+    pub(crate) fn mask_work(&self) -> MaskWork { self.mask_work }
 
     fn record_reuse(&mut self) {
         if let Some(stats) = self.last_stats.as_mut() {
@@ -159,8 +194,10 @@ impl SurfaceMapCache {
         };
         let mask_revision = message.virtual_obstacles.as_ref().map(|_| MaskRevision {
             domain,
+            commit_boot_nonce: message.commit_boot_nonce,
             occupancy_revision: message.committed_map.revision,
         });
+        let mask_layout = message.virtual_obstacles.as_ref().map(MaskLayout::new);
         let mut frontier_changes = None;
         let physical = if let Some((_, snapshot)) = self
             .physical
@@ -208,9 +245,31 @@ impl SurfaceMapCache {
         // rebuilding geometry. Full-cloud compatibility goes through the builder's
         // existing exact column comparison on each new publication revision.
         self.fine_built_root = fine_root.clone();
-        if let Some(previous) = self.latest.as_ref().filter(|previous|
-            Arc::ptr_eq(&previous.physical, &physical) && previous.mask_revision == mask_revision)
-        {
+        #[cfg(test)]
+        let mut compared_cells = 0;
+        let reusable = self.latest.as_ref().is_some_and(|previous| {
+            if !Arc::ptr_eq(&previous.physical, &physical) { return false; }
+            if previous.mask_revision == mask_revision { return true; }
+            let (Some(old), Some(next), Some(mask)) =
+                (&previous.mask_revision, &mask_revision, &message.virtual_obstacles)
+                else { return false; };
+            if old.domain != next.domain || old.commit_boot_nonce != next.commit_boot_nonce
+                || old.occupancy_revision >= next.occupancy_revision
+                || previous.mask_layout != mask_layout
+            { return false; }
+            // 比较借用完整输入与已有积分图，不保留或复制另一份遮罩。
+            previous.snapshot.matches_virtual_obstacles(
+                [mask.info.origin.position[0], mask.info.origin.position[1]],
+                f64::from(mask.info.resolution), mask.info.width as u32, mask.info.height as u32,
+                mask.data.iter().map(|value| {
+                    #[cfg(test)] { compared_cells += 1; }
+                    *value == 100
+                }),
+            )
+        });
+        #[cfg(test)] { self.mask_work.compared_cells += compared_cells; }
+        if reusable {
+            let previous = self.latest.as_ref().expect("已核对保留派生图");
             let snapshot = &previous.snapshot;
             let same_observations = match (snapshot.observations(), observations.as_ref()) {
                 (None, None) => true,
@@ -221,10 +280,11 @@ impl SurfaceMapCache {
                 else { Arc::new(snapshot.with_observations(observations.clone())) };
             self.observations = observations;
             self.fine_observed_root = fine_root;
-            self.latest = Some(DerivedSurface { mask_revision, physical, snapshot: Arc::clone(&snapshot) });
+            self.latest = Some(DerivedSurface { mask_revision, mask_layout, physical, snapshot: Arc::clone(&snapshot) });
             return Ok(snapshot);
         }
         let snapshot = if let Some(mask) = message.virtual_obstacles.as_ref() {
+            #[cfg(test)] { self.mask_work.derivations += 1; }
             let blocked: Vec<_> = mask.data.iter().map(|value| *value == 100).collect();
             Arc::new(
                 physical
@@ -248,7 +308,7 @@ impl SurfaceMapCache {
         } else { snapshot };
         self.observations = observations;
         self.fine_observed_root = fine_root;
-        self.latest = Some(DerivedSurface { mask_revision, physical, snapshot: Arc::clone(&snapshot) });
+        self.latest = Some(DerivedSurface { mask_revision, mask_layout, physical, snapshot: Arc::clone(&snapshot) });
         Ok(snapshot)
     }
 }

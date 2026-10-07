@@ -168,6 +168,34 @@ struct VirtualObstacleMask {
 }
 
 impl VirtualObstacleMask {
+    fn matches_cells(
+        &self,
+        origin: [f64; 2],
+        resolution: f64,
+        width: u32,
+        height: u32,
+        mut blocked: impl ExactSizeIterator<Item = bool>,
+    ) -> bool {
+        // 必须核对实际保留布局，不能以调用方的修订替代构造器的几何/容量校验。
+        if self.origin.map(f64::to_bits) != origin.map(f64::to_bits)
+            || self.resolution.to_bits() != resolution.to_bits()
+            || self.width != width
+            || self.height != height
+            || blocked.len() != self.width as usize * self.height as usize
+        {
+            return false;
+        }
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let Some(blocked) = blocked.next() else { return false; };
+                if sum_image_pixels(&self.integral, x, y, x, y)[0] != u32::from(blocked) {
+                    return false;
+                }
+            }
+        }
+        blocked.next().is_none()
+    }
+
     fn new(
         origin: [f64; 2],
         resolution: f64,
@@ -240,6 +268,10 @@ impl VirtualObstacleMask {
             && sum_image_pixels(&self.integral, left, top, right, bottom)[0] == 0
     }
 }
+
+#[cfg(test)]
+#[path = "surface/virtual_mask_match_tests.rs"]
+mod virtual_mask_match_tests;
 
 /// 来源声明决定连续占据带是测量区间还是实体体积。
 #[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
@@ -390,6 +422,20 @@ impl SurfaceSnapshot {
             origin, resolution, width, height, blocked,
         )?);
         self.with_virtual_mask(mask)
+    }
+
+    /// 逐格核对已保留虚拟层的完整几何；不复制遮罩、不计算内容摘要，也不授予时效权限。
+    /// 布局必须逐位相同；无虚拟层与有限范围的全空闲层仍是不同输入。
+    pub fn matches_virtual_obstacles(
+        &self,
+        origin: [f64; 2],
+        resolution: f64,
+        width: u32,
+        height: u32,
+        blocked: impl ExactSizeIterator<Item = bool>,
+    ) -> bool {
+        self.data.virtual_obstacles.as_ref().is_some_and(|mask|
+            mask.matches_cells(origin, resolution, width, height, blocked))
     }
 
     fn with_virtual_mask(&self, mask: Arc<VirtualObstacleMask>) -> Result<Self, SurfaceError> {

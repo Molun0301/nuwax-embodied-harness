@@ -4,6 +4,7 @@ use super::*;
 use futures::FutureExt;
 use nuwax_nav_stack::{register_compiled_in_process_owners, NavStackBuilder, NavStackPreset,
     NavStackProfile, NavTopicConfig, ProductionPipeline, StackRunner};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -475,6 +476,10 @@ async fn run_composition(local_planning:bool,root:&Path) {
             ExportMappingBackendCheckpointRequest {checkpoint_schema_version:2})).await.unwrap().into_inner();
         let fine=checkpoint.fine_map_artifact.as_ref().unwrap();
         let dense=checkpoint.dense_cloud_artifact.as_ref().unwrap();
+        std::fs::write(root.join("canonical-target.xyz-f32-le"), &checkpoint.canonical_cloud_checkpoint.as_ref().unwrap().xyz_f32_le).unwrap();
+        let mut dense_input=source.service.graph_artifacts.lock().open(dense).unwrap();
+        let mut dense_output=std::fs::File::create(root.join("dense-target.dc1")).unwrap();
+        std::io::copy(&mut dense_input,&mut dense_output).unwrap();
         transfer_assigned_checkpoint_member(&source.service,&service,fine,b"NUWAXAR2").await;
         transfer_assigned_checkpoint_member(&source.service,&service,dense,b"NUWAXDC1").await;
         let activated=client.activate_map(ActivateMapRequest {
@@ -502,9 +507,11 @@ async fn run_composition(local_planning:bool,root:&Path) {
         let registration_scan=world.iter().cycle().take(50_000).copied().collect::<Vec<_>>();
         sensor_frame(&handle,&common,&owner.ingress(),&applier,&registration_scan,[0.0;3],2,true).await;
         let terminal=tokio::time::timeout(Duration::from_secs(30),pending).await.unwrap().unwrap().unwrap().into_inner();
+        eprintln!("ASSIGNED_COMPOSITION relocalization terminal: {terminal:?}");
         assert_eq!(terminal.assigned_cloud_v2.as_ref().unwrap().disposition,RelocalizeDisposition::Applied as i32,"{terminal:?}");
         assert_eq!(applier.snapshot().unwrap().correction_revision,1);
         let sample=client.get_assigned_localization_sample(request).await.unwrap().into_inner();
+        eprintln!("ASSIGNED_COMPOSITION localization sample: {sample:?}");
         assert_eq!(sample.correction_revision,1);
         assert!(sample.map_from_odom.is_some() && sample.odom_from_body.is_some());
         let pose=sample.pose.unwrap().position.unwrap();
@@ -664,7 +671,7 @@ fn isolated_case(name:&str,local_planning:bool) {
     if std::env::var(CHILD_MODE).as_deref()==Ok(name) {
         let _=tracing_subscriber::fmt().with_env_filter("warn,nuwax_nav_runtime=info,nuwax_nav_stack=info").try_init();
         let root=std::env::temp_dir().join(format!("assigned-nav-{}",uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
+        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         let config=[("NUWAX_LCM_URL",crate::lcm_runtime::test_lcm_url()),
             ("NUWAX_GEOMETRY_PIPELINE","lio_3d".into()),("NUWAX_NAV_PROFILE","pct-scan-3d".into()),
             ("NUWAX_GEOMETRY_SEQUENCE_STATE_PATH",root.join("sequence.json").display().to_string()),

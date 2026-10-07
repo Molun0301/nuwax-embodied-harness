@@ -43,6 +43,7 @@ use nuwax_mapping::cost_mapper::{
 #[cfg(test)]
 use nuwax_mapping::pointclouds::occupancy::MappingError;
 use nuwax_mapping::{CostMapper, MappingSession, OccupancyGrid, PointCloudAccumulator};
+use nuwax_mapping::mapping_session::AdmittedFrameKey;
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
 use tracing::warn;
@@ -519,6 +520,15 @@ pub(crate) struct RegisteredMapCloud {
     pub(crate) points: Vec<Point3<f64>>,
     pub(crate) session_generation: u64,
     pub(crate) frame_generation: u64,
+}
+
+/// Replay mode is selected by the caller that owns admission. A canonical key
+/// comes from the immutable registered cloud, never an arrival counter.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MappingCloudSource {
+    Legacy,
+    SourceFencedCompatibility,
+    Canonical(AdmittedFrameKey),
 }
 
 #[derive(Debug)]
@@ -2163,7 +2173,7 @@ impl MappingAdapter {
         received_at_ns: u64,
         frame_id: &str,
         source_timestamp_ns: u64,
-        source_fenced: bool,
+        source: MappingCloudSource,
     ) -> Result<Option<PreparedMappingCompute>, nuwax_mapping::SessionError> {
         if self.checkpoint_localization_required {
             return Ok(None);
@@ -2191,26 +2201,21 @@ impl MappingAdapter {
             });
         }
 
-        let stats = if source_fenced {
-            self.feed_pointcloud_session_after_source_fence_impl(
-                points,
-                odom_xy,
-                point_step,
-                received_at_ns,
-                frame_id,
-                source_timestamp_ns,
-                false,
-            )?
-        } else {
-            self.feed_pointcloud_session_impl(
-                points,
-                odom_xy,
-                point_step,
-                received_at_ns,
-                frame_id,
-                source_timestamp_ns,
-                false,
-            )?
+        let stats = match source {
+            MappingCloudSource::Legacy => self.feed_pointcloud_session_impl(
+                points, odom_xy, point_step, received_at_ns, frame_id,
+                source_timestamp_ns, false, None,
+            )?,
+            MappingCloudSource::SourceFencedCompatibility | MappingCloudSource::Canonical(_) => {
+                let key = match source {
+                    MappingCloudSource::Canonical(key) => Some(key),
+                    _ => None,
+                };
+                self.feed_pointcloud_session_after_source_fence_impl(
+                    points, odom_xy, point_step, received_at_ns, frame_id,
+                    source_timestamp_ns, false, key,
+                )?
+            }
         };
         if stats.accepted == 0 {
             return Ok(None);
@@ -3201,6 +3206,7 @@ impl MappingAdapter {
             frame_id,
             source_timestamp_ns,
             true,
+            None,
         )
     }
 
@@ -3214,6 +3220,7 @@ impl MappingAdapter {
         frame_id: &str,
         source_timestamp_ns: u64,
         compatibility_kernel: bool,
+        admitted_key: Option<AdmittedFrameKey>,
     ) -> Result<nuwax_mapping::FeedStats, nuwax_mapping::SessionError> {
         self.latest_accepted_map_points.clear();
         self.latest_accepted_point_count = 0;
@@ -3300,9 +3307,10 @@ impl MappingAdapter {
         }
         #[cfg(not(test))]
         let _ = compatibility_kernel;
-        let stats =
-            self.session
-                .feed_pointcloud(map_points, dedup_xy, point_step, message_timestamp_ns)?;
+        let stats = match admitted_key {
+            Some(key) => self.session.feed_admitted_pointcloud(map_points, key, message_timestamp_ns)?,
+            None => self.session.feed_pointcloud(map_points, dedup_xy, point_step, message_timestamp_ns)?,
+        };
         if stats.accepted > 0 {
             #[cfg(test)]
             if compatibility_kernel {
@@ -3356,6 +3364,7 @@ impl MappingAdapter {
             frame_id,
             source_timestamp_ns,
             true,
+            None,
         )
     }
 
@@ -3369,6 +3378,7 @@ impl MappingAdapter {
         frame_id: &str,
         source_timestamp_ns: u64,
         compatibility_kernel: bool,
+        admitted_key: Option<AdmittedFrameKey>,
     ) -> Result<nuwax_mapping::FeedStats, nuwax_mapping::SessionError> {
         let stats = self.feed_pointcloud_session_impl(
             points,
@@ -3378,6 +3388,7 @@ impl MappingAdapter {
             frame_id,
             received_at_ns,
             compatibility_kernel,
+            admitted_key,
         )?;
         if stats.accepted > 0 {
             self.latest_pointcloud_timestamp_ns = source_timestamp_ns;
@@ -4261,6 +4272,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     include!("mapping_adapter_virtual_mask_tests.rs");
+    include!("mapping_ingest_hash_benchmark_tests.rs");
+    include!("mapping_admitted_frame_tests.rs");
     include!("mapping_adapter_rectangle_scan_tests.rs");
     include!("mapping_adapter_fail_closed_isolation_tests.rs");
 
@@ -6039,7 +6052,7 @@ mod tests {
         use std::os::unix::fs::OpenOptionsExt;
         let mut adapter = active_adapter(sample_config());
         let prepared = adapter.prepare_backend_compute(&[Point3::new(1.0, 0.0, 1.0)],
-            (0.0, 0.0), 12, 1_000_000_000, "map", 1_000_000_000, false).unwrap().unwrap();
+            (0.0, 0.0), 12, 1_000_000_000, "map", 1_000_000_000, MappingCloudSource::Legacy).unwrap().unwrap();
         let completion = prepared.worker.submit(prepared.token, prepared.input).unwrap()
             .blocking_recv().unwrap();
         let root = sequence_test_path("slow-prepare");
@@ -6084,7 +6097,7 @@ mod tests {
             let mut shared = SharedState::default();
             for sequence in 1..=2 {
                 let stamp = sequence * 1_000_000_000;
-                let prepared = adapter.prepare_backend_compute(&points,(0.0,0.0),12,stamp,"map",stamp,false).unwrap().unwrap();
+                let prepared = adapter.prepare_backend_compute(&points,(0.0,0.0),12,stamp,"map",stamp,MappingCloudSource::Legacy).unwrap().unwrap();
                 let completion = prepared.worker.submit(prepared.token,prepared.input).unwrap().blocking_recv().unwrap();
                 assert_eq!(completion.accepted_points_map.len(),points.len());
                 let committed = adapter.commit_backend_completion(completion,&mut shared).unwrap().unwrap();
@@ -6111,7 +6124,7 @@ mod tests {
                 1_000_000_000,
                 "map",
                 1_000_000_000,
-                false,
+                MappingCloudSource::Legacy,
             )
             .expect("prepare first frame")
             .expect("first frame obtains token");
@@ -6123,7 +6136,7 @@ mod tests {
                 2_000_000_000,
                 "map",
                 2_000_000_000,
-                false,
+                MappingCloudSource::Legacy,
             )
             .expect("coalesced frame is not an error")
             .is_none());
@@ -6164,7 +6177,7 @@ mod tests {
                 1_000_000_000,
                 "map",
                 1_000_000_000,
-                false,
+                MappingCloudSource::Legacy,
             )
             .expect("prepare frame")
             .expect("token");
@@ -6196,7 +6209,7 @@ mod tests {
                 1_000_000_000,
                 "map",
                 1_000_000_000,
-                false,
+                MappingCloudSource::Legacy,
             )
             .expect("prepare frame")
             .expect("token");

@@ -204,6 +204,7 @@ impl AcceptedRegisteredCloud {
                 self.envelope.odom_frame_id.clone(), self.envelope.map_frame_id.clone()],
             self.envelope.source_point_count, self.binding.clone(), &self.map_points))
     }
+    pub(crate) fn source_identity(&self) -> SourceIdentity { SourceIdentity::from_cloud(&self.envelope) }
     pub(crate) fn binding(&self) -> &RegistrationBinding { &self.binding }
     pub(crate) fn map_points(&self) -> &[Point3<f64>] { &self.map_points }
     pub(crate) fn point_step(&self) -> u32 { self.envelope.cloud.point_step as u32 }
@@ -432,6 +433,10 @@ mod registered_scan_ownership_tests {
         assert_eq!(accepted.point_step(), 12);
         assert_eq!(accepted.adapter_timestamp_ns(), 11);
         assert_eq!(accepted.source_timestamp_ns(), 10);
+        assert_eq!(accepted.source_identity(), SourceIdentity {
+            backend: LIO_BACKEND_DEVICE, runtime_generation: 7,
+            source_sequence: 3, source_timestamp_ns: 10,
+        });
         assert_eq!(accepted.map_frame_id(), "map");
         assert_eq!(accepted.body_frame_id(), "body");
         assert_eq!(accepted.binding().mapping_session_id, "owned-scan");

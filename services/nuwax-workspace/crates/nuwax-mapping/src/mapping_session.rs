@@ -4,7 +4,7 @@
 //! - 默认 `bounded_capacity = 8_000_000`(`POINTCLOUD_MAX_RAW_POINTS` 默认值)
 //! - 点预算满时滚动淘汰最旧点，持续接收新数据
 //! - freshness 只拒绝比消息时间水位倒退超过容差的旧帧
-//! - dedup 只过滤同时间戳、同内容、同采集位姿的消息重放，历史固定为 4096 帧
+//! - 通用 dedup 按时间戳、内容和采集位姿；已准入帧按来源身份，共享 4096 帧历史
 //! - `make_contiguous_points` 为同步 occupancy builder 提供零拷贝切片
 //!
 //! ## typed error 与 W12 Python 对应
@@ -233,7 +233,50 @@ pub struct SessionStats {
     pub evicted_point_count: u64,
 }
 
-type FrameDedupKey = (i64, i64, u32, u64, u64);
+/// canonical 生产路径已准入帧的不可变来源身份。
+///
+/// 这是可信生产方元数据，不是身份认证或准入证明。构造前，调用方必须已将身份绑定到
+/// 不可变帧数据，并执行 runtime generation / source sequence 的准入边界检查。
+/// 同一身份搭配不同内容属于调用方违约；`MappingSession` 不扫描点云来检测该行为。
+/// 只有身份仍在有界历史中时才保证去重。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AdmittedFrameKey {
+    backend: i32,
+    runtime_generation: i64,
+    source_sequence: i64,
+}
+
+impl AdmittedFrameKey {
+    /// 只校验三个身份标量均为正数，不读取或复制帧数据。
+    ///
+    /// 正数校验不能证明准入；调用方必须遵守 [`AdmittedFrameKey`] 的不可变帧与
+    /// 生产方代次、序列边界契约。
+    pub fn from_admitted_source(
+        backend: i32,
+        runtime_generation: i64,
+        source_sequence: i64,
+    ) -> Option<Self> {
+        if backend <= 0 || runtime_generation <= 0 || source_sequence <= 0 {
+            return None;
+        }
+        Some(Self {
+            backend,
+            runtime_generation,
+            source_sequence,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FrameDedupKey {
+    Legacy((i64, i64, u32, u64, u64)),
+    Admitted(AdmittedFrameKey),
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static POINTS_FINGERPRINT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 // ============================================================================
 // MappingSession —— 核心有界增量 session
@@ -354,6 +397,9 @@ impl MappingSession {
     }
 
     fn points_fingerprint(points: &[Point3<f64>]) -> u64 {
+        #[cfg(test)]
+        POINTS_FINGERPRINT_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         let mut hasher = DefaultHasher::new();
         points.len().hash(&mut hasher);
         for point in points {
@@ -371,13 +417,13 @@ impl MappingSession {
         message_timestamp_ns: u64,
     ) -> FrameDedupKey {
         let (x_mm, y_mm, point_step) = Self::dedup_key(odom_xy, point_step);
-        (
+        FrameDedupKey::Legacy((
             x_mm,
             y_mm,
             point_step,
             message_timestamp_ns,
             Self::points_fingerprint(points),
-        )
+        ))
     }
 
     fn remember_dedup_key(&mut self, key: FrameDedupKey) {
@@ -444,6 +490,34 @@ impl MappingSession {
         point_step: u32,
         now_ns: u64,
     ) -> Result<FeedStats, SessionError> {
+        self.feed_keyed_pointcloud(points, now_ns, || {
+            Self::frame_dedup_key(points, odom_xy, point_step, now_ns)
+        })
+    }
+
+    /// 使用生产方已准入的来源身份接收不可变点云。
+    ///
+    /// 本入口不计算点云 fingerprint。相同身份在不同接收时间仍属于重放；不同身份即使
+    /// 点云相同也属于不同采集。调用方必须遵守 [`AdmittedFrameKey`] 的准入契约。
+    ///
+    /// `received_at_ns` 使用 session 原有的 freshness 水位（`0` 跳过校验）。freshness
+    /// 先于去重，所以过旧重放仍可能返回 [`SessionError::StaleRevision`]。两种入口共享
+    /// 有界重放历史和滚动点预算；历史淘汰或 reset 后，未过期身份可以再次接收。
+    pub fn feed_admitted_pointcloud(
+        &mut self,
+        points: &[Point3<f64>],
+        key: AdmittedFrameKey,
+        received_at_ns: u64,
+    ) -> Result<FeedStats, SessionError> {
+        self.feed_keyed_pointcloud(points, received_at_ns, || FrameDedupKey::Admitted(key))
+    }
+
+    fn feed_keyed_pointcloud(
+        &mut self,
+        points: &[Point3<f64>],
+        now_ns: u64,
+        make_key: impl FnOnce() -> FrameDedupKey,
+    ) -> Result<FeedStats, SessionError> {
         // freshness 衡量消息时间是否倒退，而不是相邻到达间隔。
         if now_ns > 0
             && self.freshness > now_ns
@@ -456,8 +530,8 @@ impl MappingSession {
             });
         }
 
-        // dedup 只拒绝同一消息时间、同一内容和同一采集位姿的重放。
-        let key = Self::frame_dedup_key(points, odom_xy, point_step, now_ns);
+        // 延迟构造身份，保证 stale 输入不执行兼容入口的点云 fingerprint。
+        let key = make_key();
         if self.dedup_set.contains(&key) {
             return Ok(FeedStats::dedup_only(
                 points.len(),
@@ -877,3 +951,10 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+include!("mapping_session_hash_baseline_tests.rs");
+
+#[cfg(test)]
+#[path = "mapping_session_admitted_dedup_tests.rs"]
+mod admitted_dedup_tests;

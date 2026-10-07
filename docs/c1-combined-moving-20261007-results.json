@@ -1,0 +1,608 @@
+{
+  "source": {
+    "path": "/workspace/shared/neh-combined-moving-20261007/nuwax-nav-runtime-test",
+    "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_runtime-6a3cde7862e97042",
+    "sha256": "65b3205883b414cfa63f4d6877534063291a68be5e8b401cd82c864f0fa0b86c",
+    "bytes": 12769304,
+    "features": [
+      "body-query-profile",
+      "default"
+    ],
+    "profile": {
+      "opt_level": "3",
+      "debuginfo": 0,
+      "debug_assertions": true,
+      "overflow_checks": true,
+      "test": true
+    },
+    "source_hashes": "9173fe8e50359f7e5882c238d55ccbf0eff5a52013b06489ff747b169e966d81  crates/nuwax-nav-runtime/src/lib.rs\n924423230141fab36d4e2d4713d8b41bb62e1c0e9f078a13815440f8f6d92f4a  crates/nuwax-nav-runtime/src/route_moving_worker_tests.rs\n687f02f528e11dd8542591388e8d644d78d97fa9e8d591ea39146d3a416c8048  crates/nuwax-nav-runtime/src/route_moving_cadence_trace.rs\n894a21d5e12723aa9413d454c14dcee6524deb6f2e7af2c1875484a600aa5862  crates/nuwax-nav-runtime/src/surface_follower.rs\n86698c1888c29aef3e7a0315a180699036a2aa52de22fffe1e34226625302153  crates/nuwax-nav-runtime/src/route_follower.rs\n5c1622546dc922566197b72797c8271029d6c31144836b629e17363bd6be2305  crates/nuwax-nav-mls-planner/src/surface/body.rs\na0ecb96b0a4b77e4a7c03d953a90483b702c6bdcdaef781bded063ec5711acdf  crates/nuwax-nav-pct/src/tomogram.rs\n074ccc3910fed71e0aeea3c1da56e6db1f2eb613b7b6c24c1dbd8aa2f66b5b64  crates/nuwax-map-chunks/src/lib.rs\ne70a4dc7cf467816b75a1f78caab0371951034749c75bc0c8a000ca675465adb  crates/nuwax-codec/src/lcm/schema.rs\n2104254ba2c5a9c51e5297a7481937bc650b8b50a42107808e88328501cd5547  crates/nuwax-nav-stack/src/surface_chunks.rs\n6bdd754e651444d9b69a9065ca8d36ccb4305a0424920eb50228d480b17466ec  crates/nuwax-nav-stack/src/surface_dataflow.rs\n37397f9257f1d14e757bc621c173be6e1075c024c738c00a5743b651bf23a792  crates/nuwax-nav-stack/src/lcm_dataflow.rs\nd8db359a6f34ba899ddf8c529d715a2c54634c9a8941d9dd8b391f5509d0c040  Cargo.lock\n",
+    "local_commit": "914014667eea78f3bfdc1169b47d1e282ede7209",
+    "mapped_remote_commit": "baa93057e005132b6326fdb6338a3ada68289bb0",
+    "tree": "c9d7bea863ff94258901dbdaba699412c4963218",
+    "note": "Mixed test profile: MLS/runtime opt3, other crates ordinarytest, debug0, body-query-profile; diagnostic overhead inclusive; not release or hardware"
+  },
+  "build_seconds_reported": 9.13,
+  "dependency_profiles": {
+    "nuwax_types": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_map_chunks": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_codec": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_protocol": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_nav_types_messages": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_lcm_sys": {
+      "features": [
+        "link-liblcm"
+      ],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_lcm": {
+      "features": [
+        "link-liblcm"
+      ],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_transport": {
+      "features": [
+        "default",
+        "real-lcm"
+      ],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_explore_routing": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_nav_mls_planner": {
+      "features": [
+        "body-query-profile",
+        "default"
+      ],
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_numeric": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_core": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_stream": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_gtsam": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_mapping": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_nav_base": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_nav_control": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_motion_safety_guard": {
+      "features": [
+        "default"
+      ],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_nav_astar": {
+      "features": [
+        "default",
+        "module"
+      ],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": true
+    },
+    "nuwax_nav_pct": {
+      "features": [
+        "default",
+        "mls-adapter"
+      ],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": false
+    },
+    "nuwax_nav_scan": {
+      "features": [],
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      },
+      "fresh": false
+    },
+    "nuwax_nav_runtime": {
+      "features": [
+        "body-query-profile",
+        "default"
+      ],
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "fresh": false
+    }
+  },
+  "scope": "Three exact existing ignored moving fixtures, once each, combined accepted source. Functional/safety assertions precede cadence. OFFpasses;ON/heldfail75ms. Held also has observed65.927426ms inner step; subsequent50ms assertions not reached after cadencefail. Fixture bypasses production LCM/NavScheduler/globalplanner/MotionGuard and cannot qualify all seven overnight paths. No before/after gain or realtime/release claim.",
+  "cases": [
+    {
+      "label": "moving-off",
+      "command": [
+        "/workspace/shared/neh-combined-moving-20261007/nuwax-nav-runtime-test",
+        "route_moving_worker_tests::moving_measured_5cm_primed_off_full_goal",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "log": "/workspace/shared/neh-combined-moving-20261007/moving-off.log",
+      "log_sha256": "1bb4015d3386d3ef68fcfdffec89415e402b314d477e07b7ab47c4925af370db",
+      "wall_seconds": 22.050978614002815,
+      "user_cpu_seconds": 1.045386,
+      "system_cpu_seconds": 0.291444,
+      "launch_peak_rss_kib": 66828,
+      "voluntary_context_switches": 1010,
+      "involuntary_context_switches": 146,
+      "metrics": {
+        "scenario": "Goal",
+        "enabled": false,
+        "source_cm": 5,
+        "priming_s": 0.202,
+        "elapsed_s": 21.3,
+        "succeeded": true,
+        "continuity_complete": false,
+        "remaining_goal_m": 0.062269,
+        "delivered_negative": 0,
+        "accepted": 319,
+        "nonzero": 319,
+        "held_nonzero": 0,
+        "sensor_frames": 108,
+        "dropped_frames": 0,
+        "final_pose_xyzyaw": [
+          1.687731095778763,
+          1.5,
+          0.5,
+          1.4218074980000015
+        ],
+        "actual_displacement_m": 0.937731,
+        "actual_travel_m": 0.937731,
+        "tick_gap_ms_median_p95_max": [
+          50.001487999999995,
+          50.120667,
+          54.100918
+        ],
+        "tick_gaps_over_50ms": 219,
+        "tick_gaps_over_75ms": 0,
+        "consumer_ms_median_p95_max": [
+          0.003369,
+          0.0056949999999999995,
+          0.13342700000000002
+        ],
+        "control_step_ms_median_p95_max": [
+          1.238539,
+          2.263476,
+          7.510739
+        ],
+        "map_update_ms_median_p95_max": [
+          0.004677000000000001,
+          0.006673,
+          0.027422
+        ]
+      },
+      "inner_limits": {
+        "control_over_50ms": 0,
+        "map_over_50ms": 0,
+        "control_samples_omitted": 0
+      },
+      "receipt_metrics": {
+        "receipts": 319,
+        "traced": 319,
+        "missing": 0,
+        "worker_guard_basis_mismatches": 0,
+        "guard_receipt_state_mismatches": 213,
+        "invalid_clock_pairs": 0,
+        "source_age_at_selected_guard_ms": [
+          101.351319,
+          151.99943,
+          156.286868
+        ],
+        "compute_ms": [
+          1.088749,
+          1.964848,
+          7.59318
+        ],
+        "publication_to_retrieval_ms": [
+          48.796712,
+          49.224133,
+          52.789592
+        ]
+      },
+      "cadence_outliers": [],
+      "slowest_control_sample": "CONTROL_SLOW_STEP scenario=Goal enabled=false source_cm=5 startup=primed_two_real_frames sample_scope=all_recorded_steps rank=1 step_seq=420 control_wall_ms=7.510739 source_view_seq=106 source_present=true first_after_view_change=true pose_stamp_ns=Some(1791334220006583357) source_sample_ns=Some(1791334219954865310) step_entry_ns=1791334220006829544 step_exit_ns=1791334220014340524 step_entry_source_age_ms=Ok(51.964234) step_exit_source_age_ms=Ok(59.475214) submitted_before=0 submitted_after=0 admitted_before=0 admitted_after=0 jobs_before=0 jobs_after=0 held_before=false held_after=false held_phase_before=0 held_phase_after=0 outcome=command_nonzero inclusive_stage_ms_calls=[(\"route_current_body\", 1.007754, 1), (\"current_view_refresh\", 1.005977, 2), (\"current_body_validation\", 0.000407, 2), (\"route_progress\", 0.000767, 1), (\"plan_consume_admission\", 0.0, 0), (\"plan_schedule\", 0.0, 0), (\"controller_step\", 6.501326, 1), (\"route_intent\", 6.500195, 1), (\"guard_setup\", 0.030574, 2), (\"candidate_ranking_sweeps\", 6.455928, 1), (\"guard_cleanup\", 0.003219, 2), (\"body_support_goal\", 0.004591, 1), (\"waypoint_progress\", 0.000205, 1), (\"lookahead_selection\", 0.0, 0), (\"forward_arc_connector\", 0.0, 0), (\"connection_endpoint\", 0.0, 0), (\"translation_connector\", 0.0, 0), (\"tracking_reference_projection\", 0.000185, 3), (\"connector_projection\", 0.0, 0), (\"connector_sweep\", 0.0, 0), (\"guard_projection\", 4.785896, 14), (\"guard_observed_sweep\", 1.561738, 14), (\"guard_geometry_sweep\", 0.0, 0), (\"future_view_construction\", 0.001103, 2)] counter_counts=[(\"candidate_eligibility\", 1), (\"tracking_scores\", 3), (\"motion_memo_hits\", 26), (\"motion_memo_misses\", 14), (\"future_view_hits\", 1), (\"future_view_builds\", 2), (\"body_projection_calls\", 14), (\"observed_sweeps\", 14), (\"geometry_sweeps\", 0), (\"future_geometry_sweeps\", 0), (\"forward_arc_substeps\", 0), (\"connection_substeps\", 0)]",
+      "slowest_body_sample": "BODY_QUERY_SLOW_STEP scenario=Goal enabled=false source_cm=5 startup=primed_two_real_frames sample_scope=all_recorded_steps ranking=all_control_steps rank=1 step_seq=420 control_wall_ms=7.510739 source_view_seq=106 source_present=true first_after_view_change=true pose_stamp_ns=Some(1791334220006583357) source_sample_ns=Some(1791334219954865310) step_entry_ns=1791334220006829544 step_exit_ns=1791334220014340524 step_entry_source_age_ms=Ok(51.964234) step_exit_source_age_ms=Ok(59.475214) submitted_before=0 submitted_after=0 admitted_before=0 admitted_after=0 jobs_before=0 jobs_after=0 held_before=false held_after=false held_phase_before=0 held_phase_after=0 outcome=command_nonzero inclusive_stage_ms_calls=[(\"motion_total\", 4.783323, 14), (\"current_support_lookup\", 0.001101, 11), (\"base_near_support_lookup\", 0.002054, 11), (\"next_near_support_lookup\", 0.001539, 11), (\"contact_frame\", 4.675914, 22), (\"segment_support\", 0.010197, 11), (\"final_body_validation\", 0.082722, 14), (\"plane_cache_lookup\", 0.001966, 22), (\"contact_domain_collection\", 4.664108, 1), (\"contact_point_sort\", 0.001157, 1), (\"contact_plane_fit\", 0.002072, 1), (\"contact_frame_algebra\", 0.003091, 22), (\"dense_band_cache_read\", 0.001995, 1), (\"dense_band_selection_seed\", 4.588888, 1), (\"dense_connectivity_bfs\", 0.037369, 1), (\"dense_ordered_emission\", 0.019693, 1), (\"dense_band_cache_acquire\", 0.000345, 1), (\"observation_footprint\", 1.333478, 17), (\"observation_footprint_support\", 0.001709, 17), (\"observation_footprint_shape\", 0.009965, 17), (\"observation_footprint_patch\", 0.003077, 17), (\"observation_footprint_cells\", 1.31396, 17), (\"observation_evidence\", 0.022511, 28)] counter_counts=[(\"plane_cache_hits\", 21), (\"plane_cache_misses\", 1), (\"contact_points\", 84), (\"dense_domain_calls\", 1), (\"sparse_domain_calls\", 0), (\"dense_allocated_slots\", 196), (\"dense_cache_present_columns\", 0), (\"dense_cache_absent_columns\", 140), (\"dense_selected_columns\", 140), (\"dense_visited_columns\", 140), (\"dense_cache_single_band_columns\", 0), (\"dense_visited_table_slots\", 196), (\"observation_footprint_cache_hits\", 12), (\"observation_footprint_cache_misses\", 16), (\"observation_footprint_cells_built\", 884), (\"observation_visited_cells\", 0), (\"observation_checked_cells\", 0), (\"observation_input_cells\", 1456), (\"observation_height_columns\", 884), (\"observation_height_probes\", 884), (\"observation_height_absent\", 0), (\"observation_block_root_resolutions\", 238)] dense_initial_table_payload_bytes=6664",
+      "test_summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 235 filtered out; finished in 22.01s",
+      "process_total_cpu_seconds": 1.33683
+    },
+    {
+      "label": "moving-on",
+      "command": [
+        "/workspace/shared/neh-combined-moving-20261007/nuwax-nav-runtime-test",
+        "route_moving_worker_tests::moving_measured_5cm_primed_on_full_goal",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 101,
+      "timeout": false,
+      "log": "/workspace/shared/neh-combined-moving-20261007/moving-on.log",
+      "log_sha256": "ed820ab5e69de8c931a90309f4279a01545238d20dfb472cd506be8de476f0fc",
+      "wall_seconds": 22.428951551992213,
+      "user_cpu_seconds": 1.352747,
+      "system_cpu_seconds": 0.088517,
+      "launch_peak_rss_kib": 70324,
+      "voluntary_context_switches": 1453,
+      "involuntary_context_switches": 416,
+      "metrics": {
+        "scenario": "Goal",
+        "enabled": true,
+        "source_cm": 5,
+        "priming_s": 0.202,
+        "elapsed_s": 21.656,
+        "succeeded": true,
+        "continuity_complete": false,
+        "remaining_goal_m": 0.146755,
+        "delivered_negative": 0,
+        "accepted": 320,
+        "nonzero": 320,
+        "held_nonzero": 0,
+        "sensor_frames": 110,
+        "dropped_frames": 0,
+        "final_pose_xyzyaw": [
+          1.603244891779093,
+          1.5,
+          0.5,
+          1.436519812399997
+        ],
+        "actual_displacement_m": 0.853245,
+        "actual_travel_m": 0.853245,
+        "tick_gap_ms_median_p95_max": [
+          50.000881,
+          50.385027,
+          130.77075299999998
+        ],
+        "tick_gaps_over_50ms": 222,
+        "tick_gaps_over_75ms": 2,
+        "consumer_ms_median_p95_max": [
+          0.003334,
+          0.0054859999999999996,
+          0.441372
+        ],
+        "control_step_ms_median_p95_max": [
+          1.229528,
+          2.892827,
+          13.706763
+        ],
+        "map_update_ms_median_p95_max": [
+          0.004456,
+          0.006821000000000001,
+          0.030670999999999997
+        ]
+      },
+      "inner_limits": {
+        "control_over_50ms": 0,
+        "map_over_50ms": 0,
+        "control_samples_omitted": 0
+      },
+      "receipt_metrics": {
+        "receipts": 320,
+        "traced": 320,
+        "missing": 0,
+        "worker_guard_basis_mismatches": 0,
+        "guard_receipt_state_mismatches": 212,
+        "invalid_clock_pairs": 0,
+        "source_age_at_selected_guard_ms": [
+          57.601547,
+          108.397955,
+          204.28666
+        ],
+        "compute_ms": [
+          1.109421,
+          2.732889,
+          13.734265
+        ],
+        "publication_to_retrieval_ms": [
+          48.832725,
+          49.163022,
+          91.913294
+        ]
+      },
+      "cadence_outliers": [
+        "CADENCE_OUTLIER tick=42 previous_tick=41 raw_gap_ms=96.549789 previous_body_intertick_sleepwindow_ms=Some((0.378425, 0.016716, 96.154648)) exact_gap_reconstruction=true requested_sleep_ms=Some(49.39188) checked_oversleep_ms=Some(46.762768) no_sleep_requested=false no_adjusted_pass=true",
+        "CADENCE_OUTLIER tick=50 previous_tick=49 raw_gap_ms=130.77075299999998 previous_body_intertick_sleepwindow_ms=Some((0.23227, 0.003856, 130.534627)) exact_gap_reconstruction=true requested_sleep_ms=Some(25.184991) checked_oversleep_ms=Some(105.34963599999999) no_sleep_requested=false no_adjusted_pass=true"
+      ],
+      "slowest_control_sample": "CONTROL_SLOW_STEP scenario=Goal enabled=true source_cm=5 startup=primed_two_real_frames sample_scope=all_recorded_steps rank=1 step_seq=104 control_wall_ms=13.706763 source_view_seq=28 source_present=true first_after_view_change=false pose_stamp_ns=Some(1791334226460767074) source_sample_ns=Some(1791334226403358300) step_entry_ns=1791334226460884101 step_exit_ns=1791334226474591094 step_entry_source_age_ms=Ok(57.525801) step_exit_source_age_ms=Ok(71.232794) submitted_before=1 submitted_after=1 admitted_before=1 admitted_after=1 jobs_before=1 jobs_after=1 held_before=false held_after=false held_phase_before=0 held_phase_after=0 outcome=command_nonzero inclusive_stage_ms_calls=[(\"route_current_body\", 0.003216, 1), (\"current_view_refresh\", 0.000209, 2), (\"current_body_validation\", 0.002569, 2), (\"route_progress\", 0.001353, 1), (\"plan_consume_admission\", 0.01522, 1), (\"plan_schedule\", 0.0, 0), (\"controller_step\", 13.68518, 1), (\"route_intent\", 13.68395, 1), (\"guard_setup\", 4.327631, 2), (\"candidate_ranking_sweeps\", 9.298651, 1), (\"guard_cleanup\", 0.003362, 2), (\"body_support_goal\", 0.006514, 1), (\"waypoint_progress\", 0.008989, 1), (\"lookahead_selection\", 0.019251, 1), (\"forward_arc_connector\", 0.0, 0), (\"connection_endpoint\", 0.0, 0), (\"translation_connector\", 0.0, 0), (\"tracking_reference_projection\", 0.009611, 13), (\"connector_projection\", 0.0, 0), (\"connector_sweep\", 0.0, 0), (\"guard_projection\", 8.689035, 20), (\"guard_observed_sweep\", 0.50904, 20), (\"guard_geometry_sweep\", 0.0, 0), (\"future_view_construction\", 0.001434, 4)] counter_counts=[(\"candidate_eligibility\", 1), (\"tracking_scores\", 13), (\"motion_memo_hits\", 32), (\"motion_memo_misses\", 20), (\"future_view_hits\", 1), (\"future_view_builds\", 4), (\"body_projection_calls\", 20), (\"observed_sweeps\", 20), (\"geometry_sweeps\", 0), (\"future_geometry_sweeps\", 0), (\"forward_arc_substeps\", 0), (\"connection_substeps\", 0)]",
+      "slowest_body_sample": "BODY_QUERY_SLOW_STEP scenario=Goal enabled=true source_cm=5 startup=primed_two_real_frames sample_scope=all_recorded_steps ranking=all_control_steps rank=1 step_seq=104 control_wall_ms=13.706763 source_view_seq=28 source_present=true first_after_view_change=false pose_stamp_ns=Some(1791334226460767074) source_sample_ns=Some(1791334226403358300) step_entry_ns=1791334226460884101 step_exit_ns=1791334226474591094 step_entry_source_age_ms=Ok(57.525801) step_exit_source_age_ms=Ok(71.232794) submitted_before=1 submitted_after=1 admitted_before=1 admitted_after=1 jobs_before=1 jobs_after=1 held_before=false held_after=false held_phase_before=0 held_phase_after=0 outcome=command_nonzero inclusive_stage_ms_calls=[(\"motion_total\", 8.686554, 20), (\"current_support_lookup\", 0.001482, 18), (\"base_near_support_lookup\", 0.002769, 18), (\"next_near_support_lookup\", 0.002451, 18), (\"contact_frame\", 3.874894, 36), (\"segment_support\", 0.013283, 18), (\"final_body_validation\", 4.779421, 20), (\"plane_cache_lookup\", 0.003573, 36), (\"contact_domain_collection\", 3.849901, 6), (\"contact_point_sort\", 0.002979, 6), (\"contact_plane_fit\", 0.007609, 6), (\"contact_frame_algebra\", 0.00353, 36), (\"dense_band_cache_read\", 0.024323, 6), (\"dense_band_selection_seed\", 0.016736, 6), (\"dense_connectivity_bfs\", 0.055473, 6), (\"dense_ordered_emission\", 0.01575, 6), (\"dense_band_cache_acquire\", 0.000446, 6), (\"observation_footprint\", 4.624737, 25), (\"observation_footprint_support\", 0.00385, 25), (\"observation_footprint_shape\", 1.627327, 25), (\"observation_footprint_patch\", 0.004776, 25), (\"observation_footprint_cells\", 2.981386, 25), (\"observation_evidence\", 0.024746, 40)] counter_counts=[(\"plane_cache_hits\", 30), (\"plane_cache_misses\", 6), (\"contact_points\", 512), (\"dense_domain_calls\", 6), (\"sparse_domain_calls\", 0), (\"dense_allocated_slots\", 1260), (\"dense_cache_present_columns\", 830), (\"dense_cache_absent_columns\", 2), (\"dense_selected_columns\", 832), (\"dense_visited_columns\", 832), (\"dense_cache_single_band_columns\", 830), (\"dense_visited_table_slots\", 1260), (\"observation_footprint_cache_hits\", 16), (\"observation_footprint_cache_misses\", 24), (\"observation_footprint_cells_built\", 1225), (\"observation_visited_cells\", 0), (\"observation_checked_cells\", 0), (\"observation_input_cells\", 1960), (\"observation_height_columns\", 1225), (\"observation_height_probes\", 1225), (\"observation_height_absent\", 0), (\"observation_block_root_resolutions\", 350)] dense_initial_table_payload_bytes=42840",
+      "test_summary": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 235 filtered out; finished in 22.40s",
+      "process_total_cpu_seconds": 1.4412639999999999
+    },
+    {
+      "label": "moving-held",
+      "command": [
+        "/workspace/shared/neh-combined-moving-20261007/nuwax-nav-runtime-test",
+        "route_moving_worker_tests::moving_5cm_primed_held_planning_continuity_only",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 101,
+      "timeout": false,
+      "log": "/workspace/shared/neh-combined-moving-20261007/moving-held.log",
+      "log_sha256": "aff4077beee91f841f5aa224fed180ef4f59a4a5280ec5a98b4feb64eeb14b13",
+      "wall_seconds": 15.350325658000656,
+      "user_cpu_seconds": 1.619739,
+      "system_cpu_seconds": 0.15298799999999999,
+      "launch_peak_rss_kib": 77984,
+      "voluntary_context_switches": 988,
+      "involuntary_context_switches": 310,
+      "metrics": {
+        "scenario": "HoldSecondContinuity",
+        "enabled": true,
+        "source_cm": 5,
+        "priming_s": 0.205,
+        "elapsed_s": 14.728,
+        "succeeded": false,
+        "continuity_complete": true,
+        "remaining_goal_m": 5.931001,
+        "delivered_negative": 0,
+        "accepted": 215,
+        "nonzero": 215,
+        "held_nonzero": 6,
+        "sensor_frames": 75,
+        "dropped_frames": 0,
+        "final_pose_xyzyaw": [
+          1.8189989936999982,
+          1.5,
+          0.5,
+          0.0
+        ],
+        "actual_displacement_m": 1.068999,
+        "actual_travel_m": 1.068999,
+        "tick_gap_ms_median_p95_max": [
+          50.001211,
+          50.545303,
+          124.015877
+        ],
+        "tick_gaps_over_50ms": 151,
+        "tick_gaps_over_75ms": 3,
+        "consumer_ms_median_p95_max": [
+          0.003946,
+          0.023423,
+          0.474287
+        ],
+        "control_step_ms_median_p95_max": [
+          1.3571010000000001,
+          5.639626,
+          65.927426
+        ],
+        "map_update_ms_median_p95_max": [
+          0.003075,
+          0.024677,
+          1.368345
+        ]
+      },
+      "inner_limits": {
+        "control_over_50ms": 1,
+        "map_over_50ms": 0,
+        "control_samples_omitted": 0
+      },
+      "receipt_metrics": {
+        "receipts": 215,
+        "traced": 215,
+        "missing": 0,
+        "worker_guard_basis_mismatches": 0,
+        "guard_receipt_state_mismatches": 142,
+        "invalid_clock_pairs": 0,
+        "source_age_at_selected_guard_ms": [
+          82.94346,
+          143.064955,
+          205.554328
+        ],
+        "compute_ms": [
+          1.258577,
+          4.587922,
+          46.301981
+        ],
+        "publication_to_retrieval_ms": [
+          48.687964,
+          49.464603,
+          122.088751
+        ]
+      },
+      "cadence_outliers": [
+        "CADENCE_OUTLIER tick=173 previous_tick=172 raw_gap_ms=124.015877 previous_body_intertick_sleepwindow_ms=Some((0.047906, 0.002463, 123.965508)) exact_gap_reconstruction=true requested_sleep_ms=Some(49.178606) checked_oversleep_ms=Some(74.786902) no_sleep_requested=false no_adjusted_pass=true",
+        "CADENCE_OUTLIER tick=175 previous_tick=174 raw_gap_ms=94.163864 previous_body_intertick_sleepwindow_ms=Some((0.008854, 0.001625, 94.153385)) exact_gap_reconstruction=true requested_sleep_ms=Some(49.945729) checked_oversleep_ms=Some(44.207656) no_sleep_requested=false no_adjusted_pass=true",
+        "CADENCE_OUTLIER tick=177 previous_tick=176 raw_gap_ms=102.603155 previous_body_intertick_sleepwindow_ms=Some((0.023208, 0.0027199999999999998, 102.57722700000001)) exact_gap_reconstruction=true requested_sleep_ms=Some(49.579352) checked_oversleep_ms=Some(52.997875) no_sleep_requested=false no_adjusted_pass=true"
+      ],
+      "slowest_control_sample": "CONTROL_SLOW_STEP scenario=HoldSecondContinuity enabled=true source_cm=5 startup=primed_two_real_frames sample_scope=all_recorded_steps rank=1 step_seq=86 control_wall_ms=65.927426 source_view_seq=22 source_present=true first_after_view_change=false pose_stamp_ns=Some(1791334247881723169) source_sample_ns=Some(1791334247674421089) step_entry_ns=1791334247887994448 step_exit_ns=1791334247953922140 step_entry_source_age_ms=Ok(213.573359) step_exit_source_age_ms=Ok(279.501051) submitted_before=1 submitted_after=1 admitted_before=1 admitted_after=1 jobs_before=1 jobs_after=1 held_before=false held_after=false held_phase_before=0 held_phase_after=0 outcome=command_nonzero inclusive_stage_ms_calls=[(\"route_current_body\", 0.008255, 1), (\"current_view_refresh\", 0.006881, 2), (\"current_body_validation\", 0.000495, 2), (\"route_progress\", 0.00156, 1), (\"plan_consume_admission\", 0.348007, 1), (\"plan_schedule\", 0.0, 0), (\"controller_step\", 65.567109, 1), (\"route_intent\", 65.565932, 1), (\"guard_setup\", 0.079763, 2), (\"candidate_ranking_sweeps\", 65.430514, 1), (\"guard_cleanup\", 0.004798, 2), (\"body_support_goal\", 0.008244, 1), (\"waypoint_progress\", 0.009715, 1), (\"lookahead_selection\", 0.017067, 1), (\"forward_arc_connector\", 0.0, 0), (\"connection_endpoint\", 0.0, 0), (\"translation_connector\", 0.0, 0), (\"tracking_reference_projection\", 0.015232, 18), (\"connector_projection\", 0.0, 0), (\"connector_sweep\", 0.0, 0), (\"guard_projection\", 5.333809, 38), (\"guard_observed_sweep\", 36.250633, 38), (\"guard_geometry_sweep\", 0.0, 0), (\"future_view_construction\", 0.003727, 10)] counter_counts=[(\"candidate_eligibility\", 1), (\"tracking_scores\", 18), (\"motion_memo_hits\", 50), (\"motion_memo_misses\", 38), (\"future_view_hits\", 1), (\"future_view_builds\", 10), (\"body_projection_calls\", 38), (\"observed_sweeps\", 38), (\"geometry_sweeps\", 0), (\"future_geometry_sweeps\", 0), (\"forward_arc_substeps\", 0), (\"connection_substeps\", 0)]",
+      "slowest_body_sample": "BODY_QUERY_SLOW_STEP scenario=HoldSecondContinuity enabled=true source_cm=5 startup=primed_two_real_frames sample_scope=all_recorded_steps ranking=all_control_steps rank=1 step_seq=86 control_wall_ms=65.927426 source_view_seq=22 source_present=true first_after_view_change=false pose_stamp_ns=Some(1791334247881723169) source_sample_ns=Some(1791334247674421089) step_entry_ns=1791334247887994448 step_exit_ns=1791334247953922140 step_entry_source_age_ms=Ok(213.573359) step_exit_source_age_ms=Ok(279.501051) submitted_before=1 submitted_after=1 admitted_before=1 admitted_after=1 jobs_before=1 jobs_after=1 held_before=false held_after=false held_phase_before=0 held_phase_after=0 outcome=command_nonzero inclusive_stage_ms_calls=[(\"motion_total\", 5.326886, 38), (\"current_support_lookup\", 0.00873, 36), (\"base_near_support_lookup\", 0.015896, 36), (\"next_near_support_lookup\", 0.006375, 36), (\"contact_frame\", 0.577884, 72), (\"segment_support\", 1.066455, 36), (\"final_body_validation\", 3.623765, 38), (\"plane_cache_lookup\", 0.009365, 72), (\"contact_domain_collection\", 0.473553, 18), (\"contact_point_sort\", 0.008132, 18), (\"contact_plane_fit\", 0.041433, 18), (\"contact_frame_algebra\", 0.006737, 72), (\"dense_band_cache_read\", 0.071884, 18), (\"dense_band_selection_seed\", 0.100231, 18), (\"dense_connectivity_bfs\", 0.167682, 18), (\"dense_ordered_emission\", 0.070938, 18), (\"dense_band_cache_acquire\", 0.001107, 18), (\"observation_footprint\", 3.534249, 43), (\"observation_footprint_support\", 0.006369, 43), (\"observation_footprint_shape\", 0.026236, 43), (\"observation_footprint_patch\", 2.903582, 43), (\"observation_footprint_cells\", 0.587657, 43), (\"observation_evidence\", 0.061354, 76)] counter_counts=[(\"plane_cache_hits\", 54), (\"plane_cache_misses\", 18), (\"contact_points\", 1546), (\"dense_domain_calls\", 18), (\"sparse_domain_calls\", 0), (\"dense_allocated_slots\", 3612), (\"dense_cache_present_columns\", 2526), (\"dense_cache_absent_columns\", 10), (\"dense_selected_columns\", 2536), (\"dense_visited_columns\", 2536), (\"dense_cache_single_band_columns\", 2526), (\"dense_visited_table_slots\", 3612), (\"observation_footprint_cache_hits\", 34), (\"observation_footprint_cache_misses\", 42), (\"observation_footprint_cells_built\", 2107), (\"observation_visited_cells\", 105), (\"observation_checked_cells\", 105), (\"observation_input_cells\", 3724), (\"observation_height_columns\", 2107), (\"observation_height_probes\", 2107), (\"observation_height_absent\", 0), (\"observation_block_root_resolutions\", 602)] dense_initial_table_payload_bytes=122808",
+      "test_summary": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 235 filtered out; finished in 15.29s",
+      "process_total_cpu_seconds": 1.772727
+    }
+  ],
+  "limitations": [
+    "All source bytes match local9140146/treec9d7bea8 mapped real remotebaa93057.",
+    "Mixedtest:runtime/MLSopt3;PCT/Scan/control/etcopt0,debug0,assertionson.",
+    "Wholeprocesswait4CPU/RSS includesfixture,setup,diagnostics,oracles;notstageCPU.",
+    "Sleep-window gap decomposition is observed, underlying cause not established.",
+    "Exact65.927426ms step86 schedstat pair was not printed; no unsupported CPU/offCPU attribution.",
+    "AF_UNIXMotionGuardcomposition remains blocked; no retries/bypass."
+  ]
+}

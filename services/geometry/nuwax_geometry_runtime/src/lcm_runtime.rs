@@ -45,6 +45,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 
 use crate::mapping_adapter::{
+    MappingCloudSource,
     finish_backend_retirement, MappingAdapter, MappingAdapterConfig, MappingBackendRetirement,
 };
 use crate::mapping_backend::MappingBackendSpec;
@@ -2895,7 +2896,7 @@ async fn geometry_runtime_retained_tasks_settle_before_mapping_and_shm_cleanup()
                 "map",
                 1,
                 &state,
-                false,
+                MappingCloudSource::Legacy,
                 None,
                 None,
                 None,
@@ -8886,7 +8887,7 @@ async fn ingest_mapping_points_with_backend(
     frame_id: &str,
     source_timestamp_ns: u64,
     state: &Arc<RwLock<SharedState>>,
-    source_fenced: bool,
+    source: MappingCloudSource,
     expected_generations: Option<(u64, u64, u64)>,
     expected_relocalization_epoch: Option<u64>,
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
@@ -8919,7 +8920,7 @@ async fn ingest_mapping_points_with_backend(
             &owned_frame_id,
             source_timestamp_ns,
             &owned_state,
-            source_fenced,
+            source,
             expected_generations,
             expected_relocalization_epoch,
             owned_relocalization_mode,
@@ -8968,7 +8969,7 @@ async fn ingest_mapping_points_with_backend_owned(
     frame_id: &str,
     source_timestamp_ns: u64,
     state: &Arc<RwLock<SharedState>>,
-    source_fenced: bool,
+    source: MappingCloudSource,
     expected_generations: Option<(u64, u64, u64)>,
     expected_relocalization_epoch: Option<u64>,
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
@@ -9044,7 +9045,7 @@ async fn ingest_mapping_points_with_backend_owned(
             received_at_ns,
             frame_id,
             source_timestamp_ns,
-            source_fenced,
+            source,
         )?
     };
     let Some(mut prepared) = prepared else {
@@ -11337,6 +11338,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         adapter_timestamp_ns,
         source_timestamp_ns,
         map_frame,
+        canonical_mapping_source(accepted)?,
         Some((
             binding.mapping_session_generation,
             binding.map_frame_generation,
@@ -11557,6 +11559,7 @@ pub(crate) async fn handoff_registered_lio_cloud_replay_with_correction(
         adapter_timestamp_ns,
         source_timestamp_ns,
         map_frame,
+        canonical_mapping_source(accepted)?,
         Some((
             binding.mapping_session_generation,
             binding.map_frame_generation,
@@ -11963,6 +11966,7 @@ async fn handoff_registered_lio_cloud_inner(
         adapter_timestamp_ns,
         source_timestamp_ns,
         map_frame,
+        MappingCloudSource::SourceFencedCompatibility,
         expected_generations,
         None,
         None,
@@ -11985,6 +11989,18 @@ async fn handoff_registered_lio_cloud_inner(
     Ok(accepted)
 }
 
+fn canonical_mapping_source(
+    accepted: &crate::lio_ingress::AcceptedRegisteredCloud,
+) -> Result<MappingCloudSource, String> {
+    let source = accepted.source_identity();
+    // Admission already bound immutable bytes to this producer owner. This
+    // scalar key neither captures body points nor authenticates arbitrary input.
+    let key = nuwax_mapping::mapping_session::AdmittedFrameKey::from_admitted_source(
+        source.backend, source.runtime_generation, source.source_sequence,
+    ).ok_or_else(|| "admitted LIO producer frame identity is invalid".to_owned())?;
+    Ok(MappingCloudSource::Canonical(key))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn commit_registered_lio_cloud_inner(
     handle: &GeometryRuntimeHandle,
@@ -11993,6 +12009,7 @@ async fn commit_registered_lio_cloud_inner(
     adapter_timestamp_ns: u64,
     source_timestamp_ns: u64,
     map_frame: &str,
+    source: MappingCloudSource,
     expected_generations: Option<(u64, u64, u64)>,
     expected_relocalization_epoch: Option<u64>,
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
@@ -12015,7 +12032,7 @@ async fn commit_registered_lio_cloud_inner(
         map_frame,
         source_timestamp_ns,
         &handle.state,
-        true,
+        source,
         expected_generations,
         expected_relocalization_epoch,
         relocalization_mode,
@@ -12237,7 +12254,7 @@ fn spawn_mapping_feed_tasks(
                 &parsed.frame_id,
                 parsed.timestamp_ns,
                 &state_lidar,
-                false,
+                MappingCloudSource::Legacy,
                 None,
                 None,
                 None,
@@ -15044,7 +15061,7 @@ mod mapping_feed_tests {
                     "map",
                     1_000_000_000,
                     &state,
-                    false,
+                    MappingCloudSource::Legacy,
                     None,
                     None,
                     None,
@@ -15120,7 +15137,7 @@ mod mapping_feed_tests {
                     "map",
                     1_000_000_000,
                     &state,
-                    false,
+                    MappingCloudSource::Legacy,
                     None,
                     Some(expected_epoch),
                     Some(mode),
@@ -19430,7 +19447,7 @@ mod mapping_feed_tests {
         let resumed = ingest_mapping_points_with_backend_owned(
             &mapping,&handle.mapping_lifecycle_lock,&handle.explore_projection_gate,
             &handle.committed_map_authority,&handle.map_revision_latest_tx,&handle.cloud_map_writer,
-            &registered.points,12,3_000_000_000,"map",3_000_000_000,&handle.state,false,
+            &registered.points,12,3_000_000_000,"map",3_000_000_000,&handle.state,MappingCloudSource::Legacy,
             Some((session.session_generation,generation,1)),None,None,None,
         ).await.unwrap();
         assert_eq!(resumed.outcome.accepted_map_points.len(),1);
@@ -19452,7 +19469,7 @@ mod mapping_feed_tests {
             &mapping, &handle.mapping_lifecycle_lock, &handle.explore_projection_gate,
             &handle.committed_map_authority, &handle.map_revision_latest_tx,
             &Arc::new(parking_lot::Mutex::new(None)), &[Point3::new(1.0, 2.0, 0.0)],
-            12, 100, "robot/map", 100, &handle.state, false, None,
+            12, 100, "robot/map", 100, &handle.state, MappingCloudSource::Legacy, None,
             Some(captured), Some(mode), None,
         ).await.unwrap();
         assert!(result.outcome.accepted_map_points.is_empty());
@@ -19521,7 +19538,7 @@ mod mapping_feed_tests {
                 "robot/map",
                 100,
                 &state,
-                false,
+                MappingCloudSource::Legacy,
                 None,
                 None,
                 None,

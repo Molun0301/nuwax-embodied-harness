@@ -369,9 +369,19 @@ def _cmake(source: Path, build: Path, prefix: Path, jobs: int, run: Callable,
 
 def _prepare_livox(source: Path, destination: Path) -> None:
     # 与仓内 Nix（可复现构建工具）配方保持一致，仅修改专属构建副本。
+    # Bump recipe when the patch operations below change. The checkout already
+    # admits the pinned source; a completed preparation needs no second scan.
+    prepared = {"source": str(source.resolve()), "revision": _LIVOX_SOURCE[1], "recipe": 1}
+    marker = destination / ".neh-livox-prepared.json"
+    if not destination.is_symlink() and not marker.is_symlink():
+        try:
+            if json.loads(marker.read_text(encoding="utf-8")) == prepared:
+                return
+        except (OSError, ValueError):
+            pass
     if destination.exists():
         shutil.rmtree(destination)
-    shutil.copytree(source, destination, ignore=shutil.ignore_patterns(".git"))
+    shutil.copytree(source, destination, ignore=shutil.ignore_patterns(".git", marker.name))
     cmake = destination / "CMakeLists.txt"
     content = cmake.read_text(encoding="utf-8")
     if "add_subdirectory(samples)" not in content:
@@ -382,6 +392,7 @@ def _prepare_livox(source: Path, destination: Path) -> None:
         header.write_text("#include <cstdint>\n" + header.read_text(encoding="utf-8"), encoding="utf-8")
     for cmake in destination.rglob("CMakeLists.txt"):
         cmake.write_text(cmake.read_text(encoding="utf-8").replace("-Werror", ""), encoding="utf-8")
+    atomic_write(marker, json.dumps(prepared) + "\n", mode=0o600)
 
 
 def _build_native(root: Path, prefix: Path, cache: Path, name: str, jobs: int,

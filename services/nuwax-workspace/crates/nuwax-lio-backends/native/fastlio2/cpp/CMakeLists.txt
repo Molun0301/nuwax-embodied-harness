@@ -81,16 +81,19 @@ if(NOT NUWAX_PATCH_EXECUTABLE)
   message(FATAL_ERROR "patch is required to apply the FAST-LIO initialization fix")
 endif()
 set(FASTLIO_PATCHED_DIR "${CMAKE_CURRENT_BINARY_DIR}/fastlio-initialized")
+set(FASTLIO_PREPARE_DIR "${FASTLIO_PATCHED_DIR}/initialization-prepare")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/fastlio-initialization.patch")
-foreach(HEADER fast_lio.hpp laserMapping.hpp IMU_Processing.hpp)
+configure_file("${FASTLIO_SOURCE_DIR}/src/fast_lio.hpp"
+  "${FASTLIO_PATCHED_DIR}/src/fast_lio.hpp" COPYONLY)
+foreach(HEADER laserMapping.hpp IMU_Processing.hpp)
   configure_file("${FASTLIO_SOURCE_DIR}/src/${HEADER}"
-    "${FASTLIO_PATCHED_DIR}/src/${HEADER}" COPYONLY)
+    "${FASTLIO_PREPARE_DIR}/src/${HEADER}" COPYONLY)
 endforeach()
 execute_process(
   COMMAND "${NUWAX_PATCH_EXECUTABLE}" --batch --forward -p1
     -i "${CMAKE_CURRENT_SOURCE_DIR}/fastlio-initialization.patch"
-  WORKING_DIRECTORY "${FASTLIO_PATCHED_DIR}"
+  WORKING_DIRECTORY "${FASTLIO_PREPARE_DIR}"
   RESULT_VARIABLE FASTLIO_PATCH_RESULT
   OUTPUT_VARIABLE FASTLIO_PATCH_OUTPUT
   ERROR_VARIABLE FASTLIO_PATCH_ERROR
@@ -99,6 +102,12 @@ if(NOT FASTLIO_PATCH_RESULT EQUAL 0)
   message(FATAL_ERROR
     "FAST-LIO initialization patch failed: ${FASTLIO_PATCH_OUTPUT}${FASTLIO_PATCH_ERROR}")
 endif()
+
+# Keep consumed headers unchanged when the successfully patched bytes match.
+foreach(HEADER laserMapping.hpp IMU_Processing.hpp)
+  configure_file("${FASTLIO_PREPARE_DIR}/src/${HEADER}"
+    "${FASTLIO_PATCHED_DIR}/src/${HEADER}" COPYONLY)
+endforeach()
 
 # dimos-lcm C++ message headers
 if(NOT LIVOX_COMMON_DIR)

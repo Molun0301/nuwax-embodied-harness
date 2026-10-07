@@ -1006,7 +1006,8 @@ class DurableMemoryIndex:
                                           'fallback_reason': proof.get('fallback_reason') if proof else None}
             if not valid:
                 counts['missing'] += 1
-            payload = dict(projection['payload'])
+            # This projection was decoded or built privately for this snapshot.
+            payload = projection['payload']
             payload['vector_provenance'] = evidence
             applicability = self.applicable_modalities(projection) if record is not None else set()
             readiness = {} if include_readiness else None

@@ -98,12 +98,13 @@ def main():
                     service._vector_store.upsert_point(point_id=record.memory_id,collection_name='episodic_observations',record_kind='scene',
                         payload=payload,vectors={'text_dense':NamedVector('text_dense',model.model_name,model.dimension,vector)})
             index_seconds=time.perf_counter()-start
-            locks=[]
+            locks=[];instrumented_locks=[]
             owners=[service._repository.storage] if durable else [service._repository,service._vector_store]
             for owner in owners:
                 for attr in ('_lock','_reader_lock'):
                     if hasattr(owner,attr):
                         wrapper=TimedLock(getattr(owner,attr));setattr(owner,attr,wrapper);locks.append(wrapper)
+                        instrumented_locks.append(type(owner).__name__+'.'+attr)
             def query():return service._query_records('beacon target unique',allowed_record_kinds=(MemoryRecordKind.SCENE,),
                 similarity_threshold=.1,limit=5,payload_filter=None)
             query();samples=[];result=None;all_lock_samples=[]
@@ -143,6 +144,8 @@ def main():
                 'query_median_ms':statistics.median(samples)*1000,'query_samples_ms':[v*1000 for v in samples],
                 'query_lock_max_ms':max(lock_samples,default=0)*1000,'query_lock_total_ms':sum(lock_samples)*1000,
                 'query_lock_hold_samples_ms':all_lock_samples,
+                'query_lock_sources':instrumented_locks,
+                'query_lock_scope_note':'Only listed locks are measured; pooled-reader admission and lease duration are not included.',
                 'query_all_samples_lock_max_ms':max((value for sample in all_lock_samples for value in sample),default=0),
                 'untimed_fuzzy_evaluations':fuzzy_evaluations,
                 'query_tracemalloc_peak_mb':peak/1024/1024,'process_peak_rss_mb':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,

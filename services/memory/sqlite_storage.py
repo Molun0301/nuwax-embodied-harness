@@ -142,7 +142,7 @@ class SQLiteStorage:
     Otherwise file-backed reads use independent query-only connections without
     taking the writer lock; in-memory reads share the writer/lock. This preserves
     a route for WAL read concurrency when existing stores are integrated later.
-    One reused query-only connection serializes independent readers, not writers.
+    Two reused query-only connections allow independent readers to overlap.
     All participant writes must use this owner's transaction facade.
     """
 
@@ -151,8 +151,11 @@ class SQLiteStorage:
         self._timeout = timeout
         self._lock = threading.RLock()
         self._local = threading.local()
-        self._reader_lock = threading.RLock()
-        self._reader = None
+        self._reader_condition = threading.Condition(threading.Lock())
+        self._readers = []
+        self._idle_readers = []
+        self._active_readers = 0
+        self._closing = False
         self._notification_errors = deque(maxlen=16)
         self.notification_failure_count = 0
         self._completion_errors = deque(maxlen=16)
@@ -173,9 +176,20 @@ class SQLiteStorage:
         # still subject to the filesystem/device honoring SQLite's fsync calls.
         self._connection.execute("PRAGMA synchronous=FULL")
         self._connection.execute("PRAGMA foreign_keys=ON")
-        if self.db_path != ":memory:":
-            self._reader = self._connect()
-            self._reader.execute("PRAGMA query_only=ON")
+        try:
+            if self.db_path != ":memory:":
+                for _ in range(2):
+                    reader = self._connect()
+                    self._readers.append(reader)
+                    reader.execute("PRAGMA query_only=ON")
+                self._idle_readers.extend(self._readers)
+        except BaseException:
+            for connection in [*self._readers, self._connection]:
+                try:
+                    connection.close()
+                except BaseException:
+                    pass  # Preserve the construction failure.
+            raise
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -247,7 +261,7 @@ class SQLiteStorage:
             raise RuntimeError("Cannot upgrade a separate read snapshot to a writer transaction")
         try:
             with self._lock:
-                if self._closed:
+                if self._closed or (self._closing and not self.in_transaction):
                     raise RuntimeError("SQLite storage is closed")
                 self._reconcile_completion_locked()
                 frames = getattr(self._local, "frames", None)
@@ -343,31 +357,84 @@ class SQLiteStorage:
         if existing is not None:
             yield existing
             return
-        with self._reader_lock:
-            if self._closed:
+        with self._reader_condition:
+            while not self._idle_readers:
+                if self._closing or self._closed:
+                    raise RuntimeError("SQLite storage is closed")
+                if not self._active_readers:
+                    raise RuntimeError("SQLite read connections are unavailable")
+                self._reader_condition.wait()
+            if self._closing or self._closed:
                 raise RuntimeError("SQLite storage is closed")
-            connection = self._reader
-            frame = SQLiteTransaction(self, connection, writable=False)
+            connection = self._idle_readers.pop()
+            self._active_readers += 1
+        frame = None
+        failed = False
+        try:
             self._control(connection, "BEGIN")
+            frame = SQLiteTransaction(self, connection, writable=False)
             self._local.reader = frame
-            try:
-                yield frame
-            finally:
+            yield frame
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            cleanup_error = None
+            reusable = False
+            if frame is not None:
                 frame._active = False
-                self._local.reader = None
+            self._local.reader = None
+            try:
                 if connection.in_transaction:
                     self._control(connection, "ROLLBACK")
+                reusable = True
+            except BaseException as error:
+                cleanup_error = error
+            retired = False
+            if not reusable:
+                try:
+                    connection.close()
+                    retired = True
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+            with self._reader_condition:
+                if retired:
+                    self._readers.remove(connection)
+                elif reusable:
+                    self._idle_readers.append(connection)
+                self._active_readers -= 1
+                self._reader_condition.notify_all()
+            if not failed and cleanup_error is not None:
+                raise cleanup_error
 
     def close(self) -> None:
         if self.in_transaction or getattr(self._local, "reader", None) is not None:
             raise RuntimeError("Cannot close SQLite storage inside a transaction/snapshot")
-        with self._reader_lock, self._lock:
-            if not self._closed:
-                self._connection.close()
-                # 只有实际关闭成功才确认残留事务不可能再提交。
-                if self._unsettled_completion is not None:
-                    self._unsettled_completion._settled = True
-                    self._unsettled_completion = None
-                if self._reader is not None:
-                    self._reader.close()
+        # Use the existing writer lock for admission/close ordering, but never
+        # hold it while waiting for readers: a reader may need diagnostics on it.
+        with self._lock:
+            with self._reader_condition:
+                if self._closed:
+                    return
+                self._closing = True
+                self._reader_condition.notify_all()
+        with self._reader_condition:
+            while self._active_readers:
+                self._reader_condition.wait()
+        with self._lock:
+            if self._closed:
+                return
+            self._connection.close()
+            # 只有实际关闭成功才确认残留事务不可能再提交。
+            if self._unsettled_completion is not None:
+                self._unsettled_completion._settled = True
+                self._unsettled_completion = None
+            for connection in tuple(self._readers):
+                connection.close()
+                self._readers.remove(connection)
+                if connection in self._idle_readers:
+                    self._idle_readers.remove(connection)
+            with self._reader_condition:
                 self._closed = True
+                self._reader_condition.notify_all()

@@ -248,5 +248,67 @@ async function check(name, action) { await action(); checks++; console.log('PASS
     assert.equal(h.document.getElementById('cfg__' + KEY).value, 'false');
     assert.equal(h.nodes.get('configStatus').textContent, '已加载');
   });
+  await check('active hot-apply shows applying and previous adopted value without a restart instruction', async () => {
+    const hotKey = 'NUWAX_PERCEPTION_YOLO_WORLD_CONFIDENCE';
+    for (const advanced of [false, true]) {
+      const h = harness();
+      const data = schema('0.6', {key: hotKey, type: 'float', default_value: '0.2', advanced,
+        apply_mode: 'hot', effective_value_known: true, effective_value_scope: 'current_process',
+        effective_value: '0.2', pending_restart: true});
+      data.profile_context = {is_active: true};
+      data.application.hot_apply_pending = [hotKey];
+      h.api.renderConfigSchema(data);
+      const rendered = text(h.nodes.get('configSections'));
+      assert.match(rendered, /已保存，正在应用/);
+      assert.match(rendered, /当前生效：0.2/);
+      assert(!rendered.includes('已保存，待重启生效'));
+    }
+  });
+  await check('hot-apply status is not attributed to an inactive selected profile', async () => {
+    const h = harness();
+    const data = schema('false', {pending_restart: true});
+    data.profile_context = {is_active: false}; data.application.hot_apply_pending = [KEY];
+    h.api.renderConfigSchema(data);
+    const rendered = text(h.nodes.get('configSections'));
+    assert(!rendered.includes('正在应用'));
+    assert.match(rendered, /已保存，待重启生效/);
+  });
+  await check('completion removes applying badge while preserving an unsaved edit', async () => {
+    const h = harness();
+    const data = schema('false', {effective_value_known: true, effective_value_scope: 'current_process',
+      effective_value: 'true', pending_restart: true});
+    data.profile_context = {is_active: true}; data.application.hot_apply_pending = [KEY];
+    h.api.renderConfigSchema(data); edit(h, 'true');
+    data.application.hot_apply_pending = [];
+    data.sections[0].fields[0].pending_restart = false;
+    data.sections[0].fields[0].effective_value = 'false';
+    h.api.renderConfigSchema(data);
+    assert(!text(h.nodes.get('configSections')).includes('正在应用'));
+    assert(!text(h.nodes.get('configSections')).includes('待重启生效'));
+    assert.equal(h.document.getElementById('cfg__' + KEY).value, 'true');
+    assert.equal(h.api.configState.dirty.get(KEY), 'true');
+  });
+  await check('hot-and-restart retains external restart scope after in-process applying finishes', async () => {
+    const h = harness();
+    const data = schema('false', {apply_mode: 'hot_and_restart', apply_scope: '本进程热加载；外部进程重启生效',
+      pending_restart: true, effective_value_known: true, effective_value_scope: 'current_process', effective_value: 'true'});
+    data.profile_context = {is_active: true}; data.application.hot_apply_pending = [KEY];
+    h.api.renderConfigSchema(data);
+    assert.match(text(h.nodes.get('configSections')), /正在应用/);
+    assert.match(text(h.nodes.get('configSections')), /外部进程重启生效/);
+    data.application.hot_apply_pending = []; data.sections[0].fields[0].effective_value = 'false';
+    h.api.renderConfigSchema(data);
+    assert(!text(h.nodes.get('configSections')).includes('正在应用'));
+    assert.match(text(h.nodes.get('configSections')), /已保存，待重启生效/);
+  });
+  await check('applying status does not expose a sensitive adopted value', async () => {
+    const h = harness();
+    const field = schema('masked').sections[0].fields[0];
+    Object.assign(field, {type: 'str', sensitive: true, effective_value_known: true,
+      effective_value: 'synthetic-private-value', pending_restart: true});
+    const rendered = text(h.api.buildConfigRow(field, true));
+    assert.match(rendered, /正在应用/);
+    assert(!rendered.includes('synthetic-private-value'));
+  });
   console.log(JSON.stringify({checks, status: 'passed', scope: 'production JS with synthetic DOM and fetch; no browser or device claim'}));
 })().catch(error => { console.error(error); process.exitCode = 1; });

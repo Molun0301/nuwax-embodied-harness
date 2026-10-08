@@ -314,6 +314,8 @@ function renderConfigSchema(schema) {
   const query = (document.getElementById("configSearch").value || "").trim().toLowerCase();
   const match = (f) => !query || f.key.toLowerCase().includes(query) || (f.zh_name || "").toLowerCase().includes(query) || (f.description || "").toLowerCase().includes(query)
     || Object.entries(f.options_schema || {}).some(([key, spec]) => (key + ' ' + (spec.description || '')).toLowerCase().includes(query));
+  const applyingKeys = new Set(schema.profile_context?.is_active
+    ? schema.application?.hot_apply_pending || [] : []);
   let sectionIndex = 0;
   for (const section of schema.sections || []) {
     const fields = (section.fields || []).filter(match);
@@ -344,7 +346,7 @@ function renderConfigSchema(schema) {
     if (normal.length) {
       const grid = document.createElement("div");
       grid.className = "config-grid";
-      for (const f of normal) { grid.appendChild(buildConfigRow(f)); }
+      for (const f of normal) { grid.appendChild(buildConfigRow(f, applyingKeys.has(f.key))); }
       block.appendChild(grid);
     }
     if (advanced.length) {
@@ -354,7 +356,7 @@ function renderConfigSchema(schema) {
       wrap.open = forceAdvanced || Boolean(query);
       const grid = document.createElement("div");
       grid.className = "config-grid";
-      for (const f of advanced) { grid.appendChild(buildConfigRow(f)); }
+      for (const f of advanced) { grid.appendChild(buildConfigRow(f, applyingKeys.has(f.key))); }
       wrap.appendChild(grid);
       block.appendChild(wrap);
     }
@@ -402,7 +404,7 @@ function setupConfigScrollSpy(host, navLinks) {
   };
   host.addEventListener("scroll", host._spy, { passive: true });
 }
-function buildConfigRow(f) {
+function buildConfigRow(f, applying = false) {
   const row = document.createElement("div");
   row.className = "config-row" + (f.pending_restart ? " pending-restart" : "");
   row.dataset.key = f.key;
@@ -561,10 +563,10 @@ function buildConfigRow(f) {
   const scope = document.createElement("span");
   scope.textContent = f.apply_scope || "重启对应服务生效";
   meta.append(source, scope);
-  if (f.pending_restart) {
+  if (applying || f.pending_restart) {
     const pending = document.createElement("span");
     pending.className = "config-pending-label";
-    pending.textContent = "已保存，待重启生效";
+    pending.textContent = applying ? "已保存，正在应用" : "已保存，待重启生效";
     meta.appendChild(pending);
   }
   if (f.effective_value_known === false) {
@@ -574,7 +576,7 @@ function buildConfigRow(f) {
       : f.effective_value_scope === 'external_process'
         ? '外部进程实际采用值未核实；此处仅为启动配置' : "当前进程值未采集";
     meta.appendChild(unknown);
-  } else if (f.pending_restart && !f.sensitive && f.effective_value !== undefined) {
+  } else if ((applying || f.pending_restart) && !f.sensitive && f.effective_value !== undefined) {
     const effective = document.createElement("span");
     effective.textContent = "当前生效：" + String(f.effective_value);
     meta.appendChild(effective);

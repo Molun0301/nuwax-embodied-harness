@@ -188,9 +188,10 @@ def _save_selected_asset(owner, asset, bundle, metadata):
         'active': True, 'localization_ready': False, 'status': MapAssetStatus.LOCALIZING,
         'frame_id': bundle.frame_id, 'last_activated_at': now, 'updated_at': now, 'metadata': values})
     owner._repository.set_active_map_name(bundle.map_name)
-    owner._reconcile_catalog_active_flags(bundle.map_name)
     # 不调用会触发 StateStore/事件回调的 _save_asset。
     owner._repository.save_map_asset(selected)
+    # 完整目标已持久化；对账只需更新其它地图，避免先写一次目标 active 标志。
+    owner._reconcile_catalog_active_flags(bundle.map_name)
     return selected
 
 

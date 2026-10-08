@@ -382,7 +382,6 @@ class MotionGuardClient:
             self.close()
         except MotionGuardError as close_error:
             if exc is not None:
-                close_error.add_note(f"client context body also raised: {exc!r}")
                 raise close_error from exc
             raise
         return False
@@ -807,9 +806,6 @@ class MotionGuardClient:
             try:
                 session._fence_without_registration()
             except MotionGuardError as fence_error:
-                fence_error.add_note(
-                    f"session registration also failed: {registration_error!r}"
-                )
                 raise fence_error from registration_error
             raise
         session._start_renewal()
@@ -1102,7 +1098,6 @@ class MotionGuardSession:
             self.close()
         except MotionGuardError as close_error:
             if exc is not None:
-                close_error.add_note(f"session context body also raised: {exc!r}")
                 raise close_error from exc
             raise
         return False

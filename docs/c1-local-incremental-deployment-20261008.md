@@ -6,7 +6,7 @@
 
 共享检出 `/home/ml/Documents/Codex/2026-10-07/task/neh-done-work`，持久可写任务目录 `/home/ml/Documents/Codex/2026-10-08/task-2`。本任务未操作共享检出的 Git 索引、HEAD 或远端。收到父任务确认基线和原生独占窗口后执行，最多两个编译任务。
 
-已只读查看 README、公开安装部署/升级恢复文档、安装器和更新器；当前树及祖先未发现 AGENTS.md 或相关 .agents/skills。本机 memory_summary.md 可读，未匹配安装历史。已有 `services/nuwax-workspace/target`、Cargo registry、Rust 1.88.0 与 SDK 均保留。系统已有 CMake、C++、Eigen 3.4.0、PCL 1.14.0、LCM 1.5.0。本阶段不连接机器人、不改 systemd/鉴权/网络、不下载依赖。
+已只读查看 README、公开安装部署/升级恢复文档、安装器和更新器；当前树及祖先未发现 AGENTS.md 或相关 .agents/skills。已有 `services/nuwax-workspace/target`、Cargo registry、Rust 1.88.0 与 SDK 均保留。系统已有 CMake、C++、Eigen 3.4.0、PCL 1.14.0、LCM 1.5.0。本阶段不连接机器人、不改 systemd/鉴权/网络、不下载依赖。
 
 ## 调用链及真实范围
 
@@ -106,4 +106,4 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_update_recovery_live.py \
 
 **未运行**：精确 Python 3.8.10；完整模块首次/二次安装；实际产品网关与 SDK 全链；新安装构建成功后因新网关健康失败触发的无替身完整事务（既有事务回归覆盖该编排，真实 HTTP verify 单独覆盖错误版本）；SIGKILL/掉电后的完整人工恢复。不能将本次结果外推为全部模块速度或硬件能力验收。
 
-已有目标、SDK、构建缓存、当前/回退产物均保留。只结束本测试启动的进程。原生窗口已释放；本恢复阶段没有原生编译或正式性能测量。所有源码改动尚未暂存/提交，交由唯一 Git 操作者审查；本文档受 `.gitignore` 的 `*.md` 规则忽略，纳入版本时需显式处理。
+已有目标、SDK、构建缓存、当前/回退产物均保留。只结束本测试启动的进程。原生窗口已释放；本恢复阶段没有原生编译或正式性能测量。记录完成后，四文件已由唯一 Git 操作者以 `968b7b329d31fd00371859f153667af8eb6acae1` 发布。最终整合版增量脚本没有重跑完整矩阵；上述构建数字来自已执行并保存的两段原始探针，不等同于最终脚本再次完整执行通过。

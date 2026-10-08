@@ -1638,7 +1638,7 @@ def _format_mjpeg_frame(data: bytes, *, camera_id: str = "", sequence=None, time
         + f"Content-Length: {len(data)}".encode("ascii")
         + b"\r\n" + identity_headers + b"\r\n"
     )
-    return headers + data + b"\r\n"
+    return b"".join((headers, data, b"\r\n"))
 
 
 def _format_sse_payload(frame: StreamFrame) -> str:

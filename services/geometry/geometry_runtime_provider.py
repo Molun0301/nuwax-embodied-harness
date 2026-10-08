@@ -341,8 +341,8 @@ def _admit_assigned_localization_sample(response, *, request, expected_terminal,
     current_pose = _build_pose(pose)
     if current_pose is None:
         raise ValueError("assigned localization sample pose cannot be represented")
-    # Generic TF decoding invents receipt-time timestamps. Preserve this exact
-    # observed source time on both canonical edges and on the detached tree.
+    # This assigned sample shares one observed source time across both canonical
+    # edges and the detached tree; a generic tree may contain different edge times.
     transforms = [Transform(
         timestamp=current_pose.timestamp, parent_frame_id=edge.parent_frame,
         child_frame_id=edge.child_frame,
@@ -4000,8 +4000,15 @@ def _build_frame_tree(transforms: Any) -> Optional[FrameTree]:
         if not parent or not child:
             continue
         try:
+            source_timestamp_ns = int(getattr(t, "timestamp_ns", 0) or 0)
+            # 与 Pose 一致：保留每条边的源时间，零值表示未知，而非处理时刻。
+            source_timestamp = datetime.fromtimestamp(
+                source_timestamp_ns // 1_000_000_000,
+                tz=timezone.utc,
+            ).replace(microsecond=(source_timestamp_ns % 1_000_000_000) // 1_000)
             contract_transforms.append(
                 Transform(
+                    timestamp=source_timestamp,
                     parent_frame_id=parent,
                     child_frame_id=child,
                     translation=Vector3(x=t.translation.x, y=t.translation.y, z=t.translation.z),

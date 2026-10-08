@@ -4,7 +4,7 @@
 
 ## 修改
 
-Python 代码以 3.8 为兼容基线，本次使用隔离 CPython 3.8.20 实际执行，而非仅在新解释器中指定 AST 语法版本。
+Python 代码以部署端的 **3.8.10** 为兼容基线，本次使用隔离 CPython **3.8.20** 实际执行，而非仅在新解释器中指定 AST 语法版本。两者版本标签不混用。
 
 - `contracts/map_activation.py`：即时求值的 `set[str]` / `dict[str, Any]` 改用 `typing.Set` / `typing.Dict`，解决导入即报错；原数据和校验行为保持
 - `contracts/runtime_views.py`：`Annotated` 从 `typing_extensions` 导入；通用、模块化和兼容 requirements 及 Jetson constraints 显式声明 `typing_extensions==4.13.2`，其官方包元数据支持 Python >=3.8，满足现有 Pydantic/FastAPI 约束
@@ -37,5 +37,7 @@ python3.8 -B scripts/check_memory_sqlite_reader_pool.py
 ```
 
 ## 限定
+
+本批替换使用的 typing 容器、ContextVar / 默认 executor、字符串切片和 pathlib 路径操作均已存在于 3.8.10；相关已安装包元数据声明 Python >=3.8，没有更高补丁版本门槛。线程上下文用法见 [PEP 567](https://peps.python.org/pep-0567/#offloading-execution-to-other-threads)。这不等于整个 3.8 补丁系列行为完全一致，也不代替 3.8.10 的实际运行；目标机 SQLite 编译版本、原生依赖和硬件资格另行区分。
 
 审计覆盖当前语法、明显新版本 API 和合同模型求值；它不是所有惰性执行路径的兼容证明。新测试直接调用注册 endpoint，没有启动 HTTP listener、模型进程或设备；没有执行完整依赖安装、原生 SDK 或 Jetson CUDA/TensorRT 集成。本次也未恢复已搁置的三维定位／支撑专项，用户实机测试独立进行。

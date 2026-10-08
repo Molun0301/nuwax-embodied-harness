@@ -3800,7 +3800,6 @@ class MemoryService(SceneMappingMemoryMixin):
                     "instance": self._score_semantic_instance, "event": self._score_observation_event,
                     "scene": self._score_scene_space}[kind](normalized_query, source)
                 scores = vector_scores(point)
-                point.payload["query_vector_contributions"] = sorted(scores)
                 candidate = self._score_candidate(query=query, normalized_query=normalized_query, point=point,
                     allowed_record_kinds=allowed_record_kinds, current_pose=current_pose,
                     text_recall_score=max(scores.values(), default=0.0), query_image_vector=query_image_vector,

@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -57,6 +58,63 @@ class ProviderModeChecks(unittest.TestCase):
             service._ensure_embedders_initialized()
             service._run_durable_vectorization(claim)
         box.stop_worker(token)
+
+    def contribution_observation(self, mode):
+        """Observe real snapshot payload writes using deterministic offline providers."""
+        text = ExplicitTextEmbedder(dimension=16) if mode in ('text', 'both') else None
+        image = ExplicitVision() if mode in ('image', 'both') else None
+        service = self.fixture(text.model_name if text else 'lexical-only', text=text, image=image)
+        if image:
+            service._load_index_image = lambda ids: (b'fixture-image', ids[0], None)
+        for number in range(3):
+            record = self.record(memory_id='mem_contributions_20260101T000000Z_%08x' % number,
+                                 artifact_ids=['opaque-image'] if image else [])
+            service._repository.upsert_semantic_memory(record)
+        self.drain(service)
+        writes = {'ranking': [], 'survivor': []}
+        seen = {'ranking': 0, 'survivor': 0}
+
+        class ObservedPayload(dict):
+            def __init__(self, payload, phase, point_id):
+                super().__init__(payload)
+                self.phase, self.point_id = phase, point_id
+
+            def __setitem__(self, key, value):
+                if key == 'query_vector_contributions':
+                    writes[self.phase].append((self.point_id, list(value)))
+                super().__setitem__(key, value)
+
+        snapshot = service._durable_index.query_snapshot
+
+        def observe(*args, **kwargs):
+            page, counts = snapshot(*args, **kwargs)
+            phase = 'ranking' if kwargs.get('include_readiness') is False else 'survivor'
+            seen[phase] += len(page)
+            return [(kind, source, replace(point, payload=ObservedPayload(point.payload, phase, point.point_id)), version)
+                    for kind, source, point, version in page], counts
+
+        with patch.object(service._durable_index, 'query_snapshot', side_effect=observe):
+            result = service._query_records('desk', allowed_record_kinds=(MemoryRecordKind.SCENE,),
+                                            similarity_threshold=.4, limit=1, payload_filter=None)
+        matches = [(match.record_id, match.score, match.metadata['query_vector_contributions'],
+                    match.metadata['retrieval_mode']) for match in result.matches]
+        return {'matches': matches, 'writes': writes, 'seen': seen}
+
+    def test_contributions_are_written_only_for_rehydrated_survivors(self):
+        for mode, expected in (('lexical', []), ('text', ['text_dense']),
+                               ('image', ['image_dense']), ('both', ['image_dense', 'text_dense'])):
+            with self.subTest(mode=mode):
+                observation = self.contribution_observation(mode)
+                self.assertEqual(observation['seen']['ranking'], 3)
+                self.assertGreater(observation['seen']['survivor'], 0)
+                self.assertEqual(len(observation['writes']['survivor']), observation['seen']['survivor'])
+                self.assertTrue(all(value == expected for _, value in observation['writes']['survivor']))
+                self.assertEqual(len(observation['matches']), 1)
+                self.assertEqual(observation['matches'][0][0], 'mem_contributions_20260101T000000Z_00000000')
+                self.assertEqual(observation['matches'][0][2], expected)
+                self.assertEqual(observation['matches'][0][3],
+                                 'text_recall_then_filter_then_multimodal_rerank' if expected else 'lexical_only')
+                self.assertEqual(observation['writes']['ranking'], [])
 
     def test_lexical_and_legacy_aliases_need_no_provider_or_image_read(self):
         for model in ('lexical-only', 'disabled', 'hashing-v1', 'HASHING-old-model'):

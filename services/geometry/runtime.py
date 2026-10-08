@@ -5840,6 +5840,16 @@ class PlatformGeometryRuntime:
         Storage reads and descriptor preparation are outside runtime locks. No
         legacy manifest validation, digest, PCD rebuild, or payload clone occurs.
         """
+        return self._prepare_assigned_map_activation(bundle, bundle_root=bundle_root)
+
+    def prepare_retained_assigned_map_activation(self, activation_read, *, repository, bundle_root):
+        from services.mapping.asset_store import _AssignedActivationRead
+        if type(activation_read) is not _AssignedActivationRead:
+            raise TypeError("retained activation requires a repository read")
+        bundle, stored = activation_read.require_owner(repository, bundle_root)
+        return self._prepare_assigned_map_activation(bundle, bundle_root=bundle_root, stored=stored)
+
+    def _prepare_assigned_map_activation(self, bundle, *, bundle_root, stored=None):
         if (not isinstance(bundle, MapAssetBundle) or bundle.identity_schema_version != 2
                 or bundle.asset_state != "finalized" or bundle.manifest_sha256 is not None
                 or not isinstance(bundle.asset_identity, AssetIdentityV2)):
@@ -5860,9 +5870,10 @@ class PlatformGeometryRuntime:
             attach_epoch = getattr(self, "_provider_attach_epoch", 0)
             prior = self._map_activation_snapshot_locked()
         from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore
-        stored = MappingBackendCheckpointStore(root).load(
-            checkpoint_metadata["backend_kind"], schema_version=2,
-            expected_checkpoint_id=checkpoint_metadata.get("checkpoint_id"))
+        if stored is None:
+            stored = MappingBackendCheckpointStore(root).load(
+                checkpoint_metadata["backend_kind"], schema_version=2,
+                expected_checkpoint_id=checkpoint_metadata.get("checkpoint_id"))
         if (stored.checkpoint.schema_version != 2
                 or stored.checkpoint.checkpoint_id != checkpoint_metadata.get("checkpoint_id")
                 or stored.checkpoint.backend_kind != checkpoint_metadata["backend_kind"]):

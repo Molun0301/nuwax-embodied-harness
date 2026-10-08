@@ -322,10 +322,13 @@ class MapWorkspaceService:
         self._require_no_relocalization_recovery("activate_map")
         name = self._require_map_name(map_name)
         asset = self._repository.get_map_asset(name)
-        bundle = self.get_map_asset_bundle(map_name=name) if asset is not None and load_current_bundle else None
+        loaded = self.get_map_asset_bundle(map_name=name, _for_activation=True) if asset is not None and load_current_bundle else None
+        from services.mapping.asset_store import _AssignedActivationRead
+        activation_read = loaded if type(loaded) is _AssignedActivationRead else None
+        bundle = activation_read.bundle if activation_read is not None else loaded
         if bundle is not None and bundle.identity_schema_version == 2:
             from skills.assigned_map_activation import activate_assigned_workspace
-            return activate_assigned_workspace(self, bundle,
+            return activate_assigned_workspace(self, bundle, _activation_read=activation_read,
                 load_memory_history=load_memory_history, reset_memory_library=reset_memory_library,
                 metadata=metadata)
         return self._activate_legacy_map(map_name=map_name, create_if_missing=create_if_missing,
@@ -1607,7 +1610,7 @@ class MapWorkspaceService:
             force_relocalize=force_relocalize,
         )
 
-    def get_map_asset_bundle(self, *, map_name: str) -> Optional[MapAssetBundle]:
+    def get_map_asset_bundle(self, *, map_name: str, _for_activation: bool = False) -> Optional[MapAssetBundle]:
         name = self._require_map_name(map_name)
         asset = self._repository.get_map_asset(name)
         if asset is None:
@@ -1621,12 +1624,14 @@ class MapWorkspaceService:
                     expected_previous_identity=exchange.previous_identity, asset_identity=exchange.candidate_identity)
                 exchange = None
             # current 可能已提交而目录元数据尚未写入；所有正文读取都在守卫外。
-            bundle = self._asset_repository.get_map_asset_bundle(name, migrate_legacy=False,
-                expected_asset_identity=exchange.candidate_identity if exchange is not None
+            loaded = self._asset_repository.get_map_asset_bundle(name, migrate_legacy=False,
+                _for_activation=_for_activation, expected_asset_identity=exchange.candidate_identity if exchange is not None
                     else asset.asset_identity if asset.identity_schema_version == 2 else None)
-            if bundle is None and asset.identity_schema_version == 1:
+            if loaded is None and asset.identity_schema_version == 1:
                 # 显式兼容旧 versions；若并发发布了 current，也在守卫外按真实 schema 准入。
-                bundle = self._asset_repository.get_map_asset_bundle(name)
+                loaded = self._asset_repository.get_map_asset_bundle(name, _for_activation=_for_activation)
+            from services.mapping.asset_store import _AssignedActivationRead
+            bundle = loaded.bundle if type(loaded) is _AssignedActivationRead else loaded
         except MapAssetBundleError as exc:
             raise GatewayError("地图 %s 的 current 资产包无效：%s" % (name, exc),
                 error_code="map_asset_bundle_invalid", http_status=409, jsonrpc_code=-32000) from exc
@@ -1639,7 +1644,7 @@ class MapWorkspaceService:
             if exchange is not None:
                 self._asset_repository.settle_assigned_map_asset_exchange(name,
                     expected_previous_identity=exchange.previous_identity, asset_identity=exchange.candidate_identity)
-            return bundle
+            return loaded
         with self._repository.map_activation_guard():
             current = require_catalog_owner(self, asset, captured)
             if (not current.finalized or current.asset_manifest_sha256 != bundle.manifest_sha256

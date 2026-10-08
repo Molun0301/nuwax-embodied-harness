@@ -57,6 +57,27 @@ class MapAssetBundleValidationError(MapAssetBundleError):
     """A finalized or candidate bundle failed integrity validation."""
 
 
+@dataclass(frozen=True, init=False)
+class _AssignedActivationRead:
+    """One process-local stable read owns both metadata and retained body bytes."""
+
+    _repository: object
+    bundle: MapAssetBundle
+    root: Path
+    stored_checkpoint: object
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError("activation reads must come from the asset repository")
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("activation reads cannot be serialized or copied")
+
+    def require_owner(self, repository, root):
+        if repository is not self._repository or Path(root).absolute() != self.root:
+            raise MapAssetBundleValidationError("activation read belongs to another repository/root")
+        return self.bundle, self.stored_checkpoint
+
+
 class MapAssetCommitUncertainError(MapAssetBundleError):
     """目录交换尚未完成持久对账；暂存目录仍由交换日志拥有。"""
     preserve_staging = True
@@ -215,12 +236,14 @@ class MapAssetBundleRepository:
         *,
         migrate_legacy: bool = True,
         expected_asset_identity: Optional[AssetIdentityV2] = None,
+        _for_activation: bool = False,
     ) -> Optional[MapAssetBundle]:
         _require_typed_asset_identity(expected_asset_identity, optional=True)
         self._recover_planar_exchange(map_name)
         current_dir = self._current_dir(map_name)
         if current_dir.exists() or current_dir.is_symlink():
-            return self._load_validated_bundle(map_name, current_dir, expected_asset_identity=expected_asset_identity)
+            return self._load_validated_bundle(map_name, current_dir, expected_asset_identity=expected_asset_identity,
+                _for_activation=_for_activation)
         if expected_asset_identity is not None or not migrate_legacy:
             return None
         return self._migrate_legacy_latest(map_name)
@@ -752,7 +775,8 @@ class MapAssetBundleRepository:
             raise MapAssetBundleValidationError("assigned manifest exceeds its budget")
         _atomic_write_relative(directory, _MANIFEST_FILE_NAME, payload)
 
-    def _validate_assigned_open_directory(self, map_name, tree, manifest, *, expected_asset_identity=None):
+    def _validate_assigned_open_directory(self, map_name, tree, manifest, *, expected_asset_identity=None,
+                                          _for_activation=False):
         if set(manifest) != {"schema_version", "map_name", "bundle_path", "asset_identity", "checkpoint_source", "files"}:
             raise MapAssetBundleValidationError("assigned manifest has missing or mixed-generation fields")
         if manifest["map_name"] != map_name or manifest["bundle_path"] != _BUNDLE_FILE_NAME:
@@ -813,8 +837,27 @@ class MapAssetBundleRepository:
         elif any(path == "georeference" or path.startswith("georeference/") for path in files):
             raise MapAssetBundleValidationError("unbound georeference file")
         self._validate_geometry_assets(tree, geometry, set(files), assigned=True)
-        self._validate_assigned_checkpoint_bodies(tree, source)
+        stored = None
+        if _for_activation:
+            from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore
+            descriptor = source["manifest"]
+            try:
+                # Match the direct runtime loader's canonical-path semantics.
+                # The original open tree still verifies its named entries below.
+                stored = MappingBackendCheckpointStore(tree.path.resolve(strict=True)).load(
+                    descriptor["backend_kind"], schema_version=2,
+                    expected_checkpoint_id=descriptor["checkpoint_id"])
+            except Exception as exc:
+                raise MapAssetBundleValidationError("invalid retained activation checkpoint") from exc
+        else:
+            self._validate_assigned_checkpoint_bodies(tree, source)
         tree.verify_all()
+        if stored is not None:
+            result = object.__new__(_AssignedActivationRead)
+            for name, value in (("_repository", self), ("bundle", bundle),
+                                ("root", tree.path), ("stored_checkpoint", stored)):
+                object.__setattr__(result, name, value)
+            return result
         return bundle
 
     @staticmethod
@@ -1133,14 +1176,16 @@ class MapAssetBundleRepository:
         *,
         expected_manifest_sha256: Optional[str] = None,
         expected_asset_identity: Optional[AssetIdentityV2] = None,
+        _for_activation: bool = False,
     ) -> MapAssetBundle:
         manifest_sha256, bundle = self._validate_directory(
             map_name,
             directory,
             expected_manifest_sha256=expected_manifest_sha256,
             expected_asset_identity=expected_asset_identity,
+            _for_activation=_for_activation,
         )
-        if bundle.identity_schema_version == 2:
+        if type(bundle) is _AssignedActivationRead or bundle.identity_schema_version == 2:
             return bundle
         return bundle.model_copy(update={"manifest_sha256": manifest_sha256}, deep=True)
 
@@ -1151,6 +1196,7 @@ class MapAssetBundleRepository:
         *,
         expected_manifest_sha256: Optional[str] = None,
         expected_asset_identity: Optional[AssetIdentityV2] = None,
+        _for_activation: bool = False,
     ) -> Tuple[Optional[str], MapAssetBundle]:
         with _StableDirectoryTree(directory) as tree:
             result = self._validate_open_directory(
@@ -1158,6 +1204,7 @@ class MapAssetBundleRepository:
                 tree,
                 expected_manifest_sha256=expected_manifest_sha256,
                 expected_asset_identity=expected_asset_identity,
+                _for_activation=_for_activation,
             )
             tree.verify_all()
             return result
@@ -1169,6 +1216,7 @@ class MapAssetBundleRepository:
         *,
         expected_manifest_sha256: Optional[str] = None,
         expected_asset_identity: Optional[AssetIdentityV2] = None,
+        _for_activation: bool = False,
     ) -> Tuple[Optional[str], MapAssetBundle]:
         _require_typed_asset_identity(expected_asset_identity, optional=True)
         manifest_file = tree.require_file(_MANIFEST_FILE_NAME, "地图资产清单")
@@ -1179,7 +1227,7 @@ class MapAssetBundleRepository:
             if expected_manifest_sha256 is not None:
                 raise MapAssetBundleValidationError("assigned manifest cannot use a legacy digest expectation")
             return None, self._validate_assigned_open_directory(map_name, tree, header,
-                expected_asset_identity=expected_asset_identity)
+                expected_asset_identity=expected_asset_identity, _for_activation=_for_activation)
         if expected_asset_identity is not None or "asset_identity" in header:
             raise MapAssetBundleValidationError("legacy manifest cannot carry an assigned identity")
         manifest_payload, _manifest_size, manifest_sha256 = manifest_file.read_and_hash(_MAX_MANIFEST_JSON_BYTES)

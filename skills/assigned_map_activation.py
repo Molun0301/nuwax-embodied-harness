@@ -233,7 +233,7 @@ def _activation_evidence(owner, prepared, request, journal, initial_state, allow
 
 
 def activate_assigned_workspace(owner, bundle, *, load_memory_history, reset_memory_library=False,
-                                metadata=None, allow_dispatch=True):
+                                metadata=None, allow_dispatch=True, _activation_read=None):
     """一次显式事务；所有未知结果保留日志，绝不在异常中重新调用后端。"""
     if reset_memory_library:
         raise _problem('finalized 地图激活不支持重置记忆库。')
@@ -244,7 +244,7 @@ def activate_assigned_workspace(owner, bundle, *, load_memory_history, reset_mem
     try:
         with owner._localization_service.assigned_session_publication_scope() as publication:
             try:
-                _activate(owner, bundle, load_memory_history, metadata, allow_dispatch, publication)
+                _activate(owner, bundle, load_memory_history, metadata, allow_dispatch, publication, _activation_read)
             finally:
                 # 定位发布回调在所有 E/C/R 守卫外运行，允许后继操作真正替换当前拥有方。
                 state.assigned_active = False
@@ -268,10 +268,17 @@ def activate_assigned_workspace(owner, bundle, *, load_memory_history, reset_mem
         raise
 
 
-def _activate(owner, bundle, load_memory_history, metadata, allow_dispatch, publication):
+def _activate(owner, bundle, load_memory_history, metadata, allow_dispatch, publication, activation_read):
     runtime, repository = owner._geometry_runtime, owner._repository
-    prepared = runtime.prepare_assigned_map_activation(bundle,
-        bundle_root=owner._asset_repository.current_directory(bundle.map_name))
+    root = owner._asset_repository.current_directory(bundle.map_name)
+    if activation_read is None:
+        prepared = runtime.prepare_assigned_map_activation(bundle, bundle_root=root)
+    else:
+        from services.mapping.asset_store import _AssignedActivationRead
+        if type(activation_read) is not _AssignedActivationRead or activation_read.bundle is not bundle:
+            raise TypeError("activation read must retain the exact admitted bundle")
+        prepared = runtime.prepare_retained_assigned_map_activation(activation_read,
+            repository=owner._asset_repository, bundle_root=root)
     with _transaction(owner):
         journal = repository.get_map_activation()
         asset = repository.get_map_asset(bundle.map_name)

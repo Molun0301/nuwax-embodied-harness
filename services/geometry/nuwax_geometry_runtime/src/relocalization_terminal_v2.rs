@@ -122,7 +122,7 @@ impl AssignedRelocalizationTerminalV2 {
         if request_wire.encode_to_vec() != request_bytes {
             return Err("RELOCALIZATION_ASSIGNED_DURABLE_REQUEST_NON_CANONICAL".into());
         }
-        let request = AssignedCloudRelocalizeRequestIdentityV2::admit_canonical(request_wire)?;
+        let request = AssignedCloudRelocalizeRequestIdentityV2::admit_retained_canonical(request_wire)?;
         let terminal = Self::from_encoded(terminal_bytes.to_vec(), validator)?;
         if terminal.request() != &request {
             return Err("RELOCALIZATION_ASSIGNED_DURABLE_REQUEST_CONFLICT".into());
@@ -170,7 +170,7 @@ impl AssignedRelocalizationTerminalQueryV2 {
             || !query.activation_identity_sha256.is_empty() {
             return Err("RELOCALIZATION_ASSIGNED_QUERY_SCHEMA_OR_LEGACY_FIELDS_INVALID".into());
         }
-        let request = AssignedCloudRelocalizeRequestIdentityV2::admit(
+        let request = AssignedCloudRelocalizeRequestIdentityV2::admit_retained(
             query.assigned_request_v2.ok_or("RELOCALIZATION_ASSIGNED_QUERY_REQUEST_ABSENT")?,
         )?;
         if query.request_id != request.request_id() {
@@ -215,7 +215,7 @@ impl AssignedRelocalizationTerminalQueryV2 {
             || !response.request_identity_sha256.is_empty() || !response.activation_identity_sha256.is_empty() {
             return Err("RELOCALIZATION_ASSIGNED_QUERY_RESPONSE_BINDING_INVALID".into());
         }
-        let request = AssignedCloudRelocalizeRequestIdentityV2::admit_canonical(
+        let request = AssignedCloudRelocalizeRequestIdentityV2::admit_retained_canonical(
             response.assigned_request_v2.ok_or("RELOCALIZATION_ASSIGNED_QUERY_RESPONSE_REQUEST_ABSENT")?,
         )?;
         if request != self.request {
@@ -269,7 +269,7 @@ fn validate_result(
         return Err("RELOCALIZATION_ASSIGNED_TERMINAL_MIXED_WITH_LEGACY".into());
     }
     let body = result.assigned_cloud_v2.as_ref().ok_or("RELOCALIZATION_ASSIGNED_TERMINAL_BODY_ABSENT")?;
-    let request = AssignedCloudRelocalizeRequestIdentityV2::admit_canonical(
+    let request = AssignedCloudRelocalizeRequestIdentityV2::admit_retained_canonical(
         body.request.clone().ok_or("RELOCALIZATION_ASSIGNED_TERMINAL_REQUEST_ABSENT")?,
     )?;
     if result.request_id != request.request_id() {

@@ -168,7 +168,8 @@ class RelocalizationNativeStub(SaveNativeStub):
     def GetAssignedLocalizationSample(self, request, timeout):
         self.visit("GetAssignedLocalizationSample")
         self.sample_requests.append(deepcopy(request))
-        admitted = AssignedRelocalizationRequest.from_proto(request)
+        admitted = AssignedRelocalizationRequest.admit_retained(
+            provider_module._project_assigned_proto(request, 'request'))
         assert self.terminal is not None and self.terminal.request.exact_replay_of(admitted)
         result = sample_for_terminal(self.terminal)
         if self.sample_mutation:
@@ -396,6 +397,39 @@ class AssignedWorkspaceRelocalizationTests(unittest.TestCase):
                 self.service.recover_relocalization_receipt()
                 self.assertIsNone(self.service._repository.get_relocalization_intent())
         self.assert_original_owner()
+
+    def test_retained_policy_v2_pending_and_completed_same_timeout_recover_without_dispatch(self):
+        target = self.runtime.capture_assigned_map_activation_target(
+            map_name=MAP_NAME, asset_identity=self.saved.asset_identity)
+        policy = json.loads((Path(__file__).parent / 'fixtures/relocalization_policy_algorithm2_0276.json').read_text())
+        request = AssignedRelocalizationRequest.from_dict({
+            'schema_version': 2, 'request_id': REQUEST_ID,
+            'assigned_cloud_v2': {'target': target.activation_receipt.to_dict()['target'],
+                'policy': policy, 'logical_timeout_ms': 10_000}})
+        repository = self.service._repository
+        arguments = dict(assigned_request=request, activation_receipt=target.activation_receipt,
+            target_asset_identity=target.asset_identity)
+        # 模拟旧程序已提交而丢失回复的持久化日记；新程序只查询和取样。
+        repository.begin_assigned_relocalization_durable(**arguments)
+        repository.mark_assigned_relocalization_backend_dispatching(**arguments)
+        repository.mark_assigned_relocalization_outcome_unknown(**arguments)
+        self.stub.terminal = terminal_for_request(request)
+        for phase in ('pending', 'completed'):
+            with self.subTest(phase=phase):
+                before = list(self.stub.calls)
+                with self.assertRaises(GatewayError):
+                    self.service.relocalize_active_map(map_name=MAP_NAME,
+                        metadata={'request_id': REQUEST_ID, 'logical_timeout_ms': 250})
+                self.assertEqual(self.stub.calls, before)
+                with self.forbid_unpaired_pose():
+                    session, workspace = self.relocalize()
+                self.assertTrue(workspace.localization_ready)
+                self.assertEqual(session.status, LocalizationSessionStatus.READY)
+                self.assertEqual(session.relocalization_terminal_v2.request.to_dict(), request.to_dict())
+        self.assertEqual(self.stub.relocalization_requests, [])
+        self.assertTrue(self.stub.query_requests)
+        self.assertTrue(self.stub.sample_requests)
+        self.assertIsNone(repository.get_assigned_relocalization_intent())
 
     def test_exact_completed_request_retry_uses_retained_terminal_without_redispatch(self):
         original_session, _ = self.relocalize()

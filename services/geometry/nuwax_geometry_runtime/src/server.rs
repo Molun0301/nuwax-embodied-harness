@@ -6645,7 +6645,7 @@ impl GeometryRuntime for GeometryRuntimeService {
         &self, req: Request<RelocalizeRequest>,
     ) -> Result<Response<AssignedLocalizationSampleV2>, Status> {
         self.ensure_running_admission("GetAssignedLocalizationSample").await?;
-        let request = crate::relocalization_identity::AssignedCloudRelocalizeRequestIdentityV2::admit(req.into_inner())
+        let request = crate::relocalization_identity::AssignedCloudRelocalizeRequestIdentityV2::admit_retained(req.into_inner())
             .map_err(Status::invalid_argument)?;
         let ingress = self.relocalization_ingress.as_ref()
             .ok_or_else(|| Status::failed_precondition("RELOCALIZATION_OWNER_NOT_SELECTED"))?;

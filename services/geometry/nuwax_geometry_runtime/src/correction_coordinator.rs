@@ -33,8 +33,8 @@ mod preflight_only_contract {
     };
     use nuwax_mapping::loop_closure::options::{PgoOptions, PGO_OPTIONS_ENV};
     use nuwax_mapping::relocalization::{
-        evaluate_alignment, relocation_pipeline_with_config, IcpConfig, IcpResult, IcpSolver,
-        RelocalizationConfig, RelocalizationResult,
+        evaluate_alignment, is_upright, relocation_pipeline_with_config, IcpConfig, IcpResult,
+        IcpSolver, RelocalizationConfig, RelocalizationResult, GRAVITY_TILT_MAX_DEG,
     };
     use nuwax_nav_pgo_bridge::{
         OnlinePgoConfig, OnlinePgoIngress, OnlinePgoOwner, OnlinePgoStopCause,
@@ -156,7 +156,7 @@ mod preflight_only_contract {
     pub(crate) const ACTIVATION_RECEIPT_SCHEMA_VERSION_V1: u32 = 1;
     pub(crate) const RELOCALIZATION_SOURCE_POLICY_VERSION: u32 = 3;
     pub(crate) const RELOCALIZATION_DEADLINE_POLICY_VERSION_V1: u32 = 1;
-    pub(crate) const RELOCALIZATION_ALGORITHM_OPTIONS_VERSION: u32 = 2;
+    pub(crate) const RELOCALIZATION_ALGORITHM_OPTIONS_VERSION: u32 = 3;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum CorrectionCandidateBackend {
@@ -3552,8 +3552,23 @@ mod preflight_only_contract {
     }
 
     pub(crate) fn relocalization_algorithm_options_preimage_v1() -> Vec<u8> {
+        relocalization_algorithm_parameters(
+            RELOCALIZATION_ALGORITHM_OPTIONS_VERSION,
+            "current-registration-local-icp-then-global;accept-geometric-consensus;local-score=raw",
+        )
+    }
+
+    /// 仅供历史终态读取；不能将此策略送入当前求解执行入口。
+    pub(crate) fn retained_algorithm_options_v2() -> Vec<u8> {
+        relocalization_algorithm_parameters(
+            2,
+            "current-anchor-local-icp-then-global;submit-functional-estimate",
+        )
+    }
+
+    fn relocalization_algorithm_parameters(version: u32, strategy: &str) -> Vec<u8> {
         let mut out = b"nuwax.geometry.relocalize.algorithm-options.v1\0".to_vec();
-        out.extend_from_slice(&RELOCALIZATION_ALGORITHM_OPTIONS_VERSION.to_be_bytes());
+        out.extend_from_slice(&version.to_be_bytes());
         canonical_push_string(&mut out, "nuwax_mapping::relocation_pipeline_with_config");
         out.extend_from_slice(&1_u32.to_be_bytes());
         out.extend_from_slice(&3_u32.to_be_bytes());
@@ -3571,7 +3586,7 @@ mod preflight_only_contract {
         out.extend_from_slice(&1.0e-6_f64.to_be_bytes());
         out.extend_from_slice(&(0.1_f64 * 1.5).to_be_bytes());
         out.extend_from_slice(&10.0_f64.to_be_bytes());
-        canonical_push_string(&mut out, "current-anchor-local-icp-then-global;submit-functional-estimate");
+        canonical_push_string(&mut out, strategy);
         out.extend_from_slice(&0.8_f64.to_be_bytes());
         out
     }
@@ -8920,6 +8935,7 @@ mod preflight_only_contract {
             let source_points = Arc::clone(&source.source_points);
             let target_points = Arc::clone(&source.target_points);
             let base_anchor = source.boundary_input.base_anchor_map_from_odom;
+            let registration_seed = source.boundary_input.source_owner.binding().registration_map_from_odom;
             #[cfg(test)]
             let compute_delay_ms = runtime.compute_delay_ms.load(Ordering::Acquire);
             #[cfg(test)]
@@ -8940,6 +8956,7 @@ mod preflight_only_contract {
                         source_points.as_ref(),
                         target_points.as_ref(),
                         base_anchor,
+                        registration_seed,
                     )
                 },
             });
@@ -10067,27 +10084,42 @@ mod preflight_only_contract {
         source: &[Point3<f64>],
         target: &[Point3<f64>],
         base_anchor_map_from_odom: Isometry3<f64>,
+        registration_map_from_odom: Isometry3<f64>,
     ) -> RelocalizationComputeOutput {
         let config = RelocalizationConfig::default();
-        // 当前位姿已有初值时先完成局部对齐，避免每次必须从全图重新找位置。
-        let seeded: Vec<_> = source.iter().map(|point| base_anchor_map_from_odom * point).collect();
+        // 用源帧捕获的有效注册变换作初值，包含之前已提交的校正；固定锚点只用于
+        // 将最终 T 换算为绝对 C = A^-1 * T，不能把初值中的旧校正再累计一次。
+        let seeded: Vec<_> = source.iter().map(|point| registration_map_from_odom * point).collect();
         let local = IcpSolver::new(IcpConfig {
             max_correspondence_distance: config.voxel_sizes.into_iter().fold(0.0, f64::max),
             ..config.icp
         }).align(&seeded, target);
-        // 求解器用无限误差表示没有求得估计；已有估计直接提交，分数只作诊断。
+        // 有限误差只说明求解器产生了估计；局部极小值仍须满足原全局管线的几何门限。
+        // 沿用局部路径已有的原始点评分，不额外复制或降采样点云；全局路径仍按
+        // fine_voxel_size 降采样后评分，两者点权重不同，门限数值保持一致。
         if local.mse.is_finite() {
-            let transform = local.transformation * base_anchor_map_from_odom;
+            let transform = local.transformation * registration_map_from_odom;
             let score = evaluate_alignment(source, target, transform, config.fine_correspondence_distance);
-            return RelocalizationComputeOutput {
-                result: RelocalizationResult {
-                    registration: IcpResult { transformation: transform, ..local },
-                    feature_matches: 0,
-                    ransac_inliers: score.inlier_count,
-                    fitness: score.fitness,
-                },
-                correction: Some(base_anchor_map_from_odom.inverse() * transform),
-            };
+            if score.inlier_count >= config.min_final_inliers
+                && score.fitness >= config.min_final_fitness
+                && score.rmse.is_finite()
+                && is_upright(&transform, GRAVITY_TILT_MAX_DEG)
+            {
+                return RelocalizationComputeOutput {
+                    result: RelocalizationResult {
+                        registration: IcpResult {
+                            transformation: transform,
+                            mse: score.rmse * score.rmse,
+                            converged: true,
+                            ..local
+                        },
+                        feature_matches: 0,
+                        ransac_inliers: score.inlier_count,
+                        fitness: score.fitness,
+                    },
+                    correction: Some(base_anchor_map_from_odom.inverse() * transform),
+                };
+            }
         }
         let result = relocation_pipeline_with_config(source, target, config);
         let correction = result.registration.converged
@@ -11648,6 +11680,164 @@ mod preflight_only_contract {
         use nuwax_transport::LcmTransport;
 
         use super::*;
+
+        fn local_consensus_source() -> Vec<Point3<f64>> {
+            let mut source = Vec::new();
+            for index in 0..8 {
+                source.push(Point3::new(
+                    (index & 1) as f64 * 0.8 + 0.03 * index as f64,
+                    ((index >> 1) & 1) as f64 * 0.9 + 0.011 * (index * index) as f64,
+                    ((index >> 2) & 1) as f64 * 0.7 + 0.009 * (index * index) as f64,
+                ));
+            }
+            for index in 0..120 {
+                source.push(Point3::new(
+                    5.0 + (index % 11) as f64 * 0.43,
+                    -3.0 + ((index * 7) % 19) as f64 * 0.31,
+                    0.2 + ((index * 13) % 23) as f64 * 0.19,
+                ));
+            }
+            source
+        }
+
+        #[test]
+        fn relocalization_local_consensus_rejects_sparse_wrong_heading() {
+            let source = local_consensus_source();
+            let truth = Isometry3::from_parts(
+                Translation3::new(30.0, 20.0, 0.0),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, 37.0_f64.to_radians()),
+            );
+            let distractor = Isometry3::from_parts(
+                Translation3::new(0.1, -0.05, 0.02),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, -17.0_f64.to_radians()),
+            );
+            let mut target: Vec<_> = source.iter().map(|point| truth * point).collect();
+            target.extend(source[..8].iter().map(|point| distractor * point));
+            let local = IcpSolver::new(IcpConfig {
+                max_correspondence_distance: 0.8,
+                ..IcpConfig::default()
+            }).align(&source, &target);
+            assert!(local.converged && local.mse < 1e-12);
+            assert!((local.transformation.rotation.inverse() * truth.rotation).angle() > 0.9);
+            let output = run_relocalization_compute(&source, &target, Isometry3::identity(), Isometry3::identity());
+            // 少数重复结构可以令局部 ICP 收敛；应进入原全局管线，不能提交该局部朝向。
+            let correction = output.correction.expect("原全局管线应找回完整匹配");
+            assert!(output.result.feature_matches > 0);
+            assert_eq!(output.result.fitness, 1.0);
+            assert!((correction.rotation.inverse() * truth.rotation).angle() < 1e-6);
+            assert!((correction.translation.vector - truth.translation.vector).norm() < 1e-6);
+        }
+
+        #[test]
+        fn relocalization_local_consensus_accepts_supported_seed() {
+            let source = local_consensus_source();
+            let truth = Isometry3::from_parts(
+                Translation3::new(0.03, -0.02, 0.01),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, 0.01),
+            );
+            let target: Vec<_> = source.iter().map(|point| truth * point).collect();
+            let output = run_relocalization_compute(&source, &target, Isometry3::identity(), Isometry3::identity());
+            let correction = output.correction.expect("充分支持的近初值匹配应直接接受");
+            assert_eq!(output.result.feature_matches, 0);
+            assert!(output.result.registration.converged);
+            assert_eq!(output.result.fitness, 1.0);
+            assert!((correction.inverse() * truth).rotation.angle() < 1e-9);
+            assert!((correction.inverse() * truth).translation.vector.norm() < 1e-9);
+        }
+
+        #[test]
+        fn relocalization_local_consensus_preserves_nonzero_anchor() {
+            let source = local_consensus_source();
+            let anchor = Isometry3::from_parts(
+                Translation3::new(2.0, -3.0, 0.4),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, 0.7),
+            );
+            let delta = Isometry3::from_parts(
+                Translation3::new(0.02, -0.01, 0.005),
+                UnitQuaternion::from_euler_angles(0.01, -0.015, 0.008),
+            );
+            let truth = delta * anchor;
+            let target: Vec<_> = source.iter().map(|point| truth * point).collect();
+            let output = run_relocalization_compute(&source, &target, anchor, anchor);
+            let correction = output.correction.expect("非零锚点匹配应被接受");
+            assert_eq!(output.result.feature_matches, 0);
+            let error = (anchor * correction).inverse() * truth;
+            assert!(error.rotation.angle() < 1e-9);
+            assert!(error.translation.vector.norm() < 1e-9);
+            assert!((correction * anchor).translation.vector.metric_distance(&truth.translation.vector) > 1e-3);
+        }
+
+        #[test]
+        fn relocalization_local_consensus_rejects_tilted_estimate() {
+            let source = local_consensus_source();
+            let tilted = Isometry3::from_parts(
+                Translation3::identity(),
+                UnitQuaternion::from_euler_angles(20.0_f64.to_radians(), 0.0, 0.0),
+            );
+            let target: Vec<_> = source.iter().map(|point| tilted * point).collect();
+            // 初值恰好吻合倾斜目标，局部残差为零，也不能绕过原有重力门限。
+            let output = run_relocalization_compute(&source, &target, tilted, tilted);
+            assert!(output.correction.is_none() || output.result.feature_matches > 0);
+            if output.correction.is_some() {
+                assert!(is_upright(&output.result.registration.transformation, GRAVITY_TILT_MAX_DEG));
+            }
+        }
+
+        #[test]
+        fn relocalization_local_consensus_accepts_sparse_and_partial_view() {
+            let full_source = local_consensus_source();
+            let anchor = Isometry3::from_parts(
+                Translation3::new(1.0, -2.0, 0.2),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, 0.3),
+            );
+            let prior_correction = Isometry3::from_parts(
+                Translation3::new(30.0, 20.0, 0.0),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, 0.7),
+            );
+            let truth = anchor * prior_correction;
+            let target: Vec<_> = full_source.iter().map(|point| truth * point).collect();
+            // 仅四个非共面点，或局部可见的三十二点；地图其余区域不应稀释源点支持率。
+            let seed = Isometry3::from_parts(
+                Translation3::new(0.03, -0.02, 0.01),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, 0.01),
+            ) * truth;
+            for source in [full_source[..4].to_vec(), full_source.iter().step_by(4).copied().collect()] {
+                let output = run_relocalization_compute(&source, &target, anchor, seed);
+                let correction = output.correction.expect("稀疏但几何充分支持的有效初值应成功");
+                assert_eq!(output.result.feature_matches, 0);
+                assert_eq!(output.result.fitness, 1.0);
+                let error = (anchor * correction).inverse() * truth;
+                assert!(error.rotation.angle() < 1e-9);
+                assert!(error.translation.vector.norm() < 1e-9);
+            }
+        }
+
+        #[test]
+        fn relocalization_local_consensus_reuses_registration_without_accumulating_correction() {
+            let source = local_consensus_source();
+            let anchor = Isometry3::from_parts(
+                Translation3::new(1.0, -2.0, 0.2),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, 0.3),
+            );
+            let prior_correction = Isometry3::from_parts(
+                Translation3::new(30.0, 20.0, 0.0),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, 0.7),
+            );
+            let truth = anchor * prior_correction;
+            let target: Vec<_> = source.iter().map(|point| truth * point).collect();
+            let mut registration = truth;
+            for _ in 0..2 {
+                let output = run_relocalization_compute(&source, &target, anchor, registration);
+                let correction = output.correction.expect("重复重定位应复用当前有效初值");
+                assert_eq!(output.result.feature_matches, 0, "有效初值无需重新全局匹配");
+                let error = prior_correction.inverse() * correction;
+                assert!(error.rotation.angle() < 1e-9);
+                assert!(error.translation.vector.norm() < 1e-9);
+                registration = anchor * correction;
+                assert!((registration.inverse() * truth).rotation.angle() < 1e-9);
+                assert!((registration.inverse() * truth).translation.vector.norm() < 1e-9);
+            }
+        }
 
         const COMMIT_NONCE: u128 = 0x1020_3040_5060_7080_90a0_b0c0_d0e0_f001;
         const LEASE_NONCE: u128 = 0x8877_6655_4433_2211_1020_3040_5060_7080;
@@ -14789,6 +14979,50 @@ mod preflight_only_contract {
         }
 
         #[test]
+        fn retained_policy_v2_applied_reopens_with_current_records_and_queries_exact_bytes() {
+            let root = RelocalizationTerminalTestRoot::new();
+            fs::create_dir_all(root.path()).unwrap();
+            let mut expected = Vec::new();
+            for (historical, request_id) in [(true, "historical-applied"), (false, "current-applied")] {
+                let mut result = assigned_finalized_terminal_fixture();
+                result.request_id = request_id.into();
+                let request = result.assigned_cloud_v2.as_mut().unwrap().request.as_mut().unwrap();
+                request.request_id = request_id.into();
+                if historical {
+                    relocalization_request_body(request).policy = Some(
+                        crate::relocalization_identity::tests::historical_policy_fixture());
+                    assert!(validate_relocalize_request(request.clone()).is_err());
+                }
+                let terminal = AssignedRelocalizationTerminalV2::new(result, Some(&validate_assigned_terminal_retained)).unwrap();
+                assert_eq!(terminal.body().disposition, crate::proto::RelocalizeDisposition::Applied as i32);
+                assert!(!terminal.body().candidate_payload_v3.is_empty());
+                let durable = terminal.encode_durable().unwrap();
+                let path = root.path().join(crate::relocalization_terminal_v2::assigned_terminal_filename_v2(request_id).unwrap());
+                fs::write(&path, &durable).unwrap();
+                expected.push((terminal, durable, path));
+            }
+            let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
+            for (original, durable, path) in expected {
+                let key = RelocalizationRequestIdentity::Assigned(original.request().clone());
+                let reopened = match store.snapshot_exact(original.request().request_id(), &key) {
+                    RelocalizationTerminalSnapshot::AssignedTerminal(value) => value,
+                    other => panic!("未读到已持久化的完整终态: {other:?}"),
+                };
+                assert_eq!(reopened.encoded(), original.encoded());
+                assert_eq!(fs::read(path).unwrap(), durable, "打开仓库不得改写历史字节");
+                let query = AssignedRelocalizationTerminalQueryV2::admit(crate::proto::GetRelocalizationTerminalRequest {
+                    schema_version: 2,
+                    request_id: reopened.request().request_id().into(),
+                    assigned_request_v2: Some(reopened.request().to_wire()),
+                    ..Default::default()
+                }).unwrap();
+                let response = query.response(crate::proto::RelocalizationTerminalStatus::Terminal, Some(&reopened), None).unwrap();
+                let decoded = query.validate_response(response, Some(&validate_assigned_terminal_retained)).unwrap().unwrap();
+                assert_eq!(decoded.encoded(), original.encoded());
+            }
+        }
+
+        #[test]
         fn assigned_terminal_retained_validator_checks_real_v3_candidate_receipt_and_outcome() {
             let result = assigned_finalized_terminal_fixture();
             let terminal = AssignedRelocalizationTerminalV2::new(result.clone(), Some(&validate_assigned_terminal_retained)).unwrap();
@@ -14992,7 +15226,7 @@ mod preflight_only_contract {
             assert_eq!(exact_hex(&deadline), "6e757761782e67656f6d657472792e72656c6f63616c697a652e646561646c696e652d706f6c6963792e7631000000000100000000000000fa0000000000007530000000000000753000000000000007d00000000000001388000000010000000100000001");
             let algorithm = relocalization_algorithm_options_preimage_v1();
             let algorithm_domain = b"nuwax.geometry.relocalize.algorithm-options.v1\0";
-            assert_eq!(&algorithm[algorithm_domain.len()..algorithm_domain.len()+4], &2_u32.to_be_bytes());
+            assert_eq!(&algorithm[algorithm_domain.len()..algorithm_domain.len()+4], &3_u32.to_be_bytes());
             assert_eq!(&algorithm[algorithm.len()-8..], &0.8_f64.to_be_bytes());
             let policy = crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire();
             assert_eq!(policy.source_parameters, source);
@@ -21699,7 +21933,7 @@ pub(crate) use preflight_only_contract::{
     relocalization_algorithm_options_sha256_v1, relocalization_deadline_policy_sha256_v1,
     relocalization_source_policy_sha256_v1, validate_relocalization_request_id,
     relocalization_source_policy_preimage_v1, relocalization_deadline_policy_preimage_v1,
-    relocalization_algorithm_options_preimage_v1, normalize_relocalization_logical_timeout_ms,
+    relocalization_algorithm_options_preimage_v1, retained_algorithm_options_v2, normalize_relocalization_logical_timeout_ms,
     assigned_pose_isometry, CorrectionCandidate,
     ActivatedTargetReceiptControl, ActivationJournalEntry, ActivationJournalStatus,
     ActivationJournalStep, ActivationLedgerAdmission, ActivationPublicationProof,

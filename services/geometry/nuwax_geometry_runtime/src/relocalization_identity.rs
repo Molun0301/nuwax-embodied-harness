@@ -57,6 +57,27 @@ impl CanonicalRelocalizationPolicyV2 {
         Ok(current)
     }
 
+    /// 仅支持已发布的完整旧描述，不将任意旧版本解释为当前算法。
+    fn admit_retained(value: proto::RelocalizationPolicyDescriptorV2) -> Result<Self, String> {
+        let current = Self::current_cloud();
+        if value == *current.0 {
+            return Ok(current);
+        }
+        let historical = proto::RelocalizationPolicyDescriptorV2 {
+            schema_version: 2,
+            source_policy_version: 3,
+            source_parameters: crate::correction_coordinator::relocalization_source_policy_preimage_v1(),
+            deadline_policy_version: 1,
+            deadline_parameters: crate::correction_coordinator::relocalization_deadline_policy_preimage_v1(),
+            algorithm_options_version: 2,
+            algorithm_parameters: crate::correction_coordinator::retained_algorithm_options_v2(),
+        };
+        if value != historical {
+            return Err("RELOCALIZATION_EXACT_POLICY_PARAMETERS_MISMATCH".into());
+        }
+        Ok(Self(Arc::new(value)))
+    }
+
     pub(crate) fn to_wire(&self) -> proto::RelocalizationPolicyDescriptorV2 {
         self.0.as_ref().clone()
     }
@@ -125,9 +146,17 @@ impl AssignedCloudRelocalizeRequestIdentityV2 {
     /// Durable identities must already use the canonical normalized descriptor.
     /// Public request/query admission still accepts the defined zero timeout.
     pub(crate) fn admit_canonical(request: proto::RelocalizeRequest) -> Result<Self, String> {
+        Self::admit_canonical_with(request, false)
+    }
+
+    pub(crate) fn admit_retained_canonical(request: proto::RelocalizeRequest) -> Result<Self, String> {
+        Self::admit_canonical_with(request, true)
+    }
+
+    fn admit_canonical_with(request: proto::RelocalizeRequest, retained: bool) -> Result<Self, String> {
         use prost::Message;
         let encoded = request.encode_to_vec();
-        let identity = Self::admit(request)?;
+        let identity = Self::admit_with(request, retained)?;
         if identity.to_wire().encode_to_vec() != encoded {
             return Err("RELOCALIZATION_ASSIGNED_REQUEST_NON_CANONICAL".into());
         }
@@ -135,6 +164,15 @@ impl AssignedCloudRelocalizeRequestIdentityV2 {
     }
 
     pub(crate) fn admit(request: proto::RelocalizeRequest) -> Result<Self, String> {
+        Self::admit_with(request, false)
+    }
+
+    /// 历史身份只用于持久化、查询和已提交位姿读取，不提供执行准入。
+    pub(crate) fn admit_retained(request: proto::RelocalizeRequest) -> Result<Self, String> {
+        Self::admit_with(request, true)
+    }
+
+    fn admit_with(request: proto::RelocalizeRequest, retained: bool) -> Result<Self, String> {
         if request.schema_version != 2 {
             return Err("RELOCALIZATION_ASSIGNED_SCHEMA_UNSUPPORTED".into());
         }
@@ -155,7 +193,12 @@ impl AssignedCloudRelocalizeRequestIdentityV2 {
             return Err("RELOCALIZATION_ASSIGNED_TARGET_ABSENT_OR_UNSUPPORTED".into());
         };
         let logical_timeout_ms = crate::correction_coordinator::normalize_relocalization_logical_timeout_ms(body.logical_timeout_ms)?;
-        let policy = CanonicalRelocalizationPolicyV2::admit(body.policy.ok_or("assigned policy parameters are absent")?)?;
+        let policy = body.policy.ok_or("assigned policy parameters are absent")?;
+        let policy = if retained {
+            CanonicalRelocalizationPolicyV2::admit_retained(policy)?
+        } else {
+            CanonicalRelocalizationPolicyV2::admit(policy)?
+        };
         let target = target_from_wire(body.target.ok_or("assigned target receipt is absent")?)?;
         Ok(Self(Arc::new(AssignedCloudRelocalizeRequestData { request_id: request.request_id,
             target, policy, logical_timeout_ms })))
@@ -177,6 +220,49 @@ impl AssignedCloudRelocalizeRequestIdentityV2 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// 从 0276e5f 的 Python 策略编码器导出，独立于新历史解析实现。
+    pub(crate) fn historical_policy_fixture() -> proto::RelocalizationPolicyDescriptorV2 {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/relocalization_policy_algorithm2_0276.json"
+        )).unwrap();
+        let bytes = |field: &str| fixture[field].as_str().unwrap().as_bytes().chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect();
+        proto::RelocalizationPolicyDescriptorV2 {
+            schema_version: fixture["schema_version"].as_u64().unwrap() as u32,
+            source_policy_version: fixture["source_policy_version"].as_u64().unwrap() as u32,
+            source_parameters: bytes("source_parameters"),
+            deadline_policy_version: fixture["deadline_policy_version"].as_u64().unwrap() as u32,
+            deadline_parameters: bytes("deadline_parameters"),
+            algorithm_options_version: fixture["algorithm_options_version"].as_u64().unwrap() as u32,
+            algorithm_parameters: bytes("algorithm_parameters"),
+        }
+    }
+
+    #[test]
+    fn retained_policy_v2_reads_exact_history_but_live_admission_rejects_it() {
+        use prost::Message;
+        let mut historical = wire();
+        body(&mut historical).policy = Some(historical_policy_fixture());
+        body(&mut historical).logical_timeout_ms = 30_000;
+        let encoded = historical.encode_to_vec();
+        let retained = AssignedCloudRelocalizeRequestIdentityV2::admit_retained_canonical(historical.clone()).unwrap();
+        assert_eq!(retained.to_wire().encode_to_vec(), encoded);
+        assert!(AssignedCloudRelocalizeRequestIdentityV2::admit(historical.clone()).is_err());
+        assert!(validate_live_request_boundary(&historical).is_err());
+        for change in [0, 1, 2] {
+            let mut unknown = historical.clone();
+            let policy = body(&mut unknown).policy.as_mut().unwrap();
+            match change {
+                0 => policy.algorithm_options_version = 99,
+                1 => policy.algorithm_parameters.push(0),
+                _ => policy.source_policy_version = 2,
+            }
+            assert!(AssignedCloudRelocalizeRequestIdentityV2::admit_retained(unknown).is_err());
+        }
+        body(&mut historical).logical_timeout_ms = 0;
+        assert!(AssignedCloudRelocalizeRequestIdentityV2::admit_retained_canonical(historical).is_err());
+    }
 
     pub(crate) fn wire() -> proto::RelocalizeRequest {
         let metadata = proto::ActivationRequestMetadataV2 { activation_request_id: "mapload:fixture".into(),

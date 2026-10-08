@@ -1352,7 +1352,8 @@ def _assigned_request_for_rpc(
         policy = activation_state.get("relocalization_policy_v2")
         if policy is None:
             raise ValueError("assigned activation omitted relocalization_policy_v2")
-        if policy != request.to_dict()["assigned_cloud_v2"]["policy"]:
+        # 持久化身份可读不代表旧策略可重新执行；只比较已有策略元数据。
+        if (assigned_request_v2 is not None and policy != current_assigned_relocalization_policy()) or policy != request.to_dict()["assigned_cloud_v2"]["policy"]:
             raise ValueError("assigned request policy differs from activation state")
         if activation_state.get("activation_receipt_disposition") not in {2, 3}:
             raise ValueError("assigned relocalization requires a sealed activation")

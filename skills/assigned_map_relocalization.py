@@ -94,7 +94,7 @@ def _require_replay_metadata(request, metadata):
     if "logical_timeout_ms" in metadata:
         candidate = request.to_dict()
         candidate["assigned_cloud_v2"]["logical_timeout_ms"] = metadata["logical_timeout_ms"]
-        if not request.exact_replay_of(AssignedRelocalizationRequest.admit(candidate)):
+        if not request.exact_replay_of(AssignedRelocalizationRequest.admit_retained(candidate)):
             raise _problem("相同重定位请求不能更换逻辑超时。", request, "relocalization_request_conflict")
 
 

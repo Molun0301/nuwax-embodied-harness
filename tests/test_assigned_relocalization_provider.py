@@ -3,6 +3,7 @@ from contextlib import ExitStack
 from copy import deepcopy
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -102,6 +103,32 @@ def query_response(status=2, *, terminal=None, observation=None):
 
 
 class AssignedRelocalizationProviderTests(unittest.TestCase):
+    def test_retained_policy_v2_queries_but_cannot_dispatch_execution(self):
+        raw = request_dict(30000)
+        raw['assigned_cloud_v2']['policy'] = json.loads(
+            (Path(__file__).parent / 'fixtures/relocalization_policy_algorithm2_0276.json').read_text())
+        historical = AssignedRelocalizationRequest.from_dict(raw)
+        query = AssignedRelocalizationQuery.admit({'schema_version': 2, 'request_id': historical.request_id,
+            'assigned_request_v2': historical.to_dict()})
+        terminal = terminal_dict(5)
+        terminal['assigned_cloud_v2']['request'] = historical.to_dict()
+        terminal = AssignedRelocalizationTerminal.from_dict(terminal)
+        response = pb.GetRelocalizationTerminalResponse(**query.response_to_provider_fields(query.response(1, terminal)))
+        stub = FakeStub(response)
+        result = client(stub).get_relocalization_terminal(activation_state={}, request_id=historical.request_id,
+            logical_timeout_ms=30000, assigned_request_v2=historical)
+        self.assertEqual(result['terminal']['assigned_cloud_v2']['request'], historical.to_dict())
+        self.assertEqual(stub.calls[0][0], 'GetRelocalizationTerminal')
+        for supplied in (historical, historical.to_dict()):
+            stub = FakeStub()
+            state = state_payload(available=True)
+            # 即便调用方保留旧激活策略，也不能把旧请求当当前算法重新运行。
+            state['relocalization_policy_v2'] = raw['assigned_cloud_v2']['policy']
+            with self.assertRaisesRegex(ValueError, 'policy'):
+                client(stub).relocalize(activation_state=state, request_id=historical.request_id,
+                    logical_timeout_ms=30000, assigned_request_v2=supplied)
+            self.assertEqual(stub.calls, [])
+
     def setUp(self):
         self.guard = ExitStack()
         self.addCleanup(self.guard.close)

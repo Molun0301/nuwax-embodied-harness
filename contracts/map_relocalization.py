@@ -166,15 +166,26 @@ def _pack_string(value: str) -> bytes:
 
 def current_assigned_relocalization_policy() -> dict[str, Any]:
     """Existing production policy parameters; never fill an absent RPC policy."""
+    return _assigned_relocalization_policy(
+        3, 'current-registration-local-icp-then-global;accept-geometric-consensus;local-score=raw')
+
+
+def _retained_relocalization_policy_v2() -> dict[str, Any]:
+    """已发布算法二的完整描述，仅用于历史结果读取。"""
+    return _assigned_relocalization_policy(
+        2, 'current-anchor-local-icp-then-global;submit-functional-estimate')
+
+
+def _assigned_relocalization_policy(algorithm_version: int, strategy: str) -> dict[str, Any]:
     source = b'nuwax.geometry.relocalize.source-policy.v1\0' + struct.pack('>4I', 3, 1, 1, 8)
     source += struct.pack('>14Q', 0, 100_000, 2_400_000, 4_096, 25_600_000, 250_000, 6_000_000, 250_000, 6_000_000, 0, 100_000, 0, 2_400_000, 2_000)
     source += struct.pack('>2I', 1, 1)
     deadline = b'nuwax.geometry.relocalize.deadline-policy.v1\0' + struct.pack('>I5Q3I', 1, 250, 30_000, 30_000, 2_000, 5_000, 1, 1, 1)
-    algorithm = b'nuwax.geometry.relocalize.algorithm-options.v1\0' + struct.pack('>I', 2)
+    algorithm = b'nuwax.geometry.relocalize.algorithm-options.v1\0' + struct.pack('>I', algorithm_version)
     algorithm += _pack_string('nuwax_mapping::relocation_pipeline_with_config') + struct.pack('>2I3d3Q', 1, 3, 0.2, 0.3, 0.8, 100, 4_096, 3)
     algorithm += struct.pack('>2dQdQ3d', 0.1, 0.1 * 1.5, 3, 0.45, 50, 1.0e-6, 0.1 * 1.5, 10.0)
-    algorithm += _pack_string('current-anchor-local-icp-then-global;submit-functional-estimate') + struct.pack('>d', 0.8)
-    return {'schema_version': 2, 'source_policy_version': 3, 'source_parameters': source.hex(), 'deadline_policy_version': 1, 'deadline_parameters': deadline.hex(), 'algorithm_options_version': 2, 'algorithm_parameters': algorithm.hex()}
+    algorithm += _pack_string(strategy) + struct.pack('>d', 0.8)
+    return {'schema_version': 2, 'source_policy_version': 3, 'source_parameters': source.hex(), 'deadline_policy_version': 1, 'deadline_parameters': deadline.hex(), 'algorithm_options_version': algorithm_version, 'algorithm_parameters': algorithm.hex()}
 
 
 def _encode(value: Mapping[str, Any]) -> bytes:
@@ -299,6 +310,15 @@ class AssignedRelocalizationRequest(_MetadataOwner):
 
     @classmethod
     def admit(cls, value: Any) -> 'AssignedRelocalizationRequest':
+        return cls._admit(value, retained=False)
+
+    @classmethod
+    def admit_retained(cls, value: Any) -> 'AssignedRelocalizationRequest':
+        """只读身份解析；执行入口仍须调用 admit。"""
+        return cls._admit(value, retained=True)
+
+    @classmethod
+    def _admit(cls, value: Any, *, retained: bool) -> 'AssignedRelocalizationRequest':
         value = _normalize(value, 'request')
         if value['schema_version'] != 2:
             raise ValueError('assigned relocalization schema must be 2')
@@ -309,7 +329,9 @@ class AssignedRelocalizationRequest(_MetadataOwner):
             timeout = 30_000
         if not 250 <= timeout <= 30_000:
             raise ValueError('logical timeout differs from existing policy')
-        if body['policy'] != current_assigned_relocalization_policy():
+        if body['policy'] != current_assigned_relocalization_policy() and not (
+            retained and body['policy'] == _retained_relocalization_policy_v2()
+        ):
             raise ValueError('exact relocalization policy parameters differ')
         target = body['target']
         activation = target['activation']
@@ -324,7 +346,7 @@ class AssignedRelocalizationRequest(_MetadataOwner):
     @classmethod
     def from_dict(cls, value: Any) -> 'AssignedRelocalizationRequest':
         """Reopen a normalized catalog identity; timeout zero is not durable."""
-        owner = cls.admit(value)
+        owner = cls.admit_retained(value)
         if _encode(_normalize(value, 'request')) != owner._encoded:
             raise ValueError('durable assigned request is not normalized')
         return owner
@@ -680,7 +702,7 @@ class AssignedRelocalizationQuery(_MetadataOwner):
         if value['schema_version'] != 2:
             raise ValueError('assigned query schema must be 2')
         _bound(value, 'query', MAX_TERMINAL_BYTES)
-        request = AssignedRelocalizationRequest.admit(value['assigned_request_v2'])
+        request = AssignedRelocalizationRequest.admit_retained(value['assigned_request_v2'])
         if value['request_id'] != request.request_id:
             raise ValueError('query and exact request IDs differ')
         value['assigned_request_v2'] = request.to_dict()

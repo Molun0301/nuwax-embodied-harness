@@ -79,6 +79,32 @@ def load_proto():
     return module
 
 class AssignedRelocalizationContractTests(unittest.TestCase):
+    def test_retained_policy_v2_preserves_applied_terminal_and_rejects_new_execution(self):
+        policy = json.loads((Path(__file__).parent / 'fixtures/relocalization_policy_algorithm2_0276.json').read_text())
+        raw = terminal_dict(5)
+        raw['assigned_cloud_v2']['request']['assigned_cloud_v2']['policy'] = policy
+        terminal = AssignedRelocalizationTerminal.from_dict(raw)
+        self.assertEqual(terminal.disposition, 1)
+        self.assertEqual(terminal.to_dict(), raw)
+        request = terminal.request
+        with self.assertRaisesRegex(ValueError, 'policy'):
+            AssignedRelocalizationRequest.admit(request.to_dict())
+        query = AssignedRelocalizationQuery.admit({'schema_version': 2, 'request_id': request.request_id,
+            'assigned_request_v2': request.to_dict()})
+        self.assertEqual(query.validate_response(query.response(1, terminal)).to_dict(), raw)
+        for change in ('version', 'bytes'):
+            unknown = request.to_dict()
+            if change == 'version':
+                unknown['assigned_cloud_v2']['policy']['algorithm_options_version'] = 99
+            else:
+                unknown['assigned_cloud_v2']['policy']['algorithm_parameters'] += '00'
+            with self.assertRaisesRegex(ValueError, 'policy'):
+                AssignedRelocalizationRequest.from_dict(unknown)
+        unnormalized = request.to_dict()
+        unnormalized['assigned_cloud_v2']['logical_timeout_ms'] = 0
+        with self.assertRaisesRegex(ValueError, 'normalized'):
+            AssignedRelocalizationRequest.from_dict(unnormalized)
+
 
     def test_request_normalization_immutable_roundtrip_and_small_target_admission(self):
         raw = request_dict(points=2)
@@ -119,7 +145,7 @@ class AssignedRelocalizationContractTests(unittest.TestCase):
 
     def test_policy_exact_versions_minimum_zero_and_first_frame_guard(self):
         policy = current_assigned_relocalization_policy()
-        self.assertEqual((policy['schema_version'], policy['source_policy_version'], policy['deadline_policy_version'], policy['algorithm_options_version']), (2, 3, 1, 2))
+        self.assertEqual((policy['schema_version'], policy['source_policy_version'], policy['deadline_policy_version'], policy['algorithm_options_version']), (2, 3, 1, 3))
         source = bytes.fromhex(policy['source_parameters'])
         prefix = b'nuwax.geometry.relocalize.source-policy.v1\x00'
         self.assertTrue(source.startswith(prefix))

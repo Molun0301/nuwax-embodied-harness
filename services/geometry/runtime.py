@@ -3877,7 +3877,7 @@ class PlatformGeometryRuntime:
     def _require_assigned_map_activation_target_locked(
         self, expected_target: _AssignedMapActivationTarget,
         request: Optional[AssignedRelocalizationRequest] = None,
-        *, require_available: bool = False,
+        *, require_available: bool = False, require_current_policy: bool = True,
     ) -> Dict[str, object]:
         if not isinstance(expected_target, _AssignedMapActivationTarget):
             raise TypeError("assigned operation requires a runtime-captured target")
@@ -3890,8 +3890,8 @@ class PlatformGeometryRuntime:
         if request is not None:
             if (request.asset_identity != expected_target.asset_identity
                     or not request.activation_receipt.exact_replay_of(expected_target.activation_receipt)
-                    or request.to_dict()["assigned_cloud_v2"]["policy"]
-                    != activation["relocalization_policy_v2"]):
+                    or (require_current_policy and request.to_dict()["assigned_cloud_v2"]["policy"]
+                        != activation["relocalization_policy_v2"])):
                 raise ValueError("durable assigned request differs from the captured target or policy")
         if require_available and activation["relocalization_target_available"] is not True:
             raise RuntimeError("captured assigned relocalization target is unavailable")
@@ -3924,7 +3924,7 @@ class PlatformGeometryRuntime:
         receipt = terminal.to_dict()
         with self._runtime_state_lock:
             self._require_assigned_map_activation_target_locked(
-                expected_target, request, require_available=True)
+                expected_target, request, require_available=True, require_current_policy=False)
             if localization_sample is None:
                 yield receipt
             else:
@@ -3959,7 +3959,8 @@ class PlatformGeometryRuntime:
         if terminal.disposition not in {1, 2}:
             raise ValueError("assigned sample requires an applied relocalization terminal")
         with self._runtime_state_lock:
-            self._require_assigned_map_activation_target_locked(expected_target, request, require_available=True)
+            self._require_assigned_map_activation_target_locked(
+                expected_target, request, require_available=True, require_current_policy=False)
             provider = getattr(self, "_remote_provider", None)
             if provider is None or getattr(self, "_provider_attach_stopping", False):
                 raise RuntimeError("assigned localization provider is unavailable")

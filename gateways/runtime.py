@@ -5869,7 +5869,7 @@ class GatewayRuntime:
         events = snapshot["events"]
         snapshot["feedback"] = capture.feedback(
             lambda: build_task_feedback(self, events[-1]) if events else None)
-        metadata = dict(spec.metadata)
+        metadata = spec.metadata
         checkpoint = metadata.get("exploration_checkpoint")
         if isinstance(checkpoint, dict):
             snapshot["exploration_checkpoint"] = dict(checkpoint)

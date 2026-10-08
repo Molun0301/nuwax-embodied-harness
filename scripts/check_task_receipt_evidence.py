@@ -25,6 +25,48 @@ from core.task_manager import TaskManager, TaskReceiptUnavailableError, TaskSafe
 from gateways.runtime import GatewayRuntime
 
 
+# Complete method frozen from 7e8093ff144d956cbb20fc21c58f5b246e6c6397.
+# Keep its body unchanged: this oracle must not reconstruct the candidate.
+_HISTORICAL_TASK_SNAPSHOT = '''def get_task_snapshot(self, task_id: str, *, captured_task=None) -> Dict[str, Any]:
+    """读取独立快照；投影与回调均在任务协调锁外运行。"""
+    from core.task_manager import TaskReceiptCapture, TaskReceiptUnavailableError
+    from gateways.feedback_messages import build_task_feedback
+
+    try:
+        capture = captured_task or self.task_manager.capture_task_receipt(task_id)
+        if (not isinstance(capture, TaskReceiptCapture) or capture.task_id != task_id
+                or capture.source_id != self.task_manager.receipt_source_id):
+            raise ValueError("任务回执封套不属于当前管理器与请求任务。")
+        snapshot = capture.snapshot()
+    except TaskReceiptUnavailableError as error:
+        raise GatewayError(str(error), error_code="task_receipt_unsupported", http_status=500,
+                           details={"status_source": "live_task", "receipt_capture": "unsupported",
+                                    "task_outcome_unchanged": True, "action_replay_allowed": False}) from error
+    spec = snapshot["task"]
+    if (snapshot.get("task_id") != task_id or spec.task_id != task_id
+            or snapshot["status"].task_id != task_id):
+        raise ValueError("任务回执内容身份与封套不一致。")
+    events = snapshot["events"]
+    snapshot["feedback"] = capture.feedback(
+        lambda: build_task_feedback(self, events[-1]) if events else None)
+    metadata = dict(spec.metadata)
+    checkpoint = metadata.get("exploration_checkpoint")
+    if isinstance(checkpoint, dict):
+        snapshot["exploration_checkpoint"] = dict(checkpoint)
+    receipt = metadata.get("map_asset_finalize")
+    if isinstance(receipt, dict):
+        snapshot["map_asset_finalize"] = dict(receipt)
+        if isinstance(snapshot["result"], dict):
+            snapshot["result"] = {**snapshot["result"], "finalize_pending": False}
+    return self._attach_async_task_polling_advisory(task_id, snapshot)'''
+
+
+def historical_task_snapshot(runtime, task_id, capture):
+    namespace = dict(GatewayRuntime.get_task_snapshot.__globals__)
+    exec(_HISTORICAL_TASK_SNAPSHOT, namespace)
+    return namespace["get_task_snapshot"](runtime, task_id, captured_task=capture)
+
+
 class ReceiptEvidenceChecks(unittest.TestCase):
     def setUp(self):
         self.bus = EventBus()
@@ -668,6 +710,63 @@ class ReceiptEvidenceChecks(unittest.TestCase):
             self.manager.wait_for_task(task_id, timeout=2)
             self.assertEqual(self.manager.get_task_status(task_id).state, "succeeded" if commit else "cancelled")
             self.assertFalse(self.manager._records[task_id].resource_quarantined)
+
+
+    def test_snapshot_metadata_projection_matches_frozen_method(self):
+        from gateways.feedback import build_mcp_tool_result
+
+        variants = (
+            {},
+            {"unrelated_%d" % index: {"values": [index, "offline"]} for index in range(512)},
+            {"exploration_checkpoint": {"stage": "saved", "nested": {"values": [1]}},
+             "map_asset_finalize": {"committed": True, "nested": {"values": [2]}}},
+            {"exploration_checkpoint": None, "map_asset_finalize": ["not a mapping"]},
+            {"exploration_checkpoint": ["not a mapping"], "map_asset_finalize": "pending"},
+        )
+        for metadata in variants:
+            for result in (None, {}, {"finalize_pending": True, "nested": [3]}, ["result"]):
+                with self.subTest(metadata_keys=len(metadata), result=result):
+                    task_id = self.finish(result)
+                    self.manager.update_task_metadata(task_id, metadata)
+                    capture = self.manager.capture_task_receipt(task_id)
+                    runtime = self.runtime()
+                    expected = historical_task_snapshot(runtime, task_id, capture)
+                    actual = runtime.get_task_snapshot(task_id, captured_task=capture)
+                    self.assertEqual(actual, expected)
+                    self.assertIs(type(actual["task"].metadata), dict)
+                    # Compare complete MCP projection, without claiming an HTTP route exercise.
+                    self.assertEqual(build_mcp_tool_result(actual), build_mcp_tool_result(expected))
+
+    def test_snapshot_metadata_selected_copies_and_revision_isolation(self):
+        task_id = self.finish({"finalize_pending": True, "nested": [3]})
+        self.manager.update_task_metadata(task_id, {
+            "exploration_checkpoint": {"stage": "saved", "nested": {"values": [1]}},
+            "map_asset_finalize": {"committed": True, "nested": {"values": [2]}},
+            "unrelated": {"values": [4]},
+        })
+        runtime = self.runtime()
+        capture = self.manager.capture_task_receipt(task_id)
+        expected = historical_task_snapshot(runtime, task_id, capture)
+        actual = runtime.get_task_snapshot(task_id, captured_task=capture)
+        metadata = actual["task"].metadata
+        self.assertIsNot(actual["exploration_checkpoint"], metadata["exploration_checkpoint"])
+        self.assertIsNot(actual["map_asset_finalize"], metadata["map_asset_finalize"])
+        actual["exploration_checkpoint"]["stage"] = "caller lifted change"
+        actual["map_asset_finalize"]["committed"] = False
+        self.assertEqual(metadata["exploration_checkpoint"]["stage"], "saved")
+        self.assertTrue(metadata["map_asset_finalize"]["committed"])
+        metadata["unrelated"]["values"].append(99)
+        metadata["exploration_checkpoint"]["nested"]["values"].append(99)
+        actual["map_asset_finalize"]["nested"]["values"].append(99)
+        actual["result"]["nested"].append(99)
+        self.assertEqual(runtime.get_task_snapshot(task_id, captured_task=capture), expected)
+        self.assertEqual(runtime.get_task_snapshot(task_id), expected)
+        self.manager.update_task_metadata(task_id, {"unrelated": {"values": [5]}})
+        current = runtime.get_task_snapshot(task_id)
+        self.assertEqual(current["task"].metadata["unrelated"], {"values": [5]})
+        self.assertEqual(runtime.get_task_snapshot(task_id, captured_task=capture), expected)
+        self.assertEqual(current, historical_task_snapshot(
+            runtime, task_id, self.manager.capture_task_receipt(task_id)))
 
     def test_runtime_projection_identity_feedback_and_lock_boundary(self):
         task_id = self.finish({"known": True})

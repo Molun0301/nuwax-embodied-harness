@@ -79,6 +79,16 @@ The exact focused command, with the umask confined to a subshell, is:
 This records the finite-scan stage's actual run, separately from subsequent
 heading/compatibility validation. No tests were rerun when writing this document.
 
+## Supplemental Python 3.8 runtime check
+
+After publication of `b20d6207` and `3559c127`, the parent reran the exact
+110-test selection above on CPython **3.8.20**, NumPy **1.24.4**, Pydantic
+2.10.6 and protobuf 5.29.6. All 110 tests passed in 3.642 s, with no failures,
+errors, skips or retries. The subshell-local umask remained 022. Sources were
+unchanged throughout. This supplements the local 3.12 result; it does not
+qualify exact Python **3.8.10**, native execution or robot performance. No
+performance probe or SDK build was repeated for this runtime check.
+
 ## Function-level comparison
 
 The original two functions were extracted from baseline `0276e5f` into a

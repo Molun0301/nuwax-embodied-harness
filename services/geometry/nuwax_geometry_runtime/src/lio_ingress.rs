@@ -176,13 +176,24 @@ impl PreparedRegisteredCloud {
     }
 }
 
+/// Clone shares the immutable admitted input and its one lazy body capture.
+/// Neither map points nor envelope bytes are copied to retain this capability.
+#[derive(Debug, Clone)]
+pub(crate) struct AcceptedRegisteredCloud(Arc<AcceptedRegisteredCloudData>);
+
+// Fields stay private to admission; Deref grants no mutation or rebinding.
 #[derive(Debug)]
-pub(crate) struct AcceptedRegisteredCloud {
+pub(crate) struct AcceptedRegisteredCloudData {
     envelope: LioCloudEnvelope,
     map_points: Vec<Point3<f64>>,
     adapter_timestamp_ns: i64,
     binding: RegistrationBinding,
     scan: OnceLock<AdmittedRegisteredScan>,
+}
+
+impl std::ops::Deref for AcceptedRegisteredCloud {
+    type Target = AcceptedRegisteredCloudData;
+    fn deref(&self) -> &Self::Target { &self.0 }
 }
 
 impl PartialEq for AcceptedRegisteredCloud {
@@ -217,8 +228,8 @@ impl AcceptedRegisteredCloud {
     // allocation is transient; lazy body capture runs only for a real consumer.
     // Archived scans retain only the shared body data and frozen metadata.
     fn admitted(envelope: LioCloudEnvelope, pending: PendingRegistration, adapter_timestamp_ns: i64) -> Self {
-        Self { envelope, map_points: pending.map_points, adapter_timestamp_ns,
-            binding: pending.binding, scan: OnceLock::new() }
+        Self(Arc::new(AcceptedRegisteredCloudData { envelope, map_points: pending.map_points, adapter_timestamp_ns,
+            binding: pending.binding, scan: OnceLock::new() }))
     }
 
     #[cfg(test)]
@@ -244,8 +255,8 @@ impl AcceptedRegisteredCloud {
             source_point_count: points.len() as i64, emitted_point_count: points.len() as i64,
             cloud: rebuild_xyz_cloud(&points, source_header(identity, map_frame).unwrap()).unwrap(),
         };
-        Self { envelope, binding, map_points: points,
-            adapter_timestamp_ns: adapter_timestamp_ns.try_into().unwrap(), scan: OnceLock::new() }
+        Self(Arc::new(AcceptedRegisteredCloudData { envelope, binding, map_points: points,
+            adapter_timestamp_ns: adapter_timestamp_ns.try_into().unwrap(), scan: OnceLock::new() }))
     }
 }
 
@@ -442,12 +453,17 @@ mod registered_scan_ownership_tests {
         assert_eq!(accepted.binding().mapping_session_id, "owned-scan");
         assert_eq!(accepted.binding().frozen_odom_from_body, Isometry3::identity());
         assert!(!accepted.body_points_captured_for_test(), "ordinary mapping metadata must not transform the cloud");
+        let lazy = accepted.clone();
+        assert_eq!(lazy.map_points().as_ptr(), allocation);
+        assert!(Arc::ptr_eq(&accepted.0, &lazy.0));
+        assert!(!lazy.body_points_captured_for_test());
         assert_eq!(accepted.scan().source_timestamp_ns(), 10);
         assert_eq!(accepted.scan().body_frame_id(), "body");
         assert_eq!(accepted.scan().body_points()[0], Point3::new(4.0, 5.0, 6.0));
-        assert!(std::ptr::eq(accepted.scan(), accepted.scan()), "all consumers reuse one capture");
+        assert!(std::ptr::eq(accepted.scan(), lazy.scan()), "all lazy owners reuse one capture");
         assert!(!undemanded.body_points_captured_for_test());
         assert_eq!(accepted, undemanded, "capture cache state is not admission identity");
+        drop(lazy); // Retire the added lazy owner before the existing archive-lifetime check.
         let source = accepted.scan().clone();
         let body_allocation = source.body_points().as_ptr();
         assert_eq!(accepted.scan().body_points().as_ptr(), body_allocation);

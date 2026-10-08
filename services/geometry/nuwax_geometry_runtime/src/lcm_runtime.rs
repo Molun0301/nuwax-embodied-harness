@@ -2902,6 +2902,7 @@ async fn geometry_runtime_retained_tasks_settle_before_mapping_and_shm_cleanup()
                 None,
                 Some(&task_control),
                 None,
+                None,
             )
             .await
         });
@@ -8893,6 +8894,7 @@ async fn ingest_mapping_points_with_backend(
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
     task_control: Option<&GeometryRuntimeTaskControl>,
     sensor_origin_map: Option<[f64; 3]>,
+    accepted_cloud: Option<crate::lio_ingress::AcceptedRegisteredCloud>,
 ) -> Result<MappingIngestCommit, nuwax_mapping::SessionError> {
     let owned_mapping = mapping.clone();
     let owned_lifecycle_lock = lifecycle_lock.clone();
@@ -8925,6 +8927,7 @@ async fn ingest_mapping_points_with_backend(
             expected_relocalization_epoch,
             owned_relocalization_mode,
             sensor_origin_map,
+            accepted_cloud,
         )
         .await;
         let terminal = result
@@ -8974,6 +8977,7 @@ async fn ingest_mapping_points_with_backend_owned(
     expected_relocalization_epoch: Option<u64>,
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
     sensor_origin_map: Option<[f64; 3]>,
+    accepted_cloud: Option<crate::lio_ingress::AcceptedRegisteredCloud>,
 ) -> Result<MappingIngestCommit, nuwax_mapping::SessionError> {
     let prepared = {
         let _lifecycle_guard = lifecycle_lock.lock().await;
@@ -9203,7 +9207,7 @@ async fn ingest_mapping_points_with_backend_owned(
                     let session = current_session.clone();
                     tokio::task::spawn_blocking(move || {
                         let writer = Arc::new(parking_lot::Mutex::new(Some(work)));
-                        let acceptance = update_mapping_cloud_map_with_acceptance(&outcome, &session, &writer);
+                        let acceptance = update_mapping_cloud_map_with_source(&outcome, &session, &writer, accepted_cloud.as_ref());
                         let work = writer.lock().take().unwrap();
                         (outcome, Some((ticket, work)), acceptance)
                     }).await.map_err(|error| format!("point-cloud preparation failed: {error}"))
@@ -9388,6 +9392,15 @@ fn update_mapping_cloud_map_with_acceptance(
     current_session: &crate::mapping_adapter::MappingSessionSnapshot,
     writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
 ) -> Result<Option<CommittedMappingCloudMap>, String> {
+    update_mapping_cloud_map_with_source(outcome, current_session, writer, None)
+}
+
+fn update_mapping_cloud_map_with_source(
+    outcome: &MappingIngestOutcome,
+    current_session: &crate::mapping_adapter::MappingSessionSnapshot,
+    writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+    source: Option<&crate::lio_ingress::AcceptedRegisteredCloud>,
+) -> Result<Option<CommittedMappingCloudMap>, String> {
     if !current_session.active || current_session.session_generation != outcome.session_generation {
         return Err("point-cloud candidate mapping session is inactive or stale".into());
     }
@@ -9401,11 +9414,12 @@ fn update_mapping_cloud_map_with_acceptance(
     ) {
         (None, None) => {
             let accepted = outcome.accepted_map_points.is_empty()
-                || writer.accumulate_mapping_scan(
+                || writer.accumulate_mapping_scan_with_source(
                     outcome.session_generation,
                     outcome.accepted_map_points.as_slice(),
                     outcome.sensor_origin_map,
                     outcome.source_timestamp_ns,
+                    source,
                 );
             return if accepted { Ok(None) } else {
                 Err("point-cloud accumulation rejected pending scan".into())
@@ -9428,11 +9442,12 @@ fn update_mapping_cloud_map_with_acceptance(
         return Err("point-cloud candidate occupancy event/receipt identity mismatch".into());
     }
     if !outcome.accepted_map_points.is_empty()
-        && !writer.accumulate_mapping_scan(
+        && !writer.accumulate_mapping_scan_with_source(
             outcome.session_generation,
             outcome.accepted_map_points.as_slice(),
             outcome.sensor_origin_map,
             outcome.source_timestamp_ns,
+            source,
         )
     {
         return Err("point-cloud accumulation rejected committed scan".into());
@@ -11347,6 +11362,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         Some(initial_mode.epoch),
         Some(correction.relocalization_mode_fence()),
         binding.sensor_origin_map,
+        Some(accepted.clone()),
     )
     .await?;
     if !commit.outcome.accepted_map_points.is_empty() {
@@ -11568,6 +11584,7 @@ pub(crate) async fn handoff_registered_lio_cloud_replay_with_correction(
         Some(initial_mode.epoch),
         Some(correction.relocalization_mode_fence()),
         binding.sensor_origin_map,
+        Some(accepted.clone()),
     )
     .await?;
     if !commit.outcome.accepted_map_points.is_empty() {
@@ -11971,6 +11988,7 @@ async fn handoff_registered_lio_cloud_inner(
         None,
         None,
         sensor_origin_map,
+        None,
     )
     .await?;
     let occupancy_committed = commit.outcome.occupancy_event.is_some();
@@ -12014,6 +12032,7 @@ async fn commit_registered_lio_cloud_inner(
     expected_relocalization_epoch: Option<u64>,
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
     sensor_origin_map: Option<[f64; 3]>,
+    accepted_cloud: Option<crate::lio_ingress::AcceptedRegisteredCloud>,
 ) -> Result<MappingIngestCommit, String> {
     let mapping = handle
         .mapping_adapter
@@ -12038,6 +12057,7 @@ async fn commit_registered_lio_cloud_inner(
         relocalization_mode,
         handle.task_control.as_ref(),
         sensor_origin_map,
+        accepted_cloud,
     )
     .await
     .map_err(|error| error.to_string())?;
@@ -12255,6 +12275,7 @@ fn spawn_mapping_feed_tasks(
                 parsed.timestamp_ns,
                 &state_lidar,
                 MappingCloudSource::Legacy,
+                None,
                 None,
                 None,
                 None,
@@ -14221,6 +14242,42 @@ mod mapping_feed_tests {
         assert!(Arc::ptr_eq(&old, &fixture.writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap()));
     }
 
+    #[test]
+    fn unclassified_initial_frame_retires_unpublished_and_inflight_source() {
+        for in_flight in [false, true] {
+            let mut adapter = MappingAdapter::new_with_frames(mapping_config(), "map", "odom");
+            adapter.start_session("raw-unpublished", "raw-unpublished-map").unwrap();
+            let session = adapter.snapshot();
+            let frame = adapter.global_frame_generation();
+            let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
+            writer.begin_session(session.session_generation).unwrap();
+            writer.bind_fine_map_owner(frame, 1).unwrap();
+            let points = vec![Point3::new(0.011, 0.011, 0.011), Point3::new(0.011, 0.011, 0.041)];
+            let source = crate::lio_ingress::AcceptedRegisteredCloud::from_map_points_for_test(
+                points.clone(), 101, 100, "map", "base_link", crate::lio_ingress::RegistrationBinding {
+                    runtime_generation: 1, cloud_source_sequence: 1,
+                    correlated_odometry: crate::lio_ingress::CorrelatedOdometry { source_sequence: 1, source_timestamp_ns: 100 },
+                    mapping_session_id: session.session_id.clone(), mapping_session_generation: session.session_generation,
+                    map_frame_generation: frame, frozen_odom_from_body: nalgebra::Isometry3::identity(),
+                    base_anchor_map_from_odom: nalgebra::Isometry3::identity(), registration_map_from_odom: nalgebra::Isometry3::identity(),
+                    registration_correction_revision: 0, sensor_origin_map: None, frame_capture_relocalization_epoch: Some(0),
+                });
+            assert!(writer.accumulate_mapping_scan_with_source(session.session_generation, &points, None, 100, Some(&source)));
+            assert!(writer.latest_unclassified_fine_scan().is_some());
+            assert!(writer.committed_fine_cloud().is_none());
+            let pending = if in_flight { Some(writer.prepare_scan_work().unwrap()) } else { None };
+            adapter.feed_pose_in_frame_with_frame_transition(1.0, 2.0, 0.0, 0.0, "odom", |proof| {
+                writer.rehome_committed_fine_frame(&proof).map(|_| ())
+            }).unwrap();
+            if let Some((ticket, work)) = pending {
+                assert!(work.latest_unclassified_fine_scan().is_some(), "old private work still owns its old-frame source");
+                writer.install_scan_work(ticket, work).unwrap();
+            }
+            assert!(writer.latest_unclassified_fine_scan().is_none(), "actual owner transition retires raw stage even without a root");
+            assert!(writer.committed_fine_cloud().is_none());
+        }
+    }
+
     #[tokio::test]
     async fn first_anchor_preserves_dirty_and_inflight_map_work_without_a_busy_retry() {
         for in_flight in [false, true] {
@@ -15067,6 +15124,7 @@ mod mapping_feed_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
             })
@@ -15141,6 +15199,7 @@ mod mapping_feed_tests {
                     None,
                     Some(expected_epoch),
                     Some(mode),
+                    None,
                     None,
                     None,
                 )
@@ -17772,18 +17831,26 @@ mod mapping_feed_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn registered_lio_commit_receipts_form_exact_correction_frame_identity() {
-        exercise_registered_lio_correction_commit(true).await;
+        exercise_registered_lio_correction_commit(true, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unregistered_cloud_generation_retires_mapping_without_staging_correction() {
-        exercise_registered_lio_correction_commit(false).await;
+        exercise_registered_lio_correction_commit(false, false).await;
     }
 
-    async fn exercise_registered_lio_correction_commit(register_cloud_session: bool) {
-        let handle = build_handle_for_tests()
-            .await
-            .expect("test Geometry handle");
+    #[tokio::test]
+    async fn in_process_registered_scan_retains_unclassified_fine_evidence() {
+        exercise_registered_lio_correction_commit(true, true).await;
+    }
+
+    async fn exercise_registered_lio_correction_commit(register_cloud_session: bool, in_process: bool) {
+        let handle = if in_process {
+            let transport = LcmTransport::new(Arc::new(MappingFeedRecordingBackend::new(
+                LcmTopic::new("/unused/unit-unclassified-fine-scan").unwrap())));
+            build_test_handle_parts(false, Some(crate::mapping_backend::MappingBackendSpec::Voxel), Some(transport))
+                .await.expect("in-process fine source handle")
+        } else { build_handle_for_tests().await.expect("test Geometry handle") };
         let cloud_path = std::env::temp_dir().join(format!(
             "nuwax-g004b-receipt-{}-{}.mmap",
             std::process::id(),
@@ -17870,16 +17937,20 @@ mod mapping_feed_tests {
         .expect("retained correction ingress");
         let correction = owner.ingress();
         let mut revision_rx = handle.map_revision_tx.subscribe();
-        let map_points = vec![
+        let map_points = if in_process { vec![
+            Point3::new(2.511, -0.489, 0.011),
+            Point3::new(2.511, -0.489, 0.041),
+            Point3::new(2.7, -0.3, 0.2),
+        ] } else { vec![
             Point3::new(2.5, -0.5, 0.0),
             Point3::new(2.6, -0.4, 0.1),
             Point3::new(2.7, -0.3, 0.2),
-        ];
+        ] };
 
         let accepted = crate::lio_ingress::AcceptedRegisteredCloud::from_map_points_for_test(
             map_points.clone(), source_timestamp_ns + 1, source_timestamp_ns,
             "map", "base_link", binding.clone());
-        let admitted_body_allocation = accepted.scan().body_points().as_ptr();
+        assert!(!accepted.body_points_captured_for_test(), "first handoff must start cold");
         let result = handoff_registered_lio_cloud_with_correction(&handle, &accepted, &correction).await;
         if !register_cloud_session {
             let error = result.expect_err("未登记的点云代次必须拒绝");
@@ -17894,6 +17965,8 @@ mod mapping_feed_tests {
             return;
         }
         assert!(result.expect("registered cloud commit and correction handoff"));
+        assert!(accepted.body_points_captured_for_test(), "successful nonempty fine work materializes the source");
+        let admitted_body_allocation = accepted.scan().body_points().as_ptr();
         let event = tokio::time::timeout(Duration::from_secs(1), revision_rx.recv())
             .await
             .expect("map revision event deadline")
@@ -17979,6 +18052,68 @@ mod mapping_feed_tests {
         drop(shared);
         drop(frames);
 
+        if in_process {
+            let (captured, fine_before, republish) = {
+                let writer = handle.cloud_map_writer.lock();
+                let writer = writer.as_ref().unwrap();
+                let captured = writer.latest_unclassified_fine_scan().expect("real fine owner retained admitted evidence");
+                let metadata = writer.committed_metadata().unwrap();
+                let republish = CommittedMappingCloudMap {
+                    notification: CloudMapNotification { revision: metadata.revision,
+                        point_count: metadata.point_count, voxel_size: metadata.voxel_size,
+                        session_generation: metadata.session_generation },
+                    source_timestamp_ns, metadata, receipt: writer.last_cloud_receipt().unwrap(),
+                };
+                (captured, writer.committed_fine_cloud().unwrap(), republish)
+            };
+            assert_eq!(&captured, accepted.scan());
+            assert_eq!(captured.body_points().as_ptr(), admitted_body_allocation);
+            assert_eq!(captured.body_points().len(), 3);
+            let map_from_body = captured.binding().registration_map_from_odom * captured.binding().frozen_odom_from_body;
+            let recovered = captured.body_points().iter().map(|p| map_from_body * p).collect::<Vec<_>>();
+            for (actual, expected) in recovered.iter().zip(&map_points) { assert!((actual - expected).norm() < 1e-12); }
+            assert!((recovered[1].z - recovered[0].z - 0.030).abs() < 1e-12);
+            assert_eq!(crate::pointcloud::voxel_key(map_points[0].coords.into(), 0.05),
+                crate::pointcloud::voxel_key(map_points[1].coords.into(), 0.05));
+            let duplicate = crate::lio_ingress::AcceptedRegisteredCloud::from_map_points_for_test(
+                map_points.clone(), source_timestamp_ns + 1, source_timestamp_ns,
+                "map", "base_link", binding.clone());
+            assert!(!duplicate.body_points_captured_for_test());
+            assert!(!handoff_registered_lio_cloud_with_correction(&handle, &duplicate, &correction).await.unwrap(),
+                "existing canonical admission rejects an independent cold duplicate");
+            assert!(!duplicate.body_points_captured_for_test(), "canonical duplicate must not transform/allocate body points");
+
+            let mut stale_binding = binding.clone();
+            stale_binding.mapping_session_generation += 1;
+            stale_binding.cloud_source_sequence += 10;
+            let stale = crate::lio_ingress::AcceptedRegisteredCloud::from_map_points_for_test(
+                map_points.clone(), source_timestamp_ns + 11, source_timestamp_ns + 10,
+                "map", "base_link", stale_binding);
+            assert!(!stale.body_points_captured_for_test());
+            let error = handoff_registered_lio_cloud_with_correction(&handle, &stale, &correction).await.unwrap_err();
+            assert!(error.contains("registration permit mapping generation is stale"), "{error}");
+            assert!(!stale.body_points_captured_for_test(), "deep generation rejection must leave capture cold");
+
+            let empty_outcome = MappingIngestOutcome {
+                sensor_origin_map: None, accepted_map_points: Vec::new(), occupancy_event: None,
+                occupancy_receipt: None, occupancy_committed: false,
+                session_generation: binding.mapping_session_generation, source_timestamp_ns: source_timestamp_ns + 10,
+            };
+            assert!(update_mapping_cloud_map_with_source(&empty_outcome, &mapping.lock().snapshot(),
+                &handle.cloud_map_writer, Some(&stale)).unwrap().is_none());
+            assert!(!stale.body_points_captured_for_test(), "empty backend result is not a fine accumulation");
+            for _ in 0..2 {
+                let _lifecycle = handle.mapping_lifecycle_lock.lock().await;
+                publish_committed_global_map_in_frame(&handle, &republish, "map").await.unwrap();
+            }
+            let writer = handle.cloud_map_writer.lock();
+            let writer = writer.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&fine_before, &writer.committed_fine_cloud().unwrap()),
+                "handoff retry/publication must not reapply the fine scan");
+            assert_eq!(writer.latest_unclassified_fine_scan().unwrap().body_points().as_ptr(), admitted_body_allocation);
+            assert_eq!(writer.latest_unclassified_fine_scan().unwrap().body_points().len(), 3);
+        }
+
         // 高频样本已经进入后端，但未到栅格发布周期；不能误记拒绝或制造校正收据。
         let before_revision = handle.state.read().await.map.revision;
         let before_cloud_revision = handle.state.read().await.cloud_map_revision;
@@ -18000,6 +18135,11 @@ mod mapping_feed_tests {
         let throttled_source = crate::lio_ingress::AdmittedRegisteredScan::from_map_points_for_test(
             source_timestamp_ns + 1, throttled_binding.clone(), &map_points);
         assert_eq!(mapping.lock().pgo_static_point_indices(&throttled_source).unwrap().as_deref(), Some([0, 1, 2].as_slice()));
+        if in_process {
+            let source = handle.cloud_map_writer.lock().as_ref().unwrap().latest_unclassified_fine_scan().unwrap();
+            assert_eq!(source, throttled_source, "pending scan reaches fine owner before a new publication");
+            assert_eq!(source.body_points().len(), 3);
+        }
         assert!(revision_rx.try_recv().is_err());
         assert_eq!(sink.staged.lock().await.len(), 1);
         assert_eq!(handle.state.read().await.map.revision, before_revision);
@@ -18007,6 +18147,28 @@ mod mapping_feed_tests {
             handle.state.read().await.cloud_map_revision,
             before_cloud_revision
         );
+
+        if in_process {
+            let mut delayed_binding = throttled_binding.clone();
+            delayed_binding.cloud_source_sequence += 1;
+            let delayed = crate::lio_ingress::AcceptedRegisteredCloud::from_map_points_for_test(
+                map_points.clone(), source_timestamp_ns + 3, source_timestamp_ns + 2,
+                "map", "base_link", delayed_binding);
+            let guard = handle.mapping_lifecycle_lock.lock().await;
+            let handoff = handoff_registered_lio_cloud_with_correction(&handle, &delayed, &correction);
+            tokio::pin!(handoff);
+            // Poll enters handoff with the old mode and starts the retained
+            // ingestion task. Held L prevents that task from doing owner work.
+            assert!(matches!(futures::poll!(&mut handoff), std::task::Poll::Pending));
+            tokio::task::yield_now().await;
+            assert!(!delayed.body_points_captured_for_test(), "waiting for owner lock must remain cold");
+            correction.relocalization_mode_fence().activate_for_tests();
+            drop(guard);
+            assert!(!handoff.await.unwrap());
+            assert!(!delayed.body_points_captured_for_test(), "mode changed after handoff entry; deep fence must not capture");
+            assert_eq!(handle.cloud_map_writer.lock().as_ref().unwrap().latest_unclassified_fine_scan().unwrap(),
+                throttled_source, "empty/rejected work preserves the last successful nonempty source");
+        }
 
         // A read-only relocalization payload may only be republished while
         // its exact committed receipt is still current.  Advancing the
@@ -19449,6 +19611,7 @@ mod mapping_feed_tests {
             &handle.committed_map_authority,&handle.map_revision_latest_tx,&handle.cloud_map_writer,
             &registered.points,12,3_000_000_000,"map",3_000_000_000,&handle.state,MappingCloudSource::Legacy,
             Some((session.session_generation,generation,1)),None,None,None,
+            None,
         ).await.unwrap();
         assert_eq!(resumed.outcome.accepted_map_points.len(),1);
         assert_ne!(client.export_checkpoint().unwrap().await.unwrap().unwrap(),before);
@@ -19471,6 +19634,7 @@ mod mapping_feed_tests {
             &Arc::new(parking_lot::Mutex::new(None)), &[Point3::new(1.0, 2.0, 0.0)],
             12, 100, "robot/map", 100, &handle.state, MappingCloudSource::Legacy, None,
             Some(captured), Some(mode), None,
+            None,
         ).await.unwrap();
         assert!(result.outcome.accepted_map_points.is_empty());
         assert!(result.outcome.occupancy_receipt.is_none());
@@ -19539,6 +19703,7 @@ mod mapping_feed_tests {
                 100,
                 &state,
                 MappingCloudSource::Legacy,
+                None,
                 None,
                 None,
                 None,

@@ -13,6 +13,9 @@ pub(super) struct FineCloud {
     readers: FineCloudReaders,
     commits: u64,
     baseline: Option<nuwax_map_chunks::RootIdentity>,
+    // One shared admitted payload, not another scan history or voxel classifier.
+    // Original body coordinates and frozen binding preserve unresolved modes.
+    latest_unclassified_scan: Option<crate::lio_ingress::AdmittedRegisteredScan>,
 }
 impl FineCloud {
     pub(super) fn from_archive(file: std::fs::File) -> Result<(Self, nuwax_map_chunks::ArchivedRoot), String> {
@@ -25,7 +28,7 @@ impl FineCloud {
     }
     pub(super) fn new(size: f32) -> Result<Self, String> {
         Ok(Self { writer: Writer::new(Repository::temporary()?, size, 32 * 1024 * 1024)?,
-            dynamic: DynamicCloudFilter::default(), failure: None, readers: FineCloudReaders::default(), commits: 0, baseline: None })
+            dynamic: DynamicCloudFilter::default(), failure: None, readers: FineCloudReaders::default(), commits: 0, baseline: None, latest_unclassified_scan: None })
     }
     pub(super) fn fresh() -> Result<Self, String> { Self::new(VOXEL_SIZE) }
     #[cfg(test)]
@@ -35,11 +38,21 @@ impl FineCloud {
     pub(super) fn is_dynamic(&self, point: &Point3<f64>) -> bool {
         self.dynamic.is_dynamic([point.x, point.y, point.z])
     }
-    pub(super) fn accumulate(&mut self, points: &[Point3<f64>], origin: Option<[f64; 3]>, timestamp_ns: u64) -> Result<(), String> {
+    pub(super) fn retire_unclassified_scan(&mut self) { self.latest_unclassified_scan = None; }
+    pub(super) fn latest_unclassified_scan(&self) -> Option<&crate::lio_ingress::AdmittedRegisteredScan> {
+        self.latest_unclassified_scan.as_ref()
+    }
+    pub(super) fn accumulate(&mut self, points: &[Point3<f64>], origin: Option<[f64; 3]>, timestamp_ns: u64,
+        source: Option<&crate::lio_ingress::AcceptedRegisteredCloud>) -> Result<(), String> {
         if let Some(error) = &self.failure { return Err(error.clone()); }
         let result = self.accumulate_inner(points, origin, timestamp_ns);
         // 存储故障后不能把部分更新公开成完整提交；由原拥有方的重建/新会话恢复。
         if let Err(error) = &result { self.failure = Some(error.clone()); }
+        else {
+            // Only successfully processed fine work demands the existing lazy
+            // inverse-transform/allocation; sharing afterwards is cheap.
+            self.latest_unclassified_scan = source.map(|accepted| accepted.scan().clone());
+        }
         result
     }
     fn accumulate_inner(&mut self, points: &[Point3<f64>], origin: Option<[f64; 3]>, timestamp_ns: u64) -> Result<(), String> {
@@ -145,7 +158,7 @@ mod revision_tests {
     #[test]
     fn retained_lookup_requires_exact_root_and_block_and_pins_old_reader() {
         let mut source = FineCloud::fresh().unwrap();
-        source.accumulate(&[Point3::new(-0.025, 0.025, 0.175)], None, 1).unwrap();
+        source.accumulate(&[Point3::new(-0.025, 0.025, 0.175)], None, 1, None).unwrap();
         let first = source.seal(domain(), 1, 1).unwrap();
         let readers = source.readers();
         let identity = first.manifest().identity();
@@ -160,7 +173,7 @@ mod revision_tests {
         wrong_domain.domain.frame_generation += 1;
         assert!(readers.pin_root(&wrong_domain, &reference).is_err());
         for revision in 2..=20 {
-            source.accumulate(&[Point3::new(-0.025, 0.025, 0.175)], None, revision).unwrap();
+            source.accumulate(&[Point3::new(-0.025, 0.025, 0.175)], None, revision, None).unwrap();
             let root = source.seal(domain(), revision, revision).unwrap();
             assert_eq!(root.manifest().geometry_revision, 1);
             source.retain_committed(&root);
@@ -170,5 +183,55 @@ mod revision_tests {
         drop(first);
         drop(pinned);
         assert!(readers.pin_root(&identity, &reference).is_err());
+    }
+}
+
+#[cfg(test)]
+mod unclassified_scan_tests {
+    use super::*;
+    use crate::lio_ingress::{AcceptedRegisteredCloud, CorrelatedOdometry, RegistrationBinding};
+
+    fn source(stamp: u64, points: &[Point3<f64>]) -> AcceptedRegisteredCloud {
+        AcceptedRegisteredCloud::from_map_points_for_test(points.to_vec(), stamp, stamp, "map", "base_link", RegistrationBinding {
+            runtime_generation: 5, cloud_source_sequence: stamp as i64,
+            correlated_odometry: CorrelatedOdometry { source_sequence: stamp as i64, source_timestamp_ns: stamp as i64 },
+            mapping_session_id: "owner".into(), mapping_session_generation: 3, map_frame_generation: 4,
+            frozen_odom_from_body: nalgebra::Isometry3::identity(),
+            base_anchor_map_from_odom: nalgebra::Isometry3::identity(),
+            registration_map_from_odom: nalgebra::Isometry3::identity(), registration_correction_revision: 0,
+            sensor_origin_map: None, frame_capture_relocalization_epoch: Some(0),
+        })
+    }
+
+    #[test]
+    fn unclassified_stage_shares_modes_and_retires_with_owner_boundaries() {
+        let points = [Point3::new(0.011, 0.011, 0.011), Point3::new(0.011, 0.011, 0.041)];
+        let first = source(1, &points);
+        assert!(!first.body_points_captured_for_test());
+        let mut fine = FineCloud::fresh().unwrap();
+        fine.accumulate(&points, None, 1, Some(&first)).unwrap();
+        let raw = fine.latest_unclassified_scan().unwrap();
+        let retained = raw.retention_probe_for_test();
+        assert!(first.body_points_captured_for_test());
+        assert_eq!(raw.body_points().as_ptr(), first.scan().body_points().as_ptr());
+        assert_eq!(&**raw.body_points(), &points);
+        let voxels = fine.writer.region([0,0,0], [0,0,0], 1).unwrap();
+        assert_eq!(voxels.len(), 1);
+        assert_eq!(voxels[0].1.hits, 1, "two unresolved modes still produce one occupied voxel hit");
+        drop(first);
+        assert!(retained());
+        let second = source(2, &points);
+        fine.accumulate(&points, None, 2, Some(&second)).unwrap();
+        assert!(!retained(), "fine owner retains only the latest scan, not a second history");
+        let domain = nuwax_map_chunks::Domain { session: "owner".into(), generation: 3,
+            frame_generation: 4, producer_generation: 5 };
+        let sealed = fine.seal(domain, 1, 2).unwrap();
+        let (file, _) = nuwax_map_chunks::archive_file(sealed.manifest(), &sealed.repository).unwrap();
+        let (mut restored, _) = FineCloud::from_archive(file).unwrap();
+        assert!(restored.latest_unclassified_scan().is_none(), "archive retains occupancy, not fabricated raw scan provenance");
+        let restored_voxels = restored.writer.region([0,0,0], [0,0,0], 1).unwrap();
+        assert_eq!(restored_voxels[0].1.hits, 2);
+        fine.accumulate(&points, None, 0, None).unwrap();
+        assert!(fine.latest_unclassified_scan().is_none(), "legacy/replay without source does not inherit the prior stage");
     }
 }

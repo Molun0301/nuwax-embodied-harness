@@ -600,6 +600,18 @@ impl CloudMapShmWriter {
         sensor_origin_map: Option<[f64; 3]>,
         source_timestamp_ns: u64,
     ) -> bool {
+        self.accumulate_mapping_scan_with_source(session_generation, points, sensor_origin_map,
+            source_timestamp_ns, None)
+    }
+
+    /// Called after canonical mapping admission. The shared source is the full
+    /// unclassified admitted scan, not a claim that all returns are static or
+    /// were selected by the mapping backend. No additional replay ledger lives here.
+    pub(crate) fn accumulate_mapping_scan_with_source(
+        &mut self, session_generation: u64, points: &[Point3<f64>],
+        sensor_origin_map: Option<[f64; 3]>, source_timestamp_ns: u64,
+        source: Option<&crate::lio_ingress::AcceptedRegisteredCloud>,
+    ) -> bool {
         if points.is_empty()
             || points.len() > POINTCLOUD_MAX_FRAME_POINTS
             || session_generation == 0
@@ -633,7 +645,7 @@ impl CloudMapShmWriter {
         }
         #[cfg(test)]
         let phase_started = std::time::Instant::now();
-        if let Err(error) = self.fine_cloud.as_mut().unwrap().accumulate(points, sensor_origin_map, source_timestamp_ns) {
+        if let Err(error) = self.fine_cloud.as_mut().unwrap().accumulate(points, sensor_origin_map, source_timestamp_ns, source) {
             warn!(%error, "精细导航源拒绝不完整输入");
             return false;
         }
@@ -952,7 +964,11 @@ impl CloudMapShmWriter {
 
     pub(crate) fn bind_fine_map_owner(&mut self, frame_generation: u64, producer_generation: u64) -> Result<(), String> {
         if producer_generation == 0 { return Err("fine-map producer generation must be positive".into()); }
-        self.fine_owner = Some((frame_generation, producer_generation));
+        let next = Some((frame_generation, producer_generation));
+        if self.fine_owner != next {
+            if let Some(fine) = self.fine_cloud.as_mut() { fine.retire_unclassified_scan(); }
+        }
+        self.fine_owner = next;
         Ok(())
     }
 
@@ -1017,7 +1033,7 @@ impl CloudMapShmWriter {
         } else { return Err("fine frame transition has no source owner".into()); };
         if let Some(readers) = retained { readers.retain_committed(&next); }
         self.committed_fine_cloud = Some(next);
-        self.fine_owner = Some((new_frame, producer));
+        self.bind_fine_map_owner(new_frame, producer)?;
         Ok(true)
     }
 
@@ -1031,6 +1047,14 @@ impl CloudMapShmWriter {
         reference: &nuwax_map_chunks::BlockRef) -> Result<Arc<nuwax_map_chunks::SealedMap>, String> {
         self.fine_cloud.as_ref().map(FineCloud::readers).or_else(|| self.pending_fine_readers.clone())
             .ok_or("fine-map owner is unavailable")?.pin_root(identity, reference)
+    }
+
+    /// Source carried by the most recent successful nonempty fine accumulation.
+    /// Empty/rejected inputs do not replace it. This is neither the newest input
+    /// nor evidence attached to the current published root, and is not ground.
+    /// Older payloads remain solely in existing ScanHistory where available.
+    pub(crate) fn latest_unclassified_fine_scan(&self) -> Option<crate::lio_ingress::AdmittedRegisteredScan> {
+        self.fine_cloud.as_ref()?.latest_unclassified_scan().cloned()
     }
 
     pub(crate) fn committed_fine_cloud(&self) -> Option<Arc<nuwax_map_chunks::SealedMap>> {
@@ -1152,7 +1176,7 @@ impl CloudMapShmWriter {
                     f32::from_le_bytes(bytes[8..12].try_into().unwrap()) as f64,
                 )).collect::<Vec<_>>();
                 // 旧检查点只有历史几何，恢复提交时间不能冒充逐点观察时间。
-                fine.accumulate(&points, None, 0)?;
+                fine.accumulate(&points, None, 0, None)?;
                 fine
             }
         };

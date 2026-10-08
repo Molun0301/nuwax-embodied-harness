@@ -9,6 +9,8 @@ mod repository;
 pub use repository::{Repository, RegionReader};
 mod writer;
 pub use writer::Writer;
+/// Experimental statistics contract; not yet connected to capture or wire formats.
+pub mod surface_statistics;
 mod archive;
 pub use archive::{archive_file, ArchiveReader, ArchivedRoot, LegacyRoot, MAX_ARCHIVE_BYTES};
 

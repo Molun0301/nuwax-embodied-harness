@@ -3,9 +3,27 @@ import json
 import math
 import struct
 
+import numpy as np
+
 from services.geometry.checkpoint_payload import FrozenPayload
 
 MAX_FINE_ARCHIVE_BYTES = 1024 * 1024 * 1024
+_FINE_RECORD_DTYPE = np.dtype([("local", "<u2"), ("stamp", "<u8"), ("hits", "<u2")])
+
+
+# Both NumPy 1.24.4/2.4.4 cross near 256 records; 512 has a clear margin.
+# This selects computation only; the archive admission bound stays 32768.
+_FINE_VECTOR_MIN_POINTS = 512
+
+
+def _validate_vector_block_evidence(block, points, source_time):
+    # Views only retain this already bounded block for the duration of the call.
+    records = np.frombuffer(block, dtype=_FINE_RECORD_DTYPE, count=points, offset=16)
+    local, stamp, hits = records["local"], records["stamp"], records["hits"]
+    if (np.any(local >= 32768) or np.any(local[1:] <= local[:-1])
+            or np.any(stamp > np.uint64(source_time))
+            or np.any((stamp == 0) != (hits == 0))):
+        raise ValueError("精细地图块观察证据错误")
 
 
 def validate_fine_archive(payload, *, session=None, generation=None, cloud_revision=None,
@@ -131,11 +149,14 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
         offset += length
         if block[:8] != b"NUWAXBL1" or struct.unpack("<I", block[8:12])[0] != points or block[12:16] != bytes(4):
             raise ValueError("精细地图块格式错误")
-        last = -1
-        for local, stamp, hits in struct.iter_unpack("<HQH", block[16:]):
-            if not last < local < 32768 or stamp > source_time or (stamp == 0) != (hits == 0):
-                raise ValueError("精细地图块观察证据错误")
-            last = local
+        if points < _FINE_VECTOR_MIN_POINTS:
+            last = -1
+            for local, stamp, hits in struct.iter_unpack("<HQH", block[16:]):
+                if not last < local < 32768 or stamp > source_time or (stamp == 0) != (hits == 0):
+                    raise ValueError("精细地图块观察证据错误")
+                last = local
+        else:
+            _validate_vector_block_evidence(block, points, source_time)
     if offset != len(payload):
         raise ValueError("精细地图资产存在尾随数据")
     return root

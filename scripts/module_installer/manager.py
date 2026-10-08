@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -96,9 +96,18 @@ def choose_python(requested: str = "") -> str:
     raise InstallError("当前依赖支持 Python（编程语言）3.8—3.12；请安装其中一种，再用 --python 指定解释器。")
 
 
-def source_fingerprint(root: Path, modules: Sequence[str], robot: str) -> str:
-    """纳入实际源码与配方，避免同一提交里的修改被误判为无需更新。"""
-    digest = hashlib.sha256()
+def _file_metadata(path: Path) -> list:
+    info = path.stat()
+    return [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode]
+
+
+def source_inputs(root: Path, home: Path) -> list:
+    """Record source file metadata without reading or hashing source contents.
+
+    This is a local incremental-install hint, not content authentication.
+    Metadata-only changes may conservatively request another installation.
+    """
+    outputs = tuple((home / name).absolute() for name in ("generations", "cache", "logs", "current", "install.lock"))
     try:
         result = subprocess.run(
             ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
@@ -108,23 +117,43 @@ def source_fingerprint(root: Path, modules: Sequence[str], robot: str) -> str:
     except OSError:
         paths = []
     if not paths:
-        # 下载源码压缩包的用户未必装有 git；排除数据和构建目录后直接读源码。
+        # Preserve the source-export scope; runtime/build products are not inputs.
         excluded = {".git", ".venv", "target", "result", "build", "__pycache__", "runtime_data", "docs", "artifacts", "tests"}
         for directory, subdirs, files in os.walk(root):
-            subdirs[:] = [name for name in subdirs if name not in excluded and not name.startswith(".")]
+            subdirs[:] = [name for name in subdirs if name not in excluded and not name.startswith(".")
+                          and (Path(directory) / name).absolute() not in outputs]
             paths.extend(Path(directory) / name for name in files if not name.startswith("."))
-    # 新增安装器文件在提交之前同样参与身份。
     for directory in (root / "scripts/module_installer", root / "requirements/modules"):
         paths.extend(directory.glob("*.py"))
         paths.extend(directory.glob("*.in"))
+    records = []
     for path in sorted(set(paths)):
-        if path.is_file() and not path.is_symlink():
-            digest.update(str(path.relative_to(root)).encode())
-            with path.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-    digest.update(json.dumps([list(modules), robot]).encode())
-    return digest.hexdigest()
+        absolute = path.absolute()
+        if any(absolute == output or output in absolute.parents for output in outputs):
+            continue
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue  # A deleted tracked source no longer appears in the record.
+        if stat.S_ISREG(info.st_mode):
+            records.append([str(path.relative_to(root)), info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode])
+    return records
+
+
+def installation_inputs(request: InstallRequest, python: str) -> dict:
+    wheels = []
+    if request.robot == "go2" and request.wheel_dir is not None:
+        for distribution in ("cyclonedds", "unitree_sdk2py"):
+            for path in sorted(request.wheel_dir.glob(distribution + "-*.whl")):
+                wheels.append([str(path.resolve()), *_file_metadata(path)])
+    interpreter = Path(python).resolve()
+    return {
+        "version": 1,
+        "source_files": source_inputs(request.root, request.home),
+        "modules": list(request.modules), "robot": request.robot,
+        "python": [python, str(interpreter), *_file_metadata(interpreter)],
+        "device_wheels": wheels,
+    }
 
 
 def make_plan(request: InstallRequest, hardware, current: Mapping) -> dict:
@@ -389,17 +418,16 @@ def apply(request: InstallRequest, hardware) -> dict:
     from .lifecycle import MODES, deployment_descriptor, inspect_installation
     if request.service_mode and request.service_mode not in MODES:
         raise InstallError("未知生命周期模式")
-    source_identity = source_fingerprint(request.root, request.modules, request.robot)
-    fingerprint = hashlib.sha256((source_identity + seed).encode()).hexdigest()
     with installation_lock(request.home), idle_gateway(request.root):
         current = read_current(request.home)
         if current and current.get("source_root") != str(request.root):
             raise InstallError("此安装目录属于另一个源码工作区，请使用独立 --install-dir。")
+        inputs = installation_inputs(request, seed)
         registration = inspect_installation(request.home)["lifecycle"] if current else None
         mode = request.service_mode or (registration["mode"] if registration else "foreground")
         service_name = registration["service_name"] if registration else None
         migrate_lifecycle = bool(request.service_mode and service_name is None)
-        if current.get("fingerprint") == fingerprint and not request.repair and not migrate_lifecycle and (not request.service_mode or request.service_mode == registration["mode"]):
+        if current.get("installation_inputs") == inputs and not request.repair and not migrate_lifecycle and (not request.service_mode or request.service_mode == registration["mode"]):
             _verify_prefix(Path(current["prefix"]), request.modules)
             print("所选模块已经安装，无需重复处理。使用 --repair 可重新安装。")
             return current
@@ -426,7 +454,7 @@ def apply(request: InstallRequest, hardware) -> dict:
             _verify_prefix(prefix, request.modules)
             print("[5/5] 校验完成，切换当前安装", flush=True)
             state = {"schema": 1, "complete": True, "modules": list(request.modules),
-                     "robot": request.robot, "source_root": str(request.root), "fingerprint": fingerprint,
+                     "robot": request.robot, "source_root": str(request.root), "installation_inputs": inputs,
                      "python": seed, "binaries": binaries, "installed_at": identifier,
                      "agent_terminal_storage": terminal_policy}
             # Preserve descriptor-free foreground installs for old pinned readers.

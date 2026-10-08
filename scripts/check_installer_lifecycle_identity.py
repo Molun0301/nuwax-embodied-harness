@@ -70,7 +70,7 @@ class OfflineFixture(unittest.TestCase):
         (prefix / "settings.env").write_text("NUWAX_GATEWAY_HOST=127.0.0.7\nNUWAX_GATEWAY_PORT=9876\n")
         (prefix / "start.sh").write_text("#!/bin/sh\nexit 0\n")
         state = {"schema": 1, "complete": True, "source_root": str(self.root),
-                 "robot": "customrobot", "modules": modules or ["core"], "fingerprint": "fixture-fingerprint"}
+                 "robot": "customrobot", "modules": modules or ["core"], "installation_inputs": {"version": 1, "fixture": "same-inputs"}}
         if deployment:
             state["deployment"] = lifecycle.deployment_descriptor(
                 self.root, self.home, prefix, state["modules"], state["robot"], mode,
@@ -102,9 +102,7 @@ class OfflineFixture(unittest.TestCase):
 
         patches = {
             "check_prerequisites": Mock(return_value="/fixture/python"),
-            "source_fingerprint": Mock(return_value="fixture-source-identity"),
-            # The unrelated pre-existing no-op fingerprint is not executed.
-            "hashlib": SimpleNamespace(sha256=lambda value: SimpleNamespace(hexdigest=lambda: "fixture-fingerprint")),
+            "installation_inputs": Mock(return_value={"version": 1, "fixture": "same-inputs"}),
             "CommandRunner": Mock(return_value=Mock(side_effect=forbidden)),
             "_system_dependencies": Mock(), "_python_environment": Mock(),
             "build_modules": Mock(return_value={}), "_prepare_models": Mock(),
@@ -352,7 +350,7 @@ class ApplyRegistrationTests(OfflineFixture):
         self.apply()
         self.assertEqual(self.uuid.call_count, 1)
 
-    def test_explicit_foreground_migration_bypasses_fingerprint_noop(self):
+    def test_explicit_foreground_migration_bypasses_input_record_noop(self):
         self.generation(deployment=False)
         self.mock_apply()
         result = self.apply(service_mode="foreground")

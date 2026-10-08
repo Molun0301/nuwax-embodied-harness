@@ -15,7 +15,6 @@ Optional NEH_TERMINAL_ROLLOUT_TMP places all fixtures in an existing scratch dir
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import io
 import json
 import os
@@ -580,11 +579,8 @@ def offline_builds():
         stack.enter_context(patch.object(socket, "create_connection", side_effect=fail))
         stack.enter_context(patch.object(manager.CommandRunner, "__call__", side_effect=fail))
         stack.enter_context(patch.object(manager, "check_prerequisites", return_value=sys.executable))
-        # The rollout policy is independent of the old installer digest mechanism.
-        # No digest is computed, source traversed, package installed, or binary built.
-        if hasattr(manager, "source_fingerprint"):
-            stack.enter_context(patch.object(manager, "source_fingerprint", return_value="fixture-source"))
-        stack.enter_context(patch.object(hashlib, "sha256", return_value=NS(hexdigest=lambda: "fixture-digest")))
+        # Rollout policy does not depend on local file metadata enumeration.
+        stack.enter_context(patch.object(manager, "installation_inputs", return_value={"version": 1, "fixture": True}))
         stack.enter_context(patch.object(lifecycle, "service_identifier", return_value="neh-fixture.service"))
         for name in ("_system_dependencies", "_python_environment", "_prepare_models", "_verify_prefix", "prune_build_cache"):
             stack.enter_context(patch.object(manager, name))

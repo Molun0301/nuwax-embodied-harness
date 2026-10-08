@@ -195,12 +195,14 @@ class PerceptionService:
 
     def _run_full_pipeline(self, image_frame, camera_info=None, **kwargs):
         requested_at = perf_counter()
+        cached_geometry_inputs = self._capture_cached_geometry_inputs() if camera_info is not None else None
         with self._full_pipeline_lock:
             with self._context_condition:
                 self._ensure_open()
             acquired_at = perf_counter()
             context, scene_publication = self._process_image_locked(
-                image_frame, camera_info, lock_wait_ms=(acquired_at - requested_at) * 1000.0, **kwargs,
+                image_frame, camera_info, cached_geometry_inputs=cached_geometry_inputs,
+                lock_wait_ms=(acquired_at - requested_at) * 1000.0, **kwargs,
             )
         # 场景事件在完整分析锁内预留顺序；同步订阅不延长模型串行区。
         if scene_publication is not None:
@@ -225,6 +227,7 @@ class PerceptionService:
         image_frame,
         camera_info=None,
         *,
+        cached_geometry_inputs,
         image_artifact=None,
         requested_by: Optional[str] = None,
         detector_backend_name: Optional[str] = None,
@@ -308,6 +311,7 @@ class PerceptionService:
             detection_bundle,
             image_frame=image_frame,
             camera_info=camera_info,
+            cached_geometry_inputs=cached_geometry_inputs,
         )
         stage_duration_ms["geometry"] = self._elapsed_ms(stage_started_at)
         stage_status["geometry"] = str(
@@ -1577,12 +1581,55 @@ class PerceptionService:
             return None
         return providers
 
+    @staticmethod
+    def _has_usable_point_cloud(frame) -> bool:
+        if frame is None:
+            return False
+        points = getattr(frame, "points", None)
+        try:
+            if points is not None and len(points) > 0:
+                return True
+        except TypeError:
+            pass
+        array = getattr(frame, "points_xyz_array", None)
+        shape = getattr(array, "shape", ())
+        try:
+            return (
+                array is not None
+                and len(shape) == 2
+                and shape[0] > 0
+                and shape[1] >= 3
+            )
+        except (TypeError, IndexError):
+            return False
+
+    def _capture_cached_geometry_inputs(self):
+        """Pin a complete cached group before model/lock waits, without provider I/O.
+
+        This is a bus-slot snapshot, not source-time synchronization. Partial
+        groups keep the existing late-resolution path rather than mixing times.
+        Payloads are retained by reference; publishers replace frame objects.
+        """
+        if self._stream_bus is None:
+            return None
+        topics = ("pointcloud.frame", "localization.frame_tree", "localization.pose")
+        payloads = {
+            frame.topic: frame.payload
+            for frame in self._stream_bus.latest_frames(topics=topics)
+            if frame.status == "available"
+        }
+        cloud, tree, pose = (payloads.get(topic) for topic in topics)
+        if self._has_usable_point_cloud(cloud) and tree is not None and pose is not None:
+            return cloud, tree, pose
+        return None
+
     def _augment_detection_geometry(
         self,
         detection_bundle,
         *,
         image_frame,
         camera_info,
+        cached_geometry_inputs,
     ):
         if camera_info is None or not detection_bundle.detections_2d:
             return detection_bundle.__class__(
@@ -1595,54 +1642,36 @@ class PerceptionService:
                 },
             )
 
-        def _has_usable_point_cloud(frame) -> bool:
-            if frame is None:
-                return False
-            points = getattr(frame, "points", None)
-            try:
-                if points is not None and len(points) > 0:
-                    return True
-            except TypeError:
-                pass
-            array = getattr(frame, "points_xyz_array", None)
-            shape = getattr(array, "shape", ())
-            try:
-                return (
-                    array is not None
-                    and len(shape) == 2
-                    and shape[0] > 0
-                    and shape[1] >= 3
-                )
-            except (TypeError, IndexError):
-                return False
+        if cached_geometry_inputs is not None:
+            point_cloud_frame, frame_tree, current_pose = cached_geometry_inputs
+        else:
+            point_cloud_frame = self._latest_stream_payload("pointcloud.frame")
+            if not self._has_usable_point_cloud(point_cloud_frame):
+                point_cloud_frame = self._get_latest_point_cloud_optional()
 
-        point_cloud_frame = self._latest_stream_payload("pointcloud.frame")
-        if not _has_usable_point_cloud(point_cloud_frame):
-            point_cloud_frame = self._get_latest_point_cloud_optional()
-
-        frame_tree = self._latest_stream_payload("localization.frame_tree")
-        current_pose = self._latest_stream_payload("localization.pose")
-        if frame_tree is None or current_pose is None:
-            localization_provider = self._get_localization_provider_optional()
-            if localization_provider is not None:
-                if frame_tree is None:
-                    frame_tree_getter = getattr(localization_provider, "get_frame_tree", None)
-                    if callable(frame_tree_getter):
-                        frame_tree = frame_tree_getter()
-                if current_pose is None:
-                    pose_getter = getattr(localization_provider, "get_current_pose", None)
-                    if callable(pose_getter):
-                        current_pose = pose_getter()
-        # P0-1：探索建图阶段定位会话尚未重定位就绪，上面流/会话源的 current_pose 恒 None，
-        # 导致 map_frame_id=None、support_points_map 永不生成、下游丢失最高优先级
-        # map_point_samples 投影路径。与 PerceptionVideoRuntime._read_live_pose 同源回退到
-        # 实时位姿门面（导航后端 map→base 实时 TF）。frame_tree 同源缺失时一并回退。
-        if current_pose is None or frame_tree is None:
-            live_pose, live_frame_tree = self._read_live_pose_and_frame_tree()
-            if current_pose is None and live_pose is not None:
-                current_pose = live_pose
-            if frame_tree is None and live_frame_tree is not None:
-                frame_tree = live_frame_tree
+            frame_tree = self._latest_stream_payload("localization.frame_tree")
+            current_pose = self._latest_stream_payload("localization.pose")
+            if frame_tree is None or current_pose is None:
+                localization_provider = self._get_localization_provider_optional()
+                if localization_provider is not None:
+                    if frame_tree is None:
+                        frame_tree_getter = getattr(localization_provider, "get_frame_tree", None)
+                        if callable(frame_tree_getter):
+                            frame_tree = frame_tree_getter()
+                    if current_pose is None:
+                        pose_getter = getattr(localization_provider, "get_current_pose", None)
+                        if callable(pose_getter):
+                            current_pose = pose_getter()
+            # P0-1：探索建图阶段定位会话尚未重定位就绪，上面流/会话源的 current_pose 恒 None，
+            # 导致 map_frame_id=None、support_points_map 永不生成、下游丢失最高优先级
+            # map_point_samples 投影路径。与 PerceptionVideoRuntime._read_live_pose 同源回退到
+            # 实时位姿门面（导航后端 map→base 实时 TF）。frame_tree 同源缺失时一并回退。
+            if current_pose is None or frame_tree is None:
+                live_pose, live_frame_tree = self._read_live_pose_and_frame_tree()
+                if current_pose is None and live_pose is not None:
+                    current_pose = live_pose
+                if frame_tree is None and live_frame_tree is not None:
+                    frame_tree = live_frame_tree
 
         detections_2d, geometry_metadata = self._geometry_augmentor.augment_detections(
             detection_bundle.detections_2d,
@@ -1652,7 +1681,7 @@ class PerceptionService:
             frame_tree=frame_tree,
             current_pose=current_pose,
         )
-        if not _has_usable_point_cloud(point_cloud_frame):
+        if not self._has_usable_point_cloud(point_cloud_frame):
             geometry_metadata = {
                 **dict(geometry_metadata),
                 "geometry_projection_status": "pointcloud_unavailable",
@@ -1669,7 +1698,7 @@ class PerceptionService:
             )
         support_count = int(geometry_metadata.get("geometry_support_point_total") or 0)
         degraded_reason = str(geometry_metadata.get("geometry_projection_degradation_reason") or geometry_metadata.get("geometry_degraded_reason") or "")
-        if support_count <= 0 and _has_usable_point_cloud(point_cloud_frame):
+        if support_count <= 0 and self._has_usable_point_cloud(point_cloud_frame):
             degraded_reason = degraded_reason or "pointcloud_projection_failed"
         return detection_bundle.__class__(
             detections_2d=detections_2d,

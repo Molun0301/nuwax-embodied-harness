@@ -596,11 +596,18 @@ class ServiceRegressionChecks(unittest.TestCase):
         from difflib import SequenceMatcher
         service=self.fixture();randomizer=random.Random(3101)
         cases=[('desk',['Desk','table','desk 11','desk 99','']),
+               ('',['','desk']),('  !?  ',['','!?','desk']),
+               ('a b',['b a','a b']),('abc',['abcd','acbd','abcxxxxxxxxxx']),
+               ('  CAFÉ\x00桌子  ',['café桌子','ＣＡＦÉ 桌子','cafe\u0301桌子','CAFÉ\x00桌子']),
                ('a b c d e',['a b c x x','a b c y z']),
                ('tide',['diet']),('diet',['tide']),
                ('前方红色桌子',['前方蓝色桌子123','前方绿色桌子789']),
                ('a'*205+'b',['a'*205+'c','a'*205+'d','a'*199+'b','a'*200+'b']),
                ('x y',['','  !?  ','x' * 201,'y' * 400])]
+        for length in (199,200,201):
+            left='b'+'a'*(length-1);right='a'*(length-1)+'b'
+            cases.extend([(left,[right,'b'+'a'*(length-2)+'c']),
+                          (right,[left,'c'+'a'*(length-1)])])
         alphabet='abcdefghi中女美98312 '
         for _ in range(800):
             query=''.join(randomizer.choices('abcde中女12 ',k=randomizer.randrange(1,60)))
@@ -609,6 +616,7 @@ class ServiceRegressionChecks(unittest.TestCase):
             texts += [text.translate(str.maketrans({'f':'g','h':'i','美':'女' if '女' not in query else '美','9':'8'})) for text in texts]
             cases.append((query,texts))
         def original(query,texts):
+            if not query:return 0.0,'test'
             best=0.0
             for text in texts:
                 text=service._normalize_text(text)
@@ -619,16 +627,43 @@ class ServiceRegressionChecks(unittest.TestCase):
                 best=max(best,fuzzy,overlap,.6*fuzzy+.4*overlap)
             return best,'test'
         def score(*args,**kwargs):
-            for raw,texts in cases:
-                service._query_score_state.cache.clear()
-                service._query_score_state.fuzzy_cache.clear()
-                query=service._normalize_text(raw)
-                for text in texts:
-                    self.assertEqual(service._score_text_candidates(query,[text],fallback_reason='test'),original(query,[text]))
-                self.assertEqual(service._score_text_candidates(query,texts,fallback_reason='test'),original(query,texts))
-            self.assertLessEqual(len(service._query_score_state.cache),2048)
-            self.assertLessEqual(len(service._query_score_state.fuzzy_cache),2048)
+            for mode in ('disabled','score-only','query-local'):
+                state=SimpleNamespace()
+                if mode!='disabled':state.cache={}
+                if mode=='query-local':state.fuzzy_cache={}
+                with patch.object(service,'_query_score_state',state):
+                    for number,(raw,texts) in enumerate(cases):
+                        for name in ('cache','fuzzy_cache'):
+                            if hasattr(state,name):getattr(state,name).clear()
+                        query=service._normalize_text(raw)
+                        with self.subTest(mode=mode,case=number):
+                            # Compare the cold list before singleton calls warm either cache.
+                            self.assertEqual(service._score_text_candidates(query,texts,fallback_reason='test'),original(query,texts))
+                            for text in texts:
+                                self.assertEqual(service._score_text_candidates(query,[text],fallback_reason='test'),original(query,[text]))
+                            self.assertEqual(service._score_text_candidates(query,texts,fallback_reason='test'),original(query,texts))
+                            self.assertEqual(service._score_text_candidates(query,list(reversed(texts)),fallback_reason='test'),original(query,list(reversed(texts))))
+                    for name in ('cache','fuzzy_cache'):
+                        self.assertLessEqual(len(getattr(state,name,{})),2048)
         with patch.object(service,'_query_records_impl',side_effect=score):service._query_records('test')
+
+    def test_fuzzy_scoring_still_checks_later_exact_match_and_query_identity(self):
+        from difflib import SequenceMatcher
+        service=self.fixture();states=[]
+        def score(*args,**kwargs):
+            state=service._query_score_state
+            self.assertEqual(state.cache,{});self.assertEqual(state.fuzzy_cache,{})
+            states.append((state.cache,state.fuzzy_cache))
+            self.assertEqual(service._score_text_candidates('a b',['b a'],fallback_reason='overlap'),(1.0,'overlap'))
+            state.cache.clear();state.fuzzy_cache.clear()
+            self.assertEqual(service._score_text_candidates('a b',['b a','a b'],fallback_reason='test'),(.99,'文本完全匹配。'))
+            for query,text in (('tide','diet'),('diet','tide')):
+                self.assertEqual(service._score_text_candidates(query,[text],fallback_reason=query),(SequenceMatcher(None,query,text).ratio(),query))
+        with patch.object(service,'_query_records_impl',side_effect=score):
+            service._query_records('first');service._query_records('second')
+        self.assertIsNot(states[0][0],states[1][0]);self.assertIsNot(states[0][1],states[1][1])
+        for name in ('cache','fuzzy_cache','lexical_query'):
+            self.assertFalse(hasattr(service._query_score_state,name))
 
     def test_query_local_fuzzy_cache_reuses_only_exact_matching_structure(self):
         from difflib import SequenceMatcher

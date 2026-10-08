@@ -1093,11 +1093,12 @@ impl CorrectionAwareLioIngress {
 
 impl CommonLioIngress {
     pub(crate) fn new(spec: DeviceLioIngressSpec) -> Self {
+        let self_cloud_filter = crate::self_cloud::RobotSelfFilter::from_env(&spec.body_frame_id);
         Self {
             spec,
             state: Mutex::new(CommonLioIngressState::default()),
             sensor_origin_body: None,
-            self_cloud_filter: crate::self_cloud::RobotSelfFilter::from_env(),
+            self_cloud_filter,
             runtime: None,
             odometry_admission: Notify::new(),
             relocalization_mode_fence: OnceLock::new(),
@@ -1111,11 +1112,12 @@ impl CommonLioIngress {
         public_cloud: (LcmTopic, LcmMessageType),
         tf: (LcmTopic, LcmMessageType),
     ) -> Self {
+        let self_cloud_filter = crate::self_cloud::RobotSelfFilter::from_env(&spec.body_frame_id);
         Self {
             spec,
             state: Mutex::new(CommonLioIngressState::default()),
             sensor_origin_body: None,
-            self_cloud_filter: crate::self_cloud::RobotSelfFilter::from_env(),
+            self_cloud_filter,
             runtime: Some(CommonLioRuntime {
                 handle,
                 public_odometry,

@@ -866,7 +866,7 @@ impl GeometryRuntimeService {
             native_raw_sensor_frame,
             native_input_failure: Arc::new(parking_lot::Mutex::new(None)),
             native_input_delivery: native_ack_binding.map(|(ack, frame)| Arc::new(crate::native_input_delivery::NativeInputDelivery::new(ack, frame).with_shutdown(shutdown.request_tx.subscribe()))),
-            native_self_filter: Arc::new(crate::self_cloud::NativeSelfFilter::from_env()),
+            native_self_filter: Arc::new(crate::self_cloud::NativeSelfFilter::from_env(&configured_base_frame())),
             mapping_transition: shutdown.mapping_transition.clone(),
             graph_artifacts: Arc::new(parking_lot::Mutex::new(crate::planar_artifacts::Store::default())),
             deferred_replay: shutdown.deferred_replay.clone(),

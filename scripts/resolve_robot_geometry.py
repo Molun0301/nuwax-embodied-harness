@@ -19,6 +19,9 @@ def main() -> int:
     print("机器人外形已解析：来源={}，长宽高={:.4g}×{:.4g}×{:.4g}米，中心={}。".format(
         result.source, result.length_m, result.width_m, result.height_m, result.center_xyz_m,
     ), file=sys.stderr)
+    print("固定自体过滤模型：实体={}，排除活动连杆几何={}，不支持的固定几何={}；不包含动态腿足。".format(
+        len(result.self_collision_primitives), result.self_collision_excluded_moving,
+        result.self_collision_unsupported), file=sys.stderr)
     for warning in result.warnings:
         print("机器人外形：" + warning, file=sys.stderr)
     print(result.to_runtime_json())

@@ -128,6 +128,9 @@ class ResolvedRobotGeometry:
     model_base_link: str = ""
     reference_joint_positions: Tuple[Tuple[str, float], ...] = ()
     warnings: Tuple[str, ...] = ()
+    self_collision_primitives: Tuple[dict, ...] = ()
+    self_collision_excluded_moving: int = 0
+    self_collision_unsupported: int = 0
 
     @property
     def length_m(self) -> float:
@@ -151,6 +154,12 @@ class ResolvedRobotGeometry:
                   "z_min_m": self.z_min_m, "z_max_m": self.z_max_m, "source": self.source}
         if self.model_path:
             result["model_path"] = self.model_path
+        result["self_collision"] = {
+            "model_base_link": self.model_base_link,
+            "primitives": list(self.self_collision_primitives),
+            "excluded_moving_collision_count": self.self_collision_excluded_moving,
+            "unsupported_collision_count": self.self_collision_unsupported,
+        }
         return result
 
     def to_runtime_json(self) -> str:
@@ -477,10 +486,47 @@ def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, sour
             xy.extend(points); lows.append(lo); highs.append(hi)
     if not xy:
         raise RobotGeometryError("模型没有可读取的碰撞或显示外形。", "robot_geometry_missing")
+    # 自体实体只使用与 body 刚性连接的 collision，不能使用导航凸外包或关节零位。
+    fixed_edges = {name: [] for name in links}
+    for joint in joints.values():
+        if joint.get("type") == "fixed":
+            parent = joint.find("parent").get("link")
+            child = joint.find("child").get("link")
+            fixed_edges[parent].append(child)
+            fixed_edges[child].append(parent)
+    fixed_links, pending = {selected}, [selected]
+    while pending:
+        for neighbour in fixed_edges[pending.pop()]:
+            if neighbour not in fixed_links:
+                fixed_links.add(neighbour)
+                pending.append(neighbour)
+    primitives, excluded_moving, unsupported = [], 0, 0
+    for name, link in links.items():
+        for item in link.findall("collision"):
+            if name not in fixed_links:
+                excluded_moving += 1
+                continue
+            geometry = item.find("geometry")
+            shape = list(geometry)[0] if geometry is not None and len(geometry) == 1 else None
+            if shape is None or shape.tag not in ("box", "sphere", "cylinder"):
+                unsupported += 1
+                continue
+            rotation, translation = _compose(inverse, _compose(transforms[name], _origin(item)))
+            primitive = {"link_name": name, "shape": shape.tag,
+                         "translation_m": list(translation),
+                         "rotation_row_major": [v for row in rotation for v in row]}
+            if shape.tag == "box":
+                primitive["size_m"] = list(_vector(shape.get("size"), None, "盒尺寸"))
+            else:
+                primitive["radius_m"] = _number(shape.get("radius"), "模型半径", positive=True)
+                if shape.tag == "cylinder":
+                    primitive["length_m"] = _number(shape.get("length"), "圆柱长度", positive=True)
+            primitives.append(primitive)
     if moving:
         warnings.append("活动关节使用静态参考姿态，未填写的关节采用模型零位；不表示实时腿部姿态。")
     return ResolvedRobotGeometry(_hull(xy), min(lows), max(highs), source_prefix + "_" + kind,
-                                 str(path), selected, tuple(sorted(values.items())), tuple(warnings))
+                                 str(path), selected, tuple(sorted(values.items())), tuple(warnings),
+                                 tuple(primitives), excluded_moving, unsupported)
 
 
 def _box(length, width, height, center, source):

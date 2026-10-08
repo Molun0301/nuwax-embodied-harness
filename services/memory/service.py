@@ -3778,6 +3778,7 @@ class MemoryService(SceneMappingMemoryMixin):
         allowed_values = {item.value for item in allowed_record_kinds}
         visible_by_key = {(kind, getattr(record, SOURCES[kind][1])): record for kind, record in visible}
         sequence = 0
+        lexical_cutoff = max(0.18, similarity_threshold * 0.5)
         query_norms = {name: np.linalg.norm(vector) for name, vector in query_vectors.items()}
         def vector_scores(point):
             scores = {}
@@ -3787,6 +3788,12 @@ class MemoryService(SceneMappingMemoryMixin):
                     denominator = float(query_norms[name] * np.linalg.norm(vector.vector))
                     scores[name] = float(np.dot(query_vector, vector.vector) / denominator) if denominator else 0.0
             return scores
+        def score_with_lexical(candidate, value):
+            return self._combine_candidate_scores(
+                record_kind=candidate.record_kind, lexical_score=value,
+                text_recall_score=candidate.text_recall_score, image_score=candidate.image_score,
+                spatial_score=candidate.spatial_score, recency_score=candidate.recency_score,
+                query_scope=candidate.query_scope)
         for offset in range(0, len(visible), 128):
             page, page_counts = self._durable_index.query_snapshot(visible[offset:offset + 128], include_readiness=False)
             for key, value in page_counts.items():
@@ -3796,10 +3803,18 @@ class MemoryService(SceneMappingMemoryMixin):
                     continue
                 if payload_filter is not None and not self._point_matches_filter(point, payload_filter):
                     continue
-                lexical = {"location": self._score_location, "memory": self._score_semantic_entry,
-                    "instance": self._score_semantic_instance, "event": self._score_observation_event,
-                    "scene": self._score_scene_space}[kind](normalized_query, source)
-                scores = vector_scores(point)
+                if kind == "memory":
+                    # Preserve eager text construction, including metadata normalization.
+                    texts = self._semantic_entry_texts(source)
+                    scores = vector_scores(point)
+                    lexical = (1.0, "") if scores else self._score_text_candidates(
+                        normalized_query, texts, fallback_reason="与语义记忆内容相似。")
+                else:
+                    texts = None
+                    lexical = {"location": self._score_location,
+                        "instance": self._score_semantic_instance, "event": self._score_observation_event,
+                        "scene": self._score_scene_space}[kind](normalized_query, source)
+                    scores = vector_scores(point)
                 candidate = self._score_candidate(query=query, normalized_query=normalized_query, point=point,
                     allowed_record_kinds=allowed_record_kinds, current_pose=current_pose,
                     text_recall_score=max(scores.values(), default=0.0), query_image_vector=query_image_vector,
@@ -3807,11 +3822,28 @@ class MemoryService(SceneMappingMemoryMixin):
                     semantic_available=bool(scores))
                 if candidate is None:
                     continue
+                if texts is not None and scores:
+                    # Nonempty scores exclude the lexical-only fallback. Equal endpoints
+                    # make the final score independent of lexical score in [0, 1].
+                    if score_with_lexical(candidate, 0.0) == candidate.final_score:
+                        # A qualifying final score is <=1, so cutoff<=0.5. A later
+                        # exact-text return of 0.99 cannot undo an earlier admission.
+                        lexical_eligible = candidate.final_score >= similarity_threshold and any(
+                            self._score_text_candidates(normalized_query, [text], fallback_reason="")[0]
+                            >= lexical_cutoff for text in texts if text)
+                    else:
+                        lexical = self._score_text_candidates(
+                            normalized_query, texts, fallback_reason="与语义记忆内容相似。")
+                        candidate.lexical_score, candidate.lexical_reason = lexical
+                        candidate.final_score = score_with_lexical(candidate, lexical[0])
+                        lexical_eligible = lexical[0] >= lexical_cutoff and candidate.final_score >= similarity_threshold
+                else:
+                    lexical_eligible = lexical[0] >= lexical_cutoff and candidate.final_score >= similarity_threshold
                 key = (kind, point.point_id)
                 rank = _RecallRank(key, candidate.final_score, self._candidate_dedup_key(candidate),
                     (source.anchor_id or source.instance_id) if kind == "instance" else None,
                     tuple(source.linked_instance_ids) if kind == "event" else (), version)
-                if lexical[0] >= max(0.18, similarity_threshold * 0.5) and rank.final_score >= similarity_threshold:
+                if lexical_eligible:
                     lexical_ranks[key] = rank
                 for name, score in scores.items():
                     heap = recall_heaps[name]
@@ -6199,7 +6231,11 @@ class MemoryService(SceneMappingMemoryMixin):
         return self._score_text_candidates(normalized_query, texts, fallback_reason="与地点描述或空间标签相似。")
 
     def _score_semantic_entry(self, normalized_query: str, entry: SemanticMemoryEntry) -> Tuple[float, str]:
-        texts = [
+        return self._score_text_candidates(normalized_query, self._semantic_entry_texts(entry),
+                                          fallback_reason="与语义记忆内容相似。")
+
+    def _semantic_entry_texts(self, entry: SemanticMemoryEntry) -> List[str]:
+        return [
             entry.title,
             entry.summary,
             *entry.tags,
@@ -6210,7 +6246,6 @@ class MemoryService(SceneMappingMemoryMixin):
             entry.semantic_region_id or "",
             entry.topo_node_id or "",
         ]
-        return self._score_text_candidates(normalized_query, texts, fallback_reason="与语义记忆内容相似。")
 
     def _score_semantic_instance(self, normalized_query: str, instance: SemanticInstance) -> Tuple[float, str]:
         texts = [

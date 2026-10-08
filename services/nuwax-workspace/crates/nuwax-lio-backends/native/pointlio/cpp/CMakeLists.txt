@@ -69,6 +69,7 @@ if(NOT NUWAX_PATCH_EXECUTABLE)
   message(FATAL_ERROR "patch is required to apply the Point-LIO fixes")
 endif()
 set(POINTLIO_PATCHED_DIR "${CMAKE_CURRENT_BINARY_DIR}/pointlio-initialized")
+set(POINTLIO_PREPARE_DIR "${POINTLIO_PATCHED_DIR}/patch-prepare")
 set(POINTLIO_PATCHES
   "${CMAKE_CURRENT_SOURCE_DIR}/fastlio-resize-darwin.patch"
   "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-imu-initialization.patch"
@@ -81,13 +82,13 @@ set(POINTLIO_PATCHES
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${POINTLIO_PATCHES})
 foreach(PATCHED_SOURCE pointlio.hpp laserMapping.hpp IMU_Processing.hpp Estimator.cpp parameters.cpp)
   configure_file("${FASTLIO_SOURCE_DIR}/src/${PATCHED_SOURCE}"
-    "${POINTLIO_PATCHED_DIR}/src/${PATCHED_SOURCE}" COPYONLY)
+    "${POINTLIO_PREPARE_DIR}/src/${PATCHED_SOURCE}" COPYONLY)
 endforeach()
 foreach(POINTLIO_PATCH IN LISTS POINTLIO_PATCHES)
   execute_process(
     COMMAND "${NUWAX_PATCH_EXECUTABLE}" --batch --forward --fuzz=0 --dry-run -p1
       -i "${POINTLIO_PATCH}"
-    WORKING_DIRECTORY "${POINTLIO_PATCHED_DIR}"
+    WORKING_DIRECTORY "${POINTLIO_PREPARE_DIR}"
     RESULT_VARIABLE POINTLIO_PATCH_CHECK_RESULT
     OUTPUT_VARIABLE POINTLIO_PATCH_CHECK_OUTPUT
     ERROR_VARIABLE POINTLIO_PATCH_CHECK_ERROR
@@ -96,7 +97,7 @@ foreach(POINTLIO_PATCH IN LISTS POINTLIO_PATCHES)
     execute_process(
       COMMAND "${NUWAX_PATCH_EXECUTABLE}" --batch --forward --fuzz=0 -p1
         -i "${POINTLIO_PATCH}"
-      WORKING_DIRECTORY "${POINTLIO_PATCHED_DIR}"
+      WORKING_DIRECTORY "${POINTLIO_PREPARE_DIR}"
       RESULT_VARIABLE POINTLIO_PATCH_RESULT
       OUTPUT_VARIABLE POINTLIO_PATCH_OUTPUT
       ERROR_VARIABLE POINTLIO_PATCH_ERROR
@@ -110,7 +111,7 @@ foreach(POINTLIO_PATCH IN LISTS POINTLIO_PATCHES)
     execute_process(
       COMMAND "${NUWAX_PATCH_EXECUTABLE}" --batch --reverse --fuzz=0 --dry-run -p1
         -i "${POINTLIO_PATCH}"
-      WORKING_DIRECTORY "${POINTLIO_PATCHED_DIR}"
+      WORKING_DIRECTORY "${POINTLIO_PREPARE_DIR}"
       RESULT_VARIABLE POINTLIO_REVERSE_CHECK_RESULT
       OUTPUT_VARIABLE POINTLIO_REVERSE_CHECK_OUTPUT
       ERROR_VARIABLE POINTLIO_REVERSE_CHECK_ERROR
@@ -123,6 +124,13 @@ foreach(POINTLIO_PATCH IN LISTS POINTLIO_PATCHES)
     endif()
     message(STATUS "Point-LIO source already contains patch: ${POINTLIO_PATCH}")
   endif()
+endforeach()
+
+# Publish only after all patches succeed; equal bytes retain consumer mtimes.
+# Keep prepare inputs: configure_file registers them as configure dependencies.
+foreach(PATCHED_SOURCE pointlio.hpp laserMapping.hpp IMU_Processing.hpp Estimator.cpp parameters.cpp)
+  configure_file("${POINTLIO_PREPARE_DIR}/src/${PATCHED_SOURCE}"
+    "${POINTLIO_PATCHED_DIR}/src/${PATCHED_SOURCE}" COPYONLY)
 endforeach()
 
 if(NOT LIVOX_COMMON_DIR)

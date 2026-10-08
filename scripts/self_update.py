@@ -494,13 +494,14 @@ apply(request,hardware)
 
                     verify(probe_url, previous, recovery)
                     phase(root, status, "rolled_back", "更新失败，已恢复并验证原版本：" + message)
-                except Exception:  # noqa: BLE001 - 恢复失败保留明确人工处理状态
+                except Exception as recovery_error:  # noqa: BLE001 - 恢复失败保留明确人工处理状态
                     phase(
                         root,
                         status,
                         "recovery_required",
-                        "自动恢复未完成，请检查构建日志并从记录的源码/安装版本恢复",
+                        "自动恢复未完成：" + str(recovery_error) + "；请检查构建日志并从记录的源码/安装版本恢复",
                         failure=message,
+                        recovery_failure=str(recovery_error),
                     )
             else:
                 phase(root, status, "failed", message)

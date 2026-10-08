@@ -2818,13 +2818,8 @@ def _source_revision(context: ExecutionContext) -> str:
     return completed.stdout.strip() if completed.returncode == 0 else "signed-source-snapshot"
 
 
-def _hash_existing_files(source_root: Path, paths: Sequence[str]) -> Mapping[str, str]:
-    hashes = {}
-    for relative in dict.fromkeys(paths):
-        path = source_root / relative
-        if path.is_file():
-            hashes[relative] = _sha256(path)
-    return hashes
+def _existing_input_files(source_root: Path, paths: Sequence[str]) -> Sequence[str]:
+    return [relative for relative in dict.fromkeys(paths) if (source_root / relative).is_file()]
 
 
 def _capture_as_build_user(argv: Sequence[str], *, timeout: int) -> subprocess.CompletedProcess:
@@ -2879,8 +2874,8 @@ def _validate_release_binary(path: Path) -> str:
     return description.stdout.strip()
 
 
-def _release_source_digest(release_dir: Path) -> str:
-    digest = hashlib.sha256()
+def _release_source_files(release_dir: Path) -> Sequence[str]:
+    files_found = []
     excluded_dirs = {".venv", "bin", "models", "vendor", "__pycache__"}
     for root, directories, files in os.walk(release_dir):
         relative_root = Path(root).relative_to(release_dir)
@@ -2889,131 +2884,139 @@ def _release_source_digest(release_dir: Path) -> str:
         if relative_root.as_posix() == "runtime_data":
             directories[:] = [name for name in directories if name != "settings"]
         directories[:] = sorted(name for name in directories if name not in excluded_dirs)
-        root_path = Path(root)
         for name in sorted(files):
-            path = root_path / name
-            relative = path.relative_to(release_dir)
-            if relative.as_posix() in {"release-manifest.json", ".installing"}:
+            path = Path(root) / name
+            relative = path.relative_to(release_dir).as_posix()
+            if relative in {"release-manifest.json", ".installing"}:
                 continue
-            if path.is_symlink():
-                raise DeploymentError(f"release source contains a symlink: {relative}")
-            digest.update(relative.as_posix().encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(_sha256(path).encode("ascii"))
-            digest.update(b"\0")
-    return digest.hexdigest()
+            _require_file(path, "release source " + relative)
+            files_found.append(relative)
+    return sorted(files_found)
 
 
-def _immutable_tree_digest(root: Path, label: str) -> str:
-    if root.is_symlink() or not root.is_dir():
-        raise DeploymentError(f"{label} root is unsafe: {root}")
-    digest = hashlib.sha256()
-
-    def record(path: Path, kind: bytes, payload: bytes = b"") -> None:
-        relative = path.relative_to(root).as_posix().encode("utf-8")
-        metadata = path.lstat()
-        digest.update(kind)
-        digest.update(b"\0")
-        digest.update(relative)
-        digest.update(b"\0")
-        digest.update(f"{stat.S_IMODE(metadata.st_mode):04o}".encode("ascii"))
-        digest.update(b"\0")
-        digest.update(payload)
-        digest.update(b"\0")
-
+def _venv_inventory(release_dir: Path) -> Mapping[str, object]:
+    root = _require_dir(release_dir / ".venv", "release virtual environment")
+    if not (root / "bin" / "python").is_file():
+        raise DeploymentError(f"release virtual environment is missing: {root / 'bin' / 'python'}")
+    inventory = {}
     for current, directories, files in os.walk(root, followlinks=False):
-        current_path = Path(current)
-        kept_directories = []
-        for name in sorted(directories):
-            candidate = current_path / name
-            metadata = candidate.lstat()
-            if candidate.is_symlink():
-                record(candidate, b"L", os.readlink(candidate).encode("utf-8"))
+        kept = []
+        for name in sorted(directories + files):
+            path = Path(current) / name
+            metadata = path.lstat()
+            record = {"mode": stat.S_IMODE(metadata.st_mode)}
+            if stat.S_ISLNK(metadata.st_mode):
+                record.update(kind="symlink", target=os.readlink(path))
             elif stat.S_ISDIR(metadata.st_mode):
-                record(candidate, b"D")
-                kept_directories.append(name)
-            else:
-                raise DeploymentError(f"{label} contains a special directory entry: {candidate}")
-        directories[:] = kept_directories
-        for name in sorted(files):
-            candidate = current_path / name
-            metadata = candidate.lstat()
-            if candidate.is_symlink():
-                record(candidate, b"L", os.readlink(candidate).encode("utf-8"))
+                record["kind"] = "directory"
+                kept.append(name)
             elif stat.S_ISREG(metadata.st_mode):
-                record(candidate, b"F", _sha256(candidate).encode("ascii"))
+                record["kind"] = "file"
             else:
-                raise DeploymentError(f"{label} contains a special file: {candidate}")
-    return digest.hexdigest()
+                raise DeploymentError(f"release virtual environment contains a special node: {path}")
+            inventory[path.relative_to(root).as_posix()] = record
+        directories[:] = kept
+    return inventory
 
 
-def _venv_inventory_digest(release_dir: Path) -> str:
-    venv = release_dir / ".venv"
-    python = venv / "bin" / "python"
-    if not python.is_file():
-        raise DeploymentError(f"release virtual environment is missing: {python}")
-    return _immutable_tree_digest(venv, "release virtual environment")
+def _release_relative(value: object, label: str) -> Path:
+    if not isinstance(value, str):
+        raise DeploymentError(f"{label} path is invalid")
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise DeploymentError(f"{label} path is invalid")
+    return path
+
+
+def _release_vendor_files(root: Path) -> Sequence[str]:
+    root = _require_dir(root, "release vendor")
+    files = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if ".git" in relative.parts:
+            continue
+        if ("__pycache__" in relative.parts or path.suffix == ".pyc"
+                or any(part.endswith(".egg-info") for part in relative.parts)):
+            raise DeploymentError(f"source artifact contains generated build/import state: {path}")
+        if path.is_symlink():
+            raise DeploymentError(f"source artifact must not contain symlinks: {path}")
+        if not path.is_file():
+            continue
+        files.append(relative.as_posix())
+    return files
+
+
+def _release_model_files(release_dir: Path) -> Sequence[str]:
+    root = release_dir / "models"
+    # Preserve the legacy reader's enumeration, including a valid root alias.
+    # Unlisted symlinks and special nodes are not model file records.
+    return sorted(
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    ) if root.is_dir() else []
+
+
+def _release_binary_path(name: object) -> str:
+    path = _release_relative(name, "release binary")
+    if len(path.parts) != 1 or name != path.name:
+        raise DeploymentError("release binary name is invalid")
+    if name == "nuwax-geometry-runtime":
+        return "services/geometry/nuwax_geometry_runtime/target/release/" + name
+    return "bin/" + name
 
 
 def _validate_completed_release(release_dir: Path, manifest: Mapping[str, object]) -> None:
-    if manifest.get("schema_version") != 2:
+    schema = manifest.get("schema_version")
+    if type(schema) is not int or schema not in (2, 3):
         raise DeploymentError(f"unsupported completed release manifest: {release_dir}")
-    binaries = manifest.get("binary_sha256")
+    # Schema 2 records historical digests, not a historical path/stat inventory.
+    # Read its names without rewriting it or claiming current bytes match those digests.
+    binaries = manifest.get("binary_sha256" if schema == 2 else "binary_paths")
     if not isinstance(binaries, dict) or not binaries:
-        raise DeploymentError("completed release has no binary integrity records")
-    for name, expected in binaries.items():
-        if not isinstance(name, str) or not isinstance(expected, str):
-            raise DeploymentError("invalid release binary integrity record")
-        binary = (
-            release_dir
-            / "services"
-            / "geometry"
-            / "nuwax_geometry_runtime"
-            / "target"
-            / "release"
-            / name
-            if name == "nuwax-geometry-runtime"
-            else release_dir / "bin" / name
-        )
-        _require_file(binary, f"release binary {name}")
-        if _sha256(binary) != expected:
-            raise DeploymentError(f"completed release binary checksum mismatch: {name}")
-    if manifest.get("source_tree_sha256") != _release_source_digest(release_dir):
-        raise DeploymentError("completed release source checksum mismatch")
-    if manifest.get("venv_inventory_sha256") != _venv_inventory_digest(release_dir):
-        raise DeploymentError("completed release Python environment drifted")
-    vendor_hashes = manifest.get("vendor_tree_sha256")
-    if not isinstance(vendor_hashes, dict):
-        raise DeploymentError("completed release vendor integrity records are invalid")
-    for relative, expected in vendor_hashes.items():
-        normalized = Path(relative) if isinstance(relative, str) else Path("..")
-        if not isinstance(expected, str) or normalized.is_absolute() or ".." in normalized.parts:
-            raise DeploymentError("completed release vendor integrity record is invalid")
-        if _tree_digest(_require_dir(release_dir / "vendor" / normalized, "release vendor")) != expected:
-            raise DeploymentError(f"completed release vendor checksum mismatch: {relative}")
-    model_hashes = manifest.get("model_sha256")
-    if not isinstance(model_hashes, dict):
-        raise DeploymentError("completed release model integrity records are invalid")
-    actual_models = (
-        {
-            path.relative_to(release_dir / "models").as_posix()
-            for path in (release_dir / "models").rglob("*")
-            if path.is_file() and not path.is_symlink()
-        }
-        if (release_dir / "models").is_dir()
-        else set()
-    )
-    if actual_models != set(model_hashes):
+        raise DeploymentError("completed release has no binary records")
+    for name, recorded in binaries.items():
+        relative = _release_binary_path(name)
+        if not isinstance(recorded, str) or (schema == 3 and recorded != relative):
+            raise DeploymentError("invalid release binary record")
+        binary = _require_file(release_dir / relative, f"release binary {name}")
+        if release_dir.resolve() not in binary.parents:
+            raise DeploymentError(f"release binary escapes release layout: {name}")
+    source_files = _release_source_files(release_dir)
+    venv = _venv_inventory(release_dir)
+    if schema == 3:
+        if manifest.get("source_files") != source_files:
+            raise DeploymentError("completed release source file set mismatch")
+        if manifest.get("venv_inventory") != venv:
+            raise DeploymentError("completed release Python environment layout drifted")
+    elif not all(isinstance(manifest.get(key), str) for key in ("source_tree_sha256", "venv_inventory_sha256")):
+        raise DeploymentError("completed legacy release records are invalid")
+    vendors = manifest.get("vendor_tree_sha256" if schema == 2 else "vendor_files")
+    if not isinstance(vendors, dict):
+        raise DeploymentError("completed release vendor records are invalid")
+    for relative, recorded in vendors.items():
+        normalized = _release_relative(relative, "release vendor")
+        vendor = _require_dir(release_dir / "vendor" / normalized, "release vendor")
+        if release_dir.resolve() not in vendor.parents:
+            raise DeploymentError("release vendor escapes release layout")
+        files = _release_vendor_files(vendor)
+        if schema == 2:
+            if not isinstance(recorded, str):
+                raise DeploymentError("completed legacy release vendor record is invalid")
+        elif recorded != files:
+            raise DeploymentError(f"completed release vendor file set mismatch: {relative}")
+    models = manifest.get("model_sha256" if schema == 2 else "model_files")
+    if schema == 2:
+        if not isinstance(models, dict) or not all(isinstance(v, str) for v in models.values()):
+            raise DeploymentError("completed legacy release model records are invalid")
+        models = list(models)
+    if not isinstance(models, list):
+        raise DeploymentError("completed release model records are invalid")
+    for relative in models:
+        normalized = _release_relative(relative, "release model")
+        _require_file(release_dir / "models" / normalized, f"release model {relative}")
+    if sorted(models) != _release_model_files(release_dir):
         raise DeploymentError("completed release model file set mismatch")
-    for relative, expected in model_hashes.items():
-        if not isinstance(relative, str) or not isinstance(expected, str):
-            raise DeploymentError("completed release model integrity record is invalid")
-        normalized = Path(relative)
-        if normalized.is_absolute() or ".." in normalized.parts:
-            raise DeploymentError("completed release model path is invalid")
-        model = release_dir / "models" / normalized
-        if _sha256(_require_file(model, f"release model {relative}")) != expected:
-            raise DeploymentError(f"completed release model checksum mismatch: {relative}")
 
 
 def _validate_managed_release(
@@ -3289,7 +3292,7 @@ def install_release(context: ExecutionContext) -> None:
     _copy_release_source(options.source_root, release_dir)
     bin_dir = release_dir / "bin"
     bin_dir.mkdir(mode=0o755, exist_ok=True)
-    binary_hashes = {}
+    binary_paths = {}
     binary_metadata = {}
     build_uid = resolve_build_account().pw_uid
     for build in context.profile.rust.builds:
@@ -3304,7 +3307,7 @@ def install_release(context: ExecutionContext) -> None:
             destination,
             build_uid,
         )
-        binary_hashes[build.binary] = _sha256(destination)
+        binary_paths[build.binary] = destination.relative_to(release_dir).as_posix()
         binary_metadata[build.binary] = _validate_release_binary(destination)
     _install_geometry_release(context, release_dir)
     models = options.build_dir / "models"
@@ -3339,14 +3342,8 @@ def install_release(context: ExecutionContext) -> None:
         python_inputs.append(context.profile.python.constraints)
     if context.profile.python.source_artifact_manifest:
         python_inputs.append(context.profile.python.source_artifact_manifest)
-    model_hashes = {}
-    model_root = release_dir / "models"
-    if model_root.is_dir():
-        for model in sorted(model_root.rglob("*")):
-            if model.is_file() and not model.is_symlink():
-                model_hashes[model.relative_to(model_root).as_posix()] = _sha256(model)
     release_manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": context.profile.name,
         "fingerprint": context.plan.fingerprint,
         "release_id": options.release_id,
@@ -3355,18 +3352,18 @@ def install_release(context: ExecutionContext) -> None:
         "rust_toolchain": context.profile.rust.toolchain,
         "rust_target": platform.machine().lower(),
         "system_package_versions": context.notes.get("system_package_versions", {}),
-        "cargo_lock_sha256": _hash_existing_files(options.source_root, cargo_locks),
-        "python_input_sha256": _hash_existing_files(options.source_root, python_inputs),
-        "binary_sha256": binary_hashes,
+        "cargo_lock_files": _existing_input_files(options.source_root, cargo_locks),
+        "python_input_files": _existing_input_files(options.source_root, python_inputs),
+        "binary_paths": binary_paths,
         "binary_file": binary_metadata,
-        "source_tree_sha256": _release_source_digest(release_dir),
-        "venv_inventory_sha256": _venv_inventory_digest(release_dir),
-        "vendor_tree_sha256": (
-            {"unitree_sdk2_python": _tree_digest(release_dir / "vendor" / "unitree_sdk2_python")}
+        "source_files": _release_source_files(release_dir),
+        "venv_inventory": _venv_inventory(release_dir),
+        "vendor_files": (
+            {"unitree_sdk2_python": _release_vendor_files(release_dir / "vendor" / "unitree_sdk2_python")}
             if context.profile.robot == "go2"
             else {}
         ),
-        "model_sha256": model_hashes,
+        "model_files": _release_model_files(release_dir),
         "third_party_sha256": {
             key.split(":", 1)[1]: value
             for key, value in context.notes.items()

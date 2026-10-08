@@ -186,12 +186,14 @@ class UpdateService:
             )
             return self.status()
 
+    def _read_schedule(self):
+        return self.preferences(), updater.read_json(self.state_root / "runtime_data/updates/check.json")
+
     async def run(self):
         next_attempt = 0.0
         while True:
             try:
-                preferences = self.preferences()
-                last = updater.read_json(self.state_root / "runtime_data/updates/check.json")
+                preferences, last = await run_in_threadpool(self._read_schedule)
                 if (
                     preferences.get("auto_check")
                     and time.time() >= next_attempt

@@ -1780,12 +1780,15 @@ class GatewayRuntime:
             self._dispatch_shutdown_complete = False
             self._dispatch_shutdown_blocker = "event_bus_in_flight"
             return False
+        if (getattr(self, "_owns_stream_bus", False)
+                and self.stream_bus.shutdown(max(0.0, deadline - time.monotonic())) is False):
+            self._dispatch_shutdown_complete = False
+            self._dispatch_shutdown_blocker = "stream_bus_in_flight"
+            return False
         log_handler = getattr(self, "_log_stream_handler", None)
         if log_handler is not None:
             logging.getLogger().removeHandler(log_handler)
             log_handler.close()
-        if getattr(self, "_owns_stream_bus", False):
-            self.stream_bus.shutdown()
         if recording_error is not None:
             raise recording_error
         self._dispatch_shutdown_complete = True

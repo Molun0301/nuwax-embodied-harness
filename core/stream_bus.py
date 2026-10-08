@@ -4,12 +4,16 @@ import collections
 from collections import defaultdict
 from dataclasses import dataclass
 import logging
+import sys
 import threading
+import time
+import traceback
 from typing import Callable, DefaultDict, Deque, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 from contracts.streams import StreamFrame, StreamPayloadKind
-from core.logging_utils import LogRateLimiter
+from core.logging_utils import CorrelationContextFilter, LogRateLimiter
 from core.stream_coalescing import stream_replacement_key
+from core.stream_diagnostics import _StreamDiagnosticWriter
 
 _logger = logging.getLogger(__name__)
 _DIAGNOSTIC_LOG_LIMITER = LogRateLimiter()
@@ -63,7 +67,8 @@ class PreparedStreamPublication:
 class StreamBus:
     """支持游标续播的线程安全实时数据总线。"""
 
-    def __init__(self, retention_limit: int = 1000) -> None:
+    def __init__(self, retention_limit: int = 1000, *, diagnostic_max_items=64,
+                 diagnostic_max_bytes=256 * 1024) -> None:
         self._retention_limit = max(1, retention_limit)
         self._frames: Deque[StreamFrame] = collections.deque(maxlen=self._retention_limit)
         self._subscriptions: Dict[str, StreamSubscription] = {}
@@ -74,6 +79,9 @@ class StreamBus:
         self._next_cursor = 1
         self._next_subscription_seq = 1
         self._lock = threading.RLock()
+        self._dispatch_condition = threading.Condition(self._lock)
+        self._diagnostic_log = _StreamDiagnosticWriter(
+            _logger, max_items=diagnostic_max_items, max_bytes=diagnostic_max_bytes)
         self._dispatch_queue: collections.deque[_StreamDispatchItem] = collections.deque()
         self._dispatch_draining = False
         self._dispatch_owner_thread_id: Optional[int] = None
@@ -244,14 +252,14 @@ class StreamBus:
                 if not self._dispatch_queue:
                     self._dispatch_draining = False
                     self._dispatch_owner_thread_id = None
+                    self._dispatch_condition.notify_all()
                     break
                 dispatch_item = self._dispatch_queue.popleft()
 
             try:
                 self._dispatch_frame(dispatch_item.frame, dispatch_item.subscriptions)
             except Exception:
-                _DIAGNOSTIC_LOG_LIMITER.log(
-                    _logger,
+                self._log_diagnostic(
                     logging.ERROR,
                     "流帧分发边界异常: cursor=%s topic=%s",
                     dispatch_item.frame.cursor,
@@ -306,8 +314,7 @@ class StreamBus:
 
         dispatch_elapsed = time.perf_counter() - dispatch_start
         if dispatch_elapsed > 0.005:  # > 5ms
-            _DIAGNOSTIC_LOG_LIMITER.log(
-                _logger,
+            self._log_diagnostic(
                 logging.WARNING,
                 "[PERF] 帧分发耗时: %.2fms topic=%s subs=%d",
                 dispatch_elapsed * 1000,
@@ -317,6 +324,30 @@ class StreamBus:
                 interval_sec=_DIAGNOSTIC_LOG_INTERVAL_SEC,
                 extra={"stream_bus_internal": True},
             )
+
+    def _log_diagnostic(self, level, message, *args, key, interval_sec, extra=None, exc_info=None):
+        # Preserve rate limiting at occurrence time; only output moves to the
+        # diagnostic owner, never to the shared async subscriber queue.
+        allowed, suppressed = _DIAGNOSTIC_LOG_LIMITER._consume(key=key, interval_sec=interval_sec)
+        if not allowed or not _logger.isEnabledFor(level):
+            return
+        fields = dict(extra or {})
+        fields["stream_bus_internal"] = True
+        if suppressed:
+            fields.setdefault("suppressed_count", suppressed)
+            fields.setdefault("rate_limit_window_sec", interval_sec)
+        try:
+            record = _logger.makeRecord(_logger.name, level, __file__, 0, message, args, None, extra=fields)
+            CorrelationContextFilter().filter(record)
+            record.msg, record.args = record.getMessage(), ()
+            if exc_info:
+                info = sys.exc_info() if exc_info is True else exc_info
+                record.exc_text = "".join(traceback.format_exception(*info))
+                if info[1] is not None:
+                    record.exception_type = type(info[1]).__name__
+            self._diagnostic_log.submit(record)
+        except Exception as error:
+            self._diagnostic_log.preparation_failed(error)
 
     def _record_subscription_failures(
         self,
@@ -569,6 +600,7 @@ class StreamBus:
                 "async_pending_count": len(self._async_queue),
                 "async_gap_count": len(self._async_gaps),
                 "closed": self._shutdown,
+                "diagnostic_log": self._diagnostic_log.status(),
             }
 
     def _matches(self, subscription: StreamSubscription, frame: StreamFrame) -> bool:
@@ -604,8 +636,8 @@ class StreamBus:
                             subscription.on_gap(notice)
                         else:
                             # 无恢复回调的通用订阅仍保留明确的计数与文件诊断。
-                            _DIAGNOSTIC_LOG_LIMITER.log(
-                                _logger, logging.ERROR, "异步订阅队列溢出: subscription=%s dropped=%s",
+                            self._log_diagnostic(
+                                logging.ERROR, "异步订阅队列溢出: subscription=%s dropped=%s",
                                 subscription.subscription_id, notice["dropped_count"],
                                 key="async_dispatch_overflow", interval_sec=_DIAGNOSTIC_LOG_INTERVAL_SEC,
                                 extra={"stream_bus_internal": True, "stream_gap": notice},
@@ -613,8 +645,7 @@ class StreamBus:
                     else:
                         subscription.callback(frame)
                 except Exception as exc:
-                    _DIAGNOSTIC_LOG_LIMITER.log(
-                        _logger,
+                    self._log_diagnostic(
                         logging.WARNING,
                         "异步流回调执行异常: %s — %s",
                         exc.__class__.__name__,
@@ -624,8 +655,9 @@ class StreamBus:
                         extra={"stream_bus_internal": True},
                     )
 
-    def shutdown(self) -> None:
-        """停止后台消费者线程并清空队列。"""
+    def shutdown(self, timeout_sec: float = 2.0) -> bool:
+        """撤销未领取回调，等待在途发布者及诊断输出；超时后可继续关闭。"""
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
         with self._lock:
             self._shutdown = True
             self._subscriptions.clear()
@@ -634,5 +666,15 @@ class StreamBus:
             while self._dispatch_queue:
                 self._dispatch_queue.popleft().completion.set()
         self._async_event.set()
-        if self._consumer_thread is not threading.current_thread():
-            self._consumer_thread.join(timeout=2.0)
+        if self._consumer_thread is threading.current_thread():
+            return False
+        self._consumer_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if self._consumer_thread.is_alive():
+            return False
+        with self._dispatch_condition:
+            if self._dispatch_draining and self._dispatch_owner_thread_id == threading.get_ident():
+                return False
+            if not self._dispatch_condition.wait_for(
+                    lambda: not self._dispatch_draining, timeout=max(0.0, deadline - time.monotonic())):
+                return False
+        return self._diagnostic_log.close(max(0.0, deadline - time.monotonic()))

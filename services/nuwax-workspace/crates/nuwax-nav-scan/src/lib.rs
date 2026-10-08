@@ -976,6 +976,33 @@ mod tests {
     }
 
     #[test]
+    fn reversed_departure_through_offset_doorway() {
+        let map=scene(Some(40));let tomo=Tomogram::from_surface(&map).unwrap();
+        for sign in [1.0_f64,-1.0] {
+            let heading=if sign>0.0 {0.0}else{std::f64::consts::PI};
+            let start=([sign*0.8,-0.3,0.4],[0.0,0.0,(heading*0.5).sin(),(heading*0.5).cos()]);
+            let reference=[[sign*0.8,-0.3,0.0],[sign*0.5,0.2,0.0],[-sign*0.5,0.2,0.0],[-sign*0.8,-0.3,0.0]];
+            // Independently establish a swept feasible route before asking the search.
+            let mut witness=vec![start];
+            for target in &reference[1..] {
+                let from=*witness.last().unwrap();let dx=target[0]-from.0[0];let dy=target[1]-from.0[1];
+                rotate(&map,&mut witness,dy.atan2(dx),&motion(),&[]).unwrap();
+                witness.extend(probe_motion(&map,*witness.last().unwrap(),dx.hypot(dy),0.0,&[]).unwrap());
+            }
+            for pair in witness.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+            let goal=[-sign*0.8,-0.3,0.4];
+            let path=local_search::plan(&map,&tomo,start,&reference,&motion(),None,Some((goal,0.1)),&[],3.0,0.9,true).unwrap();
+            assert_eq!(path[0],start);
+            assert!(distance3(path.last().unwrap().0,goal)<0.1);
+            for pair in path.windows(2) {
+                map.validate_body_motion(pair[0],pair[1],&[]).unwrap();
+                let dx=pair[1].0[0]-pair[0].0[0];let dy=pair[1].0[1]-pair[0].0[1];
+                assert!(dx*yaw(pair[0].1).cos()+dy*yaw(pair[0].1).sin()>=-1e-9);
+            }
+        }
+    }
+
+    #[test]
     fn deferred_candidate_sweeps_still_reject_concave_boundary_crossing() {
         let map=scene(None);
         let start=([-0.8,0.2,0.4],[0.0,0.0,0.0,1.0]);
@@ -1337,3 +1364,7 @@ mod tests {
         .is_err());
     }
 }
+
+#[cfg(all(test, feature="profile"))]
+#[path="current_on_diagnostic.rs"]
+mod current_on_diagnostic;

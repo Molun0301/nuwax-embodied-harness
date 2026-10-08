@@ -306,6 +306,51 @@ pub fn plan(
             reference_progress([p.0[0], p.0[1], p.0[2] - support_offset], reference);
         (reference_length - progress).max(0.0) + deviation
     };
+    // Forward-only search must rank the turn needed to make progress as well as
+    // translation. A distance-only heuristic starves a reversed departure behind
+    // cheap small turns and centimetre translations within the finite budget.
+    // These weighted nominal seconds guide ordering; only swept body checks admit edges.
+    // Detours aim a body radius ahead on the reference, so a corner can be approached
+    // with its outgoing direction before reaching the exact reference vertex.
+    let guidance_distance=model.radius().max(tomogram.resolution);
+    let heuristic = |p: BodyPose| {
+        let remaining_distance=remaining(p);
+        let mut aim=target;
+        let mut along_reference=false;
+        if follow_reference {
+            let progress=reference_progress([p.0[0],p.0[1],p.0[2]-support_offset],reference).1;
+            let lookahead=progress+guidance_distance;
+            let mut along=0.0;
+            for pair in reference.windows(2) {
+                let length=(pair[1][0]-pair[0][0]).hypot(pair[1][1]-pair[0][1]);
+                if along+length>=lookahead && length>1e-9 {
+                    let t=(lookahead-along)/length;
+                    aim=std::array::from_fn(|i|pair[0][i]+t*(pair[1][i]-pair[0][i]));
+                    along_reference=true;break;
+                }
+                along+=length;
+            }
+        }
+        // The direct attempt only charges the deficit before forward progress is
+        // possible; once facing forward it keeps the original distance ordering.
+        // The reference-following attempt also ranks alignment with its local guide,
+        // rather than the straight bearing to a target on the other side of a wall.
+        let deficit=|xy:[f64;2]| {
+            let dx=xy[0]-p.0[0];let dy=xy[1]-p.0[1];
+            if dx.hypot(dy)<1e-6 {0.0} else {
+                let error=angle(dy.atan2(dx)-yaw(p.1)).abs();
+                if follow_reference {error} else {(error-std::f64::consts::FRAC_PI_2).max(0.0)}
+            }
+        };
+        let turn=if arrival.is_some() || along_reference {
+            deficit([aim[0],aim[1]])
+        } else {
+            [0.0,corridor*0.5,-corridor*0.5,corridor,-corridor].into_iter().map(|offset| {
+                deficit([target[0]-tangent.sin()*offset,target[1]+tangent.cos()*offset])
+            }).fold(f64::INFINITY,f64::min)
+        };
+        4.0*remaining_distance/motion.max_forward_mps+4.0*turn/motion.max_angular_rps
+    };
     // Exact identity retains legal centimetre departures and small rotations.
     // More distinct states compete within the same finite expansion budget.
     let mut nodes = vec![Node {
@@ -314,7 +359,7 @@ pub fn plan(
         parent: None,
         samples: Vec::new(),
     }];
-    let mut open = BinaryHeap::from([Entry(remaining(start) / motion.max_forward_mps * 4.0, 0)]);
+    let mut open = BinaryHeap::from([Entry(heuristic(start), 0)]);
     let mut best = HashMap::from([(key(start), 0.0)]);
     let mut work = SearchWork::default();
     work.nodes = 1;
@@ -328,7 +373,7 @@ pub fn plan(
     let expansion_limit = 256;
     #[cfg(test)]
     let expansion_limit = EXPANSION_LIMIT.get();
-    while let Some(Entry(_, id)) = open.pop() {
+    while let Some(Entry(_priority, id)) = open.pop() {
         super::cancellation::checkpoint()?;
         let from = nodes[id].pose;
         let cost = nodes[id].cost;
@@ -337,6 +382,11 @@ pub fn plan(
             .is_some_and(|&v| cost > v + 1e-9)
         {
             continue;
+        }
+        #[cfg(all(test,feature="profile"))]
+        if std::env::var_os("NEH_ON_DIAGNOSTIC").is_some() {
+            let support=[from.0[0],from.0[1],from.0[2]-support_offset];
+            eprintln!("ON_POP {}",serde_json::json!({"id":id,"parent":nodes[id].parent,"pose":from,"g":cost,"h":heuristic(from),"translation_h":4.0*remaining(from)/motion.max_forward_mps,"f":_priority,"remaining":distance(from),"progress":reference_progress(support,reference).1,"cell":tomogram.cell_at(support).map(|i|format!("{:?}",tomogram.cells[i]))}));
         }
         if distance(from) < distance(closest) {closest=from;}
         // 终端区域内优先尝试完整直线接续；离散动作只用于绕过确实阻挡直线的障碍。
@@ -476,6 +526,10 @@ pub fn plan(
             if super::admit_candidate(validate_projected(from,&samples,&views,boundary))?.is_none() {continue;}
             #[cfg(test)]
             if id == 0 { INITIAL_ADMISSIONS.with(|v|v.borrow_mut().push((length,turn,next))); }
+            #[cfg(all(test,feature="profile"))]
+            if std::env::var_os("NEH_ON_DIAGNOSTIC").is_some() && id==0 {
+                eprintln!("ON_ADMIT {}",serde_json::json!({"length":length,"turn":turn,"pose":next,"g":next_cost,"h":heuristic(next),"translation_h":4.0*remaining(next)/motion.max_forward_mps,"progress":reference_progress([next.0[0],next.0[1],next.0[2]-support_offset],reference).1}));
+            }
             best.insert(k,next_cost);
             let next_id = nodes.len();
             nodes.push(Node {
@@ -486,7 +540,7 @@ pub fn plan(
             });
             let heading_cost = final_yaw.map_or(0.0, |y| angle(y - yaw(next.1)).abs() / motion.max_angular_rps * 0.05);
             open.push(Entry(
-                next_cost + 4.0 * remaining(next) / motion.max_forward_mps + heading_cost,
+                next_cost + heuristic(next) + heading_cost,
                 next_id,
             ));
             work.nodes = nodes.len();
@@ -497,7 +551,8 @@ pub fn plan(
     // Neither a drained discretized search nor an expansion limit proves obstruction.
     Err(LocalPlanError {
         reason: format!(
-            "近场前向搜索未连通（{expanded}次访问，{}个状态，{}个待选，最近{:.3}米，姿态{closest:?}）",
+            "近场前向搜索{}（{expanded}次访问，{}个状态，{}个待选，最近{:.3}米，姿态{closest:?}）",
+            if budget_exhausted { "预算耗尽" } else { "离散候选耗尽" },
             nodes.len(), open.len(), distance(closest)
         ),
         kind: if budget_exhausted { super::LocalPlanFailureKind::BudgetExhausted }

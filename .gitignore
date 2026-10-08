@@ -20,6 +20,15 @@ openspec/
 .codex/
 GO2_inner_slam/
 artifacts/
+# 默认 Agent 调用账本属于运行时数据，保留原路径以兼容既有记录。
+/agent_calls.sqlite3
+/agent_calls.sqlite3-journal
+/agent_calls.sqlite3-wal
+/agent_calls.sqlite3-shm
+/agent_calls.terminals.sqlite3
+/agent_calls.terminals.sqlite3-journal
+/agent_calls.terminals.sqlite3-wal
+/agent_calls.terminals.sqlite3-shm
 .venv_model_download/
 .venv/
 .nuwax-test-env/

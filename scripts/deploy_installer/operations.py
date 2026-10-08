@@ -233,7 +233,7 @@ def _tree_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _git_source_identity(path: Path) -> str:
+def _git_source_identity(path: Path) -> Tuple[bytes, bytes]:
     git_env = source_user_environment()
     head = subprocess.run(
         source_user_command(("git", "rev-parse", "HEAD")),
@@ -261,7 +261,7 @@ def _git_source_identity(path: Path) -> str:
     )
     if head.returncode != 0 or index.returncode != 0 or dirty.returncode != 0 or dirty.stdout.strip():
         raise DeploymentError("production source identity is dirty or unreadable")
-    return hashlib.sha256(head.stdout + b"\0" + index.stdout).hexdigest()
+    return head.stdout, index.stdout
 
 
 def _verify_source_artifacts(context: ExecutionContext) -> None:
@@ -3253,7 +3253,7 @@ def install_release(context: ExecutionContext) -> None:
     release_dir = options.release_dir
     expected_source_identity = context.notes.get("source_identity_at_preflight")
     if (
-        isinstance(expected_source_identity, str)
+        isinstance(expected_source_identity, tuple)
         and _git_source_identity(options.source_root) != expected_source_identity
     ):
         raise DeploymentError("production source changed after preflight")

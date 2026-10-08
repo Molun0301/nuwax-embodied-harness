@@ -18,6 +18,7 @@ import stat
 import struct
 import time
 import uuid
+import numpy as np
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from pathlib import Path
@@ -1748,7 +1749,7 @@ def _validate_canonical_members(checkpoint, occupancy, cloud):
             raise MappingBackendCheckpointValidationError("canonical occupancy values must be [-1, 100]")
     xyz = checkpoint.canonical_cloud_xyz
     for offset in range(0, len(xyz), 65536 * 12):
-        if any(not math.isfinite(value) for point in struct.iter_unpack("<fff", xyz[offset:offset + 65536 * 12]) for value in point):
+        if not np.isfinite(np.frombuffer(xyz[offset:offset + 65536 * 12], dtype="<f4")).all():
             raise MappingBackendCheckpointValidationError("canonical cloud contains non-finite XYZ")
     _validate_member_identity(checkpoint.backend_identity, checkpoint=checkpoint,
         role="backend_state", frame=occupancy["frame_id"])
@@ -1775,7 +1776,7 @@ def _validate_backend_payload_header(payload, kind):
         if not capacity or count > retained_capacity or candidate_count > retained_capacity or len(payload) != 48 + count * 24:
             raise MappingBackendCheckpointValidationError("voxel backend size/count mismatch")
         for offset in range(48, len(payload), 65536 * 24):
-            if any(not math.isfinite(value) for point in struct.iter_unpack("<ddd", payload[offset:offset + 65536 * 24]) for value in point):
+            if not np.isfinite(np.frombuffer(payload[offset:offset + 65536 * 24], dtype="<f8")).all():
                 raise MappingBackendCheckpointValidationError("voxel backend contains non-finite coordinates")
     else:
         if len(payload) < 96:

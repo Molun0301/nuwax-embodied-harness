@@ -7,6 +7,7 @@ import multiprocessing
 import queue
 import threading
 from contextlib import asynccontextmanager
+from contextvars import copy_context
 from typing import Any, Dict
 
 from contracts.scene_decision import MAX_REQUEST_BYTES, SceneDecisionRequest
@@ -139,7 +140,7 @@ def create_app(controller: ModelProcess, *, token: str = ""):
         try:
             yield
         finally:
-            await asyncio.to_thread(controller.close)
+            await asyncio.get_running_loop().run_in_executor(None, copy_context().run, controller.close)
 
     app = FastAPI(title="场景决策本地服务", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
@@ -169,7 +170,7 @@ def create_app(controller: ModelProcess, *, token: str = ""):
 
             body = await asyncio.wait_for(read_body(), timeout=10.0)
             parsed = SceneDecisionRequest.model_validate_json(body)
-            result = await asyncio.to_thread(controller.decide, parsed)
+            result = await asyncio.get_running_loop().run_in_executor(None, copy_context().run, controller.decide, parsed)
             return JSONResponse(result)
         except asyncio.TimeoutError:
             return JSONResponse({"error": "request_read_timeout"}, status_code=408)

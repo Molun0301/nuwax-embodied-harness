@@ -71,6 +71,16 @@ initial logs are retained separately and are not final passing results.
 
 ## Limits
 
+### Python 3.8 follow-up
+
+After the explicit Python 3.8 requirement, the unchanged SQLite implementation
+was also exercised on real CPython 3.8.20, SQLite 3.46.0, Pydantic 2.10.6,
+NumPy 1.24.4 and FastAPI 0.115.14. All 17 focused tests and the same affected
+regressions listed above pass, including recall equivalence. This run includes
+the small Python 3.8 annotation/import corrections in `contracts/map_activation.py`
+and `contracts/runtime_views.py`; it is not merely a 3.8 AST parse. The Python
+3.12 results remain separate. Neither environment is a Jetson hardware result.
+
 This demonstrates storage-layer progress while another read snapshot is held,
 not a whole-service throughput or Go2 CPU improvement. Service-level instance
 locks, CPU work, pool saturation and SQLite writer/database contention still

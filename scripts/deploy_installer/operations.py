@@ -3420,7 +3420,7 @@ def _backup_config(context: ExecutionContext, path: Path) -> None:
     if backup_root.is_symlink():
         raise DeploymentError(f"config backup path must not be a symlink: {backup_root}")
     backup_root.mkdir(parents=True, exist_ok=True)
-    backup_name = hashlib.sha256(str(path).encode("utf-8")).hexdigest() + ".bak"
+    backup_name = path.name + ".bak"
     if previous is not None:
         backup_path = backup_root / backup_name
         if backup_path.is_symlink():
@@ -3475,6 +3475,17 @@ def _parse_env_values(source: str) -> Mapping[str, str]:
     return values
 
 
+def _same_file_contents(left: Path, right: Path) -> bool:
+    with left.open("rb") as left_file, right.open("rb") as right_file:
+        while True:
+            left_chunk = left_file.read(1024 * 1024)
+            right_chunk = right_file.read(1024 * 1024)
+            if left_chunk != right_chunk:
+                return False
+            if not left_chunk:
+                return True
+
+
 def _copy_migration_source(source: Path, destination: Path) -> None:
     if source.is_symlink():
         raise DeploymentError(f"legacy migration source must not be a symlink: {source}")
@@ -3486,7 +3497,7 @@ def _copy_migration_source(source: Path, destination: Path) -> None:
     if source.is_file():
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
-            if not destination.is_file() or _sha256(destination) != _sha256(source):
+            if not destination.is_file() or not _same_file_contents(destination, source):
                 raise DeploymentError(f"legacy migration target already has different data: {destination}")
             return
         shutil.copy2(source, destination)
@@ -3505,7 +3516,7 @@ def _copy_migration_source(source: Path, destination: Path) -> None:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
-            if not target.is_file() or _sha256(target) != _sha256(candidate):
+            if not target.is_file() or not _same_file_contents(target, candidate):
                 raise DeploymentError(f"legacy migration target already has different data: {target}")
             continue
         shutil.copy2(candidate, target)

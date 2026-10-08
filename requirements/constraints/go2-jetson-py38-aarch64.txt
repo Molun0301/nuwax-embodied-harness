@@ -5,6 +5,7 @@ websockets==10.4
 numpy==1.24.4
 opencv-python==4.10.0.84
 pydantic==2.10.6
+typing_extensions==4.13.2
 fastapi==0.115.14
 starlette==0.44.0
 uvicorn==0.30.6

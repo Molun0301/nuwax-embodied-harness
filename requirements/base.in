@@ -3,6 +3,7 @@ websockets==10.4
 numpy==1.24.4
 opencv-python==4.10.0.84
 pydantic==2.10.6
+typing_extensions==4.13.2
 # 通用智能体接口输入结构校验；4.19.2支持Python 3.8，MIT许可证。
 jsonschema==4.19.2
 fastapi==0.115.14

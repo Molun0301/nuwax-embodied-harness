@@ -1364,11 +1364,14 @@ def _assigned_request_for_rpc(
 def _assigned_terminal_payload(terminal: AssignedRelocalizationTerminal) -> Dict[str, Any]:
     payload = terminal.to_dict()
     body = payload["assigned_cloud_v2"]
+    disposition_name = pb2.RelocalizeDisposition.Name(terminal.disposition)
+    prefix = "RELOCALIZE_DISPOSITION_"
+    if disposition_name.startswith(prefix):
+        disposition_name = disposition_name[len(prefix):]
     payload.update(
         success=terminal.disposition in _RELOCALIZE_SUCCESS_DISPOSITIONS,
         disposition=terminal.disposition,
-        disposition_name=pb2.RelocalizeDisposition.Name(terminal.disposition)
-            .removeprefix("RELOCALIZE_DISPOSITION_").lower(),
+        disposition_name=disposition_name.lower(),
         correction_revision=terminal.correction_revision,
         detail=body["detail"],
     )

@@ -111,7 +111,7 @@ class FileIdentityChecks(unittest.TestCase):
             value = topology(identity)
             self.buildings.save(value)
             path = self.buildings._path(identity)
-            self.assertTrue(path.is_relative_to(self.buildings.root / 'by-id-v1'))
+            path.relative_to(self.buildings.root / 'by-id-v1')
             self.assertTrue(all(len(part.encode()) <= 180 for part in path.relative_to(self.buildings.root).parts))
             self.assertEqual(self.buildings.get(identity), value)
             self.assertEqual(self.buildings._files._identity_from_direct_path(path), identity)
@@ -340,7 +340,7 @@ class FileIdentityChecks(unittest.TestCase):
         with patch('services.navigation.file_identity.os.fsync', side_effect=remember):
             self.buildings.save(value)
         directory = path.parent
-        while directory.is_relative_to(self.buildings.root):
+        while directory == self.buildings.root or self.buildings.root in directory.parents:
             status = directory.stat()
             self.assertIn((status.st_dev, status.st_ino), synced)
             if directory == self.buildings.root: break

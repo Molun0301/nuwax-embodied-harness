@@ -5,12 +5,12 @@ arbitrary external bytes and never derive identity from a digest.
 """
 from dataclasses import dataclass
 import json
-from typing import Any, Mapping
+from typing import Any, Dict, Mapping, Set
 
 from contracts.map_identity import AssetIdentityV2
 
 
-def _fields(value: Any, expected: set[str], name: str) -> Mapping[str, Any]:
+def _fields(value: Any, expected: Set[str], name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping) or set(value) != expected:
         raise ValueError(f"{name} fields are missing, mixed, or unsupported")
     return value
@@ -39,7 +39,7 @@ def _assigned_id(value: Any, name: str) -> str:
     return value
 
 
-def _commit(value: Any) -> dict[str, Any]:
+def _commit(value: Any) -> Dict[str, Any]:
     value = _fields(value, {'boot_nonce', 'sequence'}, 'mapping commit')
     return {'boot_nonce': _assigned_id(value['boot_nonce'], 'boot nonce'),
             'sequence': _integer(value['sequence'], 'commit sequence')}
@@ -63,7 +63,7 @@ def _source_session(value: Any) -> str:
     return value
 
 
-def _occupancy(value: Any) -> dict[str, Any]:
+def _occupancy(value: Any) -> Dict[str, Any]:
     value = _fields(value, {'commit_id', 'session_id', 'session_generation', 'occupancy_revision',
                             'source_timestamp_ns', 'backend_kind', 'backend_generation'}, 'occupancy receipt')
     if not isinstance(value['backend_kind'], str) or value['backend_kind'] not in {'voxel', 'raytracing', 'slam_toolbox'}:
@@ -77,7 +77,7 @@ def _occupancy(value: Any) -> dict[str, Any]:
             'backend_generation': _integer(value['backend_generation'], 'backend generation')}
 
 
-def _cloud(value: Any) -> dict[str, Any]:
+def _cloud(value: Any) -> Dict[str, Any]:
     value = _fields(value, {'commit_id', 'session_generation', 'occupancy_revision', 'cloud_revision',
                             'source_timestamp_ns', 'point_count'}, 'cloud receipt')
     result = {'commit_id': _commit(value['commit_id'])}
@@ -100,7 +100,7 @@ def _paired(occupancy: Mapping[str, Any], cloud: Mapping[str, Any], *, installed
         raise ValueError('installed target must share the exact positive-time mapping commit')
 
 
-def _request(value: Any) -> dict[str, Any]:
+def _request(value: Any) -> Dict[str, Any]:
     value = _fields(value, {'activation_request_id', 'session_id', 'map_name', 'asset_identity',
                             'checkpoint_id', 'expected_runtime_generation'}, 'activation request')
     asset = _fields(value['asset_identity'], {'asset_id'}, 'asset identity')
@@ -112,7 +112,7 @@ def _request(value: Any) -> dict[str, Any]:
             'expected_runtime_generation': _integer(value['expected_runtime_generation'], 'expected runtime generation')}
 
 
-def _activation(value: Any) -> dict[str, Any]:
+def _activation(value: Any) -> Dict[str, Any]:
     value = _fields(value, {'request', 'runtime_generation', 'lifecycle_epoch', 'session_generation',
                             'backend_kind', 'backend_generation'}, 'installed activation')
     if not isinstance(value['backend_kind'], str) or value['backend_kind'] not in {'voxel', 'raytracing'}:
@@ -125,7 +125,7 @@ def _activation(value: Any) -> dict[str, Any]:
     return result
 
 
-def _source_cloud_member(value: Any) -> dict[str, Any]:
+def _source_cloud_member(value: Any) -> Dict[str, Any]:
     value = _fields(value, {'checkpoint_id', 'role', 'occupancy_receipt', 'cloud_receipt', 'frame_id',
                             'frame_generation', 'producer_generation'}, 'source cloud member')
     if value['role'] != 'canonical_cloud':
@@ -188,7 +188,7 @@ class AssignedActivationReceipt:
             object.__setattr__(owner, key, item)
         return owner
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         return json.loads(self._encoded)
 
     def exact_replay_of(self, other: 'AssignedActivationReceipt') -> bool:

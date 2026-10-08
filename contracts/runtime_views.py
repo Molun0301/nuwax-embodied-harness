@@ -23,7 +23,8 @@ from contracts.spatial_memory import (
     SemanticRegion as SpatialSemanticRegion,
     SpatialAnchor,
 )
-from typing import Annotated, List, Literal, Mapping, Optional
+from typing import List, Literal, Mapping, Optional
+from typing_extensions import Annotated
 
 
 class DiagnosticLevel(StrEnum):

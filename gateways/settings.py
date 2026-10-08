@@ -27,6 +27,8 @@ class SettingsApplication:
     def __init__(self, runtime):
         self.runtime = runtime
         self._lock = threading.RLock()
+        self._state_lock = threading.RLock()
+        self._hot_apply_pending = set()
         self._pid = os.getpid()
         self._apply_errors = {}
         self.revision_owner = config_profiles.ProfileRevisionOwner()
@@ -44,6 +46,8 @@ class SettingsApplication:
         if self._pid != os.getpid():
             # 子进程不能等待父进程其它线程持有的设置锁。
             self._lock = threading.RLock()
+            self._state_lock = threading.RLock()
+            self._hot_apply_pending = set()
             self.revision_owner = config_profiles.ProfileRevisionOwner()
             self._pid = os.getpid()
         with self._lock:
@@ -67,29 +71,57 @@ class SettingsApplication:
         return location is None or (active is not None and location["path"] == active["path"])
 
     def schema(self, robot=None, profile=None):
-        with self._lock:
-            return self._schema(robot, profile)
+        return self._schema(robot, profile)
+
+    def _runtime_state(self):
+        with self._state_lock:
+            return {"runtime_values": dict(RUNTIME_VALUES),
+                    "saved": set(config_io._SAVED_SINCE_START),
+                    "apply_errors": dict(self._apply_errors),
+                    "hot_apply_pending": sorted(self._hot_apply_pending)}
 
     def _schema(self, robot=None, profile=None):
-        if robot is None and self.started_robot:
+        captured = {}
+        owner = self.revision_owner
+
+        def location():
             active = self._active_location()
-            robot = active["robot"] if active else self.started_robot
-        schema = config_io.build_schema(robot, profile, revision_owner=self.revision_owner)
+            captured["active"] = active
+            selected = robot
+            if selected is None and self.started_robot:
+                selected = active["robot"] if active else self.started_robot
+            return configuration_location(root=self._root, robot=selected, profile=profile)
+
+        def runtime_state():
+            state = self._runtime_state()
+            captured["state"] = state
+            return state
+
+        schema = config_io.build_schema(robot, profile, revision_owner=owner,
+                                        location_provider=location, runtime_state_provider=runtime_state,
+                                        legacy_read_context=lambda: self._lock)
         context = schema.get("profile_context")
         if context:
-            active = self._active_location()
+            active = captured["active"]
             context["selected_robot"] = active["robot"] if active else ""
             context["is_active"] = bool(active and str(active["path"]) == context["path"])
             context["running_robot"] = self.started_robot
             context["running_profile"] = self.started_location["profile"] if self.started_location else ""
-        schema["application"] = self.status()
+        schema["application"] = self.status(application_state=captured["state"])
         return schema
 
-    def status(self):
+    def status(self, *, application_state=None):
         from gateways.settings_restart import restart_status
+        if application_state is None:
+            with self._state_lock:
+                application_state = {"apply_errors": dict(self._apply_errors),
+                                     "hot_apply_pending": sorted(self._hot_apply_pending)}
+        # restart_status may wait for an external service manager, never under
+        # the adopted-state lock or the serialized hot-application transaction.
         return {"process_id": os.getpid(), "running_robot": self.started_robot,
                 "running_profile": self.started_location["profile"] if self.started_location else "",
-                "apply_errors": dict(self._apply_errors), **restart_status(self._root)}
+                "apply_errors": application_state["apply_errors"],
+                "hot_apply_pending": application_state["hot_apply_pending"], **restart_status(self._root)}
 
     def save(self, updates, *, robot=None, profile=None, expected_revision=None):
         with self._lock:
@@ -144,7 +176,8 @@ class SettingsApplication:
                 after = values.get(field.key, defaults.get(field.key, ""))
                 if config_io._validate(field.key, str(before), field.type) != config_io._validate(field.key, str(after), field.type):
                     restart_keys.append(field.key)
-                    config_io._SAVED_SINCE_START.add((str(location["path"]), field.key))
+                    with self._state_lock:
+                        config_io._SAVED_SINCE_START.add((str(location["path"]), field.key))
             restart_required = robot != self.started_robot or bool(restart_keys)
             return {"profile_context": context, "hot_applied": applied, "apply_errors": dict(self._apply_errors),
                     "restart_required": restart_required, "restart_keys": restart_keys,
@@ -160,18 +193,19 @@ class SettingsApplication:
         file_keys = os.environ.get("_NUWAX_CONFIG_FILE_KEYS", "").split(":")
         blocked = {key for key in requested if key in os.environ and key not in file_keys
                    and str(os.environ[key]) != str(values.get(key, ""))}
-        for key in blocked:
-            self._apply_errors[key] = "存在显式进程环境覆盖，修改文件不能覆盖该值"
-        requested -= blocked
-        unchanged = {key for key in requested if key in RUNTIME_VALUES and
-                     config_io._validate(key, str(values.get(key, "")), config_registry.get_field(key).type)
-                     == config_io._validate(key, config_io._format_config_value(RUNTIME_VALUES[key], config_registry.get_field(key).type), config_registry.get_field(key).type)}
-        requested -= unchanged
-        for key in unchanged:
-            self._apply_errors.pop(key, None)
-        # 从当前读取记录构造候选，仅覆盖本次热加载项，不应用其它尚待重启的编辑。
-        source = {key: config_io._format_config_value(value, config_registry.get_field(key).type)
-                  for key, value in RUNTIME_VALUES.items() if config_registry.get_field(key)}
+        with self._state_lock:
+            for key in blocked:
+                self._apply_errors[key] = "存在显式进程环境覆盖，修改文件不能覆盖该值"
+            requested -= blocked
+            unchanged = {key for key in requested if key in RUNTIME_VALUES and
+                         config_io._validate(key, str(values.get(key, "")), config_registry.get_field(key).type)
+                         == config_io._validate(key, config_io._format_config_value(RUNTIME_VALUES[key], config_registry.get_field(key).type), config_registry.get_field(key).type)}
+            requested -= unchanged
+            for key in unchanged:
+                self._apply_errors.pop(key, None)
+            # 从当前读取记录构造候选，仅覆盖本次热加载项，不应用其它尚待重启的编辑。
+            source = {key: config_io._format_config_value(value, config_registry.get_field(key).type)
+                      for key, value in RUNTIME_VALUES.items() if config_registry.get_field(key)}
         for key in requested:
             source[key] = values.get(key, "")
         with config_snapshot(source, {}) as recorded:
@@ -187,25 +221,40 @@ class SettingsApplication:
                      else "stream" if path.startswith("perception.stream_runtime.") else "values")
             groups.setdefault(group, []).append(key)
         for group, group_keys in groups.items():
+            with self._state_lock:
+                self._hot_apply_pending.update(group_keys)
             try:
                 self._apply_group(group, group_keys, candidate, source)
-                for key in group_keys:
-                    if key in HOT_FIELDS:
-                        value = _attribute(candidate, HOT_FIELDS[key])
-                        _set_attribute(self.runtime.config, HOT_FIELDS[key], value)
-                    else:
-                        value = recorded.get(key, source[key])
-                    RUNTIME_VALUES[key] = value
-                    if apply_mode(key) == "hot":
-                        config_io._SAVED_SINCE_START.discard(key)
-                        active = self._active_location()
-                        if active:
-                            config_io._SAVED_SINCE_START.discard((str(active["path"]), key))
-                    self._apply_errors.pop(key, None)
-                    applied.append(key)
+                adopted = {key: (_attribute(candidate, HOT_FIELDS[key]) if key in HOT_FIELDS
+                                 else recorded.get(key, source[key])) for key in group_keys}
+                active = self._active_location()
+                with self._state_lock:
+                    for key in group_keys:
+                        if key in HOT_FIELDS:
+                            _set_attribute(self.runtime.config, HOT_FIELDS[key], adopted[key])
+                    RUNTIME_VALUES.update(adopted)
+                    for key in group_keys:
+                        if apply_mode(key) == "hot":
+                            config_io._SAVED_SINCE_START.discard(key)
+                            if active:
+                                config_io._SAVED_SINCE_START.discard((str(active["path"]), key))
+                        self._apply_errors.pop(key, None)
+                    self._hot_apply_pending.difference_update(group_keys)
+                applied.extend(group_keys)
             except Exception as error:
+                error_text = None
+                try:
+                    error_text = str(error)
+                finally:
+                    with self._state_lock:
+                        if error_text is not None:
+                            self._apply_errors.update(dict.fromkeys(group_keys, error_text))
+                        self._hot_apply_pending.difference_update(group_keys)
                 logging.getLogger("nuwax_robot_bridge.settings").exception("设置已保存但热加载失败：%s", group)
-                self._apply_errors.update({key: str(error) for key in group_keys})
+            except BaseException:
+                with self._state_lock:
+                    self._hot_apply_pending.difference_update(group_keys)
+                raise
         if groups.get("display") and set(groups["display"]) <= set(applied):
             payload = asdict(self.runtime.config.gateway.pointcloud3d)
             self.runtime.stream_bus.publish("settings.display", source="gateway", payload=payload)

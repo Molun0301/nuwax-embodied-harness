@@ -15,7 +15,7 @@ import stat
 import struct
 import subprocess
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
@@ -448,27 +448,57 @@ def _robot_geometry_preview(file_values: Dict[str, str]) -> Dict[str, object]:
 
 
 @_schema_file_snapshot()
-def build_schema(robot=None, profile=None, *, revision_owner=None) -> Dict[str, object]:
-    location = configuration_location(root=_CORE_ENV.parent, robot=robot, profile=profile)
-    token = _PROFILE_LOCATION.set(location)
-    try:
-        if location:
-            from core.config_profiles import CapturedProfile
-            with _target_lock(_CORE_ENV.parent / "runtime_data" / "settings" / "transaction"), CapturedProfile(location, _CORE_ENV.parent) as captured:
-                values_token = _PROFILE_VALUES.set(captured.values())
-                try:
-                    return _build_schema(location, profile_snapshot=captured, revision_owner=revision_owner)
-                finally:
-                    _PROFILE_VALUES.reset(values_token)
-        return _build_schema(location)
-    finally:
-        _PROFILE_LOCATION.reset(token)
+def build_schema(robot=None, profile=None, *, revision_owner=None,
+                 location_provider=None, runtime_state_provider=None,
+                 legacy_read_context=None) -> Dict[str, object]:
+    def resolve_location():
+        return location_provider() if location_provider is not None else configuration_location(
+            root=_CORE_ENV.parent, robot=robot, profile=profile)
+
+    def render(location):
+        token = _PROFILE_LOCATION.set(location)
+        try:
+            if location:
+                from core.config_profiles import CapturedProfile
+                with CapturedProfile(location, _CORE_ENV.parent) as captured:
+                    values_token = _PROFILE_VALUES.set(captured.values())
+                    try:
+                        state = runtime_state_provider() if runtime_state_provider is not None else _runtime_state_snapshot()
+                        return _build_schema(location, profile_snapshot=captured, revision_owner=revision_owner, runtime_state=state)
+                    finally:
+                        _PROFILE_VALUES.reset(values_token)
+            state = runtime_state_provider() if runtime_state_provider is not None else _runtime_state_snapshot()
+            return _build_schema(location, runtime_state=state)
+        finally:
+            _PROFILE_LOCATION.reset(token)
+
+    while True:
+        # The first resolution only chooses a lock domain. Re-resolve there so
+        # a concurrent switch between legacy/profile cannot return mixed inputs.
+        if resolve_location() is not None:
+            with _target_lock(_CORE_ENV.parent / "runtime_data" / "settings" / "transaction"):
+                location = resolve_location()
+                if location is None:
+                    continue  # Release file lock before taking the legacy write lock.
+                return render(location)
+        else:
+            with (legacy_read_context or nullcontext)():
+                location = resolve_location()
+                if location is not None:
+                    continue  # Never nest file -> legacy or legacy -> file locks.
+                return render(None)
 
 
-def _build_schema(location, *, profile_snapshot=None, revision_owner=None) -> Dict[str, object]:
+def _runtime_state_snapshot():
+    return {"runtime_values": dict(RUNTIME_VALUES), "saved": set(_SAVED_SINCE_START)}
+
+
+def _build_schema(location, *, profile_snapshot=None, revision_owner=None, runtime_state) -> Dict[str, object]:
     """构建前端 schema：按板块分组，含当前值（敏感脱敏）、默认值、常规/高级标记。"""
 
     from core import settings
+    runtime_values = runtime_state["runtime_values"]
+    saved_since_start = runtime_state["saved"]
     legacy_vals = {} if location else _read_env_values(settings.LEGACY_CONFIG_FILE)
     core_file_vals = {} if location else _read_env_values(_core_env_path())
     core_vals = dict(legacy_vals)
@@ -535,19 +565,19 @@ def _build_schema(location, *, profile_snapshot=None, revision_owner=None) -> Di
                     raw_value, source = os.environ[alias], "legacy_environment"
                     break
         edit_value = raw_value if raw_value is not None else effective_vals.get(f.key, default_vals.get(f.key, ""))
-        known = f.key in RUNTIME_VALUES
-        effective_value = _format_config_value(RUNTIME_VALUES[f.key], f.type) if known else os.environ.get(f.key, edit_value)
+        known = f.key in runtime_values
+        effective_value = _format_config_value(runtime_values[f.key], f.type) if known else os.environ.get(f.key, edit_value)
         if f.effective_value_scope == "inactive":
             known, effective_value, pending = False, None, False
         else:
-            pending = f.key in _SAVED_SINCE_START or (known and
+            pending = f.key in saved_since_start or (known and
                 _validate(f.key, str(edit_value), f.type) != _validate(f.key, str(effective_value), f.type))
             if location or f.effective_value_scope == "external_process":
                 startup = effective_value if known else os.environ.get(f.key, settings._FILE_VALUES.get(f.key, default_vals.get(f.key, "")))
                 normalized_saved = _validate(f.key, str(edit_value), f.type)
                 normalized_startup = _validate(f.key, str(startup), f.type)
                 pending = normalized_saved != normalized_startup
-                if location and apply_mode(f.key) == "hot_and_restart" and (str(location["path"]), f.key) in _SAVED_SINCE_START:
+                if location and apply_mode(f.key) == "hot_and_restart" and (str(location["path"]), f.key) in saved_since_start:
                     pending = True
             # 网关读取的启动配置不是独立导航后端的采用回执。
             if f.effective_value_scope == "external_process":

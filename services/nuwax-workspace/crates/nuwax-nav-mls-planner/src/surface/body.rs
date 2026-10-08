@@ -13,7 +13,7 @@ pub(super) type CacheSlot =
 /// 只复用同一不可变视图的一个精确足迹；不保存观察许可或失败。
 struct ObservationFootprintCache<'a> {
     snapshot: &'a SurfaceSnapshot,
-    entry: Option<([u64; 7], std::collections::BTreeSet<[i32; 3]>)>,
+    entry: Option<([u64; 7], Vec<[i32; 3]>)>,
     #[cfg(test)]
     builds: usize,
 }
@@ -24,19 +24,38 @@ impl<'a> ObservationFootprintCache<'a> {
     }
 
     fn cells(&mut self, pose: ([f64; 3], [f64; 4]))
-        -> Result<&std::collections::BTreeSet<[i32; 3]>, SurfaceError> {
+        -> Result<&[[i32; 3]], SurfaceError> {
         let key = [pose.0[0], pose.0[1], pose.0[2],
             pose.1[0], pose.1[1], pose.1[2], pose.1[3]].map(f64::to_bits);
         if self.entry.as_ref().is_none_or(|(cached, _)| *cached != key) {
             #[cfg(feature = "body-query-profile")] query_profile::count(QueryCounter::ObservationFootprintCacheMisses);
             #[cfg(test)] { self.builds += 1; }
-            let cells = self.snapshot.body_observation_footprint(pose)?;
+            let cells = self.snapshot.build_body_observation_footprint::<Vec<_>>(pose)?;
             self.entry = Some((key, cells));
         } else {
             #[cfg(feature = "body-query-profile")] query_profile::count(QueryCounter::ObservationFootprintCacheHits);
         }
-        Ok(&self.entry.as_ref().expect("successful footprint entry").1)
+        Ok(self.entry.as_ref().expect("successful footprint entry").1.as_slice())
     }
+}
+
+// Both inputs are XYZ ordered. Bound gap traversal: after one ordinary step,
+// seek rather than scanning arbitrarily many occupied keys between two cells.
+fn unoccupied_observation_cells<'a>(cells: &'a [[i32; 3]],
+    occupied: &'a std::collections::BTreeSet<[i32; 3]>) -> impl Iterator<Item=&'a [i32; 3]> {
+    let first = cells.first().copied().unwrap_or([i32::MAX; 3]);
+    let mut range = occupied.range(first..);
+    let mut next = range.next();
+    cells.iter().filter(move |&&cell| {
+        if next.is_some_and(|key| *key < cell) {
+            next = range.next();
+            if next.is_some_and(|key| *key < cell) {
+                range = occupied.range(cell..);
+                next = range.next();
+            }
+        }
+        if next == Some(&cell) { next = range.next(); false } else { true }
+    })
 }
 
 // Aggregate only after the cell loop, including early-error exits. These fixed
@@ -1570,6 +1589,14 @@ impl SurfaceSnapshot {
     pub fn body_observation_footprint(
         &self, pose: ([f64; 3], [f64; 4]),
     ) -> Result<std::collections::BTreeSet<[i32; 3]>, SurfaceError> {
+        self.build_body_observation_footprint(pose)
+    }
+
+    // One geometry implementation for private Vec and the public set. Public
+    // collection conversion remains inside the complete footprint profile.
+    fn build_body_observation_footprint<C: FromIterator<[i32; 3]>>(
+        &self, pose: ([f64; 3], [f64; 4]),
+    ) -> Result<C, SurfaceError> {
         #[cfg(feature = "body-query-profile")] let _footprint_profile=query_profile::guard(QueryStage::ObservationFootprint);
         let observations = self.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
         if observations.size_m.to_bits() != self.source_voxel_size_m().to_bits() {
@@ -1604,7 +1631,7 @@ impl SurfaceSnapshot {
         let polygon_query=PolygonQuery::new(&polygon);
         let mut observation_lookup=crate::surface::observations::ObservationBlockLookup::new(observations);
         #[cfg(feature = "body-query-profile")] let mut height_counts=ObservationHeightCounts::default();
-        let mut cells = std::collections::BTreeSet::new();
+        let mut cells = Vec::new();
         for x in min[0]..=max[0] {
             for y in min[1]..=max[1] {
                 if !polygon_query.intersects(x, y, size) { continue; }
@@ -1634,7 +1661,8 @@ impl SurfaceSnapshot {
                     self.data.occupied_columns.get(&column)
                         .is_some_and(|zs| zs.binary_search(&coarse_z).is_ok())
                 }).unwrap_or(top);
-                cells.insert([x, y, z]);
+                // Ascending x/y and one selected z per XY are strictly XYZ ordered.
+                cells.push([x, y, z]);
             }
         }
         drop(observation_lookup);
@@ -1644,7 +1672,7 @@ impl SurfaceSnapshot {
             drop(cells_profile);
             query_profile::add(QueryCounter::ObservationFootprintCellsBuilt,cells.len() as u64);
         }
-        Ok(cells)
+        Ok(cells.into_iter().collect())
     }
 
     /// 验证完整扫掠中新进入位置的实际观察；静态远端路线无需新鲜证据。
@@ -1720,9 +1748,8 @@ impl SurfaceSnapshot {
                 #[cfg(feature = "body-query-profile")] let _evidence_profile=query_profile::guard(QueryStage::ObservationEvidence);
                 #[cfg(feature = "body-query-profile")] let mut counts=ObservationEvidenceCounts::default();
                 #[cfg(feature = "body-query-profile")] query_profile::add(QueryCounter::ObservationInputCells,cells.len() as u64);
-                // Both sets use exact integer-cell ordering. Difference yields
-                // precisely the old loop's non-exempt keys in the same order.
-                for &cell in cells.difference(occupied) {
+                // Complete geometry must succeed before any TTL/evidence decision.
+                for &cell in unoccupied_observation_cells(cells, occupied) {
                     #[cfg(feature = "body-query-profile")] {counts.visited+=1;}
                     #[cfg(feature = "body-query-profile")] {counts.checked+=1;}
                     let evidence = observations.get(cell).unwrap_or(SurfaceObservation {observed_ns:0,hits:0});
@@ -2453,6 +2480,7 @@ fn quaternion_from_columns(r: [[f64; 3]; 3]) -> [f64; 4] {
 
 #[cfg(test)]
 mod tests {
+    include!("body_observation_vec_tests.rs");
     use super::*;
     #[test]
     fn voxel_projection_accounts_for_corners_and_attitude_without_yaw_inflation() {
@@ -3398,8 +3426,8 @@ mod tests {
         let occupied=map.body_observation_footprint(pose).unwrap();
         let mut cache=ObservationFootprintCache::new(&map);
         query_profile::begin();
-        assert_eq!(cache.cells(pose).unwrap(),&occupied);
-        assert_eq!(cache.cells(pose).unwrap(),&occupied);
+        assert_eq!(cache.cells(pose).unwrap(),occupied.iter().copied().collect::<Vec<_>>().as_slice());
+        assert_eq!(cache.cells(pose).unwrap(),occupied.iter().copied().collect::<Vec<_>>().as_slice());
         let geometry=query_profile::end();
         assert_eq!(geometry.counters[QueryCounter::ObservationFootprintCacheMisses as usize],1);
         assert_eq!(geometry.counters[QueryCounter::ObservationFootprintCacheHits as usize],1);
@@ -3439,7 +3467,7 @@ mod tests {
                 else { f64::from_bits(changed[index].to_bits() + 1) };
             let other = ([changed[0], changed[1], changed[2]],
                 [changed[3], changed[4], changed[5], changed[6]]);
-            assert_eq!(cache.cells(other).unwrap(), &map.body_observation_footprint(other).unwrap());
+            assert_eq!(cache.cells(other).unwrap(), map.body_observation_footprint(other).unwrap().into_iter().collect::<Vec<_>>().as_slice());
             assert_eq!(cache.builds, 2 + index * 2, "全部七个输入位模式均属于键");
             cache.cells(other).unwrap();
             assert_eq!(cache.builds, 2 + index * 2);
@@ -3466,7 +3494,7 @@ mod tests {
         for pair in poses.windows(2) {
             map.validate_body_motion_checked(pair[0], pair[1], &[], |pose| {
                 queries += 1;
-                assert_eq!(cache.cells(pose)?, &map.body_observation_footprint(pose)?);
+                assert_eq!(cache.cells(pose)?, map.body_observation_footprint(pose)?.into_iter().collect::<Vec<_>>().as_slice());
                 Ok(())
             }).unwrap();
         }

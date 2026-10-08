@@ -754,7 +754,12 @@ impl SurfaceFollower {
                 .config
                 .kinematics()
                 .is_none_or(|m| m.can_rotate_in_place);
-            if alignment_error.abs() < 0.6 || error.abs() < 0.6 || !rotate_allowed {
+            // OFF receives sparse reference segments, not Scan's executable
+            // curve tangents. Alignment with the incoming segment cannot permit
+            // translation toward a waypoint still beside/behind the actual body;
+            // alternating those intents caused a turn/micro-motion limit cycle.
+            if self.config.local_planning_enabled && alignment_error.abs() < 0.6
+                || error.abs() < 0.6 || !rotate_allowed {
                 let angular=self.config.motion_limits.as_ref().map_or_else(||
                     self.config.kinematics().map_or(self.config.max_angular_speed_rps,|motion|
                         motion.max_angular_rps.min(self.config.max_angular_speed_rps)),|motion|motion.max_angular_rps);
@@ -1109,6 +1114,34 @@ mod query_reuse_tests {
                 body_to_support_z_m:0.4,max_step_up_m:0.0,max_step_down_m:0.0,
                 max_cross_slope_deg:18.0,support_uncertainty_m:0.0}).unwrap()
             .with_observations(Some(Arc::new(observations)))
+    }
+
+    #[test]
+    fn off_sparse_corner_turns_toward_actual_waypoint_before_translation() {
+        let make=|x:f64,y:f64,yaw:f64|PoseStamped {frame_id:nuwax_nav_types_messages::NavFrameId::Map,
+            stamp:nuwax_nav_types_messages::Timestamp::from_unix(1,0),
+            pose:Pose3 {position:Point3::new(x,y,0.4),orientation:Quaternion::from_yaw(yaw)}};
+        let actual=make(2.55,1.85,0.3);
+        let path=Path3D {poses:vec![make(1.05,0.55,0.15),make(2.35,2.05,0.17),make(5.05,1.55,-0.2)]};
+        let source=Arc::new(map(0.0));
+        let mut config=SurfaceFollowerConfig::new(0.3);config.local_planning_enabled=false;
+        config.controller.simulation=true;config.controller.speed=0.5;config.controller.control_frequency=20.0;
+        config.motion_limits=Some(nuwax_nav_types_messages::MotionLimits {
+            model:nuwax_nav_types_messages::MotionModel::Differential,max_forward_mps:0.5,
+            max_reverse_mps:0.0,max_lateral_mps:0.0,max_angular_rps:0.8,
+            linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,angular_acceleration_rps2:2.0,
+            guaranteed_angular_braking_rps2:2.0,reaction_time_sec:0.05,minimum_turning_radius_m:0.0,can_rotate_in_place:true,
+        });
+        let mut follower=SurfaceFollower::new(config).unwrap();
+        follower.cumulative=cumulative_lengths(&path);follower.goal=path.poses.last().cloned();
+        follower.path=Some(path);follower.path_index=1;follower.map=Some(source.clone());follower.source_map=Some(source);
+        follower.odometry=Some(actual.clone());
+        let step=follower.step(0.2);
+        assert!(matches!(step,PlannerStep::Command(c) if c.linear.x==0.0 && c.angular_z>0.0),
+            "incoming-segment alignment must not start a turn/translation cycle: {step:?}");
+        let target=follower.control_target.unwrap();
+        assert_eq!([target.x,target.y],[actual.pose.position.x,actual.pose.position.y]);
+        assert!(follower.check_selected_candidate_for_test(follower.last_command));
     }
 
     #[test]

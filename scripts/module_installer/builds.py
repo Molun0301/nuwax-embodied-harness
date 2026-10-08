@@ -408,9 +408,13 @@ def _build_native(root: Path, prefix: Path, cache: Path, name: str, jobs: int,
     native_cache = cache / "build" / "native"
     livox_copy = native_cache / "livox-source"
     _prepare_livox(livox, livox_copy)
-    _cmake(livox_copy, native_cache / "livox", prefix, jobs, run, (
+    # Keep consumer include/link paths stable across installation generations.
+    # This small SDK install shares the existing native cache lifetime.
+    livox_prefix = native_cache / "livox-install"
+    _cmake(livox_copy, native_cache / "livox", livox_prefix, jobs, run, (
         "-DBUILD_SHARED_LIBS=ON", "-DCMAKE_INSTALL_RPATH=$ORIGIN",
     ))
+    run(("cmake", "--install", str(native_cache / "livox"), "--prefix", str(prefix)))
     library = prefix / "lib" / "liblivox_lidar_sdk_shared.so"
     if not library.is_file():
         raise RuntimeError(f"雷达开发库构建未产生预期共享库：{library}")
@@ -419,7 +423,7 @@ def _build_native(root: Path, prefix: Path, cache: Path, name: str, jobs: int,
         "-DFETCHCONTENT_SOURCE_DIR_DIMOS_LCM=" + str(messages),
         "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
         "-DLIVOX_COMMON_DIR=" + str(root / _NATIVE_ROOT / "common"),
-        "-DLIVOX_SDK=" + str(library),
+        "-DLIVOX_SDK=" + str(livox_prefix / "lib/liblivox_lidar_sdk_shared.so"),
         "-DCMAKE_PREFIX_PATH=" + str(prefix),
         "-DCMAKE_INSTALL_RPATH=$ORIGIN/../lib",
     ))

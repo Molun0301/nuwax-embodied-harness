@@ -279,7 +279,8 @@ class LivoxPreparationTests(unittest.TestCase):
                                                         if arg.startswith("-DCMAKE_INSTALL_PREFIX=")))
                     elif argv[1] == "--install":
                         build_path = Path(argv[2])
-                        prefix = prefixes[build_path]
+                        prefix = (Path(argv[argv.index("--prefix") + 1])
+                                  if "--prefix" in argv else prefixes[build_path])
                         output = prefix / ("lib/liblivox_lidar_sdk_shared.so" if build_path.name == "livox"
                                            else "bin/" + frontend + "_native")
                         output.parent.mkdir(parents=True, exist_ok=True)
@@ -296,12 +297,42 @@ class LivoxPreparationTests(unittest.TestCase):
                         second = builds._build_native(root, root / "generation-2", cache, frontend, 2, run)
                 self.assertEqual(first.read_bytes(), second.read_bytes())
                 self.assertEqual(identities(prepared), before)
-                self.assertEqual(len(commands), 12)
-                self.assertEqual([cmd[1] for cmd in commands], ["-S", "--build", "--install"] * 4)
-                self.assertEqual(commands[0][2], commands[6][2])
-                self.assertEqual(commands[0][4], commands[6][4])
-                for generation in ("generation-1", "generation-2"):
-                    self.assertTrue((root / generation / "lib/liblivox_lidar_sdk_shared.so").is_file())
+                self.assertEqual(len(commands), 14)
+                self.assertEqual([cmd[1] for cmd in commands],
+                                 ["-S", "--build", "--install", "--install", "-S", "--build", "--install"] * 2)
+                self.assertEqual(commands[0], commands[7])
+                stable_prefix = cache / "build/native/livox-install"
+                stable_library = stable_prefix / "lib/liblivox_lidar_sdk_shared.so"
+                self.assertTrue(stable_library.is_file())
+                self.assertIn("-DCMAKE_INSTALL_PREFIX=" + str(stable_prefix), commands[0])
+                for index, generation in enumerate(("generation-1", "generation-2")):
+                    prefix = root / generation
+                    offset = index * 7
+                    self.assertEqual(commands[offset + 3],
+                                     ("cmake", "--install", str(cache / "build/native/livox"),
+                                      "--prefix", str(prefix)))
+                    consumer = commands[offset + 4]
+                    self.assertIn("-DLIVOX_SDK=" + str(stable_library), consumer)
+                    self.assertIn("-DCMAKE_INSTALL_PREFIX=" + str(prefix), consumer)
+                    self.assertIn("-DCMAKE_PREFIX_PATH=" + str(prefix), consumer)
+                    self.assertIn("-DCMAKE_INSTALL_RPATH=$ORIGIN/../lib", consumer)
+                    self.assertTrue((prefix / "lib/liblivox_lidar_sdk_shared.so").is_file())
+                    self.assertTrue((prefix / ("bin/" + frontend + "_native")).is_file())
+
+                # A populated build cache cannot stand in for this generation's
+                # runtime SDK. Preserve the original installation postcondition.
+                def omit_generation_install(argv, **kwargs):
+                    if argv[1] == "--install" and "--prefix" in argv:
+                        return
+                    run(argv, **kwargs)
+
+                with patch.object(builds, "_checkout", side_effect=checkout), \
+                     patch.object(builds, "_locked_source", return_value=("fixture", "a" * 40)), \
+                     self.assertRaisesRegex(RuntimeError, "generation-missing/lib/liblivox_lidar_sdk_shared.so"):
+                    builds._build_native(root, root / "generation-missing", cache, frontend, 2,
+                                         omit_generation_install)
+                self.assertTrue(stable_library.is_file())
+                self.assertFalse((root / "generation-missing" / ("bin/" + frontend + "_native")).exists())
 
 
 if __name__ == "__main__":

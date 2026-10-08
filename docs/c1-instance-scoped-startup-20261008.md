@@ -102,3 +102,39 @@ python3 -B scripts/check_gateway_cleanup_ownership.py \
 证据：`task-2/startup-argv-final.log`、`task-2/startup-argv-final/results.json`、`task-2/startup-argv-baseline.log`、`task-2/startup-argv-baseline/results.json`。本轮生产增量为 `task-2/c1-startup-argv-production-delta.patch`。bash -n、git diff --check 和 Python 3.8 语法检查通过；实际执行 Python 3.12.3，未运行精确 3.8.10。
 
 仅三文件变更，交回父任务审查后冻结；无 Git 写操作、宿主网关、原生构建或重复安装计时。
+
+
+## 第三轮审查：信号 trap 返回状态
+
+真实受管 core 网关验证发现：只向 supervisor 发 SIGTERM 时，bash 正在等待 worker；`process_belongs_to_instance` 虽完成成功比较，但后面的裸 `return` 在信号 trap 调用链继承被中断 wait 的状态 143。supervisor 跳过 worker 和 activation monitor 后退出，后代继续持有启动锁。单独最小探针确认 `bare_return=143 explicit_return=0`。因此上一轮普通 CLI 停止与轻量 worker 通过，不能覆盖受管生命周期仅停止 supervisor 的路径。
+
+本轮生产修改只涉及两个既有谓词：归属 helper 的三处裸返回、托管角色 helper 的四个 native case 返回及 Python -m 分支返回，均改为 `return $?`；补充 trap 语义注释。归属标记、路径规则、角色识别、信号范围、锁与超时均不变。没有将无法确认归属的旧实例纳入清理。
+
+直接回归新增两项：在真实 SIGTERM trap 内核对归属与托管谓词真假；使用生产 write_runtime 生成受管 launcher、完整 shell supervisor 和轻量 Python worker，仅给 supervisor 发 TERM，再核对其自有 worker/monitor 消失、PID 文件删除、同一锁可重新获取，其他安装进程存活。该直接用例使用指向测试解释器的 venv 路径夹具，不宣称真实产品运行；下述单独集成使用真实安装器、真实 venv 和产品网关。
+
+21/21 通过（20.485 秒，轻量回归墙钟）。修复前同套 21 项中 19 通过、2 失败：trap 内归属谓词失败、supervisor TERM 后子进程残留。初次测试夹具缺少 customrobot 元数据的失败日志也保留，补齐所需实际 manifest.py/assembly.py 后才完成上述最终对照。实际 Python 3.12.3；3.8 语法检查通过，未运行精确 3.8.10。
+
+直接证据：`task-2/trap-return-fix/final.log`、`final/results.json`、`final-baseline.log`、`final-baseline/results.json`。生产差异：`task-2/trap-return-fix/production-delta.patch`。
+
+
+### 真实产品健康失败回退集成
+
+先完成 `74b9256c6279944a423a4217ca4499c86d59fb92` + trap 候选的独立集成；该轮用已有制品目录配置把账本放在 runtime_data，真实安装/错误版本 HTTP/原 120 秒校验/回退均通过。随后父任务发布账本精确根锚定 ignore 的 `2c7d53005449a445f28940b5c9c72bc15be0220a`，最终新夹具改用该发布版本 + 相同 trap 候选，不再覆盖制品目录。
+
+源码从独立对象库的指定提交读取全部跟踪文件，不复制共享工作树候选；唯一源码覆盖是本节八处返回状态及注释。测试 origin/checkout 内建立本地基线提交，目标提交只将真实 `gateways/updates.py` 的 running_revision 赋值改为错误值。该故障只在测试提交中，生产网关文件未修改。固定发布来源与本地测试提交的不同身份保存在 source-receipt.json，不把本地 fixture revision 冒充发布 SHA。
+
+最终夹具：`/home/ml/Documents/Codex/2026-10-08/task-2/real-gateway-recovery-2c7d530-default/`。真实 core/customrobot/foreground 安装使用现有只读 wheel 缓存，完全离线。默认路径实际生成两份 SQLite 账本，生产 require_clean 通过；没有迁移、删除账本或扩大忽略范围。实际生产调用链为 queue → dispatch → execute → foreground stop_current → 真实 manager.apply(repair=True, keep_previous=True) → 真实生成 launcher → 产品 uvicorn 网关 → 原 verify → stop/reset/current 回退 → 真实旧网关重新启动及核验。安装、停止、启动、HTTP、Git 回退和超时均未 mock。
+
+最终结果：**通过**。目标安装成功，真实 `/api/updates` 返回注入的错误版本；从 verifying 到 rolling_back 120.518 秒，保持原 120 秒超时。源码和 current 恢复至旧代际，新的恢复网关返回旧 revision，`/api/updates/readiness` 为 true，恢复后的 pip check 通过。
+
+| 阶段 | supervisor PID | worker PID | 验收 |
+| --- | --- | --- | --- |
+| 初始旧版 | 110 | 164 | 在目标构建前已退出 |
+| 失败目标 | 477 | 532 | 恢复后确认已退出 |
+| 恢复旧版 | 1831 | 1886 | 全新进程，旧版本接口和 readiness 通过 |
+
+还记录每个进程的 start_ticks，避免仅凭 PID 数字推断身份。最终停止恢复实例后，本安装所有自有子进程均消失，启动锁可重新获取。旧代际与失败目标代际均保留，外部 wheel 缓存只读可用。core 的 binaries 为空，没有原生编译、模型/设备调用；本轮是正确性验收，不是新的安装计时或原生增量收益证据。
+
+关键证据（均在最终夹具 evidence/）：result.json、source-receipt.json、namespace-command.json、default-ledger-path-clean.json、old-real-http.json、new-real-wrong-version.json、restored-real-http.json、phase-observations.json、old/new/recovered-owned-processes.json。原始生产日志位于 checkout/runtime_data/updates/worker.log 与 build.log。早期默认数据库阻塞、驱动环境错误、裸 return 失败及所有后续对照均保留，没有覆盖失败现场。
+
+本轮只修改启动脚本、直接回归和本文档；共享仓库不暂存、不提交、不推送。所有服务位于私有 PID/mount/network namespace，宿主根只读，最小 /dev，退出后无测试服务；未操作宿主网关、systemd、机器人、认证或网络配置。实际解释器 Python 3.12.3，仍无精确 3.8.10 执行证明。三文件交回父任务审查后冻结。

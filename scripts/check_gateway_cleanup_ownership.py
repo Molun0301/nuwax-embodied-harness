@@ -7,6 +7,7 @@ All fixtures and logs are retained under the requested evidence directory.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -296,7 +297,7 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
 
-    def launch_supervisor(self, script, action, label, relative=False):
+    def launch_supervisor(self, script, action, label, relative=False, bootstrap=None):
         logpath = self.base / ('supervisor-' + label + '.log')
         with logpath.open('w') as log:
             environment = dict(os.environ)
@@ -310,8 +311,70 @@ class CleanupTests(unittest.TestCase):
             time.sleep(.02)
         self.assertTrue((self.root / 'worker-ready').exists(), logpath.read_text())
         self.assertEqual(self.pidfile.read_text().strip(), str(p.pid))
-        self.assertIn(('NUWAX_BOOTSTRAP_ENV_FILE=' + str(self.root / '.env')).encode(), Path('/proc', str(p.pid), 'environ').read_bytes().split(b'\0'))
+        self.assertIn(('NUWAX_BOOTSTRAP_ENV_FILE=' + str(bootstrap or self.root / '.env')).encode(), Path('/proc', str(p.pid), 'environ').read_bytes().split(b'\0'))
         return p
+
+    def test_signal_trap_preserves_ownership_and_managed_predicates(self):
+        own = self.spawn('ordinary-owned-child')
+        other = self.spawn('ordinary-other-child', owner='other')
+        managed = self.spawn('nuwax-nav-stack')
+        code = '''check_trap() {
+  process_belongs_to_instance "$OWN" || exit 71
+  if process_belongs_to_instance "$OTHER"; then exit 72; fi
+  process_managed_by_systemd "$MANAGED" || exit 73
+  if process_managed_by_systemd "$OWN"; then exit 74; fi
+}
+trap check_trap TERM
+(sleep 0.1; kill -TERM $$) &
+wait "$!" || true
+'''
+        self.shell(code, environment=dict(self.environment, OWN=str(own.pid), OTHER=str(other.pid),
+                                         MANAGED=str(managed.pid), NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD='true'))
+        self.alive(own, other, managed)
+
+    def test_managed_launcher_supervisor_only_term_releases_children_and_lock(self):
+        self.prepare_supervisor()
+        (self.root / 'drivers/customrobot').mkdir(parents=True)
+        for name in ('manifest.py', 'assembly.py'):
+            shutil.copyfile(ROOT / 'drivers/customrobot' / name, self.root / 'drivers/customrobot' / name)
+        sys.path.insert(0, str(ROOT))
+        from scripts.module_installer.runtime import write_runtime
+        (self.prefix / 'venv/bin').mkdir(parents=True)
+        (self.prefix / 'venv/bin/python').symlink_to(sys.executable)
+        write_runtime(self.root, self.prefix, ('core',), 'customrobot',
+                      {'NUWAX_GATEWAY_RESTART': 'on-failure', 'NUWAX_GATEWAY_PORT': '18766',
+                       'NUWAX_GATEWAY_STOP_TIMEOUT_SEC': '1', 'NUWAX_GATEWAY_KILL_TIMEOUT_SEC': '1'})
+        self.pidfile = self.root / 'runtime_data/gateway/gateway.pid'
+        p = self.launch_supervisor(self.prefix / 'start.sh', 'start', 'managed',
+                                   bootstrap=self.prefix / 'settings.env')
+        other = self.spawn('unrelated-child', owner='other')
+        worker = int((self.root / 'worker-ready').read_text())
+        p.send_signal(signal.SIGTERM)  # Only the supervisor, as foreground lifecycle.stop_current does.
+        self.exited(p)
+        marker = ('NUWAX_INSTALL_HOME=' + str(self.home)).encode()
+        remaining = []
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            remaining = []
+            for path in Path('/proc').iterdir():
+                if not path.name.isdigit():
+                    continue
+                try:
+                    if path.joinpath('stat').read_text().rsplit(')', 1)[1].split()[0] == 'Z':
+                        continue
+                    if marker in path.joinpath('environ').read_bytes().split(b'\0'):
+                        remaining.append(int(path.name))
+                except OSError:
+                    pass
+            if not remaining:
+                break
+            time.sleep(.02)
+        self.assertEqual(remaining, [], 'Owned worker/monitor survived supervisor TERM')
+        self.assertNotIn(worker, remaining)
+        self.assertFalse(self.pidfile.exists())
+        with (self.root / 'runtime_data/gateway/start_gateway.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.alive(other)
 
     def test_full_supervisor_cli_stop_and_second_start(self):
         script = self.prepare_supervisor()

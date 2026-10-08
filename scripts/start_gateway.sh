@@ -235,6 +235,8 @@ pid_pgid() {
 }
 
 process_belongs_to_instance() {
+  # Explicit statuses also preserve predicate results in a signal trap. Bare
+  # return there would inherit the interrupted wait status (for example 143).
   local pid="$1" entry="" home="" bootstrap="" launcher="" expected=""
   local -a argv=()
   [[ -r "/proc/${pid}/environ" ]] || return 1
@@ -251,7 +253,7 @@ process_belongs_to_instance() {
     if [[ -n "${home}" ]]; then
       [[ "${home}" = /* ]] || return 1
       [[ "$(readlink -m -- "${home}")" == "${expected}" ]]
-      return
+      return $?
     fi
     # Older managed generations may only export their settings/launcher path.
     for entry in "${bootstrap}" "${launcher}"; do
@@ -267,14 +269,14 @@ process_belongs_to_instance() {
     # Relative legacy markers cannot establish where the process loaded config.
     [[ "${bootstrap}" = /* ]] || return 1
     [[ "$(readlink -m -- "${bootstrap}")" == "$(readlink -m -- "${ENV_FILE}")" ]]
-    return
+    return $?
   fi
   # Legacy default-config children exported the launcher but not bootstrap.
   [[ "$(readlink -m -- "${ENV_FILE}")" == "${REPO_ROOT}/.env" ]] || return 1
   if [[ -n "${launcher}" ]]; then
     [[ "${launcher}" = /* ]] || return 1
     [[ "$(readlink -m -- "${launcher}")" == "${REPO_ROOT}/scripts/start_gateway.sh" ]]
-    return
+    return $?
   fi
   # An old unmarked supervisor can still be stopped through its own PID file,
   # exact script invocation and working directory. Names alone never suffice.
@@ -298,16 +300,16 @@ process_managed_by_systemd() {
   # Only executable titles/basenames identify native roles; paths and ordinary
   # arguments can contain component names without making the process a component.
   case "${executable}" in
-    nuwax-geometry-runtime|nuwax-lcm-runtime) geometry_runtime_managed_by_systemd; return ;;
-    nuwax-nav-stack) nav_stack_managed_by_systemd; return ;;
-    nuwax-person-follow) person_follow_managed_by_systemd; return ;;
-    nuwax-video-streamer|nuwax-go2-video-streamer) go2_video_streamer_managed_by_systemd; return ;;
+    nuwax-geometry-runtime|nuwax-lcm-runtime) geometry_runtime_managed_by_systemd; return $? ;;
+    nuwax-nav-stack) nav_stack_managed_by_systemd; return $? ;;
+    nuwax-person-follow) person_follow_managed_by_systemd; return $? ;;
+    nuwax-video-streamer|nuwax-go2-video-streamer) go2_video_streamer_managed_by_systemd; return $? ;;
   esac
   # The Python component launcher uses: python[version] -m <module>.
   if [[ "${executable}" =~ ^python([0-9]+([.][0-9]+)*)?$
     && "${argv[1]:-}" == "-m" && "${argv[2]:-}" == "drivers.go2.video_streamer" ]]; then
     go2_video_streamer_managed_by_systemd
-    return
+    return $?
   fi
   return 1
 }

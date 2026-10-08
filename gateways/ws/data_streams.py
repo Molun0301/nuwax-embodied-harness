@@ -472,9 +472,9 @@ def _stream_json_default(value):
     raise TypeError(type(value).__name__)
 
 
-def _stream_json_dumps(value) -> str:
+def _stream_json_dumps(value, *, ensure_ascii: bool = False) -> str:
     try:
-        return json.dumps(value, default=_stream_json_default, ensure_ascii=False,
+        return json.dumps(value, default=_stream_json_default, ensure_ascii=ensure_ascii,
                           allow_nan=False, separators=(",", ":"))
     except (TypeError, ValueError):
         # 非规范诊断对象仍可展示；正常消息不经过整棵对象树的防御投影。
@@ -1659,6 +1659,16 @@ def _format_sse(event_name: str, payload: object, *, cursor: Optional[object] = 
             "id: %s" % _pointcloud_identity_integer(cursor, "cursor")
         )
     lines.append(f"event: {event_name}")
-    lines.append(f"data: {_strict_json_dumps(payload)}")
+    # 实例主题沿用 WS 的公开视图编码；源端 limit 只限制行数，不限制总字节。
+    if isinstance(payload, StreamFrame) and payload.topic == "memory.instances":
+        try:
+            # JSON 转义保证 SSE 文本可编码为 UTF-8，不预扫描或截断公开名称。
+            encoded = _stream_json_dumps(payload, ensure_ascii=True)
+        except Exception:
+            # 沿用旧 SSE 的诊断投影，避免异常对象中断已经开始的响应。
+            encoded = _strict_json_dumps(payload)
+    else:
+        encoded = _strict_json_dumps(payload)
+    lines.append(f"data: {encoded}")
     lines.append("")
     return "\n".join(lines) + "\n"

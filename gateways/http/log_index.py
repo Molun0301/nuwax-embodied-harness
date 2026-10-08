@@ -22,6 +22,19 @@ class _UnsupportedProjection(Exception):
     """敏感排序或组件字段无法无损地持久索引，须沿原扫描路径查询。"""
 
 
+def _sqlite_contention(error):
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+    code = getattr(error, "sqlite_errorcode", None)
+    if code is not None:
+        # SQLite's stable primary result codes; Python 3.8 does not export
+        # the named constants or attach sqlite_errorcode to its exceptions.
+        return code & 0xff in (5, 6)  # SQLITE_BUSY, SQLITE_LOCKED
+    message = str(error)
+    return (message in ("database is locked", "database table is locked", "database schema is locked")
+            or message.startswith(("database table is locked: ", "database schema is locked: ")))
+
+
 class _WorkBudget:
     def __init__(self):
         self.started = time.monotonic()
@@ -495,8 +508,7 @@ class LogHistoryReader:
             self.close()
             # 不记录原文、路径或SQL参数；此失败只影响可重建的缓存。
             _LOGGER.warning("历史日志持久索引不可用，使用完整扫描：%s", type(error).__name__)
-            transient_sqlite = (isinstance(error, sqlite3.OperationalError)
-                                and getattr(error, "sqlite_errorcode", 0) & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED))
+            transient_sqlite = _sqlite_contention(error)
             if not isinstance(error, protocol._LogSnapshotChanged) and not transient_sqlite:
                 self.failed_scope = scope
         return protocol.query_logs(log_file, **options)

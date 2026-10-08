@@ -265,3 +265,6 @@ mod sampling_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "mls-adapter"))]
+mod dense_terrain_tests;

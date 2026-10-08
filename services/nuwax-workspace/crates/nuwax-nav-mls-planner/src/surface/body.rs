@@ -112,13 +112,15 @@ impl CurrentBodySupport {
 }
 
 /// 数学核心使用的机体和地形参数；外层从唯一标定契约转换。
+/// 当前许可同时核验凸柱碰撞和投影下的连续地面；不是离散足端接触或足步执行模型。
+/// 凸柱包络不能用来推断实时腿部姿态、点的自体身份或地面承载材质。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SurfaceBodyEnvelope {
     /// 机体坐标中的逆时针凸包。
     pub footprint_xy_m: Vec<[f64; 2]>,
     /// 机体最低/最高局部高度。
     pub z_bounds_m: [f64; 2],
-    /// 机体到支撑参考点的正距离。
+    /// 机体到支撑参考点的正标定距离；不是实时腿部状态，也不声明固定机身高度能力。
     pub body_to_support_z_m: f64,
     /// 最大上阶高度。
     pub max_step_up_m: f64,
@@ -1747,9 +1749,15 @@ impl SurfaceSnapshot {
         }
     }
 
-    /// 粗列中心连段失真时，仅由实际参考经过的共同真实占据带补证。
+    /// 粗列中心连段失真时，由实际参考经过的共同占据带或真实踏面补证。
     /// 细列露顶仍遵循原上下阶能力；完整足迹、包络及观察随后沿实际曲线核验。
     fn fine_contact_support_samples(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]))->Option<Vec<f64>> {
+        self.fine_common_contact_support_samples(from,to)
+            .or_else(||self.fine_observed_tread_support_samples(from,to))
+    }
+
+    // 原共同占据带证明保持不变；新离散踏面证明不能扩大它的高度区间。
+    fn fine_common_contact_support_samples(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]))->Option<Vec<f64>> {
         let observations=self.observations.as_ref()?;
         if observations.size_m>=self.config().voxel_size {return None;}
         let size=f64::from(observations.size_m);let coarse=f64::from(self.config().voxel_size);
@@ -1818,6 +1826,89 @@ impl SurfaceSnapshot {
             // 所有实际参考及对角侧列共同落在已观测带内，不能逐格换层跨空隙。
             if low>high || minimum<f64::from(low)*size-1e-6 || maximum>(f64::from(high)+2.0)*size+1e-6 {return None;}
             previous=Some((x,y,current));
+        }
+        Some(samples)
+    }
+
+    /// 粗剖面跨入下一块地形时，按原始细体素的真实宽度核验已声明的踏面能力。
+    /// 只补证支撑参考的连接；调用者仍检查完整机体、接触事件、边界和观察时效。
+    /// 不删占据、不生成地面，不把相同粗列里的独立楼层连接起来。
+    fn fine_observed_tread_support_samples(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]))->Option<Vec<f64>> {
+        let observations=self.observations.as_ref()?;
+        if !observations.is_complete_geometry_source()
+            || observations.size_m.to_bits()!=self.source_voxel_size_m().to_bits() {return None;}
+        let model=self.body_envelope()?;
+        let size=f64::from(observations.size_m);
+        // 深度按源体素的有证据区间计算，而不是把粗格中心间距当作完整踏面。
+        // 与配置中的粗剖面同用f32除法；提升成f64再ceil会把20cm/1cm误算为21格。
+        let depth=(self.config().min_step_tread_depth_m/observations.size_m).ceil();
+        // 仅限制源坐标可表示范围；粗格剖面的128格上限不能套到细格数量上。
+        if !depth.is_finite() || depth<1.0 || depth>=i32::MAX as f32 {return None;}
+        let depth=depth as i32;
+        let occupied=|key:[i32;3]|observations.supports_obstacle(key)
+            && !self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&key));
+        let exposed=|key:[i32;3]| {
+            occupied(key) && key[2].checked_add(1).is_some_and(|above|
+                !observations.supports_obstacle([key[0],key[1],above]))
+        };
+        let select=|pose:([f64;3],[f64;4])|->Option<[i32;3]> {
+            let support=self.locate_support_from_body(pose.0,pose.1,model.body_to_support_z_m).ok()?;
+            let reference=self.support_position_from_body(pose.0,pose.1,model.body_to_support_z_m).ok()?;
+            let xy=[(reference[0]/size).floor() as i32,(reference[1]/size).floor() as i32];
+            // 粗顶可能来自同格另一半；限定已选支撑带，在当前细列取实际最高顶。
+            // 按有序列索引二分，不扫描别的XY或任意楼层，也不以清理结果降低顶面。
+            let lower=self.observed_support_lower_bound(support.cell);
+            let levels=observations.column_levels(xy[0],xy[1])?;
+            let end=levels.partition_point(|&z|(f64::from(z)+1.0)*size<=support.surface_xyz[2]+1e-6);
+            let z=*levels.get(end.checked_sub(1)?)?;
+            if f64::from(z)*size<lower-1e-6 {return None;}
+            let key=[xy[0],xy[1],z];
+            exposed(key).then_some(key)
+        };
+        let tread=|key:[i32;3],direction:[i32;2]|->bool {
+            (0..depth).all(|step| {
+                let Some(x)=direction[0].checked_mul(step).and_then(|v|key[0].checked_add(v)) else{return false;};
+                let Some(y)=direction[1].checked_mul(step).and_then(|v|key[1].checked_add(v)) else{return false;};
+                exposed([x,y,key[2]])
+            })
+        };
+        // 单次查询内只对有高差的唯一有向边扫描踏面；不新增共享缓存或许可寿命。
+        let mut checked_steps=std::collections::BTreeSet::new();
+        let mut edge=|a:[i32;3],b:[i32;3]|->bool {
+            let dx=b[0].abs_diff(a[0]);let dy=b[1].abs_diff(a[1]);
+            if dx+dy!=1 {return false;}
+            let rise=(f64::from(b[2])-f64::from(a[2]))*size;
+            if rise==0.0 || checked_steps.contains(&(a,b)) {return true;}
+            let limit=if rise>0.0 {model.max_step_up_m}else{model.max_step_down_m};
+            if rise.abs()+2.0*model.support_uncertainty_m>limit+1e-6
+                || rise.abs()>f64::from(self.config().step_threshold_m)+1e-6 {return false;}
+            let direction=[(b[0]-a[0]).signum(),(b[1]-a[1]).signum()];
+            if !tread(a,[-direction[0],-direction[1]]) || !tread(b,direction) {return false;}
+            checked_steps.insert((a,b));true
+        };
+        // 复用原路径网格事件；平段只做选顶，不按采样数乘踏深虚构几何否决门槛。
+        let samples=self.body_support_grid_fractions(from,to,size).ok()?;
+        let mut previous:Option<[i32;3]>=None;
+        for &t in &samples {
+            let pose=interpolated_body_pose(from,to,t);
+            let current=select(pose)?;
+            if let Some(a)=previous {
+                if a==current {continue;}
+                let dx=current[0].abs_diff(a[0]);let dy=current[1].abs_diff(a[1]);
+                if dx>1 || dy>1 || dx+dy==0 {return None;}
+                if dx+dy==1 {
+                    if !edge(a,current) {return None;}
+                } else {
+                    // 对角必须两侧均有同层的真实连接，不能切过坑或独立层。
+                    for xy in [[a[0],current[1]],[current[0],a[1]]] {
+                        // 只允许端点支撑层，不经第三高度拆分一次过高的对角阶差。
+                        let side=[a[2],current[2]].into_iter().map(|z|[xy[0],xy[1],z])
+                            .any(|side|exposed(side)&&edge(a,side)&&edge(side,current));
+                        if !side {return None;}
+                    }
+                }
+            }
+            previous=Some(current);
         }
         Some(samples)
     }
@@ -5823,3 +5914,7 @@ mod passage_tests;
 #[cfg(test)]
 #[path = "contact_domain_tests.rs"]
 mod contact_domain_tests;
+
+#[cfg(test)]
+#[path = "body_terrain_contract_tests.rs"]
+mod terrain_contract_tests;

@@ -206,6 +206,17 @@ async function runChecks() {
       assert.equal(t.previews.at(-1), null);
     }
   });
+  await check('planner failure cause survives terminal task rendering without an unreachable claim', async () => {
+    const h = harness(); await h.submit(); await h.advance(0);
+    const cause = 'planner path timeout; prior=BudgetExhausted; clearance unknown';
+    h.pending()[0].resolve({status: {state: 'failed', message: '任务执行失败: ' + cause},
+      error: cause, error_payload: {code: 'navigation_failed', message: cause}});
+    await flush();
+    assert(h.detail().includes(cause));
+    assert(!h.detail().includes('target_not_reachable'));
+    assert.equal(h.timerCount(), 0);
+    assert.equal(h.module.getState().inflightRequestId, null);
+  });
   await check('network, HTTP, and body failures retry without wedging', async () => {
     const h = harness(); await h.submit(); await h.advance(0);
     h.pending()[0].reject(new Error('offline')); await flush();

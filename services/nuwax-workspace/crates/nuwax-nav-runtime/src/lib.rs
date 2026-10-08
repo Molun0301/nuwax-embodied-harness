@@ -1641,8 +1641,13 @@ where
             LocalExecutionPayload::Pending(failures) => {
                 self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
                 self.path_wait_started_at.get_or_insert_with(Instant::now);
-                self.status.message = self.planner.execution_wait_reason().unwrap_or_else(||
-                    format!("局部轨迹待定，保持零速等待: {failures:?}"));
+                // Rebuild from this tick's evidence; never append to the previous status.
+                self.status.message = self.planner.execution_wait_reason()
+                    .filter(|reason| !reason.trim().is_empty())
+                    .unwrap_or_else(|| "局部轨迹待定，保持零速等待".into());
+                if !failures.is_empty() {
+                    self.status.message = format!("{}: {failures:?}", self.status.message);
+                }
                 self.publish_status(status_tx);
                 self.check_path_wait_timeout(status_tx).await
             }
@@ -1818,10 +1823,15 @@ where
             || Instant::now().duration_since(started_at) < self.config.path_wait_timeout {
             return Ok(());
         }
-        self.status.message = format!(
+        let timeout_message = format!(
             "planner path timeout after {}ms; fencing",
             self.config.path_wait_timeout.as_millis(),
         );
+        self.status.message = if self.status.message.trim().is_empty() {
+            timeout_message
+        } else {
+            format!("{timeout_message}; {}", self.status.message)
+        };
         self.publish_status(status_tx);
         self.finish_terminal(
             status_tx,
@@ -2965,6 +2975,7 @@ mod tests {
     #[derive(Debug)]
     struct FakePlannerState {
         step: PlannerStep,
+        wait_reason: Option<String>,
         costmap_updates: usize,
         odometry_updates: usize,
         stops: usize,
@@ -2978,6 +2989,7 @@ mod tests {
                         linear: Point2::new(0.2, 0.0),
                         angular_z: 0.1,
                     }),
+                    wait_reason: None,
                     costmap_updates: 0,
                     odometry_updates: 0,
                     stops: 0,
@@ -3005,6 +3017,10 @@ mod tests {
 
         fn step(&mut self, _robot_width_m: f64) -> PlannerStep {
             self.state.lock().expect("fake planner state").step.clone()
+        }
+
+        fn execution_wait_reason(&self) -> Option<String> {
+            self.state.lock().expect("fake planner state").wait_reason.clone()
         }
 
         fn stop(&mut self) {
@@ -3976,7 +3992,11 @@ mod tests {
             assert_eq!(scheduler.current_path, route);
             assert!(scheduler.session.is_some());
             assert_eq!(scheduler.status.phase, SchedulerPhase::Controlling);
-            if scheduler.status.message == "typed search pending" { break; }
+            if scheduler.status.message.contains("typed search pending") {
+                assert!(scheduler.status.message.contains("BudgetExhausted"));
+                assert!(scheduler.status.message.contains("finite search budget"));
+                break;
+            }
             assert!(Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -3984,6 +4004,114 @@ mod tests {
         scheduler.control_tick(&sender).await.unwrap();
         assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
         assert!(scheduler.status.last_zero_ack_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn scheduler_message_pending_retains_reason_and_failures_without_growth() {
+        for wait_reason in [None, Some(""), Some("  "), Some("typed search pending")] {
+            for has_failures in [false, true] {
+                let planner = FakePlanner::commanding();
+                let failures = if has_failures {
+                    vec![nuwax_nav_scan::LocalPlanError {
+                        kind: nuwax_nav_scan::LocalPlanFailureKind::BudgetExhausted,
+                        reason: "finite search budget; observation expired; required clearance".into(),
+                        closest_pose: None,
+                        blocked: None,
+                    }]
+                } else { vec![] };
+                {
+                    let mut state = planner.state.lock().unwrap();
+                    state.step = PlannerStep::Pending(failures);
+                    state.wait_reason = wait_reason.map(str::to_owned);
+                }
+                let mut scheduler = NavScheduler::new(
+                    FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
+                    planner, SchedulerConfig::default()).unwrap();
+                let (sender, _) = watch::channel(scheduler.status.clone());
+                scheduler.observe_odometry(&sender, map_pose(), None).unwrap();
+                scheduler.observe_costmap(&sender, costmap_at(1_000_000_000), Instant::now()).unwrap();
+                scheduler.start_session(&sender, session()).await.unwrap();
+                scheduler.submit_path(&sender, path()).await.unwrap();
+                let original_deadline = scheduler.path_wait_started_at;
+                let identity = scheduler.current_execution_identity.clone();
+                scheduler.control_tick(&sender).await.unwrap();
+                let message = scheduler.status.message.clone();
+                assert!(message.starts_with(wait_reason.filter(|r| !r.trim().is_empty())
+                    .unwrap_or("局部轨迹待定，保持零速等待")));
+                if has_failures {
+                    assert!(message.contains("BudgetExhausted"));
+                    assert!(message.contains("finite search budget; observation expired; required clearance"));
+                } else {
+                    assert!(!message.contains("[]"));
+                    assert!(!message.ends_with(':'));
+                }
+                for _ in 0..3 {
+                    scheduler.control_tick(&sender).await.unwrap();
+                    assert_eq!(scheduler.status.message, message, "repeated ticks must not accumulate text");
+                    assert_eq!(scheduler.path_wait_started_at, original_deadline);
+                    assert_eq!(scheduler.current_execution_identity, identity);
+                    assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
+                    assert_eq!(scheduler.status.last_terminal, None);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_message_timeout_first_terminal_retains_cause_and_fence() {
+        for cause in ["BudgetExhausted: finite search budget", "NearFieldObservation: cell=[1,2,3] expired",
+            "surface does not satisfy the required clearance", "", "  "] {
+            let motion = Arc::new(Mutex::new(FakeMotionState::default()));
+            let mut scheduler = NavScheduler::new(FakeMotion(motion.clone()),
+                FakePlanner::commanding(), SchedulerConfig {
+                path_wait_timeout: Duration::from_secs(1), ..SchedulerConfig::default()
+            }).unwrap();
+            scheduler.session = Some(session());
+            scheduler.lease_active = true;
+            scheduler.path_wait_started_at = Some(Instant::now() - scheduler.config.path_wait_timeout);
+            scheduler.status.message = cause.into();
+            let (sender, observed) = watch::channel(scheduler.status.clone());
+            scheduler.check_path_wait_timeout(&sender).await.unwrap();
+            let status = observed.borrow();
+            assert_eq!(status.last_terminal, Some(TerminalOutcome::PlannerFailed));
+            assert_eq!(status.phase, SchedulerPhase::Failed);
+            assert!(status.message.starts_with("planner path timeout after "));
+            assert!(status.message.contains("ms; fencing"));
+            if !cause.trim().is_empty() { assert!(status.message.contains(cause)); }
+            else { assert!(!status.message.contains("; ;")); }
+            assert!(status.message.ends_with("PlannerFailed after verified fence"));
+            assert_eq!(status.last_zero_ack_id.as_deref(), Some("zero-ack"));
+            assert_eq!(status.last_applied_twist, Some(Twist2::ZERO));
+            assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("fence:")).count(), 1);
+            assert!(scheduler.path_wait_started_at.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_message_timeout_stop_failure_remains_primary() {
+        let motion = Arc::new(Mutex::new(FakeMotionState {
+            unconfirmed_fences: 1, ..Default::default()
+        }));
+        let mut scheduler = NavScheduler::new(FakeMotion(motion.clone()),
+            FakePlanner::commanding(), SchedulerConfig {
+                path_wait_timeout: Duration::from_secs(1), ..SchedulerConfig::default()
+            }).unwrap();
+        scheduler.session = Some(session());
+        scheduler.lease_active = true;
+        scheduler.path_wait_started_at = Some(Instant::now() - scheduler.config.path_wait_timeout);
+        scheduler.status.message = "BudgetExhausted: finite search budget".into();
+        let (sender, observed) = watch::channel(scheduler.status.clone());
+        let error = scheduler.check_path_wait_timeout(&sender).await.unwrap_err();
+        assert!(matches!(error, RuntimeError::StopUnconfirmed(ref reason) if reason == "等待实际停稳"));
+        let status = observed.borrow();
+        assert_eq!(status.message, "等待实际停稳");
+        assert_eq!(status.phase, SchedulerPhase::Failed);
+        assert_eq!(status.last_terminal, None);
+        assert!(status.last_zero_ack_id.is_none());
+        assert!(!status.motion_sink_ready);
+        assert!(scheduler.lease_active);
+        assert!(scheduler.session.is_some());
+        assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("fence:")).count(), 1);
     }
 
     #[tokio::test]

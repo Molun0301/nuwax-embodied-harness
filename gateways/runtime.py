@@ -12500,7 +12500,7 @@ class GatewayRuntime:
                     if status == NavigationStatus.FAILED:
                         raise GatewayError(
                             last_context.navigation_state.message or "导航执行失败。",
-                            error_code="target_not_reachable",
+                            error_code="navigation_failed",
                             http_status=409,
                             jsonrpc_code=-32000,
                             details={

@@ -144,7 +144,7 @@
     "description": "nuwax-mapping 适配器·栅格分辨率(米/像素,默认 0.05)"
   },
   "NUWAX_MAPPING_VOXEL_SIZE": {
-    "zh_name": "建图体素大小（米）",
+    "zh_name": "旧建图适配器体素声明",
     "type": "float",
     "default": 0.05,
     "section_id": "mapping",
@@ -152,8 +152,9 @@
     "consumers": [
       "services/geometry/nuwax_geometry_runtime/src/mapping_adapter.rs"
     ],
-    "apply_scope": "重启几何运行时后生效",
-    "description": "nuwax-mapping 适配器·点云体素大小(米,默认 0.05)"
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "effective_value_scope": "inactive"
   },
   "NUWAX_MAPPING_WIDTH_CELLS": {
     "zh_name": "栅格宽度（格）",
@@ -531,7 +532,8 @@
       "services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs"
     ],
     "apply_scope": "重启几何运行时后生效",
-    "description": ""
+    "description": "",
+    "effective_value_scope": "external_process"
   },
   "NUWAX_MAPPING_RAYTRACING_MAX_RANGE": {
     "zh_name": "射线建图最大射线距离（米）",
@@ -1817,7 +1819,8 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
     ],
     "apply_scope": "重启导航栈与几何运行时后生效",
-    "description": "共享地形索引的分辨率；PCT有完整精细源时使用原始精度。来源点云不能比索引更粗。"
+    "description": "共享地形索引的分辨率；PCT有完整精细源时使用原始精度。来源点云不能比索引更粗。",
+    "effective_value_scope": "external_process"
   },
   "NUWAX_NAV_MIN_STAIR_TREAD_M": {
     "zh_name": "楼梯最小踏面深度（米）",
@@ -2448,5 +2451,95 @@
     "apply_scope": "重启网关后生效",
     "description": "默认仅记录候选；启用后仍须满足证据视角、分数、来源和修订校验。",
     "advanced": false
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_PREPROCESS_ENABLED": {
+    "zh_name": "旧点云预处理开关",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "bool",
+    "default": true,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_VOXEL_SIZE_M": {
+    "zh_name": "旧点云预处理体素",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": 0.05,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_MIN_RANGE_M": {
+    "zh_name": "旧点云最小距离",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": 0.15,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_MAX_RANGE_M": {
+    "zh_name": "旧点云最大距离",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": 8.0,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_MAX_POINTS": {
+    "zh_name": "旧点云最大点数",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "int",
+    "default": 1200,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_MIN_Z_M": {
+    "zh_name": "旧点云裁剪最低高度",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": -0.6,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_MAX_Z_M": {
+    "zh_name": "旧点云裁剪最高高度",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": 1.6,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_FORWARD_MIN_M": {
+    "zh_name": "旧点云裁剪前向起点",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": -0.5,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_FORWARD_MAX_M": {
+    "zh_name": "旧点云裁剪前向终点",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": 6.0,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_LATERAL_M": {
+    "zh_name": "旧点云裁剪侧向范围",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": 3.0,
+    "target_file": "core_env"
   }
 }

@@ -1828,6 +1828,14 @@ class RuntimeInputBridge:
             "sensor_sample_subscription_id": sensor_sample_subscription_id,
             "counters": counters,
             "native_input": native_input,
+            "scan_sampling": {
+                "value_source": "input_bridge_instance",
+                "trigger_points": self.max_points_before_downsample,
+                "target_points": self.max_points_after_downsample,
+                "native_measurement_strategy": "aligned_fields_preserve_first_last_and_max_offset",
+                "legacy_frame_strategy": "stride",
+                "scope": "per_scan_transport_not_map_voxelization",
+            },
         }
 
     def _record_error(self, message: str) -> None:

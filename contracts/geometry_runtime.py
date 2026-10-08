@@ -137,7 +137,7 @@ class GeometryTimestampQualityConfig:
 
 @dataclass
 class GeometryPointCloudPreprocessConfig:
-    """平台几何点云输入预处理配置。"""
+    """旧点云预处理声明，仅兼容保存；当前内置输入执行链不消费这些字段。"""
 
     enabled: bool = True
     voxel_size_m: float = 0.05
@@ -437,6 +437,9 @@ class PlatformGeometryConfig:
                     "timestamp_source": self.mapping.timestamp_quality.source,
                     "max_age_sec": self.mapping.timestamp_quality.max_point_cloud_age_sec,
                     "preprocess": {
+                        "status": "inactive",
+                        "reason": "legacy_configuration_not_consumed",
+                        "value_semantics": "requested_configuration",
                         "enabled": self.mapping.point_cloud_preprocess.enabled,
                         "voxel_size_m": self.mapping.point_cloud_preprocess.voxel_size_m,
                         "min_range_m": self.mapping.point_cloud_preprocess.min_range_m,
@@ -475,6 +478,9 @@ class PlatformGeometryConfig:
             },
             "preprocessing": {
                 "point_cloud": {
+                    "status": "inactive",
+                    "reason": "legacy_configuration_not_consumed",
+                    "value_semantics": "requested_configuration",
                     "enabled": self.mapping.point_cloud_preprocess.enabled,
                     "voxel_size_m": self.mapping.point_cloud_preprocess.voxel_size_m,
                     "crop_z_m": (

@@ -333,7 +333,8 @@ class ConfigurationRevisionChecks(unittest.TestCase):
                      and node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == target]
             self.assertEqual(len(calls), 1)
             keyword = next(item for item in calls[0].keywords if item.arg == 'revision_owner')
-            self.assertEqual(ast.unparse(keyword.value), 'settings_application.revision_owner')
+            self.assertEqual(ast.dump(keyword.value),
+                         ast.dump(ast.parse('settings_application.revision_owner', mode='eval').body))
 
     def lifecycle_factory(self):
         tree = ast.parse((ROOT / 'gateways/http/api.py').read_text())

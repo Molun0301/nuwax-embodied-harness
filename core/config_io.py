@@ -537,18 +537,21 @@ def _build_schema(location, *, profile_snapshot=None, revision_owner=None) -> Di
         edit_value = raw_value if raw_value is not None else effective_vals.get(f.key, default_vals.get(f.key, ""))
         known = f.key in RUNTIME_VALUES
         effective_value = _format_config_value(RUNTIME_VALUES[f.key], f.type) if known else os.environ.get(f.key, edit_value)
-        pending = f.key in _SAVED_SINCE_START or (known and
-            _validate(f.key, str(edit_value), f.type) != _validate(f.key, str(effective_value), f.type))
-        if location or f.effective_value_scope == "external_process":
-            startup = effective_value if known else os.environ.get(f.key, settings._FILE_VALUES.get(f.key, default_vals.get(f.key, "")))
-            normalized_saved = _validate(f.key, str(edit_value), f.type)
-            normalized_startup = _validate(f.key, str(startup), f.type)
-            pending = normalized_saved != normalized_startup
-            if location and apply_mode(f.key) == "hot_and_restart" and (str(location["path"]), f.key) in _SAVED_SINCE_START:
-                pending = True
-        # 网关读取的启动配置不是独立导航后端的采用回执。
-        if f.effective_value_scope == "external_process":
-            known, effective_value = False, None
+        if f.effective_value_scope == "inactive":
+            known, effective_value, pending = False, None, False
+        else:
+            pending = f.key in _SAVED_SINCE_START or (known and
+                _validate(f.key, str(edit_value), f.type) != _validate(f.key, str(effective_value), f.type))
+            if location or f.effective_value_scope == "external_process":
+                startup = effective_value if known else os.environ.get(f.key, settings._FILE_VALUES.get(f.key, default_vals.get(f.key, "")))
+                normalized_saved = _validate(f.key, str(edit_value), f.type)
+                normalized_startup = _validate(f.key, str(startup), f.type)
+                pending = normalized_saved != normalized_startup
+                if location and apply_mode(f.key) == "hot_and_restart" and (str(location["path"]), f.key) in _SAVED_SINCE_START:
+                    pending = True
+            # 网关读取的启动配置不是独立导航后端的采用回执。
+            if f.effective_value_scope == "external_process":
+                known, effective_value = False, None
         def masked(value):
             return _SENSITIVE_MASK if f.sensitive and value else value
         display_value = masked(edit_value)

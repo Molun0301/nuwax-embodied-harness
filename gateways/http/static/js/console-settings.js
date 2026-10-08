@@ -569,8 +569,10 @@ function buildConfigRow(f) {
   }
   if (f.effective_value_known === false) {
     const unknown = document.createElement("span");
-    unknown.textContent = f.effective_value_scope === 'external_process'
-      ? '外部进程实际采用值未核实；此处仅为启动配置' : "当前进程值未采集";
+    unknown.textContent = f.effective_value_scope === 'inactive'
+      ? '兼容保留，当前流水线不使用'
+      : f.effective_value_scope === 'external_process'
+        ? '外部进程实际采用值未核实；此处仅为启动配置' : "当前进程值未采集";
     meta.appendChild(unknown);
   } else if (f.pending_restart && !f.sensitive && f.effective_value !== undefined) {
     const effective = document.createElement("span");

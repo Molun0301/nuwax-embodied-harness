@@ -85,6 +85,8 @@ class StreamBus:
         self._dispatch_queue: collections.deque[_StreamDispatchItem] = collections.deque()
         self._dispatch_draining = False
         self._dispatch_owner_thread_id: Optional[int] = None
+        self._map_frame_interrupted_attempts = 0
+        self._map_frame_cancelled_attempts = 0
 
         # 异步分发队列及消费者线程
         self._async_queue = collections.OrderedDict()
@@ -213,6 +215,12 @@ class StreamBus:
             dispatch_item.completion.wait()
         return publication.frame
 
+    def is_dispatch_thread(self) -> bool:
+        """Include the async consumer so callback-initiated close never self-waits."""
+        with self._lock:
+            return (self._dispatch_owner_thread_id == threading.get_ident()
+                    or self._consumer_thread is threading.current_thread())
+
     @staticmethod
     def _map_identity_key(frame: StreamFrame):
         """内容更新不重置地图来源的游标起点；不读取或复制地图栅格。"""
@@ -270,6 +278,9 @@ class StreamBus:
                     exc_info=True,
                 )
             except BaseException as exc:
+                if dispatch_item.frame.topic == "map.frame":
+                    with self._lock:
+                        self._map_frame_interrupted_attempts += 1
                 # Finish accepted FIFO work before returning ownership to the
                 # caller. Completion means attempted, not delivered to every
                 # subscriber of the interrupted frame; never replay that item.
@@ -293,9 +304,15 @@ class StreamBus:
         dispatch_count = 0
 
         failures: List[Tuple[StreamSubscription, Exception]] = []
+        shutdown_gap_recorded = False
         for subscription in subscriptions:
             with self._lock:
-                if self._shutdown or self._subscriptions.get(subscription.subscription_id) is not subscription:
+                if self._shutdown:
+                    if frame.topic == "map.frame" and not shutdown_gap_recorded:
+                        self._map_frame_cancelled_attempts += 1
+                        shutdown_gap_recorded = True
+                    continue
+                if self._subscriptions.get(subscription.subscription_id) is not subscription:
                     continue
             if not self._matches(subscription, frame):
                 continue
@@ -597,6 +614,8 @@ class StreamBus:
                 "topic_count": len(self._latest_by_topic),
                 "topics": sorted(self._latest_by_topic),
                 "dropped_by_topic": dict(self._dropped_by_topic),
+                "map_frame_interrupted_attempts": self._map_frame_interrupted_attempts,
+                "map_frame_cancelled_attempts": self._map_frame_cancelled_attempts,
                 "async_pending_count": len(self._async_queue),
                 "async_gap_count": len(self._async_gaps),
                 "closed": self._shutdown,
@@ -664,7 +683,10 @@ class StreamBus:
             self._async_queue.clear()
             self._async_gaps.clear()
             while self._dispatch_queue:
-                self._dispatch_queue.popleft().completion.set()
+                item = self._dispatch_queue.popleft()
+                if item.frame.topic == "map.frame":
+                    self._map_frame_cancelled_attempts += 1
+                item.completion.set()
         self._async_event.set()
         if self._consumer_thread is threading.current_thread():
             return False

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from time import monotonic
 from copy import deepcopy
 import uuid
 from typing import Any
@@ -12,6 +13,7 @@ from contracts.occupancy_cells import PackedOccupancyCells
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from core.errors import GatewayError
 from providers import MapProvider
+from services.mapping.notifications import MappingNotifications
 from typing import Dict, List, Optional, Tuple
 
 
@@ -92,6 +94,9 @@ class MappingService:
         self._stream_bus = stream_bus
         self._lock = threading.RLock()
         self._publication_lock = threading.RLock()
+        self._notification_close_lock = threading.Lock()
+        self._notification_admission_closed = False
+        self._notifications = MappingNotifications(event_bus, stream_bus)
         self._latest_snapshot: Optional[MapSnapshot] = None
         self._semantic_reference: Optional[MapSnapshot] = None
         self._service_epoch = uuid.uuid4().hex
@@ -193,34 +198,32 @@ class MappingService:
         source_name = str(payload.get("source_name") or "platform_live_map_provider")
         metadata = payload.get("metadata")
         source_metadata = dict(metadata) if isinstance(metadata, dict) else {}
-        self._publish_map_heartbeat(source_name=source_name, metadata=source_metadata)
-        if source_metadata.get("suppressed_live_map_update"):
-            with self._lock:
-                return self._latest_snapshot
-        if str(source_metadata.get("event_type") or "content_update") != "content_update":
+        if (source_metadata.get("suppressed_live_map_update")
+                or str(source_metadata.get("event_type") or "content_update") != "content_update"):
+            self._publish_map_heartbeat(source_name=source_name, metadata=source_metadata)
             with self._lock:
                 return self._latest_snapshot
         display_metadata = payload.get("display_occupancy_metadata")
-        return self.ingest_external_snapshot(
-            map_name=str(payload.get("map_name") or "").strip() or None,
-            source_name=source_name,
-            source_epoch=str(payload.get("source_epoch") or "").strip() or None,
-            occupancy_grid=payload.get("occupancy_grid"),
-            cost_map=payload.get("cost_map"),
-            semantic_map=payload.get("semantic_map"),
-            metadata=source_metadata,
-            stream_occupancy_grid=payload.get("display_occupancy_grid"),
-            stream_occupancy_source=(
-                str(payload.get("display_occupancy_source") or "").strip() or None
-            ),
-            stream_occupancy_fallback_reason=(
-                str(payload.get("display_occupancy_fallback_reason") or "").strip()
-                or None
-            ),
-            stream_occupancy_metadata=(
-                dict(display_metadata) if isinstance(display_metadata, dict) else None
-            ),
-        )
+        try:
+            return self.ingest_external_snapshot(
+                map_name=str(payload.get("map_name") or "").strip() or None,
+                source_name=source_name,
+                source_epoch=str(payload.get("source_epoch") or "").strip() or None,
+                occupancy_grid=payload.get("occupancy_grid"),
+                cost_map=payload.get("cost_map"),
+                semantic_map=payload.get("semantic_map"),
+                metadata=source_metadata,
+                stream_occupancy_grid=payload.get("display_occupancy_grid"),
+                stream_occupancy_source=(str(payload.get("display_occupancy_source") or "").strip() or None),
+                stream_occupancy_fallback_reason=(str(payload.get("display_occupancy_fallback_reason") or "").strip() or None),
+                stream_occupancy_metadata=(dict(display_metadata) if isinstance(display_metadata, dict) else None),
+                _heartbeat_metadata=source_metadata,
+            )
+        except Exception:
+            # Rejected content still proves the source was heard. It must not
+            # synchronously dispatch observers or replace the accepted map.
+            self._publish_map_heartbeat(source_name=source_name, metadata=source_metadata)
+            raise
 
     def ingest_external_snapshot(
         self,
@@ -237,6 +240,7 @@ class MappingService:
         stream_occupancy_source: Optional[str] = None,
         stream_occupancy_fallback_reason: Optional[str] = None,
         stream_occupancy_metadata: Optional[Dict[str, object]] = None,
+        _heartbeat_metadata: Optional[Dict[str, object]] = None,
     ) -> MapSnapshot:
         """写入地图快照；stream occupancy override 仅用于 Web，不进入状态存储。"""
 
@@ -400,9 +404,6 @@ class MappingService:
                     metadata=display_metadata,
                 )
 
-        stream_publication = None
-        event_publication = None
-        publication_warning = None
         while True:
             with self._lock:
                 duplicate_candidate = self._latest_snapshot
@@ -428,6 +429,8 @@ class MappingService:
                                       for name in ("occupancy_grid", "cost_map", "semantic_map"))
                 )
             with self._publication_lock:
+                if self._notification_admission_closed:
+                    raise GatewayError("地图服务已关闭，拒绝新的快照。", error_code="mapping_service_closed", http_status=503)
                 with self._lock:
                     self._require_current_snapshot_source(resolved_map_name, snapshot_metadata)
                     sequence_key = (prepared.map_name, prepared.source_name, prepared.source_epoch, prepared.frame_id)
@@ -456,6 +459,8 @@ class MappingService:
                             if (display_unchanged
                                     and latest.metadata.get("semantic_reference_identity") == snapshot_metadata.get("semantic_reference_identity")
                                     and _assigned_installation_identity(latest.metadata) == _assigned_installation_identity(snapshot_metadata)):
+                                if _heartbeat_metadata is not None:
+                                    self._publish_map_heartbeat(source_name=source_name, metadata=_heartbeat_metadata)
                                 return latest
                         if update_sequence < previous_sequence and source_metadata.get("source_kind") != "map_asset_bundle":
                             raise GatewayError("地图更新早于当前已接受修订。", error_code="map_snapshot_stale_revision", http_status=409)
@@ -530,21 +535,6 @@ class MappingService:
                             stream_snapshot.metadata
                         )
 
-                    if (
-                        self._stream_bus is not None
-                        and stream_snapshot is not None
-                        and stream_event_payload is not None
-                    ):
-                        stream_publication = self._stream_bus.prepare_publication(StreamFrame(
-                            topic="map.frame",
-                            source="mapping_service",
-                            payload=stream_snapshot,
-                            frame_id=stream_snapshot.frame_id,
-                            sequence=stream_sequence,
-                            revision=str(stream_snapshot.update_sequence),
-                            status="available",
-                            metadata=stream_event_payload,
-                        ))
                     self._update_sequence_by_source_epoch[sequence_key] = max(previous_sequence, update_sequence)
                     self._semantic_reference = reference
                     self._latest_snapshot = snapshot
@@ -569,28 +559,84 @@ class MappingService:
                             self._stream_occupancy_key_by_source[source_name] = (
                                 stream_occupancy_key
                             )
-                try:
-                    if self._event_bus is not None:
-                        event_publication = self._event_bus.prepare(
-                            self._event_bus.build_event(
-                                "mapping.snapshot_ready",
-                                category=RuntimeEventCategory.ROBOT,
-                                source="mapping_service",
-                                message="地图快照已更新。",
-                                payload=dict(event_payload),
-                            )
-                        )
-                except RuntimeError as error:
-                    publication_warning = error
-                break
-        if publication_warning is not None:
-            import logging
-            logging.getLogger(__name__).warning("地图已接受，但事件通知不可用：%s", publication_warning)
-        if event_publication is not None:
-            self._event_bus.dispatch_prepared(event_publication)
-        if stream_publication is not None:
-            self._stream_bus.dispatch_prepared(stream_publication)
-        return snapshot
+                # StreamBus preparation exposes frames to async consumers and
+                # other drainers immediately. Commit above before any exposure.
+                if _heartbeat_metadata is not None:
+                    self._publish_map_heartbeat(source_name=source_name, metadata=_heartbeat_metadata)
+                if (
+                    self._stream_bus is not None
+                    and stream_snapshot is not None
+                    and stream_event_payload is not None
+                ):
+                    self._prepare_stream_notification(StreamFrame(
+                        topic="map.frame",
+                        source="mapping_service",
+                        payload=stream_snapshot,
+                        frame_id=stream_snapshot.frame_id,
+                        sequence=stream_sequence,
+                        revision=str(stream_snapshot.update_sequence),
+                        status="available",
+                        metadata=stream_event_payload,
+                    ))
+                self._prepare_event_notification(
+                    "mapping.snapshot_ready", "地图快照已更新。", event_payload)
+                return snapshot
+
+    def _prepare_stream_notification(self, frame):
+        try:
+            publication = self._stream_bus.prepare_publication(frame)
+        except RuntimeError as error:
+            self._notifications.gap(frame.topic, error)
+        else:
+            self._notifications.handoff(stream=publication)
+
+    def _prepare_event_notification(self, event_type, message, payload):
+        if self._event_bus is None:
+            return
+        try:
+            publication = self._event_bus.prepare(self._event_bus.build_event(
+                event_type, category=RuntimeEventCategory.ROBOT, source="mapping_service",
+                message=message, payload=dict(payload)))
+            self._event_bus.enqueue_prepared(publication)
+        except RuntimeError as error:
+            self._notifications.gap("event", error)
+        else:
+            self._notifications.handoff(event=publication)
+
+    def notification_status(self):
+        return self._notifications.status()
+
+    def flush_notifications(self, timeout: float = 2.0) -> bool:
+        return self._notifications.flush(timeout)
+
+    def close_notifications(self, timeout: float = 2.0) -> bool:
+        """Unsubscribe producers, then seal and drain accepted notifications.
+
+        The deadline bounds notification waits, not the provider's inherited
+        unsubscribe operation, which can wait for a producer still committing.
+        """
+        if self._notifications.is_dispatch_thread():
+            return False
+        deadline = monotonic() + max(0.0, timeout)
+        if not self._notification_close_lock.acquire(timeout=max(0.0, deadline - monotonic())):
+            return False
+        try:
+            # Never hold the publication lock while waiting for a provider
+            # delivery ticket: that ticket may still be committing its map.
+            subscription = self._map_update_subscription_id
+            if subscription is not None:
+                self._provider_owner.unsubscribe_map_updates(subscription)
+                self._map_update_subscription_id = None
+            if not self._publication_lock.acquire(timeout=max(0.0, deadline - monotonic())):
+                return False
+            try:
+                self._notification_admission_closed = True
+                self._notifications.seal()
+            finally:
+                self._publication_lock.release()
+        finally:
+            self._notification_close_lock.release()
+        return self.flush_notifications(max(0.0, deadline - monotonic()))
 
     def _require_current_snapshot_source(self, map_name: str, metadata) -> None:
         validator = getattr(self._provider_owner, "is_map_snapshot_source_current", None)
@@ -624,16 +670,15 @@ class MappingService:
         除清服务端 `_latest_snapshot` 外，还会：
         1. 在 stream_bus 上 publish 一帧 `map.frame`（payload 为空 + `event_type=catalog_cleared`），
            让前端 SSE/WS 收到一帧 occupancy_grid 缺失的 envelope，立即清掉画布；
-        2. 同步发 `map.heartbeat`，让监控面板的 streaming chip 也走刷新；
+        2. 接纳 `map.heartbeat`，让监控面板的 streaming chip 也走刷新；
         3. 调 `stream_bus.clear_topic("map.frame")` 与 `clear_topic("map.heartbeat")`，
            避免新接入的 SSE/WS 客户端首帧仍拉到旧地图。
         4. 在 event_bus 上 publish `mapping.snapshot_cleared`，与 catalog_deleted 事件呼应。
         """
 
-        publications = []
-        event_publication = None
-        publication_warning = None
         with self._publication_lock:
+            if self._notification_admission_closed:
+                raise GatewayError("地图服务已关闭，拒绝清空快照。", error_code="mapping_service_closed", http_status=503)
             with self._lock:
                 previous = self._latest_snapshot
                 # 即使之前没有 snapshot 也要发 clear 信号——前端可能在重连首帧拉到旧 cache。
@@ -653,56 +698,25 @@ class MappingService:
                     "live_streaming_ready": False,
                     "mapping_live_streaming_ready": False,
                 }
-                if self._stream_bus is not None:
-                    # 用 status="cleared" + payload=None 的 map.frame 让前端 updateMap 走 grid 缺失分支。
-                    publications.append(self._stream_bus.prepare_publication(StreamFrame(
-                        topic="map.frame",
-                        source="mapping_service",
-                        payload=None,
-                        status="cleared",
-                        metadata=cleared_payload,
-                    )))
-                    try:
-                        publications.append(self._stream_bus.prepare_publication(StreamFrame(
-                            topic="map.heartbeat",
-                            source="mapping_service",
-                            payload=cleared_payload,
-                            status="cleared",
-                            metadata=cleared_payload,
-                        )))
-                    except RuntimeError as error:
-                        publication_warning = error
-                    # 清 latest cache，下一个新 SSE/WS 客户端的首帧就拉不到旧 map.frame。
-                    self._stream_bus.clear_topic("map.frame")
-                    self._stream_bus.clear_topic("map.heartbeat")
                 self._latest_snapshot = None
                 self._semantic_reference = None
                 self._latest_display_snapshot = None
                 self._stream_occupancy_key_by_source.clear()
-            try:
-                if self._event_bus is not None:
-                    event_publication = self._event_bus.prepare(
-                        self._event_bus.build_event(
-                            "mapping.snapshot_cleared",
-                            category=RuntimeEventCategory.ROBOT,
-                            source="mapping_service",
-                            message="地图快照已清空。",
-                            payload={
-                                "cleared_map_name": cleared_payload["cleared_map_name"],
-                                "reason": cleared_payload["reason"],
-                                "previous_source_name": previous_source_name,
-                            },
-                        )
-                    )
-            except RuntimeError as error:
-                publication_warning = error
-        if publication_warning is not None:
-            import logging
-            logging.getLogger(__name__).warning("地图已清空，但部分通知不可用：%s", publication_warning)
-        if event_publication is not None:
-            self._event_bus.dispatch_prepared(event_publication)
-        for publication in publications:
-            self._stream_bus.dispatch_prepared(publication)
+                if self._stream_bus is not None:
+                    for topic, payload in (("map.frame", None), ("map.heartbeat", cleared_payload)):
+                        self._prepare_stream_notification(StreamFrame(
+                            topic=topic, source="mapping_service", payload=payload,
+                            status="cleared", metadata=cleared_payload))
+                    # Cache mutation belongs to clear acceptance, never to the
+                    # completion worker that may run after a newer ready frame.
+                    self._stream_bus.clear_topic("map.frame")
+                    self._stream_bus.clear_topic("map.heartbeat")
+            self._prepare_event_notification(
+                "mapping.snapshot_cleared", "地图快照已清空。", {
+                    "cleared_map_name": cleared_payload["cleared_map_name"],
+                    "reason": cleared_payload["reason"],
+                    "previous_source_name": previous_source_name,
+                })
 
     def is_available(self) -> bool:
         """判断地图服务当前是否可用。"""
@@ -748,17 +762,13 @@ class MappingService:
             **{key: metadata[key] for key in ("content_identity", "map_provenance", "raw_representation") if key in metadata},
         }
         sequence = self._extract_stream_sequence(heartbeat)
-        revision = None
-        self._stream_bus.publish(
-            "map.heartbeat",
-            source="mapping_service",
-            payload=heartbeat,
-            frame_id=str(heartbeat.get("frame_id") or "") or None,
-            sequence=sequence,
-            revision=str(revision) if revision is not None else None,
-            status="available",
-            metadata=dict(heartbeat),
-        )
+        with self._publication_lock:
+            if self._notification_admission_closed:
+                return
+            self._prepare_stream_notification(StreamFrame(
+                topic="map.heartbeat", source="mapping_service", payload=heartbeat,
+                frame_id=str(heartbeat.get("frame_id") or "") or None,
+                sequence=sequence, status="available", metadata=dict(heartbeat)))
 
     def _build_map_frame_metadata(
         self,

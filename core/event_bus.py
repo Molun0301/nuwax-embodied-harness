@@ -205,12 +205,39 @@ class EventBus:
             self._publication_times[cursor] = monotonic()
             return publication
 
+    def enqueue_prepared(self, publication: PreparedEventPublication) -> None:
+        """Make an accepted reservation dispatchable without running callbacks."""
+        cursor = publication.stored_event.cursor
+        if cursor is None:
+            raise ValueError("Prepared publication is missing its cursor.")
+        with self._dispatch_condition:
+            if cursor < self._next_dispatch_cursor:
+                return
+            if self._prepared_publications.get(cursor) is not publication:
+                raise ValueError("Prepared publication does not belong to this EventBus.")
+            if self._shutdown:
+                return
+            state = self._publication_states.get(cursor)
+            if state == "discarded":
+                raise RuntimeError("Prepared publication was discarded.")
+            if state == "reserved":
+                self._publication_states[cursor] = "queued"
+                self._dispatch_condition.notify_all()
+
+    def is_dispatch_thread(self) -> bool:
+        """A callback must not wait for a fence that includes its own attempt."""
+        with self._lock:
+            thread_id = threading.get_ident()
+            return (self._dispatch_owner_thread_id == thread_id
+                    or thread_id in self._active_callback_threads)
+
     def dispatch_prepared(
         self,
         publication: PreparedEventPublication,
     ) -> RuntimeEvent:
         """Dispatch one event that has already obtained its public cursor."""
 
+        self.enqueue_prepared(publication)
         stored_event = publication.stored_event
         cursor = stored_event.cursor
         if cursor is None:
@@ -229,8 +256,6 @@ class EventBus:
                 state = self._publication_states.get(cursor)
                 if state == "discarded":
                     raise RuntimeError("Prepared publication was discarded.")
-                if state == "reserved":
-                    self._publication_states[cursor] = "queued"
                 if self._dispatch_owner_thread_id == current_thread_id:
                     # Reentrant publishes are drained after every subscriber for
                     # the current cursor has returned.

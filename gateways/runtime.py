@@ -1604,7 +1604,6 @@ class GatewayRuntime:
                 ("geometry runtime", self.platform_geometry_runtime.stop),
                 ("audio service", self.audio_service.stop),
                 ("data frame streams", self._stop_data_frame_stream_sources),
-                ("geometry recording", self._close_mapping_recording),
                 ("artifact maintenance fence", self._begin_artifact_shutdown),
                 ("perception video runtime", self.perception_video_runtime.stop),
                 ("semantic mapping", self.scene_mapping_service.close),
@@ -1706,15 +1705,28 @@ class GatewayRuntime:
         if service is not None:
             self._artifact_shutdown_complete = service.close(timeout=0.0)
 
-    def _close_mapping_recording(self) -> None:
-        """所有输入与定位生产者停止后，撤销记录订阅并排空磁盘写入者。"""
+    def _close_mapping_recording(self, timeout_sec: float = 2.0) -> bool:
+        """Retain the recorder until all accepted map notification attempts finish."""
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        mapping = getattr(self, "mapping_service", None)
+        if mapping is not None and not mapping.close_notifications(timeout_sec):
+            return False
         recorder = getattr(self, "mapping_recorder", None)
         if recorder is not None:
+            if mapping is not None:
+                status = mapping.notification_status()
+                reported = getattr(self, "_recording_notification_gaps", {})
+                for reason in ("map_frame_admission_gaps", "map_frame_interrupted_attempts", "map_frame_cancelled_attempts"):
+                    count = status[reason]
+                    recorder.record_notification_gap(reason, max(0, count - reported.get(reason, 0)))
+                    reported[reason] = count
+                self._recording_notification_gaps = reported
             subscription = getattr(self, "_recording_subscription_id", None)
             if subscription is not None:
                 self.stream_bus.unsubscribe(subscription)
                 self._recording_subscription_id = None
-            recorder.close()
+            recorder.close(timeout=max(0.0, deadline - time.monotonic()))
+        return True
 
     def _close_runtime_event_bridge(self, timeout_sec: float) -> bool:
         """撤销注册并等待已认领回调；共享事件总线仍由调用方拥有。"""
@@ -1755,17 +1767,22 @@ class GatewayRuntime:
         dense_cache = getattr(self, "_saved_dense_cloud_cache", None)
         if dense_cache is not None:
             dense_cache.close()
-        recording_error = None
+        deadline = time.monotonic() + max(0.0, timeout_sec)
         try:
-            self._close_mapping_recording()
-        except Exception as error:
-            recording_error = error
+            mapping_closed = self._close_mapping_recording(max(0.0, deadline - time.monotonic()))
+        except RuntimeError:
+            self._dispatch_shutdown_complete = False
+            self._dispatch_shutdown_blocker = "mapping_recording_in_flight"
+            return False
+        if not mapping_closed:
+            self._dispatch_shutdown_complete = False
+            self._dispatch_shutdown_blocker = "mapping_notifications_in_flight"
+            return False
         building_service = getattr(self, "_building_navigation_service", None)
         if building_service is not None:
             for provider in building_service.providers.values():
                 provider.close()
             self._building_navigation_service = None
-        deadline = time.monotonic() + max(0.0, timeout_sec)
         if not self._close_runtime_event_bridge(max(0.0, deadline - time.monotonic())):
             self._dispatch_shutdown_complete = False
             self._dispatch_shutdown_blocker = "event_bridge_in_flight"
@@ -1789,8 +1806,6 @@ class GatewayRuntime:
         if log_handler is not None:
             logging.getLogger().removeHandler(log_handler)
             log_handler.close()
-        if recording_error is not None:
-            raise recording_error
         self._dispatch_shutdown_complete = True
         self._dispatch_shutdown_blocker = None
         return True
@@ -1802,6 +1817,7 @@ class GatewayRuntime:
             "mode": "stream_bus",
             "stream_bus": self.stream_bus.status(),
             "event_log": self.get_event_log_status(),
+            "mapping_notifications": self.mapping_service.notification_status(),
             "stream_endpoints": {
                 "sse": "/streams/sse?topics=map.frame,localization.pose,navigation.state,exploration.state,pointcloud_map.meta",
                 "websocket": "/streams/ws?topics=map.frame,localization.pose,navigation.state,exploration.state,pointcloud_map.meta",

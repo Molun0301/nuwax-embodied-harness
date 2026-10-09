@@ -79,6 +79,7 @@ class MappingRecorder:
         self._first_dropped_ns = None
         self._last_dropped_ns = None
         self._error = None
+        self._notification_gaps = Counter()
         self._path = None
         self._recording_id = None
         self._metadata = {}
@@ -133,6 +134,13 @@ class MappingRecorder:
                 if self._first_dropped_ns is None:
                     self._first_dropped_ns = now
                 self._last_dropped_ns = now
+                self._condition.notify_all()
+
+    def record_notification_gap(self, reason: str, count: int) -> None:
+        """Potential observer loss, not an exact count of missing SQLite rows."""
+        with self._condition:
+            if count > 0:
+                self._notification_gaps[reason] += count
                 self._condition.notify_all()
 
     def record_sensor(self, sample) -> bool:
@@ -194,8 +202,9 @@ class MappingRecorder:
                 "enabled": self.enabled, "recording_id": self._recording_id,
                 "path": str(self._path) if self._path else None,
                 "recording": self._accepting, "closed": self._closed,
-                "complete": self._thread is not None and self._closed and self._error is None and self._dropped == 0,
-                "incomplete": self._error is not None or self._dropped > 0,
+                "complete": self._thread is not None and self._closed and self._error is None and self._dropped == 0 and not self._notification_gaps,
+                "incomplete": self._error is not None or self._dropped > 0 or bool(self._notification_gaps),
+                "notification_gaps": dict(self._notification_gaps),
                 "written_records": dict(self._written), "written_payload_bytes": self._written_bytes,
                 "queued_bytes": self._queued_bytes, "queue_limit_bytes": self._queue_limit,
                 "dropped_records": self._dropped, "first_dropped_source_ns": self._first_dropped_ns,

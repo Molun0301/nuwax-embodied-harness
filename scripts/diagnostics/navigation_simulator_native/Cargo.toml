@@ -1,5 +1,6 @@
 [package]
 name = "nuwax-navigation-simulator"
+default-run = "nuwax-navigation-simulator"
 version = "0.1.0"
 edition = "2021"
 [workspace]

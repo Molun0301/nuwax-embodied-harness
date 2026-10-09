@@ -18,11 +18,13 @@ from .engine import (
     DeploymentPlan,
     ExecutionContext,
     build_deployment_plan,
+    capture_installation_inputs,
 )
 from .lock import InstallerLock
 from .model import DeploymentOptions, validate_identifier
 from .profile import ProfileError, load_named_profile, profile_sha256
 from .runner import SubprocessRunner, source_user_command, source_user_environment
+from .state import installation_inputs_equal, plan_identity_fields, record_identity
 
 
 def _repo_root() -> Path:
@@ -264,7 +266,7 @@ def _print_plan(plan: DeploymentPlan, *, json_output: bool = False) -> None:
             json.dumps(
                 {
                     "profile": plan.profile_name,
-                    "fingerprint": plan.fingerprint,
+                    "installation_inputs": plan.installation_inputs,
                     "phases": [
                         {
                             "name": phase.name,
@@ -279,7 +281,7 @@ def _print_plan(plan: DeploymentPlan, *, json_output: bool = False) -> None:
             )
         )
         return
-    print(f"profile={plan.profile_name} fingerprint={plan.fingerprint}")
+    print(f"profile={plan.profile_name}")
     for index, phase in enumerate(plan.phases, start=1):
         print(f"[{index:02d}/{len(plan.phases):02d}] {phase.name}: {phase.description}")
         if not phase.actions:
@@ -368,9 +370,177 @@ def _assert_latest_transaction(selected: dict, latest: dict) -> None:
     selected_id = selected.get("transaction_id")
     if not latest or latest.get("transaction_id") != selected_id:
         raise RuntimeError("requested deployment transaction is stale; operate on the latest transaction")
-    for key in ("profile", "fingerprint", "release_id", "transaction_id"):
-        if latest.get(key) != selected.get(key):
+    identity = record_identity(selected)
+    if identity is None or identity != record_identity(latest):
+        raise RuntimeError("latest deployment transaction ownership is inconsistent")
+    for key in ("profile", "release_id", "transaction_id"):
+        if not isinstance(selected.get(key), str) or not selected[key] or latest.get(key) != selected[key]:
             raise RuntimeError(f"latest deployment transaction {key} is inconsistent")
+
+
+def _prepare_source(args, options, profile, *, materialize):
+    manifest = None
+    if options.offline_bundle is not None:
+        from .operations import (
+            stage_verified_bundle,
+            validate_bundle_public_key,
+            validate_offline_bundle_contract,
+            verify_offline_bundle,
+        )
+
+        approved_key = validate_bundle_public_key(
+            profile,
+            options,
+            options.bundle_public_key,
+        )
+        manifest = verify_offline_bundle(options.offline_bundle, approved_key)
+        validate_offline_bundle_contract(profile, options, manifest)
+        if materialize:
+            staged_bundle, manifest = stage_verified_bundle(
+                options.offline_bundle,
+                approved_key,
+                options.cache_dir,
+            )
+            options = replace(
+                options,
+                offline_bundle=staged_bundle,
+                source_root=staged_bundle / "source",
+            )
+    if (
+        options.offline_bundle is None
+        and profile.production
+        and not options.allow_dirty_source
+        and materialize
+    ):
+        from .operations import stage_source_snapshot
+
+        live_source = options.source_root
+        with InstallerLock():
+            source_snapshot, source_revision, source_tree_id = stage_source_snapshot(
+                live_source,
+                options.cache_dir,
+            )
+        snapshot_profile = load_named_profile(args.profile, source_snapshot)
+        # Compare the existing canonical representation without rehashing it.
+        # Plain dict equality would conflate JSON values such as true and 1.
+        if json.dumps(asdict(snapshot_profile), sort_keys=True, separators=(",", ":")) != json.dumps(
+            asdict(profile), sort_keys=True, separators=(",", ":")
+        ):
+            raise RuntimeError("deployment profile changed while creating the production source snapshot")
+        profile = snapshot_profile
+        options = replace(
+            options,
+            source_root=source_snapshot,
+            trust_root=source_snapshot,
+            fingerprint_source_root=source_snapshot,
+            source_is_snapshot=True,
+            source_revision=source_revision,
+            source_tree_id=source_tree_id,
+        )
+    return options, profile, manifest
+
+
+def _plan_for_history(state: dict) -> DeploymentPlan:
+    identity = record_identity(state)
+    if identity is None:
+        raise RuntimeError("deployment transaction is missing rollback identity fields")
+    return DeploymentPlan(
+        state["profile"], identity[1] if identity[0] == "legacy-fingerprint" else "", (),
+        installation_inputs=state.get("installation_inputs"),
+        release_owner_id=identity[1] if identity[0] == "release-owner-v1" else "",
+    )
+
+
+def _recover_for_resume(args, options, profile, runner, latest):
+    previous = _load_json(options.state_dir / "transactions" / f"{args.transaction_id}.json", "deployment transaction")
+    _assert_latest_transaction(previous, latest)
+    if previous.get("profile") != profile.name:
+        raise RuntimeError("resume profile does not match persisted transaction")
+    host = previous.get("host")
+    if not isinstance(host, dict) or host.get("hostname") != platform.node() or host.get("machine") != platform.machine():
+        raise RuntimeError("resume host facts do not match persisted transaction")
+    if previous.get("status") in {"committed", "recovered", "rolled_back", "staged", "superseded"}:
+        raise RuntimeError("terminal deployment transaction does not need resume")
+    old_options = replace(options, release_id=previous["release_id"], transaction_id=previous["transaction_id"])
+    context = ExecutionContext(_plan_for_history(previous), profile, old_options, runner)
+    from . import operations
+
+    previous["status"] = "rollback_running"
+    previous["finished_at"] = None
+    previous.pop("recovery_error", None)
+    _save_transaction_state(options.state_dir, previous)
+    recovered = False
+    try:
+        if operations.load_persisted_recovery(context):
+            operations.rollback(context)
+            recovered = True
+    except Exception as exc:
+        previous["status"] = "rollback_failed"
+        previous["finished_at"] = time.time()
+        previous["recovery_error"] = str(exc)
+        _save_transaction_state(options.state_dir, previous)
+        raise
+    previous["status"] = "recovered" if recovered else "superseded"
+    previous["finished_at"] = time.time()
+    previous["active_release"] = str(options.current_link.resolve()) if options.current_link.is_symlink() else None
+    _save_transaction_state(options.state_dir, previous)
+    return previous
+
+
+def _target_record(options):
+    from .operations import _read_installing_record
+
+    if options.release_dir.is_symlink():
+        return {}, True
+    manifest = options.release_dir / "release-manifest.json"
+    marker = options.release_dir / ".installing"
+    if manifest.is_symlink() or marker.is_symlink():
+        return {}, True
+    try:
+        if manifest.is_file():
+            return _load_json(manifest, "release manifest"), True
+        if marker.is_file():
+            return _read_installing_record(marker), True
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return {}, True
+    if options.release_dir.is_dir():
+        return {}, any(options.release_dir.iterdir())
+    return {}, options.release_dir.exists()
+
+
+def _select_release(options, profile, inputs, latest, *, explicit):
+    def matches(record, candidate):
+        identity = record_identity(record)
+        return (identity is not None and identity[0] == "release-owner-v1"
+                and record.get("profile") == profile.name
+                and record.get("release_id") == candidate.release_id
+                and (latest.get("release_id") != candidate.release_id
+                     or (record_identity(latest) == identity and latest.get("profile") == profile.name))
+                and installation_inputs_equal(record.get("installation_inputs"), inputs))
+
+    if not explicit and latest.get("status") in {"committed", "staged"} and installation_inputs_equal(
+        latest.get("installation_inputs"), inputs
+    ):
+        release_id = latest.get("release_id")
+        if isinstance(release_id, str):
+            candidate = replace(options, release_id=release_id)
+            record, _ = _target_record(candidate)
+            if ((candidate.release_dir / "release-manifest.json").is_file()
+                    and matches(record, candidate) and record_identity(record) == record_identity(latest)):
+                return candidate, record_identity(record)[1]
+    record, occupied = _target_record(options)
+    if matches(record, options):
+        return options, record_identity(record)[1]
+    if occupied:
+        if explicit:
+            raise RuntimeError(f"immutable release id conflict: {options.release_id}; choose a new release id")
+        # Leave room for both the release suffix and its attempt suffix.
+        base = options.release_id[:140]
+        while occupied:
+            options = replace(options, release_id=_new_transaction_id(base))
+            _, occupied = _target_record(options)
+    return options, ""
+
 
 
 def _execute(
@@ -403,78 +573,9 @@ def _execute(
         from .operations import validate_protected_paths
 
         validate_protected_paths(options)
-    if options.offline_bundle is not None:
-        from .operations import (
-            stage_verified_bundle,
-            validate_bundle_public_key,
-            validate_offline_bundle_contract,
-            verify_offline_bundle,
-        )
-
-        approved_key = validate_bundle_public_key(
-            profile,
-            options,
-            options.bundle_public_key,
-        )
-        manifest = verify_offline_bundle(options.offline_bundle, approved_key)
-        validate_offline_bundle_contract(profile, options, manifest)
-        if not dry_run and not preflight_only and not verify_only:
-            staged_bundle = stage_verified_bundle(
-                options.offline_bundle,
-                approved_key,
-                options.cache_dir,
-            )
-            options = replace(
-                options,
-                offline_bundle=staged_bundle,
-                source_root=staged_bundle / "source",
-            )
-    if (
-        options.offline_bundle is None
-        and profile.production
-        and not options.allow_dirty_source
-        and not dry_run
-        and not preflight_only
-        and not verify_only
-    ):
-        from .operations import stage_source_snapshot
-
-        live_source = options.source_root
-        with InstallerLock():
-            source_snapshot, source_revision, source_tree_id = stage_source_snapshot(
-                live_source,
-                options.cache_dir,
-            )
-        snapshot_profile = load_named_profile(args.profile, source_snapshot)
-        # Compare the existing canonical representation without rehashing it.
-        # Plain dict equality would conflate JSON values such as true and 1.
-        if json.dumps(asdict(snapshot_profile), sort_keys=True, separators=(",", ":")) != json.dumps(
-            asdict(profile), sort_keys=True, separators=(",", ":")
-        ):
-            raise RuntimeError("deployment profile changed while creating the production source snapshot")
-        profile = snapshot_profile
-        options = replace(
-            options,
-            source_root=source_snapshot,
-            trust_root=source_snapshot,
-            fingerprint_source_root=source_snapshot,
-            source_is_snapshot=True,
-            source_revision=source_revision,
-            source_tree_id=source_tree_id,
-        )
-    plan = build_deployment_plan(profile, options)
-    if verify_only or preflight_only:
-        selected = "verify" if verify_only else "preflight"
-        phases = tuple(phase for phase in plan.phases if phase.name == selected)
-        plan = DeploymentPlan(
-            profile_name=plan.profile_name,
-            fingerprint=plan.fingerprint,
-            phases=phases,
-            rollback=None,
-        )
-        options = replace(options, persist_state=False)
     if dry_run:
-        _print_plan(plan, json_output=args.json)
+        options, profile, _ = _prepare_source(args, options, profile, materialize=False)
+        _print_plan(build_deployment_plan(profile, options), json_output=args.json)
         return 0
     if os.geteuid() != 0:
         print("部署需要 root；请使用 ./install.sh deploy ...", file=sys.stderr)
@@ -482,80 +583,60 @@ def _execute(
     runner = SubprocessRunner()
     unchanged = False
     result = None
+    recovered_state = None
+    if resume:
+        with InstallerLock():
+            latest = _newest_transaction_state(options.state_dir)
+            recovered_state = _recover_for_resume(args, options, profile, runner, latest)
+    # Preserve the original preparation lock scopes: source staging takes the
+    # existing lock; signed-bundle staging precedes the main execution lock.
+    options, profile, bundle_manifest = _prepare_source(
+        args, options, profile, materialize=not verify_only and not preflight_only,
+    )
     with InstallerLock():
         latest = _newest_transaction_state(options.state_dir)
-        if not resume and not verify_only and not preflight_only:
-            if latest.get("status") in {"running", "rollback_running", "rollback_failed"}:
-                raise RuntimeError("an unresolved deployment transaction exists; resume or roll it back first")
-            if (
-                latest.get("status") == "committed"
-                and latest.get("fingerprint") == plan.fingerprint
-                and latest.get("release_id") == options.release_id
-                and options.current_link.is_symlink()
-                and options.current_link.resolve() == options.release_dir.resolve()
-            ):
-                selected_phases = tuple(phase for phase in plan.phases if phase.name in {"preflight", "verify"})
-                validation_plan = DeploymentPlan(
-                    profile_name=plan.profile_name,
-                    fingerprint=plan.fingerprint,
-                    phases=selected_phases,
-                    rollback=None,
-                )
-                result = DeploymentEngine(runner=runner).execute(
-                    validation_plan,
-                    replace(options, persist_state=False),
-                    profile,
-                )
-                unchanged = result.status == "success"
-        if resume:
-            transaction_path = options.state_dir / "transactions" / f"{args.transaction_id}.json"
-            previous_state = _load_json(transaction_path, "deployment transaction")
-            _assert_latest_transaction(previous_state, latest)
-            if previous_state.get("fingerprint") != plan.fingerprint:
-                raise RuntimeError("resume fingerprint does not match persisted transaction")
-            host = previous_state.get("host")
-            if not isinstance(host, dict) or (
-                host.get("hostname") != platform.node() or host.get("machine") != platform.machine()
-            ):
-                raise RuntimeError("resume host facts do not match persisted transaction")
-            if previous_state.get("status") in {
-                "committed",
-                "recovered",
-                "rolled_back",
-                "staged",
-                "superseded",
-            }:
-                raise RuntimeError("terminal deployment transaction does not need resume")
-            from . import operations
-
-            recovery_context = ExecutionContext(plan, profile, options, runner)
-            previous_state["status"] = "rollback_running"
-            previous_state["finished_at"] = None
-            previous_state.pop("recovery_error", None)
-            _save_transaction_state(options.state_dir, previous_state)
-            recovered = False
+        resumed_from = ""
+        if recovered_state is not None:
+            _assert_latest_transaction(recovered_state, latest)
+            if latest.get("status") != recovered_state["status"]:
+                raise RuntimeError("recovered transaction changed before retry")
+            resumed_from = recovered_state["transaction_id"]
+        elif not verify_only and not preflight_only and latest.get("status") in {"running", "rollback_running", "rollback_failed"}:
+            raise RuntimeError("an unresolved deployment transaction exists; resume or roll it back first")
+        if verify_only or preflight_only:
+            plan = build_deployment_plan(profile, options)
+            selected = "verify" if verify_only else "preflight"
+            plan = replace(plan, phases=tuple(p for p in plan.phases if p.name == selected), rollback=None)
+            options = replace(options, persist_state=False)
+        else:
+            inputs = capture_installation_inputs(profile, options, bundle_manifest)
             try:
-                if operations.load_persisted_recovery(recovery_context):
-                    operations.rollback(recovery_context)
-                    recovered = True
-            except Exception as exc:
-                previous_state["status"] = "rollback_failed"
-                previous_state["finished_at"] = time.time()
-                previous_state["recovery_error"] = str(exc)
-                _save_transaction_state(options.state_dir, previous_state)
+                options, owner = _select_release(
+                    options, profile, inputs, latest,
+                    explicit=bool(args.release_id or options.offline_bundle is not None),
+                )
+            except RuntimeError as exc:
+                if resumed_from:
+                    raise RuntimeError(
+                        f"previous transaction {resumed_from} {latest['status']}; new installation not started: {exc}"
+                    ) from exc
                 raise
-            new_transaction_id = _new_transaction_id(options.release_id)
-            previous_state["status"] = "recovered" if recovered else "superseded"
-            previous_state["finished_at"] = time.time()
-            previous_state["resumed_by_transaction_id"] = new_transaction_id
-            previous_state["active_release"] = (
-                str(options.current_link.resolve()) if options.current_link.is_symlink() else None
+            options = replace(options, transaction_id=_new_transaction_id(options.release_id))
+            owner = owner or options.transaction_id
+            # Actions capture cwd, argv and target dirs: build only after selection.
+            plan = build_deployment_plan(
+                profile, options, installation_inputs=inputs, release_owner_id=owner,
+                resumed_from_transaction_id=resumed_from,
             )
-            _save_transaction_state(options.state_dir, previous_state)
-            options = replace(
-                options,
-                transaction_id=new_transaction_id,
-            )
+            if (not resume and latest.get("status") == "committed"
+                    and installation_inputs_equal(latest.get("installation_inputs"), inputs)
+                    and record_identity(latest) == record_identity(plan_identity_fields(plan))
+                    and latest.get("release_id") == options.release_id
+                    and options.current_link.is_symlink()
+                    and options.current_link.resolve() == options.release_dir.resolve()):
+                validation_plan = replace(plan, phases=tuple(p for p in plan.phases if p.name in {"preflight", "verify"}), rollback=None)
+                result = DeploymentEngine(runner=runner).execute(validation_plan, replace(options, persist_state=False), profile)
+                unchanged = result.status == "success"
         if result is None:
             result = DeploymentEngine(runner=runner).execute(plan, options, profile)
     if result.status == "failed":
@@ -572,7 +653,7 @@ def _execute(
         )
         return 1
     if preflight_only:
-        payload = {"status": "checked", "profile": profile.name, "fingerprint": plan.fingerprint}
+        payload = {"status": "checked", "profile": profile.name}
         print(json.dumps(payload, ensure_ascii=False) if args.json else "部署 preflight 检查通过")
         return 0
     if verify_only:
@@ -641,10 +722,9 @@ def _rollback_command(args: argparse.Namespace) -> int:
         _assert_latest_transaction(state, latest)
         if state.get("status") in {"recovered", "rolled_back", "superseded"}:
             raise RuntimeError("deployment transaction was already recovered")
-        fingerprint = state.get("fingerprint")
         release_id = state.get("release_id")
         profile_name = state.get("profile")
-        if not all(isinstance(value, str) and value for value in (fingerprint, release_id, profile_name)):
+        if not all(isinstance(value, str) and value for value in (release_id, profile_name)) or record_identity(state) is None:
             raise RuntimeError("deployment transaction is missing rollback identity fields")
         source_root = args.source_root.expanduser().resolve()
         profile = load_named_profile(profile_name, source_root)
@@ -660,7 +740,7 @@ def _rollback_command(args: argparse.Namespace) -> int:
             no_systemd=args.no_systemd,
             no_verify=args.no_verify,
         )
-        plan = DeploymentPlan(profile_name, fingerprint, ())
+        plan = _plan_for_history(state)
         context = ExecutionContext(plan, profile, options, SubprocessRunner())
         from . import operations
 

@@ -9,6 +9,52 @@ from typing import Any, Dict, List, Optional
 from .config import atomic_write
 
 
+def valid_installation_inputs(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and type(value.get("version")) is int and value["version"] == 1
+        and all(isinstance(value.get(key), dict) for key in ("profile", "source", "files", "options"))
+        and type(value.get("reusable")) is bool
+    )
+
+
+def installation_inputs_match(left: Any, right: Any) -> bool:
+    # JSON normalization at capture makes records round-trip stable; canonical
+    # comparison also preserves scalar distinctions such as true versus 1.
+    return bool(
+        valid_installation_inputs(left) and valid_installation_inputs(right)
+        and json.dumps(left, sort_keys=True, separators=(",", ":"))
+        == json.dumps(right, sort_keys=True, separators=(",", ":"))
+    )
+
+
+def installation_inputs_equal(left: Any, right: Any) -> bool:
+    return bool(installation_inputs_match(left, right) and left["reusable"] and right["reusable"])
+
+
+def record_identity(record: dict):
+    if "release_identity" in record or "installation_inputs" in record:
+        identity = record.get("release_identity")
+        if (isinstance(identity, dict) and type(identity.get("version")) is int
+                and identity["version"] == 1
+                and isinstance(identity.get("owner_id"), str) and identity["owner_id"]):
+            return ("release-owner-v1", identity["owner_id"])
+        return None
+    legacy = record.get("fingerprint")
+    if isinstance(legacy, str) and legacy:
+        return ("legacy-fingerprint", legacy)
+    return None
+
+
+def plan_identity_fields(plan) -> dict:
+    owner = getattr(plan, "release_owner_id", "")
+    inputs = getattr(plan, "installation_inputs", None)
+    if owner or inputs is not None:
+        return {"release_identity": {"version": 1, "owner_id": owner}, "installation_inputs": inputs}
+    legacy = getattr(plan, "fingerprint", "")
+    return {"fingerprint": legacy} if legacy else {}
+
+
 class StateStore:
     def __init__(self, path: Path, *, enabled: bool = True) -> None:
         self.path = path
@@ -23,7 +69,15 @@ class StateStore:
         release_id: str,
         transaction_id: str,
         actions: List[str],
+        *,
+        release_owner_id: str = "",
+        installation_inputs: Optional[dict] = None,
+        resumed_from_transaction_id: str = "",
     ) -> None:
+        if installation_inputs is not None and (
+            not release_owner_id or not valid_installation_inputs(installation_inputs)
+        ):
+            raise RuntimeError("new deployment state requires owner and installation inputs")
         self.transaction_path = self.path.parent / "transactions" / f"{transaction_id}.json"
         generation = self._next_generation()
         self.data = {
@@ -46,6 +100,15 @@ class StateStore:
             "failed_phase": None,
             "phases": [],
         }
+        if installation_inputs is not None:
+            self.data.pop("fingerprint")
+            self.data.update(
+                schema_version=3,
+                release_identity={"version": 1, "owner_id": release_owner_id},
+                installation_inputs=installation_inputs,
+            )
+        if resumed_from_transaction_id:
+            self.data["resumed_from_transaction_id"] = resumed_from_transaction_id
         self.save()
 
     def _next_generation(self) -> int:

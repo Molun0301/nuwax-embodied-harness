@@ -23,6 +23,7 @@ from scripts.systemd.prepare_lcm_network import lcm_url_from_env_text, migrated_
 from .config import atomic_write, fsync_directory, render_env
 from .gateway import gateway_health_url, resolve_gateway_listener
 from .profile import profile_sha256
+from .state import installation_inputs_match, plan_identity_fields, record_identity
 from .runner import resolve_build_account, source_user_command, source_user_environment
 
 if TYPE_CHECKING:
@@ -1055,7 +1056,7 @@ def _copy_rustup_proxies(cargo_home: Path, destination: Path, build_uid: int) ->
         os.close(cargo_descriptor)
 
 
-def stage_verified_bundle(path: Path, public_key: Path, cache_dir: Path) -> Path:
+def stage_verified_bundle(path: Path, public_key: Path, cache_dir: Path) -> Tuple[Path, Mapping[str, object]]:
     bundle_root = path.resolve()
     cache_root = Path(os.path.abspath(cache_dir)).resolve(strict=False)
     if bundle_root == cache_root or bundle_root in cache_root.parents or cache_root in bundle_root.parents:
@@ -1089,8 +1090,8 @@ def stage_verified_bundle(path: Path, public_key: Path, cache_dir: Path) -> Path
                 raise DeploymentError(f"verified bundle cache contains a special file: {candidate}")
         if _sha256(target / "bundle-manifest.json") != target.name:
             raise DeploymentError("verified bundle cache key does not match its manifest")
-        verify_offline_bundle(target, public_key)
-        return target
+        verified_manifest = verify_offline_bundle(target, public_key)
+        return target, verified_manifest
     files = manifest.get("files")
     if not isinstance(files, dict):
         raise DeploymentError("offline bundle manifest files are invalid")
@@ -1129,12 +1130,12 @@ def stage_verified_bundle(path: Path, public_key: Path, cache_dir: Path) -> Path
                 os.chmod(candidate, 0o550 if executable else 0o440)
             else:
                 raise DeploymentError(f"verified bundle staging contains a special file: {candidate}")
-        verify_offline_bundle(staging, public_key)
+        verified_manifest = verify_offline_bundle(staging, public_key)
         os.replace(staging, target)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    return target
+    return target, verified_manifest
 
 
 def stage_source_snapshot(source_root: Path, cache_dir: Path) -> Tuple[Path, str, str]:
@@ -1282,6 +1283,31 @@ def validate_protected_paths(options) -> None:
                 or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
             ):
                 raise DeploymentError(f"{label} path is not root-managed: {current}")
+
+
+def _require_release_identity(context: ExecutionContext, record: dict, *, inputs: bool = True) -> None:
+    expected = plan_identity_fields(context.plan)
+    identity = record_identity(expected)
+    if identity is None or record_identity(record) != identity:
+        raise DeploymentError("release ownership does not match deployment")
+    if identity[0] == "release-owner-v1":
+        if record.get("profile") != context.profile.name or record.get("release_id") != context.options.release_id:
+            raise DeploymentError("release identity does not match deployment target")
+        if inputs and not installation_inputs_match(record.get("installation_inputs"), expected.get("installation_inputs")):
+            raise DeploymentError("release inputs do not match deployment")
+
+
+def _read_installing_record(marker: Path) -> dict:
+    value = marker.read_text(encoding="utf-8").strip()
+    if value.startswith("{"):
+        try:
+            record = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise DeploymentError("incomplete release identity record is invalid") from exc
+        if not isinstance(record, dict) or type(record.get("schema_version")) is not int or record["schema_version"] != 1:
+            raise DeploymentError("incomplete release identity record is unsupported")
+        return record
+    return {"fingerprint": value}
 
 
 def preflight(context: ExecutionContext) -> None:
@@ -1467,10 +1493,10 @@ def preflight(context: ExecutionContext) -> None:
             existing = json.loads(existing_manifest.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise DeploymentError(f"existing release manifest is invalid: {existing_manifest}") from exc
-        if existing.get("fingerprint") != context.plan.fingerprint:
-            raise DeploymentError(f"release id {options.release_id} already belongs to a different deployment")
+        if plan_identity_fields(context.plan):
+            _require_release_identity(context, existing)
+            context.notes["reuse_release"] = True
         _validate_completed_release(options.release_dir, existing)
-        context.notes["reuse_release"] = True
 
 
 def _missing_system_packages(packages: Sequence[str]) -> Tuple[str, ...]:
@@ -2302,8 +2328,7 @@ def install_python_environment(context: ExecutionContext) -> None:
             existing = json.loads(existing_manifest.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise DeploymentError(f"existing release manifest is invalid: {existing_manifest}") from exc
-        if existing.get("fingerprint") != context.plan.fingerprint:
-            raise DeploymentError(f"existing release has a different fingerprint: {options.release_dir}")
+        _require_release_identity(context, existing)
         context.notes["reuse_release"] = True
         return
     build_account = resolve_build_account()
@@ -2313,15 +2338,15 @@ def install_python_environment(context: ExecutionContext) -> None:
     if installing_marker.is_symlink():
         raise DeploymentError(f"incomplete release marker is a symlink: {installing_marker}")
     if installing_marker.is_file():
-        marker_fingerprint = installing_marker.read_text(encoding="utf-8").strip()
-        if marker_fingerprint != context.plan.fingerprint:
-            raise DeploymentError(f"incomplete release belongs to a different deployment: {options.release_dir}")
+        _require_release_identity(context, _read_installing_record(installing_marker))
     elif installing_marker.exists():
         raise DeploymentError(f"incomplete release marker is unsafe: {installing_marker}")
     elif any(options.release_dir.iterdir()):
         raise DeploymentError(f"unmarked incomplete release directory is not reusable: {options.release_dir}")
     else:
-        atomic_write(installing_marker, context.plan.fingerprint + "\n", mode=0o600)
+        marker_record = {"schema_version": 1, "profile": context.profile.name,
+                         "release_id": options.release_id, **plan_identity_fields(context.plan)}
+        atomic_write(installing_marker, json.dumps(marker_record, sort_keys=True) + "\n", mode=0o600)
     venv_root = _prepare_mutable_build_tree(
         options.release_dir / ".venv",
         build_account.pw_uid,
@@ -3264,8 +3289,7 @@ def install_release(context: ExecutionContext) -> None:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise DeploymentError(f"existing release is incomplete: {release_dir}") from exc
-        if manifest.get("fingerprint") != context.plan.fingerprint:
-            raise DeploymentError(f"release id already exists with a different fingerprint: {release_dir}")
+        _require_release_identity(context, manifest)
         if not options.no_systemd:
             snapshot_script = _require_file(
                 options.source_root / "scripts" / "install_motion_guard_deployment.sh",
@@ -3285,8 +3309,8 @@ def install_release(context: ExecutionContext) -> None:
     options.releases_dir.mkdir(parents=True, exist_ok=True)
     release_dir.mkdir(parents=True, exist_ok=True)
     marker = release_dir / ".installing"
-    if marker.is_file() and marker.read_text(encoding="utf-8").strip() != context.plan.fingerprint:
-        raise DeploymentError(f"incomplete release has a different fingerprint: {release_dir}")
+    if marker.is_file():
+        _require_release_identity(context, _read_installing_record(marker))
     if not _venv_python(context).is_file():
         raise DeploymentError(f"release virtual environment is missing: {_venv_python(context)}")
     _copy_release_source(options.source_root, release_dir)
@@ -3345,7 +3369,7 @@ def install_release(context: ExecutionContext) -> None:
     release_manifest = {
         "schema_version": 3,
         "profile": context.profile.name,
-        "fingerprint": context.plan.fingerprint,
+        **plan_identity_fields(context.plan),
         "release_id": options.release_id,
         "source_revision": _source_revision(context),
         "source_tree_id": options.source_tree_id,
@@ -3852,8 +3876,7 @@ def activate_release(context: ExecutionContext) -> None:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise DeploymentError(f"candidate release manifest is invalid: {manifest}") from exc
-    if payload.get("fingerprint") != context.plan.fingerprint:
-        raise DeploymentError("candidate release fingerprint changed before activation")
+    _require_release_identity(context, payload, inputs=False)
     current = context.options.current_link
     stopped_previous = False
     if current.is_symlink() and current.resolve() != release_dir.resolve():

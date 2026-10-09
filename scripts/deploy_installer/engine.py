@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
+import stat
 import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -102,6 +102,9 @@ class DeploymentPlan:
     fingerprint: str
     phases: Tuple[Phase, ...]
     rollback: Optional[Callback] = None
+    installation_inputs: Optional[Dict[str, Any]] = None
+    release_owner_id: str = ""
+    resumed_from_transaction_id: str = ""
 
 
 @dataclass
@@ -163,6 +166,9 @@ class DeploymentEngine:
             options.release_id,
             options.transaction_id,
             list(rendered),
+            release_owner_id=plan.release_owner_id,
+            installation_inputs=plan.installation_inputs,
+            resumed_from_transaction_id=plan.resumed_from_transaction_id,
         )
         for phase in plan.phases:
             if context.notes.get("reuse_release") and phase.name in {
@@ -232,118 +238,68 @@ def _empty_rust_profile():
     return RustProfile(toolchain="", builds=())
 
 
-def _file_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _path_identity(path: Optional[Path]) -> str:
+def _path_input_record(path: Optional[Path], options: DeploymentOptions, bundle_manifest=None) -> dict:
     if path is None:
-        return ""
+        return {"kind": "absent"}
     path = path.resolve()
+    if options.offline_bundle is not None and bundle_manifest is not None:
+        try:
+            relative = path.relative_to(options.offline_bundle.resolve()).as_posix()
+        except ValueError:
+            pass
+        else:
+            return {"kind": "signed-bundle-member", "path": relative}
+    if options.source_is_snapshot and path == options.source_root.resolve():
+        return {"kind": "git-snapshot", "revision": options.source_revision, "tree_id": options.source_tree_id}
+    if not path.exists():
+        return {"kind": "missing", "path": str(path)}
     if path.is_file():
-        return f"file:{_file_digest(path)}"
-    if not path.is_dir():
-        return f"missing:{path}"
-    git_environment = source_user_environment()
+        info = path.stat()
+        return {"kind": "file", "path": str(path),
+                "stat": [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode]}
+    # Keep source enumeration local. No source payload or binary Git diff is read.
     git = subprocess.run(
-        source_user_command(("git", "rev-parse", "HEAD")),
-        cwd=str(path),
-        env=git_environment,
-        capture_output=True,
-        check=False,
-        timeout=30,
+        source_user_command(("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z")),
+        cwd=str(path), env=source_user_environment(), capture_output=True, check=False, timeout=30,
     )
-    if git.returncode == 0:
-        diff = subprocess.run(
-            source_user_command(("git", "diff", "--binary", "HEAD", "--")),
-            cwd=str(path),
-            env=git_environment,
-            capture_output=True,
-            check=False,
-            timeout=60,
-        )
-        status = subprocess.run(
-            source_user_command(
-                (
-                    "git",
-                    "status",
-                    "--porcelain=v1",
-                    "-z",
-                    "--untracked-files=all",
-                )
-            ),
-            cwd=str(path),
-            env=git_environment,
-            capture_output=True,
-            check=False,
-            timeout=30,
-        )
-        if diff.returncode == 0 and status.returncode == 0:
-            untracked = hashlib.sha256()
-            for record in status.stdout.split(b"\0"):
-                if not record.startswith(b"?? "):
-                    continue
-                relative = Path(os.fsdecode(record[3:]))
-                candidate = path / relative
-                if relative.is_absolute() or ".." in relative.parts:
-                    raise ValueError(f"unsafe untracked source path: {relative}")
-                if candidate.is_symlink() or not candidate.is_file():
-                    raise ValueError(f"unsupported untracked source input: {relative}")
-                untracked.update(os.fsencode(relative.as_posix()))
-                untracked.update(b"\0")
-                untracked.update(_file_digest(candidate).encode("ascii"))
-                untracked.update(b"\0")
-            payload = git.stdout.strip() + b"\0" + diff.stdout + b"\0" + status.stdout + b"\0" + untracked.digest()
-            return "git:" + hashlib.sha256(payload).hexdigest()
-    digest = hashlib.sha256()
-    for candidate in sorted(path.rglob("*")):
+    candidates = ([path / os.fsdecode(item) for item in git.stdout.split(b"\0") if item]
+                  if git.returncode == 0 else list(path.rglob("*")))
+    outputs = tuple(p.resolve() for p in (options.install_root, options.state_dir, options.cache_dir, options.config_dir))
+    files = []
+    for candidate in sorted(set(candidates)):
         relative = candidate.relative_to(path)
         if ".git" in relative.parts or "__pycache__" in relative.parts:
             continue
-        if candidate.is_symlink() or not candidate.is_file():
+        if any(candidate == output or output in candidate.parents for output in outputs):
             continue
-        digest.update(os.fsencode(relative.as_posix()))
-        digest.update(b"\0")
-        digest.update(_file_digest(candidate).encode("ascii"))
-        digest.update(b"\0")
-    return "tree:" + digest.hexdigest()
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(info.st_mode):
+            files.append([relative.as_posix(), info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode])
+        elif stat.S_ISLNK(info.st_mode):
+            files.append([relative.as_posix(), "symlink", os.readlink(candidate)])
+    return {"kind": "tree", "path": str(path), "files": files}
 
 
-def _fingerprint(profile: DeploymentProfile, options: DeploymentOptions) -> str:
+def capture_installation_inputs(profile: DeploymentProfile, options: DeploymentOptions, bundle_manifest=None) -> dict:
+    source = _path_input_record(options.fingerprint_source_root or options.source_root, options, bundle_manifest)
+    if bundle_manifest is not None:
+        source = {"kind": "signed-bundle", "manifest": bundle_manifest}
+    paths = {name: _path_input_record(getattr(options, name), options, bundle_manifest) for name in (
+        "trust_root", "go2_sdk", "go2_sdk_wheel", "clip_source", "clip_wheel",
+        "cyclonedds_source", "cyclonedds_wheel", "actuator_manifest", "bundle_public_key", "legacy_config",
+    )}
+    paths["python"] = _path_input_record(Path(options.python_bin), options, bundle_manifest)
     payload = {
-        "profile": asdict(profile),
-        "source_identity": _path_identity(options.fingerprint_source_root or options.source_root),
-        "trust_identity": _path_identity(options.trust_root),
-        "release_id": options.release_id,
-        "go2_sdk": _path_identity(options.go2_sdk),
-        "go2_sdk_wheel": _path_identity(options.go2_sdk_wheel),
-        "clip_source": _path_identity(options.clip_source),
-        "clip_wheel": _path_identity(options.clip_wheel),
-        "cyclonedds_source": _path_identity(options.cyclonedds_source),
-        "cyclonedds_wheel": _path_identity(options.cyclonedds_wheel),
-        "actuator_manifest": _path_identity(options.actuator_manifest),
-        "offline_bundle_manifest": _path_identity(
-            options.offline_bundle / "bundle-manifest.json" if options.offline_bundle else None
-        ),
-        "bundle_public_key": _path_identity(options.bundle_public_key),
-        "legacy_config": _path_identity(options.legacy_config),
-        "dds_interface": options.dds_interface,
-        "go2_robot_ip": options.go2_robot_ip,
-        "gateway_host": options.gateway_host,
-        "gateway_port": options.gateway_port,
-        "require_update_readiness": options.require_update_readiness,
-        "allow_unverified_third_party": options.allow_unverified_third_party,
-        "allow_dirty_source": options.allow_dirty_source,
-        "controlled_bringup_transaction": (options.transaction_id if options.allow_dirty_source else ""),
-        "skip_models": options.skip_models,
-        "export_yolo_engine": options.export_yolo_engine,
+        "version": 1, "profile": asdict(profile), "source": source, "files": paths,
+        "options": {name: getattr(options, name) for name in (
+            "dds_interface", "go2_robot_ip", "gateway_host", "gateway_port", "skip_models", "export_yolo_engine",
+        )},
+        "reusable": not options.allow_dirty_source,
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return json.loads(json.dumps(payload, sort_keys=True))
 
 
 def _build_user_rust_paths() -> Tuple[Path, Path, Path]:
@@ -601,6 +557,10 @@ def _geometry_release_action(
 def build_deployment_plan(
     profile: DeploymentProfile,
     options: DeploymentOptions,
+    *,
+    installation_inputs: Optional[Dict[str, Any]] = None,
+    release_owner_id: str = "",
+    resumed_from_transaction_id: str = "",
 ) -> DeploymentPlan:
     from . import operations
 
@@ -803,7 +763,10 @@ def build_deployment_plan(
     )
     return DeploymentPlan(
         profile_name=profile.name,
-        fingerprint=_fingerprint(profile, options),
+        fingerprint="",
+        installation_inputs=installation_inputs,
+        release_owner_id=release_owner_id,
+        resumed_from_transaction_id=resumed_from_transaction_id,
         phases=phases,
         rollback=operations.rollback,
     )

@@ -132,9 +132,19 @@ class ReleaseInventoryTests(unittest.TestCase):
             options=options,
             profile=profile,
             notes={"artifact_sha256:approved-input": "trust-pin"},
-            plan=SimpleNamespace(fingerprint="owner-unchanged"),
+            plan=SimpleNamespace(fingerprint="", release_owner_id="owner-unchanged",
+                                 installation_inputs={"version": 1, "reusable": True,
+                                                      "profile": {}, "source": {}, "files": {}, "options": {}}),
             runner=RecordingRunner(),
         )
+        marker_record = dict(schema_version=1, profile="fixture", release_id="release",
+                             **op.plan_identity_fields(c.plan))
+        (self.release / ".installing").write_text(json.dumps(marker_record))
+        original_open = Path.open
+        def identity_reads_only(path, *args, **kwargs):
+            if path == self.release / ".installing":
+                return original_open(path, *args, **kwargs)
+            raise AssertionError("local generation body read")
         with ExitStack() as stack:
             for name in (
                 "_prepare_backup_root",
@@ -154,11 +164,14 @@ class ReleaseInventoryTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(op, "_tree_digest", side_effect=AssertionError("local tree digest invoked"))
             )
-            stack.enter_context(patch.object(Path, "open", side_effect=AssertionError("local generation body read")))
+            stack.enter_context(patch.object(Path, "open", identity_reads_only))
             op.install_release(c)
         m = json.loads((self.release / "release-manifest.json").read_text())
         self.assertEqual(m["schema_version"], 3)
-        self.assertEqual(m["fingerprint"], "owner-unchanged")
+        self.assertEqual(m["release_identity"], {"version": 1, "owner_id": "owner-unchanged"})
+        self.assertEqual(m["installation_inputs"], c.plan.installation_inputs)
+        self.assertNotIn("fingerprint", m)
+        self.assertFalse((self.release / ".installing").exists())
         self.assertEqual(m["cargo_lock_files"], ["Cargo.lock"])
         self.assertEqual(m["python_input_files"], ["requirements.txt"])
         self.assertEqual([k for k in m if k.endswith("_sha256")], ["third_party_sha256"])
@@ -166,6 +179,22 @@ class ReleaseInventoryTests(unittest.TestCase):
         with self.no_content_reads():
             op._validate_completed_release(self.release, m)
         self.assertEqual(c.runner.executed, [])
+
+    def test_manifest_written_marker_cleanup_interrupted_remains_reusable(self):
+        original_unlink = Path.unlink
+        def interrupted(path, *args, **kwargs):
+            if path == self.release / ".installing":
+                raise OSError("marker cleanup interrupted")
+            return original_unlink(path, *args, **kwargs)
+        with patch.object(Path, "unlink", interrupted):
+            with self.assertRaisesRegex(OSError, "marker cleanup interrupted"):
+                self.test_schema3_generation_omits_local_hashes_and_body_scans()
+        record = json.loads((self.release / "release-manifest.json").read_text())
+        marker = op._read_installing_record(self.release / ".installing")
+        self.assertEqual(record["release_identity"], marker["release_identity"])
+        self.assertEqual(record["installation_inputs"], marker["installation_inputs"])
+        with self.no_content_reads():
+            op._validate_completed_release(self.release, record)
 
     def test_schema3_missing_files_and_layout_rejected(self):
         for relative in (

@@ -2973,12 +2973,15 @@ class MapWorkspaceService:
         if (pending is not None and pending.get("schema_version") == 3
                 or asset is not None and asset.identity_schema_version == 2):
             self._arm_map_activation_fence(pending, reason="restore_assigned_workspace")
-            bundle = self.get_map_asset_bundle(map_name=name)
+            loaded = self.get_map_asset_bundle(map_name=name, _for_activation=True)
+            from services.mapping.asset_store import _AssignedActivationRead
+            activation_read = loaded if type(loaded) is _AssignedActivationRead else None
+            bundle = activation_read.bundle if activation_read is not None else loaded
             if bundle is None:
                 return None
             from skills.assigned_map_activation import activate_assigned_workspace
             workspace = activate_assigned_workspace(self, bundle, load_memory_history=load_memory_history,
-                                                    allow_dispatch=False)
+                                                    allow_dispatch=False, _activation_read=activation_read)
             from skills.assigned_map_relocalization import recover_assigned_relocalization
             recovered = recover_assigned_relocalization(self)
             return recovered[1] if recovered is not None else workspace

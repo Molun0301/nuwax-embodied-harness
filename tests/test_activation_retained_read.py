@@ -33,7 +33,7 @@ class RetainedActivationReadTests(unittest.TestCase):
     def read(self):
         return self.h.service.get_map_asset_bundle(map_name=workspace_tests.MAP_NAME, _for_activation=True)
 
-    def test_public_activation_one_owned_validation_no_borrowed_pass(self):
+    def _assert_one_owned_validation(self, operation):
         counts = dict.fromkeys(('backend', 'canonical', 'fine', 'dense', 'freeze', 'load'), 0)
         with ExitStack() as stack:
             for name, label in (('_validate_backend_payload_header', 'backend'), ('_validate_canonical_members', 'canonical'),
@@ -52,10 +52,14 @@ class RetainedActivationReadTests(unittest.TestCase):
                 stack.enter_context(patch.object(cls, name, wrap))
             stack.enter_context(patch.object(self.repository, '_validate_assigned_checkpoint_bodies',
                 side_effect=AssertionError('borrowed body pass during activation')))
-            workspace = self.h.activate()
+            workspace = operation()
         self.h.assert_consistent(workspace)
         self.assertEqual(counts, dict(backend=1, canonical=1, fine=1, dense=1, freeze=3, load=1))
         self.assertEqual(self.h.stub.installs, 1)
+        return workspace
+
+    def test_public_activation_one_owned_validation_no_borrowed_pass(self):
+        self._assert_one_owned_validation(self.h.activate)
 
     def test_tree_closed_owners_retained_for_canonical_view_and_upload(self):
         closed=[]
@@ -96,7 +100,7 @@ class RetainedActivationReadTests(unittest.TestCase):
         with self.assertRaises(TypeError):pickle.dumps(read)
         self.assertEqual(self.h.stub.installs,0)
 
-    def _race(self,when,kind):
+    def _race(self,when,kind,operation=None):
         original=checkpoint.MappingBackendCheckpointStore.load;loaded=[]
         def mutate():
             if kind=='file':
@@ -114,10 +118,11 @@ class RetainedActivationReadTests(unittest.TestCase):
             return value
         gc.collect();before=len(os.listdir('/proc/self/fd'))
         with patch.object(checkpoint.MappingBackendCheckpointStore,'load',load):
-            with self.assertRaises(Exception):self.h.activate()
+            with self.assertRaises(Exception):(operation or self.h.activate)()
         gc.collect();self.assertEqual(len(os.listdir('/proc/self/fd')),before)
         self.assertEqual(loaded,[True])
-        self.assertEqual(self.h.stub.installs,0)
+        self.assertEqual(self.h.stub.installs,1 if operation else 0)
+        if operation:self.assertEqual(self.h.stub.calls,[])
         # A new exact read can still take the store lock: no descriptor/lock leaked.
         reopened=checkpoint.MappingBackendCheckpointStore(self.root).load('voxel',schema_version=2)
         self.assertEqual(reopened.checkpoint.checkpoint_id,workspace_tests.CHECKPOINT_ID)
@@ -171,3 +176,103 @@ class RetainedActivationReadTests(unittest.TestCase):
 
     def test_parent_component_catalog_preserves_direct_prepare_semantics(self):
         self._catalog_alias_activation('parent')
+
+    def _start_cold_restore(self):
+        original = self.h.activate()
+        self.h.runtime = self.h.new_runtime()
+        self.h.store = workspace_tests.StateStore()
+        self.h.mapping = workspace_tests.MappingService(
+            provider_owner=workspace_tests.SimpleNamespace(), state_store=self.h.store)
+        self.h.localization = workspace_tests.LocalizationService(
+            provider_owner=workspace_tests.SimpleNamespace(), state_store=self.h.store)
+        self.h.memory = workspace_tests.MemoryEndpoint()
+        self.h.service = self.h.new_service()
+        self.repository = self.h.service._asset_repository
+        self.h.stub.calls.clear()
+        return original.active_localization_session.activation_receipt_v2
+
+    def test_cold_restore_one_owned_validation_after_tree_closes_without_dispatch(self):
+        receipt = self._start_cold_restore()
+        closed = []
+        original_close = asset_store._StableDirectoryTree.close
+        original_prepare = self.h.runtime.prepare_retained_assigned_map_activation
+        prepared_reads = []
+        def close(tree):
+            descriptors = [tree.parent_descriptor] + [x.descriptor for x in tree.files.values()]
+            original_close(tree)
+            closed.extend(fd for fd in descriptors if fd >= 0)
+        def prepare(read, **kwargs):
+            self.assertTrue(closed)
+            for fd in closed:
+                with self.assertRaises(OSError):os.fstat(fd)
+            prepared = original_prepare(read, **kwargs)
+            self.assertIs(prepared.stored_checkpoint, read.stored_checkpoint)
+            self.assertEqual(bytes(read.stored_checkpoint.checkpoint.canonical_cloud_xyz.view()),
+                             struct.pack('<fff', 1, 2, 3))
+            prepared_reads.append(read)
+            return prepared
+        with patch.object(asset_store._StableDirectoryTree, 'close', close), \
+                patch.object(self.h.runtime, 'prepare_retained_assigned_map_activation', prepare):
+            restored = self._assert_one_owned_validation(self.h.service.restore_active_workspace)
+        self.assertEqual(len(prepared_reads), 1)
+        self.assertEqual(restored.active_localization_session.activation_receipt_v2, receipt)
+        self.assertEqual(self.h.stub.calls, ['GetMappingState', 'GetMappingState'])
+
+    def test_cold_restore_cancellation_after_read_does_not_cache_body_for_retry(self):
+        self._start_cold_restore()
+        original = self.h.runtime.prepare_retained_assigned_map_activation
+        reads = []
+        def cancel(read, **kwargs):
+            reads.append(read)
+            raise workspace_tests.ActivationCancelled('after stable read')
+        with patch.object(self.h.runtime, 'prepare_retained_assigned_map_activation', cancel):
+            with self.assertRaises(workspace_tests.ActivationCancelled):
+                self.h.service.restore_active_workspace()
+        self.assertEqual(self.h.stub.calls, [])
+        self.assertIsNone(self.h.runtime._map_activation_snapshot_read().bundle)
+        path = next((self.root / 'mapping_backend/voxel/objects').glob('*-backend.bin'))
+        body = path.read_bytes()
+        corrupt = bytearray(body);corrupt[-8:] = struct.pack('<d', float('nan'))
+        path.write_bytes(corrupt)
+        with self.assertRaises(workspace_tests.GatewayError) as rejected:
+            self.h.service.restore_active_workspace()
+        self.assertEqual(rejected.exception.error_code, 'map_asset_bundle_invalid')
+        self.assertIsInstance(rejected.exception.__cause__, asset_store.MapAssetBundleValidationError)
+        self.assertEqual(self.h.stub.calls, [])
+        path.write_bytes(body)
+        def retry(read, **kwargs):
+            self.assertIsNot(read, reads[0])
+            self.assertIsNot(read.stored_checkpoint, reads[0].stored_checkpoint)
+            return original(read, **kwargs)
+        with patch.object(self.h.runtime, 'prepare_retained_assigned_map_activation', retry):
+            self.h.assert_consistent(self.h.service.restore_active_workspace())
+        self.assertEqual(self.h.stub.installs, 1)
+        self.assertTrue(all(call == 'GetMappingState' for call in self.h.stub.calls))
+
+    def test_cold_restore_load_cancellation_releases_tree_and_never_dispatches(self):
+        self._start_cold_restore()
+        gc.collect();before = len(os.listdir('/proc/self/fd'))
+        with patch.object(checkpoint.MappingBackendCheckpointStore, 'load',
+                          side_effect=workspace_tests.ActivationCancelled('during load')):
+            with self.assertRaises(workspace_tests.ActivationCancelled):
+                self.h.service.restore_active_workspace()
+        gc.collect();self.assertEqual(len(os.listdir('/proc/self/fd')), before)
+        self.assertEqual(self.h.stub.calls, [])
+        self.h.assert_consistent(self.h.service.restore_active_workspace())
+        self.assertEqual(self.h.stub.installs, 1)
+
+    def test_cold_restore_member_replacement_before_load_rejected(self):
+        self._start_cold_restore()
+        self._race('before', 'file', self.h.service.restore_active_workspace)
+
+    def test_cold_restore_member_replacement_after_load_rejected(self):
+        self._start_cold_restore()
+        self._race('after', 'file', self.h.service.restore_active_workspace)
+
+    def test_cold_restore_directory_replacement_before_load_rejected(self):
+        self._start_cold_restore()
+        self._race('before', 'directory', self.h.service.restore_active_workspace)
+
+    def test_cold_restore_directory_replacement_after_load_rejected(self):
+        self._start_cold_restore()
+        self._race('after', 'directory', self.h.service.restore_active_workspace)

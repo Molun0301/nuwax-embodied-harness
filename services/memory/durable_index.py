@@ -961,7 +961,7 @@ class DurableMemoryIndex:
                         binding_status = self.route_binding_status(proof.get('binding', projection['binding']), binding, route)
                         versioned = publication_current and self._ack_matches(proof, ack, current, named)
                         if (not publication_current or not route_current or binding_status == 'incompatible'
-                                or (publication_current and self._ack_conflicts(proof, ack, named))):
+                                or (publication_current and not versioned and self._ack_conflicts(proof, ack, named))):
                             reason = 'input_or_incarnation_changed'
                         if reason is None and binding_status == 'legacy':
                             reason = 'provider_version_unverified'

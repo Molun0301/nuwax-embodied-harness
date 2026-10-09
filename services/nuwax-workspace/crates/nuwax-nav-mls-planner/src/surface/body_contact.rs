@@ -25,7 +25,7 @@ impl SurfaceSnapshot {
             if !self.complete_observations_cover_column(key.0,key.1){return false;}
             let bounds=[overlap.iter().map(|&p|height(p)).fold(f64::INFINITY,f64::min),overlap.iter().map(|&p|height(p)).fold(f64::NEG_INFINITY,f64::max)];
             let middle=(bounds[0]+bounds[1])*0.5;let distance=|b:[f64;2]|(b[0]-middle).max(middle-b[1]).max(0.0);
-            let bands=self.fine_contact_bands(x,y);let Some(b)=bands.iter().min_by(|a,b|distance(**a).total_cmp(&distance(**b)).then_with(||(a[1]-middle).abs().total_cmp(&(b[1]-middle).abs())).then_with(||a[1].total_cmp(&b[1]))).copied() else{return false;};
+            let bands=self.fine_contact_bands(x,y);let Some(b)=bands.iter().map(|entry|&entry.fit).min_by(|a,b|distance(**a).total_cmp(&distance(**b)).then_with(||(a[1]-middle).abs().total_cmp(&(b[1]-middle).abs())).then_with(||a[1].total_cmp(&b[1]))).copied() else{return false;};
             if b[1]-bounds[0]>model.max_step_up_m+fine+model.support_uncertainty_m+1e-6
                 || bounds[1]-b[1]>model.max_step_down_m+fine+model.support_uncertainty_m+1e-6{return false;}
             if self.current_body_support.as_ref().is_some_and(|current| {

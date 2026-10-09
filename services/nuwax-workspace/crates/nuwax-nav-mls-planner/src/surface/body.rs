@@ -405,6 +405,70 @@ pub(super) fn apply_directions(graph:&mut PlannerGraph,heights:&HeightBounds,con
     }
 }
 
+// Immutable source membership and its unchanged fitting interval share one cache entry.
+// Private clearing and pose-dependent contact permission are never stored here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FineContactBand {
+    fit: [f64; 2],
+    run: [i32; 2],
+}
+
+// Query-local contact membership. A single run needs no heap allocation.
+#[derive(Default)]
+enum FineContacts {
+    #[default]
+    Empty,
+    One([i32;2]),
+    Many(Vec<[i32;2]>),
+}
+impl FineContacts {
+    fn as_slice(&self)->&[[i32;2]] {
+        match self {Self::Empty=>&[],Self::One(run)=>std::slice::from_ref(run),Self::Many(runs)=>runs}
+    }
+    fn last_mut(&mut self)->Option<&mut [i32;2]> {
+        match self {Self::Empty=>None,Self::One(run)=>Some(run),Self::Many(runs)=>runs.last_mut()}
+    }
+    fn push(&mut self,run:[i32;2]) {
+        match self {
+            Self::Empty=>*self=Self::One(run),
+            Self::One(first)=>*self=Self::Many(vec![*first,run]),
+            Self::Many(runs)=>runs.push(run),
+        }
+    }
+}
+
+struct FineGroundColumn {
+    xy: [i32; 2],
+    // Missing source remains None; never a zero-height permission.
+    height: Option<f64>,
+    // Exact original occupied voxels eligible for contact; source bands stay intact.
+    contacts: FineContacts,
+}
+// Output type fixes whether contact membership is computed; height-only rows
+// cannot be passed to collision consumers expecting FineGroundColumn.
+struct FineGroundHeight(Option<f64>);
+trait FineGroundValue {
+    const CONTACTS: bool;
+    fn from_parts(xy:[i32;2],height:Option<f64>,contacts:FineContacts)->Self;
+}
+impl FineGroundValue for FineGroundColumn {
+    const CONTACTS: bool=true;
+    fn from_parts(xy:[i32;2],height:Option<f64>,contacts:FineContacts)->Self {
+        Self{xy,height,contacts}
+    }
+}
+impl FineGroundValue for FineGroundHeight {
+    const CONTACTS: bool=false;
+    fn from_parts(_xy:[i32;2],height:Option<f64>,_contacts:FineContacts)->Self {
+        Self(height)
+    }
+}
+impl FineGroundColumn {
+    fn permits_contact(&self,z:i32)->bool {
+        self.contacts.as_slice().iter().any(|range|range[0]<=z && z<=range[1])
+    }
+}
+
 impl SurfaceSnapshot {
     /// 为已通过来源及新鲜度检查的当前接地机体建立私有规划视图。
     /// 仅处理当前占据投影；周边地面须围住足迹，观测到的落差和禁区仍拒绝。
@@ -751,6 +815,135 @@ impl SurfaceSnapshot {
             }),
         })
     }
+    /// 本次既有足迹遍历的细列关联；不增加覆盖或连通许可条件。
+    fn fine_ground_columns(&self,ground:Option<VoxelKey>,polygon:&PolygonQuery,prism:&PrismQuery,
+        body:[f64;3],normal:[f64;3],x:i32,y:i32)->Option<Vec<FineGroundColumn>> {
+        self.fine_ground_values::<FineGroundColumn>(ground,polygon,prism,body,normal,x,y)
+    }
+
+    fn fine_ground_height(&self,ground:VoxelKey,polygon:&PolygonQuery,prism:&PrismQuery,
+        body:[f64;3],normal:[f64;3],x:i32,y:i32)->Option<f64> {
+        self.fine_ground_values::<FineGroundHeight>(Some(ground),polygon,prism,body,normal,x,y)
+            .map(|rows|rows.into_iter().filter_map(|row|row.0).max_by(f64::total_cmp)
+                .unwrap_or_else(||self.cell_position(ground)[2]))
+    }
+
+    fn fine_ground_values<T:FineGroundValue>(&self,ground:Option<VoxelKey>,polygon:&PolygonQuery,prism:&PrismQuery,
+        body:[f64;3],normal:[f64;3],x:i32,y:i32)->Option<Vec<T>> {
+        let observations=self.observations.as_ref()?;
+        if ground.is_some_and(|ground|self.current_body_support.as_ref()
+            .is_some_and(|current|current.cells.contains(&ground))) {return None;}
+        let model=self.body_envelope()?;
+        let fine=f64::from(observations.size_m);let size=f64::from(self.config().voxel_size);
+        let contact=model.max_step_up_m.max(model.max_step_down_m)+f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
+        let mut columns=Vec::new();
+        for ix in (f64::from(x)*size/fine).floor() as i32..(f64::from(x+1)*size/fine).ceil() as i32 {
+            for iy in (f64::from(y)*size/fine).floor() as i32..(f64::from(y+1)*size/fine).ceil() as i32 {
+                if polygon.intersects(ix,iy,fine) {columns.push(([ix,iy],None));}
+            }
+        }
+        // 与接触响应域相同的现有带缓存，单次批读；冷列仅扫描其原始列索引。
+        {
+            let cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+            for (xy,bands) in &mut columns {*bands=cache.fine_bands.get(&(xy[0],xy[1])).cloned();}
+        }
+        let mut missing=Vec::new();
+        for (xy,bands) in &mut columns {
+            if bands.is_none() {
+                let values=Arc::new(self.read_fine_contact_bands(xy[0],xy[1]));
+                missing.push(((xy[0],xy[1]),Arc::clone(&values)));*bands=Some(values);
+            }
+        }
+        if !missing.is_empty() {
+            let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+            if cache.fine_bands.len()>=8192 {cache.fine_bands.clear();}
+            cache.fine_bands.extend(missing);
+        }
+        Some(columns.into_iter().map(|(xy,bands)| {
+            let support_offset=model.body_to_support_z_m/normal[2];
+            let body_lower_offset=model.z_bounds_m[0]/normal[2];
+            let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
+            let allowance=(-support_offset+contact+1e-6).min(uncertainty);
+            // contact_plane has only two query-local return values. The original
+            // height-dependent fast branch still chooses between them for each Z.
+            let flat=[-normal[0]/normal[2],-normal[1]/normal[2]]==[0.0,0.0];
+            let (rectangular_plane,clipped_plane,upper_plane)=if flat {
+                (body[2],body[2],body[2])
+            } else {
+                (polygon.contact_plane(body,normal,xy[0],xy[1],fine,f64::NEG_INFINITY,0.0),
+                 polygon.contact_plane(body,normal,xy[0],xy[1],fine,f64::INFINITY,0.0),
+                 -polygon.contact_plane([body[0],body[1],-body[2]],[-normal[0],-normal[1],normal[2]],
+                    xy[0],xy[1],fine,f64::INFINITY,0.0))
+            };
+            let lower=clipped_plane-support_offset;
+            let upper=upper_plane-support_offset;
+            let nominal_upper=lower+contact+1e-6;
+            let contact_plane=|top:f64|if top<=rectangular_plane+allowance {rectangular_plane}else{clipped_plane};
+            let reference=(lower+upper)*0.5;
+            let distance=|b:[f64;2]|(b[0]-reference).max(reference-b[1]).max(0.0);
+            let bands=bands.expect("批读已填充");
+            let band=bands.iter().min_by(|a,b|distance(a.fit).total_cmp(&distance(b.fit))
+                .then_with(||(a.fit[1]-reference).abs().total_cmp(&(b.fit[1]-reference).abs()))
+                .then_with(||a.fit[1].total_cmp(&b.fit[1])));
+            // Associate the original fit interval with the existing actual-overlap
+            // nominal window. Intersection is a predicate, never a truncated band.
+            let band=band.filter(|candidate|
+                candidate.fit[0].max(upper-contact-1e-6)
+                    <= candidate.fit[1].min(nominal_upper));
+            let height=band.and_then(|band| {
+                // OccupiedVolume still selects only the collapsed fit top here.
+                let first=(band.fit[0]/fine-1.0).round() as i32;
+                let last=band.run[1];
+                (first..=last).rev().find_map(|iz| {
+                    let key=[xy[0],xy[1],iz];
+                    if self.current_body_support.as_ref()
+                        .is_some_and(|current|current.cleared_voxels.contains(&key)) {return None;}
+                    let top=f64::from(iz+1)*fine;
+                    (top<=nominal_upper || prism.intersects(key.map(|v|f64::from(v)*fine),
+                        key.map(|v|f64::from(v+1)*fine))).then_some(top)
+                })
+            });
+            let mut contacts=FineContacts::default();
+            if T::CONTACTS {
+                for candidate in bands.iter() {
+                    let [first,last]=candidate.run;
+                    if Some(candidate)==band {
+                        // Check each original selected-band voxel with the existing
+                        // nominal upper bound and height predicate. Higher intersecting
+                        // voxels remain in `height` and in the original prism checks.
+                        for iz in first..=last {
+                            let key=[xy[0],xy[1],iz];
+                            if self.current_body_support.as_ref()
+                                .is_some_and(|current|current.cleared_voxels.contains(&key)) {continue;}
+                            let top=f64::from(iz+1)*fine;
+                            if top>nominal_upper {continue;}
+                            let plane=contact_plane(top);
+                            let support=plane-support_offset;
+                            let body_lower=plane+body_lower_offset;
+                            if height_rejection(body_lower,support,plane,contact,top,uncertainty).is_none() {
+                                if let Some(run)=contacts.last_mut().filter(|run|run[1].checked_add(1)==Some(iz)) {
+                                    run[1]=iz;
+                                } else {contacts.push([iz,iz]);}
+                            }
+                        }
+                        continue;
+                    }
+                    // An extra band is not a new support anchor. Its complete exposed
+                    // top must fit the existing nominal-support travel at this overlap;
+                    // rigid-body bottom height must not enlarge that travel.
+                    let plane=contact_plane(candidate.fit[1]);
+                    let support=plane-support_offset;
+                    let body_lower=plane+body_lower_offset;
+                    if candidate.fit[1]<=support+contact+1e-6
+                        && height_rejection(body_lower,support,plane,contact,candidate.fit[1],uncertainty).is_none() {
+                        contacts.push([first,last]);
+                    }
+                }
+            }
+            T::from_parts(xy,height,contacts)
+        }).collect())
+    }
+
     /// 接触关联与包络复用实际相交精细列的地面高度；缺精细依据时仍保留粗层。
     fn footprint_ground_height(
         &self,
@@ -759,7 +952,12 @@ impl SurfaceSnapshot {
         prism_query: &PrismQuery,
         support_plane: f64,
         contact: f64,
+        selected: Option<&[FineGroundColumn]>,
     ) -> Result<f64, SurfaceError> {
+        if let Some(columns)=selected {
+            return Ok(columns.iter().filter_map(|c|c.height).max_by(f64::total_cmp)
+                .unwrap_or_else(||self.cell_position(ground)[2]));
+        }
         let (x, y, _) = ground;
         let size = f64::from(self.config().voxel_size);
         let mut ground_height = self.cell_position(ground)[2];
@@ -804,6 +1002,7 @@ impl SurfaceSnapshot {
     fn fine_ground_contact_is_compatible(
         &self,ground:VoxelKey,polygon:&PolygonQuery,prism:&PrismQuery,
         body:[f64;3],normal:[f64;3],coarse_support:f64,contact:f64,uncertainty:f64,
+        selected:Option<&[FineGroundColumn]>,
     )->Result<(),FineGroundReject> {
         let Some(observations)=self.observations.as_ref().filter(|o|o.size_m<self.config().voxel_size) else {return Err(FineGroundReject::NoFinerSource);};
         if self.current_body_support.as_ref().is_some_and(|current|current.cells.contains(&ground)) {return Err(FineGroundReject::CurrentSupportColumn);}
@@ -832,13 +1031,17 @@ impl SurfaceSnapshot {
                     if !observations.supports_obstacle(key)
                         || self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&key)) {continue;}
                     let top=f64::from(iz+1)*fine;
+                    if selected.is_some() {continue;}
                     // 与原整列地面计算选择完全相同的真实占据，只保留其各自XY。
                     if top<=coarse_support+contact+1e-6 || prism.intersects(
                         [f64::from(ix)*fine,f64::from(iy)*fine,f64::from(iz)*fine],
                         [f64::from(ix+1)*fine,f64::from(iy+1)*fine,top]) {if top>height {selected_cell=Some(key);} height=height.max(top);}
                 }
+                if let Some(columns)=selected {
+                    height=columns.iter().find(|c|c.xy==[ix,iy]).and_then(|c|c.height).unwrap_or(f64::NEG_INFINITY);
+                    if height.is_finite() {selected_cell=Some([ix,iy,(height/fine-1.0).round() as i32]);}
+                } else {height=height.min(ceiling);}
                 if !height.is_finite() {return Err(FineGroundReject::NoSelectedHeight{column:[ix,iy]});}
-                height=height.min(ceiling);
                 let plane=polygon.contact_plane(body,normal,ix,iy,fine,height,allowance);
                 let body_lower=plane+model.z_bounds_m[0]/normal[2];
                 let support=plane-model.body_to_support_z_m/normal[2];
@@ -891,9 +1094,9 @@ impl SurfaceSnapshot {
             let plane=polygon_query.contact_plane(body,r[2],x,y,size,self.cell_position(cell)[2],
                 -model.body_to_support_z_m/r[2][2]+contact_limit+1e-6);
             let support_plane=plane-model.body_to_support_z_m/r[2][2];
-            let height=if let Some(&height)=precise_ground.get(&(x,y)) {height} else {
-                self.footprint_ground_height(cell,&polygon_query,&prism_query,support_plane,contact_limit)?
-            };
+            let height=if let Some(height)=self.fine_ground_height(cell,&polygon_query,&prism_query,body,r[2],x,y) {height}
+                else if let Some(&height)=precise_ground.get(&(x,y)) {height}
+                else {self.footprint_ground_height(cell,&polygon_query,&prism_query,support_plane,contact_limit,None)?};
             min=min.min(height);max=max.max(height);contact.insert(cell);
             contact_columns.insert((x,y),(cell,height));
         }}
@@ -1145,8 +1348,12 @@ impl SurfaceSnapshot {
                         else {
                             let plane=query.contact_plane(body,r[2],key.0,key.1,size,self.cell_position(neighbor)[2],
                                 -model.body_to_support_z_m/r[2][2]+contact+1e-6);
-                            let Ok(height)=self.footprint_ground_height(neighbor,query,prism,
-                                plane-model.body_to_support_z_m/r[2][2],contact) else {continue;};
+                            let height=if let Some(height)=self.fine_ground_height(neighbor,query,prism,body,r[2],key.0,key.1) {height}
+                                else {
+                                    let Ok(height)=self.footprint_ground_height(neighbor,query,prism,
+                                        plane-model.body_to_support_z_m/r[2][2],contact,None) else {continue;};
+                                    height
+                                };
                             known_heights.insert(key,height);height
                         };
                     let rise=height-neighbor_height;
@@ -1314,14 +1521,15 @@ impl SurfaceSnapshot {
                     (-model.body_to_support_z_m/r[2][2]+contact+1e-6).min(uncertainty));
                 let lower = plane + model.z_bounds_m[0] / r[2][2];
                 let support_plane = plane - model.body_to_support_z_m / r[2][2];
-                let ground_height = if let Some(&height)=precise_ground.get(&(x,y)) {height} else {
-                    self.footprint_ground_height(ground,&polygon_query,&prism_query,support_plane,contact)?
+                let selected=self.fine_ground_columns(Some(ground),&polygon_query,&prism_query,body,r[2],x,y);
+                let ground_height = if selected.is_none() && precise_ground.contains_key(&(x,y)) {precise_ground[&(x,y)]} else {
+                    self.footprint_ground_height(ground,&polygon_query,&prism_query,support_plane,contact,selected.as_deref())?
                 };
                 // 外形最低点包含足端行程，跨阶高度以标定支撑平面为基准；
                 // 否则足端低于名义支撑的部分会再次扣减可跨阶高度。
                 if let Some((coarse_predicate,coarse_values))=height_rejection(lower,support_plane,plane,contact,ground_height,uncertainty) {
                     if let Err(fine)=self.fine_ground_contact_is_compatible(ground,&polygon_query,&prism_query,
-                        body,r[2],support_plane,contact,uncertainty) {
+                        body,r[2],support_plane,contact,uncertainty,selected.as_deref()) {
                         tracing::debug!(?body, x, y, ground_height, support_plane, contact, "机体与地面高度不兼容");
                         return Err(reject(slot,BodyRejection::Ground{coarse_cell:[x,y,ground.2],
                             coarse_predicate,coarse_values,fine,collision}));
@@ -1334,7 +1542,7 @@ impl SurfaceSnapshot {
                             z as f32 * self.config().voxel_size,
                             (z as f32 + 1.0) * self.config().voxel_size,
                         ]);
-                        if f64::from(bounds[1]) <= ground_height + 1e-6
+                        if (selected.is_none() && f64::from(bounds[1]) <= ground_height + 1e-6)
                             || f64::from(bounds[0]) > max[2]
                             || f64::from(bounds[1]) < min[2]
                         {
@@ -1352,32 +1560,43 @@ impl SurfaceSnapshot {
                             let mut found = false;
                             for ix in (f64::from(x)*size/fine).round() as i32..(f64::from(x+1)*size/fine).round() as i32 {
                                 for iy in (f64::from(y)*size/fine).round() as i32..(f64::from(y+1)*size/fine).round() as i32 {
+                                    let column=selected.as_ref().and_then(|columns|columns.iter().find(|c|c.xy==[ix,iy]));
+                                    let fine_ground=if selected.is_some() {column.and_then(|c|c.height)} else {Some(ground_height)};
                                     for iz in (f64::from(bounds[0])/fine+1e-5).floor() as i32..(f64::from(bounds[1])/fine-1e-5).ceil() as i32 {
+                                        // Both contact-run forms contain only real supported members
+                                        // of this immutable observation owner. Preserve `found` so
+                                        // an exempt fine contact cannot trigger coarse fallback.
+                                        if column.is_some_and(|c|c.permits_contact(iz)) {
+                                            found=true;
+                                            continue;
+                                        }
                                         if observations.get([ix,iy,iz]).is_none() { continue; }
                                         found = true;
                                         if !observations.supports_obstacle([ix,iy,iz]) {continue;}
-                                        if f64::from(iz+1)*fine <= ground_height+1e-6
+                                        let contact=selected.is_none()
+                                            && fine_ground.is_some_and(|height|f64::from(iz+1)*fine<=height+1e-6);
+                                        if contact
                                             || self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&[ix,iy,iz])) {continue;}
                                         checked_obstacle=true;
                                         let hit=prism_query.intersects(
                                             [f64::from(ix)*fine,f64::from(iy)*fine,f64::from(iz)*fine],
                                             [f64::from(ix+1)*fine,f64::from(iy+1)*fine,f64::from(iz+1)*fine]);
-                                        if hit && fine_hit.is_none() {fine_hit=Some(([ix,iy,iz],[f64::from(iz)*fine,f64::from(iz+1)*fine]));}
+                                        if hit && fine_hit.is_none() {fine_hit=Some(([ix,iy,iz],[f64::from(iz)*fine,f64::from(iz+1)*fine],fine_ground));}
                                         intersects |= hit;
                                     }
                                 }
                             }
                             // 缺少该占据格的精细依据时保留粗格障碍，不把缺测当作自由。
-                            if found { intersects } else { checked_obstacle=true; coarse_intersects() }
+                            if found { intersects } else { checked_obstacle=true; f64::from(bounds[1])>ground_height+1e-6 && coarse_intersects() }
                         } else { checked_obstacle=true; coarse_intersects() };
                         if checked_obstacle {collision=CollisionCheck::Partial;}
                         if intersects {
                             tracing::debug!(?body, x, y, z, ?bounds, ground_height, "机体与占据单元相交");
-                            let (cell,z_bounds,source)=match fine_hit {
-                                Some((cell,bounds))=>(cell,bounds,OccupancySource::Fine),
-                                None=>([x,y,z],bounds.map(f64::from),OccupancySource::CoarseFallback),
+                            let (cell,z_bounds,source,ground_height)=match fine_hit {
+                                Some((cell,bounds,height))=>(cell,bounds,OccupancySource::Fine,height),
+                                None=>([x,y,z],bounds.map(f64::from),OccupancySource::CoarseFallback,Some(ground_height)),
                             };
-                            return Err(reject(slot,BodyRejection::Occupancy{cell,source,z_bounds,ground_height:Some(ground_height)}));
+                            return Err(reject(slot,BodyRejection::Occupancy{cell,source,z_bounds,ground_height}));
                         }
                     }
                 }
@@ -1415,6 +1634,8 @@ impl SurfaceSnapshot {
         let xs=axis(0);let ys=axis(1);
         let outer_y:Vec<_>=ys.iter().copied().filter(|&(_,y)|y<bounds.0[1]||y>bounds.1[1]).collect();
         let contact=model.max_step_up_m.max(model.max_step_down_m)+fine+model.support_uncertainty_m;
+        let mut selected_column=None;
+        let mut selected_rows=None;
         for (ix,x) in xs {
             let row=if x<bounds.0[0] || x>bounds.1[0] {&ys}else{&outer_y};
             for &(iy,y) in row {
@@ -1427,14 +1648,23 @@ impl SurfaceSnapshot {
                 let first=((min[2]/fine).floor() as i32).saturating_sub(1);let last=(max[2]/fine).floor() as i32;
                 let begin=levels.partition_point(|&iz|iz<first);
                 if levels.get(begin).is_none_or(|&iz|iz>last) {continue;}
-                let ground=if let Some(&cell)=patch.get(&(x,y)) {
+                if selected_column!=Some((x,y)) {
+                    selected_rows=self.fine_ground_columns(patch.get(&(x,y)).copied(),polygon,prism,body,r[2],x,y);
+                    selected_column=Some((x,y));
+                }
+                let column=selected_rows.as_ref().and_then(|rows|rows.iter().find(|c|c.xy==[ix,iy]));
+                let ground=if selected_rows.is_some() {
+                    column.and_then(|c|c.height)
+                } else if let Some(&cell)=patch.get(&(x,y)) {
                     let plane=polygon.contact_plane(body,r[2],x,y,size,self.cell_position(cell)[2],
                         -model.body_to_support_z_m/r[2][2]+contact+1e-6);
-                    Some(self.footprint_ground_height(cell,polygon,prism,plane-model.body_to_support_z_m/r[2][2],contact)?)
+                    Some(self.footprint_ground_height(cell,polygon,prism,plane-model.body_to_support_z_m/r[2][2],contact,None)?)
                 } else {self.fine_footprint_ground(polygon,body,r[2],x,y).map(|(_,height)|height)};
                 for &iz in levels.iter().skip(begin).take_while(|&&iz|iz<=last) {
                     let key=[ix,iy,iz];
-                    if ground.is_some_and(|height|f64::from(iz+1)*fine<=height+1e-6)
+                    let contact=if selected_rows.is_some() {column.is_some_and(|c|c.permits_contact(iz))}
+                        else {ground.is_some_and(|height|f64::from(iz+1)*fine<=height+1e-6)};
+                    if contact
                         || !observations.supports_obstacle(key)
                         || self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&key)) {continue;}
                     *collision=CollisionCheck::Partial;
@@ -2121,9 +2351,17 @@ impl SurfaceSnapshot {
     }
 
     /// 原始细列的连续占据带；私有机体遮罩不切开真实带，也不制造新露顶。
-    fn fine_contact_bands(&self,x:i32,y:i32)->Arc<Vec<[f64;2]>> {
+    fn fine_contact_bands(&self,x:i32,y:i32)->Arc<Vec<FineContactBand>> {
         if let Some(bands)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner())
             .fine_bands.get(&(x,y)).cloned() {return bands;}
+        let bands=self.read_fine_contact_bands(x,y);
+        let bands=Arc::new(bands);
+        let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+        if cache.fine_bands.len()>=8192 {cache.fine_bands.clear();}
+        cache.fine_bands.insert((x,y),Arc::clone(&bands));bands
+    }
+
+    fn read_fine_contact_bands(&self,x:i32,y:i32)->Vec<FineContactBand> {
         let mut bands=Vec::new();
         if let Some(observations)=&self.observations {
             let size=f64::from(observations.size_m);
@@ -2132,19 +2370,16 @@ impl SurfaceSnapshot {
                 if !observations.supports_obstacle([x,y,z]) {continue;}
                 if let Some((bottom,top))=run {
                     if top.checked_add(1)==Some(z) {run=Some((bottom,z));continue;}
-                    bands.push([(f64::from(bottom)+1.0)*size,(f64::from(top)+1.0)*size]);
+                    bands.push(FineContactBand{fit:[(f64::from(bottom)+1.0)*size,(f64::from(top)+1.0)*size],run:[bottom,top]});
                 }
                 run=Some((z,z));
             }
             if let Some((bottom,top))=run {
-                bands.push([(f64::from(bottom)+1.0)*size,(f64::from(top)+1.0)*size]);
+                bands.push(FineContactBand{fit:[(f64::from(bottom)+1.0)*size,(f64::from(top)+1.0)*size],run:[bottom,top]});
             }
         }
-        if self.ground_evidence==GroundEvidence::OccupiedVolume {for band in &mut bands {band[0]=band[1];}}
-        let bands=Arc::new(bands);
-        let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
-        if cache.fine_bands.len()>=8192 {cache.fine_bands.clear();}
-        cache.fine_bands.insert((x,y),Arc::clone(&bands));bands
+        if self.ground_evidence==GroundEvidence::OccupiedVolume {for band in &mut bands {band.fit[0]=band.fit[1];}}
+        bands
     }
 
     fn fine_contact_domain(&self,origin:[f64;3],radius:f64)
@@ -2187,7 +2422,7 @@ impl SurfaceSnapshot {
                 if let Some(values)=cache.fine_bands.get(&(x,y)) {
                     // 单带的选择与参考高度无关，直接写入原有选择表，省去临时 Arc 增减。
                     // 空带与多带仍保留原缓存读取/选择路径，不跨观察拥有方复用结果。
-                    if values.len()==1 {selected[index]=Some(values[0]);}
+                    if values.len()==1 {selected[index]=Some(values[0].fit);}
                     else {bands[index]=Some(Arc::clone(values));}
                     #[cfg(feature = "body-query-profile")]
                     {
@@ -2219,7 +2454,7 @@ impl SurfaceSnapshot {
             let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
             let band=if let Some(band)=selected[index] {band} else {
                 let values=bands[index].take().unwrap_or_else(||self.fine_contact_bands(x,y));
-                let Some(&band)=values.iter().min_by(|a,b|distance(**a).total_cmp(&distance(**b))
+                let Some(&band)=values.iter().map(|entry|&entry.fit).min_by(|a,b|distance(**a).total_cmp(&distance(**b))
                     .then_with(||(a[1]-origin[2]).abs().total_cmp(&(b[1]-origin[2]).abs()))
                     .then_with(||a[1].total_cmp(&b[1]))) else {continue;};
                 band
@@ -2320,7 +2555,7 @@ impl SurfaceSnapshot {
             if distance2>enumeration*enumeration {continue;}
             let bands=self.fine_contact_bands(x,y);
             // 先选完整区间最近的带，不能先删高顶厚带再退到远处薄层。
-            let Some(&band)=bands.iter().min_by(|a,b|distance(**a).total_cmp(&distance(**b))
+            let Some(&band)=bands.iter().map(|entry|&entry.fit).min_by(|a,b|distance(**a).total_cmp(&distance(**b))
                 .then_with(||(a[1]-origin[2]).abs().total_cmp(&(b[1]-origin[2]).abs()))
                 .then_with(||a[1].total_cmp(&b[1]))) else {continue;};
             selected.insert((x,y),band);
@@ -3916,6 +4151,38 @@ mod tests {
     }
 
     #[test]
+    fn sparse_high_observation_cannot_replace_ground_or_seed_contact_response() {
+        let q=[0.0,0.0,0.0,1.0];let pose=([0.05,0.05,0.5],q);
+        let coarse=scene(&[(0.55,0.05,0.55)],false);
+        let fine=coarse.with_observations(Some(witnessed_observations(&[(0.55,0.05,0.55)],0.05)));
+        let observations=fine.observations.as_ref().unwrap();
+        assert!(!observations.is_complete_geometry_source());
+        assert_eq!(observations.column_levels(11,1),Some(&[11][..]));
+        assert_eq!(observations.get([11,1,1]),None,"原地面仅存在于保留的粗点云，不伪造细地面");
+        let centre=fine.locate_support_from_body(pose.0,q,0.4).unwrap();
+        let patch=fine.ground_patch(centre,1.0);let ground=patch[&(5,0)];
+        assert_eq!(ground,(5,0,0));
+        assert!((fine.cell_position(ground)[2]-0.1).abs()<1e-7);
+        let support=[pose.0[0],pose.0[1],pose.0[2]-0.4];
+        let domain=fine.fine_contact_domain(support,0.7);
+        let frame=fine.body_contact_frame(centre,support[2],0.0);
+        let response=fine.body_pose_after_motion(pose,[0.051,0.05],0.0);
+        eprintln!("SPARSE_SUPPORT ground={ground:?} bounds=[{},{}] fine_levels={:?} fine_bands={:?} domain={domain:?} frame={frame:?} response={response:?}",
+            fine.observed_support_lower_bound(ground),fine.cell_position(ground)[2],observations.column_levels(11,1),fine.fine_contact_bands(11,1));
+        assert_eq!(domain,Err(SurfaceError::MissingSupport));
+        assert_eq!(frame,Err(SurfaceError::MissingSupport));
+        assert_eq!(response,Err(SurfaceError::MissingSupport),"超界高障碍不能作为唯一响应拟合种子");
+        let mut witness=None;
+        assert_eq!(fine.validate_body_pose_with_witness(pose.0,q,&mut witness),Err(SurfaceError::InsufficientClearance));
+        eprintln!("SPARSE_COLLISION {witness:?}");
+        assert!(matches!(witness.unwrap().rejection,BodyRejection::Occupancy{source:OccupancySource::Fine,cell:[11,1,11],..}));
+        assert!(observations.get([11,1,11]).is_some());
+    }
+
+    mod fine_band_cache_tests {include!("body_fine_band_cache_tests.rs");}
+    mod fine_geometry_tests {include!("body_fine_geometry_tests.rs");}
+
+    #[test]
     fn body_witness_occupancy_and_motion_cache_preserve_rejected_sample() {
         let q=[0.0,0.0,0.0,1.0];let pose=([0.05,0.05,0.5],q);
         let map=scene(&[(0.55,0.05,0.55)],false);let mut slot=None;
@@ -4125,6 +4392,36 @@ mod tests {
         envelope.footprint_xy_m = vec![[-0.1,-0.08],[0.1,-0.08],[0.1,0.08],[-0.1,0.08]];
         SurfaceSnapshot::from_points(&points, config, 0.05).unwrap()
             .with_body_envelope(envelope).unwrap()
+    }
+
+    #[test]
+    fn fine_observed_rigid_low_obstacle_keeps_original_sweep_rejection() {
+        // Same observations and model as ground_band_sweep_scene(0.275), now
+        // supplying their fine source so the extra-band contact path is exercised.
+        let mut points:Vec<_>=(-20..20).flat_map(|x|(-6..6).flat_map(move|y|
+            [-0.025,0.025].into_iter().map(move|z|
+                ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,z)))).collect();
+        points.push((0.05,0.05,0.275));
+        let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for &(x,y,z) in &points {
+            let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
+            blocks.entry(key.map(|v|v.div_euclid(32))).or_default()
+                .insert(key,SurfaceObservation{observed_ns:0,hits:0});
+        }
+        let mut observed=SurfaceObservations::new(0.05,32).unwrap();
+        for (key,values) in blocks {observed.replace_block(key,values).unwrap();}
+        observed.mark_complete_geometry_source();
+        let map=ground_band_sweep_scene(0.275).with_observations(Some(Arc::new(observed)));
+        let q=[0.0,0.0,0.0,1.0];let from=([-0.65,0.05,0.375],q);let to=([0.65,0.05,0.375],q);
+        map.validate_body_pose(from.0,q).unwrap();map.validate_body_pose(to.0,q).unwrap();
+        let next=map.body_pose_after_motion(from,[to.0[0],to.0[1]],0.0).unwrap();
+        assert!((next.0[2]-from.0[2]).abs()<1e-10);
+        let mut slot=None;
+        assert_eq!(map.validate_body_pose_with_witness([0.05,0.05,0.375],q,&mut slot),Err(SurfaceError::InsufficientClearance));
+        assert!(matches!(slot.unwrap().rejection,BodyRejection::Occupancy{source:OccupancySource::Fine|OccupancySource::FineFringe,..}));
+        eprintln!("FINE_RIGID_OBSTACLE witness={slot:?}");
+        assert_eq!(map.validate_body_motion(from,to,&[]),Err(SurfaceError::InsufficientClearance));
+        assert_eq!(map.validate_body_motion(from,next,&[]),Err(SurfaceError::InsufficientClearance));
     }
 
     // 单层真实细采样令拟合在固定XY处唯一，不用厚带参考变化解释姿态搬运误差。
@@ -4715,7 +5012,7 @@ mod tests {
                 if !inside {continue;}
                 let x=low[0]+(index/stride) as i32;let y=low[1]+(index%stride) as i32;
                 let values=bands[index].take().unwrap_or_else(||map.fine_contact_bands(x,y));
-                let Some(&band)=values.iter().min_by(|a,b|distance(**a).total_cmp(&distance(**b))
+                let Some(&band)=values.iter().map(|entry|&entry.fit).min_by(|a,b|distance(**a).total_cmp(&distance(**b))
                     .then_with(||(a[1]-origin[2]).abs().total_cmp(&(b[1]-origin[2]).abs()))
                     .then_with(||a[1].total_cmp(&b[1]))) else {continue;};
                 selected[index]=Some(band);let rise=band[1]-origin[2];
@@ -5844,18 +6141,18 @@ mod tests {
                 envelope.max_step_up_m = 0.15;
                 envelope.max_step_down_m = 0.15;
                 envelope.max_cross_slope_deg = 18.0;
-                let map = SurfaceSnapshot::from_points(&points, scene(&[],false).config().clone(), fine)
-                    .unwrap().with_body_envelope(envelope).unwrap()
-                    .with_observations(Some(Arc::new(observations)));
+                let observations=Arc::new(observations);
+                for mls in [0.05,0.1] {
+                let mut cfg=scene(&[],false).config().clone();cfg.voxel_size=mls;
+                let map=SurfaceSnapshot::from_points(&points,cfg,fine).unwrap()
+                    .with_body_envelope(envelope.clone()).unwrap().with_observations(Some(observations.clone()));
                 let position = [0.027,-0.019,0.4534 + f64::from(offset)*f64::from(fine)];
                 let orientation = [-0.0188553,0.0069169,0.0021580,0.9997960];
-                let result = if inside {
-                    map.validate_body_pose(position,orientation)
-                } else {
-                    map.with_current_body_support(position,orientation)
-                        .and_then(|view|view.validate_body_pose(position,orientation))
-                };
-                assert_eq!(result.is_err(), inside, "倾斜投影与真实三维相交必须区分: {offset}, {inside}, {result:?}");
+                let result=map.validate_body_pose(position,orientation);
+                assert_eq!(result.is_err(),inside,"MLS={mls}, offset={offset}, inside={inside}: {result:?}");
+                if !inside {map.with_current_body_support(position,orientation).unwrap()
+                    .validate_body_pose(position,orientation).unwrap();}
+                }
             }
         }
     }
@@ -6138,7 +6435,7 @@ pub(super) struct BodyQueryCache {
     lower_bounds: AHashMap<VoxelKey,f64>,
     planes: AHashMap<(VoxelKey,[u64;3]),(f64,f64,f64)>,
     contact_samples: AHashMap<VoxelKey,Arc<Vec<([f64;3],f64)>>>,
-    fine_bands: AHashMap<(i32,i32),Arc<Vec<[f64;2]>>>,
+    fine_bands: AHashMap<(i32,i32),Arc<Vec<FineContactBand>>>,
     complete_columns: AHashMap<(i32,i32),bool>,
     poses: AHashMap<[u64;7],CachedBodyResult<(),BodyRejection>>,
     projections: AHashMap<[u64;6],Result<([f64;3],[f64;4]),SurfaceError>>,

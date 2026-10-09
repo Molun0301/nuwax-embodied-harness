@@ -129,19 +129,74 @@ impl tracing::Subscriber for DiagnosticSubscriber {
 
 #[test]
 fn terrain_contract_flat_tile_and_tagged_echo_keep_the_original_source() {
+    for planner in [0.05,0.1] {
     let clean=ground(Terrain::Flat);
     let echo_keys=[[-5,-3,2],[-5,2,2],[4,-3,2],[4,2,2]];
     let mut contaminated=clean.clone();contaminated.extend(echo_keys);
     let from=body(0.025,0.025,0.4);
-    let raw=build_map(&contaminated,true);
-    assert_eq!(raw.validate_body_pose(from.0,from.1),Err(SurfaceError::InsufficientClearance));
-    // 夹具知道这些点由自身产生；生产观察并没有该身份字段，不能泛化为自动识别能力。
+    let raw=build_map_config(&contaminated,true,planner,0.2);
+    // 有意修正旧 oracle：raw 必拒曾被用作“源未擦除”的代理，
+    // 但此完整高带在既有名义接触范围内；来源保留必须直接检查。
+    // echo_keys 仅是夹具标签，不进入生产接口，也不授予自体识别能力。
+    raw.validate_body_pose(from.0,from.1).unwrap();
     let view=raw.with_current_body_support(from.0,from.1).unwrap();
-    let clean_map=build_map(&clean,true);
-    assert_eq!(advance(&view,from,0.425).unwrap(),advance(&clean_map,from,0.425).unwrap());
-    for key in echo_keys {assert!(raw.observations.as_ref().unwrap().get(key).is_some());}
+    let clean_map=build_map_config(&clean,true,planner,0.2);
+    let expected_end=advance(&clean_map,from,0.425).unwrap();
+    assert_eq!(expected_end,body(0.425,0.025,0.4));
+    for map in [&raw,&view] {
+        assert!(map.current_body_support.is_none(),"既有接触许可不能依赖按自体身份清除源点");
+        let centre=map.locate_near_support([from.0[0],from.0[1],0.0],0.3).unwrap();
+        assert_eq!(map.body_contact_frame(centre,0.0,0.0).unwrap(),(0.0,from.1),
+            "高带不能替代原平地支撑参考或制造倾斜");
+        assert_eq!(advance(map,from,0.425).unwrap(),expected_end);
+        let observations=map.observations.as_ref().unwrap();
+        // 包括四个具名点在内的每条原始观察均相同：生产数据没有 tag 字段。
+        for &key in &contaminated {
+            assert_eq!(observations.get(key),Some(SurfaceObservation{observed_ns:0,hits:0}),
+                "原始观察和元数据不能被私有视图或运动查询擦除：{key:?}");
+        }
+        for key in echo_keys {
+            assert_eq!(observations.column_levels(key[0],key[1]),Some(&[-1,2][..]),
+                "保留原始两带及中间缺层，不把高带删除或填成连续占据");
+            assert_eq!(&map.fine_contact_bands(key[0],key[1]).iter().map(|band|band.fit).collect::<Vec<_>>(),
+                &vec![[0.0,0.0],[3.0*f64::from(FINE),3.0*f64::from(FINE)]],
+                "接触许可不改写完整原始带的顶面");
+        }
+        assert_eq!(map.validate_body_pose(from.0,from.1),Ok(()),
+            "派生与运动查询前后原始许可一致，不能通过持久化清理改变结果");
+    }
+    }
+}
+
+#[test]
+fn terrain_contract_out_of_contact_band_preserves_source_through_private_overlay() {
+    for planner in [0.05,0.1] {
+    let mut keys=ground(Terrain::Flat);
+    // 与低接触案例相同 XY；完整顶面约 0.30m，明确超过原 0.20m 接触范围，
+    // 且仍在当前整体凸柱内，以固定输入实际覆盖原私有 overlay 路径。
+    let upper_keys=[[-5,-3,5],[-5,2,5],[4,-3,5],[4,2,5]];
+    keys.extend(upper_keys);
+    let raw=build_map_config(&keys,true,planner,0.2);let from=body(0.025,0.025,0.4);
+    assert_eq!(raw.validate_body_pose(from.0,from.1),Err(SurfaceError::InsufficientClearance));
+    let view=raw.with_current_body_support(from.0,from.1).unwrap();
+    let overlay=view.current_body_support.as_ref().expect("必须实际派生私有 overlay");
+    assert!(!Arc::ptr_eq(&raw.body_query_cache,&view.body_query_cache));
+    for key in upper_keys {assert_eq!(view.fine_contact_bands(key[0],key[1]).iter().map(|b|b.run).collect::<Vec<_>>(),vec![[-1,-1],[5,5]]);}
+    for key in upper_keys {assert!(overlay.cleared_voxels.contains(&key));}
+    view.validate_body_pose(from.0,from.1).unwrap();
+    for map in [&raw,&view] {
+        let observations=map.observations.as_ref().unwrap();
+        for &key in &keys {assert_eq!(observations.get(key),Some(SurfaceObservation{observed_ns:0,hits:0}));}
+        for key in upper_keys {
+            assert_eq!(observations.column_levels(key[0],key[1]),Some(&[-1,5][..]));
+            assert_eq!(&map.fine_contact_bands(key[0],key[1]).iter().map(|band|band.fit).collect::<Vec<_>>(),
+                &vec![[0.0,0.0],[6.0*f64::from(FINE),6.0*f64::from(FINE)]],
+                "私有清除不能切割原始高带或把原始源改写为自由");
+        }
+    }
     assert_eq!(raw.validate_body_pose(from.0,from.1),Err(SurfaceError::InsufficientClearance),
-        "私有视图不能改写原地图或把剔除点持久化为自由空间");
+        "真实执行私有 overlay 后，原图的超接触范围拒绝仍须保留");
+    }
 }
 
 #[test]

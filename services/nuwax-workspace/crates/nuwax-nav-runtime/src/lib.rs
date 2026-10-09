@@ -3956,7 +3956,7 @@ mod tests {
             fn update_costmap(&mut self, _: CostMap2D) {}
             fn step(&mut self, _: f64) -> PlannerStep {
                 if let Some(release) = self.release.take() { release.recv().unwrap(); }
-                PlannerStep::Pending(vec![nuwax_nav_scan::LocalPlanError {
+                PlannerStep::Pending(vec![nuwax_nav_scan::LocalPlanError { body_witness: None,
                     kind: nuwax_nav_scan::LocalPlanFailureKind::BudgetExhausted,
                     reason: "finite search budget".into(), closest_pose: None, blocked: None,
                 }])
@@ -4012,7 +4012,7 @@ mod tests {
             for has_failures in [false, true] {
                 let planner = FakePlanner::commanding();
                 let failures = if has_failures {
-                    vec![nuwax_nav_scan::LocalPlanError {
+                    vec![nuwax_nav_scan::LocalPlanError { body_witness: None,
                         kind: nuwax_nav_scan::LocalPlanFailureKind::BudgetExhausted,
                         reason: "finite search budget; observation expired; required clearance".into(),
                         closest_pose: None,

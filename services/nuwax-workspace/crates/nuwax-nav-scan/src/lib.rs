@@ -63,17 +63,35 @@ pub enum LocalPlanFailureKind {
     SearchExhausted,
     Unclassified,
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub struct LocalPlanError {
     pub kind: LocalPlanFailureKind,
     /// Closest explored pose, diagnostic only; never an obstacle measurement.
     pub closest_pose: Option<BodyPose>,
     pub reason: String,
     pub blocked: Option<[f64; 3]>,
+    /// One rejected sample, not a proof that every path is blocked.
+    pub body_witness: Option<nuwax_nav_mls_planner::surface::BodyFailureWitness>,
+}
+// Diagnostic evidence does not change the equality contract of the original error fields.
+impl PartialEq for LocalPlanError {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.closest_pose == other.closest_pose
+            && self.reason == other.reason && self.blocked == other.blocked
+    }
+}
+// Candidate debug logging stays at its legacy size; detailed evidence is formatted only at the public result boundary.
+impl std::fmt::Debug for LocalPlanError {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.debug_struct("LocalPlanError").field("kind",&self.kind).field("closest_pose",&self.closest_pose)
+            .field("reason",&self.reason).field("blocked",&self.blocked).finish()
+    }
 }
 impl std::fmt::Display for LocalPlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.reason)
+        f.write_str(&self.reason)?;
+        if let Some(witness)=&self.body_witness {write!(f,"；{witness}")?;}
+        Ok(())
     }
 }
 impl From<String> for LocalPlanError {
@@ -84,7 +102,14 @@ impl From<String> for LocalPlanError {
             reason,
             closest_pose: None,
             blocked: None,
+            body_witness: None,
         }
+    }
+}
+impl LocalPlanError {
+    fn from_surface(error:nuwax_nav_mls_planner::surface::SurfaceError,
+        body_witness:Option<nuwax_nav_mls_planner::surface::BodyFailureWitness>)->Self {
+        Self {body_witness,..error.to_string().into()}
     }
 }
 impl From<&str> for LocalPlanError {
@@ -126,18 +151,19 @@ fn project_endpoint(
     #[cfg(feature="profile")]
     let began=std::time::Instant::now();
     cancellation::checkpoint()?;
-    let view=map.body_query_with_current_support(from.0,from.1);
+    let mut witness=None;
+    let view=map.body_query_with_current_support_and_witness(from.0,from.1,&mut witness);
     #[cfg(feature="profile")]
     profile::record(0,began,view.is_err());
     cancellation::checkpoint()?;
-    let view=view.map_err(|e|e.to_string())?;
+    let view=view.map_err(|e|LocalPlanError::from_surface(e,witness))?;
     #[cfg(feature="profile")]
     let began=std::time::Instant::now();
-    let next=view.body_pose_after_motion(from,xy,heading);
+    let next=view.body_pose_after_motion_with_witness(from,xy,heading,&mut witness);
     #[cfg(feature="profile")]
     profile::record(1,began,next.is_err());
     cancellation::checkpoint()?;
-    let mut next=next.map_err(|e|e.to_string())?;
+    let mut next=next.map_err(|e|LocalPlanError::from_surface(e,witness))?;
     if (xy[0] - from.0[0]).hypot(xy[1] - from.0[1]) < 1e-9 {
         next.0[2] = from.0[2];
     }
@@ -149,11 +175,12 @@ fn check_projected_motion(
     #[cfg(feature="profile")]
     let began=std::time::Instant::now();
     cancellation::checkpoint()?;
-    let checked=view.validate_body_motion(from,next,boundary);
+    let mut witness=None;
+    let checked=view.validate_body_motion_with_witness(from,next,boundary,&mut witness);
     #[cfg(feature="profile")]
     profile::record(2,began,checked.is_err());
     cancellation::checkpoint()?;
-    checked.map_err(|e|e.to_string())?;
+    checked.map_err(|e|LocalPlanError::from_surface(e,witness))?;
     Ok(())
 }
 fn rotate(
@@ -174,6 +201,7 @@ fn rotate(
     }
     let n = (change.abs() / 0.08).ceil().max(1.0) as usize;
     // 对后方目标试两个实际旋转方向，左右机体扫掠空间可能不同。
+    let mut rejected_sample=None;
     for delta in [change, change - change.signum() * std::f64::consts::TAU] {
         cancellation::checkpoint()?;
         let n = if delta == change {
@@ -197,7 +225,7 @@ fn rotate(
             let next = match result {
                 Ok(next) => next,
                 Err(error) if matches!(error.kind, LocalPlanFailureKind::Cancelled) => return Err(error),
-                Err(_) => { failed = true; break; }
+                Err(error) => { if rejected_sample.is_none() {rejected_sample=error.body_witness;} failed = true; break; }
             };
             candidate.push(next);
             previous = next;
@@ -207,7 +235,7 @@ fn rotate(
             return Ok(());
         }
     }
-    Err("近场初始转向被实际机体障碍阻断".into())
+    Err(LocalPlanError{body_witness:rejected_sample,.."近场初始转向未通过机体/支撑检查".into()})
 }
 fn project(
     map: &SurfaceSnapshot,
@@ -356,7 +384,32 @@ pub fn plan(
     let result = plan_impl(map, tomogram, start, reference, kinematics, config, final_yaw,
         arrival, boundary, follow_reference, prefer_straight);
     cancellation::checkpoint()?;
-    result
+    result.map_err(|mut failure| {
+        if let Some(witness)=failure.body_witness.take() {
+            use std::fmt::Write;
+            write!(&mut failure.reason,"；{witness}").expect("writing to String");
+        }
+        failure
+    })
+}
+
+// Only the selected final failure is expanded. Earlier branch failures never annotate success.
+fn merge_search_result<T>(result: Result<T, LocalPlanError>, polyline: LocalPlanError,
+    spline: Option<&LocalPlanError>) -> Result<T, LocalPlanError> {
+    result.map_err(|mut local| {
+        let selected = local.body_witness.map(|sample| ("近场搜索", sample))
+            .or_else(|| polyline.body_witness.map(|sample| ("折线", sample)))
+            .or_else(|| spline.and_then(|failure| failure.body_witness)
+                .map(|sample| ("样条", sample)));
+        local.reason = format!("样条：{}；折线：{}；{}",
+            spline.map_or("未生成", |failure| failure.reason.as_str()), polyline.reason, local.reason);
+        local.body_witness = None;
+        if let Some((branch, sample)) = selected {
+            use std::fmt::Write;
+            write!(&mut local.reason, "；{branch}分支{sample}").expect("writing to String");
+        }
+        local
+    })
 }
 
 fn plan_impl(
@@ -624,7 +677,7 @@ fn plan_impl(
                 && admit_candidate(rotate(map,&mut prefix,departure,kinematics,boundary))?.is_some() {
                 *prefix.last().unwrap()
             }else{start};
-            local_search::plan(
+            merge_search_result(local_search::plan(
             map,
             tomogram,
             search_start,
@@ -640,14 +693,7 @@ fn plan_impl(
         .map(|poses| {
             prefix.extend(poses.into_iter().skip(1));
             prefix
-        })
-        .map_err(|local| LocalPlanError {
-            reason: format!(
-                "样条：{}；折线：{polyline}；{local}",
-                failures.first().map_or("未生成", |failure| failure.reason.as_str())
-            ),
-            ..local
-        })?
+        }), polyline, failures.first())?
         },
     };
     #[cfg(feature="profile")]
@@ -838,6 +884,91 @@ mod tests {
         assert!(path.iter().any(|p| (p.0[0]-depart.0[0]).abs()<1e-8 && (p.0[1]-depart.0[1]).abs()<1e-8));
         for pair in path.windows(2) { map.validate_body_motion(pair[0],pair[1],&[]).unwrap(); }
     }
+    fn branch_failure(branch: &str, x: f64) -> LocalPlanError {
+        use nuwax_nav_mls_planner::surface::{BodyFailureWitness,BodyRejection};
+        LocalPlanError {body_witness:Some(BodyFailureWitness {
+            pose:([x,0.0,0.4],[0.0,0.0,0.0,1.0]),
+            rejection:BodyRejection::CoreSupport {column:[x as i32,0]},
+        }), ..branch.into()}
+    }
+
+    #[test]
+    fn body_witness_final_merge_labels_source_and_preserves_search_status() {
+        let mut search:LocalPlanError="近场前向搜索预算耗尽".into();
+        search.kind=LocalPlanFailureKind::BudgetExhausted;
+        search.closest_pose=Some(([9.0,0.0,0.4],[0.0,0.0,0.0,1.0]));
+        search.blocked=None;
+        let polyline=branch_failure("折线拒绝",2.0);
+        let spline=branch_failure("样条拒绝",3.0);
+        for (with_local,with_polyline,expected) in [(false,true,"折线"),(true,true,"近场搜索"),(false,false,"样条")] {
+            let mut local=search.clone();
+            if with_local {local.body_witness=branch_failure("",1.0).body_witness;}
+            let mut line=polyline.clone();if !with_polyline {line.body_witness=None;}
+            let result=merge_search_result::<()>(Err(local),line,Some(&spline)).unwrap_err();
+            assert_eq!(result.kind,search.kind);assert_eq!(result.closest_pose,search.closest_pose);
+            assert_eq!(result.blocked,search.blocked);assert!(result.body_witness.is_none());
+            let text=result.to_string();
+            assert_eq!(text.matches("拒绝样本").count(),1);
+            assert!(text.contains(&format!("{expected}分支拒绝样本")),"{text}");
+            let expected_sample=match expected {"近场搜索"=>1.0,"折线"=>2.0,_=>3.0};
+            assert!(text.contains(&format!("pose=([{expected_sample:?}, 0.0, 0.4]")),"{text}");
+            eprintln!("FINAL_BRANCH_{expected} {text}");
+        }
+    }
+
+    #[test]
+    fn body_witness_final_merge_success_discards_earlier_branch_failures() {
+        let spline=branch_failure("旧样条拒绝",3.0);
+        let polyline=branch_failure("旧折线拒绝",2.0);
+        let poses=vec![([4.0,0.0,0.4],[0.0,0.0,0.0,1.0])];
+        assert_eq!(merge_search_result(Ok(poses.clone()),polyline,Some(&spline)),Ok(poses));
+        let next=merge_search_result::<()>(Err("新的近场失败".into()),"新的折线失败".into(),None).unwrap_err();
+        assert!(next.body_witness.is_none());assert!(!next.to_string().contains("拒绝样本"));
+    }
+
+    #[test]
+    fn body_witness_local_error_equality_uses_only_original_fields() {
+        let a=branch_failure("same",1.0);let mut b=a.clone();b.body_witness=branch_failure("other",2.0).body_witness;
+        assert_eq!(a,b);b.body_witness=None;assert_eq!(a,b);
+        b.reason.push('!');assert_ne!(a,b);b=a.clone();
+        b.kind=LocalPlanFailureKind::BudgetExhausted;assert_ne!(a,b);b=a.clone();
+        b.closest_pose=Some(([0.0;3],[0.0,0.0,0.0,1.0]));assert_ne!(a,b);b=a.clone();
+        b.blocked=Some([0.0;3]);assert_ne!(a,b);
+    }
+
+    #[test]
+    fn body_witness_rotate_missing_support_uses_neutral_failure_text() {
+        let map=scene(None);let start=([100.0,100.0,0.4],[0.0,0.0,0.0,1.0]);
+        let mut path=vec![start];let failure=rotate(&map,&mut path,0.5,&motion(),&[]).unwrap_err();
+        assert_eq!(path,vec![start]);
+        assert_eq!(failure.reason,"近场初始转向未通过机体/支撑检查");
+        assert!(!failure.to_string().contains("实际机体障碍阻断"));
+    }
+
+    #[test]
+    fn body_witness_budget_keeps_one_rejected_sample_without_claiming_obstruction() {
+        let map=scene(Some(10));let tomo=Tomogram::from_surface(&map).unwrap();
+        let start=([-0.35,0.05,0.4],[0.0,0.0,0.0,1.0]);
+        map.validate_body_pose(start.0,start.1).unwrap();
+        let reference=[[-0.35,0.05,0.0],[0.5,0.05,0.0]];
+        let arrival=Some(([0.5,0.05,2.0],0.01));
+        let failure=local_search::with_expansion_limit(1,||local_search::plan(&map,&tomo,start,
+            &reference,&motion(),None,arrival,&[],3.0,0.9,true)).unwrap_err();
+        assert_eq!(failure.kind,LocalPlanFailureKind::BudgetExhausted);
+        assert_eq!(failure.blocked,None);
+        let sample=failure.body_witness.expect("finite search contains an actually rejected outgoing sample");
+        assert_ne!(sample.pose,start,"do not substitute the search start for a rejected pose");
+        assert!(failure.closest_pose.is_some());
+        assert!(!format!("{failure:?}").contains("拒绝样本"),"candidate debug must not format the witness");
+        let final_failure=local_search::with_expansion_limit(1,||plan(&map,&tomo,start,&reference,
+            &motion(),&ScanConfig::default(),None,arrival,&[],true,false)).unwrap_err();
+        assert_eq!(final_failure.kind,LocalPlanFailureKind::BudgetExhausted);
+        assert_eq!(final_failure.blocked,None);
+        assert!(final_failure.body_witness.is_none(),"final selected evidence is formatted exactly once");
+        assert_eq!(final_failure.reason.matches("拒绝样本").count(),1);
+        eprintln!("FINAL_SEARCH_FAILURE {final_failure}");
+    }
+
     #[test]
     fn fine_actions_admit_both_small_turns_even_with_legal_coarse_forward() {
         let map=scene(None);

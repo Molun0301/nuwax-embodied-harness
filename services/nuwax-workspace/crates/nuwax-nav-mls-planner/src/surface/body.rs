@@ -1,6 +1,7 @@
 //! 三维机体凸柱包络、支撑接触与方向性地形约束。
 use super::*;
 use std::collections::VecDeque;
+use super::body_witness::{CachedBodyResult, reject, height_rejection};
 #[cfg(feature = "body-query-profile")]
 use crate::body_query_profile::{self as query_profile, Counter as QueryCounter, Stage as QueryStage};
 #[path = "body_translation.rs"]
@@ -419,10 +420,17 @@ impl SurfaceSnapshot {
     pub(super) fn current_body_support_view(
         &self, body:[f64;3], quaternion:[f64;4], query_only:bool,
     ) -> Result<Self,SurfaceError> {
+        self.current_body_support_view_with_witness(body,quaternion,query_only,&mut None)
+    }
+
+    pub(super) fn current_body_support_view_with_witness(
+        &self, body:[f64;3], quaternion:[f64;4], query_only:bool, slot:&mut Option<BodyFailureWitness>,
+    )->Result<Self,SurfaceError> {
+        *slot=None;
         self.validate_complete_source_resolution()?;
         if let Some(current) = &self.current_body_support {
             return current.source.with_observations(self.observations.clone())
-                .current_body_support_view(body, quaternion,query_only);
+                .current_body_support_view_with_witness(body, quaternion,query_only,slot);
         }
         let Some(model) = self.body_envelope() else {
             return Ok(self.clone());
@@ -648,7 +656,7 @@ impl SurfaceSnapshot {
             source: self.clone(), body, quaternion, polygon: Arc::new(polygon),
             cells: Arc::new(inferred), cleared_voxels: Arc::new(cleared_voxels),
         }));
-        view.validate_body_pose(body,quaternion)?;
+        view.validate_body_pose_with_witness(body,quaternion,slot)?;
         Ok(view)
     }
 
@@ -796,18 +804,18 @@ impl SurfaceSnapshot {
     fn fine_ground_contact_is_compatible(
         &self,ground:VoxelKey,polygon:&PolygonQuery,prism:&PrismQuery,
         body:[f64;3],normal:[f64;3],coarse_support:f64,contact:f64,uncertainty:f64,
-    )->bool {
-        let Some(observations)=self.observations.as_ref().filter(|o|o.size_m<self.config().voxel_size) else {return false;};
-        if self.current_body_support.as_ref().is_some_and(|current|current.cells.contains(&ground)) {return false;}
-        let Some(model)=self.body_envelope() else {return false;};
+    )->Result<(),FineGroundReject> {
+        let Some(observations)=self.observations.as_ref().filter(|o|o.size_m<self.config().voxel_size) else {return Err(FineGroundReject::NoFinerSource);};
+        if self.current_body_support.as_ref().is_some_and(|current|current.cells.contains(&ground)) {return Err(FineGroundReject::CurrentSupportColumn);}
+        let Some(model)=self.body_envelope() else {return Err(FineGroundReject::MissingBodyModel);};
         let (x,y,_)=ground;let size=f64::from(self.config().voxel_size);let fine=f64::from(observations.size_m);
         let complete=self.complete_observations_cover_column(x,y);
-        if observations.is_complete_geometry_source() && !complete {return false;}
+        if observations.is_complete_geometry_source() && !complete {return Err(FineGroundReject::IncompleteColumn);}
         let ceiling=self.cell_position(ground)[2];
         let mut lower=self.observed_support_lower_bound(ground);
         if let Some(current)=&self.current_body_support {
             if polygon_intersects_cell(&current.polygon,x,y,size) {
-                let Ok(support)=self.support_position_from_body(current.body,current.quaternion,model.body_to_support_z_m) else {return false;};
+                let Ok(support)=self.support_position_from_body(current.body,current.quaternion,model.body_to_support_z_m) else {return Err(FineGroundReject::InvalidCurrentSupport);};
                 lower=lower.min(support[2]-fine);
             }
         }
@@ -817,27 +825,31 @@ impl SurfaceSnapshot {
             for iy in (f64::from(y)*size/fine).floor() as i32..(f64::from(y+1)*size/fine).ceil() as i32 {
                 if !polygon.intersects(ix,iy,fine) {continue;}
                 let mut height=f64::NEG_INFINITY;
+                let mut selected_cell=None;
                 for iz in (lower/fine+1e-5).floor() as i32..(ceiling/fine-1e-5).ceil() as i32 {
                     let key=[ix,iy,iz];
-                    if !complete && !observations.has_complete_block(key) {return false;}
+                    if !complete && !observations.has_complete_block(key) {return Err(FineGroundReject::IncompleteBlock{cell:key});}
                     if !observations.supports_obstacle(key)
                         || self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&key)) {continue;}
                     let top=f64::from(iz+1)*fine;
                     // 与原整列地面计算选择完全相同的真实占据，只保留其各自XY。
                     if top<=coarse_support+contact+1e-6 || prism.intersects(
                         [f64::from(ix)*fine,f64::from(iy)*fine,f64::from(iz)*fine],
-                        [f64::from(ix+1)*fine,f64::from(iy+1)*fine,top]) {height=height.max(top);}
+                        [f64::from(ix+1)*fine,f64::from(iy+1)*fine,top]) {if top>height {selected_cell=Some(key);} height=height.max(top);}
                 }
-                if !height.is_finite() {return false;}
+                if !height.is_finite() {return Err(FineGroundReject::NoSelectedHeight{column:[ix,iy]});}
                 height=height.min(ceiling);
                 let plane=polygon.contact_plane(body,normal,ix,iy,fine,height,allowance);
-                let lower=plane+model.z_bounds_m[0]/normal[2];
+                let body_lower=plane+model.z_bounds_m[0]/normal[2];
                 let support=plane-model.body_to_support_z_m/normal[2];
-                if lower.max(support)+contact+1e-6<height || plane<height-uncertainty {return false;}
+                if let Some((predicate,values))=height_rejection(body_lower,support,plane,contact,height,uncertainty) {
+                    return Err(FineGroundReject::Height{cell:selected_cell.expect("finite selected height"),
+                        scanned_z:[lower,ceiling],predicate,values});
+                }
                 checked=true;
             }
         }
-        checked
+        if checked {Ok(())} else {Err(FineGroundReject::NoIntersectingColumn)}
     }
 
     /// 真实支撑可来自合法阶边、连续厚层或完整观察包围的实际接触平面。
@@ -1153,50 +1165,56 @@ impl SurfaceSnapshot {
     }
 
     /// 用完整姿态检查机体凸柱与占据体素；允许已确认支撑面的接触。
-    pub fn validate_body_pose(
-        &self,
-        body: [f64; 3],
-        quaternion: [f64; 4],
-    ) -> Result<(), SurfaceError> {
+    pub fn validate_body_pose(&self, body:[f64;3], quaternion:[f64;4])->Result<(),SurfaceError> {
+        self.validate_body_pose_with_witness(body,quaternion,&mut None)
+    }
+
+    /// Same query and legacy error; the slot describes only this rejected pose.
+    pub fn validate_body_pose_with_witness(&self, body:[f64;3], quaternion:[f64;4],
+        slot:&mut Option<BodyFailureWitness>)->Result<(),SurfaceError> {
+        *slot=None;
         let key = [body[0].to_bits(),body[1].to_bits(),body[2].to_bits(),
             quaternion[0].to_bits(),quaternion[1].to_bits(),quaternion[2].to_bits(),quaternion[3].to_bits()];
-        if let Some(result)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).poses.get(&key).cloned() {
-            return result;
-        }
-        let result=self.check_body_pose(body,quaternion);
-        let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
-        if cache.poses.len()>=8192 {cache.poses.clear();}
-        cache.poses.insert(key,result.clone());
+        let mut rejection=None;
+        let cached=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).poses.get(&key).cloned();
+        let result=if let Some(cached)=cached {cached.result(&mut rejection)} else {
+            let result=self.check_body_pose(body,quaternion,&mut rejection);
+            let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+            if cache.poses.len()>=8192 {cache.poses.clear();}
+            cache.poses.insert(key,CachedBodyResult::new(result.clone(),rejection));
+            result
+        };
+        *slot=rejection.map(|rejection|BodyFailureWitness{pose:(body,quaternion),rejection});
         result
     }
 
     /// 缺少任何高度支撑的列若侵入机体投影内核，所有外轮廓检查必然失败。
     /// 此处只提前拒绝，存在支撑仍交给原来的完整机体、层与接触检查。
-    fn body_core_has_support(&self,body:[f64;3],r:[[f64;3];3],model:&SurfaceBodyEnvelope)->bool {
-        if model.z_bounds_m[0]>0.0 || model.z_bounds_m[1]<0.0 {return true;}
+    fn body_core_has_support(&self,body:[f64;3],r:[[f64;3];3],model:&SurfaceBodyEnvelope)->Result<(),[i32;2]> {
+        if model.z_bounds_m[0]>0.0 || model.z_bounds_m[1]<0.0 {return Ok(());}
         let radius=model.footprint_xy_m.iter().zip(model.footprint_xy_m.iter().cycle().skip(1))
             .filter_map(|(a,b)| {
                 let dx=b[0]-a[0];let dy=b[1]-a[1];let length=dx.hypot(dy);
                 (length>1e-12).then(||(dy*a[0]-dx*a[1])/length)
             }).fold(f64::INFINITY,f64::min);
-        if !radius.is_finite() || radius<=0.0 {return true;}
+        if !radius.is_finite() || radius<=0.0 {return Ok(());}
         // 向下取整，内核始终包含在真实投影中；不量化或放宽完整碰撞检查。
         let quantum=f64::from(self.source_voxel_size_m())*0.25;
         let radius=(radius*r[2][2]/quantum).floor()*quantum;
-        if radius<=0.0 {return true;}
+        if radius<=0.0 {return Ok(());}
         let key=(body[0].to_bits(),body[1].to_bits(),radius.to_bits());
         if let Some(value)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).support_cores.get(&key).copied() {return value;}
         let size=f64::from(self.config().voxel_size);
         let x0=((body[0]-radius)/size).floor() as i32;let x1=((body[0]+radius)/size).floor() as i32;
         let y0=((body[1]-radius)/size).floor() as i32;let y1=((body[1]+radius)/size).floor() as i32;
-        if (i64::from(x1)-i64::from(x0)+1)*(i64::from(y1)-i64::from(y0)+1)>16_384 {return true;}
-        let mut supported=true;
+        if (i64::from(x1)-i64::from(x0)+1)*(i64::from(y1)-i64::from(y0)+1)>16_384 {return Ok(());}
+        let mut supported=Ok(());
         'columns: for x in x0..=x1 {for y in y0..=y1 {
             let dx=body[0]-body[0].clamp(f64::from(x)*size,f64::from(x+1)*size);
             let dy=body[1]-body[1].clamp(f64::from(y)*size,f64::from(y+1)*size);
             if dx*dx+dy*dy<radius*radius-1e-12
                 && !self.data.physical_graph.surface_lookup.get(&(x,y)).is_some_and(|levels|!levels.is_empty()) {
-                supported=false;break 'columns;
+                supported=Err([x,y]);break 'columns;
             }
         }}
         let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
@@ -1204,17 +1222,21 @@ impl SurfaceSnapshot {
         cache.support_cores.insert(key,supported);supported
     }
 
-    fn check_body_pose(&self,body:[f64;3],quaternion:[f64;4])->Result<(),SurfaceError> {
+    fn check_body_pose(&self,body:[f64;3],quaternion:[f64;4],slot:&mut Option<BodyRejection>)->Result<(),SurfaceError> {
+        *slot=None;
         self.validate_complete_source_resolution()?;
         let model = self
             .body_envelope()
             .ok_or_else(|| SurfaceError::InvalidConfig("body envelope is unavailable".into()))?;
-        let centre = self.locate_support_from_body(body, quaternion, model.body_to_support_z_m)?;
+        let centre = self.locate_support_from_body(body, quaternion, model.body_to_support_z_m)
+            .map_err(|error| {if error==SurfaceError::MissingSupport {*slot=Some(BodyRejection::CentreSupport);} error})?;
         let r = rotation(quaternion)?;
         if r[2][2] <= 0.0 {
             return Err(SurfaceError::InvalidPose);
         }
-        if !self.body_core_has_support(body,r,model) {return Err(SurfaceError::MissingSupport);}
+        if let Err(column)=self.body_core_has_support(body,r,model) {
+            return Err(reject(slot,BodyRejection::CoreSupport{column}));
+        }
         let vertices: Vec<_> = model
             .footprint_xy_m
             .iter()
@@ -1250,7 +1272,8 @@ impl SurfaceSnapshot {
             .fold(0.0,f64::max)+size*2.0)/size).ceil()*size;
         let patch = self.ground_patch(centre, radius);
         let (patch,precise_ground)=self.refine_footprint_support(patch,&polygon_query,&prism_query,body,r,([x0,y0],[x1,y1]));
-        self.check_fine_column_fringe(body,r,&polygon_query,&prism_query,&patch,min,max,([x0,y0],[x1,y1]))?;
+        let mut collision=CollisionCheck::NotChecked;
+        self.check_fine_column_fringe(body,r,&polygon_query,&prism_query,&patch,min,max,([x0,y0],[x1,y1]),slot,&mut collision)?;
         let uncertainty = f64::from(self.source_voxel_size_m()) + model.support_uncertainty_m;
         let mut ground_points = Vec::new();
         for x in x0..=x1 {
@@ -1260,18 +1283,21 @@ impl SurfaceSnapshot {
                 }
                 let ground = *patch.get(&(x, y)).ok_or_else(|| {
                     tracing::debug!(?body,x,y,centre=?centre.cell,"机体包络下缺少连通地面");
-                    SurfaceError::MissingSupport
+                    reject(slot,BodyRejection::FootprintSupport{column:[x,y],layer:None,
+                        reason:SupportRejection::MissingConnectedPatch,collision})
                 })?;
                 if self.observations.as_ref().is_some_and(|observations|observations.is_complete_geometry_source())
                     && !self.complete_observations_cover_column(x,y) {
-                    return Err(SurfaceError::MissingSupport);
+                    return Err(reject(slot,BodyRejection::FootprintSupport{column:[x,y],layer:Some(ground.2),
+                        reason:SupportRejection::IncompleteObservation,collision}));
                 }
                 if self.current_body_support.as_ref().is_some_and(|current| {
                     !precise_ground.contains_key(&(x,y)) && current.cells.contains(&ground)
                         && !current.permits_overlap(&polygon, x, y, size)
                 }) {
                     tracing::debug!(?body, x, y, "候选机体进入当前足迹外的缺测支撑");
-                    return Err(SurfaceError::MissingSupport);
+                    return Err(reject(slot,BodyRejection::FootprintSupport{column:[x,y],layer:Some(ground.2),
+                        reason:SupportRejection::OutsideCurrentFootprint,collision}));
                 }
                 if self
                     .data
@@ -1293,11 +1319,13 @@ impl SurfaceSnapshot {
                 };
                 // 外形最低点包含足端行程，跨阶高度以标定支撑平面为基准；
                 // 否则足端低于名义支撑的部分会再次扣减可跨阶高度。
-                if (lower.max(support_plane) + contact + 1e-6 < ground_height || plane < ground_height - uncertainty)
-                    && !self.fine_ground_contact_is_compatible(ground,&polygon_query,&prism_query,
+                if let Some((coarse_predicate,coarse_values))=height_rejection(lower,support_plane,plane,contact,ground_height,uncertainty) {
+                    if let Err(fine)=self.fine_ground_contact_is_compatible(ground,&polygon_query,&prism_query,
                         body,r[2],support_plane,contact,uncertainty) {
-                    tracing::debug!(?body, x, y, ground_height, support_plane, contact, "机体与地面高度不兼容");
-                    return Err(SurfaceError::InsufficientClearance);
+                        tracing::debug!(?body, x, y, ground_height, support_plane, contact, "机体与地面高度不兼容");
+                        return Err(reject(slot,BodyRejection::Ground{coarse_cell:[x,y,ground.2],
+                            coarse_predicate,coarse_values,fine,collision}));
+                    }
                 }
                 ground_points.push([px, py, ground_height]);
                 if let Some(zs) = self.data.occupied_columns.get(&(x, y)) {
@@ -1312,6 +1340,8 @@ impl SurfaceSnapshot {
                         {
                             continue;
                         }
+                        let mut fine_hit=None;
+                        let mut checked_obstacle=false;
                         let coarse_intersects = || prism_query.intersects(
                             [x as f64 * size, y as f64 * size, f64::from(bounds[0])],
                             [(x + 1) as f64 * size, (y + 1) as f64 * size, f64::from(bounds[1])],
@@ -1328,18 +1358,26 @@ impl SurfaceSnapshot {
                                         if !observations.supports_obstacle([ix,iy,iz]) {continue;}
                                         if f64::from(iz+1)*fine <= ground_height+1e-6
                                             || self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&[ix,iy,iz])) {continue;}
-                                        intersects |= prism_query.intersects(
+                                        checked_obstacle=true;
+                                        let hit=prism_query.intersects(
                                             [f64::from(ix)*fine,f64::from(iy)*fine,f64::from(iz)*fine],
                                             [f64::from(ix+1)*fine,f64::from(iy+1)*fine,f64::from(iz+1)*fine]);
+                                        if hit && fine_hit.is_none() {fine_hit=Some(([ix,iy,iz],[f64::from(iz)*fine,f64::from(iz+1)*fine]));}
+                                        intersects |= hit;
                                     }
                                 }
                             }
                             // 缺少该占据格的精细依据时保留粗格障碍，不把缺测当作自由。
-                            if found { intersects } else { coarse_intersects() }
-                        } else { coarse_intersects() };
+                            if found { intersects } else { checked_obstacle=true; coarse_intersects() }
+                        } else { checked_obstacle=true; coarse_intersects() };
+                        if checked_obstacle {collision=CollisionCheck::Partial;}
                         if intersects {
                             tracing::debug!(?body, x, y, z, ?bounds, ground_height, "机体与占据单元相交");
-                            return Err(SurfaceError::InsufficientClearance);
+                            let (cell,z_bounds,source)=match fine_hit {
+                                Some((cell,bounds))=>(cell,bounds,OccupancySource::Fine),
+                                None=>([x,y,z],bounds.map(f64::from),OccupancySource::CoarseFallback),
+                            };
+                            return Err(reject(slot,BodyRejection::Occupancy{cell,source,z_bounds,ground_height:Some(ground_height)}));
                         }
                     }
                 }
@@ -1359,7 +1397,7 @@ impl SurfaceSnapshot {
     /// 细体素可能跨越粗列的浮点边界；粗列只是索引，不能截掉实际机体接触。
     /// 只补查中心归属在粗包围框外、实际体积却与机体相交的已知细体素。
     fn check_fine_column_fringe(&self,body:[f64;3],r:[[f64;3];3],polygon:&PolygonQuery,prism:&PrismQuery,
-        patch:&AHashMap<(i32,i32),VoxelKey>,min:[f64;3],max:[f64;3],bounds:([i32;2],[i32;2]))
+        patch:&AHashMap<(i32,i32),VoxelKey>,min:[f64;3],max:[f64;3],bounds:([i32;2],[i32;2]),slot:&mut Option<BodyRejection>,collision:&mut CollisionCheck)
         ->Result<(),SurfaceError> {
         let Some(observations)=self.observations.as_ref() else {return Ok(());};
         let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
@@ -1383,7 +1421,8 @@ impl SurfaceSnapshot {
                 if !polygon.intersects(ix,iy,fine) {continue;}
                 let Some(levels)=observations.column_levels(ix,iy) else {continue;};
                 if observations.is_complete_geometry_source() && !self.complete_observations_cover_column(x,y) {
-                    return Err(SurfaceError::MissingSupport);
+                    return Err(reject(slot,BodyRejection::FootprintSupport{column:[x,y],layer:None,
+                        reason:SupportRejection::IncompleteObservation,collision:*collision}));
                 }
                 let first=((min[2]/fine).floor() as i32).saturating_sub(1);let last=(max[2]/fine).floor() as i32;
                 let begin=levels.partition_point(|&iz|iz<first);
@@ -1398,8 +1437,10 @@ impl SurfaceSnapshot {
                     if ground.is_some_and(|height|f64::from(iz+1)*fine<=height+1e-6)
                         || !observations.supports_obstacle(key)
                         || self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&key)) {continue;}
+                    *collision=CollisionCheck::Partial;
                     if prism.intersects(key.map(|v|f64::from(v)*fine),key.map(|v|f64::from(v+1)*fine)) {
-                        return Err(SurfaceError::InsufficientClearance);
+                        return Err(reject(slot,BodyRejection::Occupancy{cell:key,source:OccupancySource::FineFringe,
+                            z_bounds:[f64::from(iz)*fine,f64::from(iz+1)*fine],ground_height:ground}));
                     }
                 }
             }
@@ -1434,6 +1475,13 @@ impl SurfaceSnapshot {
         xy: [f64; 2],
         yaw: f64,
     ) -> Result<([f64; 3], [f64; 4]), SurfaceError> {
+        self.body_pose_after_motion_with_witness(from,xy,yaw,&mut None)
+    }
+
+    /// Preserve the actual rejected projected pose without replaying its geometry.
+    pub fn body_pose_after_motion_with_witness(&self,from:([f64;3],[f64;4]),xy:[f64;2],yaw:f64,
+        slot:&mut Option<BodyFailureWitness>)->Result<([f64;3],[f64;4]),SurfaceError> {
+        *slot=None;
         #[cfg(feature = "body-query-profile")]
         let _motion_profile = query_profile::guard(QueryStage::MotionTotal);
         if !from.0.into_iter().chain(xy).chain([yaw]).all(f64::is_finite) {
@@ -1448,7 +1496,7 @@ impl SurfaceSnapshot {
         if xy == [from.0[0],from.0[1]] && yaw_delta.abs() < 1e-12 {
             #[cfg(feature = "body-query-profile")]
             let validation_profile = query_profile::guard(QueryStage::FinalBodyValidation);
-            self.validate_body_pose(from.0,from.1)?;
+            self.validate_body_pose_with_witness(from.0,from.1,slot)?;
             #[cfg(feature = "body-query-profile")]
             drop(validation_profile);
             return Ok(from);
@@ -1529,7 +1577,7 @@ impl SurfaceSnapshot {
                     && self.fine_contact_support_samples(from,flat).is_some() {
                     #[cfg(feature = "body-query-profile")]
                     let validation_profile = query_profile::guard(QueryStage::FinalBodyValidation);
-                    self.validate_body_pose(flat.0,flat.1)?;
+                    self.validate_body_pose_with_witness(flat.0,flat.1,slot)?;
                     #[cfg(feature = "body-query-profile")]
                     drop(validation_profile);
                     return Ok(flat);
@@ -1540,7 +1588,7 @@ impl SurfaceSnapshot {
         let body = [xy[0],xy[1],body_z];
         #[cfg(feature = "body-query-profile")]
         let validation_profile = query_profile::guard(QueryStage::FinalBodyValidation);
-        self.validate_body_pose(body,q)?;
+        self.validate_body_pose_with_witness(body,q,slot)?;
         #[cfg(feature = "body-query-profile")]
         drop(validation_profile);
         Ok((body,q))
@@ -1569,19 +1617,26 @@ impl SurfaceSnapshot {
         to: ([f64; 3], [f64; 4]),
         boundary: &[[f64; 2]],
     ) -> Result<(), SurfaceError> {
+        self.validate_body_motion_with_witness(from,to,boundary,&mut None)
+    }
+
+    /// Same swept samples; a cache hit restores the originally rejected sample.
+    pub fn validate_body_motion_with_witness(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),
+        boundary:&[[f64;2]],slot:&mut Option<BodyFailureWitness>)->Result<(),SurfaceError> {
+        *slot=None;
         // 观察年龄与外部边界不属于纯几何键，仍沿各自的完整验证路径处理。
         if !boundary.is_empty() {
-            return self.validate_body_motion_checked(from,to,boundary,|_|Ok(()));
+            return self.validate_body_motion_checked_with_witness(from,to,boundary,|_|Ok(()),slot);
         }
         let key=[from.0[0],from.0[1],from.0[2],from.1[0],from.1[1],from.1[2],from.1[3],
             to.0[0],to.0[1],to.0[2],to.1[0],to.1[1],to.1[2],to.1[3]].map(f64::to_bits);
         if let Some(result)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).motions.get(&key).cloned() {
-            return result;
+            return result.result(slot);
         }
-        let result=self.validate_body_motion_checked(from,to,boundary,|_|Ok(()));
+        let result=self.validate_body_motion_checked_with_witness(from,to,boundary,|_|Ok(()),slot);
         let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
         if cache.motions.len()>=8192 {cache.motions.clear();}
-        cache.motions.insert(key,result.clone());
+        cache.motions.insert(key,CachedBodyResult::new(result.clone(),*slot));
         result
     }
 
@@ -1695,7 +1750,7 @@ impl SurfaceSnapshot {
     ) -> Result<(),SurfaceError> {
         let observations = self.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
         if now_ns == 0 || max_age_ns == 0 { return Err(SurfaceError::MissingSupport); }
-        self.validate_body_motion_checked(from, to, boundary, |pose| {
+        self.validate_body_motion_checked_with_witness(from, to, boundary, |pose| {
             for cell in self.body_observation_footprint(pose)? {
                 if occupied.contains(&cell) { continue; }
                 let evidence = observations.get(cell).unwrap_or(SurfaceObservation {observed_ns:0,hits:0});
@@ -1709,7 +1764,7 @@ impl SurfaceSnapshot {
                 }
             }
             Ok(())
-        })
+        },&mut None)
     }
 
     /// 本次近场检查复用一个精确足迹，仍逐次核对完整扫掠与当前检查时刻。
@@ -1738,12 +1793,22 @@ impl SurfaceSnapshot {
         boundary: &'a [[f64; 2]],
     ) -> impl FnMut(([f64; 3], [f64; 4]), ([f64; 3], [f64; 4]), u64)
         -> Result<Option<u64>, SurfaceError> + 'a {
+        let mut check=self.observed_body_motion_checker_with_expiry_and_witness(occupied,max_age_ns,boundary);
+        move |from,to,checked_ns|check(from,to,checked_ns,&mut None)
+    }
+
+    /// Exact same expiry/geometry checks; diagnostic state is caller-owned per query.
+    pub fn observed_body_motion_checker_with_expiry_and_witness<'a>(
+        &'a self, occupied:&'a std::collections::BTreeSet<[i32;3]>, max_age_ns:u64,boundary:&'a [[f64;2]],
+    )->impl FnMut(([f64;3],[f64;4]),([f64;3],[f64;4]),u64,&mut Option<BodyFailureWitness>)
+        ->Result<Option<u64>,SurfaceError>+'a {
         let mut footprints = ObservationFootprintCache::new(self);
-        move |from, to, checked_ns| {
+        move |from, to, checked_ns, slot| {
+            *slot=None;
             let observations = self.observations.as_ref().ok_or(SurfaceError::MissingSupport)?;
             if checked_ns == 0 || max_age_ns == 0 { return Err(SurfaceError::MissingSupport); }
             let mut earliest_expiry: Option<u64> = None;
-            self.validate_body_motion_checked(from, to, boundary, |pose| {
+            self.validate_body_motion_checked_with_witness(from, to, boundary, |pose| {
                 let cells=footprints.cells(pose)?;
                 #[cfg(feature = "body-query-profile")] let _evidence_profile=query_profile::guard(QueryStage::ObservationEvidence);
                 #[cfg(feature = "body-query-profile")] let mut counts=ObservationEvidenceCounts::default();
@@ -1771,7 +1836,7 @@ impl SurfaceSnapshot {
                     }
                 }
                 Ok(())
-            })?;
+            },slot)?;
             Ok(earliest_expiry)
         }
     }
@@ -1940,17 +2005,25 @@ impl SurfaceSnapshot {
         Some(samples)
     }
 
-    fn validate_body_motion_checked(
+    #[cfg(test)]
+    fn validate_body_motion_checked(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),boundary:&[[f64;2]],
+        check:impl FnMut(([f64;3],[f64;4]))->Result<(),SurfaceError>)->Result<(),SurfaceError> {
+        self.validate_body_motion_checked_with_witness(from,to,boundary,check,&mut None)
+    }
+
+    fn validate_body_motion_checked_with_witness(
         &self,
         from: ([f64; 3], [f64; 4]),
         to: ([f64; 3], [f64; 4]),
         boundary: &[[f64; 2]],
         mut check_observations: impl FnMut(([f64; 3], [f64; 4])) -> Result<(), SurfaceError>,
+        slot:&mut Option<BodyFailureWitness>,
     ) -> Result<(), SurfaceError> {
+        *slot=None;
         validate_boundary(boundary)?;
         let model = self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
-        self.validate_body_pose(from.0, from.1)?;
-        self.validate_body_pose(to.0, to.1)?;
+        self.validate_body_pose_with_witness(from.0, from.1,slot)?;
+        self.validate_body_pose_with_witness(to.0, to.1,slot)?;
         check_observations(from)?;
         check_observations(to)?;
         let a = self.locate_support_from_body(from.0, from.1, model.body_to_support_z_m)?.support_xyz;
@@ -1992,14 +2065,14 @@ impl SurfaceSnapshot {
             // 精细层只替代错误的粗中心连段；实际机体、禁区与观察仍逐段核验。
             for t in samples {
                 let pose=interpolated_body_pose(from,to,t);
-                self.validate_body_pose(pose.0,pose.1)?;check_observations(pose)?;
+                self.validate_body_pose_with_witness(pose.0,pose.1,slot)?;check_observations(pose)?;
             }
         }
         for i in 1..count {
             let t = i as f64 / count as f64;
             let q = norm(std::array::from_fn(|j| qa[j] * (1.0 - t) + qb[j] * t));
             let p = std::array::from_fn(|j| from.0[j] * (1.0 - t) + to.0[j] * t);
-            self.validate_body_pose(p, q)?;
+            self.validate_body_pose_with_witness(p, q,slot)?;
             check_observations((p, q))?;
         }
         // 按真实占据接触事件补查，并保持调用方的实际位置与姿态插值。
@@ -2008,7 +2081,7 @@ impl SurfaceSnapshot {
                 from.0[j]*(1.0-t)+to.0[j]*t
             });
             let q=norm(std::array::from_fn(|j|qa[j]*(1.0-t)+qb[j]*t));
-            self.validate_body_pose(p,q)?;
+            self.validate_body_pose_with_witness(p,q,slot)?;
             check_observations((p,q))
         })
     }
@@ -3743,6 +3816,123 @@ mod tests {
         let hole=SurfaceSnapshot::from_points(&missing,cfg,0.025).unwrap().with_body_envelope(envelope).unwrap();
         let middle=poses[45];assert!(hole.validate_body_pose(middle.0,middle.1).is_err());
     }
+    fn assert_witness_cold_and_warm(map:&SurfaceSnapshot,pose:([f64;3],[f64;4]),expected:Option<BodyFailureWitness>) {
+        let cold=map.fork_for_planning();
+        assert!(cold.body_query_cache.lock().unwrap().poses.is_empty());
+        let error=expected.unwrap().rejection.error();let mut slot=None;
+        assert_eq!(cold.validate_body_pose_with_witness(pose.0,pose.1,&mut slot),Err(error.clone()));
+        assert_eq!(slot,expected,"cold source witness");
+        assert_eq!(cold.validate_body_pose(pose.0,pose.1),Err(error.clone()));
+        assert_eq!(cold.validate_body_pose_with_witness(pose.0,pose.1,&mut slot),Err(error));
+        assert_eq!(slot,expected,"warm witness after legacy caller");
+        eprintln!("COLD_WARM_MATCH {slot:?}");
+    }
+
+    #[test]
+    fn body_witness_centre_core_and_legacy_cache_are_exact() {
+        let q=[0.0,0.0,0.0,1.0];let body=[0.05,0.05,0.5];
+        let points:Vec<_>=(-30..30).flat_map(|x|(-30..30).filter_map(move |y|
+            if x==1&&y==0 {None}else{Some(((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.025))})).collect();
+        let map=SurfaceSnapshot::from_points(&points,scene(&[],false).config().clone(),0.1).unwrap().with_body_envelope(model()).unwrap();
+        assert_eq!(map.validate_body_pose(body,q),Err(SurfaceError::MissingSupport));
+        let mut witness=None;
+        assert_eq!(map.validate_body_pose_with_witness(body,q,&mut witness),Err(SurfaceError::MissingSupport));
+        assert_eq!(witness.unwrap().rejection,BodyRejection::CoreSupport{column:[1,0]});
+        assert_eq!(witness.unwrap().pose,(body,q));
+        assert_eq!(witness.unwrap().rejection.collision_check(),CollisionCheck::NotChecked);
+        assert_witness_cold_and_warm(&map,(body,q),witness);
+        let cache=map.body_query_cache.lock().unwrap();
+        assert_eq!(cache.poses.len(),1);assert_eq!(cache.support_cores.len(),1);drop(cache);
+        let outside=[20.05,0.05,0.5];
+        assert_eq!(map.validate_body_pose_with_witness(outside,q,&mut witness),Err(SurfaceError::MissingSupport));
+        assert_eq!(witness.unwrap().rejection,BodyRejection::CentreSupport);
+        assert_eq!(witness.unwrap().pose,(outside,q));
+        assert_witness_cold_and_warm(&map,(outside,q),witness);
+        scene(&[],false).validate_body_pose_with_witness(body,q,&mut witness).unwrap();
+        assert!(witness.is_none(),"successful next query must clear the previous candidate");
+    }
+
+    fn witnessed_observations(points:&[(f32,f32,f32)],size:f32)->Arc<SurfaceObservations> {
+        let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for &(x,y,z) in points {
+            let key=[x,y,z].map(|v|(f64::from(v)/f64::from(size)).floor() as i32);
+            blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});
+        }
+        let mut grid=SurfaceObservations::new(size,32).unwrap();
+        for (key,values) in blocks {grid.replace_block(key,values).unwrap();}
+        Arc::new(grid)
+    }
+
+    #[test]
+    fn body_witness_partial_support_is_not_collision_free() {
+        let mut points:Vec<_>=(-30..30).flat_map(|x|(-30..30).filter_map(move |y|
+            if x==4&&y==0 {None}else{Some(((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.0875))})).collect();
+        points.push((-0.45,0.1875,0.55));
+        let mut envelope=model();envelope.footprint_xy_m=vec![[-0.55,-0.12],[0.55,-0.12],[0.55,0.12],[-0.55,0.12]];
+        let map=SurfaceSnapshot::from_points(&points,scene(&[],false).config().clone(),0.025).unwrap()
+            .with_body_envelope(envelope).unwrap().with_observations(Some(witnessed_observations(&points,0.025)));
+        let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);let mut slot=None;
+        assert_eq!(map.validate_body_pose(pose.0,pose.1),Err(SurfaceError::MissingSupport));
+        assert_eq!(map.validate_body_pose_with_witness(pose.0,pose.1,&mut slot),Err(SurfaceError::MissingSupport));
+        eprintln!("PARTIAL_SUPPORT {slot:?}");
+        assert_witness_cold_and_warm(&map,pose,slot);
+        assert!(matches!(slot.unwrap().rejection,BodyRejection::FootprintSupport{collision:CollisionCheck::Partial,..}));
+    }
+
+    #[test]
+    fn body_witness_occupancy_and_motion_cache_preserve_rejected_sample() {
+        let q=[0.0,0.0,0.0,1.0];let pose=([0.05,0.05,0.5],q);
+        let map=scene(&[(0.55,0.05,0.55)],false);let mut slot=None;
+        assert_eq!(map.validate_body_pose(pose.0,q),Err(SurfaceError::InsufficientClearance));
+        assert_eq!(map.validate_body_pose_with_witness(pose.0,q,&mut slot),Err(SurfaceError::InsufficientClearance));
+        assert!(matches!(slot.unwrap().rejection,BodyRejection::Occupancy{source:OccupancySource::CoarseFallback,..}));
+        assert_witness_cold_and_warm(&map,pose,slot);
+        let fine=map.with_observations(Some(witnessed_observations(&[(0.55,0.05,0.55)],0.05)));
+        assert_eq!(fine.validate_body_pose_with_witness(pose.0,q,&mut slot),Err(SurfaceError::InsufficientClearance));
+        assert!(matches!(slot.unwrap().rejection,BodyRejection::Occupancy{source:OccupancySource::Fine,..}));
+        assert_witness_cold_and_warm(&fine,pose,slot);
+        let map=ground_band_sweep_scene(0.525);
+        let from=([-0.25,0.0295,0.375],q);let to=([0.06,0.3395,0.375],q);
+        map.validate_body_pose(from.0,q).unwrap();map.validate_body_pose(to.0,q).unwrap();
+        assert_eq!(map.validate_body_motion(from,to,&[]),Err(SurfaceError::InsufficientClearance));
+        assert_eq!(map.validate_body_motion_with_witness(from,to,&[],&mut slot),Err(SurfaceError::InsufficientClearance));
+        let witness=slot.unwrap();assert_ne!(witness.pose,from);assert_ne!(witness.pose,to);
+        assert_eq!(witness.pose.0[2],0.375);
+        let cold=map.fork_for_planning();
+        let mut cold_slot=None;
+        assert_eq!(cold.validate_body_motion_with_witness(from,to,&[],&mut cold_slot),Err(SurfaceError::InsufficientClearance));
+        assert_eq!(cold_slot,slot);
+        assert_eq!(map.body_query_cache.lock().unwrap().motions.len(),1);
+        assert_eq!(map.validate_body_motion_with_witness(from,from,&[],&mut slot),Ok(()));
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn body_witness_fine_fringe_keeps_the_actual_outside_coarse_column() {
+        let mut points:Vec<_>=(-30..30).flat_map(|x|(-30..30).map(move |y|
+            ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.075))).collect();
+        points.push((0.075,0.025,0.525));
+        let mut cfg=scene(&[],false).config().clone();cfg.wall_clearance_m=0.0;
+        let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(model()).unwrap()
+            .with_observations(Some(witnessed_observations(&[(0.075,0.025,0.525)],0.05)));
+        let pose=([f64::from(0.1_f32)+0.55,0.05,0.5],[0.0,0.0,0.0,1.0]);let mut slot=None;
+        assert_eq!(map.validate_body_pose_with_witness(pose.0,pose.1,&mut slot),Err(SurfaceError::InsufficientClearance));
+        eprintln!("FINE_FRINGE {slot:?}");
+        assert_witness_cold_and_warm(&map,pose,slot);
+        assert!(matches!(slot.unwrap().rejection,BodyRejection::Occupancy{source:OccupancySource::FineFringe,cell:[1,0,10],..}));
+    }
+
+    #[test]
+    fn body_witness_support_fallback_success_discards_initial_failure() {
+        let map=scene(&[],true);let body=[0.05,0.05,0.5];let q=[0.0,0.0,0.0,1.0];let mut slot=None;
+        assert_eq!(map.validate_body_pose_with_witness(body,q,&mut slot),Err(SurfaceError::MissingSupport));
+        assert!(slot.is_some());
+        let view=map.body_query_with_current_support_and_witness(body,q,&mut slot).unwrap();
+        assert!(slot.is_none());
+        view.validate_body_motion_with_witness((body,q),(body,q),&[],&mut slot).unwrap();
+        assert!(slot.is_none());
+    }
+
     fn model() -> SurfaceBodyEnvelope {
         SurfaceBodyEnvelope {
             footprint_xy_m: vec![[-0.55, -0.14], [0.55, -0.14], [0.55, 0.14], [-0.55, 0.14]],
@@ -5127,6 +5317,27 @@ mod tests {
         assert_eq!(map.validate_body_pose([body[0],body[1],body[2]-0.004],q),Err(SurfaceError::InsufficientClearance),
             "同一真实高细列超过接触范围仍应拒绝");
         assert!(make(true).validate_body_pose(body,q).is_err(),"细列缺失不能用整格高度补出联合许可");
+        let mut slot=None;
+        let rejected=[body[0],body[1],body[2]-0.004];
+        assert_eq!(map.validate_body_pose_with_witness(rejected,q,&mut slot),Err(SurfaceError::InsufficientClearance));
+        let witness=slot.unwrap();
+        assert_witness_cold_and_warm(&map,(rejected,q),slot);
+        match witness.rejection {
+            BodyRejection::Ground{coarse_values,fine:FineGroundReject::Height{values,scanned_z,..},..}=>{
+                assert!(coarse_values[0]<coarse_values[1]);assert!(values[0]<values[1]);
+                assert!(scanned_z[0]<=scanned_z[1]);
+                eprintln!("FINE_GROUND_REJECTION {witness:?}");
+            },other=>panic!("expected actual fine-height comparison: {other:?}"),
+        }
+        map.validate_body_pose_with_witness(body,q,&mut slot).unwrap();assert!(slot.is_none());
+        assert_eq!(base.validate_body_pose_with_witness(body,q,&mut slot),Err(SurfaceError::InsufficientClearance));
+        assert!(matches!(slot.unwrap().rejection,BodyRejection::Ground{fine:FineGroundReject::NoFinerSource,..}));
+        assert_witness_cold_and_warm(&base,(body,q),slot);
+        let missing=make(true);
+        assert_eq!(missing.validate_body_pose_with_witness(body,q,&mut slot),Err(SurfaceError::InsufficientClearance));
+        assert!(matches!(slot.unwrap().rejection,BodyRejection::Ground{fine:FineGroundReject::NoSelectedHeight{..},..}));
+        assert_witness_cold_and_warm(&missing,(body,q),slot);
+
     }
 
     #[test]
@@ -5885,15 +6096,15 @@ fn reference_prism_intersects_voxel(
 #[derive(Default)]
 pub(super) struct BodyQueryCache {
     pub(super) supports: AHashMap<[u64;8],Result<SurfaceLocation,SurfaceError>>,
-    support_cores: AHashMap<(u64,u64,u64),bool>,
+    support_cores: AHashMap<(u64,u64,u64),Result<(),[i32;2]>>,
     lower_bounds: AHashMap<VoxelKey,f64>,
     planes: AHashMap<(VoxelKey,[u64;3]),(f64,f64,f64)>,
     contact_samples: AHashMap<VoxelKey,Arc<Vec<([f64;3],f64)>>>,
     fine_bands: AHashMap<(i32,i32),Arc<Vec<[f64;2]>>>,
     complete_columns: AHashMap<(i32,i32),bool>,
-    poses: AHashMap<[u64;7],Result<(),SurfaceError>>,
+    poses: AHashMap<[u64;7],CachedBodyResult<(),BodyRejection>>,
     projections: AHashMap<[u64;6],Result<([f64;3],[f64;4]),SurfaceError>>,
-    motions: AHashMap<[u64;14],Result<(),SurfaceError>>,
+    motions: AHashMap<[u64;14],CachedBodyResult<(),BodyFailureWitness>>,
 }
 
 #[cfg(test)]
@@ -5929,7 +6140,7 @@ mod support_core_tests {
                     step_penalty_weight:1.0,viz_publish_hz:0.0};
                 let map=SurfaceSnapshot::from_points(&points,config,0.1).unwrap()
                     .with_body_envelope(model.clone()).unwrap();
-                assert!(map.body_core_has_support(body,r,&model),"横滚{roll}、俯仰{pitch}、偏航{yaw}的真实投影已全部有支撑");
+                assert!(map.body_core_has_support(body,r,&model).is_ok(),"横滚{roll}、俯仰{pitch}、偏航{yaw}的真实投影已全部有支撑");
             }
         }
     }
@@ -5946,3 +6157,19 @@ mod contact_domain_tests;
 #[cfg(test)]
 #[path = "body_terrain_contract_tests.rs"]
 mod terrain_contract_tests;
+
+#[cfg(test)]
+mod witness_cache_sizes {
+    use super::*;
+#[test]
+fn body_witness_cache_value_sizes() {
+    use std::mem::size_of;
+    fn report<K,V>(name:&str,_:&AHashMap<K,V>) {
+        eprintln!("CACHE_VALUE {name} key={} value={} entry={} max_values={}",size_of::<K>(),size_of::<V>(),size_of::<(K,V)>(),8192*size_of::<V>());
+    }
+    let c=BodyQueryCache::default();
+    eprintln!("SURFACE_ERROR {}",size_of::<SurfaceError>());
+    report("supports",&c.supports);report("support_cores",&c.support_cores);
+    report("poses",&c.poses);report("projections",&c.projections);report("motions",&c.motions);
+}
+}

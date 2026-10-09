@@ -27,6 +27,8 @@ mod passage;
 pub use passage::SurfaceBodyPassageCandidate;
 mod body_query;
 pub use body_query::SurfaceBodyQueryView;
+mod body_witness;
+pub use body_witness::{BodyFailureWitness, BodyRejection, CollisionCheck, FineGroundReject, HeightPredicate, OccupancySource, SupportRejection};
 mod frontiers;
 pub use frontiers::SurfaceFrontierCacheStats;
 mod routing;

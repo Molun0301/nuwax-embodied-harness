@@ -17,6 +17,16 @@ impl SurfaceBodyQueryView {
         ->Result<([f64;3],[f64;4]),SurfaceError> {
         self.snapshot.body_pose_after_motion(from,xy,yaw)
     }
+    /// Same projection, with one actual body rejection sample when available.
+    pub fn body_pose_after_motion_with_witness(&self,from:([f64;3],[f64;4]),xy:[f64;2],yaw:f64,
+        slot:&mut Option<BodyFailureWitness>)->Result<([f64;3],[f64;4]),SurfaceError> {
+        self.snapshot.body_pose_after_motion_with_witness(from,xy,yaw,slot)
+    }
+    /// Same sweep, preserving the rejected sampled pose through cache hits.
+    pub fn validate_body_motion_with_witness(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),boundary:&[[f64;2]],
+        slot:&mut Option<BodyFailureWitness>)->Result<(),SurfaceError> {
+        self.snapshot.validate_body_motion_with_witness(from,to,boundary,slot)
+    }
     /// 完整检查机体、支撑、实际占据接触事件及外部边界。
     pub fn validate_body_motion(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),boundary:&[[f64;2]])
         ->Result<(),SurfaceError> {
@@ -29,6 +39,12 @@ impl SurfaceSnapshot {
     pub fn body_query_with_current_support(&self,body:[f64;3],quaternion:[f64;4])
         ->Result<SurfaceBodyQueryView,SurfaceError> {
         self.current_body_support_view(body,quaternion,true).map(|snapshot|SurfaceBodyQueryView{snapshot})
+    }
+
+    /// A successful support fallback discards its rejected initial-body probe.
+    pub fn body_query_with_current_support_and_witness(&self,body:[f64;3],quaternion:[f64;4],
+        slot:&mut Option<BodyFailureWitness>)->Result<SurfaceBodyQueryView,SurfaceError> {
+        self.current_body_support_view_with_witness(body,quaternion,true,slot).map(|snapshot|SurfaceBodyQueryView{snapshot})
     }
 
     /// 只有几何、实际观察和当前足迹证明三者同一，才能复用机体查询许可。

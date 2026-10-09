@@ -14,7 +14,7 @@ pub(crate) fn checkpoint() -> Result<(), LocalPlanError> {
         }
     });
     if crate::planning_cancelled() {
-        Err(LocalPlanError {
+        Err(LocalPlanError { body_witness: None,
             kind: LocalPlanFailureKind::Cancelled,
             closest_pose: None,
             blocked: None,

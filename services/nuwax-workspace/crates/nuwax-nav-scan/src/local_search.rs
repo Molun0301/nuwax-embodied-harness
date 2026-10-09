@@ -361,6 +361,12 @@ pub fn plan(
     }];
     let mut open = BinaryHeap::from([Entry(heuristic(start), 0)]);
     let mut best = HashMap::from([(key(start), 0.0)]);
+    let mut rejected_sample=None;
+    fn admitted<T>(result:Result<T,LocalPlanError>,sample:&mut Option<nuwax_nav_mls_planner::surface::BodyFailureWitness>)
+        ->Result<Option<T>,LocalPlanError> {
+        if let Err(error)=&result {if sample.is_none() {*sample=error.body_witness;}}
+        super::admit_candidate(result)
+    }
     let mut work = SearchWork::default();
     work.nodes = 1;
     work.frontier_peak = 1;
@@ -436,12 +442,12 @@ pub fn plan(
             }
             if !visible {continue;}
             let mut prefix=vec![from];
-            if super::admit_candidate(super::rotate(map,&mut prefix,heading,motion,boundary))?.is_none() {continue;}
+            if admitted(super::rotate(map,&mut prefix,heading,motion,boundary),&mut rejected_sample)?.is_none() {continue;}
             let in_goal=|pose:BodyPose|arrival.is_some_and(|(goal,tolerance)|super::distance3(pose.0,goal)<tolerance);
-            let Some(line)=super::admit_candidate(probe_motion_until(map,*prefix.last().unwrap(),length,turn,boundary,in_goal))? else{continue;};
+            let Some(line)=admitted(probe_motion_until(map,*prefix.last().unwrap(),length,turn,boundary,in_goal),&mut rejected_sample)? else{continue;};
             prefix.extend(line);
             if let Some(heading)=final_yaw {
-                if super::admit_candidate(super::rotate(map,&mut prefix,heading,motion,boundary))?.is_none(){continue;}
+                if admitted(super::rotate(map,&mut prefix,heading,motion,boundary),&mut rejected_sample)?.is_none(){continue;}
             }
             if reach(*prefix.last().unwrap()) {
                 connection=Some(prefix);break;
@@ -509,7 +515,7 @@ pub fn plan(
                 continue;
             }
             work.candidates += 1;
-            let Some((samples,views)) = super::admit_candidate(project_motion_until(map, from, length, turn, |_|false))? else {
+            let Some((samples,views)) = admitted(project_motion_until(map, from, length, turn, |_|false),&mut rejected_sample)? else {
                 continue;
             };
             let next = *samples.last().unwrap();
@@ -523,7 +529,7 @@ pub fn plan(
             }
             // 已有合法路径代价更低时不重复做扫掠；真正入队的边仍完整核验。
             work.sweeps += 1;
-            if super::admit_candidate(validate_projected(from,&samples,&views,boundary))?.is_none() {continue;}
+            if admitted(validate_projected(from,&samples,&views,boundary),&mut rejected_sample)?.is_none() {continue;}
             #[cfg(test)]
             if id == 0 { INITIAL_ADMISSIONS.with(|v|v.borrow_mut().push((length,turn,next))); }
             #[cfg(all(test,feature="profile"))]
@@ -559,6 +565,7 @@ pub fn plan(
             else { super::LocalPlanFailureKind::SearchExhausted },
         closest_pose: Some(closest),
         blocked: None,
+        body_witness: rejected_sample,
     })
 }
 

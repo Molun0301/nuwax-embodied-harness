@@ -256,7 +256,7 @@ impl PlanKernel {
             &[false, true][..]
         } {
             if cancel.cancelled() {
-                return Err(vec![LocalPlanError {
+                return Err(vec![LocalPlanError { body_witness: None,
                     kind: nuwax_nav_scan::LocalPlanFailureKind::Cancelled,
                     closest_pose: None,
                     blocked: None,
@@ -474,7 +474,7 @@ mod tests {
                 reference,
                 final_yaw: request.final_yaw,
                 arrival: request.arrival,
-                failure: LocalPlanError {
+                failure: LocalPlanError { body_witness: None,
                     kind: nuwax_nav_scan::LocalPlanFailureKind::BudgetExhausted,
                     closest_pose: Some(body(&request.pose)),
                     blocked: None,

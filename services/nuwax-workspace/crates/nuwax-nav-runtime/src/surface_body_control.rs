@@ -13,7 +13,33 @@ struct BodyMotionSuccess {
     // Dependency of the entire successful query, including its future-view check.
     latest_start_ns: Option<u64>,
 }
+#[cfg(test)]
 type BodyMotionResult = Result<BodyMotionSuccess, nuwax_nav_mls_planner::surface::SurfaceError>;
+
+
+#[derive(Clone, Debug, PartialEq)]
+enum BodyMotionFailure {
+    Legacy(nuwax_nav_mls_planner::surface::SurfaceError),
+    Body(nuwax_nav_mls_planner::surface::BodyFailureWitness),
+}
+impl BodyMotionFailure {
+    #[cfg(test)]
+    fn legacy_error(&self)->nuwax_nav_mls_planner::surface::SurfaceError {
+        match self {Self::Legacy(error)=>error.clone(),Self::Body(witness)=>witness.rejection.error()}
+    }
+}
+impl From<nuwax_nav_mls_planner::surface::SurfaceError> for BodyMotionFailure {
+    fn from(error:nuwax_nav_mls_planner::surface::SurfaceError)->Self {Self::Legacy(error)}
+}
+impl std::fmt::Display for BodyMotionFailure {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        match self {Self::Legacy(error)=>write!(f,"{error}"),Self::Body(witness)=>write!(f,"{}; {witness}",witness.rejection.error())}
+    }
+}
+fn motion_failure<T>(result:Result<T,nuwax_nav_mls_planner::surface::SurfaceError>,
+    witness:Option<nuwax_nav_mls_planner::surface::BodyFailureWitness>)->Result<T,BodyMotionFailure> {
+    result.map_err(|error|witness.map_or_else(||BodyMotionFailure::Legacy(error),BodyMotionFailure::Body))
+}
 
 /// 仅在一次控制选择内共享；地图、当前足迹和观察集合由该调用固定。
 #[derive(Hash, PartialEq, Eq)]
@@ -24,6 +50,7 @@ struct BodyMotionQuery {
     observation_time_ns: Option<u64>,
 }
 
+#[cfg(test)]
 fn memoized_body_motion(
     cache: &std::cell::RefCell<std::collections::HashMap<BodyMotionQuery, BodyMotionResult>>,
     proof: &ObservationProofAccumulator,
@@ -33,6 +60,14 @@ fn memoized_body_motion(
     observation_time_ns: Option<u64>,
     check: impl FnOnce() -> BodyMotionResult,
 ) -> BodyMotionResult {
+    memoized_body_motion_impl(cache,proof,from,target,preserve_height,observation_time_ns,check)
+}
+
+fn memoized_body_motion_impl<E:Clone>(
+    cache:&std::cell::RefCell<std::collections::HashMap<BodyMotionQuery,Result<BodyMotionSuccess,E>>>,
+    proof:&ObservationProofAccumulator,from:BodyPose,target:PlanarPose,preserve_height:bool,
+    observation_time_ns:Option<u64>,check:impl FnOnce()->Result<BodyMotionSuccess,E>,
+)->Result<BodyMotionSuccess,E> {
     // 不量化坐标、不归一化四元数；不同的整拍/细分站姿必须分别查询。
     let key = BodyMotionQuery {
         from: [from.0[0], from.0[1], from.0[2], from.1[0], from.1[1], from.1[2], from.1[3]]
@@ -406,11 +441,12 @@ impl SurfaceFollower {
         if !robot_width.is_finite() || robot_width <= 0.0 {
             return PlannerStep::Failed("机器人宽度无效".into());
         }
+        let mut body_witness=None;
         let body_validity={
             #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::CurrentBodyValidation);
-            map.validate_body_pose(body(pose).0, body(pose).1)
+            map.validate_body_pose_with_witness(body(pose).0, body(pose).1,&mut body_witness)
         };
-        if let Err(e) = body_validity {
+        if let Err(e) = motion_failure(body_validity,body_witness) {
             return PlannerStep::ReplanRequired(format!("当前三维机体包络无效: {e}"));
         }
         #[cfg(test)] let profile_support=crate::control_profile::guard(crate::control_profile::Stage::BodySupportGoal);
@@ -793,7 +829,7 @@ impl SurfaceFollower {
     fn with_body_motion_checks<R>(&self, run: impl FnOnce(
         &mut dyn FnMut(PlanarPose, PlanarPose, f64) -> bool,
         &mut dyn FnMut(PlanarPose, PlanarPose, f64) -> bool,
-        &std::cell::RefCell<Option<nuwax_nav_mls_planner::surface::SurfaceError>>,
+        &std::cell::RefCell<Option<BodyMotionFailure>>,
         &ObservationProofAccumulator,
     ) -> R) -> Result<R, String> {
         #[cfg(test)] let proof_scope=crate::command_proof_trace::GuardScope::begin();
@@ -814,7 +850,7 @@ impl SurfaceFollower {
         let source_map=self.source_map.as_ref().unwrap_or(map);
         let motion_queries = std::cell::RefCell::new(std::collections::HashMap::new());
         let period_queries = std::cell::RefCell::new(std::collections::HashMap::new());
-        let future_views = std::cell::RefCell::new(std::collections::HashMap::<[u64;7],Result<Arc<nuwax_nav_mls_planner::SurfaceBodyQueryView>,nuwax_nav_mls_planner::surface::SurfaceError>>::new());
+        let future_views = std::cell::RefCell::new(std::collections::HashMap::<[u64;7],Result<Arc<nuwax_nav_mls_planner::SurfaceBodyQueryView>,BodyMotionFailure>>::new());
         let boundary=&self.boundary;
         let make_check = |rebase:bool| {
             let mut previous_body=body(pose);
@@ -828,7 +864,7 @@ impl SurfaceFollower {
             // time/evidence outcomes; each actual checker invocation uses the
             // existing now+elapsed. Outer exact-time motion memoization is unchanged.
             let mut observed_motion=observation_check.as_ref().map(|(occupied,anchor,age)|
-                (anchor.unix_ns,map.observed_body_motion_checker_with_expiry(occupied,*age,boundary)));
+                (anchor.unix_ns,map.observed_body_motion_checker_with_expiry_and_witness(occupied,*age,boundary)));
             // 两种回调的地形依据不同，不能共用运动许可；视图按精确站姿在本次选择内复用。
             let motion_queries=if rebase {&period_queries}else{&motion_queries};
             let future_views=&future_views;
@@ -843,7 +879,8 @@ impl SurfaceFollower {
                 let elapsed_ns=(elapsed * 1e9) as u64;
                 let observation_time = observation_check.as_ref()
                     .map(|(_, anchor, _)| anchor.unix_ns.saturating_add(elapsed_ns));
-                let b=match memoized_body_motion(motion_queries,proof,a,to,preserve_height,observation_time,|| {
+                let b=match memoized_body_motion_impl(motion_queries,proof,a,to,preserve_height,observation_time,|| -> Result<BodyMotionSuccess,BodyMotionFailure> {
+                    let mut witness=None;
                     let future=if rebase && a!=body(pose) {
                         let key=[a.0[0],a.0[1],a.0[2],a.1[0],a.1[1],a.1[2],a.1[3]].map(f64::to_bits);
                         let cached=future_views.borrow().get(&key).cloned();
@@ -857,7 +894,8 @@ impl SurfaceFollower {
                                 // 从同一环境源派生机体查询视图，旧足迹不会累积，也不重建全局路由。
                                 let view={
                                     #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::FutureViewConstruction);
-                                    source_map.body_query_with_current_support(a.0,a.1).map(Arc::new)
+                                    {let result=source_map.body_query_with_current_support_and_witness(a.0,a.1,&mut witness);
+                                    motion_failure(result,witness).map(Arc::new)}
                                 };
                                 future_views.borrow_mut().insert(key,view.clone());view?
                             }
@@ -867,8 +905,8 @@ impl SurfaceFollower {
                     let mut b={
                         #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardProjection);
                         match &future {
-                            Some(view)=>view.body_pose_after_motion(a,[to.x,to.y],to.yaw)?,
-                            None=>map.body_pose_after_motion(a,[to.x,to.y],to.yaw)?,
+                            Some(view)=>{let result=view.body_pose_after_motion_with_witness(a,[to.x,to.y],to.yaw,&mut witness);motion_failure(result,witness)?},
+                            None=>{let result=map.body_pose_after_motion_with_witness(a,[to.x,to.y],to.yaw,&mut witness);motion_failure(result,witness)?},
                         }
                     };
                     if preserve_height {b.0[2]=a.0[2];}
@@ -877,12 +915,14 @@ impl SurfaceFollower {
                         Some((now, check)) => {
                             #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::ObservedSweeps);
                             #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardObservedSweep);
-                            latest_start_for_query(check(a,b,now.saturating_add(elapsed_ns))?,elapsed_ns)
+                            {let result=check(a,b,now.saturating_add(elapsed_ns),&mut witness);
+                            latest_start_for_query(motion_failure(result,witness)?,elapsed_ns)}
                         },
                         None => {
                             #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
                             #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardGeometrySweep);
-                            map.validate_body_motion(a,b,boundary)?;
+                            let result=map.validate_body_motion_with_witness(a,b,boundary,&mut witness);
+                            motion_failure(result,witness)?;
                             None
                         },
                     };
@@ -891,7 +931,8 @@ impl SurfaceFollower {
                         if !view.same_body_query_view(map) {
                             #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::FutureGeometrySweeps);
                             #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardGeometrySweep);
-                            view.validate_body_motion(a,b,boundary)?;
+                            let result=view.validate_body_motion_with_witness(a,b,boundary,&mut witness);
+                            motion_failure(result,witness)?;
                         }
                     }
                     Ok(BodyMotionSuccess {pose:b,latest_start_ns})
@@ -1911,6 +1952,42 @@ mod query_reuse_tests {
             Counter::ObservedSweeps,Counter::FutureGeometrySweeps,Counter::FutureViewBuilds] {
             assert_eq!(record.counters[counter as usize],0,"observed selected replay reuses exact queries: {counter:?}");
         }
+    }
+
+    #[test]
+    fn body_witness_current_pose_reaches_final_controller_failure() {
+        use nuwax_nav_types_messages::{NavFrameId,Timestamp};
+        let source=Arc::new(map(0.0));
+        let pose=PoseStamped {frame_id:NavFrameId::Map,stamp:Timestamp::from_unix(1,0),
+            pose:Pose3{position:Point3::new(100.0,100.0,0.4),orientation:Quaternion::from_yaw(0.0)}};
+        let mut follower=SurfaceFollower::new(SurfaceFollowerConfig::new(0.3)).unwrap();
+        follower.map=Some(source.clone());follower.source_map=Some(source.clone());
+        follower.odometry=Some(pose.clone());follower.goal=Some(pose.clone());
+        follower.path=Some(Path3D{poses:vec![pose.clone()]});
+        // Fill the old API first: the final message must still recover evidence on a warm hit.
+        let old=source.validate_body_pose([100.0,100.0,0.4],[0.0,0.0,0.0,1.0]);
+        assert!(old.is_err());
+        let step=follower.follow_body_step_policy::<true,false,false,false>(0.2);
+        let PlannerStep::ReplanRequired(message)=step else {panic!("expected current-body rejection: {step:?}")};
+        assert!(message.contains("CentreSupport"));assert_eq!(message.matches("拒绝样本").count(),1);
+        assert!(message.contains("100.0"));
+        let current=follower.current_body_error().unwrap();
+        assert!(current.contains("CentreSupport"));assert_eq!(current.matches("拒绝样本").count(),1);
+        eprintln!("FINAL_CONTROLLER_FAILURE {message}\nFINAL_CURRENT_BODY_FAILURE {current}");
+    }
+
+    #[test]
+    fn body_witness_controller_memo_size_and_final_message() {
+        use nuwax_nav_mls_planner::surface::{BodyFailureWitness,BodyRejection};
+        eprintln!("CONTROLLER_CACHE old_value={} new_value={} key={} old_entry={} new_entry={}",
+            std::mem::size_of::<BodyMotionResult>(),std::mem::size_of::<Result<BodyMotionSuccess,BodyMotionFailure>>(),
+            std::mem::size_of::<BodyMotionQuery>(),std::mem::size_of::<(BodyMotionQuery,BodyMotionResult)>(),
+            std::mem::size_of::<(BodyMotionQuery,Result<BodyMotionSuccess,BodyMotionFailure>)>());
+        let witness=BodyFailureWitness{pose:([0.05,0.05,0.4],[0.0,0.0,0.0,1.0]),
+            rejection:BodyRejection::CoreSupport{column:[1,0]}};
+        let message=BodyMotionFailure::Body(witness).to_string();
+        assert!(message.contains("no observed support"));assert!(message.contains("拒绝样本"));
+        assert!(message.contains("NotChecked"));
     }
 
     #[test]

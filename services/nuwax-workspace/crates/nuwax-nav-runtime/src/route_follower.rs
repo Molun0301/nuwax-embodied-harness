@@ -580,7 +580,7 @@ mod tests {
     fn typed_failures() -> Vec<LocalPlanError> {
         [nuwax_nav_scan::LocalPlanFailureKind::BudgetExhausted,
          nuwax_nav_scan::LocalPlanFailureKind::SearchExhausted]
-            .into_iter().map(|kind| LocalPlanError {
+            .into_iter().map(|kind| LocalPlanError { body_witness: None,
                 kind, closest_pose: None, blocked: None, reason: "test incomplete search".into(),
             }).collect()
     }

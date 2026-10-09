@@ -217,8 +217,12 @@ impl SurfaceFollower {
         map.body_envelope()?;
         let pose = self.odometry.as_ref()?;
         let q = pose.pose.orientation;
-        map.validate_body_pose(xyz(pose.pose.position), [q.x, q.y, q.z, q.w])
-            .err().map(|error| error.to_string())
+        let mut witness=None;
+        map.validate_body_pose_with_witness(xyz(pose.pose.position), [q.x, q.y, q.z, q.w], &mut witness)
+            .err().map(|error| match witness {
+                Some(sample)=>format!("{error}; {sample}"),
+                None=>error.to_string(),
+            })
     }
 
     fn support(map: &SurfaceSnapshot, pose: &PoseStamped, offset: f64) -> Result<[f64; 3], String> {

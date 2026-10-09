@@ -1201,7 +1201,7 @@ fn tga_prove_command(
             f64::from(map.source_voxel_size_m()) * 0.5,
             map.body_envelope().unwrap().radius(), clear, period_clear,
         );
-        (choice.is_some(), last_failure.borrow().clone())
+        (choice.is_some(), last_failure.borrow().as_ref().map(|failure|failure.legacy_error()))
     }).unwrap()
 }
 

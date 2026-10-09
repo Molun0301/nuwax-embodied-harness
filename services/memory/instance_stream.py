@@ -6,6 +6,8 @@ import logging
 import threading
 import time
 
+from contracts.streams import InstanceSnapshotFrame
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -21,6 +23,8 @@ def _snapshot_frame_id(payload):
 
 class SemanticInstancePublisher:
     def __init__(self, stream_bus, snapshot_reader) -> None:
+        # snapshot_reader 每次移交新建的公开视图；不可保留可写别名或复用行容器。
+        # MemoryService.get_semantic_instances_snapshot 已在源端生成独立的行字典。
         self._stream_bus = stream_bus
         self._snapshot_reader = snapshot_reader
         self._condition = threading.Condition()
@@ -92,8 +96,8 @@ class SemanticInstancePublisher:
             with self._condition:
                 if self._stopping:
                     return
-            self._stream_bus.publish(
-                "memory.instances", source="memory_service", payload=payload,
-                frame_id=frame_id, status=status,
-            )
+            # _next_update_at 已取走；此后只读移交，不再修改信封或其嵌套内容。
+            self._stream_bus.publish_frame(InstanceSnapshotFrame(
+                source="memory_service", payload=payload, frame_id=frame_id, status=status,
+            ))
             next_publish_at = time.monotonic() + 0.1

@@ -39,6 +39,7 @@ from gateways.errors import GatewayError
 from gateways.feedback import build_public_runtime_event
 from gateways.runtime import GatewayRuntime
 from gateways.ws.console_projection import console_payload, field_value, selected_fields
+from gateways.ws.instance_encoding import InstanceSnapshotEncoder
 from gateways.ws.pointcloud_encoding import CanonicalPointCloudEncoder
 from gateways.ws.pointcloud_stream import install_pointcloud_stream
 
@@ -1119,7 +1120,7 @@ def _legacy_pointcloud_frame(frame, snapshot):
                                     "revision": snapshot.revision})
 
 
-async def _send_ws_frame(websocket: WebSocket, frame: StreamFrame, *, pointcloud_encoder=None, map_binary_version=None, runtime=None) -> None:
+async def _send_ws_frame(websocket: WebSocket, frame: StreamFrame, *, pointcloud_encoder=None, map_binary_version=None, runtime=None, instance_encoder=None) -> None:
     if ((frame.topic == "pointcloud_map.snapshot" and frame.metadata.get("chunked"))
             or frame.metadata.get("legacy_pointcloud_topic")):
         snapshot = runtime.get_pointcloud_map_snapshot() if runtime is not None else None
@@ -1139,7 +1140,7 @@ async def _send_ws_frame(websocket: WebSocket, frame: StreamFrame, *, pointcloud
     elif frame.payload_kind == StreamPayloadKind.BINARY:
         payload = await _run_blocking(_encode_ws_frame, frame)
     else:
-        payload = _encode_ws_frame(frame)
+        payload = instance_encoder.encode(frame) if instance_encoder is not None else _encode_ws_frame(frame)
     if isinstance(payload, bytes):
         await websocket.send_bytes(payload)
     else:
@@ -1180,16 +1181,19 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     """构造实时数据流路由。"""
 
     pointcloud_encoder = None
+    instance_encoder = None
 
     @asynccontextmanager
     async def lifespan(_app):
-        nonlocal pointcloud_encoder
+        nonlocal pointcloud_encoder, instance_encoder
         owner = CanonicalPointCloudEncoder(_encode_ws_frame, _run_blocking)
-        pointcloud_encoder = owner
+        instances = InstanceSnapshotEncoder(_encode_ws_frame)
+        pointcloud_encoder, instance_encoder = owner, instances
         try:
             yield
         finally:
-            pointcloud_encoder = None
+            pointcloud_encoder = instance_encoder = None
+            instances.close()
             await owner.close()
 
     router = APIRouter(lifespan=lifespan)
@@ -1395,7 +1399,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                     continue
                 if getattr(frame, 'payload_kind', None) == StreamPayloadKind.BINARY:
                     continue  # binary 帧不回放
-                await _send_ws_frame(websocket, frame, pointcloud_encoder=pointcloud_encoder, map_binary_version=map_binary_version, runtime=runtime)
+                await _send_ws_frame(websocket, frame, pointcloud_encoder=pointcloud_encoder, map_binary_version=map_binary_version, runtime=runtime, instance_encoder=instance_encoder)
             await _send_ws_json(
                 websocket,
                 {"type": "stream.replay", **_external_cursor_status(replay_status)},
@@ -1451,7 +1455,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                     if map_identity_only and frame.topic == "map.frame":
                         await _send_ws_json(websocket, _map_identity_message(frame))
                     else:
-                        await _send_ws_frame(websocket, frame, pointcloud_encoder=pointcloud_encoder, map_binary_version=map_binary_version, runtime=runtime)
+                        await _send_ws_frame(websocket, frame, pointcloud_encoder=pointcloud_encoder, map_binary_version=map_binary_version, runtime=runtime, instance_encoder=instance_encoder)
                 except _ClientStreamGap:
                     gap_notice = _take_queue_gap_notice(queue, runtime)
                     if gap_notice is not None:

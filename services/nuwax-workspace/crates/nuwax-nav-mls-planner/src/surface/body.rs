@@ -2435,9 +2435,45 @@ impl SurfaceSnapshot {
     }
 
 }
-/// 最小化平面到真实高度区间的平方距离。不能先按不断变化的参考把样本锁成点。
-/// 固定空间权重矩阵只分解一次，单层地面退化为普通最小二乘；共同可行平面保持参考。
+/// 共同水平区间最小化 Σw·dist(z,I)² + alpha·(z-h)²；alpha=rho·Σw。
+/// rho=U/(U+S)，U=Σw·区间宽²/12，S=Σw·水平距离²，是几何正则偏好，
+/// 不是已校准的传感器方差。区间残差允许非零；实际机体净空仍由完整几何检查决定。
+/// 非共同区间和零区间宽度保留原拟合，秩检查也不变。
 fn fit_contact_plane(points:&[([f64;3],f64,f64)],origin:[f64;3])->Option<(f64,f64,f64)> {
+    let original=original_fit_contact_plane(points,origin)?;
+    let low=points.iter().map(|p|p.1).fold(f64::NEG_INFINITY,f64::max);
+    let high=points.iter().map(|p|p.0[2]).fold(f64::INFINITY,f64::min);
+    if low>high {return Some(original);}
+    let h=origin[2];
+    if low<=h && h<=high {return Some((0.0,0.0,h));}
+    let mut mass=0.0;let mut uncertainty=0.0;let mut span=0.0;
+    for &(p,low,w) in points {
+        mass+=w;uncertainty+=w*(p[2]-low).powi(2)/12.0;
+        span+=w*((p[0]-origin[0]).powi(2)+(p[1]-origin[1]).powi(2));
+    }
+    if uncertainty==0.0 {return Some(original);}
+    let anchor=uncertainty/(uncertainty+span)*mass;
+    // Common intervals imply only upper OR lower endpoints can be active.
+    // In displacement coordinates, alpha*d = sum(w*max(t-d,0)).
+    let above=h>high;
+    let mut events:Vec<_>=points.iter().filter_map(|&(p,l,w)| {
+        let t=if above {h-p[2]} else {l-h};
+        (t>0.0).then_some((t,w))
+    }).collect();
+    events.sort_unstable_by(|a,b|b.0.total_cmp(&a.0));
+    let mut weight=0.0;let mut moment=0.0;
+    for (i,&(t,w)) in events.iter().enumerate() {
+        weight+=w;moment+=w*t;
+        let displacement=moment/(anchor+weight);
+        if i+1==events.len() || displacement>=events[i+1].0 {
+            return Some((0.0,0.0,if above {h-displacement} else {h+displacement}));
+        }
+    }
+    unreachable!("reference outside nonempty common interval has an active endpoint")
+}
+
+
+fn original_fit_contact_plane(points:&[([f64;3],f64,f64)],origin:[f64;3])->Option<(f64,f64,f64)> {
     if points.len()<3 {return None;}
     let rows:Vec<_>=points.iter().map(|&(p,low,w)|([p[0]-origin[0],p[1]-origin[1],1.0],low,p[2],w)).collect();
     let mut inverse=[[0.0;6];3];
@@ -4616,8 +4652,10 @@ mod tests {
         coarse.body_pose_after_motion(from,[0.001,0.0],0.0).expect("原粗响应可完成真实平地微动");
         let next=map.body_pose_after_motion(from,[0.001,0.0],0.0)
             .expect("外部孤岛恰好包含参考高度，不应夺走当前完整地面的响应种子");
-        assert!((next.0[2]-from.0[2]).abs()<1e-10 && next.1.iter().zip(from.1).all(|(a,b)|(a-b).abs()<1e-10),
-            "同层厚带可以参与估计，但不能改变脚下已证平面的实际响应");
+        // 共同带改为软区间残差后，旧“高度差<1e-10”的精确identity不再成立。
+        // 这不是放大epsilon：按独立二分求得的新目标根验证高度，同时保留零倾斜和完整扫掠许可。
+        super::scalar_response_tests::assert_flat_response_matches_reference(&map,from,next);
+        eprintln!("SCALAR_FLAT_SEED height_delta_m={:?}",next.0[2]-from.0[2]);
     }
 
     fn sparse_contact_scene(keys:Vec<[i32;3]>,mut envelope:SurfaceBodyEnvelope)->SurfaceSnapshot {
@@ -6173,3 +6211,7 @@ fn body_witness_cache_value_sizes() {
     report("poses",&c.poses);report("projections",&c.projections);report("motions",&c.motions);
 }
 }
+
+#[cfg(test)]
+#[path = "body_scalar_response_tests.rs"]
+mod scalar_response_tests;

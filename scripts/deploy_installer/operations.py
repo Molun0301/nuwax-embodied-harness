@@ -534,7 +534,7 @@ def _reject_duplicate_keys(pairs):
     return result
 
 
-def validate_actuator_manifest(path: Path) -> str:
+def validate_actuator_manifest(path: Path) -> bytes:
     if path.is_symlink() or not path.is_file():
         raise DeploymentError(f"actuator manifest must be a non-symlink regular file: {path}")
     payload = path.read_bytes()
@@ -571,7 +571,7 @@ def validate_actuator_manifest(path: Path) -> str:
         allowed_owners.add(int(sudo_uid))
     if os.geteuid() == 0 and metadata.st_uid not in allowed_owners:
         raise DeploymentError("actuator manifest must be owned by root or the invoking sudo user")
-    return hashlib.sha256(payload).hexdigest()
+    return payload
 
 
 def validate_bundle_public_key(profile, options, public_key: Path) -> Path:
@@ -1437,7 +1437,7 @@ def preflight(context: ExecutionContext) -> None:
         _verify_source_artifacts(context)
     if not options.no_systemd:
         manifest = _require_file(options.actuator_manifest, "actuator symbols manifest")
-        context.notes["actuator_manifest_sha256"] = validate_actuator_manifest(manifest)
+        context.notes["actuator_manifest_payload"] = validate_actuator_manifest(manifest)
     minimum_free_gb = int(profile.metadata.get("minimum_free_gb", 30))
     for label, requested in (
         ("source", options.source_root),
@@ -3677,7 +3677,7 @@ def install_systemd(context: ExecutionContext) -> None:
 
 def provision_safety(context: ExecutionContext) -> None:
     manifest = _require_file(context.options.actuator_manifest, "actuator symbols manifest")
-    expected = context.notes.get("actuator_manifest_sha256")
+    expected = context.notes.get("actuator_manifest_payload")
     snapshot_dir = _prepare_backup_root(context) / "inputs"
     if snapshot_dir.is_symlink():
         raise DeploymentError(f"deployment input snapshot path is a symlink: {snapshot_dir}")
@@ -3692,8 +3692,8 @@ def provision_safety(context: ExecutionContext) -> None:
             output.flush()
             os.fsync(output.fileno())
         os.chmod(temporary, 0o600)
-        digest = validate_actuator_manifest(temporary)
-        if expected and digest != expected:
+        payload = validate_actuator_manifest(temporary)
+        if expected and payload != expected:
             raise DeploymentError("actuator manifest changed after preflight")
         os.replace(temporary, snapshot)
         fsync_directory(snapshot_dir)

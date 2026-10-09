@@ -8,7 +8,7 @@ import secrets
 import subprocess
 import sys
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -446,7 +446,11 @@ def _execute(
                 options.cache_dir,
             )
         snapshot_profile = load_named_profile(args.profile, source_snapshot)
-        if profile_sha256(snapshot_profile) != profile_sha256(profile):
+        # Compare the existing canonical representation without rehashing it.
+        # Plain dict equality would conflate JSON values such as true and 1.
+        if json.dumps(asdict(snapshot_profile), sort_keys=True, separators=(",", ":")) != json.dumps(
+            asdict(profile), sort_keys=True, separators=(",", ":")
+        ):
             raise RuntimeError("deployment profile changed while creating the production source snapshot")
         profile = snapshot_profile
         options = replace(

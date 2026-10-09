@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib
+import json
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -15,6 +15,27 @@ def validate_identifier(value: str, label: str) -> str:
     if not isinstance(value, str) or _IDENTIFIER_RE.fullmatch(value) is None:
         raise ValueError(f"{label} must match {_IDENTIFIER_RE.pattern!r}: {value!r}")
     return value
+
+
+def read_rust_target_slots(path: Path) -> dict:
+    if path.is_symlink():
+        raise RuntimeError(f"Rust target mapping must not be a symlink: {path}")
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        slots = payload["slots"]
+        if type(payload.get("version")) is not int or payload["version"] != 1 or not isinstance(slots, dict):
+            raise ValueError("unsupported target mapping")
+        for identity, entry in slots.items():
+            if (not isinstance(identity, str) or not identity or "\x00" in identity
+                    or not isinstance(entry, dict) or set(entry) != {"manifest", "path"}
+                    or entry["manifest"] != identity or not isinstance(entry["path"], str)
+                    or re.fullmatch(r"[A-Za-z0-9_-]+", entry["path"]) is None):
+                raise ValueError("invalid target binding")
+        return slots
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"Rust target mapping is invalid: {path}") from exc
 
 
 @dataclass(frozen=True)
@@ -90,8 +111,29 @@ class DeploymentOptions:
         return self.state_dir / "state.json"
 
     def rust_target_dir(self, manifest: str) -> Path:
-        key = hashlib.sha256(manifest.encode("utf-8")).hexdigest()[:16]
-        return self.build_dir / "rust-targets" / key
+        parent = self.build_dir / "rust-targets"
+        record = parent / "target-paths-v1.json"
+        identity = str((self.source_root / manifest).resolve())
+        if parent.is_symlink():
+            raise RuntimeError(f"Rust target parent is unsafe: {parent}")
+        saved = read_rust_target_slots(record).get(identity)
+        if saved is None:
+            raise RuntimeError(f"Rust target has not been prepared for {identity}: {record}")
+        target = parent / saved["path"]
+        if target.is_symlink() or (target.exists() and not target.is_dir()):
+            raise RuntimeError(f"Rust target is not a managed directory: {target}")
+        if target.exists():
+            owner = target / "neh-target-owner.json"
+            try:
+                if owner.is_symlink():
+                    raise ValueError("target owner is a symlink")
+                observed = json.loads(owner.read_text(encoding="utf-8"))
+                if (not isinstance(observed, dict) or type(observed.get("version")) is not int
+                        or observed != {"version": 1, "manifest": identity}):
+                    raise ValueError("target owner does not match manifest")
+            except (OSError, ValueError, TypeError) as exc:
+                raise RuntimeError(f"Rust target owner is invalid: {owner}") from exc
+        return target
 
     @property
     def offline_rustup_home(self) -> Path:

@@ -14,6 +14,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Dict, FrozenSet, Mapping, Optional, Sequence, Tuple
@@ -23,6 +24,7 @@ from scripts.systemd.prepare_lcm_network import lcm_url_from_env_text, migrated_
 from .config import atomic_write, fsync_directory, render_env
 from .gateway import gateway_health_url, resolve_gateway_listener
 from .profile import profile_sha256
+from .model import read_rust_target_slots
 from .state import installation_inputs_match, plan_identity_fields, record_identity
 from .runner import resolve_build_account, source_user_command, source_user_environment
 
@@ -1732,20 +1734,69 @@ def _existing_rust_proxy(toolchain_bin: Path, proxy: str) -> Path:
     return candidate
 
 
+def _pending_rust_target_owner_file(path: Path) -> bool:
+    # config.atomic_write uses mkstemp with this prefix: a regular, private
+    # installer-owned file. Its bytes may be empty or partial after interruption.
+    if re.fullmatch(r"\.neh-target-owner\.json\.[a-z0-9_]{8}", path.name) is None:
+        return False
+    metadata = path.lstat()
+    return (stat.S_ISREG(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) == 0o600
+            and metadata.st_uid == os.geteuid() and metadata.st_nlink == 1)
+
+
+def _prepare_rust_targets(context: ExecutionContext, build_uid: int, build_gid: int) -> None:
+    manifests = tuple(dict.fromkeys(build.manifest for build in context.profile.rust.builds))
+    if not manifests:
+        return
+    options = context.options
+    parent = options.build_dir / "rust-targets"
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink() or not parent.is_dir():
+        raise DeploymentError(f"Rust target parent is unsafe: {parent}")
+    os.chown(parent, 0, build_gid)
+    os.chmod(parent, 0o750)
+    record = parent / "target-paths-v1.json"
+    slots = read_rust_target_slots(record)
+    for manifest in manifests:
+        identity = str((options.source_root / manifest).resolve())
+        saved = slots.get(identity)
+        target = parent / (saved["path"] if saved else "rust-" + uuid.uuid4().hex)
+        if target.is_symlink() or (target.exists() and not target.is_dir()):
+            raise DeploymentError(f"Rust target is not a managed directory: {target}")
+        if saved and target.is_dir():
+            entries = tuple(target.iterdir())
+            if entries:
+                pending_owner = all(_pending_rust_target_owner_file(path) for path in entries)
+                if not pending_owner:
+                    options.rust_target_dir(manifest)  # Require the published owner for every other layout.
+                if target.lstat().st_uid != build_uid:
+                    raise DeploymentError(f"Rust target belongs to another build user; preserved: {target}")
+                if not pending_owner:
+                    os.chmod(target, 0o750)
+                    continue
+        if not saved or not target.exists():
+            target.mkdir()  # Exclusive: never replace an unbound directory, even if empty.
+        # A saved binding owns this name. Empty directories or only recognized
+        # owner temporaries can resume interrupted recreation; retain temporaries.
+        os.chown(target, build_uid, build_gid)
+        os.chmod(target, 0o750)
+        atomic_write(target / "neh-target-owner.json", json.dumps(
+            {"version": 1, "manifest": identity}, sort_keys=True,
+        ) + "\n", mode=0o600)
+        if not saved:
+            slots[identity] = {"manifest": identity, "path": target.name}
+            # Owner first, mapping second. A crash before this publication only
+            # leaves an unbound directory, which this allocator never adopts.
+            atomic_write(record, json.dumps({"version": 1, "slots": slots}, sort_keys=True, indent=2) + "\n", mode=0o600)
+
+
 def ensure_rust_toolchain(context: ExecutionContext) -> None:
     toolchain = context.profile.rust.toolchain
     build_account = resolve_build_account()
     build_uid = build_account.pw_uid
     build_gid = build_account.pw_gid
     _prepare_build_root(context, build_gid)
-    for build in context.profile.rust.builds:
-        target = context.options.rust_target_dir(build.manifest)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.parent.is_symlink() or not target.parent.is_dir():
-            raise DeploymentError(f"Rust target parent is unsafe: {target.parent}")
-        os.chown(target.parent, 0, build_gid)
-        os.chmod(target.parent, 0o750)
-        _prepare_mutable_build_tree(target, build_uid, build_gid, "Rust target directory")
+    _prepare_rust_targets(context, build_uid, build_gid)
     build_home = _prepare_mutable_build_tree(
         context.options.build_home,
         build_uid,

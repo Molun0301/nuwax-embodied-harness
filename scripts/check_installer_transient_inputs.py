@@ -575,16 +575,17 @@ class PersistentIdentityTests(unittest.TestCase):
         build = RustBuild('fixture', 'Cargo.toml', 'fixture', 'bin/fixture')
         current = replace(self.profile, rust=RustProfile('existing', (build,)))
         selected = replace(self.options, release_id='new-selected')
-        # The old target-name algorithm is intentionally out of scope; this
-        # double checks propagation without recomputing any application hash.
+        runner = Mock()
         with patch.object(DeploymentOptions, 'rust_target_dir', lambda o, m: o.build_dir / 'existing-target'), \
                 patch.object(engine, '_build_user_rust_paths', return_value=(self.root, self.root, self.root)):
             plan = engine.build_deployment_plan(current, selected, installation_inputs=self.capture(), release_owner_id='owner')
-        rust = next(p for p in plan.phases if p.name == 'rust_build')
-        for action in rust.actions:
-            self.assertEqual(action.env['CARGO_TARGET_DIR'], str(selected.build_dir / 'existing-target'))
-            self.assertEqual(action.cwd, self.source)
-            self.assertEqual(action.argv[0], str(selected.toolchain_bin / 'cargo'))
+            context = ExecutionContext(plan, current, selected, runner)
+            for action in next(p for p in plan.phases if p.name == 'rust_build').actions:
+                action.execute(context)
+        for call in runner.run.call_args_list:
+            self.assertEqual(call.kwargs['env']['CARGO_TARGET_DIR'], str(selected.build_dir / 'existing-target'))
+            self.assertEqual(call.kwargs['cwd'], self.source)
+            self.assertEqual(call.args[0][0], str(selected.toolchain_bin / 'cargo'))
 
     def test_legacy_status_and_rollback_ignore_missing_inputs_without_rewriting_them(self):
         previous = self.history(status='failed')
@@ -779,6 +780,372 @@ class PersistentIdentityTests(unittest.TestCase):
                 options.release_dir.symlink_to(self.root / 'missing')
             with self.assertRaisesRegex(RuntimeError, 'immutable release id conflict'):
                 cli._select_release(options, self.profile, inputs, {}, explicit=True)
+
+    def rust_context(self, builds=None):
+        builds = builds or (RustBuild('nav', 'Cargo.toml', 'nav', 'bin/nav'),)
+        current = replace(self.profile, rust=RustProfile('existing', builds))
+        options = replace(self.options, no_systemd=True)
+        plan = DeploymentPlan('fixture', '', (), installation_inputs=self.capture(), release_owner_id='owner')
+        return ExecutionContext(plan, current, options, Mock())
+
+    def prepare_targets(self, context):
+        with patch.object(op.os, 'chown'), patch.object(op.hashlib, 'sha256', side_effect=AssertionError('target hash')):
+            op._prepare_rust_targets(context, os.getuid(), os.getgid())
+
+    def test_legacy_target_plan_verify_status_and_query_are_read_only(self):
+        self.profile = self.rust_context().profile
+        args = SimpleNamespace(profile='fixture', release_id='', json=True)
+        with self.cli_stack(), patch.object(Path, 'mkdir', side_effect=AssertionError('query created directory')), \
+                patch.object(op, 'atomic_write', side_effect=AssertionError('query wrote record')), \
+                patch.object(op.hashlib, 'sha256', side_effect=AssertionError('target hash')):
+            self.assertEqual(cli._execute(args, dry_run=True), 0)
+            with patch.object(op, 'verify_deployment'):
+                self.assertEqual(cli._execute(args, dry_run=False, verify_only=True), 0)
+            self.assertEqual(cli._status(self.options.state_dir, self.options.install_root), 1)
+            with self.assertRaisesRegex(RuntimeError, 'has not been prepared'):
+                self.options.rust_target_dir('Cargo.toml')
+        self.assertFalse(self.options.cache_dir.exists())
+        self.assertFalse(self.options.state_dir.exists())
+        context = self.rust_context()
+        self.prepare_targets(context)
+        record = self.options.build_dir / 'rust-targets/target-paths-v1.json'
+        saved = record.read_bytes()
+        with patch.object(Path, 'mkdir', side_effect=AssertionError('query mkdir')), \
+                patch.object(op, 'atomic_write', side_effect=AssertionError('query write')):
+            self.assertTrue(self.options.rust_target_dir('Cargo.toml').is_dir())
+        self.assertEqual(record.read_bytes(), saved)
+
+    def test_legacy_targets_share_manifest_retry_stable_and_copy_actual_built_files(self):
+        builds = (RustBuild('nav', 'Cargo.toml', 'nav', 'bin/nav'),
+                  RustBuild('follow', 'Cargo.toml', 'follow', 'bin/follow'),
+                  RustBuild('geometry', 'geometry/Cargo.toml', 'nuwax-geometry-runtime',
+                            'services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime'))
+        context = self.rust_context(builds)
+        self.prepare_targets(context)
+        workspace = self.options.rust_target_dir('Cargo.toml')
+        geometry = self.options.rust_target_dir('geometry/Cargo.toml')
+        self.assertNotEqual(workspace, geometry)
+        with patch.object(op.uuid, 'uuid4', side_effect=AssertionError('reallocation')):
+            self.prepare_targets(context)
+        calls = []
+        def run(argv, **kwargs):
+            target = Path(kwargs['env']['CARGO_TARGET_DIR'])
+            calls.append((argv, target))
+            self.assertEqual(kwargs['env']['CARGO_INCREMENTAL'], '0')
+            if 'build' in argv:
+                binary = argv[argv.index('--bin') + 1]
+                output = target / 'release' / binary
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(binary.encode())
+                output.chmod(0o755)
+        context.runner.run.side_effect = run
+        with patch.object(engine, '_build_user_rust_paths', return_value=(self.root, self.root, self.root)):
+            plan = engine.build_deployment_plan(context.profile, context.options,
+                                                installation_inputs=context.plan.installation_inputs, release_owner_id='owner')
+            for action in next(p for p in plan.phases if p.name == 'rust_build').actions:
+                action.execute(context)
+        self.assertEqual([target for argv, target in calls], [workspace, geometry, workspace, workspace, geometry])
+        python = context.options.release_dir / '.venv/bin/python'
+        python.parent.mkdir(parents=True)
+        python.write_text('fixture')
+        context.runner.reset_mock(side_effect=True)
+        # The real source-copy step normalizes these directories; this fixture
+        # substitutes that step but keeps the actual output-copy permission gate.
+        for build in builds:
+            parent = (context.options.release_dir / build.output).parent
+            parent.mkdir(parents=True, exist_ok=True)
+            parent.chmod(0o755)
+        with patch.object(op, '_copy_release_source'), patch.object(op, '_source_revision', return_value='fixture'), \
+                patch.object(op, '_validate_release_binary', return_value='fixture binary'), \
+                patch.object(op, 'resolve_build_account', return_value=SimpleNamespace(pw_uid=os.getuid())):
+            op.install_release(context)
+        for build in builds:
+            destination = context.options.release_dir / build.output
+            self.assertEqual(destination.read_bytes(), build.binary.encode())
+        self.assertEqual(context.runner.run.call_count, 0)
+
+    def test_legacy_target_build_failure_reuses_published_path(self):
+        context = self.rust_context()
+        self.prepare_targets(context)
+        target = self.options.rust_target_dir('Cargo.toml')
+        context.runner.run.side_effect = RuntimeError('fixture build failure')
+        with patch.object(engine, '_build_user_rust_paths', return_value=(self.root, self.root, self.root)):
+            action = engine.build_deployment_plan(context.profile, context.options).phases[4].actions[-1]
+            with self.assertRaisesRegex(RuntimeError, 'fixture build failure'):
+                action.execute(context)
+        with patch.object(op.uuid, 'uuid4', side_effect=AssertionError('reallocation')):
+            self.prepare_targets(context)
+        self.assertEqual(self.options.rust_target_dir('Cargo.toml'), target)
+
+    def test_legacy_target_history_is_not_scanned_adopted_or_deleted(self):
+        context = self.rust_context()
+        parent = self.options.build_dir / 'rust-targets'
+        old = parent / '0123456789abcdef'
+        old.mkdir(parents=True)
+        (old / 'user-data').write_text('keep exactly')
+        real_iterdir = Path.iterdir
+        def entries(path):
+            if path == parent:
+                raise AssertionError('scanned historical targets')
+            return real_iterdir(path)
+        with patch.object(Path, 'iterdir', entries), patch.object(op.shutil, 'rmtree', side_effect=AssertionError('deleted target')):
+            self.prepare_targets(context)
+        self.assertNotEqual(self.options.rust_target_dir('Cargo.toml'), old)
+        self.assertEqual((old / 'user-data').read_text(), 'keep exactly')
+
+    def test_legacy_target_missing_directory_recreated_same_path_and_empty_recreation_retries(self):
+        context = self.rust_context()
+        self.prepare_targets(context)
+        target = self.options.rust_target_dir('Cargo.toml')
+        record = target.parent / 'target-paths-v1.json'
+        original = record.read_bytes()
+        (target / 'neh-target-owner.json').unlink()
+        target.rmdir()
+        self.assertEqual(self.options.rust_target_dir('Cargo.toml'), target)
+        self.assertFalse(target.exists())
+        with patch.object(op.uuid, 'uuid4', side_effect=AssertionError('reallocation')), \
+                patch.object(op, 'atomic_write', side_effect=OSError('owner publication failed')):
+            with self.assertRaisesRegex(OSError, 'owner publication failed'):
+                self.prepare_targets(context)
+        self.assertEqual(list(target.iterdir()), [])
+        with patch.object(op.uuid, 'uuid4', side_effect=AssertionError('reallocation')):
+            self.prepare_targets(context)
+        self.assertEqual(self.options.rust_target_dir('Cargo.toml'), target)
+        self.assertEqual(record.read_bytes(), original)
+
+    def test_legacy_target_atomic_owner_crash_retries_bound_directory(self):
+        # A child exits without atomic_write's finally cleanup: actual mkstemp
+        # leftovers, including an unfinished write, survive in the bound target.
+        child = '''
+import os, sys
+from pathlib import Path
+from scripts.deploy_installer import config
+path, content, stage = sys.argv[1:]
+original = config.tempfile.mkstemp
+def interrupted_temp(*args, **kwargs):
+    fd, name = original(*args, **kwargs)
+    if stage == 'partial':
+        os.write(fd, b'{"ver')
+    os._exit(23)
+if stage == 'before_replace':
+    config.os.replace = lambda *args: os._exit(23)
+else:
+    config.tempfile.mkstemp = interrupted_temp
+config.atomic_write(Path(path), content, mode=0o600)
+'''
+        for stage in ('created', 'partial', 'before_replace'):
+            with self.subTest(stage=stage):
+                context = self.rust_context()
+                context.options = replace(self.options, release_id='crash-' + stage)
+                self.prepare_targets(context)
+                target = context.options.rust_target_dir('Cargo.toml')
+                owner = target / 'neh-target-owner.json'
+                record = target.parent / 'target-paths-v1.json'
+                saved = record.read_bytes()
+                owner.unlink()
+                target.rmdir()
+                def crash(path, content, **kwargs):
+                    result = op.subprocess.run([sys.executable, '-c', child, str(path), content, stage],
+                                               cwd=str(Path(__file__).resolve().parents[1]), check=False)
+                    self.assertEqual(result.returncode, 23)
+                    raise OSError('simulated process interruption')
+                with patch.object(op, 'atomic_write', side_effect=crash):
+                    with self.assertRaisesRegex(OSError, 'simulated process interruption'):
+                        self.prepare_targets(context)
+                leftovers = {p: p.read_bytes() for p in target.iterdir()}
+                self.assertEqual(len(leftovers), 1)
+                self.assertFalse(owner.exists())
+                with self.assertRaisesRegex(RuntimeError, str(owner)):
+                    context.options.rust_target_dir('Cargo.toml')  # Reads never repair.
+                with patch.object(op.uuid, 'uuid4', side_effect=AssertionError('reallocation')):
+                    self.prepare_targets(context)
+                    self.prepare_targets(context)
+                self.assertEqual(context.options.rust_target_dir('Cargo.toml'), target)
+                self.assertEqual(record.read_bytes(), saved)
+                self.assertEqual({p: p.read_bytes() for p in leftovers}, leftovers)
+
+    def test_legacy_target_owner_retry_rejects_unknown_nonempty_layout(self):
+        for kind in ('payload', 'directory', 'symlink', 'mode', 'foreign_uid', 'wrong_name', 'hardlink'):
+            with self.subTest(kind=kind):
+                context = self.rust_context()
+                context.options = replace(self.options, release_id='conflict-' + kind)
+                self.prepare_targets(context)
+                target = context.options.rust_target_dir('Cargo.toml')
+                owner = target / 'neh-target-owner.json'
+                owner.unlink()
+                fd, name = tempfile.mkstemp(prefix='.neh-target-owner.json.', dir=str(target))
+                os.close(fd)
+                pending = Path(name)
+                if kind == 'payload':
+                    (target / 'build-output').write_text('preserve')
+                elif kind == 'directory':
+                    pending.unlink()
+                    pending.mkdir()
+                elif kind == 'symlink':
+                    pending.unlink()
+                    pending.symlink_to(self.python)
+                elif kind == 'mode':
+                    pending.chmod(0o644)
+                elif kind == 'wrong_name':
+                    pending.rename(target / '.neh-target-owner.json.not-an-atomic-write')
+                elif kind == 'hardlink':
+                    os.link(pending, self.root / 'outside-link')
+                original_lstat = Path.lstat
+                def info(path):
+                    result = original_lstat(path)
+                    if kind == 'foreign_uid' and path == pending:
+                        return SimpleNamespace(st_mode=result.st_mode, st_uid=result.st_uid + 1,
+                                               st_nlink=result.st_nlink)
+                    return result
+                names = sorted(p.name for p in target.iterdir())
+                with patch.object(Path, 'lstat', info), \
+                        patch.object(op.uuid, 'uuid4', side_effect=AssertionError('reallocation')), \
+                        patch.object(op.shutil, 'rmtree', side_effect=AssertionError('deletion')):
+                    with self.assertRaisesRegex(RuntimeError, str(owner)):
+                        self.prepare_targets(context)
+                self.assertFalse(owner.exists())
+                self.assertEqual(sorted(p.name for p in target.iterdir()), names)
+
+    def test_legacy_target_corrupt_mapping_reports_path_without_reallocation(self):
+        context = self.rust_context()
+        self.prepare_targets(context)
+        record = self.options.build_dir / 'rust-targets/target-paths-v1.json'
+        original = record.read_text()
+        identity = str((self.source / 'Cargo.toml').resolve())
+        for payload in ('bad json', json.dumps({'version': True, 'slots': {}}),
+                        json.dumps({'version': 1, 'slots': {identity: {'manifest': identity, 'path': '../outside'}}})):
+            with self.subTest(payload=payload):
+                record.write_text(payload)
+                with patch.object(op.uuid, 'uuid4', side_effect=AssertionError('reallocation')):
+                    with self.assertRaisesRegex(RuntimeError, str(record)):
+                        self.prepare_targets(context)
+                self.assertEqual(record.read_text(), payload)
+        record.write_text(original)
+
+    def test_legacy_target_owner_missing_or_wrong_and_uid_mismatch_preserve_directory(self):
+        context = self.rust_context()
+        self.prepare_targets(context)
+        target = self.options.rust_target_dir('Cargo.toml')
+        owner = target / 'neh-target-owner.json'
+        original = owner.read_text()
+        (target / 'build-output').write_text('keep')
+        for value in (None, '{"version":1,"manifest":"other"}'):
+            if value is None:
+                owner.unlink()
+            else:
+                owner.write_text(value)
+            with patch.object(op.shutil, 'rmtree', side_effect=AssertionError('delete')), \
+                    patch.object(op.uuid, 'uuid4', side_effect=AssertionError('reallocation')):
+                with self.assertRaisesRegex(RuntimeError, str(owner)):
+                    self.prepare_targets(context)
+            self.assertEqual((target / 'build-output').read_text(), 'keep')
+        owner.write_text(original)
+        actual_lstat = Path.lstat
+        def info(path):
+            result = actual_lstat(path)
+            return SimpleNamespace(st_mode=result.st_mode, st_uid=result.st_uid + 1) if path == target else result
+        with patch.object(Path, 'lstat', info), patch.object(op.shutil, 'rmtree', side_effect=AssertionError('delete')):
+            with self.assertRaisesRegex(op.DeploymentError, 'another build user; preserved'):
+                self.prepare_targets(context)
+        self.assertEqual((target / 'build-output').read_text(), 'keep')
+
+    def test_legacy_target_owner_and_mapping_publication_failures_leave_unbound_directory(self):
+        for fail_name in ('neh-target-owner.json', 'target-paths-v1.json'):
+            with self.subTest(fail_name=fail_name):
+                options = replace(self.options, release_id=fail_name.replace('.', '-'))
+                context = self.rust_context()
+                context.options = options
+                real_write = op.atomic_write
+                def write(path, *args, **kwargs):
+                    if path.name == fail_name:
+                        raise OSError('publication failed')
+                    return real_write(path, *args, **kwargs)
+                with patch.object(op, 'atomic_write', side_effect=write):
+                    with self.assertRaisesRegex(OSError, 'publication failed'):
+                        self.prepare_targets(context)
+                parent = options.build_dir / 'rust-targets'
+                self.assertFalse((parent / 'target-paths-v1.json').exists())
+                orphans = list(parent.iterdir())
+                self.assertEqual(len(orphans), 1)
+                self.prepare_targets(context)
+                self.assertNotEqual(options.rust_target_dir('Cargo.toml'), orphans[0])
+                self.assertTrue(orphans[0].is_dir())
+
+    def test_legacy_target_mapping_write_reported_failure_after_replace_reuses_binding(self):
+        context = self.rust_context()
+        real_write = op.atomic_write
+        def write(path, *args, **kwargs):
+            real_write(path, *args, **kwargs)
+            if path.name == 'target-paths-v1.json':
+                raise OSError('reported fsync failure')
+        with patch.object(op, 'atomic_write', side_effect=write):
+            with self.assertRaisesRegex(OSError, 'reported fsync failure'):
+                self.prepare_targets(context)
+        target = self.options.rust_target_dir('Cargo.toml')
+        with patch.object(op.uuid, 'uuid4', side_effect=AssertionError('reallocation')):
+            self.prepare_targets(context)
+        self.assertEqual(self.options.rust_target_dir('Cargo.toml'), target)
+
+    def test_legacy_target_name_collision_never_adopts_even_empty_directory(self):
+        context = self.rust_context()
+        parent = self.options.build_dir / 'rust-targets'
+        existing = parent / 'rust-fixed'
+        existing.mkdir(parents=True)
+        with patch.object(op.uuid, 'uuid4', return_value=SimpleNamespace(hex='fixed')):
+            with self.assertRaises(FileExistsError):
+                self.prepare_targets(context)
+        self.assertEqual(list(existing.iterdir()), [])
+        self.assertFalse((parent / 'target-paths-v1.json').exists())
+
+    def test_legacy_target_toolchain_preparation_publishes_before_build_home(self):
+        context = self.rust_context()
+        account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+        with patch.object(op, 'resolve_build_account', return_value=account), \
+                patch.object(op, '_prepare_build_root'), patch.object(op.os, 'chown'), \
+                patch.object(op, '_prepare_mutable_build_tree', side_effect=PlanReached) as mutable:
+            with self.assertRaises(PlanReached):
+                op.ensure_rust_toolchain(context)
+        self.assertEqual(mutable.call_args.args[0], context.options.build_home)
+        self.assertTrue(self.options.rust_target_dir('Cargo.toml').is_dir())
+        context.runner.run.assert_not_called()
+
+
+    def test_legacy_target_new_manifest_failure_preserves_existing_binding(self):
+        context = self.rust_context()
+        self.prepare_targets(context)
+        original_target = self.options.rust_target_dir('Cargo.toml')
+        record = original_target.parent / 'target-paths-v1.json'
+        original_record = record.read_bytes()
+        context.profile = replace(context.profile, rust=RustProfile('existing', (
+            *context.profile.rust.builds, RustBuild('geometry', 'geometry/Cargo.toml', 'geometry', 'bin/geometry'),
+        )))
+        real_write = op.atomic_write
+        def write(path, *args, **kwargs):
+            if path == record:
+                raise OSError('new binding publication failed')
+            return real_write(path, *args, **kwargs)
+        with patch.object(op, 'atomic_write', side_effect=write):
+            with self.assertRaisesRegex(OSError, 'new binding publication failed'):
+                self.prepare_targets(context)
+        self.assertEqual(record.read_bytes(), original_record)
+        self.assertEqual(self.options.rust_target_dir('Cargo.toml'), original_target)
+        self.assertTrue(original_target.is_dir())
+
+    def test_legacy_target_offline_actions_use_signed_cargo_and_same_binding(self):
+        context = self.rust_context()
+        context.options = replace(context.options, offline_bundle=self.root / 'signed-fixture')
+        self.prepare_targets(context)
+        target = context.options.rust_target_dir('Cargo.toml')
+        with patch.object(engine, '_build_user_rust_paths', return_value=(self.root, self.root, self.root)):
+            plan = engine.build_deployment_plan(context.profile, context.options)
+            for action in next(p for p in plan.phases if p.name == 'rust_build').actions:
+                action.execute(context)
+        self.assertEqual(context.runner.run.call_count, 2)
+        for call in context.runner.run.call_args_list:
+            self.assertEqual(call.args[0][0], str(context.options.offline_bundle / 'cargo-bin/cargo'))
+            self.assertEqual(call.kwargs['env']['CARGO_TARGET_DIR'], str(target))
+            self.assertEqual(call.kwargs['env']['CARGO_INCREMENTAL'], '0')
+            self.assertTrue(call.kwargs['network_isolated'])
 
 
 if __name__ == '__main__':

@@ -333,6 +333,21 @@ def _cargo_environment(options: DeploymentOptions, target_dir: Path) -> Dict[str
     }
 
 
+def _cargo_build_display(profile: DeploymentProfile, build) -> str:
+    toolchain = profile.rust.toolchain
+    display_parts = [
+        f"cargo +{toolchain} build --locked --release",
+        f"--manifest-path {build.manifest}",
+    ]
+    if build.package:
+        display_parts.append(f"--package {build.package}")
+    if build.binary:
+        display_parts.append(f"--bin {build.binary}")
+    if build.features:
+        display_parts.append(f"--features {','.join(build.features)}")
+    return " ".join(display_parts)
+
+
 def _cargo_action(profile: DeploymentProfile, options: DeploymentOptions, build) -> Action:
     toolchain = profile.rust.toolchain
     _cargo_home, rustup_home, _build_user_bin = _build_user_rust_paths()
@@ -384,17 +399,7 @@ def _cargo_action(profile: DeploymentProfile, options: DeploymentOptions, build)
         argv.extend(("--bin", build.binary))
     if build.features:
         argv.extend(("--features", ",".join(build.features)))
-    display_parts = [
-        f"cargo +{toolchain} build --locked --release",
-        f"--manifest-path {build.manifest}",
-    ]
-    if build.package:
-        display_parts.append(f"--package {build.package}")
-    if build.binary:
-        display_parts.append(f"--bin {build.binary}")
-    if build.features:
-        display_parts.append(f"--features {','.join(build.features)}")
-    display = " ".join(display_parts)
+    display = _cargo_build_display(profile, build)
     return Action.command(
         f"cargo-{build.name}",
         display,
@@ -583,9 +588,23 @@ def build_deployment_plan(
         ]
 
     manifests = tuple(dict.fromkeys(build.manifest for build in profile.rust.builds))
+    # Plans render without allocating or resolving a target. The toolchain
+    # preparation phase publishes bindings before these commands are executed.
     rust_actions = tuple(
-        _cargo_metadata_action(profile, options, manifest, index) for index, manifest in enumerate(manifests, start=1)
-    ) + tuple(_cargo_action(profile, options, build) for build in profile.rust.builds)
+        Action.callback(
+            f"cargo-metadata-{index}",
+            lambda context, manifest=manifest, index=index: _cargo_metadata_action(
+                context.profile, context.options, manifest, index,
+            ).execute(context),
+            f"cargo +{profile.rust.toolchain} metadata --locked --manifest-path {manifest}",
+        ) for index, manifest in enumerate(manifests, start=1)
+    ) + tuple(
+        Action.callback(
+            f"cargo-{build.name}",
+            lambda context, build=build: _cargo_action(context.profile, context.options, build).execute(context),
+            _cargo_build_display(profile, build),
+        ) for build in profile.rust.builds
+    )
     geometry_release_action = _geometry_release_action(profile, options)
     if geometry_release_action is not None:
         native_input_check = Action.command(

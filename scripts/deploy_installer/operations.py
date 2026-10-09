@@ -1151,92 +1151,107 @@ def stage_source_snapshot(source_root: Path, cache_dir: Path) -> Tuple[Path, str
     git_env = source_user_environment()
     head = subprocess.run(
         source_user_command(("git", "rev-parse", "HEAD")),
-        cwd=str(source_root),
-        env=git_env,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
-    tree = subprocess.run(
-        source_user_command(("git", "rev-parse", "HEAD^{tree}")),
-        cwd=str(source_root),
-        env=git_env,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
+        cwd=str(source_root), env=git_env, capture_output=True, text=True, check=False, timeout=30,
     )
     revision = head.stdout.strip()
+    if head.returncode != 0 or not revision:
+        raise DeploymentError("cannot resolve production source Git identity")
+    tree = subprocess.run(
+        source_user_command(("git", "rev-parse", f"{revision}^{{tree}}")),
+        cwd=str(source_root), env=git_env, capture_output=True, text=True, check=False, timeout=30,
+    )
     tree_id = tree.stdout.strip()
-    if head.returncode != 0 or tree.returncode != 0 or not revision or not tree_id:
+    if tree.returncode != 0 or not tree_id:
         raise DeploymentError("cannot resolve production source Git identity")
     _git_source_identity(source_root)
-    target_parent = cache_dir / "source-snapshots"
-    if target_parent.is_symlink():
-        raise DeploymentError(f"source snapshot cache is a symlink: {target_parent}")
-    target_parent.mkdir(parents=True, exist_ok=True)
-    os.chown(target_parent, 0, build_gid)
-    os.chmod(target_parent, 0o750)
+    snapshot_root = cache_dir / "source-snapshots"
+    target_parent = snapshot_root / "v2"
+    for parent in (snapshot_root, target_parent):
+        if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+            raise DeploymentError(f"source snapshot cache is unsafe: {parent}")
+        parent.mkdir(parents=True, exist_ok=True)
+        os.chown(parent, 0, build_gid)
+        os.chmod(parent, 0o750)
+    # Keep legacy directories and sidecars untouched. Publish source and its
+    # provenance together, with the record outside the returned source tree.
     target = target_parent / f"{revision}-{tree_id[:16]}"
-    snapshot_manifest = target_parent / f"{target.name}.json"
+    source = target / "source"
+    snapshot_manifest = target / "snapshot.json"
     if target.is_symlink() or (target.exists() and not target.is_dir()):
         raise DeploymentError(f"source snapshot cache target is unsafe: {target}")
-    if target.is_dir() and not snapshot_manifest.exists():
-        shutil.rmtree(target)
     if target.is_dir():
+        observed = {}
+        needs_freeze = False
         for candidate in (target, *target.rglob("*")):
             metadata = candidate.lstat()
-            if candidate.is_symlink() or metadata.st_uid != 0 or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
                 raise DeploymentError(f"source snapshot cache was modified: {candidate}")
-        snapshot_manifest = _require_file(
-            snapshot_manifest,
-            "source snapshot integrity manifest",
-        )
-        manifest_metadata = snapshot_manifest.stat()
-        if manifest_metadata.st_uid != 0 or manifest_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise DeploymentError("source snapshot integrity manifest is unsafe")
+            if stat.S_ISDIR(metadata.st_mode):
+                entry = {"type": "directory"}
+                mode = 0o550
+            elif stat.S_ISREG(metadata.st_mode):
+                entry = {"type": "file", "size": metadata.st_size}
+                mode = 0o550 if metadata.st_mode & 0o111 else 0o440
+            else:
+                raise DeploymentError(f"source snapshot cache contains a special file: {candidate}")
+            needs_freeze |= metadata.st_gid != build_gid or stat.S_IMODE(metadata.st_mode) != mode
+            if candidate in (target, source):
+                if entry["type"] != "directory":
+                    raise DeploymentError(f"source snapshot directory is invalid: {candidate}")
+            elif candidate == snapshot_manifest:
+                if entry["type"] != "file":
+                    raise DeploymentError(f"source snapshot record is invalid: {candidate}")
+            elif source in candidate.parents:
+                observed[candidate.relative_to(source).as_posix()] = entry
+            else:
+                raise DeploymentError(f"source snapshot contains an unknown entry: {candidate}")
+        if not source.is_dir():
+            raise DeploymentError(f"source snapshot directory is missing: {source}")
         try:
-            snapshot_record = json.loads(snapshot_manifest.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise DeploymentError("source snapshot integrity manifest is invalid") from exc
-        if (
-            snapshot_record.get("revision") != revision
-            or snapshot_record.get("tree_id") != tree_id
-            or snapshot_record.get("tree_sha256") != _tree_digest(target)
-        ):
-            raise DeploymentError("source snapshot cache failed integrity verification")
-        _freeze_root_tree(target, build_gid)
-        return target, revision, tree_id
+            record = json.loads(snapshot_manifest.read_text(encoding="utf-8"))
+            if (not isinstance(record, dict) or type(record.get("schema_version")) is not int
+                    or record["schema_version"] != 2 or record.get("revision") != revision
+                    or record.get("tree_id") != tree_id or not isinstance(record.get("layout"), dict)):
+                raise ValueError("invalid source provenance")
+            expected = {}
+            for relative, entry in record["layout"].items():
+                if entry == {"type": "directory"}:
+                    expected[relative] = entry
+                elif (isinstance(entry, dict) and set(entry) == {"type", "size", "executable"}
+                      and entry["type"] == "file" and type(entry["size"]) is int and entry["size"] >= 0
+                      and type(entry["executable"]) is bool):
+                    # Archive executability is provenance, not a new permission
+                    # gate: retain the existing freeze policy for current modes.
+                    expected[relative] = {"type": "file", "size": entry["size"]}
+                else:
+                    raise ValueError("invalid source layout")
+            if observed != expected:
+                raise ValueError("source layout does not match publication")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise DeploymentError(f"source snapshot provenance/layout is invalid: {snapshot_manifest}") from exc
+        # No source bytes are read here. Layout/provenance is not content
+        # authentication. Reuse the old repair path when mode or build GID changed.
+        if needs_freeze:
+            _freeze_root_tree(target, build_gid)
+        return source, revision, tree_id
     staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target_parent))
-    shutil.rmtree(staging)
     try:
-        _copy_source_snapshot(source_root, staging, revision)
-        tree_sha256 = _tree_digest(staging)
-        _freeze_root_tree(staging, build_gid)
-        os.replace(staging, target)
+        layout = _copy_source_snapshot(source_root, staging / "source", revision, local_layout=True)
         atomic_write(
-            snapshot_manifest,
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "revision": revision,
-                    "tree_id": tree_id,
-                    "tree_sha256": tree_sha256,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
+            staging / "snapshot.json",
+            json.dumps({"schema_version": 2, "revision": revision, "tree_id": tree_id, "layout": layout},
+                       indent=2, sort_keys=True) + "\n",
             mode=0o440,
         )
+        _freeze_root_tree(staging, build_gid)
+        os.replace(staging, target)
         fsync_directory(target_parent)
     except BundleError as exc:
         raise DeploymentError(str(exc)) from exc
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
-    return target, revision, tree_id
+    return source, revision, tree_id
 
 
 def verify_input_admission(context: ExecutionContext) -> None:

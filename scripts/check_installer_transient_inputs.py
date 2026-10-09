@@ -1148,5 +1148,377 @@ config.atomic_write(Path(path), content, mode=0o600)
             self.assertTrue(call.kwargs['network_isolated'])
 
 
+class SourceSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        from scripts.deploy_installer import bundle
+        self.bundle = bundle
+        directory = tempfile.TemporaryDirectory(prefix='installer-snapshot-')
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.source = self.root / 'checkout'
+        self.source.mkdir()
+        self.cache = self.root / 'cache'
+        self.env = dict(os.environ, GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1',
+                        GIT_AUTHOR_NAME='Snapshot fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
+                        GIT_COMMITTER_NAME='Snapshot fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid')
+        self.git('init', '-q')
+        (self.source / 'app.py').write_text('print("source")\n')
+        (self.source / 'nested').mkdir()
+        (self.source / 'nested/run.sh').write_text('#!/bin/sh\nexit 0\n')
+        (self.source / 'nested/run.sh').chmod(0o755)
+        self.commit()
+        self.revision = self.git('rev-parse', 'HEAD').strip()
+        self.tree = self.git('rev-parse', self.revision + '^{tree}').strip()
+        self.target = self.cache / 'source-snapshots/v2' / (self.revision + '-' + self.tree[:16])
+        self.account = SimpleNamespace(pw_gid=os.getgid())
+        self.deleted = []
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        def prepare_cache(path, gid):
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        real_lstat = Path.lstat
+        def cache_stat(path, *args, **kwargs):
+            result = real_lstat(path, *args, **kwargs)
+            if path == self.cache or self.cache in path.parents:
+                values = list(result)
+                values[4] = 0  # Root ownership double; real modes/layout are exercised.
+                return os.stat_result(values)
+            return result
+        real_remove = op.shutil.rmtree
+        def remove(path, *args, **kwargs):
+            path = Path(path)
+            self.assertTrue(self.root in path.parents)
+            self.deleted.append(path)
+            # Production is root. Let this unprivileged fixture remove its own
+            # genuinely read-only staging directories after a failed seal.
+            for current, directories, files in os.walk(str(path)):
+                os.chmod(current, 0o700)
+            return real_remove(path, *args, **kwargs)
+        stack.enter_context(patch.object(op, '_prepare_root_managed_cache', side_effect=prepare_cache))
+        stack.enter_context(patch.object(op, 'resolve_build_account', return_value=self.account))
+        stack.enter_context(patch.object(op.os, 'chown'))
+        self.fchown = stack.enter_context(patch.object(op.os, 'fchown'))
+        stack.enter_context(patch.object(Path, 'lstat', cache_stat))
+        stack.enter_context(patch.object(op.shutil, 'rmtree', side_effect=remove))
+        stack.enter_context(patch.object(op, '_tree_digest', side_effect=AssertionError('local tree digest')))
+        stack.enter_context(patch.object(op, '_sha256', side_effect=AssertionError('local payload digest')))
+
+    def git(self, *args):
+        return op.subprocess.check_output(['git', '-c', 'core.hooksPath=/dev/null', *args],
+                                          cwd=str(self.source), env=self.env, text=True)
+
+    def commit(self):
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'fixture')
+
+    def stage(self):
+        return op.stage_source_snapshot(self.source, self.cache)
+
+    def test_snapshot_archive_layout_fixed_git_identity_and_external_record(self):
+        with patch.object(op.subprocess, 'run', wraps=op.subprocess.run) as run, \
+                patch.object(Path, 'rglob', side_effect=AssertionError('extra creation walk')):
+            source, revision, tree = self.stage()
+        self.assertEqual((source, revision, tree), (self.target / 'source', self.revision, self.tree))
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(['git', 'rev-parse', self.revision + '^{tree}'], commands)
+        self.assertNotIn(['git', 'rev-parse', 'HEAD^{tree}'], commands)
+        self.assertEqual((source / 'app.py').read_bytes(), (self.source / 'app.py').read_bytes())
+        self.assertFalse((source / 'snapshot.json').exists())
+        record = json.loads((self.target / 'snapshot.json').read_text())
+        self.assertEqual(record, {'schema_version': 2, 'revision': revision, 'tree_id': tree, 'layout': {
+            'app.py': {'type': 'file', 'size': (self.source / 'app.py').stat().st_size, 'executable': False},
+            'nested': {'type': 'directory'},
+            'nested/run.sh': {'type': 'file', 'size': (self.source / 'nested/run.sh').stat().st_size, 'executable': True},
+        }})
+        self.assertEqual(source.stat().st_mode & 0o777, 0o550)
+        self.assertEqual((source / 'app.py').stat().st_mode & 0o777, 0o440)
+        self.assertEqual((source / 'nested/run.sh').stat().st_mode & 0o777, 0o550)
+
+    def test_snapshot_hit_has_one_existing_walk_no_payload_read_or_refreeze(self):
+        source, revision, tree = self.stage()
+        original_open = Path.open
+        original_walk = Path.rglob
+        walks = []
+        def guarded_open(path, *args, **kwargs):
+            if path == source or source in path.parents or path == self.source or self.source in path.parents:
+                raise AssertionError('source payload opened on hit')
+            return original_open(path, *args, **kwargs)
+        def walk(path, *args, **kwargs):
+            walks.append(path)
+            return original_walk(path, *args, **kwargs)
+        with patch.object(Path, 'open', guarded_open), patch.object(Path, 'rglob', walk), \
+                patch.object(op, '_freeze_root_tree', side_effect=AssertionError('redundant freeze')), \
+                patch.object(self.bundle, '_copy_source_snapshot', side_effect=AssertionError('archive on hit')):
+            self.assertEqual(self.stage(), (source, revision, tree))
+        self.assertEqual(walks, [self.target])
+
+    def test_snapshot_modes_are_repaired_by_existing_freeze(self):
+        source, revision, tree = self.stage()
+        (source / 'app.py').chmod(0o400)
+        (source / 'nested/run.sh').chmod(0o500)
+        (source / 'nested').chmod(0o500)
+        (self.target / 'snapshot.json').chmod(0o400)
+        self.target.chmod(0o500)
+        with patch.object(op, '_freeze_root_tree', wraps=op._freeze_root_tree) as freeze:
+            self.assertEqual(self.stage(), (source, revision, tree))
+            freeze.assert_called_once_with(self.target, self.account.pw_gid)
+        self.assertEqual((source / 'app.py').stat().st_mode & 0o777, 0o440)
+        self.assertEqual((source / 'nested/run.sh').stat().st_mode & 0o777, 0o550)
+        self.assertEqual((source / 'nested').stat().st_mode & 0o777, 0o550)
+        self.assertEqual(self.target.stat().st_mode & 0o777, 0o550)
+        # Owner-writable and changed executable modes were repairable before;
+        # archive executability must not add a new rejection policy.
+        (source / 'app.py').chmod(0o700)
+        self.stage()
+        self.assertEqual((source / 'app.py').stat().st_mode & 0o777, 0o550)
+
+    def test_snapshot_changed_build_gid_uses_existing_permission_path(self):
+        source, revision, tree = self.stage()
+        self.account.pw_gid += 1000
+        self.fchown.reset_mock()
+        with patch.object(op, '_freeze_root_tree', wraps=op._freeze_root_tree) as freeze:
+            self.assertEqual(self.stage(), (source, revision, tree))
+            freeze.assert_called_once_with(self.target, self.account.pw_gid)
+        self.assertTrue(self.fchown.call_args_list)
+        self.assertTrue(all(call.args[1:] == (0, self.account.pw_gid) for call in self.fchown.call_args_list))
+
+    def test_snapshot_tree_is_pinned_when_head_moves_before_export(self):
+        previous = self.revision
+        (self.source / 'app.py').write_text('print("changed")\n')
+        self.commit()
+        real_run = op.subprocess.run
+        first = True
+        commands = []
+        def run(argv, *args, **kwargs):
+            nonlocal first
+            commands.append(argv)
+            if first and argv == ['git', 'rev-parse', 'HEAD']:
+                first = False
+                return SimpleNamespace(returncode=0, stdout=previous + '\n')
+            return real_run(argv, *args, **kwargs)
+        with patch.object(op.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(op.DeploymentError, 'revision does not match Git HEAD'):
+                self.stage()
+        self.assertIn(['git', 'rev-parse', previous + '^{tree}'], commands)
+        self.assertNotIn(['git', 'rev-parse', 'HEAD^{tree}'], commands)
+        self.assertFalse(self.target.exists())
+
+    def test_snapshot_legacy_directories_and_sidecars_are_untouched(self):
+        parent = self.cache / 'source-snapshots'
+        legacy = parent / (self.revision + '-' + self.tree[:16])
+        legacy.mkdir(parents=True)
+        (legacy / 'unrecorded-user-file').write_text('keep without sidecar')
+        other = parent / 'old-snapshot'
+        other.mkdir()
+        (other / 'original').write_text('keep with sidecar')
+        sidecar = parent / 'old-snapshot.json'
+        sidecar.write_text('{"schema_version":1,"tree_sha256":"opaque historical value"}')
+        saved = sidecar.read_bytes()
+        source, _, _ = self.stage()
+        self.assertNotEqual(source, legacy)
+        self.assertEqual((legacy / 'unrecorded-user-file').read_text(), 'keep without sidecar')
+        self.assertFalse((parent / (legacy.name + '.json')).exists())
+        self.assertEqual(sidecar.read_bytes(), saved)
+        self.assertEqual((other / 'original').read_text(), 'keep with sidecar')
+        self.assertEqual(self.deleted, [])
+
+    def test_snapshot_generated_names_rejected_only_for_local_layout(self):
+        for index, relative in enumerate(('__pycache__/tracked', 'compiled.pyc', 'package.egg-info/PKG-INFO')):
+            with self.subTest(relative=relative):
+                item = self.source / relative
+                item.parent.mkdir(parents=True, exist_ok=True)
+                item.write_text('tracked fixture')
+                self.commit()
+                revision = self.git('rev-parse', 'HEAD').strip()
+                with self.assertRaisesRegex(op.DeploymentError, 'generated build/import state'):
+                    self.stage()
+                destination = self.root / ('bundle-default-' + str(index))
+                self.assertIsNone(self.bundle._copy_source_snapshot(self.source, destination, revision))
+                self.assertEqual((destination / relative).read_text(), 'tracked fixture')
+                self.git('rm', '-q', relative)
+                self.commit()
+
+    def assert_staging_failure(self, point):
+        self.target.parent.mkdir(parents=True)
+        orphan = self.target.parent / '.unrelated-old.staging-leftover'
+        orphan.mkdir()
+        (orphan / 'keep').write_text('historical')
+        original_copy = self.bundle._copy_source_snapshot
+        original_freeze = op._freeze_root_tree
+        original_replace = op.os.replace
+        def copy(*args, **kwargs):
+            original_copy(*args, **kwargs)
+            raise self.bundle.BundleError('fixture export failure')
+        def freeze(*args, **kwargs):
+            original_freeze(*args, **kwargs)
+            raise OSError('fixture seal failure')
+        def publish(src, dst):
+            if Path(dst) == self.target:
+                raise OSError('fixture publish failure')
+            return original_replace(src, dst)
+        with ExitStack() as stack:
+            if point == 'export':
+                stack.enter_context(patch.object(self.bundle, '_copy_source_snapshot', side_effect=copy))
+            elif point == 'seal':
+                stack.enter_context(patch.object(op, '_freeze_root_tree', side_effect=freeze))
+            elif point == 'record':
+                stack.enter_context(patch.object(op, 'atomic_write', side_effect=OSError('fixture record failure')))
+            else:
+                stack.enter_context(patch.object(op.os, 'replace', side_effect=publish))
+            with self.assertRaisesRegex((op.DeploymentError, OSError), 'fixture'):
+                self.stage()
+        self.assertFalse(self.target.exists())
+        self.assertEqual((orphan / 'keep').read_text(), 'historical')
+        self.assertEqual(list(self.target.parent.iterdir()), [orphan])
+        self.assertEqual(len(self.deleted), 1)
+        self.assertTrue(self.deleted[0].name.startswith('.' + self.target.name + '.staging-'))
+        source, _, _ = self.stage()
+        self.assertTrue((source / 'app.py').is_file())
+
+    def test_snapshot_export_failure_only_cleans_current_staging(self):
+        self.assert_staging_failure('export')
+
+    def test_snapshot_seal_failure_only_cleans_current_staging(self):
+        self.assert_staging_failure('seal')
+
+    def test_snapshot_record_failure_only_cleans_current_staging(self):
+        self.assert_staging_failure('record')
+
+    def test_snapshot_publish_failure_only_cleans_current_staging(self):
+        self.assert_staging_failure('publish')
+
+    def test_snapshot_publication_contains_sealed_source_and_record(self):
+        real_replace = op.os.replace
+        def publish(src, dst):
+            if Path(dst) == self.target:
+                staging = Path(src)
+                record = json.loads((staging / 'snapshot.json').read_text())
+                self.assertEqual(record['revision'], self.revision)
+                self.assertEqual((staging / 'source/app.py').read_text(), 'print("source")\n')
+                self.assertEqual(staging.stat().st_mode & 0o777, 0o550)
+                self.assertEqual((staging / 'snapshot.json').stat().st_mode & 0o777, 0o440)
+                self.assertFalse(self.target.exists())
+            return real_replace(src, dst)
+        with patch.object(op.os, 'replace', side_effect=publish):
+            self.stage()
+
+    def test_snapshot_post_publish_error_retries_without_export(self):
+        real_replace = op.os.replace
+        def publish(src, dst):
+            real_replace(src, dst)
+            if Path(dst) == self.target:
+                raise OSError('fixture post-publish failure')
+        with patch.object(op.os, 'replace', side_effect=publish):
+            with self.assertRaisesRegex(OSError, 'post-publish'):
+                self.stage()
+        self.assertTrue((self.target / 'source/app.py').is_file())
+        self.assertTrue((self.target / 'snapshot.json').is_file())
+        self.assertEqual(self.deleted, [])
+        with patch.object(self.bundle, '_copy_source_snapshot', side_effect=AssertionError('re-export')):
+            self.assertEqual(self.stage()[0], self.target / 'source')
+
+    def test_snapshot_post_publish_fsync_error_preserves_complete_container(self):
+        with patch.object(op, 'fsync_directory', side_effect=OSError('fixture parent fsync failure')):
+            with self.assertRaisesRegex(OSError, 'parent fsync'):
+                self.stage()
+        with patch.object(self.bundle, '_copy_source_snapshot', side_effect=AssertionError('re-export')):
+            self.assertEqual(self.stage()[0], self.target / 'source')
+        self.assertEqual(self.deleted, [])
+
+    def test_snapshot_unknown_missing_or_corrupt_record_is_not_adopted(self):
+        self.stage()
+        record = self.target / 'snapshot.json'
+        original = record.read_bytes()
+        for content in (None, b'[]', b'{"schema_version":true}', original.replace(self.revision.encode(), b'other')):
+            with self.subTest(content=content):
+                self.target.chmod(0o750)
+                if record.exists():
+                    record.chmod(0o640)
+                    record.unlink()
+                if content is not None:
+                    record.write_bytes(content)
+                    record.chmod(0o440)
+                with patch.object(self.bundle, '_copy_source_snapshot', side_effect=AssertionError('adoption')):
+                    with self.assertRaisesRegex(op.DeploymentError, str(record)):
+                        self.stage()
+                self.assertTrue((self.target / 'source/app.py').is_file())
+                self.assertEqual(self.deleted, [])
+
+    def test_snapshot_layout_mismatch_preserves_files_and_reports_record(self):
+        source, _, _ = self.stage()
+        item = source / 'app.py'
+        item.chmod(0o640)
+        item.write_text('changed size')
+        with self.assertRaisesRegex(op.DeploymentError, 'provenance/layout'):
+            self.stage()
+        self.assertEqual(item.read_text(), 'changed size')
+        self.assertEqual(self.deleted, [])
+
+    def test_snapshot_unknown_entries_are_not_adopted_or_deleted(self):
+        source, _, _ = self.stage()
+        for relative in ('unknown', 'source/unknown-directory'):
+            with self.subTest(relative=relative):
+                item = self.target / relative
+                item.parent.chmod(0o750)
+                item.mkdir()
+                with patch.object(self.bundle, '_copy_source_snapshot', side_effect=AssertionError('adoption')):
+                    with self.assertRaises(op.DeploymentError):
+                        self.stage()
+                self.assertTrue(item.is_dir())
+                self.assertEqual(self.deleted, [])
+                item.rmdir()
+        (source / 'nested').chmod(0o750)
+        (source / 'nested/run.sh').unlink()
+        with self.assertRaisesRegex(op.DeploymentError, 'provenance/layout'):
+            self.stage()
+        self.assertFalse((source / 'nested/run.sh').exists())
+        self.assertEqual(self.deleted, [])
+
+    def test_snapshot_archive_rejects_links_and_closes_child_pipes(self):
+        (self.source / 'link').symlink_to('app.py')
+        self.commit()
+        actual_popen = op.subprocess.Popen
+        archives = []
+        def popen(argv, *args, **kwargs):
+            process = actual_popen(argv, *args, **kwargs)
+            if 'archive' in argv:
+                archives.append(process)
+            return process
+        with patch.object(op.subprocess, 'Popen', side_effect=popen):
+            with self.assertRaisesRegex(op.DeploymentError, 'link or special file'):
+                self.stage()
+        self.assertEqual(len(archives), 1)
+        self.assertIsNotNone(archives[0].returncode)
+        self.assertTrue(archives[0].stdout.closed)
+        self.assertTrue(archives[0].stderr.closed)
+
+    def test_snapshot_layout_does_not_claim_content_authentication(self):
+        source, _, _ = self.stage()
+        item = source / 'app.py'
+        original = item.read_bytes()
+        item.chmod(0o640)
+        item.write_bytes(b'X' * len(original))
+        item.chmod(0o440)
+        self.assertEqual(self.stage()[0], source)
+        self.assertEqual(item.read_bytes(), b'X' * len(original))
+
+    def test_snapshot_cli_roots_and_input_identity_follow_returned_source(self):
+        options = replace(DeploymentOptions.for_tests(source_root=self.source), cache_dir=self.cache,
+                          allow_dirty_source=False)
+        current = profile()
+        with patch.object(cli, 'InstallerLock', return_value=nullcontext()), \
+                patch.object(cli, 'load_named_profile', return_value=current):
+            prepared, actual_profile, manifest = cli._prepare_source(
+                SimpleNamespace(profile='fixture'), options, current, materialize=True,
+            )
+        self.assertEqual((prepared.source_root, prepared.trust_root, prepared.fingerprint_source_root),
+                         (self.target / 'source',) * 3)
+        self.assertEqual(engine._path_input_record(prepared.source_root, prepared),
+                         {'kind': 'git-snapshot', 'revision': self.revision, 'tree_id': self.tree})
+        self.assertEqual(actual_profile, current)
+        self.assertIsNone(manifest)
+
+
 if __name__ == '__main__':
     unittest.main()

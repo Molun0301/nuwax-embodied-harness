@@ -30,7 +30,9 @@ def _copy_source_snapshot(
     source: Path,
     destination: Path,
     expected_revision: str,
-) -> None:
+    *,
+    local_layout: bool = False,
+) -> Optional[Dict[str, Dict[str, object]]]:
     if not source.is_dir():
         raise BundleError(f"bundle source directory is missing: source={source}")
     git_env = source_user_environment()
@@ -75,6 +77,7 @@ def _copy_source_snapshot(
         if record and record.split(b" ", 1)[0] == b"160000":
             raise BundleError("bundle source must not contain Git submodules")
 
+    layout: Dict[str, Dict[str, object]] = {}
     destination.mkdir(parents=True, exist_ok=True)
     process = subprocess.Popen(
         source_user_command(("git", "archive", "--format=tar", actual_revision)),
@@ -91,10 +94,17 @@ def _copy_source_snapshot(
                 relative = PurePosixPath(member.name)
                 if relative.is_absolute() or ".." in relative.parts or relative.as_posix() != member.name.rstrip("/"):
                     raise BundleError(f"unsafe Git archive path: {member.name}")
+                if local_layout and (
+                    "__pycache__" in relative.parts or relative.suffix == ".pyc"
+                    or any(part.endswith(".egg-info") for part in relative.parts)
+                ):
+                    raise BundleError(f"source artifact contains generated build/import state: {member.name}")
                 target = destination.joinpath(*relative.parts)
                 if member.isdir():
                     target.mkdir(parents=True, exist_ok=True)
                     os.chmod(target, 0o755)
+                    if local_layout:
+                        layout[relative.as_posix()] = {"type": "directory"}
                 elif member.isfile():
                     source_file = archive.extractfile(member)
                     if source_file is None:
@@ -103,6 +113,10 @@ def _copy_source_snapshot(
                     with source_file, target.open("xb") as output:
                         shutil.copyfileobj(source_file, output)
                     os.chmod(target, 0o755 if member.mode & stat.S_IXUSR else 0o644)
+                    if local_layout:
+                        layout[relative.as_posix()] = {
+                            "type": "file", "size": member.size, "executable": bool(member.mode & stat.S_IXUSR),
+                        }
                 else:
                     raise BundleError(f"Git archive contains a link or special file: {member.name}")
         stderr = process.stderr.read() if process.stderr is not None else b""
@@ -113,6 +127,12 @@ def _copy_source_snapshot(
         process.kill()
         process.wait()
         raise
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+    return layout if local_layout else None
 
 
 def create_bundle(

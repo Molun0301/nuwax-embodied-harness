@@ -111,6 +111,8 @@ def handle_relocalize_active_map(
     requested_by: Optional[str] = None,
     execution_context: Optional[TaskExecutionControl] = None,
 ) -> Dict[str, Any]:
+    from contracts.relocalization_request_id import relocalization_request_identity
+    relocalization_request_identity(payload)
     if execution_context is None:
         ctx.ensure_geometry_runtime_for_capability("relocalize_active_map")
     else:
@@ -126,7 +128,8 @@ def handle_relocalize_active_map(
         map_name=params.optional_str(payload, "map_name"),
         metadata={
             "requested_by": requested_by or "unknown",
-            "request_id": params.optional_str(payload, "request_id"),
+            "request_id": payload.get("request_id"),
+            "business_request_id": payload.get("business_request_id"),
             # timeout_sec 由外层任务管理器消费；算法沿原默认时限执行。
             # 冷启动和地图读取耗时不能被转换成超出后端合同的匹配时限。
             "logical_timeout_ms": 10_000,

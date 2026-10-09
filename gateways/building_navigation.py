@@ -162,7 +162,7 @@ class GatewayBuildingPorts:
         self.ensure_active()
         try:
             session,workspace=self.runtime.map_workspace_service.relocalize_active_map(map_name=floor.map_name,metadata={
-                "requested_by":self.requested_by or "unknown", "request_id":self.runtime._build_runtime_request_id("floor_localize"),
+                "requested_by":self.requested_by or "unknown", "business_request_id":self.runtime._build_runtime_request_id("floor_localize"),
                 "logical_timeout_ms":int(min(30.0,self.remaining_sec())*1000),"planar_seed":[seed.x,seed.y,seed.yaw_rad]})
         except GatewayError as error:
             if error.error_code in {"relocalization_candidate_rejected","relocalization_failed","relocalization_deadline_exceeded"}:

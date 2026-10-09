@@ -8,6 +8,7 @@ from functools import wraps
 from contracts.map_activation import AssignedActivationReceipt
 from contracts.map_relocalization import AssignedRelocalizationRequest, AssignedRelocalizationTerminal
 from contracts.map_workspace import MapAssetStatus
+from contracts.relocalization_request_id import relocalization_request_identity
 from contracts.runtime_views import LocalizationSessionStatus
 from core.errors import GatewayError
 from skills.assigned_map_activation import activate_assigned_workspace, build_assigned_workspace
@@ -224,7 +225,7 @@ def relocalize_assigned_workspace(owner, *, map_name, metadata=None):
     metadata = owner._sanitize_relocalization_request_metadata(owner._sanitize_map_metadata(metadata) or {})
     if metadata.get("planar_seed") is not None:
         raise _problem("分配式点云重定位不接受二维初始位置。", code="invalid_params")
-    supplied_id = metadata.get("request_id")
+    supplied_id, recovery_only = relocalization_request_identity(metadata)
     pending = repository.get_assigned_relocalization_intent()
     if pending is not None:
         request = _request_from_intent(pending)
@@ -237,6 +238,8 @@ def relocalize_assigned_workspace(owner, *, map_name, metadata=None):
             if recovered is None:
                 raise _problem("原重定位拥有方已被真实封存的后继取代。", request, "relocalization_owner_changed")
             return recovered
+        if recovery_only:
+            raise _problem("原请求尚未 dispatch；旧 request_id 恢复入口不会开始执行。", request)
         target = _capture_target(owner, request, restore=False)
     else:
         asset = repository.get_map_asset(map_name)
@@ -255,6 +258,22 @@ def relocalize_assigned_workspace(owner, *, map_name, metadata=None):
                 "assigned_cloud_v2": {"target": target.activation_receipt.to_dict()["target"],
                     "policy": target.relocalization_policy,
                     "logical_timeout_ms": metadata.get("logical_timeout_ms", 30_000)}})
+        current_receipt = previous is not None and supplied_id == previous.request_id
+        if recovery_only and current_receipt:
+            return _finish(owner, request, previous, target, metadata=metadata)
+        if supplied_id is not None and not current_receipt:
+            # An explicit ID may name an older operation even when the catalog
+            # only retains a newer receipt. Query before preparing any state.
+            result = runtime.get_assigned_relocalization_terminal(assigned_request_v2=request)
+            if result.status == "terminal" and result.terminal is not None:
+                raise GatewayError("原请求已有历史终态；仅返回查询结果，不重新采用定位。",
+                    error_code="relocalization_historical_terminal", http_status=409, jsonrpc_code=-32000,
+                    details={"request_id": request.request_id, "terminal": result.terminal.to_dict()})
+            if result.status != "not_found" or recovery_only:
+                code = ("relocalization_request_conflict" if result.status == "identity_conflict"
+                        else "relocalization_request_not_found" if result.status == "not_found"
+                        else "relocalization_recovery_required")
+                raise _problem("未确认此编号可新建；保留现状，不创建或重新执行请求。", request, code)
         with _transaction(owner):
             pending = repository.begin_assigned_relocalization_durable(
                 assigned_request=request, **_owner_arguments(target))

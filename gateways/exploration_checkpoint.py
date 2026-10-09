@@ -99,7 +99,7 @@ def prepare_resume(runtime, context, request, checkpoint_id, requested_by):
     runtime.map_workspace_service.activate_map(map_name=request.map_name, create_if_missing=False,
         metadata={"source": "resume_exploration", "requested_by": requested_by or "unknown"})
     context.ensure_active()
-    metadata = {"source": "resume_exploration", "request_id": "resume-localize-" + uuid.uuid4().hex,
+    metadata = {"source": "resume_exploration", "business_request_id": "resume-localize-" + uuid.uuid4().hex,
         "logical_timeout_ms": int(min(30.0, context.timeout_remaining_sec() or 30.0) * 1000)}
     if saved.pipeline == "slam_2d":
         pose = saved.localization_seed
@@ -189,7 +189,7 @@ def _prepare_assigned_resume(runtime, context, request, saved, snapshot, catalog
         raise ValueError("已恢复重定位与当前安装不是同一拥有方")
     if pending is None or pending_phase == "prepared":
         session, workspace = service.relocalize_active_map(map_name=request.map_name,
-            metadata={"source": "resume_exploration", "request_id": retained["request_id"],
+            metadata={"source": "resume_exploration", "business_request_id": retained["request_id"],
                       "logical_timeout_ms": retained["logical_timeout_ms"]})
     context.ensure_active()
     token = service._localization_service.get_active_session_token()

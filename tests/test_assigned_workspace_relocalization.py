@@ -38,7 +38,7 @@ from services.mapping.service import MappingService
 from skills import assigned_map_relocalization as relocalization_module
 
 pb = provider_module.pb2
-REQUEST_ID = "relocalize:public-exact"
+REQUEST_ID = "order-000123"
 
 
 class RelocalizationCancelled(BaseException):
@@ -135,7 +135,8 @@ class RelocalizationNativeStub(SaveNativeStub):
         self.terminal = None
         self.terminal_phase = 5
         self.lose_relocalization_reply = False
-        self.query_status = 1
+        self.query_status = None
+        self.terminals = {}
         self.sample_mutation = None
         self.query_mutation = None
         self.before_dispatch = None
@@ -151,6 +152,7 @@ class RelocalizationNativeStub(SaveNativeStub):
             self.terminal = terminal_for_request(admitted, phase=self.terminal_phase)
         else:
             assert self.terminal.request.exact_replay_of(admitted)
+        self.terminals[admitted.request_id] = self.terminal
         if self.lose_relocalization_reply:
             raise LostReply()
         return self.terminal.to_proto(pb.RelocalizeResult)
@@ -159,7 +161,12 @@ class RelocalizationNativeStub(SaveNativeStub):
         self.visit("GetRelocalizationTerminal")
         self.query_requests.append(deepcopy(request))
         query = AssignedRelocalizationQuery.from_proto(request)
-        response = query.response(self.query_status, self.terminal if self.query_status == 1 else None)
+        terminal = (self.terminal if self.terminal is not None and self.terminal.request_id == query.request.request_id
+                    else self.terminals.get(query.request.request_id))
+        status = self.query_status
+        if status is None:
+            status = (3 if terminal is None else 1 if terminal.request.exact_replay_of(query.request) else 4)
+        response = query.response(status, terminal if status == 1 else None)
         wire = pb.GetRelocalizationTerminalResponse(**query.response_to_provider_fields(response))
         if self.query_mutation:
             self.query_mutation(wire)
@@ -199,7 +206,7 @@ class AssignedWorkspaceRelocalizationTests(unittest.TestCase):
 
     def relocalize(self, *, request_id=REQUEST_ID):
         return self.service.relocalize_active_map(map_name=MAP_NAME,
-            metadata={"request_id": request_id, "logical_timeout_ms": 10_000})
+            metadata={"business_request_id": request_id, "logical_timeout_ms": 10_000})
 
     def forbid_unpaired_pose(self):
         guard = ExitStack()
@@ -232,6 +239,203 @@ class AssignedWorkspaceRelocalizationTests(unittest.TestCase):
         for wire in self.stub.sample_requests:
             self.assertTrue(AssignedRelocalizationRequest.from_proto(wire).exact_replay_of(request))
         return request
+
+    def test_old_raw_and_unknown_canonical_ids_never_dispatch_or_create_intent(self):
+        self.stub.query_status = 3
+        for request_id in ("old-business-123", "relocalize:" + "a" * 64):
+            with self.subTest(request_id=request_id), self.assertRaises(GatewayError) as error:
+                self.service.relocalize_active_map(map_name=MAP_NAME,
+                    metadata={"request_id": request_id, "logical_timeout_ms": 10_000})
+            self.assertEqual(error.exception.error_code, "relocalization_request_not_found")
+            self.assertIsNone(self.service._repository.get_relocalization_intent())
+            self.assertFalse(self.stub.relocalization_requests)
+            self.assertEqual(self.stub.query_requests[-1].request_id, request_id)
+
+    def test_native_only_historical_terminals_are_readonly(self):
+        target = self.runtime.capture_assigned_map_activation_target(
+            map_name=MAP_NAME, asset_identity=self.saved.asset_identity)
+        old_id = "relocalize:" + "b" * 64
+        request = AssignedRelocalizationRequest.admit({"schema_version": 2, "request_id": old_id,
+            "assigned_cloud_v2": {"target": target.activation_receipt.to_dict()["target"],
+                "policy": target.relocalization_policy, "logical_timeout_ms": 10_000}})
+        session, epoch = self.localization.get_active_session_token()
+        for phase in (5, 1, 2):  # applied, pre-admission rejection, cancellation
+            self.stub.terminal = terminal_for_request(request, phase=phase)
+            with self.subTest(phase=phase), self.assertRaises(GatewayError) as error:
+                self.service.relocalize_active_map(map_name=MAP_NAME,
+                    metadata={"request_id": old_id, "logical_timeout_ms": 10_000})
+            self.assertEqual(error.exception.error_code, "relocalization_historical_terminal")
+            self.assertEqual(error.exception.details["terminal"], self.stub.terminal.to_dict())
+            self.assertIsNone(self.service._repository.get_relocalization_intent())
+            self.assertIsNone(self.service._repository.get_last_successful_relocalization_receipt())
+            current, current_epoch = self.localization.get_active_session_token()
+            self.assertIs(current, session)
+            self.assertEqual(current_epoch, epoch)
+        self.assertFalse(self.stub.relocalization_requests)
+        self.assertFalse(self.stub.sample_requests)
+
+    def test_query_older_success_after_newer_success_preserves_receipt_and_session(self):
+        self.relocalize(request_id="operation-A")
+        historical = self.stub.terminal
+        self.stub.terminal = None
+        session_b, _ = self.relocalize(request_id="operation-B")
+        terminal_b = self.stub.terminal
+        token_b = self.localization.get_active_session_token()
+        session_json = session_b.model_dump_json()
+        repository = self.service._repository
+        receipt_b = repository._relocalization_receipt_path.read_bytes()
+        before_dispatch = len(self.stub.relocalization_requests)
+
+        # The stub keeps exact historical requests separately from the current
+        # correction, so both public ID fields must discover A without a sample.
+        with patch.object(self.stub, "GetAssignedLocalizationSample",
+                side_effect=AssertionError("historical A sample cannot represent current B")) as sample:
+            for field in ("request_id", "business_request_id"):
+                with self.subTest(field=field), self.assertRaises(GatewayError) as error:
+                    self.service.relocalize_active_map(map_name=MAP_NAME,
+                        metadata={field: "operation-A", "logical_timeout_ms": 10_000})
+                self.assertEqual(error.exception.error_code, "relocalization_historical_terminal")
+                self.assertEqual(error.exception.details["terminal"], historical.to_dict())
+            # Same ID with a different exact request is a conflict, not history
+            # and not permission to create a fresh operation.
+            with self.assertRaises(GatewayError) as error:
+                self.service.relocalize_active_map(map_name=MAP_NAME,
+                    metadata={"business_request_id": "operation-A", "logical_timeout_ms": 250})
+            self.assertEqual(error.exception.error_code, "relocalization_request_conflict")
+            sample.assert_not_called()
+        self.assertEqual(repository._relocalization_receipt_path.read_bytes(), receipt_b)
+        self.assertIsNone(repository.get_relocalization_intent())
+        self.assertFalse(repository._relocalization_intent_path.exists())
+        current, epoch = self.localization.get_active_session_token()
+        self.assertIs(current, token_b[0])
+        self.assertEqual(epoch, token_b[1])
+        self.assertEqual(current.model_dump_json(), session_json)
+        self.assertEqual(len(self.stub.relocalization_requests), before_dispatch)
+        self.assertIs(self.stub.terminal, terminal_b)
+
+    def test_business_first_request_queries_before_any_catalog_or_session_change(self):
+        token = self.localization.get_active_session_token()
+        query = self.stub.GetRelocalizationTerminal
+        def first_query(wire, timeout):
+            self.assertIsNone(self.service._repository.get_relocalization_intent())
+            self.assertIs(self.localization.get_active_session_token()[0], token[0])
+            self.assertEqual(self.localization.get_active_session_token()[1], token[1])
+            self.assertFalse(self.stub.relocalization_requests)
+            return query(wire, timeout)
+        with patch.object(self.stub, "GetRelocalizationTerminal", side_effect=first_query):
+            session, workspace = self.relocalize()
+        self.assertTrue(workspace.localization_ready)
+        self.assertEqual(len(self.stub.query_requests), 1)
+        self.assertEqual(len(self.stub.relocalization_requests), 1)
+        self.assertEqual(session.relocalization_terminal_v2.request_id, REQUEST_ID)
+
+    def test_business_rejected_history_after_newer_success_is_readonly(self):
+        self.stub.terminal_phase = 1
+        with self.assertRaises(GatewayError) as error:
+            self.relocalize(request_id="rejected-A")
+        self.assertEqual(error.exception.error_code, "relocalization_rejected")
+        rejected = self.stub.terminal
+        self.stub.terminal = None
+        self.stub.terminal_phase = 5
+        session_b, _ = self.relocalize(request_id="successful-B")
+        before = self.service._repository._relocalization_receipt_path.read_bytes()
+        epoch_b = self.localization.get_active_session_token()[1]
+        dispatches = len(self.stub.relocalization_requests)
+        samples = len(self.stub.sample_requests)
+        with self.assertRaises(GatewayError) as error:
+            self.relocalize(request_id="rejected-A")
+        self.assertEqual(error.exception.error_code, "relocalization_historical_terminal")
+        self.assertEqual(error.exception.details["terminal"], rejected.to_dict())
+        self.assertEqual(self.service._repository._relocalization_receipt_path.read_bytes(), before)
+        self.assertIsNone(self.service._repository.get_relocalization_intent())
+        self.assertIs(self.localization.get_active_session_token()[0], session_b)
+        self.assertEqual(self.localization.get_active_session_token()[1], epoch_b)
+        self.assertEqual(len(self.stub.relocalization_requests), dispatches)
+        self.assertEqual(len(self.stub.sample_requests), samples)
+
+    def test_business_pending_unknown_and_query_failure_preserve_current_state(self):
+        session_b, _ = self.relocalize(request_id="current-B")
+        repository = self.service._repository
+        before = repository._relocalization_receipt_path.read_bytes()
+        epoch_b = self.localization.get_active_session_token()[1]
+        for status, failure in ((2, None), (4, None), (None, LostReply()), (None, RuntimeError("query failed"))):
+            self.stub.query_status = status
+            query = self.stub.GetRelocalizationTerminal
+            with self.subTest(status=status, failure=failure), \
+                    patch.object(self.stub, "GetRelocalizationTerminal", side_effect=failure if failure else query), \
+                    self.assertRaises(GatewayError):
+                self.relocalize(request_id="unresolved-A")
+            self.assertEqual(repository._relocalization_receipt_path.read_bytes(), before)
+            self.assertIsNone(repository.get_relocalization_intent())
+            self.assertIs(self.localization.get_active_session_token()[0], session_b)
+            self.assertEqual(self.localization.get_active_session_token()[1], epoch_b)
+            self.assertEqual(len(self.stub.relocalization_requests), 1)
+        self.stub.query_status = None
+        self.stub.query_mutation = lambda wire: setattr(wire, "status", 0)
+        with self.assertRaises(GatewayError):
+            self.relocalize(request_id="unresolved-A")
+        self.assertEqual(repository._relocalization_receipt_path.read_bytes(), before)
+        self.assertIsNone(repository.get_relocalization_intent())
+        self.assertIs(self.localization.get_active_session_token()[0], session_b)
+        self.assertEqual(self.localization.get_active_session_token()[1], epoch_b)
+        self.assertEqual(len(self.stub.relocalization_requests), 1)
+
+    def test_old_id_pending_then_current_receipt_still_recovers(self):
+        self.stub.lose_relocalization_reply = True
+        with self.assertRaises(GatewayError):
+            self.relocalize()
+        for phase in ("pending", "current_receipt"):
+            with self.subTest(phase=phase):
+                session, workspace = self.service.relocalize_active_map(map_name=MAP_NAME,
+                    metadata={"request_id": REQUEST_ID, "logical_timeout_ms": 10_000})
+                self.assertTrue(workspace.localization_ready)
+                self.assertEqual(session.relocalization_terminal_v2.request_id, REQUEST_ID)
+                self.assertIsNone(self.service._repository.get_relocalization_intent())
+        self.assertEqual(len(self.stub.relocalization_requests), 1)
+        self.assertEqual(len(self.stub.query_requests), 2)  # first admission + unknown recovery
+
+    def test_business_id_is_retained_in_unknown_intent_and_restart_retry(self):
+        self.stub.lose_relocalization_reply = True
+        with self.assertRaises(GatewayError):
+            self.relocalize()
+        pending = MapCatalogRepository(str(self.root)).get_assigned_relocalization_intent()
+        self.assertEqual(pending["request_id"], REQUEST_ID)
+        self.assertEqual(pending["assigned_request_v2"]["request_id"], REQUEST_ID)
+        self.stub.query_status = 2
+        self.service = self.new_service()
+        before = len(self.stub.relocalization_requests)
+        with self.assertRaises(GatewayError):
+            self.relocalize()
+        self.assertEqual(self.service._repository.get_relocalization_intent(), pending)
+        self.stub.query_status = 1
+        session, workspace = self.relocalize()
+        self.assertTrue(workspace.localization_ready)
+        self.assertEqual(session.relocalization_terminal_v2.request_id, REQUEST_ID)
+        self.assertEqual(len(self.stub.relocalization_requests), before)
+
+    def test_new_business_id_changed_timeout_conflicts_before_any_rpc(self):
+        self.relocalize()
+        calls = list(self.stub.calls)
+        with self.assertRaises(GatewayError) as error:
+            self.service.relocalize_active_map(map_name=MAP_NAME,
+                metadata={"business_request_id": REQUEST_ID, "logical_timeout_ms": 250})
+        self.assertEqual(error.exception.error_code, "relocalization_request_conflict")
+        self.assertEqual(self.stub.calls, calls)
+
+    def test_old_prepared_id_is_retained_without_dispatch(self):
+        target = self.runtime.capture_assigned_map_activation_target(
+            map_name=MAP_NAME, asset_identity=self.saved.asset_identity)
+        request = AssignedRelocalizationRequest.admit({"schema_version": 2, "request_id": REQUEST_ID,
+            "assigned_cloud_v2": {"target": target.activation_receipt.to_dict()["target"],
+                "policy": target.relocalization_policy, "logical_timeout_ms": 10_000}})
+        pending = self.service._repository.begin_assigned_relocalization_durable(
+            assigned_request=request, activation_receipt=target.activation_receipt,
+            target_asset_identity=target.asset_identity)
+        with self.assertRaises(GatewayError):
+            self.service.relocalize_active_map(map_name=MAP_NAME,
+                metadata={"request_id": REQUEST_ID, "logical_timeout_ms": 10_000})
+        self.assertEqual(self.service._repository.get_relocalization_intent(), pending)
+        self.assertFalse(self.stub.relocalization_requests)
 
     def test_save_load_one_durable_exact_dispatch_then_native_sample_publishes_ready(self):
         def durable_before_dispatch(request):

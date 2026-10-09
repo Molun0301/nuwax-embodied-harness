@@ -2975,7 +2975,12 @@ class GatewayRuntime:
                 input_schema=_schema_object(
                     {
                         "map_name": {"type": "string"},
-                        "request_id": {"type": "string"},
+                        "business_request_id": {"type": "string", "minLength": 1, "maxLength": 128,
+                            "pattern": "^[A-Za-z0-9._:-]+$",
+                            "description": "新重定位的业务编号，原值持久化；相同编号重试必须保持参数一致。省略则生成一次 UUID。"},
+                        "request_id": {"type": "string", "minLength": 1, "maxLength": 128,
+                            "pattern": "^[A-Za-z0-9._:-]+$",
+                            "description": "兼容恢复入口：填写此前返回的内部编号，仅查询/恢复已有请求；不得与 business_request_id 同时提供。"},
                         "planar_seed": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3,
                             "description": "二维地图初始位置[x米, y米, 偏航弧度]；缺省使用近期位置或图中保存位置作为匹配初值。"},
                         "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
@@ -10697,24 +10702,13 @@ class GatewayRuntime:
         timeout_sec = self._resolve_async_timeout(capability_name, arguments, minimum_sec=1.0)
         payload = dict(arguments or {})
         if capability_name == "relocalize_active_map":
-            def canonical_relocalize_request_id(source: str) -> str:
-                source = str(source or "").strip()
-                if source.startswith("relocalize:"):
-                    return source
-                return "relocalize:%s" % hashlib.sha256(
-                    source.encode("utf-8")
-                ).hexdigest()
-
-            # 传输层的JSON-RPC编号可被不同调用者反复使用，不能作为持久重定位身份。
-            # 只有显式业务request_id表达重试；省略时为这次受理生成独立标识。
-            request_id = str(payload.get("request_id") or "").strip()
-            if not request_id:
+            from contracts.relocalization_request_id import relocalization_request_identity
+            request_id, _ = relocalization_request_identity(payload)
+            # 传输层 JSON-RPC 编号不是业务身份。省略业务编号时只为本次受理分配一次。
+            if request_id is None:
                 request_id = "relocalize:" + uuid.uuid4().hex
-            request_id = canonical_relocalize_request_id(request_id)
-            payload["request_id"] = request_id
-            if request_context is not None and not str(
-                request_context.get("request_id") or ""
-            ).strip():
+                payload["business_request_id"] = request_id
+            if request_context is not None and not str(request_context.get("request_id") or "").strip():
                 request_context["request_id"] = request_id
 
         def runner(context) -> Dict[str, Any]:

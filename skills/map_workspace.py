@@ -2626,7 +2626,8 @@ class MapWorkspaceService:
         )
         if not isinstance(request_metadata, dict):
             request_metadata = {}
-        requested_id = request_metadata.get("request_id")
+        from contracts.relocalization_request_id import relocalization_request_identity
+        requested_id, recovery_only = relocalization_request_identity(request_metadata)
         if pending_intent is None and requested_id is not None:
             durable_receipt = (
                 self._repository.get_last_successful_relocalization_receipt()
@@ -2638,6 +2639,9 @@ class MapWorkspaceService:
                 and durable_receipt.get("asset_manifest_sha256")
                 == bundle_manifest_sha256
             ):
+                if ("logical_timeout_ms" in request_metadata
+                        and request_metadata["logical_timeout_ms"] != durable_receipt.get("logical_timeout_ms")):
+                    raise ValueError("相同重定位请求不能更换逻辑超时")
                 if request_metadata.get("planar_seed") is not None and list(request_metadata["planar_seed"]) != durable_receipt.get("planar_seed"):
                     raise ValueError("相同重定位请求不能更换二维初始位置")
                 session = self._localization_service.get_active_session()
@@ -2666,6 +2670,16 @@ class MapWorkspaceService:
                     pending_intent,
                     operation="relocalize_active_map",
                 )
+            if ("logical_timeout_ms" in request_metadata
+                    and request_metadata["logical_timeout_ms"] != pending_intent["logical_timeout_ms"]):
+                raise ValueError("相同重定位请求不能更换逻辑超时")
+            if (request_metadata.get("planar_seed") is not None
+                    and list(request_metadata["planar_seed"]) != pending_intent.get("planar_seed")):
+                raise ValueError("相同重定位请求不能更换二维初始位置")
+            if recovery_only and pending_intent["phase"] == "prepared":
+                raise GatewayError("原请求尚未 dispatch；旧 request_id 恢复入口保留原准备记录。",
+                    error_code="relocalization_recovery_required", http_status=409, jsonrpc_code=-32000,
+                    details={"request_id": requested_id})
             outcome = self._recover_relocalization_owner_complete_core(
                 operation="relocalize_active_map",
                 expected_request_id=requested_id,
@@ -2751,7 +2765,7 @@ class MapWorkspaceService:
             except (TypeError, ValueError):
                 logical_timeout_ms = 10_000
             resolved_request_id = (
-                str(requested_id).strip()
+                requested_id
                 if requested_id is not None
                 else "relocalize:%s" % uuid.uuid4().hex
             )
@@ -2760,6 +2774,24 @@ class MapWorkspaceService:
                 planar_seed = self._geometry_runtime.resolve_planar_relocalization_seed(request_metadata.get("planar_seed"))
             elif request_metadata.get("planar_seed") is not None:
                 raise ValueError("三维地图不接受二维初始位置")
+            if requested_id is not None:
+                query = self._geometry_runtime.get_relocalization_terminal(
+                    request_id=resolved_request_id, logical_timeout_ms=logical_timeout_ms,
+                    map_name=resolved_name, asset_manifest_sha256=bundle_manifest_sha256,
+                    activation_receipt=activation_receipt,
+                    **({"planar_seed": planar_seed} if planar_seed is not None else {}))
+                historical_terminal = query.get("terminal_receipt")
+                if query.get("status") == "terminal" and isinstance(historical_terminal, dict):
+                    # Both ID entry points report historical outcomes read-only.
+                    raise GatewayError("原请求已有历史终态；仅返回查询结果，不重新采用定位。",
+                        error_code="relocalization_historical_terminal", http_status=409, jsonrpc_code=-32000,
+                        details={"request_id": resolved_request_id, "terminal": historical_terminal})
+                if query.get("status") != "not_found" or historical_terminal is not None or recovery_only:
+                    raise GatewayError("未确认此编号可新建；保留现状，不创建或重新执行请求。",
+                        error_code=("relocalization_request_conflict" if query.get("status") == "identity_conflict"
+                            else "relocalization_request_not_found" if query.get("status") == "not_found"
+                            else "relocalization_recovery_required"), http_status=409, jsonrpc_code=-32000,
+                        details={"request_id": resolved_request_id})
             pending_intent = self._repository.begin_relocalization_durable(
                 request_id=resolved_request_id,
                 logical_timeout_ms=logical_timeout_ms,

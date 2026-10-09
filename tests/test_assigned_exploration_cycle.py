@@ -667,7 +667,7 @@ class AssignedExplorationCycleTests(unittest.TestCase):
                 self.stub.lose_relocalization_reply = False
                 self.stub.terminal = None
                 session, workspace = self.service.relocalize_active_map(map_name=MAP_NAME,
-                    metadata={"request_id": "relocalize:independent-successor", "logical_timeout_ms": 9_000})
+                    metadata={"business_request_id": "relocalize:independent-successor", "logical_timeout_ms": 9_000})
                 self.assertTrue(workspace.localization_ready)
                 self.assertEqual(session.status, LocalizationSessionStatus.READY)
                 replacement.append(session.relocalization_terminal_v2.request)

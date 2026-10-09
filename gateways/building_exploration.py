@@ -61,7 +61,7 @@ class GatewayBuildingExplorationPorts:
             session=self.runtime.map_workspace_service.get_active_localization_session()
             if descriptor.get("active_map_name")!=floor.map_name or session is None or str(session.status.value)!="ready":
                 self.runtime.map_workspace_service.activate_map(map_name=floor.map_name,create_if_missing=False,metadata={"source":"building_exploration"})
-                self.runtime.map_workspace_service.relocalize_active_map(map_name=floor.map_name,metadata={"request_id":"building-localize-"+uuid.uuid4().hex,"logical_timeout_ms":30000})
+                self.runtime.map_workspace_service.relocalize_active_map(map_name=floor.map_name,metadata={"business_request_id":"building-localize-"+uuid.uuid4().hex,"logical_timeout_ms":30000})
 
     def submit_exploration(self,floor,business_id,request):
         admission=self._admit_child("explore_area_v2",business_id)

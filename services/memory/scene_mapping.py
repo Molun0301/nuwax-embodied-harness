@@ -479,7 +479,7 @@ class SceneMappingService:
             self._run_lock.release()
 
     def get_map(self) -> Dict[str, Any]:
-        capture = self.memory.capture_scene_mapping_state()
+        capture = self.memory.capture_scene_mapping_state(include_decision_inputs=False)
         spaces = sorted(self.memory.current_managed_scene_spaces(capture["snapshot"], include_stale=True, copy_records=False),
                         key=lambda space: space.scene_space_id)
         return {"map_binding": capture["binding"], "regions": [_public_space(space) for space in spaces],

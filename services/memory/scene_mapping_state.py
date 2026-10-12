@@ -35,7 +35,7 @@ def same_scope(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
 class SceneMappingMemoryMixin:
     """由MemoryService持有锁、仓储与索引，本类不创建第二份记忆状态。"""
 
-    def capture_scene_mapping_state(self) -> Dict[str, Any]:
+    def capture_scene_mapping_state(self, *, include_decision_inputs: bool = True) -> Dict[str, Any]:
         snapshot = getattr(self._mapping_service, "get_semantic_snapshot", self._mapping_service.get_latest_snapshot)()
         if snapshot is None or snapshot.occupancy_grid is None:
             raise GatewayError("当前没有可分割的规范占据地图。", error_code="scene_map_not_ready", http_status=409)
@@ -47,12 +47,18 @@ class SceneMappingMemoryMixin:
                 "snapshot": snapshot, "binding": snapshot_binding(snapshot), "library_name": library,
                 "generation": getattr(self, "_scene_scope_generation", 0),
             }
-            visible = None if self._durable_index.load_history else tuple(self._semantic_entries_by_id)
-            visible_spaces = None if self._durable_index.load_history else tuple(self._scene_spaces_by_id)
-        # Decode selected evidence outside the memory/SQL writer locks. The
-        # captured memory-only generation also versions pre-index legacy rows.
-        capture["spaces"], capture["entries"] = self._repository.capture_scene_decision_entries(
-            library, visible_ids=visible, include_spaces=True, visible_space_ids=visible_spaces)
+            if include_decision_inputs:
+                visible = None if self._durable_index.load_history else tuple(self._semantic_entries_by_id)
+                visible_spaces = None if self._durable_index.load_history else tuple(self._scene_spaces_by_id)
+        if include_decision_inputs:
+            # Decode selected evidence outside the memory/SQL writer locks. The
+            # captured memory-only generation also versions pre-index legacy rows.
+            capture["spaces"], capture["entries"] = self._repository.capture_scene_decision_entries(
+                library, visible_ids=visible, include_spaces=True, visible_space_ids=visible_spaces)
+        else:
+            # 展示读取仍经过原仓储/存储生命周期边界，不加载未使用的决策记录。
+            with self._repository._read_snapshot():
+                pass
         with self._instances_lock:
             self._assert_scene_mapping_capture(capture)
         return capture

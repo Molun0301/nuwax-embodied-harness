@@ -808,3 +808,142 @@ def test_identical_concurrent_label_request_is_idempotent_after_unlocked_prepara
     result=memory.update_scene_mapping_label(**arguments)
     assert result.primary_label=='同一请求' and len(events)==1
     assert result.metadata['scene_revision']==before.metadata['scene_revision']+1
+
+
+@pytest.mark.parametrize('load_history', [False, True])
+def test_map_view_skips_decision_rows_without_initializing_or_publishing_context(setup, monkeypatch, load_history):
+    holder, memory, _, service = setup
+    remember(memory, holder, 2)
+    service.run_once()
+    memory._durable_index.load_history = load_history
+    complete = memory.capture_scene_mapping_state()
+    assert complete['spaces'] and complete['entries']
+    assert set(complete) == {'snapshot', 'binding', 'library_name', 'generation', 'spaces', 'entries'}
+    context = memory._latest_semantic_map_context
+    identity = memory._latest_semantic_map_context_identity
+    def forbidden(*args, **kwargs):
+        raise AssertionError('展示读取不能加载决策输入或初始化模型')
+    monkeypatch.setattr(memory._repository, 'capture_scene_decision_entries', forbidden)
+    monkeypatch.setattr(memory, '_ensure_embedders_initialized', forbidden)
+    result = service.get_map()
+    assert result['region_count'] == 1
+    assert result['regions'][0]['scene_space_id'] == complete['spaces'][0].scene_space_id
+    assert result['map_binding'] == complete['binding']
+    assert memory._latest_semantic_map_context is context
+    assert memory._latest_semantic_map_context_identity == identity
+
+
+def test_map_view_empty_region_cache_is_a_valid_full_response(setup):
+    _, _, _, service = setup
+    result = service.get_map()
+    assert result['regions'] == [] and result['region_count'] == 0
+    assert result['map_binding']['map_name'] == 'lab'
+    assert result['navigation_checked'] is False
+
+
+@pytest.mark.parametrize('case,code', [
+    ('not_ready', 'scene_map_not_ready'),
+    ('missing_grid', 'scene_map_not_ready'),
+    ('disabled', 'memory_disabled'),
+    ('mismatch', 'scene_map_library_mismatch'),
+    ('not_ready_and_disabled', 'scene_map_not_ready'),
+    ('mismatch_and_disabled', 'memory_disabled'),
+])
+def test_map_view_initial_state_error_priority(setup, case, code):
+    holder, memory, _, service = setup
+    if case in {'not_ready', 'not_ready_and_disabled'}:
+        holder['map'] = None
+    elif case == 'missing_grid':
+        holder['map'] = holder['map'].model_copy(update={'occupancy_grid': None})
+    elif case in {'mismatch', 'mismatch_and_disabled'}:
+        holder['map'] = make_snapshot(name='other')
+    if case in {'disabled', 'not_ready_and_disabled', 'mismatch_and_disabled'}:
+        memory._memory_enabled = False
+    with pytest.raises(GatewayError) as error:
+        service.get_map()
+    assert error.value.error_code == code
+
+
+@pytest.mark.parametrize('case,code', [
+    ('library', 'memory_library_changed'),
+    ('generation', 'scene_scope_changed'),
+    ('disabled', 'memory_library_changed'),
+    ('map_gone', 'scene_map_changed'),
+    ('map_revision', 'scene_map_changed'),
+    ('map_epoch', 'scene_map_changed'),
+    ('library_and_generation', 'memory_library_changed'),
+    ('generation_and_map', 'scene_scope_changed'),
+])
+def test_map_view_rechecks_owner_after_existing_read_boundary(setup, monkeypatch, case, code):
+    from contextlib import contextmanager
+    holder, memory, _, service = setup
+    original = memory._repository._read_snapshot
+    @contextmanager
+    def changed():
+        with original() as transaction:
+            yield transaction
+        if case in {'library', 'library_and_generation'}:
+            memory._active_library_name = 'other'
+        if case in {'generation', 'library_and_generation', 'generation_and_map'}:
+            memory._scene_scope_generation += 1
+        if case == 'disabled':
+            memory._memory_enabled = False
+        if case in {'map_gone', 'generation_and_map'}:
+            holder['map'] = None
+        elif case == 'map_revision':
+            holder['map'] = make_snapshot(sequence=2)
+        elif case == 'map_epoch':
+            holder['map'] = make_snapshot(epoch='other')
+    monkeypatch.setattr(memory._repository, '_read_snapshot', changed)
+    with pytest.raises(GatewayError) as error:
+        service.get_map()
+    assert error.value.error_code == code
+    monkeypatch.setattr(memory._repository, '_read_snapshot', original)
+
+
+@pytest.mark.parametrize('owner,message', [('repository', 'Memory repository is closed'),
+                                          ('storage', 'SQLite storage is closed')])
+def test_map_view_preserves_read_lifecycle_error_before_late_owner_check(setup, monkeypatch, owner, message):
+    from contextlib import contextmanager
+    _, memory, _, service = setup
+    original = memory._repository._read_snapshot
+    @contextmanager
+    def closed():
+        target = memory._repository if owner == 'repository' else memory._repository.storage
+        field = '_closed' if owner == 'repository' else '_closing'
+        with monkeypatch.context() as patch:
+            patch.setattr(target, field, True)
+            patch.setattr(memory, '_active_library_name', 'other')
+            with original() as transaction:
+                yield transaction
+    monkeypatch.setattr(memory._repository, '_read_snapshot', closed)
+    with pytest.raises(RuntimeError, match=message):
+        service.get_map()
+    monkeypatch.setattr(memory._repository, '_read_snapshot', original)
+
+
+def test_map_view_after_memory_close_keeps_disabled_error(setup):
+    _, memory, _, service = setup
+    assert memory.close()
+    with pytest.raises(GatewayError) as error:
+        service.get_map()
+    assert error.value.error_code == 'memory_disabled'
+
+
+def test_map_view_publishes_each_committed_region_update_as_detached_full_json(setup):
+    _, memory, _, service = setup
+    service.run_once()
+    before = service.get_map()
+    identifier = before['regions'][0]['scene_space_id']
+    revision = before['regions'][0]['metadata']['scene_revision']
+    frames = []
+    service.stream_bus = SimpleNamespace(publish=lambda topic, **kw: frames.append((topic, kw['payload'])))
+    for i in range(4):
+        service.update_label(scene_space_id=identifier, map_name='lab', expected_revision=revision+i,
+            label='区域%d' % i, request_id='view-update-%d' % i, requested_by='test')
+        assert len(frames) == i+1
+        assert frames[-1][0] == 'memory.scene_spaces'
+        assert frames[-1][1] == service.get_map()
+        assert frames[-1][1]['regions'][0]['primary_label'] == '区域%d' % i
+    assert [frame[1]['regions'][0]['primary_label'] for frame in frames] == ['区域%d' % i for i in range(4)]
+    assert before['regions'][0]['primary_label'] is None

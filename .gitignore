@@ -47,7 +47,7 @@ scripts/ci/release_gates/*
 !scripts/ci/release_gates/common.py
 !scripts/ci/release_gates/static_neg_gate.py
 
-# 文档与测试仅保留在本地工作区，不进入 Git 变更区。
+# 开发文档与测试默认仅留本地；具名回归例外见下方。
 /docs/开发文档/
 /tests/
 /requirements/README.md
@@ -200,7 +200,7 @@ drivers/.settings.lock
 drivers/*/.active_config.lock
 drivers/.active_robot.lock
 
-# NEH 产品使用与维护文档；开发记录和独立测试继续只留本地。
+# NEH 产品使用与维护文档；开发记录和未明确放行的测试继续只留本地。
 !/docs/公开文档/安装前准备.md
 !/docs/公开文档/配置说明.md
 !/docs/公开文档/控制台使用指南.md
@@ -213,6 +213,14 @@ drivers/.active_robot.lock
 # 完整合并候选的具名回归；仅开放下列目录与文件，其他本地测试仍忽略。
 !/tests/
 /tests/*
+!/tests/fixtures/
+/tests/fixtures/*
+!/tests/fixtures/assigned_quaternion_norm_nalgebra033.json
+!/tests/fixtures/assigned_quaternion_norm_nalgebra033.rs
+!/tests/fixtures/assigned_recomposition_nalgebra033.json
+!/tests/fixtures/assigned_recomposition_nalgebra033.rs
+!/tests/fixtures/checkpoint-v2-166380-member-inventory.json
+!/tests/fixtures/relocalization_policy_algorithm2_0276.json
 !/tests/integration/
 /tests/integration/*
 !/tests/unit/

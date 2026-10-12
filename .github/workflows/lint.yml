@@ -31,14 +31,35 @@ jobs:
       - name: PEP 604 union 检测（实机 Py3.8.10 兼容）
         run: python3 scripts/ci/check_pep604.py services/geometry/__init__.py services/geometry/loop_closure_state.py services/geometry/runtime.py services/geometry/external_debug_observer.py gateways scripts/deploy_installer install.py
 
-      # (d) fixture / mock / integration 测试文件不入仓
-      - name: 测试文件不入仓
+      # (d) 仅允许 .gitignore 明确放行的 fixture / mock / integration 回归文件。
+      - name: 测试文件入仓范围
         run: |
-          if git ls-files tests/fixtures/ tests/mocks/ tests/integration/ 2>/dev/null | grep -q .; then
-            echo "测试文件入仓拦截：tests/fixtures/ + tests/mocks/ + tests/integration/ 应在 .gitignore 中"
-            git ls-files tests/fixtures/ tests/mocks/ tests/integration/
-            exit 1
+          check_dir=$(mktemp -d)
+          trap 'rm -rf -- "$check_dir"' EXIT
+          git ls-files -z -- tests/fixtures/ tests/mocks/ tests/integration/ > "$check_dir/tracked" || {
+            status=$?
+            echo "无法枚举已跟踪测试文件"
+            exit "$status"
+          }
+          if git check-ignore --no-index -z --stdin < "$check_dir/tracked" > "$check_dir/ignored"; then
+            status=0
+          else
+            status=$?
           fi
+          case "$status" in
+            0)
+              echo "测试文件入仓拦截：以下文件仍被 .gitignore 忽略"
+              while IFS= read -r -d '' path; do
+                printf '%s\n' "$path"
+              done < "$check_dir/ignored"
+              exit 1
+              ;;
+            1) ;; # 无忽略命中：现有路径均获准入仓。
+            *)
+              echo "测试文件忽略规则检查失败（退出码：$status）"
+              exit "$status"
+              ;;
+          esac
 
   deployment-installer:
     runs-on: ubuntu-22.04

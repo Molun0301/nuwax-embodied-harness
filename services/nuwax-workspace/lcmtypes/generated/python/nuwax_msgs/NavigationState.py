@@ -180,4 +180,3 @@ class NavigationState(object):
     def get_hash(self):
         """Get the LCM hash of the struct"""
         return struct.unpack(">Q", NavigationState._get_packed_fingerprint())[0]
-

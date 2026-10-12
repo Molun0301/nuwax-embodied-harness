@@ -294,4 +294,3 @@ impl NavigationCapabilities {
         Ok(())
     }
 }
-

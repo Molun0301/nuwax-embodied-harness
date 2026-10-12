@@ -6,8 +6,9 @@ from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from contracts.relocalization_request_id import relocalization_request_identity
+from contracts.relocalization_request_id import relocalization_request_identity as contract_identity
 from core.errors import GatewayError
+from core.relocalization_request_id import relocalization_request_identity
 from gateways.runtime import GatewayRuntime
 from skills.handlers.localization_skills import handle_relocalize_active_map
 from skills.map_workspace import MapWorkspaceService
@@ -19,11 +20,24 @@ class RelocalizationRequestIdTests(unittest.TestCase):
         for value in ("000123", "Order-A._:-09", "x" * 128):
             self.assertEqual(relocalization_request_identity({"business_request_id": value}), (value, False))
             self.assertEqual(relocalization_request_identity({"request_id": value}), (value, True))
-        for value in ("", " 123", "123 ", 123, True, "中文编号", "a/b", "x" * 129):
-            with self.subTest(value=value), self.assertRaises(GatewayError):
-                relocalization_request_identity({"business_request_id": value})
-        with self.assertRaises(GatewayError):
+        self.assertEqual(contract_identity({}), (None, False))
+        for field in ("business_request_id", "request_id"):
+            for value in ("", " 123", "123 ", 123, True, "中文编号", "a/b", "x" * 129):
+                payload = {field: value}
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(ValueError) as contract_error:
+                        contract_identity(payload)
+                    with self.assertRaises(GatewayError) as error:
+                        relocalization_request_identity(payload)
+                    self.assertEqual(str(error.exception), str(contract_error.exception))
+                    self.assertEqual(error.exception.error_code, "invalid_params")
+                    self.assertEqual(error.exception.http_status, 422)
+                    self.assertEqual(error.exception.jsonrpc_code, -32602)
+        with self.assertRaises(GatewayError) as error:
             relocalization_request_identity({"business_request_id": "123", "request_id": "123"})
+        self.assertEqual(error.exception.error_code, "invalid_params")
+        self.assertEqual(error.exception.http_status, 422)
+        self.assertEqual(error.exception.jsonrpc_code, -32602)
 
     def submit(self, payload, request_context=None):
         gateway = SimpleNamespace(
@@ -54,8 +68,11 @@ class RelocalizationRequestIdTests(unittest.TestCase):
             metadata = ctx.map_workspace_service.relocalize_active_map.call_args.kwargs["metadata"]
             self.assertEqual(metadata[field], "000123")
         ctx.ensure_geometry_runtime_for_capability.reset_mock()
-        with self.assertRaises(GatewayError):
+        with self.assertRaises(GatewayError) as error:
             handle_relocalize_active_map(ctx, {"business_request_id": "123", "request_id": "123"})
+        self.assertEqual(error.exception.error_code, "invalid_params")
+        self.assertEqual(error.exception.http_status, 422)
+        self.assertEqual(error.exception.jsonrpc_code, -32602)
         ctx.ensure_geometry_runtime_for_capability.assert_not_called()
 
 

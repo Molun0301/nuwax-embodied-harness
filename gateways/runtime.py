@@ -10714,7 +10714,7 @@ class GatewayRuntime:
         timeout_sec = self._resolve_async_timeout(capability_name, arguments, minimum_sec=1.0)
         payload = dict(arguments or {})
         if capability_name == "relocalize_active_map":
-            from contracts.relocalization_request_id import relocalization_request_identity
+            from core.relocalization_request_id import relocalization_request_identity
             request_id, _ = relocalization_request_identity(payload)
             # 传输层 JSON-RPC 编号不是业务身份。省略业务编号时只为本次受理分配一次。
             if request_id is None:

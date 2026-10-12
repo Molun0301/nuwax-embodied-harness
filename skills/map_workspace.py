@@ -2609,7 +2609,7 @@ class MapWorkspaceService:
         )
         if not isinstance(request_metadata, dict):
             request_metadata = {}
-        from contracts.relocalization_request_id import relocalization_request_identity
+        from core.relocalization_request_id import relocalization_request_identity
         requested_id, recovery_only = relocalization_request_identity(request_metadata)
         if pending_intent is None and requested_id is not None:
             durable_receipt = (

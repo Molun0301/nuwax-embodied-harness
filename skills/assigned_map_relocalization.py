@@ -8,9 +8,9 @@ from functools import wraps
 from contracts.map_activation import AssignedActivationReceipt
 from contracts.map_relocalization import AssignedRelocalizationRequest, AssignedRelocalizationTerminal
 from contracts.map_workspace import MapAssetStatus
-from contracts.relocalization_request_id import relocalization_request_identity
 from contracts.runtime_views import LocalizationSessionStatus
 from core.errors import GatewayError
+from core.relocalization_request_id import relocalization_request_identity
 from skills.assigned_map_activation import activate_assigned_workspace, build_assigned_workspace
 
 LOGGER = logging.getLogger(__name__)

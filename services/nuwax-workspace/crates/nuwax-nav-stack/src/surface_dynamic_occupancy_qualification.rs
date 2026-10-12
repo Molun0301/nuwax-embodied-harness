@@ -1063,7 +1063,7 @@ impl OccupancyHarness {
         let feeder=tokio::spawn(async move {
             let repository=Repository::temporary().unwrap();
             let mut writer=Writer::new(repository.clone(),RESOLUTION,4*1024*1024).unwrap();
-            
+
             let mut previous_stage=Stage::Clear; let mut revision=0i64; let mut sequence=0;
             let mut next_sample=Instant::now();
             let mut ticker=tokio::time::interval(Duration::from_millis(25));

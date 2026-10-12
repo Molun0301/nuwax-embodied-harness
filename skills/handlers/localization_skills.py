@@ -111,7 +111,7 @@ def handle_relocalize_active_map(
     requested_by: Optional[str] = None,
     execution_context: Optional[TaskExecutionControl] = None,
 ) -> Dict[str, Any]:
-    from contracts.relocalization_request_id import relocalization_request_identity
+    from core.relocalization_request_id import relocalization_request_identity
     relocalization_request_identity(payload)
     if execution_context is None:
         ctx.ensure_geometry_runtime_for_capability("relocalize_active_map")

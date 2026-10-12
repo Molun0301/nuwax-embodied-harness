@@ -119,7 +119,7 @@ class ValidatedMapAssetBundleSnapshot:
     repository_inode: int
     repository_fingerprint: str
     repository_observations: tuple = ()
-    assigned_source_cloud_member: Optional[CheckpointMemberIdentity] = None
+    assigned_source_member: Optional[CheckpointMemberIdentity] = None
 
 
 @dataclass(frozen=True)
@@ -240,13 +240,269 @@ class MapAssetBundleRepository:
     ) -> Optional[MapAssetBundle]:
         _require_typed_asset_identity(expected_asset_identity, optional=True)
         self._recover_planar_exchange(map_name)
-        current_dir = self._current_dir(map_name)
+        current_dir = self._current_dir(map_name, expected_asset_identity=expected_asset_identity)
         if current_dir.exists() or current_dir.is_symlink():
             return self._load_validated_bundle(map_name, current_dir, expected_asset_identity=expected_asset_identity,
                 _for_activation=_for_activation)
         if expected_asset_identity is not None or not migrate_legacy:
             return None
         return self._migrate_legacy_latest(map_name)
+
+    def _find_legacy_cloud_import(self, map_name, provenance):
+        """Discover only small published-version documents; admit one exact owner later."""
+        matches = []
+        for path in self._map_dir(map_name).iterdir():
+            if not path.name.startswith("assigned-id-") or path.is_symlink() or not path.is_dir():
+                continue
+            try:
+                manifest = _parse_json_object(_read_regular_file(path / _MANIFEST_FILE_NAME,
+                    "import manifest", maximum_bytes=_MAX_MANIFEST_JSON_BYTES), "import manifest")
+                if (manifest.get("schema_version") != 2 or manifest.get("map_name") != map_name
+                        or manifest.get("legacy_cloud_import_source") != provenance):
+                    continue
+                identity = AssetIdentityV2.model_validate(manifest.get("asset_identity"))
+                if (manifest.get("asset_identity") != identity.model_dump()
+                        or path.name != "assigned-id-" + identity.asset_id):
+                    continue
+                matches.append(identity)
+            except (OSError, ValueError, MapAssetBundleError):
+                # Unrelated/incomplete siblings never gate legacy activation.
+                continue
+        return matches
+
+    def import_legacy_cloud_bundle(self, map_name, *, catalog_created_at, map_directory_owner):
+        """Explicit activation import of eligible schema1 current; old files stay untouched.
+
+        Caller holds the existing executor guard and commits catalog ownership.
+        None retains legacy activation for unsupported or ambiguous sources.
+        """
+        self._recover_planar_exchange(map_name)
+        current = self._map_dir(map_name) / "current"
+        if not current.exists():
+            return None
+        from services.geometry.mapping_backend_checkpoint_store import (
+            MappingBackendCheckpointStore, assign_legacy_cloud_checkpoint)
+        with _StableDirectoryTree(current) as tree:
+            manifest = _parse_json_object(tree.require_file(_MANIFEST_FILE_NAME, "legacy manifest")
+                .read(_MAX_MANIFEST_JSON_BYTES), "legacy manifest")
+            if manifest.get("schema_version") != 1:
+                return None
+            document = _parse_json_object(tree.require_file(_BUNDLE_FILE_NAME, "legacy bundle")
+                .read(_MAX_BUNDLE_JSON_BYTES), "legacy bundle")
+            bundle = MapAssetBundle.model_validate(document)
+            geometry = bundle.geometry_asset
+            source = geometry.metadata.get("mapping_backend_checkpoint") if geometry is not None else None
+            if (bundle.identity_schema_version != 1 or geometry is None or bundle.snapshot is None
+                    or bundle.snapshot.occupancy_grid is None or not geometry.pcd_path
+                    or not isinstance(source, dict) or source.get("present") is not True
+                    or source.get("schema_version") != 1 or source.get("backend_kind") not in {"voxel", "raytracing"}):
+                return None
+            if bundle.map_name != map_name:
+                raise MapAssetBundleValidationError("legacy cloud map name differs")
+            entries = manifest.get("files", [])
+            expected = {entry["path"]: entry["size"] for entry in entries}
+            if len(expected) != len(entries) or set(tree.files) != set(expected) | {_MANIFEST_FILE_NAME}:
+                raise MapAssetBundleValidationError("legacy cloud inventory differs")
+            for relative, size in expected.items():
+                if tree.require_file(relative, "legacy member").size() != size:
+                    raise MapAssetBundleValidationError("legacy cloud member size differs")
+            checkpoint_manifest = _parse_json_object(tree.require_file(source["manifest_path"], "checkpoint manifest")
+                .read(_MAX_CHECKPOINT_JSON_BYTES), "checkpoint manifest")
+            receipts = checkpoint_manifest.get("canonical_receipts")
+            if (checkpoint_manifest.get("fine_archive") is not None or not isinstance(receipts, dict)
+                    or not receipts.get("occupancy") or not receipts.get("cloud")):
+                return None
+            raw_catalog = _parse_json_object(_read_regular_file(self._map_dir(map_name) / "metadata.json",
+                "legacy catalog", maximum_bytes=_MAX_LEGACY_METADATA_JSON_BYTES), "legacy catalog")
+            root_state = os.fstat(tree.root.descriptor)
+            provenance = {"map_name": map_name, "source_reference": {"kind": "current"},
+                "catalog_created_at": catalog_created_at,
+                "map_directory_owner": list(map_directory_owner),
+                "source_directory_owner": [root_state.st_dev, root_state.st_ino],
+                "stored_manifest_alias": raw_catalog.get("asset_manifest_sha256"),
+                "stored_checkpoint_alias": source.get("manifest_sha256"),
+                "files": [list(item) for item in _assigned_observations(tree)]}
+            matches = self._find_legacy_cloud_import(map_name, provenance)
+            if len(matches) > 1:
+                return None
+            if matches:
+                selected = self.get_map_asset_bundle(map_name, migrate_legacy=False,
+                    expected_asset_identity=matches[0], _for_activation=True)
+                if (type(selected) is not _AssignedActivationRead
+                        or selected.bundle.metadata.get("legacy_cloud_import_source") != provenance):
+                    raise MapAssetBundleValidationError("published cloud import source changed")
+                tree.verify_all()
+                return selected
+            stored = MappingBackendCheckpointStore(current).load(source["backend_kind"], schema_version=1)
+            if stored.checkpoint.fine_archive is not None:
+                return None
+            if (stored.manifest_path.relative_to(current).as_posix() != source["manifest_path"]
+                    or stored.manifest_sha256 != source.get("manifest_sha256")
+                    or stored.checkpoint.content_sha256.hex() != source.get("object_sha256")):
+                raise MapAssetBundleValidationError("legacy cloud checkpoint references differ")
+            grid = bundle.snapshot.occupancy_grid
+            occupancy = stored.occupancy_asset
+            import struct
+            import numpy as np
+            from services.geometry.pointcloud_asset_stream import open_pointcloud_chunks
+            if (grid.width != occupancy["width"] or grid.height != occupancy["height"]
+                    or struct.pack("<f", grid.resolution_m) != struct.pack("<f", occupancy["resolution"])
+                    or grid.origin.position.x != occupancy["origin_x"] or grid.origin.position.y != occupancy["origin_y"]
+                    or grid.frame_id.strip().lstrip("/") != occupancy["frame_id"]):
+                return None  # Original legacy activation retains its own admission decision.
+            if geometry.frame_id != occupancy["frame_id"] or bundle.frame_id != occupancy["frame_id"]:
+                return None  # Assigned frame contract is stricter; preserve legacy activation.
+            from datetime import datetime, timezone
+            timestamp = grid.timestamp
+            if not isinstance(timestamp, datetime):
+                return None  # Original legacy activation retains its own admission decision.
+            timestamp = timestamp.replace(tzinfo=timezone.utc) if timestamp.tzinfo is None else timestamp.astimezone(timezone.utc)
+            delta = timestamp - datetime(1970, 1, 1, tzinfo=timezone.utc)
+            timestamp_ns = delta.days * 86400000000000 + delta.seconds * 1000000000 + delta.microseconds * 1000
+            if abs(timestamp_ns - occupancy["timestamp_ns"]) >= 1000:
+                return None  # Original legacy activation retains its own admission decision.
+            cells = bytes(value if value >= 0 else value + 256 for value in grid.data)
+            managed = tree.require_file(geometry.pcd_path, "canonical legacy PCD")
+            managed.verify_named_entry()
+            from services.geometry.checkpoint_payload import CHUNK_BYTES, FrozenPayload
+            with open_pointcloud_chunks(Path("/proc/self/fd/%d" % managed.descriptor), format_hint=".pcd") as (header, chunks):
+                xyz_size = header.points * 12
+                if xyz_size <= CHUNK_BYTES:
+                    xyz = b"".join(np.asarray(points, dtype="<f4", order="C").tobytes()
+                        for points in chunks)
+                else:
+                    def xyz_chunks():
+                        for points in chunks:
+                            points = np.asarray(points, dtype="<f4", order="C")
+                            for start in range(0, len(points), CHUNK_BYTES // 12):
+                                yield points[start:start + CHUNK_BYTES // 12].tobytes()
+                    xyz = FrozenPayload(xyz_chunks(), maximum_bytes=xyz_size)
+            managed.verify_named_entry()
+            if (header.points > 0 and header.points * 12 != len(xyz)
+                    or stored.cloud_asset["frame_id"] != occupancy["frame_id"]):
+                return None  # Original legacy activation retains its own admission decision.
+            if len(cells) != occupancy["raw_data_size"] or len(xyz) != stored.cloud_asset["xyz_size"]:
+                return None  # Original legacy activation retains its own admission decision.
+            # These IDs are allocated for a genuine new immutable import owner,
+            # only after published-version reuse and source preparation.
+            identity = AssetIdentityV2(asset_id=uuid.uuid4().hex)
+            checkpoint, occupancy, cloud = assign_legacy_cloud_checkpoint(stored,
+                canonical_occupancy_data=cells, canonical_cloud_xyz=xyz,
+                checkpoint_id=uuid.uuid4().hex,
+                dense_artifact_id=uuid.uuid4().hex if stored.checkpoint.dense_archive is not None else None)
+            staging = self.create_staging_directory(map_name)
+            try:
+                assigned = MappingBackendCheckpointStore(staging).publish(checkpoint,
+                    occupancy_asset=occupancy, cloud_asset=cloud)
+                assigned_source = {"present": True, "schema_version": 2, "backend_kind": checkpoint.backend_kind,
+                    "checkpoint_id": checkpoint.checkpoint_id,
+                    "manifest_path": assigned.manifest_path.relative_to(staging).as_posix()}
+                for relative, member in tree.files.items():
+                    if (relative in {_BUNDLE_FILE_NAME, _MANIFEST_FILE_NAME}
+                            or relative.startswith("mapping_backend/") or relative.endswith("/geometry_asset.json")):
+                        continue
+                    target = _contained_path(staging, relative)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with target.open("xb") as output:
+                        for offset in range(0, member.size(), _FILE_READ_CHUNK_BYTES):
+                            output.write(member.slice(offset, offset + _FILE_READ_CHUNK_BYTES))
+                geometry = geometry.model_copy(update={"metadata": {
+                    **dict(geometry.metadata), "mapping_backend_checkpoint": assigned_source}})
+                georeference = bundle.georeference
+                if georeference is not None:
+                    georeference = georeference.model_copy(update={"raw_sha256": None})
+                values = {key: getattr(bundle, key) for key in type(bundle).model_fields}
+                values.update(identity_schema_version=2, asset_identity=identity, asset_state="candidate",
+                    manifest_sha256=None, geometry_asset=geometry, georeference=georeference,
+                    metadata={**dict(bundle.metadata), "mapping_backend_checkpoint": assigned_source,
+                        "legacy_cloud_import_source": provenance})
+                candidate = MapAssetBundle(**values)
+                tree.verify_all()
+                self.finalize_assigned_map_asset_bundle(candidate, staging_dir=staging, asset_identity=identity,
+                    _independent_import=True)
+            except BaseException:
+                if staging.exists():
+                    self.discard_staging_directory(map_name, staging)
+                raise
+        return self.get_map_asset_bundle(map_name, migrate_legacy=False,
+            expected_asset_identity=identity, _for_activation=True)
+
+    def import_legacy_planar_bundle(self, map_name):
+        """Import the committed legacy current once; leave its files untouched.
+
+        The caller commits the returned assigned identity using the existing
+        catalog owner transaction. Unselected versions are never guessed.
+        """
+        current = self._map_dir(map_name) / "current"
+        if not current.exists():
+            return None
+        from services.geometry.mapping_backend_checkpoint_store import (
+            MappingBackendCheckpointStore, assign_legacy_planar_checkpoint)
+        with _StableDirectoryTree(current) as tree:
+            manifest = _parse_json_object(tree.require_file(_MANIFEST_FILE_NAME, "legacy manifest")
+                .read(_MAX_MANIFEST_JSON_BYTES), "legacy manifest")
+            if manifest.get("schema_version") != 1:
+                return None
+            document = _parse_json_object(tree.require_file(_BUNDLE_FILE_NAME, "legacy bundle")
+                .read(_MAX_BUNDLE_JSON_BYTES), "legacy bundle")
+            geometry = document.get("geometry_asset")
+            if not isinstance(geometry, dict) or geometry.get("metadata", {}).get("target_kind") != "planar_graph":
+                return None
+            bundle = MapAssetBundle.model_validate(document)
+            if bundle.map_name != map_name:
+                raise MapAssetBundleValidationError("legacy planar map name differs")
+            # Historical digest strings are aliases only. Retain inventory and
+            # regular-file ownership/size checks without content hashing.
+            entries = manifest.get("files", [])
+            expected = {entry["path"]: entry["size"] for entry in entries}
+            if set(tree.files) != set(expected) | {_MANIFEST_FILE_NAME}:
+                raise MapAssetBundleValidationError("legacy planar inventory differs")
+            for relative, size in expected.items():
+                if tree.require_file(relative, "legacy member").size() != size:
+                    raise MapAssetBundleValidationError("legacy planar member size differs")
+            stored = MappingBackendCheckpointStore(current).load("slam_toolbox", schema_version=1)
+            checkpoint, occupancy, cloud = assign_legacy_planar_checkpoint(stored,
+                checkpoint_id=uuid.uuid4().hex, artifact_id=uuid.uuid4().hex)
+            identity = AssetIdentityV2(asset_id=uuid.uuid4().hex)
+            staging = self.create_staging_directory(map_name)
+            try:
+                assigned = MappingBackendCheckpointStore(staging).publish(checkpoint,
+                    occupancy_asset=occupancy, cloud_asset=cloud)
+                object_path = assigned.object_path.relative_to(staging).as_posix()
+                source = {"present": True, "schema_version": 2, "backend_kind": "slam_toolbox",
+                    "checkpoint_id": checkpoint.checkpoint_id,
+                    "manifest_path": assigned.manifest_path.relative_to(staging).as_posix()}
+                old_graph = bundle.geometry_asset.mapping_database_path
+                for relative, managed in tree.files.items():
+                    if (relative in {_BUNDLE_FILE_NAME, _MANIFEST_FILE_NAME, old_graph}
+                            or relative.startswith("mapping_backend/") or relative.endswith("/geometry_asset.json")):
+                        continue
+                    target = _contained_path(staging, relative)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with target.open("xb") as output:
+                        for offset in range(0, managed.size(), _FILE_READ_CHUNK_BYTES):
+                            output.write(managed.slice(offset, offset + _FILE_READ_CHUNK_BYTES))
+                asset_geometry = bundle.geometry_asset
+                assets = [asset.model_copy(update={"path": object_path})
+                    if asset.asset_type == MapGeometryAssetType.PLANAR_GRAPH else asset
+                    for asset in asset_geometry.assets]
+                asset_geometry = asset_geometry.model_copy(update={"mapping_database_path": object_path,
+                    "assets": assets, "metadata": {**dict(asset_geometry.metadata), "mapping_backend_checkpoint": source}})
+                georeference = bundle.georeference
+                if georeference is not None:
+                    georeference = georeference.model_copy(update={"raw_sha256": None})
+                values = {key: getattr(bundle, key) for key in type(bundle).model_fields}
+                values.update(identity_schema_version=2, asset_identity=identity, asset_state="candidate",
+                    manifest_sha256=None, geometry_asset=asset_geometry, georeference=georeference,
+                    metadata={**dict(bundle.metadata), "mapping_backend_checkpoint": source})
+                candidate = MapAssetBundle(**values)
+                tree.verify_all()
+                return self.finalize_assigned_map_asset_bundle(candidate,
+                    staging_dir=staging, asset_identity=identity)
+            except BaseException:
+                if staging.exists():
+                    self.discard_staging_directory(map_name, staging)
+                raise
 
     def get_validated_map_asset_bundle_snapshot(
         self,
@@ -262,7 +518,7 @@ class MapAssetBundleRepository:
             raise MapAssetBundleValidationError("mixed asset identity expectations are forbidden")
         if (self._map_dir(map_name) / _PLANAR_EXCHANGE_JOURNAL).exists():
             raise MapAssetBundleValidationError("二维资产交换尚未完成持久对账")
-        current_dir = self._current_dir(map_name)
+        current_dir = self._current_dir(map_name, expected_asset_identity=expected_asset_identity)
         if not current_dir.exists() and not current_dir.is_symlink():
             return None
         with _StableDirectoryTree(current_dir) as tree:
@@ -281,7 +537,8 @@ class MapAssetBundleRepository:
                 repository_stat = os.fstat(tree.root.descriptor)
                 return ValidatedMapAssetBundleSnapshot(bundle, georeference_bytes,
                     repository_stat.st_dev, repository_stat.st_ino, "", _assigned_observations(tree),
-                    checkpoint.cloud_identity)
+                    checkpoint.graph_reference.member_identity if checkpoint.backend_kind == "slam_toolbox"
+                    else checkpoint.cloud_identity)
             georeference_bytes = b""
             if bundle.georeference is not None:
                 georeference_bytes, _size, georeference_sha256 = tree.require_file(
@@ -419,25 +676,35 @@ class MapAssetBundleRepository:
         staging_dir: Path,
         asset_identity: AssetIdentityV2,
         expected_previous_identity: Optional[AssetIdentityV2] = None,
+        _independent_import: bool = False,
     ) -> MapAssetBundle:
         """Publish an explicitly assigned owner. Legacy/default writers stay v1.
 
-        IDs are supplied once by the candidate owner. Exact same-ID retry checks
-        metadata, complete inventory and streaming body equality, never a hash.
-        Planar replacement awaits a paired checkpoint-v2 planar producer (D2).
+        IDs are supplied once by the candidate owner. Planar retry checks its
+        retained metadata/inventory without comparing graph bodies. Legacy
+        imports publish an independent version; the catalog selects it later.
         """
         _require_typed_asset_identity(asset_identity)
         _require_typed_asset_identity(expected_previous_identity, optional=True)
         if (bundle.identity_schema_version != 2 or bundle.asset_identity != asset_identity
                 or bundle.asset_state not in {"candidate", "finalized"}):
             raise MapAssetBundleValidationError("candidate does not own the exact assigned asset identity")
-        if expected_previous_identity is not None:
+        map_name = bundle.map_name
+        independent = _independent_import or (expected_previous_identity is not None
+            and self.has_assigned_version(map_name, expected_previous_identity))
+        if expected_previous_identity is not None and not independent:
             return self._replace_assigned_cloud_bundle(bundle, staging_dir=staging_dir,
                 asset_identity=asset_identity, expected_previous_identity=expected_previous_identity)
-        map_name = bundle.map_name
         staging = self._require_staging_directory(map_name, staging_dir, must_exist=True)
         owner = self._staging_owners[staging]
-        current = self._current_dir(map_name)
+        current = self._assigned_version_dir(map_name, asset_identity) if independent else self._current_dir(map_name)
+        if not independent and current.exists():
+            with _StableDirectoryTree(current) as tree:
+                header = _parse_json_object(tree.require_file(_MANIFEST_FILE_NAME, "current manifest")
+                    .read(_MAX_MANIFEST_JSON_BYTES), "current manifest")
+                independent = header.get("schema_version") == 1
+        if independent:
+            current = self._assigned_version_dir(map_name, asset_identity)
         try:
             finalized = bundle.model_copy(update={"asset_state": "finalized"})
             # Validate the source generation/descriptors before any outer body
@@ -446,7 +713,8 @@ class MapAssetBundleRepository:
                 source = self._assigned_checkpoint_source(tree, finalized.geometry_asset)
                 tree.verify_all()
             self._write_assigned_candidate_bundle(finalized, staging)
-            self._write_assigned_manifest(finalized, staging, source)
+            self._write_assigned_manifest(finalized, staging, source,
+                import_source=finalized.metadata["legacy_cloud_import_source"] if _independent_import else None)
             with _StableDirectoryTree(staging) as candidate_tree:
                 _unused, validated = self._validate_open_directory(map_name, candidate_tree,
                     expected_asset_identity=asset_identity)
@@ -478,9 +746,12 @@ class MapAssetBundleRepository:
                             expected_asset_identity=asset_identity)
                         if set(previous_tree.files) != set(candidate_tree.files):
                             raise MapAssetBundleValidationError("assigned asset ID reused with different inventory")
-                        for relative, candidate_file in candidate_tree.files.items():
-                            if not candidate_file.streaming_equals(previous_tree.files[relative]):
-                                raise MapAssetBundleValidationError("assigned asset ID reused with different body: %s" % relative)
+                        if source != self._assigned_checkpoint_source(previous_tree, existing.geometry_asset):
+                            raise MapAssetBundleValidationError("assigned asset ID reused with different checkpoint source")
+                        if source["manifest"]["backend_kind"] != "slam_toolbox":
+                            for relative, candidate_file in candidate_tree.files.items():
+                                if not candidate_file.streaming_equals(previous_tree.files[relative]):
+                                    raise MapAssetBundleValidationError("assigned asset ID reused with different body: %s" % relative)
                         previous_tree.verify_all()
                         candidate_tree.verify_all()
                         return existing
@@ -677,9 +948,12 @@ class MapAssetBundleRepository:
                 if old_identity == asset_identity:
                     if set(previous_tree.files) != set(candidate_tree.files):
                         raise MapAssetBundleValidationError("assigned asset ID reused with different inventory")
-                    for relative, candidate_file in candidate_tree.files.items():
-                        if not candidate_file.streaming_equals(previous_tree.files[relative]):
-                            raise MapAssetBundleValidationError(f"assigned asset ID reused with different body: {relative}")
+                    if source != old_source:
+                        raise MapAssetBundleValidationError("assigned asset ID reused with different checkpoint source")
+                    if source["manifest"]["backend_kind"] != "slam_toolbox":
+                        for relative, candidate_file in candidate_tree.files.items():
+                            if not candidate_file.streaming_equals(previous_tree.files[relative]):
+                                raise MapAssetBundleValidationError(f"assigned asset ID reused with different body: {relative}")
                 elif (asset_identity == expected_previous_identity
                         or source["manifest"]["checkpoint_id"] == old_source["manifest"]["checkpoint_id"]):
                     raise MapAssetBundleValidationError("assigned replacement requires a fresh asset and checkpoint owner")
@@ -762,7 +1036,7 @@ class MapAssetBundleRepository:
         _atomic_write_relative(staging, relative, _model_json_bytes(geometry), create_parents=True)
         _atomic_write_relative(staging, _BUNDLE_FILE_NAME, _model_json_bytes(bundle))
 
-    def _write_assigned_manifest(self, bundle, directory, source):
+    def _write_assigned_manifest(self, bundle, directory, source, *, import_source=None):
         with _StableDirectoryTree(directory) as tree:
             entries = [{"path": path, "size": managed.size()}
                        for path, managed in sorted(tree.files.items()) if path != _MANIFEST_FILE_NAME]
@@ -770,6 +1044,8 @@ class MapAssetBundleRepository:
         document = {"schema_version": 2, "map_name": bundle.map_name, "bundle_path": _BUNDLE_FILE_NAME,
             "asset_identity": bundle.asset_identity.model_dump(mode="json"),
             "checkpoint_source": source, "files": entries}
+        if import_source is not None:
+            document["legacy_cloud_import_source"] = import_source
         payload = _canonical_json_bytes(document)
         if len(entries) > _MAX_MANIFEST_FILE_ENTRIES or len(payload) > _MAX_MANIFEST_JSON_BYTES:
             raise MapAssetBundleValidationError("assigned manifest exceeds its budget")
@@ -777,7 +1053,10 @@ class MapAssetBundleRepository:
 
     def _validate_assigned_open_directory(self, map_name, tree, manifest, *, expected_asset_identity=None,
                                           _for_activation=False):
-        if set(manifest) != {"schema_version", "map_name", "bundle_path", "asset_identity", "checkpoint_source", "files"}:
+        fields = {"schema_version", "map_name", "bundle_path", "asset_identity", "checkpoint_source", "files"}
+        if "legacy_cloud_import_source" in manifest:
+            fields.add("legacy_cloud_import_source")
+        if set(manifest) != fields:
             raise MapAssetBundleValidationError("assigned manifest has missing or mixed-generation fields")
         if manifest["map_name"] != map_name or manifest["bundle_path"] != _BUNDLE_FILE_NAME:
             raise MapAssetBundleValidationError("assigned manifest map/path mismatch")
@@ -818,6 +1097,10 @@ class MapAssetBundleRepository:
             raise MapAssetBundleValidationError("invalid assigned bundle contract") from exc
         if bundle.map_name != map_name:
             raise MapAssetBundleValidationError("assigned bundle map mismatch")
+        if ("legacy_cloud_import_source" in manifest
+                and (not isinstance(manifest["legacy_cloud_import_source"], dict)
+                    or bundle.metadata.get("legacy_cloud_import_source") != manifest["legacy_cloud_import_source"])):
+            raise MapAssetBundleValidationError("assigned import provenance differs from its bundle")
         source = self._assigned_checkpoint_source(tree, bundle.geometry_asset)
         if source != manifest["checkpoint_source"]:
             raise MapAssetBundleValidationError("assigned checkpoint source/member descriptors changed")
@@ -869,8 +1152,8 @@ class MapAssetBundleRepository:
         if not isinstance(document, dict) or type(document.get("schema_version")) is not int or document["schema_version"] != 2:
             raise MapAssetBundleValidationError("assigned outer asset requires checkpoint schema 2")
         kind, checkpoint_id = document.get("backend_kind"), document.get("checkpoint_id")
-        if kind not in {"voxel", "raytracing"}:
-            raise MapAssetBundleValidationError("assigned planar checkpoint producer is not yet paired")
+        if kind not in {"voxel", "raytracing", "slam_toolbox"}:
+            raise MapAssetBundleValidationError("unsupported assigned checkpoint backend")
         root = "mapping_backend/%s/" % kind
         if (source["selector_path"] != root + "checkpoint-v2.json"
                 or source["manifest_path"] != root + "manifests/id-%s.json" % checkpoint_id):
@@ -890,8 +1173,8 @@ class MapAssetBundleRepository:
                 or type(raw["schema_version"]) is not int or raw["schema_version"] != 2):
             raise MapAssetBundleValidationError("assigned asset requires explicit checkpoint-v2 source, without digest aliases")
         kind, checkpoint_id = raw["backend_kind"], raw["checkpoint_id"]
-        if kind not in {"voxel", "raytracing"}:
-            raise MapAssetBundleValidationError("assigned planar checkpoint producer is not yet paired")
+        if kind not in {"voxel", "raytracing", "slam_toolbox"}:
+            raise MapAssetBundleValidationError("unsupported assigned checkpoint backend")
         root = "mapping_backend/%s/" % kind
         source = {"selector_path": root + "checkpoint-v2.json", "manifest_path": raw["manifest_path"]}
         if raw["manifest_path"] != root + "manifests/id-%s.json" % checkpoint_id:
@@ -919,7 +1202,8 @@ class MapAssetBundleRepository:
                     retained = _artifact_from_document(descriptor, role)
                 except Exception as exc:
                     raise MapAssetBundleValidationError("invalid assigned artifact companion") from exc
-                expected = checkpoint.fine_reference if role == "fine_map" else checkpoint.dense_reference
+                expected = (checkpoint.graph_reference if role == "planar_graph" else
+                    checkpoint.fine_reference if role == "fine_map" else checkpoint.dense_reference)
                 if retained != expected:
                     raise MapAssetBundleValidationError("assigned artifact companion differs from retained descriptor")
         return source
@@ -952,8 +1236,8 @@ class MapAssetBundleRepository:
         root = "mapping_backend/%s/" % checkpoint.backend_kind
         bodies = {role: BorrowedPayload(tree.require_file(root + descriptor["path"], role))
                   for role, descriptor in members.items()}
-        checkpoint = replace(checkpoint, payload=bodies["backend_state"],
-            canonical_occupancy_data=bodies["canonical_occupancy"], canonical_cloud_xyz=bodies["canonical_cloud"],
+        checkpoint = replace(checkpoint, payload=bodies["planar_graph" if checkpoint.backend_kind == "slam_toolbox" else "backend_state"],
+            canonical_occupancy_data=bodies["canonical_occupancy"], canonical_cloud_xyz=bodies.get("canonical_cloud"),
             fine_archive=bodies.get("fine_map"), dense_archive=bodies.get("dense_cloud"))
         try:
             MappingBackendCheckpointStore.validate_checkpoint_bundle(checkpoint,
@@ -1056,7 +1340,7 @@ class MapAssetBundleRepository:
                 self.discard_staging_directory(map_name, staging)
 
     def current_directory(self, map_name: str) -> Path:
-        """Return the fixed bundle root; callers must still load through validation."""
+        """Resolve the committed bundle root; callers still load through validation."""
 
         return self._current_dir(map_name)
 
@@ -1897,8 +2181,28 @@ class MapAssetBundleRepository:
         if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISDIR(path_stat.st_mode):
             raise MapAssetBundleValidationError("%s必须是真实目录。" % description)
 
-    def _current_dir(self, map_name: str) -> Path:
+    def _assigned_version_dir(self, map_name, asset_identity):
+        _require_typed_asset_identity(asset_identity)
+        return self._map_dir(map_name) / ("assigned-id-" + asset_identity.asset_id)
+
+    def _current_dir(self, map_name: str, *, expected_asset_identity=None) -> Path:
+        # Only the caller's retained identity or the committed catalog chooses
+        # an independent version. Uncommitted sibling directories are ignored.
+        identity = expected_asset_identity
+        if identity is None:
+            from services.mapping.catalog import MapCatalogRepository
+            asset = MapCatalogRepository(str(self._root_dir)).get_map_asset(map_name)
+            if asset is not None and asset.identity_schema_version == 2:
+                identity = asset.asset_identity
+        if identity is not None:
+            selected = self._assigned_version_dir(map_name, identity)
+            if selected.exists() or selected.is_symlink():
+                return selected
         return self._map_dir(map_name) / "current"
+
+    def has_assigned_version(self, map_name, asset_identity):
+        path = self._assigned_version_dir(map_name, asset_identity)
+        return path.exists() or path.is_symlink()
 
     def _map_dir(self, map_name: str) -> Path:
         resolved_name = str(map_name or "").strip()

@@ -65,7 +65,7 @@ export function decodeDenseChunk(metadata, buffer, epoch, offset, expectedDispla
       || metadata.bounds_min.some((value, axis) => value > metadata.bounds_max[axis])) {
     throw new Error('完整点云范围非法');
   }
-  const positions = new Float32Array(rangeBytes ? buffer.slice(rangeBytes) : buffer);
+  const positions = new Float32Array(buffer, rangeBytes);
   for (const value of positions) if (!Number.isFinite(value)) throw new Error('完整点云包含无效坐标');
   return { positions, total, metadata, ranges };
 }
@@ -179,7 +179,12 @@ export class DensePointCloudLayer {
       if (!count) { geometry.dispose(); this.group.remove(mesh); continue; }
       const attribute = geometry.getAttribute('position');
       geometry.setDrawRange(0, count);
-      attribute.clearUpdateRanges(); attribute.addUpdateRange(0, count * 3); attribute.needsUpdate = true;
+      const start = index === firstChanged ? ranges[0][0] % GEOMETRY_POINTS : 0;
+      // 只上传压缩后实际移动的存活点，并保留同帧尚未上传的追加或删除区间。
+      if (start < count) {
+        attribute.addUpdateRange(start * 3, (count - start) * 3);
+        attribute.needsUpdate = true;
+      }
       geometry.boundingBox.setFromArray(attribute.array.subarray(0, count * 3));
       geometry.boundingSphere = geometry.boundingBox.getBoundingSphere(new THREE.Sphere());
     }

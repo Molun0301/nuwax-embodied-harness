@@ -1,24 +1,22 @@
 //! Durable publication for mapping CLI file artifacts.
 //!
-//! Every artifact is built in a uniquely named sibling file, validated, and
+//! Every artifact is built in a uniquely owned sibling directory, validated, and
 //! synced before an atomic no-clobber link exposes the final path. Keeping the
-//! staging file beside the destination makes the publication boundary stay on
+//! staging directory beside the destination makes the publication boundary stay on
 //! one filesystem.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
 use serde_json::{json, Map, Value};
 
-const STAGE_DOMAIN: &str = ".nuwax-mapping-cli-stage-v1-";
-const BUNDLE_STAGE_DOMAIN: &str = ".nuwax-mapping-cli-map-bundle-v1-";
+const STAGE_DOMAIN: &str = ".nuwax-mapping-cli-stage-v2-";
 const MAX_STAGE_ATTEMPTS: usize = 32;
 const MAX_STAGES_PER_ARTIFACT: usize = 64;
 const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
@@ -177,6 +175,10 @@ impl std::error::Error for ArtifactPublicationError {
 /// Map bundle directory publication outcomes that callers must distinguish.
 #[derive(Debug)]
 pub(crate) enum MapBundlePublicationError {
+    PublishedCleanupFailure {
+        path: PathBuf,
+        cleanup: ArtifactCleanupFailure,
+    },
     Conflict {
         path: PathBuf,
         cleanup: Option<ArtifactCleanupFailure>,
@@ -200,6 +202,7 @@ pub(crate) enum MapBundlePublicationError {
 impl fmt::Display for MapBundlePublicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PublishedCleanupFailure { path, cleanup } => write!(formatter, "map bundle {} is durably published, but {cleanup}", path.display()),
             Self::Conflict { path, cleanup } => {
                 write!(
                     formatter,
@@ -246,6 +249,7 @@ impl fmt::Display for MapBundlePublicationError {
 impl std::error::Error for MapBundlePublicationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::PublishedCleanupFailure { cleanup, .. } => Some(cleanup),
             Self::Conflict {
                 cleanup: Some(cleanup),
                 ..
@@ -259,23 +263,24 @@ impl std::error::Error for MapBundlePublicationError {
 }
 
 /// Stage3 权威候选资产的 CLI 边界镜像。复杂字段以 canonical JSON bytes
-/// 传递，避免 CLI 依赖 Geometry crate，同时保证 Stage5 所需字段逐一保真。
+/// 传递，避免 CLI 依赖 Geometry crate，保留离线候选原始身份与来源，不分配 Stage5 资产。
 #[derive(Clone, Debug)]
-pub struct OfflineCandidateAssetsV1Dto {
+pub struct OfflineCandidateAssetsV2Dto {
     pub schema_version: u32,
     pub snapshot_schema_version: u32,
     pub identity_json: Vec<u8>,
+    pub source_provenance_json: Vec<u8>,
     pub backend_kind: String,
     pub last_source_timestamp_ns: u64,
     pub georeference_json: Vec<u8>,
     pub processing_receipt_json: Vec<u8>,
     pub map_snapshot_seed_json: Vec<u8>,
     pub deferred_json: Vec<u8>,
-    pub members: Vec<OfflineCandidateAssetMemberV1Dto>,
+    pub members: Vec<OfflineCandidateAssetMemberV2Dto>,
 }
 
 #[derive(Clone, Debug)]
-pub struct OfflineCandidateAssetMemberV1Dto {
+pub struct OfflineCandidateAssetMemberV2Dto {
     pub relative_path_intent: String,
     pub media_type: String,
     pub encoding: String,
@@ -284,42 +289,41 @@ pub struct OfflineCandidateAssetMemberV1Dto {
     pub receipt_media_type: String,
     pub receipt_encoding: String,
     pub size_bytes: u64,
-    pub sha256_hex: String,
+    pub source_commit_id_json: Vec<u8>,
     pub source_binding: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OfflineCandidateMemberV1 {
+pub struct OfflineCandidateMemberV2 {
     pub relative_path: String,
     pub media_type: String,
     pub encoding: String,
     pub bytes: Vec<u8>,
     pub size_bytes: u64,
-    pub sha256_hex: String,
+    pub source_commit_id_json: Vec<u8>,
     pub source_binding: String,
 }
 
 #[derive(Clone, Debug)]
-pub struct OfflineCheckpointBindingV1 {
+pub struct OfflineCheckpointBindingV2 {
     pub object_path: String,
     pub object_size_bytes: u64,
-    pub object_sha256_hex: String,
     pub manifest_path: String,
     pub selector_path: String,
 }
 
-impl OfflineCandidateAssetsV1Dto {
-    pub fn into_publish_bundle(self) -> anyhow::Result<OfflineCandidateBundleV1> {
-        if self.schema_version != 1 || self.snapshot_schema_version != 2 {
-            bail!("unsupported OfflineCandidateAssetsV1 schema");
+impl OfflineCandidateAssetsV2Dto {
+    pub fn into_publish_bundle(self) -> anyhow::Result<OfflineCandidateBundleV2> {
+        if self.schema_version != 2 || self.snapshot_schema_version != 3 {
+            bail!("unsupported OfflineCandidateAssetsV2 schema");
         }
-        let identity = canonical_boundary_json("identity", self.identity_json)?;
-        let georeference = canonical_boundary_json("georeference", self.georeference_json)?;
-        let processing_receipt =
-            canonical_boundary_json("processing_receipt", self.processing_receipt_json)?;
-        let map_snapshot_seed =
-            canonical_boundary_json("map_snapshot_seed", self.map_snapshot_seed_json)?;
-        let deferred = canonical_boundary_json("deferred", self.deferred_json)?;
+        let identity = canonical_boundary_json("identity", &self.identity_json)?;
+        let _georeference = canonical_boundary_json("georeference", &self.georeference_json)?;
+        let _processing_receipt =
+            canonical_boundary_json("processing_receipt", &self.processing_receipt_json)?;
+        let _map_snapshot_seed =
+            canonical_boundary_json("map_snapshot_seed", &self.map_snapshot_seed_json)?;
+        let _deferred = canonical_boundary_json("deferred", &self.deferred_json)?;
         let map_name = identity
             .get("map_name")
             .and_then(Value::as_str)
@@ -335,10 +339,9 @@ impl OfflineCandidateAssetsV1Dto {
             .iter()
             .find(|member| member.encoding == "checkpoint_object_v1")
             .ok_or_else(|| anyhow::anyhow!("candidate has no checkpoint object"))?;
-        let checkpoint = OfflineCheckpointBindingV1 {
+        let checkpoint = OfflineCheckpointBindingV2 {
             object_path: checkpoint_member.relative_path_intent.clone(),
             object_size_bytes: checkpoint_member.size_bytes,
-            object_sha256_hex: checkpoint_member.sha256_hex.clone(),
             manifest_path: "mapping_backend/checkpoint-manifest.json".to_owned(),
             selector_path: "mapping_backend/checkpoint-selector.json".to_owned(),
         };
@@ -355,38 +358,39 @@ impl OfflineCandidateAssetsV1Dto {
                         member.relative_path_intent
                     );
                 }
-                Ok(OfflineCandidateMemberV1 {
+                Ok(OfflineCandidateMemberV2 {
                     relative_path: member.relative_path_intent,
                     media_type: member.media_type,
                     encoding: member.encoding,
                     bytes: member.bytes,
                     size_bytes: member.size_bytes,
-                    sha256_hex: member.sha256_hex,
+                    source_commit_id_json: member.source_commit_id_json,
                     source_binding: member.source_binding,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(OfflineCandidateBundleV1 {
+        Ok(OfflineCandidateBundleV2 {
             schema_version: self.schema_version,
             snapshot_schema_version: self.snapshot_schema_version,
             map_name,
             frame_id,
             backend_kind: self.backend_kind,
             last_source_timestamp_ns: self.last_source_timestamp_ns,
-            identity_json: canonical_json_value(&identity)?,
-            georeference_json: canonical_json_value(&georeference)?,
-            processing_receipt_json: canonical_json_value(&processing_receipt)?,
-            map_snapshot_seed_json: canonical_json_value(&map_snapshot_seed)?,
-            deferred_json: canonical_json_value(&deferred)?,
+            identity_json: self.identity_json,
+            source_provenance_json: self.source_provenance_json,
+            georeference_json: self.georeference_json,
+            processing_receipt_json: self.processing_receipt_json,
+            map_snapshot_seed_json: self.map_snapshot_seed_json,
+            deferred_json: self.deferred_json,
             members,
             checkpoint,
         })
     }
 }
 
-fn canonical_boundary_json(label: &str, bytes: Vec<u8>) -> anyhow::Result<Value> {
+fn canonical_boundary_json(label: &str, bytes: &[u8]) -> anyhow::Result<Value> {
     let value: Value =
-        serde_json::from_slice(&bytes).with_context(|| format!("{label} is not JSON"))?;
+        serde_json::from_slice(bytes).with_context(|| format!("{label} is not JSON"))?;
     if canonical_json_value(&value)? != bytes {
         bail!("{label} must be canonical JSON");
     }
@@ -394,7 +398,7 @@ fn canonical_boundary_json(label: &str, bytes: Vec<u8>) -> anyhow::Result<Value>
 }
 
 #[derive(Clone, Debug)]
-pub struct OfflineCandidateBundleV1 {
+pub struct OfflineCandidateBundleV2 {
     pub schema_version: u32,
     pub snapshot_schema_version: u32,
     pub map_name: String,
@@ -402,43 +406,44 @@ pub struct OfflineCandidateBundleV1 {
     pub backend_kind: String,
     pub last_source_timestamp_ns: u64,
     pub identity_json: Vec<u8>,
+    pub source_provenance_json: Vec<u8>,
     pub georeference_json: Vec<u8>,
     pub processing_receipt_json: Vec<u8>,
     pub map_snapshot_seed_json: Vec<u8>,
     pub deferred_json: Vec<u8>,
-    pub members: Vec<OfflineCandidateMemberV1>,
-    pub checkpoint: OfflineCheckpointBindingV1,
+    pub members: Vec<OfflineCandidateMemberV2>,
+    pub checkpoint: OfflineCheckpointBindingV2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OfflinePublishedBundleV1 {
+pub struct OfflinePublishedBundleV2 {
     pub final_directory: PathBuf,
-    pub manifest_sha256_hex: String,
+    pub source_commit_id_json: Vec<u8>,
 }
 
 /// 物化并发布 Stage4 离线候选；不接入 map 命令，也不生成 Stage5 资产。
 pub fn publish_offline_candidate_bundle(
     final_directory: &Path,
-    candidate: &OfflineCandidateBundleV1,
-) -> anyhow::Result<OfflinePublishedBundleV1> {
-    validate_offline_candidate(candidate)?;
-    let manifest_sha256_hex = publish_map_bundle_stable(
+    candidate: &OfflineCandidateBundleV2,
+) -> anyhow::Result<OfflinePublishedBundleV2> {
+    let provenance = validate_offline_candidate(candidate)?;
+    publish_map_bundle_stable(
         final_directory,
-        |staging| materialize_offline_candidate(staging, candidate),
+        |staging| materialize_offline_candidate(staging, candidate, &provenance),
         |staging| {
-            validate_offline_candidate_directory(staging, candidate)?;
-            Ok(digest_hex(&read_fresh_file(staging, "manifest.json")?))
+            validate_offline_candidate_directory(staging, candidate, &provenance)?;
+            Ok(())
         },
     )?;
-    Ok(OfflinePublishedBundleV1 {
+    Ok(OfflinePublishedBundleV2 {
         final_directory: final_directory.to_path_buf(),
-        manifest_sha256_hex,
+        source_commit_id_json: canonical_json_value(&provenance["commit_id"])?,
     })
 }
 
-fn validate_offline_candidate(candidate: &OfflineCandidateBundleV1) -> anyhow::Result<()> {
-    if candidate.schema_version != 1
-        || candidate.snapshot_schema_version != 2
+fn validate_offline_candidate(candidate: &OfflineCandidateBundleV2) -> anyhow::Result<Value> {
+    if candidate.schema_version != 2
+        || candidate.snapshot_schema_version != 3
         || !matches!(candidate.backend_kind.as_str(), "voxel" | "raytracing")
     {
         bail!("invalid Stage4 candidate schema or backend kind");
@@ -450,8 +455,10 @@ fn validate_offline_candidate(candidate: &OfflineCandidateBundleV1) -> anyhow::R
         ("map_snapshot_seed", &candidate.map_snapshot_seed_json),
         ("deferred", &candidate.deferred_json),
     ] {
-        canonical_boundary_json(label, bytes.clone())?;
+        canonical_boundary_json(label, bytes)?;
     }
+    let provenance = canonical_boundary_json("source_provenance", &candidate.source_provenance_json)?;
+    let commit = source_commit(&provenance)?;
     let mut paths = Vec::new();
     for member in &candidate.members {
         validate_relative_path(&member.relative_path)?;
@@ -472,7 +479,7 @@ fn validate_offline_candidate(candidate: &OfflineCandidateBundleV1) -> anyhow::R
             );
         }
         if member.size_bytes != member.bytes.len() as u64
-            || member.sha256_hex != digest_hex(&member.bytes)
+            || canonical_boundary_json("source_commit_id", &member.source_commit_id_json)? != *commit
         {
             bail!(
                 "candidate receipt does not match bytes: {}",
@@ -493,7 +500,7 @@ fn validate_offline_candidate(candidate: &OfflineCandidateBundleV1) -> anyhow::R
     }
     if checkpoint.relative_path != candidate.checkpoint.object_path
         || checkpoint.size_bytes != candidate.checkpoint.object_size_bytes
-        || checkpoint.sha256_hex != candidate.checkpoint.object_sha256_hex
+        || checkpoint.relative_path != format!("mapping_backend/{}/objects/checkpoint.bin", candidate.backend_kind)
     {
         bail!("checkpoint binding mismatch");
     }
@@ -511,7 +518,23 @@ fn validate_offline_candidate(candidate: &OfflineCandidateBundleV1) -> anyhow::R
             }
         }
     }
-    Ok(())
+    Ok(provenance)
+}
+
+fn source_commit(provenance: &Value) -> anyhow::Result<&Value> {
+    let commit = provenance.get("commit_id")
+        .ok_or_else(|| anyhow::anyhow!("source provenance commit_id is missing"))?;
+    let nonce = commit.get("boot_nonce").and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("source commit boot_nonce must be decimal text"))?;
+    let parsed = nonce.parse::<u128>().context("invalid source commit boot_nonce")?;
+    if parsed.to_string() != nonce || parsed == 0
+        || commit.get("sequence").and_then(Value::as_u64).filter(|v| *v > 0).is_none()
+        || provenance.pointer("/occupancy_receipt/commit_id") != Some(commit)
+        || provenance.pointer("/cloud_receipt/commit_id") != Some(commit)
+    {
+        bail!("source provenance commit binding mismatch");
+    }
+    Ok(commit)
 }
 
 fn path_conflicts(left: &str, right: &str) -> bool {
@@ -538,7 +561,8 @@ fn validate_relative_path(path: &str) -> anyhow::Result<()> {
 
 fn materialize_offline_candidate(
     staging: &StableDirectory,
-    candidate: &OfflineCandidateBundleV1,
+    candidate: &OfflineCandidateBundleV2,
+    provenance: &Value,
 ) -> anyhow::Result<()> {
     for member in &candidate.members {
         staging.write_synced_beneath(Path::new(&member.relative_path), &member.bytes)?;
@@ -548,16 +572,19 @@ fn materialize_offline_candidate(
         .iter()
         .find(|m| m.encoding == "checkpoint_object_v1")
         .unwrap();
+    let commit = &provenance["commit_id"];
     let manifest = canonical_json_value(&json!({
-        "schema_version": 1, "backend_kind": candidate.backend_kind,
+        "schema_version": 2, "backend_kind": candidate.backend_kind,
         "processing_receipt": serde_json::from_slice::<Value>(&candidate.processing_receipt_json)?,
+        "source_provenance": provenance,
         "object": {"path": object.relative_path, "media_type": object.media_type, "encoding": object.encoding,
-            "source_binding": object.source_binding, "size": object.size_bytes, "sha256": object.sha256_hex}
+            "source_binding": object.source_binding, "size": object.size_bytes, "source_commit_id": commit}
     }))?;
     staging.write_synced_beneath(Path::new(&candidate.checkpoint.manifest_path), &manifest)?;
     let selector = canonical_json_value(&json!({
-        "schema_version": 1, "backend_kind": candidate.backend_kind,
-        "manifest": {"path": candidate.checkpoint.manifest_path, "sha256": digest_hex(&manifest)}
+        "schema_version": 2, "backend_kind": candidate.backend_kind,
+        "source_commit_id": commit,
+        "manifest": {"path": candidate.checkpoint.manifest_path}
     }))?;
     staging.write_synced_beneath(Path::new(&candidate.checkpoint.selector_path), &selector)?;
     let mut files = candidate
@@ -570,7 +597,7 @@ fn materialize_offline_candidate(
                 "encoding": member.encoding,
                 "source_binding": member.source_binding,
                 "size": member.size_bytes,
-                "sha256": member.sha256_hex,
+                "source_commit_id": commit,
             })
         })
         .collect::<Vec<_>>();
@@ -580,7 +607,7 @@ fn materialize_offline_candidate(
         "encoding": "canonical_json_v1",
         "source_binding": "stage4_checkpoint_manifest",
         "size": manifest.len(),
-        "sha256": digest_hex(&manifest),
+        "source_commit_id": commit,
     }));
     files.push(json!({
         "path": candidate.checkpoint.selector_path,
@@ -588,22 +615,23 @@ fn materialize_offline_candidate(
         "encoding": "canonical_json_v1",
         "source_binding": "stage4_checkpoint_selector",
         "size": selector.len(),
-        "sha256": digest_hex(&selector),
+        "source_commit_id": commit,
     }));
     files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
     let top = canonical_json_value(&json!({
-        "schema_version": 1, "map_name": candidate.map_name, "frame_id": candidate.frame_id,
+        "schema_version": 2, "map_name": candidate.map_name, "frame_id": candidate.frame_id,
         "backend_kind": candidate.backend_kind,
         "snapshot_schema_version": candidate.snapshot_schema_version,
         "last_source_timestamp_ns": candidate.last_source_timestamp_ns,
         "identity": serde_json::from_slice::<Value>(&candidate.identity_json)?,
         "georeference": serde_json::from_slice::<Value>(&candidate.georeference_json)?,
         "processing_receipt": serde_json::from_slice::<Value>(&candidate.processing_receipt_json)?,
+        "source_provenance": provenance,
         "map_snapshot_seed": serde_json::from_slice::<Value>(&candidate.map_snapshot_seed_json)?,
         "deferred": serde_json::from_slice::<Value>(&candidate.deferred_json)?,
         "files": files,
         "checkpoint": {"selector_path": candidate.checkpoint.selector_path, "manifest_path": candidate.checkpoint.manifest_path,
-            "object_path": object.relative_path, "manifest_sha256": digest_hex(&manifest), "object_sha256": object.sha256_hex}
+            "object_path": object.relative_path, "source_commit_id": commit}
     }))?;
     staging.write_synced_beneath(Path::new("manifest.json"), &top)?;
     Ok(())
@@ -611,9 +639,11 @@ fn materialize_offline_candidate(
 
 fn validate_offline_candidate_directory(
     root: &StableDirectory,
-    candidate: &OfflineCandidateBundleV1,
+    candidate: &OfflineCandidateBundleV2,
+    provenance: &Value,
 ) -> anyhow::Result<()> {
-    // 每次验证都以新鲜 FD 打开最终 staging inode，并复核完整的 JSON 绑定链。
+    // 原文件以 fresh no-follow FD 核尺寸；小型 JSON 仍读取并核对规范化来源绑定。
+    let commit = &provenance["commit_id"];
     let mut expected = BTreeSet::new();
     for member in &candidate.members {
         expected.insert(member.relative_path.clone());
@@ -621,7 +651,6 @@ fn validate_offline_candidate_directory(
             root,
             &member.relative_path,
             member.size_bytes,
-            &member.sha256_hex,
         )?;
     }
     let object = candidate
@@ -638,12 +667,12 @@ fn validate_offline_candidate_directory(
     if canonical_json_value(&manifest)? != manifest_bytes {
         bail!("checkpoint manifest is not canonical JSON");
     }
-    if manifest.get("schema_version") != Some(&json!(1))
+    if manifest.get("schema_version") != Some(&json!(2))
         || manifest.get("backend_kind") != Some(&json!(candidate.backend_kind))
         || manifest.get("processing_receipt")
             != Some(&canonical_boundary_json(
                 "processing_receipt",
-                candidate.processing_receipt_json.clone(),
+                &candidate.processing_receipt_json,
             )?)
         || manifest.pointer("/object/path").and_then(Value::as_str) != Some(&object.relative_path)
         || manifest
@@ -657,8 +686,8 @@ fn validate_offline_candidate_directory(
             .and_then(Value::as_str)
             != Some(object.source_binding.as_str())
         || manifest.pointer("/object/size").and_then(Value::as_u64) != Some(object.size_bytes)
-        || manifest.pointer("/object/sha256").and_then(Value::as_str)
-            != Some(object.sha256_hex.as_str())
+        || manifest.get("source_provenance") != Some(provenance)
+        || manifest.pointer("/object/source_commit_id") != Some(commit)
     {
         bail!("checkpoint manifest binding mismatch");
     }
@@ -667,12 +696,11 @@ fn validate_offline_candidate_directory(
     let selector: Value =
         serde_json::from_slice(&selector_bytes).context("checkpoint selector is not JSON")?;
     if canonical_json_value(&selector)? != selector_bytes
-        || selector.get("schema_version") != Some(&json!(1))
+        || selector.get("schema_version") != Some(&json!(2))
         || selector.get("backend_kind") != Some(&json!(candidate.backend_kind))
         || selector.pointer("/manifest/path").and_then(Value::as_str)
             != Some(&candidate.checkpoint.manifest_path)
-        || selector.pointer("/manifest/sha256").and_then(Value::as_str)
-            != Some(&digest_hex(&manifest_bytes))
+        || selector.get("source_commit_id") != Some(commit)
     {
         bail!("checkpoint selector binding mismatch");
     }
@@ -681,7 +709,7 @@ fn validate_offline_candidate_directory(
     let top: Value =
         serde_json::from_slice(&top_bytes).context("top-level manifest is not JSON")?;
     if canonical_json_value(&top)? != top_bytes
-        || top.get("schema_version") != Some(&json!(1))
+        || top.get("schema_version") != Some(&json!(2))
         || top.get("map_name") != Some(&json!(candidate.map_name))
         || top.get("frame_id") != Some(&json!(candidate.frame_id))
         || top.get("backend_kind") != Some(&json!(candidate.backend_kind))
@@ -690,27 +718,27 @@ fn validate_offline_candidate_directory(
         || top.get("identity")
             != Some(&canonical_boundary_json(
                 "identity",
-                candidate.identity_json.clone(),
+                &candidate.identity_json,
             )?)
         || top.get("georeference")
             != Some(&canonical_boundary_json(
                 "georeference",
-                candidate.georeference_json.clone(),
+                &candidate.georeference_json,
             )?)
         || top.get("processing_receipt")
             != Some(&canonical_boundary_json(
                 "processing_receipt",
-                candidate.processing_receipt_json.clone(),
+                &candidate.processing_receipt_json,
             )?)
         || top.get("map_snapshot_seed")
             != Some(&canonical_boundary_json(
                 "map_snapshot_seed",
-                candidate.map_snapshot_seed_json.clone(),
+                &candidate.map_snapshot_seed_json,
             )?)
         || top.get("deferred")
             != Some(&canonical_boundary_json(
                 "deferred",
-                candidate.deferred_json.clone(),
+                &candidate.deferred_json,
             )?)
         || top
             .pointer("/checkpoint/selector_path")
@@ -724,14 +752,8 @@ fn validate_offline_candidate_directory(
             .pointer("/checkpoint/object_path")
             .and_then(Value::as_str)
             != Some(&object.relative_path)
-        || top
-            .pointer("/checkpoint/manifest_sha256")
-            .and_then(Value::as_str)
-            != Some(&digest_hex(&manifest_bytes))
-        || top
-            .pointer("/checkpoint/object_sha256")
-            .and_then(Value::as_str)
-            != Some(object.sha256_hex.as_str())
+        || top.get("source_provenance") != Some(provenance)
+        || top.pointer("/checkpoint/source_commit_id") != Some(commit)
     {
         bail!("top-level manifest binding mismatch");
     }
@@ -750,10 +772,9 @@ fn validate_offline_candidate_directory(
             .get("size")
             .and_then(Value::as_u64)
             .ok_or_else(|| anyhow::anyhow!("invalid top-level file size"))?;
-        let sha = entry
-            .get("sha256")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("invalid top-level file digest"))?;
+        if entry.get("source_commit_id") != Some(commit) {
+            bail!("top-level file source commit mismatch");
+        }
         let media_type = entry
             .get("media_type")
             .and_then(Value::as_str)
@@ -781,7 +802,6 @@ fn validate_offline_candidate_directory(
                 || encoding != member.encoding
                 || source_binding != member.source_binding
                 || size != member.size_bytes
-                || sha != member.sha256_hex
             {
                 bail!("top-level member receipt mismatch: {path}");
             }
@@ -797,12 +817,10 @@ fn validate_offline_candidate_directory(
                 || encoding != "canonical_json_v1"
                 || source_binding != expected_generated.0
                 || size != expected_generated.1.len() as u64
-                || sha != digest_hex(expected_generated.1)
             {
                 bail!("top-level generated receipt mismatch: {path}");
             }
         }
-        validate_open_file(root, path, size, sha)?;
     }
     if listed_paths != expected {
         bail!("top-level file set does not match candidate");
@@ -829,10 +847,11 @@ fn validate_open_file(
     root: &StableDirectory,
     relative: &str,
     expected_size: u64,
-    expected_sha: &str,
 ) -> anyhow::Result<()> {
-    let bytes = read_fresh_file(root, relative)?;
-    if bytes.len() as u64 != expected_size || digest_hex(&bytes) != expected_sha {
+    validate_relative_path(relative)?;
+    let file = root.open_beneath(Path::new(relative), false)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != expected_size {
         bail!("fresh validation failed: {relative}");
     }
     Ok(())
@@ -857,18 +876,6 @@ fn canonical_json_value(value: &Value) -> anyhow::Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(&sort(value))?;
     bytes.push(b'\n');
     Ok(bytes)
-}
-
-fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
-    // CLI 只依赖 workspace 已声明的 nuwax-codec，不耦合 geometry crate。
-    nuwax_codec::sha256_bytes(bytes)
-}
-
-fn digest_hex(bytes: &[u8]) -> String {
-    sha256_bytes(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 pub(crate) fn publish_map_bundle<B, V>(
@@ -914,20 +921,10 @@ where
         }
         .into());
     }
-    let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let nonce = mix64(sequence ^ timestamp ^ u64::from(std::process::id()));
-    let staging_name = OsString::from(format!(
-        "{BUNDLE_STAGE_DOMAIN}{}-{:016x}-{nonce:016x}-{}",
-        std::process::id(),
-        recovery_policy.current_process_start(),
-        bundle_name_hash(final_name)
-    ));
-    directory.create_directory(&staging_name)?;
-    let staging_directory = directory.open_stable_directory(&staging_name)?;
+    let area = StagingArea::reserve(&directory, final_name, "bundle", &recovery_policy)?;
+    let staging_name = payload_name(final_name, None);
+    area.contents.create_directory(&staging_name)?;
+    let staging_directory = area.contents.open_stable_directory(&staging_name)?;
     let staging = staging_directory.descriptor_path();
 
     let operation = build(&staging_directory)
@@ -939,7 +936,7 @@ where
     let result = match operation {
         Ok(result) => result,
         Err(primary) => {
-            return match cleanup_map_bundle_staging_io(&directory, &staging_name) {
+            return match area.cleanup(&directory, &staging_name, None) {
                 Ok(()) => Err(primary),
                 Err(source) => Err(MapBundlePublicationError::CleanupFailure {
                     path: final_directory.to_path_buf(),
@@ -954,10 +951,11 @@ where
         }
     };
 
-    let named = directory.open_stable_directory(&staging_name)?;
+    area.require_bound(&directory)?;
+    let named = area.contents.open_stable_directory(&staging_name)?;
     if !same_file_identity(&staging_directory.metadata()?, &named.metadata()?) {
         let primary = anyhow::anyhow!("staging directory inode changed before publication");
-        return match cleanup_map_bundle_staging_io(&directory, &staging_name) {
+        return match area.cleanup(&directory, &staging_name, None) {
             Ok(()) => Err(primary),
             Err(source) => Err(MapBundlePublicationError::CleanupFailure {
                 path: final_directory.to_path_buf(),
@@ -970,10 +968,10 @@ where
             .into()),
         };
     }
-    match rename_directory_no_replace_at(&directory, &staging_name, final_name) {
+    match rename_directory_no_replace_at(&area.contents, &staging_name, &directory, final_name) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let cleanup = cleanup_map_bundle_staging_io(&directory, &staging_name)
+            let cleanup = area.cleanup(&directory, &staging_name, None)
                 .err()
                 .map(|source| ArtifactCleanupFailure {
                     staging: staging.clone(),
@@ -986,7 +984,7 @@ where
             .into());
         }
         Err(primary) => {
-            return match cleanup_map_bundle_staging_io(&directory, &staging_name) {
+            return match area.cleanup(&directory, &staging_name, None) {
                 Ok(()) => Err(primary.into()),
                 Err(source) => Err(MapBundlePublicationError::CleanupFailure {
                     path: final_directory.to_path_buf(),
@@ -1019,101 +1017,154 @@ where
             .into()),
         };
     }
-    directory
-        .sync()
+    area.contents.sync().and_then(|()| area.wrapper.sync()).and_then(|()| directory.sync())
         .map_err(|source| MapBundlePublicationError::DurabilityUnknown {
             path: final_directory.to_path_buf(),
             source,
         })?;
+    area.cleanup_empty(&directory).map_err(|source|
+        MapBundlePublicationError::PublishedCleanupFailure {
+            path: final_directory.to_path_buf(),
+            cleanup: ArtifactCleanupFailure { staging, source },
+        })?;
     Ok(result)
 }
 
-fn bundle_name_hash(final_name: &OsStr) -> String {
-    let (high, low) = stable_hash128(&os_str_bytes(final_name));
-    format!("{high:016x}{low:016x}")
+// A short, per-attempt owner wrapper carries the original name as an OsStr
+// directory entry. Payload basenames stay short even for SQLite sidecars.
+struct StagingArea {
+    wrapper_name: OsString,
+    final_name: OsString,
+    wrapper: StableDirectory,
+    contents: StableDirectory,
 }
 
-fn parse_map_bundle_stage_name(name: &str, expected_hash: &str) -> Option<StageOwner> {
-    let remainder = name.strip_prefix(BUNDLE_STAGE_DOMAIN)?;
-    let mut parts = remainder.split('-');
-    let process_id_text = parts.next()?;
-    let process_start_text = parts.next()?;
-    let nonce_text = parts.next()?;
-    let final_hash = parts.next()?;
-    if parts.next().is_some()
-        || final_hash != expected_hash
-        || final_hash.len() != 32
-        || !final_hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return None;
+impl StagingArea {
+    fn reserve(parent: &StableDirectory, final_name: &OsStr, kind: &str,
+               policy: &RecoveryPolicy) -> anyhow::Result<Self> {
+        for _ in 0..MAX_STAGE_ATTEMPTS {
+            let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+            let name = OsString::from(format!("{STAGE_DOMAIN}{kind}-{}-{:016x}-{sequence:016x}",
+                std::process::id(), policy.current_process_start()));
+            if name == final_name { continue; }
+            match parent.create_directory_mode(&name, 0o700) {
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+                Ok(()) => {}
+            }
+            let wrapper = parent.open_stable_directory(&name)?;
+            wrapper.create_directory_mode(final_name, 0o700)?;
+            let contents = wrapper.open_stable_directory(final_name)?;
+            contents.sync()?;
+            wrapper.sync()?;
+            parent.sync()?;
+            return Ok(Self { wrapper_name: name, final_name: final_name.to_os_string(), wrapper, contents });
+        }
+        bail!("could not reserve a unique staging directory after {} attempts", MAX_STAGE_ATTEMPTS)
     }
-    let process_id: u32 = process_id_text.parse().ok()?;
-    let process_start = parse_exact_lower_hex_u64(process_start_text)?;
-    parse_exact_lower_hex_u64(nonce_text)?;
-    if process_id == 0
-        || process_id > i32::MAX as u32
-        || process_id.to_string() != process_id_text
-        || process_start == 0
-    {
-        return None;
+
+    fn require_bound(&self, parent: &StableDirectory) -> io::Result<()> {
+        parent.require_named_identity(&self.wrapper_name, &self.wrapper)?;
+        self.wrapper.require_named_identity(&self.final_name, &self.contents)
     }
-    Some(StageOwner {
-        process_id,
-        process_start,
-    })
+
+    fn has_expected_shape(&self, payload: &OsStr, format: Option<ArtifactFormat>) -> io::Result<bool> {
+        let mut entries = self.wrapper.read_dir()?;
+        if entries.next().transpose()?.map(|entry| entry.file_name()).as_deref() != Some(self.final_name.as_os_str())
+            || entries.next().transpose()?.is_some() { return Ok(false); }
+        for entry in self.contents.read_dir()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let kind = entry.file_type()?;
+            if name == payload {
+                if format.is_some() && !kind.is_file() || format.is_none() && !kind.is_dir() { return Ok(false); }
+            } else if !format.is_some_and(|format| format.sqlite_sidecars().iter()
+                .any(|suffix| name == append_name_suffix(payload, suffix))) || !kind.is_file() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn cleanup(&self, parent: &StableDirectory, payload: &OsStr, format: Option<ArtifactFormat>) -> io::Result<()> {
+        self.require_bound(parent)?;
+        if !self.has_expected_shape(payload, format)? {
+            return Err(io::Error::new(io::ErrorKind::Other, "staging wrapper contains unknown entries; retained"));
+        }
+        if let Some(format) = format {
+            cleanup_stage(&self.contents, payload, format)?;
+        } else if self.contents.entry_exists(payload)? {
+            let child = self.contents.open_stable_directory(payload)?;
+            self.contents.remove_tree_bound(payload, &child)?;
+            self.contents.sync()?;
+        }
+        self.cleanup_empty(parent)
+    }
+
+    fn cleanup_empty(&self, parent: &StableDirectory) -> io::Result<()> {
+        self.require_bound(parent)?;
+        self.wrapper.remove_directory(&self.final_name)?;
+        self.wrapper.sync()?;
+        parent.require_named_identity(&self.wrapper_name, &self.wrapper)?;
+        parent.remove_directory(&self.wrapper_name)?;
+        parent.sync()
+    }
 }
 
-fn recover_stale_map_bundle_stages(
-    parent: &StableDirectory,
-    final_name: &OsStr,
-    final_directory: &Path,
-    recovery_policy: &RecoveryPolicy,
+fn parse_wrapper_name(name: &str, kind: &str) -> Option<StageOwner> {
+    let prefix = format!("{STAGE_DOMAIN}{kind}-");
+    let mut parts = name.strip_prefix(&prefix)?.split('-');
+    let pid_text = parts.next()?;
+    let process_id: u32 = pid_text.parse().ok()?;
+    let process_start = parse_exact_lower_hex_u64(parts.next()?)?;
+    parse_exact_lower_hex_u64(parts.next()?)?;
+    if parts.next().is_some() || process_id == 0 || process_id > i32::MAX as u32
+        || process_id.to_string() != pid_text || process_start == 0 { return None; }
+    Some(StageOwner { process_id, process_start })
+}
+
+fn recover_stale_wrappers(
+    parent: &StableDirectory, final_name: &OsStr, final_path: &Path,
+    format: Option<ArtifactFormat>, owner_is_proven_dead: impl Fn(StageOwner) -> bool,
 ) -> anyhow::Result<()> {
-    let expected_hash = bundle_name_hash(final_name);
-    let mut stale = Vec::new();
-    for entry in parent
-        .read_dir()
-        .with_context(|| format!("scan map bundle staging for {}", final_directory.display()))?
-    {
-        let entry = entry.with_context(|| {
-            format!("scan map bundle staging for {}", final_directory.display())
-        })?;
+    let kind = format.map_or("bundle", ArtifactFormat::stage_label);
+    let payload = payload_name(final_name, format);
+    let mut stages = Vec::new();
+    for entry in parent.read_dir()? {
+        let entry = entry?;
         let name = entry.file_name();
-        let Some(name_text) = name.to_str() else {
-            continue;
-        };
-        let Some(owner) = parse_map_bundle_stage_name(name_text, &expected_hash) else {
-            continue;
-        };
-        stale.push((name, owner));
-        if stale.len() > MAX_STAGES_PER_ARTIFACT {
-            bail!(
-                "more than {} map bundle staging directories exist for {}; refusing unbounded cleanup",
-                MAX_STAGES_PER_ARTIFACT,
-                final_directory.display()
-            );
+        let Some(owner) = name.to_str().and_then(|name| parse_wrapper_name(name, kind)) else { continue; };
+        // Empty, foreign, legacy, non-directory and unbound wrappers are retained.
+        let Ok(wrapper) = parent.open_stable_directory(&name) else { continue; };
+        let Ok(contents) = wrapper.open_stable_directory(final_name) else { continue; };
+        let area = StagingArea { wrapper_name: name, final_name: final_name.to_os_string(), wrapper, contents };
+        if !area.has_expected_shape(&payload, format)? { continue; }
+        stages.push((area, owner));
+        if stages.len() > MAX_STAGES_PER_ARTIFACT {
+            bail!("more than {} staging artifacts exist for {}; refusing unbounded cleanup", MAX_STAGES_PER_ARTIFACT, final_path.display());
         }
     }
-    for (staging_name, owner) in stale {
-        if recovery_policy.owner_is_proven_dead(owner) {
-            cleanup_map_bundle_staging_io(parent, &staging_name)
-                .with_context(|| format!("recover stale map bundle staging {:?}", staging_name))?;
-        }
+    for (area, owner) in stages {
+        if owner_is_proven_dead(owner) { area.cleanup(parent, &payload, format)?; }
     }
     Ok(())
 }
 
-fn cleanup_map_bundle_staging_io(parent: &StableDirectory, staging_name: &OsStr) -> io::Result<()> {
-    parent.remove_tree(staging_name)?;
-    parent.sync()
+fn payload_name(final_name: &OsStr, format: Option<ArtifactFormat>) -> OsString {
+    if format.is_some() { OsString::from(format!("payload.tmp{}", staging_extension_from_name(final_name))) }
+    else { OsString::from("payload") }
+}
+
+fn recover_stale_map_bundle_stages(parent: &StableDirectory, final_name: &OsStr,
+    final_directory: &Path, policy: &RecoveryPolicy) -> anyhow::Result<()> {
+    recover_stale_wrappers(parent, final_name, final_directory, None, |owner| policy.owner_is_proven_dead(owner))
 }
 
 #[cfg(target_os = "linux")]
 fn rename_directory_no_replace_at(
     directory: &StableDirectory,
     source: &OsStr,
+    destination_directory: &StableDirectory,
     destination: &OsStr,
 ) -> io::Result<()> {
     use std::ffi::CString;
@@ -1137,7 +1188,7 @@ fn rename_directory_no_replace_at(
         renameat2(
             directory.file.as_raw_fd(),
             source.as_ptr(),
-            directory.file.as_raw_fd(),
+            destination_directory.file.as_raw_fd(),
             destination.as_ptr(),
             1,
         )
@@ -1153,6 +1204,7 @@ fn rename_directory_no_replace_at(
 fn rename_directory_no_replace_at(
     _directory: &StableDirectory,
     _source: &OsStr,
+    _destination_directory: &StableDirectory,
     _destination: &OsStr,
 ) -> io::Result<()> {
     Err(io::Error::new(
@@ -1252,43 +1304,45 @@ where
     )?;
     require_absent(&directory, &final_name, final_path)?;
 
-    let (staging_name, staging_path, reservation, reserved_metadata) = reserve_staging_file(
-        &directory,
-        &final_name,
-        final_path,
-        format,
-        &recovery_policy,
-    )?;
+    let area = StagingArea::reserve(&directory, &final_name, format.stage_label(), &recovery_policy)?;
+    let staging_name = payload_name(&final_name, Some(format));
+    let staging_path = area.contents.child_path(&staging_name);
+    let reservation = area.contents.create_new(&staging_name)?;
+    let reserved_metadata = reservation.metadata()?;
     if let Err(error) = build(&staging_path, reservation) {
         return Err(cleanup_failed_build(
             &directory,
+            &area,
             &staging_name,
             &staging_path,
             format,
             error,
         ));
     }
-    if let Err(error) = verify_staging_file(&directory, &staging_name, &reserved_metadata) {
+    if let Err(error) = verify_staging_file(&area.contents, &staging_name, &reserved_metadata) {
         return Err(cleanup_failed_build(
             &directory,
+            &area,
             &staging_name,
             &staging_path,
             format,
             error,
         ));
     }
-    if let Err(error) = reject_sqlite_sidecars(&directory, &staging_name, format) {
+    if let Err(error) = reject_sqlite_sidecars(&area.contents, &staging_name, format) {
         return Err(cleanup_failed_build(
             &directory,
+            &area,
             &staging_name,
             &staging_path,
             format,
             error,
         ));
     }
-    if let Err(error) = sync_staging_file(&directory, &staging_name, &staging_path) {
+    if let Err(error) = sync_staging_file(&area.contents, &staging_name, &staging_path) {
         return Err(cleanup_failed_build(
             &directory,
+            &area,
             &staging_name,
             &staging_path,
             format,
@@ -1300,24 +1354,27 @@ where
     {
         return Err(cleanup_failed_build(
             &directory,
+            &area,
             &staging_name,
             &staging_path,
             format,
             error,
         ));
     }
-    if let Err(error) = verify_staging_file(&directory, &staging_name, &reserved_metadata) {
+    if let Err(error) = verify_staging_file(&area.contents, &staging_name, &reserved_metadata) {
         return Err(cleanup_failed_build(
             &directory,
+            &area,
             &staging_name,
             &staging_path,
             format,
             error,
         ));
     }
-    if let Err(error) = reject_sqlite_sidecars(&directory, &staging_name, format) {
+    if let Err(error) = reject_sqlite_sidecars(&area.contents, &staging_name, format) {
         return Err(cleanup_failed_build(
             &directory,
+            &area,
             &staging_name,
             &staging_path,
             format,
@@ -1325,13 +1382,14 @@ where
         ));
     }
 
-    match directory.link_no_replace(&staging_name, &final_name) {
+    area.require_bound(&directory)?;
+    match area.contents.link_no_replace_to(&staging_name, &directory, &final_name) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             return Err(conflict_after_cleanup(
                 final_path,
                 &staging_path,
-                cleanup_stage(&directory, &staging_name, format),
+                area.cleanup(&directory, &staging_name, Some(format)),
             ));
         }
         Err(error) => {
@@ -1339,11 +1397,12 @@ where
                 return Err(conflict_after_cleanup(
                     final_path,
                     &staging_path,
-                    cleanup_stage(&directory, &staging_name, format),
+                    area.cleanup(&directory, &staging_name, Some(format)),
                 ));
             }
             return Err(cleanup_failed_build(
                 &directory,
+                &area,
                 &staging_name,
                 &staging_path,
                 format,
@@ -1356,7 +1415,7 @@ where
         }
     }
 
-    if let Err(source) = directory.sync() {
+    if let Err(source) = area.contents.sync().and_then(|()| area.wrapper.sync()).and_then(|()| directory.sync()) {
         return Err(ArtifactPublicationError::DurabilityUnknown {
             path: final_path.to_path_buf(),
             staging: staging_path,
@@ -1365,7 +1424,7 @@ where
         .into());
     }
 
-    if let Err(source) = cleanup_stage(&directory, &staging_name, format) {
+    if let Err(source) = area.cleanup(&directory, &staging_name, Some(format)) {
         return Err(ArtifactPublicationError::CleanupFailure {
             path: final_path.to_path_buf(),
             cleanup: ArtifactCleanupFailure {
@@ -1406,53 +1465,6 @@ fn require_absent(
         .into());
     }
     Ok(())
-}
-
-fn reserve_staging_file(
-    directory: &StableDirectory,
-    final_name: &OsStr,
-    final_path: &Path,
-    format: ArtifactFormat,
-    recovery_policy: &RecoveryPolicy,
-) -> anyhow::Result<(OsString, PathBuf, File, Metadata)> {
-    let process_id = std::process::id();
-    let process_start = recovery_policy.current_process_start();
-    let extension = staging_extension_from_name(final_name);
-    let prefix = stage_prefix_from_name(final_name, format);
-
-    for _ in 0..MAX_STAGE_ATTEMPTS {
-        let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        let nonce = mix64(sequence ^ timestamp ^ process_start.rotate_left(17));
-        let name = format!("{prefix}{process_id}-{process_start:016x}-{nonce:016x}.tmp{extension}");
-        let staging_name = OsString::from(name);
-        let staging_path = directory.child_path(&staging_name);
-        match directory.create_new(&staging_name) {
-            Ok(file) => {
-                let metadata = file.metadata().with_context(|| {
-                    format!(
-                        "inspect reserved staging artifact {}",
-                        staging_path.display()
-                    )
-                })?;
-                return Ok((staging_name, staging_path, file, metadata));
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("reserve staging artifact {}", staging_path.display())
-                });
-            }
-        }
-    }
-    bail!(
-        "could not reserve a unique staging file for {} after {} attempts",
-        final_path.display(),
-        MAX_STAGE_ATTEMPTS
-    )
 }
 
 fn verify_staging_file(
@@ -1534,12 +1546,13 @@ fn reject_sqlite_sidecars(
 
 fn cleanup_failed_build(
     directory: &StableDirectory,
+    area: &StagingArea,
     staging_name: &OsStr,
     staging_path: &Path,
     format: ArtifactFormat,
     error: anyhow::Error,
 ) -> anyhow::Error {
-    match cleanup_stage(directory, staging_name, format) {
+    match area.cleanup(directory, staging_name, Some(format)) {
         Ok(()) => error,
         Err(cleanup_error) => error.context(format!(
             "also failed to clean staging artifact {}: {cleanup_error}",
@@ -1582,97 +1595,13 @@ fn recover_stale_stages_with(
     format: ArtifactFormat,
     owner_is_proven_dead: impl Fn(StageOwner) -> bool,
 ) -> anyhow::Result<()> {
-    let prefix = stage_prefix_from_name(final_name, format);
-    let extension = staging_extension_from_name(final_name);
-    let mut stages = BTreeMap::<OsString, StageOwner>::new();
-    for entry in directory
-        .read_dir()
-        .with_context(|| format!("scan stable output directory for {}", final_path.display()))?
-    {
-        let entry = entry.with_context(|| {
-            format!("scan stable output directory for {}", final_path.display())
-        })?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Some((base_name, owner)) = parse_stage_name(&name, &prefix, &extension, format) else {
-            continue;
-        };
-        stages.entry(OsString::from(base_name)).or_insert(owner);
-        if stages.len() > MAX_STAGES_PER_ARTIFACT {
-            bail!(
-                "more than {} staging artifacts exist for {}; refusing unbounded cleanup",
-                MAX_STAGES_PER_ARTIFACT,
-                final_path.display()
-            );
-        }
-    }
-
-    for (staging_name, owner) in stages {
-        if owner_is_proven_dead(owner) {
-            let staging_path = directory.child_path(&staging_name);
-            cleanup_stage(directory, &staging_name, format).with_context(|| {
-                format!("recover stale staging artifact {}", staging_path.display())
-            })?;
-        }
-    }
-    Ok(())
+    recover_stale_wrappers(directory, final_name, final_path, Some(format), owner_is_proven_dead)
 }
 
 #[derive(Clone, Copy)]
 struct StageOwner {
     process_id: u32,
     process_start: u64,
-}
-
-fn parse_stage_name(
-    name: &str,
-    prefix: &str,
-    expected_extension: &str,
-    format: ArtifactFormat,
-) -> Option<(String, StageOwner)> {
-    let (base_name, sidecar_suffix) = format
-        .sqlite_sidecars()
-        .iter()
-        .find_map(|suffix| name.strip_suffix(suffix).map(|base| (base, Some(*suffix))))
-        .unwrap_or((name, None));
-    let remainder = base_name.strip_prefix(prefix)?;
-    let expected_tail = format!(".tmp{expected_extension}");
-    let owner_text = remainder.strip_suffix(&expected_tail)?;
-    let mut parts = owner_text.split('-');
-    let process_id_text = parts.next()?;
-    let process_start_text = parts.next()?;
-    let nonce_text = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    let process_id: u32 = process_id_text.parse().ok()?;
-    let process_start = parse_exact_lower_hex_u64(process_start_text)?;
-    let nonce = parse_exact_lower_hex_u64(nonce_text)?;
-    if process_id == 0
-        || process_id > i32::MAX as u32
-        || process_id.to_string() != process_id_text
-        || process_start == 0
-    {
-        return None;
-    }
-    let reconstructed =
-        format!("{prefix}{process_id}-{process_start:016x}-{nonce:016x}{expected_tail}");
-    if reconstructed != base_name {
-        return None;
-    }
-    if let Some(suffix) = sidecar_suffix {
-        if format != ArtifactFormat::Memory2Sqlite || name != format!("{base_name}{suffix}") {
-            return None;
-        }
-    }
-    Some((
-        base_name.to_string(),
-        StageOwner {
-            process_id,
-            process_start,
-        },
-    ))
 }
 
 fn parse_exact_lower_hex_u64(text: &str) -> Option<u64> {
@@ -1920,6 +1849,10 @@ impl StableDirectory {
     }
 
     fn create_directory(&self, name: &OsStr) -> io::Result<()> {
+        self.create_directory_mode(name, 0o777)
+    }
+
+    fn create_directory_mode(&self, name: &OsStr, mode: u32) -> io::Result<()> {
         use std::ffi::CString;
         use std::os::fd::AsRawFd;
         use std::os::raw::{c_char, c_int};
@@ -1930,7 +1863,7 @@ impl StableDirectory {
         let name = CString::new(name.as_bytes()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "directory name contains NUL")
         })?;
-        let result = unsafe { mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o777) };
+        let result = unsafe { mkdirat(self.file.as_raw_fd(), name.as_ptr(), mode) };
         if result == 0 {
             Ok(())
         } else {
@@ -2129,7 +2062,7 @@ impl StableDirectory {
         }
     }
 
-    fn link_no_replace(&self, staging_name: &OsStr, final_name: &OsStr) -> io::Result<()> {
+    fn link_no_replace_to(&self, staging_name: &OsStr, destination: &StableDirectory, final_name: &OsStr) -> io::Result<()> {
         use std::ffi::CString;
         use std::os::raw::{c_char, c_int};
         use std::os::unix::ffi::OsStrExt;
@@ -2151,13 +2084,13 @@ impl StableDirectory {
         let final_name = CString::new(final_name.as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "final name contains NUL"))?;
         // SAFETY: both names are NUL-terminated and both operations are bound
-        // to the same live directory descriptor. flags=0 never follows a
+        // to live source and destination descriptors. flags=0 never follows a
         // symbolic-link staging entry.
         let result = unsafe {
             linkat(
                 self.file.as_raw_fd(),
                 staging.as_ptr(),
-                self.file.as_raw_fd(),
+                destination.file.as_raw_fd(),
                 final_name.as_ptr(),
                 0,
             )
@@ -2238,6 +2171,9 @@ impl StableDirectory {
     fn open_stable_directory(&self, _name: &OsStr) -> io::Result<Self> {
         Err(Self::unsupported())
     }
+    fn create_directory_mode(&self, _name: &OsStr, _mode: u32) -> io::Result<()> {
+        Err(Self::unsupported())
+    }
     fn create_directory(&self, _name: &OsStr) -> io::Result<()> {
         Err(Self::unsupported())
     }
@@ -2253,6 +2189,12 @@ impl StableDirectory {
     fn remove_tree_bound(&self, _name: &OsStr, _child: &StableDirectory) -> io::Result<()> {
         Err(Self::unsupported())
     }
+    fn require_named_identity(&self, _name: &OsStr, _held: &StableDirectory) -> io::Result<()> {
+        Err(Self::unsupported())
+    }
+    fn remove_directory(&self, _name: &OsStr) -> io::Result<()> {
+        Err(Self::unsupported())
+    }
     fn sync_tree(&self) -> io::Result<()> {
         Err(Self::unsupported())
     }
@@ -2265,7 +2207,7 @@ impl StableDirectory {
         Err(Self::unsupported())
     }
 
-    fn link_no_replace(&self, _staging_name: &OsStr, _final_name: &OsStr) -> io::Result<()> {
+    fn link_no_replace_to(&self, _staging_name: &OsStr, _destination: &StableDirectory, _final_name: &OsStr) -> io::Result<()> {
         Err(Self::unsupported())
     }
 
@@ -2290,36 +2232,9 @@ fn stage_prefix(final_path: &Path, format: ArtifactFormat) -> String {
     )
 }
 
-fn stage_prefix_from_name(final_name: &OsStr, format: ArtifactFormat) -> String {
-    let bytes = os_str_bytes(final_name);
-    let (first, second) = stable_hash128(&bytes);
-    format!(
-        "{STAGE_DOMAIN}{first:016x}{second:016x}-{}-",
-        format.stage_label()
-    )
-}
-
-#[cfg(unix)]
-fn os_str_bytes(value: &OsStr) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    value.as_bytes().to_vec()
-}
-
-#[cfg(not(unix))]
-fn os_str_bytes(value: &OsStr) -> Vec<u8> {
-    value.to_string_lossy().as_bytes().to_vec()
-}
-
-fn stable_hash128(bytes: &[u8]) -> (u64, u64) {
-    let mut first = 0xcbf2_9ce4_8422_2325_u64;
-    let mut second = 0x8422_2325_cbf2_9ce4_u64;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        first ^= u64::from(byte);
-        first = first.wrapping_mul(0x0000_0100_0000_01b3);
-        second ^= u64::from(byte).wrapping_add((index as u64).rotate_left(23));
-        second = second.rotate_left(9).wrapping_mul(0x9e37_79b1_85eb_ca87);
-    }
-    (first, second)
+#[cfg(all(test, target_os = "linux"))]
+fn stage_prefix_from_name(_final_name: &OsStr, format: ArtifactFormat) -> String {
+    format!("{STAGE_DOMAIN}{}-", format.stage_label())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -2360,17 +2275,11 @@ fn parent_directory(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn mix64(mut value: u64) -> u64 {
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -2452,15 +2361,48 @@ mod tests {
             .collect()
     }
 
-    fn dead_stage(path: &Path, format: ArtifactFormat) -> PathBuf {
-        let extension = staging_extension(path);
-        parent_directory(path).join(format!(
-            "{}{}-{:016x}-{:016x}.tmp{extension}",
-            stage_prefix(path, format),
-            absent_process_id(),
-            1_u64,
-            2_u64
-        ))
+    fn stage_fixture(
+        path: &Path,
+        format: Option<ArtifactFormat>,
+        process_id: u32,
+        process_start: u64,
+        sequence: u64,
+    ) -> (PathBuf, PathBuf) {
+        let prefix = format.map_or_else(
+            || ".nuwax-mapping-cli-stage-v2-bundle-".to_string(),
+            |format| stage_prefix(path, format),
+        );
+        let wrapper = parent_directory(path).join(format!(
+            "{prefix}{process_id}-{process_start:016x}-{sequence:016x}"
+        ));
+        let contents = wrapper.join(path.file_name().unwrap());
+        fs::create_dir_all(&contents).unwrap();
+        let payload = contents.join(if format.is_some() {
+            format!("payload.tmp{}", staging_extension(path))
+        } else {
+            "payload".to_string()
+        });
+        if format.is_none() {
+            fs::create_dir(&payload).unwrap();
+        }
+        (wrapper, payload)
+    }
+
+    fn dead_stage(path: &Path, format: ArtifactFormat) -> (PathBuf, PathBuf) {
+        stage_fixture(path, Some(format), absent_process_id(), 1, 2)
+    }
+
+    fn publish_bundle_marker(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+        publish_map_bundle_stable(
+            path,
+            |staging| staging.write_synced_beneath(Path::new("marker"), bytes).map_err(Into::into),
+            |staging| {
+                if read_fresh_file(staging, "marker")? != bytes {
+                    bail!("bundle marker mismatch");
+                }
+                Ok(())
+            },
+        )
     }
 
     fn absent_process_id() -> u32 {
@@ -2496,6 +2438,25 @@ mod tests {
                 format,
                 |staging, mut reservation| {
                     observed_name.replace(staging.file_name().map(OsStr::to_os_string));
+                    let wrappers = stage_entries(&output);
+                    assert_eq!(wrappers.len(), 1);
+                    let wrapper = &wrappers[0];
+                    let name = wrapper.file_name().unwrap().to_str().unwrap();
+                    let expected_prefix = format!(".nuwax-mapping-cli-stage-v2-{label}-");
+                    let fields: Vec<_> = name.strip_prefix(&expected_prefix).unwrap().split('-').collect();
+                    assert_eq!(fields.len(), 3);
+                    assert_eq!(fields[0], std::process::id().to_string());
+                    let policy = RecoveryPolicy::acquire().unwrap();
+                    assert_eq!(fields[1], format!("{:016x}", policy.current_process_start()));
+                    assert_eq!(fields[2].len(), 16);
+                    assert!(fields[2].bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+                    let scope_entries: Vec<_> = fs::read_dir(wrapper).unwrap()
+                        .map(|entry| entry.unwrap().file_name()).collect();
+                    assert_eq!(scope_entries, vec![output.file_name().unwrap().to_os_string()]);
+                    let contents = wrapper.join(output.file_name().unwrap());
+                    assert_eq!(fs::metadata(wrapper)?.permissions().mode() & 0o077, 0);
+                    assert_eq!(fs::metadata(&contents)?.permissions().mode() & 0o077, 0);
+                    assert!(contents.join(format!("payload.tmp{}", staging_extension(&output))).is_file());
                     reservation.write_all(b"validated")?;
                     reservation.flush()?;
                     Ok(())
@@ -2512,11 +2473,11 @@ mod tests {
             let expected_prefix = stage_prefix(&output, format);
             assert!(expected_prefix.ends_with(&format!("-{label}-")));
             assert!(prefixes.insert(expected_prefix.clone()));
-            assert!(observed_name
-                .into_inner()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with(&expected_prefix));
+            assert_eq!(expected_prefix, format!(".nuwax-mapping-cli-stage-v2-{label}-"));
+            assert_eq!(
+                observed_name.into_inner().unwrap(),
+                OsString::from(format!("payload.tmp{}", staging_extension(&output)))
+            );
 
             let wrong_output = directory.0.join(format!("{label}.bin"));
             let builder_ran = Cell::new(false);
@@ -2637,17 +2598,20 @@ mod tests {
     fn dead_staging_and_sqlite_sidecars_are_recovered_before_publish() {
         let directory = TestDir::new("stale");
         let output = directory.0.join("artifact.db");
-        let stale = dead_stage(&output, ArtifactFormat::Memory2Sqlite);
-        let hostile_extra = PathBuf::from(format!("{}-wal-extra", stale.display()));
+        let (wrapper, stale) = dead_stage(&output, ArtifactFormat::Memory2Sqlite);
         fs::write(&stale, b"partial database").unwrap();
-        fs::write(append_suffix(&stale, "-wal"), b"partial wal").unwrap();
-        fs::write(&hostile_extra, b"user file").unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            fs::write(append_suffix(&stale, suffix), b"partial sidecar").unwrap();
+        }
 
         publish_sqlite_text(&output, "validated winner").unwrap();
         assert_eq!(fs::read_to_string(&output).unwrap(), "validated winner");
+        assert!(!wrapper.exists());
         assert!(!stale.exists());
-        assert!(!append_suffix(&stale, "-wal").exists());
-        assert_eq!(fs::read(hostile_extra).unwrap(), b"user file");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!append_suffix(&stale, suffix).exists());
+        }
+        assert!(stage_entries(&output).is_empty());
     }
 
     #[test]
@@ -2655,7 +2619,7 @@ mod tests {
         let directory = TestDir::new("preserve-winner");
         let output = directory.0.join("artifact.json");
         fs::write(&output, b"winner").unwrap();
-        let stale = dead_stage(&output, ArtifactFormat::SummaryJson);
+        let (wrapper, stale) = dead_stage(&output, ArtifactFormat::SummaryJson);
         fs::write(&stale, b"loser").unwrap();
 
         let error = publish_text(&output, "replacement").unwrap_err();
@@ -2664,6 +2628,7 @@ mod tests {
             Some(ArtifactPublicationError::Conflict { .. })
         ));
         assert_eq!(fs::read(&output).unwrap(), b"winner");
+        assert!(!wrapper.exists());
         assert!(stage_entries(&output).is_empty());
     }
 
@@ -2674,11 +2639,9 @@ mod tests {
         let process_id = std::process::id();
         let policy = RecoveryPolicy::acquire().unwrap();
         let process_start = policy.current_process_start();
-        let active = directory.0.join(format!(
-            "{}{process_id}-{process_start:016x}-{:016x}.tmp.json",
-            stage_prefix(&output, ArtifactFormat::SummaryJson),
-            7_u64
-        ));
+        let (wrapper, active) = stage_fixture(
+            &output, Some(ArtifactFormat::SummaryJson), process_id, process_start, 7,
+        );
         fs::write(&active, b"active").unwrap();
 
         let stable = StableDirectory::open(&directory.0).unwrap();
@@ -2690,22 +2653,17 @@ mod tests {
             &policy,
         )
         .unwrap();
-        assert!(active.exists());
-        fs::remove_file(active).unwrap();
+        assert!(wrapper.is_dir());
+        assert_eq!(fs::read(&active).unwrap(), b"active");
+        fs::remove_dir_all(wrapper).unwrap();
     }
 
     #[test]
     fn recovery_accepts_only_exact_emitted_names() {
         let directory = TestDir::new("strict-parser");
         let output = directory.0.join("artifact.json");
-        let exact = dead_stage(&output, ArtifactFormat::SummaryJson);
-        let exact_name = exact.file_name().unwrap().to_string_lossy();
-        let other_label_name = format!(
-            "{}-replay-json-{:016x}-{:016x}.tmp.json",
-            stage_prefix(&output, ArtifactFormat::SummaryJson),
-            absent_process_id(),
-            2_u64
-        );
+        let (exact_wrapper, exact) = dead_stage(&output, ArtifactFormat::SummaryJson);
+        let exact_name = exact_wrapper.file_name().unwrap().to_str().unwrap();
         let absent_process = absent_process_id();
         fs::write(&exact, b"exact stale staging").unwrap();
         let hostile_names = [
@@ -2713,27 +2671,30 @@ mod tests {
             format!("{exact_name}-wal"),
             format!("{exact_name}-wal-extra"),
             exact_name.replacen("-0000000000000001-", "-0000000000000001A-", 1),
-            format!(
-                "{}{absent_process}-000000000000000A-0000000000000002.tmp.json",
-                stage_prefix(&output, ArtifactFormat::SummaryJson)
-            ),
-            exact_name.replacen(
-                &format!("{absent_process}-"),
-                &format!("0{absent_process}-"),
-                1,
-            ),
-            other_label_name,
+            exact_name.replacen("-0000000000000001-", "-000000000000000A-", 1),
+            exact_name.replacen("-0000000000000001-", "-0000000000000000-", 1),
+            exact_name.replacen("-0000000000000002", "-000000000000000A", 1),
+            exact_name.replacen(&format!("{absent_process}-"), &format!("0{absent_process}-"), 1),
+            exact_name.replacen("-summary-json-", "-replay-json-", 1),
         ];
         for name in &hostile_names {
-            fs::write(directory.0.join(name), b"user file").unwrap();
+            let contents = directory.0.join(name).join(output.file_name().unwrap());
+            fs::create_dir_all(&contents).unwrap();
+            fs::write(contents.join("payload.tmp.json"), b"user file").unwrap();
         }
 
         publish_text(&output, "winner").unwrap();
 
+        assert!(!exact_wrapper.exists());
         assert!(!exact.exists());
         assert_eq!(fs::read_to_string(&output).unwrap(), "winner");
         for name in hostile_names {
-            assert_eq!(fs::read(directory.0.join(name)).unwrap(), b"user file");
+            let wrapper = directory.0.join(name);
+            assert!(wrapper.is_dir());
+            assert_eq!(
+                fs::read(wrapper.join(output.file_name().unwrap()).join("payload.tmp.json")).unwrap(),
+                b"user file"
+            );
         }
     }
 
@@ -2741,7 +2702,7 @@ mod tests {
     fn unverifiable_process_identity_never_reaps_staging() {
         let directory = TestDir::new("unverifiable-owner");
         let output = directory.0.join("artifact.json");
-        let staging = dead_stage(&output, ArtifactFormat::SummaryJson);
+        let (wrapper, staging) = dead_stage(&output, ArtifactFormat::SummaryJson);
         fs::write(&staging, b"must remain").unwrap();
         let stable = StableDirectory::open(&directory.0).unwrap();
 
@@ -2754,6 +2715,7 @@ mod tests {
         )
         .unwrap();
 
+        assert!(wrapper.is_dir());
         assert_eq!(fs::read(staging).unwrap(), b"must remain");
         assert!(!owner_is_proven_dead_from_probe(
             StageOwner {
@@ -2834,10 +2796,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn stable_bundle_transaction_returns_fresh_manifest_digest() {
-        let directory = TestDir::new("bundle-digest");
+    fn stable_bundle_transaction_returns_validated_manifest_size() {
+        let directory = TestDir::new("bundle-size");
         let output = directory.0.join("bundle");
-        let expected = digest_hex(br#"{"schema_version":1}"#);
+        let expected = br#"{"schema_version":1}"#.len();
 
         let observed = publish_map_bundle_stable(
             &output,
@@ -2846,13 +2808,13 @@ mod tests {
                     .write_synced_beneath(Path::new("manifest.json"), br#"{"schema_version":1}"#)?;
                 Ok(())
             },
-            |staging| Ok(digest_hex(&read_fresh_file(staging, "manifest.json")?)),
+            |staging| Ok(read_fresh_file(staging, "manifest.json")?.len()),
         )
         .unwrap();
 
         assert_eq!(observed, expected);
         assert_eq!(
-            digest_hex(&fs::read(output.join("manifest.json")).unwrap()),
+            fs::read(output.join("manifest.json")).unwrap().len(),
             expected
         );
     }
@@ -2897,6 +2859,220 @@ mod tests {
         assert!(moved.exists());
     }
 
+
+    #[test]
+    fn recovery_preserves_entire_wrappers_with_unknown_entries() {
+        for format in [Some(ArtifactFormat::Memory2Sqlite), None] {
+            for extra_in_wrapper in [true, false] {
+                let directory = TestDir::new("unknown-wrapper-entry");
+                let output = directory.0.join(if format.is_some() { "artifact.db" } else { "bundle" });
+                let (wrapper, payload) = stage_fixture(&output, format, absent_process_id(), 1, 20);
+                let original = if format.is_some() { payload.clone() } else { payload.join("marker") };
+                fs::write(&original, b"original payload").unwrap();
+                if format.is_some() {
+                    fs::write(append_suffix(&payload, "-wal"), b"original wal").unwrap();
+                }
+                let extra = if extra_in_wrapper {
+                    wrapper.join("user-file")
+                } else if format.is_some() {
+                    append_suffix(&payload, "-wal-extra")
+                } else {
+                    payload.parent().unwrap().join("payload-extra")
+                };
+                fs::write(&extra, b"user file").unwrap();
+
+                if format.is_some() {
+                    publish_sqlite_text(&output, "validated winner").unwrap();
+                    assert_eq!(fs::read(&output).unwrap(), b"validated winner");
+                    assert_eq!(fs::read(append_suffix(&payload, "-wal")).unwrap(), b"original wal");
+                } else {
+                    publish_bundle_marker(&output, b"validated winner").unwrap();
+                    assert_eq!(fs::read(output.join("marker")).unwrap(), b"validated winner");
+                }
+                assert!(wrapper.is_dir());
+                assert_eq!(fs::read(&original).unwrap(), b"original payload");
+                assert_eq!(fs::read(&extra).unwrap(), b"user file");
+                assert_eq!(stage_entries(&output), vec![wrapper]);
+            }
+        }
+    }
+
+    #[test]
+    fn staging_preserves_raw_names_for_long_and_non_utf8_outputs() {
+        let file_names = [
+            OsString::from(format!("{}.db", "x".repeat(252))),
+            OsString::from_vec(b"artifact-\xff.db".to_vec()),
+        ];
+        for name in file_names {
+            let directory = TestDir::new("raw-file-name");
+            let output = directory.0.join(&name);
+            let (stale_wrapper, stale) = dead_stage(&output, ArtifactFormat::Memory2Sqlite);
+            fs::write(&stale, b"stale").unwrap();
+            for suffix in ["-wal", "-shm", "-journal"] {
+                fs::write(append_suffix(&stale, suffix), b"stale sidecar").unwrap();
+            }
+            publish_new_artifact(
+                &output,
+                |staging, mut reservation| {
+                    assert!(!stale_wrapper.exists());
+                    assert_eq!(staging.file_name(), Some(OsStr::new("payload.tmp.db")));
+                    let wrappers = stage_entries(&output);
+                    assert_eq!(wrappers.len(), 1);
+                    let names: Vec<_> = fs::read_dir(&wrappers[0])?
+                        .map(|entry| entry.unwrap().file_name()).collect();
+                    assert_eq!(names, vec![name.clone()]);
+                    reservation.write_all(b"validated winner")?;
+                    Ok(())
+                },
+                |staging| {
+                    assert_eq!(fs::read(staging)?, b"validated winner");
+                    Ok(())
+                },
+            ).unwrap();
+            assert_eq!(fs::read(&output).unwrap(), b"validated winner");
+            assert!(stage_entries(&output).is_empty());
+        }
+
+        let bundle_names = [OsString::from("b".repeat(255)), OsString::from_vec(b"bundle-\xff".to_vec())];
+        for name in bundle_names {
+            let directory = TestDir::new("raw-bundle-name");
+            let output = directory.0.join(&name);
+            let (wrapper, payload) = stage_fixture(&output, None, absent_process_id(), 1, 30);
+            fs::write(payload.join("marker"), b"stale").unwrap();
+            publish_bundle_marker(&output, b"validated winner").unwrap();
+            assert!(!wrapper.exists());
+            assert_eq!(fs::read(output.join("marker")).unwrap(), b"validated winner");
+            assert!(stage_entries(&output).is_empty());
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_different_raw_final_names() {
+        for format in [Some(ArtifactFormat::Memory2Sqlite), None] {
+            let directory = TestDir::new("different-raw-name");
+            let (name, foreign_name) = if format.is_some() {
+                (b"artifact-\xff.db".as_slice(), b"artifact-\xfe.db".as_slice())
+            } else {
+                (b"bundle-\xff".as_slice(), b"bundle-\xfe".as_slice())
+            };
+            let output = directory.0.join(OsString::from_vec(name.to_vec()));
+            let foreign_output = directory.0.join(OsString::from_vec(foreign_name.to_vec()));
+            let (foreign_wrapper, foreign_payload) = stage_fixture(&foreign_output, format, absent_process_id(), 1, 40);
+            let foreign_file = if format.is_some() { foreign_payload } else { foreign_payload.join("marker") };
+            fs::write(&foreign_file, b"foreign payload").unwrap();
+            let (matching_wrapper, matching_payload) = stage_fixture(&output, format, absent_process_id(), 1, 41);
+            let matching_file = if format.is_some() { matching_payload } else { matching_payload.join("marker") };
+            fs::write(&matching_file, b"matching stale payload").unwrap();
+
+            if format.is_some() {
+                publish_sqlite_text(&output, "winner").unwrap();
+                assert_eq!(fs::read(&output).unwrap(), b"winner");
+            } else {
+                publish_bundle_marker(&output, b"winner").unwrap();
+                assert_eq!(fs::read(output.join("marker")).unwrap(), b"winner");
+            }
+            assert!(!matching_wrapper.exists());
+            assert!(foreign_wrapper.is_dir());
+            assert_eq!(fs::read(foreign_file).unwrap(), b"foreign payload");
+            assert_eq!(stage_entries(&output), vec![foreign_wrapper]);
+        }
+    }
+
+    #[test]
+    fn recovery_leaves_legacy_v1_file_and_bundle_staging_untouched() {
+        let directory = TestDir::new("legacy-v1");
+        let process_id = absent_process_id();
+        // Literal legacy-v1 shapes. Recovery must ignore every v1 name without hashing.
+        let legacy_file = directory.0.join(format!(
+            ".nuwax-mapping-cli-stage-v1-0123456789abcdef0123456789abcdef-memory2-sqlite-{process_id}-0000000000000001-0000000000000002.tmp.db"
+        ));
+        fs::write(&legacy_file, b"legacy database").unwrap();
+        let legacy_wal = append_suffix(&legacy_file, "-wal");
+        fs::write(&legacy_wal, b"legacy wal").unwrap();
+        let legacy_bundle = directory.0.join(format!(
+            ".nuwax-mapping-cli-map-bundle-v1-{process_id}-0000000000000001-0000000000000002-fedcba9876543210fedcba9876543210"
+        ));
+        fs::create_dir(&legacy_bundle).unwrap();
+        fs::write(legacy_bundle.join("marker"), b"legacy bundle").unwrap();
+        let output = directory.0.join("artifact.db");
+        let bundle = directory.0.join("bundle");
+
+        publish_sqlite_text(&output, "winner").unwrap();
+        publish_bundle_marker(&bundle, b"bundle winner").unwrap();
+
+        assert_eq!(fs::read(&output).unwrap(), b"winner");
+        assert_eq!(fs::read(bundle.join("marker")).unwrap(), b"bundle winner");
+        assert_eq!(fs::read(legacy_file).unwrap(), b"legacy database");
+        assert_eq!(fs::read(legacy_wal).unwrap(), b"legacy wal");
+        assert_eq!(fs::read(legacy_bundle.join("marker")).unwrap(), b"legacy bundle");
+        assert!(stage_entries(&output).is_empty());
+    }
+
+    #[test]
+    fn bundle_wrapper_lifecycle_preserves_active_and_unverifiable_owners() {
+        let directory = TestDir::new("bundle-wrapper-lifecycle");
+        let output = directory.0.join("bundle");
+        let policy = RecoveryPolicy::acquire().unwrap();
+        let (active_wrapper, active_payload) = stage_fixture(
+            &output, None, std::process::id(), policy.current_process_start(), 50,
+        );
+        fs::write(active_payload.join("marker"), b"active").unwrap();
+        let (dead_wrapper, dead_payload) = stage_fixture(&output, None, absent_process_id(), 1, 51);
+        fs::write(dead_payload.join("marker"), b"dead").unwrap();
+        let (published_wrapper, moved_payload) = stage_fixture(&output, None, absent_process_id(), 1, 52);
+        fs::remove_dir(moved_payload).unwrap(); // Crash after payload rename: raw name remains.
+        let (empty_wrapper, unused_payload) = stage_fixture(&output, None, absent_process_id(), 1, 53);
+        fs::remove_dir(&unused_payload).unwrap();
+        fs::remove_dir(unused_payload.parent().unwrap()).unwrap(); // No destination binding remains.
+        let parent = StableDirectory::open(&directory.0).unwrap();
+
+        recover_stale_wrappers(&parent, output.file_name().unwrap(), &output, None,
+            |owner| owner_is_proven_dead_from_probe(owner, ProcessProbe::Unverifiable)).unwrap();
+        assert_eq!(fs::read(dead_payload.join("marker")).unwrap(), b"dead");
+        assert_eq!(fs::read(active_payload.join("marker")).unwrap(), b"active");
+
+        publish_bundle_marker(&output, b"validated winner").unwrap();
+
+        assert_eq!(fs::read(output.join("marker")).unwrap(), b"validated winner");
+        assert!(!dead_wrapper.exists());
+        assert!(active_wrapper.is_dir());
+        assert_eq!(fs::read(active_payload.join("marker")).unwrap(), b"active");
+        assert!(!published_wrapper.exists());
+        assert!(empty_wrapper.is_dir());
+        let mut remaining = stage_entries(&output);
+        remaining.sort();
+        let mut expected = vec![active_wrapper, empty_wrapper];
+        expected.sort();
+        assert_eq!(remaining, expected);
+    }
+
+    #[test]
+    fn bundle_postpublish_cleanup_preserves_recreated_payload() {
+        let directory = TestDir::new("bundle-postpublish-cleanup");
+        let parent = StableDirectory::open(&directory.0).unwrap();
+        let final_name = OsStr::new("bundle");
+        let policy = RecoveryPolicy::acquire().unwrap();
+        let area = StagingArea::reserve(&parent, final_name, "bundle", &policy).unwrap();
+        let payload = OsStr::new("payload");
+        area.contents.create_directory(payload).unwrap();
+        let staging = area.contents.open_stable_directory(payload).unwrap();
+        staging.write_synced_beneath(Path::new("marker"), b"winner").unwrap();
+        staging.sync_tree().unwrap();
+        area.require_bound(&parent).unwrap();
+        rename_directory_no_replace_at(&area.contents, payload, &parent, final_name).unwrap();
+        area.contents.sync().unwrap();
+        parent.sync().unwrap();
+        area.contents.create_directory(payload).unwrap();
+        let replacement = area.contents.open_stable_directory(payload).unwrap();
+        replacement.write_synced_beneath(Path::new("marker"), b"new payload").unwrap();
+
+        assert!(area.cleanup_empty(&parent).is_err());
+        assert_eq!(fs::read(directory.0.join("bundle/marker")).unwrap(), b"winner");
+        assert_eq!(read_fresh_file(&replacement, "marker").unwrap(), b"new payload");
+        area.contents.require_named_identity(payload, &replacement).unwrap();
+        area.require_bound(&parent).unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn stable_directory_operations_ignore_parent_path_retarget() {
@@ -2905,22 +3081,148 @@ mod tests {
         let moved = directory.0.join("opened-output");
         fs::create_dir(&parent).unwrap();
         let stable = StableDirectory::open(&parent).unwrap();
-        let staging_name = OsStr::new("staging.tmp.json");
+        let staging_name = OsStr::new("payload.tmp.json");
         let final_name = OsStr::new("winner.json");
-        let mut staging = stable.create_new(staging_name).unwrap();
+        let policy = RecoveryPolicy::acquire().unwrap();
+        let area = StagingArea::reserve(&stable, final_name, "summary-json", &policy).unwrap();
+        let mut staging = area.contents.create_new(staging_name).unwrap();
         staging.write_all(b"winner").unwrap();
         staging.sync_all().unwrap();
         drop(staging);
 
         fs::rename(&parent, &moved).unwrap();
         fs::create_dir(&parent).unwrap();
-        stable.link_no_replace(staging_name, final_name).unwrap();
+        area.require_bound(&stable).unwrap();
+        area.contents.link_no_replace_to(staging_name, &stable, final_name).unwrap();
         stable.sync().unwrap();
-        cleanup_stage(&stable, staging_name, ArtifactFormat::SummaryJson).unwrap();
+        area.cleanup(&stable, staging_name, Some(ArtifactFormat::SummaryJson)).unwrap();
 
         assert_eq!(fs::read(moved.join(final_name)).unwrap(), b"winner");
+        assert!(stage_entries(&moved.join(final_name)).is_empty());
         assert!(fs::read_dir(parent).unwrap().next().is_none());
     }
+    // Test-only DTO adapter: production has no Geometry -> CLI adapter.
+    fn offline_v2_fixture() -> OfflineCandidateBundleV2 {
+        let commit = json!({"boot_nonce": "340282366920938463463374607431768211455", "sequence": 7});
+        let provenance = json!({
+            "commit_id": commit,
+            "occupancy_receipt": {"commit_id": commit, "session_id":"fixture-session", "session_generation":2,
+                "occupancy_revision":7, "source_timestamp_ns":99, "backend_kind":"voxel", "backend_generation":1},
+            "cloud_receipt": {"commit_id":commit, "session_generation":2, "occupancy_revision":7,
+                "cloud_revision":7, "source_timestamp_ns":99, "point_count":1}
+        });
+        let members = [
+            ("navigation/map.yaml", "application/x-yaml", "nav2_occupancy_yaml_v1", "canonical_raw_occupancy", b"image: map.pgm\n".to_vec()),
+            ("navigation/map.pgm", "image/x-portable-graymap", "nav2_occupancy_pgm_p5_v1", "canonical_raw_occupancy", b"P5\n1 1\n255\n\0".to_vec()),
+            ("cloud/map.pcd", "application/vnd.pointclouds.pcd", "pcd_xyz_binary_v1", "committed_transformed_accepted_cloud", b"test-pcd-body".to_vec()),
+            ("mapping_backend/voxel/objects/checkpoint.bin", "application/octet-stream", "checkpoint_object_v1", "mapping_backend_checkpoint", b"test-checkpoint".to_vec()),
+        ].into_iter().map(|(path,media,encoding,source,bytes)| OfflineCandidateAssetMemberV2Dto {
+            relative_path_intent:path.into(), receipt_relative_path_intent:path.into(),
+            media_type:media.into(),receipt_media_type:media.into(),encoding:encoding.into(),receipt_encoding:encoding.into(),
+            size_bytes:bytes.len() as u64,bytes,source_binding:source.into(),source_commit_id_json:canonical_json_value(&commit).unwrap(),
+        }).collect();
+        OfflineCandidateAssetsV2Dto {
+            schema_version:2,snapshot_schema_version:3,
+            identity_json:canonical_json_value(&json!({"map_name":"fixture-map","map_frame_id":"map"})).unwrap(),
+            source_provenance_json:canonical_json_value(&provenance).unwrap(),backend_kind:"voxel".into(),last_source_timestamp_ns:99,
+            georeference_json:canonical_json_value(&json!({"frame_id":"map"})).unwrap(),
+            processing_receipt_json:canonical_json_value(&json!({"committed_point_count":2,"flush_committed":true})).unwrap(),
+            map_snapshot_seed_json:canonical_json_value(&json!({"fixture":true})).unwrap(),
+            deferred_json:canonical_json_value(&json!([])).unwrap(),members,
+        }.into_publish_bundle().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_v2_publishes_original_commit_and_source_roles() {
+        let directory=TestDir::new("offline-v2-publish");
+        let candidate=offline_v2_fixture();
+        let output=directory.0.join("bundle");
+        let result=publish_offline_candidate_bundle(&output,&candidate).unwrap();
+        assert_eq!(result.final_directory,output);
+        assert_eq!(result.source_commit_id_json,canonical_json_value(&validate_offline_candidate(&candidate).unwrap()["commit_id"]).unwrap());
+        let top:Value=serde_json::from_slice(&fs::read(output.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(top["schema_version"],2);
+        assert_eq!(top["source_provenance"]["cloud_receipt"]["point_count"],1);
+        assert_eq!(top["processing_receipt"]["committed_point_count"],2);
+        assert_eq!(top["source_provenance"]["commit_id"]["boot_nonce"],"340282366920938463463374607431768211455");
+        assert!(top["files"].as_array().unwrap().iter().all(|entry|entry.get("sha256").is_none()));
+        let pcd=top["files"].as_array().unwrap().iter().find(|entry|entry["encoding"]=="pcd_xyz_binary_v1").unwrap();
+        assert_eq!(pcd["source_binding"],"committed_transformed_accepted_cloud");
+        assert!(publish_offline_candidate_bundle(&output,&candidate).is_err());
+    }
+
+    #[test]
+    fn offline_v2_rejects_wrong_schema_commit_role_size_and_path() {
+        for mutation in 0..6 {
+            let mut candidate=offline_v2_fixture();
+            match mutation {
+                0=>candidate.schema_version=1,
+                1=>candidate.snapshot_schema_version=2,
+                2=>candidate.members[0].source_commit_id_json=canonical_json_value(&json!({"boot_nonce":"1","sequence":7})).unwrap(),
+                3=>candidate.members[2].source_binding="canonical_cloud".into(),
+                4=>candidate.members[0].size_bytes+=1,
+                _=>{candidate.members[3].relative_path="mapping_backend/voxel/objects/old-name.bin".into();candidate.checkpoint.object_path=candidate.members[3].relative_path.clone();}
+            }
+            assert!(validate_offline_candidate(&candidate).is_err(),"mutation {mutation}");
+        }
+    }
+
+    #[test]
+    fn offline_v2_rejects_noncanonical_or_mismatched_provenance() {
+        for mutation in 0..4 {
+            let mut candidate=offline_v2_fixture();
+            let mut provenance:Value=serde_json::from_slice(&candidate.source_provenance_json).unwrap();
+            match mutation {
+                0=>provenance["commit_id"]["boot_nonce"]=json!(7),
+                1=>provenance["commit_id"]["boot_nonce"]=json!("01"),
+                2=>provenance["cloud_receipt"]["commit_id"]["sequence"]=json!(8),
+                _=>provenance["commit_id"]["boot_nonce"]=json!("340282366920938463463374607431768211456"),
+            }
+            candidate.source_provenance_json=canonical_json_value(&provenance).unwrap();
+            assert!(validate_offline_candidate(&candidate).is_err(),"mutation {mutation}");
+        }
+        let mut candidate=offline_v2_fixture();
+        candidate.source_provenance_json.push(b' ');
+        assert!(validate_offline_candidate(&candidate).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_v2_directory_checks_sizes_but_not_static_binary_content() {
+        let directory=TestDir::new("offline-v2-static");
+        let stable=StableDirectory::open(&directory.0).unwrap();
+        let candidate=offline_v2_fixture();
+        materialize_offline_candidate(&stable,&candidate,&validate_offline_candidate(&candidate).unwrap()).unwrap();
+        let target=directory.0.join(&candidate.members[3].relative_path);
+        fs::write(&target,vec![b'X';candidate.members[3].size_bytes as usize]).unwrap();
+        validate_offline_candidate_directory(&stable,&candidate,&validate_offline_candidate(&candidate).unwrap()).unwrap();
+        fs::write(&target,b"short").unwrap();
+        assert!(validate_offline_candidate_directory(&stable,&candidate,&validate_offline_candidate(&candidate).unwrap()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_v2_directory_rejects_changed_json_commit_and_file_set() {
+        for mutation in 0..4 {
+            let directory=TestDir::new("offline-v2-bindings");
+            let stable=StableDirectory::open(&directory.0).unwrap();
+            let candidate=offline_v2_fixture();
+            materialize_offline_candidate(&stable,&candidate,&validate_offline_candidate(&candidate).unwrap()).unwrap();
+            let path=if mutation==0 {&candidate.checkpoint.selector_path} else {"manifest.json"};
+            let mut value:Value=serde_json::from_slice(&fs::read(directory.0.join(path)).unwrap()).unwrap();
+            match mutation {
+                0=>value["source_commit_id"]["sequence"]=json!(8),
+                1=>value["files"][0]["source_binding"]=json!("wrong"),
+                2=>value["files"].as_array_mut().unwrap().pop().map(|_|()).unwrap(),
+                _=>value["source_provenance"]["cloud_receipt"]["point_count"]=json!(2),
+            }
+            fs::write(directory.0.join(path),canonical_json_value(&value).unwrap()).unwrap();
+            assert!(validate_offline_candidate_directory(&stable,&candidate,&validate_offline_candidate(&candidate).unwrap()).is_err(),"mutation {mutation}");
+        }
+    }
+
+
 }
 
 #[cfg(all(test, not(target_os = "linux")))]

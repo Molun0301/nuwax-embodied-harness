@@ -18,7 +18,6 @@ struct GoalEnvelope {
     string committed_map_frame_id;
     int64_t source_timestamp_ns;
     string boundary_id;
-    byte boundary_sha256[32];
     string boundary_frame_id;
     int32_t boundary_points_length;
     geometry_msgs.Point boundary_points[boundary_points_length];
@@ -28,9 +27,10 @@ struct GoalEnvelope {
     int8_t allow_reverse;
     double position_tolerance_m;
     double yaw_tolerance_rad;
-    byte navigation_configuration_sha256[32];
+    string body_reference_frame_id;
+    int8_t has_body_to_support_z;
+    double body_to_support_z_m;
     // 目标产生时的规范地图坐标代际。
     int64_t map_frame_generation;
-    byte payload_sha256[32];
     geometry_msgs.PoseStamped goal;
 }

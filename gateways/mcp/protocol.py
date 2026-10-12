@@ -26,6 +26,7 @@ from gateways.feedback import (
 )
 from gateways.request_context import categorize_gateway_error
 from gateways.runtime import GatewayRuntime
+from gateways.updates import run_mcp_operation
 from gateways.feedback_stream import feedback_cursor, feedback_events, format_feedback_sse
 
 
@@ -688,6 +689,10 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
         tool_call_failure_logged = False
 
         try:
+            if not has_request_id or method not in {"tools/call", "tools/list"}:
+                # 通知/会话控制不是停车捷径，保留维护期间的拒绝口径。
+                # 它们不调用设备；准入检查在原解析之后、任何会话写入之前。
+                await run_in_threadpool(run_mcp_operation, request, lambda: None)
             if not has_request_id:
                 return Response(status_code=202)
 
@@ -775,12 +780,16 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                 MCP_LOGGER.debug("MCP 工具调用开始", extra=log_extra)
                 try:
                     result = await run_in_threadpool(
-                        lambda: runtime.invoke_tool(
-                            function_name,
-                            function_arguments,
-                            requested_by="local",
-                            request_context=request_context,
-                            project_result=False,
+                        lambda: run_mcp_operation(
+                            request,
+                            lambda: runtime.invoke_tool(
+                                function_name,
+                                function_arguments,
+                                requested_by="local",
+                                request_context=request_context,
+                                project_result=False,
+                            ),
+                            tool_name=function_name,
                         )
                     )
                     structured = result
@@ -846,6 +855,11 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
             )
         except Exception as exc:
             gateway_error = as_gateway_error(exc)
+            if gateway_error.error_code == "update_maintenance":
+                return JSONResponse(_jsonrpc_error(
+                    request_id, code=gateway_error.jsonrpc_code, message=gateway_error.message,
+                    data={"code": gateway_error.error_code, "message": gateway_error.message},
+                ), status_code=503)
             error_category = categorize_gateway_error(gateway_error.error_code, gateway_error.http_status)
             request.state.error_category = error_category
             if not tool_call_failure_logged:

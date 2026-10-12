@@ -67,11 +67,6 @@ struct _nuwax_msgs_GoalEnvelope
     char*      boundary_id;
 
     /**
-     * LCM Type: byte[32]
-     */
-    uint8_t    boundary_sha256[32];
-
-    /**
      * LCM Type: string
      */
     char*      boundary_frame_id;
@@ -93,19 +88,16 @@ struct _nuwax_msgs_GoalEnvelope
     double     yaw_tolerance_rad;
 
     /**
-     * LCM Type: byte[32]
+     * LCM Type: string
      */
-    uint8_t    navigation_configuration_sha256[32];
+    char*      body_reference_frame_id;
+    int8_t     has_body_to_support_z;
+    double     body_to_support_z_m;
 
     /**
      * 目标产生时的规范地图坐标代际。
      */
     int64_t    map_frame_generation;
-
-    /**
-     * LCM Type: byte[32]
-     */
-    uint8_t    payload_sha256[32];
     geometry_msgs_PoseStamped goal;
 };
 

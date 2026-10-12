@@ -7,6 +7,8 @@
 //! contains committed source IDs. No source history is exported during polling.
 
 use super::*;
+use crate::explore_mission::{frontier_goal_options, home_goal_options, MissionRoute};
+use nuwax_nav_types_messages::GoalOptions;
 use crate::explore_compute_owner::{self as owner, Backend, Cancellation, Decision, Settlement};
 use nuwax_exploration::mission::SourceCheckpoint;
 use nuwax_exploration::{
@@ -210,6 +212,7 @@ impl ExploreComputeBackend {
 
     fn prepare_request(
         &mut self,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
         request: ComputeRequest,
         cancelled: impl Fn() -> bool,
     ) -> ComputeProjection {
@@ -231,9 +234,9 @@ impl ExploreComputeBackend {
             (ComputeProjection::Cancelled, false)
         } else {
             match request {
-                ComputeRequest::Selection(request) => self.prepare_selection(request, &cancelled),
+                ComputeRequest::Selection(request) => self.prepare_selection(request, &cancelled, cancellation),
                 ComputeRequest::HomewardBudget(request) => {
-                    (prepare_homeward_budget(request, &cancelled), false)
+                    (prepare_homeward_budget(request, &cancelled, cancellation), false)
                 }
                 ComputeRequest::Coverage { context } => {
                     #[cfg(test)]
@@ -271,6 +274,7 @@ impl ExploreComputeBackend {
         &mut self,
         request: SelectionRequest,
         cancelled: &impl Fn() -> bool,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> (ComputeProjection, bool) {
         let SelectionRequest { context, progress } = request;
         let planning = context.input.fork_for_planning();
@@ -341,7 +345,13 @@ impl ExploreComputeBackend {
                     Err(error) => output.mission = Some(Err(error)),
                     Ok(routes) => {
                         let start = mission_pose_from_stamped(&context.robot_pose);
-                        let target = candidate.map(|goal| mission_pose_from_stamped(&goal.pose));
+                        let target = candidate.map(|goal| {
+                            let (surface, config) = match &context.input {
+                                ComputeInput::Planar(_) => (false, None),
+                                ComputeInput::Surface { config, .. } => (true, Some(config)),
+                            };
+                            (mission_pose_from_stamped(&goal.pose), frontier_goal_options(goal, surface, config))
+                        });
                         #[cfg(test)]
                         let _span = context
                             .attribution
@@ -351,8 +361,8 @@ impl ExploreComputeBackend {
                             &start,
                             progress,
                             &context.config.return_policy,
-                            target.as_ref(),
-                            |from, to| routes.distance(from, to),
+                            target.as_ref().map(|(pose, options)| (pose, *options)),
+                            |from, to, options| routes.query(from, to, options, cancellation),
                             cancelled,
                         ) {
                             RouteComputation::Complete(result) => output.mission = Some(result),
@@ -416,7 +426,7 @@ impl Backend for ExploreComputeBackend {
     type LifecycleAck = ComputeLifecycleAck;
 
     fn prepare(&mut self, request: Self::Request, cancellation: &Cancellation) -> Self::Projection {
-        self.prepare_request(request, || cancellation.is_cancelled())
+        self.prepare_request(Some(cancellation.flag()), request, || cancellation.is_cancelled())
     }
 
     fn resolve(&mut self, decision: Decision) -> Settlement<Self::Finalized> {
@@ -612,36 +622,36 @@ fn ordered_mission_query(
     start: &MissionPose,
     progress: &MissionProgress,
     policy: &ReturnPolicy,
-    candidate: Option<&MissionPose>,
-    mut distance: impl FnMut(&MissionPose, &MissionPose) -> Result<f64, String>,
+    candidate: Option<(&MissionPose, GoalOptions)>,
+    mut query: impl FnMut(&MissionPose, &MissionPose, GoalOptions) -> Result<MissionRoute, String>,
     cancelled: &impl Fn() -> bool,
 ) -> RouteComputation<Result<MissionRouteAdvice, String>> {
     if cancelled() {
         return RouteComputation::Cancelled;
     }
-    let homeward = match distance(start, &progress.home) {
+    let homeward = match query(start, &progress.home, home_goal_options()) {
         Ok(value) => value,
         Err(error) => return RouteComputation::Complete(Err(error)),
     };
     if cancelled() {
         return RouteComputation::Cancelled;
     }
-    let can_visit = if let Some(candidate) = candidate {
-        match distance(start, candidate) {
+    let can_visit = if let Some((candidate, options)) = candidate {
+        match query(start, candidate, options) {
             Err(error) => Err(error),
             Ok(outward) => {
                 if cancelled() {
                     return RouteComputation::Cancelled;
                 }
-                distance(candidate, &progress.home)
-                    .map(|back| policy.can_visit(progress.travelled_m, outward, back))
+                query(&outward.end, &progress.home, home_goal_options())
+                    .map(|back| policy.can_visit(progress.travelled_m, outward.length, back.length))
             }
         }
     } else {
         Ok(false)
     };
     RouteComputation::Complete(Ok(MissionRouteAdvice {
-        homeward,
+        homeward: homeward.length,
         can_visit,
     }))
 }
@@ -649,6 +659,7 @@ fn ordered_mission_query(
 fn prepare_homeward_budget(
     request: HomewardBudgetRequest,
     cancelled: &impl Fn() -> bool,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> ComputeProjection {
     let HomewardBudgetRequest { context, progress } = request;
     #[cfg(test)]
@@ -682,15 +693,17 @@ fn prepare_homeward_budget(
         .as_ref()
         .map(|trace| trace.begin(attribution::Stage::OwnerRouteQueries, 0));
     let result = routes
-        .distance(
+        .query(
             &mission_pose_from_stamped(&context.robot_pose),
             &progress.home,
+            home_goal_options(),
+            cancellation,
         )
         .and_then(|homeward| {
             context
                 .config
                 .return_policy
-                .should_return(progress.travelled_m, homeward)
+                .should_return(progress.travelled_m, homeward.length)
         });
     ComputeProjection::HomewardBudget(result)
 }

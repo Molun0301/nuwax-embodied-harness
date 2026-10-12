@@ -163,12 +163,9 @@ impl Client {
         tokio::task::spawn_blocking(move || {
             use std::io::{Seek, SeekFrom};
             let mut file = crate::archive::open_regular(&path)?;
-            let (size, sha) = crate::archive::hash_reader(&mut file)?;
-            if size != artifact.payload_size
-                || sha != artifact.sha256
-                || closed.load(Ordering::Acquire)
-            {
-                return Err("二维制品身份不一致或拥有方已关闭".into());
+            crate::archive::read_bound_structure(&mut file, artifact.payload_size, &artifact.identity)?;
+            if closed.load(Ordering::Acquire) {
+                return Err("二维制品拥有方已关闭".into());
             }
             file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
             Ok(file)
@@ -181,12 +178,12 @@ impl Client {
         &self,
         mut source: std::fs::File,
         size: u64,
-        sha256: [u8; 32],
+        identity: ArtifactIdentity,
     ) -> Result<FileArtifact, String> {
         let artifact = FileArtifact {
             file_name: format!("input-{}.nws2d", uuid::Uuid::new_v4().simple()),
             payload_size: size,
-            sha256,
+            identity,
         };
         artifact.validate()?;
         if self.closed.load(Ordering::Acquire) {
@@ -195,9 +192,9 @@ impl Client {
         let path = self.directory.join(&artifact.file_name);
         let closed = self.closed.clone();
         tokio::task::spawn_blocking(move || {
-            use sha2::{Digest, Sha256};
             use std::io::{Read, Seek, SeekFrom, Write};
             use std::os::unix::fs::OpenOptionsExt;
+            crate::archive::read_bound_structure(&mut source, size, &artifact.identity)?;
             let mut output = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -207,7 +204,6 @@ impl Client {
             let result = (|| {
                 source.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
                 let mut buffer = vec![0; crate::archive::CHUNK_BYTES];
-                let mut hash = Sha256::new();
                 let mut total = 0u64;
                 loop {
                     let n = source.read(&mut buffer).map_err(|e| e.to_string())?;
@@ -218,11 +214,9 @@ impl Client {
                     if total > size {
                         return Err("二维输入制品增长".into());
                     }
-                    hash.update(&buffer[..n]);
                     output.write_all(&buffer[..n]).map_err(|e| e.to_string())?;
                 }
                 if total != size
-                    || <[u8; 32]>::from(hash.finalize()) != sha256
                     || closed.load(Ordering::Acquire)
                 {
                     return Err("二维输入制品变化或拥有方已关闭".into());
@@ -277,7 +271,6 @@ impl Client {
                 .read_to_end(&mut data)
                 .map_err(|e| e.to_string())?;
             if data.len() as u64 != expected.payload_size
-                || nuwax_codec::hash::sha256_bytes(&data) != expected.data_sha256
             {
                 return Err("二维快照内容与回执不一致".into());
             }
@@ -458,3 +451,7 @@ impl Drop for ProcessOwner {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/assigned_supervisor/mod.rs"]
+mod assigned_tests;

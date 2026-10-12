@@ -295,6 +295,33 @@ impl MissionCalibration {
     }
 }
 
+/// 与实际子目标派发共用约束，返航始终保留冻结 home 的位置与朝向要求。
+pub(crate) fn home_goal_options() -> GoalOptions {
+    GoalOptions { allow_reverse: false, position_tolerance_m: 0.1, yaw_tolerance_rad: 0.2 }
+}
+
+pub(crate) fn frontier_goal_options(
+    goal: &nuwax_nav_types_messages::visual::FrontierGoal,
+    surface: bool,
+    config: Option<&SurfaceNavigationConfig>,
+) -> GoalOptions {
+    let mut options = GoalOptions::default();
+    if surface {
+        options.allow_reverse = config.and_then(|config| config.follower.kinematics())
+            .is_some_and(|motion| motion.max_reverse_mps > 0.0);
+        if goal.metadata.get("goal_orientation_required").is_some_and(|value| value == "false") {
+            options.yaw_tolerance_rad = std::f64::consts::PI;
+        }
+    }
+    options
+}
+
+/// 单次已知地图查询的实际长度和末端；不缓存路径或承诺未来执行轨迹。
+pub(crate) struct MissionRoute {
+    pub length: f64,
+    pub end: MissionPose,
+}
+
 /// 在原调度任务等待的阻塞计算内使用；结果只是本次已知地图的路线估计。
 pub(crate) enum MissionRoutes {
     Planar {
@@ -334,56 +361,53 @@ impl MissionRoutes {
             config: calibration.planar.clone(),
         })
     }
-    pub fn distance(&self, from: &MissionPose, to: &MissionPose) -> Result<f64, String> {
+    pub fn query(
+        &self,
+        from: &MissionPose,
+        to: &MissionPose,
+        options: GoalOptions,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<MissionRoute, String> {
         from.validate()?;
         to.validate()?;
-        // 与实际子目标同容差；零距离仍须运行真实可通行查询。
-        let options = GoalOptions {
-            allow_reverse: false,
-            position_tolerance_m: 0.1,
-            yaw_tolerance_rad: 0.2,
-        };
-        let points = match self {
+        // 零距离仍运行真实可通行查询；直接累计原路径，不再复制位置数组。
+        match self {
             Self::Planar { map, config } => {
                 let mut planner = SimplePlanner::new(config.clone()).map_err(|e| e.to_string())?;
                 planner.replace_costmap(map.clone());
-                let path = planner
-                    .query_route(pose3(from), pose3(to), options)
+                let (path, end_yaw) = planner
+                    .query_route_with_end_yaw(pose3(from), pose3(to), options)
                     .map_err(|e| e.to_string())?;
-                path.iter()
-                    .map(|p| [p.x, p.y, from.position[2]])
-                    .collect::<Vec<_>>()
+                let end = path.last().ok_or("返航路线为空")?;
+                let orientation = Quaternion::from_yaw(end_yaw);
+                Ok(MissionRoute {
+                    length: path.windows(2).map(|p| ((p[0].x - p[1].x).powi(2) + (p[0].y - p[1].y).powi(2)).sqrt()).sum(),
+                    end: MissionPose {
+                        position: [end.x, end.y, from.position[2]],
+                        orientation_xyzw: [orientation.x, orientation.y, orientation.z, orientation.w],
+                    },
+                })
             }
-            Self::Surface {
-                map,
-                config,
-                boundary,
-            } => nuwax_nav_stack::surface_oriented::plan(
-                map,
-                (from.position, from.orientation_xyzw),
-                (to.position, to.orientation_xyzw),
-                options,
-                config.follower.motion_limits.as_ref(),
-                boundary,
-                30_000,
-            )?
-            .into_iter()
-            .map(|p| p.0)
-            .collect(),
-        };
-        if points.is_empty() {
-            return Err("返航路线为空".into());
+            Self::Surface { map, config, boundary } => {
+                let path = nuwax_nav_stack::surface_oriented::plan_cancellable(
+                    map,
+                    (from.position, from.orientation_xyzw),
+                    (to.position, to.orientation_xyzw),
+                    options,
+                    config.follower.motion_limits.as_ref(),
+                    boundary,
+                    30_000,
+                    cancellation,
+                )?;
+                let end = path.last().ok_or("返航路线为空")?;
+                Ok(MissionRoute {
+                    length: path.windows(2).map(|p| {
+                        p[0].0.iter().zip(p[1].0).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt()
+                    }).sum(),
+                    end: MissionPose { position: end.0, orientation_xyzw: end.1 },
+                })
+            }
         }
-        Ok(points
-            .windows(2)
-            .map(|p| {
-                p[0].iter()
-                    .zip(p[1])
-                    .map(|(a, b)| (a - b).powi(2))
-                    .sum::<f64>()
-                    .sqrt()
-            })
-            .sum())
     }
 }
 
@@ -576,16 +600,16 @@ pub(crate) mod tests {
         let route =
             MissionRoutes::planar(grid.clone(), &calibration(), &ExploreStartConfig::default())
                 .unwrap();
-        let length = route.distance(&pose(2.0, 2.0), &pose(4.0, 2.0)).unwrap();
+        let length = route.query(&pose(2.0, 2.0), &pose(4.0, 2.0), home_goal_options(), None).unwrap().length;
         assert!(length > 5.0, "绕墙路线不能退化为2米直线，实际{length}");
         assert_eq!(
-            route.distance(&pose(2.0, 2.0), &pose(2.0, 2.0)).unwrap(),
+            route.query(&pose(2.0, 2.0), &pose(2.0, 2.0), home_goal_options(), None).unwrap().length,
             0.0
         );
         grid.set(40, 20, OccupancyCell::Unknown);
         let route =
             MissionRoutes::planar(grid, &calibration(), &ExploreStartConfig::default()).unwrap();
-        assert!(route.distance(&pose(2.0, 2.0), &pose(4.05, 2.05)).is_err());
+        assert!(route.query(&pose(2.0, 2.0), &pose(4.05, 2.05), home_goal_options(), None).is_err());
     }
     #[test]
     fn mission_boundary_rejects_concave_notch_through_cell() {

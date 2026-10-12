@@ -34,6 +34,7 @@ from contracts.map_relocalization import (
     AssignedRelocalizationRequest,
     AssignedRelocalizationTerminal,
     current_assigned_relocalization_policy,
+    current_assigned_planar_relocalization_policy,
 )
 from contracts.map_workspace import (
     AssetIdentityV2,
@@ -72,7 +73,8 @@ from services.geometry.geometry_runtime_provider import (
     GeometryRuntimeMapActivationAppliedError,
     GeometryRuntimeMapActivationOutcomeUnknown,
     MappingBackendCheckpointExportBundle,
-    _exploration_child_lease_fingerprint,
+    _exploration_child_lease_address,
+    _exploration_receipt_matches_child,
     _LEGACY_ACTIVATION_IDENTITY_FIELDS,
     _assigned_mapping_predecessor,
     _AssignedNativeLocalizationSample,
@@ -242,6 +244,7 @@ class _PreparedAssignedMapActivation:
     _provider_origin: tuple = field(repr=False)
     _attach_epoch: int
     prior_snapshot: _MapActivationSnapshot = field(repr=False)
+    _planar_default_seed: Optional[Tuple[float, float, float]] = field(repr=False)
 
     def __init__(self, *args, **kwargs):
         raise TypeError("assigned preparations must come from the runtime owner")
@@ -361,7 +364,7 @@ def _assigned_terminal_from_result(
     if isinstance(result, AssignedRelocalizationTerminal):
         terminal = result
     else:
-        envelope = {"schema_version", "request_id", "assigned_cloud_v2"}
+        envelope = {"schema_version", "request_id", request.body_key}
         convenience = {"success", "disposition", "disposition_name", "correction_revision", "detail"}
         if (not isinstance(result, Mapping) or not envelope <= result.keys()
                 or set(result) - envelope - convenience):
@@ -2226,6 +2229,22 @@ class PlatformGeometryRuntime:
                     return
                 LOGGER.warning("已有 geometry sidecar 存活，但 gRPC provider 重新连接失败。")
                 return
+            # 一次短暂GetStatus失败可能只清除了attach探测状态。先复核同一Rust启动代际，
+            # 保留输入桥正在使用的provider，避免关闭旧引用后仅重挂输出流造成永久断流。
+            current_provider = self.get_geometry_runtime_provider()
+            recover = getattr(self._geometry_runtime_subprocess, "recover_same_runtime", None)
+            if (current_provider is not None and not getattr(current_provider, "_stopping", False)
+                    and not getattr(self, "_provider_attach_stopping", False) and callable(recover)):
+                if recover():
+                    with getattr(self, "_provider_attach_lock", self._runtime_state_lock):
+                        if (self.get_geometry_runtime_provider() is current_provider
+                                and not getattr(current_provider, "_stopping", False)
+                                and not getattr(self, "_provider_attach_stopping", False)
+                                and getattr(self, "_runtime_started", True)):
+                            LOGGER.info("Geometry同一启动代际健康恢复，保留现有provider与输入订阅")
+                            return
+                        if getattr(self, "_provider_attach_stopping", False) or not getattr(self, "_runtime_started", True):
+                            return
             LOGGER.warning("canonical geometry runtime 已失联，清理 Python attach handle")
             try:
                 self._geometry_runtime_subprocess.stop()
@@ -3843,8 +3862,10 @@ class PlatformGeometryRuntime:
                     or activation["activation_receipt_disposition"] not in {2, 3}
                     or type(activation.get("relocalization_target_available")) is not bool):
                 raise ValueError("assigned target requires a complete sealed activation")
+            planar = activation.get("mapping_backend_kind") == "slam_toolbox"
             if any(name in activation for name in
-                   _LEGACY_ACTIVATION_IDENTITY_FIELDS + ("cloud_source_sha256",)):
+                   _LEGACY_ACTIVATION_IDENTITY_FIELDS + ("cloud_source_sha256",)
+                   if not (planar and name in {"planar_mode", "target_kind"})):
                 raise ValueError("assigned activation mixes legacy or planar identity")
             receipt = AssignedActivationReceipt.admit(activation.get("activation_receipt_v2"))
             if receipt.asset_identity != asset_identity or receipt.map_name != map_name:
@@ -3864,7 +3885,8 @@ class PlatformGeometryRuntime:
             # Validate the actual projected policy, never fill a missing policy
             # from Python's current parameters or from a legacy digest alias.
             policy = activation.get("relocalization_policy_v2")
-            expected_policy = current_assigned_relocalization_policy()
+            expected_policy = (current_assigned_planar_relocalization_policy() if planar
+                else current_assigned_relocalization_policy())
             if (not isinstance(policy, dict) or set(policy) != set(expected_policy)
                     or any(type(policy[name]) is not type(value) or policy[name] != value
                            for name, value in expected_policy.items())):
@@ -3890,7 +3912,7 @@ class PlatformGeometryRuntime:
         if request is not None:
             if (request.asset_identity != expected_target.asset_identity
                     or not request.activation_receipt.exact_replay_of(expected_target.activation_receipt)
-                    or (require_current_policy and request.to_dict()["assigned_cloud_v2"]["policy"]
+                    or (require_current_policy and request.to_dict()[request.body_key]["policy"]
                         != activation["relocalization_policy_v2"])):
                 raise ValueError("durable assigned request differs from the captured target or policy")
         if require_available and activation["relocalization_target_available"] is not True:
@@ -5378,8 +5400,8 @@ class PlatformGeometryRuntime:
         resolved_bundle_root = self._require_bundle_root(bundle_root)
         if type(checkpoint_schema_version) is not int or checkpoint_schema_version not in (1, 2):
             raise ValueError("unsupported finalized checkpoint schema")
-        assigned_cloud_export = export_backend_checkpoint and checkpoint_schema_version == 2
-        if assigned_cloud_export and (
+        assigned_export = export_backend_checkpoint and checkpoint_schema_version == 2
+        if assigned_export and (
                 bundle.identity_schema_version != 1 or bundle.manifest_sha256 is not None):
             raise TypeError("assigned checkpoint preparation requires an unsealed legacy draft")
         if export_backend_checkpoint:
@@ -5394,7 +5416,7 @@ class PlatformGeometryRuntime:
 
         checkpoint_bundle = None
         checkpoint_mapping_context: Optional[Dict[str, object]] = None
-        if assigned_cloud_export:
+        if assigned_export:
             with self._runtime_state_lock:
                 export_provider = getattr(self, "_remote_provider", None)
                 if export_provider is None or getattr(self, "_provider_attach_stopping", False):
@@ -5413,13 +5435,13 @@ class PlatformGeometryRuntime:
         if export_backend_checkpoint:
             mapping_context_before = self.get_mapping_session_context()
             mapping_backend = self._resolve_mapping_backend()
-            if assigned_cloud_export:
+            if assigned_export:
                 require_export_origin()
                 if mapping_backend is not export_provider:
                     raise RuntimeError("assigned checkpoint mapping backend provider changed")
                 if (not isinstance(mapping_context_before, dict)
-                        or mapping_context_before.get("mapping_backend_kind") not in {"voxel", "raytracing"}):
-                    raise RuntimeError("assigned checkpoint export requires an active cloud backend")
+                        or mapping_context_before.get("mapping_backend_kind") not in {"voxel", "raytracing", "slam_toolbox"}):
+                    raise RuntimeError("assigned checkpoint export requires an active native backend")
             exporter = getattr(
                 mapping_backend,
                 "export_mapping_backend_checkpoint",
@@ -5429,13 +5451,13 @@ class PlatformGeometryRuntime:
                 raise RuntimeError(
                     "active native mapping backend does not support checkpoint export"
                 )
-            # Low-level callers retain the legacy default. Public cloud saves
+            # Low-level callers retain the legacy default. Public saves
             # explicitly select the paired, hash-free schema-2 checkpoint.
             checkpoint_bundle = (
                 exporter() if checkpoint_schema_version == 1
                 else exporter(checkpoint_schema_version=checkpoint_schema_version)
             )
-            if assigned_cloud_export:
+            if assigned_export:
                 require_export_origin()
             if not isinstance(
                 checkpoint_bundle,
@@ -5447,13 +5469,13 @@ class PlatformGeometryRuntime:
             if checkpoint_bundle.checkpoint.schema_version != checkpoint_schema_version:
                 raise RuntimeError("mapping backend checkpoint export changed the requested schema")
             mapping_context_after = self.get_mapping_session_context()
-            if assigned_cloud_export and (
+            if assigned_export and (
                     not isinstance(mapping_context_after, dict)
-                    or checkpoint_bundle.backend_kind not in {"voxel", "raytracing"}
+                    or checkpoint_bundle.backend_kind not in {"voxel", "raytracing", "slam_toolbox"}
                     or checkpoint_bundle.backend_kind != mapping_context_before.get("mapping_backend_kind")
                     or checkpoint_bundle.backend_kind != mapping_context_after.get("mapping_backend_kind")):
-                raise RuntimeError("assigned checkpoint cloud backend changed during export")
-            if assigned_cloud_export and any(
+                raise RuntimeError("assigned checkpoint backend changed during export")
+            if assigned_export and any(
                     mapping_context_before.get(field) != mapping_context_after.get(field)
                     for field in ("runtime_generation", "backend_generation")):
                 raise RuntimeError("assigned checkpoint mapping owner changed during export")
@@ -5507,7 +5529,7 @@ class PlatformGeometryRuntime:
         if planar_graph:
             database_metadata = {"database_present": True, "database_source_kind": "planar_graph",
                 "database_target_path": str(mapping_database_path), "payload_size": checkpoint_bundle.checkpoint.payload_size}
-        elif assigned_cloud_export:
+        elif assigned_export:
             database_metadata = self._materialize_native_bundle_database(
                 mapping_database_path,
                 bundle=bundle,
@@ -5763,7 +5785,7 @@ class PlatformGeometryRuntime:
                 "navigation_map_ready": nav2_map_metadata.get("present"),
             },
         }
-        if assigned_cloud_export:
+        if assigned_export:
             prepared = type(bundle)(**{
                 **{name: getattr(bundle, name) for name in type(bundle).model_fields},
                 **bundle_changes,
@@ -5859,8 +5881,8 @@ class PlatformGeometryRuntime:
         if (not isinstance(checkpoint_metadata, dict)
                 or type(checkpoint_metadata.get("schema_version")) is not int
                 or checkpoint_metadata["schema_version"] != 2
-                or checkpoint_metadata.get("backend_kind") not in {"voxel", "raytracing"}):
-            raise ValueError("assigned activation requires its schema-2 cloud checkpoint")
+                or checkpoint_metadata.get("backend_kind") not in {"voxel", "raytracing", "slam_toolbox"}):
+            raise ValueError("assigned activation requires its schema-2 checkpoint")
         root = self._require_bundle_root(bundle_root)
         with self._runtime_state_lock:
             provider = getattr(self, "_remote_provider", None)
@@ -5878,11 +5900,17 @@ class PlatformGeometryRuntime:
                 or stored.checkpoint.checkpoint_id != checkpoint_metadata.get("checkpoint_id")
                 or stored.checkpoint.backend_kind != checkpoint_metadata["backend_kind"]):
             raise ValueError("assigned checkpoint differs from finalized bundle ownership")
+        planar_default_seed = None
+        if stored.checkpoint.backend_kind == "slam_toolbox":
+            payload = stored.checkpoint.payload
+            header_size = int.from_bytes(payload[8:12], "little")
+            planar_default_seed = tuple(json.loads(payload[12:12 + header_size])["source"]["estimate"]["map_from_base"])
         prepared = object.__new__(_PreparedAssignedMapActivation)
         for name, value in {
             "_owner": self, "bundle": bundle.model_copy(), "bundle_root": root,
             "stored_checkpoint": stored, "_provider": provider, "_provider_origin": origin,
             "_attach_epoch": attach_epoch, "prior_snapshot": prior,
+            "_planar_default_seed": planar_default_seed,
         }.items():
             object.__setattr__(prepared, name, value)
         with self._runtime_state_lock:
@@ -5975,14 +6003,19 @@ class PlatformGeometryRuntime:
         if not isinstance(activation_evidence, Mapping):
             raise ValueError("assigned installation requires current native metadata")
         evidence = dict(activation_evidence)
-        if any(name in evidence for name in _LEGACY_ACTIVATION_IDENTITY_FIELDS + ("cloud_source_sha256",)):
+        planar = prepared.backend_kind == "slam_toolbox"
+        if any(name in evidence for name in _LEGACY_ACTIVATION_IDENTITY_FIELDS + ("cloud_source_sha256",)
+               if not (planar and name in {"planar_mode", "target_kind"})):
             raise ValueError("assigned installation evidence mixes legacy metadata")
         receipt = AssignedActivationReceipt.admit(evidence.get("activation_receipt_v2"))
         document = receipt.to_dict()
         installed = document["activation"]
         from services.geometry.mapping_backend_checkpoint_store import _identity_document
-        source = _identity_document(prepared.stored_checkpoint.checkpoint.cloud_identity)
-        if (document["request"] != request or document["target"]["source_cloud_member"] != source
+        checkpoint = prepared.stored_checkpoint.checkpoint
+        planar = checkpoint.backend_kind == "slam_toolbox"
+        source_key = "source_graph_member" if planar else "source_cloud_member"
+        source = _identity_document(checkpoint.graph_reference.member_identity if planar else checkpoint.cloud_identity)
+        if (document["request"] != request or document["target"][source_key] != source
                 or installed["backend_kind"] != prepared.backend_kind):
             raise ValueError("assigned installation differs from request or checkpoint source")
         exact = {
@@ -5996,6 +6029,8 @@ class PlatformGeometryRuntime:
             "backend_generation": installed["backend_generation"],
             "revision": document["target"]["occupancy_receipt"]["occupancy_revision"],
         }
+        if planar:
+            exact.update(planar_mode="localization", target_kind="planar_graph")
         if any(type(evidence.get(name)) is not type(value) or evidence[name] != value
                for name, value in exact.items()):
             raise ValueError("assigned installation requires exact current native state")
@@ -6007,7 +6042,8 @@ class PlatformGeometryRuntime:
         policy = evidence.get("relocalization_policy_v2")
         if isinstance(policy, dict):
             policy = dict(policy)
-        expected_policy = current_assigned_relocalization_policy()
+        expected_policy = (current_assigned_planar_relocalization_policy() if planar
+                else current_assigned_relocalization_policy())
         if (not isinstance(policy, dict) or set(policy) != set(expected_policy)
                 or any(type(policy[name]) is not type(value) or policy[name] != value
                        for name, value in expected_policy.items())):
@@ -6017,6 +6053,8 @@ class PlatformGeometryRuntime:
                   "activation_receipt_v2": document,
                   "relocalization_target_available": evidence["relocalization_target_available"],
                   "relocalization_policy_v2": policy}
+        if planar:
+            result["planar_default_seed"] = list(prepared._planar_default_seed)
         with self._runtime_state_lock:
             self._require_prepared_assigned_origin_locked(prepared)
         return receipt, result, source
@@ -12741,7 +12779,8 @@ class PlatformGeometryProviderBundle(
             or int(exploration_generation) <= 0
             or str(expected_lease.get("parent_request_id") or "").strip()
             != correlated_id
-            or int(expected_lease.get("producer_runtime_generation") or 0) <= 0
+            or _exploration_child_lease_address(expected_lease) is None
+            or expected_runtime_generation <= 0
             or observed_runtime_generation <= expected_runtime_generation
         ):
             return False
@@ -12834,9 +12873,12 @@ class PlatformGeometryProviderBundle(
         expected_generation = int(exploration_generation)
         expected_cancel_generation = int(cancel_generation)
         expected_correlation = str(recovery_correlation or "").strip()
-        expected_fingerprint = _exploration_child_lease_fingerprint(
-            expected_lease
-        )
+        expected_address = _exploration_child_lease_address(expected_lease)
+        if expected_address is not None:
+            expected_lease = dict(zip((
+                "session_id", "owner_kind", "parent_request_id", "goal_generation",
+                "producer_runtime_generation",
+            ), expected_address))
         lock = getattr(self.runtime, "_exploration_loop_lock", None)
         if (
             not correlated_id
@@ -12844,7 +12886,7 @@ class PlatformGeometryProviderBundle(
             or expected_generation <= 0
             or expected_cancel_generation <= 0
             or not expected_correlation
-            or not expected_fingerprint
+            or expected_address is None
             or str(expected_lease.get("parent_request_id") or "").strip()
             != correlated_id
         ):
@@ -12929,8 +12971,7 @@ class PlatformGeometryProviderBundle(
             == correlated_id
             and int(receipt.get("exploration_generation") or 0)
             == expected_generation
-            and str(receipt.get("child_lease_fingerprint") or "")
-            == expected_fingerprint
+            and _exploration_receipt_matches_child(receipt, child_lease=expected_lease)
             and int(receipt.get("cancel_generation") or 0)
             == expected_cancel_generation
             and terminal_profile
@@ -12992,7 +13033,8 @@ class PlatformGeometryProviderBundle(
         self,
         *,
         recovery_correlation: str,
-        child_lease_fingerprint: str,
+        child_lease_fingerprint: str = "",
+        child_lease: Optional[Dict[str, Any]] = None,
         deadline_monotonic: Optional[float] = None,
     ) -> bool:
         """Acknowledge a receipt without coupling it to reconciliation commit."""
@@ -13004,9 +13046,8 @@ class PlatformGeometryProviderBundle(
         if not self._is_geometry_profile_enabled():
             return False
         correlation = str(recovery_correlation or "").strip()
-        fingerprint = str(child_lease_fingerprint or "").strip()
         lock = getattr(self.runtime, "_exploration_loop_lock", None)
-        if not correlation or len(fingerprint) != 64 or lock is None:
+        if not correlation or lock is None:
             return False
         with _exploration_deadline_lock(
             lock,
@@ -13024,7 +13065,8 @@ class PlatformGeometryProviderBundle(
         try:
             acknowledged = remote.acknowledge_exploration_ownership_reconciliation(
                 recovery_correlation=correlation,
-                child_lease_fingerprint=fingerprint,
+                child_lease=child_lease,
+                child_lease_fingerprint=child_lease_fingerprint,
                 **(
                     {"deadline_monotonic": deadline_monotonic}
                     if deadline_monotonic is not None

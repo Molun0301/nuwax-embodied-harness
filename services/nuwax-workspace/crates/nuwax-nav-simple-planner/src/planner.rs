@@ -141,7 +141,13 @@ pub struct SimplePlanner {
 
 impl SimplePlanner {
     /// 在私有规划实例查询完整路线，供行程预算复用生产规划与机体检查。
-    pub fn query_route(mut self, from: Pose3, to: Pose3, options: nuwax_nav_types_messages::GoalOptions) -> Result<Vec<Point2>, NavError> {
+    pub fn query_route(self, from: Pose3, to: Pose3, options: nuwax_nav_types_messages::GoalOptions) -> Result<Vec<Point2>, NavError> {
+        self.query_route_with_end_yaw(from, to, options).map(|(points, _)| points)
+    }
+
+    /// 查询同一完整机体路线，并保留实际末端朝向，供连续多段行程估计使用。
+    /// 定向搜索保留末端 yaw；普通路线及已到达分支使用已通过完整机体检查的目标 yaw。
+    pub fn query_route_with_end_yaw(mut self, from: Pose3, to: Pose3, options: nuwax_nav_types_messages::GoalOptions) -> Result<(Vec<Point2>, f64), NavError> {
         self.update_odometry(from);
         self.set_goal_options(options)?;
         self.set_goal(to.position, 0.0);
@@ -149,10 +155,18 @@ impl SimplePlanner {
         if self.goal_pose_reached() {
             let points=vec![Point2::new(from.position.x,from.position.y),Point2::new(to.position.x,to.position.y)];
             let view=if let Some(geometry)=self.config.robot_geometry.as_ref(){self.costmap.planning_view(points[0],from.orientation.yaw(),geometry)?}else{self.costmap.clone()};
-            if view.path_has_observed_clearance(&points,from.orientation.yaw(),Some(to.orientation.yaw())) {return Ok(points);}
+            if view.path_has_observed_clearance(&points,from.orientation.yaw(),Some(to.orientation.yaw())) {return Ok((points, to.orientation.yaw()));}
         } else {
             self.replan_once(0.0);
-            if let Some(path)=self.cached_path {return Ok(path);}
+            if let Some(path)=self.cached_path {
+                // Oriented results start with the start pose and retain one yaw per point.
+                // Other routes retain the goal yaw set above and validated by clearance.
+                let end_yaw = match self.cached_yaws {
+                    Some(yaws) => yaws.last().copied(),
+                    None => self.goal_yaw,
+                };
+                if let Some(end_yaw) = end_yaw { return Ok((path, end_yaw)); }
+            }
         }
         Err(NavError::InvalidInput {field:"route",reason:"完整机体路线不可达或计算预算耗尽".into()})
     }
@@ -720,6 +734,51 @@ impl SimplePlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_query_preserves_actual_final_yaw_and_legacy_points() {
+        use nuwax_nav_types_messages::{GoalOptions, MotionLimits, MotionModel, OccupancyCell, OccupancyGrid2D, RobotGeometry};
+        let make_planner = |can_rotate_in_place| {
+            let config = SimplePlannerConfig {
+                robot_geometry: Some(RobotGeometry {
+                    footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
+                    z_min_m: -0.1, z_max_m: 0.1, source: "route-end-test".into(),
+                }),
+                motion_limits: Some(MotionLimits {
+                    model: MotionModel::Differential,
+                    max_forward_mps: 0.5, max_reverse_mps: 0.2, max_lateral_mps: 0.0, max_angular_rps: 1.0,
+                    linear_acceleration_mps2: 1.0, guaranteed_braking_mps2: 1.0,
+                    angular_acceleration_rps2: 1.0, guaranteed_angular_braking_rps2: 1.0,
+                    reaction_time_sec: 0.1, minimum_turning_radius_m: 0.0, can_rotate_in_place,
+                }),
+                ..Default::default()
+            };
+            let map = Costmap::from_occupancy(OccupancyGrid2D::filled(
+                Point2::new(0.0, 0.0), 0.1, 40, 40, OccupancyCell::Free), config.inflation_radius).unwrap();
+            let mut planner = SimplePlanner::new(config).unwrap();
+            planner.replace_costmap(map);
+            planner
+        };
+        let from = Pose3 { position: Point3::new(1.05, 1.05, 0.0), orientation: Quaternion::IDENTITY };
+        // Reached branch validates and retains its actual two-point segment to target.
+        let near = Pose3 { position: Point3::new(1.15, 1.05, 0.0), orientation: Quaternion::from_yaw(0.1) };
+        let (points, yaw) = make_planner(true).query_route_with_end_yaw(from, near, GoalOptions::default()).unwrap();
+        assert_eq!(points.last(), Some(&Point2::new(1.15, 1.05)));
+        assert_eq!(yaw, near.orientation.yaw());
+        let target = Pose3 { position: Point3::new(2.05, 1.05, 0.0), orientation: Quaternion::from_yaw(1.0) };
+        // Ordinary clearance-validated route ends at the requested yaw.
+        let (points, yaw) = make_planner(true).query_route_with_end_yaw(from, target, GoalOptions::default()).unwrap();
+        assert_eq!(yaw, target.orientation.yaw());
+        assert_eq!(make_planner(true).query_route(from, target, GoalOptions::default()).unwrap(), points);
+        // Force oriented search; its orientation-free direct connection ends facing forward,
+        // not at the nominal target yaw that query_route previously discarded.
+        let options = GoalOptions { yaw_tolerance_rad: std::f64::consts::PI, ..Default::default() };
+        let (points, yaw) = make_planner(false).query_route_with_end_yaw(from, target, options).unwrap();
+        assert_eq!(points.last(), Some(&Point2::new(2.05, 1.05)));
+        assert!(yaw.abs() < 1e-12);
+        assert_ne!(yaw, target.orientation.yaw());
+        assert_eq!(make_planner(false).query_route(from, target, options).unwrap(), points);
+    }
 
     #[test]
     fn body_view_starts_from_self_returns_but_keeps_surrounding_obstacles() {

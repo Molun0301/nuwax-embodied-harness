@@ -52,14 +52,48 @@ use crate::runtime_diagnostics::{self, RuntimeDiagnostics, ServiceState, SharedS
 use crate::typed_codec;
 use nuwax_exploration::{BoundarySegment, ExplorationBoundary};
 use nuwax_mapping_cloud::{
-    ActiveMapIdentityV2, CloudQueryIdentityV1, GeoreferenceBindingV1, MappingCloudOwner,
-    MappingCloudProvider, MappingCloudRequest, MappingCloudTerminal, OsmClient, Sha256Digest,
-    VerifiedGeoreferenceV1,
+    AssignedGeoreferenceV3, AssignedMapIdentityV3, AssignedMappingCloudGoalIntentV3,
+    CloudQueryIdentityV1, MappingCloudOwner, MappingCloudProvider, MappingCloudRequest,
+    MappingCloudTerminal, OsmClient,
 };
 use nuwax_motion_safety_guard::{
     HeldRecoveryFenceProof, MotionGuardClient, ZeroConfirmation, DEFAULT_UDS_PATH,
 };
 use nuwax_nav_types_messages::geometry::Point2;
+
+// The installed receipt already owns identity; mapping-cloud only projects it.
+fn mapping_cloud_assigned_receipt(
+    activation: &InstalledActivationIdentityV2,
+    target: &InstalledTargetReceiptV2,
+) -> ActivationReceiptV2 {
+    ActivationReceiptV2 {
+        request: Some(crate::activation_contract::request_to_wire(&activation.request)),
+        activation: Some(activation.to_wire()),
+        target: Some(target.to_wire()),
+    }
+}
+
+// Mapping-cloud projects the assigned query result before shared goal admission.
+fn mapping_cloud_assigned_goal_pose(
+    intent: &AssignedMappingCloudGoalIntentV3,
+) -> Result<schema::PoseStamped, Status> {
+    let position = intent.map_position();
+    let timestamp_ns = u64::try_from(intent.query().source_timestamp_ns)
+        .map_err(|_| Status::internal("mapping-cloud timestamp is invalid"))?;
+    Ok(schema::PoseStamped {
+        header: schema::Header {
+            seq: 0,
+            stamp_sec: i32::try_from(timestamp_ns / 1_000_000_000)
+                .map_err(|_| Status::internal("mapping-cloud timestamp exceeds wire range"))?,
+            stamp_nsec: (timestamp_ns % 1_000_000_000) as i32,
+            frame_id: intent.active_map().map_frame_id.clone(),
+        },
+        pose: schema::Pose {
+            position: [position.x_m, position.y_m, position.z_m],
+            orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        },
+    })
+}
 
 #[derive(Clone)]
 pub struct GeometryRuntimeService {
@@ -2253,9 +2287,6 @@ async fn activate_map_r1(
     };
 
     if selected_backend_kind==crate::mapping_backend::MappingBackendKind::SlamToolbox {
-        if matches!(identity_class, ActivationRequestIdentityClass::Assigned(_)) {
-            return Err(Status::failed_precondition("PLANAR_ASSIGNED_ACTIVATION_NOT_PAIRED"));
-        }
         return service.activate_planar_map(request,identity_class).await;
     }
 
@@ -3242,8 +3273,8 @@ async fn activate_map_r1(
             ActivationIdentity::Assigned(identity) => {
                 let owner = assigned_checkpoint.as_ref().expect("assigned activation owns source");
                 let receipt = InstalledTargetReceiptV2 { activation: identity.clone(),
-                    source_cloud_member: owner.cloud().member().clone(), occupancy_receipt: occupancy_receipt.clone(),
-                    cloud_receipt: correlated.receipt.clone() };
+                    source_member: owner.cloud().member().clone(), occupancy_receipt: occupancy_receipt.clone(),
+                    cloud_receipt: Some(correlated.receipt.clone()) };
                 if !receipt.validate(owner) {
                     settle_started_failure!(ActivationReceiptDisposition::OutcomeUnknown,
                         "ACTIVATE_MAP_TYPED_TARGET_RECEIPT_MISMATCH".to_owned());
@@ -4107,26 +4138,42 @@ pub(crate) fn validate_mapping_checkpoint_receipts(
     Ok(())
 }
 
-fn validate_planar_checkpoint(checkpoint:&MappingBackendCheckpoint)->Result<(),String> {
-    if checkpoint.dense_cloud_artifact.is_some() { return Err("二维检查点不能携带完整三维点云".into()); }
-    if checkpoint.fine_map_artifact.is_some() { return Err("二维检查点不能携带三维精细资产".into()); }
-    let reference=checkpoint.graph_artifact.as_ref().ok_or("二维图必须通过分块制品引用加载")?;
-    if checkpoint.schema_version!=1 || checkpoint.backend_kind!="slam_toolbox" || checkpoint.target_kind!="planar_graph"
-        || checkpoint.created_at_ns==0 || checkpoint.source_session_id.is_empty() || checkpoint.source_session_generation==0
+fn validate_planar_checkpoint(checkpoint: &MappingBackendCheckpoint) -> Result<(), String> {
+    use crate::planar_artifacts::Store;
+    let reference = checkpoint.graph_artifact.as_ref().ok_or("二维图必须通过分块制品引用加载")?;
+    if checkpoint.backend_kind != "slam_toolbox" || checkpoint.target_kind != "planar_graph"
+        || checkpoint.created_at_ns == 0 || checkpoint.source_session_id.is_empty() || checkpoint.source_session_generation == 0
         || !checkpoint.payload.is_empty() || checkpoint.cloud_receipt.is_some() || checkpoint.canonical_cloud_checkpoint.is_some()
-        || reference.size!=checkpoint.payload_size || reference.sha256!=checkpoint.content_sha256
-        || reference.size==0 || reference.size>nuwax_slam_2d_runtime::archive::MAX_ARCHIVE || reference.sha256.len()!=32 {
+        || checkpoint.backend_identity.is_some() || checkpoint.fine_map_artifact.is_some() || checkpoint.dense_cloud_artifact.is_some()
+        || reference.size != checkpoint.payload_size || reference.size > nuwax_slam_2d_runtime::archive::MAX_ARCHIVE {
         return Err("二维完整图检查点类型、身份或预算非法".into());
     }
-    let receipt=checkpoint.occupancy_receipt.as_ref().ok_or("二维图缺少规范占据收据")?;
-    validate_mapping_commit_identity(receipt.commit_id.as_ref(),"二维图")?;
-    let grid=checkpoint.canonical_occupancy_checkpoint.as_ref().ok_or("二维图缺少物理栅格")?;
-    canonical_occupancy_sha256(grid)?;
-    let meta=grid.meta.as_ref().ok_or("二维栅格缺少几何")?;
-    if receipt.session_id!=checkpoint.source_session_id || receipt.session_generation!=checkpoint.source_session_generation
-        || receipt.backend_kind!="slam_toolbox" || receipt.backend_generation==0 || receipt.occupancy_revision!=meta.revision
-        || receipt.source_timestamp_ns!=meta.timestamp_ns || meta.timestamp_ns==0 || meta.revision==0 {
+    Store::validate_reference(reference)?;
+    let receipt = checkpoint.occupancy_receipt.as_ref().ok_or("二维图缺少规范占据收据")?;
+    crate::activation_identity::occupancy_receipt_from_wire(receipt)?;
+    let grid = checkpoint.canonical_occupancy_checkpoint.as_ref().ok_or("二维图缺少物理栅格")?;
+    let meta = grid.meta.as_ref().ok_or("二维栅格缺少几何")?;
+    if meta.width == 0 || meta.height == 0 || !meta.resolution.is_finite() || meta.resolution <= 0.0
+        || !meta.origin_x.is_finite() || !meta.origin_y.is_finite() || meta.frame_id.is_empty()
+        || grid.data.len() != (meta.width as usize).checked_mul(meta.height as usize).ok_or("occupancy dimensions overflow")?
+        || grid.data.iter().any(|v| !(-1..=100).contains(&(*v as i8))) {
+        return Err("二维物理栅格几何或正文非法".into());
+    }
+    if receipt.session_id != checkpoint.source_session_id || receipt.session_generation != checkpoint.source_session_generation
+        || receipt.backend_kind != "slam_toolbox" || receipt.occupancy_revision != meta.revision
+        || receipt.source_timestamp_ns != meta.timestamp_ns || meta.timestamp_ns == 0 || meta.revision == 0 {
         return Err("二维图物理栅格与规范收据身份冲突".into());
+    }
+    match checkpoint.schema_version {
+        1 if checkpoint.checkpoint_id.is_empty() && checkpoint.backend_payload_schema_version == 0
+            && checkpoint.occupancy_identity.is_none() && reference.identity_schema_version != 2
+            && reference.sha256 == checkpoint.content_sha256 => {},
+        2 if crate::planar_artifacts::assigned_id(&checkpoint.checkpoint_id) && checkpoint.backend_payload_schema_version == 2
+            && checkpoint.content_sha256.is_empty() && reference.identity_schema_version == 2 => {
+            validate_checkpoint_member_binding(checkpoint, reference.member_identity.as_ref().ok_or("二维图成员身份缺失")?, CheckpointMemberRole::PlanarGraph)?;
+            validate_checkpoint_member_binding(checkpoint, checkpoint.occupancy_identity.as_ref().ok_or("二维占据成员身份缺失")?, CheckpointMemberRole::CanonicalOccupancy)?;
+        },
+        _ => return Err("二维检查点内外身份代际混合".into()),
     }
     Ok(())
 }
@@ -4205,7 +4252,7 @@ fn validate_checkpoint_canonical_structure(checkpoint: &MappingBackendCheckpoint
 }
 fn validate_checkpoint_member_binding(checkpoint: &MappingBackendCheckpoint, member: &CheckpointMemberIdentity, role: CheckpointMemberRole) -> Result<(), String> {
     crate::planar_artifacts::validate_member_identity(member)?;
-    let frame = &checkpoint.canonical_cloud_checkpoint.as_ref().ok_or("canonical cloud required")?.frame_id;
+    let frame = &checkpoint.canonical_occupancy_checkpoint.as_ref().and_then(|grid| grid.meta.as_ref()).ok_or("canonical occupancy metadata required")?.frame_id;
     if member.checkpoint_id != checkpoint.checkpoint_id || member.role != role as i32
         || member.occupancy_receipt != checkpoint.occupancy_receipt || member.cloud_receipt != checkpoint.cloud_receipt || member.frame_id != *frame {
         return Err("checkpoint member descriptor differs from its frozen parent".into());
@@ -4213,6 +4260,10 @@ fn validate_checkpoint_member_binding(checkpoint: &MappingBackendCheckpoint, mem
     Ok(())
 }
 pub(crate) fn validate_assigned_mapping_checkpoint(checkpoint: &MappingBackendCheckpoint, expected_backend: crate::mapping_backend::MappingBackendKind) -> Result<(), String> {
+    if expected_backend == crate::mapping_backend::MappingBackendKind::SlamToolbox {
+        if checkpoint.schema_version != 2 { return Err("assigned planar checkpoint requires schema 2".into()); }
+        return validate_planar_checkpoint(checkpoint);
+    }
     if checkpoint.schema_version != ASSIGNED_CHECKPOINT_ENVELOPE_VERSION
         || !crate::planar_artifacts::assigned_id(&checkpoint.checkpoint_id) || !checkpoint.content_sha256.is_empty()
         || checkpoint.backend_payload_schema_version != crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION
@@ -4397,7 +4448,7 @@ fn exploration_state_from_snapshot(
         parent_request_id: lease.parent_request_id,
         goal_generation: lease.goal_generation,
         producer_runtime_generation: lease.producer_runtime_generation,
-        goal_payload_sha256: lease.goal_payload_sha256.to_vec(),
+
     });
     let global_stop_reconciliation = snapshot.global_stop_reconciliation;
     let global_stop_reconciliation = Some(ExplorationGlobalStopReconciliation {
@@ -4422,6 +4473,11 @@ fn exploration_state_from_snapshot(
                 parent_request_id: receipt.parent_request_id,
                 exploration_generation: receipt.exploration_generation,
                 child_lease_fingerprint: receipt.child_lease_fingerprint,
+                child_lease: receipt.child_lease.map(|lease| ExplorationChildLease {
+                    session_id: lease.session_id, owner_kind: lease.owner_kind,
+                    parent_request_id: lease.parent_request_id, goal_generation: lease.goal_generation,
+                    producer_runtime_generation: lease.producer_runtime_generation,
+                }),
                 cancel_generation: receipt.cancel_generation,
                 commit_disposition: receipt.commit_disposition,
             }
@@ -4557,7 +4613,8 @@ async fn forward_map_revision(
     }
     let occupancy_receipt = occupancy_commit_receipt_proto(&event.receipt);
     let shm_ref = match occupancy_shm_current.read().await.clone() {
-        Some(snapshot) if snapshot.revision == event.revision => {
+        Some(snapshot) if snapshot.revision == event.revision
+            && snapshot.identity.matches_event(&event) => {
             match occupancy_shm_ref(snapshot) {
                 Ok(reference) => Some(reference),
                 Err(status) => return tx.send(Err(*status)).await.is_ok(),
@@ -4652,7 +4709,7 @@ fn occupancy_shm_ref(
     if snapshot.key.trim().is_empty()
         || snapshot.file_size == 0
         || snapshot.revision == 0
-        || snapshot.layout_version != 2
+        || snapshot.layout_version != crate::occupancy_shm::OCCUPANCY_SHM_LAYOUT_VERSION
         || snapshot.payload_schema_version != 1
         || snapshot.generation == 0
         || snapshot.active_slot >= 2
@@ -4660,7 +4717,7 @@ fn occupancy_shm_ref(
         || snapshot.payload_size >= snapshot.file_size
     {
         return Err(Box::new(Status::failed_precondition(format!(
-            "invalid occupancy SHM v2 reference: layout={} schema={} generation={} slot={} file_size={} payload_size={} revision={}",
+            "invalid occupancy SHM v3 reference: layout={} schema={} generation={} slot={} file_size={} payload_size={} revision={}",
             snapshot.layout_version,
             snapshot.payload_schema_version,
             snapshot.generation,
@@ -5015,8 +5072,7 @@ fn nav_state_to_proto(update: NavigationUpdate) -> NavigationState {
         parent_request_id: feedback.parent_request_id,
         goal_generation: feedback.goal_generation,
         path_revision: feedback.path_revision,
-        goal_payload_sha256: feedback.goal_payload_sha256.to_vec(),
-        path_payload_sha256: feedback.path_payload_sha256.to_vec(),
+        planner_runtime_generation: feedback.planner_runtime_generation,
         producer_runtime_generation,
         planned_path: feedback.planned_path.into_iter().map(|p| Vec3 { x:p[0], y:p[1], z:p[2] }).collect(),
         local_path: local_path.into_iter().map(|p| Vec3 { x:p[0], y:p[1], z:p[2] }).collect(),
@@ -5444,14 +5500,17 @@ impl GeometryRuntimeService {
             let exported=async {
                 let mut file=client.open_artifact(&artifact).await?;
                 let (file,metadata,cells)=tokio::task::spawn_blocking(move|| {
-                    let metadata=archive::verify(&mut file)?;
-                    let (_,cells)=archive::grid(&mut file)?;
+                    let (metadata,cells)=archive::grid_structure(&mut file)?;
                     Ok::<_,String>((file,metadata,cells))
                 }).await.map_err(|e|e.to_string())??;
+                if metadata.identity() != artifact.identity { return Err("二维导出档案与worker身份不符".into()); }
+                let archive::ArchiveMetadata::Assigned(assigned) = &metadata else { return Err("二维导出必须返回编号档案".into()); };
+                let checkpoint_id = assigned.checkpoint_id.clone();
+                let metadata = &assigned.source;
                 let mut snapshot=nuwax_slam_2d_runtime::protocol::Snapshot {
                     snapshot_id:1,session:metadata.session.clone(),estimate:metadata.estimate.clone(),width:metadata.width,height:metadata.height,
                     resolution:metadata.resolution,origin:metadata.origin,payload_size:metadata.members[2].size,
-                    data_sha256:metadata.members[2].sha256,file_name:String::new(),
+                    file_name:String::new(),
                 };
                 // 定位静态图保留档案来源，但归属当前实际会话。
                 snapshot.session=binding.session(&session.session_id,&session.map_name,session.session_generation);
@@ -5476,12 +5535,19 @@ impl GeometryRuntimeService {
                     return Err("二维图档案与规范物理栅格或收据不一致".into());
                 }
                 let canonical=occupancy_checkpoint_proto(&map);
-                let store=self.graph_artifacts.clone();let size=artifact.payload_size;let sha=artifact.sha256;
-                let reference=tokio::task::spawn_blocking(move||store.lock().insert_legacy(file,size,sha)).await.map_err(|e|e.to_string())??;
-                Ok(MappingBackendCheckpoint{schema_version:1,backend_kind:"slam_toolbox".into(),source_session_generation:session.session_generation,
-                    source_session_id:session.session_id.clone(),content_sha256:artifact.sha256.to_vec(),payload_size:artifact.payload_size,
-                    created_at_ns:now_ns(),occupancy_receipt:Some(occupancy_commit_receipt_proto(&receipt)),canonical_occupancy_checkpoint:Some(canonical),
-                    graph_artifact:Some(reference),target_kind:"planar_graph".into(),..Default::default()})
+                let occupancy_receipt = occupancy_commit_receipt_proto(&receipt);
+                let member = CheckpointMemberIdentity { checkpoint_id: checkpoint_id.clone(), role: CheckpointMemberRole::PlanarGraph as i32,
+                    occupancy_receipt: Some(occupancy_receipt.clone()), cloud_receipt: None,
+                    frame_id: binding.settings.template.map_frame_id.clone(), frame_generation: 0, producer_generation: 0 };
+                let mut occupancy_identity = member.clone(); occupancy_identity.role = CheckpointMemberRole::CanonicalOccupancy as i32;
+                let store=self.graph_artifacts.clone();let size=artifact.payload_size;
+                let reference=tokio::task::spawn_blocking(move||store.lock().insert(file,size,member)).await.map_err(|e|e.to_string())??;
+                let checkpoint = MappingBackendCheckpoint{schema_version:2,backend_kind:"slam_toolbox".into(),source_session_generation:session.session_generation,
+                    source_session_id:session.session_id.clone(),payload_size:artifact.payload_size, checkpoint_id, backend_payload_schema_version: 2,
+                    created_at_ns:now_ns(),occupancy_receipt:Some(occupancy_receipt),canonical_occupancy_checkpoint:Some(canonical),
+                    occupancy_identity: Some(occupancy_identity), graph_artifact:Some(reference),target_kind:"planar_graph".into(),..Default::default()};
+                validate_planar_checkpoint(&checkpoint)?;
+                Ok(checkpoint)
             }.await;
             let released=binding.control_until_settled(Operation::ReleaseArtifact{artifact}).await;
             match (exported,released) {(Ok(v),Ok(_))=>Ok(v),(Err(e),_)=>Err(e),(Ok(_),Err(e))=>Err(e)}
@@ -5659,7 +5725,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             lcm_backend: diag.lcm_backend,
             geometry_pipeline: if self.bridge.mapping_adapter.as_ref().is_some_and(|a|a.lock().planar.is_some()) { "slam_2d" } else { "lio_3d" }.into(),
             runtime_generation: self.bridge.mapping_adapter.as_ref().and_then(|a|a.lock().planar.clone())
-                .map(|b|b.client.identity().runtime_generation).unwrap_or(0),
+                .map(|b|b.client.identity().runtime_generation).unwrap_or_else(|| self.activation_receipts.runtime_generation()),
             planar_input_config: self.bridge.mapping_adapter.as_ref().and_then(|a|a.lock().planar.clone())
                 .map(|b|serde_json::to_string(&b.settings.template).expect("已验证二维配置")).unwrap_or_default(),
             planar_unix_offset_ns: self.bridge.mapping_adapter.as_ref().and_then(|a|a.lock().planar.clone())
@@ -6186,7 +6252,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
             .clone();
         if adapter.lock().planar.is_some() {
-            if envelope_version == 2 { return Err(Status::failed_precondition("planar checkpoint v2 requires paired inner archive/protocol migration")); }
+            if envelope_version != 2 { return Err(Status::failed_precondition("planar export requires assigned checkpoint schema 2")); }
             let service=self.clone();
             let receiver=self.bridge.register_planar_operation(async move {service.export_planar_checkpoint().await}).map_err(Status::unavailable)?;
             return receiver.await.map_err(|_|Status::unavailable("二维图导出保留任务未返回"))?.map(Response::new).map_err(Status::failed_precondition);
@@ -6610,7 +6676,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             .relocalization_ingress
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("RELOCALIZATION_OWNER_NOT_SELECTED"))?;
-        if req.get_ref().target_kind=="planar_graph" {
+        if matches!(req.get_ref().assigned_target, Some(relocalize_request::AssignedTarget::AssignedPlanarV2(_))) {
             let lifecycle_guard = self.bridge.mapping_lifecycle_lock.clone().lock_owned().await;
             let request=req.into_inner();let task_request=request.clone();let service=self.clone();
             let work:crate::correction_coordinator::PlanarCommandWork=Box::new(move|context|Box::pin(async move {
@@ -6619,9 +6685,9 @@ impl GeometryRuntime for GeometryRuntimeService {
                 match receiver {
                     Ok(receiver)=>match receiver.await {
                         Ok(Ok(outcome))=>outcome,
-                        _=>crate::correction_coordinator::PlanarCommandOutcome{disposition:RelocalizeDisposition::OwnerFailed,detail:"二维重定位保留任务未返回".into(),correction_revision:0,evidence:Vec::new()},
+                        _=>crate::correction_coordinator::PlanarCommandOutcome{disposition:RelocalizeDisposition::OwnerFailed,detail:"二维重定位保留任务未返回".into(),correction_revision:0,evidence:None},
                     },
-                    Err(e)=>crate::correction_coordinator::PlanarCommandOutcome{disposition:RelocalizeDisposition::OwnerStopped,detail:e,correction_revision:0,evidence:Vec::new()},
+                    Err(e)=>crate::correction_coordinator::PlanarCommandOutcome{disposition:RelocalizeDisposition::OwnerStopped,detail:e,correction_revision:0,evidence:None},
                 }
             }));
             let waiter=ingress.admit_planar(request,lifecycle_guard,work).await.map_err(relocalization_command_status)?;
@@ -6649,8 +6715,6 @@ impl GeometryRuntime for GeometryRuntimeService {
             .map_err(Status::invalid_argument)?;
         let ingress = self.relocalization_ingress.as_ref()
             .ok_or_else(|| Status::failed_precondition("RELOCALIZATION_OWNER_NOT_SELECTED"))?;
-        let applier = self.canonical_correction.as_ref()
-            .ok_or_else(|| Status::failed_precondition("ASSIGNED_SAMPLE_CANONICAL_OWNER_ABSENT"))?;
         let query = crate::relocalization_terminal_v2::AssignedRelocalizationTerminalQueryV2::admit(
             GetRelocalizationTerminalRequest {schema_version:2, request_id:request.request_id().into(),
                 assigned_request_v2:Some(request.to_wire()), ..Default::default()})
@@ -6663,6 +6727,11 @@ impl GeometryRuntime for GeometryRuntimeService {
         };
         let _lifecycle = self.bridge.mapping_lifecycle_lock.lock().await;
         self.ensure_running_admission("GetAssignedLocalizationSample").await?;
+        if request.is_planar() {
+            return self.assigned_planar_localization_sample(&terminal).await.map(Response::new).map_err(Status::failed_precondition);
+        }
+        let applier = self.canonical_correction.as_ref()
+            .ok_or_else(|| Status::failed_precondition("ASSIGNED_SAMPLE_CANONICAL_OWNER_ABSENT"))?;
         let target = self.activation_receipts.current_sealed_assigned_target_snapshot()
             .filter(|snapshot| request.matches_target(&snapshot.target_receipt)
                 && self.activation_receipts.assigned_actor_available())
@@ -7146,66 +7215,42 @@ impl GeometryRuntime for GeometryRuntimeService {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<MappingCloudAuthority>, Status> {
-        self.ensure_running_admission("GetMappingCloudAuthority")
-            .await?;
-        let sealed = self
-            .activation_receipts
-            .current_sealed_target_snapshot()
-            .ok_or_else(|| {
-                Status::failed_precondition("sealed finalized map authority is unavailable")
-            })?;
-        let committed = self
-            .bridge
-            .committed_map_authority
-            .lock()
+        self.ensure_running_admission("GetMappingCloudAuthority").await?;
+        let sealed = self.activation_receipts.current_sealed_assigned_target_snapshot()
+            .ok_or_else(|| Status::failed_precondition("sealed assigned map authority is unavailable"))?;
+        let activation = &sealed.activation_identity;
+        let committed = self.bridge.committed_map_authority.lock()
             .map_err(|_| Status::unavailable("committed map authority is unavailable"))?
-            .clone()
-            .ok_or_else(|| Status::failed_precondition("committed map authority is unavailable"))?;
-        if sealed.session_id != committed.session_id
-            || i64::try_from(sealed.session_generation).ok() != Some(committed.session_generation)
-            || sealed.immutable_target.frame_id != committed.frame_id
+            .clone().ok_or_else(|| Status::failed_precondition("committed map authority is unavailable"))?;
+        if activation.request.session_id() != committed.session_id
+            || i64::try_from(activation.session_generation).ok() != Some(committed.session_generation)
+            || sealed.target_receipt.source_member.frame_id() != committed.frame_id
         {
-            return Err(Status::failed_precondition(
-                "sealed finalized map does not match committed map authority",
-            ));
+            return Err(Status::failed_precondition("sealed assigned map does not match committed map authority"));
         }
-        let asset_manifest_sha256 = sealed
-            .asset_manifest_sha256
-            .ok_or_else(|| Status::failed_precondition("asset manifest identity is unavailable"))?;
-        let asset_bundle_sha256 = sealed
-            .asset_bundle_sha256
-            .ok_or_else(|| Status::failed_precondition("asset bundle identity is unavailable"))?;
-        let backend_kind = self
-            .bridge
-            .mapping_adapter
-            .as_ref()
-            .map(|adapter| format!("{:?}", adapter.lock().backend_kind()).to_ascii_lowercase())
-            .unwrap_or_default();
         Ok(Response::new(MappingCloudAuthority {
-            map_name: sealed.map_name,
+            schema_version: 3,
+            map_name: activation.request.map_name().to_owned(),
             map_frame_id: committed.frame_id,
-            asset_manifest_sha256: asset_manifest_sha256.to_vec(),
-            asset_bundle_sha256: asset_bundle_sha256.to_vec(),
-            activation_request_id: sealed.activation_request_id,
-            activation_request_identity_sha256: sealed.activation_request_identity_sha256.to_vec(),
-            activation_identity_sha256: sealed.activation_identity_sha256.to_vec(),
-            target_receipt_sha256: sealed.target_receipt_sha256.to_vec(),
-            runtime_generation: sealed.runtime_generation,
-            lifecycle_epoch: sealed.lifecycle_epoch,
-            mapping_session_id: sealed.session_id,
-            mapping_session_generation: sealed.session_generation,
-            backend_kind,
-            backend_generation: sealed.backend_generation,
+            activation_request_id: activation.request.activation_request_id().to_owned(),
+            runtime_generation: activation.runtime_generation,
+            lifecycle_epoch: activation.lifecycle_epoch,
+            mapping_session_id: activation.request.session_id().to_owned(),
+            mapping_session_generation: activation.session_generation,
+            backend_kind: format!("{:?}", activation.backend_kind).to_ascii_lowercase(),
+            backend_generation: activation.backend_generation,
             committed_occupancy_revision: u64::try_from(committed.revision)
                 .map_err(|_| Status::internal("committed revision is invalid"))?,
-            schema_version: 2,
             committed_occupancy_commit_id: Some(MappingCommitIdentity {
                 boot_nonce: committed.commit_boot_nonce.to_vec(),
-                sequence: u64::try_from(committed.commit_sequence).map_err(|_| Status::internal("map commit sequence is invalid"))?,
+                sequence: u64::try_from(committed.commit_sequence)
+                    .map_err(|_| Status::internal("map commit sequence is invalid"))?,
             }),
             committed_occupancy_source_timestamp_ns: u64::try_from(committed.source_timestamp_ns)
                 .map_err(|_| Status::internal("map source timestamp is invalid"))?,
             owner_epoch: self.bridge.nav.producer_runtime_generation(),
+            activation_receipt_v2: Some(mapping_cloud_assigned_receipt(activation, &sealed.target_receipt)),
+            ..Default::default()
         }))
     }
 
@@ -7213,111 +7258,78 @@ impl GeometryRuntime for GeometryRuntimeService {
         &self,
         req: Request<MappingCloudGoalRequest>,
     ) -> Result<Response<MappingCloudGoalTerminal>, Status> {
-        self.ensure_running_admission("SubmitMappingCloudGoal")
-            .await?;
+        self.ensure_running_admission("SubmitMappingCloudGoal").await?;
         let request = req.into_inner();
-        if request.schema_version != 2 {
-            return Err(Status::invalid_argument("unsupported MappingCloudGoalRequest schema_version"));
+        if request.schema_version != 3 {
+            return Err(Status::invalid_argument("mapping-cloud requires assigned schema_version 3"));
         }
-        let request_commit = validate_mapping_commit_identity(request.committed_occupancy_commit_id.as_ref(), "mapping-cloud occupancy")
+        let request_commit = validate_mapping_commit_identity(
+            request.committed_occupancy_commit_id.as_ref(), "mapping-cloud occupancy")
             .map_err(Status::invalid_argument)?;
-        let digest = |field: &'static str, bytes: &[u8]| -> Result<Sha256Digest, Status> {
-            let value: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| Status::invalid_argument(format!("{field} must contain 32 bytes")))?;
-            Sha256Digest::from_bytes(value)
-                .map_err(|error| Status::invalid_argument(error.to_string()))
-        };
-        let sealed = self
-            .activation_receipts
-            .current_sealed_target_snapshot()
-            .ok_or_else(|| {
-                Status::failed_precondition("sealed finalized map authority is unavailable")
-            })?;
-        let asset_manifest_sha256 = sealed
-            .asset_manifest_sha256
-            .ok_or_else(|| Status::failed_precondition("asset manifest identity is unavailable"))?;
-        let asset_bundle_sha256 = sealed
-            .asset_bundle_sha256
-            .ok_or_else(|| Status::failed_precondition("asset bundle identity is unavailable"))?;
-        if sealed.map_name != request.map_name
-            || sealed.immutable_target.frame_id != request.map_frame_id
-            || asset_manifest_sha256.as_slice() != request.asset_manifest_sha256
-            || asset_bundle_sha256.as_slice() != request.asset_bundle_sha256
-            || sealed.activation_identity_sha256.as_slice() != request.activation_identity_sha256
-            || sealed.runtime_generation != request.runtime_generation
-            || sealed.session_id != request.mapping_session_id
-            || sealed.session_generation != request.mapping_session_generation
+        let sealed = self.activation_receipts.current_sealed_assigned_target_snapshot()
+            .ok_or_else(|| Status::failed_precondition("sealed assigned map authority is unavailable"))?;
+        let activation = &sealed.activation_identity;
+        let admitted_receipt = mapping_cloud_assigned_receipt(activation, &sealed.target_receipt);
+        if request.activation_receipt_v2.as_ref() != Some(&admitted_receipt)
+            || activation.request.map_name() != request.map_name
+            || sealed.target_receipt.source_member.frame_id() != request.map_frame_id
+            || activation.runtime_generation != request.runtime_generation
+            || activation.request.session_id() != request.mapping_session_id
+            || activation.session_generation != request.mapping_session_generation
         {
-            return Err(Status::failed_precondition(
-                "mapping-cloud request does not match current sealed map authority",
-            ));
+            return Err(Status::failed_precondition("mapping-cloud request does not match current assigned map authority"));
         }
-        let committed_map = self
-            .bridge
-            .committed_map_authority
-            .lock()
+        let committed_map = self.bridge.committed_map_authority.lock()
             .map_err(|_| Status::unavailable("committed map authority is unavailable"))?
-            .clone()
-            .ok_or_else(|| Status::failed_precondition("committed map authority is unavailable"))?;
+            .clone().ok_or_else(|| Status::failed_precondition("committed map authority is unavailable"))?;
         if committed_map.session_id != request.mapping_session_id
-            || u64::try_from(committed_map.session_generation).ok()
-                != Some(request.mapping_session_generation)
-            || u64::try_from(committed_map.revision).ok()
-                != Some(request.committed_occupancy_revision)
+            || u64::try_from(committed_map.session_generation).ok() != Some(request.mapping_session_generation)
+            || u64::try_from(committed_map.revision).ok() != Some(request.committed_occupancy_revision)
             || committed_map.commit_boot_nonce.as_slice() != request_commit.boot_nonce
             || u64::try_from(committed_map.commit_sequence).ok() != Some(request_commit.sequence)
             || u64::try_from(committed_map.source_timestamp_ns).ok() != Some(request.committed_occupancy_source_timestamp_ns)
             || committed_map.frame_id != request.map_frame_id
         {
-            return Err(Status::failed_precondition(
-                "mapping-cloud request does not match current committed map authority",
-            ));
+            return Err(Status::failed_precondition("mapping-cloud request does not match current committed map authority"));
         }
-        let georeference = Arc::new(
-            VerifiedGeoreferenceV1::from_json(
-                &request.georeference_json,
-                &GeoreferenceBindingV1::for_document(&request.georeference_json),
-            )
-            .map_err(|error| Status::invalid_argument(error.to_string()))?,
-        );
-        if georeference.contract().map_name != sealed.map_name
-            || georeference.contract().map_frame_id != sealed.immutable_target.frame_id
+        let asset_id = activation.request.asset_identity().to_wire().asset_id;
+        let georeference = Arc::new(AssignedGeoreferenceV3::from_json(&request.georeference_json, &asset_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?);
+        if georeference.contract().map_name != request.map_name
+            || georeference.contract().map_frame_id != request.map_frame_id
         {
-            return Err(Status::failed_precondition(
-                "mapping-cloud georeference does not match current sealed map authority",
-            ));
+            return Err(Status::failed_precondition("mapping-cloud georeference does not match current assigned map authority"));
         }
         let owner_epoch = self.bridge.nav.producer_runtime_generation();
         if request.runtime_generation != owner_epoch {
-            return Err(Status::failed_precondition(
-                "mapping-cloud request runtime generation is stale",
-            ));
+            return Err(Status::failed_precondition("mapping-cloud request runtime generation is stale"));
         }
         let admission_context = crate::nav_runtime::NavAdmissionContext::with_expected_map_name(
             self.bridge.mapping_lifecycle_lock.clone(),
             self.bridge.committed_map_authority.clone(),
             self.bridge.map_revision_latest_tx.subscribe(),
-            Some(sealed.map_name.clone()),
+            Some(request.map_name.clone()),
         ).with_mapping_adapter(self.bridge.mapping_adapter.clone());
-        let active_map = ActiveMapIdentityV2 {
+        let active_map = AssignedMapIdentityV3 {
+            asset_id,
+            activation_request_id: activation.request.activation_request_id().to_owned(),
+            checkpoint_id: activation.request.checkpoint_identity().to_wire_id(),
             map_name: request.map_name,
             map_frame_id: request.map_frame_id,
-            asset_manifest_sha256: digest("asset_manifest_sha256", &request.asset_manifest_sha256)?,
-            asset_bundle_sha256: digest("asset_bundle_sha256", &request.asset_bundle_sha256)?,
-            georeference_sha256: georeference.raw_sha256(),
-            activation_identity_sha256: digest(
-                "activation_identity_sha256",
-                &request.activation_identity_sha256,
-            )?,
-            runtime_generation: request.runtime_generation,
-            mapping_session_generation: request.mapping_session_generation,
+            runtime_generation: activation.runtime_generation,
+            lifecycle_epoch: activation.lifecycle_epoch,
+            mapping_session_id: activation.request.session_id().to_owned(),
+            mapping_session_generation: activation.session_generation,
+            backend_kind: format!("{:?}", activation.backend_kind).to_ascii_lowercase(),
+            backend_generation: activation.backend_generation,
             committed_occupancy_revision: request.committed_occupancy_revision,
             committed_occupancy_boot_nonce: request_commit.boot_nonce.as_slice().try_into()
                 .map_err(|_| Status::invalid_argument("map commit nonce must be 16 bytes"))?,
             committed_occupancy_commit_sequence: request_commit.sequence,
             committed_occupancy_source_timestamp_ns: request.committed_occupancy_source_timestamp_ns,
         };
+        // Only bounded original descriptors survive the network wait, not the checkpoint owner.
+        drop(sealed);
         let query_request_id = request.query_request_id.trim().to_owned();
         let cloud_request = MappingCloudRequest {
             query_identity: CloudQueryIdentityV1 {
@@ -7344,32 +7356,23 @@ impl GeometryRuntime for GeometryRuntimeService {
             .map_err(|error| Status::internal(error.to_string()))?;
         let (status, message, navigation) = match terminal {
             MappingCloudTerminal::Succeeded(intent) => {
-                intent
-                    .verify()
-                    .map_err(|error| Status::internal(error.to_string()))?;
-                let map_position = intent.map_position();
-                let timestamp_ns = u64::try_from(intent.query().source_timestamp_ns)
-                    .map_err(|_| Status::internal("mapping-cloud timestamp is invalid"))?;
-                let goal = schema::PoseStamped {
-                    header: schema::Header {
-                        seq: 0,
-                        stamp_sec: i32::try_from(timestamp_ns / 1_000_000_000).map_err(|_| {
-                            Status::internal("mapping-cloud timestamp exceeds wire range")
-                        })?,
-                        stamp_nsec: (timestamp_ns % 1_000_000_000) as i32,
-                        frame_id: committed_map.frame_id.clone(),
-                    },
-                    pose: schema::Pose {
-                        position: [map_position.x_m, map_position.y_m, map_position.z_m],
-                        orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
-                    },
-                };
+                // The local owner returns an immutable, constructor-validated assigned goal.
+                // Query latency may cross a map replacement even when a name/frame is reused.
+                let current = self.activation_receipts.current_sealed_assigned_target_snapshot()
+                    .ok_or_else(|| Status::failed_precondition("assigned map authority changed during cloud query"))?;
+                if mapping_cloud_assigned_receipt(&current.activation_identity, &current.target_receipt)
+                    != admitted_receipt
+                {
+                    return Err(Status::failed_precondition("assigned map authority changed during cloud query"));
+                }
+                drop(current);
+                let goal = mapping_cloud_assigned_goal_pose(&intent)?;
                 let admission_io = crate::nav_runtime::NavAdmissionIo::new(
                     self.bridge.state.clone(),
                     self.bridge.transport.clone(),
                     self.bridge.transport_backend_name,
-                    self.bridge.lcm_backend_available,
-                );
+                    self.bridge.lcm_backend_available, self.bridge.body_reference_frame_id.clone(),
+);
                 let outcome = crate::nav_runtime::admit_goal_intent(
                     &admission_context,
                     &admission_io,
@@ -7391,7 +7394,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                         .map_err(|_| Status::internal("cancel generation exceeds wire range"))?,
                         committed_map,
                         boundary_id: String::new(),
-                        boundary_sha256: [0; 32],
+                        body_to_support_z_m: None,
                         boundary_points: Vec::new(),
                         motion_guard_generation: i64::try_from(request.motion_guard_generation)
                             .map_err(|_| {
@@ -7414,8 +7417,6 @@ impl GeometryRuntime for GeometryRuntimeService {
                                     "motion stop generation exceeds wire range",
                                 )
                             })?,
-                        goal_sha256: schema::goal_intent_goal_sha256(&goal)
-                            .map_err(|error| Status::internal(error.to_string()))?,
                         goal,
                     },
                     crate::nav_runtime::GoalProducerEpochAuthority::MappingCloud,
@@ -7849,13 +7850,6 @@ impl GeometryRuntime for GeometryRuntimeService {
         let child = r
             .child_lease
             .ok_or_else(|| Status::invalid_argument("child_lease is required"))?;
-        let goal_payload_sha256: [u8; 32] = child
-            .goal_payload_sha256
-            .as_slice()
-            .try_into()
-            .map_err(|_| {
-                Status::invalid_argument("child goal_payload_sha256 must contain 32 bytes")
-            })?;
         let guard = r
             .guard_proof
             .ok_or_else(|| Status::invalid_argument("guard_proof is required"))?;
@@ -7874,7 +7868,6 @@ impl GeometryRuntime for GeometryRuntimeService {
                 parent_request_id: child.parent_request_id,
                 goal_generation: child.goal_generation,
                 producer_runtime_generation: child.producer_runtime_generation,
-                goal_payload_sha256,
             },
             expected_navigation_runtime_generation: r.expected_navigation_runtime_generation,
             observed_navigation_runtime_generation: r.observed_navigation_runtime_generation,
@@ -7978,13 +7971,6 @@ impl GeometryRuntime for GeometryRuntimeService {
         let child = r
             .child_lease
             .ok_or_else(|| Status::invalid_argument("child_lease is required"))?;
-        let goal_payload_sha256: [u8; 32] = child
-            .goal_payload_sha256
-            .as_slice()
-            .try_into()
-            .map_err(|_| {
-                Status::invalid_argument("child goal_payload_sha256 must contain 32 bytes")
-            })?;
         let original_motion_admission = MotionAdmissionProof::try_from_wire(
             r.admission_guard_generation,
             &r.admission_guard_boot_nonce,
@@ -8007,7 +7993,6 @@ impl GeometryRuntime for GeometryRuntimeService {
                 parent_request_id: child.parent_request_id,
                 goal_generation: child.goal_generation,
                 producer_runtime_generation: child.producer_runtime_generation,
-                goal_payload_sha256,
             },
             cancel_generation: r.cancel_generation,
             recovery_correlation: r.recovery_correlation,
@@ -8103,12 +8088,18 @@ impl GeometryRuntime for GeometryRuntimeService {
         req: Request<AcknowledgeExplorationOwnershipReconciliationRequest>,
     ) -> Result<Response<AcknowledgeExplorationOwnershipReconciliationResult>, Status> {
         let request = req.into_inner();
+        let child_lease = request.child_lease.map(|child| crate::explore_runtime::ChildNavigationLease {
+            session_id: child.session_id, owner_kind: child.owner_kind,
+            parent_request_id: child.parent_request_id, goal_generation: child.goal_generation,
+            producer_runtime_generation: child.producer_runtime_generation,
+        });
         let acknowledged = self
             .bridge
             .explore
             .acknowledge_durable_reconciliation(
                 &request.recovery_correlation,
                 &request.child_lease_fingerprint,
+                child_lease.as_ref(),
             )
             .map_err(|error| match error {
                 crate::explore_runtime::ExplorationRecoveryError::InvalidArgument(message) => {
@@ -8520,6 +8511,25 @@ impl GeometryRuntime for GeometryRuntimeService {
                     message: format!("LCM publish failed: {}", e),
                 }))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod health_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn health_check_exposes_existing_3d_root_generation() {
+        let handle = crate::lcm_runtime::build_handle_for_tests().await.expect("LCM测试拥有方");
+        let service = GeometryRuntimeService::new(handle);
+        let expected = service.activation_receipts.runtime_generation();
+        assert!(expected > 0);
+        for _ in 0..2 {
+            let reply = GeometryRuntime::health_check(&service, Request::new(HealthCheckRequest {}))
+                .await.expect("只读健康查询").into_inner();
+            assert_eq!(reply.geometry_pipeline, "lio_3d");
+            assert_eq!(reply.runtime_generation, expected);
         }
     }
 }
@@ -9491,7 +9501,9 @@ mod map_update_tests {
         let session = adapter
             .start_session("stream-session", "warehouse")
             .expect("test mapping session");
-        MapRevisionEvent::from_map_for_tests(&map, &session)
+        let committed = crate::lcm_runtime::test_owner_map_revision(&mut adapter, &map);
+        crate::lcm_runtime::PreparedMapRevisionEvent::from_map(&map, &session)
+            .seal(committed.receipt).expect("fixture uses actual mapping owner receipt")
     }
 
     #[tokio::test]
@@ -9569,7 +9581,7 @@ mod map_update_tests {
         .expect("sole SHM writer must publish current reference");
         assert_eq!(shm_ref.revision, event.revision);
         assert!(shm_ref.size > event.size, "ShmRef.size is mmap file size");
-        assert_eq!(shm_ref.layout_version, 2);
+        assert_eq!(shm_ref.layout_version, 3);
         assert_eq!(shm_ref.payload_schema_version, 1);
         assert!(shm_ref.generation > 0);
         assert!(shm_ref.active_slot < 2);
@@ -9579,8 +9591,8 @@ mod map_update_tests {
             .read()
             .await
             .clone()
-            .expect("v2 SHM metadata");
-        assert_eq!(internal.layout_version, 2);
+            .expect("v3 SHM metadata");
+        assert_eq!(internal.layout_version, 3);
         assert_eq!(internal.payload_schema_version, 1);
         assert_eq!(internal.payload_size, event.size);
         assert!(internal.generation > 0);
@@ -9686,11 +9698,12 @@ mod map_update_tests {
         for current_revision in [40, 42] {
             let current = Arc::new(RwLock::new(Some(
                 crate::lcm_runtime::OccupancyShmSnapshot {
-                    key: "/tmp/current-v2.mmap".to_string(),
+                    identity: crate::occupancy_shm::MapWriteIdentity::from_event(&event).unwrap(),
+                    key: "/tmp/current-v3.mmap".to_string(),
                     file_size: 8192,
                     payload_size: event.size,
                     revision: current_revision,
-                    layout_version: 2,
+                    layout_version: 3,
                     payload_schema_version: 1,
                     generation: 2,
                     active_slot: 1,
@@ -9718,6 +9731,31 @@ mod map_update_tests {
     }
 
     #[tokio::test]
+    async fn late_map_update_does_not_attach_another_commit_or_geometry() {
+        let event = test_mapping_event(MapState { width: 2, height: 1, resolution: 0.1,
+            frame_id: "map".into(), revision: 41, timestamp_ns: 41,
+            data: vec![0, 100], ..MapState::default() });
+        let other_commit = test_mapping_event(event.to_map_state());
+        assert_ne!(other_commit.receipt.commit_id, event.receipt.commit_id);
+        let mut other_geometry = event.clone();
+        other_geometry.origin_x += 1.0;
+        for current_event in [other_commit, other_geometry] {
+            let current = Arc::new(RwLock::new(Some(crate::lcm_runtime::OccupancyShmSnapshot {
+                identity: crate::occupancy_shm::MapWriteIdentity::from_event(&current_event).unwrap(),
+                key: "/tmp/newer-assigned-commit.mmap".into(), file_size: 8192,
+                payload_size: current_event.size, revision: current_event.revision,
+                layout_version: 3, payload_schema_version: 1, generation: 3, active_slot: 0,
+            })));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            assert!(forward_map_revision(&tx, event.clone(), &current, "map").await);
+            let update = rx.recv().await.unwrap().unwrap();
+            assert!(update.shm_ref.is_none());
+            assert_eq!(update.data.as_slice(), event.data.as_ref());
+            assert_eq!(update.occupancy_receipt.as_ref(), Some(&occupancy_commit_receipt_proto(&event.receipt)));
+        }
+    }
+
+    #[tokio::test]
     async fn map_update_carries_shm_when_revision_matches() {
         let event = test_mapping_event(MapState {
             width: 2,
@@ -9731,11 +9769,12 @@ mod map_update_tests {
         });
         let current = Arc::new(RwLock::new(Some(
             crate::lcm_runtime::OccupancyShmSnapshot {
-                key: "/tmp/current-v2.mmap".to_string(),
+                identity: crate::occupancy_shm::MapWriteIdentity::from_event(&event).unwrap(),
+                key: "/tmp/current-v3.mmap".to_string(),
                 file_size: 8192,
                 payload_size: event.size,
                 revision: event.revision,
-                layout_version: 2,
+                layout_version: 3,
                 payload_schema_version: 1,
                 generation: 2,
                 active_slot: 1,
@@ -9757,7 +9796,7 @@ mod map_update_tests {
         let shm_ref = update.shm_ref.expect("matching SHM reference");
         assert_eq!(shm_ref.revision, event.revision);
         assert_eq!(shm_ref.size, 8192);
-        assert_eq!(shm_ref.layout_version, 2);
+        assert_eq!(shm_ref.layout_version, 3);
         assert_eq!(shm_ref.payload_schema_version, 1);
         assert_eq!(shm_ref.generation, 2);
         assert_eq!(shm_ref.active_slot, 1);
@@ -9791,11 +9830,12 @@ mod map_update_tests {
         );
         *handle.occupancy_shm_current.write().await =
             Some(crate::lcm_runtime::OccupancyShmSnapshot {
+                identity: crate::occupancy_shm::MapWriteIdentity::from_event(&event).unwrap(),
                 key: "/tmp/post-commit-stop.mmap".to_string(),
                 file_size: 8192,
                 payload_size: event.size,
                 revision: event.revision,
-                layout_version: 2,
+                layout_version: 3,
                 payload_schema_version: 1,
                 generation: 1,
                 active_slot: 0,
@@ -9834,13 +9874,18 @@ mod map_update_tests {
     }
 
     #[test]
-    fn occupancy_shm_v2_projection_rejects_old_or_inconsistent_references() {
+    fn occupancy_shm_v3_projection_rejects_old_or_inconsistent_references() {
+        let event = crate::occupancy_shm::committed_event_for_tests(&MapState {
+            width: 16, height: 16, resolution: 0.1, frame_id: "map".into(),
+            revision: 7, timestamp_ns: 7, data: vec![0; 256], ..MapState::default()
+        }, 1);
         let valid = crate::lcm_runtime::OccupancyShmSnapshot {
-            key: "/tmp/occupancy-v2.mmap".to_string(),
+            identity: crate::occupancy_shm::MapWriteIdentity::from_event(&event).unwrap(),
+            key: "/tmp/occupancy-v3.mmap".to_string(),
             file_size: 8192,
             payload_size: 256,
             revision: 7,
-            layout_version: 2,
+            layout_version: 3,
             payload_schema_version: 1,
             generation: 3,
             active_slot: 0,
@@ -9849,6 +9894,10 @@ mod map_update_tests {
         for invalid in [
             crate::lcm_runtime::OccupancyShmSnapshot {
                 layout_version: 0,
+                ..valid.clone()
+            },
+            crate::lcm_runtime::OccupancyShmSnapshot {
+                layout_version: 2,
                 ..valid.clone()
             },
             crate::lcm_runtime::OccupancyShmSnapshot {
@@ -10025,6 +10074,188 @@ fn install_server_test_committed_map(handle: &GeometryRuntimeHandle, revision: u
 
 #[cfg(test)]
 mod lifecycle_tests {
+// Include inside server::lifecycle_tests. This extends the existing real
+// assigned export/transfer/activation fixture; it does not replace its owners.
+// Run only with the validation-tree business-hash instrumentation documented
+// in README.md. No public navigation endpoint is called.
+
+fn assigned_cloud_request(authority: &MappingCloudAuthority) -> MappingCloudGoalRequest {
+    MappingCloudGoalRequest {
+        schema_version: 3,
+        query_request_id: "assigned-cloud-server-boundary".into(),
+        query_text: "fixture destination".into(),
+        caller_timeout_ms: 1_000,
+        provider_timeout_ms: 500,
+        map_name: authority.map_name.clone(),
+        map_frame_id: authority.map_frame_id.clone(),
+        runtime_generation: authority.runtime_generation,
+        mapping_session_id: authority.mapping_session_id.clone(),
+        mapping_session_generation: authority.mapping_session_generation,
+        committed_occupancy_revision: authority.committed_occupancy_revision,
+        committed_occupancy_commit_id: authority.committed_occupancy_commit_id.clone(),
+        committed_occupancy_source_timestamp_ns: authority.committed_occupancy_source_timestamp_ns,
+        activation_receipt_v2: authority.activation_receipt_v2.clone(),
+        georeference_json: serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "map_name": authority.map_name,
+            "map_frame_id": authority.map_frame_id,
+            "source_crs": "EPSG:4326",
+            "projected_crs": "EPSG:3857",
+            "axis_convention": "projected_x_east_y_north_z_up",
+            "anchor_lat_deg": 0.0,
+            "anchor_lng_deg": 0.0,
+            "anchor_easting_m": 0.0,
+            "anchor_northing_m": 0.0,
+            "map_origin_x_m": 0.0,
+            "map_origin_y_m": 0.0,
+            "map_from_projected_yaw_rad": 0.0,
+            "altitude_policy": "map_plane_constant",
+            "map_plane_z_m": 0.0
+        })).unwrap(),
+        ..Default::default()
+    }
+}
+
+fn assert_assigned_cloud_projection(
+    actual: &MappingCloudAuthority,
+    activated: &MappingSessionState,
+    checkpoint: &MappingBackendCheckpoint,
+    current: &schema::CommittedMapIdentity,
+    owner_epoch: u64,
+) {
+    let receipt = activated.activation_receipt_v2.as_ref().unwrap();
+    let request = receipt.request.as_ref().unwrap();
+    let activation = receipt.activation.as_ref().unwrap();
+    let target = receipt.target.as_ref().unwrap();
+    let source = checkpoint.canonical_cloud_checkpoint.as_ref().unwrap();
+    assert_eq!(actual.schema_version, 3);
+    // Exact whole-receipt equality covers the source checkpoint/member tuple
+    // and both installation receipts; neither is reconstructed from current.
+    assert_eq!(actual.activation_receipt_v2.as_ref(), Some(receipt));
+    assert_eq!(target.source_cloud_member, source.member_identity);
+    assert_ne!(target.occupancy_receipt.as_ref().unwrap().commit_id,
+        checkpoint.occupancy_receipt.as_ref().unwrap().commit_id);
+    assert_eq!(actual.map_name, request.map_name);
+    assert_eq!(actual.activation_request_id, request.activation_request_id);
+    assert_eq!(actual.runtime_generation, activation.runtime_generation);
+    assert_eq!(actual.lifecycle_epoch, activation.lifecycle_epoch);
+    assert_eq!(actual.mapping_session_id, request.session_id);
+    assert_eq!(actual.mapping_session_generation, activation.session_generation);
+    assert_eq!(actual.backend_kind, activation.backend_kind);
+    assert_eq!(actual.backend_generation, activation.backend_generation);
+    assert_eq!(actual.owner_epoch, owner_epoch);
+    assert_eq!(actual.map_frame_id, current.frame_id);
+    assert_eq!(actual.committed_occupancy_revision, u64::try_from(current.revision).unwrap());
+    let commit = actual.committed_occupancy_commit_id.as_ref().unwrap();
+    assert_eq!(commit.boot_nonce.as_slice(), current.commit_boot_nonce.as_slice());
+    assert_eq!(commit.sequence, u64::try_from(current.commit_sequence).unwrap());
+    assert_eq!(actual.committed_occupancy_source_timestamp_ns,
+        u64::try_from(current.source_timestamp_ns).unwrap());
+    assert!(actual.asset_manifest_sha256.is_empty()
+        && actual.asset_bundle_sha256.is_empty()
+        && actual.activation_request_identity_sha256.is_empty()
+        && actual.activation_identity_sha256.is_empty()
+        && actual.target_receipt_sha256.is_empty());
+}
+
+async fn assert_assigned_cloud_rpc_rejection(
+    client: &mut crate::proto::geometry_runtime_client::GeometryRuntimeClient<tonic::transport::Channel>,
+    request: MappingCloudGoalRequest,
+    code: tonic::Code,
+    message: &str,
+) {
+    let error = client.submit_mapping_cloud_goal(request).await.unwrap_err();
+    assert_eq!(error.code(), code, "{error}");
+    assert_eq!(error.message(), message);
+}
+
+async fn assigned_mapping_cloud_boundary_slice(
+    fixture: &CanonicalResetFixture,
+    activated: &MappingSessionState,
+    checkpoint: &MappingBackendCheckpoint,
+) {
+    use crate::proto::geometry_runtime_client::GeometryRuntimeClient;
+    use crate::proto::geometry_runtime_server::GeometryRuntimeServer;
+
+    // Fence the actual owner before starting the RPC listener. Even a faulty
+    // server admission path cannot issue a Nominatim request in this slice.
+    assert_eq!(fixture.service.mapping_cloud_owner.shutdown(Duration::from_secs(1)).await,
+        nuwax_mapping_cloud::MappingCloudShutdown::Settled);
+    let original = fixture.handle.committed_map_authority.lock().unwrap().clone()
+        .expect("real assigned fixture owns committed authority");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let incoming = futures::stream::unfold(listener, |listener| async {
+        Some((listener.accept().await.map(|(stream, _)| stream), listener))
+    });
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let service = fixture.service.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(GeometryRuntimeServer::new(service))
+            .serve_with_incoming_shutdown(incoming, async { let _ = stopped.await; }).await
+    });
+    let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+        let mut client = GeometryRuntimeClient::connect(format!("http://{address}")).await.unwrap();
+        let authority = client.get_mapping_cloud_authority(Empty {}).await.unwrap().into_inner();
+        let epoch = fixture.handle.nav.producer_runtime_generation();
+        assert_assigned_cloud_projection(&authority, activated, checkpoint, &original, epoch);
+        let valid = assigned_cloud_request(&authority);
+
+        let mut schema_two = valid.clone();
+        schema_two.schema_version = 2;
+        assert_assigned_cloud_rpc_rejection(&mut client, schema_two, tonic::Code::InvalidArgument,
+            "mapping-cloud requires assigned schema_version 3").await;
+
+        let mut wrong_receipt = valid.clone();
+        wrong_receipt.activation_receipt_v2.as_mut().unwrap().target.as_mut().unwrap()
+            .source_cloud_member.as_mut().unwrap().checkpoint_id = "b".repeat(32);
+        assert_assigned_cloud_rpc_rejection(&mut client, wrong_receipt, tonic::Code::FailedPrecondition,
+            "mapping-cloud request does not match current assigned map authority").await;
+
+        // One case for each current commit field, rather than repeating legacy
+        // field rejection cases. Exact error text distinguishes the server
+        // boundary from the deliberately stopped owner's rejection.
+        for component in 0..4 {
+            let mut wrong_current = valid.clone();
+            match component {
+                0 => wrong_current.committed_occupancy_revision += 1,
+                1 => wrong_current.committed_occupancy_commit_id.as_mut().unwrap().boot_nonce[0] ^= 1,
+                2 => wrong_current.committed_occupancy_commit_id.as_mut().unwrap().sequence += 1,
+                _ => wrong_current.committed_occupancy_source_timestamp_ns += 1,
+            }
+            assert_assigned_cloud_rpc_rejection(&mut client, wrong_current, tonic::Code::FailedPrecondition,
+                "mapping-cloud request does not match current committed map authority").await;
+        }
+
+        assert_assigned_cloud_rpc_rejection(&mut client, valid.clone(), tonic::Code::FailedPrecondition,
+            "mapping-cloud owner is shutting down").await;
+        assert_eq!(fixture.service.mapping_cloud_owner.cancel(&valid.query_request_id).await.unwrap_err(),
+            nuwax_mapping_cloud::MappingCloudOwnerError::UnknownRequest);
+
+        // Controlled advancement of the existing current-authority slot tests
+        // projection only. This is not claimed as a real live mapping commit.
+        // The source owner and installed receipt remain the real fixture's.
+        let mut advanced = original.clone();
+        advanced.revision = advanced.revision.checked_add(1).unwrap();
+        advanced.commit_sequence = advanced.commit_sequence.checked_add(1).unwrap();
+        advanced.source_timestamp_ns = advanced.source_timestamp_ns.checked_add(1).unwrap();
+        *fixture.handle.committed_map_authority.lock().unwrap() = Some(advanced.clone());
+        let next = client.get_mapping_cloud_authority(Empty {}).await.unwrap().into_inner();
+        assert_assigned_cloud_projection(&next, activated, checkpoint, &advanced, epoch);
+        assert_eq!(next.activation_receipt_v2, authority.activation_receipt_v2);
+        assert_ne!(next.committed_occupancy_commit_id, authority.committed_occupancy_commit_id);
+        assert_assigned_cloud_rpc_rejection(&mut client, valid, tonic::Code::FailedPrecondition,
+            "mapping-cloud request does not match current committed map authority").await;
+        assert_assigned_cloud_rpc_rejection(&mut client, assigned_cloud_request(&next), tonic::Code::FailedPrecondition,
+            "mapping-cloud owner is shutting down").await;
+    })).await;
+    *fixture.handle.committed_map_authority.lock().unwrap() = Some(original);
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+    if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
+}
+
     mod assigned_navigation_composition {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/assigned_navigation_composition.rs"));
     }
@@ -11071,7 +11302,7 @@ mod lifecycle_tests {
                 parent_request_id: request.parent_request_id,
                 goal_generation: 1,
                 producer_runtime_generation: 1,
-                goal_payload_sha256: [7; 32],
+
             };
             *self
                 .last_lease
@@ -11181,8 +11412,6 @@ mod lifecycle_tests {
                     ],
                 },
             };
-            let goal_sha256 = schema::goal_intent_goal_sha256(&goal)
-                .map_err(|error| ChildNavigationSubmitError::Rejected(error.to_string()))?;
             let admission_context = crate::nav_runtime::NavAdmissionContext::new(
                 self.facade.mapping_lifecycle_lock.clone(),
                 self.facade.committed_map_authority.clone(),
@@ -11192,8 +11421,8 @@ mod lifecycle_tests {
                 self.facade.state.clone(),
                 self.facade.transport.clone(),
                 self.facade.transport_backend_name,
-                self.facade.lcm_backend_available,
-            );
+                self.facade.lcm_backend_available, Arc::from("base_link"),
+);
             let outcome = crate::nav_runtime::admit_goal_intent(
                 &admission_context,
                 &admission_io,
@@ -11220,15 +11449,15 @@ mod lifecycle_tests {
                         })?,
                     committed_map,
                     boundary_id: String::new(),
-                    boundary_sha256: [0; 32],
+                    body_to_support_z_m: None,
                     boundary_points: Vec::new(),
                     motion_guard_generation: request.motion_admission.guard_generation as i64,
                     motion_guard_boot_nonce: request.motion_admission.guard_boot_nonce,
                     motion_stop_generation: request.motion_admission.motion_stop_generation as i64,
-                    goal_sha256,
                     goal,
                 },
                 crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
+                boundary_owner: Arc::new(crate::explore_runtime::ExploreStartConfig::default()),
                     current_session_generation: producer_epoch_projection,
                 },
             )
@@ -12224,6 +12453,9 @@ mod lifecycle_tests {
             assert_eq!(recorded_legacy_clouds(&destination.backend).len(), published_clouds);
             assert!(matches!(map_events.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
             assert!(matches!(cloud_events.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+            if !paired {
+                assigned_mapping_cloud_boundary_slice(&destination, &activated, &checkpoint).await;
+            }
             if let Some((owner, applier)) = correction.as_ref() {
                 assigned_relocalization_navigation_slice(&destination, &activated, owner, applier).await;
             }
@@ -12901,7 +13133,7 @@ mod lifecycle_tests {
                 parent_request_id: lease.parent_request_id.clone(),
                 goal_generation: lease.goal_generation,
                 producer_runtime_generation: lease.producer_runtime_generation,
-                goal_payload_sha256: lease.goal_payload_sha256.to_vec(),
+
             }),
             expected_navigation_runtime_generation: 41,
             observed_navigation_runtime_generation: 42,
@@ -12932,11 +13164,7 @@ mod lifecycle_tests {
                 parent_request_id: child.parent_request_id.clone(),
                 goal_generation: child.goal_generation,
                 producer_runtime_generation: child.producer_runtime_generation,
-                goal_payload_sha256: child
-                    .goal_payload_sha256
-                    .as_slice()
-                    .try_into()
-                    .expect("32-byte goal hash"),
+
             },
             expected_navigation_runtime_generation: request.expected_navigation_runtime_generation,
             observed_navigation_runtime_generation: request.observed_navigation_runtime_generation,
@@ -12975,7 +13203,7 @@ mod lifecycle_tests {
                 parent_request_id: lease.parent_request_id.clone(),
                 goal_generation: lease.goal_generation,
                 producer_runtime_generation: lease.producer_runtime_generation,
-                goal_payload_sha256: lease.goal_payload_sha256.to_vec(),
+
             }),
             cancel_generation: reconciliation.cancel_generation,
             recovery_correlation: reconciliation.recovery_correlation.clone(),
@@ -13015,11 +13243,7 @@ mod lifecycle_tests {
                 parent_request_id: child.parent_request_id.clone(),
                 goal_generation: child.goal_generation,
                 producer_runtime_generation: child.producer_runtime_generation,
-                goal_payload_sha256: child
-                    .goal_payload_sha256
-                    .as_slice()
-                    .try_into()
-                    .expect("32-byte goal hash"),
+
             },
             cancel_generation: request.cancel_generation,
             recovery_correlation: request.recovery_correlation.clone(),
@@ -13529,9 +13753,7 @@ mod lifecycle_tests {
 
     #[tokio::test]
     async fn exact_global_stop_replay_precedes_live_guard_verification() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
+        let (handle, owner) = super::shared_nav_v8_recovery_tests::unit_handle().await;
         handle.explore.set_reconciliation_journal_path_for_tests(
             std::env::temp_dir()
                 .join(format!(
@@ -13564,13 +13786,11 @@ mod lifecycle_tests {
         assert!(retained.global_stop_reconciliation.eligible);
         let proto_request = global_stop_reconciliation_proto_request(&retained);
         let internal_request = global_stop_reconciliation_internal_request(&proto_request);
-        let committed = handle
-            .explore
-            .reconcile_after_global_stop(internal_request)
-            .await
-            .expect("seed completed global-stop reconciliation");
-        assert!(committed.ownership_reconciliation_receipt.is_some());
-        let service = GeometryRuntimeService::new(handle);
+        handle.explore.fail_next_reconciliation_directory_sync_for_tests();
+        assert!(matches!(handle.explore.reconcile_after_global_stop(internal_request.clone()).await,
+            Err(crate::explore_runtime::ExplorationRecoveryError::FailedPrecondition(message))
+                if message.contains("post-rename durability uncertain")));
+        let service = GeometryRuntimeService::new(handle.clone());
 
         let _env_lock = MOTION_GUARD_SOCKET_ENV_LOCK.lock().await;
         let previous_socket = std::env::var_os("NUWAX_MOTION_GUARD_SOCKET");
@@ -13579,6 +13799,15 @@ mod lifecycle_tests {
             uuid::Uuid::new_v4()
         ));
         std::env::set_var("NUWAX_MOTION_GUARD_SOCKET", &missing_socket);
+        // A typed receipt exists on disk, but live custody still requires the
+        // original server Guard verification before ownership can be released.
+        let live_result = GeometryRuntime::reconcile_exploration_after_global_stop(
+            &service, Request::new(proto_request.clone()),
+        ).await;
+        let live_after = handle.explore.snapshot();
+        let committed = handle.explore.reconcile_after_global_stop(internal_request)
+            .await.expect("finish exact live ownership for completed-replay fixture");
+        assert!(committed.ownership_reconciliation_receipt.is_some());
         let result = GeometryRuntime::reconcile_exploration_after_global_stop(
             &service,
             Request::new(proto_request),
@@ -13590,6 +13819,8 @@ mod lifecycle_tests {
             std::env::remove_var("NUWAX_MOTION_GUARD_SOCKET");
         }
 
+        assert_eq!(live_result.unwrap_err().code(), tonic::Code::Unavailable);
+        assert_eq!(live_after.child_task_id, retained.child_task_id);
         let replay = result
             .expect("exact replay must not require live Guard")
             .into_inner();
@@ -13602,6 +13833,7 @@ mod lifecycle_tests {
         let acknowledged = GeometryRuntime::acknowledge_exploration_ownership_reconciliation(
             &service,
             Request::new(AcknowledgeExplorationOwnershipReconciliationRequest {
+            child_lease: receipt.child_lease,
                 recovery_correlation: receipt.recovery_correlation,
                 child_lease_fingerprint: receipt.child_lease_fingerprint,
             }),
@@ -13610,6 +13842,9 @@ mod lifecycle_tests {
         .expect("reconciliation acknowledgement RPC")
         .into_inner();
         assert!(acknowledged.acknowledged);
+        drop(service);
+        drop(handle);
+        owner.finish().await.unwrap();
     }
 
     #[tokio::test]
@@ -14269,7 +14504,7 @@ mod lifecycle_tests {
         .into_inner();
         assert_eq!(stopped.phase, "STOPPED");
         assert!(!stopped.active);
-        handle.map_revision_tx.send(queued_event).expect("coalescer remains registered");
+        handle.map_revision_tx.send(queued_event.clone()).expect("coalescer remains registered");
         assert!(
             tokio::time::timeout(Duration::from_millis(100), stream.next())
                 .await
@@ -14283,11 +14518,12 @@ mod lifecycle_tests {
         }
         *handle.occupancy_shm_current.write().await =
             Some(crate::lcm_runtime::OccupancyShmSnapshot {
+                identity: crate::occupancy_shm::MapWriteIdentity::from_event(&queued_event).unwrap(),
                 key: "/tmp/stale.mmap".to_string(),
                 file_size: 8192,
                 payload_size: 1,
                 revision: 99,
-                layout_version: 2,
+                layout_version: 3,
                 payload_schema_version: 1,
                 generation: 1,
                 active_slot: 0,
@@ -18654,7 +18890,7 @@ mod exploration_contract_tests {
                     parent_request_id: "parent".into(),
                     goal_generation: 4,
                     producer_runtime_generation: 5,
-                    goal_payload_sha256: [7; 32],
+
                 }),
                 rollover_recovery_eligible: true,
                 global_stop_reconciliation:
@@ -18666,7 +18902,6 @@ mod exploration_contract_tests {
         assert!(proto.rollover_recovery_eligible);
         let child = proto.child_lease.expect("child lease");
         assert_eq!(child.producer_runtime_generation, 5);
-        assert_eq!(child.goal_payload_sha256, vec![7; 32]);
     }
 }
 
@@ -18704,8 +18939,8 @@ mod navigation_feedback_contract_tests {
                 parent_request_id: "request-7".into(),
                 goal_generation: 5,
                 path_revision: 2,
-                goal_payload_sha256: [7; 32],
-                path_payload_sha256: [8; 32],
+                producer_runtime_generation: 7,
+                planner_runtime_generation: 8,
             },
         });
 
@@ -18727,8 +18962,7 @@ mod navigation_feedback_contract_tests {
         assert_eq!(proto.parent_request_id, "request-7");
         assert_eq!(proto.goal_generation, 5);
         assert_eq!(proto.path_revision, 2);
-        assert_eq!(proto.goal_payload_sha256, vec![7; 32]);
-        assert_eq!(proto.path_payload_sha256, vec![8; 32]);
+        assert_eq!(proto.planner_runtime_generation, 8);
         assert_eq!(proto.producer_runtime_generation, 41);
         assert_eq!(proto.planned_path.len(),2);
         assert_eq!(proto.planned_path[1].z,0.4);
@@ -18939,7 +19173,7 @@ mod navigation_feedback_contract_tests {
         assert_eq!(goal.parent_request_id, "public-goal");
         assert!(goal.goal_generation > 0);
         assert!(goal.producer_runtime_generation > 0);
-        assert_eq!(goal.goal_payload_sha256.len(), 32);
+        assert!(goal.producer_runtime_generation > 0);
 
         let wrong_producer_runtime_generation = if goal.producer_runtime_generation == 1 {
             2
@@ -18984,7 +19218,7 @@ mod navigation_feedback_contract_tests {
             cancelled.producer_runtime_generation,
             goal.producer_runtime_generation
         );
-        assert_eq!(cancelled.goal_payload_sha256, goal.goal_payload_sha256);
+        assert_eq!(cancelled.producer_runtime_generation, goal.producer_runtime_generation);
 
         let rejected = GeometryRuntime::set_navigation_goal(
             &service,
@@ -19301,3 +19535,155 @@ mod assigned_activation_boundary_tests {
 #[cfg(test)]
 #[path = "owned_occupancy_bytes_tests.rs"]
 mod owned_occupancy_bytes_tests;
+
+#[cfg(test)]
+mod planar_assigned_checkpoint_pair_tests {
+    use super::*;
+    #[test]
+    fn planar_assigned_pair_checkpoint_binds_real_occupancy_without_cloud_or_hash() {
+        let previous = crate::map_checksum::FORBID_HASH.with(|v|v.replace(true));
+        let (checkpoint, _) = crate::planar_artifacts::planar_assigned_pair_tests::fixture();
+        validate_planar_checkpoint(&checkpoint).unwrap();
+        assert!(checkpoint.backend_identity.is_none()); assert!(checkpoint.cloud_receipt.is_none());
+        for change in 0..5 {
+            let mut bad=checkpoint.clone();
+            match change {0=>bad.occupancy_receipt.as_mut().unwrap().occupancy_revision+=1,
+                1=>bad.graph_artifact.as_mut().unwrap().member_identity.as_mut().unwrap().checkpoint_id="3".repeat(32),
+                2=>bad.occupancy_identity.as_mut().unwrap().role=CheckpointMemberRole::PlanarGraph as i32,
+                3=>bad.canonical_occupancy_checkpoint.as_mut().unwrap().data[0]=101,
+                _=>bad.graph_artifact.as_mut().unwrap().size+=1}
+            assert!(validate_planar_checkpoint(&bad).is_err(),"field {change}");
+        }
+        crate::map_checksum::FORBID_HASH.with(|v|v.set(previous));
+    }
+}
+
+
+#[cfg(all(test, unix))]
+mod shared_nav_v8_recovery_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct UnusedJournalTransport;
+    #[async_trait::async_trait]
+    impl nuwax_transport::LcmBackend for UnusedJournalTransport {
+        async fn publish(&self, _frame: RawLcmFrame) -> nuwax_transport::TransportResult<()> {
+            panic!("journal GET/ACK/replay must not emit an LCM action")
+        }
+        async fn subscribe(&self, _topic: LcmTopic, _kind: Option<LcmMessageType>) -> nuwax_transport::LcmFrameStream {
+            Box::pin(futures::stream::pending())
+        }
+        fn name(&self) -> &str { "journal-in-process-unit" }
+    }
+    pub(super) async fn unit_handle() -> (GeometryRuntimeHandle, crate::lcm_runtime::GeometryTestTaskOwner) {
+        crate::lcm_runtime::build_handle_for_tests_with_unit_transport(
+            true, None, nuwax_transport::LcmTransport::new(Arc::new(UnusedJournalTransport)),
+        ).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn legacy_journal_restores_through_real_get_and_ack_without_hash_or_new_goal() {
+        let (handle, owner) = unit_handle().await;
+        let (restarted, restarted_owner) = unit_handle().await;
+        let directory = std::env::temp_dir().join(format!("nuwax-v8-legacy-rpc-{}-{}", std::process::id(), crate::explore_runtime::now_unix_nanos()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("journal.json");
+        std::fs::write(&path, r#"{
+  "schema_version": 1,
+  "entries": [
+    {
+      "kind": "global_stop",
+      "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000065",
+      "request_fingerprint": "0000000000000000000000000000000000000000000000000000000000000066",
+      "receipt": {
+        "cause": "ordinary_global_stop",
+        "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000065",
+        "parent_request_id": "parent-101",
+        "exploration_generation": 102,
+        "child_lease_fingerprint": "0000000000000000000000000000000000000000000000000000000000000067",
+        "cancel_generation": 1,
+        "commit_disposition": "global_stop_reconciled_child_ownership"
+      },
+      "snapshot": {
+        "status": "FAILED",
+        "message": "synthetic legacy receipt fixture; no goal or proof payload",
+        "request_id": "parent-101",
+        "selected_source": "wavefront",
+        "last_stop_reason": "global_stop_reconciled_safe",
+        "frontier_count": 0,
+        "revision": 1,
+        "exploration_generation": 102
+      },
+      "committed_unix_ns": 102,
+      "acknowledged": false
+    },
+    {
+      "kind": "exact_child_zeroed",
+      "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000066",
+      "request_fingerprint": "0000000000000000000000000000000000000000000000000000000000000067",
+      "receipt": {
+        "cause": "late_exact_child_zeroed",
+        "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000066",
+        "parent_request_id": "parent-102",
+        "exploration_generation": 103,
+        "child_lease_fingerprint": "0000000000000000000000000000000000000000000000000000000000000068",
+        "cancel_generation": 1,
+        "commit_disposition": "exact_child_zeroed_released_ownership"
+      },
+      "snapshot": {
+        "status": "FAILED",
+        "message": "synthetic legacy receipt fixture; no goal or proof payload",
+        "request_id": "parent-102",
+        "selected_source": "wavefront",
+        "last_stop_reason": "child_cancel_failed",
+        "frontier_count": 0,
+        "revision": 1,
+        "exploration_generation": 103
+      },
+      "committed_unix_ns": 103,
+      "acknowledged": false
+    }
+  ]
+}
+"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        handle.explore.set_reconciliation_journal_path_for_tests(path.clone());
+        restarted.explore.set_reconciliation_journal_path_for_tests(path.clone());
+        struct NoHash;
+        impl Drop for NoHash { fn drop(&mut self) { crate::map_checksum::FORBID_HASH.with(|flag| flag.set(false)); } }
+        crate::map_checksum::FORBID_HASH.with(|flag| flag.set(true));
+        let _no_hash = NoHash;
+        handle.explore.restore_latest_durable_reconciliation_snapshot().unwrap();
+        let service = GeometryRuntimeService::new(handle.clone());
+        let state = GeometryRuntime::get_exploration_state(&service, Request::new(Empty {})).await.unwrap().into_inner();
+        assert_eq!(state.status, "FAILED");
+        assert_eq!(state.request_id, "parent-102");
+        assert!(state.child_lease.is_none());
+        assert!(handle.nav.active_goal_lease().await.is_none());
+        let receipt = state.ownership_reconciliation_receipt.unwrap();
+        assert!(receipt.child_lease.is_none());
+        assert_eq!(receipt.child_lease_fingerprint, format!("{:064x}", 104));
+        for _ in 0..2 {
+            let ack = GeometryRuntime::acknowledge_exploration_ownership_reconciliation(&service,
+                Request::new(AcknowledgeExplorationOwnershipReconciliationRequest {
+                    recovery_correlation: receipt.recovery_correlation.clone(),
+                    child_lease_fingerprint: receipt.child_lease_fingerprint.clone(), child_lease: None,
+                })).await.unwrap().into_inner();
+            assert!(ack.acknowledged);
+        }
+        let restarted_service = GeometryRuntimeService::new(restarted);
+        let next = GeometryRuntime::get_exploration_state(&restarted_service, Request::new(Empty {})).await.unwrap().into_inner();
+        assert_eq!(next.request_id, "parent-101");
+        assert!(next.child_lease.is_none());
+        let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["schema_version"], 1);
+        assert_eq!(stored["entries"][0]["request_fingerprint"], format!("{:064x}", 102));
+        assert_eq!(stored["entries"][1]["acknowledged"], true);
+        drop(service);
+        drop(restarted_service);
+        drop(handle);
+        owner.finish().await.unwrap();
+        restarted_owner.finish().await.unwrap();
+    }
+}

@@ -60,6 +60,10 @@ impl Cancellation {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
+    /// Borrow the owner's original flag for cooperative planner checkpoints.
+    pub(crate) fn flag(&self) -> &AtomicBool {
+        self.0.as_ref()
+    }
     fn new() -> Self {
         Self(Arc::new(AtomicBool::new(false)))
     }
@@ -875,6 +879,17 @@ mod tests {
     use std::cell::Cell;
     use std::thread::ThreadId;
     use std::time::Instant;
+
+    #[test]
+    fn cancellation_flag_borrows_original_owner_token() {
+        let cancellation = Cancellation::new();
+        let same_token = cancellation.clone();
+        assert!(std::ptr::eq(cancellation.flag(), same_token.flag()));
+        assert!(!cancellation.flag().load(Ordering::Acquire));
+        same_token.cancel();
+        assert!(cancellation.flag().load(Ordering::Acquire));
+        assert!(cancellation.is_cancelled());
+    }
 
     // Timeouts are deadlock watchdogs only. Every tested interleaving is established
     // by gate/phase acknowledgement, never by sleeping or assuming compute speed.

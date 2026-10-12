@@ -4,11 +4,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
-bash -n \
+for script in \
   install.sh \
   scripts/deploy_installer/entrypoint.sh \
   scripts/install_motion_guard_deployment.sh \
-  scripts/systemd/check_motion_guard_python.sh
+  scripts/systemd/check_motion_guard_python.sh; do
+  bash -n "${script}"
+done
 
 python3 -m compileall -q -f install.py scripts/deploy_installer scripts/module_installer
 ruff check scripts/deploy_installer install.py

@@ -182,8 +182,8 @@ pub struct NavigationFeedback {
     pub parent_request_id: String,
     pub goal_generation: u64,
     pub path_revision: u64,
-    pub goal_payload_sha256: [u8; 32],
-    pub path_payload_sha256: [u8; 32],
+    pub producer_runtime_generation: u64,
+    pub planner_runtime_generation: u64,
 }
 
 #[derive(Clone)]
@@ -225,12 +225,12 @@ impl NavigationUpdate {
                     .map_or_else(String::new, |lease| lease.parent_request_id.clone()),
                 goal_generation: lease.as_ref().map_or(0, |lease| lease.goal_generation),
                 path_revision: lease.as_ref().map_or(0, |lease| lease.path_revision),
-                goal_payload_sha256: lease
+                producer_runtime_generation: lease
                     .as_ref()
-                    .map_or([0; 32], |lease| lease.goal_payload_sha256),
-                path_payload_sha256: lease
+                    .map_or(0, |lease| lease.producer_runtime_generation),
+                planner_runtime_generation: lease
                     .as_ref()
-                    .map_or([0; 32], |lease| lease.path_payload_sha256),
+                    .map_or(0, |lease| lease.planner_runtime_generation),
                 ..NavigationFeedback::default()
             },
         }
@@ -528,6 +528,7 @@ impl MapRevisionEvent {
 /// it as an immutable reference and never replay an older map into the mmap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OccupancyShmSnapshot {
+    pub(crate) identity: crate::occupancy_shm::MapWriteIdentity,
     pub key: String,
     pub file_size: u64,
     pub payload_size: u64,
@@ -2548,7 +2549,6 @@ fn test_wavefront_goal_intent(
             orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
         },
     };
-    let goal_sha256 = schema::goal_intent_goal_sha256(&goal).expect("test goal hash");
     let motion_admission = crate::nav_runtime::test_motion_admission();
     schema::GoalIntent {
         map_frame_generation: 0,
@@ -2563,12 +2563,11 @@ fn test_wavefront_goal_intent(
         cancel_generation: i64::try_from(cancel_generation).expect("test cancel generation"),
         committed_map,
         boundary_id: String::new(),
-        boundary_sha256: [0; 32],
+        body_to_support_z_m: None,
         boundary_points: Vec::new(),
         motion_guard_generation: motion_admission.guard_generation as i64,
         motion_guard_boot_nonce: motion_admission.guard_boot_nonce,
         motion_stop_generation: motion_admission.motion_stop_generation as i64,
-        goal_sha256,
         goal,
     }
 }
@@ -2672,8 +2671,8 @@ async fn start_topology_exploration_goal(
         handle.state.clone(),
         handle.transport.clone(),
         handle.transport_backend_name,
-        handle.lcm_backend_available,
-    );
+        handle.lcm_backend_available, handle.body_reference_frame_id.clone(),
+);
     let outcome = crate::nav_runtime::admit_goal_intent(
         &admission_context,
         &admission_io,
@@ -2686,6 +2685,7 @@ async fn start_topology_exploration_goal(
             test_committed_map_identity(1),
         ),
         crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
+                boundary_owner: Arc::new(crate::explore_runtime::ExploreStartConfig::default()),
             current_session_generation: producer_epoch_projection,
         },
     )
@@ -3127,6 +3127,7 @@ async fn geometry_runtime_scheduler_abort_join_timeout_blocks_resource_cleanup()
 /// 以及通过 transport.publish 推送 odom / point cloud(real backend 直透 liblcm)。
 #[derive(Clone)]
 pub struct GeometryRuntimeHandle {
+    pub(crate) body_reference_frame_id: Arc<str>,
     pub state: Arc<RwLock<SharedState>>,
     pub cloud_map_tx: broadcast::Sender<CloudMapNotification>,
     /// Sole 3D mapping SHM writer shared by lidar ingestion and mapping
@@ -3606,7 +3607,7 @@ pub(crate) fn reset_canonical_localization_locked(
     state.pose_changed.send_replace(());
 }
 
-fn transform_to_entry(transform: TransformStamped) -> Option<TransformEntry> {
+pub(crate) fn transform_to_entry(transform: TransformStamped) -> Option<TransformEntry> {
     let stamp_secs = u64::try_from(transform.stamp_secs).ok()?;
     let stamp_ns = stamp_secs
         .checked_mul(1_000_000_000)?
@@ -5606,12 +5607,13 @@ fn exploration_child_lease(
         parent_request_id: lease.parent_request_id.clone(),
         goal_generation: lease.goal_generation,
         producer_runtime_generation: lease.producer_runtime_generation,
-        goal_payload_sha256: lease.goal_payload_sha256,
+
     }
 }
 
 #[derive(Clone)]
 struct ExploreNavigationBridge {
+    body_reference_frame_id: Arc<str>,
     mapping_adapter: Option<Arc<parking_lot::Mutex<MappingAdapter>>>,
     state: Arc<RwLock<SharedState>>,
     expected_map_frame: Arc<str>,
@@ -5690,6 +5692,7 @@ impl ExploreNavigationBridge {
 
     fn facade_handle(&self) -> GeometryRuntimeHandle {
         GeometryRuntimeHandle {
+        body_reference_frame_id: self.body_reference_frame_id.clone(),
             state: self.state.clone(),
             cloud_map_tx: self.cloud_map_tx.clone(),
             cloud_map_writer: Arc::new(parking_lot::Mutex::new(None)),
@@ -5898,8 +5901,8 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
             self.state.clone(),
             self.transport.clone(),
             self.transport_backend_name,
-            self.lcm_backend_available,
-        );
+            self.lcm_backend_available, self.body_reference_frame_id.clone(),
+);
         let outcome = crate::nav_runtime::admit_goal_intent(
             &admission_context,
             &admission_io,
@@ -5907,6 +5910,7 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
             request.intent,
             crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
                 current_session_generation: self.exploration_producer_epoch.clone(),
+                boundary_owner: request.boundary_owner,
             },
         )
         .await;
@@ -6129,7 +6133,7 @@ fn normalize_pending_cancel_zero_ack_path_identity(
     let complete_zero_proof = feedback.cancel_generation > 0
         && !feedback.zero_ack_id.trim().is_empty()
         && feedback.zero_applied_monotonic_ns > 0;
-    let pre_path_sentinel = feedback.path_revision == 0 && feedback.path_payload_sha256 == [0; 32];
+    let pre_path_sentinel = feedback.path_revision == 0 && feedback.planner_runtime_generation == 0;
     if !complete_zero_proof || !pre_path_sentinel {
         return;
     }
@@ -6139,7 +6143,7 @@ fn normalize_pending_cancel_zero_ack_path_identity(
         return;
     };
     let authoritative_path_is_sealed =
-        lease.path_revision > 0 && lease.path_payload_sha256 != [0; 32];
+        lease.path_revision > 0 && lease.planner_runtime_generation != 0;
     let cancellation_identity_matches = matches!(
         cancel.phase,
         crate::nav_runtime::CancelPhase::Pending
@@ -6151,13 +6155,13 @@ fn normalize_pending_cancel_zero_ack_path_identity(
         && lease.owner_kind == feedback.owner_kind
         && lease.parent_request_id == feedback.parent_request_id
         && lease.goal_generation == feedback.goal_generation
-        && lease.goal_payload_sha256 == feedback.goal_payload_sha256;
+        && lease.producer_runtime_generation == feedback.producer_runtime_generation;
     if !authoritative_path_is_sealed || !cancellation_identity_matches {
         return;
     }
 
     update.feedback.path_revision = lease.path_revision;
-    update.feedback.path_payload_sha256 = lease.path_payload_sha256;
+    update.feedback.planner_runtime_generation = lease.planner_runtime_generation;
 }
 
 async fn apply_typed_navigation_feedback(
@@ -6226,8 +6230,8 @@ async fn apply_typed_navigation_feedback(
                 &update.feedback.parent_request_id,
                 update.feedback.goal_generation,
                 update.feedback.path_revision,
-                update.feedback.goal_payload_sha256,
-                update.feedback.path_payload_sha256,
+                update.feedback.producer_runtime_generation,
+                update.feedback.planner_runtime_generation,
                 planner_observation,
                 motion_sink_observation,
             )
@@ -6253,13 +6257,13 @@ async fn apply_typed_navigation_feedback(
                     received_path_revision = update.feedback.path_revision,
                     expected_lease_source,
                     expected_path_revision = expected.map_or(0, |lease| lease.path_revision),
-                    received_path_hash_zero = update.feedback.path_payload_sha256 == [0; 32],
-                    expected_path_hash_zero = match expected {
-                        Some(lease) => lease.path_payload_sha256 == [0; 32],
+                    received_path_absent = update.feedback.planner_runtime_generation == 0,
+                    expected_path_absent = match expected {
+                        Some(lease) => lease.planner_runtime_generation == 0,
                         None => true,
                     },
-                    path_hash_matches = expected.is_some_and(|lease| {
-                        lease.path_payload_sha256 == update.feedback.path_payload_sha256
+                    planner_generation_matches = expected.is_some_and(|lease| {
+                        lease.planner_runtime_generation == update.feedback.planner_runtime_generation
                     }),
                     "typed navigation state rejected"
                 );
@@ -6416,7 +6420,7 @@ fn exploration_navigation_terminal_result(
             parent_request_id: update.feedback.parent_request_id.clone(),
             goal_generation: update.feedback.goal_generation,
             producer_runtime_generation: update.producer_runtime_generation,
-            goal_payload_sha256: update.feedback.goal_payload_sha256,
+
         },
     };
     match update.state.status.as_str() {
@@ -6730,7 +6734,6 @@ fn map_revision_coalescer_future_in_frame(
                             continue;
                         }
                         OccupancyShmCommitMode::Ready { writer, .. } => {
-                            let map = event.to_map_state();
                             let session_generation = event.session_generation;
                             // Keep mmap preparation inside the supervised task. A Tokio
                             // abort cannot report this task joined until the synchronous
@@ -6741,7 +6744,7 @@ fn map_revision_coalescer_future_in_frame(
                                 writer.begin_session(session_generation).and_then(|()| {
                                     #[cfg(test)]
                                     wait_for_topology_revision_prepare_release();
-                                    writer.prepare_occupancy(&map)
+                                    writer.prepare_occupancy(&event)
                                 })
                             };
                             #[cfg(test)]
@@ -6842,6 +6845,7 @@ fn map_revision_coalescer_future_in_frame(
                                 }
                             };
                             **current = Some(OccupancyShmSnapshot {
+                                identity: commit.identity,
                                 key: path.clone(),
                                 file_size: commit.file_size,
                                 payload_size: event.size,
@@ -7886,7 +7890,7 @@ async fn run_owned_nav_state_consumer(
                 if let Some(target) = nav_runtime.spatial_feedback_target(
                     &update.state.goal_id, update.feedback.owner_kind,
                     &update.feedback.parent_request_id, update.feedback.goal_generation,
-                    update.feedback.goal_payload_sha256,
+                    update.feedback.producer_runtime_generation,
                 ).await {
                     let current = state.read().await.pose.clone();
                     let distance = (current.x - target.x).hypot(current.y - target.y)
@@ -8159,6 +8163,7 @@ pub async fn spawn_geometry_runtime(
     let fr_binding = Some(channel_bindings.binding(ChannelKey::Frontiers));
     let odom_binding = Some(channel_bindings.binding(ChannelKey::Odom));
     let (map_frame, odom_frame, base_frame) = frame_bindings.into_parts();
+    let body_reference_frame_id: Arc<str> = Arc::from(base_frame.clone());
     let expected_map_frame: Arc<str> = Arc::from(map_frame.clone());
     let (cloud_map_tx, _) = broadcast::channel::<CloudMapNotification>(4);
     let (nav_state_tx, _) = broadcast::channel::<NavigationUpdate>(8);
@@ -8423,6 +8428,7 @@ pub async fn spawn_geometry_runtime(
     let explore_scheduler = Arc::new(tokio::sync::Mutex::new(None));
     let mapping_lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
     let handle = GeometryRuntimeHandle {
+        body_reference_frame_id: body_reference_frame_id.clone(),
         state: state.clone(),
         cloud_map_tx: cloud_map_tx.clone(),
         cloud_map_writer: cm_writer.clone(),
@@ -8626,6 +8632,7 @@ pub async fn spawn_geometry_runtime(
 
     explore_runtime.set_navigation_sink(Arc::new({
         let bridge = ExploreNavigationBridge {
+        body_reference_frame_id: body_reference_frame_id.clone(),
             mapping_adapter: handle.mapping_adapter.clone(),
             state: state.clone(),
             expected_map_frame: expected_map_frame.clone(),
@@ -9632,7 +9639,41 @@ struct NavigationMap3DPublicationMetadata {
     commit_boot_nonce: [u8; 16],
     commit_sequence: i64,
     cloud_occupancy_revision: i64,
-    virtual_obstacles: Option<schema::OccupancyGrid>,
+    virtual_obstacles: Option<NavigationVirtualObstacleMetadata>,
+}
+
+
+#[derive(Clone, Debug, PartialEq)]
+struct NavigationVirtualObstacleMetadata {
+    header: schema::Header,
+    info: schema::MapMetaData,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PreparedNavigationMap3DPublication {
+    metadata: NavigationMap3DPublicationMetadata,
+    mask_data: Vec<i8>,
+}
+
+/// Only the raw geometry needed by the existing publication checks, never a
+/// partially populated MapState or an independently owned map snapshot.
+struct NavigationVirtualObstacleGeometry {
+    width: u32,
+    height: u32,
+    resolution: f32,
+    origin_x: f64,
+    origin_y: f64,
+    frame_id: String,
+    revision: u64,
+    timestamp_ns: u64,
+}
+
+impl From<&MapState> for NavigationVirtualObstacleGeometry {
+    fn from(raw: &MapState) -> Self {
+        Self { width: raw.width, height: raw.height, resolution: raw.resolution,
+            origin_x: raw.origin_x, origin_y: raw.origin_y, frame_id: raw.frame_id.clone(),
+            revision: raw.revision, timestamp_ns: raw.timestamp_ns }
+    }
 }
 
 /// Relative ordering is only a consistency check. The baseline passed here
@@ -9731,7 +9772,34 @@ async fn navigation_map_3d_publication_metadata(
     publication: &CanonicalCloudPublication,
     state: &Arc<RwLock<SharedState>>,
     frame_id: &str,
+) -> Result<PreparedNavigationMap3DPublication, String> {
+    let (metadata, mask_data) = capture_navigation_map_3d_publication_metadata(
+        context, publication, state, frame_id,
+        |source| source.map(|source| source.rasterize().data).unwrap_or_default(),
+    ).await?;
+    Ok(PreparedNavigationMap3DPublication { metadata, mask_data })
+}
+
+async fn revalidate_navigation_map_3d_publication_metadata(
+    context: &NavigationMap3DPublishContext,
+    publication: &CanonicalCloudPublication,
+    state: &Arc<RwLock<SharedState>>,
+    frame_id: &str,
 ) -> Result<NavigationMap3DPublicationMetadata, String> {
+    // Same checks and same owner observation; only pixel derivation is omitted.
+    // Applied zones/raw geometry cannot change without a new occupancy receipt.
+    capture_navigation_map_3d_publication_metadata(
+        context, publication, state, frame_id, |_| (),
+    ).await.map(|(metadata, ())| metadata)
+}
+
+async fn capture_navigation_map_3d_publication_metadata<P>(
+    context: &NavigationMap3DPublishContext,
+    publication: &CanonicalCloudPublication,
+    state: &Arc<RwLock<SharedState>>,
+    frame_id: &str,
+    capture_payload: impl FnOnce(Option<crate::mapping_adapter::VirtualObstacleSource<'_>>) -> P,
+) -> Result<(NavigationMap3DPublicationMetadata, P), String> {
     let (
         session,
         map_frame_generation,
@@ -9739,19 +9807,20 @@ async fn navigation_map_3d_publication_metadata(
         boot_nonce,
         configured_frame,
         virtual_obstacles,
+        payload,
     ) = {
         let mapping = context.mapping.lock();
+        let mask = if publication.receipt.is_some() {
+            mapping.virtual_obstacles_source()?
+        } else { None };
         (
             mapping.snapshot(),
             mapping.global_frame_generation(),
             mapping.latest_occupancy_commit_receipt(),
             mapping.mapping_commit_boot_nonce(),
             mapping.configured_map_frame_id().to_owned(),
-            if publication.receipt.is_some() {
-                mapping.virtual_obstacles_snapshot()?
-            } else {
-                None
-            },
+            mask.map(|source| NavigationVirtualObstacleGeometry::from(source.raw)),
+            capture_payload(mask),
         )
     };
     if session.session_generation != publication.notification.session_generation
@@ -9784,7 +9853,7 @@ async fn navigation_map_3d_publication_metadata(
         if metadata.committed_map.session_id.is_empty() {
             metadata.committed_map.session_generation = 0;
         }
-        return Ok(metadata);
+        return Ok((metadata, payload));
     };
     let occupancy_receipt = occupancy_receipt
         .ok_or_else(|| "NavigationMap3D requires a real occupancy receipt".to_string())?;
@@ -9834,7 +9903,7 @@ async fn navigation_map_3d_publication_metadata(
         let stamp_sec = i32::try_from(mask.timestamp_ns / 1_000_000_000)
             .map_err(|_| "virtual obstacle timestamp exceeds i32".to_string())?;
         let stamp_nsec = (mask.timestamp_ns % 1_000_000_000) as i32;
-        metadata.virtual_obstacles = Some(schema::OccupancyGrid {
+        metadata.virtual_obstacles = Some(NavigationVirtualObstacleMetadata {
             header: schema::Header {
                 seq: i32::try_from(mask.revision)
                     .map_err(|_| "virtual obstacle revision exceeds i32".to_string())?,
@@ -9855,7 +9924,6 @@ async fn navigation_map_3d_publication_metadata(
                     orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
                 },
             },
-            data: mask.data,
         });
     }
     let authority = context
@@ -9871,21 +9939,24 @@ async fn navigation_map_3d_publication_metadata(
             return Err("NavigationMap3D canonical occupancy receipt conflicts with authority".into());
         }
     }
-    Ok(metadata)
+    Ok((metadata, payload))
 }
 
 #[cfg(test)]
 fn build_navigation_map_3d_publication_frame(
     publication: &CanonicalCloudPublication,
-    metadata: &NavigationMap3DPublicationMetadata,
+    prepared: &PreparedNavigationMap3DPublication,
     legacy_xyz_f32_le: Option<&[u8]>,
 ) -> Result<RawLcmFrame, String> {
-    build_navigation_map_3d_publication_frame_with_baseline(publication, metadata, legacy_xyz_f32_le, None)
+    // Tests may build repeatedly from one prepared fixture; production moves its payload.
+    build_navigation_map_3d_publication_frame_with_baseline(
+        publication, &prepared.metadata, prepared.mask_data.clone(), legacy_xyz_f32_le, None)
 }
 
 fn build_navigation_map_3d_publication_frame_with_baseline(
     publication: &CanonicalCloudPublication,
     metadata: &NavigationMap3DPublicationMetadata,
+    mask_data: Vec<i8>,
     legacy_xyz_f32_le: Option<&[u8]>,
     published_root: Option<&nuwax_map_chunks::RootIdentity>,
 ) -> Result<RawLcmFrame, String> {
@@ -9943,7 +10014,9 @@ fn build_navigation_map_3d_publication_frame_with_baseline(
         commit_boot_nonce: metadata.commit_boot_nonce,
         commit_sequence: metadata.commit_sequence,
         cleared: publication.receipt.is_none(),
-        virtual_obstacles: metadata.virtual_obstacles.clone(),
+        virtual_obstacles: metadata.virtual_obstacles.as_ref().map(|mask| schema::OccupancyGrid {
+            header: mask.header.clone(), info: mask.info.clone(), data: mask_data,
+        }),
         fine: None,
         cloud,
     };
@@ -10611,7 +10684,7 @@ async fn publish_latest_canonical_cloud_map_with_exposure(
             } else {
                 None
             };
-            validate_expected_navigation_exposure(navigation_context, navigation_metadata.as_ref(), expected_exposure)?;
+            validate_expected_navigation_exposure(navigation_context, navigation_metadata.as_ref().map(|prepared| &prepared.metadata), expected_exposure)?;
             if navigation_context.is_some_and(|context|
                 Some(current_navigation_map_3d_identity(context)) != navigation_identity) {
                 continue;
@@ -10625,10 +10698,14 @@ async fn publish_latest_canonical_cloud_map_with_exposure(
             } else {
                 None
             };
-            let navigation_frame = navigation_metadata.as_ref()
-                .map(|metadata| build_navigation_map_3d_publication_frame_with_baseline(
-                    &publication, metadata, exported_xyz.as_deref(), published_root.as_ref()))
-                .transpose()?;
+            let (navigation_metadata, navigation_frame) = match navigation_metadata {
+                Some(PreparedNavigationMap3DPublication { metadata, mask_data }) => {
+                    let frame = build_navigation_map_3d_publication_frame_with_baseline(
+                        &publication, &metadata, mask_data, exported_xyz.as_deref(), published_root.as_ref())?;
+                    (Some(metadata), Some(frame))
+                }
+                None => (None, None),
+            };
 
             let mut navigation_identity_rx = invalidation.navigation_identity_tx.subscribe();
             if navigation_context.is_some()
@@ -10688,7 +10765,7 @@ async fn publish_latest_canonical_cloud_map_with_exposure(
                             return Ok(false);
                         }
                         if let (Some(context), Some(expected)) = (navigation_context, navigation_metadata.as_ref()) {
-                            let current = navigation_map_3d_publication_metadata(context, &publication, state, frame_id).await?;
+                            let current = revalidate_navigation_map_3d_publication_metadata(context, &publication, state, frame_id).await?;
                             if current != *expected {
                                 return Ok(false);
                             }
@@ -10712,7 +10789,7 @@ async fn publish_latest_canonical_cloud_map_with_exposure(
                 (navigation_context, navigation_metadata.as_ref())
             {
                 let current =
-                    navigation_map_3d_publication_metadata(context, &publication, state, frame_id)
+                    revalidate_navigation_map_3d_publication_metadata(context, &publication, state, frame_id)
                         .await?;
                 if current != *expected {
                     return Err("NavigationMap3D publication identity changed during send".into());
@@ -12608,6 +12685,7 @@ async fn build_test_handle_parts_owned(
     canonical_cloud_publication_invalidation(&cloud_map_writer)
         .set_legacy_full_demand(Some("explicit-test-legacy-consumer".into()));
     Ok(GeometryRuntimeHandle {
+        body_reference_frame_id: Arc::from("base_link"),
         state,
         cloud_map_tx,
         cloud_map_writer,
@@ -13810,6 +13888,147 @@ mod mapping_feed_tests {
             .await.is_err());
     }
 
+    fn enable_revalidation_fixture_mask(masks: &MaskPublicationFixture) {
+        std::fs::write(&masks.zones, br#"{"schema_version":1,"maps":{"test-map":{"map_name":"test-map","generation":1,"zones":[{"id":"circle","shape":"circle","mode":"inside","frame_id":"map","center":{"x":0.5,"y":0.0},"radius_m":0.3}]}}}"#).unwrap();
+    }
+
+    async fn assert_mask_revalidation_error(
+        fixture: &NavigationMap3DFixture, publication: &CanonicalCloudPublication,
+        frame: &str, expected: &str,
+    ) {
+        let full = navigation_map_3d_publication_metadata(
+            &fixture.context, publication, &fixture.state, frame).await.unwrap_err();
+        let scalar = revalidate_navigation_map_3d_publication_metadata(
+            &fixture.context, publication, &fixture.state, frame).await.unwrap_err();
+        assert_eq!(full, expected);
+        assert_eq!(scalar, full);
+    }
+
+    #[tokio::test]
+    async fn mask_revalidation_matches_enabled_failclosed_and_disabled_capture() {
+        for kind in 0..3 {
+            let masks = MaskPublicationFixture::new();
+            match kind {
+                0 => enable_revalidation_fixture_mask(&masks),
+                1 => std::fs::write(&masks.zones, b"{broken-json").unwrap(),
+                _ => {}
+            }
+            let fixture = &masks.fixture;
+            fixture.commit(1_000_000_000);
+            let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer).unwrap().unwrap();
+            let full = navigation_map_3d_publication_metadata(&fixture.context, &publication,
+                &fixture.state, "map").await.unwrap();
+            let scalar = revalidate_navigation_map_3d_publication_metadata(&fixture.context,
+                &publication, &fixture.state, "map").await.unwrap();
+            assert_eq!(scalar, full.metadata);
+            let original = fixture.context.mapping.lock().virtual_obstacles_snapshot().unwrap();
+            assert_eq!(full.mask_data, original.as_ref().map(|m| m.data.clone()).unwrap_or_default());
+            assert_eq!(full.metadata.virtual_obstacles.is_some(), original.is_some());
+            let frame = build_navigation_map_3d_publication_frame(&publication, &full, None).unwrap();
+            let decoded = schema::decode_navigation_map_3d_body(&frame.payload).unwrap();
+            assert_eq!(decoded.virtual_obstacles.as_ref().map(|m| &m.data), original.as_ref().map(|m| &m.data));
+            if kind == 0 { assert!(full.mask_data.contains(&100) && full.mask_data.contains(&0)); }
+            if kind == 1 { assert!(full.mask_data.iter().all(|v| *v == 100)); }
+            if kind == 2 { assert!(full.mask_data.is_empty()); }
+        }
+    }
+
+    #[tokio::test]
+    async fn mask_revalidation_preserves_shared_geometry_authority_and_writer_errors() {
+        let masks = MaskPublicationFixture::new(); enable_revalidation_fixture_mask(&masks);
+        let fixture = &masks.fixture; fixture.commit(1_000_000_000);
+        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer).unwrap().unwrap();
+        let original = fixture.state.read().await.map.clone();
+        for kind in 0..8 {
+            let mut map = original.clone();
+            match kind {
+                0 => map.revision += 1,
+                1 => map.timestamp_ns += 1,
+                2 => map.frame_id = "foreign".into(),
+                3 => map.width += 1,
+                4 => map.height += 1,
+                5 => map.resolution *= 2.0,
+                6 => map.origin_x += 1.0,
+                _ => map.origin_y += 1.0,
+            }
+            fixture.state.write().await.map = map;
+            assert_mask_revalidation_error(fixture, &publication, "map", if kind < 3 {
+                "NavigationMap3D canonical occupancy state does not match receipt"
+            } else { "NavigationMap3D virtual obstacles do not match the committed occupancy geometry" }).await;
+        }
+        fixture.state.write().await.map = original;
+        let authority = fixture.context.committed_map_authority.lock().unwrap().clone();
+        fixture.context.committed_map_authority.lock().unwrap().as_mut().unwrap().commit_sequence += 1;
+        assert_mask_revalidation_error(fixture, &publication, "map",
+            "NavigationMap3D canonical occupancy receipt conflicts with authority").await;
+        let writer = fixture.writer.lock().take();
+        // Writer failure still precedes the simultaneous authority mismatch.
+        assert_mask_revalidation_error(fixture, &publication, "map",
+            "NavigationMap3D retained cloud receipt/root is not the current writer owner").await;
+        *fixture.writer.lock() = writer;
+        *fixture.context.committed_map_authority.lock().unwrap() = authority;
+        for kind in 0..4 {
+            let mut forged = publication.clone();
+            match kind {
+                0 => forged.receipt.as_mut().unwrap().commit_id.sequence += 1,
+                1 => forged.source_timestamp_ns += 1,
+                2 => { forged.fine = Some(Arc::new((**forged.fine.as_ref().unwrap()).clone())); }
+                _ => {
+                    let root = forged.fine.as_ref().unwrap();
+                    forged.fine = Some(Arc::new(root.rehome_frame(&root.manifest().identity(),
+                        root.manifest().domain.frame_generation + 1).unwrap()));
+                }
+            }
+            let expected = navigation_map_3d_publication_metadata(&fixture.context, &forged,
+                &fixture.state, "map").await.unwrap_err();
+            assert_mask_revalidation_error(fixture, &forged, "map", &expected).await;
+        }
+        assert_mask_revalidation_error(fixture, &publication, "foreign",
+            "NavigationMap3D publication crossed mapping session/frame identity").await;
+    }
+
+    #[tokio::test]
+    async fn mask_revalidation_rejects_stopped_owner_despite_equal_existing_identity() {
+        let masks = MaskPublicationFixture::new(); enable_revalidation_fixture_mask(&masks);
+        let fixture = &masks.fixture; fixture.commit(1_000_000_000);
+        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer).unwrap().unwrap();
+        navigation_map_3d_publication_metadata(&fixture.context, &publication, &fixture.state, "map").await.unwrap();
+        let identity = current_navigation_map_3d_identity(&fixture.context);
+        let transition = fixture.context.mapping.lock().stop_session_detached("test-session").unwrap();
+        assert_eq!(current_navigation_map_3d_identity(&fixture.context), identity);
+        assert_mask_revalidation_error(fixture, &publication, "map",
+            "NavigationMap3D map/cloud commit receipts do not match").await;
+        if let Some(retirement) = transition.retirement {
+            let generation = retirement.generation(); let result = retirement.stop_and_join();
+            fixture.context.mapping.lock().complete_backend_retirement(generation, result).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mask_revalidation_tracks_applied_receipt_not_pose_or_future_file() {
+        let masks = MaskPublicationFixture::new(); enable_revalidation_fixture_mask(&masks);
+        let fixture = &masks.fixture; fixture.commit(1_000_000_000);
+        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer).unwrap().unwrap();
+        let first = navigation_map_3d_publication_metadata(&fixture.context, &publication,
+            &fixture.state, "map").await.unwrap();
+        std::fs::write(&masks.zones, b"{broken-json").unwrap();
+        fixture.state.write().await.pose.x = 99.0;
+        let unchanged = revalidate_navigation_map_3d_publication_metadata(&fixture.context,
+            &publication, &fixture.state, "map").await.unwrap();
+        assert_eq!(unchanged, first.metadata);
+        let mut rx = fixture.map_tx.subscribe();
+        assert!(fixture.context.mapping.lock().refresh_forbidden_zones(&fixture.state, &fixture.map_tx).unwrap());
+        masks.expose(&rx.try_recv().unwrap());
+        let second = navigation_map_3d_publication_metadata(&fixture.context, &publication,
+            &fixture.state, "map").await.unwrap();
+        let revalidated = revalidate_navigation_map_3d_publication_metadata(&fixture.context,
+            &publication, &fixture.state, "map").await.unwrap();
+        assert_ne!(second.metadata, first.metadata);
+        assert_eq!(revalidated, second.metadata);
+        assert!(second.mask_data.iter().all(|v| *v == 100));
+        assert!(second.metadata.committed_map.commit_sequence > first.metadata.committed_map.commit_sequence);
+    }
+
     #[tokio::test]
     async fn mask_only_and_noop_publish_without_fine_object_io_or_cloud_materialization() {
         let masks = MaskPublicationFixture::new();
@@ -14672,12 +14891,12 @@ mod mapping_feed_tests {
         )
         .await
         .unwrap();
-        assert!(metadata.committed_map.revision > message.committed_map.revision);
-        assert!(metadata.committed_map.commit_sequence > message.committed_map.commit_sequence);
-        assert_eq!(metadata.cloud_occupancy_revision, message.committed_map.revision);
-        assert_eq!(metadata.commit_sequence, message.commit_sequence);
+        assert!(metadata.metadata.committed_map.revision > message.committed_map.revision);
+        assert!(metadata.metadata.committed_map.commit_sequence > message.committed_map.commit_sequence);
+        assert_eq!(metadata.metadata.cloud_occupancy_revision, message.committed_map.revision);
+        assert_eq!(metadata.metadata.commit_sequence, message.commit_sequence);
         let metadata_only = build_navigation_map_3d_publication_frame_with_baseline(
-            &publication, &metadata, None, Some(&baseline)).unwrap();
+            &publication, &metadata.metadata, metadata.mask_data.clone(), None, Some(&baseline)).unwrap();
         let composite = schema::decode_navigation_map_3d_body(&metadata_only.payload).unwrap();
         assert!(composite.fine.as_ref().unwrap().included.is_empty());
         assert_eq!(composite.source_timestamp_ns, message.source_timestamp_ns);
@@ -19191,6 +19410,39 @@ mod mapping_feed_tests {
         assert_eq!(backing.generation, descriptor.generation);
         assert_eq!(backing.active_slot, descriptor.active_slot);
         assert_eq!(backing.data, vec![0, 100, -1, 42]);
+        assert_eq!(backing.commit_id, event.receipt.commit_id);
+        assert_eq!(backing.session_generation, event.session_generation);
+
+        // Exercise the production admission -> writer chain, not an unbound writer bypass.
+        let mut replay = event.clone();
+        replay.data = event.data.as_ref().to_vec().into();
+        assert!(!Arc::ptr_eq(&replay.data, &event.data));
+        tx.send(replay.clone()).expect("independent exact replay");
+        Arc::make_mut(&mut replay.data)[0] = 99;
+        tx.send(replay).expect("same receipt with conflicting immutable body");
+        assert!(tokio::time::timeout(Duration::from_millis(150), latest_rx.changed())
+            .await.is_err(), "replay/conflict must not advance committed watch");
+        assert_eq!(current.read().await.as_ref(), Some(&descriptor));
+        assert_eq!(reader.read_stable().unwrap().as_ref(), Some(&backing));
+        assert_eq!(writer.lock().physical_write_count(), 1);
+
+        // A genuine later owner commit still advances, proving the rejected event did not poison the sink.
+        let mut next_map = event.to_map_state();
+        next_map.revision += 1;
+        next_map.timestamp_ns += 1;
+        next_map.data[0] = 50;
+        let next = test_owner_map_revision(&mut mapping_adapter.lock(), &next_map);
+        tx.send(next.clone()).expect("next actual owner commit");
+        tokio::time::timeout(Duration::from_secs(1), latest_rx.changed()).await
+            .expect("next owner visibility timeout").expect("watch remains open");
+        assert_eq!(latest_rx.borrow().as_ref().unwrap().receipt, next.receipt);
+        let next_descriptor = current.read().await.clone().unwrap();
+        let next_backing = reader.read_stable().unwrap().unwrap();
+        assert_eq!(next_descriptor.generation, descriptor.generation + 1);
+        assert!(next_descriptor.identity.matches_event(&next));
+        assert_eq!(next_backing.commit_id, next.receipt.commit_id);
+        assert_eq!(next_backing.data, next_map.data);
+        assert_eq!(writer.lock().physical_write_count(), 2);
         let _ = std::fs::remove_file(shm_path);
     }
 
@@ -19331,7 +19583,7 @@ mod mapping_feed_tests {
             .begin_session(event.session_generation)
             .expect("session fence");
         let prepared = writer
-            .prepare_occupancy(&event.to_map_state())
+            .prepare_occupancy(&event)
             .expect("inactive-slot prepare");
         assert!(reader.read_stable().expect("staged read").is_none());
 
@@ -19971,7 +20223,7 @@ mod exploration_adapter_tests {
                 owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
                 parent_request_id: "explore-1".to_string(),
                 goal_generation: 7,
-                goal_payload_sha256: [9; 32],
+                producer_runtime_generation: 9,
                 ..NavigationFeedback::default()
             },
         }
@@ -20054,9 +20306,9 @@ mod typed_navigation_feedback_tests {
             parent_request_id: format!("request-{goal_id}"),
             goal_generation: 1,
             producer_runtime_generation: 1,
-            goal_payload_sha256: [7; 32],
+
             path_revision: 0,
-            path_payload_sha256: [0; 32],
+            planner_runtime_generation: 0,
         }
     }
 
@@ -20084,9 +20336,9 @@ mod typed_navigation_feedback_tests {
                     .as_ref()
                     .map_or_else(String::new, |lease| lease.parent_request_id.clone()),
                 goal_generation: lease.as_ref().map_or(0, |lease| lease.goal_generation),
-                goal_payload_sha256: lease
+                producer_runtime_generation: lease
                     .as_ref()
-                    .map_or([0; 32], |lease| lease.goal_payload_sha256),
+                    .map_or(0, |lease| lease.producer_runtime_generation),
                 ..NavigationFeedback::default()
             },
         }
@@ -20100,12 +20352,14 @@ mod typed_navigation_feedback_tests {
             .expect("real-lcm test handle");
         let mut lease = test_lease(goal_id);
         lease.path_revision = 1;
-        lease.path_payload_sha256 = [8; 32];
+        lease.planner_runtime_generation = 8;
         {
             let inner = handle.nav.inner();
             let mut slot = inner.write().await;
             slot.phase = crate::nav_runtime::NavPhase::Running;
             slot.goal = Some(crate::nav_runtime::ActiveGoal {
+            options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
+            body_to_support_z_m: None, boundary_owner: None,
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
@@ -20209,6 +20463,8 @@ mod typed_navigation_feedback_tests {
                 slot.phase = crate::nav_runtime::NavPhase::Running;
                 slot.message = "B remains active".into();
                 slot.goal = Some(crate::nav_runtime::ActiveGoal {
+            options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
+            body_to_support_z_m: None, boundary_owner: None,
                     id: lease_b.session_id.clone(),
                     frame_id: "map".to_string(),
                     target: PoseState::default(),
@@ -20249,6 +20505,8 @@ mod typed_navigation_feedback_tests {
                 let mut slot = inner.write().await;
                 slot.phase = crate::nav_runtime::NavPhase::Running;
                 slot.goal = Some(crate::nav_runtime::ActiveGoal {
+            options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
+            body_to_support_z_m: None, boundary_owner: None,
                     id: lease_b.session_id.clone(),
                     frame_id: "map".to_string(),
                     target: PoseState::default(),
@@ -20289,6 +20547,91 @@ mod typed_navigation_feedback_tests {
     }
 
     #[tokio::test]
+    async fn unconfirmed_failure_keeps_exact_lease_until_late_measured_zero() {
+        use crate::proto::geometry_runtime_server::GeometryRuntime;
+        use crate::proto::CancelNavigationRequest;
+        for request_cancel in [false, true] {
+            let (handle, lease) = handle_with_active_path_lease("late-measured-stop").await;
+            let mut failed = feedback_update(&lease.session_id);
+            failed.state.status = "FAILED".into();
+            failed.state.message = "MOTION_STOP_UNCONFIRMED".into();
+            failed.feedback.path_revision = lease.path_revision;
+            failed.feedback.planner_runtime_generation = lease.planner_runtime_generation;
+            let pending = apply_typed_navigation_feedback(&handle.nav, failed.clone()).await.unwrap();
+            assert_eq!(pending.state.status, "FAILED");
+            assert!(!pending.feedback.actuator_zeroed);
+            assert_eq!(handle.nav.active_goal_lease().await, Some(lease.clone()));
+            assert!(handle.nav.terminal_receipts().await.is_empty());
+            if request_cancel {
+                begin_pending_cancel(&handle, &lease).await;
+            }
+            // 两种路径身份错误均不能借真实停车字段领取原目标回执。
+            for wrong_planner in [false, true] {
+                let mut wrong = failed.clone();
+                if wrong_planner {
+                    wrong.feedback.planner_runtime_generation += 1;
+                } else {
+                    wrong.feedback.path_revision += 1;
+                }
+                wrong.feedback.zero_ack_id = "wrong-stop".into();
+                wrong.feedback.zero_applied_monotonic_ns = 42;
+                assert!(apply_typed_navigation_feedback(&handle.nav, wrong).await.is_none());
+                assert_eq!(handle.nav.active_goal_lease().await, Some(lease.clone()));
+                assert!(handle.nav.terminal_receipts().await.is_empty());
+            }
+            failed.state.timestamp_ns += 1;
+            failed.feedback.zero_ack_id = "late-measured-zero".into();
+            failed.feedback.zero_applied_monotonic_ns = 43;
+            let terminal = apply_typed_navigation_feedback(&handle.nav, failed).await.unwrap();
+            assert!(terminal.feedback.actuator_zeroed);
+            assert_eq!(terminal.state.status, if request_cancel { "CANCELLED" } else { "FAILED" });
+            assert!(handle.nav.active_goal_lease().await.is_none());
+            assert_eq!(handle.nav.terminal_receipts().await.len(), 1);
+            let service = crate::server::GeometryRuntimeService::new(handle);
+            let response = service.cancel_navigation(tonic::Request::new(CancelNavigationRequest {
+                goal_id: lease.session_id, owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id, goal_generation: lease.goal_generation,
+                producer_runtime_generation: lease.producer_runtime_generation,
+            })).await.unwrap().into_inner();
+            assert!(response.actuator_zeroed);
+            assert_eq!(response.zero_ack_id, "late-measured-zero");
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_zero_receipt_does_not_retire_replaced_goal_or_path() {
+        for replacement in 0..3 {
+            let (handle, lease) = handle_with_active_path_lease("retained-old-stop").await;
+            let mut old = feedback_update(&lease.session_id);
+            old.state.status = "FAILED".into();
+            old.feedback.path_revision = lease.path_revision;
+            old.feedback.planner_runtime_generation = lease.planner_runtime_generation;
+            old.feedback.actuator_zeroed = true;
+            old.feedback.zero_ack_id = "already-validated-old-stop".into();
+            old.feedback.zero_applied_monotonic_ns = 43;
+            let mut current = lease.clone();
+            match replacement {
+                0 => { current.session_id = "new-goal".into(); current.goal_generation += 1; }
+                1 => current.path_revision += 1,
+                _ => current.planner_runtime_generation += 1,
+            }
+            {
+                let inner = handle.nav.inner();
+                let mut slot = inner.write().await;
+                let goal = slot.goal.as_mut().unwrap();
+                goal.id = current.session_id.clone();
+                goal.lease = current.clone();
+            }
+            // 模拟证明已通过关联、提交前目标或路径被替换的时间窗口。
+            handle.nav.retain_terminal_receipt(&old).await;
+            assert_eq!(handle.nav.active_goal_lease().await, Some(current));
+            let receipts = handle.nav.terminal_receipts().await;
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].feedback.zero_ack_id, "already-validated-old-stop");
+        }
+    }
+
+    #[tokio::test]
     async fn retained_terminal_survives_unsubscribed_stop_and_cancel_rpc_race() {
         use crate::proto::geometry_runtime_server::GeometryRuntime;
         use crate::proto::{CancelNavigationRequest,Empty};
@@ -20297,7 +20640,7 @@ mod typed_navigation_feedback_tests {
         let mut update=feedback_update(&lease.session_id);
         update.state.status="FAILED".into();
         update.feedback.path_revision=lease.path_revision;
-        update.feedback.path_payload_sha256=lease.path_payload_sha256;
+        update.feedback.planner_runtime_generation=lease.planner_runtime_generation;
         update.feedback.zero_ack_id="retained-zero".into();
         update.feedback.zero_applied_monotonic_ns=42;
         apply_typed_navigation_feedback(&handle.nav,update).await.unwrap();
@@ -20336,7 +20679,7 @@ mod typed_navigation_feedback_tests {
         let mut update=feedback_update(&lease.session_id);
         update.state.status="FAILED".into();
         update.feedback.path_revision=lease.path_revision;
-        update.feedback.path_payload_sha256=lease.path_payload_sha256;
+        update.feedback.planner_runtime_generation=lease.planner_runtime_generation;
         update.feedback.zero_ack_id="lagged-zero".into();
         update.feedback.zero_applied_monotonic_ns=43;
         let update=apply_typed_navigation_feedback(&nav,update).await.unwrap();
@@ -20356,7 +20699,7 @@ mod typed_navigation_feedback_tests {
             let mut update=feedback_update(&lease.session_id);
             update.state.status=status.into();
             update.feedback.path_revision=lease.path_revision;
-            update.feedback.path_payload_sha256=lease.path_payload_sha256;
+            update.feedback.planner_runtime_generation=lease.planner_runtime_generation;
             update.feedback.zero_ack_id="verified-normal-fence".into();
             update.feedback.zero_applied_monotonic_ns=42;
             let result=apply_typed_navigation_feedback(&handle.nav,update).await.unwrap();
@@ -20375,7 +20718,7 @@ mod typed_navigation_feedback_tests {
             let mut update=feedback_update(&lease.session_id);
             update.state.status="SUCCEEDED".into();
             update.feedback.path_revision=lease.path_revision;
-            update.feedback.path_payload_sha256=if pending_cancel{lease.path_payload_sha256}else{[9;32]};
+            update.feedback.planner_runtime_generation=if pending_cancel{lease.planner_runtime_generation}else{9};
             update.feedback.zero_ack_id="uncorrelated-normal".into();
             update.feedback.zero_applied_monotonic_ns=42;
             let result=apply_typed_navigation_feedback(&handle.nav,update).await;
@@ -20399,6 +20742,8 @@ mod typed_navigation_feedback_tests {
             let mut slot = inner.write().await;
             slot.phase = crate::nav_runtime::NavPhase::Running;
             slot.goal = Some(crate::nav_runtime::ActiveGoal {
+            options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
+            body_to_support_z_m: None, boundary_owner: None,
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
@@ -20470,8 +20815,8 @@ mod typed_navigation_feedback_tests {
         assert_eq!(applied.state.status, "CANCELLED");
         assert_eq!(applied.feedback.path_revision, lease.path_revision);
         assert_eq!(
-            applied.feedback.path_payload_sha256,
-            lease.path_payload_sha256
+            applied.feedback.planner_runtime_generation,
+            lease.planner_runtime_generation
         );
         assert_eq!(applied.feedback.cancel_phase, "ZEROED");
         assert!(applied.feedback.actuator_zeroed);
@@ -20557,8 +20902,8 @@ mod typed_navigation_feedback_tests {
             assert!(exact.feedback.actuator_zeroed);
             assert_eq!(exact.feedback.path_revision, lease.path_revision);
             assert_eq!(
-                exact.feedback.path_payload_sha256,
-                lease.path_payload_sha256
+                exact.feedback.planner_runtime_generation,
+                lease.planner_runtime_generation
             );
             assert_eq!(
                 handle.nav.cancel_snapshot().phase,
@@ -20575,7 +20920,7 @@ mod typed_navigation_feedback_tests {
         let mut update = feedback_update(&lease.session_id);
         update.state.status = "CANCELLED".into();
         update.feedback.path_revision = lease.path_revision.saturating_add(1);
-        update.feedback.path_payload_sha256 = [9; 32];
+        update.feedback.planner_runtime_generation = 9;
         update.feedback.cancel_generation = cancel.generation;
         update.feedback.zero_ack_id = "zero-wrong-path".into();
         update.feedback.zero_applied_monotonic_ns = 22;
@@ -20625,6 +20970,8 @@ mod typed_navigation_feedback_tests {
             let mut slot = inner.write().await;
             slot.phase = crate::nav_runtime::NavPhase::Running;
             slot.goal = Some(crate::nav_runtime::ActiveGoal {
+            options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
+            body_to_support_z_m: None, boundary_owner: None,
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
@@ -20638,7 +20985,7 @@ mod typed_navigation_feedback_tests {
             .await
             .is_none());
         let mut wrong_hash = feedback_update("goal-correlated");
-        wrong_hash.feedback.goal_payload_sha256 = [9; 32];
+        wrong_hash.feedback.producer_runtime_generation = 9;
         assert!(apply_typed_navigation_feedback(&handle.nav, wrong_hash)
             .await
             .is_none());
@@ -20649,12 +20996,14 @@ mod typed_navigation_feedback_tests {
         let nav = crate::nav_runtime::NavRuntimeState::from_env();
         let mut lease = test_lease("goal-diagnostic-source");
         lease.path_revision = 7;
-        lease.path_payload_sha256 = [8; 32];
+        lease.planner_runtime_generation = 8;
         futures::executor::block_on(async {
             let inner = nav.inner();
             let mut slot = inner.write().await;
             slot.phase = crate::nav_runtime::NavPhase::Running;
             slot.goal = Some(crate::nav_runtime::ActiveGoal {
+            options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
+            body_to_support_z_m: None, boundary_owner: None,
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
@@ -20682,8 +21031,8 @@ mod typed_navigation_feedback_tests {
         assert!(output.contains("typed navigation state rejected"));
         assert!(output.contains("expected_lease_source=\"active\""));
         assert!(output.contains("expected_path_revision=7"));
-        assert!(output.contains("expected_path_hash_zero=false"));
-        assert!(output.contains("path_hash_matches=false"));
+        assert!(output.contains("expected_path_absent=false"));
+        assert!(output.contains("planner_generation_matches=false"));
     }
 
     #[tokio::test]
@@ -20715,6 +21064,8 @@ mod typed_navigation_feedback_tests {
             let mut slot = inner.write().await;
             slot.phase = crate::nav_runtime::NavPhase::Running;
             slot.goal = Some(crate::nav_runtime::ActiveGoal {
+            options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
+            body_to_support_z_m: None, boundary_owner: None,
                 id: lease_a.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
@@ -20733,7 +21084,7 @@ mod typed_navigation_feedback_tests {
         stale_a.feedback.sink_ready = false;
         let mut lease_b = lease_a.clone();
         lease_b.path_revision = 1;
-        lease_b.path_payload_sha256 = [8; 32];
+        lease_b.planner_runtime_generation = 8;
 
         let stale_planner = crate::nav_runtime::PlannerInputObservation {
             generation: stale_a.feedback.runtime_generation,
@@ -20760,8 +21111,8 @@ mod typed_navigation_feedback_tests {
                     &stale_a.feedback.parent_request_id,
                     stale_a.feedback.goal_generation,
                     stale_a.feedback.path_revision,
-                    stale_a.feedback.goal_payload_sha256,
-                    stale_a.feedback.path_payload_sha256,
+                    stale_a.feedback.producer_runtime_generation,
+                    stale_a.feedback.planner_runtime_generation,
                     Some(stale_planner),
                     Some(stale_sink),
                 )
@@ -20772,6 +21123,8 @@ mod typed_navigation_feedback_tests {
             .expect("A transaction must reach the correlation/promotion boundary");
 
         let replacement_goal = crate::nav_runtime::ActiveGoal {
+            options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
+            body_to_support_z_m: None, boundary_owner: None,
             id: lease_b.session_id.clone(),
             frame_id: "map".to_string(),
             target: PoseState::default(),
@@ -20827,6 +21180,8 @@ mod typed_navigation_feedback_tests {
             let mut slot = inner.write().await;
             slot.phase = crate::nav_runtime::NavPhase::Planning;
             slot.goal = Some(crate::nav_runtime::ActiveGoal {
+            options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
+            body_to_support_z_m: None, boundary_owner: None,
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
@@ -20893,7 +21248,7 @@ mod typed_navigation_feedback_tests {
             planner_runtime_generation: 1,
             path_revision: 1,
             source_timestamp_ns: 10,
-            goal_payload_sha256: lease.goal_payload_sha256,
+
             path: schema::Path {
                 header: schema::Header {
                     stamp_sec: 1,
@@ -20914,7 +21269,7 @@ mod typed_navigation_feedback_tests {
             },
             ..schema::PathEnvelope::default()
         };
-        schema::seal_path_envelope(&mut path).expect("seal path envelope");
+        schema::validate_path_envelope(&path).expect("seal path envelope");
         transport
             .publish(crate::typed_codec::build_typed_frame(
                 topic,
@@ -20933,7 +21288,7 @@ mod typed_navigation_feedback_tests {
 
         let mut state = feedback_update(&lease.session_id);
         state.feedback.path_revision = 1;
-        state.feedback.path_payload_sha256 = path.path_payload_sha256;
+        state.feedback.planner_runtime_generation = path.planner_runtime_generation as u64;
         state.feedback.local_path = vec![[0.0,0.0,0.4],[1.0,0.5,0.4]];
         let promoted = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -20948,8 +21303,8 @@ mod typed_navigation_feedback_tests {
         assert_eq!(promoted.feedback.path_revision, 1);
         assert_eq!(promoted.feedback.local_path, state.feedback.local_path);
         assert_eq!(
-            nav.active_goal_lease().await.unwrap().path_payload_sha256,
-            path.path_payload_sha256
+            nav.active_goal_lease().await.unwrap().planner_runtime_generation,
+            path.planner_runtime_generation as u64
         );
     }
 }
@@ -21155,6 +21510,7 @@ mod exploration_cancel_retry_tests {
         let (map_revision_latest_tx, _) = watch::channel(Some(event));
         let state = Arc::new(RwLock::new(SharedState::default()));
         let bridge = ExploreNavigationBridge {
+        body_reference_frame_id: Arc::from("base_link"),
             mapping_adapter: None,
             state: state.clone(),
             expected_map_frame: Arc::from("map"),
@@ -21216,8 +21572,8 @@ mod exploration_cancel_retry_tests {
                 bridge.state.clone(),
                 bridge.transport.clone(),
                 bridge.transport_backend_name,
-                bridge.lcm_backend_available,
-            ),
+                bridge.lcm_backend_available, bridge.body_reference_frame_id.clone(),
+),
             &bridge.nav,
             test_wavefront_goal_intent(
                 goal_id,
@@ -21227,6 +21583,7 @@ mod exploration_cancel_retry_tests {
                 committed_map,
             ),
             crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
+                boundary_owner: Arc::new(crate::explore_runtime::ExploreStartConfig::default()),
                 current_session_generation: bridge.exploration_producer_epoch.clone(),
             },
         )
@@ -21509,9 +21866,9 @@ mod exploration_cancel_retry_tests {
                     owner_kind: nav_lease.owner_kind,
                     parent_request_id: nav_lease.parent_request_id.clone(),
                     goal_generation: nav_lease.goal_generation,
-                    goal_payload_sha256: nav_lease.goal_payload_sha256,
+                    producer_runtime_generation: nav_lease.producer_runtime_generation,
                     path_revision: nav_lease.path_revision,
-                    path_payload_sha256: nav_lease.path_payload_sha256,
+                    planner_runtime_generation: nav_lease.planner_runtime_generation,
                     ..NavigationFeedback::default()
                 },
             },
@@ -21577,8 +21934,8 @@ mod exploration_cancel_retry_tests {
                 bridge.state.clone(),
                 bridge.transport.clone(),
                 bridge.transport_backend_name,
-                bridge.lcm_backend_available,
-            ),
+                bridge.lcm_backend_available, bridge.body_reference_frame_id.clone(),
+),
             &bridge.nav,
             test_wavefront_goal_intent(
                 "blocked-replacement-child",
@@ -21588,6 +21945,7 @@ mod exploration_cancel_retry_tests {
                 test_committed_map_identity(1),
             ),
             crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
+                boundary_owner: Arc::new(crate::explore_runtime::ExploreStartConfig::default()),
                 current_session_generation: bridge.exploration_producer_epoch.clone(),
             },
         )
@@ -21664,8 +22022,8 @@ mod exploration_cancel_retry_tests {
                 bridge.state.clone(),
                 bridge.transport.clone(),
                 bridge.transport_backend_name,
-                bridge.lcm_backend_available,
-            ),
+                bridge.lcm_backend_available, bridge.body_reference_frame_id.clone(),
+),
             &bridge.nav,
             test_wavefront_goal_intent(
                 "replacement-child",
@@ -21675,6 +22033,7 @@ mod exploration_cancel_retry_tests {
                 replacement_map,
             ),
             crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
+                boundary_owner: Arc::new(crate::explore_runtime::ExploreStartConfig::default()),
                 current_session_generation: bridge.exploration_producer_epoch.clone(),
             },
         )
@@ -22055,6 +22414,7 @@ mod exploration_lcm_smoke_tests {
             crate::explore_runtime::ExploreRuntimeHandle::with_wavefront_map_frame(map_frame)
                 .expect("configured exploration runtime");
         let bridge = ExploreNavigationBridge {
+        body_reference_frame_id: Arc::from("base_link"),
             mapping_adapter: None,
             state: state.clone(),
             expected_map_frame: Arc::from(map_frame),
@@ -22195,11 +22555,8 @@ mod exploration_lcm_smoke_tests {
         assert_eq!(goal.session_id, lease.session_id);
         assert_eq!(goal.goal_generation, lease.goal_generation as i64);
         assert!(goal.goal_generation > 0);
-        assert_eq!(goal.payload_sha256, lease.goal_payload_sha256);
-        assert_eq!(
-            goal.payload_sha256,
-            schema::goal_envelope_payload_sha256(&goal).expect("recompute goal hash")
-        );
+        assert_eq!(goal.producer_runtime_generation, lease.producer_runtime_generation as i64);
+        assert_eq!(goal.body_reference_frame_id, bridge.body_reference_frame_id.as_ref());
         assert_eq!(goal.goal.header.frame_id, map_frame);
         assert_eq!(goal.boundary_frame_id, map_frame);
         assert_eq!(
@@ -22233,8 +22590,6 @@ mod exploration_lcm_smoke_tests {
         )
         .expect("otherwise-valid wrong-frame intent fixture");
         wrong_intent.goal.header.frame_id = "odom".to_string();
-        wrong_intent.goal_sha256 = schema::goal_intent_goal_sha256(&wrong_intent.goal)
-            .expect("rehash the deliberately wrong target frame");
         let rejection = crate::explore_runtime::ExploreNavigationSink::submit(
             &bridge,
             crate::explore_runtime::ChildNavigationRequest {
@@ -22244,8 +22599,8 @@ mod exploration_lcm_smoke_tests {
                 motion_admission: crate::nav_runtime::test_motion_admission(),
                 frontier_goal_id: "wrong-semantic-frontier".to_string(),
                 goal: wrong_goal,
-                boundary: None,
                 intent: wrong_intent,
+                boundary_owner: Arc::new(crate::explore_runtime::ExploreStartConfig::default()),
             },
         )
         .await

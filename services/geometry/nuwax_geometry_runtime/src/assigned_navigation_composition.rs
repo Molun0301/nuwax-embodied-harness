@@ -360,7 +360,7 @@ async fn assert_exact_zero(socket: &Path, state: &schema::NavigationState) {
 fn goal_state_matches(state: &schema::NavigationState, goal: &schema::GoalEnvelope) -> bool {
     state.session_id == goal.session_id && state.owner_kind == goal.owner_kind
         && state.parent_request_id == goal.parent_request_id && state.goal_generation == goal.goal_generation
-        && state.goal_payload_sha256 == goal.payload_sha256
+        && state.producer_runtime_generation == goal.producer_runtime_generation
 }
 fn diagnostic(ledger: &Arc<StdMutex<Ledger>>, sensor: &LiveSensor) -> String {
     let ledger = ledger.lock().unwrap();
@@ -556,8 +556,8 @@ async fn run_composition(local_planning:bool,root:&Path) {
             let matching=ledger.states.iter().filter(|s|goal_state_matches(s,&goal)).collect::<Vec<_>>();
             assert_eq!(matching.iter().any(|s|!s.local_path.is_empty()),local_planning,
                 "ON must admit an actual PlannerWorker/Scan candidate; OFF cannot display one");
-            assert!(ledger.paths.iter().any(|p|p.session_id==id && p.goal_payload_sha256==goal.payload_sha256
-                && p.path_revision==arrived.path_revision && p.path_payload_sha256==arrived.path_payload_sha256),
+            assert!(ledger.paths.iter().any(|p|p.session_id==id && p.producer_runtime_generation==goal.producer_runtime_generation
+                && p.path_revision==arrived.path_revision && p.planner_runtime_generation==arrived.planner_runtime_generation),
                 "arrival consumes the exact production path identity");
             assert!(ledger.maps.iter().any(|m|m.fine.is_some() && !m.cleared && m.committed_map.session_id=="composition-restored"),
                 "planner consumes restored fine-root publications");

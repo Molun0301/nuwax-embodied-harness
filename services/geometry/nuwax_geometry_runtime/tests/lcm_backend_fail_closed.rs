@@ -1707,7 +1707,7 @@ const CORRECTION_CANDIDATE_MAX_BODY_BYTES: usize = 256 * 1024 - 8;
 #[cfg(feature = "nuwax-lio-test-child")]
 const CORRECTION_FINALIZATION_TARGET: &str = "nuwax_geometry_runtime::correction_finalization";
 #[cfg(feature = "nuwax-lio-test-child")]
-const CORRECTION_FINALIZATION_EVENT: &str = "nuwax_correction_candidate_finalized_v1";
+const CORRECTION_FINALIZATION_EVENT: &str = "nuwax_correction_candidate_finalized_v3";
 
 #[cfg(feature = "nuwax-lio-test-child")]
 fn typed_binding(channel: &str, message_type: &str) -> (LcmTopic, LcmMessageType) {
@@ -2408,7 +2408,7 @@ fn wait_for_native_pgo_status(
         let status = decode_native_pgo_status(&next_frame(runtime, stream, scenario));
         assert_eq!(
             status.schema_version,
-            native_pgo::NATIVE_PGO_SCHEMA_VERSION_V2
+            native_pgo::NATIVE_PGO_SCHEMA_VERSION_V3
         );
         assert_eq!(status.backend, native_pgo::NATIVE_PGO_BACKEND);
         assert_eq!(status.runtime_generation, generation as i64);
@@ -2469,7 +2469,7 @@ fn observe_native_pgo_exchange(
     let request = decode_native_pgo_request(&request_frame);
     assert_eq!(
         request.schema_version,
-        native_pgo::NATIVE_PGO_SCHEMA_VERSION_V2
+        native_pgo::NATIVE_PGO_SCHEMA_VERSION_V3
     );
     assert_eq!(request.identity.backend, native_pgo::NATIVE_PGO_BACKEND);
     assert_eq!(request.identity.runtime_generation, generation as i64);
@@ -2884,56 +2884,41 @@ fn encode_candidate_trajectory(nodes: &[native_pgo::OptimizedKeyframe], encoded:
 }
 
 #[cfg(feature = "nuwax-lio-test-child")]
-fn native_candidate_payload_sha256(result: &native_pgo::NativePgoResult) -> [u8; 32] {
-    let identity = &result.request.identity;
-    let mut encoded = Vec::with_capacity(512);
-    encoded.extend_from_slice(&2_i32.to_be_bytes());
-    encoded.extend_from_slice(&native_pgo::NATIVE_PGO_BACKEND.to_be_bytes());
-    encoded.extend_from_slice(
-        &native_pgo::NATIVE_PGO_TRANSFORM_ABSOLUTE_LEFT_CORRECTION_SE3.to_be_bytes(),
+fn assert_native_candidate_finalization_receipt(
+    finalized: &ObservedCandidateFinalization,
+    request: &native_pgo::NativePgoRequest,
+    result: &native_pgo::NativePgoResult,
+) {
+    // V3 carries the original owner-scoped receipts, not application digests.
+    // Compare the entire echo (including frozen odometry bits and map geometry)
+    // before binding the finalizer to the same request and correction lease.
+    assert_eq!(request.schema_version, native_pgo::NATIVE_PGO_SCHEMA_VERSION_V3);
+    assert_eq!(result.schema_version, native_pgo::NATIVE_PGO_SCHEMA_VERSION_V3);
+    assert_eq!(result.request, request.echo());
+    let identity = &request.identity;
+    let lease_boot_nonce = format!(
+        "{:032x}",
+        u128::from_be_bytes(identity.correction_lease.boot_nonce)
     );
-    encoded.extend_from_slice(&identity.runtime_generation.to_be_bytes());
-    encoded.extend_from_slice(&identity.backend_generation.to_be_bytes());
-    encoded.extend_from_slice(&identity.request_sequence.to_be_bytes());
-    encode_candidate_lcm_string(&identity.mapping_session_id, &mut encoded);
-    encoded.extend_from_slice(&identity.mapping_session_generation.to_be_bytes());
-    encoded.extend_from_slice(&identity.map_frame_generation.to_be_bytes());
-    encoded.extend_from_slice(&identity.mapping_commit_id.boot_nonce);
-    encoded.extend_from_slice(&identity.mapping_commit_id.sequence.to_be_bytes());
-    encoded.extend_from_slice(&identity.occupancy_revision.to_be_bytes());
-    encoded.extend_from_slice(&identity.cloud_revision.to_be_bytes());
-    encoded.extend_from_slice(&identity.committed_map.source_timestamp_ns.to_be_bytes());
-    encoded.extend_from_slice(&identity.registered_cloud.source_sequence.to_be_bytes());
-    encoded.extend_from_slice(&identity.registered_cloud.source_timestamp_ns.to_be_bytes());
-    encoded.extend_from_slice(&identity.registered_cloud.point_count.to_be_bytes());
-    encoded.extend_from_slice(&identity.registered_cloud.envelope_sha256);
-    encoded.extend_from_slice(&identity.registered_cloud.body_points_sha256);
-    encoded.extend_from_slice(&identity.correlated_odom.source_sequence.to_be_bytes());
-    encoded.extend_from_slice(&identity.correlated_odom.source_timestamp_ns.to_be_bytes());
-    encoded.extend_from_slice(&identity.correlated_odom.pose_sha256);
-    encoded.extend_from_slice(&identity.committed_map.width.to_be_bytes());
-    encoded.extend_from_slice(&identity.committed_map.height.to_be_bytes());
-    encoded.extend_from_slice(&identity.committed_map.resolution_m.to_be_bytes());
-    encoded.extend_from_slice(&identity.committed_map.origin_x_m.to_be_bytes());
-    encoded.extend_from_slice(&identity.committed_map.origin_y_m.to_be_bytes());
-    encoded.extend_from_slice(&identity.committed_map.payload_sha256);
-    encoded.extend_from_slice(&identity.committed_map.boundary_sha256);
-    encoded.extend_from_slice(&identity.source_timestamp_ns.to_be_bytes());
-    encode_candidate_lcm_string(&identity.map_frame_id, &mut encoded);
-    encode_candidate_lcm_string(&identity.odom_frame_id, &mut encoded);
-    encode_candidate_lcm_string(&identity.body_frame_id, &mut encoded);
-    encode_candidate_lcm_string(&identity.points_frame_id, &mut encoded);
-    encoded.extend_from_slice(&identity.correction_lease.boot_nonce);
-    encoded.extend_from_slice(&identity.correction_lease.generation.to_be_bytes());
-    for value in result
-        .translation_m
-        .iter()
-        .chain(result.rotation_xyzw.iter())
-    {
-        encoded.extend_from_slice(&value.to_be_bytes());
-    }
-    encode_candidate_trajectory(&result.trajectory, &mut encoded);
-    nuwax_codec::sha256_bytes(&encoded)
+    assert_eq!(
+        (
+            finalized.runtime_generation,
+            finalized.backend_generation,
+            finalized.session_generation,
+            finalized.candidate_sequence,
+            finalized.correction_lease_boot_nonce.as_str(),
+            finalized.correction_lease_generation,
+        ),
+        (
+            u64::try_from(identity.runtime_generation).expect("request runtime generation"),
+            u64::try_from(identity.backend_generation).expect("request backend generation"),
+            u64::try_from(identity.mapping_session_generation).expect("request session generation"),
+            u64::try_from(identity.request_sequence).expect("request sequence"),
+            lease_boot_nonce.as_str(),
+            u64::try_from(identity.correction_lease.generation).expect("request lease generation"),
+        ),
+        "native finalizer must retain the original request and correction-lease identity"
+    );
 }
 
 #[cfg(feature = "nuwax-lio-test-child")]
@@ -3577,7 +3562,8 @@ struct ObservedCandidateFinalization {
     backend_generation: u64,
     session_generation: u64,
     candidate_sequence: u64,
-    payload_sha256: String,
+    correction_lease_boot_nonce: String,
+    correction_lease_generation: u64,
     disposition: ObservedCandidateDisposition,
     #[serde(default)]
     reject_reason: Option<String>,
@@ -3632,6 +3618,59 @@ fn get_occupancy_data(
         .unwrap_or_else(|error| panic!("{scenario}: GetOccupancyGridData failed: {error}"))
         .into_inner()
     })
+}
+
+#[cfg(feature = "nuwax-lio-test-child")]
+fn get_occupancy_commit_receipt_for_snapshot(
+    runtime: &tokio::runtime::Runtime,
+    client: &mut GeometryClient,
+    mapping: &native_fixture_proto::MappingSessionState,
+    occupancy: &native_fixture_proto::OccupancyGridData,
+    scenario: &str,
+) -> native_fixture_proto::CanonicalOccupancyCommitReceipt {
+    // SubscribeMapUpdates replays the real owner's current committed snapshot.
+    // Match that complete body before using its original receipt in the SHM golden.
+    let update = runtime.block_on(async {
+        tokio::time::timeout(NATIVE_FIXTURE_TIMEOUT, async {
+            let mut updates = client
+                .subscribe_map_updates(native_fixture_proto::Empty {})
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{scenario}: SubscribeMapUpdates failed: {error}")
+                })
+                .into_inner();
+            updates
+                .message()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{scenario}: committed occupancy update failed: {error}")
+                })
+                .unwrap_or_else(|| {
+                    panic!("{scenario}: committed occupancy update stream closed")
+                })
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{scenario}: committed occupancy receipt timed out"))
+    });
+    assert_eq!(update.schema_version, 2, "{scenario}");
+    assert_eq!(update.meta, occupancy.meta, "{scenario}: receipt snapshot metadata differs");
+    assert_eq!(update.data, occupancy.data, "{scenario}: receipt snapshot body differs");
+    assert_eq!(update.size, occupancy.data.len() as u64, "{scenario}");
+    assert_eq!(update.session_id, mapping.session_id, "{scenario}");
+    assert_eq!(update.session_generation, mapping.session_generation, "{scenario}");
+    let meta = occupancy.meta.as_ref().expect("receipt-bound occupancy metadata");
+    let receipt = update.occupancy_receipt.expect("actual canonical occupancy receipt");
+    let commit = receipt.commit_id.as_ref().expect("actual canonical mapping commit identity");
+    assert_eq!(commit.boot_nonce.len(), 16, "{scenario}");
+    assert!(commit.boot_nonce.iter().any(|byte| *byte != 0), "{scenario}");
+    assert!(commit.sequence > 0, "{scenario}");
+    assert_eq!(receipt.session_id, mapping.session_id, "{scenario}");
+    assert_eq!(receipt.session_generation, mapping.session_generation, "{scenario}");
+    assert_eq!(receipt.occupancy_revision, meta.revision, "{scenario}");
+    assert_eq!(receipt.source_timestamp_ns, meta.timestamp_ns, "{scenario}");
+    assert_eq!(receipt.backend_kind, mapping.mapping_backend_kind, "{scenario}");
+    assert!(receipt.backend_generation > 0, "{scenario}");
+    receipt
 }
 
 #[cfg(feature = "nuwax-lio-test-child")]
@@ -4516,8 +4555,15 @@ fn assert_mapping_outputs(
     assert_eq!(occupancy_shm.revision, occupancy_meta.revision);
     assert!(occupancy_shm.generation > 0);
     assert_eq!(occupancy_shm.payload_size, occupancy.data.len() as u64);
-    assert_eq!(occupancy_shm.layout_version, 2);
+    assert_eq!(occupancy_shm.layout_version, 3);
     assert_eq!(occupancy_shm.payload_schema_version, 1);
+    let occupancy_receipt = get_occupancy_commit_receipt_for_snapshot(
+        runtime, client, &mapping, &occupancy, scenario,
+    );
+    let occupancy_mmap = fs::read(&occupancy_shm.key).expect("read committed occupancy mmap");
+    assert_matrix_occupancy_mmap_frame_transition(
+        &occupancy_mmap, &occupancy_mmap, &occupancy, &occupancy_receipt, scenario,
+    );
 
     let cloud_shm = read_cloud_map_shm(&probe.path().join("cloud-map.mmap"));
     assert!(cloud_shm.revision > 0);
@@ -5469,8 +5515,15 @@ fn library_pgo_production_binary_real_lcm_v2_closes_hostile_and_lifecycle_fences
         first_candidate.candidate_sequence
     );
     assert_eq!(
-        finalized.payload_sha256,
-        digest_hex(&first_candidate.payload_sha256)
+        finalized.correction_lease_boot_nonce,
+        format!(
+            "{:032x}",
+            u128::from_be_bytes(first_candidate.correction_lease_boot_nonce)
+        )
+    );
+    assert_eq!(
+        finalized.correction_lease_generation,
+        first_candidate.correction_lease_generation
     );
     assert_eq!(finalized.disposition, ObservedCandidateDisposition::Applied);
     assert_eq!(finalized.reject_reason, None);
@@ -6063,7 +6116,8 @@ fn assert_native_pgo_geometry_sigkill_cleanup_is_distinguished(runtime: &tokio::
 #[cfg(all(feature = "nuwax-lio-test-child", target_os = "linux"))]
 #[test]
 fn native_pgo_production_binary_real_lcm_v2_reaches_canonical_applier() {
-    let runtime = tokio::runtime::Runtime::new().expect("create native PGO V2 runtime");
+    // Keep the established test selector; the authoritative wire contract is V3.
+    let runtime = tokio::runtime::Runtime::new().expect("create native PGO V3 runtime");
     assert_native_pgo_geometry_sigkill_cleanup_is_distinguished(&runtime);
     let probe = ProbeDir::new("g004-native-pgo-v2");
     let fixture_path = write_native_pgo_recorded_fixture(&probe);
@@ -6689,7 +6743,6 @@ fn native_pgo_production_binary_real_lcm_v2_reaches_canonical_applier() {
         "hostile traffic changed global-map content",
     );
 
-    let expected_candidate_payload = native_candidate_payload_sha256(&correction.result);
     let old_topics = nuwax_nav_pgo_bridge::OnlinePgoTopics::for_runtime(1, 1)
         .expect("derive old native PGO topics");
     let old_status_binding = binding_from_pattern(&old_topics.status, "nuwax_msgs.NativePgoStatus");
@@ -6702,7 +6755,7 @@ fn native_pgo_production_binary_real_lcm_v2_reaches_canonical_applier() {
             )
             .build();
     let old_cancel = native_pgo::seal_native_pgo_status(native_pgo::NativePgoStatus {
-        schema_version: native_pgo::NATIVE_PGO_SCHEMA_VERSION_V2,
+        schema_version: native_pgo::NATIVE_PGO_SCHEMA_VERSION_V3,
         backend: native_pgo::NATIVE_PGO_BACKEND,
         runtime_generation: 1,
         backend_generation: 1,
@@ -6715,7 +6768,6 @@ fn native_pgo_production_binary_real_lcm_v2_reaches_canonical_applier() {
         cancel_state: native_pgo::NATIVE_PGO_CANCEL_REQUESTED,
         reason_code: native_pgo::NATIVE_PGO_REASON_CANCEL_REQUESTED,
         reason: "cancel_requested".into(),
-        status_payload_sha256: [0; 32],
     })
     .expect("seal old native PGO cancel");
     let old_cancel_binding = binding_from_pattern(&old_topics.cancel, "nuwax_msgs.NativePgoStatus");
@@ -6787,9 +6839,10 @@ fn native_pgo_production_binary_real_lcm_v2_reaches_canonical_applier() {
         correction.request.identity.mapping_session_generation as u64
     );
     assert_eq!(finalized.candidate_sequence, 4);
-    assert_eq!(
-        finalized.payload_sha256,
-        digest_hex(&expected_candidate_payload)
+    assert_native_candidate_finalization_receipt(
+        finalized,
+        &correction.request,
+        &correction.result,
     );
     assert_eq!(finalized.disposition, ObservedCandidateDisposition::Applied);
     assert_eq!(finalized.reject_reason, None);
@@ -7656,6 +7709,7 @@ fn assert_matrix_occupancy_mmap_frame_transition(
     before: &[u8],
     after: &[u8],
     occupancy: &native_fixture_proto::OccupancyGridData,
+    receipt: &native_fixture_proto::CanonicalOccupancyCommitReceipt,
     scenario: &str,
 ) {
     const GLOBAL_HEADER_BYTES: usize = 128;
@@ -7667,7 +7721,7 @@ fn assert_matrix_occupancy_mmap_frame_transition(
         matrix_read_u64_le(before, 0, "occupancy magic"),
         OCCUPANCY_MAGIC
     );
-    assert_eq!(matrix_read_u32_le(before, 8, "occupancy layout version"), 2);
+    assert_eq!(matrix_read_u32_le(before, 8, "occupancy layout version"), 3);
     assert_eq!(
         matrix_read_u32_le(before, 12, "occupancy global header size"),
         GLOBAL_HEADER_BYTES as u32
@@ -7701,7 +7755,13 @@ fn assert_matrix_occupancy_mmap_frame_transition(
         .meta
         .as_ref()
         .expect("matrix committed occupancy metadata");
-    let payload_checksum = nuwax_codec::sha256_bytes(&occupancy.data);
+    let commit = receipt.commit_id.as_ref().expect("actual occupancy SHM commit identity");
+    assert_eq!(commit.boot_nonce.len(), 16, "{scenario}");
+    assert!(commit.boot_nonce.iter().any(|byte| *byte != 0), "{scenario}");
+    assert!(commit.sequence > 0, "{scenario}");
+    assert!(receipt.session_generation > 0, "{scenario}");
+    assert_eq!(receipt.occupancy_revision, meta.revision, "{scenario}");
+    assert_eq!(receipt.source_timestamp_ns, meta.timestamp_ns, "{scenario}");
     assert!(
         meta.frame_id.len() <= 128,
         "{scenario}: occupancy frame id is too long"
@@ -7724,7 +7784,7 @@ fn assert_matrix_occupancy_mmap_frame_transition(
     matrix_write_u32_le(
         &mut expected,
         slot_offset + 8,
-        2,
+        3,
         "occupancy slot layout version",
     );
     matrix_write_u32_le(
@@ -7799,7 +7859,14 @@ fn assert_matrix_occupancy_mmap_frame_transition(
         meta.origin_y.to_bits(),
         "occupancy origin y",
     );
-    expected[slot_offset + 88..slot_offset + 120].copy_from_slice(&payload_checksum);
+    // The protobuf nonce already carries the canonical owner's big-endian bytes.
+    expected[slot_offset + 88..slot_offset + 104].copy_from_slice(&commit.boot_nonce);
+    matrix_write_u64_le(
+        &mut expected, slot_offset + 104, commit.sequence, "occupancy canonical commit sequence",
+    );
+    matrix_write_u64_le(
+        &mut expected, slot_offset + 112, receipt.session_generation, "occupancy session generation",
+    );
     expected[slot_offset + 120..slot_offset + 120 + meta.frame_id.len()]
         .copy_from_slice(meta.frame_id.as_bytes());
     expected[payload_offset..payload_offset + occupancy.data.len()]
@@ -7940,9 +8007,15 @@ fn assert_matrix_relocalization_observable_transition(
     after: &MatrixObservableSnapshot,
     candidate: &DecodedCorrectionCandidate,
     global_map_frame: &RawLcmFrame,
+    occupancy_receipt: &native_fixture_proto::CanonicalOccupancyCommitReceipt,
     scenario: &str,
 ) {
     assert_matrix_observable_snapshots_equal(before, after, "APPLIED", scenario);
+    let commit = occupancy_receipt.commit_id.as_ref().expect("actual matrix occupancy commit");
+    assert_eq!(commit.boot_nonce.as_slice(), &candidate.mapping_commit_boot_nonce[..], "{scenario}");
+    assert_eq!(commit.sequence, candidate.mapping_commit_sequence, "{scenario}");
+    assert_eq!(occupancy_receipt.session_id, candidate.mapping_session_id, "{scenario}");
+    assert_eq!(occupancy_receipt.session_generation, candidate.mapping_session_generation, "{scenario}");
     let before_meta = before
         .occupancy
         .meta
@@ -8007,6 +8080,7 @@ fn assert_matrix_relocalization_observable_transition(
         &before.occupancy_mmap,
         &after.occupancy_mmap,
         &after.occupancy,
+        occupancy_receipt,
         scenario,
     );
     assert_matrix_cloud_mmap_frame_transition(
@@ -8562,7 +8636,12 @@ fn export_matrix_checkpoint(
     runtime.block_on(async {
         tokio::time::timeout(
             NATIVE_FIXTURE_TIMEOUT,
-            client.export_mapping_backend_checkpoint(native_fixture_proto::Empty {}),
+            client.export_mapping_backend_checkpoint(
+                native_fixture_proto::ExportMappingBackendCheckpointRequest {
+                    // This retained matrix explicitly exercises the legacy envelope.
+                    checkpoint_schema_version: 1,
+                },
+            ),
         )
         .await
         .unwrap_or_else(|_| panic!("{scenario}: ExportMappingBackendCheckpoint timed out"))
@@ -8610,6 +8689,8 @@ fn activate_matrix_checkpoint(
         asset_bundle_sha256: bundle.to_vec(),
         expected_runtime_generation: runtime_generation,
         activation_contract_version: 1,
+        // Contract 1 has no assigned asset identity; do not invent a V2 receipt.
+        asset_identity: None,
     };
     let activated = runtime.block_on(async {
         tokio::time::timeout(NATIVE_FIXTURE_TIMEOUT, client.activate_map(request))
@@ -8682,6 +8763,11 @@ fn matrix_relocalize_request(
             "f8b5ef8b359eeb0129f6d523244ea8bca35102143f3bce28e619598749276090",
             "algorithm policy digest",
         ),
+        target_kind: activated.target_kind.clone(),
+        target_graph_sha256: activated.target_graph_sha256.clone(),
+        // This is the existing schema-1 cloud request, without an assigned branch.
+        planar_seed: None,
+        assigned_target: None,
     }
 }
 
@@ -10318,6 +10404,11 @@ fn matrix_assert_terminal_proof_golden() -> [u8; 32] {
         detail: "APPLIED".to_owned(),
         candidate_payload_preimage_v1: vec![0x29; 19],
         evidence_disclosure_v1: vec![0x30; 23],
+        // Frozen V1 golden: these later target/assigned fields were absent.
+        target_kind: String::new(),
+        target_graph_sha256: Vec::new(),
+        assigned_cloud_v2: None,
+        assigned_planar_v2: None,
     };
     let preimage = matrix_terminal_proof_preimage(&result);
     assert_eq!(
@@ -10989,11 +11080,15 @@ fn run_relocalization_matrix_profile(profile: MatrixProfile) {
         "after_apply",
         &scenario,
     );
+    let occupancy_receipt = get_occupancy_commit_receipt_for_snapshot(
+        &runtime, &mut client, &after_apply.mapping, &after_apply.occupancy, &scenario,
+    );
     assert_matrix_relocalization_observable_transition(
         &before_apply,
         &after_apply,
         &candidate,
         &activation_global_map,
+        &occupancy_receipt,
         &scenario,
     );
 

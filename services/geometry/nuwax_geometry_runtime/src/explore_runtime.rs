@@ -299,8 +299,8 @@ pub struct ChildNavigationRequest {
     pub motion_admission: MotionAdmissionProof,
     pub frontier_goal_id: String,
     pub goal: NavigationGoal,
-    pub boundary: Option<ExplorationBoundary>,
     pub intent: schema::GoalIntent,
+    pub boundary_owner: Arc<ExploreStartConfig>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -354,9 +354,7 @@ pub(crate) fn build_wavefront_goal_intent(
             ],
         },
     };
-    let goal_sha256 =
-        schema::goal_intent_goal_sha256(&goal_pose).map_err(|error| error.to_string())?;
-    let (boundary_id, boundary_points, boundary_sha256) = match boundary {
+    let (boundary_id, boundary_points) = match boundary {
         Some(boundary) => {
             let boundary_id = format!("{parent_request_id}:boundary");
             let points = boundary
@@ -364,12 +362,9 @@ pub(crate) fn build_wavefront_goal_intent(
                 .iter()
                 .map(|point| [point.x, point.y, 0.0])
                 .collect::<Vec<_>>();
-            let digest =
-                schema::goal_intent_boundary_sha256(&committed_map.frame_id, &boundary_id, &points)
-                    .map_err(|error| error.to_string())?;
-            (boundary_id, points, digest)
+            (boundary_id, points)
         }
-        None => (String::new(), Vec::new(), [0; 32]),
+        None => (String::new(), Vec::new()),
     };
     Ok(schema::GoalIntent {
         map_frame_generation: 0,
@@ -384,24 +379,23 @@ pub(crate) fn build_wavefront_goal_intent(
         cancel_generation: cancel_generation as i64,
         committed_map,
         boundary_id,
-        boundary_sha256,
+        body_to_support_z_m: None,
         boundary_points,
         motion_guard_generation: motion_admission.guard_generation as i64,
         motion_guard_boot_nonce: motion_admission.guard_boot_nonce,
         motion_stop_generation: motion_admission.motion_stop_generation as i64,
-        goal_sha256,
         goal: goal_pose,
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildNavigationLease {
     pub session_id: String,
     pub owner_kind: i32,
     pub parent_request_id: String,
     pub goal_generation: u64,
     pub producer_runtime_generation: u64,
-    pub goal_payload_sha256: [u8; 32],
+
 }
 
 impl ChildNavigationLease {
@@ -411,7 +405,6 @@ impl ChildNavigationLease {
             && self.parent_request_id == other.parent_request_id
             && self.goal_generation == other.goal_generation
             && self.producer_runtime_generation == other.producer_runtime_generation
-            && self.goal_payload_sha256 == other.goal_payload_sha256
     }
 }
 
@@ -641,7 +634,10 @@ pub struct ExplorationOwnershipReconciliationReceipt {
     pub recovery_correlation: String,
     pub parent_request_id: String,
     pub exploration_generation: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub child_lease_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_lease: Option<ChildNavigationLease>,
     pub cancel_generation: u64,
     pub commit_disposition: String,
 }
@@ -768,7 +764,7 @@ struct CompletedGlobalStopReconciliation {
 #[derive(Debug, Clone)]
 struct CompletedExactChildZeroed {
     recovery_correlation: String,
-    request_fingerprint: String,
+    request_identity: AssignedTransitionIdentity,
     receipt: ExplorationOwnershipReconciliationReceipt,
 }
 
@@ -783,7 +779,7 @@ const GLOBAL_STOP_RECONCILIATION_CAUSE: &str = "ordinary_global_stop";
 const GLOBAL_STOP_COMMIT_DISPOSITION: &str = "global_stop_reconciled_child_ownership";
 const EXACT_CHILD_ZEROED_CAUSE: &str = "late_exact_child_zeroed";
 const EXACT_CHILD_ZEROED_DISPOSITION: &str = "exact_child_zeroed_released_ownership";
-const RECONCILIATION_JOURNAL_SCHEMA_VERSION: u32 = 1;
+const RECONCILIATION_JOURNAL_SCHEMA_VERSION: u32 = 2;
 const RECONCILIATION_JOURNAL_CAPACITY: usize = 32;
 const RECONCILIATION_JOURNAL_MAX_BYTES: u64 = 256 * 1024;
 const RECONCILIATION_JOURNAL_MAX_ID_BYTES: usize = 512;
@@ -851,11 +847,40 @@ impl DurableReconciliationSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum AssignedTransitionIdentity {
+    GlobalStop {
+        parent_request_id: String,
+        exploration_generation: u64,
+        child_lease: ChildNavigationLease,
+        cancel_generation: u64,
+        stop_operation_id: String,
+        original_guard_generation: u64,
+        original_guard_boot_nonce: [u8; 16],
+        original_motion_stop_generation: u64,
+        held_guard_generation: u64,
+        held_guard_boot_nonce: [u8; 16],
+        held_motion_stop_generation: u64,
+        zero_ack_id: String,
+        zero_applied_monotonic_ns: u64,
+    },
+    ExactChildZeroed {
+        child_lease: ChildNavigationLease,
+        cancel_generation: u64,
+        zero_ack_id: String,
+        zero_applied_monotonic_ns: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct DurableOwnershipTransition {
     kind: DurableOwnershipTransitionKind,
     recovery_correlation: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     request_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_identity: Option<AssignedTransitionIdentity>,
     receipt: ExplorationOwnershipReconciliationReceipt,
     snapshot: DurableReconciliationSnapshot,
     committed_unix_ns: u64,
@@ -875,6 +900,68 @@ impl DurableOwnershipTransition {
 struct DurableOwnershipJournal {
     schema_version: u32,
     entries: Vec<DurableOwnershipTransition>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "format", content = "transition", rename_all = "snake_case", deny_unknown_fields)]
+enum DurableOwnershipEntryV2 {
+    LegacyV1(DurableOwnershipTransition),
+    AssignedV2(DurableOwnershipTransition),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableOwnershipJournalV2 {
+    schema_version: u32,
+    entries: Vec<DurableOwnershipEntryV2>,
+}
+
+fn decode_ownership_journal(bytes: &[u8]) -> Result<DurableOwnershipJournal, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Header { schema_version: u32, entries: Vec<serde_json::Value> }
+    let header: Header = serde_json::from_slice(bytes)
+        .map_err(|error| format!("ownership journal JSON invalid: {error}"))?;
+    let mut entries = Vec::with_capacity(header.entries.len());
+    for value in header.entries {
+        let entry = match header.schema_version {
+            1 => {
+                let entry: DurableOwnershipTransition = serde_json::from_value(value)
+                    .map_err(|error| format!("legacy ownership journal JSON invalid: {error}"))?;
+                if entry.request_identity.is_some() || entry.receipt.child_lease.is_some() {
+                    return Err("legacy journal cannot contain assigned identity".into());
+                }
+                entry
+            }
+            2 => match serde_json::from_value::<DurableOwnershipEntryV2>(value)
+                .map_err(|error| format!("ownership journal v2 JSON invalid: {error}"))? {
+                    DurableOwnershipEntryV2::LegacyV1(entry) if entry.request_identity.is_none()
+                        && entry.receipt.child_lease.is_none() => entry,
+                    DurableOwnershipEntryV2::AssignedV2(entry) if entry.request_identity.is_some()
+                        && entry.receipt.child_lease.is_some() && entry.request_fingerprint.is_empty()
+                        && entry.receipt.child_lease_fingerprint.is_empty() => entry,
+                    _ => return Err("ownership journal mixes legacy and assigned identity".into()),
+                },
+            other => return Err(format!("ownership journal schema {other} is unsupported")),
+        };
+        entries.push(entry);
+    }
+    if !matches!(header.schema_version, 1 | 2) {
+        return Err(format!("ownership journal schema {} is unsupported", header.schema_version));
+    }
+    Ok(DurableOwnershipJournal { schema_version: header.schema_version, entries })
+}
+
+fn encode_ownership_journal(journal: &DurableOwnershipJournal) -> Result<Vec<u8>, serde_json::Error> {
+    if journal.schema_version != 2 {
+        return serde_json::to_vec(journal);
+    }
+    serde_json::to_vec(&DurableOwnershipJournalV2 {
+        schema_version: 2,
+        entries: journal.entries.iter().cloned().map(|entry|
+            if entry.request_identity.is_some() { DurableOwnershipEntryV2::AssignedV2(entry) }
+            else { DurableOwnershipEntryV2::LegacyV1(entry) }).collect(),
+    })
 }
 
 impl Default for DurableOwnershipJournal {
@@ -925,16 +1012,38 @@ fn is_sha256_hex(value: &str) -> bool {
 fn validate_durable_ownership_transition(entry: &DurableOwnershipTransition) -> Result<(), String> {
     let receipt = &entry.receipt;
     let snapshot = &entry.snapshot;
-    if !is_bounded_string(
-        &entry.recovery_correlation,
-        RECONCILIATION_JOURNAL_MAX_ID_BYTES,
-    ) || !entry
-        .recovery_correlation
-        .strip_prefix("exploration-global-stop:")
-        .is_some_and(is_sha256_hex)
-        || !is_sha256_hex(&entry.request_fingerprint)
+    let identity_valid = match (&entry.request_identity, &receipt.child_lease) {
+        (None, None) => entry.recovery_correlation.strip_prefix("exploration-global-stop:")
+            .is_some_and(is_sha256_hex) && is_sha256_hex(&entry.request_fingerprint)
+            && is_sha256_hex(&receipt.child_lease_fingerprint),
+        (Some(identity), Some(child)) => {
+            let (identity_child, cancel_generation, zero_ack_id, zero_ns, kind_valid) = match identity {
+                AssignedTransitionIdentity::GlobalStop { parent_request_id, exploration_generation,
+                    child_lease, cancel_generation, stop_operation_id, original_guard_generation,
+                    original_guard_boot_nonce, held_guard_generation, held_guard_boot_nonce,
+                    zero_ack_id, zero_applied_monotonic_ns, .. } => (child_lease, *cancel_generation,
+                        zero_ack_id, *zero_applied_monotonic_ns,
+                        entry.kind == DurableOwnershipTransitionKind::GlobalStop
+                        && parent_request_id == &receipt.parent_request_id
+                        && *exploration_generation == receipt.exploration_generation
+                        && is_bounded_string(stop_operation_id, RECONCILIATION_JOURNAL_MAX_ID_BYTES)
+                        && *original_guard_generation > 0 && *original_guard_boot_nonce != [0; 16]
+                        && *held_guard_generation > 0 && *held_guard_boot_nonce != [0; 16]),
+                AssignedTransitionIdentity::ExactChildZeroed { child_lease, cancel_generation,
+                    zero_ack_id, zero_applied_monotonic_ns } => (child_lease, *cancel_generation,
+                        zero_ack_id, *zero_applied_monotonic_ns,
+                        entry.kind == DurableOwnershipTransitionKind::ExactChildZeroed),
+            };
+            kind_valid && identity_child == child && child.parent_request_id == receipt.parent_request_id
+                && valid_child_lease(child) && cancel_generation == receipt.cancel_generation
+                && is_bounded_string(zero_ack_id, RECONCILIATION_JOURNAL_MAX_ID_BYTES) && zero_ns > 0
+                && entry.request_fingerprint.is_empty() && receipt.child_lease_fingerprint.is_empty()
+                && entry.recovery_correlation == assigned_recovery_correlation(child, cancel_generation)
+        }
+        _ => false,
+    };
+    if !identity_valid || !is_bounded_string(&entry.recovery_correlation, RECONCILIATION_JOURNAL_MAX_ID_BYTES)
         || receipt.recovery_correlation != entry.recovery_correlation
-        || !is_sha256_hex(&receipt.child_lease_fingerprint)
         || !is_bounded_string(
             &receipt.parent_request_id,
             RECONCILIATION_JOURNAL_MAX_ID_BYTES,
@@ -1130,14 +1239,7 @@ fn read_durable_ownership_journal(path: &Path) -> Result<DurableOwnershipJournal
     if bytes.len() as u64 > RECONCILIATION_JOURNAL_MAX_BYTES {
         return Err("ownership journal exceeds maximum byte size".to_string());
     }
-    let journal: DurableOwnershipJournal = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("ownership journal JSON invalid: {error}"))?;
-    if journal.schema_version != RECONCILIATION_JOURNAL_SCHEMA_VERSION {
-        return Err(format!(
-            "ownership journal schema {} is unsupported",
-            journal.schema_version
-        ));
-    }
+    let journal = decode_ownership_journal(&bytes)?;
     if journal.entries.len() > RECONCILIATION_JOURNAL_CAPACITY {
         return Err("ownership journal exceeds bounded capacity".to_string());
     }
@@ -1159,7 +1261,7 @@ fn persist_durable_ownership_journal(
     let parent = journal_parent(path)?;
     ensure_secure_journal_directory(parent)?;
     validate_existing_journal_file(path)?;
-    let bytes = serde_json::to_vec(journal)
+    let bytes = encode_ownership_journal(journal)
         .map_err(|error| format!("ownership journal serialization failed: {error}"))?;
     if bytes.len() as u64 > RECONCILIATION_JOURNAL_MAX_BYTES {
         return Err("ownership journal exceeds maximum byte size".to_string());
@@ -1233,6 +1335,8 @@ fn commit_durable_ownership_transition(
         .find(|entry| entry.recovery_correlation == transition.recovery_correlation)
     {
         if existing.kind == transition.kind
+            && existing.request_identity == transition.request_identity
+            && existing.receipt.child_lease == transition.receipt.child_lease
             && existing.request_fingerprint == transition.request_fingerprint
         {
             return Ok(DurableCommitOutcome::ExactReplay(Box::new(
@@ -1247,6 +1351,7 @@ fn commit_durable_ownership_transition(
         };
         journal.entries.remove(position);
     }
+    if transition.request_identity.is_some() { journal.schema_version = 2; }
     journal.entries.push(transition);
     persist_durable_ownership_journal(path, &journal)?;
     Ok(DurableCommitOutcome::Committed)
@@ -1256,7 +1361,7 @@ fn replay_durable_ownership_transition(
     path: &Path,
     kind: DurableOwnershipTransitionKind,
     recovery_correlation: &str,
-    request_fingerprint: &str,
+    request_identity: &AssignedTransitionIdentity,
 ) -> Result<Option<DurableOwnershipTransition>, String> {
     let _io_guard = RECONCILIATION_JOURNAL_IO_LOCK
         .get_or_init(|| SyncMutex::new(()))
@@ -1270,7 +1375,7 @@ fn replay_durable_ownership_transition(
     else {
         return Ok(None);
     };
-    if existing.kind == kind && existing.request_fingerprint == request_fingerprint {
+    if existing.kind == kind && existing.request_identity.as_ref() == Some(request_identity) {
         return Ok(Some(existing.clone()));
     }
     Err("ownership transition replay proof does not match the durable first winner".to_string())
@@ -1280,6 +1385,7 @@ fn acknowledge_durable_ownership_transition(
     path: &Path,
     recovery_correlation: &str,
     child_lease_fingerprint: &str,
+    child_lease: Option<&ChildNavigationLease>,
 ) -> Result<bool, String> {
     let _io_guard = RECONCILIATION_JOURNAL_IO_LOCK
         .get_or_init(|| SyncMutex::new(()))
@@ -1288,7 +1394,11 @@ fn acknowledge_durable_ownership_transition(
     let mut journal = read_durable_ownership_journal(path)?;
     let Some(existing) = journal.entries.iter_mut().find(|entry| {
         entry.recovery_correlation == recovery_correlation
-            && entry.receipt.child_lease_fingerprint == child_lease_fingerprint
+            && match (entry.receipt.child_lease.as_ref(), child_lease) {
+                (Some(stored), Some(child)) => child_lease_fingerprint.is_empty() && stored == child,
+                (None, None) => !child_lease_fingerprint.is_empty() && entry.receipt.child_lease_fingerprint == child_lease_fingerprint,
+                _ => false,
+            }
     }) else {
         return Ok(false);
     };
@@ -1300,91 +1410,43 @@ fn acknowledge_durable_ownership_transition(
     Ok(true)
 }
 
-fn append_canonical_field(target: &mut Vec<u8>, value: &[u8]) {
-    target.extend_from_slice(&(value.len() as u64).to_be_bytes());
-    target.extend_from_slice(value);
+fn valid_child_lease(child: &ChildNavigationLease) -> bool {
+    is_bounded_string(&child.session_id, RECONCILIATION_JOURNAL_MAX_ID_BYTES)
+        && is_bounded_string(&child.parent_request_id, RECONCILIATION_JOURNAL_MAX_ID_BYTES)
+        && child.owner_kind == schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+        && (1..=i64::MAX as u64).contains(&child.goal_generation)
+        && (1..=i64::MAX as u64).contains(&child.producer_runtime_generation)
 }
 
-fn append_child_lease_identity(target: &mut Vec<u8>, lease: &ChildNavigationLease) {
-    append_canonical_field(target, lease.session_id.as_bytes());
-    target.extend_from_slice(&lease.owner_kind.to_be_bytes());
-    append_canonical_field(target, lease.parent_request_id.as_bytes());
-    target.extend_from_slice(&lease.goal_generation.to_be_bytes());
-    target.extend_from_slice(&lease.producer_runtime_generation.to_be_bytes());
-    target.extend_from_slice(&lease.goal_payload_sha256);
+fn assigned_recovery_correlation(child: &ChildNavigationLease, cancel_generation: u64) -> String {
+    format!("exploration-global-stop:v2:{}:{}:{}",
+        child.producer_runtime_generation, child.goal_generation, cancel_generation)
 }
 
-fn child_lease_fingerprint(lease: &ChildNavigationLease) -> String {
-    let mut canonical = Vec::with_capacity(160);
-    append_canonical_field(&mut canonical, b"exploration-child-lease-v1");
-    append_child_lease_identity(&mut canonical, lease);
-    crate::map_checksum::sha256_hex(&canonical)
-}
-
-fn global_stop_recovery_correlation(
-    request_id: &str,
-    exploration_generation: u64,
-    child_lease: &ChildNavigationLease,
-    cancel_generation: u64,
-    motion_admission: &MotionAdmissionProof,
-) -> String {
-    let mut canonical = Vec::with_capacity(256);
-    append_canonical_field(&mut canonical, b"exploration-global-stop-reconciliation-v1");
-    append_canonical_field(&mut canonical, GLOBAL_STOP_RECONCILIATION_CAUSE.as_bytes());
-    append_canonical_field(&mut canonical, request_id.as_bytes());
-    canonical.extend_from_slice(&exploration_generation.to_be_bytes());
-    append_child_lease_identity(&mut canonical, child_lease);
-    canonical.extend_from_slice(&cancel_generation.to_be_bytes());
-    canonical.extend_from_slice(&motion_admission.guard_generation.to_be_bytes());
-    canonical.extend_from_slice(&motion_admission.guard_boot_nonce);
-    canonical.extend_from_slice(&motion_admission.motion_stop_generation.to_be_bytes());
-    format!(
-        "exploration-global-stop:{}",
-        crate::map_checksum::sha256_hex(&canonical)
-    )
-}
-
-fn global_stop_request_fingerprint(request: &ExplorationGlobalStopReconciliationRequest) -> String {
+fn global_stop_request_identity(request: &ExplorationGlobalStopReconciliationRequest) -> AssignedTransitionIdentity {
     let proof = &request.guard_proof;
-    let mut canonical = Vec::with_capacity(384);
-    append_canonical_field(&mut canonical, b"exploration-global-stop-request-v1");
-    append_canonical_field(&mut canonical, request.request_id.as_bytes());
-    canonical.extend_from_slice(&request.exploration_generation.to_be_bytes());
-    append_child_lease_identity(&mut canonical, &request.child_lease);
-    canonical.extend_from_slice(&request.cancel_generation.to_be_bytes());
-    append_canonical_field(&mut canonical, request.recovery_correlation.as_bytes());
-    append_canonical_field(&mut canonical, proof.stop_operation_id.as_bytes());
-    append_canonical_field(&mut canonical, proof.recovery_correlation.as_bytes());
-    canonical.extend_from_slice(
-        &proof
-            .original_motion_admission
-            .guard_generation
-            .to_be_bytes(),
-    );
-    canonical.extend_from_slice(&proof.original_motion_admission.guard_boot_nonce);
-    canonical.extend_from_slice(
-        &proof
-            .original_motion_admission
-            .motion_stop_generation
-            .to_be_bytes(),
-    );
-    canonical.extend_from_slice(&proof.held_guard_generation.to_be_bytes());
-    canonical.extend_from_slice(&proof.held_guard_boot_nonce);
-    canonical.extend_from_slice(&proof.held_motion_stop_generation.to_be_bytes());
-    append_canonical_field(&mut canonical, proof.zero_ack_id.as_bytes());
-    canonical.extend_from_slice(&proof.zero_applied_monotonic_ns.to_be_bytes());
-    append_canonical_field(&mut canonical, proof.recovery_fence_token.as_slice());
-    crate::map_checksum::sha256_hex(&canonical)
+    AssignedTransitionIdentity::GlobalStop {
+        parent_request_id: request.request_id.clone(),
+        exploration_generation: request.exploration_generation,
+        child_lease: request.child_lease.clone(),
+        cancel_generation: request.cancel_generation,
+        stop_operation_id: proof.stop_operation_id.clone(),
+        original_guard_generation: proof.original_motion_admission.guard_generation,
+        original_guard_boot_nonce: proof.original_motion_admission.guard_boot_nonce,
+        original_motion_stop_generation: proof.original_motion_admission.motion_stop_generation,
+        held_guard_generation: proof.held_guard_generation,
+        held_guard_boot_nonce: proof.held_guard_boot_nonce,
+        held_motion_stop_generation: proof.held_motion_stop_generation,
+        zero_ack_id: proof.zero_ack_id.clone(),
+        zero_applied_monotonic_ns: proof.zero_applied_monotonic_ns,
+    }
 }
 
-fn exact_child_zero_request_fingerprint(proof: &ChildNavigationZeroProof) -> String {
-    let mut canonical = Vec::with_capacity(256);
-    append_canonical_field(&mut canonical, b"exploration-exact-child-zero-v1");
-    append_child_lease_identity(&mut canonical, &proof.lease);
-    canonical.extend_from_slice(&proof.cancel_generation.to_be_bytes());
-    append_canonical_field(&mut canonical, proof.zero_ack_id.as_bytes());
-    canonical.extend_from_slice(&proof.zero_applied_monotonic_ns.to_be_bytes());
-    crate::map_checksum::sha256_hex(&canonical)
+fn exact_child_zero_request_identity(proof: &ChildNavigationZeroProof) -> AssignedTransitionIdentity {
+    AssignedTransitionIdentity::ExactChildZeroed {
+        child_lease: proof.lease.clone(), cancel_generation: proof.cancel_generation,
+        zero_ack_id: proof.zero_ack_id.clone(), zero_applied_monotonic_ns: proof.zero_applied_monotonic_ns,
+    }
 }
 
 fn durable_snapshot_from_runtime(
@@ -1567,13 +1629,7 @@ impl ExploreRuntimeInner {
                         && ticket.cancel_generation > 0
                         && ticket.lease.matches(child_lease),
                     cancel_generation: ticket.cancel_generation,
-                    recovery_correlation: global_stop_recovery_correlation(
-                        &self.last_request_id,
-                        self.session_generation,
-                        child_lease,
-                        ticket.cancel_generation,
-                        &motion_admission,
-                    ),
+                    recovery_correlation: assigned_recovery_correlation(child_lease, ticket.cancel_generation),
                     motion_admission: Some(motion_admission),
                 })
             })
@@ -1700,7 +1756,7 @@ struct ExactOrphanLeaseKey {
     parent_request_id: String,
     goal_generation: u64,
     producer_runtime_generation: u64,
-    goal_payload_sha256: [u8; 32],
+
 }
 
 impl From<&ChildNavigationLease> for ExactOrphanLeaseKey {
@@ -1711,7 +1767,7 @@ impl From<&ChildNavigationLease> for ExactOrphanLeaseKey {
             parent_request_id: lease.parent_request_id.clone(),
             goal_generation: lease.goal_generation,
             producer_runtime_generation: lease.producer_runtime_generation,
-            goal_payload_sha256: lease.goal_payload_sha256,
+
         }
     }
 }
@@ -2261,6 +2317,15 @@ impl ExploreRuntimeHandle {
             .insert(Arc::as_ptr(&self.inner) as usize, path);
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_reconciliation_directory_sync_for_tests(&self) {
+        let path = self.reconciliation_journal_path();
+        TEST_DIRECTORY_SYNC_FAILURES
+            .get_or_init(|| SyncMutex::new(std::collections::HashMap::new()))
+            .lock()
+            .insert(path.parent().unwrap().to_path_buf(), 1);
+    }
+
     pub fn latest_durable_reconciliation_snapshot(
         &self,
     ) -> Result<Option<ExploreRuntimeSnapshot>, ExplorationRecoveryError> {
@@ -2293,8 +2358,11 @@ impl ExploreRuntimeHandle {
         &self,
         recovery_correlation: &str,
         child_lease_fingerprint: &str,
+        child_lease: Option<&ChildNavigationLease>,
     ) -> Result<bool, ExplorationRecoveryError> {
-        if recovery_correlation.trim().is_empty() || child_lease_fingerprint.trim().is_empty() {
+        if recovery_correlation.trim().is_empty()
+            || (child_lease_fingerprint.is_empty() == child_lease.is_none())
+            || child_lease.is_some_and(|child| !valid_child_lease(child)) {
             return Err(ExplorationRecoveryError::InvalidArgument(
                 "reconciliation acknowledgement identity is incomplete".to_string(),
             ));
@@ -2303,6 +2371,7 @@ impl ExploreRuntimeHandle {
             &self.reconciliation_journal_path(),
             recovery_correlation,
             child_lease_fingerprint,
+            child_lease,
         )
         .map_err(ExplorationRecoveryError::FailedPrecondition)
     }
@@ -2597,7 +2666,6 @@ impl ExploreRuntimeHandle {
             || request.child_lease.parent_request_id.trim() != request_id
             || request.child_lease.goal_generation == 0
             || request.child_lease.producer_runtime_generation == 0
-            || request.child_lease.goal_payload_sha256 == [0; 32]
             || request.expected_navigation_runtime_generation == 0
             || request.observed_navigation_runtime_generation
                 <= request.expected_navigation_runtime_generation
@@ -2735,7 +2803,6 @@ impl ExploreRuntimeHandle {
             || request.child_lease.parent_request_id.trim() != request_id
             || request.child_lease.goal_generation == 0
             || request.child_lease.producer_runtime_generation == 0
-            || request.child_lease.goal_payload_sha256 == [0; 32]
             || request.cancel_generation == 0
             || request.recovery_correlation.trim().is_empty()
             || request.guard_proof.recovery_correlation != request.recovery_correlation
@@ -2776,12 +2843,12 @@ impl ExploreRuntimeHandle {
         request: &ExplorationGlobalStopReconciliationRequest,
     ) -> Result<Option<ExploreRuntimeSnapshot>, ExplorationRecoveryError> {
         Self::validate_global_stop_reconciliation_request(request)?;
-        let request_fingerprint = global_stop_request_fingerprint(request);
+        let request_identity = global_stop_request_identity(request);
         if let Some(durable) = replay_durable_ownership_transition(
             &self.reconciliation_journal_path(),
             DurableOwnershipTransitionKind::GlobalStop,
             &request.recovery_correlation,
-            &request_fingerprint,
+            &request_identity,
         )
         .map_err(ExplorationRecoveryError::FailedPrecondition)?
         {
@@ -2824,7 +2891,7 @@ impl ExploreRuntimeHandle {
         request: ExplorationGlobalStopReconciliationRequest,
     ) -> Result<ExploreRuntimeSnapshot, ExplorationRecoveryError> {
         Self::validate_global_stop_reconciliation_request(&request)?;
-        let request_fingerprint = global_stop_request_fingerprint(&request);
+        let request_identity = global_stop_request_identity(&request);
         let request_id = request.request_id.trim();
         let mut guard = self.inner.lock().await;
 
@@ -2897,13 +2964,7 @@ impl ExploreRuntimeHandle {
                     .to_string(),
             ));
         }
-        let expected_correlation = global_stop_recovery_correlation(
-            &guard.last_request_id,
-            guard.session_generation,
-            &active_child.lease,
-            ticket.cancel_generation,
-            &active_motion_admission,
-        );
+        let expected_correlation = assigned_recovery_correlation(&active_child.lease, ticket.cancel_generation);
         if request.recovery_correlation != expected_correlation {
             return Err(ExplorationRecoveryError::FailedPrecondition(
                 "exploration reconciliation correlation mismatch".to_string(),
@@ -2915,7 +2976,8 @@ impl ExploreRuntimeHandle {
             recovery_correlation: expected_correlation,
             parent_request_id: guard.last_request_id.clone(),
             exploration_generation: guard.session_generation,
-            child_lease_fingerprint: child_lease_fingerprint(&active_child.lease),
+            child_lease_fingerprint: String::new(),
+            child_lease: Some(active_child.lease.clone()),
             cancel_generation: ticket.cancel_generation,
             commit_disposition: GLOBAL_STOP_COMMIT_DISPOSITION.to_string(),
         };
@@ -2937,7 +2999,8 @@ impl ExploreRuntimeHandle {
         let durable_transition = DurableOwnershipTransition {
             kind: DurableOwnershipTransitionKind::GlobalStop,
             recovery_correlation: request.recovery_correlation.clone(),
-            request_fingerprint,
+            request_fingerprint: String::new(),
+            request_identity: Some(request_identity),
             receipt: receipt.clone(),
             snapshot: durable_snapshot_from_runtime(&snapshot),
             committed_unix_ns: now_unix_nanos(),
@@ -3449,7 +3512,7 @@ impl ExploreRuntimeHandle {
                 Err(error) => { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded,
                     format!("活动探索返航路线核验失败：{error}")).await; }
             };
-            let route_ticket = match self.admit_compute_locked(&mut guard, &context, &pose,
+            let route_ticket = match self.admit_compute_locked(&mut guard, &context,
                 ComputeRequest::HomewardBudget(HomewardBudgetRequest { context: context.clone(), progress })) {
                 Ok(ticket) => ticket,
                 Err(error) => { let snapshot = guard.snapshot(STATUS_PENDING, error); drop(guard); return self.store_snapshot(snapshot); }
@@ -3487,7 +3550,7 @@ impl ExploreRuntimeHandle {
             && now_monotonic_nanos().saturating_sub(guard.costmap_received_monotonic_ns) <= guard.costmap_receipt_ttl.as_nanos() as u64
         {
             let context = match self.capture_compute_context(&guard, &pose, now_ns) { Ok(context) => context, Err(_) => return self.snapshot() };
-            let coverage_ticket = match self.admit_compute_locked(&mut guard, &context, &pose, ComputeRequest::Coverage { context: context.clone() }) {
+            let coverage_ticket = match self.admit_compute_locked(&mut guard, &context, ComputeRequest::Coverage { context: context.clone() }) {
                 Ok(ticket) => ticket, Err(_) => return self.snapshot(),
             };
             drop(guard);
@@ -3645,7 +3708,7 @@ impl ExploreRuntimeHandle {
             Err(error) => { let snapshot = guard.snapshot(STATUS_PENDING, error); drop(guard); return self.store_snapshot(snapshot); }
         };
         let mission_progress = guard.mission.clone();
-        let selection_ticket = match self.admit_compute_locked(&mut guard, &context, &pose,
+        let selection_ticket = match self.admit_compute_locked(&mut guard, &context,
             ComputeRequest::Selection(SelectionRequest { context: context.clone(), progress: mission_progress.clone() })) {
             Ok(ticket) => ticket,
             Err(error) => { let snapshot = guard.snapshot(STATUS_PENDING, error); drop(guard); return self.store_snapshot(snapshot); }
@@ -3755,17 +3818,30 @@ impl ExploreRuntimeHandle {
                     navigation_goal.position_tolerance_m=0.1;
                     navigation_goal.yaw_tolerance_rad=0.2;
                 }
-                let config = guard.active_config.as_deref().cloned().unwrap_or_default();
-                let mut intent = match build_wavefront_goal_intent(
-                    guard.session_generation,
-                    cancel_generation,
-                    &guard.last_request_id,
-                    &child_request_id,
-                    &config.motion_admission,
-                    &navigation_goal,
-                    config.boundary.as_ref(),
-                    committed_map,
-                ) {
+                let (motion_admission, intent_result) = {
+                    let default_config;
+                    let config = match guard.active_config.as_deref() {
+                        Some(config) => config,
+                        None => {
+                            default_config = ExploreStartConfig::default();
+                            &default_config
+                        }
+                    };
+                    (
+                        config.motion_admission,
+                        build_wavefront_goal_intent(
+                            guard.session_generation,
+                            cancel_generation,
+                            &guard.last_request_id,
+                            &child_request_id,
+                            &config.motion_admission,
+                            &navigation_goal,
+                            config.boundary.as_ref(),
+                            committed_map,
+                        ),
+                    )
+                };
+                let mut intent = match intent_result {
                     Ok(intent) => intent,
                     Err(error) => {
                 selection_ticket.finish(&mut guard);
@@ -3781,28 +3857,31 @@ impl ExploreRuntimeHandle {
                     }
                 };
                 if let Some(surface)=&guard.surface_mode {
-                    intent.options.allow_reverse=surface.config.as_ref().ok()
-                        .and_then(|config|config.follower.kinematics())
-                        .is_some_and(|motion|motion.max_reverse_mps>0.0);
-                    // 无方向性视域只要求到达可观察位置，避免每个子目标再次停车对齐。
-                    if goal.metadata.get("goal_orientation_required").is_some_and(|value|value=="false") {
-                        intent.options.yaw_tolerance_rad=std::f64::consts::PI;
-                    }
+                    // Return endpoints are the captured body pose. Only ordinary surface
+                    // frontier coordinates were derived through support -> body.
+                    intent.body_to_support_z_m=if guard.return_goal_id.as_deref()==Some(goal.id.as_str()) { None } else {
+                        surface.config.as_ref().ok().map(|config|config.follower.body_to_support_z_m)
+                    };
                 }
-                if guard.return_goal_id.as_deref()==Some(goal.id.as_str()) {
-                    intent.options=nuwax_nav_types_messages::GoalOptions {allow_reverse:false,position_tolerance_m:0.1,yaw_tolerance_rad:0.2};
-                }
-                intent.goal_sha256=schema::goal_intent_action_sha256(&intent.goal,&intent.options).expect("目标与执行选项已核对");
+                intent.options = if guard.return_goal_id.as_deref() == Some(goal.id.as_str()) {
+                    crate::explore_mission::home_goal_options()
+                } else {
+                    crate::explore_mission::frontier_goal_options(
+                        &goal,
+                        guard.surface_mode.is_some(),
+                        guard.surface_mode.as_ref().and_then(|surface| surface.config.as_ref().ok()),
+                    )
+                };
                 intent.map_frame_generation = guard.surface_mode.as_ref().and_then(|mode| mode.latest.as_ref()).map_or(guard.costmap_frame_generation, |ticket| ticket.map_frame_generation);
                 let request = ChildNavigationRequest {
                     parent_request_id: guard.last_request_id.clone(),
                     request_id: child_request_id,
                     expected_map_name,
-                    motion_admission: config.motion_admission,
+                    motion_admission,
                     frontier_goal_id: goal.id.clone(),
                     goal: navigation_goal,
-                    boundary: config.boundary,
                     intent,
+                    boundary_owner: Arc::clone(guard.active_config.as_ref().expect("active exploration owns its start config")),
                 };
                 let dispatching = guard.snapshot(
                     STATUS_PENDING,
@@ -3918,7 +3997,6 @@ impl ExploreRuntimeHandle {
                     != Some(ticket.lease.goal_generation))
             || ticket.lease.goal_generation == 0
             || ticket.lease.producer_runtime_generation == 0
-            || ticket.lease.goal_payload_sha256 == [0; 32]
         {
             return self
                 .record_dispatch_failure(
@@ -4199,27 +4277,22 @@ impl ExploreRuntimeHandle {
                     let ticket = pending.ticket.as_ref().ok_or_else(|| {
                         "late exact ZEROED has no retained cancellation ticket".to_string()
                     })?;
-                    let motion_admission = guard
+                    let _motion_admission = guard
                         .active_config
                         .as_ref()
                         .map(|config| config.motion_admission)
                         .ok_or_else(|| {
                             "late exact ZEROED has no original motion admission".to_string()
                         })?;
-                    let recovery_correlation = global_stop_recovery_correlation(
-                        &guard.last_request_id,
-                        guard.session_generation,
-                        &active_child.lease,
-                        ticket.cancel_generation,
-                        &motion_admission,
-                    );
-                    let request_fingerprint = exact_child_zero_request_fingerprint(proof);
+                    let recovery_correlation = assigned_recovery_correlation(&active_child.lease, ticket.cancel_generation);
+                    let request_identity = exact_child_zero_request_identity(proof);
                     let receipt = ExplorationOwnershipReconciliationReceipt {
                         cause: EXACT_CHILD_ZEROED_CAUSE.to_string(),
                         recovery_correlation: recovery_correlation.clone(),
                         parent_request_id: guard.last_request_id.clone(),
                         exploration_generation: guard.session_generation,
-                        child_lease_fingerprint: child_lease_fingerprint(&active_child.lease),
+                        child_lease_fingerprint: String::new(),
+            child_lease: Some(active_child.lease.clone()),
                         cancel_generation: ticket.cancel_generation,
                         commit_disposition: EXACT_CHILD_ZEROED_DISPOSITION.to_string(),
                     };
@@ -4240,7 +4313,8 @@ impl ExploreRuntimeHandle {
                     let transition = DurableOwnershipTransition {
                         kind: DurableOwnershipTransitionKind::ExactChildZeroed,
                         recovery_correlation: recovery_correlation.clone(),
-                        request_fingerprint: request_fingerprint.clone(),
+                        request_fingerprint: String::new(),
+                        request_identity: Some(request_identity.clone()),
                         receipt: receipt.clone(),
                         snapshot: durable_snapshot_from_runtime(&durable_snapshot),
                         committed_unix_ns: now_unix_nanos(),
@@ -4265,7 +4339,7 @@ impl ExploreRuntimeHandle {
                     guard.completed_rollover_recovery = Some(
                         CompletedOwnershipTransition::ExactChildZeroed(CompletedExactChildZeroed {
                             recovery_correlation,
-                            request_fingerprint,
+                            request_identity,
                             receipt,
                         }),
                     );
@@ -5376,7 +5450,7 @@ mod tests {
                     parent_request_id: request.parent_request_id.clone(),
                     goal_generation: self.next_goal_generation.fetch_add(1, Ordering::SeqCst) + 1,
                     producer_runtime_generation: 11,
-                    goal_payload_sha256: [7; 32],
+
                 });
             Ok(ChildNavigationTicket { lease })
         }
@@ -5747,6 +5821,18 @@ mod tests {
                 goal.pose.position.z
             );
             assert_eq!(requests[0].intent.goal.header.frame_id, "map");
+            assert_eq!(requests[0].intent.goal.pose.position,
+                [goal.pose.position.x, goal.pose.position.y, goal.pose.position.z]);
+            assert_eq!(requests[0].intent.goal.pose.orientation_xyzw,
+                [orientation.x, orientation.y, orientation.z, orientation.w]);
+            assert_eq!(requests[0].intent.map_frame_generation, 1);
+            assert_eq!(requests[0].intent.body_to_support_z_m, Some(surface_config("map").follower.body_to_support_z_m));
+            assert_eq!(requests[0].intent.options, nuwax_nav_types_messages::GoalOptions {
+                allow_reverse: surface_config("map").follower.kinematics()
+                    .is_some_and(|motion| motion.max_reverse_mps > 0.0),
+                yaw_tolerance_rad: std::f64::consts::PI,
+                ..Default::default()
+            });
         }
     }
 
@@ -6430,7 +6516,23 @@ mod tests {
 
         let active = handle.tick((2.0, 2.0)).await;
         assert_eq!(active.status, STATUS_ACTIVE);
-        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+        {
+            let submitted = sink.submitted.lock().unwrap();
+            assert_eq!(submitted.len(), 1);
+            let request = &submitted[0];
+            let expected = build_wavefront_goal_intent(
+                active.exploration_generation, 0, "req-flow", "req-flow.nav.1",
+                &crate::nav_runtime::test_motion_admission(), &request.goal, None,
+                committed_map_identity(1, "map"),
+            ).unwrap();
+            assert_eq!(request.intent, expected);
+            assert!(request.intent.boundary_points.is_empty());
+            assert!(request.intent.boundary_id.is_empty());
+            assert!(request.intent.boundary_points.is_empty());
+            assert_eq!(request.goal.id, request.request_id);
+            assert_eq!(request.expected_map_name, "map");
+            assert_eq!(request.motion_admission, crate::nav_runtime::test_motion_admission());
+        }
         assert!(!active.child_task_id.is_empty());
         assert_eq!(active.frontier_count, 1);
         assert!(active.revision > 0);
@@ -6705,6 +6807,10 @@ mod tests {
             assert!(submitted
                 .iter()
                 .all(|request| request.parent_request_id == "req-readiness"));
+            assert!(submitted
+                .iter()
+                .all(|request| request.intent == submitted[0].intent));
+            assert_eq!(submitted[0].intent.committed_map, committed_map_identity(1, "map"));
         }
 
         let diagnostics = handle.diagnostics().await;
@@ -6785,7 +6891,7 @@ mod tests {
                 parent_request_id: "req-invalid-lease".to_string(),
                 goal_generation: 1,
                 producer_runtime_generation: 11,
-                goal_payload_sha256: [7; 32],
+
             },
             ChildNavigationLease {
                 session_id: "invalid-generation".to_string(),
@@ -6793,7 +6899,7 @@ mod tests {
                 parent_request_id: "req-invalid-lease".to_string(),
                 goal_generation: 1,
                 producer_runtime_generation: 0,
-                goal_payload_sha256: [7; 32],
+
             },
         ] {
             let (handle, sink) = configured_handle();
@@ -7200,8 +7306,8 @@ mod tests {
         assert_eq!(receipt.exploration_generation, exact.exploration_generation);
         assert_eq!(receipt.cancel_generation, exact.cancel_generation);
         assert_eq!(
-            receipt.child_lease_fingerprint,
-            child_lease_fingerprint(&exact.child_lease)
+            receipt.child_lease,
+            Some(exact.child_lease.clone())
         );
         assert_eq!(receipt.commit_disposition, GLOBAL_STOP_COMMIT_DISPOSITION);
 
@@ -7312,8 +7418,8 @@ mod tests {
         assert!(handle
             .acknowledge_durable_reconciliation(
                 &receipt.recovery_correlation,
-                &receipt.child_lease_fingerprint,
-            )
+                &receipt.child_lease_fingerprint, receipt.child_lease.as_ref(),
+)
             .expect("durable acknowledgement"));
         assert!(handle
             .latest_durable_reconciliation_snapshot()
@@ -7427,7 +7533,7 @@ mod tests {
                 parent_request_id: "debug-parent".to_string(),
                 goal_generation: 1,
                 producer_runtime_generation: 1,
-                goal_payload_sha256: [7; 32],
+
             }),
             global_stop_reconciliation: ExplorationGlobalStopReconciliationSnapshot {
                 eligible: true,
@@ -7450,10 +7556,12 @@ mod tests {
     fn durable_test_transition(index: usize) -> DurableOwnershipTransition {
         let correlation = format!("exploration-global-stop:{index:064x}");
         DurableOwnershipTransition {
+            request_identity: None,
             kind: DurableOwnershipTransitionKind::GlobalStop,
             recovery_correlation: correlation.clone(),
             request_fingerprint: format!("{:064x}", index + 1),
             receipt: ExplorationOwnershipReconciliationReceipt {
+            child_lease: None,
                 cause: GLOBAL_STOP_RECONCILIATION_CAUSE.to_string(),
                 recovery_correlation: correlation,
                 parent_request_id: format!("parent-{index}"),
@@ -7536,7 +7644,7 @@ mod tests {
                 _ => unreachable!(),
             }
             let path = reconciliation_test_path(label);
-            let bytes = serde_json::to_vec(&DurableOwnershipJournal {
+            let bytes = encode_ownership_journal(&DurableOwnershipJournal {
                 schema_version: RECONCILIATION_JOURNAL_SCHEMA_VERSION,
                 entries: vec![invalid],
             })
@@ -7668,8 +7776,8 @@ mod tests {
         assert!(acknowledge_durable_ownership_transition(
             &path,
             &first.recovery_correlation,
-            &first.receipt.child_lease_fingerprint,
-        )
+            &first.receipt.child_lease_fingerprint, first.receipt.child_lease.as_ref(),
+)
         .unwrap());
         assert!(matches!(
             commit_durable_ownership_transition(
@@ -8080,7 +8188,13 @@ mod tests {
         assert_eq!(active.status, STATUS_ACTIVE);
         let submitted = sink.submitted.lock().unwrap();
         assert_eq!(submitted.len(), 1);
-        assert_eq!(submitted[0].boundary.as_ref(), Some(&boundary));
+        assert_eq!(submitted[0].intent.boundary_id, "req-boundary:boundary");
+        assert_eq!(submitted[0].intent.goal.header.frame_id, "map");
+        assert_eq!(submitted[0].intent.committed_map.frame_id, "map");
+        assert_eq!(submitted[0].intent.boundary_points, vec![
+            [0.0, 0.0, 0.0], [5.0, 0.0, 0.0],
+            [5.0, 5.0, 0.0], [0.0, 5.0, 0.0],
+        ]);
         assert_eq!(
             submitted[0].motion_admission,
             crate::nav_runtime::test_motion_admission()
@@ -8229,6 +8343,37 @@ mod tests {
             .await
             .expect("scheduler shutdown must abort a blocked pose provider")
             .expect("owner-requested scheduler cancellation must settle nonfatally");
+    }
+
+    #[tokio::test]
+    async fn stop_during_submit_cancels_late_ticket_and_retains_orphan() {
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        handle.start("req-late-ticket", "prefer_wavefront").await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        *sink.submit_release.lock().unwrap() = Some(release.clone());
+        let ticking = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.tick((2.0, 2.0)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), sink.submit_entered.notified())
+            .await.expect("submit must wait outside the exploration lock");
+        let frozen = handle.inner.lock().await.pending_child_dispatch.clone().unwrap();
+        assert_eq!(frozen.request_id, "req-late-ticket.nav.1");
+        let stopped = tokio::time::timeout(Duration::from_secs(1), handle.stop("req-late-ticket"))
+            .await.expect("stop must not wait for child submission");
+        assert_eq!(stopped.status, STATUS_CANCELLED);
+        assert!(handle.inner.lock().await.pending_child_dispatch.is_none());
+        release.notify_one();
+        let settled = tokio::time::timeout(Duration::from_secs(1), ticking)
+            .await.expect("late child ticket must settle").unwrap();
+        assert_eq!(settled.status, STATUS_CANCELLED);
+        assert!(settled.child_task_id.is_empty());
+        assert!(handle.inner.lock().await.active_child.is_none());
+        assert_eq!(sink.submitted.lock().unwrap()[0].intent, frozen.intent);
+        assert_eq!(*sink.cancelled.lock().unwrap(), vec![frozen.request_id]);
+        assert!(handle.orphan_cancellations.has_entries());
+        assert!(handle.blocks_mapping_mutation().await);
     }
 
     #[tokio::test]
@@ -8486,6 +8631,222 @@ mod tests {
     include!("explore_compute_runtime_tests.rs");
     include!("explore_compute_surface_tests.rs");
 
+    #[tokio::test]
+    async fn compute_owner_surface_slow_prepare_keeps_result_but_rejects_stale_next_tick() {
+        let (handle, sink) = configured_handle();
+        let (message, _, snapshot) = install_surface_fixture(&handle, "map").await;
+        let request_id = "owner-surface-slow-prepare";
+        assert_eq!(
+            handle.start(request_id, "prefer_wavefront").await.status,
+            STATUS_ACCEPTED
+        );
+        let audit = Arc::new(StdMutex::new(SurfaceOwnerAudit::default()));
+        let gate = Arc::new(OwnerRuntimeGate::default());
+        let _release = OwnerRuntimeGateRelease(gate.clone());
+        let receiver =
+            install_gated_real_surface_source(&handle, audit.clone(), gate.clone(), None).await;
+        let original = receiver.freeze().unwrap();
+        let pose = surface_pose(&snapshot, 0.0, Quaternion::IDENTITY);
+        let identity = {
+            let guard = handle.inner.lock().await;
+            (
+                guard.generation,
+                guard.session_generation,
+                guard.last_request_id.clone(),
+                guard.compute.history,
+                guard.committed_map.clone(),
+                guard.compute.status().unwrap().incarnation,
+            )
+        };
+        let tick = tokio::spawn({
+            let handle = handle.clone();
+            let pose = pose.clone();
+            async move { handle.tick_with_pose(pose).await }
+        });
+        owner_watchdog(gate.entered()).await;
+        // Hold the actual Surface source after preparation. The native worker
+        // has not published a proposal, so Accept/commit still run normally.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(pose.received_monotonic_ns != 0);
+        assert!(
+            now_monotonic_nanos().saturating_sub(pose.received_monotonic_ns)
+                > DEFAULT_POSE_RECEIPT_TTL.as_nanos() as u64
+        );
+        // Only a real same-source map receipt is refreshed. Neither the sampled
+        // pose nor its timestamp/receipt is rewritten to make completion pass.
+        publish_surface_owner_receipt(&handle, &message.committed_map, 2, snapshot.clone()).await;
+        assert!(original.same_source_view(&receiver.freeze().unwrap()));
+        {
+            let guard = handle.inner.lock().await;
+            assert_eq!(
+                (
+                    guard.generation,
+                    guard.session_generation,
+                    guard.last_request_id.clone(),
+                    guard.compute.history,
+                    guard.committed_map.clone(),
+                    guard.compute.status().unwrap().incarnation,
+                ),
+                identity
+            );
+        }
+        assert!(!tick.is_finished());
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        gate.release();
+        let active = owner_watchdog(tick).await.unwrap();
+        assert_eq!(active.status, STATUS_ACTIVE, "{}", active.message);
+        assert_eq!(active.child_task_id, "owner-surface-slow-prepare.nav.1");
+        {
+            let audit = audit.lock().unwrap();
+            assert_eq!(
+                (audit.captures.len(), audit.commits.len(), audit.discards),
+                (1, 1, 0)
+            );
+            assert_surface_owner_capture(
+                &audit.captures[0], &snapshot, original.notification(), &pose,
+            );
+            let submitted = sink.submitted.lock().unwrap();
+            assert_eq!(submitted.len(), 1);
+            assert_eq!(
+                submitted[0].frontier_goal_id,
+                surface_owner_goal(&audit.commits[0]).id
+            );
+        }
+        // This recording sink proves exploration handoff, not live navigation
+        // admission or motor safety. Those independent consumers are unchanged.
+        let lease = active_child_lease(&handle).await;
+        owner_watchdog(handle.report_navigation_result(
+            &active.child_task_id,
+            ChildNavigationResult::Reached(terminal_proof(&lease)),
+        ))
+        .await
+        .unwrap();
+        owner_watchdog(handle.await_compute_idle()).await.unwrap();
+        assert!(handle.inner.lock().await.active_child.is_none());
+        // The identical now-old receipt remains invalid at the next tick's
+        // entrance. Removing completion age must not admit a stale new request.
+        let stale = owner_watchdog(handle.tick_with_pose(pose)).await;
+        assert_eq!(stale.status, STATUS_FAILED, "{}", stale.message);
+        assert!(stale.message.contains("pose source stale"));
+        owner_watchdog(handle.await_compute_idle()).await.unwrap();
+        {
+            let audit = audit.lock().unwrap();
+            assert_eq!(
+                (audit.captures.len(), audit.commits.len(), audit.discards),
+                (1, 1, 0)
+            );
+        }
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+        handle.request_compute_shutdown().await;
+        owner_watchdog(handle.compute_service.join()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compute_owner_zero_pose_source_or_receipt_is_rejected_before_prepare() {
+        for zero_source in [false, true] {
+            let (handle, sink) = configured_handle();
+            let (_, _, snapshot) = install_surface_fixture(&handle, "map").await;
+            assert_eq!(
+                handle.start("owner-zero-pose", "prefer_wavefront").await.status,
+                STATUS_ACCEPTED
+            );
+            let audit = Arc::new(StdMutex::new(SurfaceOwnerAudit::default()));
+            let gate = Arc::new(OwnerRuntimeGate::default());
+            let _release = OwnerRuntimeGateRelease(gate.clone());
+            install_gated_real_surface_source(&handle, audit.clone(), gate, None).await;
+            let mut pose = surface_pose(&snapshot, 0.0, Quaternion::IDENTITY);
+            if zero_source {
+                pose.source_timestamp_ns = 0;
+            } else {
+                pose.received_monotonic_ns = 0;
+            }
+            let rejected = owner_watchdog(handle.tick_with_pose(pose)).await;
+            assert_eq!(rejected.status, STATUS_FAILED, "{}", rejected.message);
+            assert!(rejected.message.contains("pose source stale"));
+            owner_watchdog(handle.await_compute_idle()).await.unwrap();
+            {
+                let audit = audit.lock().unwrap();
+                assert!(audit.captures.is_empty());
+                assert!(audit.commits.is_empty());
+                assert_eq!(audit.discards, 0);
+            }
+            assert!(sink.submitted.lock().unwrap().is_empty());
+            handle.request_compute_shutdown().await;
+            owner_watchdog(handle.compute_service.join()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_owner_feedback_still_invalidates_an_accepted_selection() {
+        let (handle, sink) = configured_handle();
+        let (_, _, snapshot) = install_surface_fixture(&handle, "map").await;
+        assert_eq!(
+            handle.start("owner-feedback-basis", "prefer_wavefront").await.status,
+            STATUS_ACCEPTED
+        );
+        let audit = Arc::new(StdMutex::new(SurfaceOwnerAudit::default()));
+        let gate = Arc::new(OwnerRuntimeGate::default());
+        gate.release();
+        install_gated_real_surface_source(&handle, audit.clone(), gate, None).await;
+        let pose = surface_pose(&snapshot, 0.0, Quaternion::IDENTITY);
+        let mut guard = handle.inner.lock().await;
+        let context = handle.capture_compute_context(&guard, &pose, now_unix_nanos()).unwrap();
+        let ticket = handle.admit_compute_locked(
+            &mut guard,
+            &context,
+            ComputeRequest::Selection(SelectionRequest { context: context.clone(), progress: None }),
+        ).unwrap();
+        drop(guard);
+        // Exercise the real native prepare/Accept/commit protocol, not a
+        // constructed ComputeBasis or a direct mutation of its history.
+        let finalized = owner_watchdog(handle.await_compute(&ticket)).await.unwrap();
+        let goal_id = match &finalized.projection {
+            ComputeProjection::Selection(selection) => {
+                surface_owner_goal(selection.poll.as_ref().unwrap()).id.clone()
+            }
+            _ => panic!("expected real Surface selection"),
+        };
+        guard = handle.inner.lock().await;
+        assert!(ticket.current(&guard));
+        let history_before = guard.compute.history;
+        let generation = guard.generation;
+        let feedback = ExplorationGoalFeedback::Failed("new source feedback".into());
+        let feedback_ticket = handle.admit_feedback_locked(
+            &mut guard,
+            FeedbackIdentity::Internal {
+                generation,
+                lineage: format!("poll:{}:{}", ticket.id.incarnation, ticket.id.sequence),
+                goal: goal_id.clone(),
+                feedback: feedback.clone(),
+            },
+            goal_id.clone(), feedback.clone(), None, false,
+        ).unwrap();
+        ticket.feedback_handoff(&mut guard);
+        assert!(!ticket.current(&guard), "pending feedback must fence the old result");
+        assert!(!ticket.current_after_feedback(&guard, &feedback_ticket));
+        drop(guard);
+        owner_watchdog(handle.await_feedback(&feedback_ticket)).await.unwrap();
+        guard = handle.inner.lock().await;
+        assert_eq!(guard.compute.history, history_before + 1);
+        assert!(!ticket.current(&guard), "acknowledged feedback must supersede old history");
+        assert!(!ticket.current_after_feedback(&guard, &feedback_ticket));
+        ticket.finish(&mut guard);
+        drop(guard);
+        owner_watchdog(handle.await_compute_idle()).await.unwrap();
+        {
+            let audit = audit.lock().unwrap();
+            assert_eq!((audit.captures.len(), audit.commits.len(), audit.discards), (1, 1, 0));
+            assert_eq!(audit.feedback, vec![(goal_id, feedback)]);
+        }
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        assert_eq!(
+            owner_watchdog(handle.stop("owner-feedback-basis")).await.status,
+            STATUS_CANCELLED
+        );
+        handle.request_compute_shutdown().await;
+        owner_watchdog(handle.compute_service.join()).await.unwrap();
+    }
+
     // These fixtures never dispatch a goal or compute a legacy identity.
     async fn hashfree_checkpoint_fixture() -> (String, ExploreStartConfig) {
         let (handle, sink) = configured_handle();
@@ -8734,8 +9095,11 @@ mod tests {
         let requests=sink.submitted.lock().unwrap().clone();
         assert_eq!(requests.len(),1);
         assert!(requests[0].frontier_goal_id.contains(".return."));
-        assert_eq!(requests[0].intent.options.position_tolerance_m,0.1);
+        assert_eq!(requests[0].intent.options,nuwax_nav_types_messages::GoalOptions {
+            allow_reverse:false,position_tolerance_m:0.1,yaw_tolerance_rad:0.2,
+        });
         assert_eq!(requests[0].intent.goal.pose.position,[2.0,2.0,0.0]);
+        assert_eq!(requests[0].intent.body_to_support_z_m, None);
         let lease=active_child_lease(&handle).await;
         assert!(handle.report_navigation_result("old-child",ChildNavigationResult::Reached(terminal_proof(&lease))).await.is_err());
         assert_eq!(handle.snapshot().status,STATUS_ACTIVE);
@@ -8958,4 +9322,228 @@ mod tests {
             WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
         assert_eq!(adapter.source_name(), Cow::Borrowed("wavefront"));
     }
+    fn assigned_journal_fixture(index: usize) -> DurableOwnershipTransition {
+        let mut entry = durable_test_transition(index);
+        let child = ChildNavigationLease {
+            session_id: format!("child-{index}"), owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+            parent_request_id: entry.receipt.parent_request_id.clone(), goal_generation: index as u64 + 1,
+            producer_runtime_generation: 77,
+        };
+        entry.kind = DurableOwnershipTransitionKind::ExactChildZeroed;
+        entry.recovery_correlation = assigned_recovery_correlation(&child, 1);
+        entry.request_fingerprint.clear();
+        entry.request_identity = Some(AssignedTransitionIdentity::ExactChildZeroed {
+            child_lease: child.clone(), cancel_generation: 1,
+            zero_ack_id: format!("zero-{index}"), zero_applied_monotonic_ns: 1,
+        });
+        entry.receipt.recovery_correlation = entry.recovery_correlation.clone();
+        entry.receipt.cause = EXACT_CHILD_ZEROED_CAUSE.into();
+        entry.receipt.commit_disposition = EXACT_CHILD_ZEROED_DISPOSITION.into();
+        entry.receipt.child_lease_fingerprint.clear();
+        entry.receipt.child_lease = Some(child);
+        entry.snapshot.last_stop_reason = "child_cancel_failed".into();
+        entry
+    }
+
+    #[test]
+    fn legacy_v1_restore_and_opaque_ack_keep_both_original_receipts() {
+        struct NoHash;
+        impl Drop for NoHash { fn drop(&mut self) { crate::map_checksum::FORBID_HASH.with(|flag| flag.set(false)); } }
+        crate::map_checksum::FORBID_HASH.with(|flag| flag.set(true));
+        let _no_hash = NoHash;
+        // Shape-only constants from the original v1 fixture; no goal/proof body
+        // exists here and no legacy digest is calculated or reconstructed.
+        let bytes = r#"{
+  "schema_version": 1,
+  "entries": [
+    {
+      "kind": "global_stop",
+      "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000065",
+      "request_fingerprint": "0000000000000000000000000000000000000000000000000000000000000066",
+      "receipt": {
+        "cause": "ordinary_global_stop",
+        "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000065",
+        "parent_request_id": "parent-101",
+        "exploration_generation": 102,
+        "child_lease_fingerprint": "0000000000000000000000000000000000000000000000000000000000000067",
+        "cancel_generation": 1,
+        "commit_disposition": "global_stop_reconciled_child_ownership"
+      },
+      "snapshot": {
+        "status": "FAILED",
+        "message": "synthetic legacy receipt fixture; no goal or proof payload",
+        "request_id": "parent-101",
+        "selected_source": "wavefront",
+        "last_stop_reason": "global_stop_reconciled_safe",
+        "frontier_count": 0,
+        "revision": 1,
+        "exploration_generation": 102
+      },
+      "committed_unix_ns": 102,
+      "acknowledged": false
+    },
+    {
+      "kind": "exact_child_zeroed",
+      "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000066",
+      "request_fingerprint": "0000000000000000000000000000000000000000000000000000000000000067",
+      "receipt": {
+        "cause": "late_exact_child_zeroed",
+        "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000066",
+        "parent_request_id": "parent-102",
+        "exploration_generation": 103,
+        "child_lease_fingerprint": "0000000000000000000000000000000000000000000000000000000000000068",
+        "cancel_generation": 1,
+        "commit_disposition": "exact_child_zeroed_released_ownership"
+      },
+      "snapshot": {
+        "status": "FAILED",
+        "message": "synthetic legacy receipt fixture; no goal or proof payload",
+        "request_id": "parent-102",
+        "selected_source": "wavefront",
+        "last_stop_reason": "child_cancel_failed",
+        "frontier_count": 0,
+        "revision": 1,
+        "exploration_generation": 103
+      },
+      "committed_unix_ns": 103,
+      "acknowledged": false
+    }
+  ]
+}
+"#;
+        let path = reconciliation_test_path("v8-legacy-v1");
+        write_raw_test_journal(&path, bytes.as_bytes());
+        let original = read_durable_ownership_journal(&path).unwrap();
+        assert_eq!(original.schema_version, 1);
+        assert_eq!(original.entries.len(), 2);
+        let latest = original.entries.last().unwrap();
+        assert!(latest.request_identity.is_none());
+        let snapshot = latest.runtime_snapshot();
+        assert!(snapshot.child_lease.is_none());
+        assert_eq!(snapshot.status, STATUS_FAILED);
+        assert_eq!(snapshot.ownership_reconciliation_receipt.as_ref(), Some(&latest.receipt));
+        assert!(!acknowledge_durable_ownership_transition(&path, &latest.recovery_correlation, "wrong-opaque", None).unwrap());
+        for _ in 0..2 {
+            assert!(acknowledge_durable_ownership_transition(&path, &latest.recovery_correlation,
+                &latest.receipt.child_lease_fingerprint, None).unwrap());
+        }
+        let restarted = read_durable_ownership_journal(&path).unwrap();
+        assert_eq!(restarted.schema_version, 1);
+        assert_eq!(restarted.entries[0], original.entries[0]);
+        assert_eq!(restarted.entries[1].request_fingerprint, latest.request_fingerprint);
+        assert_eq!(restarted.entries[1].receipt, latest.receipt);
+        assert!(restarted.entries[1].acknowledged);
+        assert_eq!(restarted.entries.iter().rev().find(|entry| !entry.acknowledged).unwrap(), &original.entries[0]);
+    }
+
+    #[test]
+    fn assigned_journal_v2_keeps_legacy_entries_and_exact_ack_branches() {
+        let path = reconciliation_test_path("v8-mixed-journal");
+        let legacy = durable_test_transition(1);
+        write_raw_test_journal(&path, &encode_ownership_journal(&DurableOwnershipJournal {
+            schema_version: 1, entries: vec![legacy.clone()],
+        }).unwrap());
+        let assigned = assigned_journal_fixture(2);
+        assert!(matches!(commit_durable_ownership_transition(&path, assigned.clone()).unwrap(), DurableCommitOutcome::Committed));
+        let journal = read_durable_ownership_journal(&path).unwrap();
+        assert_eq!(journal.schema_version, 2);
+        assert_eq!(journal.entries, vec![legacy.clone(), assigned.clone()]);
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["entries"][0]["format"], "legacy_v1");
+        assert_eq!(raw["entries"][1]["format"], "assigned_v2");
+        assert!(raw["entries"][1]["transition"].get("request_fingerprint").is_none());
+        assert!(!acknowledge_durable_ownership_transition(&path, &assigned.recovery_correlation,
+            &legacy.receipt.child_lease_fingerprint, assigned.receipt.child_lease.as_ref()).unwrap());
+        assert!(acknowledge_durable_ownership_transition(&path, &assigned.recovery_correlation,
+            "", assigned.receipt.child_lease.as_ref()).unwrap());
+        assert!(acknowledge_durable_ownership_transition(&path, &legacy.recovery_correlation,
+            &legacy.receipt.child_lease_fingerprint, None).unwrap());
+        assert!(read_durable_ownership_journal(&path).unwrap().entries.iter().all(|entry| entry.acknowledged));
+    }
+
+    #[test]
+    fn assigned_journal_first_winner_replays_once_and_rejects_real_changes() {
+        let path = reconciliation_test_path("v8-assigned-first-winner");
+        let entry = assigned_journal_fixture(3);
+        assert!(matches!(commit_durable_ownership_transition(&path, entry.clone()).unwrap(), DurableCommitOutcome::Committed));
+        assert!(matches!(commit_durable_ownership_transition(&path, entry.clone()).unwrap(), DurableCommitOutcome::ExactReplay(_)));
+        let mut changed = entry.clone();
+        if let Some(AssignedTransitionIdentity::ExactChildZeroed { zero_ack_id, .. }) = &mut changed.request_identity {
+            zero_ack_id.push_str("-changed");
+        }
+        assert!(commit_durable_ownership_transition(&path, changed).err().unwrap().contains("first winner"));
+        let mut mixed = entry.clone();
+        mixed.receipt.child_lease_fingerprint = "0".repeat(64);
+        assert!(validate_durable_ownership_transition(&mixed).is_err());
+        assert_eq!(read_durable_ownership_journal(&path).unwrap().entries, vec![entry]);
+    }
+
+    #[test]
+    fn assigned_write_cannot_evict_any_unacknowledged_legacy_receipt() {
+        let path = reconciliation_test_path("v8-mixed-capacity");
+        let entries = (0..RECONCILIATION_JOURNAL_CAPACITY).map(durable_test_transition).collect::<Vec<_>>();
+        write_raw_test_journal(&path, &encode_ownership_journal(&DurableOwnershipJournal {
+            schema_version: 1, entries: entries.clone(),
+        }).unwrap());
+        let assigned = assigned_journal_fixture(50);
+        assert!(commit_durable_ownership_transition(&path, assigned.clone()).is_err());
+        assert_eq!(read_durable_ownership_journal(&path).unwrap().entries, entries);
+        assert!(acknowledge_durable_ownership_transition(&path, &entries[0].recovery_correlation,
+            &entries[0].receipt.child_lease_fingerprint, None).unwrap());
+        assert!(matches!(commit_durable_ownership_transition(&path, assigned.clone()).unwrap(), DurableCommitOutcome::Committed));
+        let migrated = read_durable_ownership_journal(&path).unwrap();
+        assert_eq!(migrated.schema_version, 2);
+        assert_eq!(&migrated.entries[..31], &entries[1..]);
+        assert_eq!(migrated.entries.last(), Some(&assigned));
+    }
+
+    #[tokio::test]
+    async fn surface_return_keeps_captured_body_home_without_support_contract() {
+        eprintln!("surface return: constructing complete-body source");
+        let handle = ExploreRuntimeHandle::with_wavefront_map_frame("map").unwrap();
+        let sink = Arc::new(RecordingNavSink::default());
+        handle.set_navigation_sink(sink.clone());
+        // Mission route queries require the real complete-body view, unlike
+        // the older point-only surface-frontier fixture.
+        let mut config = surface_config("map");
+        config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+            footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+            z_min_m: -0.05, z_max_m: 0.2, source: "surface return body fixture".into(),
+        }), None).unwrap();
+        handle.configure_surface_source(Ok(config.clone()), 37, [7;16]).await.unwrap();
+        let message = surface_message("map", 1);
+        let ticket = handle.begin_surface_map_update(&message, now_monotonic_nanos()).await.unwrap().unwrap();
+        let snapshot = Arc::new(SurfaceSnapshot::from_points(
+            &schema::navigation_map_3d_points(&message).unwrap(), config.geometry.clone(), message.source_voxel_size,
+        ).unwrap().with_body_envelope(config.body_envelope.clone().unwrap()).unwrap());
+        assert!(handle.finish_surface_map_update(ticket, Ok(snapshot.clone())).await);
+        eprintln!("surface return: complete-body source committed");
+        let started = handle.start_with_config("surface-return-body", ExploreStartConfig {
+            motion_admission: crate::nav_runtime::test_motion_admission(), ..Default::default()
+        }).await;
+        assert_eq!(started.status, STATUS_ACCEPTED, "{}", started.message);
+        enable_test_mission(&handle, Some(0.01)).await;
+        let body_pose = surface_pose(&snapshot, 0.0, Quaternion::IDENTITY);
+        let home = [body_pose.x, body_pose.y, body_pose.z];
+        snapshot.validate_body_pose(home, [0.0, 0.0, 0.0, 1.0]).expect("captured home has real support and complete-body clearance");
+        eprintln!("surface return: home {:?} validated, d={}", home, config.follower.body_to_support_z_m);
+        // A previously captured body home after a completed outward journey.
+        // Exhaustion runs the real homeward query, without an unrelated new
+        // frontier route search before selecting the return action.
+        let mut progress = MissionProgress::new(MissionPose {
+            position: home, orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        }).unwrap();
+        progress.travelled_m = 0.02;
+        handle.inner.lock().await.mission = Some(progress);
+        eprintln!("surface return: entering original exhausted-budget tick/homeward route");
+        let active = handle.tick_with_pose(body_pose).await;
+        eprintln!("surface return: tick completed: {} {}", active.status, active.message);
+        assert_eq!(active.status, STATUS_ACTIVE, "{}", active.message);
+        let requests = sink.submitted.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].frontier_goal_id.contains(".return."));
+        assert_eq!(requests[0].intent.goal.pose.position, home);
+        assert_eq!(requests[0].intent.body_to_support_z_m, None);
+    }
+
 }

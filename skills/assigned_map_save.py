@@ -57,8 +57,12 @@ def reconcile_assigned_current(owner, asset, bundle, *, captured, reason=None, m
     with owner._repository.map_activation_guard():
         current = require_catalog_owner(owner, asset, captured)
         if current.identity_schema_version == 2 and current.asset_identity != bundle.asset_identity:
+            independent = owner._asset_repository.has_assigned_version(asset.map_name, bundle.asset_identity)
             proof = owner._asset_repository.get_assigned_map_asset_exchange(asset.map_name)
-            if (expected_previous_identity != current.asset_identity or proof is None or not proof.committed
+            if independent:
+                if expected_previous_identity != current.asset_identity:
+                    raise _problem("分配式目录前任身份已改变。", "map_asset_bundle_invalid")
+            elif (expected_previous_identity != current.asset_identity or proof is None or not proof.committed
                     or proof.previous_identity != current.asset_identity or proof.candidate_identity != bundle.asset_identity
                     or proof.catalog_created_at != current.created_at.isoformat()
                     or proof.map_directory != captured[:2]):
@@ -160,7 +164,8 @@ def finalize_assigned_cloud_map(owner, asset, *, context, reason, metadata, geor
         committed = reconcile_assigned_current(owner, asset, finalized, captured=captured,
             reason=reason, metadata=metadata, confirm_durable=True,
             expected_previous_identity=expected_previous_identity)
-        if expected_previous_identity is not None:
+        if (expected_previous_identity is not None
+                and not owner._asset_repository.has_assigned_version(name, identity)):
             owner._asset_repository.settle_assigned_map_asset_exchange(name,
                 expected_previous_identity=expected_previous_identity, asset_identity=identity)
     except BaseException as exc:

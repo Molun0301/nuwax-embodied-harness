@@ -3,8 +3,8 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const VERSION: u32 = 6;
-pub const WORKER_CONTRACT: &str = "nuwax-slam-2d-worker-v6";
+pub const VERSION: u32 = 7;
+pub const WORKER_CONTRACT: &str = "nuwax-slam-2d-worker-v7";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Identity {
@@ -243,7 +243,6 @@ pub struct Snapshot {
     pub resolution: f64,
     pub origin: [f64; 2],
     pub payload_size: u64,
-    pub data_sha256: [u8; 32],
     pub file_name: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -258,12 +257,27 @@ pub struct Response {
     pub error: Option<String>,
 }
 
+/// Legacy is only a read-format marker; historical digests never cross this IPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "scheme", rename_all = "snake_case")]
+pub enum ArtifactIdentity {
+    Legacy,
+    Assigned { checkpoint_id: String },
+}
+impl ArtifactIdentity {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Self::Assigned { checkpoint_id } = self {
+            crate::archive::validate_checkpoint_id(checkpoint_id)?;
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FileArtifact {
     pub file_name: String,
     pub payload_size: u64,
-    pub sha256: [u8; 32],
+    pub identity: ArtifactIdentity,
 }
 impl FileArtifact {
     pub fn validate(&self) -> Result<(), String> {
@@ -276,10 +290,13 @@ impl FileArtifact {
             || self.file_name.starts_with('.')
             || self.payload_size == 0
             || self.payload_size > crate::archive::MAX_ARCHIVE
-            || self.sha256 == [0; 32]
         {
             return Err("二维文件制品描述非法".into());
         }
-        Ok(())
+        self.identity.validate()
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/assigned_protocol/mod.rs"]
+mod assigned_tests;

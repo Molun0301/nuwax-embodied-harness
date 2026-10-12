@@ -21,6 +21,35 @@ from scripts import self_update as updater
 
 LOG = logging.getLogger("nuwax_robot_bridge.updates")
 
+# 与既有 Web 停止入口一致；stop_mapping 会保存地图，不属于停车豁免。
+_MCP_MAINTENANCE_STOPS = frozenset({
+    "cancel_navigation", "cancel_task", "stop_all_motion", "stop_exploration",
+})
+# 已核对的任务/导航只读合同；不按 get_ 前缀或风险等级猜测新工具语义。
+_MCP_MAINTENANCE_READS = frozenset({
+    "get_active_tasks", "get_task_status", "get_navigation_state",
+})
+_MCP_UPDATE_OWNER = "neh.update_maintenance_owner"
+
+
+def run_mcp_operation(request, operation, *, tool_name=None):
+    """在实际工作线程内成对准入/退出，HTTP 取消不能提前释放仍执行的操作。"""
+    service = request.scope.get(_MCP_UPDATE_OWNER)
+    if (service is None or tool_name in _MCP_MAINTENANCE_STOPS
+            or tool_name in _MCP_MAINTENANCE_READS):
+        return operation()
+    if not service.begin_mutation():
+        from gateways.errors import GatewayError
+        raise GatewayError(
+            "软件更新维护中，暂不接受新的操作；停止与取消入口仍可用",
+            error_code="update_maintenance", http_status=503, jsonrpc_code=-32000,
+        )
+    try:
+        return operation()
+    finally:
+        service.end_mutation()
+
+
 
 class UpdateService:
     def __init__(self, runtime, root=None):
@@ -313,8 +342,14 @@ class UpdateMaintenanceMiddleware:
                 "/api/capabilities/stop_exploration/invoke",
             }
         )
+        # MCP 的 HTTP POST 同时承载查询和停车。由已解析、已校验的工具入口
+        # 使用本中间件的唯一维护状态拥有方准入，不在这里重复读取/解析请求体。
+        mcp_post = scope["type"] == "http" and path == "/mcp" and scope.get("method") == "POST"
+        if mcp_post:
+            scope[_MCP_UPDATE_OWNER] = self.service
         mutation = (
             scope["type"] == "http"
+            and not mcp_post
             and scope.get("method") not in {"GET", "HEAD", "OPTIONS"}
             and not path.startswith("/api/updates")
             and not emergency

@@ -863,7 +863,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
             use_worker_process=use_worker_process,
             worker_retry_backoff_sec=worker_retry_backoff_sec,
         )
-        self._configured_class_names = self._normalize_class_names(class_names) or (() if self._use_tensorrt else ("object",))
+        self._configured_class_names = self._normalize_class_names(class_names)
         self._dynamic_class_metadata_keys = tuple(
             str(item).strip()
             for item in dynamic_class_metadata_keys
@@ -884,6 +884,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         )
         self._configured_aliases = self._parse_alias_entries(class_aliases)
         self._last_class_names: Tuple[str, ...] = ()
+        self._default_model_class_names: Optional[Tuple[str, ...]] = None
         provider_metadata = resolve_detection_provider_spec(
             backend_name=name,
             backend_kind="yolo_world",
@@ -938,7 +939,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
             image_bgr = decode_image_frame_to_bgr(image_frame)
             if not class_names:
                 try:
-                    results = self._predict(image_bgr)
+                    results = self._predict_with_classes(image_bgr, ())
                 except Exception as exc:
                     return DetectionBundle(
                         metadata={
@@ -946,8 +947,8 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
                             "raw_detection_count": 0,
                             "stage_status": "not_ready",
                             "availability": "unavailable",
-                            "reason": "open_vocabulary_classes_empty",
-                            "fallback_reason": "open_vocabulary_classes_empty",
+                            "reason": "model_not_loaded_or_prediction_failed",
+                            "fallback_reason": "model_not_loaded_or_prediction_failed",
                             "error": str(exc),
                             "model_loaded": self._model is not None,
                             "worker_fallback_used": bool(self._worker_fallback_reason) and self._last_inference_execution == "in_process",
@@ -976,14 +977,16 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
                     )
             first_result = results[0] if results else None
             requested_classes = class_names
-            if self._use_tensorrt:
-                # 固定引擎无法应用动态请求词表，只报告模型实际返回的类别表。
+            if self._use_tensorrt or not class_names:
+                # 未提供外部词汇时报告模型实际默认类别，固定引擎同样报告其真实类别。
                 names = getattr(first_result, "names", None)
                 if not isinstance(names, (dict, list, tuple)):
                     names = getattr(self._model, "names", ())
                 class_names = self._normalize_class_names(tuple(names.values()) if isinstance(names, dict) else names)
                 base_metadata["open_vocabulary_classes"] = list(class_names)
                 base_metadata["open_vocabulary_class_count"] = len(class_names)
+                if not self._use_tensorrt:
+                    base_metadata["open_vocabulary_class_source"] = "model_default_classes"
             else:
                 base_metadata["class_prompt_applied"] = bool(class_names)
             detections_2d = self._enrich_open_vocabulary_detections(
@@ -1043,7 +1046,12 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         # 其余 → PyTorch(用 YOLOWorld 开放词汇类，set_classes 动态设类别)。
         # 注意 YOLOWorld 无法加载 .engine（ultralytics 8.x 会报 'str' object has no attribute 'names'）。
         model_class = YOLO if self._use_tensorrt else YOLOWorld
-        self._model = model_class(self._weights)
+        model = model_class(self._weights)
+        if not self._use_tensorrt:
+            from ultralytics.utils.torch_utils import select_device
+            # 首次词表创建前固定设备，避免预测迁移模型后文本编码器仍在CPU造词元。
+            model.to(select_device(self._device, verbose=False))
+        self._model = model
         self._resolved_model_source = self._weights
         self._resolved_backend_kind = self._resolved_backend_kind or "yolo_world"
         DETECTOR_LOGGER.info(
@@ -1062,6 +1070,17 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
             return self._predict(image_bgr)
 
         model = self._get_model()
+        if self._default_model_class_names is None:
+            names = getattr(model, "names", ())
+            self._default_model_class_names = self._normalize_class_names(
+                tuple(names.values()) if isinstance(names, dict) else names
+            )
+        if not class_names and self._last_class_names:
+            if not self._default_model_class_names:
+                raise RuntimeError("当前模型没有可恢复的默认类别。")
+            # 任务动态查询结束后恢复原类别，避免普通观察沿用上一次找物目标。
+            model.set_classes(list(self._default_model_class_names))
+            self._last_class_names = ()
         if class_names != self._last_class_names:
             if not callable(getattr(model, "set_classes", None)):
                 raise RuntimeError("当前检测模型不支持设置动态类别词表。")

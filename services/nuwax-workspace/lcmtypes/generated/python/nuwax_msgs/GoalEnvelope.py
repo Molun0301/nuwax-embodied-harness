@@ -11,11 +11,11 @@ import geometry_msgs
 
 class GoalEnvelope(object):
 
-    __slots__ = ["schema_version", "session_id", "owner_kind", "parent_request_id", "goal_generation", "producer", "producer_epoch", "producer_runtime_generation", "committed_map_session_id", "committed_map_session_generation", "committed_map_revision", "committed_map_boot_nonce", "committed_map_commit_sequence", "committed_map_source_timestamp_ns", "committed_map_frame_id", "source_timestamp_ns", "boundary_id", "boundary_sha256", "boundary_frame_id", "boundary_points_length", "boundary_points", "motion_guard_generation", "motion_guard_boot_nonce", "motion_stop_generation", "allow_reverse", "position_tolerance_m", "yaw_tolerance_rad", "navigation_configuration_sha256", "map_frame_generation", "payload_sha256", "goal"]
+    __slots__ = ["schema_version", "session_id", "owner_kind", "parent_request_id", "goal_generation", "producer", "producer_epoch", "producer_runtime_generation", "committed_map_session_id", "committed_map_session_generation", "committed_map_revision", "committed_map_boot_nonce", "committed_map_commit_sequence", "committed_map_source_timestamp_ns", "committed_map_frame_id", "source_timestamp_ns", "boundary_id", "boundary_frame_id", "boundary_points_length", "boundary_points", "motion_guard_generation", "motion_guard_boot_nonce", "motion_stop_generation", "allow_reverse", "position_tolerance_m", "yaw_tolerance_rad", "body_reference_frame_id", "has_body_to_support_z", "body_to_support_z_m", "map_frame_generation", "goal"]
 
-    __typenames__ = ["int32_t", "string", "int32_t", "string", "int64_t", "string", "int64_t", "int64_t", "string", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "string", "int64_t", "string", "byte", "string", "int32_t", "geometry_msgs.Point", "int64_t", "byte", "int64_t", "int8_t", "double", "double", "byte", "int64_t", "byte", "geometry_msgs.PoseStamped"]
+    __typenames__ = ["int32_t", "string", "int32_t", "string", "int64_t", "string", "int64_t", "int64_t", "string", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "string", "int64_t", "string", "string", "int32_t", "geometry_msgs.Point", "int64_t", "byte", "int64_t", "int8_t", "double", "double", "string", "int8_t", "double", "int64_t", "geometry_msgs.PoseStamped"]
 
-    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, [16], None, None, None, None, None, [32], None, None, ["boundary_points_length"], None, [16], None, None, None, None, [32], None, [32], None]
+    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, [16], None, None, None, None, None, None, None, ["boundary_points_length"], None, [16], None, None, None, None, None, None, None, None, None]
 
     def __init__(self):
         self.schema_version = 0
@@ -52,8 +52,6 @@ class GoalEnvelope(object):
         """ LCM Type: int64_t """
         self.boundary_id = ""
         """ LCM Type: string """
-        self.boundary_sha256 = b""
-        """ LCM Type: byte[32] """
         self.boundary_frame_id = ""
         """ LCM Type: string """
         self.boundary_points_length = 0
@@ -72,16 +70,18 @@ class GoalEnvelope(object):
         """ LCM Type: double """
         self.yaw_tolerance_rad = 0.0
         """ LCM Type: double """
-        self.navigation_configuration_sha256 = b""
-        """ LCM Type: byte[32] """
+        self.body_reference_frame_id = ""
+        """ LCM Type: string """
+        self.has_body_to_support_z = 0
+        """ LCM Type: int8_t """
+        self.body_to_support_z_m = 0.0
+        """ LCM Type: double """
         self.map_frame_generation = 0
         """
         目标产生时的规范地图坐标代际。
         LCM Type: int64_t
         """
 
-        self.payload_sha256 = b""
-        """ LCM Type: byte[32] """
         self.goal = geometry_msgs.PoseStamped()
         """ LCM Type: geometry_msgs.PoseStamped """
 
@@ -124,7 +124,6 @@ class GoalEnvelope(object):
         buf.write(struct.pack('>I', len(__boundary_id_encoded)+1))
         buf.write(__boundary_id_encoded)
         buf.write(b"\0")
-        buf.write(bytearray(self.boundary_sha256[:32]))
         __boundary_frame_id_encoded = self.boundary_frame_id.encode('utf-8')
         buf.write(struct.pack('>I', len(__boundary_frame_id_encoded)+1))
         buf.write(__boundary_frame_id_encoded)
@@ -136,9 +135,11 @@ class GoalEnvelope(object):
         buf.write(struct.pack(">q", self.motion_guard_generation))
         buf.write(bytearray(self.motion_guard_boot_nonce[:16]))
         buf.write(struct.pack(">qbdd", self.motion_stop_generation, self.allow_reverse, self.position_tolerance_m, self.yaw_tolerance_rad))
-        buf.write(bytearray(self.navigation_configuration_sha256[:32]))
-        buf.write(struct.pack(">q", self.map_frame_generation))
-        buf.write(bytearray(self.payload_sha256[:32]))
+        __body_reference_frame_id_encoded = self.body_reference_frame_id.encode('utf-8')
+        buf.write(struct.pack('>I', len(__body_reference_frame_id_encoded)+1))
+        buf.write(__body_reference_frame_id_encoded)
+        buf.write(b"\0")
+        buf.write(struct.pack(">bdq", self.has_body_to_support_z, self.body_to_support_z_m, self.map_frame_generation))
         assert self.goal._get_packed_fingerprint() == geometry_msgs.PoseStamped._get_packed_fingerprint()
         self.goal._encode_one(buf)
 
@@ -175,7 +176,6 @@ class GoalEnvelope(object):
         self.source_timestamp_ns = struct.unpack(">q", buf.read(8))[0]
         __boundary_id_len = struct.unpack('>I', buf.read(4))[0]
         self.boundary_id = buf.read(__boundary_id_len)[:-1].decode('utf-8', 'replace')
-        self.boundary_sha256 = buf.read(32)
         __boundary_frame_id_len = struct.unpack('>I', buf.read(4))[0]
         self.boundary_frame_id = buf.read(__boundary_frame_id_len)[:-1].decode('utf-8', 'replace')
         self.boundary_points_length = struct.unpack(">i", buf.read(4))[0]
@@ -185,9 +185,9 @@ class GoalEnvelope(object):
         self.motion_guard_generation = struct.unpack(">q", buf.read(8))[0]
         self.motion_guard_boot_nonce = buf.read(16)
         self.motion_stop_generation, self.allow_reverse, self.position_tolerance_m, self.yaw_tolerance_rad = struct.unpack(">qbdd", buf.read(25))
-        self.navigation_configuration_sha256 = buf.read(32)
-        self.map_frame_generation = struct.unpack(">q", buf.read(8))[0]
-        self.payload_sha256 = buf.read(32)
+        __body_reference_frame_id_len = struct.unpack('>I', buf.read(4))[0]
+        self.body_reference_frame_id = buf.read(__body_reference_frame_id_len)[:-1].decode('utf-8', 'replace')
+        self.has_body_to_support_z, self.body_to_support_z_m, self.map_frame_generation = struct.unpack(">bdq", buf.read(17))
         self.goal = geometry_msgs.PoseStamped._decode_one(buf)
         return self
 
@@ -195,7 +195,7 @@ class GoalEnvelope(object):
     def _get_hash_recursive(parents):
         if GoalEnvelope in parents: return 0
         newparents = parents + [GoalEnvelope]
-        tmphash = (0x5d3968dcf3163b7b+ geometry_msgs.Point._get_hash_recursive(newparents)+ geometry_msgs.PoseStamped._get_hash_recursive(newparents)) & 0xffffffffffffffff
+        tmphash = (0x34fd110ceb7cf58f+ geometry_msgs.Point._get_hash_recursive(newparents)+ geometry_msgs.PoseStamped._get_hash_recursive(newparents)) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None

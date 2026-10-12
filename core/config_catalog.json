@@ -2441,7 +2441,7 @@
   "NUWAX_SCENE_MAPPING_AUTO_APPLY": {
     "zh_name": "自动采纳语义标签",
     "type": "bool",
-    "default": false,
+    "default": true,
     "section_id": "runtime_data",
     "target_file": "core_env",
     "consumers": [
@@ -2449,7 +2449,7 @@
       "services/memory/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
-    "description": "默认仅记录候选；启用后仍须满足证据视角、分数、来源和修订校验。",
+    "description": "语义建图启用后默认自动填写有充分观察依据的区域名称；关闭则仅保留候选。用户或智能体显式命名优先。",
     "advanced": false
   },
   "NUWAX_GEOMETRY_POINT_CLOUD_PREPROCESS_ENABLED": {
@@ -2541,5 +2541,125 @@
     "type": "float",
     "default": 3.0,
     "target_file": "core_env"
+  },
+  "NUWAX_NAV_ACTUATOR_MOTION_MODEL": {
+    "type": "str",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/resolve_navigation_pipeline.py",
+      "services/geometry/source_runtime_env.sh",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航栈后生效",
+    "zh_name": "执行器基本运动形式",
+    "choices": [
+      "",
+      "omnidirectional"
+    ],
+    "choice_labels": [
+      "未显式声明",
+      "前后左右移动及原地转向"
+    ],
+    "description": "通用适配的显式运动学声明。与两项速度上限成组填写；当前只接入现有全向平面通道，空值不推断通用机器人的能力。仅声明通道，不提供保证制动或台阶能力；三维链消费。"
+  },
+  "NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS": {
+    "type": "str",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/resolve_navigation_pipeline.py",
+      "services/geometry/source_runtime_env.sh",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航栈后生效",
+    "zh_name": "执行器基本平面速度上限（米/秒）",
+    "description": "与基本运动形式、偏航速度成组填写，有限正数且不大于5。对前后左右采用相同保守命令上限，必须由实际适配通道支持；不表示已达到该速度。全组留空时沿现有设备缺省声明。"
+  },
+  "NUWAX_NAV_ACTUATOR_MAX_YAW_RPS": {
+    "type": "str",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/resolve_navigation_pipeline.py",
+      "services/geometry/source_runtime_env.sh",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航栈后生效",
+    "zh_name": "执行器基本偏航速度上限（弧度/秒）",
+    "description": "与基本运动形式、平面速度成组填写，有限正数且不大于4π。需要实际支持原地转向，不据此推测制动能力。非法或缺半组配置在业务进程启动前拒绝。"
+  },
+  "NUWAX_MANIPULATION_ENABLED": {
+    "zh_name": "外部物体操作任务",
+    "type": "bool",
+    "default": false,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/manipulation/http_backend.py",
+      "gateways/manipulation.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "显式启用配置的外部操作设备；未发现实际任务能力时不公开工具。"
+  },
+  "NUWAX_MANIPULATION_BASE_URL": {
+    "zh_name": "操作设备HTTP地址",
+    "type": "str",
+    "default": "",
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/manipulation/http_backend.py",
+      "gateways/manipulation.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "本机或远端设备基础地址；NEH不加载设备动作模型。"
+  },
+  "NUWAX_MANIPULATION_HTTP_TIMEOUT_SEC": {
+    "zh_name": "操作设备请求期限",
+    "type": "float",
+    "default": 3.0,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/manipulation/http_backend.py",
+      "gateways/manipulation.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "每次HTTP请求最长等待秒数。"
+  },
+  "NUWAX_MANIPULATION_STOP_TIMEOUT_SEC": {
+    "zh_name": "操作任务停止确认期限",
+    "type": "float",
+    "default": 10.0,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/manipulation/http_backend.py",
+      "gateways/manipulation.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "取消后等待匹配任务终态及physics_paused的最长秒数。"
+  },
+  "NUWAX_MANIPULATION_POLL_INTERVAL_SEC": {
+    "zh_name": "操作任务状态查询间隔",
+    "type": "float",
+    "default": 0.2,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/manipulation/http_backend.py",
+      "gateways/manipulation.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "查询同一设备任务状态的间隔秒数。"
   }
 }

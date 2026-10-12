@@ -14,7 +14,8 @@ pub(crate) fn validate_member_identity(member: &CheckpointMemberIdentity) -> Res
     }
     let role = CheckpointMemberRole::try_from(member.role).map_err(|_| "检查点成员角色未知")?;
     let occupancy = member.occupancy_receipt.as_ref().ok_or("检查点成员缺少占据收据")?;
-    if role == CheckpointMemberRole::PlanarGraph {
+    if occupancy.backend_kind == "slam_toolbox" {
+        if !matches!(role, CheckpointMemberRole::PlanarGraph | CheckpointMemberRole::CanonicalOccupancy) { return Err("二维检查点成员角色非法".into()); }
         crate::server::validate_mapping_commit_identity(occupancy.commit_id.as_ref(), "planar member")?;
         if member.cloud_receipt.is_some() || occupancy.backend_kind != "slam_toolbox"
             || occupancy.session_id.is_empty() || occupancy.session_generation == 0 || occupancy.backend_generation == 0
@@ -61,7 +62,7 @@ impl Store {
     pub fn insert_legacy(&mut self, mut file: File, size: u64, sha: [u8; 32]) -> Result<GraphArtifactRef, String> {
         file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         let mut magic = [0; 8]; file.read_exact(&mut magic).map_err(|e| e.to_string())?;
-        if &magic == b"NUWAXAR2" { return Err("AR2不能包装为旧摘要制品".into()); }
+        if matches!(&magic, b"NUWAXAR2" | b"NWS2D002") { return Err("AR2/NWS2D002编号档案不能包装为旧摘要制品".into()); }
         file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         if crate::dense_cloud::hash_reader(&mut file)? != (size, sha) { return Err("旧制品导入摘要变化".into()); }
         self.admit_file(file, GraphArtifactRef { id: uuid::Uuid::new_v4().simple().to_string(), size, sha256: sha.to_vec(), ..Default::default() })
@@ -127,9 +128,24 @@ impl Store {
                 }
                 if scan { for key in keys { fine.block_by_key(key)?; } }
             }
-            b"NWS2D001" => {
-                if member.is_some() { return Err("二维内层档案尚未迁移，不能作为v2制品接纳".into()); }
-                if scan { archive::verify(file)?; }
+            b"NWS2D001" | b"NWS2D002" => {
+                let metadata = if scan { archive::grid_structure(file)?.0 } else { archive::read_structure(file)?.0 };
+                match (&metadata, member) {
+                    (archive::ArchiveMetadata::Legacy(_), None) if r.identity_schema_version != 2 => {},
+                    (archive::ArchiveMetadata::Assigned(assigned), Some(m)) if r.identity_schema_version == 2 => {
+                        let source = &assigned.source;
+                        let o = m.occupancy_receipt.as_ref().ok_or("二维图缺少规范占据收据")?;
+                        if m.role != CheckpointMemberRole::PlanarGraph as i32
+                            || m.checkpoint_id != assigned.checkpoint_id || m.cloud_receipt.is_some()
+                            || m.frame_id != source.session.map_frame_id
+                            || o.session_id != source.session.session_id
+                            || o.session_generation != source.session.session_generation
+                            || o.source_timestamp_ns != source.source_unix_timestamp_ns {
+                            return Err("二维档案与检查点或来源身份不符".into());
+                        }
+                    },
+                    _ => return Err("二维档案与外层身份代际混合".into()),
+                }
             }
             _ => return Err("未知制品档案格式".into()),
         }
@@ -306,16 +322,34 @@ mod assigned_identity_tests {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TargetIdentity {
+    Legacy([u8; 32]),
+    Assigned(GraphArtifactRef),
+}
+impl TargetIdentity {
+    pub fn runtime_identity(&self) -> nuwax_slam_2d_runtime::protocol::ArtifactIdentity {
+        match self {
+            Self::Legacy(_) => nuwax_slam_2d_runtime::protocol::ArtifactIdentity::Legacy,
+            Self::Assigned(reference) => nuwax_slam_2d_runtime::protocol::ArtifactIdentity::Assigned {
+                checkpoint_id: reference.member_identity.as_ref().expect("validated graph member").checkpoint_id.clone(),
+            },
+        }
+    }
+    pub fn legacy_digest(&self) -> Option<[u8; 32]> {
+        match self { Self::Legacy(sha) => Some(*sha), Self::Assigned(_) => None }
+    }
+}
 #[derive(Debug)]
 pub(crate) struct Target {
     pub file: std::sync::Arc<File>,
     pub size: u64,
-    pub sha: [u8; 32],
-    pub metadata: archive::Metadata,
+    pub identity: TargetIdentity,
+    pub metadata: archive::ArchiveMetadata,
 }
 impl PartialEq for Target {
     fn eq(&self, other: &Self) -> bool {
-        self.size == other.size && self.sha == other.sha && self.metadata == other.metadata
+        self.size == other.size && self.identity == other.identity && self.metadata == other.metadata
     }
 }
 impl Target {
@@ -333,7 +367,7 @@ impl Target {
     ) -> [u8; 32] {
         let mut data = b"nuwax.geometry.planar-target.v1\0".to_vec();
         data.extend_from_slice(&activation);
-        data.extend_from_slice(&self.sha);
+        data.extend_from_slice(&self.identity.legacy_digest().expect("legacy target receipt requires legacy target"));
         data.extend_from_slice(&receipt.commit_id.boot_nonce.to_be_bytes());
         for n in [
             self.size,
@@ -346,5 +380,81 @@ impl Target {
             data.extend_from_slice(&n.to_be_bytes());
         }
         nuwax_codec::hash::sha256_bytes(&data)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod planar_assigned_pair_tests {
+    use super::*;
+    use crate::proto::{CanonicalOccupancyCommitReceipt, MappingBackendCheckpoint, MappingCommitIdentity, OccupancyGridData, OccupancyGridMeta};
+
+    pub(crate) fn fixture() -> (MappingBackendCheckpoint, Vec<u8>) {
+        let metadata = archive::AssignedMetadata {
+            checkpoint_id: "1".repeat(32),
+            source: archive::Metadata {
+                version: 2,
+                session: serde_json::from_str(r#"{"session_id":"source","map_name":"map","session_generation":2,"sensor_id":"laser","frame_id":"laser","map_frame_id":"map","odom_frame_id":"odom","body_frame_id":"base","clock_domain":"unix_ns","clock_id":"","calibration_ref":"calibration-1","odometry_source":"device","core_config":{"base_from_laser":[0,0,0]}}"#).unwrap(),
+                estimate: nuwax_slam_2d_runtime::protocol::Estimate { graph_revision: 9, ..Default::default() },
+                source_unix_timestamp_ns: 100, width: 3, height: 1, resolution: 0.05, origin: [1.0, 2.0],
+                members: ["graph.posegraph", "graph.data", "grid.i8"].map(|name| archive::AssignedMember { name: name.into(), size: 3 }),
+            },
+        };
+        let header = serde_json::to_vec(&metadata).unwrap();
+        let bytes = [b"NWS2D002".as_slice(), &(header.len() as u32).to_le_bytes(), &header, b"abcdef\0\x64\xff"].concat();
+        let receipt = CanonicalOccupancyCommitReceipt {
+            commit_id: Some(MappingCommitIdentity { boot_nonce: vec![1;16], sequence: 5 }),
+            session_id: "source".into(), session_generation: 2, occupancy_revision: 7,
+            source_timestamp_ns: 100, backend_kind: "slam_toolbox".into(), backend_generation: 3,
+        };
+        let graph = CheckpointMemberIdentity { checkpoint_id: metadata.checkpoint_id.clone(), role: CheckpointMemberRole::PlanarGraph as i32,
+            occupancy_receipt: Some(receipt.clone()), cloud_receipt: None, frame_id: "map".into(), frame_generation: 0, producer_generation: 0 };
+        let mut occupancy = graph.clone(); occupancy.role = CheckpointMemberRole::CanonicalOccupancy as i32;
+        (MappingBackendCheckpoint {
+            schema_version: 2, backend_kind: "slam_toolbox".into(), source_session_id: "source".into(), source_session_generation: 2,
+            created_at_ns: 101, checkpoint_id: metadata.checkpoint_id, backend_payload_schema_version: 2,
+            payload_size: bytes.len() as u64, target_kind: "planar_graph".into(), occupancy_receipt: Some(receipt), occupancy_identity: Some(occupancy),
+            graph_artifact: Some(GraphArtifactRef { id: "2".repeat(32), size: bytes.len() as u64, identity_schema_version: 2, member_identity: Some(graph), sha256: Vec::new() }),
+            canonical_occupancy_checkpoint: Some(OccupancyGridData { meta: Some(OccupancyGridMeta { width: 3, height: 1, resolution: 0.05,
+                origin_x: 1.0, origin_y: 2.0, frame_id: "map".into(), revision: 7, timestamp_ns: 100 }), data: vec![0,100,255] }),
+            ..Default::default()
+        }, bytes)
+    }
+    pub(crate) fn transfer(store: &mut Store, r: &GraphArtifactRef, action: u32, offset: u64, data: Vec<u8>) -> Result<GraphArtifactTransferResponse, String> {
+        store.transfer(GraphArtifactTransferRequest { action, artifact: Some(r.clone()), offset, data })
+    }
+    pub(crate) fn upload(store: &mut Store, r: &GraphArtifactRef, bytes: &[u8]) -> Result<(), String> {
+        transfer(store,r,1,0,vec![])?; transfer(store,r,2,0,bytes.to_vec())?; transfer(store,r,3,0,vec![])?; Ok(())
+    }
+    #[test]
+    fn planar_assigned_pair_seal_retry_and_reader_survive_release_without_hash() {
+        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+        let (checkpoint, bytes) = fixture(); let r=checkpoint.graph_artifact.unwrap(); let mut store=Store::default();
+        upload(&mut store,&r,&bytes).unwrap(); transfer(&mut store,&r,3,0,vec![]).unwrap();
+        assert_eq!(store.entries[&r.id].validation_runs,1);
+        let mut pinned=store.open(&r).unwrap(); transfer(&mut store,&r,5,0,vec![]).unwrap();
+        let (metadata,cells)=archive::grid_structure(&mut pinned).unwrap();
+        assert_eq!(metadata.identity(),nuwax_slam_2d_runtime::protocol::ArtifactIdentity::Assigned {checkpoint_id:"1".repeat(32)});
+        assert_eq!(cells,vec![0,100,-1]); assert!(store.open(&r).is_err());
+    }
+    #[test]
+    fn planar_assigned_pair_binds_graph_role_checkpoint_session_frame_and_source_time() {
+        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+        for change in 0..6 {
+            let (checkpoint, bytes)=fixture(); let mut r=checkpoint.graph_artifact.unwrap(); let m=r.member_identity.as_mut().unwrap();
+            match change {0=>m.checkpoint_id="3".repeat(32),1=>m.occupancy_receipt.as_mut().unwrap().session_id="other".into(),
+                2=>m.occupancy_receipt.as_mut().unwrap().session_generation+=1,3=>m.frame_id="odom".into(),
+                4=>m.occupancy_receipt.as_mut().unwrap().source_timestamp_ns+=1,_=>m.role=CheckpointMemberRole::CanonicalOccupancy as i32}
+            assert!(upload(&mut Store::default(),&r,&bytes).is_err(),"source field {change}");
+        }
+        let (checkpoint, mut bytes)=fixture(); let r=checkpoint.graph_artifact.unwrap();
+        *bytes.last_mut().unwrap()=101; assert!(upload(&mut Store::default(),&r,&bytes).is_err());
+        bytes.pop(); assert!(upload(&mut Store::default(),&r,&bytes).is_err());
+    }
+    #[test]
+    fn planar_assigned_pair_legacy_envelope_cannot_hash_an_assigned_archive() {
+        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+        let (_,bytes)=fixture();
+        let r=GraphArtifactRef {id:"legacy".into(),size:bytes.len() as u64,sha256:vec![7;32],..Default::default()};
+        assert!(upload(&mut Store::default(),&r,&bytes).unwrap_err().contains("代际"));
     }
 }

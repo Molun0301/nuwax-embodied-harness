@@ -241,7 +241,7 @@ struct Algorithm {
     pending_grid: Option<Estimate>,
     directory: PathBuf,
     artifacts: Vec<FileArtifact>,
-    loaded: Option<crate::archive::Metadata>,
+    loaded: Option<crate::archive::ArchiveMetadata>,
 }
 impl Algorithm {
     fn matches(&self, id: &str, generation: u64) -> bool {
@@ -400,7 +400,6 @@ impl Algorithm {
                         resolution: grid.metadata.resolution,
                         origin: [grid.metadata.origin_x, grid.metadata.origin_y],
                         payload_size: bytes.len() as u64,
-                        data_sha256: nuwax_codec::hash::sha256_bytes(&bytes),
                         file_name,
                     };
                     self.snapshot = Some(snapshot.clone());
@@ -487,22 +486,19 @@ impl Algorithm {
                     }
                     let mut file =
                         crate::archive::open_regular(&self.directory.join(&artifact.file_name))?;
-                    let (size, sha) = crate::archive::hash_reader(&mut file)?;
-                    if size != artifact.payload_size || sha != artifact.sha256 {
-                        return Err("图输入制品身份变化".into());
-                    }
-                    let metadata = crate::archive::verify(&mut file)?;
+                    let (metadata, _) = crate::archive::read_bound_structure(
+                        &mut file, artifact.payload_size, &artifact.identity)?;
                     metadata.compatible_with(session)?;
                     let config: Config = serde_json::from_value(session.core_config.clone())
                         .map_err(|e| e.to_string())?;
                     config.validate().map_err(|e| e.to_string())?;
-                    if config.resolution != metadata.resolution {
+                    if config.resolution != metadata.resolution() {
                         return Err("图加载分辨率与档案不一致".into());
                     }
                     let directory = self.directory.join("loaded");
                     std::fs::create_dir(&directory).map_err(|e| e.to_string())?;
                     let loaded = (|| {
-                        crate::archive::unpack(&mut file, &directory)?;
+                        let saved = crate::archive::unpack_parsed(&mut file, &directory, &metadata)?;
                         let mut slam = Slam::new(config).map_err(|e| e.to_string())?;
                         slam.load(
                             &directory.join("graph"),
@@ -515,11 +511,10 @@ impl Algorithm {
                         )
                         .map_err(|e| e.to_string())?;
                         let grid = slam.occupancy_grid().map_err(|e| e.to_string())?;
-                        let (_, saved) = crate::archive::grid(&mut file)?;
-                        if grid.metadata.width != metadata.width
-                            || grid.metadata.height != metadata.height
-                            || grid.metadata.resolution != metadata.resolution
-                            || [grid.metadata.origin_x, grid.metadata.origin_y] != metadata.origin
+                        if grid.metadata.width != metadata.dimensions().0
+                            || grid.metadata.height != metadata.dimensions().1
+                            || grid.metadata.resolution != metadata.resolution()
+                            || [grid.metadata.origin_x, grid.metadata.origin_y] != metadata.origin()
                             || grid.cells != saved
                         {
                             return Err("恢复核心的物理栅格与完整图档案不一致".into());
@@ -535,7 +530,7 @@ impl Algorithm {
                     }
                     self.session = Some(session.clone());
                     self.highest_session = session.session_generation;
-                    let mut estimate = metadata.estimate.clone();
+                    let mut estimate = metadata.estimate().clone();
                     estimate.graph_revision = 1;
                     self.last_graph_estimate = Some(estimate);
                     self.loaded = Some(metadata);
@@ -577,11 +572,11 @@ impl Algorithm {
         let localization = self.loaded.is_some()
             && self.slam.as_ref().is_some()
             && self.loaded.as_ref().is_some_and(|m| {
-                estimate.graph_revision == 1 || m.estimate.graph_revision == estimate.graph_revision
+                estimate.graph_revision == 1 || m.estimate().graph_revision == estimate.graph_revision
             });
-        let temporary = self
-            .directory
-            .join(format!("export-{}", uuid::Uuid::new_v4().simple()));
+        // This one freeze ID is returned and retained in the existing command receipt.
+        let checkpoint_id = uuid::Uuid::new_v4().simple().to_string();
+        let temporary = self.directory.join(format!("export-{checkpoint_id}"));
         std::fs::create_dir(&temporary).map_err(|e| e.to_string())?;
         let result = (|| {
             let slam = self.slam.as_mut().ok_or("二维核心未加载")?;
@@ -603,21 +598,22 @@ impl Algorithm {
             std::fs::write(temporary.join("grid.i8"), &cells).map_err(|e| e.to_string())?;
             let mut members = Vec::new();
             for name in ["graph.posegraph", "graph.data", "grid.i8"] {
-                let descriptor = crate::archive::describe(&temporary.join(name))?;
-                members.push(crate::archive::Member {
+                let file = crate::archive::open_regular(&temporary.join(name))?;
+                members.push(crate::archive::AssignedMember {
                     name: name.into(),
-                    size: descriptor.payload_size,
-                    sha256: descriptor.sha256,
+                    size: file.metadata().map_err(|e| e.to_string())?.len(),
                 });
             }
             let source_unix_timestamp_ns = if unchanged_loaded {
-                self.loaded.as_ref().unwrap().source_unix_timestamp_ns
+                self.loaded.as_ref().unwrap().source_unix_timestamp_ns()
             } else {
                 u64::try_from(estimate.source_timestamp_ns as i128 + unix_offset_ns as i128)
                     .map_err(|_| "图来源时间越界")?
             };
-            let metadata = crate::archive::Metadata {
-                version: 1,
+            let metadata = crate::archive::AssignedMetadata {
+                checkpoint_id: checkpoint_id.clone(),
+                source: crate::archive::Metadata {
+                version: 2,
                 session: self.session.clone().unwrap(),
                 estimate,
                 source_unix_timestamp_ns,
@@ -626,17 +622,23 @@ impl Algorithm {
                 resolution: grid.metadata.resolution,
                 origin: [grid.metadata.origin_x, grid.metadata.origin_y],
                 members: members.try_into().unwrap(),
+                },
             };
-            let filename = format!("graph-{}.nws2d", uuid::Uuid::new_v4().simple());
-            crate::archive::write(
-                &self.directory.join(filename),
+            let filename = format!("graph-{checkpoint_id}.nws2d");
+            let assigned = crate::archive::write_assigned(
+                &self.directory.join(&filename),
                 &metadata,
                 [
                     &temporary.join("graph.posegraph"),
                     &temporary.join("graph.data"),
                     &temporary.join("grid.i8"),
                 ],
-            )
+            )?;
+            Ok(FileArtifact {
+                file_name: filename,
+                payload_size: assigned.payload_size,
+                identity: ArtifactIdentity::Assigned { checkpoint_id: assigned.checkpoint_id },
+            })
         })();
         let cleanup = std::fs::remove_dir_all(temporary).map_err(|e| e.to_string());
         match (result, cleanup) {

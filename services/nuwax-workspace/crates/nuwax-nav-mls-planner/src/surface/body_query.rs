@@ -65,6 +65,46 @@ impl SurfaceSnapshot {
         config.wall_clearance_m==0.0 && upper_cost.is_finite()
     }
 
+    /// Conservative XY read radius for a reference-only geometry refresh advisory.
+    /// `pure_yaw` requires every reference quaternion to have exactly zero X/Y;
+    /// `xy_scale` bounds its coordinates. This never grants a motion permission.
+    pub fn reference_geometry_scope_radius(&self,pure_yaw:bool,xy_scale:f64)->Option<f64> {
+        if !self.can_defer_body_query_edges() || !xy_scale.is_finite() || xy_scale<0.0
+            || self.observations.as_ref().is_some_and(|observations|
+                observations.size_m.to_bits()!=self.source_voxel_size_m().to_bits()) {return None;}
+        let model=self.body_envelope()?;
+        let s=f64::from(self.config().voxel_size);let f=f64::from(self.source_voxel_size_m());
+        let r=model.radius();
+        // Same rotation scale as validate_body_motion_checked_with_witness.
+        let rho=r.hypot(model.z_bounds_m.into_iter().map(f64::abs)
+            .fold(model.body_to_support_z_m,f64::max));
+        let (projection,h)=if pure_yaw {(r,0.0)}else{(rho,rho)};
+        // MLS cell centres use f32. Cover their rounding before ground_patch's
+        // ceil, and round the final world-space bound outward as well.
+        let rounding=16.0*f64::from(f32::EPSILON)*xy_scale.max(rho).max(s).max(1.0)+1e-9;
+        let diagonal=std::f64::consts::SQRT_2;let d=h+s/diagonal+rounding;
+        let profile=(f64::from(self.data.profile_cells)+1.0)*s;
+        // Keep the actual fine fallback's f32 division/ceil, not a f64 variant.
+        let depth=(self.config().min_step_tread_depth_m/self.source_voxel_size_m()).ceil();
+        if !depth.is_finite() || depth<1.0 || depth>=i32::MAX as f32 {return None;}
+        let radii=[
+            // Raw ground_patch and its final cardinal contact_neighbors probe;
+            // this read chain does not traverse classified edges or wall costs.
+            d+((projection+d+2.0*s+rounding)/s).ceil()*s+s,
+            // validate_segment's support/diagonal side columns and side_profile.
+            h+diagonal*s+profile,
+            // locate_step_contact's legal_step profile within the footprint.
+            projection+diagonal*s+profile,
+            // Fine fringe plus supports_obstacle's neighbouring evidence.
+            rho+diagonal*f,
+            // Independent fine_observed_tread_support_samples axial tread,
+            // diagonal side column, and neighbouring evidence. Never omit it.
+            h+f64::from(depth)*f+2.0*diagonal*f,
+        ];
+        let radius=radii.into_iter().fold(0.0,f64::max)+rounding;
+        (radii.into_iter().all(|v|v.is_finite()&&v>=0.0)&&radius.is_finite()).then_some(radius)
+    }
+
     pub(super) fn with_body_query_columns(&self,updates:&[SurfaceColumnUpdate])->Result<Self,SurfaceError> {
         debug_assert!(self.can_defer_body_query_edges());
         let mut columns=(*self.data.occupied_columns).clone();

@@ -63,11 +63,6 @@ struct _nuwax_msgs_PathEnvelope
      * LCM Type: string
      */
     char*      boundary_id;
-
-    /**
-     * LCM Type: byte[32]
-     */
-    uint8_t    boundary_sha256[32];
     int64_t    motion_guard_generation;
 
     /**
@@ -78,16 +73,6 @@ struct _nuwax_msgs_PathEnvelope
     int64_t    planner_runtime_generation;
     int64_t    path_revision;
     int64_t    source_timestamp_ns;
-
-    /**
-     * LCM Type: byte[32]
-     */
-    uint8_t    goal_payload_sha256[32];
-
-    /**
-     * LCM Type: byte[32]
-     */
-    uint8_t    path_payload_sha256[32];
     nav_msgs_Path path;
 };
 

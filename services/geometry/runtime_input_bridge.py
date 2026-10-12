@@ -90,10 +90,9 @@ _LIO_BACKEND_ENV = "NUWAX_GEOMETRY_LIO_BACKEND"
 _DEVICE_LIO_BACKEND = "device"
 _LIO_SENSOR_FRAME_ENV = "NUWAX_GEOMETRY_LIDAR_FRAME"
 _DEFAULT_LIO_SENSOR_FRAME = "utlidar_lidar"
-# 两个相邻配组批次各最多16帧；同时限制载荷与等待时间，不能靠替换旧帧续算。
+# 两个相邻配组批次各最多16帧；同时限制帧数和载荷，不能靠替换旧帧续算。
 _MAX_LIO_PUBLISH_QUEUE_SIZE = 32
 _MAX_LIO_PUBLISH_QUEUE_BYTES = 8 * 1024 * 1024
-_MAX_LIO_PUBLISH_QUEUE_WAIT_SEC = 1.0
 _APPLIED_TRANSFORM_PROVENANCE_PREFIX = "calibration_applied:"
 _INPUT_ERROR_LOG_INTERVAL_SEC = 5.0
 # 仅汇总已知逐样本重复诊断，固定键集合不会随任意异常正文增长。
@@ -1409,10 +1408,8 @@ class RuntimeInputBridge:
                     self._lio_queue_bytes -= size
                     if queued_generation != generation:
                         continue
-                    if time.monotonic() - enqueued_at > _MAX_LIO_PUBLISH_QUEUE_WAIT_SEC:
-                        self._increment_counter("dropped_pointcloud_count")
-                        self._fail_native_input_locked("原生扫描待发超过1秒，禁止以旧输入继续估计", measurement.scan_begin_timestamp_ns)
-                        break
+                    # 等待本身不是扫描缺失；有界队列仍按原时间顺序交付。
+                    # 实际容量耗尽或发布失败才封存缺口，下游另核对位姿有效期。
                     self._lio_in_flight_count += 1
                 try:
                     if not self._publish_native_lio_measurement(measurement, generation=generation):
@@ -1733,9 +1730,19 @@ class RuntimeInputBridge:
         if isinstance(canonical_lidar, CanonicalLidarFrame):
             return RuntimeInputBridge._encode_canonical_lidar_bytes(canonical_lidar)
         if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[1] >= 3:
-            xyz = np.ascontiguousarray(arr[:, :3], dtype="<f4")
             intensity = metadata.get("intensity_array")
             offset_ns = metadata.get("offset_ns_array")
+            # 仅 interleaved 输出复用普通对齐 f32 的步长；其它输入保持原转换。
+            direct_xyz = (
+                (intensity is not None or offset_ns is not None)
+                and type(arr) is np.ndarray
+                and arr.dtype == np.dtype("<f4")
+                and arr.flags.aligned
+            )
+            if direct_xyz:
+                xyz = np.asarray(arr[:, :3], dtype="<f4")
+            else:
+                xyz = np.ascontiguousarray(arr[:, :3], dtype="<f4")
             if intensity is not None and not (
                 isinstance(intensity, np.ndarray)
                 and intensity.shape == (xyz.shape[0],)

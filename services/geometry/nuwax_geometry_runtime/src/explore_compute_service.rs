@@ -294,7 +294,6 @@ pub(super) struct ComputeBasis {
     frame: i64,
     committed_map: Option<schema::CommittedMapIdentity>,
     input: ComputeInput,
-    pose_receipt: u64,
     return_on_completion: bool,
     mission_present: bool,
     no_frontier_timeout: Duration,
@@ -313,6 +312,9 @@ impl ComputeBasis {
                 && self.parent == inner.last_request_id
                 && expected_history == inner.compute.history;
         }
+        // Tick admission validates the sampled pose. Completion can outlive
+        // that sample's receipt TTL; navigation consumers check their live pose.
+        // Map identity and the current installed map receipt still qualify here.
         if !inner.logical_active
             || self.generation != inner.generation
             || self.parent != inner.last_request_id
@@ -325,9 +327,6 @@ impl ComputeBasis {
                 .feedback
                 .as_ref()
                 .is_some_and(|feedback| feedback.result.is_none())
-            || self.pose_receipt == 0
-            || now_monotonic_nanos().saturating_sub(self.pose_receipt)
-                > DEFAULT_POSE_RECEIPT_TTL.as_nanos() as u64
             || inner.costmap_received_monotonic_ns == 0
             || now_monotonic_nanos().saturating_sub(inner.costmap_received_monotonic_ns)
                 > inner.costmap_receipt_ttl.as_nanos() as u64
@@ -719,7 +718,6 @@ impl ExploreRuntimeHandle {
         &self,
         inner: &mut ExploreRuntimeInner,
         context: &ComputeContext,
-        pose: &ExploreRobotPose,
         request: ComputeRequest,
     ) -> Result<JobTicket, String> {
         if let Some(error) = &inner.compute.fault {
@@ -751,7 +749,6 @@ impl ExploreRuntimeHandle {
             frame: input_frame(inner),
             committed_map: inner.committed_map.clone(),
             input: context.input.clone(),
-            pose_receipt: pose.received_monotonic_ns,
             return_on_completion: context.config.return_policy.return_on_completion,
             mission_present: matches!(
                 &request,
@@ -1100,20 +1097,6 @@ impl ExploreRuntimeHandle {
             };
         }
         let now = now_unix_nanos();
-        let pose = ExploreRobotPose {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            orientation: Quaternion {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-                w: 1.0,
-            },
-            frame_id: self.expected_map_frame.to_string(),
-            source_timestamp_ns: now,
-            received_monotonic_ns: now_monotonic_nanos(),
-        };
         // Inspection never evaluates map/pose input. A source-free fixture may
         // use this inert context; ComputeBasis::inspection validates only session
         // and history, and the backend never forks or queries this grid.
@@ -1148,7 +1131,7 @@ impl ExploreRuntimeHandle {
                         y: 0.0,
                         z: 0.0,
                     },
-                    orientation: pose.orientation,
+                    orientation: Quaternion::IDENTITY,
                 },
             },
             now: Timestamp {
@@ -1164,7 +1147,6 @@ impl ExploreRuntimeHandle {
         let ticket = self.admit_compute_locked(
             &mut guard,
             &context,
-            &pose,
             ComputeRequest::InspectCheckpoint {
                 context: context.clone(),
             },

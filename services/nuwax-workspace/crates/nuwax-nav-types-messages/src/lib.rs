@@ -47,4 +47,4 @@ pub use robot_geometry::*;
 pub use sensors::*;
 pub use visual::*;
 
-pub use nuwax_types::navigation::GoalOptions;
+pub use nuwax_types::navigation::{GoalKey, GoalOptions, PathKey};

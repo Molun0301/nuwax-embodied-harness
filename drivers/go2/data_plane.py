@@ -432,6 +432,8 @@ class Go2DirectDdsBridge:
                 config.lio_body_from_sensor, config.lio_body_from_imu, owner=self._calibration_owner)
         else:
             self._calibration_profile = GO2_CALIBRATION_PROFILE
+        # 自定义标定实现仍沿用原始快照时机，不假定其变换不修改输入。
+        self._reuse_decoded_source_xyz = type(self._calibration_profile) is Go2CalibrationProfile
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._lifecycle_generation = 0
@@ -1572,7 +1574,8 @@ class Go2DirectDdsBridge:
         is_dense = decoded.is_dense
         coordinate_fields = decoded.fields
         xyz_array = decoded.xyz_array
-        source_xyz_array = xyz_array.copy()
+        source_xyz_array = xyz_array if self._reuse_decoded_source_xyz else xyz_array.copy()
+        source_xyz_needs_copy = self._reuse_decoded_source_xyz
         intensity_array = decoded.intensity_array
         offset_ns_array = decoded.offset_ns_array
         try:
@@ -1635,6 +1638,7 @@ class Go2DirectDdsBridge:
                 except (TypeError, ValueError) as exc:
                     reject(f"utlidar_lidar 到 odom 坐标变换失败：{exc}")
                     return
+                source_xyz_needs_copy = False
                 registered_to_odom = True
                 registration_assertion = "driver_sensor_to_odom"
                 driver_sensor_to_odom_applied = True
@@ -1696,8 +1700,13 @@ class Go2DirectDdsBridge:
                     origin_x,
                     origin_y,
                 )
+                source_xyz_needs_copy = False
                 yaw_stabilization_applied = True
                 yaw_stabilization_origin_xy = [origin_x, origin_y]
+
+        # 变换已分配独立输出时保留原解码数组；未变换仍保留两份可写数据。
+        if source_xyz_needs_copy:
+            source_xyz_array = source_xyz_array.copy()
 
         try:
             point_cloud = PointCloudFrame(

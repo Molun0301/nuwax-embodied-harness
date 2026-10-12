@@ -426,6 +426,17 @@ impl SurfaceSnapshot {
         self.with_virtual_mask(mask)
     }
 
+    /// 将前一快照保留的虚拟层应用到本快照的物理图；仍完整派生图和连通区域。
+    /// 调用者负责证明该层仍是所需输入。本操作不继承来源快照的几何或时效。
+    /// 来源没有虚拟层时返回 None，不将其解释为移除当前虚拟层。
+    pub fn with_retained_virtual_obstacles_from(
+        &self,
+        previous: &SurfaceSnapshot,
+    ) -> Option<Result<SurfaceSnapshot, SurfaceError>> {
+        previous.data.virtual_obstacles.as_ref()
+            .map(|mask| self.with_virtual_mask(Arc::clone(mask)))
+    }
+
     /// 逐格核对已保留虚拟层的完整几何；不复制遮罩、不计算内容摘要，也不授予时效权限。
     /// 布局必须逐位相同；无虚拟层与有限范围的全空闲层仍是不同输入。
     pub fn matches_virtual_obstacles(
@@ -446,22 +457,36 @@ impl SurfaceSnapshot {
                 .with_virtual_mask(mask)?.with_current_body_support(current.body, current.quaternion);
         }
         let physical = Arc::clone(&self.data.physical_graph);
-        let mut graph = physical.as_ref().clone();
-        let excluded: AHashSet<_> = graph
+        let excluded: AHashSet<_> = physical
             .cells
             .ids()
             .filter(|&id| {
                 !mask.permits_cell(
-                    graph.cells.coord(id),
+                    physical.cells.coord(id),
                     f64::from(self.config().voxel_size),
                     f64::from(self.config().wall_clearance_m),
                 )
             })
             .collect();
-        for (id, edges) in graph.cells.iter_edges_mut() {
-            edges.retain(|edge| !excluded.contains(&id) && !excluded.contains(&edge.dest));
-        }
-        let regions=Arc::new(regions::RegionGraph::full(&graph,self.config().voxel_size));
+        let (graph, regions) = if excluded.is_empty() {
+            // The finite mask still applies to later body and boundary queries.
+            // A query-only graph may carry an inherited, stale routing index.
+            let regions = if !self.data.body_query_only
+                && Arc::ptr_eq(&self.data.graph, &physical)
+            {
+                Arc::clone(&self.data.regions)
+            } else {
+                Arc::new(regions::RegionGraph::full(&physical, self.config().voxel_size))
+            };
+            (Arc::clone(&physical), regions)
+        } else {
+            let mut graph = physical.as_ref().clone();
+            for (id, edges) in graph.cells.iter_edges_mut() {
+                edges.retain(|edge| !excluded.contains(&id) && !excluded.contains(&edge.dest));
+            }
+            let regions = Arc::new(regions::RegionGraph::full(&graph, self.config().voxel_size));
+            (Arc::new(graph), regions)
+        };
         let result=Self {
             ground_evidence:self.ground_evidence,
             observations: self.observations.clone(),
@@ -474,7 +499,7 @@ impl SurfaceSnapshot {
                 routing_cache: Default::default(),
                 body_envelope: self.data.body_envelope.clone(),
                 height_bounds: Arc::clone(&self.data.height_bounds),
-                graph: Arc::new(graph),
+                graph,
                 regions,
                 physical_graph: physical,
                 occupied_columns: Arc::clone(&self.data.occupied_columns),
@@ -2037,3 +2062,7 @@ mod tests {
             .is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "surface/empty_mask_reuse_tests.rs"]
+mod empty_mask_reuse_tests;

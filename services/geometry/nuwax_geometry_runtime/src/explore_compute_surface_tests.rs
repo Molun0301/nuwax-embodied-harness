@@ -186,6 +186,13 @@ async fn publish_surface_owner_receipt(
 ) -> SurfaceMapTicket {
     let mut message = surface_message("map", revision);
     message.committed_map = committed.clone();
+    // Redeliver the original source receipt; only the notification advances.
+    message.cloud_occupancy_revision = committed.revision;
+    message.commit_boot_nonce = committed.commit_boot_nonce;
+    message.commit_sequence = committed.commit_sequence;
+    message.source_timestamp_ns = committed.source_timestamp_ns;
+    message.cloud.header.stamp_sec = (committed.source_timestamp_ns / 1_000_000_000) as i32;
+    message.cloud.header.stamp_nsec = (committed.source_timestamp_ns % 1_000_000_000) as i32;
     let received = now_monotonic_nanos();
     let ticket = owner_watchdog(handle.begin_surface_map_update(&message, received))
         .await

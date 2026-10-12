@@ -219,7 +219,9 @@ impl PlannerWorker {
                         planner.local_path_for_display()
                     } else { Vec::new() };
                     let elapsed = started.elapsed();
-                    let slow_result = (elapsed > DEFAULT_CONTROL_HORIZON
+                    // 快速重规划也保留原因，避免被紧接着的路径接纳状态覆盖；不改变计算结果。
+                    let diagnostic_result = ((elapsed > DEFAULT_CONTROL_HORIZON
+                        || matches!(computed, PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_)))
                         && slow_log_at.is_none_or(|last| last.elapsed() >= Duration::from_secs(5)))
                         .then(|| format!("{computed:?}"));
                     let mut input = lock.lock().unwrap();
@@ -249,10 +251,10 @@ impl PlannerWorker {
                     }
                     drop(input);
                     // 日志不持输入锁，慢磁盘不能阻塞调度器的取消与续租。
-                    if let Some(result) = slow_result {
-                        tracing::warn!(target: "navigation.local", event = "navigation.local.slow",
+                    if let Some(result) = diagnostic_result {
+                        tracing::warn!(target: "navigation.local", event = "navigation.local.result",
                             elapsed_ms = elapsed.as_secs_f64() * 1000.0, current, result,
-                            "局部计算超过速度预测窗口，速度候选不延长许可，状态结论继续交付");
+                            "局部计算诊断：慢结果或重规划/失败原因；原有速度许可窗口保持不变");
                         slow_log_at = Some(std::time::Instant::now());
                     }
                 }

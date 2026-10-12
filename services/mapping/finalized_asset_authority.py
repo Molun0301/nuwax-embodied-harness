@@ -1,22 +1,20 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
-from typing import Callable, Mapping, Optional
+from typing import Callable, Dict, Mapping, Optional
 
+from contracts.map_activation import AssignedActivationReceipt, _commit, _integer
 from contracts.map_workspace import MapGeoreferenceV1
+from services.geometry.mapping_backend_checkpoint_store import _identity_document
 from services.mapping.asset_store import (
     MapAssetBundleRepository,
     MapAssetBundleValidationError,
 )
 from services.mapping.catalog import MapCatalogRepository
 
-_COMPANION_DOMAIN = b"nuwax.mapping.finalized-asset-authority.v1\0"
-
 
 class FinalizedAssetAuthorityError(RuntimeError):
-    """finalized 资产权威无法形成同一份可信快照。"""
+    """The finalized asset and native assigned authority do not form one snapshot."""
 
     def __init__(self, code: str, message: str) -> None:
         self.code = code
@@ -24,300 +22,142 @@ class FinalizedAssetAuthorityError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class SealedFinalizedAssetIdentity:
-    """由 Batch03 sealed snapshot 投影的服务端内部身份。"""
-
-    map_name: str
-    map_frame_id: str
-    asset_manifest_sha256: str
-    asset_bundle_sha256: str
-    activation_request_id: str
-    activation_request_identity_sha256: str
-    activation_identity_sha256: str
-    target_receipt_sha256: str
-    runtime_generation: int
-    lifecycle_epoch: int
-    session_id: str
-    session_generation: int
-    backend_kind: str
-    backend_generation: int
-
-
-@dataclass(frozen=True)
-class CommittedMapAuthority:
-    """由 Geometry committed-map handle 投影的只读身份。"""
-
-    session_id: str
-    session_generation: int
-    revision: int
-    payload_sha256: str
-    frame_id: str
-
-
-@dataclass(frozen=True)
 class FinalizedMapRuntimeAuthority:
-    """一次 Geometry authority provider 原子读取的组合结果。"""
+    """Bounded metadata captured by one atomic Geometry authority read."""
 
-    sealed: SealedFinalizedAssetIdentity
-    committed_map: CommittedMapAuthority
+    activation_receipt: AssignedActivationReceipt
+    owner_epoch: int
+    committed_revision: int
+    committed_boot_nonce: str
+    committed_sequence: int
+    committed_source_timestamp_ns: int
+
+    @classmethod
+    def admit(cls, value: Mapping[str, object]) -> FinalizedMapRuntimeAuthority:
+        try:
+            if not isinstance(value, Mapping) or type(value.get("schema_version")) is not int or value["schema_version"] != 3:
+                raise ValueError("mapping-cloud authority requires schema 3")
+            receipt = AssignedActivationReceipt.admit(value.get("activation_receipt_v2"))
+            commit = _commit(value.get("committed_occupancy_commit_id"))
+            authority = cls(receipt, _integer(value.get("owner_epoch"), "owner epoch"),
+                _integer(value.get("committed_occupancy_revision"), "committed occupancy revision"),
+                commit["boot_nonce"], commit["sequence"],
+                _integer(value.get("committed_occupancy_source_timestamp_ns"), "committed occupancy source time"))
+            expected = authority.to_dict()
+            for name in ("runtime_generation", "lifecycle_epoch", "mapping_session_generation", "backend_generation"):
+                _integer(value.get(name), name)
+            for name in ("map_name", "map_frame_id", "runtime_generation", "lifecycle_epoch",
+                         "mapping_session_id", "mapping_session_generation", "backend_kind", "backend_generation"):
+                if value.get(name) != expected[name]:
+                    raise ValueError("mapping-cloud %s differs from assigned receipt" % name)
+            # Current committed occupancy can advance after target installation.
+            # Its tuple is fenced independently of the original source and
+            # installed target receipts; none may substitute for another.
+            return authority
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FinalizedAssetAuthorityError("invalid_runtime_authority", str(exc)) from exc
+
+    def to_dict(self) -> Dict[str, object]:
+        receipt = self.activation_receipt.to_dict()
+        activation = receipt["activation"]
+        source_key = "source_graph_member" if activation["backend_kind"] == "slam_toolbox" else "source_cloud_member"
+        return {
+            "schema_version": 3,
+            "activation_receipt_v2": receipt,
+            "map_name": self.activation_receipt.map_name,
+            "map_frame_id": receipt["target"][source_key]["frame_id"],
+            "runtime_generation": activation["runtime_generation"],
+            "lifecycle_epoch": activation["lifecycle_epoch"],
+            "mapping_session_id": self.activation_receipt.session_id,
+            "mapping_session_generation": activation["session_generation"],
+            "backend_kind": activation["backend_kind"],
+            "backend_generation": activation["backend_generation"],
+            "committed_occupancy_revision": self.committed_revision,
+            "committed_occupancy_commit_id": {"boot_nonce": self.committed_boot_nonce, "sequence": self.committed_sequence},
+            "committed_occupancy_source_timestamp_ns": self.committed_source_timestamp_ns,
+            "owner_epoch": self.owner_epoch,
+        }
 
 
 @dataclass(frozen=True)
-class ResolvedFinalizedAssetAuthorityV1:
-    """S5 内部消费的 finalized-asset authority companion。"""
+class ResolvedFinalizedAssetAuthority:
+    """Original validated georeference bytes and their existing assigned owner."""
 
-    map_name: str
-    map_frame_id: str
-    asset_manifest_sha256: str
-    asset_bundle_sha256: str
+    authority: FinalizedMapRuntimeAuthority
     georeference_bytes: bytes
-    georeference_sha256: str
     georeference: MapGeoreferenceV1
-    activation_request_id: str
-    activation_request_identity_sha256: str
-    activation_identity_sha256: str
-    target_receipt_sha256: str
-    runtime_generation: int
-    lifecycle_epoch: int
-    session_id: str
-    session_generation: int
-    backend_kind: str
-    backend_generation: int
-    committed_revision: int
-    committed_payload_sha256: str
-    owner_epoch: int
-    companion_sha256: str
 
 
 class FinalizedAssetAuthorityResolver:
-    """只读 join finalized repository、activation receipt 与 Geometry authority。"""
+    """Join the stable asset snapshot, durable activation and native authority."""
 
     def __init__(
         self,
         *,
         asset_repository: MapAssetBundleRepository,
         catalog_repository: MapCatalogRepository,
-        runtime_authority_provider: Callable[[], Optional[FinalizedMapRuntimeAuthority]],
-        owner_epoch_provider: Callable[[], int],
+        runtime_authority_provider: Callable[[], Optional[Mapping[str, object]]],
     ) -> None:
         self._asset_repository = asset_repository
         self._catalog_repository = catalog_repository
         self._runtime_authority_provider = runtime_authority_provider
-        self._owner_epoch_provider = owner_epoch_provider
 
-    def resolve(self) -> ResolvedFinalizedAssetAuthorityV1:
-        """fresh 读取全部服务端 authority；任一缺失、变化或冲突均 fail closed。"""
-
-        initial = self._runtime_authority_provider()
-        if initial is None:
+    def _read_authority(self) -> FinalizedMapRuntimeAuthority:
+        value = self._runtime_authority_provider()
+        if value is None:
             self._fail("runtime_authority_unavailable", "Geometry 当前没有 sealed 地图权威。")
-        assert initial is not None
-        self._validate_runtime_authority(initial)
-        sealed = initial.sealed
-        committed = initial.committed_map
+        return FinalizedMapRuntimeAuthority.admit(value)
 
+    def resolve(self) -> ResolvedFinalizedAssetAuthority:
+        initial = self._read_authority()
+        receipt = initial.activation_receipt
         snapshot = self._asset_repository.get_validated_map_asset_bundle_snapshot(
-            sealed.map_name,
-            expected_manifest_sha256=sealed.asset_manifest_sha256,
+            receipt.map_name, expected_asset_identity=receipt.asset_identity,
         )
         if snapshot is None:
             self._fail("finalized_asset_missing", "finalized 地图 current 资产不存在。")
-        assert snapshot is not None
         bundle = snapshot.bundle
-        if bundle.map_name != sealed.map_name or bundle.frame_id != sealed.map_frame_id:
-            self._fail("repository_identity_mismatch", "finalized 资产 map/frame 与 sealed 权威不一致。")
-        if bundle.manifest_sha256 != sealed.asset_manifest_sha256:
-            self._fail("manifest_mismatch", "finalized 资产清单摘要与 sealed 权威不一致。")
+        payload = receipt.to_dict()
+        source_key = "source_graph_member" if payload["activation"]["backend_kind"] == "slam_toolbox" else "source_cloud_member"
+        source_member = payload["target"][source_key]
+        frame_id = source_member["frame_id"]
+        if (bundle.identity_schema_version != 2 or bundle.asset_identity != receipt.asset_identity
+                or bundle.map_name != receipt.map_name or bundle.frame_id != frame_id):
+            self._fail("repository_identity_mismatch", "finalized 资产 assigned/map/frame 与 sealed 权威不一致。")
+        source = snapshot.assigned_source_member
+        if source is None or _identity_document(source) != source_member:
+            self._fail("repository_source_mismatch", "finalized 资产原 checkpoint 成员与 sealed 权威不一致。")
         if bundle.georeference is None:
-            self._fail(
-                "map_georeference_required",
-                "当前地图没有地理锚点，无法将经纬度转换为地图目标；本地地图坐标仍可使用。",
-            )
-        assert bundle.georeference is not None
+            self._fail("map_georeference_required",
+                "当前地图没有地理锚点，无法将经纬度转换为地图目标；本地地图坐标仍可使用。")
         georeference = bundle.georeference.contract
-        georeference_sha256 = hashlib.sha256(snapshot.georeference_bytes).hexdigest()
-        if (
-            bundle.georeference.raw_sha256 != georeference_sha256
-            or georeference.map_name != sealed.map_name
-            or georeference.map_frame_id != sealed.map_frame_id
-        ):
-            self._fail("georeference_identity_mismatch", "地理参考原文、map 或 frame 身份不一致。")
+        if georeference.map_name != receipt.map_name or georeference.map_frame_id != frame_id:
+            self._fail("georeference_identity_mismatch", "地理参考 map 或 frame 身份不一致。")
 
-        receipt = self._catalog_repository.get_last_successful_map_activation_receipt()
-        if receipt is None or receipt.get("trusted_identity") is not True:
-            self._fail("trusted_receipt_unavailable", "缺少可信的 sealed activation receipt。")
-        assert receipt is not None
-        self._validate_receipt(receipt, sealed)
-
-        owner_epoch = self._require_positive_int(
-            self._owner_epoch_provider(),
-            "owner_epoch",
-        )
-        final = self._runtime_authority_provider()
-        final_owner_epoch = self._require_positive_int(
-            self._owner_epoch_provider(),
-            "owner_epoch",
-        )
-        if final is None or final != initial:
-            self._fail("runtime_authority_changed", "解析期间 Geometry 地图权威已变化。")
-        if final_owner_epoch != owner_epoch:
-            self._fail("owner_epoch_changed", "解析期间 S5 owner epoch 已变化。")
+        catalog = self._catalog_repository.get_last_successful_map_activation_receipt()
+        if (not isinstance(catalog, Mapping) or catalog.get("trusted_identity") is not True
+                or type(catalog.get("schema_version")) is not int or catalog["schema_version"] != 3):
+            self._fail("trusted_receipt_unavailable", "缺少可信的 assigned sealed activation receipt。")
         try:
-            self._asset_repository.validate_map_asset_bundle_snapshot_identity(
-                sealed.map_name,
-                snapshot,
-            )
+            durable_receipt = AssignedActivationReceipt.admit(catalog.get("activation_receipt_v2"))
+        except (TypeError, ValueError) as exc:
+            raise FinalizedAssetAuthorityError("activation_receipt_mismatch", "activation receipt 非法。") from exc
+        if not receipt.exact_replay_of(durable_receipt):
+            self._fail("activation_receipt_mismatch", "activation receipt 与 sealed 权威不一致。")
+
+        # owner_epoch belongs to each complete native snapshot. A separate RPC
+        # for it would mix observations instead of making this join more atomic.
+        final = self._read_authority()
+        if final.owner_epoch != initial.owner_epoch:
+            self._fail("owner_epoch_changed", "解析期间 S5 owner epoch 已变化。")
+        if final != initial:
+            self._fail("runtime_authority_changed", "解析期间 Geometry 地图权威已变化。")
+        try:
+            self._asset_repository.validate_map_asset_bundle_snapshot_identity(receipt.map_name, snapshot)
         except MapAssetBundleValidationError as exc:
-            raise FinalizedAssetAuthorityError(
-                "repository_snapshot_changed",
-                "解析期间 finalized repository snapshot 已变化。",
-            ) from exc
-
-        digest_fields = {
-            "activation_identity_sha256": sealed.activation_identity_sha256,
-            "activation_request_id": sealed.activation_request_id,
-            "activation_request_identity_sha256": sealed.activation_request_identity_sha256,
-            "asset_bundle_sha256": sealed.asset_bundle_sha256,
-            "asset_manifest_sha256": sealed.asset_manifest_sha256,
-            "backend_generation": sealed.backend_generation,
-            "backend_kind": sealed.backend_kind,
-            "committed_payload_sha256": committed.payload_sha256,
-            "committed_revision": committed.revision,
-            "georeference_sha256": georeference_sha256,
-            "lifecycle_epoch": sealed.lifecycle_epoch,
-            "map_frame_id": sealed.map_frame_id,
-            "map_name": sealed.map_name,
-            "owner_epoch": owner_epoch,
-            "runtime_generation": sealed.runtime_generation,
-            "session_generation": sealed.session_generation,
-            "session_id": sealed.session_id,
-            "target_receipt_sha256": sealed.target_receipt_sha256,
-        }
-        companion_sha256 = hashlib.sha256(
-            _COMPANION_DOMAIN
-            + json.dumps(
-                digest_fields,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-        return ResolvedFinalizedAssetAuthorityV1(
-            map_name=sealed.map_name,
-            map_frame_id=sealed.map_frame_id,
-            asset_manifest_sha256=sealed.asset_manifest_sha256,
-            asset_bundle_sha256=sealed.asset_bundle_sha256,
-            georeference_bytes=snapshot.georeference_bytes,
-            georeference_sha256=georeference_sha256,
-            georeference=georeference,
-            activation_request_id=sealed.activation_request_id,
-            activation_request_identity_sha256=sealed.activation_request_identity_sha256,
-            activation_identity_sha256=sealed.activation_identity_sha256,
-            target_receipt_sha256=sealed.target_receipt_sha256,
-            runtime_generation=sealed.runtime_generation,
-            lifecycle_epoch=sealed.lifecycle_epoch,
-            session_id=sealed.session_id,
-            session_generation=sealed.session_generation,
-            backend_kind=sealed.backend_kind,
-            backend_generation=sealed.backend_generation,
-            committed_revision=committed.revision,
-            committed_payload_sha256=committed.payload_sha256,
-            owner_epoch=owner_epoch,
-            companion_sha256=companion_sha256,
-        )
-
-    def _validate_runtime_authority(self, authority: FinalizedMapRuntimeAuthority) -> None:
-        sealed = authority.sealed
-        committed = authority.committed_map
-        required_text = {
-            "map_name": sealed.map_name,
-            "map_frame_id": sealed.map_frame_id,
-            "activation_request_id": sealed.activation_request_id,
-            "session_id": sealed.session_id,
-            "backend_kind": sealed.backend_kind,
-        }
-        for field_name, value in required_text.items():
-            if not isinstance(value, str) or not value or value.strip() != value:
-                self._fail("invalid_runtime_authority", "%s 非法。" % field_name)
-        for field_name in (
-            "asset_manifest_sha256",
-            "asset_bundle_sha256",
-            "activation_request_identity_sha256",
-            "activation_identity_sha256",
-            "target_receipt_sha256",
-        ):
-            self._require_sha256(getattr(sealed, field_name), field_name)
-        for field_name in (
-            "runtime_generation",
-            "lifecycle_epoch",
-            "session_generation",
-            "backend_generation",
-        ):
-            self._require_positive_int(getattr(sealed, field_name), field_name)
-        committed_required_text = {
-            "committed session_id": committed.session_id,
-            "committed frame_id": committed.frame_id,
-        }
-        for field_name, value in committed_required_text.items():
-            if not isinstance(value, str) or not value or value.strip() != value:
-                self._fail("invalid_runtime_authority", "%s 非法。" % field_name)
-        self._require_positive_int(committed.session_generation, "committed session_generation")
-        self._require_positive_int(committed.revision, "committed revision")
-        self._require_sha256(committed.payload_sha256, "committed payload_sha256")
-        if (
-            committed.session_id != sealed.session_id
-            or committed.session_generation != sealed.session_generation
-            or committed.frame_id != sealed.map_frame_id
-        ):
-            self._fail("committed_map_mismatch", "committed map 与 sealed session/frame 不一致。")
-
-    def _validate_receipt(
-        self,
-        receipt: Mapping[str, object],
-        sealed: SealedFinalizedAssetIdentity,
-    ) -> None:
-        expected = {
-            "target_map_name": sealed.map_name,
-            "target_manifest_sha256": sealed.asset_manifest_sha256,
-            "asset_bundle_sha256": sealed.asset_bundle_sha256,
-            "activation_request_id": sealed.activation_request_id,
-            "activation_request_identity_sha256": sealed.activation_request_identity_sha256,
-            "activation_identity_sha256": sealed.activation_identity_sha256,
-            "target_receipt_sha256": sealed.target_receipt_sha256,
-            "runtime_generation": sealed.runtime_generation,
-            "session_id": sealed.session_id,
-            "session_generation": sealed.session_generation,
-            "mapping_backend_kind": sealed.backend_kind,
-            "backend_generation": sealed.backend_generation,
-        }
-        for field_name, expected_value in expected.items():
-            if receipt.get(field_name) != expected_value:
-                self._fail(
-                    "activation_receipt_mismatch",
-                    "activation receipt 字段 %s 与 sealed 权威不一致。" % field_name,
-                )
-
-    @staticmethod
-    def _require_positive_int(value: object, field_name: str) -> int:
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise FinalizedAssetAuthorityError(
-                "invalid_runtime_authority",
-                "%s 必须为正整数。" % field_name,
-            )
-        return value
-
-    @staticmethod
-    def _require_sha256(value: object, field_name: str) -> str:
-        if (
-            not isinstance(value, str)
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-        ):
-            raise FinalizedAssetAuthorityError(
-                "invalid_runtime_authority",
-                "%s 必须为小写 SHA-256。" % field_name,
-            )
-        return value
+            raise FinalizedAssetAuthorityError("repository_snapshot_changed",
+                "解析期间 finalized repository snapshot 已变化。") from exc
+        return ResolvedFinalizedAssetAuthority(initial, snapshot.georeference_bytes, georeference)
 
     @staticmethod
     def _fail(code: str, message: str) -> None:

@@ -129,14 +129,11 @@ fn identity(session_id: &str, path_revision: i64) -> PathExecutionIdentity {
         committed_map_source_timestamp_ns: 1,
         committed_map_frame_id: "map".to_string(),
         boundary_id: String::new(),
-        boundary_sha256: [0; 32],
         motion_guard_generation: 7,
         motion_guard_boot_nonce: [7; 16],
         motion_stop_generation: 1,
         planner_runtime_generation: if path_revision == 0 { 0 } else { 1 },
         path_revision: path_revision as u64,
-        goal_payload_sha256: [4; 32],
-        path_payload_sha256: if path_revision == 0 { [0; 32] } else { [5; 32] },
     }
 }
 
@@ -162,7 +159,6 @@ fn path() -> VersionedPath {
         session_id: "nav_scheduler_20hz_baseline-nav".to_string(),
         execution_identity: identity("nav_scheduler_20hz_baseline-nav", 1),
         path_revision: 1,
-        payload_hash: [5; 32],
         path: ExecutionPath::Planar(Path2D::stamped(
             NavFrameId::Map,
             Timestamp::from_unix(1, 0),

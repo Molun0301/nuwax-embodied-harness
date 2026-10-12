@@ -1,7 +1,7 @@
 //! FAR 规划器的真实 liblcm typed worker。
 //!
 //! worker 只消费版本化 `GoalEnvelope` 和精确关联的 `CancelNavigation`。
-//! 算法结果通过 FAR 私有 `NavigationState` v2 合同发布，由后续唯一 adapter
+//! 算法结果通过 FAR 私有 `NavigationState` v3 合同发布，由后续唯一 adapter
 //! 封装 canonical `PathEnvelope`；本模块绝不发布 canonical path topic。
 
 use std::collections::HashMap;
@@ -23,13 +23,13 @@ const ODOMETRY_TYPE: &str = "nav_msgs.Odometry";
 const POINT_CLOUD_TYPE: &str = "sensor_msgs.PointCloud2";
 const RESULT_TYPE: &str = "nuwax_msgs.NavigationState";
 const EVENT_TYPE: &str = "nuwax_msgs.NavigationState";
-const PRIVATE_RESULT_MAGIC: &[u8; 4] = b"FAR2";
-const PRIVATE_RESULT_VERSION: u8 = 2;
+const PRIVATE_RESULT_MAGIC: &[u8; 4] = b"FAR3";
+const PRIVATE_RESULT_VERSION: u8 = 3;
 const PRIVATE_RESULT_KIND_PATH: u8 = 1;
 const MAX_PRIVATE_PATH_BYTES: usize = 4 * 1024 * 1024;
 
-/// FAR 私有 result v2 的 READY 合同标记。
-pub const FAR_RESULT_V2_CONTRACT: &str = "far-private-result-v2";
+/// FAR 私有 result v3 的 READY 合同标记。
+pub const FAR_RESULT_V3_CONTRACT: &str = "far-private-result-v3";
 
 /// worker READY 事件。
 pub const FAR_EVENT_READY: i32 = 1;
@@ -120,7 +120,7 @@ impl FarReadyContract {
             registered_scan: options.topics.registered_scan.clone(),
             planner_result: options.topics.planner_result.clone(),
             worker_event: options.topics.worker_event.clone(),
-            result_contract: FAR_RESULT_V2_CONTRACT.into(),
+            result_contract: FAR_RESULT_V3_CONTRACT.into(),
         }
     }
 
@@ -240,13 +240,14 @@ pub enum WorkerError {
     Transport(String),
 }
 
-/// 严格解码 FAR 私有 result v2，并重算 Path body 摘要。
-pub fn decode_private_result_v2(state: &NavigationState) -> Result<Path, WorkerError> {
+/// 严格解码 FAR 私有 result v3，并验证原代际与 Path 结构。
+pub fn decode_private_result_v3(state: &NavigationState) -> Result<Path, WorkerError> {
     if state.state != FAR_EVENT_SUCCEEDED
         || state.runtime_generation <= 0
         || state.path_revision <= 0
-        || state.goal_payload_sha256 == [0; 32]
-        || state.path_payload_sha256 == [0; 32]
+        || state.producer_runtime_generation <= 0
+        || state.goal_generation <= 0
+        || state.planner_runtime_generation != state.runtime_generation
     {
         return Err(WorkerError::Codec(
             "invalid private result correlation fields".into(),
@@ -273,26 +274,23 @@ pub fn decode_private_result_v2(state: &NavigationState) -> Result<Path, WorkerE
         ));
     }
     let path_body = &private[minimum..];
-    if nuwax_codec::sha256_bytes(path_body) != state.path_payload_sha256 {
-        return Err(WorkerError::Codec(
-            "private result path digest mismatch".into(),
-        ));
-    }
     let mut encoded = schema::PATH_FINGERPRINT.to_vec();
     encoded.extend_from_slice(path_body);
     schema::decode_path(&encoded)
         .map_err(|error| WorkerError::Codec(format!("private result path codec:{error}")))
 }
 
-/// 将 Path 严格封入 FAR 私有 result v2 `NavigationState`。
-pub fn seal_private_result_v2(
+/// 将 Path 严格封入 FAR 私有 result v3 `NavigationState`。
+pub fn seal_private_result_v3(
     mut state: NavigationState,
     path: &Path,
 ) -> Result<NavigationState, WorkerError> {
     if state.state != FAR_EVENT_SUCCEEDED
         || state.runtime_generation <= 0
         || state.path_revision <= 0
-        || state.goal_payload_sha256 == [0; 32]
+        || state.producer_runtime_generation <= 0
+        || state.goal_generation <= 0
+        || state.planner_runtime_generation != state.runtime_generation
     {
         return Err(WorkerError::Codec(
             "invalid private result correlation fields".into(),
@@ -305,7 +303,6 @@ pub fn seal_private_result_v2(
             "private result path exceeds size limit".into(),
         ));
     }
-    state.path_payload_sha256 = nuwax_codec::sha256_bytes(&path_body);
     let mut private = Vec::with_capacity(10 + path_body.len());
     private.extend_from_slice(PRIVATE_RESULT_MAGIC);
     private.push(PRIVATE_RESULT_VERSION);
@@ -319,7 +316,6 @@ pub fn seal_private_result_v2(
 #[derive(Debug, Clone, Copy)]
 struct PathCorrelation {
     revision: i64,
-    digest: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -676,7 +672,9 @@ pub async fn run_with_transport(
                 if fence.runtime_generation != options.planner_generation
                     || fence.goal_generation != completion.goal.goal_generation
                     || fence.parent_request_id != completion.goal.parent_request_id
-                    || fence.goal_payload_sha256 != completion.goal.payload_sha256
+                    || fence.producer_runtime_generation != completion.goal.producer_runtime_generation
+                    || fence.session_id != completion.goal.session_id
+                    || fence.owner_kind != completion.goal.owner_kind
                 {
                     continue;
                 }
@@ -699,7 +697,7 @@ pub async fn run_with_transport(
                 record_terminal(&mut terminal_watermarks, &current.goal);
                 match completion.outcome {
                     PlanOutcome::Path(path) => {
-                        let correlation = publish_private_result_v2(
+                        let correlation = publish_private_result_v3(
                             &transport,
                             &options,
                             &current.goal,
@@ -959,7 +957,6 @@ fn same_goal(left: &GoalEnvelope, right: &GoalEnvelope) -> bool {
         && left.parent_request_id == right.parent_request_id
         && left.goal_generation == right.goal_generation
         && left.producer_runtime_generation == right.producer_runtime_generation
-        && left.payload_sha256 == right.payload_sha256
 }
 
 fn cancel_matches(cancel: &CancelNavigation, goal: &GoalEnvelope) -> bool {
@@ -1108,7 +1105,7 @@ async fn publish_commit_fence(
         owner_kind: goal.owner_kind,
         parent_request_id: goal.parent_request_id.clone(),
         goal_generation: goal.goal_generation,
-        goal_payload_sha256: goal.payload_sha256,
+        producer_runtime_generation: goal.producer_runtime_generation,
         ..NavigationState::default()
     };
     let body = schema::encode_navigation_state_body(&fence)
@@ -1133,7 +1130,7 @@ async fn publish_rejected(
     .await
 }
 
-async fn publish_private_result_v2(
+async fn publish_private_result_v3(
     transport: &LcmTransport,
     options: &WorkerOptions,
     goal: &GoalEnvelope,
@@ -1149,14 +1146,12 @@ async fn publish_private_result_v2(
         0,
         PathCorrelation {
             revision: path_revision,
-            digest: [0; 32],
         },
         String::new(),
     );
-    let state = seal_private_result_v2(state, &path)?;
+    let state = seal_private_result_v3(state, &path)?;
     let correlation = PathCorrelation {
         revision: state.path_revision,
-        digest: state.path_payload_sha256,
     };
     let body = schema::encode_navigation_state_body(&state)
         .map_err(|error| WorkerError::Codec(error.to_string()))?;
@@ -1178,7 +1173,7 @@ async fn publish_success_event(
         Some(current),
         0,
         correlation,
-        "succeeded:private-result-v2-published".into(),
+        "succeeded:private-result-v3-published".into(),
     );
     let body = schema::encode_navigation_state_body(&state)
         .map_err(|error| WorkerError::Codec(error.to_string()))?;
@@ -1224,8 +1219,9 @@ fn navigation_state(
         parent_request_id: goal.map_or_else(String::new, |value| value.parent_request_id.clone()),
         goal_generation: goal.map_or(0, |value| value.goal_generation),
         path_revision: correlation.revision,
-        goal_payload_sha256: goal.map_or([0; 32], |value| value.payload_sha256),
-        path_payload_sha256: correlation.digest,
+        local_path: Vec::new(),
+        producer_runtime_generation: goal.map_or(0, |value| value.producer_runtime_generation),
+        planner_runtime_generation: if correlation.revision > 0 { options.planner_generation } else { 0 },
     }
 }
 
@@ -1260,7 +1256,7 @@ async fn publish_event(
             POINT_CLOUD_TYPE,
             options.topics.planner_result,
             RESULT_TYPE,
-            FAR_RESULT_V2_CONTRACT,
+            FAR_RESULT_V3_CONTRACT,
             options.topics.worker_event,
             EVENT_TYPE,
         )
@@ -1273,7 +1269,6 @@ async fn publish_event(
         cancel_generation,
         PathCorrelation {
             revision: 0,
-            digest: [0; 32],
         },
         message,
     );
@@ -1360,6 +1355,7 @@ mod tests {
     #[test]
     fn cancel_requires_exact_goal_identity() {
         let goal = GoalEnvelope {
+            body_reference_frame_id: "base_link".into(),
             session_id: "session".into(),
             owner_kind: 1,
             parent_request_id: "request".into(),
@@ -1435,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn private_result_v2_recomputes_digest_and_rejects_trailing_bytes() {
+    fn private_result_v3_checks_original_generations_and_rejects_old_or_trailing_bytes() {
         let path = Path {
             header: schema::Header {
                 seq: 1,
@@ -1454,23 +1450,30 @@ mod tests {
             parent_request_id: "request".into(),
             goal_generation: 9,
             path_revision: 2,
-            goal_payload_sha256: [0x11; 32],
+            producer_runtime_generation: 11,
+            planner_runtime_generation: 7,
             ..NavigationState::default()
         };
-        let sealed = seal_private_result_v2(state, &path).expect("seal private result v2");
+        let sealed = seal_private_result_v3(state, &path).expect("seal private result v3");
         assert_eq!(
-            decode_private_result_v2(&sealed).expect("decode private result v2"),
+            decode_private_result_v3(&sealed).expect("decode private result v3"),
             path
         );
 
-        let mut wrong_digest = sealed.clone();
-        wrong_digest.path_payload_sha256[0] ^= 1;
-        assert!(decode_private_result_v2(&wrong_digest).is_err());
+        let mut wrong_generation = sealed.clone();
+        wrong_generation.planner_runtime_generation += 1;
+        assert!(decode_private_result_v3(&wrong_generation).is_err());
+        let mut old_version = sealed.clone();
+        let mut old_private = hex_decode(&old_version.message).unwrap();
+        old_private[3] = b'2';
+        old_private[4] = 2;
+        old_version.message = hex_encode(&old_private);
+        assert!(decode_private_result_v3(&old_version).is_err());
 
         let mut trailing = sealed;
         let mut private = hex_decode(&trailing.message).expect("decode private bytes");
         private.push(0);
         trailing.message = hex_encode(&private);
-        assert!(decode_private_result_v2(&trailing).is_err());
+        assert!(decode_private_result_v3(&trailing).is_err());
     }
 }

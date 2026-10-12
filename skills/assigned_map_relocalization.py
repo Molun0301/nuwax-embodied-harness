@@ -84,7 +84,9 @@ def _owner_arguments(target):
 
 def _expected_session(owner, target):
     session, epoch = owner._localization_service.get_active_session_token()
-    frame = target.activation_receipt.to_dict()["target"]["source_cloud_member"]["frame_id"]
+    document = target.activation_receipt.to_dict()
+    source_key = "source_graph_member" if document["activation"]["backend_kind"] == "slam_toolbox" else "source_cloud_member"
+    frame = document["target"][source_key]["frame_id"]
     if (session is None or session.identity_schema_version != 2 or session.frame_id != frame
             or not session.activation_receipt_v2.exact_replay_of(target.activation_receipt)):
         raise _problem("当前定位会话不属于原重定位安装。", code="relocalization_owner_changed")
@@ -94,9 +96,18 @@ def _expected_session(owner, target):
 def _require_replay_metadata(request, metadata):
     if "logical_timeout_ms" in metadata:
         candidate = request.to_dict()
-        candidate["assigned_cloud_v2"]["logical_timeout_ms"] = metadata["logical_timeout_ms"]
+        candidate[request.body_key]["logical_timeout_ms"] = metadata["logical_timeout_ms"]
         if not request.exact_replay_of(AssignedRelocalizationRequest.admit_retained(candidate)):
             raise _problem("相同重定位请求不能更换逻辑超时。", request, "relocalization_request_conflict")
+
+    if metadata.get("planar_seed") is not None:
+        seed = metadata["planar_seed"]
+        if request.backend_kind != "slam_toolbox" or not isinstance(seed, (list, tuple)) or len(seed) != 3:
+            raise _problem("二维初始位置与原重定位后端不符。", request, "relocalization_request_conflict")
+        candidate = request.to_dict()
+        candidate[request.body_key]["seed"] = dict(zip(("x", "y", "yaw"), seed))
+        if not request.exact_replay_of(AssignedRelocalizationRequest.admit_retained(candidate)):
+            raise _problem("相同重定位请求不能更换二维初始位置。", request, "relocalization_request_conflict")
 
 
 def _set_pending_session(owner, target, request):
@@ -223,8 +234,6 @@ def recover_assigned_relocalization(owner):
 def relocalize_assigned_workspace(owner, *, map_name, metadata=None):
     repository, runtime = owner._repository, owner._geometry_runtime
     metadata = owner._sanitize_relocalization_request_metadata(owner._sanitize_map_metadata(metadata) or {})
-    if metadata.get("planar_seed") is not None:
-        raise _problem("分配式点云重定位不接受二维初始位置。", code="invalid_params")
     supplied_id, recovery_only = relocalization_request_identity(metadata)
     pending = repository.get_assigned_relocalization_intent()
     if pending is not None:
@@ -253,11 +262,18 @@ def relocalize_assigned_workspace(owner, *, map_name, metadata=None):
             if not request.activation_receipt.exact_replay_of(target.activation_receipt):
                 raise _problem("保留请求不属于当前安装。", request, "relocalization_owner_changed")
         else:
+            activation = target.activation_receipt.to_dict()
+            planar = activation["activation"]["backend_kind"] == "slam_toolbox"
+            body = {"target": activation["target"], "policy": target.relocalization_policy,
+                    "logical_timeout_ms": metadata.get("logical_timeout_ms", 30_000)}
+            if planar:
+                seed = runtime.resolve_planar_relocalization_seed(metadata.get("planar_seed"))
+                body["seed"] = dict(zip(("x", "y", "yaw"), seed))
+            elif metadata.get("planar_seed") is not None:
+                raise _problem("分配式点云重定位不接受二维初始位置。", code="invalid_params")
             request = AssignedRelocalizationRequest.admit({"schema_version": 2,
                 "request_id": supplied_id if supplied_id is not None else uuid.uuid4().hex,
-                "assigned_cloud_v2": {"target": target.activation_receipt.to_dict()["target"],
-                    "policy": target.relocalization_policy,
-                    "logical_timeout_ms": metadata.get("logical_timeout_ms", 30_000)}})
+                "assigned_planar_v2" if planar else "assigned_cloud_v2": body})
         current_receipt = previous is not None and supplied_id == previous.request_id
         if recovery_only and current_receipt:
             return _finish(owner, request, previous, target, metadata=metadata)

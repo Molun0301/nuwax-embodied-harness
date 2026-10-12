@@ -20,7 +20,7 @@ use nuwax_motion_safety_guard::{
 };
 use nuwax_nav_astar::local_planner::{LocalPlanner, LocalPlannerConfig, StopMessage};
 use nuwax_nav_astar::navigation_map::CostMap2D;
-use nuwax_nav_types_messages::{Path2D, Path3D, PoseStamped, Twist2};
+use nuwax_nav_types_messages::{GoalKey, Path2D, Path3D, PoseStamped, Twist2};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -50,6 +50,19 @@ pub enum ExecutionPath {
     Planar(Path2D),
     /// 完整机体参考位置与姿态路径。
     Surface(Path3D),
+}
+
+// Resend timestamps do not change the route actually consumed by a follower.
+// Preserve all consumed coordinates, orientations, frames and dimensionality.
+fn same_execution_path(left: &ExecutionPath, right: &ExecutionPath) -> bool {
+    match (left, right) {
+        (ExecutionPath::Planar(left), ExecutionPath::Planar(right)) =>
+            left.frame_id == right.frame_id && left.points == right.points,
+        (ExecutionPath::Surface(left), ExecutionPath::Surface(right)) =>
+            left.poses.len() == right.poses.len() && left.poses.iter().zip(&right.poses)
+                .all(|(left, right)| left.frame_id == right.frame_id && left.pose == right.pose),
+        _ => false,
+    }
 }
 
 /// 当前局部执行使用的不可变地图输入。
@@ -123,7 +136,7 @@ pub struct NavMotionAdmission {
 /// This type is deliberately not a wire schema. Goal admission initializes the
 /// goal-level fields and leaves the planner/path fields at their neutral values;
 /// an accepted path carries the same goal-level fields plus its sealed planner
-/// generation, revision, and payload digest.
+/// generation and revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathExecutionIdentity {
     /// Stable goal/session identifier.
@@ -156,8 +169,7 @@ pub struct PathExecutionIdentity {
     pub committed_map_frame_id: String,
     /// Navigation boundary identifier.
     pub boundary_id: String,
-    /// Navigation boundary digest.
-    pub boundary_sha256: [u8; 32],
+
     /// Admitted Motion Guard generation.
     pub motion_guard_generation: i64,
     /// Admitted Motion Guard boot nonce.
@@ -168,13 +180,14 @@ pub struct PathExecutionIdentity {
     pub planner_runtime_generation: i64,
     /// Monotonic path revision; zero before path admission.
     pub path_revision: u64,
-    /// Canonical goal payload digest.
-    pub goal_payload_sha256: [u8; 32],
-    /// Canonical path payload digest; zero before path admission.
-    pub path_payload_sha256: [u8; 32],
 }
 
 impl PathExecutionIdentity {
+    /// Original Geometry-assigned goal identity.
+    pub fn goal_key(&self) -> GoalKey {
+        GoalKey { producer_runtime_generation: self.producer_runtime_generation as u64, goal_generation: self.goal_generation as u64 }
+    }
+
     fn has_same_goal_identity(&self, other: &Self) -> bool {
         self.session_id == other.session_id
             && self.owner_kind == other.owner_kind
@@ -191,11 +204,9 @@ impl PathExecutionIdentity {
             && self.committed_map_source_timestamp_ns == other.committed_map_source_timestamp_ns
             && self.committed_map_frame_id == other.committed_map_frame_id
             && self.boundary_id == other.boundary_id
-            && self.boundary_sha256 == other.boundary_sha256
             && self.motion_guard_generation == other.motion_guard_generation
             && self.motion_guard_boot_nonce == other.motion_guard_boot_nonce
             && self.motion_stop_generation == other.motion_stop_generation
-            && self.goal_payload_sha256 == other.goal_payload_sha256
     }
 }
 
@@ -227,8 +238,7 @@ pub struct VersionedPath {
     pub execution_identity: PathExecutionIdentity,
     /// Monotonic path revision within the active navigation session.
     pub path_revision: u64,
-    /// Canonical payload digest supplied by the versioned codec.
-    pub payload_hash: [u8; 32],
+
     /// Planner output consumed by the local controller.
     pub path: ExecutionPath,
     /// 可选路径朝向；生产入口由已核对身份的目标与路径生成，末项为请求的到达朝向。
@@ -1029,7 +1039,7 @@ pub struct NavScheduler<M, P> {
     session: Option<NavSession>,
     lease_active: bool,
     current_path_revision: u64,
-    current_payload_hash: Option<[u8; 32]>,
+
     current_path: Option<(ExecutionPath, Option<Vec<f64>>)>,
     current_execution_identity: Option<Arc<PathExecutionIdentity>>,
     local_intent_sequence: u64,
@@ -1068,7 +1078,7 @@ where
             session: None,
             lease_active: false,
             current_path_revision: 0,
-            current_payload_hash: None,
+
             current_path: None,
             current_execution_identity: None,
             local_intent_sequence: 0,
@@ -1261,9 +1271,9 @@ where
             InputKind::UpdateCostmap(observation, received_at) => {
                 self.observe_costmap(status_tx, observation, received_at)
             }
-            InputKind::PlanningDiagnostic(goal_id, hash, message) => {
+            InputKind::PlanningDiagnostic(goal_id, key, message) => {
                 if self.status.phase == SchedulerPhase::AwaitingPath && self.session.as_ref().is_some_and(|session|
-                    session.session_id == goal_id && session.execution_identity.goal_payload_sha256 == hash) {
+                    session.session_id == goal_id && session.execution_identity.goal_key() == key) {
                     self.status.message = message; self.publish_status(status_tx);
                 }
                 Ok(())
@@ -1413,7 +1423,7 @@ where
         self.planner.configure_boundary(&session.boundary);
         self.session = Some(session);
         self.current_path_revision = 0;
-        self.current_payload_hash = None;
+
         self.current_path = None;
         self.current_execution_identity = None;
         self.local_intent_sequence = 0;
@@ -1470,7 +1480,7 @@ where
                 self.planner.stop();
                 self.session = None;
                 self.current_path_revision = 0;
-                self.current_payload_hash = None;
+
                 self.current_path = None;
                 self.current_execution_identity = None;
                 self.local_intent_sequence = 0;
@@ -1515,9 +1525,8 @@ where
             return Err(path_rejected("path revision is stale"));
         }
         if path.path_revision == self.current_path_revision && self.current_path_revision != 0 {
-            let immutable = self.current_payload_hash == Some(path.payload_hash)
-                && self.current_path.as_ref().is_some_and(|(current, yaws)| {
-                    current == &path.path && yaws == &path.path_yaws
+            let immutable = self.current_path.as_ref().is_some_and(|(current, yaws)| {
+                    same_execution_path(current, &path.path) && yaws == &path.path_yaws
                 })
                 && self
                     .current_execution_identity
@@ -1555,7 +1564,7 @@ where
             path_yaws,
             execution_identity,
             path_revision,
-            payload_hash,
+
             ..
         } = path;
         self.planner.replace_execution_path(
@@ -1564,7 +1573,7 @@ where
             session.goal_pose.clone(),
         )?;
         self.current_path_revision = path_revision;
-        self.current_payload_hash = Some(payload_hash);
+
         self.current_path = Some((planner_path, path_yaws));
         self.current_execution_identity = Some(Arc::new(execution_identity));
         // 等待预算在真正执行有效控制步骤后清除，不能靠反复投递无效新路径续期。
@@ -1937,7 +1946,7 @@ where
         self.planner.stop();
         self.session = None;
         self.current_path_revision = 0;
-        self.current_payload_hash = None;
+
         self.current_path = None;
         self.current_execution_identity = None;
         self.local_intent_sequence = 0;
@@ -2115,8 +2124,8 @@ impl NavSchedulerHandle {
     }
 
     /// 规划诊断按目标摘要关联，仅更新等待路径阶段，不能覆盖执行或终态。
-    pub async fn report_planning_diagnostic(&self,goal_id:String,hash:[u8;32],message:String)->Result<(),RuntimeError> {
-        self.send_input(InputKind::PlanningDiagnostic(goal_id,hash,message)).await
+    pub async fn report_planning_diagnostic(&self,goal_id:String,key:GoalKey,message:String)->Result<(),RuntimeError> {
+        self.send_input(InputKind::PlanningDiagnostic(goal_id,key,message)).await
     }
 
     /// Read the latest scheduler status.
@@ -2211,6 +2220,14 @@ fn production_surface_backend(config: SurfaceFollowerConfig) -> Result<planner_w
     planner_worker::PlannerWorker::new(RouteFollower::new(config)?)
 }
 
+/// Construct the unchanged production backend for opt-in cross-crate qualification.
+#[cfg(feature = "surface-recovery-qualification")]
+pub fn qualification_surface_backend(
+    config: SurfaceFollowerConfig,
+) -> Result<impl NavPlanner, RuntimeError> {
+    production_surface_backend(config)
+}
+
 enum SchedulerEvent { Input(Option<InputCommand>), Tick }
 
 struct InputCommand {
@@ -2223,7 +2240,7 @@ enum InputKind {
     SubmitPath(VersionedPath),
     UpdateOdometry(PoseStamped, Option<Instant>),
     UpdateCostmap(CostmapObservation, Instant),
-    PlanningDiagnostic(String, [u8;32], String),
+    PlanningDiagnostic(String, GoalKey, String),
 }
 
 enum UrgentCommand {
@@ -2416,14 +2433,6 @@ fn validate_path_shape(path: &VersionedPath) -> Result<(), RuntimeError> {
         return Err(RuntimeError::InvalidInput {
             field: "path.revision",
             reason: "must be non-zero and equal the execution identity revision".into(),
-        });
-    }
-    if path.payload_hash == [0; 32]
-        || path.payload_hash != path.execution_identity.path_payload_sha256
-    {
-        return Err(RuntimeError::InvalidInput {
-            field: "path.payload_hash",
-            reason: "must be non-zero and equal the execution identity digest".into(),
         });
     }
     if path.execution_identity.planner_runtime_generation <= 0 {
@@ -3068,12 +3077,12 @@ mod tests {
         let (handle,task)=spawn_scheduler(NavScheduler::new(motion,FakePlanner::commanding(),SchedulerConfig::default()).unwrap());
         handle.update_odometry(map_pose()).await.unwrap();handle.update_costmap(costmap_at(1)).await.unwrap();
         handle.start_session(session()).await.unwrap();
-        handle.report_planning_diagnostic("goal-1".into(),[4;32],"等待路径：起点支撑不足".into()).await.unwrap();
+        handle.report_planning_diagnostic("goal-1".into(),execution_identity_for("goal-1",0).goal_key(),"等待路径：起点支撑不足".into()).await.unwrap();
         handle.update_odometry(map_pose_at(2)).await.unwrap();
-        handle.report_planning_diagnostic("goal-1".into(),[9;32],"旧目标的错误".into()).await.unwrap();
+        handle.report_planning_diagnostic("goal-1".into(),GoalKey {producer_runtime_generation:9,goal_generation:1},"旧目标的错误".into()).await.unwrap();
         assert_eq!(handle.status().message,"等待路径：起点支撑不足");
         handle.cancel("goal-1").await.unwrap();
-        handle.report_planning_diagnostic("goal-1".into(),[4;32],"晚到报告".into()).await.unwrap();
+        handle.report_planning_diagnostic("goal-1".into(),execution_identity_for("goal-1",0).goal_key(),"晚到报告".into()).await.unwrap();
         assert_eq!(handle.status().last_terminal,Some(TerminalOutcome::Cancelled));
         handle.shutdown().await.unwrap();task.await.unwrap().unwrap();
     }
@@ -3165,18 +3174,13 @@ mod tests {
             committed_map_source_timestamp_ns: 1,
             committed_map_frame_id: "map".into(),
             boundary_id: String::new(),
-            boundary_sha256: [0; 32],
+
             motion_guard_generation: 7,
             motion_guard_boot_nonce: [7; 16],
             motion_stop_generation: 1,
             planner_runtime_generation: i64::from(path_revision != 0),
             path_revision,
-            goal_payload_sha256: [4; 32],
-            path_payload_sha256: if path_revision == 0 {
-                [0; 32]
-            } else {
-                [u8::try_from(path_revision).unwrap_or(u8::MAX); 32]
-            },
+
         }
     }
 
@@ -3205,7 +3209,7 @@ mod tests {
             session_id: session_id.into(),
             execution_identity: execution_identity_for(session_id, path_revision),
             path_revision,
-            payload_hash: [u8::try_from(path_revision).unwrap_or(u8::MAX); 32],
+
             path_yaws: None,
             path: ExecutionPath::Planar(Path2D::stamped(
                 NavFrameId::Map,
@@ -3628,6 +3632,12 @@ mod tests {
             .await
             .expect("exact same-revision replay is idempotent");
         assert_eq!(handle.status().message, "versioned path accepted");
+        let mut resent = accepted.clone();
+        if let ExecutionPath::Planar(path) = &mut resent.path {
+            path.stamp = Timestamp::from_unix(9, 0);
+            path.points[0].y = -0.0;
+        }
+        handle.submit_path(resent).await.expect("same route with a new send time is idempotent");
 
         let mut wrong_identity = accepted.clone();
         wrong_identity.session_id = "wrong-session".into();

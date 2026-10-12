@@ -12,9 +12,9 @@ mod offline_replay_owner;
 mod persistent_occupancy;
 
 pub use offline_asset_export::{
-    export_offline_candidate_assets_v1, AssetReceiptV1, CandidateAssetEncodingV1,
-    CandidateAssetMemberV1, DeferredAssetMemberV1, OfflineAssetExportError,
-    OfflineCandidateAssetsV1,
+    export_offline_candidate_assets_v2, AssetReceiptV2, CandidateAssetEncodingV1,
+    CandidateAssetMemberV2, DeferredAssetMemberV1, OfflineAssetExportError,
+    OfflineCandidateAssetsV2, OfflineCandidateSourceProvenanceV2,
 };
 pub use offline_replay::{
     OfflineBackendConfigV1, OfflineBackendKind, OfflineGeometryFacade, OfflineGeoreferenceV1,
@@ -24,9 +24,9 @@ pub use offline_replay::{
     ValidatedOfflineReplayFrameV1, ValidatedOfflineReplayRequestV1,
 };
 pub use offline_replay_owner::{
-    GeometryOfflineReplayOwner, OfflineCanonicalCheckpointProjectionV1,
-    OfflineCanonicalCloudAssetProjectionV1, OfflineCanonicalCloudReceiptV1,
-    OfflineCanonicalCommitIdV1, OfflineCanonicalOccupancyAssetProjectionV1,
-    OfflineCanonicalOccupancyReceiptV1, OfflineGeometrySnapshotV2,
+    GeometryOfflineReplayOwner, OfflineCanonicalCheckpointProjectionV2,
+    OfflineCanonicalCloudAssetProjectionV2, OfflineCanonicalCloudReceiptV1,
+    OfflineCanonicalCommitIdV1, OfflineCanonicalOccupancyAssetProjectionV2,
+    OfflineCanonicalOccupancyReceiptV1, OfflineGeometrySnapshotV3,
     OfflineReplayProcessingReceiptV1, ReplayBarrierIdentityV1,
 };

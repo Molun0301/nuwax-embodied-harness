@@ -131,3 +131,63 @@ async fn held_global_owner_keeps_unchanged_mask_work_but_changed_mask_retires_it
     harness.terminal(TerminalOutcome::Cancelled).await;
     harness.shutdown().await;
 }
+
+#[test]
+fn new_physical_updates_reapply_only_cell_proven_retained_masks() {
+    for variant in ["same_cells", "changed_cells", "layout", "domain", "boot", "equal_revision"] {
+        let mut message = map_message(1, "retained-mask-update");
+        message.virtual_obstacles = Some(virtual_mask(&message, true));
+        let mut cache = SurfaceGeometryCache::new(config().geometry);
+        let previous = cache.build(&message).unwrap();
+        let old_physical = cache.physical_snapshot().unwrap();
+        if variant != "equal_revision" { advance_mask(&mut message, true); }
+        advance_scan(&mut message);
+        // Replace a real physical floor support with a higher obstacle column.
+        let z_offset = (20 * 30 + 15) * 12 + 8;
+        message.cloud.data[z_offset..z_offset + 4].copy_from_slice(&2.85_f32.to_le_bytes());
+        match variant {
+            "changed_cells" | "equal_revision" => {
+                // Equal revision deliberately does not prove content equality for
+                // every direct cache caller; its previous reconstruction must remain.
+                message.virtual_obstacles.as_mut().unwrap().data[0] = 100;
+            }
+            "layout" => message.virtual_obstacles.as_mut().unwrap().info.origin.position[0] = -0.1,
+            "domain" => message.committed_map.session_id = "retained-mask-new-domain".into(),
+            "boot" => {
+                message.commit_boot_nonce = [0x55; 16];
+                message.committed_map.commit_boot_nonce = [0x55; 16];
+            }
+            _ => {}
+        }
+        let actual = cache.build(&message).unwrap();
+        let physical = cache.physical_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&old_physical, &physical), "{variant}");
+        assert!(!actual.same_geometry(&previous), "{variant}");
+        let mask = message.virtual_obstacles.as_ref().unwrap();
+        let blocked: Vec<_> = mask.data.iter().map(|&value| value == 100).collect();
+        let expected = physical.with_virtual_obstacles(
+            [mask.info.origin.position[0], mask.info.origin.position[1]],
+            f64::from(mask.info.resolution), mask.info.width as u32, mask.info.height as u32,
+            &blocked).unwrap();
+        assert!(actual.matches_virtual_obstacles(
+            [mask.info.origin.position[0], mask.info.origin.position[1]],
+            f64::from(mask.info.resolution), mask.info.width as u32, mask.info.height as u32,
+            blocked.iter().copied()), "{variant}");
+        let mut actual_cells: Vec<_> = actual.cell_keys().collect();
+        let mut expected_cells: Vec<_> = expected.cell_keys().collect();
+        actual_cells.sort_unstable(); expected_cells.sort_unstable();
+        assert_eq!(actual_cells, expected_cells, "{variant}");
+        for cell in actual_cells {
+            let mut a = actual.neighbors(cell); let mut b = expected.neighbors(cell);
+            a.sort_unstable(); b.sort_unstable();
+            assert_eq!(a, b, "{variant} {cell:?}");
+            for next in a { assert_eq!(actual.transition(cell, next), expected.transition(cell, next)); }
+            assert_eq!(actual.navigation_column_allowed([cell.0, cell.1], 0.1),
+                expected.navigation_column_allowed([cell.0, cell.1], 0.1));
+        }
+        assert_eq!(cache.mask_work().derivations, 2, "new physical requires derivation: {variant}");
+        assert_eq!(cache.mask_work().compared_cells, match variant {
+            "same_cells" => blocked.len(), "changed_cells" => 1, _ => 0,
+        }, "{variant}");
+    }
+}

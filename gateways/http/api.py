@@ -717,40 +717,23 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     ) -> Dict[str, Any]:
         bounded_history_limit = min(max(int(history_limit), 0), 100)
 
-        def _summary_for_status(status: Any) -> Dict[str, Any]:
-            task_id = str(_payload_value(status, "task_id", "") or "").strip()
-            spec = None
-            error_payload = None
-            if task_id:
-                try:
-                    spec = runtime.task_manager.get_task_spec(task_id)
-                except (KeyError, AttributeError):
-                    spec = None
-                try:
-                    error_payload = runtime.task_manager.get_task_error_payload(task_id)
-                except (KeyError, AttributeError):
-                    error_payload = None
+        sources = runtime.task_manager.capture_task_list(history_limit=bounded_history_limit)
+
+        def _summary_for_source(source: Dict[str, Any]) -> Dict[str, Any]:
             summary = build_task_summary(
-                status,
-                spec=spec,
-                error_payload=error_payload,
+                source["status"],
+                spec=source["task"],
+                error_payload=source["error_payload"],
             )
-            if task_id:
-                event = runtime.task_manager.get_latest_task_event(task_id)
-                if event is not None:
-                    summary["feedback"] = build_task_feedback(runtime, event)
-                    summary["summary"] = summary["feedback"]["message"]
+            event = source["event"]
+            if event is not None:
+                summary["feedback"] = build_task_feedback(runtime, event)
+                summary["summary"] = summary["feedback"]["message"]
             return summary
 
         return {
-            "active_tasks": [
-                _summary_for_status(status)
-                for status in runtime.task_manager.list_active_tasks()
-            ],
-            "history_tasks": [
-                _summary_for_status(status)
-                for status in runtime.task_manager.list_history(limit=bounded_history_limit)
-            ],
+            "active_tasks": [_summary_for_source(source) for source in sources["active_tasks"]],
+            "history_tasks": [_summary_for_source(source) for source in sources["history_tasks"]],
             "history_limit": bounded_history_limit,
         }
 

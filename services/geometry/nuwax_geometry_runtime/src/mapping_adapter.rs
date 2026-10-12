@@ -1231,6 +1231,31 @@ struct ActiveMappingCheckpointExport {
     flush_token_id: Option<u128>,
 }
 
+/// A view of one already-applied mask source, valid only under the mapping borrow.
+#[derive(Clone, Copy)]
+pub(crate) struct VirtualObstacleSource<'a> {
+    pub(crate) raw: &'a MapState,
+    loaded: &'a crate::forbidden_zones::LoadedForbiddenZones,
+}
+
+impl VirtualObstacleSource<'_> {
+    pub(crate) fn rasterize(self) -> MapState {
+        let raw = self.raw;
+        let free = MapState {
+            width: raw.width,
+            height: raw.height,
+            resolution: raw.resolution,
+            origin_x: raw.origin_x,
+            origin_y: raw.origin_y,
+            frame_id: raw.frame_id.clone(),
+            revision: raw.revision,
+            timestamp_ns: raw.timestamp_ns,
+            data: vec![0; raw.data.len()],
+        };
+        crate::forbidden_zones::rasterize_effective_map(free, self.loaded)
+    }
+}
+
 /// nuwax-mapping adapter 本体。
 ///
 /// 持有:
@@ -2879,7 +2904,7 @@ impl MappingAdapter {
     }
 
     /// 只生成已应用禁区的虚拟遮罩，物理占据和未知单元均不进入该层。
-    pub(crate) fn virtual_obstacles_snapshot(&self) -> Result<Option<MapState>, String> {
+    pub(crate) fn virtual_obstacles_source(&self) -> Result<Option<VirtualObstacleSource<'_>>, String> {
         let Some(loaded) = self.applied_forbidden_zones.as_ref() else {
             return Ok(None);
         };
@@ -2894,18 +2919,12 @@ impl MappingAdapter {
             .raw_map
             .as_ref()
             .ok_or_else(|| "applied forbidden zones have no physical map geometry".to_string())?;
-        let free = MapState {
-            width: raw.width,
-            height: raw.height,
-            resolution: raw.resolution,
-            origin_x: raw.origin_x,
-            origin_y: raw.origin_y,
-            frame_id: raw.frame_id.clone(),
-            revision: raw.revision,
-            timestamp_ns: raw.timestamp_ns,
-            data: vec![0; raw.data.len()],
-        };
-        crate::forbidden_zones::compose_effective_map_owned(free, loaded).map(Some)
+        crate::forbidden_zones::validate_map_layout(raw)?;
+        Ok(Some(VirtualObstacleSource { raw, loaded }))
+    }
+
+    pub(crate) fn virtual_obstacles_snapshot(&self) -> Result<Option<MapState>, String> {
+        Ok(self.virtual_obstacles_source()?.map(VirtualObstacleSource::rasterize))
     }
 
     fn load_forbidden_zones(&self) -> crate::forbidden_zones::LoadedForbiddenZones {
@@ -4956,6 +4975,44 @@ mod tests {
         assert!(s.map.revision >= 1);
         assert_eq!(s.map.width, 30);
         assert_eq!(s.map.height, 20);
+    }
+
+    #[test]
+    fn virtual_obstacle_source_preserves_layout_errors_and_selection() {
+        let mut adapter = active_adapter(sample_config());
+        let loaded = crate::forbidden_zones::LoadedForbiddenZones {
+            signature: "fail-closed-fixture".into(), generation: 1, zones: Vec::new(),
+            status: crate::forbidden_zones::ZoneLoadStatus::FailClosed("fixture".into()),
+        };
+        adapter.applied_forbidden_zones = Some(loaded.clone());
+        assert_eq!(adapter.virtual_obstacles_source().err().unwrap(),
+            "applied forbidden zones have no physical map geometry");
+        let valid = MapState { width: 2, height: 2, resolution: 1.0, origin_x: 0.0,
+            origin_y: 0.0, frame_id: "map".into(), revision: 1, timestamp_ns: 1,
+            data: vec![0; 4] };
+        for kind in 0..5 {
+            let mut raw = valid.clone();
+            match kind {
+                0 => raw.width = 0,
+                1 => raw.height = 0,
+                2 => raw.resolution = f32::NAN,
+                3 => raw.resolution = 0.0,
+                _ => { raw.data.pop(); }
+            }
+            adapter.raw_map = Some(raw);
+            assert_eq!(adapter.virtual_obstacles_source().err().unwrap(), "raw occupancy layout is invalid");
+            assert_eq!(adapter.virtual_obstacles_snapshot().err().unwrap(), "raw occupancy layout is invalid");
+        }
+        adapter.raw_map = Some(valid);
+        let source = adapter.virtual_obstacles_source().unwrap().unwrap();
+        assert_eq!(source.raw.data, vec![0; 4]);
+        assert_eq!(source.rasterize().data, vec![100; 4]);
+        adapter.applied_forbidden_zones = Some(crate::forbidden_zones::LoadedForbiddenZones {
+            status: crate::forbidden_zones::ZoneLoadStatus::Empty, ..loaded
+        });
+        adapter.raw_map = None;
+        assert!(adapter.virtual_obstacles_source().unwrap().is_none(),
+            "disabled masks must return before the raw-map requirement");
     }
 
     #[test]

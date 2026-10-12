@@ -145,13 +145,23 @@ impl ClientSlot {
         self.current().publish_scan(g, s).await
     }
 }
+/// Provenance copied from the existing armed input owner, not an allocated ticket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RelocalizationScanSource {
+    pub process_owner: String,
+    pub session_generation: u64,
+    pub mode_epoch: u64,
+    pub source_sequence: u64,
+    pub source_timestamp_ns: u64,
+    pub source_unix_ns: u64,
+}
 #[derive(Clone)]
 struct RelocalizationInput {
     client: Client,
     session_generation: u64,
     epoch: u64,
     armed_unix_ns: u64,
-    scans: Arc<parking_lot::Mutex<std::collections::VecDeque<(u64, u64, [u8; 32])>>>,
+    scans: Arc<parking_lot::Mutex<std::collections::VecDeque<RelocalizationScanSource>>>,
 }
 struct Owners {
     current: Option<ProcessOwner>,
@@ -198,17 +208,17 @@ impl Binding {
             *input = None;
         }
     }
-    pub fn relocation_scan_proof(&self, epoch: u64, sequence: u64) -> Option<(u64, [u8; 32])> {
+    pub fn relocation_scan_proof(&self, epoch: u64, generation: u64, process_owner: &str, sequence: u64) -> Option<RelocalizationScanSource> {
         let input = self.relocation.read().clone()?;
-        if input.epoch != epoch {
+        if input.epoch != epoch || input.session_generation != generation || input.client.identity().owner_nonce != process_owner {
             return None;
         }
         let result = input
             .scans
             .lock()
             .iter()
-            .find(|(s, _, _)| *s == sequence)
-            .map(|(_, t, h)| (*t, *h));
+            .find(|source| source.source_sequence == sequence)
+            .cloned();
         result
     }
     pub async fn route_relocalization_scan(
@@ -234,7 +244,6 @@ impl Binding {
         {
             return Err("二维重定位扫描不是本次请求后的新鲜来源".into());
         }
-        let bytes = nuwax_codec::lcm::planar::encode(scan).map_err(|e| e.to_string())?;
         input
             .client
             .publish_scan(input.session_generation, scan)
@@ -243,11 +252,14 @@ impl Binding {
         if scans.len() >= 16 {
             scans.pop_front();
         }
-        scans.push_back((
-            scan.source_sequence as u64,
-            stamp,
-            nuwax_codec::hash::sha256_bytes(&bytes),
-        ));
+        scans.push_back(RelocalizationScanSource {
+            process_owner: input.client.identity().owner_nonce.clone(),
+            session_generation: input.session_generation,
+            mode_epoch: input.epoch,
+            source_sequence: scan.source_sequence as u64,
+            source_timestamp_ns: scan.timestamp_ns as u64,
+            source_unix_ns: stamp,
+        });
         Ok(())
     }
     pub async fn route_relocalization_odom(
@@ -297,7 +309,7 @@ impl Binding {
         &self,
         source: std::fs::File,
         size: u64,
-        sha: [u8; 32],
+        identity: nuwax_slam_2d_runtime::protocol::ArtifactIdentity,
         session: Session,
         localization: bool,
         seed: [f64; 3],
@@ -312,7 +324,7 @@ impl Binding {
         let client = owner.client();
         self.owners.lock().staged.push(owner);
         let result = async {
-            let artifact = client.stage_artifact(source, size, sha).await?;
+            let artifact = client.stage_artifact(source, size, identity).await?;
             let response = client
                 .execute(Operation::LoadGraph {
                     session,

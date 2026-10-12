@@ -6,6 +6,7 @@
 //! eight-byte recursive schema fingerprint, while nested fields do not repeat it.
 
 use crate::{CodecError, CodecResult};
+pub use nuwax_types::navigation::{GoalKey, PathKey};
 
 /// `geometry_msgs.Pose` fingerprint from `dimos-lcm==0.1.3`.
 pub const POSE_FINGERPRINT: [u8; 8] = 0x2456_34ae_2ab1_7b76_u64.to_be_bytes();
@@ -20,9 +21,9 @@ pub const BOOL_FINGERPRINT: [u8; 8] = 0x1ebe_f06a_5095_0e3e_u64.to_be_bytes();
 /// `nav_msgs.Path` fingerprint from `dimos-lcm==0.1.3`.
 pub const PATH_FINGERPRINT: [u8; 8] = 0xc3ae_62ac_b357_93e2_u64.to_be_bytes();
 /// `nuwax_msgs.GoalEnvelope` generated-C recursive fingerprint.
-pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0xec74_63f7_558a_ac72_u64.to_be_bytes();
+pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0x9bfbb4574658209a_u64.to_be_bytes();
 /// `nuwax_msgs.PathEnvelope` generated-C recursive fingerprint.
-pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0xeec1_8428_127b_3f5a_u64.to_be_bytes();
+pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0x4487ffa270d0b490_u64.to_be_bytes();
 /// `nav_msgs.OccupancyGrid` fingerprint from `dimos-lcm==0.1.3`.
 pub const OCCUPANCY_GRID_FINGERPRINT: [u8; 8] = 0xe7df_d179_cdfc_3b65_u64.to_be_bytes();
 /// `nav_msgs.Odometry` fingerprint from `dimos-lcm==0.1.3`.
@@ -49,7 +50,7 @@ pub const TF_MESSAGE_FINGERPRINT: [u8; 8] = 0xc2b8_a1c3_3a89_23ec_u64.to_be_byte
 /// `geometry_msgs.Transform` fingerprint generated from the repository IDL.
 pub const GEOMETRY_TRANSFORM_FINGERPRINT: [u8; 8] = 0xee5f_f426_47bf_3f91_u64.to_be_bytes();
 /// `nuwax_msgs.NavigationState` generated-C fingerprint.
-pub const NAVIGATION_STATE_FINGERPRINT: [u8; 8] = 0x9ea3_f3f5_fd5a_fbda_u64.to_be_bytes();
+pub const NAVIGATION_STATE_FINGERPRINT: [u8; 8] = 0xe5c3f7a4ae8abcb8_u64.to_be_bytes();
 /// `nuwax_msgs.CancelNavigation` generated-C fingerprint.
 pub const CANCEL_NAVIGATION_FINGERPRINT: [u8; 8] = 0x9704_4b28_e9c5_dd22_u64.to_be_bytes();
 /// `nuwax_msgs.Frontier` generated-C fingerprint.
@@ -59,7 +60,7 @@ pub const FRONTIER_LIST_FINGERPRINT: [u8; 8] = 0x213d_b68f_b817_1f76_u64.to_be_b
 /// The checked-in `FrontierList.lcm` declares a fixed array of this size.
 pub const FRONTIER_LIST_CAPACITY: usize = 256;
 /// Current immutable navigation-envelope schema.
-pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 7;
+pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 8;
 /// A public navigation request owns the goal lease.
 pub const NAVIGATION_OWNER_KIND_PUBLIC_NAV: i32 = 1;
 /// An exploration parent owns the child navigation goal lease.
@@ -145,6 +146,8 @@ pub struct CommittedMapIdentity {
 pub struct GoalIntent {
     /// 目标来源的坐标代际，普通地图修订前进不能改变它。
     pub map_frame_generation: i64,
+    /// Surface producer 实际使用的 body 到 support 正有限标量；其它目标不声明。
+    pub body_to_support_z_m: Option<f64>,
     /// 随原目标封存的倒车与到达约束。
     pub options: nuwax_types::navigation::GoalOptions,
     /// 稳定 producer 名称，例如 `public-navigation` 或 `wavefront`。
@@ -167,8 +170,6 @@ pub struct GoalIntent {
     pub committed_map: CommittedMapIdentity,
     /// 规范边界身份；无边界时为空。
     pub boundary_id: String,
-    /// 规范边界字段的 SHA-256；无边界时全零。
-    pub boundary_sha256: [u8; 32],
     /// 有序边界顶点；闭合边为隐式。
     pub boundary_points: Vec<[f64; 3]>,
     /// 请求级运动检查准入的 Guard 代次。
@@ -177,60 +178,28 @@ pub struct GoalIntent {
     pub motion_guard_boot_nonce: [u8; 16],
     /// 请求级运动检查观察到的全局停止代次。
     pub motion_stop_generation: i64,
-    /// 规范目标位姿字段的 SHA-256。
-    pub goal_sha256: [u8; 32],
     /// 已提交地图坐标系中的目标位姿。
     pub goal: PoseStamped,
 }
 
-/// 计算单个目标位姿的规范摘要。
-pub fn goal_intent_goal_sha256(goal: &PoseStamped) -> CodecResult<[u8; 32]> {
-    goal_intent_action_sha256(goal, &nuwax_types::navigation::GoalOptions::default())
-}
-
-/// 目标位姿与执行约束共同决定请求摘要。
-pub fn goal_intent_action_sha256(goal: &PoseStamped, options: &nuwax_types::navigation::GoalOptions) -> CodecResult<[u8;32]> {
-    options.validate().map_err(CodecError::LcmEncode)?;
-    let mut canonical=encode_pose_stamped_body(goal)?;
-    encode_goal_options(options,&mut canonical);
-    Ok(crate::hash::sha256_bytes(&canonical))
-}
 fn encode_goal_options(options:&nuwax_types::navigation::GoalOptions,out:&mut Vec<u8>) {
     out.push(u8::from(options.allow_reverse));
     out.extend_from_slice(&options.position_tolerance_m.to_be_bytes());
     out.extend_from_slice(&options.yaw_tolerance_rad.to_be_bytes());
 }
 
-/// 计算单个边界身份和多边形的规范摘要。
-pub fn goal_intent_boundary_sha256(
-    frame_id: &str,
-    boundary_id: &str,
-    points: &[[f64; 3]],
-) -> CodecResult<[u8; 32]> {
-    let mut canonical = Vec::new();
-    encode_string(frame_id, &mut canonical)?;
-    encode_string(boundary_id, &mut canonical)?;
-    let point_count = i32::try_from(points.len())
-        .map_err(|_| CodecError::LcmEncode("GoalIntent boundary exceeds int32".into()))?;
-    canonical.extend_from_slice(&point_count.to_be_bytes());
-    for point in points {
-        for coordinate in point {
-            canonical.extend_from_slice(&coordinate.to_bits().to_be_bytes());
-        }
-    }
-    Ok(crate::hash::sha256_bytes(&canonical))
-}
-
 /// Versioned navigation goal with public identity and lease ownership.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GoalEnvelope {
-    /// 随目标摘要封存的地图坐标代际。
+    /// 随目标保留的地图坐标代际。
     pub map_frame_generation: i64,
-    /// 几何与控制组件必须一致的启动参数摘要。
-    pub navigation_configuration_sha256: [u8;32],
-    /// 随目标载荷摘要封存的执行约束。
+    /// 目标位姿对应的实际机体参考点，由启动绑定提供。
+    pub body_reference_frame_id: String,
+    /// Surface-derived 目标实际使用的 body 到 support 正有限标量。
+    pub body_to_support_z_m: Option<f64>,
+    /// 随目标保留的执行约束。
     pub options: nuwax_types::navigation::GoalOptions,
-    /// 当前线格式版本为7。
+    /// 当前线格式版本为8。
     pub schema_version: i32,
     /// Single public business identifier; API `goal_id` maps here losslessly.
     pub session_id: String,
@@ -264,8 +233,6 @@ pub struct GoalEnvelope {
     pub source_timestamp_ns: i64,
     /// Stable boundary identifier; empty when no boundary is active.
     pub boundary_id: String,
-    /// Canonical boundary identity and polygon digest; zero when absent.
-    pub boundary_sha256: [u8; 32],
     /// Authoritative frame for all boundary points.
     pub boundary_frame_id: String,
     /// Optional closed navigation boundary, represented as XYZ points.
@@ -276,16 +243,24 @@ pub struct GoalEnvelope {
     pub motion_guard_boot_nonce: [u8; 16],
     /// Global stop generation observed by the request-level motion check.
     pub motion_stop_generation: i64,
-    /// SHA-256 of the canonical fields excluding this digest.
-    pub payload_sha256: [u8; 32],
     /// Goal pose.
     pub goal: PoseStamped,
+}
+
+impl GoalEnvelope {
+    /// Project the original assigned goal numbers after envelope validation.
+    pub fn goal_key(&self) -> GoalKey {
+        GoalKey {
+            producer_runtime_generation: self.producer_runtime_generation as u64,
+            goal_generation: self.goal_generation as u64,
+        }
+    }
 }
 
 /// Planner output correlated to exactly one versioned goal.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PathEnvelope {
-    /// 当前线格式版本为7。
+    /// 当前线格式版本为8。
     pub schema_version: i32,
     /// Public business identifier copied from the goal envelope.
     pub session_id: String,
@@ -317,8 +292,6 @@ pub struct PathEnvelope {
     pub committed_map_frame_id: String,
     /// Boundary identifier copied from the goal envelope.
     pub boundary_id: String,
-    /// Boundary digest copied from the goal envelope.
-    pub boundary_sha256: [u8; 32],
     /// Guard generation copied from the goal envelope.
     pub motion_guard_generation: i64,
     /// Guard boot nonce copied from the goal envelope.
@@ -331,12 +304,27 @@ pub struct PathEnvelope {
     pub path_revision: i64,
     /// Source timestamp in nanoseconds.
     pub source_timestamp_ns: i64,
-    /// Goal canonical digest copied without modification.
-    pub goal_payload_sha256: [u8; 32],
-    /// SHA-256 of canonical path-envelope fields excluding this digest.
-    pub path_payload_sha256: [u8; 32],
     /// Planner path.
     pub path: Path,
+}
+
+impl PathEnvelope {
+    /// Project the original assigned goal numbers after envelope validation.
+    pub fn goal_key(&self) -> GoalKey {
+        GoalKey {
+            producer_runtime_generation: self.producer_runtime_generation as u64,
+            goal_generation: self.goal_generation as u64,
+        }
+    }
+
+    /// Project the original goal and planner numbers after envelope validation.
+    pub fn path_key(&self) -> PathKey {
+        PathKey {
+            goal: self.goal_key(),
+            planner_runtime_generation: self.planner_runtime_generation as u64,
+            path_revision: self.path_revision as u64,
+        }
+    }
 }
 
 /// LCM representation of `nav_msgs.MapMetaData` nested in an occupancy grid.
@@ -415,7 +403,7 @@ pub struct NavigationState {
     pub progress: f64,
     /// Human-readable status.
     pub message: String,
-    /// Geometry runtime process generation.
+    /// Nav-stack telemetry runtime generation.
     pub runtime_generation: i64,
     /// Motion guard generation that acknowledged the command path.
     pub guard_generation: i64,
@@ -441,15 +429,37 @@ pub struct NavigationState {
     pub parent_request_id: String,
     /// Goal generation associated with this state.
     pub goal_generation: i64,
-    /// Latest accepted path revision.
+    /// Geometry runtime generation of the actual goal.
+    pub producer_runtime_generation: i64,
+    /// Latest accepted planner runtime generation; zero when no path is accepted.
+    pub planner_runtime_generation: i64,
+    /// Latest accepted path revision; zero when no path is accepted.
     pub path_revision: i64,
-    /// Canonical goal payload digest.
-    pub goal_payload_sha256: [u8; 32],
-    /// Canonical path payload digest.
-    pub path_payload_sha256: [u8; 32],
     /// 同一目标的局部规划展示点，不授予运动权限。
     pub local_path: Vec<[f64; 3]>,
 
+}
+
+impl NavigationState {
+    /// The reported goal, or no goal for an empty heartbeat.
+    pub fn goal_key(&self) -> Option<GoalKey> {
+        (self.producer_runtime_generation > 0 && self.goal_generation > 0).then_some(GoalKey {
+            producer_runtime_generation: self.producer_runtime_generation as u64,
+            goal_generation: self.goal_generation as u64,
+        })
+    }
+
+    /// The reported accepted path; absent before a path has been accepted.
+    pub fn path_key(&self) -> Option<PathKey> {
+        if self.planner_runtime_generation <= 0 || self.path_revision <= 0 {
+            return None;
+        }
+        Some(PathKey {
+            goal: self.goal_key()?,
+            planner_runtime_generation: self.planner_runtime_generation as u64,
+            path_revision: self.path_revision as u64,
+        })
+    }
 }
 
 /// Repository-native navigation cancellation bridge message.
@@ -788,15 +798,17 @@ pub fn validate_navigation_map_3d(message: &NavigationMap3D) -> Result<(), Strin
         if fine.included.len() > NAVIGATION_MAP_MAX_INCLUDED_BLOCKS {
             return Err("携带精细块数量超预算".into());
         }
-        let blocks = root.blocks.iter().map(|b| (b.object, b)).collect::<std::collections::BTreeMap<_, _>>();
-        let mut total = 0_usize;
-        for (object, bytes) in &fine.included {
-            total = total.checked_add(bytes.len()).ok_or("精细块大小溢出")?;
-            if total > NAVIGATION_MAP_MAX_INCLUDED_BYTES { return Err("携带精细块超预算".into()); }
-            let reference = blocks.get(object).ok_or("携带精细块不属于根清单")?;
-            let (points, latest) = nuwax_map_chunks::block_summary(bytes)?;
-            if points != reference.points || latest > root.source_timestamp_ns {
-                return Err("携带精细块证据与根不符".into());
+        if !fine.included.is_empty() {
+            let blocks = root.blocks.iter().map(|b| (b.object, b)).collect::<std::collections::BTreeMap<_, _>>();
+            let mut total = 0_usize;
+            for (object, bytes) in &fine.included {
+                total = total.checked_add(bytes.len()).ok_or("精细块大小溢出")?;
+                if total > NAVIGATION_MAP_MAX_INCLUDED_BYTES { return Err("携带精细块超预算".into()); }
+                let reference = blocks.get(object).ok_or("携带精细块不属于根清单")?;
+                let (points, latest) = nuwax_map_chunks::block_summary(bytes)?;
+                if points != reference.points || latest > root.source_timestamp_ns {
+                    return Err("携带精细块证据与根不符".into());
+                }
             }
         }
     }
@@ -1346,25 +1358,9 @@ fn decode_path_from(cursor: &mut Cursor<'_>) -> CodecResult<Path> {
     Ok(Path { header, poses })
 }
 
-/// Fill the canonical SHA-256 field of a versioned goal envelope.
-pub fn seal_goal_envelope(message: &mut GoalEnvelope) -> CodecResult<()> {
-    validate_goal_envelope_semantics(message, false).map_err(CodecError::LcmEncode)?;
-    message.payload_sha256 = goal_envelope_payload_sha256(message)?;
-    Ok(())
-}
-
-/// Compute the canonical goal digest, excluding the digest field itself.
-pub fn goal_envelope_payload_sha256(message: &GoalEnvelope) -> CodecResult<[u8; 32]> {
-    let mut canonical = Vec::new();
-    encode_goal_envelope_prefix(message, &mut canonical)?;
-    encode_header(&message.goal.header, &mut canonical)?;
-    encode_pose_body(&message.goal.pose, &mut canonical);
-    Ok(crate::hash::sha256_bytes(&canonical))
-}
-
-/// Validate version, ownership, revision, boundary and canonical goal digest.
+/// Validate goal version, ownership, authority, boundary and coordinate contract.
 pub fn validate_goal_envelope(message: &GoalEnvelope) -> CodecResult<()> {
-    validate_goal_envelope_semantics(message, true).map_err(CodecError::LcmDecode)
+    validate_goal_envelope_semantics(message).map_err(CodecError::LcmDecode)
 }
 
 /// Encode a top-level `nuwax_msgs.GoalEnvelope` generated message.
@@ -1375,10 +1371,9 @@ pub fn encode_goal_envelope(message: &GoalEnvelope) -> CodecResult<Vec<u8>> {
 
 /// Encode only the generated-C `GoalEnvelope` body.
 pub fn encode_goal_envelope_body(message: &GoalEnvelope) -> CodecResult<Vec<u8>> {
-    validate_goal_envelope_semantics(message, true).map_err(CodecError::LcmEncode)?;
+    validate_goal_envelope_semantics(message).map_err(CodecError::LcmEncode)?;
     let mut out = Vec::new();
     encode_goal_envelope_prefix(message, &mut out)?;
-    out.extend_from_slice(&message.payload_sha256);
     encode_header(&message.goal.header, &mut out)?;
     encode_pose_body(&message.goal.pose, &mut out);
     Ok(out)
@@ -1423,7 +1418,6 @@ fn encode_goal_envelope_prefix(message: &GoalEnvelope, out: &mut Vec<u8>) -> Cod
     encode_string(&message.committed_map_frame_id, out)?;
     out.extend_from_slice(&message.source_timestamp_ns.to_be_bytes());
     encode_string(&message.boundary_id, out)?;
-    out.extend_from_slice(&message.boundary_sha256);
     encode_string(&message.boundary_frame_id, out)?;
     out.extend_from_slice(&boundary_points_length.to_be_bytes());
     for point in &message.boundary_points {
@@ -1433,7 +1427,9 @@ fn encode_goal_envelope_prefix(message: &GoalEnvelope, out: &mut Vec<u8>) -> Cod
     out.extend_from_slice(&message.motion_guard_boot_nonce);
     out.extend_from_slice(&message.motion_stop_generation.to_be_bytes());
     encode_goal_options(&message.options, out);
-    out.extend_from_slice(&message.navigation_configuration_sha256);
+    encode_string(&message.body_reference_frame_id, out)?;
+    out.push(u8::from(message.body_to_support_z_m.is_some()));
+    out.extend_from_slice(&message.body_to_support_z_m.unwrap_or(0.0).to_be_bytes());
     out.extend_from_slice(&message.map_frame_generation.to_be_bytes());
     Ok(())
 }
@@ -1456,10 +1452,6 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
     let committed_map_frame_id = cursor.read_string()?;
     let source_timestamp_ns = cursor.read_i64()?;
     let boundary_id = cursor.read_string()?;
-    let boundary_sha256 = cursor
-        .read_exact(32)?
-        .try_into()
-        .expect("32-byte boundary digest");
     let boundary_frame_id = cursor.read_string()?;
     let boundary_points_length = cursor.read_nonnegative_len("boundary_points_length")?;
     if boundary_points_length > cursor.remaining() / 24 {
@@ -1479,19 +1471,23 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
     let motion_stop_generation = cursor.read_i64()?;
     let allow_reverse=match cursor.read_exact(1)?[0] {0=>false,1=>true,_=>return Err(CodecError::LcmDecode("allow_reverse must be 0 or 1".into()))};
     let options=nuwax_types::navigation::GoalOptions {allow_reverse,position_tolerance_m:cursor.read_f64()?,yaw_tolerance_rad:cursor.read_f64()?};
-    let navigation_configuration_sha256=cursor.read_exact(32)?.try_into().expect("32-byte configuration digest");
+    let body_reference_frame_id = cursor.read_string()?;
+    let has_body_to_support_z = cursor.read_u8()?;
+    let support = cursor.read_f64()?;
+    let body_to_support_z_m = match has_body_to_support_z {
+        0 => None,
+        1 => Some(support),
+        _ => return Err(CodecError::LcmDecode("has_body_to_support_z must be 0 or 1".into())),
+    };
     let map_frame_generation = cursor.read_i64()?;
-    let payload_sha256 = cursor
-        .read_exact(32)?
-        .try_into()
-        .expect("32-byte goal digest");
     let goal = PoseStamped {
         header: decode_header(cursor)?,
         pose: decode_pose_body(cursor)?,
     };
     Ok(GoalEnvelope {
         map_frame_generation,
-        navigation_configuration_sha256,
+        body_reference_frame_id,
+        body_to_support_z_m,
         options,
         schema_version,
         session_id,
@@ -1510,22 +1506,23 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
         committed_map_frame_id,
         source_timestamp_ns,
         boundary_id,
-        boundary_sha256,
         boundary_frame_id,
         boundary_points,
         motion_guard_generation,
         motion_guard_boot_nonce,
         motion_stop_generation,
-        payload_sha256,
         goal,
     })
 }
 
 fn validate_goal_envelope_semantics(
     message: &GoalEnvelope,
-    check_digest: bool,
 ) -> Result<(), String> {
     message.options.validate()?;
+    validate_navigation_frame_id(&message.body_reference_frame_id, "body reference")?;
+    if message.body_to_support_z_m.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+        return Err("body_to_support_z_m must be finite and positive when present".into());
+    }
     if message.map_frame_generation < 0 { return Err("map_frame_generation must be non-negative".into()); }
     validate_navigation_identity(
         message.schema_version,
@@ -1576,7 +1573,6 @@ fn validate_goal_envelope_semantics(
     match message.owner_kind {
         NAVIGATION_OWNER_KIND_PUBLIC_NAV => {
             if !message.boundary_id.is_empty()
-                || message.boundary_sha256 != [0; 32]
                 || !message.boundary_frame_id.is_empty()
                 || !message.boundary_points.is_empty()
             {
@@ -1586,7 +1582,6 @@ fn validate_goal_envelope_semantics(
         NAVIGATION_OWNER_KIND_EXPLORATION_CHILD => {
             if message.boundary_points.is_empty() {
                 if !message.boundary_id.is_empty()
-                    || message.boundary_sha256 != [0; 32]
                     || !message.boundary_frame_id.is_empty()
                 {
                     return Err("empty boundary must have empty identity and frame".into());
@@ -1594,51 +1589,20 @@ fn validate_goal_envelope_semantics(
             } else {
                 if message.boundary_id.trim().is_empty()
                     || message.boundary_id.trim() != message.boundary_id
-                    || message.boundary_sha256 == [0; 32]
                     || message.boundary_frame_id != message.committed_map_frame_id
                 {
                     return Err("exploration boundary identity or frame is invalid".into());
-                }
-                let expected = goal_intent_boundary_sha256(
-                    &message.boundary_frame_id,
-                    &message.boundary_id,
-                    &message.boundary_points,
-                )
-                .map_err(|error| error.to_string())?;
-                if message.boundary_sha256 != expected {
-                    return Err("boundary_sha256 mismatch".into());
                 }
             }
         }
         _ => unreachable!("owner kind validated above"),
     }
-    if check_digest {
-        let expected = goal_envelope_payload_sha256(message).map_err(|error| error.to_string())?;
-        if message.payload_sha256 != expected {
-            return Err("goal payload_sha256 mismatch".into());
-        }
-    }
     Ok(())
 }
 
-/// Fill the canonical SHA-256 field of a versioned path envelope.
-pub fn seal_path_envelope(message: &mut PathEnvelope) -> CodecResult<()> {
-    validate_path_envelope_semantics(message, false).map_err(CodecError::LcmEncode)?;
-    message.path_payload_sha256 = path_envelope_payload_sha256(message)?;
-    Ok(())
-}
-
-/// Compute the canonical path digest, excluding the path digest field itself.
-pub fn path_envelope_payload_sha256(message: &PathEnvelope) -> CodecResult<[u8; 32]> {
-    let mut canonical = Vec::new();
-    encode_path_envelope_prefix(message, &mut canonical)?;
-    encode_path_into(&message.path, &mut canonical)?;
-    Ok(crate::hash::sha256_bytes(&canonical))
-}
-
-/// Validate version, ownership, revision and canonical path digest.
+/// Validate path version, ownership, authority and finite path geometry.
 pub fn validate_path_envelope(message: &PathEnvelope) -> CodecResult<()> {
-    validate_path_envelope_semantics(message, true).map_err(CodecError::LcmDecode)
+    validate_path_envelope_semantics(message).map_err(CodecError::LcmDecode)
 }
 
 /// Encode a top-level `nuwax_msgs.PathEnvelope` generated message.
@@ -1649,10 +1613,9 @@ pub fn encode_path_envelope(message: &PathEnvelope) -> CodecResult<Vec<u8>> {
 
 /// Encode only the generated-C `PathEnvelope` body.
 pub fn encode_path_envelope_body(message: &PathEnvelope) -> CodecResult<Vec<u8>> {
-    validate_path_envelope_semantics(message, true).map_err(CodecError::LcmEncode)?;
+    validate_path_envelope_semantics(message).map_err(CodecError::LcmEncode)?;
     let mut out = Vec::new();
     encode_path_envelope_prefix(message, &mut out)?;
-    out.extend_from_slice(&message.path_payload_sha256);
     encode_path_into(&message.path, &mut out)?;
     Ok(out)
 }
@@ -1693,14 +1656,12 @@ fn encode_path_envelope_prefix(message: &PathEnvelope, out: &mut Vec<u8>) -> Cod
     out.extend_from_slice(&message.committed_map_source_timestamp_ns.to_be_bytes());
     encode_string(&message.committed_map_frame_id, out)?;
     encode_string(&message.boundary_id, out)?;
-    out.extend_from_slice(&message.boundary_sha256);
     out.extend_from_slice(&message.motion_guard_generation.to_be_bytes());
     out.extend_from_slice(&message.motion_guard_boot_nonce);
     out.extend_from_slice(&message.motion_stop_generation.to_be_bytes());
     out.extend_from_slice(&message.planner_runtime_generation.to_be_bytes());
     out.extend_from_slice(&message.path_revision.to_be_bytes());
     out.extend_from_slice(&message.source_timestamp_ns.to_be_bytes());
-    out.extend_from_slice(&message.goal_payload_sha256);
     Ok(())
 }
 
@@ -1721,10 +1682,6 @@ fn decode_path_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<PathEnvelop
     let committed_map_source_timestamp_ns = cursor.read_i64()?;
     let committed_map_frame_id = cursor.read_string()?;
     let boundary_id = cursor.read_string()?;
-    let boundary_sha256 = cursor
-        .read_exact(32)?
-        .try_into()
-        .expect("32-byte boundary digest");
     let motion_guard_generation = cursor.read_i64()?;
     let motion_guard_boot_nonce = cursor
         .read_exact(16)?
@@ -1734,14 +1691,6 @@ fn decode_path_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<PathEnvelop
     let planner_runtime_generation = cursor.read_i64()?;
     let path_revision = cursor.read_i64()?;
     let source_timestamp_ns = cursor.read_i64()?;
-    let goal_payload_sha256 = cursor
-        .read_exact(32)?
-        .try_into()
-        .expect("32-byte goal digest");
-    let path_payload_sha256 = cursor
-        .read_exact(32)?
-        .try_into()
-        .expect("32-byte path digest");
     let path = decode_path_from(cursor)?;
     Ok(PathEnvelope {
         schema_version,
@@ -1760,22 +1709,18 @@ fn decode_path_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<PathEnvelop
         committed_map_source_timestamp_ns,
         committed_map_frame_id,
         boundary_id,
-        boundary_sha256,
         motion_guard_generation,
         motion_guard_boot_nonce,
         motion_stop_generation,
         planner_runtime_generation,
         path_revision,
         source_timestamp_ns,
-        goal_payload_sha256,
-        path_payload_sha256,
         path,
     })
 }
 
 fn validate_path_envelope_semantics(
     message: &PathEnvelope,
-    check_digest: bool,
 ) -> Result<(), String> {
     validate_navigation_identity(
         message.schema_version,
@@ -1797,8 +1742,8 @@ fn validate_path_envelope_semantics(
         message.committed_map_source_timestamp_ns,
         &message.committed_map_frame_id,
     )?;
-    if message.boundary_id.is_empty() != (message.boundary_sha256 == [0; 32]) {
-        return Err("path boundary identity and digest must be present together".into());
+    if message.boundary_id.trim() != message.boundary_id {
+        return Err("path boundary identity is invalid".into());
     }
     if message.owner_kind == NAVIGATION_OWNER_KIND_PUBLIC_NAV && !message.boundary_id.is_empty() {
         return Err("PUBLIC_NAV path must not carry a navigation boundary".into());
@@ -1822,9 +1767,6 @@ fn validate_path_envelope_semantics(
     if message.path_revision <= 0 {
         return Err("path_revision must be positive".into());
     }
-    if message.goal_payload_sha256 == [0; 32] {
-        return Err("goal_payload_sha256 must be populated".into());
-    }
     validate_navigation_frame_id(&message.path.header.frame_id, "path")?;
     if message.path.header.frame_id != message.committed_map_frame_id {
         return Err("path frame_id must match committed map frame_id".into());
@@ -1836,12 +1778,6 @@ fn validate_path_envelope_semantics(
         pose.header.frame_id != message.path.header.frame_id || !pose_is_finite(&pose.pose)
     }) {
         return Err("path poses must be finite and match the path frame_id".into());
-    }
-    if check_digest {
-        let expected = path_envelope_payload_sha256(message).map_err(|error| error.to_string())?;
-        if message.path_payload_sha256 != expected {
-            return Err("path payload_sha256 mismatch".into());
-        }
     }
     Ok(())
 }
@@ -2327,8 +2263,8 @@ pub fn encode_navigation_state_body(message: &NavigationState) -> CodecResult<Ve
     encode_string(&message.parent_request_id, &mut out)?;
     out.extend_from_slice(&message.goal_generation.to_be_bytes());
     out.extend_from_slice(&message.path_revision.to_be_bytes());
-    out.extend_from_slice(&message.goal_payload_sha256);
-    out.extend_from_slice(&message.path_payload_sha256);
+    out.extend_from_slice(&message.producer_runtime_generation.to_be_bytes());
+    out.extend_from_slice(&message.planner_runtime_generation.to_be_bytes());
     if message.local_path.len() > 65536 || message.local_path.iter().flatten().any(|v| !v.is_finite()) {
         return Err(CodecError::LcmEncode("局部路线点数越界或坐标非法".into()));
     }
@@ -2379,14 +2315,8 @@ fn decode_navigation_state_from(cursor: &mut Cursor<'_>) -> CodecResult<Navigati
         parent_request_id: cursor.read_string()?,
         goal_generation: cursor.read_i64()?,
         path_revision: cursor.read_i64()?,
-        goal_payload_sha256: cursor
-            .read_exact(32)?
-            .try_into()
-            .expect("32-byte goal digest"),
-        path_payload_sha256: cursor
-            .read_exact(32)?
-            .try_into()
-            .expect("32-byte path digest"),
+        producer_runtime_generation: cursor.read_i64()?,
+        planner_runtime_generation: cursor.read_i64()?,
         local_path: {
             let count = cursor.read_nonnegative_len("local_path_count")?;
             if count > 65536 || count > cursor.remaining() / 24 {
@@ -3538,6 +3468,7 @@ mod navigation_map_3d_tests {
             "nuwax_msgs/NavigationMap3D",
             "nuwax_msgs/GoalEnvelope",
             "nuwax_msgs/PathEnvelope",
+            "nuwax_msgs/NavigationState",
             "nuwax_msgs/PlanarNavigationMap",
         ];
         for python in [false, true] {
@@ -3563,6 +3494,8 @@ mod navigation_map_3d_tests {
             "nuwax_msgs_GoalEnvelope.h",
             "nuwax_msgs_PathEnvelope.c",
             "nuwax_msgs_PathEnvelope.h",
+            "nuwax_msgs_NavigationState.c",
+            "nuwax_msgs_NavigationState.h",
             "nuwax_msgs_PlanarNavigationMap.c",
             "nuwax_msgs_PlanarNavigationMap.h",
         ] {
@@ -3571,7 +3504,7 @@ mod navigation_map_3d_tests {
                 fs::read(root.join("generated/c").join(file)).unwrap()
             );
         }
-        for file in ["NavigationMap3D.py", "NavigationMapBlock.py", "GoalEnvelope.py", "PathEnvelope.py", "PlanarNavigationMap.py"] {
+        for file in ["NavigationMap3D.py", "NavigationMapBlock.py", "GoalEnvelope.py", "PathEnvelope.py", "NavigationState.py", "PlanarNavigationMap.py"] {
             assert_eq!(
                 fs::read(py_dir.join("nuwax_msgs").join(file)).unwrap(),
                 fs::read(root.join("generated/python/nuwax_msgs").join(file)).unwrap()
@@ -3584,14 +3517,50 @@ mod navigation_map_3d_tests {
 #include <stdlib.h>
 #include <string.h>
 #include "nuwax_msgs_NavigationMap3D.h"
+#include "nuwax_msgs_GoalEnvelope.h"
+#include "nuwax_msgs_PathEnvelope.h"
+#include "nuwax_msgs_NavigationState.h"
+#define ROUNDTRIP(TYPE, CHECK) do { \
+    TYPE message; \
+    if (TYPE##_decode(data, 0, (int)size, &message) != size) return 20; \
+    if (!(CHECK)) return 21; \
+    int length = TYPE##_encoded_size(&message); \
+    unsigned char *encoded = malloc((size_t)length); \
+    if (!encoded || TYPE##_encode(encoded, 0, length, &message) != length) return 22; \
+    FILE *output = fopen(argv[2], "wb"); \
+    if (!output || fwrite(encoded, 1, (size_t)length, output) != (size_t)length) return 23; \
+    fclose(output); TYPE##_decode_cleanup(&message); free(encoded); free(data); return 0; \
+} while (0)
 int main(int argc, char **argv) {
-    if (argc != 3) return 1;
+    if (argc != 3 && argc != 4) return 1;
     FILE *input = fopen(argv[1], "rb");
     if (!input) return 2;
     fseek(input, 0, SEEK_END); long size = ftell(input); rewind(input);
     unsigned char *data = malloc((size_t) size);
     if (!data || fread(data, 1, (size_t)size, input) != (size_t)size) return 3;
     fclose(input);
+    if (argc == 4) {
+        if (!strcmp(argv[3], "GoalEnvelope")) {
+            ROUNDTRIP(nuwax_msgs_GoalEnvelope, message.schema_version == 8 &&
+                message.producer_runtime_generation == 7 && message.goal_generation == 2 &&
+                !strcmp(message.body_reference_frame_id, "robot/body") &&
+                message.has_body_to_support_z == 1 && message.body_to_support_z_m == 0.4 &&
+                message.boundary_points_length == 3);
+        }
+        if (!strcmp(argv[3], "PathEnvelope")) {
+            ROUNDTRIP(nuwax_msgs_PathEnvelope, message.schema_version == 8 &&
+                message.producer_runtime_generation == 7 && message.goal_generation == 2 &&
+                message.planner_runtime_generation == 8 && message.path_revision == 1 &&
+                message.path.poses_length == 1);
+        }
+        if (!strcmp(argv[3], "NavigationState")) {
+            ROUNDTRIP(nuwax_msgs_NavigationState, message.runtime_generation == 99 &&
+                message.producer_runtime_generation == 7 && message.goal_generation == 2 &&
+                message.planner_runtime_generation == 8 && message.path_revision == 1 &&
+                message.local_path_count == 1);
+        }
+        return 24;
+    }
     nuwax_msgs_NavigationMap3D message;
     if (nuwax_msgs_NavigationMap3D_decode(data, 0, (int)size, &message) != size) return 4;
     if (message.schema_version != 4 || message.cloud_revision != 17 || message.commit_boot_nonce[0] != 0x34 ||
@@ -3637,6 +3606,59 @@ int main(int argc, char **argv) {
             )
             .arg("-llcm");
         run(compile);
+        let goal = super::tests::configured_frame_goal("robot/map");
+        let path = super::tests::configured_frame_path(&goal, "robot/map");
+        let state = NavigationState {
+            session_id: goal.session_id.clone(), owner_kind: goal.owner_kind,
+            parent_request_id: goal.parent_request_id.clone(), goal_generation: goal.goal_generation,
+            producer_runtime_generation: goal.producer_runtime_generation,
+            planner_runtime_generation: path.planner_runtime_generation, path_revision: path.path_revision,
+            runtime_generation: 99, local_path: vec![[1.0, 2.0, 0.4]], ..NavigationState::default()
+        };
+        for (name, wire) in [
+            ("GoalEnvelope", encode_goal_envelope(&goal).unwrap()),
+            ("PathEnvelope", encode_path_envelope(&path).unwrap()),
+            ("NavigationState", encode_navigation_state(&state).unwrap()),
+        ] {
+            let input = temp.0.join(format!("{name}.bin"));
+            let c_output = temp.0.join(format!("{name}-c.bin"));
+            let py_output = temp.0.join(format!("{name}-python.bin"));
+            fs::write(&input, &wire).unwrap();
+            let mut parity = Command::new(&binary);
+            parity.arg(&input).arg(&c_output).arg(name);
+            run(parity);
+            assert_eq!(fs::read(c_output).unwrap(), wire);
+            let mut python = Command::new("python3");
+            python.args(["-I", "-S", "-B", "-c", r#"
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import nuwax_msgs
+name = sys.argv[4]
+raw = Path(sys.argv[2]).read_bytes()
+message = getattr(nuwax_msgs, name).decode(raw)
+assert message.goal_generation == 2 and message.producer_runtime_generation == 7
+if name == "GoalEnvelope":
+    assert message.schema_version == 8
+    assert message.body_reference_frame_id == "robot/body"
+    assert message.has_body_to_support_z == 1 and message.body_to_support_z_m == 0.4
+else:
+    assert message.planner_runtime_generation == 8 and message.path_revision == 1
+    if name == "NavigationState":
+        assert message.runtime_generation == 99 and message.local_path_count == 1
+    else:
+        assert message.schema_version == 8
+assert message.encode() == raw
+Path(sys.argv[3]).write_bytes(message.encode())
+"#]).arg(&py_dir).arg(&input).arg(&py_output).arg(name);
+            run(python);
+            assert_eq!(fs::read(py_output).unwrap(), wire);
+            match name {
+                "GoalEnvelope" => assert_eq!(decode_goal_envelope(&wire).unwrap(), goal),
+                "PathEnvelope" => assert_eq!(decode_path_envelope(&wire).unwrap(), path),
+                _ => assert_eq!(decode_navigation_state(&wire).unwrap(), state),
+            }
+        }
         for (name, message) in [
             ("live", live_map()),
             ("clear", cleared_map()),
@@ -3804,13 +3826,13 @@ mod tests {
         assert_eq!(decode_path(&encoded).unwrap(), message);
     }
 
-    fn configured_frame_goal(frame_id: &str) -> GoalEnvelope {
+    pub(super) fn configured_frame_goal(frame_id: &str) -> GoalEnvelope {
         let boundary_id = "configured-frame-exploration:boundary".to_string();
         let boundary_points = vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
-        let boundary_sha256 =
-            goal_intent_boundary_sha256(frame_id, &boundary_id, &boundary_points).unwrap();
         GoalEnvelope {
             schema_version: NAVIGATION_ENVELOPE_SCHEMA_VERSION,
+            body_reference_frame_id: "robot/body".into(),
+            body_to_support_z_m: Some(0.4),
             session_id: "configured-frame-goal".into(),
             owner_kind: NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
             parent_request_id: "configured-frame-exploration".into(),
@@ -3827,7 +3849,6 @@ mod tests {
             committed_map_frame_id: frame_id.into(),
             source_timestamp_ns: 123_000_000_456,
             boundary_id,
-            boundary_sha256,
             boundary_frame_id: frame_id.into(),
             boundary_points,
             motion_guard_generation: 11,
@@ -3849,7 +3870,7 @@ mod tests {
         }
     }
 
-    fn configured_frame_path(goal: &GoalEnvelope, frame_id: &str) -> PathEnvelope {
+    pub(super) fn configured_frame_path(goal: &GoalEnvelope, frame_id: &str) -> PathEnvelope {
         PathEnvelope {
             schema_version: NAVIGATION_ENVELOPE_SCHEMA_VERSION,
             session_id: goal.session_id.clone(),
@@ -3867,14 +3888,12 @@ mod tests {
             committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
             committed_map_frame_id: goal.committed_map_frame_id.clone(),
             boundary_id: goal.boundary_id.clone(),
-            boundary_sha256: goal.boundary_sha256,
             motion_guard_generation: goal.motion_guard_generation,
             motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
             motion_stop_generation: goal.motion_stop_generation,
             planner_runtime_generation: 8,
             path_revision: 1,
             source_timestamp_ns: 124_000_000_000,
-            goal_payload_sha256: goal.payload_sha256,
             path: Path {
                 header: Header {
                     frame_id: frame_id.into(),
@@ -3893,113 +3912,91 @@ mod tests {
     }
 
     #[test]
-    fn configured_navigation_frames_round_trip_and_bind_payload_hashes() {
-        let mut goal_digests = Vec::new();
-        let mut path_digests = Vec::new();
-
+    fn configured_navigation_frames_round_trip_with_original_assigned_keys() {
         for frame_id in ["map", "robot/map"] {
-            let mut goal = configured_frame_goal(frame_id);
-            seal_goal_envelope(&mut goal).unwrap();
-            assert_eq!(
-                goal.payload_sha256,
-                goal_envelope_payload_sha256(&goal).unwrap()
-            );
-
+            let goal = configured_frame_goal(frame_id);
+            let goal_key = GoalKey { producer_runtime_generation: 7, goal_generation: 2 };
+            assert_eq!(goal.goal_key(), goal_key);
             let goal_body = encode_goal_envelope_body(&goal).unwrap();
             assert_eq!(decode_goal_envelope_body(&goal_body).unwrap(), goal);
             let encoded_goal = encode_goal_envelope(&goal).unwrap();
             assert_eq!(&encoded_goal[..8], &GOAL_ENVELOPE_FINGERPRINT);
             assert_eq!(decode_goal_envelope(&encoded_goal).unwrap(), goal);
-            goal_digests.push(goal.payload_sha256);
 
-            if frame_id == "robot/map" {
-                let mut stale_goal_frame = goal.clone();
-                stale_goal_frame.boundary_frame_id = "robot/odom".into();
-                stale_goal_frame.goal.header.frame_id = "robot/odom".into();
-                assert!(encode_goal_envelope(&stale_goal_frame)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("must match committed map frame_id"));
-            }
-
-            let mut path = configured_frame_path(&goal, frame_id);
-            seal_path_envelope(&mut path).unwrap();
-            assert_eq!(
-                path.path_payload_sha256,
-                path_envelope_payload_sha256(&path).unwrap()
-            );
-
+            let path = configured_frame_path(&goal, frame_id);
+            assert_eq!(path.goal_key(), goal_key);
+            assert_eq!(path.path_key(), PathKey { goal: goal_key, planner_runtime_generation: 8, path_revision: 1 });
             let path_body = encode_path_envelope_body(&path).unwrap();
             assert_eq!(decode_path_envelope_body(&path_body).unwrap(), path);
             let encoded_path = encode_path_envelope(&path).unwrap();
             assert_eq!(&encoded_path[..8], &PATH_ENVELOPE_FINGERPRINT);
             assert_eq!(decode_path_envelope(&encoded_path).unwrap(), path);
-            path_digests.push(path.path_payload_sha256);
 
-            if frame_id == "robot/map" {
-                let mut stale_path_frame = path.clone();
-                stale_path_frame.path.header.frame_id = "robot/odom".into();
-                stale_path_frame.path.poses[0].header.frame_id = "robot/odom".into();
-                assert!(encode_path_envelope(&stale_path_frame)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("must match committed map frame_id"));
-            }
+            let mut stale_goal = goal.clone();
+            stale_goal.goal.header.frame_id = "robot/odom".into();
+            assert!(encode_goal_envelope(&stale_goal).is_err());
+            let mut stale_path = path.clone();
+            stale_path.path.header.frame_id = "robot/odom".into();
+            assert!(encode_path_envelope(&stale_path).is_err());
         }
-
-        assert_ne!(goal_digests[0], goal_digests[1]);
-        assert_ne!(path_digests[0], path_digests[1]);
     }
 
     #[test]
-    fn envelope_receipts_are_required_bound_and_versioned_without_digest_compatibility() {
-        let mut goal = configured_frame_goal("robot/map");
-        seal_goal_envelope(&mut goal).unwrap();
-        let mut path = configured_frame_path(&goal, "robot/map");
-        seal_path_envelope(&mut path).unwrap();
-        for mutate in [
-            (|m: &mut GoalEnvelope| m.committed_map_boot_nonce[0] ^= 1) as fn(&mut GoalEnvelope),
-            |m| m.committed_map_commit_sequence += 1,
-            |m| m.committed_map_source_timestamp_ns += 1,
-        ] {
-            let mut altered = goal.clone();
-            mutate(&mut altered);
-            assert!(validate_goal_envelope(&altered).is_err());
-            seal_goal_envelope(&mut altered).unwrap();
-            assert_ne!(altered.payload_sha256, goal.payload_sha256);
-        }
-        for mutate in [
-            (|m: &mut PathEnvelope| m.committed_map_boot_nonce[0] ^= 1) as fn(&mut PathEnvelope),
-            |m| m.committed_map_commit_sequence += 1,
-            |m| m.committed_map_source_timestamp_ns += 1,
-        ] {
-            let mut altered = path.clone();
-            mutate(&mut altered);
-            assert!(validate_path_envelope(&altered).is_err());
-            seal_path_envelope(&mut altered).unwrap();
-            assert_ne!(altered.path_payload_sha256, path.path_payload_sha256);
-        }
+    fn envelope_authority_is_structurally_validated_and_old_wire_is_rejected() {
+        let goal = configured_frame_goal("robot/map");
+        let path = configured_frame_path(&goal, "robot/map");
         for mutate in [
             (|m: &mut GoalEnvelope| m.committed_map_boot_nonce = [0; 16]) as fn(&mut GoalEnvelope),
             |m| m.committed_map_commit_sequence = 0,
             |m| m.committed_map_source_timestamp_ns = -1,
+            |m| m.goal_generation = 0,
+            |m| m.producer_runtime_generation = -1,
+            |m| m.owner_kind = 99,
+            |m| m.parent_request_id.clear(),
+            |m| m.producer_epoch = 0,
+            |m| m.options.position_tolerance_m = f64::NAN,
+            |m| m.motion_stop_generation = -1,
         ] {
-            let mut absent = goal.clone();
-            mutate(&mut absent);
-            assert!(seal_goal_envelope(&mut absent).is_err());
+            let mut invalid = goal.clone();
+            mutate(&mut invalid);
+            assert!(encode_goal_envelope(&invalid).is_err());
+        }
+        for mutate in [
+            (|m: &mut PathEnvelope| m.committed_map_boot_nonce = [0; 16]) as fn(&mut PathEnvelope),
+            |m| m.committed_map_commit_sequence = 0,
+            |m| m.goal_generation = 0,
+            |m| m.producer_runtime_generation = -1,
+            |m| m.planner_runtime_generation = 0,
+            |m| m.path_revision = 0,
+            |m| m.owner_kind = 99,
+            |m| m.motion_stop_generation = -1,
+        ] {
+            let mut invalid = path.clone();
+            mutate(&mut invalid);
+            assert!(encode_path_envelope(&invalid).is_err());
         }
         let mut old_goal = encode_goal_envelope(&goal).unwrap();
-        old_goal[8..12].copy_from_slice(&6_i32.to_be_bytes());
+        old_goal[8..12].copy_from_slice(&7_i32.to_be_bytes());
         assert!(decode_goal_envelope(&old_goal).is_err());
         let mut old_path = encode_path_envelope(&path).unwrap();
-        old_path[8..12].copy_from_slice(&6_i32.to_be_bytes());
+        old_path[8..12].copy_from_slice(&7_i32.to_be_bytes());
         assert!(decode_path_envelope(&old_path).is_err());
         let mut old_goal = encode_goal_envelope(&goal).unwrap();
-        old_goal[..8].copy_from_slice(&0xdd19_bb81_9d6c_3e44_u64.to_be_bytes());
+        old_goal[..8].copy_from_slice(&0xec74_63f7_558a_ac72_u64.to_be_bytes());
         assert!(decode_goal_envelope(&old_goal).is_err());
         let mut old_path = encode_path_envelope(&path).unwrap();
-        old_path[..8].copy_from_slice(&0xf11d_70cc_600f_1ab1_u64.to_be_bytes());
+        old_path[..8].copy_from_slice(&0xeec1_8428_127b_3f5a_u64.to_be_bytes());
         assert!(decode_path_envelope(&old_path).is_err());
+        let encoded_goal = encode_goal_envelope(&goal).unwrap();
+        assert!(decode_goal_envelope(&encoded_goal[..encoded_goal.len() - 1]).is_err());
+        let mut trailing_goal = encoded_goal;
+        trailing_goal.push(0);
+        assert!(decode_goal_envelope(&trailing_goal).is_err());
+        let encoded_path = encode_path_envelope(&path).unwrap();
+        assert!(decode_path_envelope(&encoded_path[..encoded_path.len() - 1]).is_err());
+        let mut trailing_path = encoded_path;
+        trailing_path.push(0);
+        assert!(decode_path_envelope(&trailing_path).is_err());
     }
 
     #[test]
@@ -4007,9 +4004,9 @@ mod tests {
         let mut goal = configured_frame_goal("robot/map");
         // An epoch-zero source timestamp is legitimate receipt data.
         goal.committed_map_source_timestamp_ns = 0;
-        seal_goal_envelope(&mut goal).unwrap();
+        validate_goal_envelope(&goal).unwrap();
         let mut path = configured_frame_path(&goal, "robot/map");
-        seal_path_envelope(&mut path).unwrap();
+        validate_path_envelope(&path).unwrap();
         let planar = crate::lcm::planar_navigation::PlanarNavigationMap {
             map_frame_generation: 1, runtime_generation: 7,
             session_id: goal.committed_map_session_id.clone(), session_generation: 3,
@@ -4045,11 +4042,14 @@ if name == 'PlanarNavigationMap':
     assert message.map_commit_sequence == 29 and message.map_source_timestamp_ns == 0
     assert message.source_timestamp_ns == 1_000_000_001
 else:
-    assert message.schema_version == 7
+    assert message.schema_version == 8
     assert bytes(message.committed_map_boot_nonce) == bytes([0x31] * 16)
     assert message.committed_map_commit_sequence == 29
     assert message.committed_map_source_timestamp_ns == 0
     assert message.committed_map_frame_id == 'robot/map'
+    if name == 'GoalEnvelope':
+        assert message.body_reference_frame_id == 'robot/body'
+        assert message.has_body_to_support_z == 1 and message.body_to_support_z_m == 0.4
 assert message.encode() == raw
 sys.stdout.buffer.write(message.encode())
 "#])
@@ -4065,11 +4065,10 @@ sys.stdout.buffer.write(message.encode())
         goal.owner_kind = NAVIGATION_OWNER_KIND_PUBLIC_NAV;
         goal.parent_request_id = "configured-frame-public".into();
         goal.boundary_id.clear();
-        goal.boundary_sha256 = [0; 32];
         goal.boundary_frame_id.clear();
         goal.boundary_points.clear();
 
-        seal_goal_envelope(&mut goal).unwrap();
+        validate_goal_envelope(&goal).unwrap();
         let encoded = encode_goal_envelope(&goal).unwrap();
         assert_eq!(decode_goal_envelope(&encoded).unwrap(), goal);
     }
@@ -4078,7 +4077,7 @@ sys.stdout.buffer.write(message.encode())
     fn configured_navigation_frames_reject_empty_mismatched_or_non_finite_geometry() {
         for invalid_frame_id in ["", " robot/map ", "/robot/map"] {
             let mut goal = configured_frame_goal(invalid_frame_id);
-            assert!(seal_goal_envelope(&mut goal)
+            assert!(validate_goal_envelope(&goal)
                 .unwrap_err()
                 .to_string()
                 .contains("frame_id is invalid"));
@@ -4086,147 +4085,140 @@ sys.stdout.buffer.write(message.encode())
 
         let mut missing_boundary_frame = configured_frame_goal("robot/map");
         missing_boundary_frame.boundary_frame_id.clear();
-        assert!(seal_goal_envelope(&mut missing_boundary_frame)
+        assert!(validate_goal_envelope(&missing_boundary_frame)
             .unwrap_err()
             .to_string()
             .contains("exploration boundary identity or frame is invalid"));
 
         let mut mismatched_boundary_frame = configured_frame_goal("robot/map");
         mismatched_boundary_frame.boundary_frame_id = "map".into();
-        assert!(seal_goal_envelope(&mut mismatched_boundary_frame)
+        assert!(validate_goal_envelope(&mismatched_boundary_frame)
             .unwrap_err()
             .to_string()
             .contains("exploration boundary identity or frame is invalid"));
 
         let mut non_finite_goal = configured_frame_goal("robot/map");
         non_finite_goal.goal.pose.position[0] = f64::NAN;
-        assert!(seal_goal_envelope(&mut non_finite_goal)
+        assert!(validate_goal_envelope(&non_finite_goal)
             .unwrap_err()
             .to_string()
             .contains("non-finite coordinate"));
 
         let mut non_finite_boundary = configured_frame_goal("robot/map");
         non_finite_boundary.boundary_points[0][0] = f64::INFINITY;
-        assert!(seal_goal_envelope(&mut non_finite_boundary)
+        assert!(validate_goal_envelope(&non_finite_boundary)
             .unwrap_err()
             .to_string()
             .contains("non-finite coordinate"));
 
         let mut goal = configured_frame_goal("robot/map");
-        seal_goal_envelope(&mut goal).unwrap();
+        validate_goal_envelope(&goal).unwrap();
 
         let mut empty_path_frame = configured_frame_path(&goal, "");
-        assert!(seal_path_envelope(&mut empty_path_frame)
+        assert!(validate_path_envelope(&empty_path_frame)
             .unwrap_err()
             .to_string()
             .contains("path frame_id is invalid"));
 
         let mut mismatched_pose_frame = configured_frame_path(&goal, "robot/map");
         mismatched_pose_frame.path.poses[0].header.frame_id = "map".into();
-        assert!(seal_path_envelope(&mut mismatched_pose_frame)
+        assert!(validate_path_envelope(&mismatched_pose_frame)
             .unwrap_err()
             .to_string()
             .contains("match the path frame_id"));
 
         let mut non_finite_path = configured_frame_path(&goal, "robot/map");
         non_finite_path.path.poses[0].pose.position[0] = f64::INFINITY;
-        assert!(seal_path_envelope(&mut non_finite_path)
+        assert!(validate_path_envelope(&non_finite_path)
             .unwrap_err()
             .to_string()
             .contains("must be finite"));
     }
 
     #[test]
-    fn versioned_envelopes_round_trip_and_reject_identity_or_hash_mutation() {
-        let pose = PoseStamped {
-            header: Header {
-                seq: 42,
-                stamp_sec: 123,
-                stamp_nsec: 456,
-                frame_id: "map".into(),
-            },
-            pose: Pose {
-                position: [1.0, 2.0, 0.0],
-                orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
-            },
-        };
-        let mut goal = configured_frame_goal("map");
-        goal.goal = pose.clone();
-        seal_goal_envelope(&mut goal).unwrap();
-        let encoded = encode_goal_envelope(&goal).unwrap();
-        assert_eq!(&encoded[..8], &GOAL_ENVELOPE_FINGERPRINT);
-        assert_eq!(decode_goal_envelope(&encoded).unwrap(), goal);
+    fn envelope_decoders_reject_negative_or_impossible_collection_lengths() {
+        let goal = configured_frame_goal("robot/map");
+        let goal_wire = encode_goal_envelope(&goal).unwrap();
+        let boundary_marker = format!("{}\0", goal.boundary_id).into_bytes();
+        let frame_at = goal_wire.windows(boundary_marker.len())
+            .position(|bytes| bytes == boundary_marker).unwrap() + boundary_marker.len();
+        let frame_len = i32::from_be_bytes(goal_wire[frame_at..frame_at + 4].try_into().unwrap()) as usize;
+        let boundary_count_at = frame_at + 4 + frame_len;
+        let path = configured_frame_path(&goal, "robot/map");
+        let path_wire = encode_path_envelope(&path).unwrap();
+        let path_body = encode_path_body(&path.path).unwrap();
+        let path_count_at = path_wire.len() - path_body.len();
+        for count in [-1_i32, i32::MAX] {
+            let mut invalid_goal = goal_wire.clone();
+            invalid_goal[boundary_count_at..boundary_count_at + 4].copy_from_slice(&count.to_be_bytes());
+            assert!(decode_goal_envelope(&invalid_goal).is_err());
+            let mut invalid_path = path_wire.clone();
+            invalid_path[path_count_at..path_count_at + 4].copy_from_slice(&count.to_be_bytes());
+            assert!(decode_path_envelope(&invalid_path).is_err());
+        }
+    }
 
-        let mut mutated_goal = goal.clone();
-        mutated_goal.boundary_points[1][0] = 3.0;
-        assert!(encode_goal_envelope(&mutated_goal)
-            .unwrap_err()
-            .to_string()
-            .contains("boundary_sha256 mismatch"));
+    #[test]
+    fn coordinate_contract_is_explicit_and_optional_support_is_not_a_configuration_digest() {
+        let goal = configured_frame_goal("map");
+        for invalid in ["", " body ", "/robot/body", "robot//body", "body-point"] {
+            let mut bad = goal.clone();
+            bad.body_reference_frame_id = invalid.into();
+            assert!(encode_goal_envelope(&bad).is_err());
+        }
+        for invalid in [0.0, -0.0, -0.5, f64::NAN, f64::INFINITY] {
+            let mut bad = goal.clone();
+            bad.body_to_support_z_m = Some(invalid);
+            assert!(encode_goal_envelope(&bad).is_err());
+        }
+        let mut public = goal.clone();
+        public.owner_kind = NAVIGATION_OWNER_KIND_PUBLIC_NAV;
+        public.boundary_id.clear();
+        public.boundary_frame_id.clear();
+        public.boundary_points.clear();
+        public.body_to_support_z_m = None;
+        let encoded = encode_goal_envelope(&public).unwrap();
+        assert_eq!(decode_goal_envelope(&encoded).unwrap(), public);
 
-        let mut mutated_proof = goal.clone();
-        mutated_proof.motion_stop_generation += 1;
-        assert!(encode_goal_envelope(&mutated_proof)
-            .unwrap_err()
-            .to_string()
-            .contains("payload_sha256 mismatch"));
+        // A profile owner, not the wire codec, decides whether support is required.
+        let mut absent = goal.clone();
+        absent.body_to_support_z_m = None;
+        let mut wire = encode_goal_envelope(&absent).unwrap();
+        let marker = b"robot/body\0";
+        let flag = wire.windows(marker.len()).position(|v| v == marker).unwrap() + marker.len();
+        wire[flag + 1..flag + 9].copy_from_slice(&123.5_f64.to_be_bytes());
+        assert_eq!(decode_goal_envelope(&wire).unwrap().body_to_support_z_m, None);
+        wire[flag] = 2;
+        assert!(decode_goal_envelope(&wire).is_err());
+        wire[flag] = 1;
+        wire[flag + 1..flag + 9].copy_from_slice(&f64::NAN.to_be_bytes());
+        assert!(decode_goal_envelope(&wire).is_err());
+    }
 
-        let mut missing_proof = goal.clone();
+    #[test]
+    fn codec_preserves_business_fields_without_rederiving_an_identity() {
+        let original = configured_frame_goal("map");
+        let mut changed = original.clone();
+        changed.boundary_points[1][0] = 3.0;
+        changed.goal.pose.position[0] = -0.0;
+        changed.source_timestamp_ns += 1;
+        changed.motion_stop_generation += 1;
+        assert_eq!(changed.goal_key(), original.goal_key());
+        assert_eq!(decode_goal_envelope(&encode_goal_envelope(&changed).unwrap()).unwrap(), changed);
+        let mut missing_proof = original.clone();
         missing_proof.motion_guard_boot_nonce = [0; 16];
-        assert!(seal_goal_envelope(&mut missing_proof)
-            .unwrap_err()
-            .to_string()
-            .contains("must not be all zero"));
-
-        let mut public_with_boundary = goal.clone();
+        assert!(validate_goal_envelope(&missing_proof).is_err());
+        let mut public_with_boundary = original.clone();
         public_with_boundary.owner_kind = NAVIGATION_OWNER_KIND_PUBLIC_NAV;
-        assert!(seal_goal_envelope(&mut public_with_boundary)
-            .unwrap_err()
-            .to_string()
-            .contains("must not carry a navigation boundary"));
+        assert!(validate_goal_envelope(&public_with_boundary).is_err());
 
-        let mut path = PathEnvelope {
-            schema_version: NAVIGATION_ENVELOPE_SCHEMA_VERSION,
-            session_id: goal.session_id.clone(),
-            owner_kind: goal.owner_kind,
-            parent_request_id: goal.parent_request_id.clone(),
-            goal_generation: goal.goal_generation,
-            producer: goal.producer.clone(),
-            producer_epoch: goal.producer_epoch,
-            producer_runtime_generation: goal.producer_runtime_generation,
-            committed_map_session_id: goal.committed_map_session_id.clone(),
-            committed_map_session_generation: goal.committed_map_session_generation,
-            committed_map_revision: goal.committed_map_revision,
-            committed_map_boot_nonce: goal.committed_map_boot_nonce,
-            committed_map_commit_sequence: goal.committed_map_commit_sequence,
-            committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
-            committed_map_frame_id: goal.committed_map_frame_id.clone(),
-            boundary_id: goal.boundary_id.clone(),
-            boundary_sha256: goal.boundary_sha256,
-            motion_guard_generation: goal.motion_guard_generation,
-            motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
-            motion_stop_generation: goal.motion_stop_generation,
-            planner_runtime_generation: 8,
-            path_revision: 1,
-            source_timestamp_ns: 124_000_000_000,
-            goal_payload_sha256: goal.payload_sha256,
-            path: Path {
-                header: pose.header.clone(),
-                poses: vec![pose],
-            },
-            ..PathEnvelope::default()
-        };
-        seal_path_envelope(&mut path).unwrap();
-        let encoded = encode_path_envelope(&path).unwrap();
-        assert_eq!(&encoded[..8], &PATH_ENVELOPE_FINGERPRINT);
-        assert_eq!(decode_path_envelope(&encoded).unwrap(), path);
-
-        let mut mutated_path = path.clone();
-        mutated_path.source_timestamp_ns += 1;
-        assert!(encode_path_envelope(&mutated_path)
-            .unwrap_err()
-            .to_string()
-            .contains("payload_sha256 mismatch"));
+        let path = configured_frame_path(&original, "map");
+        let mut changed_path = path.clone();
+        changed_path.path.header.stamp_nsec += 1;
+        changed_path.path.poses[0].pose.position[0] = 9.0;
+        assert_eq!(changed_path.path_key(), path.path_key());
+        assert_eq!(decode_path_envelope(&encode_path_envelope(&changed_path).unwrap()).unwrap(), changed_path);
+        // Same-key action conflicts are checked by the existing admission/execution owner.
     }
 
     #[test]
@@ -4399,6 +4391,27 @@ sys.stdout.buffer.write(message.encode())
     }
 
     #[test]
+    fn navigation_state_projects_actual_goal_and_path_domains() {
+        let mut state = NavigationState::default();
+        assert_eq!(state.goal_key(), None);
+        assert_eq!(state.path_key(), None);
+        // Backend diagnostics can have a named session without an assigned goal.
+        state.session_id = "mls-backend".into();
+        assert_eq!(decode_navigation_state(&encode_navigation_state(&state).unwrap()).unwrap(), state);
+        assert_eq!(state.goal_key(), None);
+        state.goal_generation = 2;
+        state.producer_runtime_generation = 7;
+        state.runtime_generation = 99;
+        let goal = GoalKey { producer_runtime_generation: 7, goal_generation: 2 };
+        assert_eq!(state.goal_key(), Some(goal));
+        assert_eq!(state.path_key(), None);
+        state.planner_runtime_generation = 8;
+        state.path_revision = 1;
+        assert_eq!(state.path_key(), Some(PathKey { goal, planner_runtime_generation: 8, path_revision: 1 }));
+        assert_eq!(decode_navigation_state(&encode_navigation_state(&state).unwrap()).unwrap(), state);
+    }
+
+    #[test]
     fn navigation_local_display_rejects_corrupt_sizes_and_coordinates() {
         let mut message = NavigationState { local_path: vec![[0.0, 1.0, 0.4]], ..Default::default() };
         let encoded = encode_navigation_state_body(&message).unwrap();
@@ -4452,8 +4465,8 @@ sys.stdout.buffer.write(message.encode())
             parent_request_id: "request-1".into(),
             goal_generation: 5,
             path_revision: 2,
-            goal_payload_sha256: [0x11; 32],
-            path_payload_sha256: [0x22; 32],
+            producer_runtime_generation: 9,
+            planner_runtime_generation: 13,
             local_path: vec![[0.5, 1.0, 0.4], [1.0, 2.0, 0.6]],
         };
         let encoded = encode_navigation_state(&navigation).unwrap();
@@ -4466,7 +4479,7 @@ sys.stdout.buffer.write(message.encode())
         );
 
         let mut legacy_fingerprint = encoded.clone();
-        legacy_fingerprint[..8].copy_from_slice(&0x402e_9704_f8d2_5156_u64.to_be_bytes());
+        legacy_fingerprint[..8].copy_from_slice(&0x9ea3_f3f5_fd5a_fbda_u64.to_be_bytes());
         assert!(decode_navigation_state(&legacy_fingerprint).is_err());
 
         let mut legacy_body = encode_navigation_state_body(&navigation).unwrap();

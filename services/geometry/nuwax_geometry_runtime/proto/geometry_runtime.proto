@@ -305,6 +305,7 @@ message InstalledTargetReceiptV2 {
   CheckpointMemberIdentity source_cloud_member = 2;
   CanonicalOccupancyCommitReceipt occupancy_receipt = 3;
   CanonicalCloudCommitReceipt cloud_receipt = 4;
+  CheckpointMemberIdentity source_graph_member = 5;
 }
 message ActivationReceiptV2 {
   ActivationRequestMetadataV2 request = 1;
@@ -394,6 +395,13 @@ message AssignedCloudRelocalizeRequestV2 {
   uint64 logical_timeout_ms = 3;
 }
 
+message AssignedPlanarRelocalizeRequestV2 {
+  InstalledTargetReceiptV2 target = 1;
+  RelocalizationPolicyDescriptorV2 policy = 2;
+  uint64 logical_timeout_ms = 3;
+  PlanarSeed seed = 4;
+}
+
 message RelocalizeRequest {
   uint32 schema_version = 1;
   string request_id = 2;
@@ -421,6 +429,7 @@ message RelocalizeRequest {
   // Schema 2 uses request_id plus this body only; all legacy fields are absent.
   oneof assigned_target {
     AssignedCloudRelocalizeRequestV2 assigned_cloud_v2 = 24;
+    AssignedPlanarRelocalizeRequestV2 assigned_planar_v2 = 25;
   }
 }
 
@@ -562,6 +571,56 @@ message AssignedCloudRelocalizeResultV2 {
   AssignedRelocalizationEvidenceV2 evidence = 6;
 }
 
+// Existing armed process/session/epoch and input sequence, never a new scan ticket.
+message PlanarRelocalizationScanV2 {
+  string process_owner = 1;
+  uint64 session_generation = 2;
+  uint64 mode_epoch = 3;
+  uint64 source_sequence = 4;
+  uint64 source_timestamp_ns = 5;
+  uint64 source_unix_ns = 6;
+  fixed64 matching_response_bits = 7;
+}
+message PlanarRelocalizationEstimateV2 {
+  uint64 source_timestamp_ns = 1;
+  string clock_domain = 2;
+  string clock_id = 3;
+  uint64 source_sequence = 4;
+  uint64 graph_revision = 5;
+  uint64 optimizations = 6;
+  repeated fixed64 anchor_odom_from_base_bits = 7;
+  repeated fixed64 odom_from_base_bits = 8;
+  repeated fixed64 map_from_base_bits = 9;
+  repeated fixed64 map_from_odom_bits = 10;
+  repeated fixed64 covariance_bits = 11;
+  fixed64 matching_response_bits = 12;
+  fixed64 local_response_bits = 13;
+  string disposition = 14;
+  uint32 node_count = 15;
+  uint32 edge_count = 16;
+}
+message AssignedPlanarRelocalizationEvidenceV2 {
+  uint32 schema_version = 1;
+  AssignedRelocalizationEvidencePhaseV2 phase = 2;
+  optional uint64 admission_ordinal = 3;
+  RelocalizationOwnerReceiptV2 owner = 4;
+  string previous_process = 5;
+  string committed_process = 6;
+  uint64 mode_epoch = 7;
+  repeated PlanarRelocalizationScanV2 accepted_scans = 8;
+  PlanarRelocalizationEstimateV2 estimate = 9;
+  uint64 frame_generation = 10;
+  uint64 source_unix_ns = 11;
+  uint64 committed_unix_ns = 12;
+}
+message AssignedPlanarRelocalizeResultV2 {
+  RelocalizeRequest request = 1;
+  RelocalizeDisposition disposition = 2;
+  uint64 correction_revision = 3;
+  string detail = 4;
+  AssignedPlanarRelocalizationEvidenceV2 evidence = 5;
+}
+
 message RelocalizeResult {
   uint32 schema_version = 1;
   string request_id = 2;
@@ -613,6 +672,7 @@ message RelocalizeResult {
   // Schema 2 uses schema_version, request_id and this body exclusively.
   // Every legacy field 3..32 is empty/zero, including legacy dispositions.
   AssignedCloudRelocalizeResultV2 assigned_cloud_v2 = 33;
+  AssignedPlanarRelocalizeResultV2 assigned_planar_v2 = 34;
 }
 
 // A live canonical observation bound to the exact retained applied command.
@@ -717,8 +777,8 @@ message CancelNavigationRequest {
   uint64 producer_runtime_generation = 5;
 }
 message NavigationState {
-  reserved 13, 24;
-  reserved "planner_map_revision", "map_version_id";
+  reserved 13, 22, 23, 24;
+  reserved "planner_map_revision", "map_version_id", "goal_payload_sha256", "path_payload_sha256";
   string status = 1;
   string message = 2;
   string goal_id = 3;
@@ -739,13 +799,12 @@ message NavigationState {
   string parent_request_id = 19;
   uint64 goal_generation = 20;
   uint64 path_revision = 21;
-  bytes goal_payload_sha256 = 22;
-  bytes path_payload_sha256 = 23;
   uint64 producer_runtime_generation = 25;
   // 当前目标已计算路径；终态为空，点采用planner_map_frame坐标。
   repeated Vec3 planned_path = 26;
   // 同一目标与全局路径修订下的局部规划展示；缺失或终态为空。
   repeated Vec3 local_path = 27;
+  uint64 planner_runtime_generation = 28;
 }
 message NavigationReadiness {
   reserved 10;
@@ -863,7 +922,8 @@ message ExplorationChildLease {
   string parent_request_id = 3;
   uint64 goal_generation = 4;
   uint64 producer_runtime_generation = 5;
-  bytes goal_payload_sha256 = 6;
+  reserved 6;
+  reserved "goal_payload_sha256";
 }
 message ExplorationRecoveryGuardProof {
   string stop_operation_id = 1;
@@ -907,13 +967,17 @@ message ExplorationOwnershipReconciliationReceipt {
   string recovery_correlation = 2;
   string parent_request_id = 3;
   uint64 exploration_generation = 4;
+  // Legacy committed receipt only. New receipts use child_lease exclusively.
   string child_lease_fingerprint = 5;
   uint64 cancel_generation = 6;
   string commit_disposition = 7;
+  ExplorationChildLease child_lease = 8;
 }
 message AcknowledgeExplorationOwnershipReconciliationRequest {
   string recovery_correlation = 1;
+  // Legacy opaque acknowledgement only; never combine with child_lease.
   string child_lease_fingerprint = 2;
+  ExplorationChildLease child_lease = 3;
 }
 message AcknowledgeExplorationOwnershipReconciliationResult {
   bool acknowledged = 1;
@@ -1030,6 +1094,8 @@ message MappingCloudAuthority {
   uint32 schema_version = 18;
   MappingCommitIdentity committed_occupancy_commit_id = 19;
   uint64 committed_occupancy_source_timestamp_ns = 20;
+  // Schema 3: the original assigned activation receipt is the sole asset authority.
+  ActivationReceiptV2 activation_receipt_v2 = 21;
 }
 
 message MappingCloudGoalRequest {
@@ -1055,6 +1121,8 @@ message MappingCloudGoalRequest {
   uint32 schema_version = 19;
   MappingCommitIdentity committed_occupancy_commit_id = 20;
   uint64 committed_occupancy_source_timestamp_ns = 21;
+  // Schema 3: copied from the original assigned authority response.
+  ActivationReceiptV2 activation_receipt_v2 = 22;
 }
 
 message MappingCloudGoalTerminal {

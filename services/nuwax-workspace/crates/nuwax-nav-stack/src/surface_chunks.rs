@@ -16,13 +16,25 @@ impl FineMapReader {
         root: &Manifest,
         previous: Option<(&Manifest, &Arc<nuwax_nav_mls_planner::SurfaceObservations>)>,
     ) -> Result<Arc<nuwax_nav_mls_planner::SurfaceObservations>, String> {
+        self.observations_with_changes(root, previous).map(|(grid, _)| grid)
+    }
+
+    /// The optional delta is complete relative to the compatible previous root.
+    /// None means first/root-domain/resolution change, never an empty proof.
+    pub(super) fn observations_with_changes(
+        &mut self,
+        root: &Manifest,
+        previous: Option<(&Manifest, &Arc<nuwax_nav_mls_planner::SurfaceObservations>)>,
+    ) -> Result<(Arc<nuwax_nav_mls_planner::SurfaceObservations>, Option<Vec<[i32; 2]>>), String> {
         use nuwax_nav_mls_planner::{SurfaceObservation, SurfaceObservations};
         use std::collections::BTreeMap;
         let previous = previous.filter(|(old, _)| old.domain == root.domain
             && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits());
         if let Some((_, grid)) = previous.filter(|(old, _)| *old == root) {
-            return Ok(Arc::clone(grid));
+            return Ok((Arc::clone(grid), Some(Vec::new())));
         }
+        let known = previous.is_some();
+        let mut changed = Vec::new();
         let mut grid = match previous {
             Some((_, grid)) => grid.as_ref().clone(),
             None => SurfaceObservations::new(root.voxel_size_m, 32).map_err(|e| e.to_string())?,
@@ -30,7 +42,8 @@ impl FineMapReader {
         let old: BTreeMap<_, _> = previous.into_iter().flat_map(|(r, _)| &r.blocks).map(|b| (b.key, b)).collect();
         let new: BTreeMap<_, _> = root.blocks.iter().map(|b| (b.key, b)).collect();
         for key in old.keys().filter(|key| !new.contains_key(*key)) {
-            grid.replace_block(*key, BTreeMap::new()).map_err(|e| e.to_string())?;
+            changed.extend(grid.replace_block_with_geometry_changes(*key, BTreeMap::new())
+                .map_err(|e| e.to_string())?);
         }
         for reference in &root.blocks {
             if old.get(&reference.key).is_some_and(|old| old.block_revision == reference.block_revision) { continue; }
@@ -41,12 +54,15 @@ impl FineMapReader {
                 values.insert(nuwax_map_chunks::global_key(reference.key, local)?,
                     SurfaceObservation { observed_ns: evidence.observed_ns, hits: evidence.hits });
             }
-            grid.replace_block(reference.key, values).map_err(|e| e.to_string())?;
+            changed.extend(grid.replace_block_with_geometry_changes(reference.key, values)
+                .map_err(|e| e.to_string())?);
         }
         grid.set_source_timestamp_ns(root.source_timestamp_ns);
         // 同一提交根的全部块已经读取并验证，缺少占据块不等于缺少已提交的几何源。
         grid.mark_complete_geometry_source();
-        Ok(Arc::new(grid))
+        changed.sort_unstable();
+        changed.dedup();
+        Ok((Arc::new(grid), known.then_some(changed)))
     }
 
     pub(super) fn new(lcm_url: String) -> Result<Self, String> {

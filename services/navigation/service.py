@@ -23,7 +23,7 @@ from services.localization import LocalizationService
 from services.mapping.service import MappingService
 from services.geometry.geometry_runtime_provider import (
     GeometryRuntimeRpcError,
-    _exploration_child_lease_fingerprint,
+    _exploration_receipt_matches_child,
 )
 from typing import Deque, Dict, Optional, Sequence, Tuple
 
@@ -2425,9 +2425,15 @@ class NavigationService:
         expected_generation = int(exploration_generation)
         expected_cancel_generation = int(cancel_generation)
         expected_correlation = str(recovery_correlation or "").strip()
-        expected_fingerprint = _exploration_child_lease_fingerprint(
-            dict(child_lease or {})
-        )
+        expected_lease = {
+            "session_id": str(child_lease.get("session_id") or ""),
+            "owner_kind": int(child_lease.get("owner_kind") or 0),
+            "parent_request_id": str(child_lease.get("parent_request_id") or ""),
+            "goal_generation": int(child_lease.get("goal_generation") or 0),
+            "producer_runtime_generation": int(
+                child_lease.get("producer_runtime_generation") or 0
+            ),
+        }
         accepted = reconcile(
             request_id=correlated_id,
             exploration_generation=expected_generation,
@@ -2490,9 +2496,7 @@ class NavigationService:
             == correlated_id
             and int(receipt.get("exploration_generation") or 0)
             == expected_generation
-            and expected_fingerprint
-            and str(receipt.get("child_lease_fingerprint") or "")
-            == expected_fingerprint
+            and _exploration_receipt_matches_child(receipt, child_lease=expected_lease)
             and int(receipt.get("cancel_generation") or 0)
             == expected_cancel_generation
             and terminal_profile
@@ -2522,7 +2526,8 @@ class NavigationService:
         self,
         *,
         recovery_correlation: str,
-        child_lease_fingerprint: str,
+        child_lease_fingerprint: str = "",
+        child_lease: Optional[Dict[str, object]] = None,
         deadline_monotonic: Optional[float] = None,
     ) -> bool:
         """Explicitly acknowledge a durable receipt after outer release steps."""
@@ -2548,9 +2553,8 @@ class NavigationService:
             )
         acknowledged = acknowledge(
             recovery_correlation=str(recovery_correlation or "").strip(),
-            child_lease_fingerprint=str(
-                child_lease_fingerprint or ""
-            ).strip(),
+            child_lease=child_lease,
+            child_lease_fingerprint=child_lease_fingerprint,
             **(
                 {"deadline_monotonic": deadline_monotonic}
                 if deadline_monotonic is not None

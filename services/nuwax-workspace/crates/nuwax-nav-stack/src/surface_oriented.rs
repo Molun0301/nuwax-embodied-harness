@@ -523,8 +523,9 @@ pub fn plan(
 }
 
 /// 后台规划按明确取消退出，不用墙钟截止替代任务生命周期。
+/// Borrows the caller's existing cancellation flag throughout search and smoothing.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn plan_cancellable(
+pub fn plan_cancellable(
     map: &SurfaceSnapshot,
     start: BodyPose,
     goal: BodyPose,

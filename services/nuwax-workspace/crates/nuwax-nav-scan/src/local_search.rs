@@ -183,6 +183,102 @@ fn reference_progress(p: [f64; 3], reference: &[[f64; 3]]) -> (f64, f64, f64) {
     }
     best
 }
+#[derive(Clone, Copy)]
+struct ReferenceTurn {
+    heading: Option<f64>,
+    suffix: f64,
+    next: Option<usize>,
+}
+// One plan-local preparation; the guide's original >1e-9 heading rule is unchanged.
+fn reference_turns(reference: &[[f64; 3]]) -> Result<Vec<ReferenceTurn>, LocalPlanError> {
+    let mut turns = Vec::with_capacity(reference.len().saturating_sub(1));
+    for pair in reference.windows(2) {
+        super::cancellation::checkpoint()?;
+        let dx = pair[1][0] - pair[0][0];
+        let dy = pair[1][1] - pair[0][1];
+        turns.push(ReferenceTurn {
+            heading: if dx.hypot(dy) > 1e-9 { Some(dy.atan2(dx)) } else { None },
+            suffix: 0.0, next: None,
+        });
+    }
+    let mut next: Option<usize> = None;
+    for index in (0..turns.len()).rev() {
+        super::cancellation::checkpoint()?;
+        turns[index].next = next;
+        if let Some(heading) = turns[index].heading {
+            if let Some(next) = next {
+                turns[index].suffix = angle(heading - turns[next].heading.unwrap()).abs() + turns[next].suffix;
+            }
+            next = Some(index);
+        }
+    }
+    Ok(turns)
+}
+#[derive(Clone, Copy)]
+struct ReferenceGuide {
+    point: [f64; 3],
+    segment: Option<usize>,
+    at_vertex: bool,
+    matched: bool,
+}
+fn reference_guide(reference: &[[f64; 3]], lookahead: f64, reference_length: f64) -> ReferenceGuide {
+    let mut guide = ReferenceGuide { point: *reference.last().unwrap(), segment: None, at_vertex: false, matched: false };
+    let mut along = 0.0;
+    for (index, pair) in reference.windows(2).enumerate() {
+        let length = (pair[1][0]-pair[0][0]).hypot(pair[1][1]-pair[0][1]);
+        if along+length >= lookahead && length > 1e-9 {
+            let t = (lookahead-along)/length;
+            guide.point = std::array::from_fn(|i| pair[0][i]+t*(pair[1][i]-pair[0][i]));
+            // A terminal guide has no reference continuation or invented goal heading.
+            guide.segment = if lookahead < reference_length { Some(index) } else { None };
+            guide.at_vertex = t >= 1.0;
+            guide.matched = true;
+            break;
+        }
+        along += length;
+    }
+    guide
+}
+// Experimental angular accounting changes ordering, never body admission.
+fn reference_guide_turn(position: [f64; 2], heading: f64, guide: ReferenceGuide, turns: &[ReferenceTurn]) -> f64 {
+    let dx = guide.point[0]-position[0];
+    let dy = guide.point[1]-position[1];
+    let coincident = dx.hypot(dy) < 1e-6;
+    let segment = if coincident && guide.at_vertex {
+        guide.segment.and_then(|index| turns[index].next)
+    } else { guide.segment };
+    let continuation = segment.and_then(|index| turns[index].heading.map(|theta| (theta,turns[index].suffix)));
+    // Collapse an absent approach leg; never assign atan2(0,0) an eastward bearing.
+    if coincident {
+        return continuation.map_or(0.0, |(theta,suffix)| angle(heading-theta).abs()+suffix);
+    }
+    let bearing = dy.atan2(dx);
+    angle(heading-bearing).abs()
+        + continuation.map_or(0.0, |(theta,suffix)| angle(bearing-theta).abs()+suffix)
+}
+fn heading_potential(p: BodyPose, target: [f64;3], tangent: f64, corridor: f64,
+    arrival: bool, guide: Option<ReferenceGuide>, turns: &[ReferenceTurn]) -> f64 {
+    if let Some(guide) = guide {
+        if guide.matched || arrival {
+            return reference_guide_turn([p.0[0],p.0[1]],yaw(p.1),guide,turns);
+        }
+    }
+    // Preserve the original terminal cross-section fallback when no guide was found.
+    let deficit=|xy:[f64;2]| {
+        let dx=xy[0]-p.0[0];let dy=xy[1]-p.0[1];
+        if dx.hypot(dy)<1e-6 {0.0} else {
+            let error=angle(dy.atan2(dx)-yaw(p.1)).abs();
+            if guide.is_some() {error} else {(error-std::f64::consts::FRAC_PI_2).max(0.0)}
+        }
+    };
+    if arrival {
+        deficit([target[0],target[1]])
+    } else {
+        [0.0,corridor*0.5,-corridor*0.5,corridor,-corridor].into_iter().map(|offset| {
+            deficit([target[0]-tangent.sin()*offset,target[1]+tangent.cos()*offset])
+        }).fold(f64::INFINITY,f64::min)
+    }
+}
 pub(super) fn validate_caps(motion: &MotionKinematics) -> Result<(), LocalPlanError> {
     if !motion.max_forward_mps.is_finite() || motion.max_forward_mps<=0.0
         || !motion.max_angular_rps.is_finite() || motion.max_angular_rps<=0.0 {
@@ -204,10 +300,19 @@ fn projected_cost(from: BodyPose, samples: &[BodyPose], offset: f64,
     tomogram: &Tomogram, reference: &[[f64;3]], motion: &MotionKinematics) -> f64 {
     let soft=|p:BodyPose|preference(tomogram,[p.0[0],p.0[1],p.0[2]-offset],reference);
     let mut previous=from; let mut cost=0.0;
+    let mut previous_soft=None;
     for &next in samples {
         if super::cancellation::checkpoint().is_err() { return f64::INFINITY; }
         let distance=super::distance3(previous.0,next.0);
-        let weight=if distance==0.0 {0.0} else {(soft(previous)+soft(next))*0.5};
+        let weight=if distance==0.0 {
+            previous_soft=None;
+            0.0
+        } else {
+            let left=previous_soft.unwrap_or_else(||soft(previous));
+            let right=soft(next);
+            previous_soft=Some(right);
+            (left+right)*0.5
+        };
         cost+=step_cost(distance,angle(yaw(next.1)-yaw(previous.1)),weight,motion);
         previous=next;
     }
@@ -300,11 +405,11 @@ pub fn plan(
     // 沿已给出的参考走廊估计剩余行程，仍由实际机体动作决定能否通行。
     let remaining = |p: BodyPose| {
         if !follow_reference {
-            return distance(p);
+            return (distance(p), 0.0);
         }
         let (deviation, progress, _) =
             reference_progress([p.0[0], p.0[1], p.0[2] - support_offset], reference);
-        (reference_length - progress).max(0.0) + deviation
+        ((reference_length - progress).max(0.0) + deviation, progress)
     };
     // Forward-only search must rank the turn needed to make progress as well as
     // translation. A distance-only heuristic starves a reversed departure behind
@@ -313,42 +418,11 @@ pub fn plan(
     // Detours aim a body radius ahead on the reference, so a corner can be approached
     // with its outgoing direction before reaching the exact reference vertex.
     let guidance_distance=model.radius().max(tomogram.resolution);
+    let turns = if follow_reference { reference_turns(reference)? } else { Vec::new() };
     let heuristic = |p: BodyPose| {
-        let remaining_distance=remaining(p);
-        let mut aim=target;
-        let mut along_reference=false;
-        if follow_reference {
-            let progress=reference_progress([p.0[0],p.0[1],p.0[2]-support_offset],reference).1;
-            let lookahead=progress+guidance_distance;
-            let mut along=0.0;
-            for pair in reference.windows(2) {
-                let length=(pair[1][0]-pair[0][0]).hypot(pair[1][1]-pair[0][1]);
-                if along+length>=lookahead && length>1e-9 {
-                    let t=(lookahead-along)/length;
-                    aim=std::array::from_fn(|i|pair[0][i]+t*(pair[1][i]-pair[0][i]));
-                    along_reference=true;break;
-                }
-                along+=length;
-            }
-        }
-        // The direct attempt only charges the deficit before forward progress is
-        // possible; once facing forward it keeps the original distance ordering.
-        // The reference-following attempt also ranks alignment with its local guide,
-        // rather than the straight bearing to a target on the other side of a wall.
-        let deficit=|xy:[f64;2]| {
-            let dx=xy[0]-p.0[0];let dy=xy[1]-p.0[1];
-            if dx.hypot(dy)<1e-6 {0.0} else {
-                let error=angle(dy.atan2(dx)-yaw(p.1)).abs();
-                if follow_reference {error} else {(error-std::f64::consts::FRAC_PI_2).max(0.0)}
-            }
-        };
-        let turn=if arrival.is_some() || along_reference {
-            deficit([aim[0],aim[1]])
-        } else {
-            [0.0,corridor*0.5,-corridor*0.5,corridor,-corridor].into_iter().map(|offset| {
-                deficit([target[0]-tangent.sin()*offset,target[1]+tangent.cos()*offset])
-            }).fold(f64::INFINITY,f64::min)
-        };
+        let (remaining_distance,progress)=remaining(p);
+        let guide = follow_reference.then(|| reference_guide(reference,progress+guidance_distance,reference_length));
+        let turn = heading_potential(p,target,tangent,corridor,arrival.is_some(),guide,&turns);
         4.0*remaining_distance/motion.max_forward_mps+4.0*turn/motion.max_angular_rps
     };
     // Exact identity retains legal centimetre departures and small rotations.
@@ -392,7 +466,7 @@ pub fn plan(
         #[cfg(all(test,feature="profile"))]
         if std::env::var_os("NEH_ON_DIAGNOSTIC").is_some() {
             let support=[from.0[0],from.0[1],from.0[2]-support_offset];
-            eprintln!("ON_POP {}",serde_json::json!({"id":id,"parent":nodes[id].parent,"pose":from,"g":cost,"h":heuristic(from),"translation_h":4.0*remaining(from)/motion.max_forward_mps,"f":_priority,"remaining":distance(from),"progress":reference_progress(support,reference).1,"cell":tomogram.cell_at(support).map(|i|format!("{:?}",tomogram.cells[i]))}));
+            eprintln!("ON_POP {}",serde_json::json!({"id":id,"parent":nodes[id].parent,"pose":from,"g":cost,"h":heuristic(from),"translation_h":4.0*remaining(from).0/motion.max_forward_mps,"f":_priority,"remaining":distance(from),"progress":reference_progress(support,reference).1,"cell":tomogram.cell_at(support).map(|i|format!("{:?}",tomogram.cells[i]))}));
         }
         if distance(from) < distance(closest) {closest=from;}
         // 终端区域内优先尝试完整直线接续；离散动作只用于绕过确实阻挡直线的障碍。
@@ -534,7 +608,7 @@ pub fn plan(
             if id == 0 { INITIAL_ADMISSIONS.with(|v|v.borrow_mut().push((length,turn,next))); }
             #[cfg(all(test,feature="profile"))]
             if std::env::var_os("NEH_ON_DIAGNOSTIC").is_some() && id==0 {
-                eprintln!("ON_ADMIT {}",serde_json::json!({"length":length,"turn":turn,"pose":next,"g":next_cost,"h":heuristic(next),"translation_h":4.0*remaining(next)/motion.max_forward_mps,"progress":reference_progress([next.0[0],next.0[1],next.0[2]-support_offset],reference).1}));
+                eprintln!("ON_ADMIT {}",serde_json::json!({"length":length,"turn":turn,"pose":next,"g":next_cost,"h":heuristic(next),"translation_h":4.0*remaining(next).0/motion.max_forward_mps,"progress":reference_progress([next.0[0],next.0[1],next.0[2]-support_offset],reference).1}));
             }
             best.insert(k,next_cost);
             let next_id = nodes.len();
@@ -594,6 +668,125 @@ mod identity_tests {
         assert_ne!(original,key(antipode));
         assert!(admitted.insert(key(antipode),8).is_none());
         assert_eq!(admitted.insert(original,9),Some(0));
+    }
+}
+
+#[cfg(test)]
+mod projected_cost_reuse_tests {
+    use super::*;
+    use super::super::tests::{motion,coarse_open_floor};
+
+    // Independent pre-reuse implementation: retain original expressions/checkpoints.
+    fn original_projected_cost(from: BodyPose, samples: &[BodyPose], offset: f64,
+        tomogram: &Tomogram, reference: &[[f64;3]], motion: &MotionKinematics) -> f64 {
+        let soft=|p:BodyPose|preference(tomogram,[p.0[0],p.0[1],p.0[2]-offset],reference);
+        let mut previous=from; let mut cost=0.0;
+        for &next in samples {
+            if super::super::cancellation::checkpoint().is_err() { return f64::INFINITY; }
+            let distance=super::super::distance3(previous.0,next.0);
+            let weight=if distance==0.0 {0.0} else {(soft(previous)+soft(next))*0.5};
+            cost+=step_cost(distance,angle(yaw(next.1)-yaw(previous.1)),weight,motion);
+            previous=next;
+        }
+        cost
+    }
+    fn pose(x: f64, y: f64, z: f64, heading: f64) -> BodyPose {
+        ([x,y,z],[0.0,0.0,(heading*0.5).sin(),(heading*0.5).cos()])
+    }
+    fn same_bits(label: &str, from: BodyPose, samples: &[BodyPose], offset: f64,
+        tomo: &Tomogram, reference: &[[f64;3]]) {
+        let caps=motion();
+        let expected=original_projected_cost(from,samples,offset,tomo,reference,&caps);
+        let actual=projected_cost(from,samples,offset,tomo,reference,&caps);
+        assert_eq!(actual.to_bits(),expected.to_bits(),"{label}: actual={actual:?}, original={expected:?}");
+    }
+
+    #[test]
+    fn actual_projected_cost_matches_original_bits_across_terrain_and_references() {
+        let map=coarse_open_floor();let mut tomo=Tomogram::from_surface(&map).unwrap();
+        let from=pose(0.0,0.2,0.4,0.0);
+        let projected=probe_motion(&map,from,0.5,0.0,&[]).unwrap();
+        assert!(projected.len()>2);
+        let a=pose(0.1,0.2,0.4,0.0);let rotated=pose(0.1,0.2,0.4,0.3);
+        let b=pose(0.2,0.2,0.4,0.3);
+        let cases=vec![
+            ("empty",vec![]), ("one",vec![a]), ("projected",projected),
+            ("rotate_repeat_between_runs",vec![a,rotated,rotated,b,pose(0.3,0.25,0.45,0.5)]),
+            ("zero_only",vec![from,pose(0.0,0.2,0.4,0.3),from]),
+            ("signed_zero_antipode",vec![pose(-0.0,0.2,0.4,0.0),(from.0,from.1.map(|v|-v)),a,b]),
+            ("missing_cell",vec![pose(50.0,0.2,0.4,0.0),pose(51.0,0.2,0.5,0.1)]),
+        ];
+        let references=vec![vec![],vec![[0.0,0.2,0.0]],vec![[0.0,0.2,0.0];3],
+            vec![[0.0,0.2,0.0],[0.5,0.2,0.0]],
+            vec![[-0.1,0.1,0.0],[0.2,0.1,0.0],[0.2,0.1,0.4],[0.2,0.5,0.4],[0.5,0.2,0.0]]];
+        for terrain in 0..7 {
+            for cell in &mut tomo.cells {
+                cell.cost=match terrain {
+                    0 => if cell.column[0]<0 {0.25} else {3.0+(cell.column[1].rem_euclid(3) as f64)},
+                    1 => -1.0, 2 => f64::NAN, 3 => f64::NEG_INFINITY,
+                    4 => 0.0, 5 => 1.0, _ => f64::INFINITY,
+                };
+            }
+            for offset in [0.4,0.0,0.6] { for reference in &references { for (label,samples) in &cases {
+                same_bits(label,from,samples,offset,&tomo,reference);
+            }}}
+        }
+    }
+
+    #[test]
+    fn underflow_zero_segment_discards_the_previous_endpoint_preference() {
+        let map=coarse_open_floor();let mut tomo=Tomogram::from_surface(&map).unwrap();
+        for cell in &mut tomo.cells {cell.cost=if cell.column[0]<0 {1.0} else {9.0};}
+        let left=pose(-1e-200,0.2,0.4,0.0);let right=pose(1e-200,0.2,0.4,0.0);
+        assert_ne!(left.0[0].to_bits(),right.0[0].to_bits());
+        assert_eq!(super::super::distance3(left.0,right.0),0.0);
+        let left_id=tomo.cell_at([left.0[0],0.2,0.0]).unwrap();
+        let right_id=tomo.cell_at([right.0[0],0.2,0.0]).unwrap();
+        assert_ne!(left_id,right_id);
+        assert_ne!(tomo.cells[left_id].cost,tomo.cells[right_id].cost);
+        let reference=[[0.0,0.2,0.0],[0.5,0.2,0.0]];
+        same_bits("underflow crossing cells",pose(0.1,0.2,0.4,0.0),
+            &[left,right,pose(0.2,0.2,0.4,0.0)],0.4,&tomo,&reference);
+    }
+
+    #[test]
+    fn nonfinite_helper_inputs_retain_original_result_bits() {
+        let map=coarse_open_floor();let mut tomo=Tomogram::from_surface(&map).unwrap();
+        for cell in &mut tomo.cells {cell.cost=0.75;}
+        let from=pose(0.0,0.2,0.4,0.0);let a=pose(0.1,0.2,0.4,0.0);
+        let b=pose(0.2,0.2,0.4,0.2);
+        let reference=[[0.0,0.2,0.0],[0.5,0.2,0.0]];
+        for value in [f64::INFINITY,f64::NEG_INFINITY,f64::NAN,f64::from_bits(0x7ff8000000000042)] {
+            same_bits("nonfinite x",from,&[a,pose(value,0.2,0.4,0.0),b],0.4,&tomo,&reference);
+            same_bits("nonfinite z",from,&[a,pose(0.15,0.2,value,0.0),b],0.4,&tomo,&reference);
+            same_bits("nonfinite offset",from,&[a,b],value,&tomo,&reference);
+            same_bits("nonfinite reference",from,&[a,b],0.4,&tomo,&[[value,0.2,0.0],[0.5,0.2,0.0]]);
+            same_bits("nonfinite rotation",from,&[a,(a.0,[0.0,0.0,value,1.0]),b],0.4,&tomo,&reference);
+        }
+    }
+
+    #[test]
+    fn cancellation_at_each_sample_preserves_result_and_checkpoint_consumption() {
+        let map=coarse_open_floor();let tomo=Tomogram::from_surface(&map).unwrap();
+        let caps=motion();let from=pose(0.0,0.2,0.4,0.0);
+        let reference=[[0.0,0.2,0.0],[0.5,0.2,0.0]];
+        let a=pose(0.1,0.2,0.4,0.0);
+        let samples=[a,pose(0.2,0.2,0.4,0.0),pose(0.2,0.2,0.4,0.3),pose(0.3,0.2,0.4,0.3)];
+        for length in 0..=samples.len() { for budget in 0..=length+1 {
+            let selected=&samples[..length];
+            let expected=super::super::cancellation::after_checkpoints(budget,|| {
+                let cost=original_projected_cost(from,selected,0.4,&tomo,&reference,&caps);
+                (cost.to_bits(),super::super::cancellation::checkpoint().is_err())
+            });
+            let actual=super::super::cancellation::after_checkpoints(budget,|| {
+                let cost=projected_cost(from,selected,0.4,&tomo,&reference,&caps);
+                (cost.to_bits(),super::super::cancellation::checkpoint().is_err())
+            });
+            assert_eq!(actual,expected,"length={length}, budget={budget}");
+            assert_eq!(actual.1,budget<=length);
+            if budget<length {assert_eq!(actual.0,f64::INFINITY.to_bits());}
+            else {assert!(f64::from_bits(actual.0).is_finite());}
+        }}
     }
 }
 
@@ -667,4 +860,125 @@ mod objective_tests {
         assert_eq!(reference_distance([1.0,0.2,0.0],&reference),1.0);
         assert_eq!(reference_progress([1.0,0.2,0.0],&reference),(1.0,0.0,0.0));
     }
+}
+
+#[cfg(test)]
+mod complete_guide_turn_tests {
+    use super::*;
+    fn close(a: f64, b: f64) { assert!((a-b).abs()<1e-12,"{a} != {b}"); }
+    fn length(reference: &[[f64;3]]) -> f64 {
+        reference.windows(2).map(|p|(p[1][0]-p[0][0]).hypot(p[1][1]-p[0][1])).sum()
+    }
+    fn potential(reference: &[[f64;3]], lookahead: f64, position: [f64;2], heading: f64) -> f64 {
+        let turns=reference_turns(reference).unwrap();
+        reference_guide_turn(position,heading,reference_guide(reference,lookahead,length(reference)),&turns)
+    }
+
+    #[test]
+    fn angular_accounting_redistributes_bearing_and_has_no_forward_switch_jump() {
+        let theta=std::f64::consts::FRAC_PI_2;
+        for bearing in [0.0,0.3,0.9,theta] {
+            close(angle(0.0-bearing).abs()+angle(bearing-theta).abs(),theta);
+        }
+        for (incoming,outgoing) in [(0.0,theta),(3.0,-3.0),(-2.0,1.0)] {
+            for heading in [-3.0,0.0,2.0] { for bearing in [-3.1,-0.1,0.8,3.1] {
+                let before=angle(heading-bearing).abs()+angle(bearing-incoming).abs()+angle(incoming-outgoing).abs()+0.7;
+                let after=angle(heading-bearing).abs()+angle(bearing-outgoing).abs()+0.7;
+                assert!(after<=before+1e-12);
+            }}
+        }
+    }
+
+    #[test]
+    fn actual_tie_region_turns_match_original_guide_slope_and_reverse_fixed_segment_penalty() {
+        for (mirror,position,heading,delta,progress,incoming) in [
+            (false,[-1.6940133792580234,1.268233336269405],1.549999999999999,-0.3,2.7,std::f64::consts::FRAC_PI_2),
+            (true,[-1.576267083366934,0.11019567393312495],-3.133185307179587,0.3,1.5,std::f64::consts::PI),
+        ] {
+            let sign=if mirror {-1.0}else{1.0};
+            let reference=[[0.0,0.0,0.0],[-1.5,0.0,0.0],[-1.5,sign*1.2,0.0],[1.2,sign*1.2,0.0],[1.2,0.0,0.0]];
+            let turns=reference_turns(&reference).unwrap();
+            let start_guide=reference_guide(&reference,0.3_f64.hypot(0.16),length(&reference));
+            close(reference_guide_turn([0.0,0.0],0.3,start_guide,&turns)
+                -reference_guide_turn([0.0,0.0],0.0,start_guide,&turns),-0.3);
+            let guide=reference_guide(&reference,progress+0.3_f64.hypot(0.16),length(&reference));
+            let before=reference_guide_turn(position,heading,guide,&turns);
+            let after=reference_guide_turn(position,heading+delta,guide,&turns);
+            let bearing=(guide.point[1]-position[1]).atan2(guide.point[0]-position[0]);
+            let old_delta=angle(heading+delta-bearing).abs()-angle(heading-bearing).abs();
+            close(after-before,old_delta); // Added continuation debt is yaw-independent here.
+            close(delta.abs()/0.8+4.0*(after-before)/0.8,-1.125);
+            let fixed_delta=angle(heading+delta-incoming).abs()-angle(heading-incoming).abs();
+            close(delta.abs()/0.8+4.0*fixed_delta/0.8,1.875);
+        }
+    }
+
+    #[test]
+    fn terminal_guide_never_imposes_last_segment_heading() {
+        let reference=[[0.0,0.0,0.0],[1.0,0.0,0.0],[1.0,1.0,0.0]];
+        for lookahead in [2.0,3.0] {
+            let guide=reference_guide(&reference,lookahead,length(&reference));
+            assert!(guide.segment.is_none());
+            close(potential(&reference,lookahead,[0.0,1.0],0.0),0.0);
+            close(potential(&reference,lookahead,[0.0,1.0],std::f64::consts::PI),std::f64::consts::PI);
+            for heading in [-2.0,0.0,2.0] { close(potential(&reference,lookahead,[1.0,1.0],heading),0.0); }
+        }
+        let point=[[0.0,0.0,0.0]];
+        close(potential(&point,1.0,[0.0,0.0],2.0),0.0);
+        close(potential(&point,1.0,[-1.0,0.0],0.0),0.0);
+    }
+
+    #[test]
+    fn coincident_internal_guide_uses_outgoing_segment_across_duplicates_and_heights() {
+        let reference=[[0.0,0.0,0.0],[1.0,0.0,0.0],[1.0,0.0,2.0],[1.0,1.0,2.0]];
+        let guide=reference_guide(&reference,1.0,length(&reference));
+        assert_eq!(guide.segment,Some(0)); assert!(guide.at_vertex);
+        close(potential(&reference,1.0,[1.0,0.0],std::f64::consts::FRAC_PI_2),0.0);
+        close(potential(&reference,1.0,[1.0+0.5e-6,0.0],0.0),std::f64::consts::FRAC_PI_2);
+        // At exactly the old 1e-6 cutoff the nonzero approach bearing remains defined.
+        let simple=[[0.0,0.0,0.0],[0.0,1.0,0.0]];
+        let turns=reference_turns(&simple).unwrap();
+        let internal=ReferenceGuide {point:[0.0,0.0,0.0],segment:Some(0),at_vertex:false,matched:true};
+        close(reference_guide_turn([-1e-6,0.0],std::f64::consts::FRAC_PI_2,internal,&turns),std::f64::consts::PI);
+        close(reference_guide_turn([0.0,0.0],std::f64::consts::FRAC_PI_2,internal,&turns),0.0);
+    }
+
+    #[test]
+    fn collinear_subdivision_wrap_and_original_threshold_difference_are_explicit() {
+        let original=[[0.0,0.0,0.0],[2.0,0.0,0.0],[2.0,2.0,0.0]];
+        let divided=[[0.0,0.0,0.0],[1.0,0.0,0.0],[1.0,0.0,0.0],[2.0,0.0,0.0],[2.0,1.0,0.0],[2.0,2.0,0.0]];
+        for lookahead in [0.5,1.0,1.5,2.0,2.5,4.0] { for heading in [-3.0,0.0,3.0] {
+            close(potential(&original,lookahead,[0.2,0.1],heading),potential(&divided,lookahead,[0.2,0.1],heading));
+        }}
+        let a=179.0_f64.to_radians();let b=-179.0_f64.to_radians();let point=[a.cos(),a.sin(),0.0];
+        let wrapped=[[0.0,0.0,0.0],point,point,[point[0]+b.cos(),point[1]+b.sin(),0.0]];
+        close(reference_turns(&wrapped).unwrap()[0].suffix,2.0_f64.to_radians());
+        let tiny=[[0.0,0.0,0.0],[1e-9,0.0,0.0]];
+        assert!(reference_turns(&tiny).unwrap()[0].heading.is_none()); // Guide retains >1e-9.
+        close(reference_progress([1e-9,0.0,0.0],&tiny).1,1e-9); // Projection retains <1e-9 skip.
+        assert!(reference_guide(&tiny,0.5e-9,length(&tiny)).segment.is_none());
+    }
+    #[test]
+    fn missed_terminal_guide_preserves_full_error_cross_section_fallback() {
+        let reference=[[-2.0,0.0,0.0],[0.0,0.0,0.0]];
+        let target=[0.0,0.0,0.0];
+        let pose=([-1.0,1.0,0.0],[0.0,0.0,0.0,1.0]);
+        let turns=reference_turns(&reference).unwrap();
+        let terminal=reference_guide(&reference,2.0,length(&reference));
+        let beyond=reference_guide(&reference,3.0,length(&reference));
+        assert!(terminal.matched && terminal.segment.is_none());
+        assert!(!beyond.matched && beyond.segment.is_none());
+        // Exactly terminal still matched the old loop and therefore aims at the center.
+        close(heading_potential(pose,target,0.0,2.0,false,Some(terminal),&turns),std::f64::consts::FRAC_PI_4);
+        // Beyond it, no arrival means the unchanged five-offset full-error minimum.
+        close(heading_potential(pose,target,0.0,2.0,false,Some(beyond),&turns),0.0);
+        close(heading_potential(pose,target,0.0,2.0,true,Some(beyond),&turns),std::f64::consts::FRAC_PI_4);
+        let point=[target];let point_guide=reference_guide(&point,1.0,0.0);
+        assert!(!point_guide.matched);
+        close(heading_potential(pose,target,0.0,2.0,false,Some(point_guide),&[]),0.0);
+        close(heading_potential(pose,target,0.0,2.0,true,Some(point_guide),&[]),std::f64::consts::FRAC_PI_4);
+        // Direct mode keeps its existing pi/2 clamp rather than reference full error.
+        close(heading_potential(pose,target,0.0,2.0,true,None,&[]),0.0);
+    }
+
 }

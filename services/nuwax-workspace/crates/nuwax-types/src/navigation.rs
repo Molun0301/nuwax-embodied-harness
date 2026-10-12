@@ -1,7 +1,27 @@
-//! 封存导航目标的执行选项；与通信和具体规划器解耦。
+//! 导航原编号与执行选项；与通信和具体规划器解耦。
 use serde::{Deserialize, Serialize};
 
-/// 必须随目标摘要传递的执行约束。
+/// Geometry owner 已分配的目标编号；非空编号各分量必须在正 i64 范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoalKey {
+    /// 分配目标的 Geometry runtime 代次。
+    pub producer_runtime_generation: u64,
+    /// 该 runtime 中的目标代次。
+    pub goal_generation: u64,
+}
+
+/// 规划 owner 已分配的路径编号，不由路径内容派生。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathKey {
+    /// 路径所属的原目标。
+    pub goal: GoalKey,
+    /// 生成路径的 planner runtime 代次。
+    pub planner_runtime_generation: u64,
+    /// 该目标的路径修订号。
+    pub path_revision: u64,
+}
+
+/// 必须随目标传递的执行约束。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoalOptions {

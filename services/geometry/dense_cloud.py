@@ -6,7 +6,7 @@ import threading
 
 import numpy as np
 
-from services.geometry.checkpoint_payload import FrozenPayload, payload_digest
+from services.geometry.checkpoint_payload import FrozenPayload
 
 MAX_DENSE_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024
 DENSE_CHUNK_POINTS = 65_536
@@ -199,7 +199,8 @@ class SavedDenseCloudCache:
             return self._read_assigned(source, expected_epoch=expected_epoch, offset_points=offset_points)
         from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore
 
-        key = (str(source["bundle_root"]), source["backend_kind"], source["manifest_sha256"], source["frame_id"])
+        key = (str(source["bundle_root"]), source["backend_kind"], source["manifest_sha256"],
+               source["frame_id"], source["activation_generation"])
         with self._lock:
             if self._closed:
                 raise RuntimeError("完整点云读取已关闭")
@@ -215,7 +216,9 @@ class SavedDenseCloudCache:
                 if metadata["frame_id"] != source["frame_id"]:
                     raise ValueError("完整点云坐标系与活动资产不一致")
                 self._key, self._payload, self._metadata, self._offset = key, payload, metadata, offset
-                self._epoch = "saved:" + payload_digest(payload).hex()
+                # Historical manifest alias is retained, not recomputed from the body.
+                # The runtime increments this original generation on every installation.
+                self._epoch = "saved-legacy:%s:%s:%s" % (key[1], key[2], key[4])
             if expected_epoch and expected_epoch != self._epoch:
                 raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
             metadata = self._metadata

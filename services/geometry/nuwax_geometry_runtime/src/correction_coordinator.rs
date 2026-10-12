@@ -3900,29 +3900,38 @@ mod preflight_only_contract {
                         Some(owner),
                         Some(ActivationIdentity::Assigned(activation)),
                         Some(TargetReceipt::Assigned(receipt)),
-                        Some(proof),
                     ) = (
                         record.checkpoint_owner.as_ref(),
                         record.activation_identity.as_ref(),
                         record.target_receipt.as_ref(),
-                        record.publication_proof.as_ref(),
-                    )
-                    else {
+                    ) else {
                         return false;
                     };
                     // Only small, immutable descriptors are compared while holding the ledger lock.
-                    activation.request == *metadata
-                        && activation.lifecycle_epoch == record.epoch
-                        && activation.session_generation == record.session_generation
-                        && activation.backend_generation == record.backend_generation
-                        && receipt.activation == *activation
-                        && receipt.validate(owner)
-                        && proof.target_receipt == *record.target_receipt.as_ref().unwrap()
-                        && proof.cloud_receipt == receipt.cloud_receipt
+                    if activation.request != *metadata
+                        || activation.lifecycle_epoch != record.epoch
+                        || activation.session_generation != record.session_generation
+                        || activation.backend_generation != record.backend_generation
+                        || receipt.activation != *activation
+                        || !receipt.validate(owner)
+                    {
+                        return false;
+                    }
+                    if owner.backend_kind() == crate::mapping_backend::MappingBackendKind::SlamToolbox {
+                        return record.seed.planar_target.is_some()
+                            && record.planar_receipt.as_ref() == Some(&receipt.occupancy_receipt);
+                    }
+                    let (Some(proof), Some(cloud)) =
+                        (record.publication_proof.as_ref(), receipt.cloud_receipt.as_ref())
+                    else {
+                        return false;
+                    };
+                    proof.target_receipt == *record.target_receipt.as_ref().unwrap()
+                        && proof.cloud_receipt == *cloud
                         && proof.point_count == owner.cloud().point_count()
                         && proof.voxel_size.to_bits() == owner.cloud().voxel_size().to_bits()
-                        && proof.cloud_revision == receipt.cloud_receipt.cloud_revision
-                        && proof.source_timestamp_ns == receipt.cloud_receipt.source_timestamp_ns
+                        && proof.cloud_revision == cloud.cloud_revision
+                        && proof.source_timestamp_ns == cloud.source_timestamp_ns
                 }
                 ActivationRequestKey::LegacyDigest(_) => {
                     let Some(ActivationIdentity::LegacyDigest(activation)) =
@@ -3961,12 +3970,11 @@ mod preflight_only_contract {
         }
 
         fn sealed_target_available(record: &PermanentActivationRecord) -> bool {
-            // Keep the legacy digest/snapshot surface closed for assigned targets.
-            // Schema 2 uses its own exact owner plus the live cloud actor capability.
-            matches!(
-                record.seed.request_key,
-                ActivationRequestKey::LegacyDigest(_)
-            ) && record.state == PermanentActivationState::Sealed
+            // Planar targets use the existing planar owner. Assigned cloud targets keep
+            // their separate typed snapshot and live cloud actor capability.
+            (matches!(record.seed.request_key, ActivationRequestKey::LegacyDigest(_))
+                || record.planar_target_required)
+                && record.state == PermanentActivationState::Sealed
                 && Self::has_complete_target_proof(record)
         }
 
@@ -4090,11 +4098,17 @@ mod preflight_only_contract {
                         && seed.asset_manifest_sha256.is_none()
                         && seed.asset_bundle_sha256.is_none()
                         && seed.immutable_target.is_none()
-                        && seed.planar_target.is_none()
-                        && seed
-                            .checkpoint_owner
-                            .as_ref()
-                            .is_some_and(|owner| owner.identity() == metadata.checkpoint_identity())
+                        && seed.checkpoint_owner.as_ref().is_some_and(|owner| {
+                            owner.identity() == metadata.checkpoint_identity()
+                                && match seed.planar_target.as_ref() {
+                                    None => true, // A known request may replay before target preparation.
+                                    Some(target) => matches!(
+                                        &target.identity,
+                                        crate::planar_artifacts::TargetIdentity::Assigned(reference)
+                                            if owner.graph().is_some_and(|graph| graph.reference() == reference)
+                                    ),
+                                }
+                        })
                 }
             };
             if !seed_valid {
@@ -4293,10 +4307,13 @@ mod preflight_only_contract {
                 ledger.records.insert(
                     request_id.clone(),
                     PermanentActivationRecord {
-                        planar_target_required: seed.planar_target.is_some(),
+                        planar_target_required: seed.planar_target.is_some()
+                            || checkpoint_owner.as_ref().is_some_and(|owner|
+                                owner.backend_kind() == crate::mapping_backend::MappingBackendKind::SlamToolbox),
                         planar_receipt: None,
                         cloud_target_required: immutable_target.is_some()
-                            || checkpoint_owner.is_some(),
+                            || checkpoint_owner.as_ref().is_some_and(|owner|
+                                owner.backend_kind() != crate::mapping_backend::MappingBackendKind::SlamToolbox),
                         seed,
                         immutable_target,
                         checkpoint_owner,
@@ -4581,15 +4598,16 @@ mod preflight_only_contract {
                         record.activation_identity.as_ref()
                             == Some(&ActivationIdentity::Assigned(receipt.activation.clone()))
                             && record.checkpoint_owner.as_ref().is_some_and(|owner| {
-                                receipt.validate(owner)
+                                owner.backend_kind() != crate::mapping_backend::MappingBackendKind::SlamToolbox
+                                    && receipt.validate(owner)
                                     && proof.point_count == owner.cloud().point_count()
-                                    && proof.voxel_size.to_bits()
-                                        == owner.cloud().voxel_size().to_bits()
+                                    && proof.voxel_size.to_bits() == owner.cloud().voxel_size().to_bits()
                             })
-                            && proof.cloud_receipt == receipt.cloud_receipt
-                            && proof.cloud_revision == receipt.cloud_receipt.cloud_revision
-                            && proof.source_timestamp_ns
-                                == receipt.cloud_receipt.source_timestamp_ns
+                            && receipt.cloud_receipt.as_ref().is_some_and(|cloud| {
+                                proof.cloud_receipt == *cloud
+                                    && proof.cloud_revision == cloud.cloud_revision
+                                    && proof.source_timestamp_ns == cloud.source_timestamp_ns
+                            })
                     }
                     _ => false,
                 };
@@ -4620,18 +4638,36 @@ mod preflight_only_contract {
             &self,
             token: &ActivationToken,
             receipt: crate::mapping_commit::OccupancyCommitReceipt,
-        ) -> Option<[u8; 32]> {
+        ) -> Option<TargetReceipt> {
             self.with_staged_record_mut(token, |record| {
                 let target = record.seed.planar_target.as_ref()?;
-                let digest = target.receipt(
-                    record.activation_identity.as_ref()?.legacy_digest()?,
-                    &receipt,
-                );
+                let target_receipt = match record.activation_identity.as_ref()? {
+                    ActivationIdentity::LegacyDigest(activation) =>
+                        TargetReceipt::LegacyDigest(target.receipt(*activation, &receipt)),
+                    ActivationIdentity::Assigned(activation) => {
+                        let owner = record.checkpoint_owner.as_ref()?;
+                        if owner.backend_kind() != crate::mapping_backend::MappingBackendKind::SlamToolbox {
+                            return None;
+                        }
+                        let installed = InstalledTargetReceiptV2 {
+                            activation: activation.clone(),
+                            source_member: owner.source_member().clone(),
+                            occupancy_receipt: receipt.clone(),
+                            cloud_receipt: None,
+                        };
+                        if !installed.validate(owner) {
+                            return None;
+                        }
+                        TargetReceipt::Assigned(installed)
+                    }
+                };
+                if record.target_receipt.as_ref().is_some_and(|stored| stored != &target_receipt) {
+                    return None;
+                }
                 record.planar_receipt = Some(receipt);
-                record.target_receipt = Some(TargetReceipt::LegacyDigest(digest));
-                Some(digest)
-            })
-            .flatten()
+                record.target_receipt = Some(target_receipt.clone());
+                Some(target_receipt)
+            }).flatten()
         }
         pub(crate) fn current_sealed_planar_target(
             &self,
@@ -4682,7 +4718,9 @@ mod preflight_only_contract {
                     .map(ActivationTargetSource::Legacy),
                 ActivationRequestKey::Assigned(_) => record
                     .checkpoint_owner
-                    .clone()
+                    .as_ref()
+                    .filter(|owner| owner.backend_kind() != crate::mapping_backend::MappingBackendKind::SlamToolbox)
+                    .cloned()
                     .map(ActivationTargetSource::Assigned),
             })
             .flatten()
@@ -5134,6 +5172,7 @@ mod preflight_only_contract {
             state.relocalization_policy_v2 = match state.mapping_backend_kind.as_str() {
                 "voxel" | "raytracing" => Some(
                     crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire()),
+                "slam_toolbox" => Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire()),
                 _ => None,
             };
         }
@@ -5181,9 +5220,11 @@ mod preflight_only_contract {
                     state.deadline_policy_sha256.clear();
                     state.algorithm_options_version = 0;
                     state.algorithm_options_sha256.clear();
-                    state.relocalization_policy_v2 = Some(
-                        crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire(),
-                    );
+                    state.relocalization_policy_v2 = if state.mapping_backend_kind == "slam_toolbox" {
+                        Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire())
+                    } else {
+                        Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire())
+                    };
                     state.activation_receipt_v2 = Some(crate::proto::ActivationReceiptV2 {
                         request: Some(crate::activation_contract::request_to_wire(request)),
                         activation: None,
@@ -5199,6 +5240,11 @@ mod preflight_only_contract {
             seed: &ActivationReceiptSeed,
         ) {
             self.apply_request_key(state, &seed.activation_request_id, &seed.request_key);
+            if seed.checkpoint_owner.as_ref().is_some_and(|owner|
+                owner.backend_kind() == crate::mapping_backend::MappingBackendKind::SlamToolbox)
+            {
+                state.relocalization_policy_v2 = Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire());
+            }
             if matches!(seed.request_key, ActivationRequestKey::LegacyDigest(_)) {
                 state.asset_manifest_sha256 = seed
                     .asset_manifest_sha256
@@ -5246,7 +5292,8 @@ mod preflight_only_contract {
                     state.relocalization_target_available = target_available;
                     if let Some(target) = record.seed.planar_target.as_ref() {
                         state.target_kind = "planar_graph".into();
-                        state.target_graph_sha256 = target.sha.to_vec();
+                        state.target_graph_sha256 = target.identity.legacy_digest()
+                            .map(|value| value.to_vec()).unwrap_or_default();
                     }
                     if record.planar_target_required {
                         state.source_policy_sha256 = planar_source_policy_sha256().to_vec();
@@ -5266,7 +5313,12 @@ mod preflight_only_contract {
                         Some(TargetReceipt::Assigned(value)) => Some(value.to_wire()),
                         _ => None,
                     };
-                    state.relocalization_target_available = self.assigned_actor_available()
+                    if record.planar_target_required {
+                        state.target_kind = "planar_graph".into();
+                        state.planar_mode = "localization".into();
+                        state.relocalization_policy_v2 = Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire());
+                    }
+                    state.relocalization_target_available = (record.planar_target_required || self.assigned_actor_available())
                         && matches!(disposition, crate::proto::ActivationReceiptDisposition::Sealed
                             | crate::proto::ActivationReceiptDisposition::SealedReplay)
                         && record.epoch == self.lifecycle_epoch()
@@ -6540,21 +6592,21 @@ mod preflight_only_contract {
         pub disposition:crate::proto::RelocalizeDisposition,
         pub detail:String,
         pub correction_revision:u64,
-        pub evidence:Vec<u8>,
+        pub evidence:Option<crate::proto::AssignedPlanarRelocalizationEvidenceV2>,
     }
     pub(crate) type PlanarCommandWork = Box<dyn FnOnce(PlanarCommandContext)->std::pin::Pin<Box<dyn std::future::Future<Output=PlanarCommandOutcome>+Send>>+Send>;
-    struct PlanarClaim {request_id:String,identity:[u8;32],reply:oneshot::Sender<bool>}
+    struct PlanarClaim {request_id:String,identity:RelocalizationRequestIdentity,reply:oneshot::Sender<bool>}
     pub(crate) struct PlanarCommandContext {
         pub epoch:u64,
         pub deadline:Instant,
-        pub request_identity:[u8;32],
+        pub request_identity:AssignedCloudRelocalizeRequestIdentityV2,
         request_id:String,
         claim:mpsc::Sender<PlanarClaim>,
     }
     impl PlanarCommandContext {
         pub async fn claim(&self)->bool {
             let (tx,rx)=oneshot::channel();
-            if self.claim.send(PlanarClaim{request_id:self.request_id.clone(),identity:self.request_identity,reply:tx}).await.is_err() {return false;}
+            if self.claim.send(PlanarClaim{request_id:self.request_id.clone(),identity:RelocalizationRequestIdentity::Assigned(self.request_identity.clone()),reply:tx}).await.is_err() {return false;}
             rx.await.unwrap_or(false)
         }
     }
@@ -6574,6 +6626,8 @@ mod preflight_only_contract {
 
     #[derive(Clone)]
     pub(crate) struct RelocalizationCommandIngress {
+        // Original actor identity; no new generation, lease, or authority is allocated.
+        owner_identity: Option<CorrectionOwnerRuntimeIdentity>,
         sender: mpsc::Sender<RelocalizationAdmissionRequest>,
         terminal_query_sender: mpsc::Sender<RelocalizationTerminalQueryRequest>,
         terminal_store: RelocalizationTerminalStore,
@@ -6583,6 +6637,14 @@ mod preflight_only_contract {
     }
 
     impl RelocalizationCommandIngress {
+        pub(crate) fn owns_receipt(&self, receipt: &crate::proto::RelocalizationOwnerReceiptV2) -> bool {
+            self.is_open() && self.owner_identity.as_ref().is_some_and(|owner| {
+                owner.runtime_generation == receipt.runtime_generation
+                    && owner.backend_generation == receipt.correction_backend_generation
+                    && owner.correction_lease.generation == receipt.correction_lease_generation
+                    && owner.correction_lease.boot_nonce.to_be_bytes().as_slice() == receipt.correction_lease_boot_nonce.as_slice()
+            })
+        }
         pub(crate) async fn admit(
             &self,
             request: crate::proto::RelocalizeRequest,
@@ -6607,8 +6669,10 @@ mod preflight_only_contract {
             mapping_lifecycle_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
             planar_work: Option<PlanarCommandWork>,
         ) -> Result<RelocalizationCommandWaiter, RelocalizationCommandError> {
-            validate_relocalize_request(request.clone()).map_err(RelocalizationCommandError::InvalidRequest)?;
-            if planar_work.is_some() { return Err(RelocalizationCommandError::InvalidRequest("RELOCALIZATION_ASSIGNED_TARGET_ABSENT_OR_UNSUPPORTED".into())); }
+            let validated = validate_relocalize_request(request.clone()).map_err(RelocalizationCommandError::InvalidRequest)?;
+            if validated.identity.is_planar() != planar_work.is_some() {
+                return Err(RelocalizationCommandError::InvalidRequest("RELOCALIZATION_ASSIGNED_BACKEND_DISPATCH_MISMATCH".into()));
+            }
             if !self.admission_open.load(Ordering::Acquire) {
                 return Err(RelocalizationCommandError::Stopped);
             }
@@ -6700,6 +6764,7 @@ mod preflight_only_contract {
             });
             let (_admission_tx, admission_rx) = watch::channel(true);
             Self {
+                owner_identity: None,
                 sender,
                 terminal_query_sender,
                 terminal_store,
@@ -7497,7 +7562,7 @@ mod preflight_only_contract {
         let encoded = decode_hex(&record.terminal_hex, RELOCALIZATION_MAX_TERMINAL_BYTES)?;
         let result = crate::proto::RelocalizeResult::decode(encoded.as_slice())
             .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_TERMINAL_INVALID")?;
-        if result.schema_version != 1 || result.assigned_cloud_v2.is_some()
+        if result.schema_version != 1 || result.assigned_cloud_v2.is_some() || result.assigned_planar_v2.is_some()
             || result.request_id != record.request_id
             || result.request_identity_sha256.as_slice() != request_alias
             || result.activation_identity_sha256.as_slice() != activation_alias
@@ -8002,6 +8067,13 @@ mod preflight_only_contract {
     }
 
     enum RelocalizationExecution {
+        Planar {
+            request: ValidatedRelocalizeRequest,
+            admission_ordinal: u64,
+            mode_epoch: u64,
+            logical_deadline: Instant,
+            work: Option<PlanarCommandWork>,
+        },
         Accumulating(Box<RelocalizationAccumulation>),
         Computing {
             request: Box<ValidatedRelocalizeRequest>,
@@ -8117,6 +8189,7 @@ mod preflight_only_contract {
             let terminal_store = prepared_store.unwrap_or_else(||RelocalizationTerminalStore::open()
                 .expect("durable relocalization terminal store must open before admission"));
             let ingress = RelocalizationCommandIngress {
+                owner_identity: Some(owner_identity.clone()),
                 sender,
                 terminal_query_sender,
                 terminal_store: terminal_store.clone(),
@@ -8309,6 +8382,15 @@ mod preflight_only_contract {
             disposition: crate::proto::RelocalizeDisposition, detail: &str,
         ) -> Result<StoredRelocalizationResult, CorrectionRuntimeError> {
             let mut evidence = self.assigned_evidence(request, admission_ordinal, None, None)?;
+            if request.identity.is_planar() {
+                let result = assigned_planar_relocalization_result(&request.identity, disposition, 0, detail,
+                    crate::proto::AssignedPlanarRelocalizationEvidenceV2 {
+                        schema_version: 2, phase: evidence.phase, admission_ordinal: evidence.admission_ordinal,
+                        owner: evidence.owner, ..Default::default()
+                    });
+                return AssignedRelocalizationTerminalV2::new(result, None)
+                    .map(StoredRelocalizationResult::Assigned).map_err(CorrectionRuntimeError::Apply);
+            }
             if admission_ordinal.is_some() {
                 match self.execution.as_ref() {
                     Some(RelocalizationExecution::Accumulating(accumulation)) if accumulation.request.key() == request.key() => {
@@ -8481,9 +8563,13 @@ mod preflight_only_contract {
             // no mapping completion can pass its final commit boundary while
             // the mode fence changes to active.
             let _mapping_lifecycle_guard = mapping_lifecycle_guard;
-            let validated = if planar_work.is_some() {
-                Err("RELOCALIZATION_ASSIGNED_TARGET_ABSENT_OR_UNSUPPORTED".into())
-            } else { validate_relocalize_request(raw_request) };
+            let validated = validate_relocalize_request(raw_request).and_then(|request| {
+                if request.identity.is_planar() != planar_work.is_some()
+                    || (request.identity.is_planar() && runtime.is_some()) {
+                    return Err("RELOCALIZATION_ASSIGNED_BACKEND_DISPATCH_MISMATCH".into());
+                }
+                Ok(request)
+            });
             let claim_fence = phase_a.command_claim_fence();
             let claim_guard = claim_fence.lock();
             if !phase_a.is_open() {
@@ -8652,7 +8738,12 @@ mod preflight_only_contract {
                 }
             };
             if let Some((ordinal, epoch, deadline)) = started {
-                if let Some(runtime) = runtime {
+                if let Some(work) = planar_work {
+                    self.execution = Some(RelocalizationExecution::Planar {
+                        request, admission_ordinal: ordinal, mode_epoch: epoch,
+                        logical_deadline: deadline, work: Some(work),
+                    });
+                } else if let Some(runtime) = runtime {
                     self.begin_runtime_execution(request, ordinal, epoch, deadline, runtime)?;
                 } else {
                     self.settle_active(crate::proto::RelocalizeDisposition::TargetUnavailable,
@@ -9474,13 +9565,74 @@ mod preflight_only_contract {
         detached_tx: &mpsc::UnboundedSender<RelocalizationWaiterEvent>, phase_a: &CorrectionPhaseAControl,
     ) -> Result<(), CorrectionRuntimeError> {
         let mut admission_rx = phase_a.admission_tx.subscribe();
+        let (claim_tx, mut claims) = mpsc::channel::<PlanarClaim>(RELOCALIZATION_COMMAND_QUEUE_CAPACITY);
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut shutting_down = false;
         loop {
+            if let Some(RelocalizationExecution::Planar { request, mode_epoch, logical_deadline, work, .. }) = actor.execution.as_mut() {
+                if let Some(work) = work.take() {
+                    let context = PlanarCommandContext { epoch: *mode_epoch, deadline: *logical_deadline,
+                        request_identity: request.identity.clone(), request_id: request.request_id().into(), claim: claim_tx.clone() };
+                    let request_id = request.request_id().to_owned();
+                    let identity = request.key();
+                    tasks.spawn(async move { (request_id, identity, work(context).await) });
+                }
+            }
+            if shutting_down && tasks.is_empty() { return Ok(()); }
+            let deadline = actor.ledger.active_identity().and_then(|active|
+                (active.4 == RelocalizationClaimPhase::Preclaim).then_some(active.3));
             tokio::select! { biased;
-                _ = wait_for_admission_close(&mut admission_rx) => {
+                _ = wait_for_admission_close(&mut admission_rx), if !shutting_down => {
+                    shutting_down = true;
                     admissions.close();
                     actor.settle_active(crate::proto::RelocalizeDisposition::OwnerStopped,
                         "RELOCALIZATION_OWNER_STOPPED_PRECLAIM")?;
-                    return Ok(());
+                },
+                _ = wait_until_optional_instant(deadline), if deadline.is_some() => {
+                    actor.settle_active(crate::proto::RelocalizeDisposition::DeadlineExceeded,
+                        "RELOCALIZATION_LOGICAL_DEADLINE_EXCEEDED_PRECLAIM")?;
+                },
+                claim = claims.recv(), if !tasks.is_empty() => if let Some(claim) = claim {
+                    let fence = phase_a.command_claim_fence();
+                    let _guard = fence.lock();
+                    let allowed = phase_a.is_open() && actor.ledger.active_identity().is_some_and(|active|
+                        active.0 == claim.request_id && active.1 == claim.identity
+                        && active.4 == RelocalizationClaimPhase::Preclaim && Instant::now() < active.3);
+                    let claimed = allowed && actor.ledger.mark_postclaim(&claim.request_id, &claim.identity).is_ok();
+                    let _ = claim.reply.send(claimed);
+                },
+                joined = tasks.join_next(), if !tasks.is_empty() => match joined {
+                    Some(Ok((id, identity, outcome))) => {
+                        let Some(RelocalizationExecution::Planar { request, admission_ordinal, .. }) = actor.execution.take() else {
+                            return Err(CorrectionRuntimeError::Apply("planar retained execution absent".into()));
+                        };
+                        if request.request_id() != id || request.key() != identity {
+                            return Err(CorrectionRuntimeError::Apply("planar retained execution identity mismatch".into()));
+                        }
+                        // Cancellation/deadline already stored the authoritative terminal. The
+                        // retained worker is still joined after candidate discard/unpause finishes.
+                        if actor.ledger.terminal(&id).is_none() {
+                            let base = actor.assigned_evidence(&request, Some(admission_ordinal), None, None)?;
+                            let mut evidence = outcome.evidence.unwrap_or_else(|| crate::proto::AssignedPlanarRelocalizationEvidenceV2 {
+                                schema_version: 2, phase: crate::proto::AssignedRelocalizationEvidencePhaseV2::Admitted as i32,
+                                ..Default::default()
+                            });
+                            evidence.admission_ordinal = base.admission_ordinal;
+                            evidence.owner = base.owner;
+                            let result = assigned_planar_relocalization_result(&request.identity, outcome.disposition,
+                                outcome.correction_revision, &outcome.detail, evidence);
+                            let terminal = AssignedRelocalizationTerminalV2::new(result, None)
+                                .map(StoredRelocalizationResult::Assigned).map_err(CorrectionRuntimeError::Apply)?;
+                            let terminal = actor.settle_terminal_durable(&id, &identity, terminal)?;
+                            actor.notify_terminal(terminal);
+                        }
+                    },
+                    Some(Err(error)) => {
+                        actor.settle_active(crate::proto::RelocalizeDisposition::OwnerFailed, "RELOCALIZATION_RETAINED_TASK_FAILED")?;
+                        phase_a.begin();
+                        return Err(CorrectionRuntimeError::WorkerJoin(format!("planar retained task failed: {error}")));
+                    },
+                    None => {},
                 },
                 query = terminal_queries.recv() => match query {
                     Some(query) => actor.handle_terminal_query(query), None => return Err(CorrectionRuntimeError::IngressClosed),
@@ -9489,9 +9641,10 @@ mod preflight_only_contract {
                     Some(RelocalizationWaiterEvent::Detached(id)) => actor.handle_detached(id)?,
                     None => return Err(CorrectionRuntimeError::IngressClosed),
                 },
-                admission = admissions.recv() => match admission {
+                admission = admissions.recv(), if !shutting_down => match admission {
                     Some(admission) => actor.handle_admission(admission, detached_tx, None, phase_a)?,
-                    None => return Ok(()),
+                    None => { shutting_down = true; actor.settle_active(crate::proto::RelocalizeDisposition::OwnerStopped,
+                        "RELOCALIZATION_OWNER_STOPPED_PRECLAIM")?; },
                 },
             }
         }
@@ -9672,7 +9825,7 @@ mod preflight_only_contract {
             || !snapshot.target_receipt.validate(&snapshot.checkpoint_owner)
             || snapshot.checkpoint_owner.cloud().member().frame_id() != map_frame_id
             || snapshot.publication_proof.target_receipt != TargetReceipt::Assigned(snapshot.target_receipt.clone())
-            || snapshot.publication_proof.cloud_receipt != snapshot.target_receipt.cloud_receipt {
+            || Some(&snapshot.publication_proof.cloud_receipt) != snapshot.target_receipt.cloud_receipt.as_ref() {
             return Err((Disposition::TargetInvalidated, "RELOCALIZATION_TARGET_IDENTITY_MISMATCH"));
         }
         Ok(())
@@ -9780,6 +9933,17 @@ mod preflight_only_contract {
         })
     }
 
+    fn assigned_planar_relocalization_result(
+        request: &AssignedCloudRelocalizeRequestIdentityV2, disposition: crate::proto::RelocalizeDisposition,
+        correction_revision: u64, detail: &str, evidence: crate::proto::AssignedPlanarRelocalizationEvidenceV2,
+    ) -> crate::proto::RelocalizeResult {
+        crate::proto::RelocalizeResult { schema_version: 2, request_id: request.request_id().into(),
+            assigned_planar_v2: Some(crate::proto::AssignedPlanarRelocalizeResultV2 {
+                request: Some(request.to_wire()), disposition: disposition as i32,
+                correction_revision, detail: detail.into(), evidence: Some(evidence),
+            }), ..Default::default() }
+    }
+
     fn assigned_relocalization_result(
         request: &AssignedCloudRelocalizeRequestIdentityV2, disposition: crate::proto::RelocalizeDisposition,
         correction_revision: u64, detail: &str, candidate_payload_v3: Vec<u8>, evidence: crate::proto::AssignedRelocalizationEvidenceV2,
@@ -9870,7 +10034,7 @@ mod preflight_only_contract {
                 let derived = CorrectionTransform::from_isometry(&(base.inverse() * estimate));
                 if transform.translation_m.iter().zip(derived.translation_m).any(|(a,b)| a.to_bits() != b.to_bits())
                     || transform.rotation_xyzw.iter().zip(derived.rotation_xyzw).any(|(a,b)| a.to_bits() != b.to_bits())
-                    || request.target().cloud_receipt.point_count < RELOCALIZATION_MIN_SOURCE_POINTS as u32 {
+                    || request.target().cloud_receipt.as_ref().is_none_or(|cloud| cloud.point_count < RELOCALIZATION_MIN_SOURCE_POINTS as u32) {
                     return Err("RELOCALIZATION_ASSIGNED_ALGORITHM_BINDING_MISMATCH".into());
                 }
             }
@@ -12253,6 +12417,7 @@ mod preflight_only_contract {
         fn relocalization_request_body(request: &mut crate::proto::RelocalizeRequest) -> &mut crate::proto::AssignedCloudRelocalizeRequestV2 {
             match request.assigned_target.as_mut().unwrap() {
                 crate::proto::relocalize_request::AssignedTarget::AssignedCloudV2(body) => body,
+            _ => panic!("cloud fixture expected"),
             }
         }
 
@@ -13147,7 +13312,7 @@ mod preflight_only_contract {
             proof.cloud_revision = cloud_revision;
             proof.cloud_receipt.cloud_revision = cloud_revision;
             let TargetReceipt::Assigned(receipt) = &mut proof.target_receipt else { unreachable!() };
-            receipt.cloud_receipt.cloud_revision = cloud_revision;
+            receipt.cloud_receipt.as_mut().unwrap().cloud_revision = cloud_revision;
             let target = receipt.clone();
             assert!(control.store_publication_proof(&token, proof));
             control.seal(&token, Some(TargetReceipt::Assigned(target.clone())), state).unwrap();
@@ -15169,6 +15334,113 @@ mod preflight_only_contract {
             phase_a.begin(); supervisor.shutdown().await.unwrap();
         }
 
+        struct PlanarNoHash;
+        impl PlanarNoHash { fn enter() -> Self { crate::map_checksum::FORBID_HASH.with(|value| value.set(true)); Self } }
+        impl Drop for PlanarNoHash { fn drop(&mut self) { crate::map_checksum::FORBID_HASH.with(|value| value.set(false)); } }
+
+        fn planar_c_supervisor(phase_a: &CorrectionPhaseAControl) -> RelocalizationOwnerSupervisor {
+            RelocalizationOwnerSupervisor::start_inner(phase_a.clone(), CorrectionOwnerRuntimeIdentity {
+                runtime_generation: 3, backend_generation: 9,
+                correction_lease: CorrectionLeaseId { boot_nonce: 4, generation: 8 },
+            }, "map".into(), "odom".into(), "body".into(), None, None)
+        }
+        fn planar_c_query(request: crate::proto::RelocalizeRequest) -> AssignedRelocalizationTerminalQueryV2 {
+            AssignedRelocalizationTerminalQueryV2::admit(crate::proto::GetRelocalizationTerminalRequest {
+                schema_version: 2, request_id: request.request_id.clone(), assigned_request_v2: Some(request), ..Default::default()
+            }).unwrap()
+        }
+        fn planar_c_unrun_work() -> PlanarCommandWork {
+            Box::new(|_| Box::pin(async { panic!("joined/replayed planar work must never run") }))
+        }
+
+        #[tokio::test]
+        async fn planar_c_existing_actor_claim_survives_unknown_response_and_replays_same_terminal() {
+            let _guard = PlanarNoHash::enter();
+            let phase_a = CorrectionPhaseAControl::for_tests();
+            let mut supervisor = planar_c_supervisor(&phase_a);
+            let ingress = supervisor.ingress();
+            let request = crate::relocalization_terminal_v2::planar_tests::wire();
+            let (claimed_tx, claimed_rx) = oneshot::channel();
+            let (finish_tx, finish_rx) = oneshot::channel();
+            let work: PlanarCommandWork = Box::new(move |context| Box::pin(async move {
+                assert!(context.claim().await);
+                claimed_tx.send((context.epoch,context.deadline)).unwrap();
+                finish_rx.await.unwrap();
+                let mut result = crate::relocalization_terminal_v2::planar_tests::terminal(true);
+                let body = result.assigned_planar_v2.take().unwrap();
+                PlanarCommandOutcome { disposition: crate::proto::RelocalizeDisposition::Applied, detail: body.detail,
+                    correction_revision: body.correction_revision, evidence: body.evidence }
+            }));
+            let waiter = ingress.admit_planar(request.clone(), Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,work).await.unwrap();
+            let (epoch, deadline) = claimed_rx.await.unwrap();
+            assert_eq!(epoch,1); assert!(deadline > Instant::now());
+            drop(waiter); // Response is unknown to the caller, but claim retains command authority.
+            let query = planar_c_query(request.clone());
+            let pending = ingress.terminal_snapshot_assigned(&query).await.unwrap();
+            assert!(matches!(pending.terminal,RelocalizationTerminalSnapshot::Pending));
+            assert_eq!(pending.ledger_observation.claimed_command_count,1);
+            let replay_waiter = ingress.admit_planar(request.clone(),Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,planar_c_unrun_work()).await.unwrap();
+            finish_tx.send(()).unwrap();
+            let terminal = replay_waiter.wait().await.unwrap();
+            assert_eq!(terminal.assigned_planar_v2.as_ref().unwrap().disposition,crate::proto::RelocalizeDisposition::Applied as i32);
+            let owner = terminal.assigned_planar_v2.as_ref().unwrap().evidence.as_ref().unwrap().owner.as_ref().unwrap();
+            assert!(ingress.owns_receipt(owner));
+            let mut replaced_owner = owner.clone(); replaced_owner.correction_lease_generation += 1;
+            assert!(!ingress.owns_receipt(&replaced_owner));
+            let mut replaced_owner = owner.clone(); replaced_owner.runtime_generation += 1;
+            assert!(!ingress.owns_receipt(&replaced_owner));
+            let mut replaced_owner = owner.clone(); replaced_owner.correction_backend_generation += 1;
+            assert!(!ingress.owns_receipt(&replaced_owner));
+            let replay = ingress.admit_planar(request,Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,planar_c_unrun_work()).await.unwrap().wait().await.unwrap();
+            assert_eq!(terminal.encode_to_vec(),replay.encode_to_vec());
+            let snapshot = ingress.terminal_snapshot_assigned(&query).await.unwrap();
+            assert_eq!(snapshot.ledger_observation.admitted_command_count,1);
+            assert_eq!(snapshot.ledger_observation.claimed_command_count,1);
+            assert_eq!(snapshot.ledger_observation.terminal_record_count,1);
+            assert!(!phase_a.relocalization_mode().snapshot().active);
+            phase_a.begin();supervisor.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn planar_c_existing_actor_cancel_conflict_and_cleanup_do_not_create_new_command() {
+            let _guard = PlanarNoHash::enter();
+            let phase_a = CorrectionPhaseAControl::for_tests();
+            let mut supervisor = planar_c_supervisor(&phase_a);
+            let ingress = supervisor.ingress();
+            let request = crate::relocalization_terminal_v2::planar_tests::wire();
+            let (started_tx,started_rx) = oneshot::channel();
+            let (cleanup_tx,cleanup_rx) = oneshot::channel();
+            let cleaned = Arc::new(AtomicBool::new(false));let marker=cleaned.clone();
+            let work: PlanarCommandWork = Box::new(move |context| Box::pin(async move {
+                started_tx.send(context.deadline).unwrap();cleanup_rx.await.unwrap();
+                assert!(!context.claim().await);marker.store(true,Ordering::Release);
+                PlanarCommandOutcome { disposition:crate::proto::RelocalizeDisposition::Cancelled,detail:"retained cleanup finished".into(),correction_revision:0,evidence:None }
+            }));
+            let waiter=ingress.admit_planar(request.clone(),Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,work).await.unwrap();
+            let deadline=started_rx.await.unwrap();
+            let joined=ingress.admit_planar(request.clone(),Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,planar_c_unrun_work()).await.unwrap();
+            let mut changed=request.clone();
+            let Some(crate::proto::relocalize_request::AssignedTarget::AssignedPlanarV2(body))=changed.assigned_target.as_mut() else{unreachable!()};
+            body.seed.as_mut().unwrap().x=10.0;
+            let conflict=ingress.admit_planar(changed.clone(),Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,planar_c_unrun_work()).await.unwrap().wait().await.unwrap();
+            assert_eq!(conflict.assigned_planar_v2.unwrap().disposition,crate::proto::RelocalizeDisposition::ReplayConflict as i32);
+            assert!(matches!(ingress.terminal_snapshot_assigned(&planar_c_query(changed)).await.unwrap().terminal,RelocalizationTerminalSnapshot::IdentityConflict));
+            let mut absent=request.clone();absent.request_id="planar:absent".into();
+            assert!(matches!(ingress.terminal_snapshot_assigned(&planar_c_query(absent)).await.unwrap().terminal,RelocalizationTerminalSnapshot::NotFound));
+            drop(waiter);drop(joined);
+            let query=planar_c_query(request);
+            tokio::time::timeout(Duration::from_secs(2),async {
+                loop {
+                    if let RelocalizationTerminalSnapshot::AssignedTerminal(terminal)=ingress.terminal_snapshot_assigned(&query).await.unwrap().terminal {
+                        assert_eq!(terminal.result().assigned_planar_v2.as_ref().unwrap().disposition,crate::proto::RelocalizeDisposition::Cancelled as i32);break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            assert!(deadline>Instant::now());cleanup_tx.send(()).unwrap();
+            phase_a.begin();supervisor.shutdown().await.unwrap();assert!(cleaned.load(Ordering::Acquire));
+        }
+
         #[tokio::test]
         async fn relocalization_legacy_mixed_live_versions_fail_before_waiter_or_source_admission() {
             let phase_a = CorrectionPhaseAControl::for_tests();
@@ -15188,7 +15460,7 @@ mod preflight_only_contract {
             let called = Arc::new(AtomicBool::new(false));
             let marker = called.clone();
             let work: PlanarCommandWork = Box::new(move |_| { marker.store(true, Ordering::Release); Box::pin(async {
-                PlanarCommandOutcome { disposition: crate::proto::RelocalizeDisposition::Rejected, detail: "must not run".into(), correction_revision: 0, evidence: Vec::new() }
+                PlanarCommandOutcome { disposition: crate::proto::RelocalizeDisposition::Rejected, detail: "must not run".into(), correction_revision: 0, evidence: None }
             }) });
             assert!(matches!(ingress.admit_planar(relocalization_command_request("planar-gated", 7),
                 Arc::new(tokio::sync::Mutex::new(())).lock_owned().await, work).await, Err(RelocalizationCommandError::InvalidRequest(_))));
@@ -15504,9 +15776,9 @@ mod preflight_only_contract {
             };
             let target_receipt = InstalledTargetReceiptV2 {
                 activation,
-                source_cloud_member: owner.cloud().member().clone(),
+                source_member: owner.source_member().clone(),
                 occupancy_receipt,
-                cloud_receipt: cloud_receipt.clone(),
+                cloud_receipt: Some(cloud_receipt.clone()),
             };
             ActivationPublicationProof {
                 source_timestamp_ns: cloud_receipt.source_timestamp_ns,
@@ -15583,7 +15855,7 @@ mod preflight_only_contract {
             state.relocalization_policy_v2 = Some(
                 crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire());
             control.decorate_current_state(&mut state);
-            assert!(state.relocalization_policy_v2.is_none());
+            assert_eq!(state.relocalization_policy_v2, Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire()));
             assert_eq!(state.planar_mode, "localization");
             assert_eq!(state.mapping_backend_kind, "slam_toolbox");
             assert!(state.active);
@@ -15605,6 +15877,112 @@ mod preflight_only_contract {
             assert!(!state.relocalization_target_available);
             assert!(state.relocalization_policy_v2.is_some());
             assert!(state.source_policy_sha256.is_empty());
+        }
+
+        fn assigned_planar_seed() -> (ActivationReceiptSeed, CanonicalCheckpointOwnerV2) {
+            let (wire, mut store, metadata) = crate::activation_request::planar_test_support::fixture();
+            let request = crate::activation_request::planar_test_support::admit(wire, &mut store,
+                &crate::activation_request::CheckpointOwnerInternerV2::default());
+            let (request, owner) = request.into_parts();
+            let graph = owner.graph().unwrap();
+            let target = crate::planar_artifacts::Target {
+                file: Arc::new(graph.file().try_clone().unwrap()), size: graph.reference().size,
+                identity: crate::planar_artifacts::TargetIdentity::Assigned(graph.reference().clone()),
+                metadata: nuwax_slam_2d_runtime::archive::ArchiveMetadata::Assigned(metadata),
+            };
+            (ActivationReceiptSeed {
+                activation_request_id: request.activation_request_id().into(),
+                request_key: ActivationRequestKey::Assigned(request), checkpoint_owner: Some(owner.clone()),
+                asset_manifest_sha256: None, asset_bundle_sha256: None, modern: true,
+                immutable_target: None, planar_target: Some(Arc::new(target)),
+            }, owner)
+        }
+
+        fn assigned_planar_installed_occupancy() -> crate::mapping_commit::OccupancyCommitReceipt {
+            crate::mapping_commit::OccupancyCommitReceipt {
+                commit_id: MappingCommitId { boot_nonce: 31, sequence: 32 }, session_id: "destination".into(),
+                session_generation: 23, occupancy_revision: 33, source_timestamp_ns: 34,
+                backend_kind: crate::mapping_backend::MappingBackendKind::SlamToolbox, backend_generation: 19,
+            }
+        }
+
+        #[test]
+        fn assigned_planar_existing_ledger_seals_and_replays_without_cloud_proof() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let (seed, owner) = assigned_planar_seed();
+            let mut state = assigned_base_state();
+            state.mapping_backend_kind = "slam_toolbox".into();
+            let mut replay_seed = seed.clone();
+            let token = match control.stage_or_replay(seed, state.clone(), true) {
+                ActivationLedgerAdmission::Execute(token) => token,
+                ActivationLedgerAdmission::Terminal(state) => panic!("expected planar admission: {}", state.message),
+            };
+            let token = control.reserve_backend_generation(&token, 19).unwrap();
+            let token = control.bind_assigned_activation_identity(&token, 23).unwrap();
+            assert!(control.seal(&token, None, state.clone()).is_none());
+            let occupancy = assigned_planar_installed_occupancy();
+            let mut wrong = occupancy.clone();
+            wrong.backend_kind = crate::mapping_backend::MappingBackendKind::Voxel;
+            assert!(control.store_planar_proof(&token, wrong).is_none());
+            let target = control.store_planar_proof(&token, occupancy.clone()).unwrap();
+            assert!(target.assigned().unwrap().validate(&owner));
+            assert_eq!(control.store_planar_proof(&token, occupancy.clone()), Some(target.clone()));
+            let mut changed = occupancy;
+            changed.occupancy_revision += 1;
+            assert!(control.store_planar_proof(&token, changed).is_none());
+            assert!(control.publication_proof(&token).is_none());
+            let terminal = control.seal(&token, Some(target), state.clone()).unwrap();
+            assert!(terminal.relocalization_target_available);
+            assert_eq!(terminal.target_kind, "planar_graph");
+            assert_eq!(terminal.planar_mode, "localization");
+            assert_eq!(terminal.relocalization_policy_v2, Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire()));
+            assert!(terminal.target_graph_sha256.is_empty());
+            let receipt = terminal.activation_receipt_v2.as_ref().unwrap().target.as_ref().unwrap();
+            assert!(receipt.source_graph_member.is_some());
+            assert!(receipt.source_cloud_member.is_none());
+            assert!(receipt.cloud_receipt.is_none());
+            assert!(control.current_sealed_planar_target().is_some());
+            assert!(control.current_sealed_assigned_target_snapshot().is_none());
+            // Normal server replay runs before target preparation and reuses the sealed owner.
+            replay_seed.planar_target = None;
+            let replay = match control.stage_or_replay(replay_seed, state, false) {
+                ActivationLedgerAdmission::Terminal(state) => state,
+                ActivationLedgerAdmission::Execute(_) => panic!("sealed planar request must replay"),
+            };
+            assert!(replay.idempotent_replay);
+            assert_eq!(replay.activation_receipt_v2, terminal.activation_receipt_v2);
+            assert!(replay.relocalization_target_available);
+        }
+
+        #[test]
+        fn assigned_planar_seed_rejects_a_different_graph_descriptor() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let (mut seed, _) = assigned_planar_seed();
+            let target = Arc::get_mut(seed.planar_target.as_mut().unwrap()).unwrap();
+            let crate::planar_artifacts::TargetIdentity::Assigned(reference) = &mut target.identity else { unreachable!() };
+            reference.id = "33333333333333333333333333333333".into();
+            match control.stage_or_replay(seed, assigned_base_state(), true) {
+                ActivationLedgerAdmission::Terminal(state) => {
+                    assert_eq!(state.activation_receipt_disposition, crate::proto::ActivationReceiptDisposition::Conflict as i32);
+                    assert!(!state.success);
+                }
+                ActivationLedgerAdmission::Execute(_) => panic!("different graph descriptor must not stage"),
+            }
+        }
+
+        #[test]
+        fn assigned_planar_missing_target_cannot_seal_as_cloudless_success() {
+            let control = ActivatedTargetReceiptControl::new(17);
+            let (mut seed, _) = assigned_planar_seed();
+            seed.planar_target = None;
+            let token = match control.stage_or_replay(seed, assigned_base_state(), true) {
+                ActivationLedgerAdmission::Execute(token) => token,
+                ActivationLedgerAdmission::Terminal(state) => panic!("unexpected admission rejection: {}", state.message),
+            };
+            let token = control.reserve_backend_generation(&token, 19).unwrap();
+            let token = control.bind_assigned_activation_identity(&token, 23).unwrap();
+            assert!(control.store_planar_proof(&token, assigned_planar_installed_occupancy()).is_none());
+            assert!(control.seal(&token, None, assigned_base_state()).is_none());
         }
 
         #[test]
@@ -15886,7 +16264,7 @@ mod preflight_only_contract {
                                 else {
                                     unreachable!()
                                 };
-                                receipt.cloud_receipt.cloud_revision += 1;
+                                receipt.cloud_receipt.as_mut().unwrap().cloud_revision += 1;
                             }
                             "proof" => {
                                 record.publication_proof.as_mut().unwrap().cloud_revision += 1
@@ -16105,8 +16483,8 @@ mod preflight_only_contract {
                     unreachable!()
                 };
                 match field {
-                    "commit" => receipt.cloud_receipt.commit_id.sequence += 1,
-                    "occupancy" => receipt.cloud_receipt.occupancy_revision += 1,
+                    "commit" => receipt.cloud_receipt.as_mut().unwrap().commit_id.sequence += 1,
+                    "occupancy" => receipt.cloud_receipt.as_mut().unwrap().occupancy_revision += 1,
                     "backend" => {
                         receipt.activation.backend_kind =
                             crate::mapping_backend::MappingBackendKind::Raytracing
@@ -16321,7 +16699,7 @@ mod preflight_only_contract {
             let target = proof.target_receipt.assigned().unwrap().clone();
             let activation = target.activation.clone();
             let occupancy = target.occupancy_receipt.clone();
-            let cloud = target.cloud_receipt.clone();
+            let cloud = target.cloud_receipt.clone().unwrap();
             assert!(control.store_publication_proof(&token, proof));
             let cases = [
                 (
@@ -16429,7 +16807,7 @@ mod preflight_only_contract {
                 &token,
                 entry(
                     Step::CloudInstall,
-                    Verifier::Cloud(target.cloud_receipt.clone())
+                    Verifier::Cloud(target.cloud_receipt.clone().unwrap())
                 )
             ));
             for field in ["nonce", "sequence", "revision", "timestamp"] {
@@ -16463,7 +16841,7 @@ mod preflight_only_contract {
                 "timestamp",
                 "points",
             ] {
-                let mut cloud = target.cloud_receipt.clone();
+                let mut cloud = target.cloud_receipt.clone().unwrap();
                 match field {
                     "nonce" => cloud.commit_id.boot_nonce += 1,
                     "sequence" => cloud.commit_id.sequence += 1,
@@ -16496,7 +16874,7 @@ mod preflight_only_contract {
             }
             assert!(control.journal(
                 &token,
-                entry(Step::CloudInstall, Verifier::Cloud(target.cloud_receipt))
+                entry(Step::CloudInstall, Verifier::Cloud(target.cloud_receipt.unwrap()))
             ));
             assert!(control.journal(
                 &token,

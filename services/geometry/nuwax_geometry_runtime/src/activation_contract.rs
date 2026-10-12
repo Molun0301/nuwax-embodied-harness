@@ -36,16 +36,15 @@ pub(crate) enum ActivationIdentity {
 pub(crate) struct InstalledTargetReceiptV2 {
     pub(crate) activation: InstalledActivationIdentityV2,
     /// Frozen source descriptor; never replaced with an installed receipt.
-    pub(crate) source_cloud_member: CheckpointMemberIdentityV2,
+    pub(crate) source_member: CheckpointMemberIdentityV2,
     pub(crate) occupancy_receipt: OccupancyCommitReceipt,
-    pub(crate) cloud_receipt: CloudCommitReceipt,
+    pub(crate) cloud_receipt: Option<CloudCommitReceipt>,
 }
 
 impl InstalledTargetReceiptV2 {
     pub(crate) fn validate(&self, owner: &CanonicalCheckpointOwnerV2) -> bool {
         let activation = &self.activation;
         let occupancy = &self.occupancy_receipt;
-        let cloud = &self.cloud_receipt;
         activation.runtime_generation > 0
             && activation.runtime_generation == activation.request.expected_runtime_generation()
             && activation.lifecycle_epoch > 0
@@ -53,7 +52,7 @@ impl InstalledTargetReceiptV2 {
             && activation.backend_generation > 0
             && activation.backend_kind == owner.backend_kind()
             && activation.request.checkpoint_identity() == owner.identity()
-            && self.source_cloud_member == *owner.cloud().member()
+            && self.source_member == *owner.source_member()
             && occupancy.session_id == activation.request.session_id()
             && occupancy.session_generation == activation.session_generation
             && occupancy.backend_kind == activation.backend_kind
@@ -62,20 +61,30 @@ impl InstalledTargetReceiptV2 {
             && occupancy.commit_id.sequence > 0
             && occupancy.occupancy_revision > 0
             && occupancy.source_timestamp_ns > 0
-            && cloud.commit_id == occupancy.commit_id
-            && cloud.session_generation == occupancy.session_generation
-            && cloud.occupancy_revision == occupancy.occupancy_revision
-            && cloud.source_timestamp_ns == occupancy.source_timestamp_ns
-            && cloud.cloud_revision > 0
-            && cloud.point_count == owner.cloud().point_count()
+            && match activation.backend_kind {
+                MappingBackendKind::SlamToolbox => owner.graph().is_some() && self.cloud_receipt.is_none(),
+                MappingBackendKind::Voxel | MappingBackendKind::Raytracing => {
+                    self.cloud_receipt.as_ref().is_some_and(|cloud| {
+                        cloud.commit_id == occupancy.commit_id
+                            && cloud.session_generation == occupancy.session_generation
+                            && cloud.occupancy_revision == occupancy.occupancy_revision
+                            && cloud.source_timestamp_ns == occupancy.source_timestamp_ns
+                            && cloud.cloud_revision > 0
+                            && cloud.point_count == owner.cloud().point_count()
+                    })
+                }
+            }
     }
 
     pub(crate) fn to_wire(&self) -> proto::InstalledTargetReceiptV2 {
         proto::InstalledTargetReceiptV2 {
             activation: Some(self.activation.to_wire()),
-            source_cloud_member: Some(member_to_wire(&self.source_cloud_member)),
+            source_cloud_member: (self.activation.backend_kind != MappingBackendKind::SlamToolbox)
+                .then(|| member_to_wire(&self.source_member)),
+            source_graph_member: (self.activation.backend_kind == MappingBackendKind::SlamToolbox)
+                .then(|| member_to_wire(&self.source_member)),
             occupancy_receipt: Some(occupancy_to_wire(&self.occupancy_receipt)),
-            cloud_receipt: Some(cloud_to_wire(&self.cloud_receipt)),
+            cloud_receipt: self.cloud_receipt.as_ref().map(cloud_to_wire),
         }
     }
 }
@@ -182,7 +191,7 @@ impl ActivationTargetSource {
     pub(crate) fn frame_id(&self) -> &str {
         match self {
             Self::Legacy(value) => &value.frame_id,
-            Self::Assigned(value) => value.cloud().member().frame_id(),
+            Self::Assigned(value) => value.source_member().frame_id(),
         }
     }
     pub(crate) fn source_revision(&self) -> u64 {

@@ -5,6 +5,7 @@ Rust 运行时是主要的平台几何交互层（替代旧 nuwax-ros-bridge）�
 """
 from __future__ import annotations
 
+from services.geometry.planar_archive import read_planar_structure
 from services.geometry.checkpoint_payload import FrozenPayload, payload_chunks, payload_digest, MAX_PLANAR_ARCHIVE_BYTES
 from core.config_values import runtime_value
 
@@ -35,6 +36,8 @@ from contracts.maps import OccupancyGrid
 from contracts.navigation import NavigationGoal, NavigationState, NavigationStatus
 from contracts.map_activation import (
     AssignedActivationReceipt,
+    _commit as _admit_assigned_commit,
+    _integer as _admit_assigned_integer,
     _request as _admit_assigned_activation_request,
     _activation as _admit_assigned_activation_identity,
 )
@@ -43,7 +46,9 @@ from contracts.map_relocalization import (
     AssignedRelocalizationTerminal,
     AssignedRelocalizationQuery,
     current_assigned_relocalization_policy,
+    current_assigned_planar_relocalization_policy,
     _project_proto as _project_assigned_proto,
+    _provider_fields as _assigned_proto_fields,
     _pose as _validate_assigned_pose_bits,
     MAX_TERMINAL_BYTES,
 )
@@ -247,6 +252,12 @@ class _AssignedActivationAttempt:
                 or self.connection_epoch != origin[1]):
             return False
         original = self.stored_checkpoint
+        if original.checkpoint.backend_kind == "slam_toolbox":
+            # Pending planar replay stays bound to the retained immutable owner.
+            # A matching ID or a newly reopened body is not that owner.
+            return (original.checkpoint is stored_checkpoint.checkpoint
+                and original.occupancy_asset == stored_checkpoint.occupancy_asset
+                and stored_checkpoint.cloud_asset is None)
         # 重开文件只比较原生请求的实际成员；分块精确比较在状态锁外完成，不引入摘要。
         return original is stored_checkpoint or (
             original.checkpoint == stored_checkpoint.checkpoint
@@ -310,11 +321,18 @@ def _admit_assigned_localization_sample(response, *, request, expected_terminal,
             or not expected_terminal.exact_replay_of(terminal)
             or terminal.disposition not in _RELOCALIZE_SUCCESS_DISPOSITIONS):
         raise ValueError("assigned localization sample differs from the retained applied terminal")
-    evidence = terminal.to_dict()["assigned_cloud_v2"]["evidence"]
-    owner, source = evidence["owner"], evidence["source_frames"][-1]
+    evidence = terminal.to_dict()[terminal.request.body_key]["evidence"]
+    owner = evidence["owner"]
+    if request.backend_kind == "slam_toolbox":
+        frame_generation = evidence["frame_generation"]
+        source_stamp = evidence["source_unix_ns"]
+    else:
+        source = evidence["source_frames"][-1]
+        frame_generation = source["map_frame_generation"]
+        source_stamp = source["correlated_odom_source_timestamp_ns"]
     if (_project_assigned_proto(response.correction_owner, "owner") != owner
             or response.correction_revision != terminal.correction_revision
-            or response.map_frame_generation != source["map_frame_generation"]):
+            or response.map_frame_generation != frame_generation):
         raise ValueError("assigned localization sample correction owner or frame lineage differs")
     pose, map_edge, odom_edge = response.pose, response.map_from_odom, response.odom_from_body
     if (pose.frame_id != owner["map_frame_id"]
@@ -323,7 +341,7 @@ def _admit_assigned_localization_sample(response, *, request, expected_terminal,
         raise ValueError("assigned localization sample frame IDs differ from the retained owner")
     stamp = pose.timestamp_ns
     if (not stamp or stamp != map_edge.timestamp_ns or stamp != odom_edge.timestamp_ns
-            or stamp < source["correlated_odom_source_timestamp_ns"]):
+            or stamp < source_stamp):
         raise ValueError("assigned localization sample source timestamp is stale or inconsistent")
     for geometry, position, orientation in ((pose, "position", "orientation"),
                                             (map_edge, "translation", "rotation"),
@@ -429,10 +447,10 @@ class MappingBackendCheckpointExportBundle:
         return message
 
     def canonical_cloud_checkpoint(self):
-        if self.checkpoint.schema_version == 2:
-            return _canonical_cloud_from_stored(self.checkpoint, self.cloud_asset)
         if self.checkpoint.backend_kind == "slam_toolbox":
             return None
+        if self.checkpoint.schema_version == 2:
+            return _canonical_cloud_from_stored(self.checkpoint, self.cloud_asset)
         message = pb2.CloudMapCheckpoint()
         message.ParseFromString(self.canonical_cloud_checkpoint_bytes)
         return message
@@ -534,6 +552,16 @@ def _cloud_receipt_dict(message) -> Dict[str, object]:
 def _validate_checkpoint_identity_envelope(response):
     """Reject known wire skew before downloading any optional artifact bodies."""
     if int(response.schema_version) == 2:
+        if response.backend_kind == "slam_toolbox":
+            _require_proto_message_field(response, "occupancy_identity")
+            reference = _artifact_reference_from_proto(_require_proto_message_field(response, "graph_artifact"))
+            if (response.content_sha256 or response.payload or response.backend_payload_schema_version != 2
+                    or response.target_kind != "planar_graph" or reference.identity_schema_version != 2
+                    or reference.member_identity.role != "planar_graph"
+                    or reference.member_identity.checkpoint_id != response.checkpoint_id
+                    or any(response.HasField(name) for name in ("backend_identity", "cloud_receipt", "canonical_cloud_checkpoint", "fine_map_artifact", "dense_cloud_artifact"))):
+                raise ValueError("assigned planar checkpoint envelope mismatch")
+            return
         _require_proto_message_field(response, "backend_identity")
         _require_proto_message_field(response, "occupancy_identity")
         cloud = _require_proto_message_field(response, "canonical_cloud_checkpoint")
@@ -818,8 +846,10 @@ def _protobuf_payload_bytes(value):
 
 
 def _checkpoint_export_bundle_v2(response, payload, fine_payload, dense_payload):
-    if response.backend_kind == "slam_toolbox" or response.HasField("graph_artifact") or payload is not None:
-        raise ValueError("planar v2 checkpoint producer is not paired")
+    if response.backend_kind == "slam_toolbox":
+        return _planar_checkpoint_export_bundle_v2(response, payload, fine_payload, dense_payload)
+    if response.HasField("graph_artifact") or payload is not None:
+        raise ValueError("cloud checkpoint cannot carry graph artifact")
     if response.target_kind != "":
         raise ValueError("v2 cloud checkpoint target kind mismatch")
     if response.content_sha256 or response.backend_payload_schema_version != 1:
@@ -852,6 +882,28 @@ def _checkpoint_export_bundle_v2(response, payload, fine_payload, dense_payload)
     return MappingBackendCheckpointExportBundle(checkpoint, occupancy_asset, cloud_asset)
 
 
+def _planar_checkpoint_export_bundle_v2(response, payload, fine_payload=None, dense_payload=None):
+    if fine_payload is not None or dense_payload is not None or not isinstance(payload, FrozenPayload):
+        raise ValueError("planar checkpoint requires one retained graph FrozenPayload")
+    occupancy = _require_proto_message_field(response, "canonical_occupancy_checkpoint")
+    meta = _require_proto_message_field(occupancy, "meta")
+    checkpoint = MappingBackendCheckpoint(schema_version=2, backend_kind="slam_toolbox",
+        source_session_id=response.source_session_id, source_session_generation=response.source_session_generation,
+        content_sha256=b"", payload_size=response.payload_size, created_at_ns=response.created_at_ns,
+        payload=payload, occupancy_receipt=_occupancy_receipt_dict(_require_proto_message_field(response, "occupancy_receipt")),
+        cloud_receipt=None, checkpoint_id=response.checkpoint_id, target_kind="planar_graph",
+        backend_payload_schema_version=2, canonical_occupancy_data=bytes(occupancy.data),
+        graph_reference=_artifact_reference_from_proto(response.graph_artifact),
+        occupancy_identity=_member_identity_from_proto(response.occupancy_identity))
+    occupancy_asset = dict(raw_data_size=len(checkpoint.canonical_occupancy_data), width=int(meta.width), height=int(meta.height),
+        resolution=float(meta.resolution), origin_x=float(meta.origin_x), origin_y=float(meta.origin_y), frame_id=str(meta.frame_id),
+        source_occupancy_revision=int(meta.revision), timestamp_ns=int(meta.timestamp_ns))
+    checkpoint, occupancy_asset, cloud_asset = MappingBackendCheckpointStore.validate_checkpoint_bundle(checkpoint,
+        occupancy_asset=occupancy_asset, cloud_asset=None)
+    return MappingBackendCheckpointExportBundle(checkpoint, occupancy_asset, cloud_asset)
+
+
+
 def reopen_mapping_backend_checkpoint(
     map_bundle_root, backend_kind, *, schema_version=2, expected_checkpoint_id=None,
 ):
@@ -866,9 +918,10 @@ def reopen_mapping_backend_checkpoint(
 
 def _mapping_backend_checkpoint_v2_proto(stored, *, graph_artifact=None, fine_map_artifact=None, dense_cloud_artifact=None):
     checkpoint = stored.checkpoint
-    if graph_artifact is not None:
+    if graph_artifact is not None and checkpoint.backend_kind != "slam_toolbox":
         raise ValueError("cloud checkpoint cannot carry planar graph artifact")
-    for supplied, retained, maximum in ((fine_map_artifact, checkpoint.fine_reference, MAX_FINE_ARCHIVE_BYTES),
+    for supplied, retained, maximum in ((graph_artifact, checkpoint.graph_reference, MAX_PLANAR_ARCHIVE_BYTES),
+                                       (fine_map_artifact, checkpoint.fine_reference, MAX_FINE_ARCHIVE_BYTES),
                                        (dense_cloud_artifact, checkpoint.dense_reference, MAX_DENSE_ARCHIVE_BYTES)):
         if supplied is not None and _artifact_reference_from_proto(supplied, maximum) != retained:
             raise ValueError("reupload must preserve the retained artifact identity")
@@ -884,10 +937,14 @@ def _populate_mapping_backend_checkpoint_v2(message, stored):
     for field in ("backend_kind", "source_session_id", "source_session_generation", "checkpoint_id",
                   "backend_payload_schema_version", "payload_size", "created_at_ns", "target_kind"):
         setattr(message, field, getattr(checkpoint, field))
-    message.payload = _protobuf_payload_bytes(checkpoint.payload)
+    planar = checkpoint.backend_kind == "slam_toolbox"
+    if planar:
+        message.graph_artifact.CopyFrom(_artifact_reference_proto(checkpoint.graph_reference))
+    else:
+        message.payload = _protobuf_payload_bytes(checkpoint.payload)
+        message.cloud_receipt.CopyFrom(_cloud_receipt_proto(checkpoint.cloud_receipt))
+        message.backend_identity.CopyFrom(_member_identity_proto(checkpoint.backend_identity))
     message.occupancy_receipt.CopyFrom(_occupancy_receipt_proto(checkpoint.occupancy_receipt))
-    message.cloud_receipt.CopyFrom(_cloud_receipt_proto(checkpoint.cloud_receipt))
-    message.backend_identity.CopyFrom(_member_identity_proto(checkpoint.backend_identity))
     message.occupancy_identity.CopyFrom(_member_identity_proto(checkpoint.occupancy_identity))
     occupancy = stored.occupancy_asset
     meta = message.canonical_occupancy_checkpoint.meta
@@ -895,6 +952,8 @@ def _populate_mapping_backend_checkpoint_v2(message, stored):
         setattr(meta, field, occupancy[field])
     meta.revision = occupancy["source_occupancy_revision"]
     message.canonical_occupancy_checkpoint.data = _protobuf_payload_bytes(checkpoint.canonical_occupancy_data)
+    if planar:
+        return
     cloud = stored.cloud_asset
     target = message.canonical_cloud_checkpoint
     for field in ("frame_id", "point_count", "voxel_size"):
@@ -912,7 +971,7 @@ def _populate_mapping_backend_checkpoint_v2(message, stored):
 def _assigned_activation_request_proto(stored, *, asset_identity, session_id, map_name,
                                        activation_request_id, expected_runtime_generation):
     """Construct explicit v2 wire ownership without enabling default callers."""
-    from contracts.map_workspace import AssetIdentityV2
+    from contracts.map_identity import AssetIdentityV2
     if not isinstance(asset_identity, AssetIdentityV2):
         raise ValueError("activation requires an admitted typed asset identity")
     asset_identity = AssetIdentityV2(asset_id=asset_identity.asset_id)
@@ -950,13 +1009,20 @@ def _assigned_activation_ack(response, *, activation_request, stored_checkpoint)
     receipt = AssignedActivationReceipt.admit(payload["activation_receipt_v2"])
     actual = receipt.to_dict()
     checkpoint = stored_checkpoint.checkpoint
+    planar = checkpoint.backend_kind == "slam_toolbox"
+    source_key = "source_graph_member" if planar else "source_cloud_member"
+    source_identity = checkpoint.graph_reference.member_identity if planar else checkpoint.cloud_identity
     if (actual["request"] != activation_request
             or payload["revision"] != actual["target"]["occupancy_receipt"]["occupancy_revision"]
             or actual["activation"]["backend_kind"] != checkpoint.backend_kind
-            or actual["target"]["source_cloud_member"] != _identity_document(checkpoint.cloud_identity)):
+            or actual["target"][source_key] != _identity_document(source_identity)):
         raise ValueError("ActivateMap receipt differs from the retained request/checkpoint owner")
-    if payload["relocalization_policy_v2"] != current_assigned_relocalization_policy():
-        raise ValueError("ActivateMap omitted the exact assigned relocalization policy")
+    if planar and (payload.get("planar_mode") != "localization" or payload.get("target_kind") != "planar_graph"):
+        raise ValueError("ActivateMap planar mode/target kind differs from its installed graph")
+    expected_policy = (current_assigned_planar_relocalization_policy() if planar
+        else current_assigned_relocalization_policy())
+    if payload["relocalization_policy_v2"] != expected_policy:
+        raise ValueError("ActivateMap assigned relocalization policy differs from its backend")
     if payload["idempotent_replay"] != (payload["activation_receipt_disposition"] == 3):
         raise ValueError("ActivateMap replay disposition differs from its acknowledgement")
     return payload
@@ -1190,6 +1256,24 @@ def _require_supported_activation_schema(state: Mapping[str, object]) -> None:
             raise ValueError("schema-0 activation state cannot claim an installed target")
 
 
+def _planar_activation_target_payload(message):
+    """Project only the planar activation branch; cloud relocalization stays separate."""
+    if message.DESCRIPTOR.full_name != "nuwax.geometry.InstalledTargetReceiptV2":
+        raise ValueError("assigned target protobuf type differs")
+    source_field = message.DESCRIPTOR.fields_by_name.get("source_graph_member")
+    if source_field is None or source_field.number != 5 or source_field.type != 11:
+        raise ValueError("planar target source field differs from paired protocol")
+    source = _member_identity_from_proto(_require_proto_message_field(message, "source_graph_member"))
+    if (source.role != "planar_graph" or source.cloud_receipt is not None
+            or message.HasField("source_cloud_member") or message.HasField("cloud_receipt")):
+        raise ValueError("planar activation target source differs from its backend")
+    return {
+        "activation": _project_assigned_proto(_require_proto_message_field(message, "activation"), "activation"),
+        "source_graph_member": _identity_document(source),
+        "occupancy_receipt": _project_assigned_proto(_require_proto_message_field(message, "occupancy_receipt"), "occupancy"),
+    }
+
+
 def _assigned_activation_receipt_payload(message) -> Dict[str, Any]:
     """按实际字段存在性投影；失败/退休回执不能补造成完整目标。"""
     if message.DESCRIPTOR.full_name != "nuwax.geometry.ActivationReceiptV2":
@@ -1215,11 +1299,60 @@ def _assigned_activation_receipt_payload(message) -> Dict[str, Any]:
     if message.HasField("target"):
         if activation is None:
             raise ValueError("assigned target omitted its installed activation")
-        target = _project_assigned_proto(message.target, "target")
+        target = (_planar_activation_target_payload(message.target)
+            if activation["backend_kind"] == "slam_toolbox" else _project_assigned_proto(message.target, "target"))
         return AssignedActivationReceipt.admit({
             "request": request, "activation": activation, "target": target,
         }).to_dict()
     return {"request": request, "activation": activation, "target": target}
+
+
+def _assigned_activation_receipt_proto(receipt: AssignedActivationReceipt):
+    """Project the admitted original metadata without constructing new identities."""
+    payload = receipt.to_dict()
+    target = payload["target"]
+    if payload["activation"]["backend_kind"] == "slam_toolbox":
+        source = target["source_graph_member"]
+        source["occupancy_receipt"] = _assigned_proto_fields(source["occupancy_receipt"], "occupancy")
+        target_fields = pb2.InstalledTargetReceiptV2(
+            activation=_assigned_proto_fields(target["activation"], "activation"),
+            source_graph_member=_member_identity_proto(CheckpointMemberIdentity(**source)),
+            occupancy_receipt=_assigned_proto_fields(target["occupancy_receipt"], "occupancy"),
+        )
+    else:
+        target_fields = _assigned_proto_fields(target, "target")
+    return pb2.ActivationReceiptV2(
+        request=_assigned_proto_fields(payload["request"], "activation_request"),
+        activation=_assigned_proto_fields(payload["activation"], "activation"),
+        target=target_fields,
+    )
+
+
+def _mapping_cloud_authority_receipt(authority: Mapping[str, Any]) -> AssignedActivationReceipt:
+    """Admit schema-3 metadata; current, installed and source commits stay distinct."""
+    if type(authority.get("schema_version")) is not int or authority["schema_version"] != 3:
+        raise ValueError("mapping-cloud authority requires schema 3")
+    receipt = AssignedActivationReceipt.admit(authority.get("activation_receipt_v2"))
+    payload = receipt.to_dict()
+    activation = payload["activation"]
+    source_key = "source_graph_member" if activation["backend_kind"] == "slam_toolbox" else "source_cloud_member"
+    expected = {
+        "map_name": receipt.map_name,
+        "map_frame_id": payload["target"][source_key]["frame_id"],
+        "runtime_generation": activation["runtime_generation"],
+        "lifecycle_epoch": activation["lifecycle_epoch"],
+        "mapping_session_id": receipt.session_id,
+        "mapping_session_generation": activation["session_generation"],
+        "backend_kind": activation["backend_kind"],
+        "backend_generation": activation["backend_generation"],
+    }
+    for name in ("runtime_generation", "lifecycle_epoch", "mapping_session_generation", "backend_generation",
+                 "committed_occupancy_revision", "committed_occupancy_source_timestamp_ns", "owner_epoch"):
+        _admit_assigned_integer(authority.get(name), name)
+    _admit_assigned_commit(authority.get("committed_occupancy_commit_id"))
+    if any(authority.get(name) != value for name, value in expected.items()):
+        raise ValueError("mapping-cloud authority differs from assigned activation receipt")
+    return receipt
 
 
 def _unactivated_mapping_state_payload(response, disposition: int, disposition_name: str) -> Dict[str, Any]:
@@ -1239,10 +1372,10 @@ def _unactivated_mapping_state_payload(response, disposition: int, disposition_n
         raise ValueError("schema-0 mapping state contains activation/target claims")
     policy = None
     if response.HasField("relocalization_policy_v2"):
-        if response.mapping_backend_kind not in {"voxel", "raytracing"}:
-            raise ValueError("unactivated backend does not support the cloud policy")
         policy = _project_assigned_proto(response.relocalization_policy_v2, "policy")
-        if policy != current_assigned_relocalization_policy():
+        expected_policy = (current_assigned_planar_relocalization_policy()
+            if response.mapping_backend_kind == "slam_toolbox" else current_assigned_relocalization_policy())
+        if policy != expected_policy:
             raise ValueError("unactivated mapping state policy parameters differ")
     fields = (
         "success", "phase", "message", "session_id", "map_name", "session_generation",
@@ -1270,8 +1403,10 @@ def _assigned_mapping_state_payload(response, disposition: int, disposition_name
         raise ValueError("assigned mapping state omitted activation receipt")
     if disposition not in {1, 2, 3, 5, 6, 7, 8, 9}:
         raise ValueError("assigned activation disposition is unsupported")
-    if any(getattr(response, name) for name in _LEGACY_ACTIVATION_IDENTITY_FIELDS):
-        raise ValueError("assigned mapping state mixes legacy/planar identity")
+    planar = response.mapping_backend_kind == "slam_toolbox"
+    legacy_fields = (name for name in _LEGACY_ACTIVATION_IDENTITY_FIELDS if not (planar and name in {"planar_mode", "target_kind"}))
+    if any(getattr(response, name) for name in legacy_fields):
+        raise ValueError("assigned mapping state mixes legacy identity")
     receipt = _assigned_activation_receipt_payload(response.activation_receipt_v2)
     sealed = disposition in {2, 3}
     if sealed and receipt["target"] is None:
@@ -1281,7 +1416,9 @@ def _assigned_mapping_state_payload(response, disposition: int, disposition_name
     policy = None
     if response.HasField("relocalization_policy_v2"):
         policy = _project_assigned_proto(response.relocalization_policy_v2, "policy")
-        if policy != current_assigned_relocalization_policy():
+        expected_policy = (current_assigned_planar_relocalization_policy() if planar
+            else current_assigned_relocalization_policy())
+        if policy != expected_policy:
             raise ValueError("assigned mapping state policy parameters differ")
     if sealed:
         activation = receipt["activation"]
@@ -1310,12 +1447,15 @@ def _assigned_mapping_state_payload(response, disposition: int, disposition_name
         activation_receipt_v2=receipt,
         relocalization_policy_v2=policy,
     )
+    if planar:
+        result["planar_mode"] = response.planar_mode
+        result["target_kind"] = response.target_kind
     return result
 
 
 def _assigned_request_for_rpc(
     *, activation_state: Mapping[str, object], assigned_request_v2,
-    request_id: Optional[str], logical_timeout_ms: int, query_only: bool,
+    request_id: Optional[str], logical_timeout_ms: int, query_only: bool, planar_seed=None,
 ) -> AssignedRelocalizationRequest:
     """查询必须使用持久化精确请求；不从旧 SHA 或缺失别名重建身份。"""
     if assigned_request_v2 is not None:
@@ -1334,15 +1474,29 @@ def _assigned_request_for_rpc(
         policy = activation_state.get("relocalization_policy_v2")
         if policy is None:
             raise ValueError("assigned activation omitted relocalization_policy_v2")
-        request = AssignedRelocalizationRequest.admit({
-            "schema_version": 2,
+        planar = receipt.to_dict()["activation"]["backend_kind"] == "slam_toolbox"
+        body_key = "assigned_planar_v2" if planar else "assigned_cloud_v2"
+        body = {"target": receipt.to_dict()["target"], "policy": policy,
+                "logical_timeout_ms": logical_timeout_ms}
+        if planar:
+            if not isinstance(planar_seed, (list, tuple)) or len(planar_seed) != 3:
+                raise ValueError("assigned planar request requires its three-value seed")
+            body["seed"] = dict(zip(("x", "y", "yaw"), planar_seed))
+        request = AssignedRelocalizationRequest.admit({"schema_version": 2,
             "request_id": _canonical_relocalization_request_id(request_id, generate_if_missing=True),
-            "assigned_cloud_v2": {"target": receipt.to_dict()["target"],
-                                  "policy": policy, "logical_timeout_ms": logical_timeout_ms},
-        })
+            body_key: body})
+    planar = request.backend_kind == "slam_toolbox"
+    if planar_seed is not None:
+        if not planar or not isinstance(planar_seed, (list, tuple)) or len(planar_seed) != 3:
+            raise ValueError("planar seed differs from the assigned backend")
+        replay = request.to_dict()
+        replay[request.body_key]["seed"] = dict(zip(("x", "y", "yaw"), planar_seed))
+        if not request.exact_replay_of(AssignedRelocalizationRequest.admit_retained(replay)):
+            raise ValueError("assigned planar retry changed its seed")
     if not query_only:
         if any(activation_state.get(name) for name in
-               _LEGACY_ACTIVATION_IDENTITY_FIELDS + ("cloud_source_sha256",)):
+               _LEGACY_ACTIVATION_IDENTITY_FIELDS + ("cloud_source_sha256",)
+               if not (planar and name in {"planar_mode", "target_kind"})):
             raise ValueError("assigned activation state mixes legacy/planar identity")
         if activation_state.get("activation_receipt_schema_version") != 2:
             raise ValueError("assigned request requires an assigned activation state")
@@ -1353,7 +1507,9 @@ def _assigned_request_for_rpc(
         if policy is None:
             raise ValueError("assigned activation omitted relocalization_policy_v2")
         # 持久化身份可读不代表旧策略可重新执行；只比较已有策略元数据。
-        if (assigned_request_v2 is not None and policy != current_assigned_relocalization_policy()) or policy != request.to_dict()["assigned_cloud_v2"]["policy"]:
+        expected_policy = (current_assigned_planar_relocalization_policy() if planar
+            else current_assigned_relocalization_policy())
+        if (assigned_request_v2 is not None and policy != expected_policy) or policy != request.to_dict()[request.body_key]["policy"]:
             raise ValueError("assigned request policy differs from activation state")
         if activation_state.get("activation_receipt_disposition") not in {2, 3}:
             raise ValueError("assigned relocalization requires a sealed activation")
@@ -1364,7 +1520,7 @@ def _assigned_request_for_rpc(
 
 def _assigned_terminal_payload(terminal: AssignedRelocalizationTerminal) -> Dict[str, Any]:
     payload = terminal.to_dict()
-    body = payload["assigned_cloud_v2"]
+    body = payload[terminal.request.body_key]
     disposition_name = pb2.RelocalizeDisposition.Name(terminal.disposition)
     prefix = "RELOCALIZE_DISPOSITION_"
     if disposition_name.startswith(prefix):
@@ -3132,7 +3288,7 @@ def _coalesced_navigation_updates(call):
         status = str(getattr(update, "status", "") or "").strip().lower()
         return (
             _navigation_lease_from_message(update),
-            bytes(getattr(update, "goal_payload_sha256", b"")),
+            int(getattr(update, "planner_runtime_generation", 0)),
             int(getattr(update, "runtime_generation", 0)),
             int(getattr(update, "guard_generation", 0)),
             status if status in _NAV_TERMINAL_STATUS or status not in _NAV_STREAM_STATUS else "progress",
@@ -3683,6 +3839,9 @@ def _navigation_state_typed_metadata(update) -> Dict[str, Any]:
         "producer_runtime_generation": int(
             getattr(update, "producer_runtime_generation", 0) or 0
         ),
+        "planner_runtime_generation": int(
+            getattr(update, "planner_runtime_generation", 0) or 0
+        ),
         "cancel_phase": str(getattr(update, "cancel_phase", "") or ""),
         "cancel_generation": int(getattr(update, "cancel_generation", 0) or 0),
         "actuator_zeroed": bool(getattr(update, "actuator_zeroed", False)),
@@ -3846,44 +4005,85 @@ def _normalize_frame(frame_id: str) -> str:
     return str(frame_id or "").strip().lstrip("/")
 
 
-def _exploration_child_lease_fingerprint(lease: Dict[str, object]) -> str:
-    """Mirror Rust's canonical non-secret child lease fingerprint."""
-
+def _exploration_child_lease_address(lease: Any) -> Optional[_NavigationLease]:
+    """Read the assigned address using the existing RPC scalar normalization."""
+    if not isinstance(lease, dict):
+        return None
     try:
+        session_id = str(lease.get("session_id") or "")
+        parent_request_id = str(lease.get("parent_request_id") or "")
         owner_kind = int(lease.get("owner_kind") or 0)
         goal_generation = int(lease.get("goal_generation") or 0)
-        producer_generation = int(
-            lease.get("producer_runtime_generation") or 0
-        )
-        payload_sha256 = bytes(lease.get("goal_payload_sha256") or b"")
-        if (
-            owner_kind <= 0
-            or goal_generation <= 0
-            or producer_generation <= 0
-            or len(payload_sha256) != 32
-        ):
-            return ""
+        producer_generation = int(lease.get("producer_runtime_generation") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not session_id.strip() or not parent_request_id.strip()
+        or owner_kind != _EXPLORATION_CHILD_NAV_OWNER_KIND
+        or not 0 < goal_generation < (1 << 64)
+        or not 0 < producer_generation < (1 << 64)
+    ):
+        return None
+    return (session_id, owner_kind, parent_request_id, goal_generation, producer_generation)
 
-        canonical = bytearray()
 
-        def append_field(value: bytes) -> None:
-            canonical.extend(len(value).to_bytes(8, "big", signed=False))
-            canonical.extend(value)
+def _exploration_child_lease_to_dict(lease: Any) -> Dict[str, Any]:
+    return {
+        "session_id": str(lease.session_id or ""),
+        "owner_kind": int(lease.owner_kind),
+        "parent_request_id": str(lease.parent_request_id or ""),
+        "goal_generation": int(lease.goal_generation),
+        "producer_runtime_generation": int(lease.producer_runtime_generation),
+    }
 
-        append_field(b"exploration-child-lease-v1")
-        append_field(str(lease.get("session_id") or "").encode("utf-8"))
-        canonical.extend(owner_kind.to_bytes(4, "big", signed=True))
-        append_field(
-            str(lease.get("parent_request_id") or "").encode("utf-8")
+
+def _exploration_reconciliation_ack_fields(
+    *,
+    child_lease: Optional[Dict[str, Any]] = None,
+    child_lease_fingerprint: str = "",
+) -> Dict[str, Any]:
+    """Choose exactly one assigned address or stored legacy opaque identifier."""
+    if child_lease is not None:
+        address = _exploration_child_lease_address(child_lease)
+        if child_lease_fingerprint or address is None:
+            raise ValueError("ownership receipt has an invalid or mixed child identity")
+        return {"child_lease": dict(zip((
+            "session_id", "owner_kind", "parent_request_id", "goal_generation",
+            "producer_runtime_generation",
+        ), address))}
+    if (
+        not isinstance(child_lease_fingerprint, str)
+        or len(child_lease_fingerprint) != 64
+        or any(ch not in "0123456789abcdef" for ch in child_lease_fingerprint)
+    ):
+        raise ValueError("ownership receipt lacks its stored legacy identifier")
+    return {"child_lease_fingerprint": child_lease_fingerprint}
+
+
+def _exploration_receipt_matches_child(
+    receipt: Any,
+    *,
+    child_lease: Optional[Dict[str, Any]] = None,
+    child_lease_fingerprint: str = "",
+) -> bool:
+    """Compare already projected receipt addresses, not a second format gate."""
+    if not isinstance(receipt, dict):
+        return False
+    observed_child = receipt.get("child_lease")
+    observed_legacy = receipt.get("child_lease_fingerprint") or ""
+    if child_lease is not None:
+        return bool(
+            not child_lease_fingerprint and not observed_legacy
+            and isinstance(observed_child, dict)
+            and all(child_lease.get(name) == observed_child.get(name) for name in (
+                "session_id", "owner_kind", "parent_request_id", "goal_generation",
+                "producer_runtime_generation",
+            ))
         )
-        canonical.extend(goal_generation.to_bytes(8, "big", signed=False))
-        canonical.extend(
-            producer_generation.to_bytes(8, "big", signed=False)
-        )
-        canonical.extend(payload_sha256)
-        return hashlib.sha256(canonical).hexdigest()
-    except (OverflowError, TypeError, ValueError):
-        return ""
+    return bool(
+        observed_child is None and child_lease_fingerprint
+        and observed_legacy == child_lease_fingerprint
+    )
 
 
 def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
@@ -3895,18 +4095,7 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
     """
     child_lease = None
     if resp.HasField("child_lease"):
-        lease = resp.child_lease
-        child_lease = {
-            "session_id": str(lease.session_id or ""),
-            "owner_kind": int(lease.owner_kind),
-            "parent_request_id": str(lease.parent_request_id or ""),
-            "goal_generation": int(lease.goal_generation),
-            "producer_runtime_generation": int(
-                lease.producer_runtime_generation
-            ),
-            # 元数据采用可完整编码的字节数组，原恢复入口仍以bytes(...)无损还原。
-            "goal_payload_sha256": list(lease.goal_payload_sha256),
-        }
+        child_lease = _exploration_child_lease_to_dict(resp.child_lease)
     global_stop_reconciliation = None
     if resp.HasField("global_stop_reconciliation"):
         reconciliation = resp.global_stop_reconciliation
@@ -3936,12 +4125,19 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
             ),
             "parent_request_id": str(receipt.parent_request_id or ""),
             "exploration_generation": int(receipt.exploration_generation),
-            "child_lease_fingerprint": str(
-                receipt.child_lease_fingerprint or ""
-            ),
             "cancel_generation": int(receipt.cancel_generation),
             "commit_disposition": str(receipt.commit_disposition or ""),
         }
+        if receipt.HasField("child_lease"):
+            if receipt.child_lease_fingerprint:
+                raise ValueError("ownership receipt has mixed child identities")
+            ownership_reconciliation_receipt["child_lease"] = (
+                _exploration_child_lease_to_dict(receipt.child_lease)
+            )
+        else:
+            ownership_reconciliation_receipt["child_lease_fingerprint"] = str(
+                receipt.child_lease_fingerprint or ""
+            )
     return {
         "mission_progress": json.loads(resp.mission_progress_json) if getattr(resp, "mission_progress_json", "") else None,
         "status": resp.status,
@@ -5062,7 +5258,7 @@ class GeometryRuntimeProvider:
             raise ValueError("unsupported relocalization result schema")
         if int(getattr(response, "schema_version", 0) or 0) == 2:
             return _assigned_terminal_payload(AssignedRelocalizationTerminal.from_proto(response))
-        if getattr(response, "HasField", lambda name: False)("assigned_cloud_v2"):
+        if (response.HasField("assigned_cloud_v2") or response.HasField("assigned_planar_v2")):
             raise ValueError("legacy relocalization result contains assigned metadata")
         disposition = int(getattr(response, "disposition", 0) or 0)
         try:
@@ -5428,7 +5624,7 @@ class GeometryRuntimeProvider:
     def _download_graph_artifact(self, reference, maximum_bytes=MAX_PLANAR_ARCHIVE_BYTES, *, validate_structure=True,
                                  _stub_override=None, _release_on_completion=True):
         retained = _artifact_reference_from_proto(reference, maximum_bytes)
-        if retained.identity_schema_version == 2 and retained.member_identity.role not in ("fine_map", "dense_cloud"):
+        if retained.identity_schema_version == 2 and retained.member_identity.role not in ("planar_graph", "fine_map", "dense_cloud"):
             raise ValueError("unpaired assigned artifact role")
         transfer_options = {"stub": _stub_override} if _stub_override is not None else {}
         def chunks():
@@ -5446,6 +5642,12 @@ class GeometryRuntimeProvider:
                 raise ValueError("artifact downloaded size mismatch")
             if retained.identity_schema_version == 2 and validate_structure:
                 identity = retained.member_identity
+                if identity.role == "planar_graph":
+                    read_planar_structure(payload, checkpoint_id=identity.checkpoint_id,
+                        session_id=identity.occupancy_receipt["session_id"],
+                        generation=identity.occupancy_receipt["session_generation"],
+                        timestamp_ns=identity.occupancy_receipt["source_timestamp_ns"])
+                    return payload
                 keywords = dict(session=identity.occupancy_receipt["session_id"],
                     generation=identity.occupancy_receipt["session_generation"], cloud_revision=identity.cloud_receipt["cloud_revision"],
                     source_timestamp_ns=identity.cloud_receipt["source_timestamp_ns"])
@@ -5469,13 +5671,19 @@ class GeometryRuntimeProvider:
         payload = checkpoint.payload if payload is None else payload
         if checkpoint.schema_version == 2:
             if reference is None:
-                reference = checkpoint.fine_reference if payload is checkpoint.fine_archive else checkpoint.dense_reference if payload is checkpoint.dense_archive else None
+                reference = (checkpoint.graph_reference if checkpoint.backend_kind == "slam_toolbox" and payload is checkpoint.payload
+                    else checkpoint.fine_reference if payload is checkpoint.fine_archive
+                    else checkpoint.dense_reference if payload is checkpoint.dense_archive else None)
             if reference is None:
                 raise ValueError("v2 upload requires the retained artifact reference")
             if not isinstance(reference, CheckpointArtifactReference):
                 reference = _artifact_reference_from_proto(reference, max(MAX_DENSE_ARCHIVE_BYTES, len(payload)))
             validate_artifact_reference(reference, checkpoint=checkpoint, maximum_bytes=MAX_DENSE_ARCHIVE_BYTES)
-            if reference == checkpoint.fine_reference:
+            if reference == checkpoint.graph_reference:
+                retained_payload = checkpoint.payload
+                if checkpoint._admission is None or not isinstance(payload, FrozenPayload) or payload is not retained_payload:
+                    raise ValueError("planar upload requires its retained immutable payload owner")
+            elif reference == checkpoint.fine_reference:
                 retained_payload = checkpoint.fine_archive
             elif reference == checkpoint.dense_reference:
                 retained_payload = checkpoint.dense_archive
@@ -5543,8 +5751,8 @@ class GeometryRuntimeProvider:
             ) from exc
         if response.schema_version != checkpoint_schema_version:
             raise ValueError("server returned a different checkpoint schema; downgrade is forbidden")
-        if origin is not None and response.backend_kind not in {"voxel", "raytracing"}:
-            raise ValueError("assigned checkpoint export requires a cloud backend")
+        if origin is not None and response.backend_kind not in {"voxel", "raytracing", "slam_toolbox"}:
+            raise ValueError("assigned checkpoint export requires a paired backend")
         _validate_checkpoint_identity_envelope(response)
         if origin is not None:
             # The export owns all returned leases. Pin reads and cleanup to its
@@ -5554,6 +5762,7 @@ class GeometryRuntimeProvider:
             cleanup_error = None
             try:
                 for field_name, role, maximum in (
+                    ("graph_artifact", "planar_graph", MAX_PLANAR_ARCHIVE_BYTES),
                     ("fine_map_artifact", "fine_map", MAX_FINE_ARCHIVE_BYTES),
                     ("dense_cloud_artifact", "dense_cloud", MAX_DENSE_ARCHIVE_BYTES),
                 ):
@@ -5578,7 +5787,12 @@ class GeometryRuntimeProvider:
                     validate_structure=False, _stub_override=origin_stub, _release_on_completion=False,
                 ) if "dense_cloud_artifact" in references else None
                 self.require_assigned_activation_origin(origin)
-                exported = _checkpoint_export_bundle_from_proto(response, None, fine_payload, dense_payload)
+                graph_payload = self._download_graph_artifact(
+                    references["graph_artifact"], MAX_PLANAR_ARCHIVE_BYTES,
+                    validate_structure=False, _stub_override=origin_stub, _release_on_completion=False,
+                ) if "graph_artifact" in references else None
+                self.require_assigned_activation_origin(origin)
+                exported = _checkpoint_export_bundle_from_proto(response, graph_payload, fine_payload, dense_payload)
                 self.require_assigned_activation_origin(origin)
                 completed = True
             finally:
@@ -5725,13 +5939,17 @@ class GeometryRuntimeProvider:
                     if state["activation_receipt_schema_version"] != 2:
                         raise ValueError("active assigned replay requires its retained request owner")
                     current = state["activation_receipt_v2"]
+                    planar = checkpoint.backend_kind == "slam_toolbox"
+                    source_key = "source_graph_member" if planar else "source_cloud_member"
+                    source_identity = checkpoint.graph_reference.member_identity if planar else checkpoint.cloud_identity
                     if (current["request"] != retained or (current["target"] is not None
-                            and current["target"]["source_cloud_member"] != _identity_document(checkpoint.cloud_identity))):
+                            and current["target"][source_key] != _identity_document(source_identity))):
                         raise ValueError("active assigned replay differs from its retained request/source owner")
                     # STAGED 没有完整 target 时也只发送调用方原请求，由原生账本裁定显式重放。
             require_origin()
             # 只重放原始制品身份及不可变字节；不生成摘要或替代 ID。
-            for archive, reference in ((checkpoint.fine_archive, checkpoint.fine_reference),
+            for archive, reference in ((checkpoint.payload, checkpoint.graph_reference),
+                                       (checkpoint.fine_archive, checkpoint.fine_reference),
                                        (checkpoint.dense_archive, checkpoint.dense_reference)):
                 if reference is not None:
                     attempted_artifacts.append(_artifact_reference_proto(reference))
@@ -6496,11 +6714,9 @@ class GeometryRuntimeProvider:
         state = dict(activation_state or {})
         _require_supported_activation_schema(state)
         if assigned_request_v2 is not None or state.get("activation_receipt_schema_version") == 2:
-            if planar_seed is not None:
-                raise ValueError("assigned cloud relocalization does not accept a planar seed")
             assigned = _assigned_request_for_rpc(
                 activation_state=state, assigned_request_v2=assigned_request_v2,
-                request_id=request_id, logical_timeout_ms=logical_timeout_ms, query_only=False,
+                request_id=request_id, logical_timeout_ms=logical_timeout_ms, query_only=False, planar_seed=planar_seed,
             )
             request = assigned.to_proto(pb2.RelocalizeRequest)
             try:
@@ -6591,7 +6807,7 @@ class GeometryRuntimeProvider:
             )
         except grpc.RpcError as exc:
             raise GeometryRuntimeRpcError.from_rpc_error("Relocalize", exc) from exc
-        if response.schema_version != 1 or response.HasField("assigned_cloud_v2"):
+        if response.schema_version != 1 or response.HasField("assigned_cloud_v2") or response.HasField("assigned_planar_v2"):
             raise ValueError("legacy relocalization received a different identity schema")
         payload = self._relocalize_result_payload(response)
         if request.target_kind == "planar_graph":
@@ -6621,11 +6837,9 @@ class GeometryRuntimeProvider:
         if assigned_request_v2 is None:
             _require_supported_activation_schema(state)
         if assigned_request_v2 is not None or state.get("activation_receipt_schema_version") == 2:
-            if planar_seed is not None:
-                raise ValueError("assigned cloud terminal query does not accept a planar seed")
             assigned = _assigned_request_for_rpc(
                 activation_state=state, assigned_request_v2=assigned_request_v2,
-                request_id=request_id, logical_timeout_ms=logical_timeout_ms, query_only=True,
+                request_id=request_id, logical_timeout_ms=logical_timeout_ms, query_only=True, planar_seed=planar_seed,
             )
             query = AssignedRelocalizationQuery.from_dict({
                 "schema_version": 2, "request_id": assigned.request_id,
@@ -6789,7 +7003,7 @@ class GeometryRuntimeProvider:
             }
         if not has_terminal:
             raise RuntimeError("terminal query response omitted terminal proof")
-        if response.terminal.schema_version != 1 or response.terminal.HasField("assigned_cloud_v2"):
+        if response.terminal.schema_version != 1 or response.terminal.HasField("assigned_cloud_v2") or response.terminal.HasField("assigned_planar_v2"):
             raise ValueError("legacy terminal query contained a different nested identity schema")
         terminal = self._relocalize_result_payload(response.terminal)
         if relocalize_request.target_kind == "planar_graph":
@@ -7733,38 +7947,31 @@ class GeometryRuntimeProvider:
         response = self._stub.GetMappingCloudAuthority(
             pb2.Empty(), timeout=_read_deadline_sec()
         )
-        if response.schema_version != 2:
+        self._raise_if_stopping("get_mapping_cloud_authority")
+        if response.schema_version != 3:
             raise ValueError("unsupported MappingCloudAuthority schema_version")
-        commit = _mapping_commit_identity_dict(_require_proto_message_field(response, "committed_occupancy_commit_id"))
-        if len(commit["boot_nonce"]) != 16 or not any(commit["boot_nonce"]) or commit["sequence"] <= 0:
-            raise ValueError("mapping-cloud occupancy receipt is missing or invalid")
-        return {
-            "schema_version": 2,
+        receipt = _assigned_activation_receipt_payload(
+            _require_proto_message_field(response, "activation_receipt_v2"))
+        commit = _mapping_commit_identity_dict(
+            _require_proto_message_field(response, "committed_occupancy_commit_id"))
+        authority = {
+            "schema_version": 3,
+            "activation_receipt_v2": receipt,
             "map_name": str(response.map_name),
             "map_frame_id": str(response.map_frame_id),
-            "asset_manifest_sha256": bytes(response.asset_manifest_sha256).hex(),
-            "asset_bundle_sha256": bytes(response.asset_bundle_sha256).hex(),
-            "activation_request_id": str(response.activation_request_id),
-            "activation_request_identity_sha256": bytes(
-                response.activation_request_identity_sha256
-            ).hex(),
-            "activation_identity_sha256": bytes(
-                response.activation_identity_sha256
-            ).hex(),
-            "target_receipt_sha256": bytes(response.target_receipt_sha256).hex(),
             "runtime_generation": int(response.runtime_generation),
             "lifecycle_epoch": int(response.lifecycle_epoch),
             "mapping_session_id": str(response.mapping_session_id),
             "mapping_session_generation": int(response.mapping_session_generation),
             "backend_kind": str(response.backend_kind),
             "backend_generation": int(response.backend_generation),
-            "committed_occupancy_revision": int(
-                response.committed_occupancy_revision
-            ),
+            "committed_occupancy_revision": int(response.committed_occupancy_revision),
             "committed_occupancy_commit_id": {"boot_nonce": commit["boot_nonce"].hex(), "sequence": commit["sequence"]},
             "committed_occupancy_source_timestamp_ns": int(response.committed_occupancy_source_timestamp_ns),
             "owner_epoch": int(response.owner_epoch),
         }
+        _mapping_cloud_authority_receipt(authority)
+        return authority
 
     def submit_mapping_cloud_goal(
         self,
@@ -7782,42 +7989,35 @@ class GeometryRuntimeProvider:
         self._raise_if_stopping("submit_mapping_cloud_goal")
         if not self._connected or not self._stub:
             raise RuntimeError("Geometry runtime 未连接。")
-        if authority.get("schema_version") != 2:
-            raise ValueError("mapping-cloud authority requires schema 2")
+        receipt = _mapping_cloud_authority_receipt(authority)
         commit = authority["committed_occupancy_commit_id"]
-        nonce = bytes.fromhex(commit["boot_nonce"])
-        if len(nonce) != 16 or not any(nonce) or type(commit["sequence"]) is not int or not 1 <= commit["sequence"] <= (1 << 64) - 1:
-            raise ValueError("mapping-cloud occupancy receipt is missing or invalid")
         request = pb2.MappingCloudGoalRequest(
-            schema_version=2,
+            schema_version=3,
+            activation_receipt_v2=_assigned_activation_receipt_proto(receipt),
             query_request_id=str(query_request_id),
             query_text=str(query_text),
             caller_timeout_ms=int(caller_timeout_ms),
             provider_timeout_ms=int(provider_timeout_ms),
-            map_name=str(authority["map_name"]),
-            map_frame_id=str(authority["map_frame_id"]),
-            asset_manifest_sha256=bytes.fromhex(authority["asset_manifest_sha256"]),
-            asset_bundle_sha256=bytes.fromhex(authority["asset_bundle_sha256"]),
+            map_name=authority["map_name"],
+            map_frame_id=authority["map_frame_id"],
             georeference_json=bytes(georeference_json),
-            activation_identity_sha256=bytes.fromhex(
-                authority["activation_identity_sha256"]
-            ),
-            runtime_generation=int(authority["runtime_generation"]),
-            mapping_session_id=str(authority["mapping_session_id"]),
-            mapping_session_generation=int(authority["mapping_session_generation"]),
-            committed_occupancy_revision=int(
-                authority["committed_occupancy_revision"]
-            ),
-            committed_occupancy_commit_id=pb2.MappingCommitIdentity(boot_nonce=nonce, sequence=commit["sequence"]),
-            committed_occupancy_source_timestamp_ns=int(authority["committed_occupancy_source_timestamp_ns"]),
+            runtime_generation=authority["runtime_generation"],
+            mapping_session_id=authority["mapping_session_id"],
+            mapping_session_generation=authority["mapping_session_generation"],
+            committed_occupancy_revision=authority["committed_occupancy_revision"],
+            committed_occupancy_commit_id=pb2.MappingCommitIdentity(
+                boot_nonce=bytes.fromhex(commit["boot_nonce"]), sequence=commit["sequence"]),
+            committed_occupancy_source_timestamp_ns=authority["committed_occupancy_source_timestamp_ns"],
             motion_guard_generation=int(motion_admission["guard_generation"]),
             motion_guard_boot_nonce=bytes(motion_admission["guard_boot_nonce"]),
             motion_stop_generation=int(motion_admission["motion_stop_generation"]),
         )
+        self._raise_if_stopping("submit_mapping_cloud_goal")
         response = self._stub.SubmitMappingCloudGoal(
             request,
             timeout=max(float(caller_timeout_ms) / 1000.0 + 1.0, 2.0),
         )
+        self._raise_if_stopping("submit_mapping_cloud_goal")
         navigation = response.navigation if response.HasField("navigation") else None
         return {
             "status": str(response.status),
@@ -7834,9 +8034,10 @@ class GeometryRuntimeProvider:
                 "producer_runtime_generation": int(
                     navigation.producer_runtime_generation
                 ),
-                "goal_payload_sha256": bytes(
-                    navigation.goal_payload_sha256
-                ).hex(),
+                "parent_request_id": str(navigation.parent_request_id),
+                "planner_runtime_generation": int(navigation.planner_runtime_generation),
+                "runtime_generation": int(navigation.runtime_generation),
+                "path_revision": int(navigation.path_revision),
             },
         }
 
@@ -9604,17 +9805,10 @@ class GeometryRuntimeProvider:
                 child_lease=pb2.ExplorationChildLease(
                     session_id=str(child_lease.get("session_id") or ""),
                     owner_kind=int(child_lease.get("owner_kind") or 0),
-                    parent_request_id=str(
-                        child_lease.get("parent_request_id") or ""
-                    ),
-                    goal_generation=int(
-                        child_lease.get("goal_generation") or 0
-                    ),
+                    parent_request_id=str(child_lease.get("parent_request_id") or ""),
+                    goal_generation=int(child_lease.get("goal_generation") or 0),
                     producer_runtime_generation=int(
                         child_lease.get("producer_runtime_generation") or 0
-                    ),
-                    goal_payload_sha256=bytes(
-                        child_lease.get("goal_payload_sha256") or b""
                     ),
                 ),
                 expected_navigation_runtime_generation=int(
@@ -9690,17 +9884,10 @@ class GeometryRuntimeProvider:
                 child_lease=pb2.ExplorationChildLease(
                     session_id=str(child_lease.get("session_id") or ""),
                     owner_kind=int(child_lease.get("owner_kind") or 0),
-                    parent_request_id=str(
-                        child_lease.get("parent_request_id") or ""
-                    ),
-                    goal_generation=int(
-                        child_lease.get("goal_generation") or 0
-                    ),
+                    parent_request_id=str(child_lease.get("parent_request_id") or ""),
+                    goal_generation=int(child_lease.get("goal_generation") or 0),
                     producer_runtime_generation=int(
                         child_lease.get("producer_runtime_generation") or 0
-                    ),
-                    goal_payload_sha256=bytes(
-                        child_lease.get("goal_payload_sha256") or b""
                     ),
                 ),
                 cancel_generation=int(cancel_generation),
@@ -9758,7 +9945,8 @@ class GeometryRuntimeProvider:
         self,
         *,
         recovery_correlation: str,
-        child_lease_fingerprint: str,
+        child_lease_fingerprint: str = "",
+        child_lease: Optional[Dict[str, Any]] = None,
         deadline_monotonic: Optional[float] = None,
     ) -> bool:
         """Acknowledge one durable ownership receipt after external release."""
@@ -9772,11 +9960,14 @@ class GeometryRuntimeProvider:
                 "AcknowledgeExplorationOwnershipReconciliation"
             )
         try:
+            identity = _exploration_reconciliation_ack_fields(
+                child_lease=child_lease,
+                child_lease_fingerprint=child_lease_fingerprint,
+            )
+            if "child_lease" in identity:
+                identity["child_lease"] = pb2.ExplorationChildLease(**identity["child_lease"])
             request = pb2.AcknowledgeExplorationOwnershipReconciliationRequest(
-                recovery_correlation=str(recovery_correlation or ""),
-                child_lease_fingerprint=str(
-                    child_lease_fingerprint or ""
-                ),
+                recovery_correlation=str(recovery_correlation or ""), **identity,
             )
             rpc_timeout = _exploration_rpc_timeout(
                 deadline_monotonic,

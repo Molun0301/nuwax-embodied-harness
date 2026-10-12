@@ -1,4 +1,4 @@
-"""Assigned cloud relocalization metadata, deliberately disconnected from providers.
+"""Assigned relocalization metadata, deliberately disconnected from providers.
 
 Catalog dictionaries use exact integer IEEE-754 bits and lowercase hexadecimal
 for byte fields. They contain no source XYZ, map/checkpoint payload, content ID,
@@ -64,6 +64,32 @@ _SCHEMA = {
     'response': [('schema_version', 1, 'u32'), ('request_id', 2, 'str'), ('status', 5, 'enum'), ('terminal', 6, '?result'), ('ledger_observation', 7, '?observation'), ('assigned_request_v2', 8, 'request')],
 }
 
+# Planar and cloud bodies share the same immutable owners and protobuf codec.
+# A graph source is its existing checkpoint member, never a cloud receipt.
+_SCHEMA.update({
+    'planar_member': [('checkpoint_id', 1, 'str'), ('role', 2, 'planar_role'), ('occupancy_receipt', 3, 'occupancy'), ('cloud_receipt', 4, '?cloud'), ('frame_id', 5, 'str'), ('frame_generation', 6, 'u64'), ('producer_generation', 7, 'u64')],
+    'planar_target': [('activation', 1, 'activation'), ('occupancy_receipt', 3, 'occupancy'), ('source_graph_member', 5, 'planar_member')],
+    'planar_seed': [('x', 1, 'double'), ('y', 2, 'double'), ('yaw', 3, 'double')],
+    'planar_request_body': [('target', 1, 'planar_target'), ('policy', 2, 'policy'), ('logical_timeout_ms', 3, 'u64'), ('seed', 4, 'planar_seed')],
+    'planar_request': [('schema_version', 1, 'u32'), ('request_id', 2, 'str'), ('assigned_planar_v2', 25, 'planar_request_body')],
+    'planar_scan': [('process_owner', 1, 'str'), ('session_generation', 2, 'u64'), ('mode_epoch', 3, 'u64'), ('source_sequence', 4, 'u64'), ('source_timestamp_ns', 5, 'u64'), ('source_unix_ns', 6, 'u64'), ('matching_response_bits', 7, 'bits')],
+    'planar_estimate': [('source_timestamp_ns', 1, 'u64'), ('clock_domain', 2, 'str'), ('clock_id', 3, 'str'), ('source_sequence', 4, 'u64'), ('graph_revision', 5, 'u64'), ('optimizations', 6, 'u64'), ('anchor_odom_from_base_bits', 7, '*bits'), ('odom_from_base_bits', 8, '*bits'), ('map_from_base_bits', 9, '*bits'), ('map_from_odom_bits', 10, '*bits'), ('covariance_bits', 11, '*planar_bits'), ('matching_response_bits', 12, 'bits'), ('local_response_bits', 13, 'bits'), ('disposition', 14, 'str'), ('node_count', 15, 'u32'), ('edge_count', 16, 'u32')],
+    'planar_evidence': [('schema_version', 1, 'u32'), ('phase', 2, 'enum'), ('admission_ordinal', 3, '?u64'), ('owner', 4, '?owner'), ('previous_process', 5, 'str'), ('committed_process', 6, 'str'), ('mode_epoch', 7, 'u64'), ('accepted_scans', 8, '*planar_scan'), ('estimate', 9, '?planar_estimate'), ('frame_generation', 10, 'u64'), ('source_unix_ns', 11, 'u64'), ('committed_unix_ns', 12, 'u64')],
+    'planar_result_body': [('request', 1, 'request'), ('disposition', 2, 'enum'), ('correction_revision', 3, 'u64'), ('detail', 4, 'str'), ('evidence', 5, 'planar_evidence')],
+    'planar_result': [('schema_version', 1, 'u32'), ('request_id', 2, 'str'), ('assigned_planar_v2', 34, 'planar_result_body')],
+})
+
+
+def _resolve_kind(value: Any, kind: str) -> str:
+    if kind in {'request', 'result'}:
+        if isinstance(value, Mapping):
+            planar = 'assigned_planar_v2' in value
+        else:
+            planar = 'assigned_planar_v2' in value.DESCRIPTOR.fields_by_name and value.HasField('assigned_planar_v2')
+        if planar:
+            return 'planar_' + kind
+    return kind
+
 
 def _hex(value: Any, name: str) -> str:
     if not isinstance(value, str) or len(value) % 2 or any(c not in '0123456789abcdef' for c in value):
@@ -81,11 +107,16 @@ def _normalize(value: Any, kind: str) -> Any:
             raise ValueError('source frame bound exceeded')
         if kind == '*bits' and len(value) > 4:
             raise ValueError('pose component count invalid')
+        if kind == '*planar_bits' and len(value) > 9:
+            raise ValueError('planar covariance component count invalid')
+        if kind == '*planar_scan' and len(value) > 16:
+            raise ValueError('planar scan receipt bound exceeded')
         return [_normalize(item, kind[1:]) for item in value]
+    kind = _resolve_kind(value, kind)
     if kind in _SCHEMA:
         value = _fields(value, {name for name, _, _ in _SCHEMA[kind]}, kind)
         return {name: _normalize(value[name], field_kind) for name, _, field_kind in _SCHEMA[kind]}
-    if kind in {'u64', 'bits', 'u32'}:
+    if kind in {'u64', 'bits', 'planar_bits', 'u32'}:
         result = _integer(value, kind, 0)
         if kind == 'u32' and result > (1 << 32) - 1:
             raise ValueError('integer exceeds u32')
@@ -98,11 +129,27 @@ def _normalize(value: Any, kind: str) -> Any:
         if type(value) is not bool:
             raise ValueError('boolean metadata must be exact bool')
         return value
+    if kind == 'double':
+        if type(value) not in {int, float}:
+            raise ValueError('planar seed must contain finite doubles')
+        try:
+            result = float(value)
+        except OverflowError as error:
+            raise ValueError('planar seed must contain finite doubles') from error
+        if not math.isfinite(result):
+            raise ValueError('planar seed must contain finite doubles')
+        # Existing nonoptional PlanarSeed doubles omit both zero signs in prost.
+        # Canonical identity follows that native wire, retaining other finite bits.
+        return 0.0 if result == 0.0 else result
     if kind == 'hex':
         return _hex(value, kind)
     if kind == 'role':
         if value != 'canonical_cloud':
             raise ValueError('assigned cloud target requires canonical_cloud role')
+        return value
+    if kind == 'planar_role':
+        if value != 'planar_graph':
+            raise ValueError('assigned planar target requires planar_graph role')
         return value
     if kind == 'str':
         if not isinstance(value, str):
@@ -124,6 +171,7 @@ def _varint(value: int) -> bytes:
 def _wire(value: Mapping[str, Any], kind: str) -> bytes:
     """Exact proto3 metadata encoding, used to apply existing native budgets."""
     out = bytearray()
+    kind = _resolve_kind(value, kind)
     for name, tag, field_kind in _SCHEMA[kind]:
         item = value[name]
         optional = field_kind.startswith('?')
@@ -131,7 +179,7 @@ def _wire(value: Mapping[str, Any], kind: str) -> bytes:
         field_kind = field_kind.lstrip('?*')
         if item is None:
             continue
-        if repeated and field_kind == 'bits':
+        if repeated and field_kind in {'bits', 'planar_bits'}:
             if item:
                 payload = b''.join(struct.pack('<Q', b) for b in item)
                 out += _varint((tag << 3) | 2) + _varint(len(payload)) + payload
@@ -147,8 +195,13 @@ def _wire(value: Mapping[str, Any], kind: str) -> bytes:
             elif field_kind == 'bits':
                 if element or optional:
                     out += _varint((tag << 3) | 1) + struct.pack('<Q', element)
+            elif field_kind == 'double':
+                if element != 0.0 or optional:
+                    out += _varint((tag << 3) | 1) + struct.pack('<d', element)
             else:
-                number = 3 if field_kind == 'role' else int(element)
+                number = {'role': 3, 'planar_role': 6}.get(field_kind)
+                if number is None:
+                    number = int(element)
                 if number or optional:
                     out += _varint(tag << 3) + _varint(number & ((1 << 64) - 1))
     return bytes(out)
@@ -168,6 +221,17 @@ def current_assigned_relocalization_policy() -> dict[str, Any]:
     """Existing production policy parameters; never fill an absent RPC policy."""
     return _assigned_relocalization_policy(
         3, 'current-registration-local-icp-then-global;accept-geometric-consensus;local-score=raw')
+
+
+def current_assigned_planar_relocalization_policy() -> dict[str, Any]:
+    """The existing native seeded-planar policy, with its shared deadline."""
+    deadline = current_assigned_relocalization_policy()
+    return {'schema_version': 2, 'source_policy_version': 1,
+            'source_parameters': b'nuwax.planar-source.v1;fresh-after-arm;max-age-ns=500000000;accepted-scans=3;strict-sequence;matched-odometry'.hex(),
+            'deadline_policy_version': deadline['deadline_policy_version'],
+            'deadline_parameters': deadline['deadline_parameters'],
+            'algorithm_options_version': 1,
+            'algorithm_parameters': b'nuwax.planar-relocalization.v1;karto-2.10.0;explicit-se2-seed;candidate-process;static-graph;canonical-tf'.hex()}
 
 
 def _retained_relocalization_policy_v2() -> dict[str, Any]:
@@ -230,11 +294,12 @@ def _provider_fields(value: Any, kind: str) -> Any:
         return None if value is None else _provider_fields(value, kind[1:])
     if kind.startswith('*'):
         return [_provider_fields(item, kind[1:]) for item in value]
+    kind = _resolve_kind(value, kind)
     if kind in _SCHEMA:
         return {name: _provider_fields(value[name], field_kind) for name, _, field_kind in _SCHEMA[kind] if value[name] is not None}
     if kind == 'hex':
         return bytes.fromhex(value)
-    return 3 if kind == 'role' else value
+    return {'role': 3, 'planar_role': 6}.get(kind, value)
 
 
 _PROTO_NAMES = {
@@ -250,6 +315,14 @@ _PROTO_NAMES = {
     'result': 'RelocalizeResult', 'query': 'GetRelocalizationTerminalRequest',
     'observation': 'RelocalizationLedgerObservation', 'response': 'GetRelocalizationTerminalResponse',
 }
+_PROTO_NAMES.update({
+    'planar_member': 'CheckpointMemberIdentity', 'planar_target': 'InstalledTargetReceiptV2',
+    'planar_seed': 'PlanarSeed', 'planar_request_body': 'AssignedPlanarRelocalizeRequestV2',
+    'planar_request': 'RelocalizeRequest', 'planar_scan': 'PlanarRelocalizationScanV2',
+    'planar_estimate': 'PlanarRelocalizationEstimateV2',
+    'planar_evidence': 'AssignedPlanarRelocalizationEvidenceV2',
+    'planar_result_body': 'AssignedPlanarRelocalizeResultV2', 'planar_result': 'RelocalizeResult',
+})
 
 
 def _project_proto(message: Any, kind: str) -> dict[str, Any]:
@@ -258,6 +331,7 @@ def _project_proto(message: Any, kind: str) -> dict[str, Any]:
     Unknown protobuf fields cannot disappear silently at the DTO boundary.
     Existing legacy scalar fields may exist in the descriptor only at default.
     """
+    kind = _resolve_kind(message, kind)
     if message.DESCRIPTOR.full_name != 'nuwax.geometry.' + _PROTO_NAMES[kind]:
         raise ValueError('protobuf message type differs from assigned contract')
     known = {name for name, _, _ in _SCHEMA[kind]}
@@ -275,7 +349,7 @@ def _project_proto(message: Any, kind: str) -> dict[str, Any]:
             raise ValueError('protobuf schema differs from exact assigned field mapping')
         optional, repeated = field_kind.startswith('?'), field_kind.startswith('*')
         field_kind = field_kind.lstrip('?*')
-        expected_type = 11 if field_kind in _SCHEMA else {'str': 9, 'hex': 12, 'u64': 4, 'u32': 13, 'i32': 5, 'enum': 14, 'role': 14, 'bits': 6, 'bool': 8}[field_kind]
+        expected_type = 11 if field_kind in _SCHEMA else {'str': 9, 'hex': 12, 'u64': 4, 'u32': 13, 'i32': 5, 'enum': 14, 'role': 14, 'planar_role': 14, 'bits': 6, 'planar_bits': 6, 'bool': 8, 'double': 1}[field_kind]
         if descriptor.type != expected_type or (descriptor.label == 3) != repeated:
             raise ValueError('protobuf scalar type/cardinality differs from assigned contract')
         if optional or field_kind in _SCHEMA and not repeated:
@@ -294,6 +368,10 @@ def _project_proto(message: Any, kind: str) -> dict[str, Any]:
                 if element != 3:
                     raise ValueError('protobuf member is not canonical_cloud')
                 return 'canonical_cloud'
+            if field_kind == 'planar_role':
+                if element != 6:
+                    raise ValueError('protobuf member is not planar_graph')
+                return 'planar_graph'
             return element
         result[name] = [project(element) for element in item] if repeated else project(item)
     return result
@@ -307,6 +385,26 @@ class AssignedRelocalizationRequest(_MetadataOwner):
     asset_identity: AssetIdentityV2
     logical_timeout_ms: int
     _kind = 'request'
+
+    @property
+    def body_key(self) -> str:
+        return 'assigned_planar_v2' if self.backend_kind == 'slam_toolbox' else 'assigned_cloud_v2'
+
+    @property
+    def backend_kind(self) -> str:
+        return self.activation_receipt.to_dict()['activation']['backend_kind']
+
+    @property
+    def source_member_key(self) -> str:
+        return 'source_graph_member' if self.backend_kind == 'slam_toolbox' else 'source_cloud_member'
+
+    @property
+    def target(self) -> dict[str, Any]:
+        return self.activation_receipt.to_dict()['target']
+
+    @property
+    def source_member(self) -> dict[str, Any]:
+        return self.target[self.source_member_key]
 
     @classmethod
     def admit(cls, value: Any) -> 'AssignedRelocalizationRequest':
@@ -323,14 +421,16 @@ class AssignedRelocalizationRequest(_MetadataOwner):
         if value['schema_version'] != 2:
             raise ValueError('assigned relocalization schema must be 2')
         request_id = _text(value['request_id'], 'relocalization request ID', 128, ascii_identity=True)
-        body = value['assigned_cloud_v2']
+        planar = 'assigned_planar_v2' in value
+        body = value['assigned_planar_v2' if planar else 'assigned_cloud_v2']
         timeout = body['logical_timeout_ms']
         if timeout == 0:
             timeout = 30_000
         if not 250 <= timeout <= 30_000:
             raise ValueError('logical timeout differs from existing policy')
-        if body['policy'] != current_assigned_relocalization_policy() and not (
-            retained and body['policy'] == _retained_relocalization_policy_v2()
+        policy = current_assigned_planar_relocalization_policy() if planar else current_assigned_relocalization_policy()
+        if body['policy'] != policy and not (
+            not planar and retained and body['policy'] == _retained_relocalization_policy_v2()
         ):
             raise ValueError('exact relocalization policy parameters differ')
         target = body['target']
@@ -635,6 +735,57 @@ def _validate_candidate(body: bytes, evidence: Mapping[str, Any]) -> None:
         raise ValueError('canonical V3 candidate differs from retained owner/source/algorithm bindings')
 
 
+def _validate_planar_evidence(request: AssignedRelocalizationRequest, evidence: Mapping[str, Any], *, applied: bool) -> None:
+    """Retained native planar process/scan bindings, not source attestation."""
+    _bound(evidence, 'planar_evidence', MAX_EVIDENCE_BYTES)
+    if evidence['schema_version'] != 2 or evidence['phase'] not in {1, 2, 5}:
+        raise ValueError('unsupported assigned planar evidence schema or phase')
+    phase, owner = evidence['phase'], evidence['owner']
+    if phase == 1:
+        if evidence['admission_ordinal'] is not None or owner is not None:
+            raise ValueError('pre-admission planar evidence cannot contain owner claims')
+    else:
+        target = request.target
+        if (not evidence['admission_ordinal'] or owner is None
+                or owner['runtime_generation'] != target['activation']['runtime_generation']
+                or not owner['correction_backend_generation'] or not owner['correction_lease_generation']
+                or len(owner['correction_lease_boot_nonce']) != 32 or owner['correction_lease_boot_nonce'] == '0' * 32
+                or owner['map_frame_id'] != target['source_graph_member']['frame_id']
+                or not owner['odom_frame_id'] or not owner['body_frame_id'] or not owner['relocalization_epoch']):
+            raise ValueError('planar correction owner differs from requested ownership')
+    if phase != 5:
+        if (applied or evidence['previous_process'] or evidence['committed_process']
+                or evidence['mode_epoch'] or evidence['accepted_scans'] or evidence['estimate'] is not None
+                or evidence['frame_generation'] or evidence['source_unix_ns'] or evidence['committed_unix_ns']):
+            raise ValueError('unfinalized planar evidence cannot contain outcome claims')
+        return
+    valid_process = lambda value: len(value) == 32 and all(character in '0123456789abcdefABCDEF' for character in value)
+    scans = evidence['accepted_scans']
+    if (not applied or not valid_process(evidence['previous_process']) or not valid_process(evidence['committed_process'])
+            or owner['relocalization_epoch'] != evidence['mode_epoch'] or not evidence['frame_generation']
+            or len(scans) != 3 or not evidence['source_unix_ns'] or not evidence['committed_unix_ns']):
+        raise ValueError('finalized planar evidence lacks the actual process outcome')
+    previous = None
+    for scan in scans:
+        if (scan['process_owner'] != evidence['committed_process']
+                or scan['session_generation'] != request.target['activation']['session_generation']
+                or scan['mode_epoch'] != evidence['mode_epoch']
+                or previous is not None and scan['source_sequence'] <= previous
+                or not scan['source_timestamp_ns'] or not scan['source_unix_ns']
+                or not _float(scan['matching_response_bits']) >= 0.3):
+            raise ValueError('planar scan differs from retained process/session/source bindings')
+        previous = scan['source_sequence']
+    estimate, last = evidence['estimate'], scans[-1]
+    if (estimate is None or estimate['source_sequence'] != last['source_sequence']
+            or estimate['source_timestamp_ns'] != last['source_timestamp_ns']
+            or estimate['matching_response_bits'] != last['matching_response_bits']
+            or evidence['source_unix_ns'] != last['source_unix_ns']
+            or estimate['disposition'] != 'accepted' or not estimate['clock_domain']
+            or any(len(estimate[name]) != 3 for name in ('anchor_odom_from_base_bits', 'odom_from_base_bits', 'map_from_base_bits', 'map_from_odom_bits'))
+            or len(estimate['covariance_bits']) != 9):
+        raise ValueError('planar estimate differs from final accepted scan')
+
+
 @dataclass(frozen=True, init=False)
 class AssignedRelocalizationTerminal(_MetadataOwner):
     _encoded: bytes
@@ -644,24 +795,43 @@ class AssignedRelocalizationTerminal(_MetadataOwner):
     correction_revision: int
     _kind = 'result'
 
+    @property
+    def body_key(self) -> str:
+        return self.request.body_key
+
     @classmethod
     def admit(cls, value: Any) -> 'AssignedRelocalizationTerminal':
         value = _normalize(value, 'result')
         if value['schema_version'] != 2:
             raise ValueError('assigned terminal schema must be 2')
-        body = value['assigned_cloud_v2']
-        if len(body['candidate_payload_v3']) > 2 * MAX_CANDIDATE_BYTES:
+        planar = 'assigned_planar_v2' in value
+        body = value['assigned_planar_v2' if planar else 'assigned_cloud_v2']
+        if not planar and len(body['candidate_payload_v3']) > 2 * MAX_CANDIDATE_BYTES:
             raise ValueError('candidate exceeds native body budget')
         _bound(value, 'result', MAX_TERMINAL_BYTES)
         request = AssignedRelocalizationRequest.from_dict(body['request'])
         if value['request_id'] != request.request_id:
             raise ValueError('terminal and normalized request IDs differ')
+        if planar != (request.body_key == 'assigned_planar_v2'):
+            raise ValueError('terminal and normalized request target kinds differ')
         disposition, revision = body['disposition'], body['correction_revision']
         if disposition not in range(1, 16):
             raise ValueError('terminal disposition unsupported')
         applied = disposition in {1, 2}
-        if (applied and revision == 0) or (not applied and disposition != 3 and revision != 0):
+        if (applied and revision == 0) or (not applied and (planar or disposition != 3) and revision != 0):
             raise ValueError('terminal revision and disposition differ')
+        evidence = body['evidence']
+        if planar:
+            _validate_planar_evidence(request, evidence, applied=applied)
+        else:
+            cls._validate_cloud_outcome(request, body, disposition, revision, applied)
+        owner = object.__new__(cls)
+        for name, item in {'_encoded': _encode(value), 'request': request, 'request_id': request.request_id, 'disposition': disposition, 'correction_revision': revision}.items():
+            object.__setattr__(owner, name, item)
+        return owner
+
+    @staticmethod
+    def _validate_cloud_outcome(request: AssignedRelocalizationRequest, body: Mapping[str, Any], disposition: int, revision: int, applied: bool) -> None:
         evidence = body['evidence']
         _validate_evidence(request, evidence)
         phase, algorithm = evidence['phase'], evidence['algorithm']
@@ -678,10 +848,6 @@ class AssignedRelocalizationTerminal(_MetadataOwner):
                 _validate_candidate(candidate, evidence)
             elif phase == 5 or revision != 0 or applied:
                 raise ValueError('terminal outcome requires canonical candidate body')
-        owner = object.__new__(cls)
-        for name, item in {'_encoded': _encode(value), 'request': request, 'request_id': request.request_id, 'disposition': disposition, 'correction_revision': revision}.items():
-            object.__setattr__(owner, name, item)
-        return owner
 
     @classmethod
     def from_dict(cls, value: Any) -> 'AssignedRelocalizationTerminal':

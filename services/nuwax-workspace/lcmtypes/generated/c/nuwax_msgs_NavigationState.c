@@ -21,7 +21,7 @@ uint64_t __nuwax_msgs_NavigationState_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_NavigationState_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0x4f51f9fafead7dedLL
+    uint64_t hash = (uint64_t)0x72e1fbd257455e5cLL
          + __string_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
@@ -49,8 +49,8 @@ uint64_t __nuwax_msgs_NavigationState_hash_recursive(const __lcm_hash_ptr *p)
          + __string_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
-         + __byte_hash_recursive(&cp)
-         + __byte_hash_recursive(&cp)
+         + __int64_t_hash_recursive(&cp)
+         + __int64_t_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
          + __double_hash_recursive(&cp)
         ;
@@ -156,10 +156,10 @@ int __nuwax_msgs_NavigationState_encode_array(void *buf, int offset, int maxlen,
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].path_revision), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].goal_payload_sha256, 32);
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].path_payload_sha256, 32);
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].planner_runtime_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].local_path_count), 1);
@@ -249,9 +249,9 @@ int __nuwax_msgs_NavigationState_encoded_array_size(const nuwax_msgs_NavigationS
 
         size += __int64_t_encoded_array_size(&(p[element].path_revision), 1);
 
-        size += __byte_encoded_array_size(p[element].goal_payload_sha256, 32);
+        size += __int64_t_encoded_array_size(&(p[element].producer_runtime_generation), 1);
 
-        size += __byte_encoded_array_size(p[element].path_payload_sha256, 32);
+        size += __int64_t_encoded_array_size(&(p[element].planner_runtime_generation), 1);
 
         size += __int32_t_encoded_array_size(&(p[element].local_path_count), 1);
 
@@ -357,10 +357,10 @@ int __nuwax_msgs_NavigationState_decode_array(const void *buf, int offset, int m
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].path_revision), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].goal_payload_sha256, 32);
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].path_payload_sha256, 32);
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].planner_runtime_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].local_path_count), 1);
@@ -439,9 +439,9 @@ int __nuwax_msgs_NavigationState_decode_array_cleanup(nuwax_msgs_NavigationState
 
         __int64_t_decode_array_cleanup(&(p[element].path_revision), 1);
 
-        __byte_decode_array_cleanup(p[element].goal_payload_sha256, 32);
+        __int64_t_decode_array_cleanup(&(p[element].producer_runtime_generation), 1);
 
-        __byte_decode_array_cleanup(p[element].path_payload_sha256, 32);
+        __int64_t_decode_array_cleanup(&(p[element].planner_runtime_generation), 1);
 
         __int32_t_decode_array_cleanup(&(p[element].local_path_count), 1);
 
@@ -537,9 +537,9 @@ int __nuwax_msgs_NavigationState_clone_array(const nuwax_msgs_NavigationState *p
 
         __int64_t_clone_array(&(p[element].path_revision), &(q[element].path_revision), 1);
 
-        __byte_clone_array(p[element].goal_payload_sha256, q[element].goal_payload_sha256, 32);
+        __int64_t_clone_array(&(p[element].producer_runtime_generation), &(q[element].producer_runtime_generation), 1);
 
-        __byte_clone_array(p[element].path_payload_sha256, q[element].path_payload_sha256, 32);
+        __int64_t_clone_array(&(p[element].planner_runtime_generation), &(q[element].planner_runtime_generation), 1);
 
         __int32_t_clone_array(&(p[element].local_path_count), &(q[element].local_path_count), 1);
 

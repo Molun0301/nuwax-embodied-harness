@@ -159,7 +159,7 @@ pub enum WorkerError {
 }
 
 const WORKER_PROTOCOL_MAGIC: &[u8; 4] = b"MLS1";
-const WORKER_PROTOCOL_VERSION: u8 = 2;
+const WORKER_PROTOCOL_VERSION: u8 = 3;
 const WORKER_KIND_READY: u8 = 1;
 const WORKER_KIND_PLANNED: u8 = 2;
 const WORKER_KIND_CANCELLED: u8 = 3;
@@ -1494,7 +1494,7 @@ pub fn encode_worker_event_body(
         state.owner_kind = goal.owner_kind;
         state.parent_request_id = goal.parent_request_id.clone();
         state.goal_generation = goal.goal_generation;
-        state.goal_payload_sha256 = goal.payload_sha256;
+        state.producer_runtime_generation = goal.producer_runtime_generation;
     }
     schema::encode_navigation_state_body(&state)
         .map_err(|error| WorkerError::Codec(error.to_string()))
@@ -1568,7 +1568,7 @@ pub fn decode_worker_event_body(body: &[u8]) -> Result<(String, i64, WorkerEvent
             || state.owner_kind != goal.owner_kind
             || state.parent_request_id != goal.parent_request_id
             || state.goal_generation != goal.goal_generation
-            || state.goal_payload_sha256 != goal.payload_sha256
+            || state.producer_runtime_generation != goal.producer_runtime_generation
             || state.guard_generation != goal.motion_guard_generation
             || state.planner_map_frame != goal.committed_map_frame_id
             || state.planner_pose_frame != goal.goal.header.frame_id
@@ -1587,7 +1587,9 @@ pub fn decode_worker_event_body(body: &[u8]) -> Result<(String, i64, WorkerEvent
             || state.owner_kind != 0
             || !state.parent_request_id.is_empty()
             || state.goal_generation != 0
-            || state.goal_payload_sha256 != [0; 32]
+            || state.producer_runtime_generation != 0
+            || state.planner_runtime_generation != 0
+            || state.path_revision != 0
             || state.guard_generation != 0
             || !state.planner_map_frame.is_empty()
             || !state.planner_pose_frame.is_empty()
@@ -1837,6 +1839,7 @@ mod tests {
 
     fn goal(session_id: &str, generation: i64) -> GoalEnvelope {
         let mut goal = GoalEnvelope {
+            body_reference_frame_id: "base_link".into(),
             schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
             session_id: session_id.into(),
             owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
@@ -1879,13 +1882,8 @@ mod tests {
             },
             ..GoalEnvelope::default()
         };
-        goal.boundary_sha256 = schema::goal_intent_boundary_sha256(
-            &goal.boundary_frame_id,
-            &goal.boundary_id,
-            &goal.boundary_points,
-        )
-        .unwrap();
-        schema::seal_goal_envelope(&mut goal).unwrap();
+
+        schema::validate_goal_envelope(&goal).unwrap();
         goal
     }
 
@@ -2036,6 +2034,26 @@ mod tests {
         assert_eq!(backend, "mls3d");
         assert_eq!(generation, 11);
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn mls3_rejects_old_private_protocol_and_foreign_goal_runtime() {
+        let goal = goal("assigned-event", 8);
+        let event = WorkerEvent::Planned(PlannerResult {
+            goal: goal.clone(),
+            backend_generation: 11,
+            path: Path { header: goal.goal.header.clone(), poses: vec![goal.goal.clone()] },
+        });
+        let body = encode_worker_event_body("mls3d", 11, &event).unwrap();
+        assert!(decode_worker_event_body(&body).is_ok());
+        let mut state = schema::decode_navigation_state_body(&body).unwrap();
+        state.producer_runtime_generation += 1;
+        assert!(decode_worker_event_body(&schema::encode_navigation_state_body(&state).unwrap()).is_err());
+        let mut state = schema::decode_navigation_state_body(&body).unwrap();
+        let mut private = hex_decode(&state.message).unwrap();
+        private[4] = 2;
+        state.message = hex_encode(&private);
+        assert!(decode_worker_event_body(&schema::encode_navigation_state_body(&state).unwrap()).is_err());
     }
 
     #[tokio::test]

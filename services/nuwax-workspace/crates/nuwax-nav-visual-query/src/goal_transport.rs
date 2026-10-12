@@ -56,8 +56,6 @@ pub struct AdmittedGoalLease {
     pub goal_generation: u64,
     /// Geometry 生产运行时代次。
     pub producer_runtime_generation: u64,
-    /// 密封目标载荷哈希；间接绑定目标姿态、frame 与 source timestamp。
-    pub goal_payload_sha256: [u8; 32],
 }
 
 /// 对外输出的类型化导航准入/终态。
@@ -159,17 +157,14 @@ impl GeometryGoalTransport {
                 state.status, state.reason_code, state.message
             ));
         }
-        let goal_payload_sha256: [u8; 32] = state
-            .goal_payload_sha256
-            .as_slice()
-            .try_into()
-            .map_err(|_| "ACCEPTED navigation state has invalid goal payload hash".to_string())?;
+        if state.goal_generation == 0 || state.producer_runtime_generation == 0 {
+            return Err("ACCEPTED navigation state has invalid assigned goal identity".into());
+        }
         let lease = AdmittedGoalLease {
             goal_id: state.goal_id.clone(),
             parent_request_id: state.parent_request_id.clone(),
             goal_generation: state.goal_generation,
             producer_runtime_generation: state.producer_runtime_generation,
-            goal_payload_sha256,
         };
         Ok((lease, NavigationOutcome::from_state(state)))
     }
@@ -244,7 +239,6 @@ fn matches_lease(state: &NavigationState, lease: &AdmittedGoalLease) -> bool {
         && state.parent_request_id == lease.parent_request_id
         && state.goal_generation == lease.goal_generation
         && state.producer_runtime_generation == lease.producer_runtime_generation
-        && state.goal_payload_sha256.as_slice() == lease.goal_payload_sha256
 }
 
 fn cancel_rejected(state: &NavigationState) -> String {
@@ -525,7 +519,6 @@ mod tests {
             parent_request_id: "session-1".into(),
             goal_generation: 7,
             producer_runtime_generation: 8,
-            goal_payload_sha256: [9; 32],
         };
         let mut state = NavigationState {
             owner_kind: PUBLIC_NAV_OWNER,
@@ -533,14 +526,13 @@ mod tests {
             parent_request_id: lease.parent_request_id.clone(),
             goal_generation: lease.goal_generation,
             producer_runtime_generation: lease.producer_runtime_generation,
-            goal_payload_sha256: lease.goal_payload_sha256.to_vec(),
             ..NavigationState::default()
         };
         assert!(matches_lease(&state, &lease));
         state.owner_kind = 2;
         assert!(!matches_lease(&state, &lease));
         state.owner_kind = PUBLIC_NAV_OWNER;
-        state.goal_payload_sha256[0] ^= 1;
+        state.producer_runtime_generation += 1;
         assert!(!matches_lease(&state, &lease));
     }
 }

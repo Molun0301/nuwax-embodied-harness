@@ -295,17 +295,3 @@ impl NavigationCapabilities {
     }
 }
 
-/// 同一启动输入的控制/观察标定、机体外形与支撑偏移摘要，用于拒绝跨组件参数不一致。
-/// 空配置保留零摘要，便于未声明高级能力的独立算法调用。
-pub fn configuration_digest_from_env() -> Result<[u8;32],String> {
-    let capabilities=NavigationCapabilities::from_env()?;
-    let geometry=std::env::var("NUWAX_ROBOT_GEOMETRY_JSON").ok().filter(|v|!v.trim().is_empty())
-        .map(|value|crate::RobotGeometry::from_runtime_json(&value)).transpose()?;
-    let support=std::env::var("NUWAX_NAV_BODY_TO_SUPPORT_Z_M").ok().filter(|v|!v.trim().is_empty())
-        .map(|value|value.parse::<f64>().map_err(|_|"机体支撑偏移无效".to_string())).transpose()?;
-    if support.is_some_and(|value|!value.is_finite() || value<=0.0) {return Err("机体支撑偏移必须为正值".into());}
-    if capabilities.is_none() && geometry.is_none() && support.is_none(){return Ok([0;32]);}
-    let base=std::env::var("NUWAX_BASE_FRAME").unwrap_or_default();
-    let value=serde_json::to_vec(&(capabilities,geometry,support,base)).map_err(|error|error.to_string())?;
-    Ok(nuwax_codec::hash::sha256_bytes(&value))
-}

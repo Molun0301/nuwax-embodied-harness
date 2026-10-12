@@ -5,7 +5,7 @@
 //! 设计：
 //! - `CostMap2D`：u8 占据栅格，`0=FREE`, `100=OCCUPIED`, `255=UNKNOWN`。
 //! - `NavigationMap`：缓存最近一次 binary costmap，提供 `make_gradient_costmap` 接口。
-//!   障碍膨胀和距离代价统一调用 `nuwax-mapping::occupancy::gradient`，
+//!   障碍膨胀和距离代价统一调用 `nuwax-numeric::occupancy::gradient`，
 //!   支持普通梯度与 Voronoi（泰森多边形）策略。
 
 use crate::helpers::Point2;
@@ -200,7 +200,7 @@ impl CostMap2D {
 //
 // 单元 cell 距离权重:corner=2, edge=3, center=e=0。
 // 反向 pass 用镜像 mask。
-// rework22 P1 #2:这些常量现由 nuwax_mapping::occupancy::gradient 统一实装,这里保留为参考
+// rework22 P1 #2:这些常量现由 nuwax_numeric::occupancy::gradient 统一实装,这里保留为参考
 #[allow(dead_code)]
 const MEILHON_A: f64 = 2.0; // 对角(左上)
 #[allow(dead_code)]
@@ -224,7 +224,7 @@ pub enum GradientStrategy {
 /// 设计说明：
 /// - `update(costmap)` 缓存 binary。
 /// - `make_gradient_costmap(robot_increase)`：构造 obstacle inflate + 距离梯度 costmap。
-///   代价生成由 `nuwax-mapping::occupancy::gradient` 负责，本类型处理栅格转换与缓存。
+///   代价生成由 `nuwax-numeric::occupancy::gradient` 负责，本类型处理栅格转换与缓存。
 pub struct NavigationMap {
     robot_width: f64,
     #[allow(dead_code)] // 策略参数供运行时切换 gradient 行为,Binary 矩阵调用方暂未查询
@@ -265,7 +265,7 @@ impl NavigationMap {
 
     /// 构造 gradient costmap
     ///
-    /// 使用 mapping crate 的精确 EDT/Voronoi 实现生成原版 path map。
+    /// 使用 numeric crate 的精确 EDT/Voronoi 实现生成原版 path map。
     ///
     /// 流程:
     /// 1. 将 `CostMap2D` (binary) 转 `OccupancyGrid` 桥接
@@ -284,7 +284,7 @@ impl NavigationMap {
 
         // 阶段 1: CostMap2D → OccupancyGrid 桥接
         let mut occ_grid =
-            nuwax_mapping::occupancy::OccupancyGrid::new(width as u32, height as u32, resolution);
+            nuwax_numeric::occupancy::OccupancyGrid::new(width as u32, height as u32, resolution);
         for y in 0..height {
             for x in 0..width {
                 let v = binary.get(x, y);
@@ -299,20 +299,20 @@ impl NavigationMap {
         }
 
         // 阶段 2: 调统一 make_costmap
-        let cfg = nuwax_mapping::occupancy::gradient::CostMapConfig {
+        let cfg = nuwax_numeric::occupancy::gradient::CostMapConfig {
             resolution,
             robot_increase: robot_increase.max(0.0) * self.robot_width / 2.0,
             max_cost: 99,
         };
         let strategy = match self.strategy {
             GradientStrategy::Gradient => {
-                nuwax_mapping::occupancy::gradient::DistanceCostStrategy::Gradient
+                nuwax_numeric::occupancy::gradient::DistanceCostStrategy::Gradient
             }
             GradientStrategy::Voronoi => {
-                nuwax_mapping::occupancy::gradient::DistanceCostStrategy::Voronoi
+                nuwax_numeric::occupancy::gradient::DistanceCostStrategy::Voronoi
             }
         };
-        let result = nuwax_mapping::occupancy::gradient::make_costmap_with_strategy(
+        let result = nuwax_numeric::occupancy::gradient::make_costmap_with_strategy(
             &occ_grid, &cfg, strategy, 1.5,
         );
 

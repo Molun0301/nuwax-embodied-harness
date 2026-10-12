@@ -23,11 +23,15 @@ CATEGORIES = {
     "meeting_room": "会议室：主要用途为多人讨论会议，会议桌、围坐席位和演示设备等证据相互支持。",
     "corridor": "走廊：主要用于通行和连接其他区域，不是摆有工位的狭长房间。",
     "kitchen": "茶水间或厨房：有备餐、饮水、清洗或食品相关设施。",
+    "living_room": "客厅或起居室：主要用于家庭休闲或会客，有沙发、茶几、电视等相互支持的证据；不能仅凭一把椅子判断。",
+    "bedroom": "卧室：主要用于睡眠，有床、寝具等证据；不能把办公室或客厅的临时休息座椅当作卧室。",
+    "bathroom": "卫生间或浴室：有马桶、淋浴、浴缸等卫生或洗浴设施；仅有水槽不能排除厨房。",
     "storage": "储物间：主要为存储物品的架柜或堆放空间。",
     "other": "其他明确用途：证据充分表明不是以上类别，但无法用以上具体类别命名。",
     "unknown": "未知：缺少证据、观察相互矛盾、图像只看到局部，或无法可靠判断用途。",
 }
 LABELS = {"office": "办公室", "meeting_room": "会议室", "corridor": "走廊", "kitchen": "茶水间",
+          "living_room": "客厅", "bedroom": "卧室", "bathroom": "卫生间",
           "storage": "储物间", "other": "其他空间", "unknown": "未知空间"}
 LOCKED_STATUSES = {SceneSpaceReviewStatus.REVIEWED, SceneSpaceReviewStatus.CORRECTED, SceneSpaceReviewStatus.REJECTED}
 
@@ -172,6 +176,7 @@ class SceneMappingService:
             if not unchanged:
                 metadata.pop("decision_inputs_v2", None)
                 metadata.pop("last_decision", None)
+                metadata.pop("adopted_label_evidence", None)
             updates = {"metadata": metadata}
             if old is not None:
                 updates.update({"human_aliases": old.human_aliases,
@@ -343,17 +348,42 @@ class SceneMappingService:
         raw["probability_calibrated_for_robot_rooms"] = False
         raw["image_count"] = len(request.images)
         raw["visual_view_consistency"] = consistent_views
+        raw["adoption_blockers"] = [reason for blocked, reason in (
+            (not apply_labels, "automatic_adoption_disabled"),
+            (not consistent_views, "visual_views_not_consistent"),
+            (winner in ("unknown", "other"), "category_not_specific"),
+            (score < self.config.min_label_score, "label_score_below_threshold"),
+            (margin < self.config.min_label_margin, "label_margin_below_threshold"),
+            (len(entries) < self.config.min_evidence_views, "independent_views_insufficient"),
+        ) if blocked]
         return space.model_copy(update={
-            "primary_label": LABELS[winner] if adopted else None,
-            "review_status": SceneSpaceReviewStatus.AUTO_LABELED if adopted else SceneSpaceReviewStatus.CANDIDATE,
             "observation_samples": samples, "observation_sample_ids": [sample.sample_id for sample in samples],
             "candidate_labels": [SceneCandidateLabel(label=LABELS[key], normalized_label=key,
                 confidence=value, source_model=result.model_id,
                 evidence_observation_sample_ids=[sample.sample_id for sample in samples],
                 metadata={"score_kind": result.score_kind, "calibrated": False}) for key, value in ranked],
             "metadata": {**space.metadata, "last_decision": raw, "decision_inputs_v2": evidence_key,
-                         "category": winner, "label_source": "model" if adopted else "model_candidate"},
+                         "category": winner},
         }, deep=True)
+
+    def _naming_policy_inputs(self, adopting):
+        # 同一证据的采用开关/判定规则变化后，旧候选必须重新处理。
+        return {
+            "apply_labels": bool(adopting), "backend": self.config.backend, "model": self.config.model,
+            "min_label_score": self.config.min_label_score, "min_label_margin": self.config.min_label_margin,
+            "min_evidence_views": self.config.min_evidence_views,
+        }
+
+
+    def _publish_map(self):
+        if self.stream_bus is not None:
+            self.stream_bus.publish("memory.scene_spaces", source="scene_mapping_service", payload=self.get_map(), status="available")
+
+
+    def update_label(self, **arguments):
+        """网页和智能体显式命名与模型提交共享通知出口。"""
+        return self.memory.update_scene_mapping_label(**arguments, on_committed=self._publish_map)
+
 
     def run_once(self, *, apply_labels: Optional[bool] = None, cancel_check=None, background=False, expected_capture=None) -> Dict[str, Any]:
         if not self.config.enabled:
@@ -382,6 +412,7 @@ class SceneMappingService:
             capture, spaces = self._refresh_regions(ensure, expected_capture=expected_capture)
             applied, processed, skipped, failures = [], [], [], []
             adopting = self.config.auto_apply if apply_labels is None else apply_labels
+            policy_inputs = self._naming_policy_inputs(adopting)
             for space in spaces:
                 ensure()
                 if space.metadata.get("label_locked") or space.review_status in LOCKED_STATUSES:
@@ -392,7 +423,7 @@ class SceneMappingService:
                     skipped.append({"id": space.scene_space_id, "reason": "no_valid_observation_evidence"})
                     continue
                 if background and all(getattr(entry, "_scene_decision_source_revision", None) is not None
-                                      or (getattr(entry, "_memory_business_token", None) or (None,))[0] == "business" for entry in entries) and space.metadata.get("decision_inputs_v2") == _evidence_inputs(entries, self.config.model):
+                                      or (getattr(entry, "_memory_business_token", None) or (None,))[0] == "business" for entry in entries) and space.metadata.get("decision_inputs_v2") == _evidence_inputs(entries, self.config.model) and space.metadata.get("decision_policy_inputs") == policy_inputs:
                     skipped.append({"id": space.scene_space_id, "reason": "evidence_unchanged"})
                     continue
                 if len(processed) + len(failures) >= self.config.max_regions_per_cycle:
@@ -414,12 +445,18 @@ class SceneMappingService:
                             raise GatewayError("模型返回时区域边界已变化。", error_code="scene_geometry_changed", http_status=409)
                     updated = self._decision_space(space, result, entries, request, apply_labels=adopting)
                     updated.metadata["map_binding"] = current_capture["binding"]
+                    updated.metadata["decision_policy_inputs"] = policy_inputs
+                    adopted = updated.metadata["last_decision"]["adopted"]
                     with self._lock:
                         ensure()
-                        committed = self.memory.commit_scene_mapping_spaces(current_capture, [updated], expected_revisions={
-                            space.scene_space_id: int(space.metadata["scene_revision"])})[0]
+                        committed = self.memory.commit_scene_mapping_label(
+                            current_capture, updated, label=LABELS[updated.metadata["category"]] if adopted else None,
+                            source="model" if adopted else "model_candidate",
+                            expected_revision=int(space.metadata["scene_revision"]),
+                        )
+                    self._publish_map()
                     processed.append(committed.scene_space_id)
-                    if committed.review_status == SceneSpaceReviewStatus.AUTO_LABELED:
+                    if adopted:
                         applied.append(committed.scene_space_id)
                 except GatewayError as exc:
                     if exc.error_code in ("scene_mapping_stopped", "scene_scope_changed", "memory_library_changed"):
@@ -433,8 +470,8 @@ class SceneMappingService:
                 self._last_result = response
                 self._last_finished_at = utc_now().isoformat()
                 self._last_error = None if not failures else {"code": "scene_mapping_partial_failure"}
-            if self.stream_bus is not None:
-                self.stream_bus.publish("memory.scene_spaces", source="scene_mapping_service", payload=self.get_map(), status="available")
+            if not processed:
+                self._publish_map()
             return response
         finally:
             with self._lock:
@@ -476,7 +513,7 @@ def _evidence_inputs(entries, model):
         owned_revision = getattr(entry, "_scene_decision_source_revision", None)
         revision = list(owned_revision) if owned_revision is not None else list(token) if token and token[0] == "business" else None
         values.append({"memory_id": entry.memory_id, "source_revision": revision})
-    return {"version": 2, "model": model, "entries": values}
+    return {"version": 2, "model": model, "categories": dict(CATEGORIES), "entries": values}
 
 
 def _distance_to_boundary(point, polygon) -> float:

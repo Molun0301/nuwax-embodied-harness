@@ -35,8 +35,10 @@ from typing import (
 )
 
 
-REQUEST_SCHEMA_VERSION = 3
-ACTIVE_SCHEMA_VERSION = 1
+REQUEST_SCHEMA_VERSION = 4
+LEGACY_REQUEST_SCHEMA_VERSION = 3
+ACTIVE_SCHEMA_VERSION = 2
+LEGACY_ACTIVE_SCHEMA_VERSION = 1
 STATE_ENVELOPE_SCHEMA_VERSION = 1
 DEFAULT_MAX_LOG_BYTES = 64 * 1024
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 5.0
@@ -62,7 +64,8 @@ MIN_STATE_AUTH_KEY_BYTES = 32
 MAX_STATE_AUTH_KEY_BYTES = 4096
 OWNER_LOCK_NAME = ".nuwax-offline-cli-owner-v1.lock"
 ACTIVE_JOURNAL_NAME = ".nuwax-offline-cli-active-v1.json"
-REQUEST_FILE_PREFIX = ".nuwax-offline-cli-request-v1-"
+LEGACY_REQUEST_FILE_PREFIX = ".nuwax-offline-cli-request-v1-"
+REQUEST_FILE_PREFIX = ".nuwax-offline-cli-request-v2-"
 TEMP_FILE_PREFIX = ".nuwax-offline-cli-temp-v1-"
 INPUT_ALIAS_DIR_NAME = ".nuwax-offline-cli-input-aliases-v1"
 INPUT_ALIAS_PREFIX = ".nuwax-offline-cli-input-v1-"
@@ -72,8 +75,11 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _OPERATION_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 _STATE_MAC_RE = re.compile(r"[0-9a-f]{64}\Z")
+_LEGACY_REQUEST_FILE_RE = re.compile(
+    re.escape(LEGACY_REQUEST_FILE_PREFIX) + r"([0-9a-f]{64})\.json\Z"
+)
 _REQUEST_FILE_RE = re.compile(
-    re.escape(REQUEST_FILE_PREFIX) + r"([0-9a-f]{64})\.json\Z"
+    re.escape(REQUEST_FILE_PREFIX) + r"([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})\.json\Z"
 )
 _INPUT_ALIAS_RE = re.compile(
     re.escape(INPUT_ALIAS_PREFIX)
@@ -257,7 +263,8 @@ class OfflineCliReleaseProof:
 
 
 @dataclass(frozen=True)
-class OfflineCliStatus:
+class LegacyOfflineCliStatus:
+    schema_version: int
     request_id: str
     request_digest: str
     operation_id: str
@@ -294,9 +301,10 @@ class OfflineCliStatus:
     message: str
 
     @classmethod
-    def from_record(cls, record: Mapping[str, object]) -> "OfflineCliStatus":
+    def from_record(cls, record: Mapping[str, object]) -> "LegacyOfflineCliStatus":
         _validate_record_shape(record)
         return cls(
+            schema_version=int(record["schema_version"]),
             request_id=str(record["request_id"]),
             request_digest=str(record["request_digest"]),
             operation_id=str(record["operation_id"]),
@@ -324,6 +332,86 @@ class OfflineCliStatus:
             output_relative_path=str(record["output_relative_path"]),
             output_size=_optional_int(record["output_size"]),
             output_sha256=_optional_text(record["output_sha256"]),
+            receipt=(None if record["receipt"] is None else dict(record["receipt"])),
+            release_generation=str(record["release_generation"]),
+            release_manifest_sha256=str(record["release_manifest_sha256"]),
+            offline_cli_artifact_sha256=str(record["offline_cli_artifact_sha256"]),
+            offline_cli_artifact_size=int(record["offline_cli_artifact_size"]),
+            error_code=_optional_text(record["error_code"]),
+            message=str(record["message"]),
+        )
+
+
+@dataclass(frozen=True)
+class OfflineCliStatus:
+    schema_version: int
+    request_id: str
+    operation_id: str
+    command_kind: OfflineCliCommandKind
+    state: OfflineCliState
+    terminal: bool
+    dataset_size: int
+    dataset_format: str
+    dataset_device: int
+    dataset_inode: int
+    dataset_mtime_ns: int
+    dataset_ctime_ns: int
+    submitted_at_unix_ns: int
+    deadline_at_unix_ns: int
+    started_at_unix_ns: Optional[int]
+    completed_at_unix_ns: Optional[int]
+    pid: Optional[int]
+    process_start_token: Optional[int]
+    pgid: Optional[int]
+    sid: Optional[int]
+    exit_code: Optional[int]
+    stdout: str
+    stderr: str
+    stdout_truncated: bool
+    stderr_truncated: bool
+    output_relative_path: str
+    output_size: Optional[int]
+    receipt: Optional[Mapping[str, object]]
+    release_generation: str
+    release_manifest_sha256: str
+    offline_cli_artifact_sha256: str
+    offline_cli_artifact_size: int
+    error_code: Optional[str]
+    message: str
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, object]) -> Union["OfflineCliStatus", LegacyOfflineCliStatus]:
+        if record.get("schema_version") == LEGACY_REQUEST_SCHEMA_VERSION:
+            return LegacyOfflineCliStatus.from_record(record)
+        _validate_record_shape(record)
+        return cls(
+            schema_version=int(record["schema_version"]),
+            request_id=str(record["request_id"]),
+            operation_id=str(record["operation_id"]),
+            command_kind=OfflineCliCommandKind(str(record["command_kind"])),
+            state=OfflineCliState(str(record["state"])),
+            terminal=bool(record["terminal"]),
+            dataset_size=int(record["dataset_size"]),
+            dataset_format=str(record["dataset_format"]),
+            dataset_device=int(record["dataset_device"]),
+            dataset_inode=int(record["dataset_inode"]),
+            dataset_mtime_ns=int(record["dataset_mtime_ns"]),
+            dataset_ctime_ns=int(record["dataset_ctime_ns"]),
+            submitted_at_unix_ns=int(record["submitted_at_unix_ns"]),
+            deadline_at_unix_ns=int(record["deadline_at_unix_ns"]),
+            started_at_unix_ns=_optional_int(record["started_at_unix_ns"]),
+            completed_at_unix_ns=_optional_int(record["completed_at_unix_ns"]),
+            pid=_optional_int(record["pid"]),
+            process_start_token=_optional_int(record["process_start_token"]),
+            pgid=_optional_int(record["pgid"]),
+            sid=_optional_int(record["sid"]),
+            exit_code=_optional_int(record["exit_code"]),
+            stdout=str(record["stdout"]),
+            stderr=str(record["stderr"]),
+            stdout_truncated=bool(record["stdout_truncated"]),
+            stderr_truncated=bool(record["stderr_truncated"]),
+            output_relative_path=str(record["output_relative_path"]),
+            output_size=_optional_int(record["output_size"]),
             receipt=(None if record["receipt"] is None else dict(record["receipt"])),
             release_generation=str(record["release_generation"]),
             release_manifest_sha256=str(record["release_manifest_sha256"]),
@@ -672,12 +760,13 @@ def _request_contract(
     release_manifest_sha256: str,
     offline_cli_artifact_sha256: str,
     offline_cli_artifact_size: int,
-    dataset_sha256: str,
     dataset_size: int,
     dataset_format: str,
     dataset_device: int,
     dataset_inode: int,
-) -> Tuple[Dict[str, object], str, List[str], float]:
+    dataset_mtime_ns: int,
+    dataset_ctime_ns: int,
+) -> Tuple[Dict[str, object], List[str], float]:
     if not isinstance(request.request_id, str):
         raise OfflineCliValidationError("request_id must be a string")
     request_id = request.request_id.strip()
@@ -699,11 +788,12 @@ def _request_contract(
         "release_manifest_sha256": release_manifest_sha256,
         "offline_cli_artifact_sha256": offline_cli_artifact_sha256,
         "offline_cli_artifact_size": offline_cli_artifact_size,
-        "dataset_sha256": dataset_sha256,
         "dataset_size": dataset_size,
         "dataset_format": dataset_format,
         "dataset_device": dataset_device,
         "dataset_inode": dataset_inode,
+        "dataset_mtime_ns": dataset_mtime_ns,
+        "dataset_ctime_ns": dataset_ctime_ns,
         "command": command_payload,
     }
     encoded = json.dumps(
@@ -715,7 +805,9 @@ def _request_contract(
     ).encode("utf-8")
     if len(encoded) > MAX_REQUEST_BYTES:
         raise OfflineCliValidationError("typed request exceeds the bounded size")
-    return payload, hashlib.sha256(encoded).hexdigest(), argv, timeout
+    if type(request.command) is MapCommand:
+        argv.extend(["--request-id", request_id])
+    return payload, argv, timeout
 
 
 def _durable_command_contract(payload: object) -> Dict[str, object]:
@@ -868,78 +960,39 @@ class _ResolvedInput:
         ):
             raise OfflineCliValidationError("input identity changed before process release")
 
-    def content_proof(self) -> Tuple[str, int, str, int, int]:
+    def observe_input(self) -> Tuple[int, str, int, int, int, int]:
         self.verify_current_identity()
-        fixed_digest = _sha256_fd(self.file_fd)
-        fresh_fd = os.open(
-            self.path.name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=self.parent_fd,
-        )
-        try:
-            fresh = os.fstat(fresh_fd)
-            if not _same_identity(fresh, self.metadata):
-                raise OfflineCliValidationError("fresh input FD identity does not match admission")
-            fresh_digest = _sha256_fd(fresh_fd)
-            completed = os.fstat(fresh_fd)
-            if (
-                not _same_identity(fresh, completed)
-                or completed.st_size != fresh.st_size
-                or completed.st_mtime_ns != fresh.st_mtime_ns
-                or completed.st_ctime_ns != fresh.st_ctime_ns
-                or fresh_digest != fixed_digest
-            ):
-                raise OfflineCliValidationError("fresh input bytes do not match the fixed admission FD")
-        finally:
-            os.close(fresh_fd)
-        suffix = self.path.suffix
+        metadata = self.metadata
         formats = {".jsonl": "jsonl", ".ndjson": "ndjson", ".db": "memory2_sqlite"}
+        suffix = self.path.suffix
         if suffix not in formats:
             raise OfflineCliValidationError("input format is unsupported")
-        return fixed_digest, fresh.st_size, formats[suffix], fresh.st_dev, fresh.st_ino
+        if not 0 < metadata.st_size < (1 << 64) or any(
+               not 0 <= value < (1 << 64) for value in
+               (metadata.st_dev, metadata.st_ino)) or any(
+               not -(1 << 63) <= value < (1 << 63) for value in
+               (metadata.st_mtime_ns, metadata.st_ctime_ns)):
+            raise OfflineCliValidationError("input observation is outside the supported integer bounds")
+        return (metadata.st_size, formats[suffix], metadata.st_dev, metadata.st_ino,
+                metadata.st_mtime_ns, metadata.st_ctime_ns)
 
-    def verify_content_proof(
+    def verify_input_observation(
         self,
-        expected_sha256: str,
         expected_size: int,
         expected_format: str,
         expected_device: int,
         expected_inode: int,
+        expected_mtime_ns: int,
+        expected_ctime_ns: int,
     ) -> None:
         self.verify_current_identity()
-        fixed_digest = _sha256_fd(self.file_fd)
-        fresh_fd = os.open(
-            self.path.name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=self.parent_fd,
-        )
-        try:
-            fresh = os.fstat(fresh_fd)
-            fresh_digest = _sha256_fd(fresh_fd)
-            completed = os.fstat(fresh_fd)
-            formats = {
-                ".jsonl": "jsonl",
-                ".ndjson": "ndjson",
-                ".db": "memory2_sqlite",
-            }
-            if (
-                not _same_identity(fresh, self.metadata)
-                or not _same_identity(fresh, completed)
-                or fresh.st_size != expected_size
-                or fresh.st_dev != expected_device
-                or fresh.st_ino != expected_inode
-                or completed.st_size != fresh.st_size
-                or completed.st_mtime_ns != fresh.st_mtime_ns
-                or completed.st_ctime_ns != fresh.st_ctime_ns
-                or formats.get(self.path.suffix) != expected_format
-                or fixed_digest != expected_sha256
-                or fresh_digest != expected_sha256
-            ):
-                raise OfflineCliValidationError(
-                    "fresh input proof does not match the durable request"
-                )
-        finally:
-            os.close(fresh_fd)
+        metadata = self.metadata
+        formats = {".jsonl": "jsonl", ".ndjson": "ndjson", ".db": "memory2_sqlite"}
+        observed = (metadata.st_size, formats.get(self.path.suffix), metadata.st_dev,
+                    metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns)
+        if observed != (expected_size, expected_format, expected_device,
+                        expected_inode, expected_mtime_ns, expected_ctime_ns):
+            raise OfflineCliValidationError("input observation does not match the durable request")
 
     def close(self) -> None:
         os.close(self.file_fd)
@@ -957,7 +1010,7 @@ class _ResolvedOutput:
         if not _same_identity(current, self.parent_metadata) or not stat.S_ISDIR(current.st_mode):
             raise OfflineCliValidationError("output parent identity changed")
 
-    def inspect_final(self) -> Tuple[int, str]:
+    def inspect_final(self) -> int:
         self.verify_parent_identity()
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
         descriptor = os.open(self.path.name, flags, dir_fd=self.parent_fd)
@@ -971,27 +1024,7 @@ class _ResolvedOutput:
                 raise OfflineCliOwnerError(
                     "durable CLI output is missing, empty, linked, or non-regular"
                 )
-            digest = hashlib.sha256()
-            total = 0
-            while True:
-                chunk = os.read(descriptor, 1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-                total += len(chunk)
-            completed = os.fstat(descriptor)
-            if (
-                not _same_identity(metadata, completed)
-                or completed.st_nlink != 1
-                or completed.st_size != metadata.st_size
-                or completed.st_mtime_ns != metadata.st_mtime_ns
-                or completed.st_ctime_ns != metadata.st_ctime_ns
-                or total != metadata.st_size
-            ):
-                raise OfflineCliOwnerError(
-                    "durable CLI output changed while it was being inspected"
-                )
-            return total, digest.hexdigest()
+            return metadata.st_size
         finally:
             os.close(descriptor)
 
@@ -1189,59 +1222,34 @@ def _validate_durable_map_receipt(
     receipt: object,
     *,
     command: Mapping[str, object],
-    request_id: str,
-    request_digest: str,
-    dataset_sha256: object,
-    dataset_size: object,
-    dataset_format: object,
-    dataset_device: object,
-    dataset_inode: object,
-    output_size: object,
-    output_sha256: object,
-    release_generation: object,
-    release_manifest_sha256: object,
-    artifact_sha256: object,
-    artifact_size: object,
+    record: Mapping[str, object],
 ) -> None:
+    legacy = record["schema_version"] == LEGACY_REQUEST_SCHEMA_VERSION
     expected = {
-        "map_name",
-        "frame_id",
-        "output_directory",
-        "manifest_sha256",
-        "bundle_size",
-        "dataset_sha256",
-        "dataset_size",
-        "dataset_format",
-        "dataset_device",
-        "dataset_inode",
-        "offline_cli_artifact_size",
-        "files",
-        "release_generation",
-        "release_manifest_sha256",
-        "offline_cli_artifact_sha256",
-        "request_id",
-        "request_digest",
+        "map_name", "frame_id", "output_directory", "bundle_size",
+        "dataset_size", "dataset_format", "dataset_device", "dataset_inode",
+        "offline_cli_artifact_size", "files", "release_generation",
+        "release_manifest_sha256", "offline_cli_artifact_sha256", "request_id",
     }
+    expected |= ({"manifest_sha256", "dataset_sha256", "request_digest"} if legacy else
+                 {"schema_version", "dataset_mtime_ns", "dataset_ctime_ns"})
     if not isinstance(receipt, dict) or set(receipt) != expected:
         raise OfflineCliRecoveryError("durable map receipt field set is not exact")
+    bound_fields = (
+        "dataset_size", "dataset_format", "dataset_device", "dataset_inode",
+        "offline_cli_artifact_size", "release_generation", "release_manifest_sha256",
+        "offline_cli_artifact_sha256", "request_id",
+    ) + (("dataset_sha256", "request_digest") if legacy else
+         ("dataset_mtime_ns", "dataset_ctime_ns"))
     if (
         receipt["map_name"] != command["map_name"]
         or receipt["frame_id"] != command["frame_id"]
-        or receipt["manifest_sha256"] != output_sha256
-        or receipt["bundle_size"] != output_size
-        or receipt["dataset_sha256"] != dataset_sha256
-        or receipt["dataset_size"] != dataset_size
-        or receipt["dataset_format"] != dataset_format
-        or receipt["dataset_device"] != dataset_device
-        or receipt["dataset_inode"] != dataset_inode
-        or receipt["offline_cli_artifact_size"] != artifact_size
-        or receipt["release_generation"] != release_generation
-        or receipt["release_manifest_sha256"] != release_manifest_sha256
-        or receipt["offline_cli_artifact_sha256"] != artifact_sha256
-        or receipt["request_id"] != request_id
-        or receipt["request_digest"] != request_digest
+        or receipt["bundle_size"] != record["output_size"]
+        or any(receipt[field] != record[field] for field in bound_fields)
+        or (legacy and receipt["manifest_sha256"] != record["output_sha256"])
+        or (not legacy and (type(receipt["schema_version"]) is not int or receipt["schema_version"] != 2))
     ):
-        raise OfflineCliRecoveryError("durable map receipt identity proof is inconsistent")
+        raise OfflineCliRecoveryError("durable map receipt identity is inconsistent")
     output_directory = receipt["output_directory"]
     if not isinstance(output_directory, str) or not os.path.isabs(output_directory):
         raise OfflineCliRecoveryError("durable map receipt output directory is invalid")
@@ -1253,14 +1261,14 @@ def _validate_durable_map_receipt(
         raise OfflineCliRecoveryError("durable map receipt files are not exact")
     expected_paths = ("asset.json", "map.pgm")
     for item, expected_path in zip(files, expected_paths):
-        if not isinstance(item, dict) or set(item) != {"path", "size", "sha256"}:
-            raise OfflineCliRecoveryError("durable map receipt file proof shape is invalid")
+        if not isinstance(item, dict) or set(item) != ({"path", "size", "sha256"} if legacy else {"path", "size"}):
+            raise OfflineCliRecoveryError("durable map receipt file shape is invalid")
         if item["path"] != expected_path:
             raise OfflineCliRecoveryError("durable map receipt files are not byte-sorted")
-        if isinstance(item["size"], bool) or not isinstance(item["size"], int) or item["size"] <= 0:
+        if type(item["size"]) is not int or item["size"] <= 0:
             raise OfflineCliRecoveryError("durable map receipt file size is invalid")
-        if not isinstance(item["sha256"], str) or not _SHA256_RE.fullmatch(item["sha256"]):
-            raise OfflineCliRecoveryError("durable map receipt file digest is invalid")
+        if legacy and (not isinstance(item["sha256"], str) or not _SHA256_RE.fullmatch(item["sha256"])):
+            raise OfflineCliRecoveryError("durable legacy map receipt alias is invalid")
 
 
 def _validate_record_shape(record: Mapping[str, object]) -> None:
@@ -1303,16 +1311,22 @@ def _validate_record_shape(record: Mapping[str, object]) -> None:
         "error_code",
         "message",
     }
-    if not isinstance(record, dict) or set(record) != required:
+    if not isinstance(record, dict):
+        raise OfflineCliRecoveryError("durable request record is not an object")
+    legacy = record.get("schema_version") == LEGACY_REQUEST_SCHEMA_VERSION
+    if not legacy:
+        required -= {"request_digest", "dataset_sha256", "output_sha256"}
+        required |= {"dataset_mtime_ns", "dataset_ctime_ns"}
+    if set(record) != required:
         raise OfflineCliRecoveryError("durable request record has unknown or missing fields")
-    if record.get("schema_version") != REQUEST_SCHEMA_VERSION:
+    if record.get("schema_version") not in {REQUEST_SCHEMA_VERSION, LEGACY_REQUEST_SCHEMA_VERSION}:
         raise OfflineCliRecoveryError("durable request record schema is unsupported")
     request_id = record.get("request_id")
     digest = record.get("request_digest")
     operation_id = record.get("operation_id")
     if not isinstance(request_id, str) or not _REQUEST_ID_RE.fullmatch(request_id):
         raise OfflineCliRecoveryError("durable request ID is invalid")
-    if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+    if legacy and (not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest)):
         raise OfflineCliRecoveryError("durable request digest is invalid")
     if not isinstance(operation_id, str) or not _OPERATION_ID_RE.fullmatch(operation_id):
         raise OfflineCliRecoveryError("durable operation ID is invalid")
@@ -1328,20 +1342,27 @@ def _validate_record_shape(record: Mapping[str, object]) -> None:
     except OfflineCliValidationError as error:
         raise OfflineCliRecoveryError("durable timeout is invalid") from error
     request_payload = {
-        "schema_version": REQUEST_SCHEMA_VERSION,
+        "schema_version": record["schema_version"],
         "request_id": request_id,
         "timeout_seconds": timeout,
         "release_generation": record["release_generation"],
         "release_manifest_sha256": record["release_manifest_sha256"],
         "offline_cli_artifact_sha256": record["offline_cli_artifact_sha256"],
         "offline_cli_artifact_size": record["offline_cli_artifact_size"],
-        "dataset_sha256": record["dataset_sha256"],
         "dataset_size": record["dataset_size"],
         "dataset_format": record["dataset_format"],
         "dataset_device": record["dataset_device"],
         "dataset_inode": record["dataset_inode"],
         "command": command,
     }
+    if legacy:
+        request_payload["dataset_sha256"] = record["dataset_sha256"]
+    else:
+        for field in ("dataset_mtime_ns", "dataset_ctime_ns"):
+            value = record[field]
+            if type(value) is not int or not -(1 << 63) <= value < (1 << 63):
+                raise OfflineCliRecoveryError("durable input timestamp is outside signed i64")
+            request_payload[field] = value
     encoded = json.dumps(
         request_payload,
         allow_nan=False,
@@ -1349,8 +1370,8 @@ def _validate_record_shape(record: Mapping[str, object]) -> None:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    if len(encoded) > MAX_REQUEST_BYTES or hashlib.sha256(encoded).hexdigest() != digest:
-        raise OfflineCliRecoveryError("durable request digest does not match its payload")
+    if len(encoded) > MAX_REQUEST_BYTES:
+        raise OfflineCliRecoveryError("durable request exceeds its bounded size")
     try:
         command_kind = OfflineCliCommandKind(record.get("command_kind"))
         state = OfflineCliState(record.get("state"))
@@ -1386,8 +1407,7 @@ def _validate_record_shape(record: Mapping[str, object]) -> None:
         "release_generation",
         "release_manifest_sha256",
         "offline_cli_artifact_sha256",
-        "dataset_sha256",
-    ):
+    ) + (("dataset_sha256",) if legacy else ()):
         if not isinstance(record.get(field_name), str) or not _SHA256_RE.fullmatch(str(record[field_name])):
             raise OfflineCliRecoveryError("durable release proof field is invalid")
     for field_name in (
@@ -1397,7 +1417,7 @@ def _validate_record_shape(record: Mapping[str, object]) -> None:
         "dataset_inode",
     ):
         value = record.get(field_name)
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        if isinstance(value, bool) or not isinstance(value, int) or value < (1 if legacy or field_name in {"offline_cli_artifact_size", "dataset_size"} else 0) or (not legacy and value >= (1 << 64)):
             raise OfflineCliRecoveryError("durable byte or file identity field is invalid")
     if record.get("dataset_format") not in {"jsonl", "ndjson", "memory2_sqlite"}:
         raise OfflineCliRecoveryError("durable dataset format is invalid")
@@ -1474,28 +1494,12 @@ def _validate_record_shape(record: Mapping[str, object]) -> None:
                 or isinstance(record["output_size"], bool)
                 or not isinstance(record["output_size"], int)
                 or record["output_size"] <= 0
-                or output_digest is None
+                or (legacy and output_digest is None)
                 or error_code is not None
             ):
                 raise OfflineCliRecoveryError("successful durable request proof is incomplete")
             if command_kind == OfflineCliCommandKind.MAP:
-                _validate_durable_map_receipt(
-                    receipt,
-                    command=command,
-                    request_id=request_id,
-                    request_digest=digest,
-                    dataset_sha256=record["dataset_sha256"],
-                    dataset_size=record["dataset_size"],
-                    dataset_format=record["dataset_format"],
-                    dataset_device=record["dataset_device"],
-                    dataset_inode=record["dataset_inode"],
-                    output_size=record["output_size"],
-                    output_sha256=output_digest,
-                    release_generation=record["release_generation"],
-                    release_manifest_sha256=record["release_manifest_sha256"],
-                    artifact_sha256=record["offline_cli_artifact_sha256"],
-                    artifact_size=record["offline_cli_artifact_size"],
-                )
+                _validate_durable_map_receipt(receipt, command=command, record=record)
             elif receipt is not None:
                 raise OfflineCliRecoveryError("non-map durable success contains a map receipt")
         elif (
@@ -1528,7 +1532,9 @@ def _canonical_json_bytes(payload: object) -> bytes:
 
 def _require_state_name(name: object) -> str:
     if not isinstance(name, str) or (
-        name != ACTIVE_JOURNAL_NAME and _REQUEST_FILE_RE.fullmatch(name) is None
+        name != ACTIVE_JOURNAL_NAME
+        and _REQUEST_FILE_RE.fullmatch(name) is None
+        and _LEGACY_REQUEST_FILE_RE.fullmatch(name) is None
     ):
         raise OfflineCliRecoveryError("state entry name is outside the authenticated domain")
     return name
@@ -1738,8 +1744,9 @@ class _OwnerStateStore:
                 self.remove_input_alias(name)
 
     def request_name(self, request_id: str) -> str:
-        digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
-        return "%s%s.json" % (REQUEST_FILE_PREFIX, digest)
+        if not isinstance(request_id, str) or not _REQUEST_ID_RE.fullmatch(request_id):
+            raise OfflineCliRecoveryError("request ID is not canonical")
+        return "%s%s.json" % (REQUEST_FILE_PREFIX, request_id)
 
     def read_json(self, name: str) -> Optional[Dict[str, object]]:
         logical_name = _require_state_name(name)
@@ -1898,7 +1905,8 @@ class _OwnerStateStore:
 
     def request_names(self) -> Tuple[str, ...]:
         names = sorted(
-            name for name in self.list_names() if _REQUEST_FILE_RE.fullmatch(name)
+            name for name in self.list_names()
+            if _REQUEST_FILE_RE.fullmatch(name) or _LEGACY_REQUEST_FILE_RE.fullmatch(name)
         )
         if len(names) > MAX_REQUEST_RECORDS:
             raise OfflineCliCapacityError(
@@ -2059,7 +2067,6 @@ class _BoundedCapture:
 @dataclass
 class _Operation:
     request_id: str
-    request_digest: str
     record: Dict[str, object]
     input_alias_name: str
     resolved_input: _ResolvedInput
@@ -2095,9 +2102,14 @@ def _validate_active_journal(active: Mapping[str, object]) -> None:
         "pgid",
         "sid",
     }
-    if not isinstance(active, dict) or set(active) != required:
+    if not isinstance(active, dict):
+        raise OfflineCliRecoveryError("active journal is not an object")
+    legacy = active.get("schema_version") == LEGACY_ACTIVE_SCHEMA_VERSION
+    if not legacy:
+        required.remove("request_digest")
+    if set(active) != required:
         raise OfflineCliRecoveryError("active journal has unknown or missing fields")
-    if active.get("schema_version") != ACTIVE_SCHEMA_VERSION:
+    if active.get("schema_version") not in {ACTIVE_SCHEMA_VERSION, LEGACY_ACTIVE_SCHEMA_VERSION}:
         raise OfflineCliRecoveryError("active journal schema is unsupported")
     for field_name in (
         "owner_pid",
@@ -2115,7 +2127,7 @@ def _validate_active_journal(active: Mapping[str, object]) -> None:
     operation_id = active.get("operation_id")
     if not isinstance(request_id, str) or not _REQUEST_ID_RE.fullmatch(request_id):
         raise OfflineCliRecoveryError("active journal request ID is invalid")
-    if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+    if legacy and (not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest)):
         raise OfflineCliRecoveryError("active journal request digest is invalid")
     if not isinstance(operation_id, str) or not _OPERATION_ID_RE.fullmatch(operation_id):
         raise OfflineCliRecoveryError("active journal operation ID is invalid")
@@ -2226,7 +2238,7 @@ def _parse_strict_pgm_p5_header(header: bytes) -> Tuple[int, int, int]:
 
 def _open_and_inspect_stable_pgm_p5(
     directory_fd: int, name: str, label: str
-) -> Tuple[int, int, int, int, str, int, os.stat_result]:
+) -> Tuple[int, int, int, int, int, os.stat_result]:
     descriptor = os.open(
         name,
         os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -2261,17 +2273,6 @@ def _open_and_inspect_stable_pgm_p5(
             raise OfflineCliOwnerError(
                 "%s payload length disagrees with PGM dimensions" % label
             )
-        digest = hashlib.sha256()
-        digest.update(prefix)
-        total = len(prefix)
-        while total < expected_size:
-            chunk = os.read(descriptor, min(1024 * 1024, expected_size - total))
-            if not chunk:
-                break
-            digest.update(chunk)
-            total += len(chunk)
-        if total != expected_size or os.read(descriptor, 1):
-            raise OfflineCliOwnerError("%s changed length while it was being inspected" % label)
         completed = os.fstat(descriptor)
         if (
             not _same_identity(opened, completed)
@@ -2286,7 +2287,6 @@ def _open_and_inspect_stable_pgm_p5(
             height,
             maxval,
             opened.st_size,
-            digest.hexdigest(),
             descriptor,
             opened,
         )
@@ -2299,17 +2299,17 @@ def _inspect_map_bundle(
     resolved: _ResolvedOutput,
     command: Mapping[str, object],
     request_id: str,
-    request_digest: str,
-    dataset_sha256: str,
     dataset_size: int,
     dataset_format: str,
     dataset_device: int,
     dataset_inode: int,
+    dataset_mtime_ns: int,
+    dataset_ctime_ns: int,
     release_generation: str,
     release_manifest_sha256: str,
     artifact_sha256: str,
     artifact_size: int,
-) -> Tuple[int, str, Mapping[str, object]]:
+) -> Tuple[int, Mapping[str, object]]:
     resolved.verify_parent_identity()
     final_directory_fd = os.open(
         resolved.path.name,
@@ -2342,7 +2342,6 @@ def _inspect_map_bundle(
             pgm_height,
             pgm_maxval,
             map_size,
-            map_sha256,
             map_descriptor,
             map_metadata,
         ) = _open_and_inspect_stable_pgm_p5(
@@ -2387,30 +2386,31 @@ def _inspect_map_bundle(
     manifest = json.loads(manifest_bytes.decode("utf-8"))
     if manifest_bytes != _canonical_json_bytes(manifest):
         raise OfflineCliOwnerError("map manifest is not canonical JSON")
-    expected_manifest_keys = {"schema_version", "map_name", "frame_id", "asset_path", "files"}
+    expected_manifest_keys = {"schema_version", "map_name", "frame_id", "asset_path", "files", "request_id"}
     if not isinstance(manifest, dict) or set(manifest) != expected_manifest_keys:
         raise OfflineCliOwnerError("map manifest field set is not exact")
     if (
-        manifest["schema_version"] != "nuwax.mapping.offline-map-manifest.v1"
+        manifest["schema_version"] != "nuwax.mapping.offline-map-manifest.v2"
         or manifest["map_name"] != command["map_name"]
         or manifest["frame_id"] != command["frame_id"]
         or manifest["asset_path"] != "asset.json"
+        or manifest["request_id"] != request_id
     ):
         raise OfflineCliOwnerError("map manifest identity is inconsistent")
     files = manifest["files"]
-    if not isinstance(files, list) or [item.get("path") for item in files] != ["asset.json", "map.pgm"]:
+    if not isinstance(files, list) or not all(isinstance(item, dict) for item in files) or [item.get("path") for item in files] != ["asset.json", "map.pgm"]:
         raise OfflineCliOwnerError("map manifest files are not exact and sorted")
     verified_files: List[Mapping[str, object]] = []
     member_proofs = {
-        "asset.json": (len(asset_bytes), hashlib.sha256(asset_bytes).hexdigest()),
-        "map.pgm": (map_size, map_sha256),
+        "asset.json": len(asset_bytes),
+        "map.pgm": map_size,
     }
     total_size = len(manifest_bytes)
     for item in files:
-        if not isinstance(item, dict) or set(item) != {"path", "size", "sha256"}:
+        if not isinstance(item, dict) or set(item) != {"path", "size"}:
             raise OfflineCliOwnerError("map manifest file proof shape is invalid")
-        member_size, member_sha256 = member_proofs[str(item["path"])]
-        if item["size"] != member_size or item["sha256"] != member_sha256:
+        member_size = member_proofs[str(item["path"])]
+        if type(item["size"]) is not int or item["size"] != member_size:
             raise OfflineCliOwnerError("map bundle member proof mismatch")
         total_size += member_size
         verified_files.append(dict(item))
@@ -2420,28 +2420,32 @@ def _inspect_map_bundle(
     asset = _exact_json_object(
         asset,
         frozenset(
-            {"schema_version", "map_name", "frame_id", "source", "grid", "producer"}
+            {"schema_version", "map_name", "frame_id", "source", "grid", "producer", "request_id"}
         ),
         "map asset",
     )
     if (
-        asset["schema_version"] != "nuwax.mapping.offline-map-asset.v1"
+        asset["schema_version"] != "nuwax.mapping.offline-map-asset.v2"
         or asset["map_name"] != command["map_name"]
         or asset["frame_id"] != command["frame_id"]
+        or asset["request_id"] != request_id
     ):
         raise OfflineCliOwnerError("map asset identity is inconsistent")
 
     source = _exact_json_object(
         asset["source"],
-        frozenset({"dataset_sha256", "dataset_size", "input_format"}),
+        frozenset({"dataset_size", "input_format", "dataset_device", "dataset_inode", "dataset_mtime_ns", "dataset_ctime_ns"}),
         "map asset source",
     )
-    if source != {
-        "dataset_sha256": dataset_sha256,
+    if any(type(source[field]) is not int for field in source if field != "input_format") or source != {
         "dataset_size": dataset_size,
         "input_format": dataset_format,
+        "dataset_device": dataset_device,
+        "dataset_inode": dataset_inode,
+        "dataset_mtime_ns": dataset_mtime_ns,
+        "dataset_ctime_ns": dataset_ctime_ns,
     }:
-        raise OfflineCliOwnerError("map asset source proof does not match admitted input bytes")
+        raise OfflineCliOwnerError("map asset source proof does not match admitted input observation")
 
     grid = _exact_json_object(
         asset["grid"],
@@ -2502,34 +2506,33 @@ def _inspect_map_bundle(
         )
     ):
         raise OfflineCliOwnerError("map asset producer proof is inconsistent")
-    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
     receipt: Mapping[str, object] = {
+        "schema_version": 2,
         "map_name": command["map_name"],
         "frame_id": command["frame_id"],
         "output_directory": str(resolved.path),
-        "manifest_sha256": manifest_sha256,
         "bundle_size": total_size,
-        "dataset_sha256": dataset_sha256,
         "dataset_size": dataset_size,
         "dataset_format": dataset_format,
         "dataset_device": dataset_device,
         "dataset_inode": dataset_inode,
+        "dataset_mtime_ns": dataset_mtime_ns,
+        "dataset_ctime_ns": dataset_ctime_ns,
         "offline_cli_artifact_size": artifact_size,
         "files": verified_files,
         "release_generation": release_generation,
         "release_manifest_sha256": release_manifest_sha256,
         "offline_cli_artifact_sha256": artifact_sha256,
         "request_id": request_id,
-        "request_digest": request_digest,
     }
-    return total_size, manifest_sha256, receipt
+    return total_size, receipt
 
 
 def _inspect_output(
     resolved: _ResolvedOutput,
     relative_path: str,
-) -> Tuple[int, str, Optional[Mapping[str, object]]]:
-    size, digest = resolved.inspect_final()
+) -> Tuple[int, Optional[Mapping[str, object]]]:
+    size = resolved.inspect_final()
     if Path(relative_path).suffix == ".db":
         for suffix in ("-journal", "-shm", "-wal"):
             try:
@@ -2543,7 +2546,7 @@ def _inspect_output(
             if stat.S_ISREG(metadata.st_mode):
                 raise OfflineCliOwnerError("durable SQLite output still has a companion file")
             raise OfflineCliOwnerError("durable SQLite companion path is not a regular file")
-    return size, digest, None
+    return size, None
 
 
 class OfflineMappingCliOwner:
@@ -2616,6 +2619,7 @@ class OfflineMappingCliOwner:
         self._condition = threading.Condition(threading.RLock())
         self._active: Optional[_Operation] = None
         self._volatile_records: Dict[str, Dict[str, object]] = {}
+        self._record_names: Dict[str, str] = {}
         self._closing = False
         self._resources_closed = False
         self._poisoned: Optional[str] = None
@@ -2655,6 +2659,7 @@ class OfflineMappingCliOwner:
                 state_auth_key=state_auth_key,
             )
             self._state_store.acquire_lock()
+            self._index_request_records()
             self._state_store.cleanup_stale_temps()
             self._recover_stale_active()
             self._recover_orphaned_records()
@@ -2787,22 +2792,55 @@ class OfflineMappingCliOwner:
         if self._poisoned is None:
             self._poisoned = _bounded_text(message)
 
+    def _index_request_records(self) -> None:
+        store = self._require_store()
+        for name in store.request_names():
+            record = store.read_json(name)
+            if record is None:
+                raise OfflineCliRecoveryError("durable request disappeared during indexing")
+            _validate_record_shape(record)
+            request_id = str(record["request_id"])
+            legacy = record["schema_version"] == LEGACY_REQUEST_SCHEMA_VERSION
+            if ((legacy and _LEGACY_REQUEST_FILE_RE.fullmatch(name) is None)
+                    or (not legacy and name != store.request_name(request_id))):
+                raise OfflineCliRecoveryError("durable request filename/schema mismatch")
+            if request_id in self._record_names:
+                raise OfflineCliRecoveryError("multiple authenticated records have the same request ID")
+            self._record_names[request_id] = name
+
     def _write_record_locked(self, record: Mapping[str, object]) -> None:
         try:
             _validate_record_shape(record)
-            self._require_store().write_json(
-                self._require_store().request_name(str(record["request_id"])),
-                record,
-            )
+            if record["schema_version"] != REQUEST_SCHEMA_VERSION:
+                raise OfflineCliRecoveryError("legacy request identities are read-only")
+            request_id = str(record["request_id"])
+            name = self._require_store().request_name(request_id)
+            self._require_store().write_json(name, record)
+            self._record_names[request_id] = name
         except Exception as error:
             self._poison_locked("durable request state write failed: %s" % error)
             raise
+
+    def _write_recovered_record(self, previous: Mapping[str, object], record: Mapping[str, object]) -> None:
+        if record["schema_version"] != LEGACY_REQUEST_SCHEMA_VERSION:
+            self._write_record_locked(record)
+            return
+        allowed = {"state", "terminal", "completed_at_unix_ns", "error_code", "message"}
+        if (previous["terminal"] or record["state"] != OfflineCliState.FAILED.value
+                or not record["terminal"]
+                or any(record[key] != value for key, value in previous.items() if key not in allowed)):
+            raise OfflineCliRecoveryError("legacy recovery attempted to change the original request identity")
+        _validate_record_shape(record)
+        name = self._record_names[str(record["request_id"])]
+        self._require_store().write_json(name, record)
 
     def _read_record_locked(self, request_id: str) -> Optional[Dict[str, object]]:
         volatile = self._volatile_records.get(request_id)
         if volatile is not None:
             return dict(volatile)
-        record = self._require_store().read_json(self._require_store().request_name(request_id))
+        store = self._require_store()
+        name = self._record_names.get(request_id, store.request_name(request_id))
+        record = store.read_json(name)
         if record is None:
             return None
         _validate_record_shape(record)
@@ -2957,25 +2995,18 @@ class OfflineMappingCliOwner:
             "durable map output path",
         )
         final_name = os.fsencode(output_parts[-1])
-        first = 0xCBF29CE484222325
-        second = 0x84222325CBF29CE4
-        mask = (1 << 64) - 1
-        for index, byte in enumerate(final_name):
-            first ^= byte
-            first = (first * 0x00000100000001B3) & mask
-            mixed = (byte + (((index << 23) | (index >> 41)) & mask)) & mask
-            second ^= mixed
-            second = (((second << 9) | (second >> 55)) & mask)
-            second = (second * 0x9E3779B185EBCA87) & mask
         expected = re.compile(
-            re.escape(".nuwax-mapping-cli-map-bundle-v1-")
+            re.escape(".nuwax-mapping-cli-stage-v2-bundle-")
             + str(pid)
             + "-"
             + ("%016x" % process_start_token)
-            + r"-[0-9a-f]{16}-"
-            + ("%016x%016x" % (first, second))
-            + r"\Z"
+            + r"-[0-9a-f]{16}\Z"
         )
+
+        def require_bound(parent_fd: int, name: bytes, metadata: os.stat_result) -> None:
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not _same_identity(current, metadata) or stat.S_IFMT(current.st_mode) != stat.S_IFMT(metadata.st_mode):
+                raise OfflineCliRecoveryError("MAP staging entry identity changed")
 
         def remove_tree(parent_fd: int, name: str) -> None:
             try:
@@ -3002,14 +3033,56 @@ class OfflineMappingCliOwner:
                 parent_fd = owned_parent_fd
             else:
                 parent_fd = output_parent_fd
-            removed = False
             with os.scandir(parent_fd) as entries:
-                names = [entry.name for entry in entries if expected.fullmatch(entry.name)]
+                names = [os.fsencode(entry.name) for entry in entries if expected.fullmatch(entry.name)]
             for name in names:
-                remove_tree(parent_fd, name)
-                removed = True
-            if removed:
-                os.fsync(parent_fd)
+                wrapper_fd = -1
+                contents_fd = -1
+                try:
+                    # Legacy, unbound, foreign, symlink and unknown shapes stay intact.
+                    try:
+                        wrapper_fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
+                        wrapper_metadata = os.fstat(wrapper_fd)
+                        with os.scandir(wrapper_fd) as entries:
+                            wrapper_names = [os.fsencode(entry.name) for entry in entries]
+                        if wrapper_names != [final_name]:
+                            continue
+                        contents_fd = os.open(final_name, _directory_flags(), dir_fd=wrapper_fd)
+                    except OSError:
+                        continue
+                    contents_metadata = os.fstat(contents_fd)
+
+                    def require_area() -> None:
+                        require_bound(parent_fd, name, wrapper_metadata)
+                        require_bound(wrapper_fd, final_name, contents_metadata)
+
+                    with os.scandir(contents_fd) as entries:
+                        content_names = [os.fsencode(entry.name) for entry in entries]
+                    if content_names not in ([], [b"payload"]):
+                        continue
+                    payload_metadata = None
+                    if content_names:
+                        payload_metadata = os.stat(b"payload", dir_fd=contents_fd, follow_symlinks=False)
+                        if not stat.S_ISDIR(payload_metadata.st_mode):
+                            continue
+                    require_area()
+
+                    if payload_metadata is not None:
+                        remove_tree(contents_fd, b"payload")
+                        os.fsync(contents_fd)
+                    # Never recursively remove the outer directories: a newly
+                    # inserted sibling or replacement payload must be retained.
+                    require_area()
+                    os.rmdir(final_name, dir_fd=wrapper_fd)
+                    os.fsync(wrapper_fd)
+                    require_bound(parent_fd, name, wrapper_metadata)
+                    os.rmdir(name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                finally:
+                    if contents_fd >= 0:
+                        os.close(contents_fd)
+                    if wrapper_fd >= 0:
+                        os.close(wrapper_fd)
         except BaseException as error:
             raise OfflineCliRecoveryError("MAP staging cleanup is unproven") from error
         finally:
@@ -3032,20 +3105,22 @@ class OfflineMappingCliOwner:
             raise OfflineCliRecoveryError("prior offline CLI owner is still alive")
 
         request_id = str(active["request_id"])
-        record = store.read_json(store.request_name(request_id))
+        record = self._read_record_locked(request_id)
         if record is None:
             raise OfflineCliRecoveryError("active journal has no durable request record")
         _validate_record_shape(record)
         exact_fields = (
             "request_id",
-            "request_digest",
             "operation_id",
             "pid",
             "process_start_token",
             "pgid",
             "sid",
         )
-        if any(record[field] != active[field] for field in exact_fields):
+        legacy = active["schema_version"] == LEGACY_ACTIVE_SCHEMA_VERSION
+        if (legacy != (record["schema_version"] == LEGACY_REQUEST_SCHEMA_VERSION)
+                or (legacy and record["request_digest"] != active["request_digest"])
+                or any(record[field] != active[field] for field in exact_fields)):
             raise OfflineCliRecoveryError("active journal and request identity disagree")
 
         members = self._verified_group_members(
@@ -3068,6 +3143,7 @@ class OfflineMappingCliOwner:
             int(active["process_start_token"]),
         )
         if not bool(record["terminal"]):
+            previous = dict(record)
             record.update(
                 {
                     "state": OfflineCliState.FAILED.value,
@@ -3081,7 +3157,7 @@ class OfflineMappingCliOwner:
                     ),
                 }
             )
-            store.write_json(store.request_name(request_id), record)
+            self._write_recovered_record(previous, record)
         store.remove(ACTIVE_JOURNAL_NAME)
 
     def _recover_orphaned_records(self) -> None:
@@ -3093,7 +3169,7 @@ class OfflineMappingCliOwner:
                     "durable request record disappeared during recovery"
                 )
             _validate_record_shape(record)
-            expected_name = store.request_name(str(record["request_id"]))
+            expected_name = self._record_names.get(str(record["request_id"]))
             if name != expected_name:
                 raise OfflineCliRecoveryError(
                     "durable request filename identity mismatch"
@@ -3120,6 +3196,7 @@ class OfflineMappingCliOwner:
                     int(record["pid"]),
                     int(record["process_start_token"]),
                 )
+            previous = dict(record)
             record.update(
                 {
                     "state": OfflineCliState.FAILED.value,
@@ -3131,7 +3208,7 @@ class OfflineMappingCliOwner:
                     ),
                 }
             )
-            store.write_json(name, record)
+            self._write_recovered_record(previous, record)
 
     def _await_launcher_identity(
         self,
@@ -3326,7 +3403,6 @@ class OfflineMappingCliOwner:
             stderr_capture.start()
             operation = _Operation(
                 request_id=str(record["request_id"]),
-                request_digest=str(record["request_digest"]),
                 record=record,
                 input_alias_name=input_alias_name,
                 resolved_input=resolved_input,
@@ -3357,7 +3433,6 @@ class OfflineMappingCliOwner:
                     "owner_pid": self._owner_pid,
                     "owner_start_token": self._owner_start_token,
                     "request_id": record["request_id"],
-                    "request_digest": record["request_digest"],
                     "operation_id": record["operation_id"],
                     "pid": process.pid,
                     "process_start_token": info.start_token,
@@ -3504,26 +3579,35 @@ class OfflineMappingCliOwner:
             self._ensure_startable_locked()
             if self._input_root is None or self._output_root is None:
                 raise OfflineCliClosedError("configured roots are unavailable")
+            try:
+                existing = self._read_record_locked(request_id)
+            except Exception as error:
+                self._poison_locked("durable request lookup failed: %s" % error)
+                raise
+            if existing is not None and existing["schema_version"] == LEGACY_REQUEST_SCHEMA_VERSION:
+                raise OfflineCliRequestConflict("legacy request is read-only; query its recorded status instead of resubmitting")
             resolved_input = self._input_root.resolve_input(str(command["input_path"]))
             try:
                 (
-                    dataset_sha256,
                     dataset_size,
                     dataset_format,
                     dataset_device,
                     dataset_inode,
-                ) = resolved_input.content_proof()
-                payload, request_digest, argv, timeout_seconds = _request_contract(
+                    dataset_mtime_ns,
+                    dataset_ctime_ns,
+                ) = resolved_input.observe_input()
+                payload, argv, timeout_seconds = _request_contract(
                     request,
                     release_generation=self._release_generation,
                     release_manifest_sha256=self._release_manifest_sha256,
                     offline_cli_artifact_sha256=self._artifact_sha256,
                     offline_cli_artifact_size=self._artifact_size,
-                    dataset_sha256=dataset_sha256,
                     dataset_size=dataset_size,
                     dataset_format=dataset_format,
                     dataset_device=dataset_device,
                     dataset_inode=dataset_inode,
+                    dataset_mtime_ns=dataset_mtime_ns,
+                    dataset_ctime_ns=dataset_ctime_ns,
                 )
             except BaseException:
                 resolved_input.close()
@@ -3536,15 +3620,9 @@ class OfflineMappingCliOwner:
                 )
                 for value in argv
             ]
-            try:
-                existing = self._read_record_locked(request_id)
-            except Exception as error:
-                resolved_input.close()
-                self._poison_locked("durable request lookup failed: %s" % error)
-                raise
             if existing is not None:
                 resolved_input.close()
-                if existing["request_digest"] != request_digest:
+                if any(existing[key] != value for key, value in payload.items()):
                     raise OfflineCliRequestConflict("request_id is permanently bound to another typed request")
                 if not bool(existing["terminal"]) and (
                     self._active is None or self._active.request_id != request_id
@@ -3568,17 +3646,17 @@ class OfflineMappingCliOwner:
             record: Dict[str, object] = {
                 "schema_version": REQUEST_SCHEMA_VERSION,
                 "request_id": request_id,
-                "request_digest": request_digest,
                 "operation_id": uuid.uuid4().hex,
                 "command_kind": str(command["kind"]),
                 "command": command,
                 "state": OfflineCliState.ACCEPTED.value,
                 "terminal": False,
-                "dataset_sha256": str(payload["dataset_sha256"]),
                 "dataset_size": int(payload["dataset_size"]),
                 "dataset_format": str(payload["dataset_format"]),
                 "dataset_device": int(payload["dataset_device"]),
                 "dataset_inode": int(payload["dataset_inode"]),
+                "dataset_mtime_ns": int(payload["dataset_mtime_ns"]),
+                "dataset_ctime_ns": int(payload["dataset_ctime_ns"]),
                 "timeout_seconds": timeout_seconds,
                 "submitted_at_unix_ns": submitted_at,
                 "deadline_at_unix_ns": submitted_at + int(timeout_seconds * 1_000_000_000),
@@ -3595,7 +3673,6 @@ class OfflineMappingCliOwner:
                 "stderr_truncated": False,
                 "output_relative_path": str(command["output_path"]),
                 "output_size": None,
-                "output_sha256": None,
                 "receipt": None,
                 "release_generation": str(payload["release_generation"]),
                 "release_manifest_sha256": str(payload["release_manifest_sha256"]),
@@ -3674,7 +3751,6 @@ class OfflineMappingCliOwner:
         message: str,
         cleanup_proven: bool,
         output_size: Optional[int],
-        output_sha256: Optional[str],
         receipt: Optional[Mapping[str, object]],
     ) -> None:
         stdout, stdout_truncated, stdout_error = operation.stdout_capture.snapshot()
@@ -3684,13 +3760,11 @@ class OfflineMappingCliOwner:
             error_code = "log_capture_failed"
             message = "bounded log capture failed: %s" % (stdout_error if stdout_error is not None else stderr_error)
             output_size = None
-            output_sha256 = None
             receipt = None
         if not cleanup_proven:
             state = OfflineCliState.FAILED
             error_code = "cleanup_unproven"
             output_size = None
-            output_sha256 = None
             receipt = None
 
         operation.record.update(
@@ -3704,7 +3778,6 @@ class OfflineMappingCliOwner:
                 "stdout_truncated": stdout_truncated,
                 "stderr_truncated": stderr_truncated,
                 "output_size": output_size,
-                "output_sha256": output_sha256,
                 "receipt": (None if receipt is None else dict(receipt)),
                 "error_code": error_code,
                 "message": _bounded_text(message),
@@ -3737,7 +3810,6 @@ class OfflineMappingCliOwner:
         cleanup_proven = True
         process_cleanup_proven = False
         output_size: Optional[int] = None
-        output_sha256: Optional[str] = None
         receipt: Optional[Mapping[str, object]] = None
         try:
             while True:
@@ -3802,12 +3874,13 @@ class OfflineMappingCliOwner:
                 error_code = "nonzero_exit"
                 message = "offline CLI exited with status %s" % operation.process.returncode
             else:
-                operation.resolved_input.verify_content_proof(
-                    str(operation.record["dataset_sha256"]),
+                operation.resolved_input.verify_input_observation(
                     int(operation.record["dataset_size"]),
                     str(operation.record["dataset_format"]),
                     int(operation.record["dataset_device"]),
                     int(operation.record["dataset_inode"]),
+                    int(operation.record["dataset_mtime_ns"]),
+                    int(operation.record["dataset_ctime_ns"]),
                 )
                 if self._input_root is None or self._output_root is None:
                     raise OfflineCliClosedError("configured roots are unavailable")
@@ -3815,23 +3888,23 @@ class OfflineMappingCliOwner:
                 self._output_root.verify_current_identity()
                 self._verify_binary_identity()
                 if operation.record["command_kind"] == OfflineCliCommandKind.MAP.value:
-                    output_size, output_sha256, receipt = _inspect_map_bundle(
+                    output_size, receipt = _inspect_map_bundle(
                         operation.resolved_output,
                         operation.record["command"],
                         operation.request_id,
-                        str(operation.record["request_digest"]),
-                        str(operation.record["dataset_sha256"]),
                         int(operation.record["dataset_size"]),
                         str(operation.record["dataset_format"]),
                         int(operation.record["dataset_device"]),
                         int(operation.record["dataset_inode"]),
+                        int(operation.record["dataset_mtime_ns"]),
+                        int(operation.record["dataset_ctime_ns"]),
                         self._release_generation,
                         self._release_manifest_sha256,
                         self._artifact_sha256,
                         self._artifact_size,
                     )
                 else:
-                    output_size, output_sha256, receipt = _inspect_output(
+                    output_size, receipt = _inspect_output(
                         operation.resolved_output,
                         str(operation.record["output_relative_path"]),
                     )
@@ -3843,7 +3916,6 @@ class OfflineMappingCliOwner:
             error_code = "owner_monitor_failed"
             message = "offline CLI supervision failed: %s" % error
             output_size = None
-            output_sha256 = None
             try:
                 self._terminate_identity(
                     pid=operation.process.pid,
@@ -3867,7 +3939,6 @@ class OfflineMappingCliOwner:
                 error_code = "log_drain_failed"
                 message = "bounded log drain failed: %s" % capture_error
                 output_size = None
-                output_sha256 = None
         if process_cleanup_proven:
             try:
                 self._cleanup_map_staging(
@@ -3905,7 +3976,6 @@ class OfflineMappingCliOwner:
             message=message,
             cleanup_proven=cleanup_proven,
             output_size=output_size,
-            output_sha256=output_sha256,
             receipt=receipt,
         )
 

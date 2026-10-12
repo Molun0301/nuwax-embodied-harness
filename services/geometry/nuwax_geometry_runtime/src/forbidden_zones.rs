@@ -455,15 +455,7 @@ pub fn compose_effective_map(
     Ok(rasterize_effective_map(raw.clone(), loaded))
 }
 
-pub(crate) fn compose_effective_map_owned(
-    effective: MapState,
-    loaded: &LoadedForbiddenZones,
-) -> Result<MapState, String> {
-    validate_map_layout(&effective)?;
-    Ok(rasterize_effective_map(effective, loaded))
-}
-
-fn validate_map_layout(raw: &MapState) -> Result<(), String> {
+pub(crate) fn validate_map_layout(raw: &MapState) -> Result<(), String> {
     let expected = raw.width as usize * raw.height as usize;
     if raw.width == 0
         || raw.height == 0
@@ -476,7 +468,7 @@ fn validate_map_layout(raw: &MapState) -> Result<(), String> {
     Ok(())
 }
 
-fn rasterize_effective_map(
+pub(crate) fn rasterize_effective_map(
     mut effective: MapState,
     loaded: &LoadedForbiddenZones,
 ) -> MapState {

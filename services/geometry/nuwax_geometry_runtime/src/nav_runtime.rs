@@ -154,6 +154,7 @@ pub(crate) struct NavAdmissionIo {
     transport: LcmTransport,
     transport_backend_name: &'static str,
     lcm_backend_available: bool,
+    body_reference_frame_id: Arc<str>,
 }
 
 impl NavAdmissionIo {
@@ -162,12 +163,14 @@ impl NavAdmissionIo {
         transport: LcmTransport,
         transport_backend_name: &'static str,
         lcm_backend_available: bool,
+        body_reference_frame_id: Arc<str>,
     ) -> Self {
         Self {
             shared_state,
             transport,
             transport_backend_name,
             lcm_backend_available,
+            body_reference_frame_id,
         }
     }
 }
@@ -264,12 +267,10 @@ pub struct GoalLease {
     pub goal_generation: u64,
     /// Geometry runtime generation that sealed the goal.
     pub producer_runtime_generation: u64,
-    /// Canonical sealed goal digest.
-    pub goal_payload_sha256: [u8; 32],
     /// Last scheduler-confirmed planner path revision.
     pub path_revision: u64,
-    /// Canonical scheduler-confirmed path digest, zero before confirmation.
-    pub path_payload_sha256: [u8; 32],
+    /// Actual scheduler-confirmed planner incarnation; zero before a path.
+    pub planner_runtime_generation: u64,
 }
 
 impl GoalLease {
@@ -278,6 +279,7 @@ impl GoalLease {
             && self.owner_kind == other.owner_kind
             && self.parent_request_id == other.parent_request_id
             && self.goal_generation == other.goal_generation
+            && self.producer_runtime_generation == other.producer_runtime_generation
     }
 }
 
@@ -292,7 +294,12 @@ pub struct ActiveGoal {
     pub target: PoseState,
     /// 收到 `set_goal` 的本地墙钟(ns),给 `timestamp_ns` 字段用。
     pub accepted_at_ns: u64,
-    /// Immutable owner/hash identity used by goal/path/cancel CAS.
+    pub options: nuwax_nav_types_messages::GoalOptions,
+    pub producer: String,
+    pub producer_epoch: i64,
+    pub body_to_support_z_m: Option<f64>,
+    pub boundary_owner: Option<Arc<crate::explore_runtime::ExploreStartConfig>>,
+    /// Immutable assigned identity used by goal/path/cancel CAS.
     pub lease: GoalLease,
 }
 
@@ -310,7 +317,7 @@ pub struct NavRuntimeSlot {
     /// Goal incarnation associated with the pending planner path candidates.
     path_candidate_goal: Option<GoalLease>,
     /// Published planner paths awaiting scheduler confirmation.
-    path_candidates: VecDeque<(u64, [u8; 32])>,
+    path_candidates: VecDeque<nuwax_nav_types_messages::PathKey>,
     /// 最近同目标的计算路径，仅用于展示，不能替代执行回执。
     display_path: Option<(GoalLease, Vec<[f64; 3]>)>,
     /// 已核验的停车终态独立于展示缓存，供取消重试和订阅重连读取。
@@ -560,6 +567,7 @@ pub(crate) enum GoalProducerEpochAuthority {
     MappingCloud,
     Wavefront {
         current_session_generation: Arc<AtomicU64>,
+        boundary_owner: Arc<crate::explore_runtime::ExploreStartConfig>,
     },
 }
 
@@ -730,7 +738,22 @@ impl NavRuntimeState {
             || update.feedback.zero_ack_id.is_empty() || update.feedback.zero_applied_monotonic_ns == 0 {
             return;
         }
+        let _transaction_guard = self.transaction_gate.lock().await;
         let mut slot=self.inner.write().await;
+        // 失败先保留原拥有方；仅同目标、同路径的真实停稳证明才能退休它。
+        // 状态关联后若已切换目标或规划器代际，旧证明不能清掉新的拥有方。
+        if slot.goal.as_ref().is_some_and(|active| {
+            let lease = &active.lease;
+            lease.session_id == update.state.goal_id
+                && lease.owner_kind == update.feedback.owner_kind
+                && lease.parent_request_id == update.feedback.parent_request_id
+                && lease.goal_generation == update.feedback.goal_generation
+                && lease.producer_runtime_generation == update.producer_runtime_generation
+                && lease.path_revision == update.feedback.path_revision
+                && lease.planner_runtime_generation == update.feedback.planner_runtime_generation
+        }) {
+            slot.goal = None;
+        }
         slot.terminal_receipts.retain(|old| !(old.state.goal_id==update.state.goal_id
             && old.feedback.owner_kind==update.feedback.owner_kind
             && old.feedback.parent_request_id==update.feedback.parent_request_id
@@ -896,7 +919,7 @@ impl NavRuntimeState {
         owner_kind: i32,
         parent_request_id: &str,
         goal_generation: u64,
-        goal_payload_sha256: [u8; 32],
+        producer_runtime_generation: u64,
     ) -> Option<PoseState> {
         if self.configured_profile != PROFILE_MLS3D {
             return None;
@@ -908,7 +931,7 @@ impl NavRuntimeState {
             && lease.owner_kind == owner_kind
             && lease.parent_request_id == parent_request_id
             && lease.goal_generation == goal_generation
-            && lease.goal_payload_sha256 == goal_payload_sha256)
+            && lease.producer_runtime_generation == producer_runtime_generation)
             .then(|| goal.target.clone())
     }
 
@@ -919,77 +942,54 @@ impl NavRuntimeState {
         path: &schema::PathEnvelope,
     ) -> Result<GoalLease, String> {
         let _transaction_guard = self.transaction_gate.lock().await;
-        schema::validate_path_envelope(path).map_err(|error| error.to_string())?;
-        let path_goal_generation = u64::try_from(path.goal_generation)
-            .map_err(|_| "PathEnvelope goal_generation is invalid".to_string())?;
-        let path_revision = u64::try_from(path.path_revision)
-            .map_err(|_| "PathEnvelope path_revision is invalid".to_string())?;
+        let key = path.path_key();
         let mut slot = self.inner.write().await;
-        let confirmed = slot
-            .goal
-            .as_ref()
-            .map(|active| active.lease.clone())
+        let confirmed = slot.goal.as_ref().map(|active| active.lease.clone())
             .ok_or_else(|| "PATH_LEASE_REJECTED: no active goal lease".to_string())?;
         if path.session_id != confirmed.session_id
             || path.owner_kind != confirmed.owner_kind
             || path.parent_request_id != confirmed.parent_request_id
-            || path_goal_generation != confirmed.goal_generation
-            || path.goal_payload_sha256 != confirmed.goal_payload_sha256
+            || key.goal.goal_generation != confirmed.goal_generation
+            || key.goal.producer_runtime_generation != confirmed.producer_runtime_generation
         {
-            return Err(
-                "PATH_LEASE_REJECTED: identity/goal hash does not match active lease".to_string(),
-            );
+            return Err("PATH_LEASE_REJECTED: assigned goal does not match active lease".to_string());
         }
-        let cancel = self
-            .cancel
-            .lock()
+        let cancel = self.cancel.lock()
             .map_err(|_| "PATH_LEASE_REJECTED: cancel state unavailable".to_string())?;
-        let cancel_freezes_lease =
-            cancel.phase != CancelPhase::Idle && cancel.lease.as_ref() == Some(&confirmed);
+        let cancel_freezes_lease = cancel.phase != CancelPhase::Idle
+            && cancel.lease.as_ref() == Some(&confirmed);
         drop(cancel);
         if cancel_freezes_lease {
             return Err("PATH_LEASE_REJECTED[CANCEL_PENDING]: active lease is frozen".to_string());
         }
-
-        let candidate_goal_matches =
-            slot.path_candidate_goal
-                .as_ref()
-                .is_some_and(|candidate_goal| {
-                    candidate_goal.identity_matches(&confirmed)
-                        && candidate_goal.producer_runtime_generation
-                            == confirmed.producer_runtime_generation
-                        && candidate_goal.goal_payload_sha256 == confirmed.goal_payload_sha256
-                });
-        if !candidate_goal_matches {
+        if !slot.path_candidate_goal.as_ref().is_some_and(|goal| goal.identity_matches(&confirmed)) {
             slot.path_candidate_goal = Some(confirmed.clone());
             slot.path_candidates.clear();
         }
-        let (latest_revision, latest_hash) = slot
-            .path_candidates
-            .back()
-            .copied()
-            .unwrap_or((confirmed.path_revision, confirmed.path_payload_sha256));
-        if path_revision < latest_revision {
+        // Retain the pre-existing per-goal revision watermark across planner
+        // incarnations. A new planner value is not itself execution authority.
+        let latest_revision = slot.path_candidates.back().map_or(confirmed.path_revision, |candidate| candidate.path_revision);
+        if key.path_revision < latest_revision {
             return Err("PATH_LEASE_REJECTED: stale path revision".to_string());
         }
-        if path_revision == latest_revision {
-            if path.path_payload_sha256 == latest_hash {
-                let mut observed = confirmed;
-                observed.path_revision = latest_revision;
-                observed.path_payload_sha256 = latest_hash;
-                return Ok(observed);
-            }
-            return Err("PATH_LEASE_REJECTED: conflicting path hash at same revision".to_string());
+        let mut observed = confirmed;
+        observed.path_revision = key.path_revision;
+        observed.planner_runtime_generation = key.planner_runtime_generation;
+        if slot.path_candidates.contains(&key)
+            || (observed.planner_runtime_generation == slot.goal.as_ref().unwrap().lease.planner_runtime_generation
+                && observed.path_revision == slot.goal.as_ref().unwrap().lease.path_revision)
+        {
+            // Geometry only correlates display candidates. The scheduler owns
+            // execution-content mutation detection at the same assigned key.
+            return Ok(observed);
         }
-
-        let mut observed = confirmed.clone();
-        observed.path_revision = path_revision;
-        observed.path_payload_sha256 = path.path_payload_sha256;
+        if key.path_revision == latest_revision {
+            return Err("PATH_LEASE_REJECTED: conflicting planner identity at same revision".to_string());
+        }
         if slot.path_candidates.len() == MAX_PENDING_PATH_CANDIDATES {
             slot.path_candidates.pop_front();
         }
-        slot.path_candidates
-            .push_back((path_revision, path.path_payload_sha256));
+        slot.path_candidates.push_back(key);
         slot.display_path = Some((observed.clone(), path.path.poses.iter().map(|p| p.pose.position).collect()));
         Ok(observed)
     }
@@ -1001,7 +1001,6 @@ impl NavRuntimeState {
             owner.identity_matches(lease)
             && (include_confirmed || owner.path_revision>lease.path_revision)
             && owner.producer_runtime_generation == lease.producer_runtime_generation
-            && owner.goal_payload_sha256 == lease.goal_payload_sha256
         ).map(|(_, points)| points.clone()).unwrap_or_default()
     }
 
@@ -1015,8 +1014,8 @@ impl NavRuntimeState {
         parent_request_id: &str,
         goal_generation: u64,
         path_revision: u64,
-        goal_payload_sha256: [u8; 32],
-        path_payload_sha256: [u8; 32],
+        producer_runtime_generation: u64,
+        planner_runtime_generation: u64,
     ) -> Result<Option<GoalLease>, String> {
         let _transaction_guard = self.transaction_gate.lock().await;
         self.correlate_navigation_state_inner(
@@ -1025,8 +1024,8 @@ impl NavRuntimeState {
             parent_request_id,
             goal_generation,
             path_revision,
-            goal_payload_sha256,
-            path_payload_sha256,
+            producer_runtime_generation,
+            planner_runtime_generation,
         )
         .await
     }
@@ -1039,8 +1038,8 @@ impl NavRuntimeState {
         parent_request_id: &str,
         goal_generation: u64,
         path_revision: u64,
-        goal_payload_sha256: [u8; 32],
-        path_payload_sha256: [u8; 32],
+        producer_runtime_generation: u64,
+        planner_runtime_generation: u64,
     ) -> Result<Option<GoalLease>, String> {
         if session_id.is_empty() {
             return Ok(None);
@@ -1059,14 +1058,14 @@ impl NavRuntimeState {
             if goal_generation != lease.goal_generation {
                 fields.push("goal_generation");
             }
-            if goal_payload_sha256 != lease.goal_payload_sha256 {
-                fields.push("goal_payload_sha256");
+            if producer_runtime_generation != lease.producer_runtime_generation {
+                fields.push("producer_runtime_generation");
             }
             if path_revision != lease.path_revision {
                 fields.push("path_revision");
             }
-            if path_payload_sha256 != lease.path_payload_sha256 {
-                fields.push("path_payload_sha256");
+            if planner_runtime_generation != lease.planner_runtime_generation {
+                fields.push("planner_runtime_generation");
             }
             fields
         };
@@ -1100,9 +1099,9 @@ impl NavRuntimeState {
             && owner_kind == confirmed.owner_kind
             && parent_request_id == confirmed.parent_request_id
             && goal_generation == confirmed.goal_generation
-            && goal_payload_sha256 == confirmed.goal_payload_sha256;
+            && producer_runtime_generation == confirmed.producer_runtime_generation;
         let confirmed_path_matches = path_revision == confirmed.path_revision
-            && path_payload_sha256 == confirmed.path_payload_sha256;
+            && planner_runtime_generation == confirmed.planner_runtime_generation;
         if goal_identity_matches && confirmed_path_matches {
             return Ok(Some(confirmed));
         }
@@ -1125,21 +1124,20 @@ impl NavRuntimeState {
                         candidate_goal.identity_matches(&confirmed)
                             && candidate_goal.producer_runtime_generation
                                 == confirmed.producer_runtime_generation
-                            && candidate_goal.goal_payload_sha256 == confirmed.goal_payload_sha256
                     });
             let candidate_matches = candidate_goal_matches
-                && slot.path_candidates.iter().any(|(revision, hash)| {
-                    *revision == path_revision && *hash == path_payload_sha256
+                && slot.path_candidates.iter().any(|key| {
+                    key.path_revision == path_revision && key.planner_runtime_generation == planner_runtime_generation
                 });
             if candidate_matches {
                 let mut promoted = confirmed;
                 promoted.path_revision = path_revision;
-                promoted.path_payload_sha256 = path_payload_sha256;
+                promoted.planner_runtime_generation = planner_runtime_generation;
                 slot.goal.as_mut().expect("active goal checked above").lease = promoted.clone();
                 while slot
                     .path_candidates
                     .front()
-                    .is_some_and(|(revision, _)| *revision <= path_revision)
+                    .is_some_and(|key| key.path_revision <= path_revision)
                 {
                     slot.path_candidates.pop_front();
                 }
@@ -1159,8 +1157,8 @@ impl NavRuntimeState {
         parent_request_id: &str,
         goal_generation: u64,
         path_revision: u64,
-        goal_payload_sha256: [u8; 32],
-        path_payload_sha256: [u8; 32],
+        producer_runtime_generation: u64,
+        planner_runtime_generation: u64,
         planner_observation: Option<PlannerInputObservation>,
         motion_sink_observation: Option<MotionSinkObservation>,
     ) -> Result<(NavState, GoalLease), String> {
@@ -1172,8 +1170,8 @@ impl NavRuntimeState {
                 parent_request_id,
                 goal_generation,
                 path_revision,
-                goal_payload_sha256,
-                path_payload_sha256,
+                producer_runtime_generation,
+                planner_runtime_generation,
             )
             .await?
             .ok_or_else(|| {
@@ -1334,7 +1332,7 @@ impl NavRuntimeState {
             } else if let Some(phase) = observed_phase {
                 slot.phase = phase;
                 slot.message = observed.message.clone();
-                if phase.is_terminal() {
+                if phase.is_terminal() && expected_lease.is_none() {
                     slot.goal = None;
                 }
             }
@@ -2398,7 +2396,8 @@ struct AdmittedGoalInput {
     producer_epoch: i64,
     committed_map: schema::CommittedMapIdentity,
     boundary_id: String,
-    boundary_sha256: [u8; 32],
+    body_to_support_z_m: Option<f64>,
+    boundary_owner: Option<Arc<crate::explore_runtime::ExploreStartConfig>>,
 }
 
 /// Machine-readable reason that allows a navigation admission to be retried.
@@ -2586,8 +2585,8 @@ async fn goal_intent_from_set_goal(
             ],
         },
     };
-    let goal_sha256 = schema::goal_intent_action_sha256(&goal, &input.options).map_err(|error| error.to_string())?;
-    let (boundary_id, boundary_points, boundary_sha256) = match boundary {
+    input.options.validate().map_err(|reason| nuwax_codec::CodecError::LcmEncode(reason).to_string())?;
+    let (boundary_id, boundary_points) = match boundary {
         Some(boundary) => {
             if boundary.frame_id.trim() != committed_map.frame_id.trim() {
                 return Err(
@@ -2595,15 +2594,9 @@ async fn goal_intent_from_set_goal(
                 );
             }
             let boundary_id = format!("{}:boundary", input.parent_request_id);
-            let boundary_sha256 = schema::goal_intent_boundary_sha256(
-                &committed_map.frame_id,
-                &boundary_id,
-                &boundary.points,
-            )
-            .map_err(|error| error.to_string())?;
-            (boundary_id, boundary.points, boundary_sha256)
+            (boundary_id, boundary.points)
         }
-        None => (String::new(), Vec::new(), [0; 32]),
+        None => (String::new(), Vec::new()),
     };
     Ok(schema::GoalIntent {
         map_frame_generation: admission.map_frame_generation(),
@@ -2618,12 +2611,11 @@ async fn goal_intent_from_set_goal(
         cancel_generation,
         committed_map,
         boundary_id,
-        boundary_sha256,
+        body_to_support_z_m: None,
         boundary_points,
         motion_guard_generation: input.motion_admission.guard_generation as i64,
         motion_guard_boot_nonce: input.motion_admission.guard_boot_nonce,
         motion_stop_generation: input.motion_admission.motion_stop_generation as i64,
-        goal_sha256,
         goal,
     })
 }
@@ -2684,8 +2676,8 @@ pub async fn set_goal_with_boundary(
         handle.state.clone(),
         handle.transport.clone(),
         handle.transport_backend_name,
-        handle.lcm_backend_available,
-    );
+        handle.lcm_backend_available, handle.body_reference_frame_id.clone(),
+);
     let intent = match goal_intent_from_set_goal(&admission, state, input, boundary).await {
         Ok(intent) => intent,
         Err(reason) => return rejected_goal_intent(goal_id, reason),
@@ -2705,7 +2697,7 @@ pub(crate) async fn admit_goal_intent(
     admission: &NavAdmissionContext,
     io: &NavAdmissionIo,
     state: &NavRuntimeState,
-    intent: schema::GoalIntent,
+    mut intent: schema::GoalIntent,
     producer_authority: GoalProducerEpochAuthority,
 ) -> SetGoalOutcome {
     let goal_id = intent.session_id.clone();
@@ -2722,6 +2714,10 @@ pub(crate) async fn admit_goal_intent(
                 100
             )
     );
+    let boundary_owner = match &producer_authority {
+        GoalProducerEpochAuthority::Wavefront { boundary_owner, .. } => Some(Arc::clone(boundary_owner)),
+        _ => None,
+    };
     let authoritative_producer_epoch = match producer_authority {
         GoalProducerEpochAuthority::PublicNavigation if intent.producer == "public-navigation" => {
             state.producer_runtime_generation()
@@ -2731,6 +2727,7 @@ pub(crate) async fn admit_goal_intent(
         }
         GoalProducerEpochAuthority::Wavefront {
             current_session_generation,
+            ..
         } if intent.producer == "wavefront" => {
             current_session_generation.load(AtomicOrdering::Acquire)
         }
@@ -2784,15 +2781,14 @@ pub(crate) async fn admit_goal_intent(
     if let Err(reason) = motion_admission.validate() {
         return rejected_goal_intent(goal_id, reason);
     }
-    let expected_goal_sha256 = match schema::goal_intent_action_sha256(&intent.goal, &intent.options) {
-        Ok(hash) => hash,
-        Err(error) => return rejected_goal_intent(goal_id, error.to_string()),
-    };
-    if intent.goal_sha256 == [0; 32] || intent.goal_sha256 != expected_goal_sha256 {
-        return rejected_goal_intent(goal_id, "goal hash mismatch");
+    if let Err(reason) = intent.options.validate() {
+        return rejected_goal_intent(goal_id, nuwax_codec::CodecError::LcmEncode(reason).to_string());
+    }
+    if !boundary_matches_owner(&intent.committed_map.frame_id, &intent.boundary_points, boundary_owner.as_deref()) {
+        return rejected_goal_intent(goal_id, "boundary differs from the original exploration owner");
     }
     let boundary = if intent.boundary_points.is_empty() {
-        if !intent.boundary_id.is_empty() || intent.boundary_sha256 != [0; 32] {
+        if !intent.boundary_id.is_empty() {
             return rejected_goal_intent(goal_id, "empty boundary carries non-empty identity");
         }
         None
@@ -2808,20 +2804,9 @@ pub(crate) async fn admit_goal_intent(
         {
             return rejected_goal_intent(goal_id, "boundary identity or polygon is invalid");
         }
-        let expected_boundary_sha256 = match schema::goal_intent_boundary_sha256(
-            &intent.committed_map.frame_id,
-            &intent.boundary_id,
-            &intent.boundary_points,
-        ) {
-            Ok(hash) => hash,
-            Err(error) => return rejected_goal_intent(goal_id, error.to_string()),
-        };
-        if intent.boundary_sha256 == [0; 32] || intent.boundary_sha256 != expected_boundary_sha256 {
-            return rejected_goal_intent(goal_id, "boundary hash mismatch");
-        }
         Some(GoalBoundaryConstraint {
             frame_id: intent.committed_map.frame_id.clone(),
-            points: intent.boundary_points.clone(),
+            points: std::mem::take(&mut intent.boundary_points),
         })
     };
     let cancel = state.cancel_snapshot();
@@ -2892,9 +2877,30 @@ pub(crate) async fn admit_goal_intent(
         producer_epoch: intent.producer_epoch,
         committed_map: intent.committed_map,
         boundary_id: intent.boundary_id,
-        boundary_sha256: intent.boundary_sha256,
+        body_to_support_z_m: intent.body_to_support_z_m,
+        boundary_owner,
     };
     admit_goal_input(io, state, admitted, boundary, cancel_fence, admission).await
+}
+
+fn pose_action_matches(left: &PoseState, right: &PoseState) -> bool {
+    [left.x, left.y, left.z, left.qx, left.qy, left.qz, left.qw]
+        == [right.x, right.y, right.z, right.qx, right.qy, right.qz, right.qw]
+}
+
+fn boundary_matches_owner(
+    frame_id: &str,
+    points: &[[f64; 3]],
+    owner: Option<&crate::explore_runtime::ExploreStartConfig>,
+) -> bool {
+    let boundary = owner.and_then(|owner| owner.boundary.as_ref());
+    match boundary {
+        None => points.is_empty(),
+        Some(boundary) => !frame_id.is_empty()
+            && points.len() == boundary.vertices().len()
+            && points.iter().zip(boundary.vertices()).all(|(point, vertex)|
+                point[0] == vertex.x && point[1] == vertex.y && point[2] == 0.0),
+    }
 }
 
 async fn admit_goal_input(
@@ -2912,7 +2918,8 @@ async fn admit_goal_input(
         producer_epoch,
         committed_map,
         boundary_id,
-        boundary_sha256,
+        body_to_support_z_m,
+        boundary_owner,
     } = admitted;
     input.goal_id = input.goal_id.trim().to_string();
     input.parent_request_id = input.parent_request_id.trim().to_string();
@@ -3034,10 +3041,6 @@ async fn admit_goal_input(
         state.configured_profile() == PROFILE_MLS3D,
     )
     .await;
-    let configuration_sha256=match nuwax_nav_types_messages::navigation_capabilities::configuration_digest_from_env() {
-        Ok(value)=>value,
-        Err(error)=>return rejected_goal_intent(input.goal_id.clone(),error),
-    };
     let transaction_guard = state.transaction_gate.lock().await;
     let map_goal_guard = admission.mapping_lifecycle_lock.lock().await;
     // 入口已核验源提交；等就绪期间的普通修订前进不撤销目标，坐标代际仍必须一致。
@@ -3104,16 +3107,17 @@ async fn admit_goal_input(
     let (boundary_frame_id, boundary_points) = boundary
         .map(|boundary| (boundary.frame_id.trim().to_string(), boundary.points))
         .unwrap_or_default();
-    let mut envelope = schema::GoalEnvelope {
+    let envelope = schema::GoalEnvelope {
         map_frame_generation,
-        navigation_configuration_sha256: configuration_sha256,
+        body_reference_frame_id: io.body_reference_frame_id.to_string(),
+        body_to_support_z_m,
         options: input.options,
         schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
         session_id: input.goal_id.clone(),
         owner_kind: input.owner_kind,
         parent_request_id: input.parent_request_id.clone(),
         goal_generation: goal_generation as i64,
-        producer,
+        producer: producer.clone(),
         producer_epoch,
         producer_runtime_generation: producer_runtime_generation as i64,
         committed_map_session_id: committed_map.session_id,
@@ -3125,7 +3129,6 @@ async fn admit_goal_input(
         committed_map_frame_id: committed_map.frame_id,
         source_timestamp_ns: input.target.timestamp_ns as i64,
         boundary_id,
-        boundary_sha256,
         motion_guard_generation: input.motion_admission.guard_generation as i64,
         motion_guard_boot_nonce: input.motion_admission.guard_boot_nonce,
         motion_stop_generation: input.motion_admission.motion_stop_generation as i64,
@@ -3150,36 +3153,28 @@ async fn admit_goal_input(
         },
         ..schema::GoalEnvelope::default()
     };
-    if let Err(error) = schema::seal_goal_envelope(&mut envelope) {
-        return SetGoalOutcome {
-            state: NavState {
-                status: NavPhase::Failed.as_str().to_string(),
-                message: format!("SET_GOAL_REJECTED[GOAL_ENVELOPE_INVALID]: {error}"),
-                goal_id: input.goal_id,
-                distance_remaining: 0.0,
-                timestamp_ns: now_ns(),
-            },
-            lease: None,
-            retry_reason: None,
-            reject_reason: None,
-        };
-    }
     let lease = GoalLease {
         session_id: envelope.session_id.clone(),
         owner_kind: envelope.owner_kind,
         parent_request_id: envelope.parent_request_id.clone(),
         goal_generation,
         producer_runtime_generation,
-        goal_payload_sha256: envelope.payload_sha256,
         path_revision: 0,
-        path_payload_sha256: [0; 32],
+        planner_runtime_generation: 0,
     };
 
+    let goal_payload;
     {
         let mut slot = state.inner.write().await;
         if let Some(active) = slot.goal.as_ref() {
             if active.lease.identity_matches(&lease)
-                && active.lease.goal_payload_sha256 == lease.goal_payload_sha256
+                && active.frame_id == input.frame_id
+                && pose_action_matches(&active.target, &input.target)
+                && active.options == input.options
+                && active.producer == producer
+                && active.producer_epoch == producer_epoch
+                && active.body_to_support_z_m == body_to_support_z_m
+                && boundary_matches_owner(&input.frame_id, &envelope.boundary_points, active.boundary_owner.as_deref())
             {
                 return SetGoalOutcome {
                     state: NavState {
@@ -3267,6 +3262,23 @@ async fn admit_goal_input(
                 reject_reason: None,
             };
         }
+        goal_payload = match typed_codec::encode_goal_envelope_payload(&envelope) {
+        Ok(payload) => payload,
+        Err(error) => {
+        return SetGoalOutcome {
+            state: NavState {
+                status: NavPhase::Failed.as_str().to_string(),
+                message: format!("SET_GOAL_REJECTED[GOAL_ENVELOPE_INVALID]: {error}"),
+                goal_id: input.goal_id,
+                distance_remaining: 0.0,
+                timestamp_ns: now_ns(),
+            },
+            lease: None,
+            retry_reason: None,
+            reject_reason: None,
+        };
+    }
+    };
         let admitted_cancel_generation = cancel.generation;
         slot.last_goal_generation = goal_generation;
         slot.phase = NavPhase::Accepted;
@@ -3279,6 +3291,11 @@ async fn admit_goal_input(
             frame_id: input.frame_id.clone(),
             target: input.target.clone(),
             accepted_at_ns: now_ns(),
+            options: input.options,
+            producer,
+            producer_epoch,
+            body_to_support_z_m,
+            boundary_owner,
             lease: lease.clone(),
         });
         *cancel = CancelTracker {
@@ -3318,7 +3335,7 @@ async fn admit_goal_input(
     drop(transaction_guard);
 
     // 2. publish sealed GoalEnvelope without N, L, slot, or synchronous guards.
-    let publish_result = publish_goal_frame_from_transport(&io.transport, &envelope).await;
+    let publish_result = publish_encoded_goal_frame_from_transport(&io.transport, goal_payload).await;
     let _transaction_guard = state.transaction_gate.lock().await;
     if !state.finish_publish(PublishKind::Goal, &lease, goal_generation, publish_attempt) {
         return SetGoalOutcome {
@@ -3340,7 +3357,7 @@ async fn admit_goal_input(
         let provisional_goal_matches = slot.goal.as_ref().is_some_and(|goal| {
             goal.lease == lease
                 && goal.lease.path_revision == 0
-                && goal.lease.path_payload_sha256 == [0; 32]
+                && goal.lease.planner_runtime_generation == 0
                 && slot.phase == NavPhase::Accepted
         });
         if provisional_goal_matches {
@@ -3825,15 +3842,19 @@ async fn publish_goal_frame_from_transport(
     transport: &LcmTransport,
     envelope: &schema::GoalEnvelope,
 ) -> Result<(), String> {
-    let (topic, msg_type) = goal_envelope_binding()?;
     let payload = typed_codec::encode_goal_envelope_payload(envelope)
         .map_err(|e| format!("GoalEnvelope LCM encode failed: {e}"))?;
+    publish_encoded_goal_frame_from_transport(transport, payload).await
+}
+
+async fn publish_encoded_goal_frame_from_transport(
+    transport: &LcmTransport,
+    payload: Vec<u8>,
+) -> Result<(), String> {
+    let (topic, msg_type) = goal_envelope_binding()?;
     let frame: RawLcmFrame =
         typed_codec::build_typed_frame(topic, msg_type, payload, now_ns() & 0x0000_FFFF_FFFF_FFFF);
-    transport
-        .publish(frame)
-        .await
-        .map_err(|e| format!("LcmTransport::publish 失败: {}", e))
+    transport.publish(frame).await.map_err(|e| format!("LcmTransport::publish 失败: {}", e))
 }
 
 /// publish `/nav/goal` typed frame。
@@ -4182,12 +4203,18 @@ mod tests {
             handle.state.clone(),
             handle.transport.clone(),
             handle.transport_backend_name,
-            handle.lcm_backend_available,
-        );
+            handle.lcm_backend_available, handle.body_reference_frame_id.clone(),
+);
         let producer_epoch = state.producer_runtime_generation();
         if producer_epoch == 0 {
             return rejected_goal_intent(goal_id, "invalid fixture producer epoch");
         }
+        let boundary_owner = Arc::new(crate::explore_runtime::ExploreStartConfig {
+            boundary: boundary.as_ref().map(|boundary| nuwax_exploration::ExplorationBoundary::from_vertices(
+                boundary.points.iter().map(|point| nuwax_nav_types_messages::geometry::Point2 { x: point[0], y: point[1] }).collect()
+            ).expect("synthetic boundary owner")),
+            ..Default::default()
+        });
         let intent = match goal_intent_from_set_goal(&admission, state, input, boundary).await {
             Ok(intent) => intent,
             Err(reason) => return rejected_goal_intent(goal_id, reason),
@@ -4198,6 +4225,7 @@ mod tests {
             state,
             intent,
             GoalProducerEpochAuthority::Wavefront {
+                boundary_owner,
                 current_session_generation: Arc::new(AtomicU64::new(producer_epoch)),
             },
         )
@@ -4315,6 +4343,20 @@ mod tests {
         (handle, backend)
     }
 
+    // Explicit available external port for admission unit tests. The production
+    // owner/codec still run; this fixture neither opens nor claims real LCM.
+    async fn make_unit_blocking_handle(
+        outcomes: impl IntoIterator<Item = Option<String>>,
+    ) -> (GeometryRuntimeHandle, BlockingPublishBackend, crate::lcm_runtime::GeometryTestTaskOwner) {
+        let backend = BlockingPublishBackend::new(outcomes);
+        let (mut handle, owner) = crate::lcm_runtime::build_handle_for_tests_with_unit_transport(
+            true, None, LcmTransport::new(Arc::new(backend.clone())),
+        ).await.expect("in-process admission fixture");
+        handle.lcm_backend_available = true;
+        install_committed_map_fixture(&handle, "map", true).await;
+        (handle, backend, owner)
+    }
+
     fn test_goal_input(goal_id: &str) -> SetGoalInput {
         SetGoalInput {
             options: Default::default(),
@@ -4340,9 +4382,9 @@ mod tests {
             parent_request_id: format!("request-{goal_id}"),
             goal_generation: generation,
             producer_runtime_generation: 1,
-            goal_payload_sha256: [generation as u8; 32],
+
             path_revision: 0,
-            path_payload_sha256: [0; 32],
+            planner_runtime_generation: 0,
         }
     }
 
@@ -4352,6 +4394,8 @@ mod tests {
 
     fn test_active_goal_with_lease(lease: GoalLease) -> ActiveGoal {
         ActiveGoal {
+            options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
+            body_to_support_z_m: None, boundary_owner: None,
             id: lease.session_id.clone(),
             frame_id: "map".to_string(),
             target: PoseState {
@@ -4414,7 +4458,7 @@ mod tests {
             planner_runtime_generation: 1,
             path_revision: path_revision as i64,
             source_timestamp_ns: now_ns() as i64,
-            goal_payload_sha256: lease.goal_payload_sha256,
+
             path: schema::Path {
                 header: schema::Header {
                     frame_id: "map".to_string(),
@@ -4433,7 +4477,7 @@ mod tests {
             },
             ..schema::PathEnvelope::default()
         };
-        schema::seal_path_envelope(&mut path).expect("seal test path");
+        schema::validate_path_envelope(&path).expect("seal test path");
         path
     }
 
@@ -4911,8 +4955,8 @@ mod tests {
                     handle.state.clone(),
                     handle.transport.clone(),
                     handle.transport_backend_name,
-                    handle.lcm_backend_available,
-                ),
+                    handle.lcm_backend_available, handle.body_reference_frame_id.clone(),
+),
                 &state,
                 intent,
                 GoalProducerEpochAuthority::PublicNavigation,
@@ -4961,8 +5005,8 @@ mod tests {
                 handle.state.clone(),
                 handle.transport.clone(),
                 handle.transport_backend_name,
-                handle.lcm_backend_available,
-            ),
+                handle.lcm_backend_available, handle.body_reference_frame_id.clone(),
+),
             &state,
             intent,
             GoalProducerEpochAuthority::PublicNavigation,
@@ -5049,7 +5093,7 @@ mod tests {
         assert_eq!(goal.motion_guard_boot_nonce, [7; 16]);
         assert_eq!(goal.motion_stop_generation, 1);
         assert!(goal.goal_generation > 0);
-        assert_ne!(goal.payload_sha256, [0; 32]);
+        assert_ne!(goal.producer_runtime_generation, 0);
         assert!(
             goal.goal.header.stamp_sec > 0 || goal.goal.header.stamp_nsec > 0,
             "published goal must carry a real timestamp"
@@ -5294,8 +5338,8 @@ mod tests {
                 handle.state.clone(),
                 handle.transport.clone(),
                 handle.transport_backend_name,
-                handle.lcm_backend_available,
-            ),
+                handle.lcm_backend_available, handle.body_reference_frame_id.clone(),
+),
             &state,
             intent,
             GoalProducerEpochAuthority::PublicNavigation,
@@ -5343,8 +5387,8 @@ mod tests {
                 handle.state.clone(),
                 handle.transport.clone(),
                 handle.transport_backend_name,
-                handle.lcm_backend_available,
-            ),
+                handle.lcm_backend_available, handle.body_reference_frame_id.clone(),
+),
             &state,
             intent,
             GoalProducerEpochAuthority::PublicNavigation,
@@ -5691,19 +5735,17 @@ mod tests {
         assert!(state.display_path_for(&test_lease("other-goal",6),true).await.is_empty());
         assert!(state.display_path_for(&accepted,false).await.is_empty(),"等待重规划时不能继续显示已失效的旧路径");
         assert_eq!(accepted.path_revision, 1);
-        assert_eq!(accepted.path_payload_sha256, first.path_payload_sha256);
+        assert_eq!(accepted.planner_runtime_generation, first.planner_runtime_generation as u64);
         assert_eq!(
             state.observe_path_envelope(&first).await.unwrap(),
             accepted,
-            "same revision/hash is idempotent"
+            "same assigned PathKey is idempotent"
         );
 
         let conflicting = sealed_path(&lease, 1, 2.0);
-        assert!(state
-            .observe_path_envelope(&conflicting)
-            .await
-            .unwrap_err()
-            .contains("conflicting path hash"));
+        assert_eq!(state.observe_path_envelope(&conflicting).await.unwrap(), accepted);
+        assert_eq!(state.display_path_for(&lease, true).await, first.path.poses.iter()
+            .map(|pose| pose.pose.position).collect::<Vec<_>>(), "display retains first same-key candidate; scheduler detects real mutation");
         let advanced = sealed_path(&lease, 2, 3.0);
         assert_eq!(
             state
@@ -5719,13 +5761,13 @@ mod tests {
             .unwrap_err()
             .contains("stale path revision"));
         let mut wrong_goal = sealed_path(&lease, 3, 4.0);
-        wrong_goal.goal_payload_sha256 = [9; 32];
-        schema::seal_path_envelope(&mut wrong_goal).expect("reseal wrong goal identity");
+        wrong_goal.producer_runtime_generation = 9;
+        schema::validate_path_envelope(&wrong_goal).expect("reseal wrong goal identity");
         assert!(state
             .observe_path_envelope(&wrong_goal)
             .await
             .unwrap_err()
-            .contains("identity/goal hash"));
+            .contains("assigned goal"));
     }
 
     #[tokio::test]
@@ -5756,8 +5798,8 @@ mod tests {
                 &lease.parent_request_id,
                 lease.goal_generation,
                 lease.path_revision,
-                lease.goal_payload_sha256,
-                lease.path_payload_sha256,
+                lease.producer_runtime_generation,
+                lease.planner_runtime_generation,
             )
             .await
             .expect("path-first publication must preserve zero/zero state correlation")
@@ -5771,8 +5813,8 @@ mod tests {
                 &candidate.parent_request_id,
                 candidate.goal_generation,
                 candidate.path_revision,
-                candidate.goal_payload_sha256,
-                candidate.path_payload_sha256,
+                candidate.producer_runtime_generation,
+                candidate.planner_runtime_generation,
             )
             .await
             .expect("exact scheduler state promotes revision 1")
@@ -5799,8 +5841,8 @@ mod tests {
                     &lease.parent_request_id,
                     lease.goal_generation,
                     0,
-                    lease.goal_payload_sha256,
-                    [0; 32],
+                    lease.producer_runtime_generation,
+                    0,
                 )
                 .await
                 .expect("state-first zero/zero correlation")
@@ -5835,8 +5877,8 @@ mod tests {
                 &lease.parent_request_id,
                 lease.goal_generation,
                 2,
-                lease.goal_payload_sha256,
-                second_path.path_payload_sha256,
+                lease.producer_runtime_generation,
+                second_path.planner_runtime_generation as u64,
             )
             .await
             .expect_err("NavState cannot authorize a path Geometry has not observed yet")
@@ -5851,8 +5893,8 @@ mod tests {
                 &first_candidate.parent_request_id,
                 first_candidate.goal_generation,
                 first_candidate.path_revision,
-                first_candidate.goal_payload_sha256,
-                first_candidate.path_payload_sha256,
+                first_candidate.producer_runtime_generation,
+                first_candidate.planner_runtime_generation,
             )
             .await
             .expect("revision 1 remains independently promotable")
@@ -5865,8 +5907,8 @@ mod tests {
                 &candidate.parent_request_id,
                 candidate.goal_generation,
                 candidate.path_revision,
-                candidate.goal_payload_sha256,
-                candidate.path_payload_sha256,
+                candidate.producer_runtime_generation,
+                candidate.planner_runtime_generation,
             )
             .await
             .expect("scheduler acknowledgement promotes an observed candidate")
@@ -5911,8 +5953,8 @@ mod tests {
                 &lease.parent_request_id,
                 lease.goal_generation,
                 2,
-                lease.goal_payload_sha256,
-                sealed_path(&lease, 2, 2.0).path_payload_sha256,
+                lease.producer_runtime_generation,
+                sealed_path(&lease, 2, 2.0).planner_runtime_generation as u64,
             )
             .await
             .expect_err("pending cancel freezes the confirmed path lease");
@@ -5948,7 +5990,7 @@ mod tests {
         lease_a.producer_runtime_generation = 41;
         let mut lease_b = lease_a.clone();
         lease_b.producer_runtime_generation = 42;
-        lease_b.goal_payload_sha256 = [42; 32];
+        lease_b.producer_runtime_generation = 42;
         {
             let mut slot = state.inner.write().await;
             slot.phase = NavPhase::Running;
@@ -6043,8 +6085,8 @@ mod tests {
                 &lease.parent_request_id,
                 lease.goal_generation,
                 lease.path_revision,
-                lease.goal_payload_sha256,
-                lease.path_payload_sha256,
+                lease.producer_runtime_generation,
+                lease.planner_runtime_generation,
             )
             .await
             .expect("the retained pre-cancel path lease must correlate")
@@ -6083,8 +6125,8 @@ mod tests {
                 &lease.parent_request_id,
                 lease.goal_generation,
                 lease.path_revision,
-                lease.goal_payload_sha256,
-                lease.path_payload_sha256,
+                lease.producer_runtime_generation,
+                lease.planner_runtime_generation,
             )
             .await
             .expect("matching lease identity must correlate")
@@ -6098,8 +6140,8 @@ mod tests {
                 &lease.parent_request_id,
                 lease.goal_generation,
                 lease.path_revision,
-                lease.goal_payload_sha256,
-                lease.path_payload_sha256,
+                lease.producer_runtime_generation,
+                lease.planner_runtime_generation,
             )
             .await
             .expect_err("wrong owner must not match an owned navigation state");
@@ -6157,8 +6199,8 @@ mod tests {
                 &lease.parent_request_id,
                 lease.goal_generation,
                 lease.path_revision,
-                lease.goal_payload_sha256,
-                lease.path_payload_sha256,
+                lease.producer_runtime_generation,
+                lease.planner_runtime_generation,
             )
             .await
             .expect("confirmed pre-path lease correlation")
@@ -6206,8 +6248,8 @@ mod tests {
                 &candidate_a.parent_request_id,
                 candidate_a.goal_generation,
                 candidate_a.path_revision,
-                candidate_a.goal_payload_sha256,
-                candidate_a.path_payload_sha256,
+                candidate_a.producer_runtime_generation,
+                candidate_a.planner_runtime_generation,
             )
             .await
             .expect_err("stale candidate A must not promote replacement B");
@@ -6676,7 +6718,7 @@ mod tests {
 
             let mut replacement = lease.clone();
             replacement.path_revision = 1;
-            replacement.path_payload_sha256 = [9; 32];
+            replacement.planner_runtime_generation = 9;
             {
                 let mut slot = state.inner.write().await;
                 slot.phase = NavPhase::Running;
@@ -7279,7 +7321,8 @@ mod tests {
             assert!(!detail.ready);
             assert!(detail.blockers.contains(&NavigationReadinessCode::PlannerNotReady));
             assert!(!detail.blockers.contains(&NavigationReadinessCode::PlannerFrameMismatch));
-            let io = NavAdmissionIo::new(handle.state.clone(), handle.transport.clone(), handle.transport_backend_name, handle.lcm_backend_available);
+            let io = NavAdmissionIo::new(handle.state.clone(), handle.transport.clone(), handle.transport_backend_name, handle.lcm_backend_available, handle.body_reference_frame_id.clone(),
+);
             let admission = compute_admission_readiness(&io, &state).await;
             assert!(admission.blockers.contains(&NavigationReadinessCode::PlannerNotReady));
             assert!(!admission.blockers.contains(&NavigationReadinessCode::PlannerFrameMismatch));
@@ -7518,4 +7561,255 @@ mod tests {
             "facade cancellation must not publish /cmd_vel; the guard UDS is the sole actuator ingress"
         );
     }
+
+    // These tests exercise the actual internal producer/admission functions only.
+    // They stop at existing rejection fences before configuration/wire SHA paths.
+    fn self_hash_stage_context() -> (NavAdmissionContext, NavRuntimeState) {
+        let committed = schema::CommittedMapIdentity {
+            session_id: "stage-a-map".into(), session_generation: 1, revision: 2,
+            commit_boot_nonce: [3; 16], commit_sequence: 4, source_timestamp_ns: 5,
+            frame_id: "map".into(),
+        };
+        let (_, rx) = tokio::sync::watch::channel(None);
+        let admission = NavAdmissionContext::new(
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(StdMutex::new(Some(committed))), rx,
+        );
+        let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 7);
+        (admission, state)
+    }
+
+    #[tokio::test]
+    async fn goal_intent_self_hash_public_construction_preserves_options() {
+        let (admission, state) = self_hash_stage_context();
+        let mut input = test_goal_input("stage-a-public");
+        input.options.allow_reverse = true;
+        input.options.position_tolerance_m = 0.12;
+        input.options.yaw_tolerance_rad = std::f64::consts::PI;
+        let expected = input.options;
+        let intent = goal_intent_from_set_goal(&admission, &state, input, None).await.unwrap();
+        assert_eq!(intent.options, expected);
+        assert_eq!(intent.producer, "public-navigation");
+        assert_eq!(intent.producer_epoch, 7);
+        assert_eq!(intent.goal.header.frame_id, "map");
+        assert!(intent.boundary_points.is_empty());
+        for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut input = test_goal_input("stage-a-invalid-options");
+            input.options.position_tolerance_m = invalid;
+            assert!(goal_intent_from_set_goal(&admission, &state, input, None)
+                .await.unwrap_err().contains("导航目标容差无效"));
+        }
+        assert_eq!(state.next_goal_generation.load(AtomicOrdering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn goal_intent_self_hash_wavefront_construction_keeps_original_identity() {
+        use nuwax_nav_types_messages::geometry::{Pose3, PoseStamped, Quaternion, Timestamp};
+        use nuwax_nav_types_messages::frames::NavFrameId;
+        use nuwax_nav_types_messages::goal::NavigationGoal;
+        let (admission, _) = self_hash_stage_context();
+        let committed = admission.committed_map_authority.lock().unwrap().clone().unwrap();
+        let goal = NavigationGoal::new("original-frontier", PoseStamped {
+            stamp: Timestamp::from_unix(1, 2), frame_id: NavFrameId::Map,
+            pose: Pose3 { orientation: Quaternion::IDENTITY, ..Pose3::default() },
+        });
+        let mut intent = crate::explore_runtime::build_wavefront_goal_intent(
+            9, 4, "parent-exploration", "original-child", &test_motion_admission(),
+            &goal, None, committed,
+        ).unwrap();
+        assert_eq!(intent.producer, "wavefront");
+        assert_eq!(intent.producer_epoch, 9);
+        assert_eq!(intent.cancel_generation, 4);
+        assert_eq!(intent.parent_request_id, "parent-exploration");
+        assert_eq!(intent.session_id, "original-child");
+        intent.options.allow_reverse = true;
+        intent.options.yaw_tolerance_rad = std::f64::consts::PI;
+        assert!(intent.options.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn goal_intent_self_hash_admission_rejects_before_legacy_wire_hashes() {
+        let (admission, state) = self_hash_stage_context();
+        let backend = BlockingPublishBackend::new([None]);
+        let io = NavAdmissionIo::new(Arc::new(RwLock::new(SharedState::default())),
+            LcmTransport::new(Arc::new(backend.clone())), "blocking-test", true, Arc::from("base_link"),
+);
+        let original = goal_intent_from_set_goal(&admission, &state,
+            test_goal_input("stage-a-rejections"), None).await.unwrap();
+        for source in ["public-navigation", "mapping-cloud", "wavefront"] {
+            for mutation in ["options-position", "options-yaw", "pose", "frame", "seconds",
+                "nanoseconds", "sequence", "producer-epoch", "map-generation", "cancel"] {
+                let mut intent = original.clone();
+                intent.producer = source.into();
+                if source == "wavefront" {
+                    intent.owner_kind = schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;
+                    intent.priority = 100;
+                }
+                // Valid changed options must reach the pre-existing cancel fence.
+                intent.options.allow_reverse = true;
+                intent.options.yaw_tolerance_rad = std::f64::consts::PI;
+                let expected = match mutation {
+                    "options-position" => { intent.options.position_tolerance_m = f64::NAN; "导航目标容差无效" }
+                    "options-yaw" => { intent.options.yaw_tolerance_rad = -1.0; "导航目标容差无效" }
+                    "pose" => { intent.goal.pose.position[0] = f64::INFINITY; "goal header, frame, timestamp, or pose is invalid" }
+                    "frame" => { intent.goal.header.frame_id = "odom".into(); "goal header, frame, timestamp, or pose is invalid" }
+                    "seconds" => { intent.goal.header.stamp_sec = -1; "goal header, frame, timestamp, or pose is invalid" }
+                    "nanoseconds" => { intent.goal.header.stamp_nsec = 1_000_000_000; "goal header, frame, timestamp, or pose is invalid" }
+                    "sequence" => { intent.goal.header.seq = 1; "goal header, frame, timestamp, or pose is invalid" }
+                    "producer-epoch" => { intent.producer_epoch += 1; "invalid producer, owner, priority, or generation identity" }
+                    "map-generation" => { intent.map_frame_generation += 1; "map session or coordinate generation changed" }
+                    _ => { intent.cancel_generation += 1; "cancel generation changed before admission" }
+                };
+                let authority = match source {
+                    "wavefront" => GoalProducerEpochAuthority::Wavefront {
+                boundary_owner: Arc::new(crate::explore_runtime::ExploreStartConfig::default()),
+                        current_session_generation: Arc::new(AtomicU64::new(7)),
+                    },
+                    "mapping-cloud" => GoalProducerEpochAuthority::MappingCloud,
+                    _ => GoalProducerEpochAuthority::PublicNavigation,
+                };
+                let outcome = admit_goal_intent(&admission, &io, &state, intent, authority).await;
+                assert_eq!(outcome.state.status, "FAILED", "{source}/{mutation}");
+                assert!(outcome.state.message.contains(expected), "{source}/{mutation}: {}", outcome.state.message);
+                assert!(outcome.lease.is_none());
+            }
+        }
+        assert_eq!(backend.publish_count(), 0);
+        assert_eq!(state.next_goal_generation.load(AtomicOrdering::Acquire), 0);
+        assert!(state.inner.read().await.goal.is_none());
+        assert_eq!(state.cancel_snapshot().generation, 0);
+    }
+    #[tokio::test]
+    async fn assigned_goal_replay_uses_action_values_and_original_body_binding() {
+        let (mut handle, backend, owner) = make_unit_blocking_handle([None]).await;
+        handle.body_reference_frame_id = Arc::from("robot/body_a");
+        backend.publish_gate.add_permits(1);
+        let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 1);
+        observe_ready_execution_chain(&state).await;
+        let mut input = test_goal_input("assigned-action-values");
+        input.goal_generation = 61;
+        let first = set_goal(&handle, &state, input.clone()).await;
+        assert_eq!(first.state.status, "ACCEPTED", "{}", first.state.message);
+        let mut replay = input.clone();
+        replay.target.x = -0.0;
+        replay.target.timestamp_ns += 1;
+        let same = set_goal(&handle, &state, replay).await;
+        assert_eq!(same.lease, first.lease);
+        assert!(same.state.message.contains("GOAL_LEASE_IDEMPOTENT"));
+        for changed in [0, 1, 2] {
+            let mut different = input.clone();
+            match changed {
+                0 => different.target.x = 1.0,
+                1 => different.options.allow_reverse = !different.options.allow_reverse,
+                _ => different.options.position_tolerance_m += 0.1,
+            }
+            let rejected = set_goal(&handle, &state, different).await;
+            assert_eq!(rejected.state.status, "FAILED");
+            assert!(rejected.state.message.contains("GOAL_LEASE_BUSY"));
+        }
+        assert_eq!(backend.publish_count(), 1);
+        let frames = backend.frames.lock().unwrap();
+        let envelope = schema::decode_goal_envelope_body(&frames[0].payload).unwrap();
+        assert_eq!(envelope.body_reference_frame_id, "robot/body_a");
+        assert_eq!(envelope.body_to_support_z_m, None);
+        drop(frames);
+        drop(handle);
+        owner.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn path_key_keeps_original_revision_watermark_across_planner_domains() {
+        let state = NavRuntimeState::from_env();
+        let lease = test_lease("planner-domain-watermark", 3);
+        { let mut slot = state.inner.write().await; slot.phase = NavPhase::Planning;
+            slot.goal = Some(test_active_goal_with_lease(lease.clone())); }
+        let old = sealed_path(&lease, 1, 1.0);
+        state.observe_path_envelope(&old).await.unwrap();
+        let mut new = sealed_path(&lease, 2, 2.0);
+        new.planner_runtime_generation = 9;
+        state.observe_path_envelope(&new).await.unwrap();
+        let promoted = state.correlate_navigation_state(&lease.session_id, lease.owner_kind,
+            &lease.parent_request_id, lease.goal_generation, 2, lease.producer_runtime_generation, 9)
+            .await.unwrap().unwrap();
+        assert_eq!(promoted.path_revision, 2);
+        assert!(state.correlate_navigation_state(&lease.session_id, lease.owner_kind,
+            &lease.parent_request_id, lease.goal_generation, 1, lease.producer_runtime_generation, 1).await.is_err());
+        assert!(state.observe_path_envelope(&old).await.is_err());
+        let mut same_revision_other_planner = new;
+        same_revision_other_planner.planner_runtime_generation = 10;
+        assert!(state.observe_path_envelope(&same_revision_other_planner).await.is_err());
+        assert_eq!(state.active_goal_lease().await.unwrap(), promoted);
+    }
+
+    #[tokio::test]
+    async fn all_goal_producers_emit_v8_from_original_body_and_boundary_owners_without_hash() {
+        let (mut handle, backend, owner) = make_unit_blocking_handle([None, None, None]).await;
+        handle.body_reference_frame_id = Arc::from("robot/body_a");
+        backend.publish_gate.add_permits(3);
+        let body = Arc::clone(&handle.body_reference_frame_id);
+        struct NoHash;
+        impl Drop for NoHash { fn drop(&mut self) { crate::map_checksum::FORBID_HASH.with(|flag| flag.set(false)); } }
+        crate::map_checksum::FORBID_HASH.with(|flag| flag.set(true));
+        let _no_hash = NoHash;
+        for (index, source) in ["public-navigation", "mapping-cloud", "wavefront"].into_iter().enumerate() {
+            let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 70 + index as u64);
+            observe_ready_execution_chain(&state).await;
+            let mut input = test_goal_input(source);
+            input.goal_generation = 5;
+            if source == "public-navigation" {
+                let result = set_goal(&handle, &state, input).await;
+                assert_eq!(result.state.status, "ACCEPTED", "{}", result.state.message);
+                continue;
+            }
+            let admission = NavAdmissionContext::new(handle.mapping_lifecycle_lock.clone(),
+                handle.committed_map_authority.clone(), handle.map_revision_latest_tx.subscribe())
+                .with_mapping_adapter(handle.mapping_adapter.clone());
+            let io = NavAdmissionIo::new(handle.state.clone(), handle.transport.clone(),
+                handle.transport_backend_name, handle.lcm_backend_available, Arc::clone(&body));
+            let (intent, authority) = if source == "mapping-cloud" {
+                let mut intent = goal_intent_from_set_goal(&admission, &state, input, None).await.unwrap();
+                intent.producer = source.into();
+                (intent, GoalProducerEpochAuthority::MappingCloud)
+            } else {
+                use nuwax_nav_types_messages::geometry::{Point2, Point3, Pose3, PoseStamped, Quaternion, Timestamp};
+                let owner = Arc::new(crate::explore_runtime::ExploreStartConfig {
+                    boundary: Some(nuwax_exploration::ExplorationBoundary::from_vertices(vec![
+                        Point2 { x: -1.0, y: -1.0 }, Point2 { x: 2.0, y: -1.0 }, Point2 { x: 2.0, y: 2.0 },
+                    ]).unwrap()),
+                    ..Default::default()
+                });
+                let goal = nuwax_nav_types_messages::goal::NavigationGoal::new("wavefront", PoseStamped {
+                    frame_id: nuwax_nav_types_messages::frames::NavFrameId::Map,
+                    stamp: Timestamp::from_unix(1_700_000_000, 0),
+                    pose: Pose3 { position: Point3::new(0.0, 0.0, 0.0), orientation: Quaternion::IDENTITY },
+                });
+                let committed = handle.committed_map_authority.lock().unwrap().clone().unwrap();
+                let mut intent = crate::explore_runtime::build_wavefront_goal_intent(
+                    state.producer_runtime_generation(), 0, "wavefront-parent", "wavefront", &test_motion_admission(),
+                    &goal, owner.boundary.as_ref(), committed).unwrap();
+                intent.map_frame_generation = admission.map_frame_generation();
+                intent.goal_generation = 5;
+                (intent, GoalProducerEpochAuthority::Wavefront {
+                    current_session_generation: Arc::new(AtomicU64::new(state.producer_runtime_generation())), boundary_owner: owner,
+                })
+            };
+            let result = admit_goal_intent(&admission, &io, &state, intent, authority).await;
+            assert_eq!(result.state.status, "ACCEPTED", "{source}: {}", result.state.message);
+        }
+        let frames = backend.frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        for (index, frame) in frames.iter().enumerate() {
+            let goal = schema::decode_goal_envelope_body(&frame.payload).unwrap();
+            assert_eq!(goal.schema_version, 8);
+            assert_eq!(goal.body_reference_frame_id, "robot/body_a");
+            assert_eq!(goal.producer_runtime_generation, 70 + index as i64);
+            if goal.producer == "wavefront" {
+                assert_eq!(goal.boundary_points, vec![[-1.0,-1.0,0.0],[2.0,-1.0,0.0],[2.0,2.0,0.0]]);
+            } else { assert!(goal.boundary_points.is_empty()); }
+        }
+        drop(frames);
+        drop(handle);
+        owner.finish().await.unwrap();
+    }
+
 }

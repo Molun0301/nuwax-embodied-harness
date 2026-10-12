@@ -3,7 +3,7 @@
 //! 占据栅格进程间共享映射。
 //!
 //! 双槽布局在非活动槽准备完整载荷，提交时通过原子发布头更新代次与槽位。
-//! 读者核对前后稳定序列和槽位摘要，活动槽不原位修改。
+//! 读者核对前后稳定序列、规范提交与槽位几何，活动槽不原位修改。
 //! 在线交付依赖共享内存可见性，运行时映射不承担断电后的地图资产恢复。
 
 use std::io::{Error, ErrorKind};
@@ -12,16 +12,19 @@ use std::sync::atomic::{fence, AtomicU64, Ordering};
 use memmap2::{Mmap, MmapMut};
 use tracing::info;
 
+use crate::lcm_runtime::MapRevisionEvent;
+use crate::mapping_commit::{MappingCommitId, OccupancyCommitReceipt};
+#[cfg(test)]
 use crate::lcm_runtime::MapState;
 use crate::pointcloud::{
     capture_product_owned_mmap, unlink_product_owned_mmap, ProductOwnedMmapIdentity,
 };
 
 #[cfg(not(target_has_atomic = "64"))]
-compile_error!("occupancy SHM v2 requires lock-free 64-bit atomics");
+compile_error!("occupancy SHM v3 requires lock-free 64-bit atomics");
 
 const OCC_SHM_MAGIC: u64 = 0x4E55_5741_584F_4343;
-pub const OCCUPANCY_SHM_LAYOUT_VERSION: u32 = 2;
+pub const OCCUPANCY_SHM_LAYOUT_VERSION: u32 = 3;
 pub const OCCUPANCY_SHM_PAYLOAD_SCHEMA_VERSION: u32 = 1;
 const OCC_INITIAL_CAPACITY: usize = 16 * 1024 * 1024;
 const OCC_GROW_FACTOR: usize = 2;
@@ -54,11 +57,14 @@ const SLOT_HEIGHT_OFFSET: usize = 60;
 const SLOT_RESOLUTION_OFFSET: usize = 64;
 const SLOT_ORIGIN_X_OFFSET: usize = 72;
 const SLOT_ORIGIN_Y_OFFSET: usize = 80;
-const SLOT_CHECKSUM_OFFSET: usize = 88;
+const SLOT_COMMIT_BOOT_NONCE_OFFSET: usize = 88;
+const SLOT_COMMIT_SEQUENCE_OFFSET: usize = 104;
+const SLOT_SESSION_GENERATION_OFFSET: usize = 112;
 const SLOT_FRAME_ID_OFFSET: usize = 120;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct MapWriteIdentity {
+pub(crate) struct MapWriteIdentity {
+    receipt: OccupancyCommitReceipt,
     width: u32,
     height: u32,
     resolution_bits: u32,
@@ -68,7 +74,6 @@ struct MapWriteIdentity {
     revision: u64,
     timestamp_ns: u64,
     data_len: usize,
-    data_checksum: [u8; 32],
 }
 
 /// 完整占据载荷已准备到非活动槽，读者可见的发布头尚未改变。
@@ -92,8 +97,9 @@ pub(crate) struct PreparedOccupancyWrite {
 }
 
 /// Exact descriptor facts returned after the global header has been committed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OccupancyShmCommit {
+    pub identity: MapWriteIdentity,
     pub file_size: u64,
     pub revision: u64,
     pub generation: u64,
@@ -121,9 +127,10 @@ pub(crate) struct OccupancySessionFenceTransaction {
 }
 
 impl MapWriteIdentity {
-    fn from_map(map: &MapState) -> Self {
-        let bytes = map_data_bytes(map);
-        Self {
+    pub(crate) fn from_event(map: &MapRevisionEvent) -> std::io::Result<Self> {
+        validate_map(map)?;
+        Ok(Self {
+            receipt: map.receipt.clone(),
             width: map.width,
             height: map.height,
             resolution_bits: map.resolution.to_bits(),
@@ -133,8 +140,16 @@ impl MapWriteIdentity {
             revision: map.revision,
             timestamp_ns: map.timestamp_ns,
             data_len: map.data.len(),
-            data_checksum: crate::map_checksum::sha256_bytes(bytes),
-        }
+        })
+    }
+
+    pub(crate) fn matches_event(&self, event: &MapRevisionEvent) -> bool {
+        self.receipt == event.receipt && self.width == event.width && self.height == event.height
+            && self.resolution_bits == event.resolution.to_bits()
+            && self.origin_x_bits == event.origin_x.to_bits()
+            && self.origin_y_bits == event.origin_y.to_bits()
+            && self.frame_id == event.frame_id && self.revision == event.revision
+            && self.timestamp_ns == event.timestamp_ns && self.data_len == event.data.len()
     }
 }
 
@@ -197,7 +212,7 @@ impl OccupancyGridShmWriter {
         atomic_store_u64(&mmap, GLOBAL_PUBLISHED_STATE_OFFSET, 0, Ordering::Release)?;
         mmap.flush_range(0, GLOBAL_HEADER_BYTES)?;
         info!(
-            "occupancy grid SHM v2 created: {:?} (total={} slot={})",
+            "occupancy grid SHM v3 created: {:?} (total={} slot={})",
             shm_path, capacity, slot_capacity
         );
         Ok(Self {
@@ -309,18 +324,19 @@ impl OccupancyGridShmWriter {
     }
 
     /// Serialize and atomically publish one map revision into the inactive slot.
-    pub fn write_occupancy(&mut self, map: &MapState) -> std::io::Result<u64> {
+    #[cfg(test)]
+    fn write_occupancy(&mut self, map: &MapRevisionEvent) -> std::io::Result<u64> {
         let prepared = self.prepare_occupancy(map)?;
         Ok(self.commit_prepared(prepared)?.revision)
     }
 
-    /// 在非活动槽写入并校验地图，保持读者可见的发布头不变。
+    /// 在非活动槽准备已接纳的规范地图，保持读者可见的发布头不变。
+    /// The coalescer rejects conflicting immutable bodies before this sole writer boundary.
     pub(crate) fn prepare_occupancy(
         &mut self,
-        map: &MapState,
+        map: &MapRevisionEvent,
     ) -> std::io::Result<PreparedOccupancyWrite> {
-        validate_map(map)?;
-        let identity = MapWriteIdentity::from_map(map);
+        let identity = MapWriteIdentity::from_event(map)?;
         if map.revision < self.last_revision {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
@@ -399,7 +415,7 @@ impl OccupancyGridShmWriter {
             (false, Some(slot)) => 1 - slot,
             (false, None) => 0,
         };
-        self.write_and_verify_slot(
+        self.write_slot(
             next_slot,
             staged_slot_capacity,
             next_generation,
@@ -443,6 +459,7 @@ impl OccupancyGridShmWriter {
                 )
             })?;
             return Ok(OccupancyShmCommit {
+                identity: prepared.identity,
                 file_size,
                 revision: prepared.revision,
                 generation: self.published_generation,
@@ -502,9 +519,10 @@ impl OccupancyGridShmWriter {
         self.active_slot = Some(next_slot);
         self.published_generation = prepared.staged_generation;
         self.last_revision = prepared.revision;
-        self.last_identity = Some(prepared.identity);
+        self.last_identity = Some(prepared.identity.clone());
         self.physical_write_count = self.physical_write_count.saturating_add(1);
         Ok(OccupancyShmCommit {
+            identity: prepared.identity,
             file_size,
             revision: self.last_revision,
             generation: self.published_generation,
@@ -534,12 +552,12 @@ impl OccupancyGridShmWriter {
         Ok(())
     }
 
-    fn write_and_verify_slot(
+    fn write_slot(
         &mut self,
         slot: usize,
         slot_capacity: usize,
         generation: u64,
-        map: &MapState,
+        map: &MapRevisionEvent,
         identity: &MapWriteIdentity,
     ) -> std::io::Result<()> {
         let slot_offset = slot_offset(slot, slot_capacity)?;
@@ -615,21 +633,17 @@ impl OccupancyGridShmWriter {
             slot_offset + SLOT_ORIGIN_Y_OFFSET,
             map.origin_y,
         );
-        self.mmap[slot_offset + SLOT_CHECKSUM_OFFSET..slot_offset + SLOT_CHECKSUM_OFFSET + 32]
-            .copy_from_slice(&identity.data_checksum);
+        self.mmap[slot_offset + SLOT_COMMIT_BOOT_NONCE_OFFSET..slot_offset + SLOT_COMMIT_BOOT_NONCE_OFFSET + 16]
+            .copy_from_slice(&identity.receipt.commit_id.boot_nonce.to_be_bytes());
+        write_u64(&mut self.mmap, slot_offset + SLOT_COMMIT_SEQUENCE_OFFSET,
+            identity.receipt.commit_id.sequence);
+        write_u64(&mut self.mmap, slot_offset + SLOT_SESSION_GENERATION_OFFSET,
+            identity.receipt.session_generation);
         let frame_end = slot_offset + SLOT_FRAME_ID_OFFSET + map.frame_id.len();
         self.mmap[slot_offset + SLOT_FRAME_ID_OFFSET..frame_end]
             .copy_from_slice(map.frame_id.as_bytes());
-        self.mmap[payload_offset..payload_end].copy_from_slice(map_data_bytes(map));
+        self.mmap[payload_offset..payload_end].copy_from_slice(map.data.as_ref());
 
-        let staged_checksum =
-            crate::map_checksum::sha256_bytes(&self.mmap[payload_offset..payload_end]);
-        if staged_checksum != identity.data_checksum {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "inactive occupancy slot checksum verification failed",
-            ));
-        }
         // 读者与写者共享页缓存；提交的原子序列承担可见性，不在此等待磁盘刷新。
         Ok(())
     }
@@ -647,7 +661,7 @@ impl OccupancyGridShmWriter {
         self.mmap = new_mmap;
         self.capacity = new_capacity;
         info!(
-            "occupancy grid SHM v2 allocation grew in-place: total={} staged_slot={}",
+            "occupancy grid SHM v3 allocation grew in-place: total={} staged_slot={}",
             new_capacity, new_slot_capacity
         );
         Ok(())
@@ -705,7 +719,8 @@ pub(crate) struct OccupancyGridShmSnapshot {
     pub origin_x: f64,
     pub origin_y: f64,
     pub frame_id: String,
-    pub payload_checksum: [u8; 32],
+    pub commit_id: MappingCommitId,
+    pub session_generation: u64,
     pub data: Vec<i8>,
 }
 
@@ -799,12 +814,11 @@ impl OccupancyGridShmReader {
                 "occupancy slot dimensions differ from payload length",
             ));
         }
-        let checksum = crate::map_checksum::sha256_bytes(&payload);
-        if checksum != header.payload_checksum {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "occupancy slot payload checksum mismatch",
-            ));
+        if header.schema_version != OCCUPANCY_SHM_PAYLOAD_SCHEMA_VERSION
+            || header.commit_id.boot_nonce == 0 || header.commit_id.sequence == 0
+            || header.session_generation == 0 {
+            return Err(Error::new(ErrorKind::InvalidData,
+                "occupancy slot assigned commit or payload schema is invalid"));
         }
 
         Ok(Some(OccupancyGridShmSnapshot {
@@ -820,7 +834,8 @@ impl OccupancyGridShmReader {
             origin_x: header.origin_x,
             origin_y: header.origin_y,
             frame_id: header.frame_id,
-            payload_checksum: checksum,
+            commit_id: header.commit_id,
+            session_generation: header.session_generation,
             data: payload.into_iter().map(|byte| byte as i8).collect(),
         }))
     }
@@ -851,7 +866,8 @@ struct SlotHeader {
     origin_x: f64,
     origin_y: f64,
     frame_id: String,
-    payload_checksum: [u8; 32],
+    commit_id: MappingCommitId,
+    session_generation: u64,
 }
 
 fn parse_slot_header(
@@ -859,6 +875,9 @@ fn parse_slot_header(
     slot_offset: usize,
     slot_capacity: usize,
 ) -> std::io::Result<SlotHeader> {
+    if slot_capacity < SLOT_HEADER_BYTES {
+        return Err(Error::new(ErrorKind::InvalidData, "occupancy slot capacity is too small"));
+    }
     if read_u64(buf, slot_offset + SLOT_MAGIC_OFFSET)? != SLOT_MAGIC {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -905,11 +924,12 @@ fn parse_slot_header(
     )
     .map_err(|_| Error::new(ErrorKind::InvalidData, "occupancy frame id is not UTF-8"))?
     .to_string();
-    let mut payload_checksum = [0u8; 32];
-    payload_checksum.copy_from_slice(
-        buf.get(slot_offset + SLOT_CHECKSUM_OFFSET..slot_offset + SLOT_CHECKSUM_OFFSET + 32)
-            .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "occupancy checksum truncated"))?,
-    );
+    let nonce_start = slot_offset + SLOT_COMMIT_BOOT_NONCE_OFFSET;
+    let boot_nonce = u128::from_be_bytes(buf.get(nonce_start..nonce_start + 16)
+        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "occupancy commit nonce truncated"))?
+        .try_into().expect("length checked"));
+    let commit_id = MappingCommitId { boot_nonce,
+        sequence: read_u64(buf, slot_offset + SLOT_COMMIT_SEQUENCE_OFFSET)? };
     Ok(SlotHeader {
         schema_version: read_u32(buf, slot_offset + SLOT_SCHEMA_VERSION_OFFSET)?,
         generation: read_u64(buf, slot_offset + SLOT_GENERATION_OFFSET)?,
@@ -922,7 +942,8 @@ fn parse_slot_header(
         origin_x: read_f64(buf, slot_offset + SLOT_ORIGIN_X_OFFSET)?,
         origin_y: read_f64(buf, slot_offset + SLOT_ORIGIN_Y_OFFSET)?,
         frame_id,
-        payload_checksum,
+        commit_id,
+        session_generation: read_u64(buf, slot_offset + SLOT_SESSION_GENERATION_OFFSET)?,
     })
 }
 
@@ -954,7 +975,7 @@ fn validate_global_header(buf: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn validate_map(map: &MapState) -> std::io::Result<()> {
+fn validate_map(map: &MapRevisionEvent) -> std::io::Result<()> {
     let expected_cells = checked_cells(map.width, map.height)?;
     if expected_cells != map.data.len() {
         return Err(Error::new(
@@ -971,7 +992,7 @@ fn validate_map(map: &MapState) -> std::io::Result<()> {
     if map.frame_id.len() > SLOT_FRAME_ID_MAX_BYTES {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            "occupancy frame id exceeds v2 fixed header capacity",
+            "occupancy frame id exceeds v3 fixed header capacity",
         ));
     }
     Ok(())
@@ -1034,10 +1055,6 @@ fn decode_published_state(state: u64) -> std::io::Result<(u64, usize)> {
     Ok((generation, slot))
 }
 
-fn map_data_bytes(map: &MapState) -> &[u8] {
-    // i8 and u8 have identical one-byte layout; SHM persists the original two's-complement bytes.
-    unsafe { std::slice::from_raw_parts(map.data.as_ptr().cast::<u8>(), map.data.len()) }
-}
 
 fn usize_to_u64(value: usize, label: &str) -> std::io::Result<u64> {
     u64::try_from(value)
@@ -1120,6 +1137,30 @@ fn read_f64(buf: &[u8], offset: usize) -> std::io::Result<f64> {
     Ok(f64::from_bits(read_u64(buf, offset)?))
 }
 
+/// Explicit test owner using the canonical clock; never derives a commit ID from a revision.
+#[cfg(test)]
+pub(crate) fn committed_event_for_tests(map: &MapState, session_generation: u64) -> MapRevisionEvent {
+    thread_local! {
+        static OWNER_CLOCK: std::cell::RefCell<crate::mapping_commit::MappingCommitClock> =
+            std::cell::RefCell::new(crate::mapping_commit::MappingCommitClock::new());
+    }
+    let session = crate::mapping_adapter::MappingSessionSnapshot {
+        session_id: format!("occupancy-shm-test-owner-{session_generation}"),
+        map_name: "occupancy-shm-test-map".into(), session_generation,
+        phase: crate::mapping_adapter::MappingSessionPhase::Active,
+        revision: map.revision, active: true, idempotent_replay: false,
+        legacy_checkpoint_reconstructed: false, mapping_backend_kind: "voxel".into(),
+    };
+    let receipt = OccupancyCommitReceipt {
+        commit_id: OWNER_CLOCK.with(|clock| clock.borrow_mut().reserve().expect("test owner commit")),
+        session_id: session.session_id.clone(), session_generation,
+        occupancy_revision: map.revision, source_timestamp_ns: map.timestamp_ns,
+        backend_kind: crate::mapping_backend::MappingBackendKind::Voxel, backend_generation: 1,
+    };
+    crate::lcm_runtime::PreparedMapRevisionEvent::from_map(map, &session)
+        .seal(receipt).expect("test owner event")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1130,8 +1171,8 @@ mod tests {
         std::env::temp_dir().join(format!("nuwax_occ_{name}_{}.mmap", std::process::id()))
     }
 
-    fn sample_map(width: u32, height: u32, fill: i8) -> MapState {
-        MapState {
+    fn sample_map(width: u32, height: u32, fill: i8) -> MapRevisionEvent {
+        committed_event_for_tests(&MapState {
             width,
             height,
             resolution: 0.05,
@@ -1141,7 +1182,7 @@ mod tests {
             revision: 1,
             timestamp_ns: 12345,
             data: vec![fill; (width * height) as usize],
-        }
+        }, 1)
     }
 
     fn read_until_snapshot(
@@ -1210,11 +1251,11 @@ mod tests {
     }
 
     #[test]
-    fn create_writer_succeeds_with_v2_atomic_header() {
+    fn create_writer_succeeds_with_v3_atomic_header() {
         let path = test_path("create");
         let _ = std::fs::remove_file(&path);
         let writer = OccupancyGridShmWriter::new(&path).expect("create");
-        assert_eq!(writer.layout_version(), 2);
+        assert_eq!(writer.layout_version(), 3);
         assert_eq!(writer.published_generation(), 0);
         assert_eq!(writer.active_slot(), None);
         let mut reader = OccupancyGridShmReader::open(&path).expect("reader mmap");
@@ -1223,26 +1264,25 @@ mod tests {
     }
 
     #[test]
-    fn write_then_separate_mmap_reader_roundtrips_fixed_header_and_checksum() {
+    fn write_then_separate_mmap_reader_roundtrips_fixed_header_and_receipt() {
         let path = test_path("roundtrip");
         let _ = std::fs::remove_file(&path);
         let mut writer = OccupancyGridShmWriter::new(&path).expect("create");
+        writer.begin_session(1).expect("test owner session");
         let mut reader = OccupancyGridShmReader::open(&path).expect("reader mmap");
         let map = sample_map(4, 4, 100);
         writer.write_occupancy(&map).expect("write");
 
         let snapshot = read_until_snapshot(&mut reader, 1);
-        assert_eq!(snapshot.layout_version, 2);
+        assert_eq!(snapshot.layout_version, 3);
         assert_eq!(snapshot.schema_version, 1);
         assert_eq!(snapshot.generation, 1);
         assert_eq!(snapshot.active_slot, 0);
         assert_eq!((snapshot.width, snapshot.height), (4, 4));
         assert_eq!(snapshot.frame_id, "map");
-        assert_eq!(snapshot.data, map.data);
-        assert_eq!(
-            snapshot.payload_checksum,
-            crate::map_checksum::sha256_bytes(map_data_bytes(&map))
-        );
+        assert_eq!(snapshot.data, map.to_map_state().data);
+        assert_eq!(snapshot.commit_id, map.receipt.commit_id);
+        assert_eq!(snapshot.session_generation, map.session_generation);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1251,24 +1291,29 @@ mod tests {
         let path = test_path("grow");
         let _ = std::fs::remove_file(&path);
         let mut writer = OccupancyGridShmWriter::new_with_capacity(&path, 4096).expect("create");
+        writer.begin_session(1).expect("test owner session");
         let initial_capacity = writer.capacity();
         let initial_inode = file_identity(&path);
         let mut reader = OccupancyGridShmReader::open(&path).expect("reader mmap");
 
         let first = sample_map(16, 16, 7);
         writer.write_occupancy(&first).expect("first slot");
-        assert_eq!(read_until_snapshot(&mut reader, 1).data, first.data);
+        assert_eq!(read_until_snapshot(&mut reader, 1).data, first.to_map_state().data);
 
         let mut second = sample_map(16, 16, 8);
         second.revision = 2;
+        second.receipt.occupancy_revision = 2;
         second.timestamp_ns = 23456;
+        second.receipt.source_timestamp_ns = 23456;
         writer.write_occupancy(&second).expect("second slot");
         assert_eq!(writer.active_slot(), Some(1));
-        assert_eq!(read_until_snapshot(&mut reader, 2).data, second.data);
+        assert_eq!(read_until_snapshot(&mut reader, 2).data, second.to_map_state().data);
 
         let mut third = sample_map(64, 64, 42);
         third.revision = 3;
+        third.receipt.occupancy_revision = 3;
         third.timestamp_ns = 34567;
+        third.receipt.source_timestamp_ns = 34567;
         writer
             .write_occupancy(&third)
             .expect("grow while old slot1 is active");
@@ -1276,25 +1321,31 @@ mod tests {
         assert_eq!(file_identity(&path), initial_inode);
         let snapshot = read_until_snapshot(&mut reader, 3);
         assert_eq!(snapshot.active_slot, 1);
-        assert_eq!(snapshot.data, third.data);
+        assert_eq!(snapshot.data, third.to_map_state().data);
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn duplicate_revision_is_idempotent_but_conflict_and_regression_are_rejected() {
+    fn duplicate_revision_is_idempotent_but_identity_conflict_and_regression_are_rejected() {
         let path = test_path("identity");
         let _ = std::fs::remove_file(&path);
         let mut writer = OccupancyGridShmWriter::new(&path).expect("create");
+        writer.begin_session(1).expect("test owner session");
         let mut map = sample_map(4, 4, 100);
         map.revision = 2;
+        map.receipt.occupancy_revision = 2;
 
         writer.write_occupancy(&map).expect("first write");
         writer.write_occupancy(&map).expect("same revision replay");
+        let mut independent = map.clone();
+        independent.data = map.data.as_ref().to_vec().into();
+        assert!(!Arc::ptr_eq(&independent.data, &map.data));
+        writer.write_occupancy(&independent).expect("independent identical body replay");
         assert_eq!(writer.physical_write_count(), 1);
         assert_eq!(writer.published_generation(), 1);
 
         let mut conflicting = map.clone();
-        conflicting.data[0] = 0;
+        conflicting.origin_x += 1.0;
         assert_eq!(
             writer
                 .write_occupancy(&conflicting)
@@ -1304,6 +1355,7 @@ mod tests {
         );
         let mut regressed = map;
         regressed.revision = 1;
+        regressed.receipt.occupancy_revision = 1;
         assert_eq!(
             writer
                 .write_occupancy(&regressed)
@@ -1321,6 +1373,7 @@ mod tests {
         let path = test_path("prepare_abort");
         let _ = std::fs::remove_file(&path);
         let mut writer = OccupancyGridShmWriter::new_with_capacity(&path, 4096).expect("create");
+        writer.begin_session(1).expect("test owner session");
         let mut reader = OccupancyGridShmReader::open(&path).expect("reader mmap");
         let first = sample_map(16, 16, 7);
         writer.write_occupancy(&first).expect("baseline write");
@@ -1329,7 +1382,9 @@ mod tests {
 
         let mut second = sample_map(16, 16, 8);
         second.revision = 2;
+        second.receipt.occupancy_revision = 2;
         second.timestamp_ns = 23456;
+        second.receipt.source_timestamp_ns = 23456;
         let prepared = writer.prepare_occupancy(&second).expect("prepare");
 
         assert_eq!(&writer.mmap[..GLOBAL_HEADER_BYTES], header_before);
@@ -1347,15 +1402,18 @@ mod tests {
         let path = test_path("prepare_commit");
         let _ = std::fs::remove_file(&path);
         let mut writer = OccupancyGridShmWriter::new(&path).expect("create");
+        writer.begin_session(1).expect("test owner session");
         let mut reader = OccupancyGridShmReader::open(&path).expect("reader mmap");
         let first = sample_map(4, 4, 1);
         writer.write_occupancy(&first).expect("baseline write");
 
         let mut second = sample_map(4, 4, 2);
         second.revision = 2;
+        second.receipt.occupancy_revision = 2;
         second.timestamp_ns = 23456;
+        second.receipt.source_timestamp_ns = 23456;
         let prepared = writer.prepare_occupancy(&second).expect("prepare");
-        assert_eq!(read_until_snapshot(&mut reader, 1).data, first.data);
+        assert_eq!(read_until_snapshot(&mut reader, 1).data, first.to_map_state().data);
 
         let commit = writer.commit_prepared(prepared).expect("commit");
         assert_eq!(commit.revision, 2);
@@ -1365,7 +1423,7 @@ mod tests {
         let snapshot = read_until_snapshot(&mut reader, 2);
         assert_eq!(snapshot.generation, commit.generation);
         assert_eq!(snapshot.active_slot, commit.active_slot);
-        assert_eq!(snapshot.data, second.data);
+        assert_eq!(snapshot.data, second.to_map_state().data);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1374,6 +1432,7 @@ mod tests {
         let path = test_path("stale_tokens");
         let _ = std::fs::remove_file(&path);
         let mut writer = OccupancyGridShmWriter::new(&path).expect("create");
+        writer.begin_session(1).expect("test owner session");
         let mut reader = OccupancyGridShmReader::open(&path).expect("reader mmap");
         writer.begin_session(1).expect("session one");
         let first = sample_map(4, 4, 1);
@@ -1382,6 +1441,7 @@ mod tests {
 
         let mut stale_after_restart = sample_map(4, 4, 2);
         stale_after_restart.revision = 2;
+        stale_after_restart.receipt.occupancy_revision = 2;
         let stale_after_restart = writer
             .prepare_occupancy(&stale_after_restart)
             .expect("prepare before restart");
@@ -1397,11 +1457,21 @@ mod tests {
 
         let mut superseded = sample_map(4, 4, 3);
         superseded.revision = 3;
+        superseded.receipt.occupancy_revision = 3;
+        superseded.session_generation = 2;
+        superseded.session_id = "occupancy-shm-test-owner-2".into();
+        superseded.receipt.session_generation = 2;
+        superseded.receipt.session_id = superseded.session_id.clone();
         let superseded = writer
             .prepare_occupancy(&superseded)
             .expect("first session-two prepare");
         let mut current = sample_map(4, 4, 4);
         current.revision = 4;
+        current.receipt.occupancy_revision = 4;
+        current.session_generation = 2;
+        current.session_id = "occupancy-shm-test-owner-2".into();
+        current.receipt.session_generation = 2;
+        current.receipt.session_id = current.session_id.clone();
         let current_token = writer
             .prepare_occupancy(&current)
             .expect("superseding prepare");
@@ -1416,7 +1486,7 @@ mod tests {
         writer
             .commit_prepared(current_token)
             .expect("current token commit");
-        assert_eq!(read_until_snapshot(&mut reader, 4).data, current.data);
+        assert_eq!(read_until_snapshot(&mut reader, 4).data, current.to_map_state().data);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1425,12 +1495,14 @@ mod tests {
         let path = test_path("session_fence_rollback");
         let _ = std::fs::remove_file(&path);
         let mut writer = OccupancyGridShmWriter::new(&path).expect("create");
+        writer.begin_session(1).expect("test owner session");
         writer.begin_session(1).expect("session one");
         let baseline = sample_map(4, 4, 1);
         writer.write_occupancy(&baseline).expect("baseline write");
 
         let mut stale = sample_map(4, 4, 2);
         stale.revision = 2;
+        stale.receipt.occupancy_revision = 2;
         let stale = writer
             .prepare_occupancy(&stale)
             .expect("prepare before session fence");
@@ -1472,7 +1544,7 @@ mod tests {
             .begin_session_transactional(2)
             .expect("prepare transaction");
         let staged = prepare_writer
-            .prepare_occupancy(&sample_map(4, 4, 2))
+            .prepare_occupancy(&committed_event_for_tests(&sample_map(4, 4, 2).to_map_state(), 2))
             .expect("cross fence with prepare");
         assert_eq!(
             prepare_writer
@@ -1495,7 +1567,7 @@ mod tests {
             .begin_session_transactional(2)
             .expect("commit transaction");
         let staged = commit_writer
-            .prepare_occupancy(&sample_map(4, 4, 2))
+            .prepare_occupancy(&committed_event_for_tests(&sample_map(4, 4, 2).to_map_state(), 2))
             .expect("prepare committed revision");
         commit_writer
             .commit_prepared(staged)
@@ -1516,11 +1588,13 @@ mod tests {
         let path = test_path("staged_growth");
         let _ = std::fs::remove_file(&path);
         let mut writer = OccupancyGridShmWriter::new_with_capacity(&path, 1024).expect("create");
+        writer.begin_session(1).expect("test owner session");
         let mut reader = OccupancyGridShmReader::open(&path).expect("reader mmap");
         let first = sample_map(8, 8, 1);
         writer.write_occupancy(&first).expect("first write");
         let mut second = sample_map(8, 8, 2);
         second.revision = 2;
+        second.receipt.occupancy_revision = 2;
         writer.write_occupancy(&second).expect("second write");
         let baseline = read_until_snapshot(&mut reader, 2);
         let published_capacity = writer.slot_capacity;
@@ -1529,6 +1603,7 @@ mod tests {
 
         let mut grown = sample_map(128, 64, 3);
         grown.revision = 3;
+        grown.receipt.occupancy_revision = 3;
         let prepared = writer.prepare_occupancy(&grown).expect("growth prepare");
         assert!(writer.capacity() > 1024);
         assert_eq!(writer.slot_capacity, published_capacity);
@@ -1544,7 +1619,7 @@ mod tests {
         assert_eq!(commit.active_slot, 1);
         assert_eq!(file_identity(&path), inode_before);
         let snapshot = read_until_snapshot(&mut reader, 3);
-        assert_eq!(snapshot.data, grown.data);
+        assert_eq!(snapshot.data, grown.to_map_state().data);
         assert_eq!(snapshot.active_slot, commit.active_slot);
         let _ = std::fs::remove_file(&path);
     }
@@ -1554,6 +1629,7 @@ mod tests {
         let path = test_path("failed_prepare");
         let _ = std::fs::remove_file(&path);
         let mut writer = OccupancyGridShmWriter::new(&path).expect("create");
+        writer.begin_session(1).expect("test owner session");
         let mut reader = OccupancyGridShmReader::open(&path).expect("reader mmap");
         let first = sample_map(4, 4, 1);
         writer.write_occupancy(&first).expect("baseline write");
@@ -1562,7 +1638,8 @@ mod tests {
 
         let mut malformed = sample_map(4, 4, 2);
         malformed.revision = 2;
-        malformed.data.pop();
+        malformed.receipt.occupancy_revision = 2;
+        malformed.data = malformed.data[..malformed.data.len() - 1].to_vec().into();
         assert_eq!(
             writer
                 .prepare_occupancy(&malformed)
@@ -1603,16 +1680,9 @@ mod tests {
                             snapshot.data.len(),
                             (snapshot.width as usize) * (snapshot.height as usize)
                         );
-                        assert_eq!(
-                            snapshot.payload_checksum,
-                            crate::map_checksum::sha256_bytes(
-                                &snapshot
-                                    .data
-                                    .iter()
-                                    .map(|value| *value as u8)
-                                    .collect::<Vec<_>>()
-                            )
-                        );
+                        assert_ne!(snapshot.commit_id.boot_nonce, 0);
+                        assert!(snapshot.commit_id.sequence > 0);
+                        assert_eq!(snapshot.session_generation, 1);
                         let expected = (snapshot.revision % 101) as i8;
                         assert!(snapshot.data.iter().all(|value| *value == expected));
                         reader_accepted.fetch_add(1, Ordering::Relaxed);
@@ -1627,12 +1697,15 @@ mod tests {
 
         let writer_thread = std::thread::spawn(move || {
             let mut writer = writer;
+            writer.begin_session(1).expect("test owner session");
             for revision in 1..=WRITES {
                 let width = if revision % 3 == 0 { 96 } else { 64 };
                 let height = if revision % 5 == 0 { 48 } else { 32 };
                 let mut map = sample_map(width, height, (revision % 101) as i8);
                 map.revision = revision;
+                map.receipt.occupancy_revision = revision;
                 map.timestamp_ns = revision * 1_000_000;
+                map.receipt.source_timestamp_ns = revision * 1_000_000;
                 writer.write_occupancy(&map).expect("stress write");
                 if revision % 8 == 0 {
                     std::thread::yield_now();
@@ -1646,6 +1719,107 @@ mod tests {
         assert!(accepted.load(Ordering::Relaxed) > 100);
         assert!(in_progress_reads.load(Ordering::Relaxed) > 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn assigned_write_preserves_input_arc_and_rejects_metadata_conflict() {
+        let path = test_path("input-preserved");
+        let mut writer = OccupancyGridShmWriter::new(&path).unwrap();
+        writer.begin_session(1).unwrap();
+        let event = sample_map(8, 4, -1);
+        let pointer = event.data.as_ptr();
+        let strong_count = Arc::strong_count(&event.data);
+        let prepared = writer.prepare_occupancy(&event).unwrap();
+        assert_eq!(event.data.as_ptr(), pointer);
+        assert_eq!(Arc::strong_count(&event.data), strong_count);
+        assert!(event.data.iter().all(|byte| *byte == 255));
+        let committed = writer.commit_prepared(prepared).unwrap();
+        assert!(committed.identity.matches_event(&event));
+        assert_eq!(Arc::strong_count(&event.data), strong_count);
+        let mut wrong_geometry = event.clone();
+        wrong_geometry.origin_x += 1.0;
+        assert_eq!(writer.prepare_occupancy(&wrong_geometry).unwrap_err().kind(), ErrorKind::InvalidData);
+        let mut wrong_receipt = event.clone();
+        wrong_receipt.receipt = committed_event_for_tests(&event.to_map_state(), 1).receipt;
+        assert_eq!(writer.prepare_occupancy(&wrong_receipt).unwrap_err().kind(), ErrorKind::InvalidData);
+        assert_eq!(writer.physical_write_count(), 1);
+        assert_eq!(event.data.as_ptr(), pointer);
+        assert!(event.data.iter().all(|byte| *byte == 255));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn layout_two_global_and_slot_headers_are_rejected() {
+        let path = test_path("reject-layout-two");
+        let mut writer = OccupancyGridShmWriter::new(&path).unwrap();
+        writer.begin_session(1).unwrap();
+        let event = sample_map(2, 2, 42);
+        writer.write_occupancy(&event).unwrap();
+        let mut reader = OccupancyGridShmReader::open(&path).unwrap();
+        write_u32(&mut writer.mmap, GLOBAL_LAYOUT_VERSION_OFFSET, 2);
+        assert_eq!(reader.read_stable().unwrap_err().kind(), ErrorKind::InvalidData);
+        write_u32(&mut writer.mmap, GLOBAL_LAYOUT_VERSION_OFFSET, OCCUPANCY_SHM_LAYOUT_VERSION);
+        let offset = slot_offset(writer.active_slot().unwrap(), writer.slot_capacity).unwrap();
+        write_u32(&mut writer.mmap, offset + SLOT_LAYOUT_VERSION_OFFSET, 2);
+        assert_eq!(reader.read_stable().unwrap_err().kind(), ErrorKind::InvalidData);
+        write_u32(&mut writer.mmap, offset + SLOT_LAYOUT_VERSION_OFFSET, OCCUPANCY_SHM_LAYOUT_VERSION);
+        assert_eq!(reader.read_stable().unwrap().unwrap().commit_id, event.receipt.commit_id);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn assigned_slots_reuse_and_grow_across_session_rollover() {
+        let path = test_path("assigned-rollover");
+        let mut writer = OccupancyGridShmWriter::new_with_capacity(&path, 1024).unwrap();
+        let mut reader = OccupancyGridShmReader::open(&path).unwrap();
+        let inode = file_identity(&path);
+        let mut previous_physical_generation = 0;
+        for session_generation in 1..=2 {
+            writer.begin_session(session_generation).unwrap();
+            for revision in 1..=8 {
+                let width = if revision >= 4 { 64 } else { 4 };
+                let map = MapState { width, height: 16, resolution: 0.125,
+                    origin_x: -1.0, origin_y: 2.0, frame_id: "map".into(), revision,
+                    timestamp_ns: session_generation * 100 + revision,
+                    data: vec![revision as i8; (width * 16) as usize] };
+                let event = committed_event_for_tests(&map, session_generation);
+                let prepared = writer.prepare_occupancy(&event).unwrap();
+                let commit = writer.commit_prepared(prepared).unwrap();
+                assert_eq!(commit.generation, previous_physical_generation + 1);
+                previous_physical_generation = commit.generation;
+                let snapshot = reader.read_stable().unwrap().unwrap();
+                assert_eq!(snapshot.commit_id, event.receipt.commit_id);
+                assert_eq!(snapshot.session_generation, session_generation);
+                assert_eq!(snapshot.revision, revision);
+                assert_eq!(snapshot.timestamp_ns, map.timestamp_ns);
+                assert_eq!(snapshot.generation, commit.generation);
+                assert_eq!(snapshot.active_slot, commit.active_slot);
+                assert_eq!(snapshot.data, map.data);
+                assert_eq!(file_identity(&path), inode);
+            }
+        }
+        assert_eq!(writer.physical_write_count(), 16);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn assigned_reader_rejects_invalid_receipt_and_slot_geometry() {
+        let path = test_path("assigned-invalid-header");
+        let mut writer = OccupancyGridShmWriter::new(&path).unwrap();
+        writer.begin_session(1).unwrap();
+        let event = sample_map(2, 2, 7);
+        writer.write_occupancy(&event).unwrap();
+        let mut reader = OccupancyGridShmReader::open(&path).unwrap();
+        let offset = slot_offset(writer.active_slot().unwrap(), writer.slot_capacity).unwrap();
+        write_u64(&mut writer.mmap, offset + SLOT_COMMIT_SEQUENCE_OFFSET, 0);
+        assert_eq!(reader.read_stable().unwrap_err().kind(), ErrorKind::InvalidData);
+        write_u64(&mut writer.mmap, offset + SLOT_COMMIT_SEQUENCE_OFFSET, event.receipt.commit_id.sequence);
+        write_u32(&mut writer.mmap, offset + SLOT_WIDTH_OFFSET, 3);
+        assert_eq!(reader.read_stable().unwrap_err().kind(), ErrorKind::InvalidData);
+        write_u32(&mut writer.mmap, offset + SLOT_WIDTH_OFFSET, event.width);
+        write_u64(&mut writer.mmap, offset + SLOT_GENERATION_OFFSET, 2);
+        assert_eq!(reader.read_stable().unwrap_err().kind(), ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(unix)]

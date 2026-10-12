@@ -243,8 +243,88 @@ class SceneMappingMemoryMixin:
         # 需要独立对象的调用方在锁外复制；公开JSON读取只序列化捕获的记录。
         return [space.model_copy(deep=True) for space in result] if copy_records else result
 
+    def commit_scene_mapping_label(self, capture, space, *, label, source, expected_revision,
+                                   request_id=None, requested_by=None, on_committed=None) -> SceneSpace:
+        """所有命名复用修订校验、来源记录、持久化和提交后通知。"""
+        if source not in {"model", "model_candidate", "explicit_tool_update"}:
+            raise ValueError("未知区域命名来源")
+        explicit = source == "explicit_tool_update"
+        if source != "model_candidate" and (not isinstance(label, str) or not label.strip() or len(label) > 120):
+            raise GatewayError("名称无效。", error_code="invalid_params", http_status=422)
+        if explicit and (not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 160):
+            raise GatewayError("请求标识无效。", error_code="invalid_params", http_status=422)
+        with self._instances_lock:
+            self._assert_scene_mapping_capture(capture)
+            current = self._scene_spaces_by_id.get(space.scene_space_id)
+            if explicit and current and current.metadata.get("last_label_request", {}).get("request_id") == request_id:
+                last = current.metadata["last_label_request"]
+                if last.get("label") != label or last.get("requested_by") != requested_by:
+                    raise GatewayError("请求标识已用于不同的修改。", error_code="scene_request_conflict", http_status=409)
+                return current.model_copy(deep=True)
+            revision = int(current.metadata.get("scene_revision", 0)) if current else 0
+            if revision != expected_revision:
+                raise GatewayError("区域在处理期间已修改，拒绝覆盖。", error_code="scene_revision_conflict", http_status=409)
+            if not explicit and current and (current.metadata.get("label_locked") or current.review_status in {
+                SceneSpaceReviewStatus.REVIEWED, SceneSpaceReviewStatus.CORRECTED, SceneSpaceReviewStatus.REJECTED,
+            }):
+                raise GatewayError("区域显式名称受保护。", error_code="scene_label_protected", http_status=409)
+        # 捕获记录后在结构锁外准备；原提交路径在SQL事务内再次核对修订和来源。
+        metadata = {**space.metadata, "label_source": source}
+        updates = {
+            "primary_label": label,
+            # 自动采用和工具写入都不是人工审核。
+            "review_status": SceneSpaceReviewStatus.AUTO_LABELED if label else SceneSpaceReviewStatus.CANDIDATE,
+            "metadata": metadata,
+        }
+        preserve_adopted = bool(source == "model_candidate" and current and current.primary_label
+                                and current.review_status == SceneSpaceReviewStatus.AUTO_LABELED)
+        if preserve_adopted:
+            # 最新判断可以不足以命名；它并不撤销同一区域已采纳的名称。
+            updates.update(primary_label=current.primary_label, review_status=current.review_status)
+            metadata["label_source"] = current.metadata.get("label_source", "model")
+            metadata.pop("category", None)
+            if "category" in current.metadata:
+                metadata["category"] = current.metadata["category"]
+        evidence_space = current if preserve_adopted else space
+        if source == "model" or (preserve_adopted and "adopted_label_evidence" not in metadata
+                                 and current.metadata.get("last_decision", {}).get("adopted")):
+            # 只保留一份已采纳依据；旧记录首次收到弱候选时也可从原记录提取。
+            metadata["adopted_label_evidence"] = {
+                "label": current.primary_label if preserve_adopted else label,
+                "category": evidence_space.metadata.get("category"),
+                "decision": copy.deepcopy(evidence_space.metadata.get("last_decision")),
+                "observation_samples": [sample.model_dump(mode="json") for sample in evidence_space.observation_samples],
+                "map_binding": copy.deepcopy(evidence_space.metadata.get("map_binding")),
+            }
+        if explicit:
+            metadata.pop("adopted_label_evidence", None)
+            metadata.update(label_locked=True, last_label_request={
+                "request_id": request_id, "label": label, "requested_by": requested_by,
+            })
+            updates["human_aliases"] = list(dict.fromkeys([*space.human_aliases, label]))
+        updated = space.model_copy(update=updates, deep=True)
+        try:
+            written = self.commit_scene_mapping_spaces(capture, [updated], expected_revisions={space.scene_space_id: expected_revision})[0]
+        except GatewayError as exc:
+            if not explicit or exc.error_code != "scene_revision_conflict":
+                raise
+            # 锁外准备期间相同显式请求可由另一调用完成；不重复写入或通知。
+            with self._instances_lock:
+                self._assert_scene_mapping_capture(capture)
+                current = self._scene_spaces_by_id.get(space.scene_space_id)
+                last = current.metadata.get("last_label_request", {}) if current else {}
+                if last.get("request_id") != request_id:
+                    raise
+                if last.get("label") != label or last.get("requested_by") != requested_by:
+                    raise GatewayError("请求标识已用于不同的修改。", error_code="scene_request_conflict", http_status=409) from exc
+            return current.model_copy(deep=True)
+        if on_committed is not None:
+            on_committed()
+        return written
+
+
     def update_scene_mapping_label(self, *, scene_space_id: str, map_name: str, expected_revision: int,
-                                   label: str, request_id: str, requested_by: str) -> SceneSpace:
+                                   label: str, request_id: str, requested_by: str, on_committed=None) -> SceneSpace:
         label = label.strip()
         if not label or len(label) > 120 or not request_id.strip() or len(request_id) > 160:
             raise GatewayError("名称或请求标识无效。", error_code="invalid_params", http_status=422)
@@ -263,12 +343,7 @@ class SceneMappingMemoryMixin:
                 if last.get("label") != label or last.get("requested_by") != requested_by:
                     raise GatewayError("请求标识已用于不同的修改。", error_code="scene_request_conflict", http_status=409)
                 return current.model_copy(deep=True)
-            updated = current.model_copy(update={
-                "primary_label": label,
-                "human_aliases": list(dict.fromkeys([*current.human_aliases, label])),
-                # 工具写入是明确标注来源，不能伪造人工审核状态。
-                "review_status": SceneSpaceReviewStatus.AUTO_LABELED,
-                "metadata": {**current.metadata, "label_locked": True, "label_source": "explicit_tool_update",
-                             "last_label_request": {"request_id": request_id, "label": label, "requested_by": requested_by}},
-            }, deep=True)
-            return self._persist_managed_scene_space(updated, expected_revision=expected_revision)
+        return self.commit_scene_mapping_label(
+            capture, current, label=label, source="explicit_tool_update", expected_revision=expected_revision,
+            request_id=request_id, requested_by=requested_by, on_committed=on_committed,
+        )

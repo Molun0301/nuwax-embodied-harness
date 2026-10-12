@@ -529,7 +529,7 @@ class SceneMappingConfig:
     max_regions_per_cycle: int = 4
     max_evidence_age_sec: float = 300.0
     max_images: int = 3
-    auto_apply: bool = False
+    auto_apply: bool = True
 
     def __post_init__(self) -> None:
         from core.config_registry import catalog_number_in_range, runtime_catalog
@@ -581,6 +581,24 @@ def _load_scene_mapping_config() -> SceneMappingConfig:
 
 
 @dataclass
+class ManipulationConfig:
+    """外部操作设备边界；默认不启用，不指定任何机器人或模型。"""
+    enabled: bool = False
+    base_url: str = ""
+    http_timeout_sec: float = 3.0
+    stop_timeout_sec: float = 10.0
+    poll_interval_sec: float = 0.2
+
+    def __post_init__(self):
+        import math
+        for name, maximum in (("http_timeout_sec",30), ("stop_timeout_sec",120), ("poll_interval_sec",5)):
+            value = getattr(self, name)
+            if not math.isfinite(value) or not 0 < value <= maximum:
+                raise ValueError("操作设备配置必须为有界正数: " + name)
+
+
+
+@dataclass
 class NuwaxRobotBridgeConfig:
     """项目总配置。"""
 
@@ -596,6 +614,7 @@ class NuwaxRobotBridgeConfig:
     volume: VolumeControlConfig
     perception: PerceptionConfig
     scene_mapping: SceneMappingConfig = field(default_factory=SceneMappingConfig)
+    manipulation: ManipulationConfig = field(default_factory=ManipulationConfig)
 
 
 @dataclass
@@ -1186,6 +1205,13 @@ def load_config() -> NuwaxRobotBridgeConfig:
         volume=volume,
         perception=perception,
         scene_mapping=_load_scene_mapping_config(),
+        manipulation=ManipulationConfig(
+            enabled=_cfg_bool("NUWAX_MANIPULATION_ENABLED", False),
+            base_url=_cfg_str("NUWAX_MANIPULATION_BASE_URL", ""),
+            http_timeout_sec=_cfg_float("NUWAX_MANIPULATION_HTTP_TIMEOUT_SEC", 3.0),
+            stop_timeout_sec=_cfg_float("NUWAX_MANIPULATION_STOP_TIMEOUT_SEC", 10.0),
+            poll_interval_sec=_cfg_float("NUWAX_MANIPULATION_POLL_INTERVAL_SEC", 0.2),
+        ),
     )
 
 

@@ -391,6 +391,11 @@ impl GeoreferenceV1 {
 
     fn project(&self, position: LatLng) -> Result<MapMetricPosition, GeoreferenceError> {
         self.validate()?;
+        self.project_validated(position)
+    }
+
+    // Only immutable, previously validated owners may bypass contract validation.
+    fn project_validated(&self, position: LatLng) -> Result<MapMetricPosition, GeoreferenceError> {
         validate_latitude("goal_lat_deg", position.lat)?;
         validate_longitude("goal_lng_deg", position.lng)?;
         let (easting, northing) = wgs84_to_web_mercator(position.lat, position.lng);
@@ -420,6 +425,71 @@ impl GeoreferenceV1 {
             z_m: self.map_plane_z_m,
         })
     }
+}
+
+/// A validated georeference owned by an existing assigned asset identity.
+///
+/// The caller must join the asset and its stable repository snapshot with the
+/// current sealed activation receipt. This value validates the bounded JSON
+/// contract, but does not attest external bytes or create another identity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssignedGeoreferenceV3 {
+    asset_id: String,
+    contract: GeoreferenceV1,
+}
+
+impl AssignedGeoreferenceV3 {
+    /// Parse and validate georeference-v1 JSON for an existing assigned asset.
+    ///
+    /// Duplicate/unknown fields and oversized documents fail closed. No digest
+    /// or new asset ID is derived from the document.
+    ///
+    /// # Errors
+    /// Rejects malformed asset identity, JSON, or georeference fields.
+    pub fn from_json(raw_json: &[u8], asset_id: &str) -> Result<Self, GeoreferenceError> {
+        if !valid_assigned_id(asset_id) {
+            return Err(GeoreferenceError::InvalidAssignedAssetId);
+        }
+        if raw_json.is_empty() {
+            return Err(GeoreferenceError::EmptyDocument);
+        }
+        if raw_json.len() > MAX_GEOREFERENCE_JSON_BYTES {
+            return Err(GeoreferenceError::DocumentTooLarge(raw_json.len()));
+        }
+        let contract: GeoreferenceV1 = serde_json::from_slice(raw_json)
+            .map_err(|error| GeoreferenceError::InvalidJson(error.to_string()))?;
+        contract.validate()?;
+        Ok(Self {
+            asset_id: asset_id.to_owned(),
+            contract,
+        })
+    }
+
+    /// Borrow the existing assigned asset ID, unchanged.
+    #[must_use]
+    pub fn asset_id(&self) -> &str {
+        &self.asset_id
+    }
+
+    /// Borrow the immutable validated georeference contract.
+    #[must_use]
+    pub const fn contract(&self) -> &GeoreferenceV1 {
+        &self.contract
+    }
+
+    /// Convert WGS84 into the immutable asset's map frame.
+    ///
+    /// # Errors
+    /// Rejects invalid WGS84, non-finite results, and out-of-bounds goals.
+    pub fn project_wgs84(&self, position: LatLng) -> Result<MapMetricPosition, GeoreferenceError> {
+        self.contract.project_validated(position)
+    }
+}
+
+pub(crate) fn valid_assigned_id(value: &str) -> bool {
+    value.len() == 32
+        && value.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        && value.bytes().any(|byte| byte != b'0')
 }
 
 /// A validated georeference bound to exact finalized-asset bytes.
@@ -510,6 +580,9 @@ pub struct MapMetricPosition {
 /// Fail-closed georeference validation or conversion errors.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum GeoreferenceError {
+    /// The assigned asset identity was absent or not a canonical nonzero ID.
+    #[error("asset_id must be a nonzero 32-character lowercase hexadecimal assigned ID")]
+    InvalidAssignedAssetId,
     /// The document schema version was not exactly one.
     #[error("unsupported georeference schema version {0}")]
     UnsupportedSchema(u32),
@@ -1525,5 +1598,55 @@ mod tests {
             }),
             Err(GeoreferenceError::GoalTooFar { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod assigned_tests {
+    use super::*;
+    use crate::assigned_test_support::{anchor, ASSET_ID, OTHER_ASSET_ID, RAW};
+
+    #[test]
+    fn assigned_georeference_preserves_asset_and_projects_anchor() {
+        let value = AssignedGeoreferenceV3::from_json(RAW, ASSET_ID).unwrap();
+        assert_eq!(value.asset_id(), ASSET_ID);
+        assert_eq!(value.contract().map_name, "shanghai_lab");
+        let position = value.project_wgs84(anchor()).unwrap();
+        assert!((position.x_m - 10.0).abs() < 1e-6);
+        assert!((position.y_m + 4.0).abs() < 1e-6);
+        assert_eq!(position.z_m, 1.25);
+        assert_ne!(value, AssignedGeoreferenceV3::from_json(RAW, OTHER_ASSET_ID).unwrap());
+    }
+
+    #[test]
+    fn assigned_georeference_rejects_invalid_document_and_identity() {
+        for asset_id in ["", "0", "00000000000000000000000000000000",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "1111111111111111111111111111111/"] {
+            assert_eq!(AssignedGeoreferenceV3::from_json(RAW, asset_id),
+                Err(GeoreferenceError::InvalidAssignedAssetId));
+        }
+        assert_eq!(AssignedGeoreferenceV3::from_json(b"", ASSET_ID),
+            Err(GeoreferenceError::EmptyDocument));
+        assert!(matches!(AssignedGeoreferenceV3::from_json(&vec![b' '; MAX_GEOREFERENCE_JSON_BYTES + 1], ASSET_ID),
+            Err(GeoreferenceError::DocumentTooLarge(_))));
+        for suffix in [r#", "schema_version":1}"#, r#", "unexpected":1}"#] {
+            let mut duplicate = RAW[..RAW.len() - 1].to_vec();
+            duplicate.extend_from_slice(suffix.as_bytes());
+            assert!(matches!(AssignedGeoreferenceV3::from_json(&duplicate, ASSET_ID),
+                Err(GeoreferenceError::InvalidJson(_))));
+        }
+        let malformed = std::str::from_utf8(RAW).unwrap().replace("\"map_origin_x_m\":10.0", "\"map_origin_x_m\":-0.0");
+        assert!(matches!(AssignedGeoreferenceV3::from_json(malformed.as_bytes(), ASSET_ID),
+            Err(GeoreferenceError::NegativeZero(_))));
+    }
+
+    #[test]
+    fn assigned_georeference_rejects_invalid_or_distant_positions() {
+        let value = AssignedGeoreferenceV3::from_json(RAW, ASSET_ID).unwrap();
+        for position in [LatLng { lat: f64::NAN, lng: 121.0 },
+            LatLng { lat: 90.0, lng: 121.0 }, LatLng { lat: 31.0, lng: 181.0 },
+            LatLng { lat: -0.0, lng: 121.0 }, LatLng { lat: 0.0, lng: 0.0 }] {
+            assert!(value.project_wgs84(position).is_err());
+        }
     }
 }

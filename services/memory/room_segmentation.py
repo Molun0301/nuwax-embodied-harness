@@ -217,7 +217,8 @@ class RoomSegmentationService:
         missing = missing[missing != 0]
         replacement = np.zeros(component_count, dtype=np.int32)
         replacement[missing] = np.arange(count, count + len(missing), dtype=np.int32)
-        labels[replacement[components] > 0] = replacement[components][replacement[components] > 0]
+        added = replacement[components]
+        labels[added > 0] = added[added > 0]
         labels = self._expand(labels, free)
         return self._spaces(labels, distance, grid.resolution_m, origin, snapshot, minimum_cells, existing_spaces)
 

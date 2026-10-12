@@ -103,7 +103,9 @@ from services.geometry import (
 )
 from services.geometry.geometry_runtime_provider import GeometryRuntimeRpcError
 from services.geometry.geometry_runtime_provider import (
-    _exploration_child_lease_fingerprint,
+    _exploration_child_lease_address,
+    _exploration_receipt_matches_child,
+    _exploration_reconciliation_ack_fields,
     resolve_direct_static_calibration_edge,
 )
 from services.geometry.pointcloud_map import (
@@ -419,7 +421,7 @@ class _ExplorationStopTransaction:
     request_id: str = ""
     exploration_generation: int = 0
     child_lease: MetadataDict = field(default_factory=dict)
-    child_lease_fingerprint: str = ""
+    legacy_child_lease_fingerprint: str = ""
     receipt_available: bool = False
     terminal_receipt: MetadataDict = field(default_factory=dict)
     terminal_stop_reason: str = ""
@@ -1092,6 +1094,7 @@ class GatewayRuntime:
         )
         perception_components = _build_perception_components(config)
         self.perception_service = PerceptionService(
+            spatial_context_provider=lambda: self.memory_service.capture_observation_spatial_context(),
             provider_owner=robot,
             localization_provider_owner=self.platform_geometry_runtime,
             live_pose_provider=getattr(self.platform_geometry_runtime, "providers", None),
@@ -1755,6 +1758,13 @@ class GatewayRuntime:
 
     def _close_dispatch_resources(self, timeout_sec: float = 2.0) -> bool:
         """释放构造期资源；未调用 start 的实例也需要关闭自己的后台线程。"""
+
+        # stop已先取消并等待TaskManager；仍有设备HTTP使用者时保留客户端供收尾重试。
+        manipulation = getattr(self, "manipulation_service", None)
+        if manipulation is not None and manipulation.close(timeout=timeout_sec) is False:
+            self._dispatch_shutdown_complete = False
+            self._dispatch_shutdown_blocker = "manipulation_in_flight"
+            return False
 
         if not self._close_artifact_dependencies(timeout_sec):
             self._dispatch_shutdown_complete = False
@@ -3975,7 +3985,9 @@ class GatewayRuntime:
             )
         from gateways.scene_mapping import register_scene_mapping_capabilities
         scene_capability_names = register_scene_mapping_capabilities(self)
-        self._gateway_capability_names = tuple(descriptor.name for descriptor in capabilities) + scene_capability_names
+        from gateways.manipulation import register_capability as register_manipulation_capability
+        manipulation_names = register_manipulation_capability(self)
+        self._gateway_capability_names = tuple(descriptor.name for descriptor in capabilities) + scene_capability_names + manipulation_names
         self._refresh_dynamic_capability_matrix()
 
     def register_default_skills(self) -> None:
@@ -4444,6 +4456,8 @@ class GatewayRuntime:
             self.skill_registry.register(descriptor, overwrite=True)
         from gateways.scene_mapping import register_scene_mapping_skills
         register_scene_mapping_skills(self)
+        from gateways.manipulation import register_skill as register_manipulation_skill
+        register_manipulation_skill(self)
 
     def _decorate_gateway_descriptor(
         self,
@@ -6410,10 +6424,8 @@ class GatewayRuntime:
     def _handle_get_active_tasks(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
         del requested_by
         history_limit = int(arguments.get("history_limit", 20))
-        return {
-            "active_tasks": self.task_manager.list_active_tasks(),
-            "history_tasks": self.task_manager.list_history(limit=history_limit),
-        }
+        captured = self.task_manager.capture_task_list(history_limit=history_limit, status_only=True)
+        return {name: tuple(statuses) for name, statuses in captured.items()}
 
     def _handle_list_capabilities(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
         include_unsupported = bool(arguments.get("include_unsupported", False))
@@ -11193,43 +11205,13 @@ class GatewayRuntime:
         }
 
     @staticmethod
-    def _canonical_global_stop_correlation(
-        *,
-        request_id: str,
-        exploration_generation: int,
-        child_lease: MetadataDict,
-        cancel_generation: int,
-        admission_guard_generation: int,
-        admission_guard_boot_nonce: bytes,
-        admission_motion_stop_generation: int,
+    def _assigned_global_stop_correlation(
+        *, child_lease: MetadataDict, cancel_generation: int,
     ) -> str:
-        canonical = bytearray()
-
-        def append_field(value: bytes) -> None:
-            canonical.extend(len(value).to_bytes(8, "big", signed=False))
-            canonical.extend(value)
-
-        append_field(b"exploration-global-stop-reconciliation-v1")
-        append_field(b"ordinary_global_stop")
-        append_field(request_id.encode("utf-8"))
-        canonical.extend(exploration_generation.to_bytes(8, "big", signed=False))
-        append_field(str(child_lease.get("session_id") or "").encode("utf-8"))
-        canonical.extend(int(child_lease.get("owner_kind") or 0).to_bytes(4, "big", signed=True))
-        append_field(str(child_lease.get("parent_request_id") or "").encode("utf-8"))
-        canonical.extend(int(child_lease.get("goal_generation") or 0).to_bytes(8, "big", signed=False))
-        canonical.extend(
-            int(child_lease.get("producer_runtime_generation") or 0).to_bytes(
-                8, "big", signed=False
-            )
+        return "exploration-global-stop:v2:%d:%d:%d" % (
+            int(child_lease.get("producer_runtime_generation") or 0),
+            int(child_lease.get("goal_generation") or 0), cancel_generation,
         )
-        canonical.extend(bytes(child_lease.get("goal_payload_sha256") or b""))
-        canonical.extend(cancel_generation.to_bytes(8, "big", signed=False))
-        canonical.extend(admission_guard_generation.to_bytes(8, "big", signed=False))
-        canonical.extend(admission_guard_boot_nonce)
-        canonical.extend(
-            admission_motion_stop_generation.to_bytes(8, "big", signed=False)
-        )
-        return "exploration-global-stop:" + hashlib.sha256(canonical).hexdigest()
 
     @staticmethod
     def _confirmation_zero(confirmation: Any, *, expected_operation_id: str) -> Tuple[str, int]:
@@ -11249,6 +11231,7 @@ class GatewayRuntime:
         request_id: str,
         exploration_generation: int,
         recovery_correlation: str,
+        child_lease: Optional[MetadataDict],
         child_lease_fingerprint: str,
         cancel_generation: int,
     ) -> Tuple[MetadataDict, str]:
@@ -11280,8 +11263,10 @@ class GatewayRuntime:
             == exploration_generation
             and str(receipt.get("recovery_correlation") or "")
             == recovery_correlation
-            and str(receipt.get("child_lease_fingerprint") or "")
-            == child_lease_fingerprint
+            and _exploration_receipt_matches_child(
+                receipt, child_lease=child_lease,
+                child_lease_fingerprint=child_lease_fingerprint,
+            )
             and int(receipt.get("cancel_generation") or 0) == cancel_generation
             and terminal_profile
             in (
@@ -11311,7 +11296,8 @@ class GatewayRuntime:
             request_id=transaction.request_id,
             exploration_generation=transaction.exploration_generation,
             recovery_correlation=transaction.recovery_correlation,
-            child_lease_fingerprint=transaction.child_lease_fingerprint,
+            child_lease=transaction.child_lease or None,
+            child_lease_fingerprint=transaction.legacy_child_lease_fingerprint,
             cancel_generation=transaction.cancel_generation,
         )
         if transaction.terminal_receipt and transaction.terminal_receipt != receipt:
@@ -11355,7 +11341,7 @@ class GatewayRuntime:
             if not isinstance(child_lease, dict):
                 raise RuntimeError("global-stop reconciliation lacks exact child lease")
             child_lease = dict(child_lease)
-            child_fingerprint = _exploration_child_lease_fingerprint(child_lease)
+            child_fingerprint = ""
             cancel_generation = int(candidate.get("cancel_generation") or 0)
             admission_generation = int(candidate.get("admission_guard_generation") or 0)
             admission_nonce = bytes(candidate.get("admission_guard_boot_nonce") or b"")
@@ -11363,20 +11349,14 @@ class GatewayRuntime:
                 candidate.get("admission_motion_stop_generation") or 0
             )
             correlation = str(candidate.get("recovery_correlation") or "").strip()
-            expected_correlation = self._canonical_global_stop_correlation(
-                request_id=request_id,
-                exploration_generation=exploration_generation,
-                child_lease=child_lease,
-                cancel_generation=cancel_generation,
-                admission_guard_generation=admission_generation,
-                admission_guard_boot_nonce=admission_nonce,
-                admission_motion_stop_generation=admission_stop_generation,
+            expected_correlation = self._assigned_global_stop_correlation(
+                child_lease=child_lease, cancel_generation=cancel_generation,
             )
             if (
                 not str(child_lease.get("session_id") or "").strip()
                 or int(child_lease.get("owner_kind") or 0) != 2
                 or str(child_lease.get("parent_request_id") or "") != request_id
-                or not child_fingerprint
+                or _exploration_child_lease_address(child_lease) is None
                 or cancel_generation <= 0
                 or admission_generation <= 0
                 or len(admission_nonce) != 16
@@ -11386,24 +11366,33 @@ class GatewayRuntime:
             ):
                 raise RuntimeError("global-stop reconciliation candidate identity mismatch")
         elif receipt:
-            child_lease = {}
-            child_fingerprint = str(receipt.get("child_lease_fingerprint") or "").strip()
+            identity = _exploration_reconciliation_ack_fields(
+                child_lease=receipt.get("child_lease"),
+                child_lease_fingerprint=receipt.get("child_lease_fingerprint", ""),
+            )
+            child_lease = identity.get("child_lease", {})
+            child_fingerprint = identity.get("child_lease_fingerprint", "")
             cancel_generation = int(receipt.get("cancel_generation") or 0)
             correlation = str(receipt.get("recovery_correlation") or "").strip()
             admission_generation = 0
             admission_nonce = b""
             admission_stop_generation = 0
-            if (
-                len(child_fingerprint) != 64
-                or any(ch not in "0123456789abcdef" for ch in child_fingerprint)
-                or cancel_generation <= 0
-                or not correlation.startswith("exploration-global-stop:")
-                or len(correlation) != len("exploration-global-stop:") + 64
-                or any(
-                    ch not in "0123456789abcdef"
-                    for ch in correlation[len("exploration-global-stop:") :]
+            if child_lease:
+                valid_correlation = (
+                    child_lease["parent_request_id"] == request_id
+                    and correlation == self._assigned_global_stop_correlation(
+                        child_lease=child_lease, cancel_generation=cancel_generation,
+                    )
                 )
-            ):
+            else:
+                # The stored legacy value is opaque. Never derive a child from it.
+                prefix = "exploration-global-stop:"
+                valid_correlation = (
+                    correlation.startswith(prefix)
+                    and len(correlation) == len(prefix) + 64
+                    and all(ch in "0123456789abcdef" for ch in correlation[len(prefix):])
+                )
+            if cancel_generation <= 0 or not valid_correlation:
                 raise RuntimeError("global-stop reconciliation receipt identity mismatch")
         else:
             raise RuntimeError("global-stop reconciliation target is absent")
@@ -11414,7 +11403,7 @@ class GatewayRuntime:
         transaction.request_id = request_id
         transaction.exploration_generation = exploration_generation
         transaction.child_lease = child_lease
-        transaction.child_lease_fingerprint = child_fingerprint
+        transaction.legacy_child_lease_fingerprint = child_fingerprint
         transaction.cancel_generation = cancel_generation
         transaction.recovery_correlation = correlation
         transaction.admission_guard_generation = admission_generation
@@ -11422,8 +11411,20 @@ class GatewayRuntime:
         transaction.admission_motion_stop_generation = admission_stop_generation
 
         if receipt:
-            self._record_terminal_receipt(transaction, state)
-            transaction.receipt_available = True
+            if candidate and candidate.get("eligible") is True:
+                # A durable commit can precede live child cleanup. Re-enter the
+                # authenticated reconciliation path until that owner is gone.
+                if not (
+                    _exploration_receipt_matches_child(receipt, child_lease=child_lease)
+                    and str(receipt.get("parent_request_id") or "") == request_id
+                    and int(receipt.get("exploration_generation") or 0) == exploration_generation
+                    and str(receipt.get("recovery_correlation") or "") == correlation
+                    and int(receipt.get("cancel_generation") or 0) == cancel_generation
+                ):
+                    raise RuntimeError("live ownership receipt identity mismatch")
+            else:
+                self._record_terminal_receipt(transaction, state)
+                transaction.receipt_available = True
         transaction.phase = _ExplorationStopPhase.TARGETED
 
     def _release_reconciled_exploration_quarantine(
@@ -11550,7 +11551,7 @@ class GatewayRuntime:
                 )
             ):
                 raise RuntimeError("recovery fence hold proof identity mismatch")
-            if transaction.child_lease and (
+            if not transaction.receipt_available and transaction.child_lease and (
                 fence_generation != transaction.admission_guard_generation
                 or fence_nonce != transaction.admission_guard_boot_nonce
                 or fence_stop_generation
@@ -11665,7 +11666,8 @@ class GatewayRuntime:
             "child_task_id": None,
             "last_stop_reason": transaction.terminal_stop_reason,
             "recovery_correlation": transaction.recovery_correlation,
-            "child_lease_fingerprint": transaction.child_lease_fingerprint,
+            **({"child_lease_fingerprint": transaction.legacy_child_lease_fingerprint}
+               if transaction.legacy_child_lease_fingerprint else {}),
             "ownership_reconciliation_receipt": dict(
                 transaction.terminal_receipt
             ),
@@ -11694,7 +11696,8 @@ class GatewayRuntime:
         if transaction.phase < _ExplorationStopPhase.JOURNAL_ACKED:
             self.navigation_service.acknowledge_exploration_ownership_reconciliation(
                 recovery_correlation=transaction.recovery_correlation,
-                child_lease_fingerprint=transaction.child_lease_fingerprint,
+                child_lease=transaction.child_lease or None,
+                child_lease_fingerprint=transaction.legacy_child_lease_fingerprint,
                 deadline_monotonic=deadline,
             )
             transaction.phase = _ExplorationStopPhase.JOURNAL_ACKED
@@ -11703,7 +11706,10 @@ class GatewayRuntime:
             "attempted": True,
             "request_id": transaction.request_id,
             "recovery_correlation": transaction.recovery_correlation,
-            "child_lease_fingerprint": transaction.child_lease_fingerprint,
+            **({"child_lease": transaction.child_lease}
+               if transaction.child_lease else {
+                   "child_lease_fingerprint": transaction.legacy_child_lease_fingerprint,
+               }),
             "released_quarantined_task_ids": list(transaction.released_task_ids),
             "recovery_fence_release_operation_id": release_operation_id,
             "recovery_release_zero_ack_id": transaction.release_zero_ack_id,
@@ -13097,9 +13103,6 @@ class GatewayRuntime:
                         child_owner_kind = 0
                         child_goal_generation = 0
                         child_producer_generation = 0
-                    child_payload_sha256 = child_lease.get("goal_payload_sha256")
-                    if not isinstance(child_payload_sha256, (bytes, bytearray)):
-                        child_payload_sha256 = b""
                     complete_rollover_identity = bool(
                         metadata.get("rollover_recovery_eligible") is True
                         and exploration_generation > 0
@@ -13112,8 +13115,7 @@ class GatewayRuntime:
                         and child_owner_kind > 0
                         and child_goal_generation > 0
                         and child_producer_generation > 0
-                        and len(child_payload_sha256) == 32
-                        and any(child_payload_sha256)
+                        and _exploration_child_lease_address(child_lease) is not None
                     )
                     if complete_rollover_identity:
                         return last_context
@@ -13279,9 +13281,6 @@ class GatewayRuntime:
             child_parent_request_id = str(
                 child_lease.get("parent_request_id") or ""
             ).strip()
-            child_payload_sha256 = child_lease.get("goal_payload_sha256")
-            if not isinstance(child_payload_sha256, (bytes, bytearray)):
-                child_payload_sha256 = b""
             complete_identity = bool(
                 safe_terminal_status == ExplorationStatus.FAILED.value
                 and self._exploration_state_request_id(terminal_context) == request_id
@@ -13292,8 +13291,7 @@ class GatewayRuntime:
                 and child_owner_kind > 0
                 and child_goal_generation > 0
                 and child_producer_generation > 0
-                and len(child_payload_sha256) == 32
-                and any(child_payload_sha256)
+                and _exploration_child_lease_address(child_lease) is not None
             )
             if not complete_identity:
                 details["rollover_recovery_identity_complete"] = False
@@ -13302,20 +13300,15 @@ class GatewayRuntime:
                     details=details,
                 )
 
-            recovery_identity = "\0".join(
-                (
-                    request_id,
-                    str(exploration_generation),
-                    child_session_id,
-                    str(child_goal_generation),
-                    str(expected_navigation_generation),
-                    str(observed_navigation_generation),
-                )
+            # Reuse the original child and observed runtime domains; do not
+            # allocate a UUID or derive a digest for an already assigned goal.
+            recovery_address = "%d:%d:%d:%d" % (
+                child_producer_generation, child_goal_generation,
+                expected_navigation_generation, observed_navigation_generation,
             )
-            recovery_key = uuid.uuid5(uuid.NAMESPACE_URL, recovery_identity).hex
-            correlation_id = "exploration-rollover:%s" % recovery_key
-            hold_operation_id = "exploration-rollover-hold:%s" % recovery_key
-            release_operation_id = "exploration-rollover-release:%s" % recovery_key
+            correlation_id = "exploration-rollover:v2:" + recovery_address
+            hold_operation_id = correlation_id + ":hold"
+            release_operation_id = correlation_id + ":release"
             details.update(
                 {
                     "rollover_recovery_identity_complete": True,
@@ -15066,6 +15059,9 @@ class GatewayRuntime:
         *,
         fallback: Optional[CapabilityAvailability] = None,
     ) -> CapabilityAvailability:
+        if capability_name == "execute_manipulation_task":
+            from gateways.manipulation import availability as manipulation_availability
+            return manipulation_availability(self)
         metadata = dict(fallback.metadata) if fallback is not None else {}
         reason = fallback.reason if fallback is not None else None
         supported = fallback.supported if fallback is not None else True

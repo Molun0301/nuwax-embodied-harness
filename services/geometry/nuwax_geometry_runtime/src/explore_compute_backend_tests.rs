@@ -124,7 +124,7 @@ fn real_wavefront_discard_reprepare_matches_direct_goal_checkpoint_and_ids() {
     let before = checkpoint_payloads(&backend.controller);
     let diagnostics = backend.controller.diagnostics();
 
-    let first = selection(backend.prepare_request(selection_request(&context), || false));
+    let first = selection(backend.prepare_request(None, selection_request(&context), || false));
     assert!(matches!(first.poll, Ok(ExplorationPoll::Goal(_))));
     assert_eq!(
         ids.load(Ordering::SeqCst),
@@ -141,7 +141,7 @@ fn real_wavefront_discard_reprepare_matches_direct_goal_checkpoint_and_ids() {
     assert_eq!(checkpoint_payloads(&backend.controller), before);
     assert_eq!(ids.load(Ordering::SeqCst), 0);
 
-    let second = selection(backend.prepare_request(selection_request(&context), || false));
+    let second = selection(backend.prepare_request(None, selection_request(&context), || false));
     assert_eq!(
         first.poll, second.poll,
         "same sampled source yields the same draft after discard"
@@ -175,7 +175,7 @@ fn real_wavefront_feedback_precedes_stop_and_explicit_checkpoint_export() {
     let context = context();
     let (controller, _) = controller();
     let mut backend = ExploreComputeBackend::new(controller);
-    backend.prepare_request(selection_request(&context), || false);
+    backend.prepare_request(None, selection_request(&context), || false);
     let accepted = finalized(&mut backend);
     let ExplorationPoll::Goal(goal) = selection(accepted.projection).poll.unwrap() else {
         panic!("real frontier fixture")
@@ -223,6 +223,7 @@ fn route_only_resolution_and_returning_selection_have_no_controller_delta() {
     let before = checkpoint_payloads(&backend.controller);
     let progress = MissionProgress::new(mission_pose_from_stamped(&context.robot_pose)).unwrap();
     let projection = backend.prepare_request(
+        None,
         ComputeRequest::HomewardBudget(HomewardBudgetRequest {
             context: context.clone(),
             progress: progress.clone(),
@@ -243,6 +244,7 @@ fn route_only_resolution_and_returning_selection_have_no_controller_delta() {
     let mut returning = progress;
     returning.returning = true;
     let projection = selection(backend.prepare_request(
+        None,
         ComputeRequest::Selection(SelectionRequest {
             context,
             progress: Some(returning),
@@ -264,7 +266,7 @@ fn cancellation_after_real_preparation_retains_delta_until_discard() {
     let mut backend = ExploreComputeBackend::new(controller);
     let before = checkpoint_payloads(&backend.controller);
     let checks = Cell::new(0);
-    let result = selection(backend.prepare_request(selection_request(&context), || {
+    let result = selection(backend.prepare_request(None, selection_request(&context), || {
         checks.set(checks.get() + 1);
         checks.get() >= 3 // initial, post-fork, post-controller-prepare
     }));
@@ -277,7 +279,7 @@ fn cancellation_after_real_preparation_retains_delta_until_discard() {
     ));
     assert_eq!(checkpoint_payloads(&backend.controller), before);
     assert_eq!(ids.load(Ordering::SeqCst), 0);
-    backend.prepare_request(selection_request(&context), || false);
+    backend.prepare_request(None, selection_request(&context), || false);
     assert!(matches!(
         selection(finalized(&mut backend).projection).poll,
         Ok(ExplorationPoll::Goal(_))
@@ -317,7 +319,7 @@ fn unsupported_source_is_typed_and_cancellation_cannot_launder_its_error() {
     controller.begin_exploration().unwrap();
     let mut backend = ExploreComputeBackend::new(controller);
     let checks = Cell::new(0);
-    let result = selection(backend.prepare_request(selection_request(&context()), || {
+    let result = selection(backend.prepare_request(None, selection_request(&context()), || {
         checks.set(checks.get() + 1);
         checks.get() >= 3
     }));
@@ -397,13 +399,13 @@ fn mission_queries_preserve_homeward_first_and_candidate_error_nesting() {
             &start,
             &progress,
             &policy,
-            Some(&candidate),
-            |from, to| {
+            Some((&candidate, GoalOptions::default())),
+            |from, to, _options| {
                 calls.push((from.position[0], to.position[0]));
                 if calls.len() == failing_call {
                     Err(format!("route-{failing_call}"))
                 } else {
-                    Ok(1.0)
+                    Ok(MissionRoute { length: 1.0, end: to.clone() })
                 }
             },
             &|| false,
@@ -697,6 +699,7 @@ fn actual_surface_backend_uses_original_input_and_pins_it_until_resolution() {
     ));
     drop(snapshot);
     let projection = selection(backend.prepare_request(
+        None,
         ComputeRequest::Selection(SelectionRequest {
             context,
             progress: None,
@@ -752,11 +755,13 @@ fn actual_calibrated_homeward_budget_query_succeeds_without_controller_delta() {
     let homeward = context
         .routes(None)
         .unwrap()
-        .distance(
+        .query(
             &mission_pose_from_stamped(&context.robot_pose),
             &progress.home,
+            home_goal_options(),
+            None,
         )
-        .unwrap();
+        .unwrap().length;
     assert!(homeward > 5.0, "real route must detour around the wall");
     Arc::make_mut(&mut context.config)
         .return_policy
@@ -765,6 +770,7 @@ fn actual_calibrated_homeward_budget_query_succeeds_without_controller_delta() {
     let mut backend = ExploreComputeBackend::new(controller);
     let before = checkpoint_payloads(&backend.controller);
     let projection = backend.prepare_request(
+        None,
         ComputeRequest::HomewardBudget(HomewardBudgetRequest { context, progress }),
         || false,
     );
@@ -789,6 +795,7 @@ fn coverage_and_narrow_retirement_do_not_add_navigation_outcomes() {
     let mut backend = ExploreComputeBackend::new(controller);
     let before = checkpoint_payloads(&backend.controller);
     let projection = backend.prepare_request(
+        None,
         ComputeRequest::Coverage {
             context: context.clone(),
         },
@@ -802,6 +809,7 @@ fn coverage_and_narrow_retirement_do_not_add_navigation_outcomes() {
     assert_eq!(checkpoint_payloads(&backend.controller), before);
 
     backend.prepare_request(
+        None,
         ComputeRequest::InspectCheckpoint {
             context: context.clone(),
         },
@@ -820,7 +828,7 @@ fn coverage_and_narrow_retirement_do_not_add_navigation_outcomes() {
         before
     );
 
-    backend.prepare_request(selection_request(&context), || false);
+    backend.prepare_request(None, selection_request(&context), || false);
     let ExplorationPoll::Goal(goal) = selection(finalized(&mut backend).projection).poll.unwrap()
     else {
         panic!("real frontier")
@@ -900,4 +908,227 @@ fn install_rejects_unsupported_source_before_begin_and_preserves_old_controller(
         "wavefront"
     );
     assert_eq!(checkpoint_payloads(&backend.controller), before);
+}
+
+fn cancellable_surface_context() -> ComputeContext {
+    let map = surface_fixture(0.0)
+        .with_body_envelope(nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+            footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
+            z_bounds_m: [-0.05, 0.2],
+            body_to_support_z_m: 0.3,
+            max_step_up_m: 0.2,
+            max_step_down_m: 0.2,
+            max_cross_slope_deg: 15.0,
+            support_uncertainty_m: 0.0,
+        }).unwrap();
+    let receiver = SurfaceInputReceiver::new();
+    receiver.observe(Arc::new(map)).unwrap();
+    let mut context = context();
+    context.robot_pose.pose.position = Point3::new(1.05, 1.05, 0.4);
+    context.input = ComputeInput::Surface {
+        original: receiver.freeze().unwrap(),
+        config: SurfaceNavigationConfig::new("map".into(), 0.3, 0.2, 0.45, 0.1, 0.2, 25.0, 0.3)
+            .unwrap(),
+    };
+    context
+}
+
+#[test]
+fn single_surface_query_observes_same_flag_after_backend_prechecks() {
+    // Set the flag at the last existing between-stage check, but return false
+    // from that test predicate: only the real planner can observe cancellation.
+    // Both queries would otherwise succeed on this actual full-body map.
+    for returning_selection in [false, true] {
+        let context = cancellable_surface_context();
+        let start = mission_pose_from_stamped(&context.robot_pose);
+        let planning = context.input.fork_for_planning();
+        let routes = context.routes(planning.as_ref()).unwrap();
+        assert!(routes.query(&start, &start, home_goal_options(), None).unwrap().length.is_finite());
+        let mut progress = MissionProgress::new(start).unwrap();
+        let request = if returning_selection {
+            progress.returning = true;
+            ComputeRequest::Selection(SelectionRequest { context, progress: Some(progress) })
+        } else {
+            ComputeRequest::HomewardBudget(HomewardBudgetRequest { context, progress })
+        };
+        let (controller, ids) = controller();
+        let mut backend = ExploreComputeBackend::new(controller);
+        let before = checkpoint_payloads(&backend.controller);
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let checks = Cell::new(0);
+        let last_check = if returning_selection { 4 } else { 3 };
+        let projection = backend.prepare_request(Some(&cancellation), request, || {
+            checks.set(checks.get() + 1);
+            if checks.get() == last_check {
+                cancellation.store(true, Ordering::Release);
+            }
+            false
+        });
+        assert_eq!(checks.get(), last_check);
+        if returning_selection {
+            let result = selection(projection);
+            assert_eq!(result.mission, Some(Err("三维规划已取消".into())));
+            assert!(!result.cancelled, "the real query error retains its existing nesting");
+        } else {
+            assert!(matches!(projection, ComputeProjection::HomewardBudget(Err(ref error))
+                if error == "三维规划已取消"));
+        }
+        assert!(!backend.prepared.as_ref().unwrap().controller_prepared);
+        assert!(matches!(backend.resolve(Decision::Discard), Settlement::Discarded));
+        assert!(backend.prepared.is_none());
+        assert_eq!(checkpoint_payloads(&backend.controller), before);
+        assert_eq!(ids.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn surface_motion_limits_error_precedes_cancel_without_changing_route_nesting() {
+    use nuwax_nav_types_messages::{MotionLimits, MotionModel};
+    let mut context = cancellable_surface_context();
+    let limits = MotionLimits {
+        model: MotionModel::Differential,
+        max_forward_mps: 0.5, max_reverse_mps: 0.3, max_lateral_mps: 0.0,
+        max_angular_rps: 0.7, linear_acceleration_mps2: 1.0,
+        guaranteed_braking_mps2: 0.0, // Not part of MotionKinematics validation.
+        angular_acceleration_rps2: 2.0, guaranteed_angular_braking_rps2: 2.0,
+        reaction_time_sec: 0.1, minimum_turning_radius_m: 0.0, can_rotate_in_place: true,
+    };
+    let expected = limits.validate().unwrap_err();
+    assert!(limits.kinematics().validate().is_ok());
+    let ComputeInput::Surface { config, .. } = &mut context.input else { unreachable!() };
+    config.follower.motion_limits = Some(limits);
+    let planning = context.input.fork_for_planning();
+    let invalid = context.routes(planning.as_ref()).unwrap();
+    let valid_context = cancellable_surface_context();
+    let valid_planning = valid_context.input.fork_for_planning();
+    let valid = valid_context.routes(valid_planning.as_ref()).unwrap();
+    let start = mission_pose_from_stamped(&context.robot_pose);
+    let progress = MissionProgress::new(start.clone()).unwrap();
+    for failing_query in 1..=3 {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let mut calls = 0;
+        let result = ordered_mission_query(&start, &progress, &ReturnPolicy::default(), Some((&start, GoalOptions::default())),
+            |from, to, options| {
+                calls += 1;
+                if calls == failing_query {
+                    flag.store(true, Ordering::Release);
+                    invalid.query(from, to, options, Some(&flag))
+                } else {
+                    valid.query(from, to, options, Some(&flag))
+                }
+            }, &|| flag.load(Ordering::Acquire));
+        assert_eq!(calls, failing_query);
+        let RouteComputation::Complete(result) = result else {
+            panic!("a real validation error must not be replaced by cancellation")
+        };
+        if failing_query == 1 {
+            assert_eq!(result, Err(expected.clone()));
+        } else {
+            assert_eq!(result.unwrap().can_visit, Err(expected.clone()));
+        }
+    }
+}
+
+
+#[test]
+fn mission_frontier_options_match_child_dispatch_and_keep_home_strict() {
+    let context = cancellable_surface_context();
+    let ComputeInput::Surface { config, .. } = &context.input else { unreachable!() };
+    let mut goal = FrontierGoal::new("constraints", context.robot_pose.clone(), 1.0);
+    assert_eq!(frontier_goal_options(&goal, true, None), GoalOptions::default());
+    for directional in [true, false] {
+        goal.metadata.insert("goal_orientation_required".into(), directional.to_string());
+        let options = frontier_goal_options(&goal, true, Some(config));
+        assert_eq!(options.position_tolerance_m, 0.35);
+        assert_eq!(options.yaw_tolerance_rad, if directional { 0.35 } else { std::f64::consts::PI });
+        assert_eq!(options.allow_reverse, config.follower.kinematics().is_some_and(|m| m.max_reverse_mps > 0.0));
+        assert_eq!(frontier_goal_options(&goal, true, None).yaw_tolerance_rad, options.yaw_tolerance_rad);
+        let planar = frontier_goal_options(&goal, false, None);
+        assert_eq!(planar, GoalOptions::default());
+        // Even orientation-free surface metadata must never relax return goals.
+        assert_eq!(home_goal_options(), GoalOptions {
+            allow_reverse: false, position_tolerance_m: 0.1, yaw_tolerance_rad: 0.2,
+        });
+    }
+}
+
+#[test]
+fn mission_queries_connect_actual_endpoint_and_charge_only_actual_lengths() {
+    let start = mission_point(1.0);
+    let candidate = mission_point(2.0);
+    let end = MissionPose { position: [1.8, 0.1, 0.0], orientation_xyzw: [0.0, 0.0, 0.5, 0.8660254037844386] };
+    let mut progress = MissionProgress::new(mission_point(0.0)).unwrap();
+    progress.travelled_m = 1.0;
+    let policy = ReturnPolicy { maximum_distance_m: Some(6.0), reserve_distance_m: 1.0, ..Default::default() };
+    let options = GoalOptions { yaw_tolerance_rad: std::f64::consts::PI, ..Default::default() };
+    let mut calls = Vec::new();
+    let result = ordered_mission_query(&start, &progress, &policy, Some((&candidate, options)),
+        |from, to, options| {
+            calls.push((from.clone(), to.clone(), options));
+            Ok(MissionRoute { length: if calls.len() == 1 { 99.0 } else { 2.0 },
+                end: if calls.len() == 2 { end.clone() } else { to.clone() } })
+        }, &|| false);
+    let RouteComputation::Complete(Ok(advice)) = result else { panic!("expected completed advice") };
+    assert_eq!(advice.homeward, 99.0);
+    assert_eq!(advice.can_visit, Ok(true)); // travelled + Q1 + Q2 + reserve = 6; Q0 is separate.
+    assert_eq!(calls, vec![
+        (start.clone(), progress.home.clone(), home_goal_options()),
+        (start, candidate, options),
+        (end, progress.home, home_goal_options()),
+    ]);
+}
+
+#[test]
+fn mission_surface_route_carries_real_projected_endpoint_into_home_query() {
+    let context = cancellable_surface_context();
+    let planning = context.input.fork_for_planning();
+    let routes = context.routes(planning.as_ref()).unwrap();
+    let start = mission_pose_from_stamped(&context.robot_pose);
+    let mut goal = FrontierGoal::new("projected-end", context.robot_pose.clone(), 1.0);
+    goal.pose.pose.position.x += 0.3;
+    goal.pose.pose.position.z += 0.2;
+    goal.pose.pose.orientation = Quaternion::from_yaw(std::f64::consts::PI);
+    goal.metadata.insert("goal_orientation_required".into(), "false".into());
+    let ComputeInput::Surface { config, .. } = &context.input else { unreachable!() };
+    let options = frontier_goal_options(&goal, true, Some(config));
+    let candidate = mission_pose_from_stamped(&goal.pose);
+    let MissionRoutes::Surface { map, config, boundary } = &routes else { unreachable!() };
+    let path = nuwax_nav_stack::surface_oriented::plan_cancellable(map,
+        (start.position, start.orientation_xyzw), (candidate.position, candidate.orientation_xyzw),
+        options, config.follower.motion_limits.as_ref(), boundary, 30_000, None).unwrap();
+    let expected_end = path.last().unwrap();
+    let expected_length: f64 = path.windows(2).map(|p|
+        p[0].0.iter().zip(p[1].0).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt()).sum();
+    let outward = routes.query(&start, &candidate, options, None).unwrap();
+    assert_eq!(outward.end.position, expected_end.0);
+    assert_eq!(outward.end.orientation_xyzw, expected_end.1);
+    assert_eq!(outward.length, expected_length);
+    assert_ne!(outward.end.position, candidate.position, "terrain projection must expose a different endpoint");
+    assert_ne!(outward.end.orientation_xyzw, candidate.orientation_xyzw, "free yaw must not invent nominal orientation");
+    let progress = MissionProgress::new(start.clone()).unwrap();
+    let mut calls = 0;
+    let result = ordered_mission_query(&start, &progress, &ReturnPolicy::default(), Some((&candidate, options)),
+        |from, to, options| {
+            calls += 1;
+            if calls == 3 {
+                assert_eq!(from, &outward.end);
+                assert_eq!(to, &progress.home);
+                assert_eq!(options, home_goal_options());
+            }
+            routes.query(from, to, options, None)
+        }, &|| false);
+    assert_eq!(calls, 3);
+    let RouteComputation::Complete(Ok(advice)) = result else { panic!("expected real route advice") };
+    assert!(advice.can_visit.is_ok());
+}
+
+#[test]
+fn mission_zero_length_surface_query_still_requires_complete_body_model() {
+    let routes = MissionRoutes::Surface {
+        map: surface_fixture(0.0),
+        config: SurfaceNavigationConfig::new("map".into(), 0.3, 0.2, 0.45, 0.1, 0.2, 25.0, 0.3).unwrap(),
+        boundary: Vec::new(),
+    };
+    let start = MissionPose { position: [1.05, 1.05, 0.4], orientation_xyzw: [0.0, 0.0, 0.0, 1.0] };
+    assert!(routes.query(&start, &start, home_goal_options(), None).is_err());
 }

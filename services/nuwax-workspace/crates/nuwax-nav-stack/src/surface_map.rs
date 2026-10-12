@@ -6,6 +6,21 @@ use nuwax_nav_mls_planner::{
 };
 use std::sync::Arc;
 
+/// Short-lived raw geometry scope, relative to one successful complete source.
+/// Arc ownership in SurfaceMapUpdate makes hub delivery constant-time.
+#[derive(Debug)]
+pub(crate) enum SurfaceGeometryChanges {
+    Empty,
+    Columns { fine_size: f32, fine: Vec<[i32; 2]>, planner_size: f32, coarse: Vec<[i32; 2]> },
+    Unknown,
+}
+
+pub(crate) struct SurfaceMapUpdate {
+    pub snapshot: Arc<SurfaceSnapshot>,
+    pub change_basis: Option<Arc<SurfaceSnapshot>>,
+    pub changes: Arc<SurfaceGeometryChanges>,
+}
+
 /// Publication identities are assigned by the owner, never derived from payload bytes.
 #[derive(Clone, PartialEq, Eq)]
 enum GeometryRevision {
@@ -154,6 +169,18 @@ impl SurfaceMapCache {
         &mut self,
         message: &schema::NavigationMap3D,
     ) -> Result<Arc<SurfaceSnapshot>, String> {
+        self.build_with_changes(message).map(|update| update.snapshot)
+    }
+
+    pub(crate) fn build_with_changes(
+        &mut self,
+        message: &schema::NavigationMap3D,
+    ) -> Result<SurfaceMapUpdate, String> {
+        // A failed mask derivation may have advanced physical/builder state. Its
+        // next local delta cannot be attached to the previous successful source.
+        let change_basis = self.latest.as_ref().map(|old| Arc::clone(&old.snapshot));
+        let intact_basis = self.latest.as_ref().zip(self.physical.as_ref())
+            .is_some_and(|(old, (_, physical))| Arc::ptr_eq(&old.physical, physical));
         schema::validate_navigation_map_3d(message)?;
         if message.cleared {
             self.reset();
@@ -172,13 +199,16 @@ impl SurfaceMapCache {
         } else {
             None
         };
-        let observations = if self.observation_enabled {
+        let (observations, fine_changes) = if self.observation_enabled {
             match fine_root.as_ref() {
-                Some(root) => Some(self.fine.as_mut().unwrap().observations(root,
-                    self.fine_observed_root.as_deref().zip(self.observations.as_ref()))?),
-                None => None,
+                Some(root) => {
+                    let (observations, changes) = self.fine.as_mut().unwrap().observations_with_changes(root,
+                        self.fine_observed_root.as_deref().zip(self.observations.as_ref()))?;
+                    (Some(observations), changes)
+                }
+                None => (None, self.observations.is_none().then(Vec::new)),
             }
-        } else { None };
+        } else { (None, Some(Vec::new())) };
         let domain = schema::navigation_map_3d_domain(message);
         let physical_revision = match fine_root.as_ref() {
             Some(root) => GeometryRevision::Fine {
@@ -199,6 +229,7 @@ impl SurfaceMapCache {
         });
         let mask_layout = message.virtual_obstacles.as_ref().map(MaskLayout::new);
         let mut frontier_changes = None;
+        let mut coarse_changes = Some(Vec::new());
         let physical = if let Some((_, snapshot)) = self
             .physical
             .as_ref()
@@ -236,7 +267,8 @@ impl SurfaceMapCache {
             self.fine_built_root = fine_root.clone();
             if result.stats.kind != SurfaceBuildKind::Full {
                 frontier_changes = Some(result.changed_columns.clone());
-            }
+                coarse_changes = Some(result.changed_columns);
+            } else { coarse_changes = None; }
             self.last_stats = Some(result.stats);
             self.physical = Some((physical_revision, Arc::clone(&result.snapshot)));
             result.snapshot
@@ -247,8 +279,7 @@ impl SurfaceMapCache {
         self.fine_built_root = fine_root.clone();
         #[cfg(test)]
         let mut compared_cells = 0;
-        let reusable = self.latest.as_ref().is_some_and(|previous| {
-            if !Arc::ptr_eq(&previous.physical, &physical) { return false; }
+        let same_mask = self.latest.as_ref().is_some_and(|previous| {
             if previous.mask_revision == mask_revision { return true; }
             let (Some(old), Some(next), Some(mask)) =
                 (&previous.mask_revision, &mask_revision, &message.virtual_obstacles)
@@ -268,6 +299,27 @@ impl SurfaceMapCache {
             )
         });
         #[cfg(test)] { self.mask_work.compared_cells += compared_cells; }
+        let reusable = same_mask && self.latest.as_ref()
+            .is_some_and(|old| Arc::ptr_eq(&old.physical, &physical));
+        let changes = |snapshot: &Arc<SurfaceSnapshot>| {
+            if !intact_basis { return SurfaceGeometryChanges::Unknown; }
+            if change_basis.as_ref().is_some_and(|old| nuwax_nav_pct::same_source_geometry(old, snapshot)) {
+                return SurfaceGeometryChanges::Empty;
+            }
+            if !same_mask || change_basis.as_ref().is_none_or(|old|
+                old.source_voxel_size_m().to_bits() != snapshot.source_voxel_size_m().to_bits()
+                    || old.ground_evidence() != snapshot.ground_evidence()) {
+                return SurfaceGeometryChanges::Unknown;
+            }
+            match (fine_changes, coarse_changes) {
+                (Some(fine), Some(coarse)) if fine.is_empty() && coarse.is_empty() => SurfaceGeometryChanges::Empty,
+                (Some(fine), Some(coarse)) => SurfaceGeometryChanges::Columns {
+                    fine_size: snapshot.source_voxel_size_m(), fine,
+                    planner_size: snapshot.config().voxel_size, coarse,
+                },
+                _ => SurfaceGeometryChanges::Unknown,
+            }
+        };
         if reusable {
             let previous = self.latest.as_ref().expect("已核对保留派生图");
             let snapshot = &previous.snapshot;
@@ -281,22 +333,31 @@ impl SurfaceMapCache {
             self.observations = observations;
             self.fine_observed_root = fine_root;
             self.latest = Some(DerivedSurface { mask_revision, mask_layout, physical, snapshot: Arc::clone(&snapshot) });
-            return Ok(snapshot);
+            let changes = Arc::new(changes(&snapshot));
+            return Ok(SurfaceMapUpdate { snapshot, change_basis, changes });
         }
         let snapshot = if let Some(mask) = message.virtual_obstacles.as_ref() {
             #[cfg(test)] { self.mask_work.derivations += 1; }
-            let blocked: Vec<_> = mask.data.iter().map(|value| *value == 100).collect();
-            Arc::new(
-                physical
-                    .with_virtual_obstacles(
-                        [mask.info.origin.position[0], mask.info.origin.position[1]],
-                        f64::from(mask.info.resolution),
-                        mask.info.width as u32,
-                        mask.info.height as u32,
-                        &blocked,
-                    )
-                    .map_err(|error| error.to_string())?,
-            )
+            // 仅较新修订的逐格证明允许复用遮罩存储；同修订快路不证明输入内容。
+            let retained = self.latest.as_ref()
+                .filter(|previous| same_mask && previous.mask_revision != mask_revision)
+                .and_then(|previous| physical.with_retained_virtual_obstacles_from(&previous.snapshot));
+            if let Some(result) = retained {
+                Arc::new(result.map_err(|error| error.to_string())?)
+            } else {
+                let blocked: Vec<_> = mask.data.iter().map(|value| *value == 100).collect();
+                Arc::new(
+                    physical
+                        .with_virtual_obstacles(
+                            [mask.info.origin.position[0], mask.info.origin.position[1]],
+                            f64::from(mask.info.resolution),
+                            mask.info.width as u32,
+                            mask.info.height as u32,
+                            &blocked,
+                        )
+                        .map_err(|error| error.to_string())?,
+                )
+            }
         } else {
             Arc::clone(&physical)
         };
@@ -309,6 +370,7 @@ impl SurfaceMapCache {
         self.observations = observations;
         self.fine_observed_root = fine_root;
         self.latest = Some(DerivedSurface { mask_revision, mask_layout, physical, snapshot: Arc::clone(&snapshot) });
-        Ok(snapshot)
+        let changes = Arc::new(changes(&snapshot));
+        Ok(SurfaceMapUpdate { snapshot, change_basis, changes })
     }
 }

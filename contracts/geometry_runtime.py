@@ -7,7 +7,7 @@ from typing import Dict, Tuple
 
 GEOMETRY_STACK_NAME = "nuwax_geometry_runtime"
 NAVIGATION_BACKEND_NAME = "nuwax_navigation_stack"
-OCCUPANCY_SHM_LAYOUT_VERSION = 2
+OCCUPANCY_SHM_LAYOUT_VERSION = 3
 OCCUPANCY_SHM_PAYLOAD_SCHEMA_VERSION = 1
 
 

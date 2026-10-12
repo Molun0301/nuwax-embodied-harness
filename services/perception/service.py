@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import threading
 import time
 from collections import deque
@@ -83,6 +84,7 @@ class PerceptionService:
         video_frame_sink: Optional[VideoFrameSink] = None,
         video_frame_source: Optional[VideoFrameSource] = None,
         live_pose_provider=None,
+        spatial_context_provider=None,
         history_limit: int = 100,
         pipeline_name: str = "default_perception_pipeline",
     ) -> None:
@@ -100,6 +102,8 @@ class PerceptionService:
         self._video_frame_sink = video_frame_sink
         self._video_frame_source = video_frame_source
         self._live_pose_provider = live_pose_provider
+        self._spatial_context_provider = spatial_context_provider
+        self._observation_spatial_contexts = {}
         self._history: Deque[PerceptionContext] = deque(maxlen=max(1, history_limit))
         self._fast_frame_cache = {}
         self._last_published_video_frames = {}
@@ -164,6 +168,7 @@ class PerceptionService:
         source_name: Optional[str] = None,
         detection_metadata: Optional[Dict[str, object]] = None,
         open_vocabulary_classes: Optional[Iterable[str]] = None,
+        spatial_context=None,
     ) -> PerceptionContext:
         """消费标准图像并产出检测、跟踪和场景摘要。
 
@@ -176,6 +181,9 @@ class PerceptionService:
         if image_artifact is not None and not isinstance(image_artifact, ArtifactRef):
             raise TypeError("PerceptionService.process_image 的 image_artifact 必须是 ArtifactRef。")
         with self._operation():
+            if spatial_context is None and self._spatial_context_provider is not None:
+                spatial_context = self._spatial_context_provider()
+            spatial_context = self._copy_spatial_context(spatial_context)
             # 已存在引用的文件查验在两个推理锁之外；等待锁和慢推理期间拥有方不失效。
             hold = self._artifact_service.acquire_artifacts(
                 [image_artifact.artifact_id], owner="perception.process",
@@ -188,6 +196,7 @@ class PerceptionService:
                     requested_by=requested_by, detector_backend_name=detector_backend_name,
                     source_name=source_name, detection_metadata=detection_metadata,
                     open_vocabulary_classes=open_vocabulary_classes, artifact_hold=hold,
+                    spatial_context=spatial_context,
                 )
             finally:
                 if hold is not None:
@@ -236,6 +245,7 @@ class PerceptionService:
         open_vocabulary_classes: Optional[Iterable[str]] = None,
         lock_wait_ms: Optional[float] = None,
         artifact_hold=None,
+        spatial_context=None,
     ) -> Tuple[PerceptionContext, Optional[PreparedEventPublication]]:
         """完整分析的实现；调用方持有完整分析锁，检测/跟踪独立加锁。"""
 
@@ -421,6 +431,7 @@ class PerceptionService:
         self._publish_context(
             context, image_frame=image_frame, source=source_name or detector_spec.name,
             kind="latest_perception", hold=artifact_hold, full=True,
+            spatial_context=spatial_context,
         )
         scene_publication = None
         if self._event_bus is not None:
@@ -497,6 +508,8 @@ class PerceptionService:
                     "ingest_status": ingest_status,
                 },
             )
+        # 在取帧后、模型等待前捕获一次空间归属，不改写源时间。
+        spatial_context = self._copy_spatial_context(self._spatial_context_provider()) if self._spatial_context_provider is not None else None
         camera_info = self._camera_info_from_video_frame(image_frame)
         source_name = str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver")
         self._publish_video_frame(
@@ -514,6 +527,7 @@ class PerceptionService:
             camera_info,
             image_artifact=image_artifact,
             artifact_hold=artifact_hold,
+            spatial_context=spatial_context,
             requested_by=requested_by,
             detector_backend_name=detector_backend_name,
             source_name=source_name,
@@ -636,7 +650,7 @@ class PerceptionService:
         source_frame = image_frame
         cacheable = not detection_metadata and open_vocabulary_classes is None
         cache_key = (detector_backend_name or self._detector_pipeline.default_backend_name, source_name, requested_by)
-        input_signature = self._fast_input_signature(image_frame, camera_info)
+        input_signature = self._fast_input_signature(image_frame, camera_info) if cacheable else None
         cacheable = cacheable and input_signature is not None
         cached = self._fast_frame_cache.get(image_frame.camera_id)
         if (
@@ -876,6 +890,24 @@ class PerceptionService:
         with self._context_condition:
             return self._select_latest(self._latest_full_by_camera, camera_id)
 
+    @staticmethod
+    def _copy_spatial_context(captured):
+        if captured is None:
+            return None
+        # 地图是拥有方发布的只读图层句柄，不为一次观察遍历/复制整张地图。
+        copied = deepcopy({key: value for key, value in captured.items() if key != "map_snapshot"})
+        if "map_snapshot" in captured:
+            copied["map_snapshot"] = captured["map_snapshot"]
+        return copied
+
+    def get_observation_spatial_context(self, observation_id):
+        """读取同一完整观察的空间快照；已接线但缺失时不借用当前位置。"""
+        with self._context_condition:
+            captured = self._observation_spatial_contexts.get(observation_id)
+            if captured is not None:
+                return self._copy_spatial_context(captured)
+        return {} if self._spatial_context_provider is not None else None
+
     def acquire_latest_perception(self, camera_id=None, *, owner, full=False):
         """在短槽位锁内选择上下文并取得独立读取拥有方。"""
         with self._context_condition:
@@ -990,7 +1022,7 @@ class PerceptionService:
                 hold.release()
                 raise
 
-    def _publish_context(self, context, *, image_frame, source, kind, hold, full):
+    def _publish_context(self, context, *, image_frame, source, kind, hold, full, spatial_context=None):
         with self._context_condition:
             self._ensure_open()
             if hold is not None:
@@ -1027,6 +1059,15 @@ class PerceptionService:
                 self._latest_full_by_camera[context.camera_id] = context
                 if new_holds[2] is not None:
                     self._full_holds[context.camera_id] = new_holds[2]
+            # 只在结果及制品拥有方发布成功后一起登记，随相同槽位/历史淘汰。
+            if full and spatial_context is not None:
+                self._observation_spatial_contexts[context.observation.observation_id] = spatial_context
+            retained = {item.observation.observation_id for item in self._history}
+            retained.update(item.observation.observation_id for item in self._latest_full_by_camera.values())
+            retained.update(item.observation.observation_id for item in self._latest_by_camera.values())
+            for observation_id in tuple(self._observation_spatial_contexts):
+                if observation_id not in retained:
+                    self._observation_spatial_contexts.pop(observation_id)
             for old_hold in old_holds:
                 if old_hold is not None:
                     old_hold.release()
@@ -1078,6 +1119,7 @@ class PerceptionService:
             holds = tuple(self._latest_holds.values()) + tuple(self._full_holds.values()) + tuple(self._history_holds)
             self._latest_by_camera.clear()
             self._latest_full_by_camera.clear()
+            self._observation_spatial_contexts.clear()
             self._latest_frame_timestamp_by_camera.clear()
             self._history.clear()
             self._fast_frame_cache.clear()

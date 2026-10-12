@@ -351,6 +351,8 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
     let zero_applied_monotonic_ns = u64::try_from(message.zero_applied_monotonic_ns).ok()?;
     let goal_generation = u64::try_from(message.goal_generation).ok()?;
     let path_revision = u64::try_from(message.path_revision).ok()?;
+    let producer_runtime_generation = u64::try_from(message.producer_runtime_generation).ok()?;
+    let planner_runtime_generation = u64::try_from(message.planner_runtime_generation).ok()?;
     let sink_ready = match message.sink_ready {
         0 => false,
         1 => true,
@@ -366,9 +368,9 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
             )
             || message.parent_request_id.trim().is_empty()
             || goal_generation == 0
-            || message.goal_payload_sha256 == [0; 32]
-            || (path_revision == 0 && message.path_payload_sha256 != [0; 32])
-            || (path_revision > 0 && message.path_payload_sha256 == [0; 32])
+            || message.producer_runtime_generation == 0
+            || (path_revision == 0 && message.planner_runtime_generation != 0)
+            || (path_revision > 0 && message.planner_runtime_generation == 0)
         {
             return None;
         }
@@ -376,8 +378,8 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
         || !message.parent_request_id.is_empty()
         || goal_generation != 0
         || path_revision != 0
-        || message.goal_payload_sha256 != [0; 32]
-        || message.path_payload_sha256 != [0; 32]
+        || message.producer_runtime_generation != 0
+        || message.planner_runtime_generation != 0
     {
         return None;
     }
@@ -389,7 +391,7 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
         timestamp_ns,
     };
     Some(NavigationUpdate {
-        producer_runtime_generation: 0,
+        producer_runtime_generation,
         feedback: NavigationFeedback {
             reason_code: navigation_state_name(message.state, &state.message),
             runtime_generation,
@@ -404,8 +406,8 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
             parent_request_id: message.parent_request_id,
             goal_generation,
             path_revision,
-            goal_payload_sha256: message.goal_payload_sha256,
-            path_payload_sha256: message.path_payload_sha256,
+            producer_runtime_generation,
+            planner_runtime_generation,
             local_path: if message.state == 2 { message.local_path } else { Vec::new() },
             ..NavigationFeedback::default()
         },
@@ -599,8 +601,8 @@ mod tests {
             parent_request_id: "request-7".into(),
             goal_generation: 5,
             path_revision: 0,
-            goal_payload_sha256: [7; 32],
-            path_payload_sha256: [0; 32],
+            producer_runtime_generation: 7,
+            planner_runtime_generation: 0,
             local_path: vec![[0.0,0.0,0.4],[0.5,0.0,0.4]],
         })
         .unwrap();
@@ -621,7 +623,7 @@ mod tests {
         );
         assert_eq!(nav.feedback.parent_request_id, "request-7");
         assert_eq!(nav.feedback.goal_generation, 5);
-        assert_eq!(nav.feedback.goal_payload_sha256, [7; 32]);
+        assert_eq!(nav.feedback.producer_runtime_generation, 7);
 
         let tf = schema::encode_tf_message_body(&schema::TfMessage {
             transforms: vec![schema::TransformStamped {
@@ -694,8 +696,8 @@ mod tests {
             parent_request_id: "request-cancelled".into(),
             goal_generation: 3,
             path_revision: 1,
-            goal_payload_sha256: [3; 32],
-            path_payload_sha256: [4; 32],
+            producer_runtime_generation: 3,
+            planner_runtime_generation: 4,
             local_path: vec![[0.0,0.0,0.4],[0.5,0.0,0.4]],
         })
         .expect("encode stack cancel ack");
@@ -742,7 +744,7 @@ mod tests {
             owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
             parent_request_id: "request-without-guard".into(),
             goal_generation: 1,
-            goal_payload_sha256: [7; 32],
+            producer_runtime_generation: 7,
             ..schema::NavigationState::default()
         })
         .expect("encode active navigation state");

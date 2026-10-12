@@ -58,6 +58,17 @@ impl SurfaceObservations {
         block: [i32; 3],
         values: BTreeMap<[i32; 3], SurfaceObservation>,
     ) -> Result<(), SurfaceError> {
+        self.replace_block_with_geometry_changes(block, values).map(|_| ())
+    }
+
+    /// Replace a complete block and return only XY columns whose final occupied
+    /// levels changed, including removals. Evidence-only updates return empty.
+    pub fn replace_block_with_geometry_changes(
+        &mut self,
+        block: [i32; 3],
+        values: BTreeMap<[i32; 3], SurfaceObservation>,
+    ) -> Result<Vec<[i32; 2]>, SurfaceError> {
+        let mut changed = Vec::new();
         if values.len() > (self.block_edge as usize).pow(3) {
             return Err(SurfaceError::InvalidConfig("观察块坐标或容量无效".into()));
         }
@@ -87,9 +98,12 @@ impl SurfaceObservations {
                 levels.retain(|z|z.div_euclid(self.block_edge)!=block[2]);
                 if let Some(replacement)=replacement.remove(&column) {levels.extend(replacement);}
                 levels.sort_unstable();levels.dedup();
-                if levels.is_empty() {self.columns.remove(&column);}
-                else if self.columns.get(&column).is_none_or(|previous|previous.as_slice()!=levels.as_slice()) {
-                    self.columns.insert(column,Arc::new(levels));
+                let differs = self.columns.get(&column)
+                    .map_or(!levels.is_empty(), |previous| previous.as_slice() != levels.as_slice());
+                if differs {
+                    changed.push(column);
+                    if levels.is_empty() { self.columns.remove(&column); }
+                    else { self.columns.insert(column, Arc::new(levels)); }
                 }
             }
         }
@@ -99,7 +113,7 @@ impl SurfaceObservations {
             self.blocks.insert(block, Arc::new(values.into_iter().collect()));
         }
         self.obstacle_cache = Default::default();
-        Ok(())
+        Ok(changed)
     }
 
     /// 确认本索引覆盖同域、同精度、同次几何提交的全部已知占据。

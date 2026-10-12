@@ -504,11 +504,10 @@ fn path_matches_active_goal(path: &schema::PathEnvelope, goal: &schema::GoalEnve
         && path.committed_map_source_timestamp_ns == goal.committed_map_source_timestamp_ns
         && path.committed_map_frame_id == goal.committed_map_frame_id
         && path.boundary_id == goal.boundary_id
-        && path.boundary_sha256 == goal.boundary_sha256
         && path.motion_guard_generation == goal.motion_guard_generation
         && path.motion_guard_boot_nonce == goal.motion_guard_boot_nonce
         && path.motion_stop_generation == goal.motion_stop_generation
-        && path.goal_payload_sha256 == goal.payload_sha256
+        && path.producer_runtime_generation == goal.producer_runtime_generation
 }
 
 fn is_canonical_path_candidate(entry: &PathLedgerEntry, goal: &schema::GoalEnvelope) -> bool {
@@ -516,8 +515,7 @@ fn is_canonical_path_candidate(entry: &PathLedgerEntry, goal: &schema::GoalEnvel
     path_matches_active_goal(path, goal)
         && path.planner_runtime_generation > 0
         && path.path_revision > 0
-        && path.path_payload_sha256
-            == schema::path_envelope_payload_sha256(path).expect("candidate path hash")
+        && schema::validate_path_envelope(path).is_ok()
 }
 
 fn accepted_state_matches_active_goal(
@@ -528,7 +526,7 @@ fn accepted_state_matches_active_goal(
         && state.owner_kind == goal.owner_kind
         && state.parent_request_id == goal.parent_request_id
         && state.goal_generation == goal.goal_generation
-        && state.goal_payload_sha256 == goal.payload_sha256
+        && state.producer_runtime_generation == goal.producer_runtime_generation
 }
 
 fn match_accepted_path_candidate(
@@ -550,14 +548,14 @@ fn match_accepted_path_candidate(
             && path.owner_kind == state.owner_kind
             && path.parent_request_id == state.parent_request_id
             && path.goal_generation == state.goal_generation
-            && path.goal_payload_sha256 == state.goal_payload_sha256
+            && path.producer_runtime_generation == state.producer_runtime_generation
             && path.path_revision == state.path_revision
-            && path.path_payload_sha256 == state.path_payload_sha256;
+            && path.planner_runtime_generation == state.planner_runtime_generation;
         if exact {
             return AcceptedPathCandidateMatch::Matched(entry.clone());
         }
         if path.path_revision == state.path_revision
-            || path.path_payload_sha256 == state.path_payload_sha256
+            || (path.planner_runtime_generation == state.planner_runtime_generation && path.path_revision > state.path_revision)
         {
             conflicting_candidate = true;
         }
@@ -594,9 +592,9 @@ fn classify_pending_accepted_state_update(
         && incoming.owner_kind == pending.owner_kind
         && incoming.parent_request_id == pending.parent_request_id
         && incoming.goal_generation == pending.goal_generation
-        && incoming.goal_payload_sha256 == pending.goal_payload_sha256
+        && incoming.producer_runtime_generation == pending.producer_runtime_generation
         && incoming.path_revision == pending.path_revision
-        && incoming.path_payload_sha256 == pending.path_payload_sha256;
+        && incoming.planner_runtime_generation == pending.planner_runtime_generation;
     if duplicate {
         PendingAcceptedStateUpdate::Duplicate
     } else if incoming.path_revision == pending.path_revision {
@@ -1599,8 +1597,8 @@ fn has_empty_navigation_identity(state: &schema::NavigationState) -> bool {
         && state.parent_request_id.is_empty()
         && state.goal_generation == 0
         && state.path_revision == 0
-        && state.goal_payload_sha256 == [0; 32]
-        && state.path_payload_sha256 == [0; 32]
+        && state.producer_runtime_generation == 0
+        && state.planner_runtime_generation == 0
 }
 
 async fn fail_pre_path_gate(
@@ -1668,7 +1666,7 @@ fn spawn_path_ledger(
             let first = path.path.poses.first().map(|pose| pose.pose.position);
             let last = path.path.poses.last().map(|pose| pose.pose.position);
             eprintln!(
-                "V2 PATH_LEDGER ordinal={} elapsed_ns={} schema={} session={} owner={} parent={} goal_generation={} producer={} producer_epoch={} producer_runtime_generation={} map_session={} map_session_generation={} map_revision={} map_boot_nonce={:02x?} map_commit_sequence={} map_source_timestamp_ns={} map_frame={} boundary_id={} boundary_hash={:02x?} guard_generation={} guard_nonce={:02x?} stop_generation={} planner_generation={} revision={} source_timestamp_ns={} goal_hash={:02x?} path_hash={:02x?} points={} first={:?} last={:?}",
+                "V2 PATH_LEDGER ordinal={} elapsed_ns={} schema={} session={} owner={} parent={} goal_generation={} producer={} producer_epoch={} producer_runtime_generation={} map_session={} map_session_generation={} map_revision={} map_boot_nonce={:02x?} map_commit_sequence={} map_source_timestamp_ns={} map_frame={} boundary_id={} guard_generation={} guard_nonce={:02x?} stop_generation={} planner_generation={} revision={} source_timestamp_ns={} goal_runtime={} planner_runtime={} points={} first={:?} last={:?}",
                 ordinal,
                 elapsed_ns,
                 path.schema_version,
@@ -1687,15 +1685,14 @@ fn spawn_path_ledger(
                 path.committed_map_source_timestamp_ns,
                 path.committed_map_frame_id,
                 path.boundary_id,
-                path.boundary_sha256,
                 path.motion_guard_generation,
                 path.motion_guard_boot_nonce,
                 path.motion_stop_generation,
                 path.planner_runtime_generation,
                 path.path_revision,
                 path.source_timestamp_ns,
-                path.goal_payload_sha256,
-                path.path_payload_sha256,
+                path.producer_runtime_generation,
+                path.planner_runtime_generation,
                 path.path.poses.len(),
                 first,
                 last
@@ -1743,7 +1740,7 @@ fn spawn_nav_state_ledger(
                 .observe_receipt(&state, ordinal, receipt_at);
             send_live_input_ack_wakes(&ack_wake_tx, ack_wake);
             eprintln!(
-                "V2 STATE_LEDGER ordinal={} elapsed_ns={} session={} runtime_generation={} guard_generation={} pose_source_timestamp_ns={} costmap_source_timestamp_ns={} goal_generation={} path_revision={} goal_hash={:02x?} path_hash={:02x?} state={} message={:?} zero_ack={} zero_ns={}",
+                "V2 STATE_LEDGER ordinal={} elapsed_ns={} session={} runtime_generation={} guard_generation={} pose_source_timestamp_ns={} costmap_source_timestamp_ns={} goal_generation={} path_revision={} goal_runtime={} planner_runtime={} state={} message={:?} zero_ack={} zero_ns={}",
                 ordinal,
                 elapsed_ns,
                 state.session_id,
@@ -1753,8 +1750,8 @@ fn spawn_nav_state_ledger(
                 state.costmap_source_timestamp_ns,
                 state.goal_generation,
                 state.path_revision,
-                state.goal_payload_sha256,
-                state.path_payload_sha256,
+                state.producer_runtime_generation,
+                state.planner_runtime_generation,
                 state.state,
                 state.message,
                 state.zero_ack_id,
@@ -1942,13 +1939,13 @@ async fn cleanup_v2_canary(
     let dump = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         for entry in path_ledger.iter() {
             eprintln!(
-                "V2 CLEANUP_PATH ordinal={} elapsed_ns={} session={} goal_generation={} revision={} path_hash={:02x?}",
+                "V2 CLEANUP_PATH ordinal={} elapsed_ns={} session={} goal_generation={} revision={} planner_runtime={}",
                 entry.ordinal,
                 entry.elapsed_ns,
                 entry.path.session_id,
                 entry.path.goal_generation,
                 entry.path.path_revision,
-                entry.path.path_payload_sha256
+                entry.path.planner_runtime_generation
             );
         }
         nav_state_ledger.dump("V2 CLEANUP_STATE");
@@ -2631,6 +2628,7 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
     let (nav_state_tx, _) = broadcast::channel(8);
     let (frontiers_tx, _) = broadcast::channel(4);
     let bridge = Arc::new(ExploreNavigationBridge {
+        body_reference_frame_id: Arc::from("base_link"),
         mapping_adapter: None,
         state: state.clone(),
         expected_map_frame: Arc::from("map"),
@@ -3196,7 +3194,7 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
         goal.producer_runtime_generation,
         lease.producer_runtime_generation as i64
     );
-    assert_eq!(goal.payload_sha256, lease.goal_payload_sha256);
+    assert_eq!(goal.producer_runtime_generation, lease.producer_runtime_generation as i64);
     assert_eq!(goal.boundary_frame_id, "map");
     assert_eq!(goal.boundary_points.len(), 4);
     assert_eq!(goal.goal.header.frame_id, "map");
@@ -3382,7 +3380,7 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
 
             let mut wrong_identity = path.clone();
             wrong_identity.session_id.push_str("-stale");
-            schema::seal_path_envelope(&mut wrong_identity).expect("reseal wrong-identity path");
+            schema::validate_path_envelope(&wrong_identity).expect("reseal wrong-identity path");
             assert!(nav.observe_path_envelope(&wrong_identity).await.is_err());
             assert_eq!(explore.snapshot().status, "ACTIVE");
             resources
@@ -3503,13 +3501,13 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
         }
         PathAcceptanceOutcome::UnexpectedAccepted(entry) => {
             acceptance_failure = Some(format!(
-                "unexpected Path accepted: ordinal={} session={:?} goal_generation={} path_revision={} goal_hash={:02x?} path_hash={:02x?} message={:?}",
+                "unexpected Path accepted: ordinal={} session={:?} goal_generation={} path_revision={} goal_runtime={} planner_runtime={} message={:?}",
                 entry.ordinal,
                 entry.state.session_id,
                 entry.state.goal_generation,
                 entry.state.path_revision,
-                entry.state.goal_payload_sha256,
-                entry.state.path_payload_sha256,
+                entry.state.producer_runtime_generation,
+                entry.state.planner_runtime_generation,
                 entry.state.message
             ));
             let terminal_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -3606,7 +3604,7 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
                             NavCriticalEvidenceKind::UnexpectedState
                         };
                         quiet_failure = Some(format!(
-                            "noncanonical NavigationState during post-terminal quiet window: ordinal={} state={} session={:?} owner={} parent={:?} goal_generation={} path_revision={} goal_hash={:02x?} path_hash={:02x?} message={:?}",
+                            "noncanonical NavigationState during post-terminal quiet window: ordinal={} state={} session={:?} owner={} parent={:?} goal_generation={} path_revision={} goal_runtime={} planner_runtime={} message={:?}",
                             entry.ordinal,
                             entry.state.state,
                             entry.state.session_id,
@@ -3614,8 +3612,8 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
                             entry.state.parent_request_id,
                             entry.state.goal_generation,
                             entry.state.path_revision,
-                            entry.state.goal_payload_sha256,
-                            entry.state.path_payload_sha256,
+                            entry.state.producer_runtime_generation,
+                            entry.state.planner_runtime_generation,
                             entry.state.message
                         ));
                         nav_state_ledger.record(NavEvidenceKind::Critical(kind), entry);
@@ -3646,15 +3644,15 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
 
     for entry in &path_ledger {
         eprintln!(
-            "V2 PATH_LEDGER_FINAL ordinal={} elapsed_ns={} session={} planner_generation={} goal_generation={} revision={} goal_hash={:02x?} path_hash={:02x?} points={}",
+            "V2 PATH_LEDGER_FINAL ordinal={} elapsed_ns={} session={} planner_generation={} goal_generation={} revision={} goal_runtime={} planner_runtime={} points={}",
             entry.ordinal,
             entry.elapsed_ns,
             entry.path.session_id,
             entry.path.planner_runtime_generation,
             entry.path.goal_generation,
             entry.path.path_revision,
-            entry.path.goal_payload_sha256,
-            entry.path.path_payload_sha256,
+            entry.path.producer_runtime_generation,
+            entry.path.planner_runtime_generation,
             entry.path.path.poses.len()
         );
     }
@@ -3672,7 +3670,9 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
             left.path.session_id == right.path.session_id
                 && left.path.goal_generation == right.path.goal_generation
                 && left.path.path_revision == right.path.path_revision
-                && left.path.path_payload_sha256 != right.path.path_payload_sha256
+                && left.path.producer_runtime_generation == right.path.producer_runtime_generation
+                && left.path.planner_runtime_generation == right.path.planner_runtime_generation
+                && left.path.path.poses.iter().map(|p| &p.pose).ne(right.path.path.poses.iter().map(|p| &p.pose))
         })
     }) || retained_nav_states.iter().any(|entry| {
         let message = entry.state.message.to_ascii_lowercase();
@@ -3931,7 +3931,7 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
     }
     assert_eq!(second_path.session_id, second_goal.session_id);
     assert_eq!(second_path.goal_generation, second_goal.goal_generation);
-    assert_eq!(second_path.goal_payload_sha256, second_goal.payload_sha256);
+    assert_eq!(second_path.producer_runtime_generation, second_goal.producer_runtime_generation);
 
     let second_child_lease = next_active
         .child_lease
@@ -3983,11 +3983,10 @@ fn acceptance_test_goal() -> schema::GoalEnvelope {
         committed_map_source_timestamp_ns: 17,
         committed_map_frame_id: "map".to_string(),
         boundary_id: "acceptance-boundary".to_string(),
-        boundary_sha256: [0x17; 32],
         motion_guard_generation: 18,
         motion_guard_boot_nonce: [0x19; 16],
         motion_stop_generation: 20,
-        payload_sha256: [0x21; 32],
+        body_reference_frame_id: "base_link".into(),
         ..schema::GoalEnvelope::default()
     }
 }
@@ -4014,14 +4013,13 @@ fn acceptance_test_path(
         committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
         committed_map_frame_id: goal.committed_map_frame_id.clone(),
         boundary_id: goal.boundary_id.clone(),
-        boundary_sha256: goal.boundary_sha256,
         motion_guard_generation: goal.motion_guard_generation,
         motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
         motion_stop_generation: goal.motion_stop_generation,
         planner_runtime_generation: 22,
         path_revision: revision,
         source_timestamp_ns: 2_000_000_000,
-        goal_payload_sha256: goal.payload_sha256,
+
         path: schema::Path {
             header: schema::Header {
                 stamp_sec: 2,
@@ -4039,7 +4037,7 @@ fn acceptance_test_path(
         },
         ..schema::PathEnvelope::default()
     };
-    schema::seal_path_envelope(&mut path).expect("seal acceptance test path");
+    schema::validate_path_envelope(&path).expect("seal acceptance test path");
     PathLedgerEntry {
         ordinal,
         elapsed_ns: u128::from(ordinal),
@@ -4055,8 +4053,8 @@ fn acceptance_test_state(path: &schema::PathEnvelope) -> schema::NavigationState
         parent_request_id: path.parent_request_id.clone(),
         goal_generation: path.goal_generation,
         path_revision: path.path_revision,
-        goal_payload_sha256: path.goal_payload_sha256,
-        path_payload_sha256: path.path_payload_sha256,
+        producer_runtime_generation: path.producer_runtime_generation,
+        planner_runtime_generation: path.planner_runtime_generation,
         ..schema::NavigationState::default()
     }
 }
@@ -4073,8 +4071,7 @@ fn canonical_path_candidate_requires_exact_committed_map_receipt() {
             1 => conflict.path.committed_map_commit_sequence += 1,
             _ => conflict.path.committed_map_source_timestamp_ns += 1,
         }
-        // A valid path-body hash cannot repair mismatched canonical map provenance.
-        conflict.path.path_payload_sha256 = schema::path_envelope_payload_sha256(&conflict.path).unwrap();
+        // Reusing an assigned path key cannot repair mismatched map provenance.
         assert!(!is_canonical_path_candidate(&conflict, &goal));
     }
 }
@@ -4115,7 +4112,7 @@ fn accepted_path_candidate_waits_for_state_before_path_reordering() {
 }
 
 #[test]
-fn accepted_path_candidate_rejects_identity_hash_and_revision_conflicts() {
+fn accepted_path_candidate_rejects_identity_planner_and_revision_conflicts() {
     let goal = acceptance_test_goal();
     let revision_two = acceptance_test_path(&goal, 2, 2);
     let candidates = VecDeque::from([revision_two.clone()]);
@@ -4127,10 +4124,10 @@ fn accepted_path_candidate_rejects_identity_hash_and_revision_conflicts() {
         AcceptedPathCandidateMatch::Conflict
     ));
 
-    let mut wrong_hash = acceptance_test_state(&revision_two.path);
-    wrong_hash.path_payload_sha256[0] ^= 1;
+    let mut wrong_planner = acceptance_test_state(&revision_two.path);
+    wrong_planner.planner_runtime_generation += 1;
     assert!(matches!(
-        match_accepted_path_candidate(&wrong_hash, &goal, &candidates),
+        match_accepted_path_candidate(&wrong_planner, &goal, &candidates),
         AcceptedPathCandidateMatch::Conflict
     ));
 
@@ -4184,10 +4181,10 @@ fn pending_accepted_state_distinguishes_duplicate_and_revision_rollback() {
         PendingAcceptedStateUpdate::Duplicate
     );
 
-    let mut same_revision_different_hash = state_two.clone();
-    same_revision_different_hash.path_payload_sha256[0] ^= 1;
+    let mut same_revision_different_planner = state_two.clone();
+    same_revision_different_planner.planner_runtime_generation += 1;
     assert_eq!(
-        classify_pending_accepted_state_update(&state_two, &same_revision_different_hash, &goal,),
+        classify_pending_accepted_state_update(&state_two, &same_revision_different_planner, &goal,),
         PendingAcceptedStateUpdate::Conflict
     );
 
@@ -4308,6 +4305,7 @@ fn canary_readiness_handle(nav: &crate::nav_runtime::NavRuntimeState) -> Geometr
     let (map_revision_tx, _) = broadcast::channel(1);
     let (map_revision_latest_tx, _) = watch::channel(None);
     ExploreNavigationBridge {
+        body_reference_frame_id: Arc::from("base_link"),
         mapping_adapter: None,
         state: Arc::new(RwLock::new(SharedState::default())),
         expected_map_frame: Arc::from("map"),
@@ -5998,7 +5996,7 @@ async fn cleanup_recognizes_real_pre_start_explore_as_settled() {
         parent_request_id: "retained-parent".to_string(),
         goal_generation: 1,
         producer_runtime_generation: 1,
-        goal_payload_sha256: [1; 32],
+
     });
     assert!(!explore_pre_start_allows_sink_clear(&retained, false));
     retained.child_lease = None;
@@ -6009,6 +6007,7 @@ async fn cleanup_recognizes_real_pre_start_explore_as_settled() {
 
     retained.ownership_reconciliation_receipt = Some(
         crate::explore_runtime::ExplorationOwnershipReconciliationReceipt {
+            child_lease: None,
             cause: "test-residual".to_string(),
             recovery_correlation: "test-correlation".to_string(),
             parent_request_id: "retained-parent".to_string(),
@@ -6046,7 +6045,7 @@ fn cleanup_requires_exact_explore_terminal_before_sink_clear() {
         parent_request_id: "retained-parent".to_string(),
         goal_generation: 1,
         producer_runtime_generation: 1,
-        goal_payload_sha256: [1; 32],
+
     });
     assert!(!explore_stop_allows_sink_clear(&stopped, false));
     stopped.child_lease = None;

@@ -8,7 +8,11 @@ use super::offline_replay::{
     OfflineBackendConfigV1, OfflineBackendKind, OfflineGeoreferenceV1, OfflineMapSnapshotSeedV2,
     OfflineReplayIdentityV2,
 };
-use super::offline_replay_owner::{OfflineGeometrySnapshotV2, OfflineReplayProcessingReceiptV1};
+use super::offline_replay_owner::{
+    OfflineCanonicalCloudReceiptV1, OfflineCanonicalCommitIdV1,
+    OfflineCanonicalOccupancyReceiptV1, OfflineGeometrySnapshotV3,
+    OfflineReplayProcessingReceiptV1,
+};
 use nuwax_mapping_raytracing::voxel_ray_tracer::{
     decode_voxel_map_checkpoint_for_config, Config as RayConfig, VOXEL_MAP_CHECKPOINT_ENTRY_BYTES,
     VOXEL_MAP_CHECKPOINT_HEADER_BYTES,
@@ -24,7 +28,7 @@ const MAX_RETAINED_VOXEL_POINTS: usize =
     (super::mapping_backend::MAX_MAPPING_BACKEND_CHECKPOINT_BYTES - 48) / 24;
 
 #[derive(Clone, Debug)]
-pub struct OfflineCandidateAssetsV1 {
+pub struct OfflineCandidateAssetsV2 {
     pub schema_version: u32,
     pub snapshot_schema_version: u32,
     pub identity: OfflineReplayIdentityV2,
@@ -32,27 +36,36 @@ pub struct OfflineCandidateAssetsV1 {
     pub last_source_timestamp_ns: u64,
     pub georeference: OfflineGeoreferenceV1,
     pub processing_receipt: OfflineReplayProcessingReceiptV1,
+    pub source_provenance: OfflineCandidateSourceProvenanceV2,
     pub map_snapshot_seed: OfflineMapSnapshotSeedV2,
     pub deferred: Vec<DeferredAssetMemberV1>,
-    pub members: Vec<CandidateAssetMemberV1>,
+    pub members: Vec<CandidateAssetMemberV2>,
+}
+
+/// Existing canonical source receipts, not an assigned asset or a content digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineCandidateSourceProvenanceV2 {
+    pub commit_id: OfflineCanonicalCommitIdV1,
+    pub occupancy_receipt: OfflineCanonicalOccupancyReceiptV1,
+    pub cloud_receipt: OfflineCanonicalCloudReceiptV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CandidateAssetMemberV1 {
+pub struct CandidateAssetMemberV2 {
     pub relative_path_intent: String,
     pub media_type: &'static str,
     pub encoding: CandidateAssetEncodingV1,
     pub bytes: Vec<u8>,
-    pub receipt: AssetReceiptV1,
+    pub receipt: AssetReceiptV2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AssetReceiptV1 {
+pub struct AssetReceiptV2 {
     pub relative_path_intent: String,
     pub media_type: &'static str,
     pub encoding: CandidateAssetEncodingV1,
     pub size_bytes: u64,
-    pub sha256_hex: String,
+    pub source_commit_id: OfflineCanonicalCommitIdV1,
     pub source_binding: &'static str,
 }
 
@@ -75,7 +88,7 @@ pub enum DeferredAssetMemberV1 {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum OfflineAssetExportError {
-    #[error("offline snapshot schema_version must be 2")]
+    #[error("offline snapshot schema_version must be 3")]
     InvalidSnapshotSchema,
     #[error("offline snapshot barrier and processing receipt are inconsistent")]
     InvalidProcessingReceipt,
@@ -105,21 +118,26 @@ pub enum OfflineAssetExportError {
     AssetSizeOverflow,
 }
 
-pub fn export_offline_candidate_assets_v1(
-    snapshot: &OfflineGeometrySnapshotV2,
-) -> Result<OfflineCandidateAssetsV1, OfflineAssetExportError> {
+pub fn export_offline_candidate_assets_v2(
+    snapshot: &OfflineGeometrySnapshotV3,
+) -> Result<OfflineCandidateAssetsV2, OfflineAssetExportError> {
     validate_snapshot(snapshot)?;
 
     let pgm = encode_nav2_pgm(snapshot)?;
     let yaml = encode_nav2_yaml(snapshot)?.into_bytes();
     let pcd = encode_pcd(snapshot)?;
-    let checkpoint_digest = hex_digest(&nuwax_codec::sha256_bytes(&snapshot.checkpoint));
+    let projection = &snapshot.canonical_checkpoint_projection;
+    let source_provenance = OfflineCandidateSourceProvenanceV2 {
+        commit_id: projection.occupancy_receipt.commit_id,
+        occupancy_receipt: projection.occupancy_receipt.clone(),
+        cloud_receipt: projection.cloud_receipt.clone(),
+    };
     let backend_name = match snapshot.backend_kind {
         OfflineBackendKind::Voxel => "voxel",
         OfflineBackendKind::Raytracing => "raytracing",
     };
     let checkpoint_path =
-        format!("mapping_backend/{backend_name}/objects/sha256-{checkpoint_digest}.bin");
+        format!("mapping_backend/{backend_name}/objects/checkpoint.bin");
 
     let members = vec![
         member(
@@ -128,6 +146,7 @@ pub fn export_offline_candidate_assets_v1(
             CandidateAssetEncodingV1::Nav2OccupancyYamlV1,
             yaml,
             "canonical_raw_occupancy",
+            source_provenance.commit_id,
         )?,
         member(
             NAV2_PGM_PATH,
@@ -135,6 +154,7 @@ pub fn export_offline_candidate_assets_v1(
             CandidateAssetEncodingV1::Nav2OccupancyPgmP5V1,
             pgm,
             "canonical_raw_occupancy",
+            source_provenance.commit_id,
         )?,
         member(
             PCD_PATH,
@@ -142,6 +162,7 @@ pub fn export_offline_candidate_assets_v1(
             CandidateAssetEncodingV1::PcdXyzBinaryV1,
             pcd,
             "committed_transformed_accepted_cloud",
+            source_provenance.commit_id,
         )?,
         member(
             &checkpoint_path,
@@ -149,18 +170,20 @@ pub fn export_offline_candidate_assets_v1(
             CandidateAssetEncodingV1::CheckpointObjectV1,
             snapshot.checkpoint.clone(),
             "mapping_backend_checkpoint",
+            source_provenance.commit_id,
         )?,
     ];
     let members = sort_and_validate_members(members)?;
 
-    Ok(OfflineCandidateAssetsV1 {
-        schema_version: 1,
+    Ok(OfflineCandidateAssetsV2 {
+        schema_version: 2,
         snapshot_schema_version: snapshot.schema_version,
         identity: snapshot.identity.clone(),
         backend_kind: snapshot.backend_kind,
         last_source_timestamp_ns: snapshot.last_source_timestamp_ns,
         georeference: snapshot.georeference.clone(),
         processing_receipt: snapshot.processing_receipt.clone(),
+        source_provenance,
         map_snapshot_seed: snapshot.map_snapshot_seed.clone(),
         deferred: vec![
             DeferredAssetMemberV1::CheckpointSelectorManifestStage4,
@@ -173,8 +196,8 @@ pub fn export_offline_candidate_assets_v1(
     })
 }
 
-fn validate_snapshot(snapshot: &OfflineGeometrySnapshotV2) -> Result<(), OfflineAssetExportError> {
-    if snapshot.schema_version != 2 {
+fn validate_snapshot(snapshot: &OfflineGeometrySnapshotV3) -> Result<(), OfflineAssetExportError> {
+    if snapshot.schema_version != 3 {
         return Err(OfflineAssetExportError::InvalidSnapshotSchema);
     }
     let receipt = &snapshot.processing_receipt;
@@ -186,6 +209,22 @@ fn validate_snapshot(snapshot: &OfflineGeometrySnapshotV2) -> Result<(), Offline
                 .map_err(|_| OfflineAssetExportError::InvalidProcessingReceipt)?
     {
         return Err(OfflineAssetExportError::InvalidProcessingReceipt);
+    }
+    let projection = &snapshot.canonical_checkpoint_projection;
+    let occupancy_receipt = &projection.occupancy_receipt;
+    let cloud_receipt = &projection.cloud_receipt;
+    if projection.schema_version != 2
+        || occupancy_receipt.commit_id != cloud_receipt.commit_id
+        || occupancy_receipt.commit_id.sequence != receipt.committed_frame_count
+        || occupancy_receipt.session_id != snapshot.barrier.replay_id
+        || occupancy_receipt.backend_kind != snapshot.backend_kind
+        || occupancy_receipt.backend_generation != snapshot.barrier.backend_generation
+        || occupancy_receipt.source_timestamp_ns != snapshot.last_source_timestamp_ns
+        || cloud_receipt.source_timestamp_ns != occupancy_receipt.source_timestamp_ns
+        || cloud_receipt.occupancy_revision != occupancy_receipt.occupancy_revision
+        || cloud_receipt.session_generation != occupancy_receipt.session_generation
+    {
+        return Err(OfflineAssetExportError::IdentityMismatch);
     }
     let identity = &snapshot.identity;
     if snapshot.barrier.replay_id != format!("{}:{}", identity.map_name, identity.source_id)
@@ -253,7 +292,7 @@ fn validate_snapshot(snapshot: &OfflineGeometrySnapshotV2) -> Result<(), Offline
 }
 
 fn validate_checkpoint(
-    snapshot: &OfflineGeometrySnapshotV2,
+    snapshot: &OfflineGeometrySnapshotV3,
 ) -> Result<(), OfflineAssetExportError> {
     let payload = snapshot.checkpoint.as_slice();
     if payload.is_empty()
@@ -465,7 +504,7 @@ fn read_u64(payload: &[u8], offset: usize) -> Result<u64, OfflineAssetExportErro
 }
 
 fn encode_nav2_pgm(
-    snapshot: &OfflineGeometrySnapshotV2,
+    snapshot: &OfflineGeometrySnapshotV3,
 ) -> Result<Vec<u8>, OfflineAssetExportError> {
     let grid = &snapshot.canonical_raw_occupancy;
     let mut bytes = format!("P5\n{} {}\n255\n", grid.width, grid.height).into_bytes();
@@ -491,7 +530,7 @@ fn encode_nav2_pgm(
 }
 
 fn encode_nav2_yaml(
-    snapshot: &OfflineGeometrySnapshotV2,
+    snapshot: &OfflineGeometrySnapshotV3,
 ) -> Result<String, OfflineAssetExportError> {
     let grid = &snapshot.canonical_raw_occupancy;
     let yaw = occupancy_yaw(grid.origin_orientation)?;
@@ -514,7 +553,7 @@ fn occupancy_yaw(rotation: [f64; 4]) -> Result<f64, OfflineAssetExportError> {
     }
 }
 
-fn encode_pcd(snapshot: &OfflineGeometrySnapshotV2) -> Result<Vec<u8>, OfflineAssetExportError> {
+fn encode_pcd(snapshot: &OfflineGeometrySnapshotV3) -> Result<Vec<u8>, OfflineAssetExportError> {
     let point_count = snapshot.committed_transformed_accepted_cloud.len();
     let mut bytes = format!(
         "# .PCD v0.7 - Point Cloud Data file format\nVERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\nWIDTH {point_count}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS {point_count}\nDATA binary\n"
@@ -534,19 +573,20 @@ fn member(
     encoding: CandidateAssetEncodingV1,
     bytes: Vec<u8>,
     source_binding: &'static str,
-) -> Result<CandidateAssetMemberV1, OfflineAssetExportError> {
+    source_commit_id: OfflineCanonicalCommitIdV1,
+) -> Result<CandidateAssetMemberV2, OfflineAssetExportError> {
     let size_bytes =
         u64::try_from(bytes.len()).map_err(|_| OfflineAssetExportError::AssetSizeOverflow)?;
     let relative_path_intent = path.to_owned();
-    let receipt = AssetReceiptV1 {
+    let receipt = AssetReceiptV2 {
         relative_path_intent: relative_path_intent.clone(),
         media_type,
         encoding,
         size_bytes,
-        sha256_hex: hex_digest(&nuwax_codec::sha256_bytes(&bytes)),
+        source_commit_id,
         source_binding,
     };
-    Ok(CandidateAssetMemberV1 {
+    Ok(CandidateAssetMemberV2 {
         relative_path_intent,
         media_type,
         encoding,
@@ -556,8 +596,8 @@ fn member(
 }
 
 fn sort_and_validate_members(
-    mut members: Vec<CandidateAssetMemberV1>,
-) -> Result<Vec<CandidateAssetMemberV1>, OfflineAssetExportError> {
+    mut members: Vec<CandidateAssetMemberV2>,
+) -> Result<Vec<CandidateAssetMemberV2>, OfflineAssetExportError> {
     members.sort_by(|left, right| {
         left.relative_path_intent
             .as_bytes()
@@ -571,16 +611,6 @@ fn sort_and_validate_members(
         return Err(OfflineAssetExportError::DuplicatePath);
     }
     Ok(members)
-}
-
-fn hex_digest(digest: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
 }
 
 fn python_g12(value: f64) -> String {
@@ -626,9 +656,9 @@ mod tests {
         OfflineReplayFrameV1, OfflineReplayRequestV1, OfflineVoxelConfigV1,
     };
     use crate::offline_replay_owner::{
-        GeometryOfflineReplayOwner, OfflineCanonicalCheckpointProjectionV1,
-        OfflineCanonicalCloudAssetProjectionV1, OfflineCanonicalCloudReceiptV1,
-        OfflineCanonicalCommitIdV1, OfflineCanonicalOccupancyAssetProjectionV1,
+        GeometryOfflineReplayOwner, OfflineCanonicalCheckpointProjectionV2,
+        OfflineCanonicalCloudAssetProjectionV2, OfflineCanonicalCloudReceiptV1,
+        OfflineCanonicalCommitIdV1, OfflineCanonicalOccupancyAssetProjectionV2,
         OfflineCanonicalOccupancyReceiptV1, ReplayBarrierIdentityV1,
     };
 
@@ -708,15 +738,15 @@ mod tests {
         }
     }
 
-    async fn real_snapshot(kind: OfflineBackendKind) -> OfflineGeometrySnapshotV2 {
+    async fn real_snapshot(kind: OfflineBackendKind) -> OfflineGeometrySnapshotV3 {
         let mut owner = GeometryOfflineReplayOwner::start(request(kind)).unwrap();
         for sequence in 1..=3 {
             owner.submit_frame(frame(sequence)).await.unwrap();
         }
-        owner.finish_v2().await.unwrap()
+        owner.finish_v3().await.unwrap()
     }
 
-    fn synthetic_snapshot() -> OfflineGeometrySnapshotV2 {
+    fn synthetic_snapshot() -> OfflineGeometrySnapshotV3 {
         let barrier = ReplayBarrierIdentityV1 {
             replay_id: "map:source".to_owned(),
             backend_generation: 1,
@@ -765,24 +795,16 @@ mod tests {
             .into_iter()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
-        let canonical_checkpoint_projection = OfflineCanonicalCheckpointProjectionV1 {
-            schema_version: 1,
+        let canonical_checkpoint_projection = OfflineCanonicalCheckpointProjectionV2 {
+            schema_version: 2,
             created_at_ns: 1,
             source_session_id: "map:source".to_owned(),
             source_session_generation: 1,
             backend_kind: OfflineBackendKind::Voxel,
-            checkpoint_sha256: nuwax_codec::sha256_bytes(&checkpoint),
             checkpoint_size: checkpoint.len() as u64,
             occupancy_receipt,
             cloud_receipt,
-            occupancy_asset: OfflineCanonicalOccupancyAssetProjectionV1 {
-                raw_data_sha256: nuwax_codec::sha256_bytes(
-                    &grid
-                        .data
-                        .iter()
-                        .map(|value| value.to_le_bytes()[0])
-                        .collect::<Vec<_>>(),
-                ),
+            occupancy_asset: OfflineCanonicalOccupancyAssetProjectionV2 {
                 raw_data_size: 6,
                 width: 2,
                 height: 3,
@@ -793,8 +815,7 @@ mod tests {
                 source_occupancy_revision: 1,
                 timestamp_ns: 1,
             },
-            cloud_asset: OfflineCanonicalCloudAssetProjectionV1 {
-                xyz_sha256: nuwax_codec::sha256_bytes(&xyz_f32_le),
+            cloud_asset: OfflineCanonicalCloudAssetProjectionV2 {
                 xyz_size: 12,
                 frame_id: "map_frame".to_owned(),
                 source_cloud_revision: 1,
@@ -804,8 +825,8 @@ mod tests {
                 xyz_f32_le,
             },
         };
-        OfflineGeometrySnapshotV2 {
-            schema_version: 2,
+        OfflineGeometrySnapshotV3 {
+            schema_version: 3,
             barrier: barrier.clone(),
             identity: OfflineReplayIdentityV2 {
                 map_name: "map".to_owned(),
@@ -847,7 +868,13 @@ mod tests {
 
     #[test]
     fn non_square_nav2_assets_and_python_pcd_oracle_are_exact() {
-        let candidate = export_offline_candidate_assets_v1(&synthetic_snapshot()).unwrap();
+        let snapshot = synthetic_snapshot();
+        let candidate = export_offline_candidate_assets_v2(&snapshot).unwrap();
+        assert_eq!(candidate.schema_version, 2);
+        assert_eq!(candidate.snapshot_schema_version, 3);
+        assert_eq!(candidate.source_provenance.commit_id, snapshot.canonical_checkpoint_projection.occupancy_receipt.commit_id);
+        assert_eq!(candidate.source_provenance.cloud_receipt.point_count, 1);
+        assert_eq!(candidate.processing_receipt.committed_point_count, 2);
         let pgm = candidate
             .members
             .iter()
@@ -885,9 +912,12 @@ mod tests {
             python_oracle.extend_from_slice(&(value as f32).to_le_bytes());
         }
         assert_eq!(pcd.bytes, python_oracle);
+        assert_eq!(pcd.receipt.source_binding, "committed_transformed_accepted_cloud");
+        assert_ne!(candidate.processing_receipt.committed_point_count,
+            u64::from(candidate.source_provenance.cloud_receipt.point_count));
         let points_json = "[[1.234567890123,-2.5000001192092896,3.750000238418579],[-4.125000476837158,5.500000953674316,-6.750001907348633]]";
         let python = std::process::Command::new(
-            "/home/ml/Deeprob/nuwax_robot_bridge/.venv_model_download/bin/python",
+            std::env::var_os("NEH_PYTHON").unwrap_or_else(|| "python3".into()),
         )
         .args([
             "-c",
@@ -913,8 +943,8 @@ mod tests {
             assert_eq!(member.receipt.encoding, member.encoding);
             assert_eq!(member.receipt.size_bytes, member.bytes.len() as u64);
             assert_eq!(
-                member.receipt.sha256_hex,
-                hex_digest(&nuwax_codec::sha256_bytes(&member.bytes))
+                member.receipt.source_commit_id,
+                candidate.source_provenance.commit_id
             );
             assert!(!member.receipt.source_binding.is_empty());
         }
@@ -935,10 +965,14 @@ mod tests {
         let mut boot_nonces = Vec::new();
         for kind in [OfflineBackendKind::Voxel, OfflineBackendKind::Raytracing] {
             let snapshot = real_snapshot(kind).await;
-            let first = export_offline_candidate_assets_v1(&snapshot).unwrap();
-            let second = export_offline_candidate_assets_v1(&snapshot).unwrap();
+            let first = export_offline_candidate_assets_v2(&snapshot).unwrap();
+            let second = export_offline_candidate_assets_v2(&snapshot).unwrap();
             assert_eq!(first.members, second.members);
             assert_eq!(first.members.len(), 4);
+            assert_eq!(first.source_provenance, second.source_provenance);
+            assert!(first.processing_receipt.flush_committed);
+            assert_eq!(first.source_provenance.commit_id.sequence,
+                first.processing_receipt.barrier.mapping_commit_sequence);
             let checkpoint = first
                 .members
                 .iter()
@@ -946,29 +980,27 @@ mod tests {
                 .unwrap();
             assert_eq!(checkpoint.bytes, snapshot.checkpoint);
             assert_eq!(
-                checkpoint.receipt.sha256_hex,
-                hex_digest(&nuwax_codec::sha256_bytes(&snapshot.checkpoint))
+                checkpoint.receipt.source_commit_id,
+                snapshot.canonical_checkpoint_projection.occupancy_receipt.commit_id
             );
-            assert!(checkpoint.relative_path_intent.starts_with(match kind {
-                OfflineBackendKind::Voxel => "mapping_backend/voxel/objects/sha256-",
+            assert!(checkpoint.relative_path_intent == match kind {
+                OfflineBackendKind::Voxel => "mapping_backend/voxel/objects/checkpoint.bin",
                 OfflineBackendKind::Raytracing => {
-                    "mapping_backend/raytracing/objects/sha256-"
+                    "mapping_backend/raytracing/objects/checkpoint.bin"
                 }
-            }));
+            });
             assert!(first.members.windows(2).all(|pair| {
                 pair[0].relative_path_intent.as_bytes() < pair[1].relative_path_intent.as_bytes()
             }));
             let projection = &snapshot.canonical_checkpoint_projection;
-            assert_eq!(projection.schema_version, 1);
+            assert_eq!(projection.schema_version, 2);
             assert!(projection.created_at_ns > 0);
             assert_eq!(projection.source_session_id, "map:source");
             assert_eq!(projection.source_session_generation, 1);
             assert_eq!(projection.backend_kind, kind);
             assert_eq!(projection.checkpoint_size, snapshot.checkpoint.len() as u64);
-            assert_eq!(
-                projection.checkpoint_sha256,
-                nuwax_codec::sha256_bytes(&snapshot.checkpoint)
-            );
+            assert_eq!(first.source_provenance.occupancy_receipt, projection.occupancy_receipt);
+            assert_eq!(first.source_provenance.cloud_receipt, projection.cloud_receipt);
             assert_ne!(projection.occupancy_receipt.commit_id.boot_nonce, 0);
             boot_nonces.push(projection.occupancy_receipt.commit_id.boot_nonce);
             assert_eq!(projection.occupancy_receipt.commit_id.sequence, 3);
@@ -995,10 +1027,7 @@ mod tests {
                 projection.cloud_asset.xyz_f32_le.len(),
                 projection.cloud_asset.point_count as usize * 12
             );
-            assert_eq!(
-                projection.cloud_asset.xyz_sha256,
-                nuwax_codec::sha256_bytes(&projection.cloud_asset.xyz_f32_le)
-            );
+            assert_eq!(projection.cloud_asset.xyz_size, projection.cloud_asset.xyz_f32_le.len() as u64);
             assert_eq!(
                 projection.cloud_asset.source_cloud_revision,
                 projection.cloud_receipt.cloud_revision
@@ -1033,21 +1062,21 @@ mod tests {
                 let mut invalid = snapshot.clone();
                 invalid.checkpoint.truncate(length);
                 assert_eq!(
-                    export_offline_candidate_assets_v1(&invalid).unwrap_err(),
+                    export_offline_candidate_assets_v2(&invalid).unwrap_err(),
                     OfflineAssetExportError::InvalidCheckpointHeader
                 );
             }
             let mut trailing = snapshot.clone();
             trailing.checkpoint.push(0);
             assert_eq!(
-                export_offline_candidate_assets_v1(&trailing).unwrap_err(),
+                export_offline_candidate_assets_v2(&trailing).unwrap_err(),
                 OfflineAssetExportError::InvalidCheckpointHeader
             );
             let mut oversized = snapshot.clone();
             oversized.checkpoint =
                 vec![0; crate::mapping_backend::MAX_MAPPING_BACKEND_CHECKPOINT_BYTES + 1];
             assert_eq!(
-                export_offline_candidate_assets_v1(&oversized).unwrap_err(),
+                export_offline_candidate_assets_v2(&oversized).unwrap_err(),
                 OfflineAssetExportError::InvalidCheckpointHeader
             );
             if kind == OfflineBackendKind::Voxel {
@@ -1057,7 +1086,7 @@ mod tests {
                 retained_overflow.checkpoint[32..40]
                     .copy_from_slice(&(MAX_RETAINED_VOXEL_POINTS as u64 + 1).to_le_bytes());
                 assert_eq!(
-                    export_offline_candidate_assets_v1(&retained_overflow).unwrap_err(),
+                    export_offline_candidate_assets_v2(&retained_overflow).unwrap_err(),
                     OfflineAssetExportError::InvalidCheckpointHeader
                 );
             }
@@ -1067,7 +1096,7 @@ mod tests {
                 OfflineBackendConfigV1::Raytracing(config) => config.voxel_size_m *= 2.0,
             }
             assert_eq!(
-                export_offline_candidate_assets_v1(&wrong_config).unwrap_err(),
+                export_offline_candidate_assets_v2(&wrong_config).unwrap_err(),
                 OfflineAssetExportError::InvalidCheckpointHeader
             );
         }
@@ -1112,7 +1141,7 @@ mod tests {
             1_000_000_000_000.0,
             -1.234_567_890_123e-12,
         ];
-        let python = std::process::Command::new("python3")
+        let python = std::process::Command::new(std::env::var_os("NEH_PYTHON").unwrap_or_else(|| "python3".into()))
             .args([
                 "-c",
                 "import sys; print('\\n'.join('%.12g' % float(v) for v in sys.argv[1:]))",
@@ -1133,6 +1162,7 @@ mod tests {
 
     #[test]
     fn duplicate_path_guard_uses_the_production_helper() {
+        let source_commit_id = synthetic_snapshot().canonical_checkpoint_projection.occupancy_receipt.commit_id;
         let bytes = vec![1];
         let first = member(
             "same",
@@ -1140,6 +1170,7 @@ mod tests {
             CandidateAssetEncodingV1::CheckpointObjectV1,
             bytes.clone(),
             "test",
+            source_commit_id,
         )
         .unwrap();
         let second = member(
@@ -1148,6 +1179,7 @@ mod tests {
             CandidateAssetEncodingV1::CheckpointObjectV1,
             bytes,
             "test",
+            source_commit_id,
         )
         .unwrap();
         assert_eq!(
@@ -1155,4 +1187,27 @@ mod tests {
             OfflineAssetExportError::DuplicatePath
         );
     }
+
+    #[test]
+    fn source_provenance_rejects_old_schema_and_mismatched_original_receipts() {
+        let snapshot = synthetic_snapshot();
+        let mut old_snapshot = snapshot.clone();
+        old_snapshot.schema_version = 2;
+        assert_eq!(export_offline_candidate_assets_v2(&old_snapshot).unwrap_err(),
+            OfflineAssetExportError::InvalidSnapshotSchema);
+        for change in 0..5 {
+            let mut changed = snapshot.clone();
+            let projection = &mut changed.canonical_checkpoint_projection;
+            match change {
+                0 => projection.schema_version = 1,
+                1 => projection.cloud_receipt.commit_id.sequence += 1,
+                2 => projection.occupancy_receipt.backend_generation += 1,
+                3 => projection.cloud_receipt.source_timestamp_ns += 1,
+                _ => projection.occupancy_receipt.commit_id.sequence += 1,
+            }
+            assert_eq!(export_offline_candidate_assets_v2(&changed).unwrap_err(),
+                OfflineAssetExportError::IdentityMismatch);
+        }
+    }
+
 }

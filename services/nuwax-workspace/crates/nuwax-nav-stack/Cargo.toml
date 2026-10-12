@@ -33,6 +33,11 @@ description = "Navigation stack orchestration for the nuwax robot platform (prof
 # ============================================================
 [features]
 default = []
+# Opt-in real-owner/worker recovery qualification; absent from default builds.
+surface-recovery-qualification = [
+    "mls",
+    "nuwax-nav-runtime/surface-recovery-qualification",
+]
 
 # ---- Foundation(强制打开,因为 types-messages 是核心协议层)----
 foundation = [

@@ -8,6 +8,7 @@
 #![warn(missing_docs)]
 
 pub mod grid;
+pub mod occupancy;
 pub mod point;
 
 pub use grid::OccupancyGridLike;

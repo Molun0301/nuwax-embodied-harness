@@ -75,8 +75,7 @@ pub struct OfflineCanonicalCloudReceiptV1 {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct OfflineCanonicalOccupancyAssetProjectionV1 {
-    pub raw_data_sha256: [u8; 32],
+pub struct OfflineCanonicalOccupancyAssetProjectionV2 {
     pub raw_data_size: u64,
     pub width: u32,
     pub height: u32,
@@ -89,9 +88,8 @@ pub struct OfflineCanonicalOccupancyAssetProjectionV1 {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct OfflineCanonicalCloudAssetProjectionV1 {
+pub struct OfflineCanonicalCloudAssetProjectionV2 {
     pub xyz_f32_le: Vec<u8>,
-    pub xyz_sha256: [u8; 32],
     pub xyz_size: u64,
     pub frame_id: String,
     pub source_cloud_revision: u64,
@@ -100,23 +98,26 @@ pub struct OfflineCanonicalCloudAssetProjectionV1 {
     pub payload_schema_version: u32,
 }
 
+/// Receipt-linked export view: the backend checkpoint is taken after processing
+/// flush; occupancy/cloud still describe the last canonical commit, not the same
+/// serialized backend state.
 #[derive(Clone, Debug, PartialEq)]
-pub struct OfflineCanonicalCheckpointProjectionV1 {
+pub struct OfflineCanonicalCheckpointProjectionV2 {
     pub schema_version: u32,
     pub created_at_ns: u64,
     pub source_session_id: String,
     pub source_session_generation: u64,
     pub backend_kind: OfflineBackendKind,
-    pub checkpoint_sha256: [u8; 32],
+    /// Backend checkpoint exported after the processing flush, associated with this commit.
     pub checkpoint_size: u64,
     pub occupancy_receipt: OfflineCanonicalOccupancyReceiptV1,
     pub cloud_receipt: OfflineCanonicalCloudReceiptV1,
-    pub occupancy_asset: OfflineCanonicalOccupancyAssetProjectionV1,
-    pub cloud_asset: OfflineCanonicalCloudAssetProjectionV1,
+    pub occupancy_asset: OfflineCanonicalOccupancyAssetProjectionV2,
+    pub cloud_asset: OfflineCanonicalCloudAssetProjectionV2,
 }
 
 #[derive(Clone, Debug)]
-pub struct OfflineGeometrySnapshotV2 {
+pub struct OfflineGeometrySnapshotV3 {
     pub schema_version: u32,
     pub barrier: ReplayBarrierIdentityV1,
     pub identity: OfflineReplayIdentityV2,
@@ -129,11 +130,11 @@ pub struct OfflineGeometrySnapshotV2 {
     pub committed_transformed_accepted_cloud: Vec<Point3<f64>>,
     pub processing_receipt: OfflineReplayProcessingReceiptV1,
     pub map_snapshot_seed: OfflineMapSnapshotSeedV2,
-    pub canonical_checkpoint_projection: OfflineCanonicalCheckpointProjectionV1,
+    pub canonical_checkpoint_projection: OfflineCanonicalCheckpointProjectionV2,
 }
 
 struct FinishedReplayBarrier {
-    v2: OfflineGeometrySnapshotV2,
+    v3: OfflineGeometrySnapshotV3,
     backend_occupancy_observation: Option<OccupancyGrid>,
 }
 
@@ -242,9 +243,9 @@ impl GeometryOfflineReplayOwner {
         finish_with_exact_join(&mut self, result)
     }
 
-    pub async fn finish_v2(mut self) -> Result<OfflineGeometrySnapshotV2, String> {
+    pub async fn finish_v3(mut self) -> Result<OfflineGeometrySnapshotV3, String> {
         self.intake_open = false;
-        let result = self.finish_barrier().await.map(|finished| finished.v2);
+        let result = self.finish_barrier().await.map(|finished| finished.v3);
         finish_with_exact_join(&mut self, result)
     }
 
@@ -331,8 +332,8 @@ impl GeometryOfflineReplayOwner {
         let backend_config = validator.request().backend_config().clone();
         let georeference = validator.request().georeference().clone();
         Ok(FinishedReplayBarrier {
-            v2: OfflineGeometrySnapshotV2 {
-                schema_version: 2,
+            v3: OfflineGeometrySnapshotV3 {
+                schema_version: 3,
                 barrier,
                 identity,
                 backend_kind: self.backend_kind,
@@ -601,7 +602,7 @@ fn canonical_checkpoint_projection(
     occupancy_receipt: OfflineCanonicalOccupancyReceiptV1,
     cloud_receipt: OfflineCanonicalCloudReceiptV1,
     cloud_snapshot: OfflineCanonicalCloudSnapshot,
-) -> Result<OfflineCanonicalCheckpointProjectionV1, String> {
+) -> Result<OfflineCanonicalCheckpointProjectionV2, String> {
     if created_at_ns == 0
         || checkpoint.is_empty()
         || replay_id.trim().is_empty()
@@ -632,11 +633,6 @@ fn canonical_checkpoint_projection(
     if cloud_snapshot.xyz_f32_le.len() != expected_cloud_size {
         return Err("offline canonical cloud payload length mismatch".to_owned());
     }
-    let raw_data = occupancy
-        .data
-        .iter()
-        .map(|value| value.to_le_bytes()[0])
-        .collect::<Vec<_>>();
     let expected_occupancy_size = usize::try_from(occupancy.width)
         .ok()
         .and_then(|width| {
@@ -645,17 +641,16 @@ fn canonical_checkpoint_projection(
                 .and_then(|height| width.checked_mul(height))
         })
         .ok_or_else(|| "offline canonical occupancy dimensions overflow".to_owned())?;
-    if raw_data.is_empty() || raw_data.len() != expected_occupancy_size {
+    if occupancy.data.is_empty() || occupancy.data.len() != expected_occupancy_size {
         return Err("offline canonical occupancy payload length mismatch".to_owned());
     }
     let checkpoint_size = u64::try_from(checkpoint.len())
         .map_err(|_| "offline checkpoint size exceeds u64".to_owned())?;
-    let raw_data_size = u64::try_from(raw_data.len())
+    let raw_data_size = u64::try_from(occupancy.data.len())
         .map_err(|_| "offline canonical occupancy size exceeds u64".to_owned())?;
     let xyz_size = u64::try_from(cloud_snapshot.xyz_f32_le.len())
         .map_err(|_| "offline canonical cloud size exceeds u64".to_owned())?;
-    let occupancy_asset = OfflineCanonicalOccupancyAssetProjectionV1 {
-        raw_data_sha256: nuwax_codec::sha256_bytes(&raw_data),
+    let occupancy_asset = OfflineCanonicalOccupancyAssetProjectionV2 {
         raw_data_size,
         width: occupancy.width,
         height: occupancy.height,
@@ -666,8 +661,7 @@ fn canonical_checkpoint_projection(
         source_occupancy_revision: occupancy_receipt.occupancy_revision,
         timestamp_ns: occupancy_receipt.source_timestamp_ns,
     };
-    let cloud_asset = OfflineCanonicalCloudAssetProjectionV1 {
-        xyz_sha256: nuwax_codec::sha256_bytes(&cloud_snapshot.xyz_f32_le),
+    let cloud_asset = OfflineCanonicalCloudAssetProjectionV2 {
         xyz_size,
         frame_id: occupancy.frame_id.clone(),
         source_cloud_revision: cloud_receipt.cloud_revision,
@@ -676,13 +670,12 @@ fn canonical_checkpoint_projection(
         payload_schema_version: OFFLINE_CANONICAL_CLOUD_PAYLOAD_SCHEMA_VERSION,
         xyz_f32_le: cloud_snapshot.xyz_f32_le,
     };
-    Ok(OfflineCanonicalCheckpointProjectionV1 {
-        schema_version: 1,
+    Ok(OfflineCanonicalCheckpointProjectionV2 {
+        schema_version: 2,
         created_at_ns,
         source_session_id: replay_id.to_owned(),
         source_session_generation: 1,
         backend_kind,
-        checkpoint_sha256: nuwax_codec::sha256_bytes(checkpoint),
         checkpoint_size,
         occupancy_receipt,
         cloud_receipt,
@@ -704,13 +697,13 @@ fn finish_with_exact_join<T>(
 }
 
 fn project_v1(finished: FinishedReplayBarrier) -> OfflineGeometrySnapshotV1 {
-    let OfflineGeometrySnapshotV2 {
+    let OfflineGeometrySnapshotV3 {
         barrier,
         checkpoint,
         committed_transformed_accepted_cloud,
         processing_receipt,
         ..
-    } = finished.v2;
+    } = finished.v3;
     OfflineGeometrySnapshotV1 {
         barrier,
         checkpoint,
@@ -822,7 +815,7 @@ mod tests {
                 }).await.unwrap();
                 assert_eq!(owner.canonical_occupancy.as_ref().unwrap().grid.data.contains(&100), sequence == 2);
             }
-            let snapshot = owner.finish_v2().await.unwrap();
+            let snapshot = owner.finish_v3().await.unwrap();
             assert_eq!(snapshot.processing_receipt.committed_frame_count,2);
             assert!(snapshot.canonical_raw_occupancy.data.contains(&0));
             assert!(snapshot.canonical_raw_occupancy.data.contains(&100));

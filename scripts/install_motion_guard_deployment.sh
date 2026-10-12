@@ -529,7 +529,7 @@ check_sources() {
   grep -qF '@NUWAX_BIN_DIR@/nuwax-geometry-runtime' \
     "${GEOMETRY_UNIT_SOURCE}" \
     || fail "Geometry service source does not pin the canonical runtime binary"
-  bash -n \
+  for script in \
     "${REPO_ROOT}/scripts/systemd/check_motion_guard_python.sh" \
     "${REPO_ROOT}/scripts/systemd/start_nav_stack.sh" \
     "${GEOMETRY_LAUNCHER}" \
@@ -542,7 +542,9 @@ check_sources() {
     "${REPO_ROOT}/scripts/systemd/activate_geometry_runtime.sh" \
     "${LCM_PREFLIGHT}" \
     "${REPO_ROOT}/scripts/build_nav_stack.sh" \
-    "${REPO_ROOT}/scripts/start_gateway.sh"
+    "${REPO_ROOT}/scripts/start_gateway.sh"; do
+    bash -n "${script}"
+  done
   check_systemd_owned_invariants
   check_unit_templates
   echo "motion guard deployment sources: PASS"

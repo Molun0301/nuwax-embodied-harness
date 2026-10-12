@@ -971,6 +971,36 @@ class TaskManager:
                              if record.status.state not in _TERMINAL_STATES)
         return deepcopy(statuses)
 
+    def capture_task_list(self, *, history_limit: int = 20, status_only: bool = False) -> Dict[str, Any]:
+        """同一时刻捕获列表分类和摘要来源；不读取结果或完整事件历史。"""
+        def summary_source(record):
+            if status_only:
+                return record.status
+            return {"status": record.status, "task": record.spec,
+                    "error_payload": record.error_payload,
+                    "event": record.events[-1] if record.events else None}
+
+        with self._lock:
+            active = [summary_source(record) for record in self._records.values()
+                      if record.status.state not in _TERMINAL_STATES]
+            history = []
+            if history_limit > 0:
+                for task_id in reversed(self._history_order):
+                    record = self._records.get(task_id)
+                    if record is not None:
+                        history.append(summary_source(record))
+                        if len(history) >= history_limit:
+                            break
+                history.reverse()
+            elif status_only and history_limit < 0:
+                # MCP 既有入口实际接受负数；保留旧 list_history 的前缀排除语义。
+                history = [self._records[task_id].status for task_id in self._history_order
+                           if task_id in self._records][-history_limit:]
+        # 状态、定义和事件由写入端替换/追加，捕获的引用可在锁外独立复制。
+        captured = {"active_tasks": active, "history_tasks": history}
+        # MCP 仅需要状态；不要复制定义、事件和元数据后再丢弃。
+        return deepcopy(captured) if status_only else _copy_task_value(captured)
+
     def list_quarantined_tasks(self) -> Tuple[TaskStatus, ...]:
         """列出仍持有隔离资源的终态任务。"""
 

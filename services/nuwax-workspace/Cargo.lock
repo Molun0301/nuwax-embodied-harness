@@ -1821,7 +1821,6 @@ dependencies = [
  "nalgebra 0.33.3",
  "ndarray",
  "nuwax-core",
- "nuwax-mapping",
  "nuwax-nav-base",
  "nuwax-nav-control",
  "nuwax-nav-types-messages",
@@ -2237,10 +2236,12 @@ dependencies = [
  "kiddo",
  "nalgebra 0.33.3",
  "ndarray",
+ "nuwax-types",
  "pretty_assertions",
  "proptest",
  "rayon",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 

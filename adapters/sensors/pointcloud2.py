@@ -175,7 +175,7 @@ def _read_field(raw_field: object, index: int, *, bigendian: bool = False) -> Di
     }
 
 
-def _extract_values(
+def _field_view(
     data: bytes,
     height: int,
     width: int,
@@ -183,10 +183,10 @@ def _extract_values(
     point_step: int,
     spec: Mapping[str, Any],
 ) -> np.ndarray:
-    """按 PointCloud2 的行步长和点步长展开一个标量字段。"""
+    """按 PointCloud2 的行步长和点步长查看一个二维标量字段。"""
 
     if height == 0 or width == 0:
-        return np.empty(0, dtype=spec["numpy_dtype"])
+        return np.empty((height, width), dtype=spec["numpy_dtype"])
     try:
         values = np.ndarray(
             shape=(height, width),
@@ -199,6 +199,20 @@ def _extract_values(
         raise GenericPointCloud2DecodeError(
             "PointCloud2 %s ndarray 解析失败：%s" % (spec["name"], exc)
         ) from exc
+    return values
+
+
+def _extract_values(
+    data: bytes,
+    height: int,
+    width: int,
+    row_step: int,
+    point_step: int,
+    spec: Mapping[str, Any],
+) -> np.ndarray:
+    """为可选字段保留原有连续一维数组语义。"""
+
+    values = _field_view(data, height, width, row_step, point_step, spec)
     return np.ascontiguousarray(values.reshape(-1))
 
 
@@ -290,9 +304,14 @@ def decode_generic_pointcloud2(
             raise GenericPointCloud2DecodeError("PointCloud2 %s 字段必须为标量" % name)
 
     xyz = np.empty((point_count, 3), dtype=np.float32)
+    xyz_rows = xyz.reshape(height, width, 3)
     for column, name in enumerate(("x", "y", "z")):
-        values = _extract_values(data, height, width, row_step, point_step, parsed[name])
-        xyz[:, column] = values.astype(np.float32, copy=False)
+        values = _field_view(data, height, width, row_step, point_step, parsed[name])
+        if values.dtype == np.float32 and values.flags.aligned:
+            xyz_rows[:, :, column] = values
+        else:
+            values = np.ascontiguousarray(values.reshape(-1))
+            xyz[:, column] = values.astype(np.float32, copy=False)
     is_dense = bool(_member(message, "is_dense", True))
     if is_dense and not np.all(np.isfinite(xyz)):
         raise GenericPointCloud2DecodeError("PointCloud2 XYZ 必须全部为有限值")

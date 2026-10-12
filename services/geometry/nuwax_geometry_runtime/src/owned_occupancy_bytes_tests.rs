@@ -121,8 +121,10 @@ fn assert_same_error(actual: Status, expected: Status) {
     assert_eq!(actual.message(), expected.message());
 }
 fn descriptor(revision: u64, count: usize) -> OccupancyShmSnapshot {
-    OccupancyShmSnapshot { key: "unit-descriptor-no-file-read".into(), file_size: 4096,
-        payload_size: count as u64, revision, layout_version: 2, payload_schema_version: 1,
+    let event = crate::occupancy_shm::committed_event_for_tests(&map(vec![0; count], revision), 1);
+    OccupancyShmSnapshot {
+        identity: crate::occupancy_shm::MapWriteIdentity::from_event(&event).unwrap(), key: "unit-descriptor-no-file-read".into(), file_size: 4096,
+        payload_size: count as u64, revision, layout_version: 3, payload_schema_version: 1,
         generation: revision, active_slot: 0 }
 }
 

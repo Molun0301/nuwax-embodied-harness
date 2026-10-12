@@ -268,11 +268,15 @@ fn validate_result(
         || !result.target_graph_sha256.is_empty() {
         return Err("RELOCALIZATION_ASSIGNED_TERMINAL_MIXED_WITH_LEGACY".into());
     }
+    if result.assigned_planar_v2.is_some() {
+        if result.assigned_cloud_v2.is_some() { return Err("RELOCALIZATION_ASSIGNED_TERMINAL_MIXED_BACKENDS".into()); }
+        return validate_planar_result(result);
+    }
     let body = result.assigned_cloud_v2.as_ref().ok_or("RELOCALIZATION_ASSIGNED_TERMINAL_BODY_ABSENT")?;
     let request = AssignedCloudRelocalizeRequestIdentityV2::admit_retained_canonical(
         body.request.clone().ok_or("RELOCALIZATION_ASSIGNED_TERMINAL_REQUEST_ABSENT")?,
     )?;
-    if result.request_id != request.request_id() {
+    if request.is_planar() || result.request_id != request.request_id() {
         return Err("RELOCALIZATION_ASSIGNED_TERMINAL_REQUEST_ID_MISMATCH".into());
     }
     use proto::RelocalizeDisposition as Disposition;
@@ -318,6 +322,81 @@ fn validate_result(
     Ok(request)
 }
 
+fn validate_planar_result(result: &proto::RelocalizeResult) -> Result<AssignedCloudRelocalizeRequestIdentityV2, String> {
+    use proto::{AssignedRelocalizationEvidencePhaseV2 as Phase, RelocalizeDisposition as Disposition};
+    let body = result.assigned_planar_v2.as_ref().ok_or("ASSIGNED_PLANAR_TERMINAL_BODY_ABSENT")?;
+    let request = AssignedCloudRelocalizeRequestIdentityV2::admit_retained_canonical(
+        body.request.clone().ok_or("ASSIGNED_PLANAR_TERMINAL_REQUEST_ABSENT")?)?;
+    if !request.is_planar() || request.request_id() != result.request_id {
+        return Err("ASSIGNED_PLANAR_TERMINAL_REQUEST_CONFLICT".into());
+    }
+    let disposition = Disposition::try_from(body.disposition).map_err(|_| "ASSIGNED_PLANAR_TERMINAL_DISPOSITION_INVALID")?;
+    if disposition == Disposition::Unspecified { return Err("ASSIGNED_PLANAR_TERMINAL_DISPOSITION_INVALID".into()); }
+    let applied = matches!(disposition, Disposition::Applied | Disposition::AlreadyApplied);
+    if applied != (body.correction_revision > 0) { return Err("ASSIGNED_PLANAR_TERMINAL_REVISION_MISMATCH".into()); }
+    let evidence = body.evidence.as_ref().ok_or("ASSIGNED_PLANAR_TERMINAL_EVIDENCE_ABSENT")?;
+    bounded(evidence.encoded_len(), RELOCALIZATION_MAX_EVIDENCE_DISCLOSURE_BYTES, "PLANAR_EVIDENCE")?;
+    if evidence.schema_version != 2 { return Err("ASSIGNED_PLANAR_EVIDENCE_SCHEMA_INVALID".into()); }
+    let phase = Phase::try_from(evidence.phase).map_err(|_| "ASSIGNED_PLANAR_EVIDENCE_PHASE_INVALID")?;
+    if !matches!(phase, Phase::PreAdmission | Phase::Admitted | Phase::Finalized) {
+        return Err("ASSIGNED_PLANAR_EVIDENCE_PHASE_INVALID".into());
+    }
+    if phase == Phase::PreAdmission {
+        if evidence.admission_ordinal.is_some() || evidence.owner.is_some() {
+            return Err("ASSIGNED_PLANAR_PRE_ADMISSION_CLAIM_INVALID".into());
+        }
+    } else {
+        let owner = evidence.owner.as_ref().ok_or("ASSIGNED_PLANAR_OWNER_ABSENT")?;
+        if evidence.admission_ordinal.is_none_or(|value| value == 0)
+            || owner.runtime_generation != request.target().activation.runtime_generation
+            || owner.correction_backend_generation == 0 || owner.correction_lease_boot_nonce.len() != 16
+            || owner.correction_lease_boot_nonce.iter().all(|byte| *byte == 0) || owner.correction_lease_generation == 0
+            || owner.map_frame_id != request.target().source_member.frame_id()
+            || owner.odom_frame_id.is_empty() || owner.body_frame_id.is_empty()
+            || owner.relocalization_epoch.is_none_or(|epoch| epoch == 0) {
+            return Err("ASSIGNED_PLANAR_OWNER_BINDING_INVALID".into());
+        }
+    }
+    if phase != Phase::Finalized {
+        if applied || !evidence.previous_process.is_empty() || !evidence.committed_process.is_empty()
+            || evidence.mode_epoch != 0 || !evidence.accepted_scans.is_empty() || evidence.estimate.is_some()
+            || evidence.frame_generation != 0 || evidence.source_unix_ns != 0 || evidence.committed_unix_ns != 0 {
+            return Err("ASSIGNED_PLANAR_UNFINALIZED_OUTCOME_CLAIM_INVALID".into());
+        }
+        return Ok(request);
+    }
+    let valid_process = |value: &str| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let owner = evidence.owner.as_ref().ok_or("ASSIGNED_PLANAR_OWNER_ABSENT")?;
+    if !applied || !valid_process(&evidence.previous_process) || !valid_process(&evidence.committed_process)
+        || owner.relocalization_epoch != Some(evidence.mode_epoch) || evidence.frame_generation == 0
+        || evidence.accepted_scans.len() != 3 || evidence.source_unix_ns == 0 || evidence.committed_unix_ns == 0 {
+        return Err("ASSIGNED_PLANAR_FINALIZED_OUTCOME_INCOMPLETE".into());
+    }
+    let mut previous = None;
+    for scan in &evidence.accepted_scans {
+        if scan.process_owner != evidence.committed_process
+            || scan.session_generation != request.target().activation.session_generation
+            || scan.mode_epoch != evidence.mode_epoch
+            || previous.is_some_and(|sequence| scan.source_sequence <= sequence)
+            || scan.source_timestamp_ns == 0 || scan.source_unix_ns == 0
+            || !(f64::from_bits(scan.matching_response_bits) >= 0.3) {
+            return Err("ASSIGNED_PLANAR_SCAN_BINDING_INVALID".into());
+        }
+        previous = Some(scan.source_sequence);
+    }
+    let estimate = evidence.estimate.as_ref().ok_or("ASSIGNED_PLANAR_ESTIMATE_ABSENT")?;
+    let last = evidence.accepted_scans.last().unwrap();
+    if estimate.source_sequence != last.source_sequence || estimate.source_timestamp_ns != last.source_timestamp_ns
+        || estimate.matching_response_bits != last.matching_response_bits || evidence.source_unix_ns != last.source_unix_ns
+        || estimate.disposition != "accepted" || estimate.clock_domain.is_empty()
+        || [&estimate.anchor_odom_from_base_bits, &estimate.odom_from_base_bits,
+            &estimate.map_from_base_bits, &estimate.map_from_odom_bits].iter().any(|bits| bits.len() != 3)
+        || estimate.covariance_bits.len() != 9 {
+        return Err("ASSIGNED_PLANAR_ESTIMATE_BINDING_INVALID".into());
+    }
+    Ok(request)
+}
+
 fn validate_evidence(
     request: &AssignedCloudRelocalizeRequestIdentityV2,
     evidence: &proto::AssignedRelocalizationEvidenceV2,
@@ -358,7 +437,7 @@ fn validate_evidence(
     // An admitted failure may precede target capture. Once source selection is
     // claimed, its map frame must be the requested installed target frame.
     if !evidence.source_frames.is_empty()
-        && owner.map_frame_id != request.target().source_cloud_member.frame_id() {
+        && owner.map_frame_id != request.target().source_member.frame_id() {
         return Err("RELOCALIZATION_ASSIGNED_SOURCE_TARGET_FRAME_MISMATCH".into());
     }
     match phase {
@@ -745,7 +824,7 @@ mod tests {
         }).unwrap();
         let mut response = query.response(Status::NotFound, None, None).unwrap();
         let proto::relocalize_request::AssignedTarget::AssignedCloudV2(target) =
-            response.assigned_request_v2.as_mut().unwrap().assigned_target.as_mut().unwrap();
+            response.assigned_request_v2.as_mut().unwrap().assigned_target.as_mut().unwrap() else { panic!("cloud fixture") };
         target.target.as_mut().unwrap().activation.as_mut().unwrap().lifecycle_epoch += 1;
         assert!(query.validate_response(response, None).is_err());
         let mut query_wire = query.to_wire(); query_wire.request_identity_sha256 = vec![1; 32];
@@ -794,7 +873,7 @@ mod tests {
     fn selected_source_cannot_reopen_under_a_different_target_frame() {
         let mut malformed = source_selected();
         let request = body(&mut malformed).request.as_mut().unwrap();
-        let proto::relocalize_request::AssignedTarget::AssignedCloudV2(target) = request.assigned_target.as_mut().unwrap();
+        let proto::relocalize_request::AssignedTarget::AssignedCloudV2(target) = request.assigned_target.as_mut().unwrap() else { panic!("cloud fixture") };
         target.target.as_mut().unwrap().source_cloud_member.as_mut().unwrap().frame_id = "different_map".into();
         let request_bytes = body(&mut malformed).request.as_ref().unwrap().encode_to_vec();
         let terminal_bytes = malformed.encode_to_vec();
@@ -887,3 +966,7 @@ mod tests {
         assert!(assigned_terminal_request_id_from_filename_v2("assigned-v2..terminal").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "planar_relocalization_assigned_tests.rs"]
+pub(crate) mod planar_tests;

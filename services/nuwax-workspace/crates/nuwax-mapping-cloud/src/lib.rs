@@ -37,6 +37,9 @@ pub mod osm;
 #[cfg(feature = "cloud-enabled")]
 pub mod owner;
 
+#[cfg(all(test, feature = "cloud-enabled"))]
+mod assigned_test_support;
+
 #[cfg(feature = "cloud-enabled")]
 pub use coords::{web_mercator_to_wgs84, wgs84_to_tile, wgs84_to_web_mercator};
 #[cfg(feature = "cloud-enabled")]
@@ -46,7 +49,7 @@ pub use current_location::{
 };
 #[cfg(feature = "cloud-enabled")]
 pub use georeference::{
-    DigestError, GeoreferenceBindingV1, GeoreferenceError, GeoreferenceV1, MapMetricPosition,
+    AssignedGeoreferenceV3, DigestError, GeoreferenceBindingV1, GeoreferenceError, GeoreferenceV1, MapMetricPosition,
     Sha256Digest, VerifiedGeoreferenceV1, GEOREFERENCE_ALTITUDE_POLICY,
     GEOREFERENCE_AXIS_CONVENTION, GEOREFERENCE_CANONICAL_PATH, GEOREFERENCE_PROJECTED_CRS,
     GEOREFERENCE_SCHEMA_VERSION, GEOREFERENCE_SOURCE_CRS, MAX_ABSOLUTE_MAP_COORDINATE_M,
@@ -54,8 +57,10 @@ pub use georeference::{
 };
 #[cfg(feature = "cloud-enabled")]
 pub use goal_adapter::{
-    adapt_wgs84_goal_intent, ActiveMapIdentityV2, CloudQueryIdentityV1, GoalAdapterError,
+    adapt_assigned_wgs84_goal_intent, adapt_wgs84_goal_intent, ActiveMapIdentityV2,
+    AssignedMapIdentityV3, AssignedMappingCloudGoalIntentV3, CloudQueryIdentityV1, GoalAdapterError,
     MappingCloudGoalIntentV2, TerminalHeadingPolicy, MAPPING_CLOUD_GOAL_INTENT_SCHEMA_VERSION,
+    ASSIGNED_MAPPING_CLOUD_GOAL_INTENT_SCHEMA_VERSION,
 };
 #[cfg(feature = "cloud-enabled")]
 pub use google_maps::{

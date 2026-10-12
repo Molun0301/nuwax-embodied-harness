@@ -47,6 +47,25 @@ impl CanonicalRelocalizationPolicyV2 {
         }))).clone()
     }
 
+    pub(crate) fn current_planar() -> Self {
+        static CURRENT: OnceLock<CanonicalRelocalizationPolicyV2> = OnceLock::new();
+        CURRENT.get_or_init(|| Self(Arc::new(proto::RelocalizationPolicyDescriptorV2 {
+            schema_version: 2,
+            source_policy_version: 1,
+            source_parameters: b"nuwax.planar-source.v1;fresh-after-arm;max-age-ns=500000000;accepted-scans=3;strict-sequence;matched-odometry".to_vec(),
+            deadline_policy_version: crate::correction_coordinator::RELOCALIZATION_DEADLINE_POLICY_VERSION_V1,
+            deadline_parameters: crate::correction_coordinator::relocalization_deadline_policy_preimage_v1(),
+            algorithm_options_version: 1,
+            algorithm_parameters: b"nuwax.planar-relocalization.v1;karto-2.10.0;explicit-se2-seed;candidate-process;static-graph;canonical-tf".to_vec(),
+        }))).clone()
+    }
+
+    fn admit_planar(value: proto::RelocalizationPolicyDescriptorV2) -> Result<Self, String> {
+        let current = Self::current_planar();
+        if value != *current.0 { return Err("RELOCALIZATION_EXACT_PLANAR_POLICY_PARAMETERS_MISMATCH".into()); }
+        Ok(current)
+    }
+
     fn admit(value: proto::RelocalizationPolicyDescriptorV2) -> Result<Self, String> {
         let current = Self::current_cloud();
         if value != *current.0 {
@@ -88,6 +107,7 @@ pub(crate) fn activation_from_wire(value: proto::InstalledActivationIdentityV2) 
     let backend_kind = match value.backend_kind.as_str() {
         "voxel" => MappingBackendKind::Voxel,
         "raytracing" => MappingBackendKind::Raytracing,
+        "slam_toolbox" => MappingBackendKind::SlamToolbox,
         _ => return Err("ASSIGNED_CLOUD_RELOCALIZATION_BACKEND_UNSUPPORTED".into()),
     };
     if value.runtime_generation == 0 || value.runtime_generation != request.expected_runtime_generation()
@@ -100,7 +120,11 @@ pub(crate) fn activation_from_wire(value: proto::InstalledActivationIdentityV2) 
 }
 
 pub(crate) fn target_from_wire(value: proto::InstalledTargetReceiptV2) -> Result<InstalledTargetReceiptV2, String> {
+    if value.source_graph_member.is_some() { return Err("ASSIGNED_CLOUD_RELOCALIZATION_REQUIRES_CLOUD_MEMBER".into()); }
     let activation = activation_from_wire(value.activation.ok_or("assigned activation identity is absent")?)?;
+    if activation.backend_kind == MappingBackendKind::SlamToolbox {
+        return Err("ASSIGNED_CLOUD_RELOCALIZATION_BACKEND_UNSUPPORTED".into());
+    }
     let source_cloud_member = CheckpointMemberIdentityV2::try_from(value.source_cloud_member.ok_or("source cloud member is absent")?)?;
     let occupancy_receipt = occupancy_receipt_from_wire(value.occupancy_receipt.as_ref().ok_or("installed occupancy receipt is absent")?)?;
     let cloud_receipt = cloud_receipt_from_wire(value.cloud_receipt.as_ref().ok_or("installed cloud receipt is absent")?)?;
@@ -119,7 +143,28 @@ pub(crate) fn target_from_wire(value: proto::InstalledTargetReceiptV2) -> Result
         || cloud_receipt.point_count != source_cloud.point_count {
         return Err("assigned relocalization target receipt binding differs".into());
     }
-    Ok(InstalledTargetReceiptV2 { activation, source_cloud_member, occupancy_receipt, cloud_receipt })
+    Ok(InstalledTargetReceiptV2 { activation, source_member: source_cloud_member, occupancy_receipt, cloud_receipt: Some(cloud_receipt) })
+}
+
+pub(crate) fn planar_target_from_wire(value: proto::InstalledTargetReceiptV2) -> Result<InstalledTargetReceiptV2, String> {
+    if value.source_cloud_member.is_some() || value.cloud_receipt.is_some() {
+        return Err("ASSIGNED_PLANAR_RELOCALIZATION_CLOUD_FIELDS_FORBIDDEN".into());
+    }
+    let activation = activation_from_wire(value.activation.ok_or("assigned activation identity is absent")?)?;
+    let source_member = CheckpointMemberIdentityV2::try_from(value.source_graph_member.ok_or("source graph member is absent")?)?;
+    let occupancy_receipt = occupancy_receipt_from_wire(value.occupancy_receipt.as_ref().ok_or("installed occupancy receipt is absent")?)?;
+    if activation.backend_kind != MappingBackendKind::SlamToolbox
+        || source_member.role() != proto::CheckpointMemberRole::PlanarGraph
+        || source_member.checkpoint_id() != activation.request.checkpoint_identity()
+        || source_member.occupancy_receipt().backend_kind != MappingBackendKind::SlamToolbox
+        || source_member.cloud_receipt().is_some()
+        || occupancy_receipt.session_id != activation.request.session_id()
+        || occupancy_receipt.session_generation != activation.session_generation
+        || occupancy_receipt.backend_kind != activation.backend_kind
+        || occupancy_receipt.backend_generation != activation.backend_generation {
+        return Err("ASSIGNED_PLANAR_RELOCALIZATION_TARGET_BINDING_MISMATCH".into());
+    }
+    Ok(InstalledTargetReceiptV2 { activation, source_member, occupancy_receipt, cloud_receipt: None })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -128,6 +173,7 @@ struct AssignedCloudRelocalizeRequestData {
     target: InstalledTargetReceiptV2,
     policy: CanonicalRelocalizationPolicyV2,
     logical_timeout_ms: u64,
+    planar_seed_bits: Option<[u64; 3]>,
 }
 
 /// Immutable small request comparison material. Payload ownership belongs to the
@@ -189,32 +235,57 @@ impl AssignedCloudRelocalizeRequestIdentityV2 {
             || !request.target_graph_sha256.is_empty() || request.planar_seed.is_some() {
             return Err("RELOCALIZATION_ASSIGNED_FIELDS_MIXED_WITH_LEGACY".into());
         }
-        let Some(proto::relocalize_request::AssignedTarget::AssignedCloudV2(body)) = request.assigned_target else {
-            return Err("RELOCALIZATION_ASSIGNED_TARGET_ABSENT_OR_UNSUPPORTED".into());
+        let (target, policy, timeout, planar_seed_bits) = match request.assigned_target {
+            Some(proto::relocalize_request::AssignedTarget::AssignedCloudV2(body)) => {
+                let policy = body.policy.ok_or("assigned policy parameters are absent")?;
+                let policy = if retained { CanonicalRelocalizationPolicyV2::admit_retained(policy)? }
+                    else { CanonicalRelocalizationPolicyV2::admit(policy)? };
+                (target_from_wire(body.target.ok_or("assigned target receipt is absent")?)?, policy,
+                    body.logical_timeout_ms, None)
+            },
+            Some(proto::relocalize_request::AssignedTarget::AssignedPlanarV2(body)) => {
+                let seed = body.seed.ok_or("ASSIGNED_PLANAR_RELOCALIZATION_SEED_ABSENT")?;
+                if ![seed.x, seed.y, seed.yaw].iter().all(|value| value.is_finite()) {
+                    return Err("ASSIGNED_PLANAR_RELOCALIZATION_SEED_INVALID".into());
+                }
+                (planar_target_from_wire(body.target.ok_or("assigned planar target receipt is absent")?)?,
+                    CanonicalRelocalizationPolicyV2::admit_planar(body.policy.ok_or("assigned planar policy is absent")?)?,
+                    body.logical_timeout_ms, Some([seed.x, seed.y, seed.yaw].map(|value| if value == 0.0 { 0 } else { value.to_bits() })))
+            },
+            None => return Err("RELOCALIZATION_ASSIGNED_TARGET_ABSENT_OR_UNSUPPORTED".into()),
         };
-        let logical_timeout_ms = crate::correction_coordinator::normalize_relocalization_logical_timeout_ms(body.logical_timeout_ms)?;
-        let policy = body.policy.ok_or("assigned policy parameters are absent")?;
-        let policy = if retained {
-            CanonicalRelocalizationPolicyV2::admit_retained(policy)?
-        } else {
-            CanonicalRelocalizationPolicyV2::admit(policy)?
-        };
-        let target = target_from_wire(body.target.ok_or("assigned target receipt is absent")?)?;
+        let logical_timeout_ms = crate::correction_coordinator::normalize_relocalization_logical_timeout_ms(timeout)?;
         Ok(Self(Arc::new(AssignedCloudRelocalizeRequestData { request_id: request.request_id,
-            target, policy, logical_timeout_ms })))
+            target, policy, logical_timeout_ms, planar_seed_bits })))
     }
 
     pub(crate) fn request_id(&self) -> &str { &self.0.request_id }
     pub(crate) fn target(&self) -> &InstalledTargetReceiptV2 { &self.0.target }
     pub(crate) fn logical_timeout_ms(&self) -> u64 { self.0.logical_timeout_ms }
     pub(crate) fn matches_target(&self, target: &InstalledTargetReceiptV2) -> bool { self.target() == target }
-    pub(crate) fn to_wire(&self) -> proto::RelocalizeRequest {
-        proto::RelocalizeRequest { schema_version: 2, request_id: self.0.request_id.clone(),
-            assigned_target: Some(proto::relocalize_request::AssignedTarget::AssignedCloudV2(
-                proto::AssignedCloudRelocalizeRequestV2 { target: Some(self.0.target.to_wire()),
-                    policy: Some(self.0.policy.to_wire()), logical_timeout_ms: self.0.logical_timeout_ms })),
-            ..Default::default() }
+    pub(crate) fn is_planar(&self) -> bool { self.0.planar_seed_bits.is_some() }
+    pub(crate) fn planar_seed(&self) -> Option<proto::PlanarSeed> {
+        self.0.planar_seed_bits.map(|bits| proto::PlanarSeed {
+            x: f64::from_bits(bits[0]), y: f64::from_bits(bits[1]), yaw: f64::from_bits(bits[2]),
+        })
     }
+    pub(crate) fn to_wire(&self) -> proto::RelocalizeRequest {
+        use proto::relocalize_request::AssignedTarget;
+        let target = Some(self.0.target.to_wire());
+        let policy = Some(self.0.policy.to_wire());
+        let logical_timeout_ms = self.0.logical_timeout_ms;
+        let assigned_target = Some(match self.planar_seed() {
+            Some(seed) => AssignedTarget::AssignedPlanarV2(proto::AssignedPlanarRelocalizeRequestV2 {
+                target, policy, logical_timeout_ms, seed: Some(seed),
+            }),
+            None => AssignedTarget::AssignedCloudV2(proto::AssignedCloudRelocalizeRequestV2 {
+                target, policy, logical_timeout_ms,
+            }),
+        });
+        proto::RelocalizeRequest { schema_version: 2, request_id: self.0.request_id.clone(),
+            assigned_target, ..Default::default() }
+    }
+
 }
 
 #[cfg(test)]
@@ -290,7 +361,7 @@ pub(crate) mod tests {
                         role: proto::CheckpointMemberRole::CanonicalCloud as i32,
                         occupancy_receipt: Some(source_occupancy), cloud_receipt: Some(source_cloud),
                         frame_id: "map".into(), frame_generation: 0, producer_generation: 0 }),
-                    occupancy_receipt: Some(installed_occupancy), cloud_receipt: Some(installed_cloud) }),
+                    occupancy_receipt: Some(installed_occupancy), cloud_receipt: Some(installed_cloud), source_graph_member: None }),
                 policy: Some(CanonicalRelocalizationPolicyV2::current_cloud().to_wire()), logical_timeout_ms: 0 })),
             ..Default::default() }
     }
@@ -298,6 +369,7 @@ pub(crate) mod tests {
     fn body(request: &mut proto::RelocalizeRequest) -> &mut proto::AssignedCloudRelocalizeRequestV2 {
         match request.assigned_target.as_mut().unwrap() {
             proto::relocalize_request::AssignedTarget::AssignedCloudV2(body) => body,
+            _ => panic!("cloud fixture expected"),
         }
     }
 

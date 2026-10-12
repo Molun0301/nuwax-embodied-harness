@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import fcntl
-import hashlib
 import json
 import math
 import os
@@ -28,6 +27,7 @@ from contracts.map_relocalization import (
     AssignedRelocalizationTerminal,
     _normalize as _normalize_assigned_metadata,
     current_assigned_relocalization_policy,
+    current_assigned_planar_relocalization_policy,
 )
 from contracts.naming import build_safe_dir_segment
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
@@ -330,11 +330,13 @@ class MapCatalogRepository:
         }
 
     @staticmethod
-    def _assigned_activation_policy(value):
+    def _assigned_activation_policy(value, backend_kind=None):
         # Admission keeps the policy actually returned by the backend. It never
         # replaces an absent or unsupported policy with locally current values.
         policy = _normalize_assigned_metadata(value, "policy")
-        if policy != current_assigned_relocalization_policy():
+        expected = (current_assigned_planar_relocalization_policy() if backend_kind == "slam_toolbox"
+            else current_assigned_relocalization_policy())
+        if policy != expected:
             raise ValueError("assigned activation policy parameters differ")
         return policy
 
@@ -362,7 +364,8 @@ class MapCatalogRepository:
             "activation_receipt_schema_version": 2, "activation_receipt_v2": receipt,
             "activation_receipt_disposition": disposition, "activation_receipt_disposition_name": name,
             "relocalization_target_available": payload["relocalization_target_available"],
-            "relocalization_policy_v2": MapCatalogRepository._assigned_activation_policy(payload["relocalization_policy_v2"]),
+            "relocalization_policy_v2": MapCatalogRepository._assigned_activation_policy(
+                payload["relocalization_policy_v2"], receipt["activation"]["backend_kind"]),
         }
         # Existing native metadata admission owns all field limits. In particular,
         # source session text has no new journal-specific length/alphabet gate.
@@ -2453,8 +2456,6 @@ class MapCatalogRepository:
         manifest_path = current_dir / "manifest.json"
         if "finalized" not in payload:
             payload["finalized"] = bool(current_dir.is_dir() and manifest_path.is_file())
-        if payload.get("finalized") and not payload.get("asset_manifest_sha256") and manifest_path.is_file():
-            payload["asset_manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         if payload.get("finalized") and not payload.get("finalized_at") and current_dir.is_dir():
             payload["finalized_at"] = payload.get("updated_at")
         return MapAsset.model_validate(payload)

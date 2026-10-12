@@ -218,11 +218,13 @@ struct CanonicalCheckpointDataV2 {
     backend_kind: MappingBackendKind,
     backend_payload_schema_version: u32,
     created_at_ns: u64,
-    backend_member: CheckpointMemberIdentityV2,
+    backend_member: Option<CheckpointMemberIdentityV2>,
     occupancy_member: CheckpointMemberIdentityV2,
     payload: Vec<u8>,
     occupancy: proto::OccupancyGridData,
-    cloud: CanonicalCloudTargetV2,
+    cloud: Option<CanonicalCloudTargetV2>,
+    graph_member: Option<CheckpointMemberIdentityV2>,
+    graph: Option<SealedArtifactOwnerV2>,
     fine_map: Option<SealedArtifactOwnerV2>,
     dense_cloud: Option<SealedArtifactOwnerV2>,
 }
@@ -261,18 +263,6 @@ impl CanonicalCheckpointOwnerV2 {
                 .as_ref()
                 .ok_or("occupancy receipt required")?,
         )?;
-        let cloud_receipt = cloud_receipt_from_wire(
-            checkpoint
-                .cloud_receipt
-                .as_ref()
-                .ok_or("cloud receipt required")?,
-        )?;
-        let backend_member = CheckpointMemberIdentityV2::try_from(
-            checkpoint
-                .backend_identity
-                .take()
-                .ok_or("backend member required")?,
-        )?;
         let occupancy_member = CheckpointMemberIdentityV2::try_from(
             checkpoint
                 .occupancy_identity
@@ -283,28 +273,48 @@ impl CanonicalCheckpointOwnerV2 {
             .canonical_occupancy_checkpoint
             .take()
             .ok_or("canonical occupancy required")?;
-        let cloud = CanonicalCloudTargetV2::admit(
-            checkpoint
-                .canonical_cloud_checkpoint
-                .take()
-                .ok_or("canonical cloud required")?,
-            identity,
-            &occupancy_receipt,
-            &cloud_receipt,
-            expected_map_frame,
-        )?;
+        let (backend_member, cloud, graph_member) = match expected_backend {
+            MappingBackendKind::SlamToolbox => {
+                let member = CheckpointMemberIdentityV2::try_from(
+                    checkpoint.graph_artifact.as_ref()
+                        .and_then(|reference| reference.member_identity.clone())
+                        .ok_or("planar graph member required")?,
+                )?;
+                if member.frame_id() != expected_map_frame {
+                    return Err("planar target frame must match the canonical map frame".into());
+                }
+                (None, None, Some(member))
+            }
+            MappingBackendKind::Voxel | MappingBackendKind::Raytracing => {
+                let cloud_receipt = cloud_receipt_from_wire(
+                    checkpoint.cloud_receipt.as_ref().ok_or("cloud receipt required")?,
+                )?;
+                let backend_member = CheckpointMemberIdentityV2::try_from(
+                    checkpoint.backend_identity.take().ok_or("backend member required")?,
+                )?;
+                let cloud = CanonicalCloudTargetV2::admit(
+                    checkpoint.canonical_cloud_checkpoint.take().ok_or("canonical cloud required")?,
+                    identity,
+                    &occupancy_receipt,
+                    &cloud_receipt,
+                    expected_map_frame,
+                )?;
+                (Some(backend_member), Some(cloud), None)
+            }
+        };
 
-        let (fine_map, dense_cloud) = if let Some(retained) = retained {
+        let (fine_map, dense_cloud, graph) = if let Some(retained) = retained {
             // An assigned object already has one authoritative owner. Transfer leases may
             // expire, or even be re-created under a conflicting ID, without changing it.
             // Do not consult that temporary namespace for retries of a live source.
             if checkpoint.fine_map_artifact.as_ref() != retained.fine_map().map(|v| v.reference())
                 || checkpoint.dense_cloud_artifact.as_ref()
                     != retained.dense_cloud().map(|v| v.reference())
+                || checkpoint.graph_artifact.as_ref() != retained.graph().map(|v| v.reference())
             {
                 return Err("assigned checkpoint artifact descriptor replay conflict".into());
             }
-            (retained.0.fine_map.clone(), retained.0.dense_cloud.clone())
+            (retained.0.fine_map.clone(), retained.0.dense_cloud.clone(), retained.0.graph.clone())
         } else {
             // Store::open validates the exact reference and sealed state. Its lock need only
             // cover each callback, never validation, equality or the interner critical section.
@@ -318,7 +328,12 @@ impl CanonicalCheckpointOwnerV2 {
                 .take()
                 .map(|reference| SealedArtifactOwnerV2::pin(reference, pin_artifact))
                 .transpose()?;
-            (fine_map, dense_cloud)
+            let graph = checkpoint
+                .graph_artifact
+                .take()
+                .map(|reference| SealedArtifactOwnerV2::pin(reference, pin_artifact))
+                .transpose()?;
+            (fine_map, dense_cloud, graph)
         };
         Ok(Self(Arc::new(CanonicalCheckpointDataV2 {
             identity,
@@ -330,6 +345,8 @@ impl CanonicalCheckpointOwnerV2 {
             payload: checkpoint.payload,
             occupancy,
             cloud,
+            graph_member,
+            graph,
             fine_map,
             dense_cloud,
         })))
@@ -348,17 +365,16 @@ impl CanonicalCheckpointOwnerV2 {
         self.0.created_at_ns
     }
     pub(crate) fn backend_member(&self) -> &CheckpointMemberIdentityV2 {
-        &self.0.backend_member
+        self.0.backend_member.as_ref().expect("spatial checkpoint backend member")
     }
     pub(crate) fn occupancy_member(&self) -> &CheckpointMemberIdentityV2 {
         &self.0.occupancy_member
     }
     pub(crate) fn occupancy_receipt(&self) -> &OccupancyCommitReceipt {
-        self.0.backend_member.occupancy_receipt()
+        self.0.occupancy_member.occupancy_receipt()
     }
     pub(crate) fn cloud_receipt(&self) -> &CloudCommitReceipt {
-        self.0
-            .backend_member
+        self.backend_member()
             .cloud_receipt()
             .expect("validated cloud receipt")
     }
@@ -369,7 +385,16 @@ impl CanonicalCheckpointOwnerV2 {
         &self.0.occupancy
     }
     pub(crate) fn cloud(&self) -> &CanonicalCloudTargetV2 {
-        &self.0.cloud
+        self.0.cloud.as_ref().expect("spatial checkpoint cloud target")
+    }
+    pub(crate) fn graph(&self) -> Option<&SealedArtifactOwnerV2> {
+        self.0.graph.as_ref()
+    }
+    pub(crate) fn source_member(&self) -> &CheckpointMemberIdentityV2 {
+        match self.backend_kind() {
+            MappingBackendKind::SlamToolbox => self.0.graph_member.as_ref().expect("planar graph member"),
+            MappingBackendKind::Voxel | MappingBackendKind::Raytracing => self.cloud().member(),
+        }
     }
     pub(crate) fn fine_map(&self) -> Option<&SealedArtifactOwnerV2> {
         self.0.fine_map.as_ref()
@@ -399,6 +424,11 @@ impl CanonicalCheckpointOwnerV2 {
             || left.payload != right.payload
             || !exact_occupancy(&left.occupancy, &right.occupancy)
             || left.cloud != right.cloud
+            || left.graph_member != right.graph_member
+            // Graph ownership is pinned by the sealed Store and retained on replay. The
+            // assigned descriptor is compared here; do not rescan whole archives by ID.
+            || left.graph.as_ref().map(|value| value.reference())
+                != right.graph.as_ref().map(|value| value.reference())
             || !exact_optional_artifact(left.fine_map.as_ref(), right.fine_map.as_ref())?
             || !exact_optional_artifact(left.dense_cloud.as_ref(), right.dense_cloud.as_ref())?
         {
@@ -1304,5 +1334,159 @@ mod tests {
         let winner = left.or(right).unwrap();
         assert_eq!(interner.owners.lock().len(), 1);
         assert!(matches!(winner.checkpoint().backend_payload()[20], 1 | 2));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod planar_test_support {
+    use super::*;
+    use nuwax_slam_2d_runtime::{archive, protocol};
+
+    /// Real NWS2D002 producer and sealed Store; no legacy writer or digest fixture.
+    pub(crate) fn fixture() -> (proto::ActivateMapRequest, crate::planar_artifacts::Store, archive::AssignedMetadata) {
+        let checkpoint_id = "11111111111111111111111111111111";
+        let directory = std::env::temp_dir().join(format!("assigned-planar-owner-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&directory).unwrap();
+        let names = ["graph.posegraph", "graph.data", "grid.i8"];
+        for (name, bytes) in names.into_iter().zip([b"graph".as_slice(), b"scans".as_slice(), &[0]]) {
+            std::fs::write(directory.join(name), bytes).unwrap();
+        }
+        let metadata = archive::AssignedMetadata {
+            checkpoint_id: checkpoint_id.into(),
+            source: archive::Metadata {
+                version: 2,
+                session: protocol::Session {
+                    session_id: "source".into(), map_name: "Map One".into(), session_generation: 2,
+                    sensor_id: "laser".into(), frame_id: "laser".into(), map_frame_id: "map".into(),
+                    odom_frame_id: "odom".into(), body_frame_id: "base".into(), clock_domain: "unix_ns".into(),
+                    clock_id: String::new(), calibration_ref: "calibration".into(),
+                    odometry_source: protocol::OdometrySource::Device,
+                    core_config: serde_json::json!({"base_from_laser": [0.0, 0.0, 0.0]}),
+                },
+                estimate: protocol::Estimate { graph_revision: 11, source_timestamp_ns: 100, ..Default::default() },
+                source_unix_timestamp_ns: 100, width: 1, height: 1, resolution: 0.05, origin: [0.0, 0.0],
+                members: [
+                    archive::AssignedMember { name: names[0].into(), size: 5 },
+                    archive::AssignedMember { name: names[1].into(), size: 5 },
+                    archive::AssignedMember { name: names[2].into(), size: 1 },
+                ],
+            },
+        };
+        let archive_path = directory.join("checkpoint.nws");
+        let paths = names.map(|name| directory.join(name));
+        let descriptor = archive::write_assigned(&archive_path, &metadata, paths.each_ref().map(|path| path.as_path())).unwrap();
+        let occupancy = proto::CanonicalOccupancyCommitReceipt {
+            commit_id: Some(proto::MappingCommitIdentity { boot_nonce: vec![1; 16], sequence: 5 }),
+            session_id: "source".into(), session_generation: 2, occupancy_revision: 7,
+            source_timestamp_ns: 100, backend_kind: "slam_toolbox".into(), backend_generation: 3,
+        };
+        let member = |role| proto::CheckpointMemberIdentity {
+            checkpoint_id: checkpoint_id.into(), role: role as i32, occupancy_receipt: Some(occupancy.clone()),
+            cloud_receipt: None, frame_id: "map".into(), frame_generation: 0, producer_generation: 0,
+        };
+        let mut store = crate::planar_artifacts::Store::default();
+        let reference = store.insert(File::open(&archive_path).unwrap(), descriptor.payload_size,
+            member(proto::CheckpointMemberRole::PlanarGraph)).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        let checkpoint = proto::MappingBackendCheckpoint {
+            schema_version: 2, backend_kind: "slam_toolbox".into(), source_session_generation: 2,
+            created_at_ns: 101, source_session_id: "source".into(), payload_size: descriptor.payload_size,
+            checkpoint_id: checkpoint_id.into(), backend_payload_schema_version: 2,
+            occupancy_identity: Some(member(proto::CheckpointMemberRole::CanonicalOccupancy)),
+            occupancy_receipt: Some(occupancy), graph_artifact: Some(reference), target_kind: "planar_graph".into(),
+            canonical_occupancy_checkpoint: Some(proto::OccupancyGridData {
+                meta: Some(proto::OccupancyGridMeta { width: 1, height: 1, resolution: 0.05, origin_x: 0.0,
+                    origin_y: 0.0, frame_id: "map".into(), revision: 7, timestamp_ns: 100 }), data: vec![0],
+            }),
+            ..Default::default()
+        };
+        (proto::ActivateMapRequest {
+            session_id: "destination".into(), map_name: "Map One".into(), activation_request_id: "activate-planar".into(),
+            expected_runtime_generation: 17, activation_contract_version: 2,
+            asset_identity: Some(proto::AssetIdentityV2 { asset_id: "22222222222222222222222222222222".into() }),
+            mapping_backend_checkpoint: Some(checkpoint), ..Default::default()
+        }, store, metadata)
+    }
+
+    pub(crate) fn admit(wire: proto::ActivateMapRequest, store: &mut crate::planar_artifacts::Store,
+        interner: &CheckpointOwnerInternerV2) -> ValidatedActivationRequestV2 {
+        ValidatedActivationRequestV2::admit(wire, 17, MappingBackendKind::SlamToolbox, "map",
+            |reference| store.open(reference), interner).unwrap()
+    }
+
+    #[test]
+    fn assigned_planar_owner_pins_single_graph_and_reuses_it_after_release() {
+        use std::os::unix::fs::FileExt;
+        let (wire, mut store, _) = fixture();
+        let replay_wire = wire.clone();
+        let checkpoint = wire.mapping_backend_checkpoint.as_ref().unwrap();
+        let grid_pointer = checkpoint.canonical_occupancy_checkpoint.as_ref().unwrap().data.as_ptr();
+        let reference = checkpoint.graph_artifact.clone().unwrap();
+        let interner = CheckpointOwnerInternerV2::default();
+        let admitted = admit(wire, &mut store, &interner);
+        let owner = admitted.checkpoint();
+        assert_eq!(owner.occupancy().data.as_ptr(), grid_pointer);
+        assert!(owner.backend_payload().is_empty());
+        assert!(owner.0.cloud.is_none());
+        assert!(owner.0.backend_member.is_none());
+        assert_eq!(owner.source_member().role(), proto::CheckpointMemberRole::PlanarGraph);
+        assert_eq!(owner.occupancy_receipt().backend_kind, MappingBackendKind::SlamToolbox);
+        store.transfer(proto::GraphArtifactTransferRequest { artifact: Some(reference), action: 5, ..Default::default() }).unwrap();
+        let replay = ValidatedActivationRequestV2::admit(replay_wire, 17, MappingBackendKind::SlamToolbox, "map",
+            |_| panic!("retained graph replay must not reopen the transfer namespace"), &interner).unwrap();
+        assert!(owner.shares_source_with(replay.checkpoint()));
+        let mut magic = [0; 8];
+        owner.graph().unwrap().file().read_exact_at(&mut magic, 0).unwrap();
+        assert_eq!(&magic, b"NWS2D002");
+        assert!(owner.graph().unwrap().file().write_at(b"x", 0).is_err());
+    }
+
+    #[test]
+    fn assigned_planar_owner_descriptor_conflict_is_rejected_before_repinning() {
+        let (wire, mut store, _) = fixture();
+        let interner = CheckpointOwnerInternerV2::default();
+        let original = admit(wire.clone(), &mut store, &interner);
+        let mut changed = wire;
+        changed.mapping_backend_checkpoint.as_mut().unwrap().graph_artifact.as_mut().unwrap().id = "33333333333333333333333333333333".into();
+        assert!(ValidatedActivationRequestV2::admit(changed, 17, MappingBackendKind::SlamToolbox, "map",
+            |_| panic!("a live owner descriptor conflict must precede pinning"), &interner).is_err());
+        assert_eq!(original.checkpoint().source_member().checkpoint_id(), original.checkpoint().identity());
+    }
+
+    #[test]
+    fn assigned_planar_target_receipt_uses_graph_and_no_cloud() {
+        use crate::activation_contract::{InstalledActivationIdentityV2, InstalledTargetReceiptV2};
+        let (wire, mut store, _) = fixture();
+        let admitted = admit(wire, &mut store, &CheckpointOwnerInternerV2::default());
+        let owner = admitted.checkpoint();
+        let activation = InstalledActivationIdentityV2 {
+            request: admitted.metadata().clone(), runtime_generation: 17, lifecycle_epoch: 1,
+            session_generation: 23, backend_kind: MappingBackendKind::SlamToolbox, backend_generation: 19,
+        };
+        let receipt = InstalledTargetReceiptV2 {
+            activation, source_member: owner.source_member().clone(), cloud_receipt: None,
+            occupancy_receipt: OccupancyCommitReceipt {
+                commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 31, sequence: 32 },
+                session_id: "destination".into(), session_generation: 23, occupancy_revision: 33,
+                source_timestamp_ns: 34, backend_kind: MappingBackendKind::SlamToolbox, backend_generation: 19,
+            },
+        };
+        assert!(receipt.validate(owner));
+        let wire = receipt.to_wire();
+        assert!(wire.source_cloud_member.is_none());
+        assert!(wire.cloud_receipt.is_none());
+        assert_eq!(wire.source_graph_member.unwrap().role, proto::CheckpointMemberRole::PlanarGraph as i32);
+        let mut changed = receipt.clone();
+        changed.occupancy_receipt.backend_generation += 1;
+        assert!(!changed.validate(owner));
+        changed = receipt.clone();
+        changed.source_member = owner.occupancy_member().clone();
+        assert!(!changed.validate(owner));
+        changed = receipt;
+        changed.cloud_receipt = Some(CloudCommitReceipt {
+            commit_id: changed.occupancy_receipt.commit_id, session_generation: 23,
+            occupancy_revision: 33, cloud_revision: 35, source_timestamp_ns: 34, point_count: 1,
+        });
+        assert!(!changed.validate(owner));
     }
 }

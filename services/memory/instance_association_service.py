@@ -644,6 +644,8 @@ class InstanceAssociationService:
             current.observation_window,
             observation,
             now=now,
+            map_name=map_name or current.map_name,
+            localization_session_id=localization_session_id or current.localization_session_id,
         )
         deferred_cache = self._build_deferred_projection_cache(
             current.deferred_projection_cache,
@@ -666,9 +668,10 @@ class InstanceAssociationService:
         )
         if self._is_fallback_observation(observation) and self._instance_pose_is_reliable(current):
             # 坐标保留时同步保留其证据，最新观测退化另存 last_observation 字段。
+            pose_metadata = self._clear_dynamic_navigation_policy(current.metadata)
             for key in self._POSE_EVIDENCE_KEYS:
-                if key in current.metadata:
-                    metadata[key] = current.metadata[key]
+                if key in pose_metadata:
+                    metadata[key] = pose_metadata[key]
                 else:
                     metadata.pop(key, None)
             metadata["observation_only"] = False
@@ -729,7 +732,9 @@ class InstanceAssociationService:
             cost_map=cost_map,
         )
         movability = self._infer_movability(observation.label, observation.attributes)
-        observation_window = self._build_observation_window((), observation, now=now)
+        observation_window = self._build_observation_window(
+            (), observation, now=now, map_name=map_name, localization_session_id=localization_session_id
+        )
         deferred_cache = self._build_deferred_projection_cache((), observation, now=now)
         dynamic_state, dynamic_metadata = self._classify_dynamic_state(
             label=observation.label,
@@ -801,7 +806,7 @@ class InstanceAssociationService:
         movability: InstanceMovability,
         current_metadata: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
-        previous_metadata = dict(current_metadata or {})
+        previous_metadata = self._clear_dynamic_navigation_policy(current_metadata or {})
         backend = str(
             observation.attributes.get("backend")
             or observation.attributes.get("backend_type")
@@ -991,6 +996,8 @@ class InstanceAssociationService:
         observation: ProjectedObservation,
         *,
         now: datetime,
+        map_name: Optional[str] = None,
+        localization_session_id: Optional[str] = None,
     ) -> List[InstanceObservationWindowSample]:
         window = [item for item in current_window if isinstance(item, InstanceObservationWindowSample)]
         projection_method = str(observation.attributes.get("projection_method") or "")
@@ -1003,6 +1010,9 @@ class InstanceAssociationService:
                 confidence=float(observation.score),
                 track_id=observation.track_id,
                 metadata={
+                    "map_name": map_name,
+                    "map_source_epoch": observation.attributes.get("map_source_epoch"),
+                    "localization_session_id": localization_session_id,
                     "camera_id": observation.camera_id or "",
                     "source_observation_id": observation.source_observation_id,
                     "projection_method": projection_method,
@@ -1011,7 +1021,16 @@ class InstanceAssociationService:
                 },
             )
         )
-        return window[-self._OBSERVATION_WINDOW_LIMIT :]
+        # 快帧仍保留最新跟踪信息；不能以帧率优势挤掉可靠物体运动历史。
+        latest = window[-1]
+        reliable = [item for item in window[:-1] if self._sample_projection_reliable(item)]
+        selected = reliable[-(self._OBSERVATION_WINDOW_LIMIT - 1):] + [latest]
+        selected_ids = {id(item) for item in selected}
+        remaining = self._OBSERVATION_WINDOW_LIMIT - len(selected)
+        if remaining:
+            recent = [item for item in window[:-1] if id(item) not in selected_ids]
+            selected.extend(recent[-remaining:])
+        return sorted(selected, key=lambda item: item.timestamp)
 
     def _observer_pose_from_observation(self, observation: ProjectedObservation) -> Optional[Pose]:
         """从观测的射线光心(map frame)构造观测者位姿，供三角化/延迟投影使用。"""
@@ -1167,31 +1186,36 @@ class InstanceAssociationService:
         return mapping.get(value)
 
     def _dynamic_window_metrics(self, observation_window: List[InstanceObservationWindowSample]) -> Dict[str, object]:
-        if not observation_window:
-            return {"observation_count": 0, "duration_sec": 0.0, "max_displacement_m": 0.0, "estimated_speed_mps": 0.0, "track_ids": []}
-        first = observation_window[0]
-        last = observation_window[-1]
-        duration_sec = max(0.0, (last.timestamp - first.timestamp).total_seconds())
-        # 阶段0：位移仅基于坐标可信(非 fallback)的样本计算，避免 fallback 机器人位姿
-        # 与三角化/点云物体位姿混算位移导致的假 DYNAMIC 误判。
         reliable = [item for item in observation_window if self._sample_projection_reliable(item)]
-        displacement_samples = reliable if len(reliable) >= 2 else observation_window
-        ref_first = displacement_samples[0]
-        ref_last = displacement_samples[-1]
+        if reliable:
+            reference = observation_window[-1]
+            scope = {
+                key: next((item.metadata[key] for item in reversed(observation_window) if item.metadata.get(key) is not None), None)
+                for key in ("map_name", "map_source_epoch")
+            }
+            # 依实例归属兼容旧样本；只拒绝已知地图/地图代际冲突，不把定位重启当地图变化。
+            reliable = [item for item in reliable if (
+                frame_ids_semantically_equal(item.pose.frame_id, reference.pose.frame_id)
+                and all(
+                    item.metadata.get(key) is None or scope[key] is None
+                    or item.metadata[key] == scope[key]
+                    for key in ("map_name", "map_source_epoch")
+                )
+            )]
+        duration_sec = 0.0
         max_displacement = 0.0
-        for item in displacement_samples:
-            max_displacement = max(
-                max_displacement,
-                self._distance(ref_first.pose, item.pose),
-                self._distance(ref_last.pose, item.pose),
-            )
+        if len(reliable) >= 2:
+            first, last = reliable[0], reliable[-1]
+            duration_sec = max(0.0, (last.timestamp - first.timestamp).total_seconds())
+            for item in reliable:
+                max_displacement = max(max_displacement, self._distance(first.pose, item.pose), self._distance(last.pose, item.pose))
         speed = max_displacement / duration_sec if duration_sec > 0.0 else 0.0
         track_ids: List[str] = []
         for item in observation_window:
             if item.track_id and item.track_id not in track_ids:
                 track_ids.append(item.track_id)
         return {
-            "observation_count": len(observation_window),
+            "observation_count": len(reliable),
             "duration_sec": round(duration_sec, 6),
             "max_displacement_m": round(float(max_displacement), 6),
             "estimated_speed_mps": round(float(speed), 6),
@@ -1203,19 +1227,49 @@ class InstanceAssociationService:
         """观测窗口样本坐标是否可信(非 current_pose_fallback)。"""
 
         metadata = sample.metadata or {}
+        if metadata.get("projection_method") == "current_pose_fallback":
+            return False
+        if not all(math.isfinite(v) for v in (sample.pose.position.x, sample.pose.position.y, sample.pose.position.z)):
+            return False
         if "projection_reliable" in metadata:
             return bool(metadata.get("projection_reliable"))
         # 兼容旧样本(无该标记)：按 projection_method 推断。
         method = str(metadata.get("projection_method") or "")
-        return method != "current_pose_fallback"
+        return bool(method) and method != "current_pose_fallback"
+
+    def _clear_dynamic_navigation_policy(self, metadata: Dict[str, object]) -> Dict[str, object]:
+        """只撤销运动分类拥有的拒绝，恢复其叠加前的导航约束。"""
+        updated = dict(metadata)
+        previous = updated.pop("dynamic_navigation_previous", {})
+        if updated.get("non_navigable_reason") in {"dynamic_entity", "quasi_static_entity"}:
+            updated.pop("navigable", None)
+            updated.pop("non_navigable_reason", None)
+            if updated.get("navigation_exclusion_scope") == "long_term_static_target":
+                updated.pop("navigation_exclusion_scope")
+            if updated.get("local_retry_policy") == "retry_after_dynamic_obstacle_clears":
+                updated.pop("local_retry_policy")
+            if isinstance(previous, dict):
+                for key in ("navigable", "non_navigable_reason", "navigation_exclusion_scope", "local_retry_policy"):
+                    if key in previous and key not in updated:
+                        updated[key] = previous[key]
+            # 兼容没有保存叠加前条件的旧记录；回退位置仍不是可导航物体坐标。
+            if updated.get("observation_only") is True or updated.get("projection_method") == "current_pose_fallback":
+                updated["navigable"] = False
+                if not updated.get("non_navigable_reason"):
+                    updated["non_navigable_reason"] = "current_pose_fallback_no_geometry"
+        return updated
 
     def _apply_dynamic_navigation_policy(
         self,
         metadata: Dict[str, object],
         dynamic_state: InstanceDynamicState,
     ) -> Dict[str, object]:
-        updated = dict(metadata)
+        updated = self._clear_dynamic_navigation_policy(metadata)
         if dynamic_state in {InstanceDynamicState.DYNAMIC, InstanceDynamicState.QUASI_STATIC}:
+            updated["dynamic_navigation_previous"] = {
+                key: updated[key] for key in ("navigable", "non_navigable_reason", "navigation_exclusion_scope", "local_retry_policy")
+                if key in updated
+            }
             updated["navigable"] = False
             updated["non_navigable_reason"] = "dynamic_entity" if dynamic_state == InstanceDynamicState.DYNAMIC else "quasi_static_entity"
             updated["navigation_exclusion_scope"] = "long_term_static_target"

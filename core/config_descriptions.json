@@ -53,5 +53,10 @@
   "NUWAX_GEOMETRY_RUNTIME_LOG_NAME": "运行管理记录的几何日志名称。",
   "NUWAX_EXPLORE_ARBITRATION": "探索 source arbitration；当前生产构建只 qualification prefer_wavefront。",
   "NUWAX_GEOMETRY_ODOM_TOPIC": "里程计话题（实机由 Unitree 驱动发布 /utlidar/robot_odom,settings.py 默认 /utlidar/robot_odom 与 .env.example 对齐）",
-  "NUWAX_GEOMETRY_TF_TOPIC": "TF 话题（settings.py / tf_static 配套使用,默认 /tf）"
+  "NUWAX_GEOMETRY_TF_TOPIC": "TF 话题（settings.py / tf_static 配套使用,默认 /tf）",
+  "NUWAX_MANIPULATION_ENABLED": "显式启用配置的外部操作设备；未发现实际任务能力时不公开工具。",
+  "NUWAX_MANIPULATION_BASE_URL": "本机或远端设备基础地址；NEH不加载设备动作模型。",
+  "NUWAX_MANIPULATION_HTTP_TIMEOUT_SEC": "每次HTTP请求最长等待秒数。",
+  "NUWAX_MANIPULATION_STOP_TIMEOUT_SEC": "取消后等待匹配任务终态及physics_paused的最长秒数。",
+  "NUWAX_MANIPULATION_POLL_INTERVAL_SEC": "查询同一设备任务状态的间隔秒数。"
 }

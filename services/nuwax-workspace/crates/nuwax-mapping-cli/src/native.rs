@@ -1858,7 +1858,7 @@ mod tests {
             .unwrap()
             .filter_map(Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(".nuwax-mapping-cli-stage-v1-"))
+            .filter(|name| name.starts_with(".nuwax-mapping-cli-stage-v2-"))
             .collect();
         assert!(
             entries.is_empty(),
@@ -1891,6 +1891,30 @@ mod tests {
             .all(|entry| !entry
                 .file_name()
                 .to_string_lossy()
-                .starts_with(".nuwax-mapping-cli-stage-v1-")));
+                .starts_with(".nuwax-mapping-cli-stage-v2-")));
     }
+
+    #[test]
+    fn memory2_255_byte_name_uses_short_staging_sqlite_journal() {
+        let directory = TestDir::new("long-name");
+        let source_path = directory.0.join("source.db");
+        create_memory2_fixture(&source_path);
+        let source = open_memory2(&source_path).unwrap();
+        let output = directory.0.join(format!("{}.db", "m".repeat(252)));
+        with_memory2_copy(&source, &output, |connection| {
+            transaction(connection, |connection| {
+                connection.execute("UPDATE lidar SET value = 8.0 WHERE id = 1", &[])?;
+                Ok(())
+            })
+        }).unwrap();
+        let published = sqlite::Connection::open_read_only(&output).unwrap();
+        assert_eq!(published.query("SELECT value FROM lidar WHERE id = 1", &[]).unwrap(),
+            vec![vec![sqlite::Value::Real(8.0)]]);
+        assert_eq!(source.query("SELECT value FROM lidar WHERE id = 1", &[]).unwrap(),
+            vec![vec![sqlite::Value::Real(7.0)]]);
+        validate_memory2_publication(&output).unwrap();
+        assert!(fs::read_dir(&directory.0).unwrap().filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with(".nuwax-mapping-cli-stage-v2-")));
+    }
+
 }

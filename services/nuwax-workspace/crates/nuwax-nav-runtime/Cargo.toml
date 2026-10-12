@@ -31,5 +31,7 @@ prost = { workspace = true }
 
 [features]
 default = []
+# Opt-in construction seam for cross-crate recovery qualification tests.
+surface-recovery-qualification = []
 # Opt-in wall-time attribution only; no production navigation option.
 body-query-profile = ["nuwax-nav-mls-planner/body-query-profile"]

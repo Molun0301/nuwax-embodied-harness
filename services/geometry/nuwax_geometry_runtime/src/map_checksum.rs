@@ -15,9 +15,13 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex_buf
 }
 
+#[cfg(test)]
+std::thread_local! { pub(crate) static FORBID_HASH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
 /// SHA-256 原始 32 字节摘要。
 #[must_use]
 pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    #[cfg(test)] FORBID_HASH.with(|v| assert!(!v.get(), "legacy map hash reached assigned planar path"));
     Sha256::digest(data).into()
 }
 

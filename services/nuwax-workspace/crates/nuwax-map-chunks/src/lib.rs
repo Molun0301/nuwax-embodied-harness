@@ -318,16 +318,15 @@ impl Receiver {
         self.reader.retain_objects(&objects);
         // Collection is maintenance after the complete candidate transaction. It
         // must not report a failed receive after installing a successful root.
-        self.collection_error = self.repository.collect_unreferenced(&live).err();
+        self.collection_error = self.repository.collect_objects(&objects).err();
         result
     }
     fn validate_progression(&mut self, old: &Manifest, new: &Manifest) -> Result<(), String> {
         if new.geometry_revision < old.geometry_revision { return Err("root geometry revision rolled back".into()); }
-        let previous: BTreeMap<_, _> = old.blocks.iter().map(|b| (b.key, b)).collect();
-        let next: BTreeSet<_> = new.blocks.iter().map(|b| b.key).collect();
-        let mut membership_changed = previous.keys().any(|key| !next.contains(key));
+        let mut membership_changed = old.blocks.iter().any(|a| new.blocks.binary_search_by_key(&a.key, |b| b.key).is_err());
         for b in &new.blocks {
-            let Some(a) = previous.get(&b.key) else { membership_changed = true; continue; };
+            let Ok(index) = old.blocks.binary_search_by_key(&b.key, |a| a.key) else { membership_changed = true; continue; };
+            let a = &old.blocks[index];
             if b.block_revision < a.block_revision || b.geometry_revision < a.geometry_revision { return Err("block revision rolled back".into()); }
             if b.object != a.object {
                 if b.block_revision <= a.block_revision { return Err("changed object needs advanced evidence revision".into()); }

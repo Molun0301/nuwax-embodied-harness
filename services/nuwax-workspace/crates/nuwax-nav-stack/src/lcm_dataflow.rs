@@ -66,7 +66,7 @@ use nuwax_nav_types_messages::PoseStamped;
     feature = "patrolling"
 ))]
 use nuwax_nav_types_messages::Twist2;
-use nuwax_nav_types_messages::{NavFrameId, Point3, Pose3, Quaternion, Timestamp};
+use nuwax_nav_types_messages::{GoalKey, NavFrameId, Point3, Pose3, Quaternion, Timestamp};
 #[cfg(feature = "explore")]
 use nuwax_nav_types_messages::{OccupancyCell, OccupancyGrid2D};
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame, RawLcmFrameBuilder};
@@ -564,12 +564,12 @@ fn validate_ports(node: &ModuleNode, inputs: usize, outputs: &[usize]) -> NavSta
 }
 
 #[cfg(feature = "guard-runtime")]
-pub(crate) fn map_pose_owner(node: &ModuleNode) -> NavStackResult<Box<dyn InProcessNode>> {
+pub(crate) fn map_pose_owner(node: &ModuleNode, body_reference_frame_id: Arc<str>) -> NavStackResult<Box<dyn InProcessNode>> {
     validate_ports(node, 2, &[1])?;
     let node = node.clone();
     Ok(boxed_owner(
         "map-pose-adapter",
-        Box::new(move |shutdown, ready| Box::pin(run_map_pose_adapter(node, shutdown, ready))),
+        Box::new(move |shutdown, ready| Box::pin(run_map_pose_adapter(node, body_reference_frame_id, shutdown, ready))),
     ))
 }
 
@@ -730,23 +730,31 @@ fn retain_newest_map_pose(
 }
 
 #[cfg(feature = "guard-runtime")]
+fn bound_map_pose_adapter(
+    map_frame: String,
+    odom_frame: String,
+    body_reference_frame_id: &str,
+) -> NavStackResult<crate::map_pose::MapPoseAdapter> {
+    crate::map_pose::MapPoseAdapter::new(map_frame, odom_frame, body_reference_frame_id)
+        .map(|adapter| adapter.require_body_reference())
+        .map_err(|error| module_error("map_pose_adapter", error))
+}
+
+#[cfg(feature = "guard-runtime")]
 async fn run_map_pose_adapter(
     node: ModuleNode,
+    body_reference_frame_id: Arc<str>,
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
     let transport = lcm_transport()?;
     let mut odometry = typed_stream(&transport, &node.inputs[0], "nav_msgs.Odometry").await?;
     let mut transforms = typed_stream(&transport, &node.inputs[1], "tf2_msgs.TFMessage").await?;
-    let mut adapter = crate::map_pose::MapPoseAdapter::new(
+    let mut adapter = bound_map_pose_adapter(
         configured_frame("NUWAX_GEOMETRY_MAP_FRAME", "map")?,
         configured_frame("NUWAX_GEOMETRY_ODOM_FRAME", "odom")?,
-        configured_frame_alias("NUWAX_BASE_FRAME", "NUWAX_GEOMETRY_BASE_FRAME", "base_link")?,
-    )
-    .map_err(|error| module_error("map_pose_adapter", error))?;
-    if node.feature_gate.as_deref() == Some("mls") {
-        adapter = adapter.require_body_reference();
-    }
+        &body_reference_frame_id,
+    )?;
     let mut diagnostics = InputDiagnosticLimiter::default();
     let mut pending_odometry: Option<Box<schema::Odometry>> = None;
     let mut last_published_timestamp_ns = None;
@@ -846,7 +854,6 @@ fn configured_frame(key: &str, fallback: &str) -> NavStackResult<String> {
     }
 }
 
-#[cfg(feature = "guard-runtime")]
 fn configured_frame_alias(
     preferred_key: &str,
     legacy_key: &str,
@@ -861,7 +868,6 @@ fn configured_frame_alias(
     })
 }
 
-#[cfg(feature = "guard-runtime")]
 fn resolve_frame_alias(
     preferred: Option<&str>,
     legacy: Option<&str>,
@@ -877,13 +883,12 @@ fn resolve_frame_alias(
 
 #[cfg(feature = "guard-runtime")]
 pub(crate) fn guarded_nav_scheduler_owner(
-    node: &ModuleNode,
-) -> NavStackResult<Box<dyn InProcessNode>> {
+    node: &ModuleNode, body_reference_frame_id: Arc<str>) -> NavStackResult<Box<dyn InProcessNode>> {
     validate_ports(node, 5, &[4])?;
     let node = node.clone();
     Ok(boxed_owner(
         "guarded-nav-scheduler",
-        Box::new(move |shutdown, ready| Box::pin(run_guarded_nav_scheduler(node, shutdown, ready))),
+        Box::new(move |shutdown, ready| Box::pin(run_guarded_nav_scheduler(node, body_reference_frame_id, shutdown, ready))),
     ))
 }
 
@@ -907,8 +912,8 @@ struct GuardedNavTelemetry {
     initial_distance: f64,
     progress: f64,
     path_revision: i64,
-    goal_payload_sha256: [u8; 32],
-    path_payload_sha256: [u8; 32],
+    producer_runtime_generation: i64,
+    planner_runtime_generation: i64,
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -931,14 +936,11 @@ fn guarded_goal_execution_identity(
         committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
         committed_map_frame_id: goal.committed_map_frame_id.clone(),
         boundary_id: goal.boundary_id.clone(),
-        boundary_sha256: goal.boundary_sha256,
         motion_guard_generation: goal.motion_guard_generation,
         motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
         motion_stop_generation: goal.motion_stop_generation,
         planner_runtime_generation: 0,
         path_revision: 0,
-        goal_payload_sha256: goal.payload_sha256,
-        path_payload_sha256: [0; 32],
     }
 }
 
@@ -962,14 +964,11 @@ fn guarded_path_execution_identity(
         committed_map_source_timestamp_ns: path.committed_map_source_timestamp_ns,
         committed_map_frame_id: path.committed_map_frame_id.clone(),
         boundary_id: path.boundary_id.clone(),
-        boundary_sha256: path.boundary_sha256,
         motion_guard_generation: path.motion_guard_generation,
         motion_guard_boot_nonce: path.motion_guard_boot_nonce,
         motion_stop_generation: path.motion_stop_generation,
         planner_runtime_generation: path.planner_runtime_generation,
         path_revision: u64::try_from(path.path_revision).expect("validated positive path revision"),
-        goal_payload_sha256: path.goal_payload_sha256,
-        path_payload_sha256: path.path_payload_sha256,
     }
 }
 
@@ -997,7 +996,6 @@ fn observe_guarded_cancel_generation(
 ) -> Result<(), String> {
     if let Some(observed) = watermark.as_mut().filter(|observed| {
         planner_goal_identity_matches(&observed.goal, goal)
-            && observed.goal.payload_sha256 == goal.payload_sha256
     }) {
         if generation < observed.generation {
             return Err(format!(
@@ -1287,6 +1285,7 @@ where
 #[cfg(feature = "guard-runtime")]
 async fn run_guarded_nav_scheduler(
     node: ModuleNode,
+    body_reference_frame_id: Arc<str>,
     shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
@@ -1326,6 +1325,8 @@ async fn run_guarded_nav_scheduler(
         status,
         Some(source_max_age),
         planar_navigation_enabled(),
+        &body_reference_frame_id,
+        None,
     );
     let task_future = async move {
         task.await
@@ -1570,6 +1571,8 @@ async fn run_guarded_nav_loop<M, T>(
     mut status: tokio::sync::watch::Receiver<nuwax_nav_runtime::SchedulerStatus>,
     source_max_age: Option<Duration>,
     planar_mode: bool,
+    body_reference_frame_id: &str,
+    surface_support_z_m: Option<f64>,
 ) -> NavStackResult<()>
 where
     M: Stream<Item = TransportResult<T>> + Unpin + Send,
@@ -1583,7 +1586,7 @@ where
         ..GuardedNavTelemetry::default()
     };
     let mut active_session: Option<schema::GoalEnvelope> = None;
-    let mut accepted_planner_generation: Option<([u8; 32], i64)> = None;
+    let mut accepted_planner_generation: Option<(GoalKey, i64)> = None;
     let mut goal_buffer = PlannerGoalBuffer::default();
     let mut surface_authority: Option<GuardedMapAuthority> = None;
     let mut planar_admission=nuwax_codec::lcm::planar_navigation::Admission::default();
@@ -1773,7 +1776,7 @@ where
                                 scheduler.invalidate_map_received("二维导航来源已撤销或切换",tokio::time::Instant::from_std(invalidated_at)).await
                                     .map_err(|e|module_error("planar map invalidation",e))?;
                                 goal_buffer.costmap_observed=false;
-                                goal_buffer.active_goal_sha256=None;
+                                goal_buffer.active_goal_applied = false;
                                 if value.cleared || !goal_buffer.pending_goal.as_ref().is_some_and(|goal|authority.permits_goal(goal)) {
                                     goal_buffer.pending_invalidated = true;
                                 }
@@ -1808,7 +1811,7 @@ where
                                 .await
                                 .map_err(|error| module_error("surface map invalidation", error))?;
                             goal_buffer.costmap_observed = false;
-                            goal_buffer.active_goal_sha256 = None;
+                            goal_buffer.active_goal_applied = false;
                             // 精细源失败或换域时仍保留待执行目标；否则之后的取消
                             // 找不到原目标，几何拥有方会永久等待无法关联的停车回执。
                             if (update.snapshot.is_err() && !update.awaiting_build)
@@ -1914,7 +1917,7 @@ where
             }
             GuardedNavEvent::Goal(message) => {
                 let frame = required_frame(message, "guarded_nav_scheduler.goal")?;
-                let goal_envelope = match decode_configured_goal_envelope(&frame.payload) {
+                let goal_envelope = match decode_configured_goal_envelope(&frame.payload, body_reference_frame_id, surface_support_z_m) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         // 契约完整但本机配置拒绝的目标仍属于原请求。保留不可执行
@@ -2083,7 +2086,7 @@ where
                 }
                 if planner_generation_is_stale(
                     accepted_planner_generation,
-                    active_goal.payload_sha256,
+                    active_goal.goal_key(),
                     path_envelope.planner_runtime_generation,
                 ) {
                     publish_guarded_rejection(
@@ -2121,7 +2124,6 @@ where
                         execution_identity: guarded_path_execution_identity(&path_envelope),
                         path_revision: u64::try_from(path_envelope.path_revision)
                             .expect("validated positive path revision"),
-                        payload_hash: path_envelope.path_payload_sha256,
                         path_yaws: if node.id == "surface_nav_scheduler" {
                             None
                         } else {
@@ -2165,11 +2167,11 @@ where
                     }
                 } else {
                     accepted_planner_generation = Some((
-                        active_goal.payload_sha256,
+                        active_goal.goal_key(),
                         path_envelope.planner_runtime_generation,
                     ));
                     telemetry.path_revision = path_envelope.path_revision;
-                    telemetry.path_payload_sha256 = path_envelope.path_payload_sha256;
+                    telemetry.planner_runtime_generation = path_envelope.planner_runtime_generation;
                 }
             }
             GuardedNavEvent::Cancel(message) => {
@@ -2211,7 +2213,7 @@ where
                 candidate_telemetry.parent_request_id = cancel.parent_request_id.clone();
                 candidate_telemetry.goal_generation = cancel.goal_generation;
                 candidate_telemetry.path_revision = 0;
-                candidate_telemetry.path_payload_sha256 = [0; 32];
+                candidate_telemetry.planner_runtime_generation = 0;
                 if let Some(active_goal) = active_session.clone() {
                     if let Err(reason) = validate_cancel_goal_correlation(&cancel, &active_goal) {
                         publish_guarded_rejection(
@@ -2687,9 +2689,9 @@ async fn activate_guarded_goal(
     candidate_telemetry.owner_kind = goal_envelope.owner_kind;
     candidate_telemetry.parent_request_id = goal_envelope.parent_request_id.clone();
     candidate_telemetry.goal_generation = goal_envelope.goal_generation;
-    candidate_telemetry.goal_payload_sha256 = goal_envelope.payload_sha256;
+    candidate_telemetry.producer_runtime_generation = goal_envelope.producer_runtime_generation;
     candidate_telemetry.path_revision = 0;
-    candidate_telemetry.path_payload_sha256 = [0; 32];
+    candidate_telemetry.planner_runtime_generation = 0;
     candidate_telemetry.initial_distance = telemetry_distance(&candidate_telemetry);
     candidate_telemetry.progress = 0.0;
     if let Err(error) = scheduler
@@ -2765,9 +2767,9 @@ fn clear_guarded_session_telemetry(telemetry: &mut GuardedNavTelemetry) {
     telemetry.cancel_generation = 0;
     telemetry.goal = [0.0; 3];
     telemetry.goal_z = 0.0;
-    telemetry.goal_payload_sha256 = [0; 32];
+    telemetry.producer_runtime_generation = 0;
     telemetry.path_revision = 0;
-    telemetry.path_payload_sha256 = [0; 32];
+    telemetry.planner_runtime_generation = 0;
     telemetry.initial_distance = 0.0;
     telemetry.progress = 0.0;
 }
@@ -2810,12 +2812,12 @@ fn planner_generation_matches_authority(candidate: i64, authoritative: i64) -> b
 
 #[cfg(feature = "guard-runtime")]
 fn planner_generation_is_stale(
-    accepted: Option<([u8; 32], i64)>,
-    active_goal_digest: [u8; 32],
+    accepted: Option<(GoalKey, i64)>,
+    active_goal_key: GoalKey,
     candidate_generation: i64,
 ) -> bool {
-    accepted.is_some_and(|(goal_digest, generation)| {
-        goal_digest == active_goal_digest && candidate_generation < generation
+    accepted.is_some_and(|(goal_key, generation)| {
+        goal_key == active_goal_key && candidate_generation < generation
     })
 }
 
@@ -2839,14 +2841,12 @@ fn validate_path_goal_correlation(
         || path.committed_map_source_timestamp_ns != goal.committed_map_source_timestamp_ns
         || path.committed_map_frame_id != goal.committed_map_frame_id
         || path.boundary_id != goal.boundary_id
-        || path.boundary_sha256 != goal.boundary_sha256
         || path.motion_guard_generation != goal.motion_guard_generation
         || path.motion_guard_boot_nonce != goal.motion_guard_boot_nonce
         || path.motion_stop_generation != goal.motion_stop_generation
-        || path.goal_payload_sha256 != goal.payload_sha256
     {
         return Err(
-            "PathEnvelope identity/goal hash does not match the active GoalEnvelope".into(),
+            "PathEnvelope goal identity does not match the active GoalEnvelope".into(),
         );
     }
     Ok(())
@@ -2887,9 +2887,9 @@ fn guarded_buffered_cancel_telemetry(
         goal_pose.pose.position.y,
         goal_pose.pose.orientation.yaw(),
     ];
-    candidate.goal_payload_sha256 = goal.payload_sha256;
+    candidate.producer_runtime_generation = goal.producer_runtime_generation;
     candidate.path_revision = 0;
-    candidate.path_payload_sha256 = [0; 32];
+    candidate.planner_runtime_generation = 0;
     candidate.goal_z = goal_pose.pose.position.z;
     candidate.initial_distance = telemetry_distance(&candidate);
     candidate.progress = 0.0;
@@ -2933,7 +2933,7 @@ fn update_progress(telemetry: &mut GuardedNavTelemetry) {
 #[cfg(feature = "guard-runtime")]
 #[derive(Default)]
 struct GuardedStatusPublications {
-    goal: Option<(String, i32, String, i64, [u8; 32])>,
+    goal: Option<(String, i32, String, i64, i64)>,
     applied_commands: u64,
     last_zero_ack_id: Option<String>,
     reached_published: bool,
@@ -2955,7 +2955,7 @@ impl GuardedStatusPublications {
                 telemetry.owner_kind,
                 telemetry.parent_request_id.clone(),
                 telemetry.goal_generation,
-                telemetry.goal_payload_sha256,
+                telemetry.producer_runtime_generation,
             );
             if self.goal.as_ref() != Some(&goal) {
                 self.goal = Some(goal);
@@ -3132,8 +3132,8 @@ fn build_guarded_navigation_state(
         parent_request_id: telemetry.parent_request_id.clone(),
         goal_generation: telemetry.goal_generation,
         path_revision: telemetry.path_revision,
-        goal_payload_sha256: telemetry.goal_payload_sha256,
-        path_payload_sha256: telemetry.path_payload_sha256,
+        producer_runtime_generation: telemetry.producer_runtime_generation,
+        planner_runtime_generation: telemetry.planner_runtime_generation,
         local_path: if state == 2
             && status.session_id.as_deref() == Some(telemetry.public_session_id.as_str())
             && i64::try_from(status.path_revision).ok() == Some(telemetry.path_revision)
@@ -3903,7 +3903,7 @@ struct PlannerGoalBuffer {
     pending_invalidated: bool,
     pending_goal: Option<schema::GoalEnvelope>,
     newest_goal: Option<schema::GoalEnvelope>,
-    active_goal_sha256: Option<[u8; 32]>,
+    active_goal_applied: bool,
 }
 
 #[cfg(any(
@@ -3918,7 +3918,7 @@ impl PlannerGoalBuffer {
                 return PlannerGoalIngress::Rejected(reason);
             }
         }
-        self.active_goal_sha256 = None;
+        self.active_goal_applied = false;
         self.pending_invalidated = false;
         self.newest_goal = Some(goal.clone());
         if self.costmap_observed {
@@ -3941,10 +3941,9 @@ impl PlannerGoalBuffer {
     fn mark_applied(&mut self, goal: &schema::GoalEnvelope) -> bool {
         let is_current = self.is_newest_goal(goal);
         if is_current {
-            self.active_goal_sha256 = Some(goal.payload_sha256);
+            self.active_goal_applied = true;
             if self.pending_goal.as_ref().is_some_and(|pending| {
                 planner_goal_identity_matches(pending, goal)
-                    && pending.payload_sha256 == goal.payload_sha256
             }) {
                 self.pending_goal = None;
             }
@@ -3955,17 +3954,15 @@ impl PlannerGoalBuffer {
     fn is_newest_goal(&self, goal: &schema::GoalEnvelope) -> bool {
         self.newest_goal.as_ref().is_some_and(|newest| {
             planner_goal_identity_matches(goal, newest)
-                && goal.payload_sha256 == newest.payload_sha256
         })
     }
 
     fn defer_ready_goal(&mut self, goal: schema::GoalEnvelope) -> bool {
         let is_current = self.newest_goal.as_ref().is_some_and(|newest| {
             planner_goal_identity_matches(&goal, newest)
-                && goal.payload_sha256 == newest.payload_sha256
         });
         if is_current {
-            self.active_goal_sha256 = None;
+            self.active_goal_applied = false;
             self.pending_goal = Some(goal);
         }
         is_current
@@ -3980,12 +3977,12 @@ impl PlannerGoalBuffer {
     }
 
     fn has_applied_goal(&self) -> bool {
-        self.active_goal_sha256.is_some()
+        self.active_goal_applied
     }
 
     #[cfg(feature = "simple-2d")]
     fn clear_applied_goal(&mut self) {
-        self.active_goal_sha256 = None;
+        self.active_goal_applied = false;
     }
 
     fn cancelled_pending_goal(
@@ -4002,11 +3999,10 @@ impl PlannerGoalBuffer {
     fn clear_pending_goal_for(&mut self, goal: &schema::GoalEnvelope) -> bool {
         let matches = self.pending_goal.as_ref().is_some_and(|pending| {
             planner_goal_identity_matches(pending, goal)
-                && pending.payload_sha256 == goal.payload_sha256
         });
         if matches {
             self.pending_goal = None;
-            self.active_goal_sha256 = None;
+            self.active_goal_applied = false;
         }
         matches
     }
@@ -4050,7 +4046,10 @@ fn planner_goal_order(goal: &schema::GoalEnvelope) -> (i64, i64) {
 #[cfg(any(
     feature = "guard-runtime",
     feature = "simple-2d",
-    feature = "replanning-astar"
+    feature = "replanning-astar",
+    feature = "cmu-native",
+    feature = "explore",
+    feature = "mls"
 ))]
 fn planner_goal_identity_matches(
     left: &schema::GoalEnvelope,
@@ -4071,7 +4070,14 @@ fn planner_goal_identity_matches(
         && left.committed_map_source_timestamp_ns == right.committed_map_source_timestamp_ns
         && left.committed_map_frame_id == right.committed_map_frame_id
         && left.boundary_id == right.boundary_id
-        && left.boundary_sha256 == right.boundary_sha256
+        && left.boundary_frame_id == right.boundary_frame_id
+        && left.boundary_points == right.boundary_points
+        && left.goal.pose == right.goal.pose
+        && left.goal.header.frame_id == right.goal.header.frame_id
+        && left.options == right.options
+        && left.body_reference_frame_id == right.body_reference_frame_id
+        && left.body_to_support_z_m == right.body_to_support_z_m
+        && left.map_frame_generation == right.map_frame_generation
         && left.motion_guard_generation == right.motion_guard_generation
         && left.motion_guard_boot_nonce == right.motion_guard_boot_nonce
         && left.motion_stop_generation == right.motion_stop_generation
@@ -4090,7 +4096,7 @@ fn validate_goal_envelope_order(
         std::cmp::Ordering::Less => Err(PlannerGoalRejectReason::SupersededLease),
         std::cmp::Ordering::Equal => {
             if planner_goal_identity_matches(candidate, newest)
-                && candidate.payload_sha256 == newest.payload_sha256
+
             {
                 Err(PlannerGoalRejectReason::DuplicateLease)
             } else {
@@ -4310,14 +4316,43 @@ fn validate_newer_source_timestamp(
     }
 }
 
-fn decode_configured_goal_envelope(payload:&[u8])->nuwax_codec::CodecResult<schema::GoalEnvelope> {
-    let message=schema::decode_goal_envelope_body(payload)?;
-    let expected=nuwax_nav_types_messages::navigation_capabilities::configuration_digest_from_env()
-        .map_err(nuwax_codec::CodecError::LcmDecode)?;
-    if message.navigation_configuration_sha256!=expected {
-        return Err(nuwax_codec::CodecError::LcmDecode("navigation configuration differs across owners".into()));
-    }
+fn decode_configured_goal_envelope(
+    payload: &[u8],
+    body_reference_frame_id: &str,
+    surface_support_z_m: Option<f64>,
+) -> nuwax_codec::CodecResult<schema::GoalEnvelope> {
+    let message = schema::decode_goal_envelope_body(payload)?;
+    validate_goal_reference(&message, body_reference_frame_id, surface_support_z_m)?;
     Ok(message)
+}
+
+fn validate_goal_reference(
+    message: &schema::GoalEnvelope,
+    body_reference_frame_id: &str,
+    surface_support_z_m: Option<f64>,
+) -> nuwax_codec::CodecResult<()> {
+    if message.body_reference_frame_id != body_reference_frame_id {
+        return Err(nuwax_codec::CodecError::LcmDecode("navigation body reference differs across owners".into()));
+    }
+    if let (Some(declared), Some(expected)) = (message.body_to_support_z_m, surface_support_z_m) {
+        if declared != expected {
+            return Err(nuwax_codec::CodecError::LcmDecode("goal support conversion differs from execution owner".into()));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn capture_body_reference() -> Result<Arc<str>, String> {
+    let body = configured_frame_alias("NUWAX_BASE_FRAME", "NUWAX_GEOMETRY_BASE_FRAME", "base_link")
+        .map_err(|error| error.to_string())?;
+    if !crate::map_pose::valid_body_reference(&body) {
+        return Err("navigation body reference must be a valid frame ID".into());
+    }
+    Ok(Arc::from(body))
+}
+
+pub(crate) fn captured_body_reference(body: &Result<Arc<str>, String>) -> NavStackResult<Arc<str>> {
+    body.as_ref().map(Arc::clone).map_err(|reason| NavStackError::InvalidConfig(reason.clone()))
 }
 
 #[cfg(feature = "simple-2d")]
@@ -4440,9 +4475,9 @@ struct FarJoinKey {
     owner_kind: i32,
     parent_request_id: String,
     goal_generation: i64,
-    goal_payload_sha256: [u8; 32],
+    producer_runtime_generation: i64,
     path_revision: i64,
-    path_payload_sha256: [u8; 32],
+    planner_runtime_generation: i64,
 }
 
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
@@ -4450,8 +4485,9 @@ fn far_join_key(state: &schema::NavigationState) -> Option<FarJoinKey> {
     if state.state != nuwax_nav_far_planner_bridge::worker::FAR_EVENT_SUCCEEDED
         || state.runtime_generation <= 0
         || state.path_revision <= 0
-        || state.goal_payload_sha256 == [0; 32]
-        || state.path_payload_sha256 == [0; 32]
+        || state.producer_runtime_generation <= 0
+        || state.goal_generation <= 0
+        || state.planner_runtime_generation != state.runtime_generation
     {
         return None;
     }
@@ -4462,9 +4498,9 @@ fn far_join_key(state: &schema::NavigationState) -> Option<FarJoinKey> {
         owner_kind: state.owner_kind,
         parent_request_id: state.parent_request_id.clone(),
         goal_generation: state.goal_generation,
-        goal_payload_sha256: state.goal_payload_sha256,
+        producer_runtime_generation: state.producer_runtime_generation,
         path_revision: state.path_revision,
-        path_payload_sha256: state.path_payload_sha256,
+        planner_runtime_generation: state.planner_runtime_generation,
     })
 }
 
@@ -4481,7 +4517,8 @@ fn far_key_matches_goal(
         && key.owner_kind == goal.owner_kind
         && key.parent_request_id == goal.parent_request_id
         && key.goal_generation == goal.goal_generation
-        && key.goal_payload_sha256 == goal.payload_sha256
+        && key.producer_runtime_generation == goal.producer_runtime_generation
+        && key.planner_runtime_generation == accepted_generation
 }
 
 #[cfg(all(any(feature = "cmu-native", feature = "explore"), test))]
@@ -4538,7 +4575,7 @@ fn mls_result_matches_goal(
         && generation > 0
         && generation == accepted_generation
         && result.backend_generation == generation
-        && result.goal == *goal
+        && planner_goal_identity_matches(&result.goal, goal)
 }
 
 #[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
@@ -4564,8 +4601,7 @@ fn admit_native_adapter_goal(
 
 #[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
 pub(crate) fn native_planner_path_adapter_owner(
-    node: &ModuleNode,
-) -> NavStackResult<Box<dyn InProcessNode>> {
+    node: &ModuleNode, body_reference_frame_id: Arc<str>) -> NavStackResult<Box<dyn InProcessNode>> {
     if node.inputs.len() < 2 || node.inputs.len() > 3 || node.outputs.len() != 1 {
         return Err(NavStackError::InvalidConfig(format!(
             "native planner adapter requires 2 or 3 inputs and one output, got {}/{}",
@@ -4577,7 +4613,7 @@ pub(crate) fn native_planner_path_adapter_owner(
     Ok(boxed_owner(
         "native-planner-path-adapter",
         Box::new(move |shutdown, ready| {
-            Box::pin(run_native_planner_path_adapter(node, shutdown, ready))
+            Box::pin(run_native_planner_path_adapter(node, body_reference_frame_id, shutdown, ready))
         }),
     ))
 }
@@ -4585,10 +4621,22 @@ pub(crate) fn native_planner_path_adapter_owner(
 #[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
 async fn run_native_planner_path_adapter(
     node: ModuleNode,
-    mut shutdown: oneshot::Receiver<()>,
+    body_reference_frame_id: Arc<str>,
+    shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
     let transport = lcm_transport()?;
+    run_native_planner_path_adapter_with_transport(node, body_reference_frame_id, transport, shutdown, ready).await
+}
+
+#[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
+async fn run_native_planner_path_adapter_with_transport(
+    node: ModuleNode,
+    body_reference_frame_id: Arc<str>,
+    transport: LcmTransport,
+    mut shutdown: oneshot::Receiver<()>,
+    ready: ReadySender,
+) -> NavStackResult<()> {
     let mut goals = typed_stream(&transport, &node.inputs[0], "nuwax_msgs.GoalEnvelope").await?;
     let mut events =
         typed_stream(&transport, &node.inputs[1], "nuwax_msgs.NavigationState").await?;
@@ -4616,7 +4664,7 @@ async fn run_native_planner_path_adapter(
             _ = &mut shutdown => break,
             frame = goals.next() => {
                 let frame = required_frame(frame, "native_planner_path_adapter.goal")?;
-                let goal = match decode_configured_goal_envelope(&frame.payload) {
+                let goal = match decode_configured_goal_envelope(&frame.payload, &body_reference_frame_id, None) {
                     Ok(goal) => goal,
                     Err(_) => continue,
                 };
@@ -4663,7 +4711,7 @@ async fn run_native_planner_path_adapter(
                     {
                         continue;
                     }
-                    let path = match nuwax_nav_far_planner_bridge::worker::decode_private_result_v2(&state) {
+                    let path = match nuwax_nav_far_planner_bridge::worker::decode_private_result_v3(&state) {
                         Ok(path) => path,
                         Err(_) => continue,
                     };
@@ -4799,18 +4847,19 @@ async fn run_native_planner_path_adapter(
 }
 
 #[cfg(feature = "simple-2d")]
-pub(crate) fn simple_planner_owner(node: &ModuleNode) -> NavStackResult<Box<dyn InProcessNode>> {
+pub(crate) fn simple_planner_owner(node: &ModuleNode, body_reference_frame_id: Arc<str>) -> NavStackResult<Box<dyn InProcessNode>> {
     validate_ports(node, 4, &[2])?;
     let node = node.clone();
     Ok(boxed_owner(
         "simple-planner",
-        Box::new(move |shutdown, ready| Box::pin(run_simple_planner(node, shutdown, ready))),
+        Box::new(move |shutdown, ready| Box::pin(run_simple_planner(node, body_reference_frame_id, shutdown, ready))),
     ))
 }
 
 #[cfg(feature = "simple-2d")]
 async fn run_simple_planner(
     node: ModuleNode,
+    body_reference_frame_id: Arc<str>,
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
@@ -4964,7 +5013,7 @@ async fn run_simple_planner(
             }
             message = goal_pose.next() => {
                 let frame = required_frame(message, "simple_planner.goal_pose")?;
-                let envelope = match decode_configured_goal_envelope(&frame.payload) {
+                let envelope = match decode_configured_goal_envelope(&frame.payload, &body_reference_frame_id, None) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         diagnostics.reject("simple_planner.goal_pose", &error.to_string());
@@ -5166,18 +5215,31 @@ async fn publish_simple_output(
 }
 
 #[cfg(feature = "replanning-astar")]
-pub(crate) fn astar_planner_owner(node: &ModuleNode) -> NavStackResult<Box<dyn InProcessNode>> {
+pub(crate) fn astar_planner_owner(node: &ModuleNode, body_reference_frame_id: Arc<str>) -> NavStackResult<Box<dyn InProcessNode>> {
     validate_ports(node, 4, &[4])?;
     let node = node.clone();
     Ok(boxed_owner(
         "astar-planner",
-        Box::new(move |shutdown, ready| Box::pin(run_astar_planner(node, shutdown, ready))),
+        Box::new(move |shutdown, ready| Box::pin(run_astar_planner(node, body_reference_frame_id, shutdown, ready))),
     ))
 }
 
 #[cfg(feature = "replanning-astar")]
 async fn run_astar_planner(
     node: ModuleNode,
+    body_reference_frame_id: Arc<str>,
+    shutdown: oneshot::Receiver<()>,
+    ready: ReadySender,
+) -> NavStackResult<()> {
+    let transport = lcm_transport()?;
+    run_astar_planner_with_transport(node, body_reference_frame_id, transport, shutdown, ready).await
+}
+
+#[cfg(feature = "replanning-astar")]
+async fn run_astar_planner_with_transport(
+    node: ModuleNode,
+    body_reference_frame_id: Arc<str>,
+    transport: LcmTransport,
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
@@ -5185,7 +5247,6 @@ async fn run_astar_planner(
         Module, ModuleOutput, NavigationInterface, ReplanningAStarPlannerModule,
     };
 
-    let transport = lcm_transport()?;
     let mut map_pose =
         typed_stream(&transport, &node.inputs[0], "geometry_msgs.PoseStamped").await?;
     let mut costmap = typed_stream(&transport, &node.inputs[1], "nav_msgs.OccupancyGrid").await?;
@@ -5370,7 +5431,7 @@ async fn run_astar_planner(
             }
             message = goal.next() => {
                 let frame = required_frame(message, "astar_planner.goal")?;
-                let envelope = match decode_configured_goal_envelope(&frame.payload) {
+                let envelope = match decode_configured_goal_envelope(&frame.payload, &body_reference_frame_id, None) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         diagnostics.reject("astar_planner.goal", &error.to_string());
@@ -6416,7 +6477,7 @@ fn build_versioned_path_from_schema(
     source_timestamp_ns: i64,
     path: schema::Path,
 ) -> NavStackResult<schema::PathEnvelope> {
-    let mut envelope = schema::PathEnvelope {
+    let envelope = schema::PathEnvelope {
         schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
         session_id: goal.session_id.clone(),
         owner_kind: goal.owner_kind,
@@ -6433,19 +6494,14 @@ fn build_versioned_path_from_schema(
         committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
         committed_map_frame_id: goal.committed_map_frame_id.clone(),
         boundary_id: goal.boundary_id.clone(),
-        boundary_sha256: goal.boundary_sha256,
         motion_guard_generation: goal.motion_guard_generation,
         motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
         motion_stop_generation: goal.motion_stop_generation,
         planner_runtime_generation: planner_runtime_generation,
         path_revision: path_revision,
         source_timestamp_ns,
-        goal_payload_sha256: goal.payload_sha256,
-        path_payload_sha256: [0; 32],
         path,
     };
-    schema::seal_path_envelope(&mut envelope)
-        .map_err(|error| NavStackError::InvalidConfig(format!("PathEnvelope seal: {error}")))?;
     Ok(envelope)
 }
 
@@ -6605,6 +6661,7 @@ fn prefixed(fingerprint: [u8; 8], body: &[u8]) -> Vec<u8> {
 #[cfg(all(test, any(feature = "simple-2d", feature = "replanning-astar")))]
 fn planner_test_goal(session_id: &str, goal_generation: i64) -> schema::GoalEnvelope {
     let mut goal = schema::GoalEnvelope {
+            body_reference_frame_id: "base_link".into(),
         schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
         session_id: session_id.into(),
         owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
@@ -6647,13 +6704,8 @@ fn planner_test_goal(session_id: &str, goal_generation: i64) -> schema::GoalEnve
         },
         ..schema::GoalEnvelope::default()
     };
-    goal.boundary_sha256 = schema::goal_intent_boundary_sha256(
-        &goal.boundary_frame_id,
-        &goal.boundary_id,
-        &goal.boundary_points,
-    )
-    .expect("hash planner test boundary");
-    schema::seal_goal_envelope(&mut goal).expect("seal planner test goal");
+
+    schema::validate_goal_envelope(&goal).expect("seal planner test goal");
     goal
 }
 
@@ -6693,8 +6745,7 @@ mod planner_goal_buffer_tests {
         fn goal(&self, session_id: &str, goal_generation: i64) -> schema::GoalEnvelope {
             let mut goal = planner_test_goal(session_id, goal_generation);
             goal.producer_runtime_generation = self.producer_runtime_generation;
-            goal.payload_sha256 = [0; 32];
-            schema::seal_goal_envelope(&mut goal).expect("seal producer fixture goal");
+            schema::validate_goal_envelope(&goal).expect("seal producer fixture goal");
             goal
         }
     }
@@ -6888,7 +6939,7 @@ mod simple_tests {
         goal.goal.pose.position[2] = 3.0;
         let half_yaw = std::f64::consts::FRAC_PI_4;
         goal.goal.pose.orientation_xyzw = [0.0, 0.0, half_yaw.sin(), half_yaw.cos()];
-        schema::seal_goal_envelope(&mut goal).unwrap();
+        schema::validate_goal_envelope(&goal).unwrap();
         let path = Path2D::stamped(
             NavFrameId::Map,
             Timestamp::from_unix(12, 0),
@@ -7070,7 +7121,7 @@ mod simple_tests {
     #[test]
     fn simple_goal_arriving_before_costmap_is_applied_once_with_full_envelope() {
         let goal = planner_test_goal("simple-goal", 4);
-        let expected_hash = goal.payload_sha256;
+        let expected_key = goal.goal_key();
         let expected_boundary = goal.boundary_points.clone();
         let mut buffer = PlannerGoalBuffer::default();
         assert!(matches!(
@@ -7082,7 +7133,7 @@ mod simple_tests {
         let ready = buffer
             .observe_costmap()
             .expect("first valid costmap must release the buffered simple goal");
-        assert_eq!(ready.payload_sha256, expected_hash);
+        assert_eq!(ready.goal_key(), expected_key);
         assert_eq!(ready.boundary_points, expected_boundary);
 
         let mut planner = SimplePlannerModule::new();
@@ -7309,8 +7360,8 @@ mod simple_tests {
         .expect("build map-b PathEnvelope")
         .expect("map-b path stays inside boundary");
         assert_eq!(
-            envelope.goal_payload_sha256,
-            active_goal.as_ref().unwrap().payload_sha256
+            envelope.goal_key(),
+            active_goal.as_ref().unwrap().goal_key()
         );
         assert!(matches!(
             buffer.observe_goal(goal_12),
@@ -7890,6 +7941,7 @@ mod guarded_tests {
 
     fn active_goal(session_id: &str) -> schema::GoalEnvelope {
         schema::GoalEnvelope {
+            body_reference_frame_id: "base_link".into(),
             session_id: session_id.into(),
             ..schema::GoalEnvelope::default()
         }
@@ -7897,6 +7949,7 @@ mod guarded_tests {
 
     fn sealed_goal(session_id: &str) -> schema::GoalEnvelope {
         let mut goal = schema::GoalEnvelope {
+            body_reference_frame_id: "base_link".into(),
             schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
             session_id: session_id.into(),
             owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
@@ -7929,7 +7982,7 @@ mod guarded_tests {
             },
             ..schema::GoalEnvelope::default()
         };
-        schema::seal_goal_envelope(&mut goal).expect("seal goal");
+        schema::validate_goal_envelope(&goal).expect("seal goal");
         goal
     }
 
@@ -7951,15 +8004,13 @@ mod guarded_tests {
             committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
             committed_map_frame_id: goal.committed_map_frame_id.clone(),
             boundary_id: goal.boundary_id.clone(),
-            boundary_sha256: goal.boundary_sha256,
             motion_guard_generation: goal.motion_guard_generation,
             motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
             motion_stop_generation: goal.motion_stop_generation,
             planner_runtime_generation: saturating_i64(runtime_generation()),
             path_revision: 1,
             source_timestamp_ns: 2_000_000_000,
-            goal_payload_sha256: goal.payload_sha256,
-            path: schema::Path {
+                path: schema::Path {
                 header: schema::Header {
                     stamp_sec: 2,
                     frame_id: "map".into(),
@@ -7976,7 +8027,7 @@ mod guarded_tests {
             },
             ..schema::PathEnvelope::default()
         };
-        schema::seal_path_envelope(&mut path).expect("seal path");
+        schema::validate_path_envelope(&path).expect("seal path");
         path
     }
 
@@ -7991,8 +8042,7 @@ mod guarded_tests {
         goal.producer_runtime_generation = producer_runtime_generation;
         goal.goal_generation = goal_generation;
         goal.source_timestamp_ns = goal.source_timestamp_ns.saturating_add(1_000_000_000);
-        goal.payload_sha256 = [0; 32];
-        schema::seal_goal_envelope(&mut goal).expect("seal rollover goal");
+        schema::validate_goal_envelope(&goal).expect("seal rollover goal");
         goal
     }
 
@@ -8511,12 +8561,17 @@ mod guarded_tests {
         async fn spawn() -> Self {Self::spawn_with_planar_mode(false).await}
 
         async fn spawn_with_planar_mode(planar_mode:bool) -> Self {
+            Self::spawn_with_reference(planar_mode, "base_link", None).await
+        }
+
+        async fn spawn_with_reference(planar_mode:bool, body_reference: &'static str, support: Option<f64>) -> Self {
             static NEXT_LOOP_ID: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let loop_id = NEXT_LOOP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let port = 20_000 + ((u64::from(std::process::id()) * 97 + loop_id) % 40_000) as u16;
-            let transport = LcmTransport::new_real(&format!("udpm://239.255.76.67:{port}?ttl=1"))
-                .expect("guarded loop test LCM");
+            // One real liblcm context is shared by this in-process fixture.
+            // Functional owner/codec checks do not require a host multicast route.
+            let transport = LcmTransport::new_real("memq://")
+                .expect("guarded loop test LCM memq");
             let motion_calls = Arc::new(Mutex::new(Vec::<String>::new()));
             let planner_succeeds = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let planner_twist = Arc::new(Mutex::new(Twist2 {
@@ -8592,6 +8647,8 @@ mod guarded_tests {
                     status,
                     None,
                     planar_mode,
+                    body_reference,
+                    support,
                 )
                 .await
             }));
@@ -9038,8 +9095,8 @@ mod guarded_tests {
     async fn configuration_rejected_goal_stays_cancellable_and_cannot_reactivate() {
         let mut harness = GuardedLoopHarness::spawn().await;
         let mut goal = sealed_goal("configuration-rejected");
-        goal.navigation_configuration_sha256 = [0x7d; 32];
-        schema::seal_goal_envelope(&mut goal).unwrap();
+        goal.body_reference_frame_id = "other/body".into();
+        schema::validate_goal_envelope(&goal).unwrap();
         harness.send_goal_and_wait_dequeued(&goal).await;
         harness.assert_no_session().await;
         harness.send_pose(1);
@@ -9053,12 +9110,129 @@ mod guarded_tests {
         assert_eq!(harness.motion_call_count("zero:"), 1);
         let mut next = sealed_goal("configuration-recovered");
         next.goal_generation = goal.goal_generation + 1;
-        schema::seal_goal_envelope(&mut next).unwrap();
+        schema::validate_goal_envelope(&next).unwrap();
         harness.send_goal_and_wait_dequeued(&next).await;
         harness.wait_for_session(&next.session_id).await;
         harness.send_cancel(&next, 1);
         harness.wait_for_correlated_zero(&next, 1).await;
         harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn support_rejected_goal_stays_cancellable_and_cannot_reactivate() {
+        let mut harness = GuardedLoopHarness::spawn_with_reference(false, "base_link", Some(0.4)).await;
+        let mut goal = sealed_goal("support-rejected");
+        goal.body_to_support_z_m = Some(0.6);
+        harness.send_goal_and_wait_dequeued(&goal).await;
+        harness.assert_no_session().await;
+        harness.send_pose(1);
+        harness.wait_for_pose(1).await;
+        harness.send_costmap(11);
+        harness.wait_for_costmap(11).await;
+        harness.assert_no_session().await;
+        assert_eq!(harness.motion_call_count("acquire:"), 0);
+        harness.send_cancel(&goal, 1);
+        let terminal = harness.wait_for_correlated_zero(&goal, 1).await;
+        assert_eq!(terminal.producer_runtime_generation, goal.producer_runtime_generation);
+        assert_eq!(terminal.planner_runtime_generation, 0);
+        assert_eq!(harness.motion_call_count("zero:"), 1);
+        let mut next = sealed_goal("support-recovered");
+        next.goal_generation = goal.goal_generation + 1;
+        next.body_to_support_z_m = Some(0.4);
+        harness.send_goal_and_wait_dequeued(&next).await;
+        harness.wait_for_session(&next.session_id).await;
+        harness.send_cancel(&next, 1);
+        harness.wait_for_correlated_zero(&next, 1).await;
+        harness.shutdown().await;
+    }
+
+    #[test]
+    fn goal_reference_contract_uses_only_consumed_body_and_support_facts() {
+        let mut goal = sealed_goal("reference-contract");
+        let captured_body = Arc::<str>::from("base_link");
+        assert!(validate_goal_reference(&goal, &captured_body, None).is_ok());
+        // Explicit public body poses do not consume Geometry's support conversion.
+        assert!(validate_goal_reference(&goal, &captured_body, Some(0.2)).is_ok());
+        assert!(validate_goal_reference(&goal, &captured_body, Some(0.9)).is_ok());
+        goal.body_reference_frame_id = "body".into();
+        assert!(validate_goal_reference(&goal, &captured_body, None).is_err());
+        goal.body_reference_frame_id = captured_body.to_string();
+        goal.owner_kind = schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;
+        goal.producer = "wavefront".into();
+        // Mission-return home is an original body pose, not a support-derived endpoint.
+        // None is also the valid planar exploration contract.
+        assert!(validate_goal_reference(&goal, &captured_body, Some(0.4)).is_ok());
+        assert!(validate_goal_reference(&goal, &captured_body, None).is_ok());
+        goal.body_to_support_z_m = Some(0.4);
+        assert!(validate_goal_reference(&goal, &captured_body, Some(0.4)).is_ok());
+        assert!(validate_goal_reference(&goal, &captured_body, Some(0.6)).is_err());
+        // Planar owners do not consume support offsets; their existing coordinate/profile rules still apply.
+        assert!(validate_goal_reference(&goal, &captured_body, None).is_ok());
+        // The assigned contract is preserved on sloped body poses, where offset affects XY too.
+        goal.goal.pose.orientation_xyzw = [0.0, 0.3826834323650898, 0.0, 0.9238795325112867];
+        let body = schema::encode_goal_envelope_body(&goal).unwrap();
+        assert!(decode_configured_goal_envelope(&body, &captured_body, Some(0.4)).is_ok());
+        assert!(decode_configured_goal_envelope(&body, &captured_body, Some(0.6)).is_err());
+        assert!(decode_configured_goal_envelope(&body, &captured_body, None).is_ok());
+    }
+
+    #[test]
+    fn all_goal_bound_profiles_accept_their_canonical_body_tf_and_goal_reference() {
+        use crate::{NavFeatureFlags, NavStackProfile, NavTopicConfig};
+        for profile in [NavStackProfile::Simple2D, NavStackProfile::ReplanningAStar, NavStackProfile::Mls3D] {
+            let graph = crate::profiles::build_graph(profile, &NavTopicConfig::default(), NavFeatureFlags::default());
+            assert!(graph.find("map_pose_adapter").is_some());
+            for body in ["base_link", "body", "robot/body_a"] {
+                let mut adapter = bound_map_pose_adapter("map".into(), "odom".into(), body).unwrap();
+                let tf = schema::TfMessage { transforms: vec![
+                    schema::TransformStamped {
+                        header: schema::Header { stamp_sec: 7, frame_id: "map".into(), ..Default::default() },
+                        child_frame_id: "odom".into(),
+                        transform: schema::Transform { translation: [1.0, 2.0, 0.0], rotation_xyzw: [0.0, 0.0, 0.0, 1.0] },
+                    },
+                    schema::TransformStamped {
+                        header: schema::Header { stamp_sec: 7, frame_id: "odom".into(), ..Default::default() },
+                        child_frame_id: body.into(),
+                        transform: schema::Transform { translation: [3.0, 4.0, 0.5], rotation_xyzw: [0.0, 0.0, 0.0, 1.0] },
+                    },
+                ] };
+                let wire = schema::encode_tf_message_body(&tf).unwrap();
+                let OwnerInput::Accepted(Some(observed)) = ingest_map_pose_tf(&mut adapter, &wire).unwrap() else {
+                    panic!("canonical bound TF must produce the actual body pose");
+                };
+                assert_eq!(observed.pose.pose.position, [4.0, 6.0, 0.5]);
+                let mut goal = sealed_goal("canonical-bound-goal");
+                goal.body_reference_frame_id = body.into();
+                assert!(decode_configured_goal_envelope(&schema::encode_goal_envelope_body(&goal).unwrap(), body, None).is_ok());
+                let odom = schema::Odometry {
+                    header: schema::Header { stamp_sec: 7, frame_id: "odom".into(), ..Default::default() },
+                    child_frame_id: format!(" {body} "),
+                    pose: schema::Pose { position: [3.0, 4.0, 0.5], orientation_xyzw: [0.0, 0.0, 0.0, 1.0] },
+                    ..Default::default()
+                };
+                assert!(adapter.transform_odometry(&odom).unwrap().is_some(), "existing whitespace normalization is retained");
+            }
+        }
+    }
+
+    #[test]
+    fn retained_goal_replay_ignores_send_time_and_signed_zero_but_keeps_actions() {
+        let mut accepted = sealed_goal("assigned-replay");
+        accepted.goal.pose.position[1] = 0.0;
+        let mut replay = accepted.clone();
+        replay.source_timestamp_ns += 1;
+        replay.goal.header.stamp_nsec += 1;
+        replay.goal.header.seq += 1;
+        replay.goal.pose.position[1] = -0.0;
+        assert_eq!(validate_goal_envelope_order(&replay, &accepted), Err(PlannerGoalRejectReason::DuplicateLease));
+        replay.goal.pose.position[0] += 0.1;
+        assert_eq!(validate_goal_envelope_order(&replay, &accepted), Err(PlannerGoalRejectReason::ConflictingLease));
+        replay = accepted.clone();
+        replay.options.allow_reverse = !replay.options.allow_reverse;
+        assert_eq!(validate_goal_envelope_order(&replay, &accepted), Err(PlannerGoalRejectReason::ConflictingLease));
+        replay = accepted.clone();
+        replay.producer_epoch += 1;
+        assert_eq!(validate_goal_envelope_order(&replay, &accepted), Err(PlannerGoalRejectReason::ConflictingLease));
     }
 
     #[tokio::test]
@@ -9085,7 +9259,7 @@ mod guarded_tests {
         .expect("buffered goal cancellation did not become terminal");
         let terminal = harness.wait_for_correlated_zero(&goal, 1).await;
         assert_eq!(terminal.path_revision, 0);
-        assert_eq!(terminal.path_payload_sha256, [0; 32]);
+        assert_eq!(terminal.planner_runtime_generation, 0);
         assert!(harness.scheduler.status().session_id.is_none());
         assert!(harness
             .motion_calls
@@ -9244,8 +9418,7 @@ mod guarded_tests {
         let goal = activate_map_a(&harness).await;
         let mut late = sealed_path(&goal);
         late.planner_runtime_generation -= 1;
-        late.path_payload_sha256 = [0; 32];
-        schema::seal_path_envelope(&mut late).expect("seal old-generation late path");
+        schema::validate_path_envelope(&late).expect("seal old-generation late path");
 
         harness.send_path(&late);
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -9272,8 +9445,7 @@ mod guarded_tests {
         let mut higher_revision = current;
         higher_revision.path_revision = 2;
         higher_revision.source_timestamp_ns += 1;
-        higher_revision.path_payload_sha256 = [0; 32];
-        schema::seal_path_envelope(&mut higher_revision)
+        schema::validate_path_envelope(&higher_revision)
             .expect("seal same-generation higher-revision path");
         harness.send_path(&higher_revision);
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -9311,7 +9483,7 @@ mod guarded_tests {
         harness.wait_for_zero().await;
         let terminal = harness.wait_for_correlated_zero(&goal, 2).await;
         assert_eq!(terminal.path_revision, 0);
-        assert_eq!(terminal.path_payload_sha256, [0; 32]);
+        assert_eq!(terminal.planner_runtime_generation, 0);
         harness.shutdown().await;
     }
 
@@ -9565,7 +9737,7 @@ mod guarded_tests {
         harness.send_path(&path);
         let mut wrong_identity = path.clone();
         wrong_identity.session_id.push_str("-wrong");
-        schema::seal_path_envelope(&mut wrong_identity).expect("seal wrong identity path");
+        schema::validate_path_envelope(&wrong_identity).expect("seal wrong identity path");
         harness.send_path(&wrong_identity);
         tokio::time::sleep(Duration::from_millis(50)).await;
         let after_late = harness.scheduler.status();
@@ -9594,7 +9766,7 @@ mod guarded_tests {
 
         let mut mutation = path;
         mutation.path.poses[0].pose.position[0] += 0.25;
-        schema::seal_path_envelope(&mut mutation).expect("seal same-revision mutation");
+        schema::validate_path_envelope(&mutation).expect("seal same-revision mutation");
         harness.send_path(&mutation);
         tokio::time::timeout(Duration::from_secs(1), async {
             while harness.scheduler.status().last_terminal != Some(TerminalOutcome::SafetyFailed) {
@@ -9793,13 +9965,16 @@ mod guarded_tests {
             initial_distance: 3.0,
             progress: 0.5,
             path_revision: 3,
-            goal_payload_sha256: [0x11; 32],
-            path_payload_sha256: [0x22; 32],
+            producer_runtime_generation: 11,
+            planner_runtime_generation: 22,
         };
 
         let terminal_message =
             build_guarded_navigation_state(&terminal, &telemetry, None, Duration::from_secs(1));
         assert_eq!(terminal_message.session_id, "goal-a");
+        assert_eq!(terminal_message.producer_runtime_generation, 11);
+        assert_eq!(terminal_message.planner_runtime_generation, 22);
+        assert_eq!(terminal_message.runtime_generation, 0);
         assert_eq!(terminal_message.guard_generation, 98);
         assert_eq!(terminal_message.cancel_generation, 2);
         assert_eq!(terminal_message.zero_ack_id, "zero-ack-a");
@@ -9830,8 +10005,8 @@ mod guarded_tests {
         assert!(heartbeat.parent_request_id.is_empty());
         assert_eq!(heartbeat.goal_generation, 0);
         assert_eq!(heartbeat.path_revision, 0);
-        assert_eq!(heartbeat.goal_payload_sha256, [0; 32]);
-        assert_eq!(heartbeat.path_payload_sha256, [0; 32]);
+        assert_eq!(heartbeat.producer_runtime_generation, 0);
+        assert_eq!(heartbeat.planner_runtime_generation, 0);
         assert_eq!(heartbeat.runtime_generation, 42);
         assert_eq!(heartbeat.planner_map_frame, "map");
         assert_eq!(heartbeat.planner_pose_frame, "map");
@@ -9866,7 +10041,7 @@ mod guarded_tests {
         validate_path_goal_correlation(&path, &goal).expect("correlated path");
 
         let mut foreign_path = path.clone();
-        foreign_path.goal_payload_sha256[0] ^= 0xff;
+        foreign_path.goal_generation += 1;
         assert!(validate_path_goal_correlation(&foreign_path, &goal).is_err());
 
         let mut wrong_revision = path.clone();
@@ -9877,14 +10052,14 @@ mod guarded_tests {
         assert!(validate_path_goal_correlation(&wrong_map_nonce, &goal).is_err());
         let mut wrong_map_sequence = path.clone();
         wrong_map_sequence.committed_map_commit_sequence += 1;
-        schema::seal_path_envelope(&mut wrong_map_sequence).unwrap();
+        schema::validate_path_envelope(&wrong_map_sequence).unwrap();
         assert!(validate_path_goal_correlation(&wrong_map_sequence, &goal).is_err());
         let mut wrong_map_time = path.clone();
         wrong_map_time.committed_map_source_timestamp_ns += 1;
-        schema::seal_path_envelope(&mut wrong_map_time).unwrap();
+        schema::validate_path_envelope(&wrong_map_time).unwrap();
         assert!(validate_path_goal_correlation(&wrong_map_time, &goal).is_err());
         let mut wrong_boundary = path.clone();
-        wrong_boundary.boundary_sha256[0] ^= 0xff;
+        wrong_boundary.boundary_id.push_str("-other");
         assert!(validate_path_goal_correlation(&wrong_boundary, &goal).is_err());
         let mut wrong_producer_generation = path.clone();
         wrong_producer_generation.producer_runtime_generation += 1;
@@ -9906,38 +10081,38 @@ mod guarded_tests {
         ));
         assert!(
             !planner_generation_matches_authority(authoritative - 1, authoritative)
-                && !planner_generation_is_stale(None, goal.payload_sha256, authoritative - 1),
+                && !planner_generation_is_stale(None, goal.goal_key(), authoritative - 1),
             "an old-process late path is rejected even when it arrives before the new generation"
         );
         assert!(
             planner_generation_matches_authority(authoritative, authoritative)
                 && !planner_generation_is_stale(
-                    Some((goal.payload_sha256, authoritative)),
-                    goal.payload_sha256,
+                    Some((goal.goal_key(), authoritative)),
+                    goal.goal_key(),
                     authoritative,
                 ),
             "same-generation higher path revisions remain eligible for scheduler ordering"
         );
 
-        let accepted = Some((goal.payload_sha256, 12));
+        let accepted = Some((goal.goal_key(), 12));
         assert!(planner_generation_is_stale(
             accepted,
-            goal.payload_sha256,
+            goal.goal_key(),
             11
         ));
         assert!(!planner_generation_is_stale(
             accepted,
-            goal.payload_sha256,
+            goal.goal_key(),
             12
         ));
         assert!(!planner_generation_is_stale(
             accepted,
-            goal.payload_sha256,
+            goal.goal_key(),
             13
         ));
-        let mut new_goal_digest = goal.payload_sha256;
-        new_goal_digest[0] ^= 0xff;
-        assert!(!planner_generation_is_stale(accepted, new_goal_digest, 1));
+        let mut new_goal_key = goal.goal_key();
+        new_goal_key.producer_runtime_generation += 1;
+        assert!(!planner_generation_is_stale(accepted, new_goal_key, 1));
 
         let cancel = schema::CancelNavigation {
             session_id: goal.session_id.clone(),
@@ -9959,14 +10134,12 @@ mod guarded_tests {
         let mut goal_a = sealed_goal("same-public-goal");
         goal_a.goal_generation = 1;
         goal_a.producer_runtime_generation = 41;
-        goal_a.payload_sha256 = [0; 32];
-        schema::seal_goal_envelope(&mut goal_a).expect("seal producer 41 goal");
+        schema::validate_goal_envelope(&goal_a).expect("seal producer 41 goal");
 
         let mut goal_b = goal_a.clone();
         goal_b.producer_runtime_generation = 42;
         goal_b.source_timestamp_ns += 1_000_000_000;
-        goal_b.payload_sha256 = [0; 32];
-        schema::seal_goal_envelope(&mut goal_b).expect("seal producer 42 goal");
+        schema::validate_goal_envelope(&goal_b).expect("seal producer 42 goal");
 
         let delayed_a = schema::CancelNavigation {
             session_id: goal_a.session_id.clone(),
@@ -9995,8 +10168,7 @@ mod guarded_tests {
         let mut goal_a = sealed_goal("same-public-goal");
         goal_a.goal_generation = 1;
         goal_a.producer_runtime_generation = 41;
-        goal_a.payload_sha256 = [0; 32];
-        schema::seal_goal_envelope(&mut goal_a).expect("seal producer 41 goal");
+        schema::validate_goal_envelope(&goal_a).expect("seal producer 41 goal");
         harness.send_pose(1);
         harness.wait_for_pose(1).await;
         harness.send_costmap(11);
@@ -10007,8 +10179,7 @@ mod guarded_tests {
         let mut goal_b = goal_a.clone();
         goal_b.producer_runtime_generation = 42;
         goal_b.source_timestamp_ns += 1_000_000_000;
-        goal_b.payload_sha256 = [0; 32];
-        schema::seal_goal_envelope(&mut goal_b).expect("seal producer 42 goal");
+        schema::validate_goal_envelope(&goal_b).expect("seal producer 42 goal");
         harness.send_goal(&goal_b);
         harness.wait_for_zero().await;
         harness.send_costmap(12);
@@ -10154,7 +10325,6 @@ mod guarded_tests {
         let mut path_identity = guarded_goal_execution_identity(&goal_a);
         path_identity.planner_runtime_generation = 1;
         path_identity.path_revision = 1;
-        path_identity.path_payload_sha256 = [0x11; 32];
         handle
             .start_session(nuwax_nav_runtime::NavSession {
             boundary: Vec::new(),
@@ -10179,7 +10349,6 @@ mod guarded_tests {
                 session_id: goal_a.session_id.clone(),
                 execution_identity: path_identity,
                 path_revision: 1,
-                payload_hash: [0x11; 32],
                 path: nuwax_nav_runtime::ExecutionPath::Planar(Path2D::stamped(
                     NavFrameId::Map,
                     Timestamp::from_unix(1, 0),
@@ -10229,8 +10398,8 @@ mod guarded_tests {
             map_frame: "map".into(),
             pose_frame: "map".into(),
             path_revision: 1,
-            goal_payload_sha256: [0x22; 32],
-            path_payload_sha256: [0x33; 32],
+            producer_runtime_generation: 22,
+            planner_runtime_generation: 33,
             ..GuardedNavTelemetry::default()
         };
         fence_guarded_active_session(&handle, &mut telemetry, &mut active_session)
@@ -10238,8 +10407,8 @@ mod guarded_tests {
             .expect("pending map-b goal fences map-a");
         assert!(active_session.is_none());
         assert_eq!(telemetry.path_revision, 0);
-        assert_eq!(telemetry.goal_payload_sha256, [0; 32]);
-        assert_eq!(telemetry.path_payload_sha256, [0; 32]);
+        assert_eq!(telemetry.producer_runtime_generation, 0);
+        assert_eq!(telemetry.planner_runtime_generation, 0);
         assert!(goal_buffer.pending_goal.is_none());
         assert!(motion_calls
             .lock()
@@ -11122,13 +11291,13 @@ mod tests {
         .add_output(format!("{prefix}/path"))
         .add_output(format!("{prefix}/reached"))
         .add_output(format!("{prefix}/failed"));
-        let transport = lcm_transport().expect("real LCM transport");
+        let transport = LcmTransport::new_real("memq://").expect("real LCM memq transport");
         let mut paths = typed_stream(&transport, &node.outputs[1], "nuwax_msgs.PathEnvelope")
             .await
             .expect("path subscription");
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
-        let owner = tokio::spawn(run_astar_planner(node.clone(), shutdown_rx, ready_tx));
+        let owner = tokio::spawn(run_astar_planner_with_transport(node.clone(), Arc::from("base_link"), transport.clone(), shutdown_rx, ready_tx));
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match ready_rx.try_recv() {
@@ -11199,7 +11368,7 @@ mod tests {
         let path = schema::decode_path_envelope_body(&frame.payload).expect("decode path envelope");
         assert_eq!(path.session_id, goal.session_id);
         assert_eq!(path.path_revision, 1);
-        assert_eq!(path.goal_payload_sha256, goal.payload_sha256);
+        assert_eq!(path.goal_key(), goal.goal_key());
 
         shutdown_tx.send(()).expect("A* owner shutdown receiver");
         tokio::time::timeout(Duration::from_secs(3), owner)
@@ -11287,7 +11456,7 @@ mod tests {
         use nuwax_nav_astar::module::{Module, NavigationInterface, ReplanningAStarPlannerModule};
 
         let goal = planner_test_goal("astar-goal", 5);
-        let expected_hash = goal.payload_sha256;
+        let expected_key = goal.goal_key();
         let expected_boundary = goal.boundary_points.clone();
         let mut buffer = PlannerGoalBuffer::default();
         assert!(matches!(
@@ -11299,7 +11468,7 @@ mod tests {
         let ready = buffer
             .observe_costmap()
             .expect("first valid costmap must release the buffered A* goal");
-        assert_eq!(ready.payload_sha256, expected_hash);
+        assert_eq!(ready.goal_key(), expected_key);
         assert_eq!(ready.boundary_points, expected_boundary);
 
         let mut planner =
@@ -11437,8 +11606,8 @@ mod tests {
         .expect("build A* map-b PathEnvelope")
         .expect("A* map-b path stays inside boundary");
         assert_eq!(
-            envelope.goal_payload_sha256,
-            active_goal.as_ref().unwrap().payload_sha256
+            envelope.goal_key(),
+            active_goal.as_ref().unwrap().goal_key()
         );
         assert!(matches!(
             buffer.observe_goal(goal_12),
@@ -11543,6 +11712,7 @@ mod boundary_tests {
 
     fn goal(owner_kind: i32, boundary_points: Vec<[f64; 3]>) -> schema::GoalEnvelope {
         schema::GoalEnvelope {
+            body_reference_frame_id: "base_link".into(),
             owner_kind,
             boundary_frame_id: if boundary_points.is_empty() {
                 String::new()
@@ -11655,6 +11825,7 @@ mod native_adapter_tests {
 
     fn goal() -> schema::GoalEnvelope {
         let mut goal = schema::GoalEnvelope {
+            body_reference_frame_id: "base_link".into(),
             schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
             session_id: "native-session".into(),
             owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
@@ -11697,13 +11868,8 @@ mod native_adapter_tests {
             },
             ..schema::GoalEnvelope::default()
         };
-        goal.boundary_sha256 = schema::goal_intent_boundary_sha256(
-            &goal.boundary_frame_id,
-            &goal.boundary_id,
-            &goal.boundary_points,
-        )
-        .expect("hash native boundary");
-        schema::seal_goal_envelope(&mut goal).expect("seal native goal");
+
+        schema::validate_goal_envelope(&goal).expect("seal native goal");
         goal
     }
 
@@ -11718,7 +11884,7 @@ mod native_adapter_tests {
         value.source_timestamp_ns = generation * 1_000_000_000;
         value.goal.header.seq = i32::try_from(generation).expect("test generation fits i32");
         value.goal.header.stamp_sec = i32::try_from(generation).expect("test generation fits i32");
-        schema::seal_goal_envelope(&mut value).expect("reseal native goal generation");
+        schema::validate_goal_envelope(&value).expect("reseal native goal generation");
         value
     }
 
@@ -11731,9 +11897,9 @@ mod native_adapter_tests {
             owner_kind: goal.owner_kind,
             parent_request_id: goal.parent_request_id.clone(),
             goal_generation: goal.goal_generation,
-            goal_payload_sha256: goal.payload_sha256,
+            producer_runtime_generation: goal.producer_runtime_generation,
             path_revision: 4,
-            path_payload_sha256: [0x44; 32],
+            planner_runtime_generation: 12,
         }
     }
 
@@ -11754,7 +11920,7 @@ mod native_adapter_tests {
             registered_scan: "/scan".into(),
             planner_result: "/result".into(),
             worker_event: "/event".into(),
-            result_contract: nuwax_nav_far_planner_bridge::worker::FAR_RESULT_V2_CONTRACT.into(),
+            result_contract: nuwax_nav_far_planner_bridge::worker::FAR_RESULT_V3_CONTRACT.into(),
         };
         let mut published = expected.clone();
         published.generation = 12;
@@ -11767,6 +11933,10 @@ mod native_adapter_tests {
             ..schema::NavigationState::default()
         };
         assert!(far_ready_contract_matches(&expected, 12, &state));
+        published.result_contract = "far-private-result-v2".into();
+        state.message = published.encode_v2();
+        assert!(!far_ready_contract_matches(&expected, 12, &state));
+        published.result_contract = nuwax_nav_far_planner_bridge::worker::FAR_RESULT_V3_CONTRACT.into();
         published.odometry = "/wrong-odometry".into();
         state.message = published.encode_v2();
         assert!(!far_ready_contract_matches(&expected, 12, &state));
@@ -11912,8 +12082,8 @@ mod native_adapter_tests {
             parent_request_id: goal.parent_request_id.clone(),
             goal_generation: goal.goal_generation,
             path_revision: 4,
-            goal_payload_sha256: goal.payload_sha256,
-            path_payload_sha256: [0x44; 32],
+            producer_runtime_generation: goal.producer_runtime_generation,
+            planner_runtime_generation: 12,
             ..schema::NavigationState::default()
         };
         assert!(far_terminal_matches_goal(&state, &goal, 12));
@@ -11921,8 +12091,8 @@ mod native_adapter_tests {
         assert!(!far_terminal_matches_goal(&state, &goal, 13));
 
         let mut wrong_goal = goal;
-        wrong_goal.committed_map_revision += 1;
-        schema::seal_goal_envelope(&mut wrong_goal).expect("reseal wrong goal");
+        wrong_goal.producer_runtime_generation += 1;
+        schema::validate_goal_envelope(&wrong_goal).expect("reseal wrong goal");
         assert!(!far_terminal_matches_goal(&state, &wrong_goal, 12));
     }
 
@@ -11937,9 +12107,9 @@ mod native_adapter_tests {
             owner_kind: goal.owner_kind,
             parent_request_id: goal.parent_request_id.clone(),
             goal_generation: goal.goal_generation,
-            goal_payload_sha256: goal.payload_sha256,
+            producer_runtime_generation: goal.producer_runtime_generation,
             path_revision: 4,
-            path_payload_sha256: [0x44; 32],
+            planner_runtime_generation: 12,
         };
         let mut pending_results = HashMap::from([(
             good.clone(),
@@ -11960,11 +12130,11 @@ mod native_adapter_tests {
         .is_none());
         assert!(pending_results.contains_key(&good));
 
-        let mut wrong_digest = good.clone();
-        wrong_digest.path_payload_sha256[0] ^= 1;
-        pending_terminals.insert(wrong_digest.clone());
+        let mut wrong_backend = good.clone();
+        wrong_backend.backend = "another-backend".into();
+        pending_terminals.insert(wrong_backend.clone());
         assert!(take_far_join(
-            &wrong_digest,
+            &wrong_backend,
             &mut pending_results,
             &mut pending_terminals,
             &mut consumed,
@@ -12004,14 +12174,16 @@ mod native_adapter_tests {
         .add_input(format!("{prefix}/e"))
         .add_input(format!("{prefix}/p"))
         .add_output(format!("{prefix}/o"));
-        let transport = lcm_transport().expect("real LCM transport");
+        let transport = LcmTransport::new_real("memq://").expect("real LCM memq transport");
         let mut paths = typed_stream(&transport, &node.outputs[0], "nuwax_msgs.PathEnvelope")
             .await
             .expect("canonical path subscription");
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
-        let owner = tokio::spawn(run_native_planner_path_adapter(
+        let owner = tokio::spawn(run_native_planner_path_adapter_with_transport(
             node.clone(),
+            Arc::from("base_link"),
+            transport.clone(),
             shutdown_rx,
             ready_tx,
         ));
@@ -12055,7 +12227,8 @@ mod native_adapter_tests {
             parent_request_id: goal.parent_request_id.clone(),
             goal_generation: goal.goal_generation,
             path_revision: revision,
-            goal_payload_sha256: goal.payload_sha256,
+            planner_runtime_generation: 12,
+            producer_runtime_generation: goal.producer_runtime_generation,
             ..schema::NavigationState::default()
         };
 
@@ -12080,7 +12253,7 @@ mod native_adapter_tests {
 
         let mut wrong_header = goal.goal.header.clone();
         wrong_header.frame_id = "odom".into();
-        let wrong_result = nuwax_nav_far_planner_bridge::worker::seal_private_result_v2(
+        let wrong_result = nuwax_nav_far_planner_bridge::worker::seal_private_result_v3(
             state(1),
             &schema::Path {
                 header: wrong_header.clone(),
@@ -12092,7 +12265,7 @@ mod native_adapter_tests {
         )
         .expect("seal wrong-header FAR result");
         let mut wrong_terminal = wrong_result.clone();
-        wrong_terminal.message = "succeeded:private-result-v2-published".into();
+        wrong_terminal.message = "succeeded:private-result-v3-published".into();
         publish_body(
             &transport,
             &node.inputs[2],
@@ -12117,7 +12290,7 @@ mod native_adapter_tests {
             "wrong-header FAR result must not become canonical"
         );
 
-        let accepted_result = nuwax_nav_far_planner_bridge::worker::seal_private_result_v2(
+        let accepted_result = nuwax_nav_far_planner_bridge::worker::seal_private_result_v3(
             state(2),
             &schema::Path {
                 header: goal.goal.header.clone(),
@@ -12126,7 +12299,7 @@ mod native_adapter_tests {
         )
         .expect("seal accepted FAR result");
         let mut accepted_terminal = accepted_result.clone();
-        accepted_terminal.message = "succeeded:private-result-v2-published".into();
+        accepted_terminal.message = "succeeded:private-result-v3-published".into();
         publish_body(
             &transport,
             &node.inputs[1],
@@ -12152,11 +12325,11 @@ mod native_adapter_tests {
             .expect("FAR canonical path transport");
         let envelope = schema::decode_path_envelope_body(&frame.payload)
             .expect("decode FAR canonical PathEnvelope");
-        assert_eq!(envelope.goal_payload_sha256, goal.payload_sha256);
+        assert_eq!(envelope.goal_key(), goal.goal_key());
         assert_eq!(envelope.planner_runtime_generation, 12);
         assert_eq!(envelope.path_revision, 2);
 
-        let result_first = nuwax_nav_far_planner_bridge::worker::seal_private_result_v2(
+        let result_first = nuwax_nav_far_planner_bridge::worker::seal_private_result_v3(
             state(3),
             &schema::Path {
                 header: goal.goal.header.clone(),
@@ -12165,7 +12338,7 @@ mod native_adapter_tests {
         )
         .expect("seal result-first FAR result");
         let mut terminal_second = result_first.clone();
-        terminal_second.message = "succeeded:private-result-v2-published".into();
+        terminal_second.message = "succeeded:private-result-v3-published".into();
         publish_body(
             &transport,
             &node.inputs[2],
@@ -12245,13 +12418,8 @@ mod native_adapter_tests {
 
         let mut wrong_result = result;
         wrong_result.goal.boundary_id = "other-boundary".into();
-        wrong_result.goal.boundary_sha256 = schema::goal_intent_boundary_sha256(
-            &wrong_result.goal.boundary_frame_id,
-            &wrong_result.goal.boundary_id,
-            &wrong_result.goal.boundary_points,
-        )
-        .expect("hash wrong MLS boundary");
-        schema::seal_goal_envelope(&mut wrong_result.goal).expect("reseal wrong MLS goal");
+
+        schema::validate_goal_envelope(&wrong_result.goal).expect("reseal wrong MLS goal");
         assert!(!mls_result_matches_goal(
             "mls3d",
             12,
@@ -12280,14 +12448,16 @@ mod native_adapter_tests {
         .add_input(format!("{prefix}/goal"))
         .add_input(format!("{prefix}/event"))
         .add_output(format!("{prefix}/path"));
-        let transport = lcm_transport().expect("real LCM transport");
+        let transport = LcmTransport::new_real("memq://").expect("real LCM memq transport");
         let mut paths = typed_stream(&transport, &node.outputs[0], "nuwax_msgs.PathEnvelope")
             .await
             .expect("canonical path subscription");
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
-        let owner = tokio::spawn(run_native_planner_path_adapter(
+        let owner = tokio::spawn(run_native_planner_path_adapter_with_transport(
             node.clone(),
+            Arc::from("base_link"),
+            transport.clone(),
             shutdown_rx,
             ready_tx,
         ));
@@ -12372,7 +12542,7 @@ mod native_adapter_tests {
             .expect("canonical path transport");
         let envelope = schema::decode_path_envelope_body(&frame.payload)
             .expect("decode canonical PathEnvelope");
-        assert_eq!(envelope.goal_payload_sha256, goal.payload_sha256);
+        assert_eq!(envelope.goal_key(), goal.goal_key());
         assert_eq!(envelope.planner_runtime_generation, 12);
 
         shutdown_tx.send(()).expect("shutdown native adapter");

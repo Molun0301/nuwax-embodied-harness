@@ -76,7 +76,7 @@ fn route_request(message: &schema::NavigationMap3D, wide: bool, height: f64)
     goal.source_timestamp_ns = SOURCE_NS;
     goal.goal.header.stamp_sec = (SOURCE_NS / 1_000_000_000) as i32;
     goal.goal.header.stamp_nsec = 0;
-    schema::seal_goal_envelope(&mut goal).unwrap();
+    schema::validate_goal_envelope(&goal).unwrap();
     let mut start = pose_from_schema(&goal.goal).unwrap();
     start.pose.position.x = from_x;
     (start, goal)

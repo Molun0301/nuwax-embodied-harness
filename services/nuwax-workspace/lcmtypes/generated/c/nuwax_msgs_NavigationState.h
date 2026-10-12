@@ -8,8 +8,8 @@
 
 #include <stdint.h>
 #include <stdlib.h>
-#include <lcm/lcm_coretypes.h>
-#include <lcm/lcm.h>
+#include "lcm/lcm_coretypes.h"
+#include "lcm/lcm.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -73,16 +73,8 @@ struct _nuwax_msgs_NavigationState
     char*      parent_request_id;
     int64_t    goal_generation;
     int64_t    path_revision;
-
-    /**
-     * LCM Type: byte[32]
-     */
-    uint8_t    goal_payload_sha256[32];
-
-    /**
-     * LCM Type: byte[32]
-     */
-    uint8_t    path_payload_sha256[32];
+    int64_t    producer_runtime_generation;
+    int64_t    planner_runtime_generation;
 
     /**
      * 同一目标与路径修订的局部规划展示；终态为空。

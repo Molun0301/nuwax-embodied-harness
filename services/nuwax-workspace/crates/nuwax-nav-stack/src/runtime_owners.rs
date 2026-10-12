@@ -33,13 +33,15 @@ fn far_ready_contract(
             registered_scan: native_topic(node, "registered_scan")?,
             planner_result: native_topic(node, "goal_path")?,
             worker_event: native_topic(node, "way_point")?,
-            result_contract: nuwax_nav_far_planner_bridge::worker::FAR_RESULT_V2_CONTRACT.into(),
+            result_contract: nuwax_nav_far_planner_bridge::worker::FAR_RESULT_V3_CONTRACT.into(),
         },
     ))
 }
 
 /// Register every concrete in-process owner available in this build.
 pub(crate) fn register_compiled_owners(_runner: &mut StackRunner) {
+    #[cfg(any(feature = "guard-runtime", feature = "cmu-native", feature = "explore", feature = "mls"))]
+    let body_reference = crate::lcm_dataflow::capture_body_reference();
     #[cfg(all(
         feature = "native-runner",
         any(feature = "cmu-native", feature = "explore", feature = "mls")
@@ -62,10 +64,10 @@ pub(crate) fn register_compiled_owners(_runner: &mut StackRunner) {
     #[cfg(feature = "guard-runtime")]
     {
         _runner
-            .register_in_process_factory("map_pose_adapter", crate::lcm_dataflow::map_pose_owner);
+            .register_in_process_factory("map_pose_adapter", { let body = body_reference.clone(); move |node: &crate::graph::ModuleNode| crate::lcm_dataflow::map_pose_owner(node, crate::lcm_dataflow::captured_body_reference(&body)?) });
         _runner.register_in_process_factory(
             "guarded_nav_scheduler",
-            crate::lcm_dataflow::guarded_nav_scheduler_owner,
+            { let body = body_reference.clone(); move |node: &crate::graph::ModuleNode| crate::lcm_dataflow::guarded_nav_scheduler_owner(node, crate::lcm_dataflow::captured_body_reference(&body)?) },
         );
     }
 
@@ -74,15 +76,15 @@ pub(crate) fn register_compiled_owners(_runner: &mut StackRunner) {
 
     #[cfg(feature = "simple-2d")]
     _runner
-        .register_in_process_factory("simple_planner", crate::lcm_dataflow::simple_planner_owner);
+        .register_in_process_factory("simple_planner", { let body = body_reference.clone(); move |node: &crate::graph::ModuleNode| crate::lcm_dataflow::simple_planner_owner(node, crate::lcm_dataflow::captured_body_reference(&body)?) });
 
     #[cfg(feature = "replanning-astar")]
-    _runner.register_in_process_factory("astar_planner", crate::lcm_dataflow::astar_planner_owner);
+    _runner.register_in_process_factory("astar_planner", { let body = body_reference.clone(); move |node: &crate::graph::ModuleNode| crate::lcm_dataflow::astar_planner_owner(node, crate::lcm_dataflow::captured_body_reference(&body)?) });
 
     #[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
     _runner.register_in_process_factory(
         "native_planner_path_adapter",
-        crate::lcm_dataflow::native_planner_path_adapter_owner,
+        { let body = body_reference.clone(); move |node: &crate::graph::ModuleNode| crate::lcm_dataflow::native_planner_path_adapter_owner(node, crate::lcm_dataflow::captured_body_reference(&body)?) },
     );
 
     #[cfg(feature = "basic-path-follower")]
@@ -103,7 +105,7 @@ pub(crate) fn register_compiled_owners(_runner: &mut StackRunner) {
     #[cfg(feature = "patrolling")]
     _runner.register_in_process_factory("patrolling", crate::lcm_dataflow::patrolling_owner);
     #[cfg(feature = "mls")]
-    crate::lcm_dataflow::register_surface_owners(_runner);
+    crate::lcm_dataflow::register_surface_owners(_runner, body_reference);
 }
 
 #[cfg(all(
@@ -246,7 +248,7 @@ mod tests {
         assert_eq!(contract.generation, 0);
         assert_eq!(
             contract.result_contract,
-            nuwax_nav_far_planner_bridge::worker::FAR_RESULT_V2_CONTRACT
+            nuwax_nav_far_planner_bridge::worker::FAR_RESULT_V3_CONTRACT
         );
     }
 

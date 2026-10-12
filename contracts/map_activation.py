@@ -115,8 +115,8 @@ def _request(value: Any) -> Dict[str, Any]:
 def _activation(value: Any) -> Dict[str, Any]:
     value = _fields(value, {'request', 'runtime_generation', 'lifecycle_epoch', 'session_generation',
                             'backend_kind', 'backend_generation'}, 'installed activation')
-    if not isinstance(value['backend_kind'], str) or value['backend_kind'] not in {'voxel', 'raytracing'}:
-        raise ValueError('assigned planar activation is not paired yet')
+    if not isinstance(value['backend_kind'], str) or value['backend_kind'] not in {'voxel', 'raytracing', 'slam_toolbox'}:
+        raise ValueError('unsupported assigned activation backend')
     result = {'request': _request(value['request']), 'backend_kind': value['backend_kind']}
     for key in ('runtime_generation', 'lifecycle_epoch', 'session_generation', 'backend_generation'):
         result[key] = _integer(value[key], key)
@@ -142,6 +142,21 @@ def _source_cloud_member(value: Any) -> Dict[str, Any]:
     return result
 
 
+def _source_graph_member(value: Any) -> Dict[str, Any]:
+    value = _fields(value, {'checkpoint_id', 'role', 'occupancy_receipt', 'cloud_receipt', 'frame_id',
+                            'frame_generation', 'producer_generation'}, 'source graph member')
+    if value['role'] != 'planar_graph' or value['cloud_receipt'] is not None:
+        raise ValueError('installed planar target requires a source graph member')
+    result = {'checkpoint_id': _assigned_id(value['checkpoint_id'], 'source checkpoint ID'), 'role': 'planar_graph',
+              'occupancy_receipt': _occupancy(value['occupancy_receipt']), 'cloud_receipt': None,
+              'frame_id': _text(value['frame_id'], 'source frame', 1024),
+              'frame_generation': _integer(value['frame_generation'], 'source frame generation', 0),
+              'producer_generation': _integer(value['producer_generation'], 'source producer generation', 0)}
+    if result['frame_generation'] or result['producer_generation']:
+        raise ValueError('non-fine source member cannot carry fine root generations')
+    return result
+
+
 @dataclass(frozen=True, init=False)
 class AssignedActivationReceipt:
     """Admitted metadata owner. Encoded storage contains no map/cloud payload."""
@@ -161,10 +176,16 @@ class AssignedActivationReceipt:
         value = _fields(value, {'request', 'activation', 'target'}, 'assigned activation receipt')
         request = _request(value['request'])
         activation = _activation(value['activation'])
-        target = _fields(value['target'], {'activation', 'source_cloud_member', 'occupancy_receipt', 'cloud_receipt'}, 'installed target')
+        planar = activation['backend_kind'] == 'slam_toolbox'
+        source_key = 'source_graph_member' if planar else 'source_cloud_member'
+        fields = {'activation', source_key, 'occupancy_receipt'}
+        if not planar:
+            fields.add('cloud_receipt')
+        target = _fields(value['target'], fields, 'installed target')
         target_activation = _activation(target['activation'])
-        source = _source_cloud_member(target['source_cloud_member'])
-        occupancy, cloud = _occupancy(target['occupancy_receipt']), _cloud(target['cloud_receipt'])
+        source = (_source_graph_member if planar else _source_cloud_member)(target[source_key])
+        occupancy = _occupancy(target['occupancy_receipt'])
+        cloud = None if planar else _cloud(target['cloud_receipt'])
         if activation['request'] != request or target_activation != activation:
             raise ValueError('assigned receipt nested activation identities differ')
         if (source['checkpoint_id'] != request['checkpoint_id']
@@ -173,12 +194,14 @@ class AssignedActivationReceipt:
                 or occupancy['backend_kind'] != activation['backend_kind']
                 or occupancy['backend_generation'] != activation['backend_generation']
                 or source['occupancy_receipt']['backend_kind'] != activation['backend_kind']
-                or cloud['point_count'] != source['cloud_receipt']['point_count']):
+                or (not planar and cloud['point_count'] != source['cloud_receipt']['point_count'])):
             raise ValueError('assigned target differs from its request/source/installed ownership')
-        _paired(occupancy, cloud, installed=True)
-        normalized = {'request': request, 'activation': activation,
-                      'target': {'activation': target_activation, 'source_cloud_member': source,
-                                 'occupancy_receipt': occupancy, 'cloud_receipt': cloud}}
+        if not planar:
+            _paired(occupancy, cloud, installed=True)
+        normalized_target = {'activation': target_activation, source_key: source, 'occupancy_receipt': occupancy}
+        if not planar:
+            normalized_target['cloud_receipt'] = cloud
+        normalized = {'request': request, 'activation': activation, 'target': normalized_target}
         encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
         owner = object.__new__(cls)
         for key, item in {'_encoded': encoded, 'asset_identity': AssetIdentityV2(**request['asset_identity']),

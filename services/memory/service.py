@@ -1482,10 +1482,24 @@ class MemoryService(SceneMappingMemoryMixin):
         map_snapshot = self._get_map_snapshot()
         observation_context = None
         perception_context = None
-        if attach_latest_observation:
-            observation_context = self._observation_service.get_latest_observation(camera_id)
         if attach_latest_perception:
-            perception_context = self._perception_service.get_latest_perception(camera_id)
+            perception_context = self._latest_complete_perception(camera_id)
+        if attach_latest_observation and perception_context is None:
+            observation_context = self._observation_service.get_latest_observation(camera_id)
+        if camera_id is None:
+            camera_id = (perception_context.camera_id if perception_context is not None
+                         else observation_context.camera_id if observation_context is not None else None)
+        captured = self._observation_spatial_capture(perception_context, expected_library, expected_generation)
+        observation_pose = captured.get("observation_pose") if captured is not None else None
+        observation_map = captured.get("map_snapshot") if captured is not None else map_snapshot
+        observation_localization = captured.get("localization_snapshot") if captured is not None else localization_snapshot
+        if (observation_map is not None and map_snapshot is not None
+                and observation_map.source_name and observation_map.source_epoch
+                and map_snapshot.source_name and map_snapshot.source_epoch
+                and any(getattr(observation_map, key) != getattr(map_snapshot, key)
+                        for key in ("map_name", "source_name", "source_epoch", "frame_id"))):
+            raise GatewayError("完整观察来自另一地图来源，不能关联到当前地点。",
+                               error_code="memory_map_source_changed", http_status=409)
 
         semantic_region_id, semantic_labels = self._resolve_semantic_region(
             localization_snapshot.current_pose,
@@ -1534,7 +1548,8 @@ class MemoryService(SceneMappingMemoryMixin):
             semantic_region_id=semantic_region_id,
             semantic_labels=semantic_labels,
             observation_id=(
-                observation_context.observation.observation_id if observation_context is not None else None
+                perception_context.observation.observation_id if perception_context is not None
+                else observation_context.observation.observation_id if observation_context is not None else None
             ),
             perception_headline=(
                 perception_context.scene_summary.headline if perception_context is not None else description
@@ -1577,6 +1592,13 @@ class MemoryService(SceneMappingMemoryMixin):
                 linked_location=tagged_location,
                 camera_id=camera_id,
                 metadata={"source": "tag_location", **dict(merged_metadata)},
+                perception_context=perception_context,
+                observation_context=observation_context,
+                use_observation_snapshot=True,
+                observation_pose=observation_pose,
+                use_spatial_snapshot=True,
+                map_snapshot=observation_map,
+                localization_snapshot=observation_localization,
             )
             tagged_location = tagged_location.model_copy(
                 update={"memory_id": memory_entry.memory_id},
@@ -1713,6 +1735,73 @@ class MemoryService(SceneMappingMemoryMixin):
             ),
         )
 
+    def capture_observation_spatial_context(self):
+        """捕获库激活代际和观察空间；读取期间切库则拒绝这次捕获。"""
+        with self._instances_lock:
+            library_name = self._active_library_name
+            generation = self._durable_index.activation_generation
+        localization = self._get_or_refresh_localization(allow_missing=True, prefer_live=True)
+        snapshot = self._get_map_snapshot()
+        with self._instances_lock:
+            if (library_name != self._active_library_name
+                    or generation != self._durable_index.activation_generation):
+                raise GatewayError("观察采集期间记忆库已切换。", error_code="memory_library_changed", http_status=409)
+        return {"library_name": library_name, "activation_generation": generation,
+                "observation_pose": localization.current_pose if localization is not None else None,
+                "localization_snapshot": localization, "map_snapshot": snapshot}
+
+    def _latest_complete_perception(self, camera_id):
+        """照片记忆只消费完整观察，兼容未提供完整缓存接口的旧提供器。"""
+        getter = getattr(self._perception_service, "get_latest_full_perception", None)
+        if not callable(getter):
+            getter = self._perception_service.get_latest_perception
+        return getter(camera_id)
+
+    def _observation_spatial_capture(self, perception_context, expected_library, expected_generation):
+        if perception_context is None:
+            return None
+        getter = getattr(self._perception_service, "get_observation_spatial_context", None)
+        captured = getter(perception_context.observation.observation_id) if callable(getter) else None
+        if captured and (captured.get("library_name") != expected_library
+                         or captured.get("activation_generation") != expected_generation):
+            raise GatewayError("观察采集后记忆库已切换，请重新观察当前场景。",
+                               error_code="memory_library_changed", http_status=409)
+        return captured
+
+    def _location_linked_to_observation(self, perception_context, snapshot, expected_library, expected_generation):
+        """只复用同一原始观察已明确关联的唯一地点，不按距离或名称猜测。"""
+        if (perception_context is None or snapshot is None
+                or not snapshot.source_name or not snapshot.source_epoch or not snapshot.frame_id):
+            return None
+        observation_id = perception_context.observation.observation_id
+        with self._instances_lock:
+            self._assert_observation_library(expected_library, expected_generation)
+            candidates = [location for location in self._tagged_locations_by_id.values()
+                if location.observation_id == observation_id
+                and self._record_library_name(location) == expected_library
+                and location.map_name == snapshot.map_name and location.pose.frame_id == snapshot.frame_id
+                and location.metadata.get("map_source_name") == snapshot.source_name
+                and location.metadata.get("map_source_epoch") == snapshot.source_epoch]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _attach_location_photo_memory(self, location, entry, expected_library, expected_generation):
+        """仅更新照片关联，沿既有仓储/outbox提交后发布缓存，地点位置保持不变。"""
+        if location is None or not entry.artifact_ids:
+            return
+        with self._instances_lock:
+            self._assert_observation_library(expected_library, expected_generation)
+            current = self._tagged_locations_by_id.get(location.location_id)
+            if current is not location:
+                raise GatewayError("照片关联期间地点已变化。", error_code="memory_location_changed", http_status=409)
+            updated = current.model_copy(update={"memory_id": entry.memory_id}, deep=True)
+        previous_scope = self._observation_write_scope()
+        self._observation_write_state.scope = {"library_name": expected_library,
+                                              "activation_generation": expected_generation}
+        try:
+            self._repository.upsert_tagged_location(updated)
+        finally:
+            self._observation_write_state.scope = previous_scope
+
     def remember_current_scene(
         self,
         *,
@@ -1745,10 +1834,38 @@ class MemoryService(SceneMappingMemoryMixin):
         if explicit_context and camera_id is not None and perception_context.camera_id != camera_id:
             raise GatewayError("关键帧观察与请求相机不一致。", error_code="perception_camera_mismatch", http_status=409)
         if perception_context is None:
-            perception_context = self._perception_service.get_latest_perception(camera_id)
-        observation_context = None if explicit_context else self._observation_service.get_latest_observation(camera_id)
+            # 快速检测只用于即时框显示；记忆须消费仍带同帧图像与空间依据的完整分析。
+            perception_context = self._latest_complete_perception(camera_id)
+        use_spatial_snapshot = explicit_context
+        if not explicit_context:
+            captured = self._observation_spatial_capture(perception_context, expected_library, expected_generation)
+            if captured is not None:
+                observation_pose = captured.get("observation_pose")
+                map_snapshot = captured.get("map_snapshot")
+                localization_snapshot = captured.get("localization_snapshot")
+                use_spatial_snapshot = True
+        if linked_location is None:
+            linked_location = self._location_linked_to_observation(perception_context, map_snapshot, expected_library, expected_generation)
+        if linked_location is not None:
+            if self._record_library_name(linked_location) != expected_library:
+                raise GatewayError("地点已不属于当前记忆库。", error_code="memory_library_changed", http_status=409)
+            if map_snapshot is not None and (
+                linked_location.map_name != map_snapshot.map_name
+                or linked_location.pose.frame_id != map_snapshot.frame_id
+                or any(linked_location.metadata.get(key) is not None and getattr(map_snapshot, field) is not None
+                       and linked_location.metadata[key] != getattr(map_snapshot, field)
+                       for key, field in (("map_source_name", "source_name"), ("map_source_epoch", "source_epoch")))
+            ):
+                raise GatewayError("照片与地点不属于同一地图来源。", error_code="memory_map_source_changed", http_status=409)
+        # 有感知时只使用其同帧制品，不能合并另一次抓拍的观察与图像。
+        observation_context = (
+            None if perception_context is not None
+            else self._observation_service.get_latest_observation(camera_id)
+        )
         if perception_context is None and observation_context is None:
             raise GatewayError("当前没有可写入记忆的观察或感知结果。")
+        if camera_id is None:
+            camera_id = perception_context.camera_id if perception_context is not None else observation_context.camera_id
 
         if title is None:
             title = (
@@ -1774,7 +1891,7 @@ class MemoryService(SceneMappingMemoryMixin):
         if perception_context is not None:
             merged_metadata.update(self._build_scene_memory_metadata(perception_context))
 
-        return self._create_scene_memory_entry(
+        entry = self._create_scene_memory_entry(
             title=title,
             summary=summary,
             tags=collected_tags,
@@ -1785,12 +1902,15 @@ class MemoryService(SceneMappingMemoryMixin):
             observation_context=observation_context,
             use_observation_snapshot=True,
             observation_pose=observation_pose,
-            use_spatial_snapshot=explicit_context,
+            use_spatial_snapshot=use_spatial_snapshot,
             map_snapshot=map_snapshot,
             localization_snapshot=localization_snapshot,
             expected_library_name=expected_library,
             expected_activation_generation=expected_generation,
         )
+
+        self._attach_location_photo_memory(linked_location, entry, expected_library, expected_generation)
+        return entry
 
     def query_location(
         self,
@@ -1892,6 +2012,9 @@ class MemoryService(SceneMappingMemoryMixin):
 
         if not self.is_enabled():
             return None
+        with self._instances_lock:
+            captured_library = self._active_library_name
+            captured_generation = self._durable_index.activation_generation
         resolved_localization_session_id = str(localization_session_id or "").strip() or None
         payload_filter = (
             MemoryPayloadFilter(
@@ -1908,9 +2031,40 @@ class MemoryService(SceneMappingMemoryMixin):
             limit=1,
             payload_filter=payload_filter,
         )
-        if not result.matches:
+        if result.matches:
+            return result.matches[0].tagged_location
+        # 地点属于规范地图；同一地图的精确名称不应随临时定位会话换代失效。
+        snapshot = self._get_map_snapshot() if map_name else None
+        if (snapshot is None or snapshot.map_name != map_name
+                or not snapshot.source_name or not snapshot.source_epoch or not snapshot.frame_id):
             return None
-        return result.matches[0].tagged_location
+        with self._instances_lock:
+            if (not self._memory_enabled or self._active_library_name != captured_library
+                    or self._durable_index.activation_generation != captured_generation):
+                return None
+            locations = tuple(self._tagged_locations_by_id.values())
+        normalized_query = self._normalize_text(query)
+        matches = []
+        for location in locations:
+            if (self._record_library_name(location) != captured_library
+                    or location.map_name != map_name
+                    or location.pose.frame_id != snapshot.frame_id
+                    or location.metadata.get("map_source_name") != snapshot.source_name
+                    or location.metadata.get("map_source_epoch") != snapshot.source_epoch):
+                continue
+            names = {self._normalize_text(name) for name in (location.name, *location.aliases)}
+            if normalized_query and normalized_query in names:
+                matches.append(location)
+        # 模糊命中或同名歧义继续按原检索处理，不猜测目标，不改写原采集会话。
+        if len(matches) != 1:
+            return None
+        selected = matches[0]
+        with self._instances_lock:
+            if (not self._memory_enabled or self._active_library_name != captured_library
+                    or self._durable_index.activation_generation != captured_generation
+                    or self._tagged_locations_by_id.get(selected.location_id) is not selected):
+                return None
+        return selected
 
     def _build_goal_spec_from_grounding_plan(self, grounding_plan: GroundingQueryPlan) -> GoalSpec:
         metadata = dict(grounding_plan.metadata or {})
@@ -3601,21 +3755,16 @@ class MemoryService(SceneMappingMemoryMixin):
             if perception_context.image_artifact.artifact_id not in artifact_ids:
                 artifact_ids.append(perception_context.image_artifact.artifact_id)
 
-        pose = None
-        if linked_location is not None:
-            pose = linked_location.pose
-        elif observation_pose is not None:
-            pose = observation_pose
-        elif localization_snapshot is not None:
+        # 地点关联不是观察坐标的替代品；照片保留其采集时位姿和时间。
+        pose = observation_pose
+        if pose is None and localization_snapshot is not None:
             pose = localization_snapshot.current_pose
+        if pose is None and linked_location is not None and perception_context is None and observation_context is None:
+            pose = linked_location.pose
         semantic_region_id = None
         semantic_labels: List[str] = []
         topo_node_id = None
-        if linked_location is not None:
-            semantic_region_id = linked_location.semantic_region_id
-            semantic_labels = list(linked_location.semantic_labels)
-            topo_node_id = linked_location.topo_node_id
-        elif pose is not None:
+        if pose is not None:
             semantic_region_id, semantic_labels = self._resolve_semantic_region(
                 pose,
                 map_snapshot.semantic_map if map_snapshot is not None else None,
@@ -4739,6 +4888,7 @@ class MemoryService(SceneMappingMemoryMixin):
     ) -> MemoryQueryMatch:
         candidate_localization_session_id = str(candidate.point.payload.get("localization_session_id") or "").strip() or None
         navigation_candidate = None
+        linked_photo = None
         navigation_metadata = self._evaluate_navigation_metadata(
             dict(candidate.point.payload),
             backend_name=str(candidate.point.payload.get("backend") or candidate.point.payload.get("backend_type") or "memory_service"),
@@ -4750,6 +4900,17 @@ class MemoryService(SceneMappingMemoryMixin):
             expected_localization_session_id=expected_localization_session_id,
         )
         if candidate.tagged_location is not None:
+            location = candidate.tagged_location
+            photo = self._semantic_entries_by_id.get(location.memory_id) if location.memory_id else None
+            if (photo is not None and photo.artifact_ids and photo.linked_location_id == location.location_id
+                    and photo.map_name == location.map_name
+                    and self._record_library_name(photo) == self._record_library_name(location)
+                    and all(photo.metadata.get(key) == location.metadata.get(key)
+                            for key in ("map_source_name", "map_source_epoch"))):
+                linked_photo = {"memory_id": photo.memory_id, "artifact_ids": list(photo.artifact_ids),
+                    "observation_id": photo.observation_id, "camera_id": photo.metadata.get("camera_id"),
+                    "frame_timestamp": photo.metadata.get("frame_timestamp"),
+                    "observation_pose": photo.pose.model_dump(mode="json") if photo.pose is not None else None}
             source_metadata = {**dict(candidate.tagged_location.metadata), **dict(candidate.point.payload)}
             backend_name = "memory_service.tagged_location"
             navigation_metadata = self._evaluate_navigation_metadata(
@@ -4775,11 +4936,11 @@ class MemoryService(SceneMappingMemoryMixin):
                     map_name=candidate.tagged_location.map_name,
                     topo_node_id=candidate.tagged_location.topo_node_id,
                     semantic_region_id=candidate.tagged_location.semantic_region_id,
-                    artifact_ids=[],
+                    artifact_ids=list(linked_photo["artifact_ids"]) if linked_photo else [],
                     current_pose=current_pose,
                     verification_memory_id=candidate.tagged_location.memory_id,
                     verification_text=candidate.tagged_location.perception_headline or query,
-                    camera_id=None,
+                    camera_id=linked_photo.get("camera_id") if linked_photo else None,
                     localization_session_id=candidate_localization_session_id,
                     source_metadata=source_metadata,
                     backend_name=backend_name,
@@ -4977,6 +5138,7 @@ class MemoryService(SceneMappingMemoryMixin):
             metadata={
                 "retrieval_mode": ("text_recall_then_filter_then_multimodal_rerank"
                                    if candidate.point.payload.get("query_vector_contributions") else "lexical_only"),
+                **({"linked_photo": linked_photo} if linked_photo is not None else {}),
                 "text_recall_score": round(candidate.text_recall_score, 6),
                 "lexical_score": round(candidate.lexical_score, 6),
                 "image_score": round(candidate.image_score, 6),

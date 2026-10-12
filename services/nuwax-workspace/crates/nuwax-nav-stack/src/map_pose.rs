@@ -48,6 +48,10 @@ fn is_base_frame_leaf(leaf: &str) -> bool {
         || leaf.ends_with("_base_footprint")
 }
 
+pub(crate) fn valid_body_reference(frame: &str) -> bool {
+    validated_frame_tokens(frame).is_some()
+}
+
 fn infer_frame_role(leaf: &str) -> FrameRole {
     match leaf {
         "map" => FrameRole::Map,
@@ -205,21 +209,18 @@ impl MapPoseAdapter {
         })
     }
 
-    /// 三维接线不能把足印参考点与机体参考点当作同一高度。
+    /// Goal-bound execution requires the actual captured body reference, not role aliases.
     pub(crate) fn require_body_reference(mut self) -> Self {
         self.strict_body_reference = true;
         self
     }
 
     fn matches_base_frame(&self, actual: &str) -> bool {
-        let is_footprint = |frame: &str| {
-            frame
-                .rsplit('/')
-                .next()
-                .is_some_and(|leaf| leaf.ends_with("base_footprint"))
-        };
-        (!self.strict_body_reference || is_footprint(actual) == is_footprint(&self.base_frame))
-            && frame_ids_semantically_equal(actual, &self.base_frame)
+        if self.strict_body_reference {
+            actual.trim() == self.base_frame
+        } else {
+            frame_ids_semantically_equal(actual, &self.base_frame)
+        }
     }
 
     /// Observe the latest real map->odom transform. Returns whether one was accepted.
@@ -622,6 +623,34 @@ mod tests {
         body.pose.position[2] = 0.4;
         let observed = adapter.transform_odometry(&body).unwrap().unwrap();
         assert_eq!(observed.pose.pose.position[2], 0.4);
+    }
+
+    #[test]
+    fn strict_body_binding_selects_the_actual_child_even_when_role_alias_is_last() {
+        let mut adapter = MapPoseAdapter::new("map", "odom", "robot/body_a")
+            .unwrap().require_body_reference();
+        let mut chain = coherent_tf_chain(0.0, 0.0, 1.0, 2.0);
+        chain.transforms[1].child_frame_id = "robot/body_a".into();
+        let mut foreign = chain.transforms[1].clone();
+        foreign.child_frame_id = "robot/base_link".into();
+        foreign.transform.translation[0] = 9.0;
+        chain.transforms.push(foreign.clone());
+        let observed = adapter.observe_tf_message(&chain).unwrap().map_pose.unwrap();
+        assert_eq!(observed.pose.pose.position[0], 1.0);
+        let mut foreign_only = map_to_odom(0.0, 0.0);
+        foreign_only.transforms.push(foreign);
+        assert!(adapter.observe_tf_message(&foreign_only).unwrap().map_pose.is_none());
+        assert!(adapter.transform_odometry(&odometry("odom", "robot/base_link", 9.0, 2.0)).is_err());
+        assert!(adapter.transform_odometry(&odometry("odom", "robot/body_a", 1.0, 2.0)).unwrap().is_some());
+    }
+
+    #[test]
+    fn strict_body_binding_does_not_treat_body_and_base_link_as_physical_synonyms() {
+        let mut adapter = MapPoseAdapter::new("map", "odom", "body")
+            .unwrap().require_body_reference();
+        adapter.observe_tf(&map_to_odom(0.0, 0.0)).unwrap();
+        assert!(adapter.transform_odometry(&odometry("odom", "base_link", 1.0, 2.0)).is_err());
+        assert!(adapter.transform_odometry(&odometry("odom", "body", 1.0, 2.0)).unwrap().is_some());
     }
 
     #[test]

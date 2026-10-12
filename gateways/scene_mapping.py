@@ -66,11 +66,10 @@ def _handle(runtime, operation, arguments: Dict[str, Any], *, requested_by=None,
     if operation == "locate":
         return service.locate()
     if operation == "label":
-        space = runtime.memory_service.update_scene_mapping_label(
+        space = service.update_label(
             scene_space_id=arguments["scene_space_id"], map_name=arguments["map_name"],
             expected_revision=arguments["expected_revision"], label=arguments["label"],
             request_id=arguments["request_id"], requested_by=requested_by or "unknown")
-        runtime.stream_bus.publish("memory.scene_spaces", source="scene_mapping_service", payload=service.get_map(), status="available")
         return {"scene_space": space}
     if operation == "refresh":
         if not service.config.enabled:

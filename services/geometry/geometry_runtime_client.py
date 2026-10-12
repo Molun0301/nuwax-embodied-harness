@@ -59,6 +59,10 @@ class GeometryRuntimeSubprocess:
         # attach 状态下 gRPC 健康检查缓存（runtime monitor / is_running 复用）
         self._attached_health_check_at = 0.0
         self._attached_health_check_ok = False
+        # 健康探测失败不能丢掉已确认的拥有方身份；显式关闭才撤销复用资格。
+        self._bound_ready_pid: Optional[int] = None
+        self._bound_runtime_generation: Optional[int] = None
+        self._last_probed_runtime_generation: Optional[int] = None
 
     @property
     def grpc_target(self) -> str:
@@ -192,6 +196,8 @@ class GeometryRuntimeSubprocess:
             self._attached_health_check_at = time.monotonic()
             self._attached_health_check_ok = True
             self._last_error = None
+            self._bound_ready_pid = self._attached_ready_pid
+            self._bound_runtime_generation = self._last_probed_runtime_generation
             LOGGER.info(
                 "nuwax-geometry-runtime 已在端口 %d 运行，gRPC 验活通过，Python 只挂接",
                 self._port,
@@ -203,6 +209,8 @@ class GeometryRuntimeSubprocess:
         """释放 Python 本地挂接；外部 runtime 生命周期归 canonical owner。"""
 
         with self._lock:
+            self._bound_ready_pid = None
+            self._bound_runtime_generation = None
             self._started = False
             self._reset_attached_state_locked()
 
@@ -213,8 +221,32 @@ class GeometryRuntimeSubprocess:
         重新执行端口 + gRPC 双门验活；不向外部 owner 发送信号。
         """
         with self._lock:
+            self._bound_ready_pid = None
+            self._bound_runtime_generation = None
             self._reset_attached_state_locked()
             self._started = False
+
+    def recover_same_runtime(self) -> bool:
+        """完整复核短暂失联的同一Rust启动代际，不创建或替换provider。"""
+        with self._lock:
+            pid, generation = self._bound_ready_pid, self._bound_runtime_generation
+            if pid is None or generation is None:
+                return False
+            if not self._is_port_open() or not self._verify_ready_locked():
+                self._reset_attached_state_locked()
+                return False
+            if self._attached_ready_pid != pid or not self._verify_attached_runtime_locked():
+                self._reset_attached_state_locked()
+                return False
+            if (self._last_probed_runtime_generation != generation
+                    or not self._verify_ready_locked() or self._attached_ready_pid != pid):
+                self._reset_attached_state_locked()
+                return False
+            self._attached = self._started = True
+            self._attached_health_check_at = time.monotonic()
+            self._attached_health_check_ok = True
+            self._last_error = None
+            return True
 
     def _is_port_open(self) -> bool:
         try:
@@ -236,11 +268,20 @@ class GeometryRuntimeSubprocess:
         except Exception as exc:  # pragma: no cover - 部署损坏时 fail-closed
             LOGGER.error("attach 验活: gRPC proto 导入失败: %s", exc)
             return False
+        self._last_probed_runtime_generation = None
         try:
             channel = grpc.insecure_channel(self.grpc_target)
             try:
                 stub = pb2_grpc.GeometryRuntimeStub(channel)
                 stub.GetStatus(pb2.Empty(), timeout=_ATTACHED_HEALTH_CHECK_TIMEOUT_SEC)
+                # 旧运行时没有代际字段时仍可按原协议挂接，但不允许同代复用优化。
+                try:
+                    health = stub.HealthCheck(pb2.HealthCheckRequest(), timeout=_ATTACHED_HEALTH_CHECK_TIMEOUT_SEC)
+                    generation = int(health.runtime_generation)
+                    if generation > 0:
+                        self._last_probed_runtime_generation = generation
+                except Exception as exc:
+                    LOGGER.debug("当前GetStatus可用，但未取得可复核runtime_generation：%s", exc)
                 return True
             finally:
                 channel.close()
@@ -261,6 +302,9 @@ class GeometryRuntimeSubprocess:
         ) < _ATTACHED_HEALTH_CHECK_TTL_SEC:
             return True
         ok = self._verify_attached_runtime_locked() and self._verify_ready_locked()
+        if (self._bound_runtime_generation is not None and self._last_probed_runtime_generation is not None
+                and self._last_probed_runtime_generation != self._bound_runtime_generation):
+            ok = False
         self._attached_health_check_at = now
         self._attached_health_check_ok = ok
         if not ok:

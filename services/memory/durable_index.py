@@ -740,7 +740,9 @@ class DurableMemoryIndex:
         vectors = {}
         for row in vector_rows:
             try:
-                array = _decode_vector(row['vector_payload'])
+                # SQL BLOB bytes own this read-only view; cosine consumers must not mutate it.
+                raw = row['vector_payload']
+                array = np.frombuffer(raw, dtype=np.float32) if isinstance(raw, bytes) else _decode_vector(raw)
             except (ValueError, TypeError, OverflowError):
                 array = np.empty(0, dtype=np.float32)
             try:

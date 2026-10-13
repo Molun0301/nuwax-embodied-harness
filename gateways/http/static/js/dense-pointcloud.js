@@ -244,8 +244,13 @@ export class DensePointCloudLayer {
     this.group.visible = false;
   }
 
+  _assignedComplete() {
+    // 指定保存资产在同一安装代次内不可变；后续失效由地图/点云来源事件驱动。
+    return this.displaySource?.assigned_source && this.metadata && this.count === this.total;
+  }
+
   async _poll(serial) {
-    if (!this._active || serial !== this._serial) return;
+    if (!this._active || serial !== this._serial || this._assignedComplete()) return;
     const controller = new AbortController();
     this._abort = controller;
     const timeout = setTimeout(() => controller.abort(), 15000);
@@ -280,7 +285,7 @@ export class DensePointCloudLayer {
       clearTimeout(timeout);
       if (this._active && serial === this._serial) {
         this._abort = null;
-        this._timer = setTimeout(() => this._poll(serial), delay);
+        this._timer = this._assignedComplete() ? null : setTimeout(() => this._poll(serial), delay);
       }
     }
   }

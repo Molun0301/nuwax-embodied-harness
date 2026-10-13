@@ -5,7 +5,7 @@ import { OrbitControls } from './OrbitControls.js';
 import { PointCloudProcessor } from './pointcloud-processing.js?v=20260918-dense-pointcloud';
 import { IncrementalPointCloudConnection, mappingEpochFromMap, pointCloudAssignedSourceEpoch } from './pointcloud-incremental.js?v=20261006-assigned-pages';
 import { IncrementalPointCloudLayer } from './pointcloud-pages.js?v=20261002-pages';
-import { DensePointCloudLayer } from './dense-pointcloud.js?v=20261006-assigned-pages';
+import { DensePointCloudLayer } from './dense-pointcloud.js?v=20261013-dense-saved-complete';
 
 const COLORS = {
   robot: 0xfbbf24,

@@ -45,6 +45,7 @@ mod scheduler_detour_cancellation {
         }
     }
     struct Admission {
+        lifecycle: Lifecycle,
         pose: PoseStamped,
         applied: Twist2,
         path: Path3D,
@@ -75,6 +76,7 @@ mod scheduler_detour_cancellation {
             if state.latest.is_none_or(|old| lifecycle.4 > old.4) && lifecycle.4 > 0 {
                 assert!(state.admissions.len() < 64, "bounded candidate history");
                 state.admissions.push(Admission {
+                    lifecycle,
                     pose: self.pose.clone().unwrap(),
                     applied: self.applied,
                     path: self.inner.local_path().unwrap().clone(),
@@ -248,6 +250,7 @@ mod scheduler_detour_cancellation {
         }
     }
     struct Receipt {
+        operation_id: String,
         map: Arc<SurfaceSnapshot>,
         pose: PlanarPose,
         before: Twist2,
@@ -363,6 +366,7 @@ mod scheduler_detour_cancellation {
                         "one worker result cannot be applied twice"
                     );
                     let receipt = Receipt {
+                        operation_id: id.to_owned(),
                         map: plant.map.clone(),
                         pose: plant.pose,
                         before: plant.command,
@@ -516,14 +520,26 @@ mod scheduler_detour_cancellation {
     #[tokio::test]
     #[ignore = "real-scheduler persistent-obstacle recovery and actual motion oracle; run in isolation"]
     async fn real_scheduler_preserves_detour_and_reaches_original_goal() {
-        run(false).await;
+        run(RecoveryCase::Persistent, false).await;
     }
     #[tokio::test]
     #[ignore = "causal attribution only, stops at second rejection; not goal qualification"]
     async fn real_scheduler_old_admission_turning_room_attribution() {
-        run(true).await;
+        run(RecoveryCase::Persistent, true).await;
     }
-    async fn run(attribution_only: bool) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RecoveryCase { Persistent, ClearsWhileHeld, CancelThenNewGoal }
+    #[tokio::test]
+    #[ignore = "real scheduler moving recovery after genuinely clearing obstacle; run in isolation"]
+    async fn real_scheduler_cleared_obstacle_recovers_original_goal() {
+        run(RecoveryCase::ClearsWhileHeld, false).await;
+    }
+    #[tokio::test]
+    #[ignore = "real scheduler held-work cancellation and replacement goal arrival; run in isolation"]
+    async fn real_scheduler_cancelled_held_detour_cannot_move_replacement_goal() {
+        run(RecoveryCase::CancelThenNewGoal, false).await;
+    }
+    async fn run(case: RecoveryCase, attribution_only: bool) {
         let (config, base, keys) = crate::route_moving_worker_tests::fixture(true, 0.05, 6.0);
         assert!(!config.controller.simulation);
         let limits = config.motion_limits.clone().unwrap();
@@ -548,7 +564,9 @@ mod scheduler_detour_cancellation {
         observations.mark_complete_geometry_source();
         let clear = Arc::new(base.with_observations(Some(Arc::new(observations))));
         let start = pose(0.5, 1.5, 0.0);
-        let goal = pose(3.0, 1.5, 0.0);
+        let mut goal = pose(3.0, 1.5, 0.0);
+        let original_goal = goal.clone();
+        let mut session_id = "goal-1";
         let trace: Trace = Default::default();
         let _dump = TraceDump(trace.clone());
         let stops: Stops = Default::default();
@@ -653,6 +671,12 @@ mod scheduler_detour_cancellation {
         let mut attribution_rejection = false;
         let mut held_command_results = 0;
         let mut held_lifecycle = None;
+        let mut obstacle_cleared = false;
+        let mut clear_source_ns = None;
+        let mut replaced = false;
+        let mut replacement_receipt_start = None;
+        let mut old_worker_basis = None;
+        let mut replacement_admission_start = None;
         loop {
             let now = WallInstant::now();
             if now.duration_since(began) >= Duration::from_secs(60) {
@@ -714,7 +738,7 @@ mod scheduler_detour_cancellation {
                 // Every actual new acquisition retains the same physical obstacle
                 // after onset; no clear/static refresh can erase the held problem.
                 sequence += 1;
-                let (next, ns) = if let Some(x) = obstacle_x {
+                let (next, ns) = if let Some(x) = obstacle_x.filter(|_| !obstacle_cleared) {
                     obstacle_update(&map, sequence, x)
                 } else {
                     let ns = now_ns();
@@ -742,7 +766,7 @@ mod scheduler_detour_cancellation {
             if !started_detour && entered.try_recv().is_ok() {
                 started_detour = true;
             }
-            let status = handle.status();
+            let mut status = handle.status();
             if started_detour
                 && !released
                 && status.last_applied_twist == Some(Twist2::ZERO)
@@ -765,23 +789,64 @@ mod scheduler_detour_cancellation {
                         SchedulerPhase::Controlling,
                         "local recovery must not request an external path"
                     );
-                    assert_eq!(
-                        stops.lock().unwrap().len(),
-                        stops_at_hold,
-                        "local wait must not cancel the planning owner"
-                    );
+                    if !replaced {
+                        assert_eq!(stops.lock().unwrap().len(), stops_at_hold,
+                            "local wait must not cancel the planning owner");
+                    }
                     let current = state.lock().unwrap().latest.unwrap();
                     let held = held_lifecycle.unwrap();
-                    assert_eq!(
-                        (current.0, current.1),
-                        (held.0, held.1),
-                        "source updates cannot retire the held owner or route generation"
-                    );
+                    if !replaced {
+                        assert_eq!((current.0, current.1), (held.0, held.1),
+                            "source updates cannot retire the held owner or route generation");
+                    }
                     if !attribution_only {
                         assert_eq!(state.lock().unwrap().command_results, held_command_results,
                             "withdrawn old admission must not produce Command(ZERO) or nonzero and reset the pending wait budget");
                         assert_eq!(plant.lock().unwrap().receipts.len(), held_receipts,
                             "withdrawn old admission must retain confirmed ZERO until re-admission");
+                    }
+                    if case == RecoveryCase::ClearsWhileHeld && !obstacle_cleared
+                        && now.duration_since(started) >= Duration::from_millis(250) {
+                        sequence += 1;
+                        let ns = now_ns();
+                        let cleared = Arc::new(map.with_recent_obstacle_points(sequence,ns,0,&[],std::iter::empty()).unwrap());
+                        let current_pose = plant.lock().unwrap().measured_pose();
+                        cleared.validate_body_motion(crate::route_planning::body(&current_pose),
+                            crate::route_planning::body(&goal),&[]).expect("genuine clearing acquisition restores the direct full-body route");
+                        log(&trace,"obstacle_cleared_while_held",(ns,&current_pose));
+                        publish(&handle,&plant,map,cleared.clone(),ns).await;
+                        map=cleared;obstacle_cleared=true;clear_source_ns=Some(ns);
+                        next_source=now+Duration::from_millis(200);
+                        held_sources+=1;
+                    }
+                    if case == RecoveryCase::CancelThenNewGoal && !replaced
+                        && now.duration_since(started) >= Duration::from_millis(300) {
+                        let before = plant.lock().unwrap().receipts.last().unwrap().proof.proof.input.clone();
+                        handle.cancel(session_id).await.unwrap();
+                        let cancelled=handle.status();
+                        assert_eq!(cancelled.last_terminal,Some(TerminalOutcome::Cancelled));
+                        assert!(cancelled.last_zero_ack_id.is_some(),"cancel must confirm the real fixture fence");
+                        assert_eq!(cancelled.last_applied_twist,Some(Twist2::ZERO));
+                        let current_pose={let mut p=plant.lock().unwrap();
+                            let measured=p.measured_pose();assert_eq!(p.command,Twist2::ZERO);
+                            replacement_receipt_start=Some(p.receipts.len());measured};
+                        replacement_admission_start=Some(state.lock().unwrap().admissions.len());
+                        old_worker_basis=Some((before.epoch,before.goal_version,before.path_version));
+                        goal=pose(3.0,2.3,0.0);
+                        let witness=[current_pose.clone(),pose(current_pose.pose.position.x,1.5,std::f64::consts::FRAC_PI_2),
+                            pose(current_pose.pose.position.x,2.3,std::f64::consts::FRAC_PI_2),
+                            pose(current_pose.pose.position.x,2.3,0.0),goal.clone()];
+                        for pair in witness.windows(2) {map.validate_body_motion(crate::route_planning::body(&pair[0]),
+                            crate::route_planning::body(&pair[1]),&[]).expect("replacement goal has independent full-body feasible route");}
+                        session_id="goal-2";
+                        let mut next_session=session_for(session_id);next_session.goal_pose=goal.clone();
+                        assert_eq!(next_session.options,options,"replacement retains original tolerances");
+                        handle.start_session(next_session).await.unwrap();
+                        let mut next_route=path_for(session_id,1);
+                        next_route.path=ExecutionPath::Surface(Path3D{poses:vec![current_pose.clone(),goal.clone()]});
+                        handle.submit_path(next_route).await.unwrap();
+                        replaced=true;status=handle.status();
+                        log(&trace,"cancel_fenced_then_new_goal_while_held",(old_worker_basis,&current_pose,&goal,&status));
                     }
                     if now.duration_since(started) >= Duration::from_millis(650) {
                         assert!(
@@ -822,7 +887,7 @@ mod scheduler_detour_cancellation {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         if !arrived && handle.status().session_id.is_some() {
-            handle.cancel("goal-1").await.unwrap();
+            handle.cancel(session_id).await.unwrap();
         }
         handle.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
@@ -831,12 +896,12 @@ mod scheduler_detour_cancellation {
         let audit = state.lock().unwrap();
         for (index, admission) in audit.admissions.iter().enumerate() {
             eprintln!(
-                "SCHEDULER_ADMISSION index={index} current_pose={:?} applied={:?} path={:?}",
-                admission.pose, admission.applied, admission.path
+                "SCHEDULER_ADMISSION index={index} lifecycle={:?} current_pose={:?} applied={:?} path={:?}",
+                admission.lifecycle, admission.pose, admission.applied, admission.path
             );
         }
         for (index, r) in p.receipts.iter().enumerate() {
-            eprintln!("SCHEDULER_RECEIPT index={index} ns={} source_ns={} id={} pose={:?} before={:?} command={:?} proof={:?}",r.ns,r.source_ns,r.id,r.pose,r.before,r.command,r.proof);
+            eprintln!("SCHEDULER_RECEIPT index={index} ns={} source_ns={} id={} operation={} pose={:?} before={:?} command={:?} proof={:?}",r.ns,r.source_ns,r.id,r.operation_id,r.pose,r.before,r.command,r.proof);
         }
         for (index, e) in p.edges.iter().enumerate() {
             eprintln!(
@@ -893,9 +958,35 @@ mod scheduler_detour_cancellation {
             assert!(safety_failures.is_empty(), "independent motion audit failed: {safety_failures:?}");
             return;
         }
+        if case == RecoveryCase::ClearsWhileHeld {
+            assert!(obstacle_cleared,"clear scenario must publish an actual clearing acquisition while held");
+            assert!(p.receipts.iter().filter(|r|r.ns>=clear_source_ns.unwrap()).all(|r|r.source_ns>=clear_source_ns.unwrap()),
+                "post-clear receipts must use current genuinely acquired evidence");
+        }
+        if case == RecoveryCase::CancelThenNewGoal {
+            assert!(replaced,"cancellation and new goal must occur before held work releases");
+            let old=old_worker_basis.unwrap();
+            let after=&p.receipts[replacement_receipt_start.unwrap()..];
+            assert!(!after.is_empty(),"new goal must execute real nonzero receipts");
+            for receipt in after {
+                let proof=&receipt.proof.proof.input;
+                assert!(receipt.operation_id.starts_with("nav:goal-2:twist:"),"obsolete session cannot issue a receipt");
+                assert!(proof.epoch>old.0 && proof.goal_version>old.1 && proof.path_version>old.2,
+                    "old goal/epoch/path result cannot move under replacement identity");
+            }
+            let held=held_lifecycle.unwrap();
+            for admission in &audit.admissions[replacement_admission_start.unwrap()..] {
+                assert!(admission.lifecycle.0>held.0 && admission.lifecycle.1>held.1,
+                    "released obsolete candidate cannot be admitted under old owner/generation");
+                let end=admission.path.poses.last().expect("replacement candidate endpoint").pose.position;
+                assert!(end.distance(goal.pose.position)<options.position_tolerance_m,
+                    "this short full-horizon replacement candidate must target goal-2, never the released old goal");
+            }
+            assert!(stops.lock().unwrap().len()>stops_at_hold,"explicit user cancellation still stops the owner");
+        }
         assert!(safety_failures.is_empty(), "independent motion audit failed: {safety_failures:?}");
         assert!(failure.is_none(), "{}", failure.unwrap_or_default());
-        assert!(arrived, "same original goal must be completed");
+        assert!(arrived, "the scenario's active goal must be completed");
         let at_release = release_position.unwrap();
         assert!(
             (p.pose.x - at_release.x).hypot(p.pose.y - at_release.y) > 1.0,
@@ -909,7 +1000,7 @@ mod scheduler_detour_cancellation {
             nuwax_nav_astar::controllers::angle_diff(p.pose.yaw, goal.pose.orientation.yaw()).abs()
                 < options.yaw_tolerance_rad
         );
-        eprintln!("SCHEDULER_RECOVERY_RESULT elapsed_s={} source_acquisitions={} held_sources={} held_fresh_nonzero={} receipts={} actual_edges={} final_pose={:?} original_goal={:?}",
-            began.elapsed().as_secs_f64(),sequence,held_sources,held_nonzero,p.receipts.len(),p.edges.len(),p.pose,goal.pose);
+        eprintln!("SCHEDULER_RECOVERY_RESULT case={case:?} session={session_id} elapsed_s={} source_acquisitions={} held_sources={} held_fresh_nonzero={} receipts={} actual_edges={} final_pose={:?} original_goal={:?} active_goal={:?}",
+            began.elapsed().as_secs_f64(),sequence,held_sources,held_nonzero,p.receipts.len(),p.edges.len(),p.pose,original_goal.pose,goal.pose);
     }
 }

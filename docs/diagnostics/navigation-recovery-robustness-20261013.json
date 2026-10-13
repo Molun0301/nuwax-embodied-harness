@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-10-13T23:25:00Z",
+  "source_commit": "8949d9d0919a4eb72609161e7a18af35de816754",
+  "candidate": "cfg(test)-only RecoveryCase variants in existing scheduler_detour_cancellation_tests.rs; production recovery0eed9d2 and committed Scan reuse unchanged",
+  "external_evidence_root": "/workspace/scratch/71cdb9d17732/scheduler-recovery-robustness-20261013",
+  "binary": "runtime-v1",
+  "fixture_snapshot": "fixture-v1.rs",
+  "build": "build-v1.jsonl",
+  "scope": "actual NavScheduler, PlannerWorker, RouteFollower and PlanKernel with real source acquisition clocks and a bounded ideal plant; not physical actuator qualification",
+  "shared_inputs": {
+    "total_goal_window_s": 60,
+    "window_origin": "original goal-1 start; never reset for goal-2",
+    "held_planning_ms": 650,
+    "control_hold_cap_ms": 50,
+    "hold_note": "ideal plant only, additionally capped by original worker and source deadlines",
+    "source_hz": 5,
+    "pose_hz": 40,
+    "source_ttl_ms": 1000,
+    "motion_limits": "unchanged generic fixture calibration",
+    "position_tolerance_m": 0.35,
+    "yaw_tolerance_rad": 0.35,
+    "reverse_speed_mps": 0,
+    "scan_horizon_m": 5,
+    "planning_expansion_budget": 256,
+    "source_voxel_m": 0.05,
+    "obstacle_points": [
+      [
+        0.8907157909999999,
+        1.3,
+        0.5
+      ],
+      [
+        0.8907157909999999,
+        1.4000000000000001,
+        0.5
+      ],
+      [
+        0.8907157909999999,
+        1.5,
+        0.5
+      ],
+      [
+        0.8907157909999999,
+        1.6,
+        0.5
+      ],
+      [
+        0.8907157909999999,
+        1.7000000000000002,
+        0.5
+      ]
+    ],
+    "initial_goal": [
+      3,
+      1.5,
+      0.5,
+      0
+    ],
+    "geometry_gates": [
+      "current body legal",
+      "direct original route blocked",
+      "independently swept feasible detour"
+    ],
+    "audits": [
+      "all actual executed body-motion edges",
+      "every receipt original unique worker proof and expiry",
+      "every receipt fresh genuine source",
+      "every receipt complete unchanged braking tail"
+    ]
+  },
+  "cases": [
+    {
+      "case": "ClearsWhileHeld",
+      "raw_log": "run-clear-v1.log",
+      "passed": true,
+      "elapsed_s": 13.201772947,
+      "counts": {
+        "source_acquisitions": 66,
+        "held_sources": 3,
+        "held_fresh_nonzero": 0,
+        "receipts": 230,
+        "actual_edges": 712,
+        "planning_submissions": 2,
+        "local_admissions": 2
+      },
+      "audit_failures": [],
+      "summary": "SCHEDULER_RECOVERY_RESULT case=ClearsWhileHeld session=goal-1 elapsed_s=13.201772947 source_acquisitions=66 held_sources=3 held_fresh_nonzero=0 receipts=230 actual_edges=712 final_pose=PlanarPose { x: 2.7494987561414472, y: 1.6166990134054817, yaw: -0.29148653085458465 } original_goal=Pose3 { position: Point3 { x: 3.0, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } } active_goal=Pose3 { position: Point3 { x: 3.0, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } }",
+      "exact_audit": "SCHEDULER_SAFETY_AUDIT receipts=230 actual_edges=712 failures=[]",
+      "lifecycle_evidence": [
+        "SCHEDULER_DETOUR 1791933765267221991 recovery_zero_wait \"当前轨迹受阻，保持零速等待局部接续：当前状态或最新近期障碍拒绝已选停车轨迹: Ok((false, Some(Body(BodyFailureWitness { pose: ([0.7046879143499999, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]), rejection: Occupancy { cell: [17, 27, 9], source: Recent, z_bounds: [0.45000000670552254, 0.5000000074505806], ground_height: None } })), Ok(None)))\"",
+        "SCHEDULER_DETOUR 1791933765521539948 obstacle_cleared_while_held (1791933765518919792, PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 1791933765518925701, clock: Unix }, pose: Pose3 { position: Point3 { x: 0.6121594563499998, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } } })",
+        "SCHEDULER_DETOUR 1791933765919399377 plan_hook_released (5, true)",
+        "SCHEDULER_DETOUR 1791933777514393361 fenced (\"nav:goal-1:fence:312\", true)"
+      ],
+      "first_failure": null,
+      "mutation": "genuine obstacle-free recent acquisition after250ms of held recovery; all subsequent acquisitions remain clear",
+      "assertions": [
+        "independent direct full-body sweep becomes legal at clearing publication",
+        "same owner epoch6 and route generation5 retained through hold",
+        "same goal-1 and path revision1 complete",
+        "all post-clear receipts use genuinely newer source samples",
+        "zero nonzero receipts and no old-admission Command including ZERO during hold"
+      ]
+    },
+    {
+      "case": "CancelThenNewGoal",
+      "raw_log": "run-cancel-replace-v1.log",
+      "passed": true,
+      "elapsed_s": 10.812491681000001,
+      "counts": {
+        "source_acquisitions": 54,
+        "held_sources": 3,
+        "held_fresh_nonzero": 0,
+        "receipts": 185,
+        "actual_edges": 571,
+        "planning_submissions": 3,
+        "local_admissions": 2,
+        "goal_1_receipts": 9,
+        "goal_2_receipts": 176
+      },
+      "audit_failures": [],
+      "summary": "SCHEDULER_RECOVERY_RESULT case=CancelThenNewGoal session=goal-2 elapsed_s=10.812491681000001 source_acquisitions=54 held_sources=3 held_fresh_nonzero=0 receipts=185 actual_edges=571 final_pose=PlanarPose { x: 2.67956216559843, y: 2.2503524130886756, yaw: 0.14146861277234946 } original_goal=Pose3 { position: Point3 { x: 3.0, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } } active_goal=Pose3 { position: Point3 { x: 3.0, y: 2.3, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } }",
+      "exact_audit": "SCHEDULER_SAFETY_AUDIT receipts=185 actual_edges=571 failures=[]",
+      "lifecycle_evidence": [
+        "SCHEDULER_DETOUR 1791933791822650125 recovery_zero_wait \"当前轨迹受阻，保持零速等待局部接续：当前状态或最新近期障碍拒绝已选停车轨迹: Ok((false, Some(Body(BodyFailureWitness { pose: ([0.7025987817000001, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]), rejection: Occupancy { cell: [17, 27, 9], source: Recent, z_bounds: [0.45000000670552254, 0.5000000074505806], ground_height: None } })), Ok(None)))\"",
+        "SCHEDULER_DETOUR 1791933792123471753 fenced (\"nav:goal-1:fence:23\", true)",
+        "SCHEDULER_DETOUR 1791933792129951255 cancel_fenced_then_new_goal_while_held (Some((3, 2, 3)), PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 1791933792123480667, clock: Unix }, pose: Pose3 { position: Point3 { x: 0.6120787797, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } } }, PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 1791933792123481618, clock: Unix }, pose: Pose3 { position: Point3 { x: 3.0, y: 2.3, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } } }, SchedulerStatus { phase: Controlling, session_id: Some(\"goal-2\"), path_revision: 1, applied_commands: 0, last_applied_twist: None, motion_sink_ready: true, guard_generation: 7, planner_inputs_fresh: true, pose_source_timestamp_ns: 1791933792101721327, costmap_source_timestamp_ns: 1791933791215259177, pose_receipt_age_ms: 18, costmap_receipt_age_ms: 901, last_terminal: None, last_zero_ack_id: None, last_fence_monotonic_ns: 0, message: \"versioned path accepted\", local_path: [] })",
+        "SCHEDULER_DETOUR 1791933792473474504 plan_hook_released (5, true)",
+        "SCHEDULER_DETOUR 1791933801869826607 fenced (\"nav:goal-2:fence:258\", true)"
+      ],
+      "first_failure": null,
+      "mutation": "cancel/fence goal-1 after300ms of held recovery; start supported new goal-2 before releasing old work",
+      "replacement_goal": [
+        3,
+        2.3,
+        0.5,
+        0
+      ],
+      "first_goal_2_receipt_proof": "SCHEDULER_RECEIPT index=9 ns=1791933792670383676 source_ns=1791933792575555050 id=48 operation=nav:goal-2:twist:37 pose=PlanarPose { x: 0.6120787797, y: 1.5, yaw: 0.0 } before=Twist2 { linear: Point2 { x: 0.0, y: 0.0 }, angular_z: 0.0 } command=Twist2 { linear: Point2 { x: 0.0, y: 0.0 }, angular_z: 0.1 } proof=DeliveredCommandContext { proof: ComputedCommandContext { input: ComputeInputTrace { result_id: 48, pose: Some(PoseTrace { bits: [4603688335073633032, 4609434218613702656, 4602678819172646912, 0, 0, 0, 4607182418800017408], stamp: Timestamp { nanos: 1791933792603400958, clock: Unix }, frame_id: Map }), applied_bits: [0, 0, 0], epoch: 8, goal_version: 6, path_version: 8, map_version: 9, boundary_version: 2, pose_version: 18, applied_version: 14, compute_started: Instant { tv_sec: 27895, tv_nsec: 852942901 }, compute_start_unix_ns: 1791933792619942711 }, guard: GuardSelectionTrace { invocation_id: 1, pose: PoseTrace { bits: [4603688335073633032, 4609434218613702656, 4602678819172646912, 0, 0, 0, 4607182418800017408], stamp: Timestamp { nanos: 1791933792603400958, clock: Unix }, frame_id: Map }, applied_bits: [0, 0, 0], selected_command_bits: [0, 0, 4591870180066957722], observation_anchor_ns: None, observation_max_age_ns: None }, compute_completion_unix_ns: 1791933792620378840, worker_guard_pose_bits_equal: true, worker_guard_pose_stamp_equal: true, worker_guard_pose_frame_equal: true, worker_guard_applied_bits_equal: true }, publication_unix_ns: 1791933792620383957, retrieval_unix_ns: 1791933792670375554 }",
+      "assertions": [
+        "cancel returns correlated fence and confirmedZERO before new session",
+        "no nonzero receipts while old work remains held",
+        "every subsequent receipt belongs to goal-2 and has newer actual worker epoch/goal/path version",
+        "new admissions have newer owner epoch/route generation and full-horizon endpoint at goal-2",
+        "distinct goal-2 actually arrives under unchanged tolerances",
+        "old request released only after new goal installed"
+      ]
+    }
+  ],
+  "ordinary_runtime_suite": {
+    "status": "passed",
+    "log": "runtime-suite-v1.log",
+    "passed": 236,
+    "failed": 0,
+    "ignored": 58,
+    "excluded": 5,
+    "elapsed_s": 56.45,
+    "excluded_tests": [
+      "cancel_preempts_delayed_renew_over_real_uds_with_qualified_latency",
+      "cancel_preempts_delayed_submit_over_real_uds_with_qualified_latency",
+      "cancel_replays_identical_fence_after_first_response_timeout",
+      "real_uds_adapter_requires_correlated_applied_and_fence_proofs",
+      "server_deadline_renewal_keeps_legal_slow_commands_alive"
+    ],
+    "note": "Both new ignored moving arms explicitly passed separately; persistent arm not repeated"
+  },
+  "limits": [
+    "Persistent13s arm was not repeated; its existing inputs and assertions remain unchanged",
+    "No hardware, real SDK timing, physical braking, or unfiltered UDS qualification",
+    "Separate dispatch activation/hold contract finding remains unresolved and untouched"
+  ]
+}

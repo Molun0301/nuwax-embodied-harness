@@ -837,58 +837,7 @@ fn run_with_source_layout(enabled:bool,resolution:f32,scenario:Scenario,factory:
     // Report CPU raw /proc values; no false per-thread CPU attribution. Factory
     // runs deliberately have no inner probe: consumer latency is NOT control CPU.
     drop(p);drop(sensor);
-    report_proof_receipts(&receipts);
-    // Run expensive independent oracles after wall-timed control. Retained immutable
-    // snapshots preserve geometry and the actual source/receipt timestamps.
-    for (i,s) in segments.iter().enumerate(){
-        s.map.validate_body_motion(body(s.from),body(s.to),&s.boundary).unwrap_or_else(|e|panic!("segment {i} body: {e:?}"));
-    }
-    for (i,r) in receipts.iter().enumerate(){
-        assert!(source_healthy_at(r.source_sample_ns,r.ns),"receipt {i} has stale or invalid sensor acquisition");
-        // Retain the independent flat-body and future-view geometric oracle.
-        // Production projection alternatives remain diagnostic only.
-        let first_failure=std::cell::RefCell::new(None::<String>);
-        let make_check=|kind:&'static str| {
-            let first_failure=&first_failure;
-            move |a:PlanarPose,b:PlanarPose,elapsed:f64| {
-                let checked_ns=r.ns+(elapsed*1e9)as u64;
-                let result=r.map.validate_body_motion(body(a),body(b),&r.boundary)
-                    .map_err(|e|format!("source geometry sweep: {e:?}"))
-                    .and_then(|_|r.map.body_query_with_current_support(body(a).0,body(a).1)
-                        .and_then(|view|view.validate_body_motion(body(a),body(b),&r.boundary))
-                        .map_err(|e|format!("future-footprint geometry sweep: {e:?}")));
-                if let Err(reason)=result {
-                    if first_failure.borrow().is_none() {
-                        // Alternatives are printed only, never used as permission.
-                        let source_projection=r.map.body_pose_after_motion(body(a),[b.x,b.y],b.yaw);
-                        let view_projection=r.map.body_query_with_current_support(body(a).0,body(a).1)
-                            .and_then(|view|view.body_pose_after_motion(body(a),[b.x,b.y],b.yaw));
-                        *first_failure.borrow_mut()=Some(format!("callback={kind} elapsed_s={elapsed:.9} from={:?} to={:?} checked_ns={checked_ns} source_age_at_check_ms={:.6} reason={reason} source_projection={source_projection:?} future_view_projection={view_projection:?}",
-                            body(a),body(b),checked_ns.saturating_sub(r.source_sample_ns)as f64/1e6));
-                    }
-                    return false;
-                }
-                true
-            }
-        };
-        let choice=nuwax_nav_control::check_stopping_trajectory_with_period_check(r.pose,r.before,r.command,&limits(),PERIOD.as_secs_f64(),f64::from(resolution)*0.5,r.map.body_envelope().unwrap().radius(),make_check("geometric-subdivision"),make_check("physical-period"));
-        if choice.is_none() {
-            let current_body_result=r.map.validate_body_pose(body(r.pose).0,body(r.pose).1);
-            let current_view_same=r.map.with_current_body_support(body(r.pose).0,body(r.pose).1).map(|view|view.same_body_query_view(&r.map));
-            if let Some(context)=&r.proof_context {
-                let guard=&context.proof.guard;
-                let same_pose=guard.pose.bits==r.receipt_pose.bits && guard.pose.frame_id==r.receipt_pose.frame_id;
-                let same_applied=guard.applied_bits==crate::command_proof_trace::command_bits(r.before);
-                let historical=guard.observation_anchor_ns.map(|anchor|receipt_oracle_at(r,resolution,anchor));
-                eprintln!("PROOF_TIME_REPLAY receipt={i} result_id={} guard_pose_equals_receipt={same_pose} guard_applied_equals_receipt={same_applied} guard_anchor_receipt_basis_pass={historical:?} original_receipt_basis_pass=false original_ttl_ns={:?} fixture_ttl_ns={} historical_anchor_is_captured_not_fabricated=true",
-                    context.proof.input.result_id,guard.observation_max_age_ns,(OBS_AGE*1e9)as u64);
-            }
-
-            eprintln!("BRAKING_ORACLE_FAILURE receipt={i} source_cm={} receipt_ns={} pose_stamp_ns={} source_sample_ns={} source_sequence={} source_age_at_receipt_ms={:.6} worker_result_age_ms={:.6} worker_remaining_ms={:.6} selected_proof_context={:?} receipt_pose_raw={:?} pose={:?} before={:?} command={:?} current_body={current_body_result:?} current_view_same={current_view_same:?} first_failure={:?}",
-                resolution*100.0,r.ns,r.pose_stamp_ns,r.source_sample_ns,r.source_sequence,r.ns.saturating_sub(r.source_sample_ns)as f64/1e6,r.worker_result_age_ms,r.worker_remaining_ms,r.proof_context,r.receipt_pose,r.pose,r.before,r.command,first_failure.borrow());
-        }
-        assert!(choice.is_some(),"receipt {i} independent full braking oracle rejected: {:?}",first_failure.into_inner());
-    }
+    validate_motion_history(&receipts,&segments,resolution);
     assert!(delivered_negative_reason.is_none()||expected_current_rejection,"delivered_negative={delivered_negative}: {}",delivered_negative_reason.as_deref().unwrap_or("none"));
     let p=probe.lock().unwrap();
     if matches!(scenario,Scenario::Goal|Scenario::HoldFirst|Scenario::HoldSecond){assert!(succeeded,"full position plus final yaw required");assert!(nonzero_count>0);assert!(!segments.is_empty());assert!(current.pose.position.x>1.5,"actual accepted-command displacement required");assert!(current.pose.position.distance(goal.pose.position)<options.position_tolerance_m);assert!(nuwax_nav_astar::controllers::angle_diff(current.pose.orientation.yaw(),goal.pose.orientation.yaw()).abs()<options.yaw_tolerance_rad);}
@@ -1281,3 +1230,62 @@ fn moving_prepared_source_1cm_primed_off_full_goal(){run_with_source_layout(fals
 #[test]
 #[ignore="separate fixed-coverage prepared-source experiment; original full-plane arm retained"]
 fn moving_prepared_source_1cm_primed_on_full_goal(){run_with_source_layout(true,0.01,Scenario::Goal,false,true,MAX_TICKS,true);}
+
+// Shared unchanged actual-edge and complete delivered braking-tail oracle.
+fn validate_motion_history(receipts:&[RawReceipt],segments:&[RawSegment],resolution:f32) {
+    report_proof_receipts(receipts);
+    // Run expensive independent oracles after wall-timed control. Retained immutable
+    // snapshots preserve geometry and the actual source/receipt timestamps.
+    for (i,s) in segments.iter().enumerate(){
+        s.map.validate_body_motion(body(s.from),body(s.to),&s.boundary).unwrap_or_else(|e|panic!("segment {i} body: {e:?}"));
+    }
+    for (i,r) in receipts.iter().enumerate(){
+        assert!(source_healthy_at(r.source_sample_ns,r.ns),"receipt {i} has stale or invalid sensor acquisition");
+        // Retain the independent flat-body and future-view geometric oracle.
+        // Production projection alternatives remain diagnostic only.
+        let first_failure=std::cell::RefCell::new(None::<String>);
+        let make_check=|kind:&'static str| {
+            let first_failure=&first_failure;
+            move |a:PlanarPose,b:PlanarPose,elapsed:f64| {
+                let checked_ns=r.ns+(elapsed*1e9)as u64;
+                let result=r.map.validate_body_motion(body(a),body(b),&r.boundary)
+                    .map_err(|e|format!("source geometry sweep: {e:?}"))
+                    .and_then(|_|r.map.body_query_with_current_support(body(a).0,body(a).1)
+                        .and_then(|view|view.validate_body_motion(body(a),body(b),&r.boundary))
+                        .map_err(|e|format!("future-footprint geometry sweep: {e:?}")));
+                if let Err(reason)=result {
+                    if first_failure.borrow().is_none() {
+                        // Alternatives are printed only, never used as permission.
+                        let source_projection=r.map.body_pose_after_motion(body(a),[b.x,b.y],b.yaw);
+                        let view_projection=r.map.body_query_with_current_support(body(a).0,body(a).1)
+                            .and_then(|view|view.body_pose_after_motion(body(a),[b.x,b.y],b.yaw));
+                        *first_failure.borrow_mut()=Some(format!("callback={kind} elapsed_s={elapsed:.9} from={:?} to={:?} checked_ns={checked_ns} source_age_at_check_ms={:.6} reason={reason} source_projection={source_projection:?} future_view_projection={view_projection:?}",
+                            body(a),body(b),checked_ns.saturating_sub(r.source_sample_ns)as f64/1e6));
+                    }
+                    return false;
+                }
+                true
+            }
+        };
+        let choice=nuwax_nav_control::check_stopping_trajectory_with_period_check(r.pose,r.before,r.command,&limits(),PERIOD.as_secs_f64(),f64::from(resolution)*0.5,r.map.body_envelope().unwrap().radius(),make_check("geometric-subdivision"),make_check("physical-period"));
+        if choice.is_none() {
+            let current_body_result=r.map.validate_body_pose(body(r.pose).0,body(r.pose).1);
+            let current_view_same=r.map.with_current_body_support(body(r.pose).0,body(r.pose).1).map(|view|view.same_body_query_view(&r.map));
+            if let Some(context)=&r.proof_context {
+                let guard=&context.proof.guard;
+                let same_pose=guard.pose.bits==r.receipt_pose.bits && guard.pose.frame_id==r.receipt_pose.frame_id;
+                let same_applied=guard.applied_bits==crate::command_proof_trace::command_bits(r.before);
+                let historical=guard.observation_anchor_ns.map(|anchor|receipt_oracle_at(r,resolution,anchor));
+                eprintln!("PROOF_TIME_REPLAY receipt={i} result_id={} guard_pose_equals_receipt={same_pose} guard_applied_equals_receipt={same_applied} guard_anchor_receipt_basis_pass={historical:?} original_receipt_basis_pass=false original_ttl_ns={:?} fixture_ttl_ns={} historical_anchor_is_captured_not_fabricated=true",
+                    context.proof.input.result_id,guard.observation_max_age_ns,(OBS_AGE*1e9)as u64);
+            }
+
+            eprintln!("BRAKING_ORACLE_FAILURE receipt={i} source_cm={} receipt_ns={} pose_stamp_ns={} source_sample_ns={} source_sequence={} source_age_at_receipt_ms={:.6} worker_result_age_ms={:.6} worker_remaining_ms={:.6} selected_proof_context={:?} receipt_pose_raw={:?} pose={:?} before={:?} command={:?} current_body={current_body_result:?} current_view_same={current_view_same:?} first_failure={:?}",
+                resolution*100.0,r.ns,r.pose_stamp_ns,r.source_sample_ns,r.source_sequence,r.ns.saturating_sub(r.source_sample_ns)as f64/1e6,r.worker_result_age_ms,r.worker_remaining_ms,r.proof_context,r.receipt_pose,r.pose,r.before,r.command,first_failure.borrow());
+        }
+        assert!(choice.is_some(),"receipt {i} independent full braking oracle rejected: {:?}",first_failure.into_inner());
+    }
+}
+
+#[path="route_sustained_worker_tests.rs"]
+mod sustained_worker;

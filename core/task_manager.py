@@ -514,6 +514,8 @@ class TaskManager:
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="runtime-task")
         self._history_retention = max(1, history_retention)
         self._records: Dict[str, TaskRecord] = {}
+        # 只含非终态记录，保持 _records 注册顺序；注册、回滚和终态转换共用同一锁。
+        self._active_records: Dict[str, TaskRecord] = {}
         self._history_order: List[str] = []
         self._lock = threading.RLock()
         self._cleanup_log_limiter = LogRateLimiter()
@@ -652,6 +654,7 @@ class TaskManager:
 
             with self._lock:
                 self._records[task_id] = record
+                self._active_records[task_id] = record
 
             def correlated_runner():
                 request_context = metadata_payload.get("request_context") or {}
@@ -720,6 +723,7 @@ class TaskManager:
             if cleanup_succeeded:
                 with self._lock:
                     self._records.pop(task_id, None)
+                    self._active_records.pop(task_id, None)
                     if task_id in self._history_order:
                         self._history_order.remove(task_id)
             raise
@@ -967,22 +971,19 @@ class TaskManager:
         """读取活动任务数量，不复制公开状态快照。"""
 
         with self._lock:
-            return sum(1 for record in self._records.values()
-                       if record.status.state not in _TERMINAL_STATES)
+            return len(self._active_records)
 
     def has_active_tasks(self) -> bool:
-        """检查是否存在活动任务，找到首个后即停止。"""
+        """检查是否存在活动任务，不遍历记录或复制状态。"""
 
         with self._lock:
-            return any(record.status.state not in _TERMINAL_STATES
-                       for record in self._records.values())
+            return bool(self._active_records)
 
     def list_active_tasks(self) -> Tuple[TaskStatus, ...]:
         """列出活动任务。"""
 
         with self._lock:
-            statuses = tuple(record.status for record in self._records.values()
-                             if record.status.state not in _TERMINAL_STATES)
+            statuses = tuple(record.status for record in self._active_records.values())
         return deepcopy(statuses)
 
     def capture_task_list(self, *, history_limit: int = 20, status_only: bool = False) -> Dict[str, Any]:
@@ -995,8 +996,7 @@ class TaskManager:
                     "event": record.events[-1] if record.events else None}
 
         with self._lock:
-            active = [summary_source(record) for record in self._records.values()
-                      if record.status.state not in _TERMINAL_STATES]
+            active = [summary_source(record) for record in self._active_records.values()]
             history = []
             if history_limit > 0:
                 for task_id in reversed(self._history_order):
@@ -1785,6 +1785,7 @@ class TaskManager:
                     "started_at": record.status.started_at or now,
                 }
             )
+            self._active_records.pop(task_id, None)
             if not record.runner_returned:
                 record.result = result
             record.error = error

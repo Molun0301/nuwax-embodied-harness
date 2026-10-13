@@ -84,6 +84,8 @@ class TaskSummaryReads(unittest.TestCase):
         )
         with self.manager._lock:
             self.manager._records[task_id] = record
+            if state in (TaskState.ACCEPTED, TaskState.RUNNING):
+                self.manager._active_records[task_id] = record
             if state not in {TaskState.ACCEPTED, TaskState.RUNNING}:
                 self.manager._history_order.append(task_id)
         if event:
@@ -314,24 +316,23 @@ class TaskSummaryReads(unittest.TestCase):
         expected[0].message = "caller edit"
         self.assertEqual(self.manager.get_task_status(active_ids[0]).message, "Synthetic status")
 
-    def test_active_scalar_queries_are_locked_and_boolean_short_circuits(self):
+    def test_active_scalar_queries_are_locked_and_do_not_iterate(self):
         self.record(TaskState.RUNNING, event=False)
         self.record(event=False)
         manager = self.manager
         class CountedRecords(dict):
             visits = 0
+            def __len__(self):
+                assert manager._lock._is_owned(), "scalar selection must hold the task lock"
+                return super().__len__()
             def values(self):
-                for record in super().values():
-                    assert manager._lock._is_owned(), "scalar selection must hold the task lock"
-                    self.visits += 1
-                    yield record
-        records = CountedRecords(manager._records)
-        manager._records = records
+                raise AssertionError("scalar query must not iterate")
+        records = CountedRecords(manager._active_records)
+        manager._active_records = records
         self.assertTrue(manager.has_active_tasks())
-        self.assertEqual(records.visits, 1)
-        records.visits = 0
+        self.assertEqual(records.visits, 0)
         self.assertEqual(manager.count_active_tasks(), 1)
-        self.assertEqual(records.visits, 2)
+        self.assertEqual(records.visits, 0)
 
     def test_active_scalar_queries_follow_real_transitions_and_terminal_quarantine(self):
         task_id = self.record(TaskState.ACCEPTED, event=False)
@@ -372,20 +373,18 @@ class TaskSummaryReads(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(results, [(0, False)])
 
-    def test_active_filter_still_checks_current_records_under_lock(self):
+    def test_active_snapshot_selects_index_under_lock(self):
         active = self.record(TaskState.RUNNING, event=False)
         self.record(event=False)
-        source = self.manager._records
+        source = self.manager._active_records
         manager = self.manager
         class LockedRecords(dict):
             def values(self):
                 assert manager._lock._is_owned(), "active filtering must hold the task lock"
                 return super().values()
-        self.manager._records = LockedRecords(source)
+        self.manager._active_records = LockedRecords(source)
         self.assertEqual([status.task_id for status in self.manager.list_active_tasks()], [active])
-        with self.manager._lock:
-            self.manager._records[active].status = self.manager._records[active].status.model_copy(
-                update={"state": TaskState.SUCCEEDED})
+        self.manager._set_terminal_state(active, TaskState.SUCCEEDED, "Synthetic completion")
         self.assertEqual(self.manager.list_active_tasks(), ())
 
 

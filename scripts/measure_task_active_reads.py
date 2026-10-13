@@ -37,6 +37,15 @@ class TimedLock:
 
 class CountedRecords(dict):
     visits = 0
+    lookups = 0
+
+    def get(self, key, default=None):
+        self.lookups += 1
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        self.lookups += 1
+        return super().__getitem__(key)
 
     def values(self):
         for value in super().values():
@@ -44,12 +53,31 @@ class CountedRecords(dict):
             yield value
 
 
+class CountedHistory(list):
+    visits = 0
+
+    def __reversed__(self):
+        for task_id in super().__reversed__():
+            self.visits += 1
+            yield task_id
+
+
 def measure(manager, call, repeats):
     records = manager._records
     counted = CountedRecords(records)
     manager._records = counted
+    history = manager._history_order
+    counted_history = CountedHistory(history)
+    manager._history_order = counted_history
+    active = getattr(manager, "_active_records", None)
+    counted_active = CountedRecords(active) if active is not None else None
+    if counted_active is not None:
+        manager._active_records = counted_active
     call()
     manager._records = records
+    manager._history_order = history
+    if active is not None:
+        manager._active_records = active
     elapsed, held = [], []
     for _ in range(repeats):
         manager._lock.held_ns = 0
@@ -57,7 +85,10 @@ def measure(manager, call, repeats):
         call()
         elapsed.append((time.perf_counter_ns() - start) / 1e6)
         held.append(manager._lock.held_ns / 1e6)
-    return {"record_visits": counted.visits, "median_ms": statistics.median(elapsed),
+    return {"record_visits": counted.visits, "record_lookups": counted.lookups,
+            "history_visits": counted_history.visits,
+            "active_index_visits": counted_active.visits if counted_active is not None else None,
+            "median_ms": statistics.median(elapsed),
             "median_lock_ms": statistics.median(held)}
 
 
@@ -71,7 +102,7 @@ def main():
         manager._lock = TimedLock()
         try:
             for index in range(terminal + 50):
-                task_id = build_task_id("offline_task")
+                task_id = build_task_id("offline_task", suffix="%08x" % index)
                 record = TaskRecord(spec=TaskSpec(task_id=task_id, capability_name="offline_task"),
                                     status=TaskStatus(task_id=task_id, state=TaskState.SUCCEEDED))
                 manager._records[task_id] = record
@@ -82,6 +113,10 @@ def main():
                 manager._records = dict(all_records[:terminal + active])
                 for _, record in all_records[terminal:terminal + active]:
                     record.status = record.status.model_copy(update={"state": TaskState.RUNNING})
+                if hasattr(manager, "_active_records"):
+                    manager._active_records = dict(all_records[terminal:terminal + active])
+                assert len(manager._records) == terminal + active
+                assert len(manager.list_active_tasks()) == active
                 calls = {"list_active_tasks": manager.list_active_tasks,
                          "capture_task_list": lambda: manager.capture_task_list(history_limit=20),
                          "capture_status_only": lambda: manager.capture_task_list(history_limit=20, status_only=True)}

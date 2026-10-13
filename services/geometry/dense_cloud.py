@@ -65,8 +65,9 @@ def validate_dense_archive(payload, *, session=None, generation=None, cloud_revi
         points = np.frombuffer(data, dtype="<f4").reshape(-1, 3)
         if not np.isfinite(points).all():
             raise ValueError("完整点云资产包含无效坐标")
-        lower = np.minimum(lower, points.min(axis=0))
-        upper = np.maximum(upper, points.max(axis=0))
+        # 每个轴使用同一 XYZ 缓冲区的步进视图，避免逐点执行三元素归约。
+        lower = np.minimum(lower, [points[:, axis].min() for axis in range(3)])
+        upper = np.maximum(upper, [points[:, axis].max() for axis in range(3)])
         offset += len(data)
     if not np.array_equal(lower, np.asarray(metadata["bounds_min"], dtype=np.float32)) or not np.array_equal(upper, np.asarray(metadata["bounds_max"], dtype=np.float32)):
         raise ValueError("完整点云资产边界与数据不符")

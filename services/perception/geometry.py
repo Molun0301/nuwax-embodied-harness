@@ -368,31 +368,31 @@ class DetectionGeometryAugmentor:
             & (projected_pixels[:, 1] >= y_min)
             & (projected_pixels[:, 1] <= y_max)
         )
-        bbox_support_count = int(np.count_nonzero(bbox_mask))
+        bbox_indices = np.flatnonzero(bbox_mask)
+        bbox_support_count = int(bbox_indices.size)
         polygon = self._segmentation_polygon(detection)
-        support_mask = bbox_mask
+        support_indices = bbox_indices
         projection_method = "pointcloud_bbox_projection"
         projection_status = "bbox_depth_support" if bbox_support_count else "bbox_no_depth_support"
         polygon_support_count = 0
         if polygon:
-            polygon_mask = np.zeros(projected_pixels.shape[0], dtype=bool)
-            polygon_mask[bbox_mask] = self._points_in_polygon(projected_pixels[bbox_mask], polygon)
-            polygon_support_count = int(np.count_nonzero(polygon_mask))
+            polygon_mask = self._points_in_polygon(projected_pixels[bbox_indices], polygon)
+            polygon_indices = bbox_indices[polygon_mask]
+            polygon_support_count = int(polygon_indices.size)
             if polygon_support_count:
-                support_mask = polygon_mask
+                support_indices = polygon_indices
                 projection_method = "pointcloud_mask_projection"
                 projection_status = "mask_depth_support"
             elif bbox_support_count:
-                support_mask = bbox_mask
+                support_indices = bbox_indices
                 projection_status = "mask_no_depth_support_bbox_fallback"
             else:
-                support_mask = polygon_mask
+                support_indices = polygon_indices
                 projection_method = "pointcloud_mask_projection"
                 projection_status = "mask_no_depth_support"
         elif not bbox_support_count:
             projection_status = "segmentation_absent_no_depth_support"
 
-        support_indices = np.flatnonzero(support_mask)
         attributes = dict(detection.attributes or {})
         attributes["geometry_bbox_support_point_count"] = bbox_support_count
         attributes["geometry_projection_method"] = projection_method

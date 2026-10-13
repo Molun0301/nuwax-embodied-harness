@@ -1,0 +1,6 @@
+{"python": "3.8.10", "case": "sparse", "baseline_ms": 22.960560499996063, "candidate_ms": 21.155216624720197, "full_peak_bytes": [9816983, 9816983], "single_peak_bytes": [315821, 300386]}
+{"python": "3.8.10", "case": "dense", "baseline_ms": 44.02695149974534, "candidate_ms": 42.67386824994901, "full_peak_bytes": [9816535, 9816535], "single_peak_bytes": [2297928, 2797082]}
+{"python": "3.8.10", "case": "sparse", "baseline_ms": 24.161150624877337, "candidate_ms": 21.21777987531459, "full_peak_bytes": [9816983, 9816983], "single_peak_bytes": [315821, 300386]}
+{"python": "3.8.10", "case": "dense", "baseline_ms": 43.077168249965325, "candidate_ms": 37.662993499907316, "full_peak_bytes": [9816535, 9816535], "single_peak_bytes": [2297928, 2797082]}
+{"python": "3.8.10", "case": "sparse", "baseline_ms": 23.56700912469023, "candidate_ms": 21.76010587527344, "full_peak_bytes": [9816983, 9816983], "single_peak_bytes": [315821, 300386]}
+{"python": "3.8.10", "case": "dense", "baseline_ms": 43.83000899997569, "candidate_ms": 40.44146387514047, "full_peak_bytes": [9816535, 9816535], "single_peak_bytes": [2297928, 2797082]}

@@ -494,6 +494,18 @@ impl FineGroundValue for FineGroundHeight {
         Self(height)
     }
 }
+// Recent surface points need the selected height at an exact fine XY, but do
+// not consume static contact membership. Keep aggregate height rows compact.
+struct FineGroundHeightRow {
+    xy: [i32; 2],
+    height: Option<f64>,
+}
+impl FineGroundValue for FineGroundHeightRow {
+    const CONTACTS: bool=false;
+    fn from_parts(xy:[i32;2],height:Option<f64>,_contacts:FineContacts)->Self {
+        Self{xy,height}
+    }
+}
 impl FineGroundColumn {
     fn permits_contact(&self,z:i32)->bool {
         self.contacts.as_slice().iter().any(|range|range[0]<=z && z<=range[1])
@@ -1480,6 +1492,11 @@ impl SurfaceSnapshot {
         let (patch,precise_ground)=self.refine_footprint_support(patch,&polygon_query,&prism_query,body,r,([x0,y0],[x1,y1]));
         if let Some(recent)=&self.recent_obstacles {
             let fine=recent.size;
+            // All row inputs (pose, patch, source, prism and private clearing)
+            // stay fixed during this query. Reuse only the last coarse column;
+            // every recent frame, fine XY and Z still executes in original order.
+            let mut selected_column=None;
+            let mut selected_rows:Option<Vec<FineGroundHeightRow>>=None;
             for frame in &recent.frames {
                 let low=[(min[0]/fine).floor() as i32,(min[1]/fine).floor() as i32];
                 let high=[(max[0]/fine).floor() as i32,(max[1]/fine).floor() as i32];
@@ -1493,8 +1510,12 @@ impl SurfaceSnapshot {
                             let cx=(((f64::from(x)+0.5)*fine)/coarse).floor() as i32;
                             let cy=(((f64::from(y)+0.5)*fine)/coarse).floor() as i32;
                             let ground=patch.get(&(cx,cy)).copied();
-                            let selected=ground.and_then(|g|self.fine_ground_columns(Some(g),&polygon_query,&prism_query,body,r[2],cx,cy));
-                            let height=if let Some(rows)=&selected {rows.iter().find(|row|row.xy==[x,y]).and_then(|row|row.height)}
+                            if selected_column!=Some((cx,cy)) {
+                                selected_rows=ground.and_then(|g|self.fine_ground_values::<FineGroundHeightRow>(
+                                    Some(g),&polygon_query,&prism_query,body,r[2],cx,cy));
+                                selected_column=Some((cx,cy));
+                            }
+                            let height=if let Some(rows)=&selected_rows {rows.iter().find(|row|row.xy==[x,y]).and_then(|row|row.height)}
                                 else {ground.map(|g|self.cell_position(g)[2])};
                             for &z in zs {
                                 if let Some(points)=frame.surface_points.get(&[x,y,z]) {
@@ -3106,6 +3127,7 @@ fn quaternion_from_columns(r: [[f64; 3]; 3]) -> [f64; 4] {
 
 #[cfg(test)]
 mod tests {
+    mod recent_query_tests { include!("body_recent_query_tests.rs"); }
     mod live_geometry_tests { include!("body_live_geometry_tests.rs"); }
     include!("body_observation_vec_tests.rs");
     use super::*;

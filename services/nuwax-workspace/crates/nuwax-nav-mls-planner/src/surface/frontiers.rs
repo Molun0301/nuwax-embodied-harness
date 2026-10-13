@@ -42,6 +42,20 @@ impl DirtyBounds {
         (self.min_x..=self.max_x).contains(&i64::from(cell.0))
             && (self.min_y..=self.max_y).contains(&i64::from(cell.1))
     }
+    fn column_ranges(
+        self,
+        scan_slots: usize,
+    ) -> Option<(std::ops::RangeInclusive<i32>, std::ops::RangeInclusive<i32>)> {
+        let min_x = self.min_x.max(i64::from(i32::MIN));
+        let max_x = self.max_x.min(i64::from(i32::MAX));
+        let min_y = self.min_y.max(i64::from(i32::MIN));
+        let max_y = self.max_y.min(i64::from(i32::MAX));
+        // 比较实际循环次数；稀疏/远隔变化仍走槽位扫描，避免枚举巨大的空矩形。
+        let columns = (max_x - min_x + 1) as u128 * (max_y - min_y + 1) as u128;
+        (columns <= scan_slots as u128)
+            .then_some((min_x as i32..=max_x as i32, min_y as i32..=max_y as i32))
+    }
+
     fn union(self, other: Self) -> Self {
         Self {
             min_x: self.min_x.min(other.min_x),
@@ -199,14 +213,35 @@ impl SurfaceSnapshot {
         });
         let retained_frontiers = gains.len();
         let mut evaluated_cells = 0;
-        for cell in self.cell_keys() {
-            if dirty.is_some_and(|dirty| !dirty.contains(cell)) {
-                continue;
-            }
+        let mut evaluate = |cell| {
             evaluated_cells += 1;
             let gain = self.frontier_gain(cell, boundary);
             if gain > 0.0 {
                 gains.insert(cell, gain);
+            }
+        };
+        if let Some((xs, ys)) =
+            dirty.and_then(|bounds| bounds.column_ranges(self.data.graph.cells.slot_capacity()))
+        {
+            for x in xs {
+                for y in ys.clone() {
+                    for &z in self
+                        .data
+                        .graph
+                        .surface_lookup
+                        .get(&(x, y))
+                        .into_iter()
+                        .flatten()
+                    {
+                        evaluate((x, y, z));
+                    }
+                }
+            }
+        } else {
+            for cell in self.cell_keys() {
+                if dirty.is_none_or(|bounds| bounds.contains(cell)) {
+                    evaluate(cell);
+                }
             }
         }
         let index = Arc::new(FrontierIndex {
@@ -353,3 +388,29 @@ impl SurfaceSnapshot {
 #[cfg(test)]
 #[path = "frontiers_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::DirtyBounds;
+
+    #[test]
+    fn inclusive_negative_bounds_and_broad_scan_fallback() {
+        let bounds = DirtyBounds {
+            min_x: -2,
+            max_x: 1,
+            min_y: -1,
+            max_y: 1,
+        };
+        let (xs, ys) = bounds.column_ranges(12).unwrap();
+        assert_eq!(xs.collect::<Vec<_>>(), [-2, -1, 0, 1]);
+        assert_eq!(ys.collect::<Vec<_>>(), [-1, 0, 1]);
+        assert!(bounds.column_ranges(11).is_none());
+        let broad = DirtyBounds {
+            min_x: i64::from(i32::MIN) - 50,
+            max_x: i64::from(i32::MAX) + 50,
+            min_y: i64::from(i32::MIN) - 50,
+            max_y: i64::from(i32::MAX) + 50,
+        };
+        assert!(broad.column_ranges(usize::MAX).is_none());
+    }
+}

@@ -162,3 +162,62 @@ fn boundary_and_virtual_obstacle_changes_discard_incompatible_frontier_indexes()
     assert_eq!(signature(&changed, &[]), signature(&fresh, &[]));
     assert!(!changed.frontier_cache_stats().unwrap().incremental);
 }
+
+#[test]
+fn local_bounds_visit_negative_columns_all_layers_and_reused_slots() {
+    let mut input: BTreeSet<_> = [-30, 0, 30]
+        .into_iter()
+        .flat_map(|z| (-40..40).flat_map(move |x| (-30..30).map(move |y| (x, y, z))))
+        .collect();
+    let mut builder = SurfaceMapBuilder::new(config());
+    let first = builder.build(&points(&input), 0.1).unwrap().snapshot;
+    let original = first.frontier_index(&[]);
+    for (cell, insert) in [
+        ((-20, -10, 0), false),
+        ((-20, -10, -30), false),
+        ((-20, -10, 30), false),
+        ((-20, -10, 0), true),
+        ((-20, -10, -30), true),
+        ((-20, -10, 30), true),
+        ((-21, -10, 30), false),
+    ] {
+        if insert {
+            input.insert(cell);
+        } else {
+            input.remove(&cell);
+        }
+        let next = builder.build(&points(&input), 0.1).unwrap().snapshot;
+        let full = SurfaceSnapshot::from_points(&points(&input), config(), 0.1).unwrap();
+        let actual = next.frontier_index(&[]);
+        assert!(next.frontier_cache_stats().unwrap().incremental);
+        assert_eq!(actual.gains, full.frontier_index(&[]).gains);
+        assert!(Arc::ptr_eq(&original, &first.frontier_index(&[])));
+    }
+}
+
+#[test]
+fn sparse_widely_separated_dirty_columns_match_full_frontiers() {
+    let mut input: BTreeSet<_> = [-300, 300]
+        .into_iter()
+        .flat_map(|offset| {
+            (0..8).flat_map(move |x| (0..8).map(move |y| (offset + x, offset + y, 0)))
+        })
+        .collect();
+    let mut builder = SurfaceMapBuilder::new(config());
+    let first = builder.build(&points(&input), 0.1).unwrap().snapshot;
+    first.prepare_frontier_geometry(&[]).unwrap();
+    input.remove(&(-296, -296, 0));
+    let deferred = builder.build(&points(&input), 0.1).unwrap().snapshot;
+    assert!(deferred.frontier_cache_stats().is_none());
+    input.remove(&(304, 304, 0));
+    let next = builder.build(&points(&input), 0.1).unwrap().snapshot;
+    let full = SurfaceSnapshot::from_points(&points(&input), config(), 0.1).unwrap();
+    assert_eq!(
+        next.frontier_index(&[]).gains,
+        full.frontier_index(&[]).gains
+    );
+    assert_eq!(
+        next.frontier_cache_stats().unwrap().evaluated_cells,
+        input.len()
+    );
+}

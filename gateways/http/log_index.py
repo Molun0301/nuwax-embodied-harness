@@ -387,6 +387,34 @@ class PersistentLogIndex:
                     self._anchor_cache.pop(key, None)
             previous_key = page[-1][0]
 
+    def _sources_before(self, matcher, budget):
+        db = self.connection
+        rows = db.execute("SELECT source,time_key,identity FROM entries WHERE scope_id=?"
+                          " ORDER BY source,time_key,identity LIMIT 32", (self.scope_id,)).fetchall()
+        sources = []
+        while rows:
+            # 短样本已跨来源时逐来源查询反而更贵；余下来源保留DISTINCT。
+            # 后续也检查相邻记录，避免首个大来源掩盖大量单记录来源。
+            if rows[0][0] != rows[-1][0]:
+                conditions, parameters = ["scope_id=?", "source>=?"], [self.scope_id, rows[0][0]]
+                if matcher.cursor:
+                    conditions.append("(time_key,identity)<(?,?)")
+                    parameters.extend(matcher.cursor)
+                if matcher.timestamp_before:
+                    conditions.append("time_key<?")
+                    parameters.append(matcher.timestamp_before)
+                sources.extend(row[0] for row in db.execute("SELECT DISTINCT source FROM entries WHERE " +
+                                                           " AND ".join(conditions), parameters))
+                return sources
+            # entry_source中每个来源的最早记录即可判断游标前是否存在该来源。
+            row = rows[0]
+            if matcher.before_key(row[1:]):
+                sources.append(row[0])
+            rows = db.execute("SELECT source,time_key,identity FROM entries WHERE scope_id=? AND source>?"
+                              " ORDER BY source,time_key,identity LIMIT 2", (self.scope_id, row[0])).fetchall()
+            budget.yield_if_due()
+        return sources
+
     def query(self, log_file, *, log_dir="", limit=200, before="", level="", source="",
               component="", query="", request_id="", task_id=""):
         from . import logs as protocol
@@ -412,9 +440,8 @@ class PersistentLogIndex:
             if matcher.timestamp_before:
                 conditions.append("e.time_key<?")
                 parameters.append(matcher.timestamp_before)
-            cursor_sql = " AND ".join(conditions) or "1"
             # 原来源列表涵盖游标前的全部记录，不限于本次筛选命中。
-            sources = [row[0] for row in db.execute("SELECT DISTINCT e.source FROM entries e WHERE " + cursor_sql, parameters)]
+            sources = self._sources_before(matcher, budget)
             if matcher.levels:
                 conditions.append("e.level IN (" + ",".join("?" for _ in matcher.levels) + ")")
                 parameters.extend(sorted(matcher.levels))

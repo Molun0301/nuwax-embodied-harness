@@ -299,6 +299,81 @@ class LogIndexChecks(unittest.TestCase):
         self.assert_scan(limit=4, before=first['next_before'], source='first')
         self.assert_scan(limit=4, before='not a cursor')
 
+    def test_source_seeks_preserve_unicode_ties_timestamp_and_filtered_empty_pages(self):
+        sources = ['Alpha', 'alpha', 'ß', 'SS', '中', '😀', 'a\x00b']
+        self.write([entry(n, source=sources[n % len(sources)],
+                          timestamp=entry(n // 3)['timestamp']) for n in range(42)])
+        first = self.assert_scan(limit=1, level='error')
+        self.assertEqual(first['entries'], [])
+        self.assertEqual(first['sources'], sorted(sources))
+        page = self.assert_scan(limit=4)
+        while page['next_before']:
+            before = page['next_before']
+            self.assert_scan(limit=2, before=before, source='missing')
+            page = self.assert_scan(limit=4, before=before)
+        for stamp in (entry(0)['timestamp'], entry(3)['timestamp'], entry(50)['timestamp']):
+            self.assert_scan(limit=1, before=stamp, query='not present')
+        self.log.rename(self.root / 'main.log.1')
+        self.write([entry(100, source='new-only')])
+        self.assert_scan(limit=1, before=entry(50)['timestamp'])
+        (self.root / 'main.log.1').unlink()
+        self.assert_scan(limit=1, before=entry(50)['timestamp'])
+
+    def test_source_seeks_match_distinct_sql_with_randomized_scopes_and_cursors(self):
+        import random
+        rng = random.Random(1741)
+        sources = ['', 'a', 'A', 'a\x00b', 'ß', 'SS', 'é', 'é', '中', '😀']
+        db = sqlite3.connect(':memory:')
+        self.addCleanup(db.close)
+        db.executescript('CREATE TABLE entries(scope_id INTEGER,source TEXT,time_key TEXT,identity TEXT);'
+                         'CREATE INDEX entry_source ON entries(scope_id,source,time_key,identity);')
+        db.executemany('INSERT INTO entries VALUES(?,?,?,?)',
+                       [(rng.randrange(3), rng.choice(sources), str(rng.randrange(40)),
+                         rng.choice(sources)) for _ in range(2000)])
+        # A many-source scope exercises batches crossing source boundaries.
+        db.executemany('INSERT INTO entries VALUES(?,?,?,?)',
+                       [(3, 'source-' + str(n), str(n % 40), str(n)) for n in range(1000)])
+        db.executemany('INSERT INTO entries VALUES(?,?,?,?)',
+                       [(4, '' if n < 100 else 'source-' + str(n), str(n % 40), str(n))
+                        for n in range(1000)])
+        from types import SimpleNamespace
+        owner = SimpleNamespace(connection=db, scope_id=0)
+        budget = index_module._WorkBudget()
+        for scope in range(6):
+            owner.scope_id = scope
+            for _ in range(80):
+                matcher = protocol._LogFilter('', '', '', '', '', '', '')
+                matcher.cursor = (str(rng.randrange(45)), rng.choice(sources)) if rng.randrange(2) else None
+                matcher.timestamp_before = str(rng.randrange(45)) if rng.randrange(2) else ''
+                sql = 'SELECT DISTINCT source FROM entries WHERE scope_id=?'
+                args = [scope]
+                if matcher.cursor:
+                    sql += ' AND (time_key,identity)<(?,?)'; args.extend(matcher.cursor)
+                if matcher.timestamp_before:
+                    sql += ' AND time_key<?'; args.append(matcher.timestamp_before)
+                expected = sorted(row[0] for row in db.execute(sql, args))
+                self.assertEqual(sorted(PersistentLogIndex._sources_before(owner, matcher, budget)), expected)
+
+    def test_dense_sources_use_bounded_sqlite_work(self):
+        from types import SimpleNamespace
+        db = sqlite3.connect(':memory:')
+        self.addCleanup(db.close)
+        db.executescript('CREATE TABLE entries(scope_id INTEGER,source TEXT,time_key TEXT,identity TEXT);'
+                         'CREATE INDEX entry_source ON entries(scope_id,source,time_key,identity);')
+        db.executemany('INSERT INTO entries VALUES(1,?,?,?)',
+                       [('source-' + str(n % 3), str(n), str(n)) for n in range(10000)])
+        operations = [0]
+        def progress():
+            operations[0] += 100
+            return 0
+        db.set_progress_handler(progress, 100)
+        owner = SimpleNamespace(connection=db, scope_id=1)
+        matcher = protocol._LogFilter('', '', '', '', '', '', '')
+        actual = PersistentLogIndex._sources_before(owner, matcher, index_module._WorkBudget())
+        db.set_progress_handler(None, 0)
+        self.assertEqual(actual, ['source-0', 'source-1', 'source-2'])
+        self.assertLess(operations[0], 1000)
+
     def test_missing_or_replaced_source_after_refresh_rejects_stale_offsets(self):
         self.write([entry(1, request_id=SECRET_A)]); self.query()
         opened = index_module._RawCandidateReader._opened

@@ -952,6 +952,41 @@ impl SurfaceFollower {
         Ok(result)
     }
 
+    /// Replay captured guard/receipt inputs through the real current-view and
+    /// stopping callbacks. Test diagnostics only; never grants motion authority.
+    #[cfg(test)]
+    pub(crate) fn replay_stopping_trajectory_for_test(
+        config: &SurfaceFollowerConfig,
+        source: Arc<SurfaceSnapshot>,
+        pose: PoseStamped,
+        applied: Twist2,
+        selected: Twist2,
+        boundary: &[[f64; 2]],
+    ) -> Result<(bool, Option<String>), String> {
+        let mut follower = Self::new(config.clone()).map_err(|error| error.to_string())?;
+        follower.configure_boundary(boundary);
+        follower.update_execution_map(ExecutionMap::Surface(source))
+            .map_err(|error| error.to_string())?;
+        follower.update_odometry(pose);
+        follower.observe_applied_command(applied);
+        follower.refresh_current_body_view();
+        let map = follower.map.as_ref().ok_or("missing replay surface")?;
+        let pose = follower.odometry.as_ref().ok_or("missing replay pose")?;
+        let limits = forward_navigation_limits(
+            follower.config.motion_limits.as_ref().ok_or("missing replay motion limits")?,
+        );
+        let radius = map.body_envelope().ok_or("missing replay body envelope")?.radius();
+        let dt = 1.0 / follower.config.controller.control_frequency;
+        let sample_step = f64::from(map.source_voxel_size_m()) * 0.5;
+        follower.with_body_motion_checks(|clear, period, failure, _| {
+            let accepted = nuwax_nav_control::check_stopping_trajectory_with_period_check(
+                planar(pose), applied, selected, &limits, dt, sample_step, radius,
+                clear, period,
+            ).is_some();
+            (accepted, failure.borrow().as_ref().map(|witness| format!("{witness:?}")))
+        })
+    }
+
     /// Timing-only entry: callers supply a known reachable candidate. This is
     /// not a command issuance API and does not install or renew any permission.
     #[cfg(test)]
@@ -2093,3 +2128,91 @@ mod dense_doorway_checkpoint_diagnostic;
 #[cfg(test)]
 #[path = "current_view_recheck_diagnostic.rs"]
 mod current_view_recheck_diagnostic;
+
+#[cfg(test)]
+mod reconstructed_receipt_geometry_diagnostic {
+    use super::*;
+    use nuwax_nav_mls_planner::{SurfaceObservation, SurfaceObservations};
+    use nuwax_nav_types_messages::{NavFrameId, Pose3, Timestamp};
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    // Geometry reconstruction only. This does not recover the historical source
+    // snapshot, qualify its health clock, or establish an actual-motion result.
+    #[test]
+    #[ignore = "bounded reconstructed-geometry callback diagnostic; not historical motion qualification"]
+    fn reconstructed_attribution_v1_geometry_callback_differential() {
+        let (config, base, keys) = crate::route_moving_worker_tests::fixture(true, 0.05, 6.0);
+        let mut observations = SurfaceObservations::new(base.source_voxel_size_m(), 32).unwrap();
+        let mut blocks = BTreeMap::<_, BTreeMap<_, _>>::new();
+        for &key in keys.iter() {
+            blocks.entry(key.map(|v| v.div_euclid(32))).or_default().insert(
+                key, SurfaceObservation { observed_ns: 1_000_000_000, hits: 1 },
+            );
+        }
+        for (key, block) in blocks { observations.replace_block(key, block).unwrap(); }
+        observations.mark_complete_geometry_source();
+        let source = Arc::new(base.with_observations(Some(Arc::new(observations)))
+            .with_recent_obstacle_points(1, 1_000_000_000, 0, &[],
+                (0..5).map(|i| (i, [0.8907157909999999, 1.3 + f64::from(i) * 0.1, 0.5])))
+            .unwrap());
+        // Exact guard quaternion bits from attribution-v1 receipt24/result90.
+        let guard = PoseStamped {
+            frame_id: NavFrameId::Map,
+            stamp: Timestamp::from_unix(1791929988, 211613022),
+            pose: Pose3 {
+                position: Point3::new(f64::from_bits(4604048498741908056), f64::from_bits(4609434385710343966), 0.5),
+                orientation: Quaternion { x: 0.0, y: 0.0,
+                    z: f64::from_bits(4593189189793215493), w: f64::from_bits(4607119164048589611) },
+            },
+        };
+        let mut receipt = guard.clone();
+        receipt.stamp.nanos = 1791929988238382688;
+        receipt.pose.orientation = Quaternion::from_yaw(0.2585811667);
+        let command = Twist2 { linear: Point2::new(0.0, 0.0), angular_z: 0.8 };
+        let limits = config.motion_limits.as_ref().unwrap();
+        let dt = 1.0 / config.controller.control_frequency;
+        assert_eq!(dt, crate::DEFAULT_TICK_INTERVAL.as_secs_f64());
+        let radius = source.body_envelope().unwrap().radius();
+        let as_body = |p: PlanarPose| {
+            let q = Quaternion::from_yaw(p.yaw);
+            ([p.x, p.y, 0.5], [q.x, q.y, q.z, q.w])
+        };
+        let mut results = Vec::new();
+        for (label, pose) in [("captured_guard", guard), ("captured_receipt", receipt)] {
+            let production = SurfaceFollower::replay_stopping_trajectory_for_test(
+                &config, source.clone(), pose.clone(), command, command, &[],
+            ).unwrap();
+            let mut independent_results = Vec::new();
+            for (sampling, sample_step) in [("original_audit", 0.025),
+                ("production_step", f64::from(source.source_voxel_size_m()) * 0.5)] {
+                let first_failure = RefCell::new(None);
+                let check = || |a: PlanarPose, b: PlanarPose, _: f64| {
+                    let a = as_body(a);
+                    let b = as_body(b);
+                    let mut witness = None;
+                    let result = source.validate_body_motion_with_witness(a, b, &[], &mut witness)
+                        .and_then(|_| source.body_query_with_current_support_and_witness(a.0, a.1, &mut witness)
+                            .and_then(|view| view.validate_body_motion_with_witness(a, b, &[], &mut witness)));
+                    if let Err(error) = result {
+                        first_failure.borrow_mut().get_or_insert_with(|| format!("error={error:?} witness={witness:?}"));
+                        false
+                    } else { true }
+                };
+                let accepted = nuwax_nav_control::check_stopping_trajectory_with_period_check(
+                    planar(&pose), command, command, limits, dt, sample_step, radius, check(), check(),
+                ).is_some();
+                independent_results.push((sampling, accepted, first_failure.into_inner()));
+            }
+            eprintln!("RECONSTRUCTED_GEOMETRY_ONLY label={label} pose={:?} production={production:?} independent={independent_results:?}", pose.pose);
+            results.push((label, production.0, independent_results));
+        }
+        for (label, production, independent) in &results {
+            for (sampling, accepted, _) in independent {
+                assert_eq!(production, accepted, "reconstructed callback disagreement at {label}/{sampling}");
+            }
+        }
+        assert!(results[0].1, "captured guard geometry must retain its accepted stopping tail");
+        assert!(!results[1].1, "captured receipt geometry must reproduce the rejected stopping tail");
+    }
+}

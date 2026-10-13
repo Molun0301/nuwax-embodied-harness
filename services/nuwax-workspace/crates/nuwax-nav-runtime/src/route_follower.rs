@@ -66,6 +66,10 @@ impl RouteFollower {
         let mut kernel=PlanKernel::new(config.clone());kernel.hook=Some(hook);
         Self::with_kernel(config,kernel)
     }
+    #[cfg(test)]
+    pub(crate) fn planning_lifecycle_for_test(&self)->(Option<u64>,u64,Option<u64>,u64,u64) {
+        (self.owner.as_ref().map(PlanningOwner::epoch),self.route_generation,self.submitted.map(|r|r.0),self.local_planning_calls,self.local_plans)
+    }
     fn with_kernel(config:SurfaceFollowerConfig,mut kernel:PlanKernel)->Result<Self,RuntimeError> {
         let scan = config.scan.clone();
         scan.validate().map_err(error)?;
@@ -268,6 +272,31 @@ impl RouteFollower {
             self.retry_after=Instant::now()+Duration::from_millis(250);
         }
     }
+    fn current_rejection(&mut self, reason: String) -> PlannerStep {
+        self.dirty = true;
+        self.schedule(true);
+        // A rejected current command still means confirmed ZERO. With a local
+        // owner, keep consuming current evidence while its replacement is being
+        // computed (including the existing retry cooldown). Asking the scheduler
+        // for a global path here would stop this owner and cancel that same job.
+        let local_recovery = self.config.local_planning_enabled
+            && self.owner.as_ref().is_some_and(|owner| !owner.faulted())
+            && self.route.is_some() && self.goal.is_some() && self.map.is_some()
+            && self.pose.as_ref().is_some_and(|pose| nuwax_nav_pct::inside_boundary(
+                [pose.pose.position.x, pose.pose.position.y], &self.boundary))
+            && self.preparation_fault.is_none() && self.permanent_fault.is_none()
+            && self.qualified_failure.is_none();
+        if local_recovery {
+            // Retire only execution permission for the rejected local path. Keep
+            // its owner/job and global route; consume_plan must re-admit before
+            // any old-path Command (including ZERO) can reset the wait budget.
+            self.admitted_generation = None;
+            self.wait_reason = Some(format!("当前轨迹受阻，保持零速等待局部接续：{reason}"));
+            PlannerStep::Pending(self.local_failures.clone())
+        } else {
+            PlannerStep::ReplanRequired(reason)
+        }
+    }
     fn consume_plan(&mut self) {
         #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::PlanConsumeAdmission);
         let Some(owner)=&self.owner else {return;};
@@ -325,13 +354,17 @@ impl RouteFollower {
 impl NavPlanner for RouteFollower {
     fn revalidate_selected_command(&mut self,command:Twist2)->Option<PlannerStep> {
         let result=self.controller.revalidate_selected_command(command);
-        if matches!(result,Some(PlannerStep::ReplanRequired(_))) {self.dirty=true;self.schedule(true);}
-        result
+        result.map(|step| match step {
+            PlannerStep::ReplanRequired(reason) => self.current_rejection(reason),
+            step => step,
+        })
     }
     fn revalidate_selected_command_at_current_state(&mut self,command:Twist2)->Option<PlannerStep> {
         let result=self.controller.revalidate_selected_command_at_current_state(command);
-        if matches!(result,Some(PlannerStep::ReplanRequired(_))) {self.dirty=true;self.schedule(true);}
-        result
+        result.map(|step| match step {
+            PlannerStep::ReplanRequired(reason) => self.current_rejection(reason),
+            step => step,
+        })
     }
     fn take_command_dispatch_bound(&mut self)->Option<crate::CommandDispatchBound> {self.controller.take_command_dispatch_bound()}
     fn configure_boundary(&mut self, boundary: &[[f64; 2]]) {
@@ -521,9 +554,8 @@ impl NavPlanner for RouteFollower {
             #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ControllerStep);
             self.controller.step(width)
         };
-        if matches!(step,PlannerStep::ReplanRequired(_)) {self.dirty=true;self.schedule(true);}
-        // Preserve a genuine current rejection verbatim while detour work is pending.
-        if matches!(step,PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_)) {return step;}
+        if let PlannerStep::ReplanRequired(reason) = step {return self.current_rejection(reason);}
+        if matches!(step,PlannerStep::Failed(_)) {return step;}
         if let Some(reason)=&self.qualified_failure {return PlannerStep::ReplanRequired(reason.clone());}
         step
     }
@@ -719,6 +751,58 @@ mod tests {
             if reason.contains("invalid local input")));
         assert_eq!(follower.local_failures()[0].kind, nuwax_nav_scan::LocalPlanFailureKind::Unclassified);
         assert_eq!(follower.local_failures()[1].kind, nuwax_nav_scan::LocalPlanFailureKind::SearchExhausted);
+    }
+    #[test]
+    fn local_rejection_waits_through_existing_retry_cooldown_without_losing_route() {
+        let mut follower = open_follower();
+        assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(_)));
+        follower.cancel_planning();
+        let route = follower.route.clone();
+        let goal = follower.goal.clone();
+        let epoch = follower.owner.as_ref().unwrap().epoch();
+        let generation = follower.route_generation;
+        let plans = follower.local_plans();
+        let calls = follower.local_planning_calls();
+        follower.retry_after = Instant::now() + Duration::from_millis(250);
+        assert!(matches!(follower.current_rejection("current stopping trajectory blocked".into()), PlannerStep::Pending(_)));
+        assert!(follower.submitted.is_none());
+        assert_eq!(follower.local_planning_calls(), calls);
+        assert_eq!(follower.owner.as_ref().unwrap().epoch(), epoch);
+        assert_eq!(follower.route, route);
+        assert_eq!(follower.goal, goal);
+        assert!(follower.execution_wait_reason().unwrap().contains("current stopping trajectory blocked"));
+        assert_eq!(follower.admitted_generation, None);
+        for _ in 0..3 {
+            assert!(matches!(follower.step(0.3), PlannerStep::Pending(_)),
+                "rejected old admission must not emit a Command, even ZERO, during cooldown");
+            assert!(follower.submitted.is_none());
+            assert_eq!(follower.owner.as_ref().unwrap().epoch(), epoch);
+            assert_eq!(follower.route_generation, generation);
+        }
+        std::thread::sleep(Duration::from_millis(260));
+        assert!(matches!(follower.current_rejection("current stopping trajectory blocked".into()), PlannerStep::Pending(_)));
+        assert!(follower.submitted.is_some());
+        assert_eq!(follower.local_planning_calls(), calls + 1);
+        assert_eq!(follower.owner.as_ref().unwrap().epoch(), epoch);
+        assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(_)));
+        assert_eq!(follower.admitted_generation, Some(generation));
+        assert!(follower.local_plans() > plans);
+        assert_eq!(follower.route, route);
+        assert_eq!(follower.goal, goal);
+    }
+    #[test]
+    fn local_rejection_does_not_mask_preparation_permanent_or_qualified_faults() {
+        for fault in 0..3 {
+            let mut follower = open_follower();
+            assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(_)));
+            match fault {
+                0 => follower.preparation_fault=Some("preparation fault".into()),
+                1 => follower.permanent_fault=Some("permanent fault".into()),
+                _ => follower.qualified_failure=Some("qualified failure".into()),
+            }
+            assert_eq!(follower.current_rejection("current rejection".into()),
+                PlannerStep::ReplanRequired("current rejection".into()));
+        }
     }
     #[test]
     fn unavailable_kinematics_is_a_real_preparation_error_not_pending() {

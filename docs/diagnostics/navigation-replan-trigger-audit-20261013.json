@@ -1,0 +1,334 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-10-13T22:38:00Z",
+  "scope": "Cloud real NavScheduler + PlannerWorker + RouteFollower + PlanKernel with acknowledged ideal-plant motion; not physical actuator qualification or a timing guarantee",
+  "production_base_file_last_commit": "65d15c5262af71ee0ab532133bd0afdcb5e75911",
+  "source_identity_note": "Existing Git commit identifies the last committed RouteFollower base. Each experimental candidate was an uncommitted source variant described below; no content hashes are used. External source/binary snapshots remain preserved.",
+  "common_moving_inputs": {
+    "fixture": "route_moving_worker_tests::fixture(true,0.05,6.0)",
+    "start": [
+      0.5,
+      1.5,
+      0.5,
+      0.0
+    ],
+    "original_goal": [
+      3.0,
+      1.5,
+      0.5,
+      0.0
+    ],
+    "goal_options": "unchanged GoalOptions::default()",
+    "source_voxel_m": 0.05,
+    "control_period_ms": 50,
+    "pose_hz": 40,
+    "source_hz": 5,
+    "source_max_age_ms": 1000,
+    "planning_hold_ms": 650,
+    "goal_window_s": 60,
+    "reverse_capability_mps": 0,
+    "planning_expansion_budget": 256,
+    "fixed_obstacle_points": [
+      [
+        0.8907157909999999,
+        1.3,
+        0.5
+      ],
+      [
+        0.8907157909999999,
+        1.4000000000000001,
+        0.5
+      ],
+      [
+        0.8907157909999999,
+        1.5,
+        0.5
+      ],
+      [
+        0.8907157909999999,
+        1.6,
+        0.5
+      ],
+      [
+        0.8907157909999999,
+        1.7000000000000002,
+        0.5
+      ]
+    ],
+    "gates": [
+      "current body pose legal",
+      "direct swept route blocked",
+      "independently swept detour via y=2.2 exists"
+    ],
+    "clocks": "real acquisition and wall clocks; no expiry or collision threshold changes",
+    "trajectory_note": "Wall-clock integration causes small onset/request/receipt pose differences between arms; input geometry is fixed, trajectory identity is not claimed"
+  },
+  "external_evidence_root": "/workspace/scratch/71cdb9d17732/scheduler-detour-audit-20261013",
+  "arms": [
+    {
+      "id": "v1",
+      "candidate": "unmodified RouteFollower",
+      "source_snapshot": "fixture-v1.rs",
+      "preserved_binary": "runtime-v1",
+      "raw_log": "run-v1.log",
+      "outcome": "failed fixture geometry gate",
+      "test_result": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 291 filtered out; finished in 0.44s",
+      "details": {
+        "obstacle_x": 0.75,
+        "full_motion_audit": "not reached"
+      },
+      "compact_exact_evidence": [
+        "independent full-body detour witness: InsufficientClearance"
+      ],
+      "elapsed_s": 0.44
+    },
+    {
+      "id": "v2",
+      "candidate": "unmodified RouteFollower",
+      "source_snapshot": "fixture-v2.rs",
+      "preserved_binary": "runtime-v2",
+      "raw_log": "run-v2.log",
+      "outcome": "confirmed new detour cancellation",
+      "test_result": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 291 filtered out; finished in 0.68s",
+      "details": {
+        "obstacle_x": 0.8,
+        "owner_epoch_before_after": [
+          6,
+          7
+        ],
+        "route_generation_before_after": [
+          5,
+          6
+        ],
+        "request_id": 2,
+        "confirmed_zero_before_stop": true,
+        "global_phase_after_rejection": "AwaitingPath",
+        "full_motion_audit": "fixed-pose lifecycle fixture, not a moving-goal test"
+      },
+      "compact_exact_evidence": [],
+      "elapsed_s": 0.68
+    },
+    {
+      "id": "recovery-v4",
+      "candidate": "Pending on recoverable rejection; rejected local admission retained",
+      "source_snapshot": "fixture-recovery-v4.rs",
+      "preserved_binary": "runtime-recovery-v4",
+      "raw_log": "run-recovery-v4.log",
+      "outcome": "failed 60-second original-goal window",
+      "test_result": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 293 filtered out; finished in 60.04s",
+      "details": {
+        "obstacle_x": 0.8907157909999999,
+        "obstacle_placement": "onset pose plus0.30m; exact resulting coordinate frozen in subsequent arms",
+        "planning_submissions": 215,
+        "local_admissions": 2,
+        "full_motion_audit": "did not execute: original timeout asserted first",
+        "goal_reached": false
+      },
+      "compact_exact_evidence": [],
+      "elapsed_s": 60.04
+    },
+    {
+      "id": "attribution-v1",
+      "candidate": "Pending on recoverable rejection; rejected local admission retained",
+      "source_snapshot": "fixture-attribution-v1.rs",
+      "preserved_binary": "runtime-attribution-v1",
+      "raw_log": "run-attribution-v1.log",
+      "outcome": "failed complete actual-receipt braking tail",
+      "test_result": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 294 filtered out; finished in 2.12s",
+      "details": {
+        "actual_edges": 77,
+        "actual_edges_passed": true,
+        "first_failing_receipt": 24,
+        "first_failing_result": 90,
+        "turn_comparison": "not reached because audit originally asserted first",
+        "goal_reached": "not tested",
+        "receipt_source_age_ms": 188.535064
+      },
+      "compact_exact_evidence": [
+        "actual receipt 24 result=90 rejected by complete independent braking-tail oracle pose=PlanarPose { x: 0.6520649794152389, y: 1.500037102907704, yaw: 0.2585811667 } before=Twist2 { linear: Point2 { x: 0.0, y: 0.0 }, angular_z: 0.8 } command=Twist2 { linear: Point2 { x: 0.0, y: 0.0 }, angular_z: 0.8 }",
+        "SCHEDULER_RECEIPT index=24 ns=1791929988238382688 source_ns=1791929988049847624 id=90 pose=PlanarPose { x: 0.6520649794152389, y: 1.500037102907704, yaw: 0.2585811667 } before=Twist2 { linear: Point2 { x: 0.0, y: 0.0 }, angular_z: 0.8 } command=Twist2 { linear: Point2 { x: 0.0, y: 0.0 }, angular_z: 0.8 } proof=DeliveredCommandContext { proof: ComputedCommandContext { input: ComputeInputTrace { result_id: 90, pose: Some(PoseTrace { bits: [4604048498741908056, 4609434385710343966, 4602678819172646912, 0, 0, 4593189189793215493, 4607119164048589611], stamp: Timestamp { nanos: 1791929988211613022, clock: Unix }, frame_id: Map }), applied_bits: [0, 0, 4605380978949069210], epoch: 3, goal_version: 2, path_version: 3, map_version: 12, boundary_version: 1, pose_version: 48, applied_version: 28, compute_started: Instant { tv_sec: 24091, tv_nsec: 421916771 }, compute_start_unix_ns: 1791929988211670990 }, guard: GuardSelectionTrace { invocation_id: 1, pose: PoseTrace { bits: [4604048498741908056, 4609434385710343966, 4602678819172646912, 0, 0, 4593189189793215493, 4607119164048589611], stamp: Timestamp { nanos: 1791929988211613022, clock: Unix }, frame_id: Map }, applied_bits: [0, 0, 4605380978949069210], selected_command_bits: [0, 0, 4605380978949069210], observation_anchor_ns: None, observation_max_age_ns: None }, compute_completion_unix_ns: 1791929988212356404, worker_guard_pose_bits_equal: true, worker_guard_pose_stamp_equal: true, worker_guard_pose_frame_equal: true, worker_guard_applied_bits_equal: true }, publication_unix_ns: 1791929988212359529, retrieval_unix_ns: 1791929988238375767 }"
+      ],
+      "elapsed_s": 2.12
+    },
+    {
+      "id": "attribution-v2",
+      "candidate": "Pending on recoverable rejection; rejected local admission retained; audit summaries before assertions",
+      "source_snapshot": "fixture-attribution-v2.rs",
+      "preserved_binary": "runtime-attribution-v2",
+      "raw_log": "run-attribution-v2.log",
+      "outcome": "failed complete actual-receipt braking tail; planned turn room loss proven",
+      "test_result": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 294 filtered out; finished in 2.14s",
+      "details": {
+        "receipts": 25,
+        "actual_edges": 78,
+        "actual_edges_passed": true,
+        "first_failing_receipt": 24,
+        "first_failing_result": 89,
+        "held_nonzero_receipts": 3,
+        "candidate_turn_legal": true,
+        "same_turn_at_later_actual_pose": "InsufficientClearance",
+        "goal_reached": "not tested",
+        "receipt_source_age_ms": 192.03058
+      },
+      "compact_exact_evidence": [
+        "SCHEDULER_SAFETY_AUDIT receipts=25 actual_edges=78 failures=[\"actual receipt 24 result=89 rejected by complete independent braking-tail oracle pose=PlanarPose { x: 0.6519895085133783, y: 1.5000367602415834, yaw: 0.2584603485000003 } before=Twist2 { linear: Point2 { x: 0.0, y: 0.0 }, angular_z: 0.8 } command=Twist2 { linear: Point2 { x: 0.0, y: 0.0 }, angular_z: 0.8 }\"]",
+        "SCHEDULER_TURN_ATTRIBUTION candidate_start=Pose3 { position: Point3 { x: 0.583920908, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } } candidate_turn=Pose3 { position: Point3 { x: 0.583920908, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 0.7403405747323492, x: 0.0, y: 0.0, z: 0.6722319788621893 } } admission_pose=Pose3 { position: Point3 { x: 0.6245964066499999, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } } actual_pose=PlanarPose { x: 0.6519895085133783, y: 1.5000367602415834, yaw: 0.2823875893000003 } held_fresh_nonzero=3 original_turn=Ok(()) same_turn_at_actual=Err(InsufficientClearance) max_reverse_mps=0",
+        "SCHEDULER_RECEIPT index=24 ns=1791930116388423712 source_ns=1791930116196393132 id=89 pose=PlanarPose { x: 0.6519895085133783, y: 1.5000367602415834, yaw: 0.2584603485000003 } before=Twist2 { linear: Point2 { x: 0.0, y: 0.0 }, angular_z: 0.8 } command=Twist2 { linear: Point2 { x: 0.0, y: 0.0 }, angular_z: 0.8 } proof=DeliveredCommandContext { proof: ComputedCommandContext { input: ComputeInputTrace { result_id: 89, pose: Some(PoseTrace { bits: [4604047818960457063, 4609434384167112953, 4602678819172646912, 0, 0, 4593794882674857141, 4607107836599890981], stamp: Timestamp { nanos: 1791930116387291012, clock: Unix }, frame_id: Map }), applied_bits: [0, 0, 4605380978949069210], epoch: 3, goal_version: 2, path_version: 3, map_version: 12, boundary_version: 1, pose_version: 49, applied_version: 28, compute_started: Instant { tv_sec: 24219, tv_nsec: 571798073 }, compute_start_unix_ns: 1791930116387359861 }, guard: GuardSelectionTrace { invocation_id: 1, pose: PoseTrace { bits: [4604047818960457063, 4609434384167112953, 4602678819172646912, 0, 0, 4593794882674857141, 4607107836599890981], stamp: Timestamp { nanos: 1791930116387291012, clock: Unix }, frame_id: Map }, applied_bits: [0, 0, 4605380978949069210], selected_command_bits: [0, 0, 4605380978949069210], observation_anchor_ns: None, observation_max_age_ns: None }, compute_completion_unix_ns: 1791930116388010844, worker_guard_pose_bits_equal: true, worker_guard_pose_stamp_equal: true, worker_guard_pose_frame_equal: true, worker_guard_applied_bits_equal: true }, publication_unix_ns: 1791930116388013939, retrieval_unix_ns: 1791930116388419085 }"
+      ],
+      "elapsed_s": 2.14
+    },
+    {
+      "id": "attribution-v3",
+      "candidate": "same Pending-only production candidate; added diagnostic callback replay",
+      "source_snapshot": "fixture-attribution-v3.rs",
+      "preserved_binary": "runtime-attribution-v3",
+      "raw_log": "run-attribution-v3.log",
+      "outcome": "passed short attribution; planned turn room loss proven",
+      "test_result": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 294 filtered out; finished in 2.09s",
+      "details": {
+        "receipts": 25,
+        "actual_edges": 79,
+        "full_motion_audit": "passed",
+        "held_nonzero_receipts": 3,
+        "candidate_turn_legal": true,
+        "same_turn_at_later_actual_pose": "InsufficientClearance",
+        "goal_reached": "not tested"
+      },
+      "compact_exact_evidence": [
+        "SCHEDULER_SAFETY_AUDIT receipts=25 actual_edges=79 failures=[]",
+        "SCHEDULER_TURN_ATTRIBUTION candidate_start=Pose3 { position: Point3 { x: 0.5883662962499999, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } } candidate_turn=Pose3 { position: Point3 { x: 0.5883662962499999, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 0.7368441223773844, x: 0.0, y: 0.0, z: 0.6760626741049252 } } admission_pose=Pose3 { position: Point3 { x: 0.6249688686499999, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } } actual_pose=PlanarPose { x: 0.6505788154105369, y: 1.5000371236773546, yaw: 0.286619632199999 } held_fresh_nonzero=3 original_turn=Ok(()) same_turn_at_actual=Err(InsufficientClearance) max_reverse_mps=0"
+      ],
+      "elapsed_s": 2.09
+    },
+    {
+      "id": "attribution-v3-repeat",
+      "candidate": "unchanged runtime-attribution-v3; one bounded repeat",
+      "source_snapshot": "fixture-attribution-v3.rs",
+      "preserved_binary": "runtime-attribution-v3",
+      "raw_log": "run-attribution-v3-repeat.log",
+      "outcome": "passed short attribution; planned turn room loss proven",
+      "test_result": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 294 filtered out; finished in 1.97s",
+      "details": {
+        "receipts": 25,
+        "actual_edges": 77,
+        "full_motion_audit": "passed",
+        "held_nonzero_receipts": 3,
+        "candidate_turn_legal": true,
+        "same_turn_at_later_actual_pose": "InsufficientClearance",
+        "goal_reached": "not tested"
+      },
+      "compact_exact_evidence": [
+        "SCHEDULER_SAFETY_AUDIT receipts=25 actual_edges=77 failures=[]",
+        "SCHEDULER_TURN_ATTRIBUTION candidate_start=Pose3 { position: Point3 { x: 0.5909644833999997, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } } candidate_turn=Pose3 { position: Point3 { x: 0.5909644833999997, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 0.734788408452522, x: 0.0, y: 0.0, z: 0.6782963915603633 } } admission_pose=Pose3 { position: Point3 { x: 0.62323816505, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } } actual_pose=PlanarPose { x: 0.6518686610965441, y: 1.50003714766094, yaw: 0.2702847555999983 } held_fresh_nonzero=3 original_turn=Ok(()) same_turn_at_actual=Err(InsufficientClearance) max_reverse_mps=0"
+      ],
+      "elapsed_s": 1.97
+    },
+    {
+      "id": "withdrawal-v1",
+      "candidate": "Pending on recoverable rejection plus admitted_generation=None; owner/global route retained",
+      "source_snapshot": "fixture-withdrawal-v1.rs",
+      "preserved_binary": "runtime-withdrawal-v1",
+      "raw_log": "run-withdrawal-v1.log",
+      "outcome": "passed persistent-obstacle original-goal arm",
+      "test_result": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 294 filtered out; finished in 13.32s",
+      "details": {
+        "planning_submissions": 2,
+        "local_admissions": 2,
+        "source_acquisitions": 66,
+        "held_source_acquisitions": 3,
+        "held_nonzero_receipts": 0,
+        "held_old_admission_command_results_including_zero": 0,
+        "receipts": 232,
+        "actual_edges": 715,
+        "full_motion_audit": "passed",
+        "goal_reached": true,
+        "original_path_revision": 1,
+        "held_owner_epoch": 6,
+        "held_route_generation": 5
+      },
+      "compact_exact_evidence": [
+        "SCHEDULER_SAFETY_AUDIT receipts=232 actual_edges=715 failures=[]",
+        "SCHEDULER_RECOVERY_RESULT elapsed_s=13.282135381 source_acquisitions=66 held_sources=3 held_fresh_nonzero=0 receipts=232 actual_edges=715 final_pose=PlanarPose { x: 2.750221942027795, y: 1.6160339352459614, yaw: -0.3002540731238277 } original_goal=Pose3 { position: Point3 { x: 3.0, y: 1.5, z: 0.5 }, orientation: Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } }"
+      ],
+      "elapsed_s": 13.32
+    }
+  ],
+  "build_notes": [
+    {
+      "id": "build-recovery-v1",
+      "outcome": "compile failed",
+      "cause": "test-only motion mock retained MutexGuard across await; fixed lexical lifetime without changing production"
+    }
+  ],
+  "regressions": [
+    {
+      "id": "focused-withdrawal-v1",
+      "log": "focused-withdrawal-v1.log",
+      "passed": 3,
+      "description": "no-job cooldown and re-admission, strict faults, worker Pending deadline/timeout/fence"
+    },
+    {
+      "id": "runtime-suite-withdrawal-v1",
+      "log": "runtime-suite-withdrawal-v1.log",
+      "passed": 234,
+      "failed": 1,
+      "ignored": 55,
+      "excluded": 5,
+      "failure": "recent_obstacle_updates_keep_terrain_and_trigger_bounded_detour_then_recover: stationary yaw cannot complete the newly admitted initial turn; real-elapsed fixture correction pending validation",
+      "excluded_tests": [
+        "cancel_preempts_delayed_renew_over_real_uds_with_qualified_latency",
+        "cancel_preempts_delayed_submit_over_real_uds_with_qualified_latency",
+        "cancel_replays_identical_fence_after_first_response_timeout",
+        "real_uds_adapter_requires_correlated_applied_and_fence_proofs",
+        "server_deadline_renewal_keeps_legal_slow_commands_alive"
+      ]
+    },
+    {
+      "id": "focused-cleared-withdrawal-v2",
+      "log": "focused-cleared-withdrawal-v2.log",
+      "passed": 1,
+      "elapsed_s": 2.27,
+      "fixture_correction": "integrate actual returned turn with real elapsed pose/applied input; preserve positive-forward5s deadline and request/epoch bounds; all actual edges and selected complete tails audited"
+    },
+    {
+      "id": "runtime-suite-withdrawal-v2",
+      "log": "runtime-suite-withdrawal-v2.log",
+      "binary": "runtime-withdrawal-v2",
+      "passed": 235,
+      "failed": 0,
+      "ignored": 56,
+      "excluded": 5,
+      "elapsed_s": 51.15,
+      "exclusions": "same named cloud UDS exclusions as v1",
+      "source_note": "Includes stationary-fixture correction and ignored geometric differential; production recovery code and full moving fixture are identical to goal-qualified withdrawal-v1. Subsequent RSS module edits are excluded from this built binary."
+    }
+  ],
+  "unresolved": [
+    "Earlier actual-receipt braking-tail failures are a separate activation-delay safety finding. Reconstructed geometric replay rules out callback/sample-step mismatch: real callbacks and independent checks accept captured guard pose and reject captured actual receipt pose at identical Recent occupancy witness. Historical source-health and end-to-end delay repair remain unqualified.",
+    "All results are cloud ideal-plant/module tests; no physical actuator or general real-time claim."
+  ],
+  "geometry_differential": {
+    "id": "reconstructed-attribution-v1",
+    "binary": "runtime-withdrawal-v2",
+    "log": "reconstructed-differential-v2.log",
+    "selector": "surface_follower::body_control::reconstructed_receipt_geometry_diagnostic::reconstructed_attribution_v1_geometry_callback_differential",
+    "scope": "exact captured poses against reconstructed identical floor and fixed obstacle; not historical source-health or actual delayed-motion qualification",
+    "expected_outcome": "guard pose accepted, actual receipt pose rejected by both real production callbacks and independent oracle",
+    "passed": true,
+    "elapsed_s": 0.03,
+    "rejection_cell": [
+      17,
+      29,
+      9
+    ],
+    "rejection_source": "Recent",
+    "sampling_variants": [
+      "original0.025m",
+      "exactf64(source_voxel)/2"
+    ],
+    "exact_evidence": [
+      "test surface_follower::body_control::reconstructed_receipt_geometry_diagnostic::reconstructed_attribution_v1_geometry_callback_differential ... RECONSTRUCTED_GEOMETRY_ONLY label=captured_guard pose=Pose3 { position: Point3 { x: 0.6520649794152389, y: 1.500037102907704, z: 0.5 }, orientation: Quaternion { w: 0.9929773118547919, x: 0.0, y: 0.0, z: 0.11830493709744878 } } production=(true, None) independent=[(\"original_audit\", true, None), (\"production_step\", true, None)]",
+      "RECONSTRUCTED_GEOMETRY_ONLY label=captured_receipt pose=Pose3 { position: Point3 { x: 0.6520649794152389, y: 1.500037102907704, z: 0.5 }, orientation: Quaternion { w: 0.9916536088136071, x: 0.0, y: 0.0, z: 0.1289306795411762 } } production=(false, Some(\"Body(BodyFailureWitness { pose: ([0.6520649794152389, 1.500037102907704, 0.5], [0.0, 0.0, 0.24671653445208672, 0.9690876903706662]), rejection: Occupancy { cell: [17, 29, 9], source: Recent, z_bounds: [0.45000000670552254, 0.5000000074505806], ground_height: None } })\")) independent=[(\"original_audit\", false, Some(\"error=InsufficientClearance witness=Some(BodyFailureWitness { pose: ([0.6520649794152389, 1.500037102907704, 0.5], [0.0, 0.0, 0.24671653445208672, 0.9690876903706662]), rejection: Occupancy { cell: [17, 29, 9], source: Recent, z_bounds: [0.45000000670552254, 0.5000000074505806], ground_height: None } })\")), (\"production_step\", false, Some(\"error=InsufficientClearance witness=Some(BodyFailureWitness { pose: ([0.6520649794152389, 1.500037102907704, 0.5], [0.0, 0.0, 0.24671653445208672, 0.9690876903706662]), rejection: Occupancy { cell: [17, 29, 9], source: Recent, z_bounds: [0.45000000670552254, 0.5000000074505806], ground_height: None } })\"))]"
+    ]
+  }
+}

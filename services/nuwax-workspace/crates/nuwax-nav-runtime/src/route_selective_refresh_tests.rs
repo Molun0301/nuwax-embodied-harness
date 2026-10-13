@@ -203,7 +203,8 @@ fn recent_obstacle_updates_keep_terrain_and_trigger_bounded_detour_then_recover(
     });
     follower.retry_after=Instant::now();
     let rejected=follower.step(0.3);
-    assert!(matches!(rejected,PlannerStep::ReplanRequired(_)),"{rejected:?}");
+    assert!(matches!(rejected,PlannerStep::Pending(_)),"{rejected:?}");
+    assert!(follower.execution_wait_reason().is_some_and(|reason|reason.contains("当前轨迹受阻")),"original rejection must remain visible during local recovery");
     assert_eq!(follower.owner.as_ref().unwrap().epoch(),epoch,"live obstacle must not cancel terrain work");
     assert!(follower.local_planning_calls()>calls,"guard rejection must schedule detour work");
     let submitted=follower.local_planning_calls();
@@ -215,12 +216,48 @@ fn recent_obstacle_updates_keep_terrain_and_trigger_bounded_detour_then_recover(
     follower.controller.observe_applied_command(nuwax_nav_types_messages::Twist2::ZERO);
     // This fixture uses simulation time; advance its real pose clock past braking.
     follower.update_odometry(comparison_pose(0.5,20));
-    let deadline=Instant::now()+Duration::from_secs(5);
+    // A newly admitted detour may begin with an in-place turn even after the
+    // obstacle clears. Execute that turn rather than repeatedly asking a frozen
+    // yaw for a forward command. Pose stamps advance only by real elapsed time.
+    let began=Instant::now();
+    let deadline=began+Duration::from_secs(5);
+    let mut previous=began;
+    let mut actual=nuwax_nav_control::PlanarPose{x:0.5,y:1.0,yaw:0.0};
+    let mut applied=nuwax_nav_types_messages::Twist2::ZERO;
+    let limits=follower.config.motion_limits.clone().unwrap();
+    let period=1.0/follower.config.controller.control_frequency;
+    let map=follower.map.clone().unwrap();
+    let body_at=|p:nuwax_nav_control::PlanarPose| {
+        let q=Quaternion::from_yaw(p.yaw);
+        ([p.x,p.y,0.5],[q.x,q.y,q.z,q.w])
+    };
     loop {
+        let now=Instant::now();
+        let next=nuwax_nav_control::integrate(actual,applied,now.duration_since(previous).as_secs_f64());
+        map.validate_body_motion(body_at(actual),body_at(next),&[]).expect("actual cleared-obstacle recovery edge");
+        actual=next;previous=now;
+        let elapsed=now.duration_since(began);
+        let mut observed=comparison_pose(actual.x,20);
+        observed.pose.position.y=actual.y;
+        observed.pose.orientation=Quaternion::from_yaw(actual.yaw);
+        observed.stamp=Timestamp::from_unix(2+elapsed.as_secs() as i64,elapsed.subsec_nanos());
+        follower.update_odometry(observed);
+        follower.observe_applied_command(applied);
         let step=follower.step(0.3);
-        if matches!(step,PlannerStep::Command(c) if c.linear.x>0.0) {break;}
+        if let PlannerStep::Command(command)=step {
+            let check=|| |a:nuwax_nav_control::PlanarPose,b:nuwax_nav_control::PlanarPose,_:f64| {
+                map.validate_body_motion(body_at(a),body_at(b),&[])
+                    .and_then(|_|map.body_query_with_current_support(body_at(a).0,body_at(a).1)
+                        .and_then(|view|view.validate_body_motion(body_at(a),body_at(b),&[]))).is_ok()
+            };
+            assert!(nuwax_nav_control::check_stopping_trajectory_with_period_check(actual,applied,command,&limits,
+                period,f64::from(map.source_voxel_size_m())*0.5,map.body_envelope().unwrap().radius(),check(),check()).is_some(),
+                "cleared-obstacle recovery command must retain its complete braking tail");
+            applied=command;
+            if command.linear.x>0.0 {break;}
+        } else {applied=nuwax_nav_types_messages::Twist2::ZERO;}
         assert!(Instant::now()<deadline,"cleared recent obstacle never recovered: {step:?}");
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_secs_f64(period));
     }
     assert_eq!(follower.owner.as_ref().unwrap().epoch(),epoch);
     assert!(follower.local_planning_calls()<=submitted+2,"recovery must remain bounded");
@@ -258,7 +295,8 @@ fn persistent_recent_single_obstacle_can_admit_a_short_local_detour() {
         linear:nuwax_nav_types_messages::Point2::new(0.5,0.0),angular_z:0.0,
     });
     follower.retry_after=Instant::now();
-    assert!(matches!(follower.step(0.3),PlannerStep::ReplanRequired(_)));
+    assert!(matches!(follower.step(0.3),PlannerStep::Pending(_)));
+    assert!(follower.execution_wait_reason().is_some_and(|reason|reason.contains("当前轨迹受阻")));
     follower.controller.observe_applied_command(nuwax_nav_types_messages::Twist2::ZERO);
     follower.update_odometry(comparison_pose(0.5,20));
     let deadline=Instant::now()+Duration::from_secs(5);
@@ -300,7 +338,8 @@ fn recent_wide_close_obstacle_admits_bounded_live_detour() {
     });
     follower.retry_after=Instant::now();
     let rejected=follower.step(0.3);
-    assert!(matches!(rejected,PlannerStep::ReplanRequired(_)),"{rejected:?}");
+    assert!(matches!(rejected,PlannerStep::Pending(_)),"{rejected:?}");
+    assert!(follower.execution_wait_reason().is_some_and(|reason|reason.contains("当前轨迹受阻")),"original rejection must remain visible during local recovery");
     assert_eq!(follower.owner.as_ref().unwrap().epoch(),epoch,"live obstacle must not cancel terrain work");
     assert!(follower.local_planning_calls()>calls,"guard rejection must schedule detour work");
     let submitted=follower.local_planning_calls();

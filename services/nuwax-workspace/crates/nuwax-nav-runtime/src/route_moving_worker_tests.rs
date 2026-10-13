@@ -55,7 +55,7 @@ fn limits()->MotionLimits {MotionLimits {
     guaranteed_angular_braking_rps2:2.0,reaction_time_sec:0.05,
     minimum_turning_radius_m:0.0,can_rotate_in_place:true,
 }}
-fn fixture(enabled:bool, resolution:f32, length:f32)->(SurfaceFollowerConfig,Arc<SurfaceSnapshot>,Arc<Vec<[i32;3]>>) {
+pub(crate) fn fixture(enabled:bool, resolution:f32, length:f32)->(SurfaceFollowerConfig,Arc<SurfaceSnapshot>,Arc<Vec<[i32;3]>>) {
     let envelope=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],
         z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
         max_cross_slope_deg:18.0,support_uncertainty_m:0.0};

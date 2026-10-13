@@ -2541,6 +2541,7 @@ fn path_rejected(reason: impl Into<String>) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     include!("recent_source_health_tests.rs");
+    include!("scheduler_detour_cancellation_tests.rs");
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};

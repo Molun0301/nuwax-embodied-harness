@@ -4,16 +4,18 @@
 
 The historical call graph below is a read-only source audit of Geometry
 checkpoint, activation, and forbidden-zone content hashing at baseline commit
-`9eb9617`. All numbered source references refer to that baseline, not to the
-post-cleanup source. The initial audit was documented after HEAD advanced to
+`9eb9617`. Numbered source references in that historical call graph refer to
+that baseline, not to the post-cleanup source. The initial audit was documented after HEAD advanced to
 `935d732`; no changes to its cited server/runtime/workspace files were observed
 between those commits. No hashing functions, tests, or benchmarks were executed
 for that initial source audit.
 
 The forbidden-zone cleanup is now implemented and verified on the final source,
-as recorded in its implementation section below. The remaining legacy export
-and activation routes were not changed. This is not a repository-wide claim
-that all application hashing has been removed.
+as recorded in its implementation section below. A subsequent narrow cleanup
+also reuses the already-verified retained target digest during legacy publication
+resume, as recorded below. The remaining legacy export and activation hashes
+were not removed. This is not a repository-wide claim that all application
+hashing has been removed.
 
 Assigned identity v2 and the older enum variant named `Modern` are different:
 `Modern` means activation contract v1 and still computes content hashes.
@@ -87,7 +89,9 @@ contract versions 0 and 1:
 - `server.rs:2426`, `2469`, `3055/3073`, and `3271`: bundle, request, installed
   activation, and target-receipt identity hashing
 - `server.rs:2098/2111`, `2174`, `2784`, and `3127`: legacy-only journal/effect
-  verifier hashing; assigned alternatives use typed fields
+  verifier hashing at the audit baseline; assigned alternatives use typed fields.
+  The duplicate cloud pass formerly at `2784` was subsequently removed as
+  documented below; the other listed computations remain
 
 For planar v1 activation, `server_planar.rs:62–74` computes occupancy/backend,
 bundle, and request hashes, while `229` computes the installed activation hash.
@@ -204,6 +208,80 @@ its checksum verification must not be presented as equivalent verified behavior.
 Any future ID-based import needs a real immutable owner, structural validation,
 and session/frame/member/receipt binding. Never fabricate hashes or treat a
 legacy digest as proof that a newly assigned owner has been validated.
+
+## Retained publication verifier: duplicate cloud pass removed
+
+Final source verification: 2026-10-13, 21:10 UTC. This change replaces only the
+duplicate legacy cloud-byte hash in the resumed `TypedGlobalMap` journal entry.
+On this source, `server.rs:2133` defines
+`resumed_cloud_publication_verifier`; its production call is at `server.rs:2797`.
+It matches the retained `ActivationTargetSource` directly: legacy returns the
+existing `xyz_sha256`, and assigned returns the supplied `CloudCommitReceipt`.
+There is no new assertion, fallback digest, identity allocator or journal type.
+
+The legacy digest is a required `[u8; 32]` inside the same immutable target as
+the bytes. The only production target constructor is
+`pointcloud.rs::decode_immutable_activated_target`: it verifies the incoming
+checksum and finite XYZ before retaining the copied bytes and verified digest.
+Activation puts that target into its receipt seed; `stage_or_replay` moves it
+into an `Arc`. The resumed path obtains the existing owner through
+`ActivatedTargetReceiptControl::target_source`, rather than from a new file or
+an unrelated request field. No production mutation path for that retained
+target's bytes or digest was found in the source audit.
+
+Request class and target class are already coherently bound. Admission rejects
+legacy seeds containing assigned owners and assigned seeds containing legacy
+targets. `target_source` selects the target variant from the retained record's
+request-key variant, after current-token/epoch validation, including equality
+of the token and retained request keys. Staged legacy replay compares the full
+target, then rechecks the exact retained `Arc` owner. Existing retained-frame,
+publication-receipt, lifecycle, session/generation and physical geometry checks
+remain unchanged. Reusing this digest does not claim to validate different bytes.
+
+The warm-target release build completed in 8m 32s with exit status 0. Its exact
+selection ran **2 tests, both passed; 0 failed, 0 ignored, 1,330 filtered out**:
+
+- `server::resumed_cloud_publication_verifier_tests::retained_legacy_verifier_reuses_exact_digest_without_hashing`
+- `server::resumed_cloud_publication_verifier_tests::retained_assigned_verifier_preserves_exact_receipt_without_hashing`
+
+Both enable the existing `map_checksum::FORBID_HASH` sentinel before fixture
+construction and restore its prior state on exit. The legacy test uses two
+predefined digest literals and a synthetic already-admitted target; it checks
+exact journal-verifier equality and shared `Arc`/payload pointers on clone and
+reuse. These literals deliberately do not claim to be checksums of the fixture
+body. The assigned test uses real schema-2 assembly/admission and verifies exact
+supplied-receipt parity and shared payload ownership. Its existing frozen test
+fixture was made visible to the sibling test module, only under `cfg(test)`.
+
+Exact command, run from the repository root:
+
+```sh
+source /workspace/scratch/71cdb9d17732/neh-toolchain/env.sh
+export CARGO_BUILD_JOBS=2 CMAKE_BUILD_PARALLEL_LEVEL=1
+cargo test --offline --release \
+  --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml \
+  --bin nuwax-geometry-runtime resumed_cloud_publication_verifier_tests \
+  -- --test-threads=1
+```
+
+Successful evidence is retained outside the repository at
+`/workspace/scratch/71cdb9d17732/neh-evidence/retained-cloud-verifier-nohash-retry-test.log`
+and the adjacent `retained-cloud-verifier-nohash-retry-test.exit` containing `0`.
+The first attempt's separate
+`retained-cloud-verifier-nohash-final-test.log` ends at compiler warnings after
+interruption, without a completion or test result. Its session was unavailable
+on recovery and the executable still predated the edit. That attempt is preserved
+as incomplete, not counted as passing; its interruption cause was not established.
+The successful retry used the unchanged source and the same warm target.
+
+These tests qualify the verifier helper; the production wiring and ownership
+invariant were reviewed in source. This is not full legacy admission/publication-
+resume flow coverage. No legacy hashing fixture, hash
+benchmark or binary-provenance hash was run. No latency or percentage speedup was
+measured. Legacy export, admission, request/bundle/receipt identities, policy
+identities and journal-key hashing still remain; the earlier compatibility
+boundary continues to apply. This cleanup removes one redundant full-cloud pass
+without changing saved map formats or weakening their admission checks.
 
 ## Explicit exclusions
 

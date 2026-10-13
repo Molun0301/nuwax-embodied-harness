@@ -2130,6 +2130,20 @@ fn cloud_activation_verifier(key: &ActivationRequestKey, legacy: Option<[u8; 32]
     }
 }
 
+fn resumed_cloud_publication_verifier(
+    target: &ActivationTargetSource,
+    receipt: &crate::mapping_commit::CloudCommitReceipt,
+) -> ActivationJournalVerifier {
+    // target_source binds this retained owner to the staged request's identity class.
+    // Legacy admission already verified this digest against the same owned bytes.
+    match target {
+        ActivationTargetSource::Legacy(target) => target.xyz_sha256.into(),
+        ActivationTargetSource::Assigned(_) => ActivationJournalVerifier::Assigned(
+            ActivationJournalVerifierV2::Cloud(receipt.clone()),
+        ),
+    }
+}
+
 fn activation_failure_state(
     service: &GeometryRuntimeService,
     adapter: &Arc<parking_lot::Mutex<MappingAdapter>>,
@@ -2780,10 +2794,7 @@ async fn activate_map_r1(
                 activation_request_key.clone(),
                 crate::correction_coordinator::ActivationJournalStep::TypedGlobalMap,
                 crate::correction_coordinator::ActivationJournalStatus::Applied,
-                Some(match &activation_request_key {
-                    ActivationRequestKey::LegacyDigest(_) => crate::map_checksum::sha256_bytes(target.xyz_f32_le()).into(),
-                    ActivationRequestKey::Assigned(_) => ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::Cloud(proof.cloud_receipt.clone())),
-                }),
+                Some(resumed_cloud_publication_verifier(&target, &proof.cloud_receipt)),
                 None,
             ) {
                 settle_current_failure!(
@@ -8511,6 +8522,98 @@ impl GeometryRuntime for GeometryRuntimeService {
                     message: format!("LCM publish failed: {}", e),
                 }))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod resumed_cloud_publication_verifier_tests {
+    use super::*;
+
+    struct HashForbidden(bool);
+    impl HashForbidden {
+        fn enter() -> Self {
+            Self(crate::map_checksum::FORBID_HASH.with(|flag| flag.replace(true)))
+        }
+    }
+    impl Drop for HashForbidden {
+        fn drop(&mut self) {
+            crate::map_checksum::FORBID_HASH.with(|flag| flag.set(self.0));
+        }
+    }
+
+    #[test]
+    fn retained_legacy_verifier_reuses_exact_digest_without_hashing() {
+        let _forbid = HashForbidden::enter();
+        let receipt = crate::mapping_commit::CloudCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 1, sequence: 2 },
+            session_generation: 3,
+            occupancy_revision: 4,
+            cloud_revision: 5,
+            source_timestamp_ns: 6,
+            point_count: 1,
+        };
+        // Synthetic already-admitted owners: these literals deliberately do not claim
+        // to be checksums of the payload. This tests reuse, not legacy admission.
+        for digest in [[0x31; 32], [0xa7; 32]] {
+            let target = ActivationTargetSource::Legacy(Arc::new(
+                crate::pointcloud::ImmutableActivatedTarget {
+                    frame_id: "map".into(),
+                    source_revision: 5,
+                    point_count: 1,
+                    voxel_size: 0.05,
+                    xyz_f32_le: vec![0; 12],
+                    xyz_sha256: digest,
+                    payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
+                },
+            ));
+            let replay = target.clone();
+            let (ActivationTargetSource::Legacy(original), ActivationTargetSource::Legacy(retained)) =
+                (&target, &replay) else { unreachable!() };
+            assert!(Arc::ptr_eq(original, retained));
+            assert_eq!(target.xyz_f32_le().as_ptr(), replay.xyz_f32_le().as_ptr());
+            let expected = ActivationJournalVerifier::LegacyDigest(digest);
+            assert_eq!(resumed_cloud_publication_verifier(&target, &receipt), expected);
+            assert_eq!(resumed_cloud_publication_verifier(&replay, &receipt), expected);
+            let mut other_receipt = receipt.clone();
+            other_receipt.commit_id.sequence += 1;
+            assert_eq!(resumed_cloud_publication_verifier(&replay, &other_receipt), expected);
+        }
+    }
+
+    #[test]
+    fn retained_assigned_verifier_preserves_exact_receipt_without_hashing() {
+        let _forbid = HashForbidden::enter();
+        let backend = crate::mapping_backend::MappingBackendKind::Voxel;
+        let checkpoint = assemble_mapping_checkpoint_export(
+            super::assigned_checkpoint_assembly_tests::frozen(), 2, backend,
+        ).unwrap();
+        let request = ActivateMapRequest {
+            session_id: "destination".into(),
+            map_name: "Map One".into(),
+            activation_request_id: "resume-assigned".into(),
+            expected_runtime_generation: 17,
+            activation_contract_version: 2,
+            asset_identity: Some(AssetIdentityV2 { asset_id: "2".repeat(32) }),
+            mapping_backend_checkpoint: Some(checkpoint),
+            ..Default::default()
+        };
+        let admitted = crate::activation_request::ValidatedActivationRequestV2::admit(
+            request, 17, backend, "map",
+            |_| Err("fixture has no artifacts".into()),
+            &crate::activation_request::CheckpointOwnerInternerV2::default(),
+        ).unwrap();
+        let owner = admitted.checkpoint().clone();
+        let mut receipt = owner.cloud_receipt().clone();
+        let target = ActivationTargetSource::Assigned(owner);
+        let replay = target.clone();
+        assert_eq!(target.xyz_f32_le().as_ptr(), replay.xyz_f32_le().as_ptr());
+        for _ in 0..2 {
+            assert_eq!(resumed_cloud_publication_verifier(&replay, &receipt),
+                ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::Cloud(receipt.clone())));
+            // The verifier follows the supplied installed receipt, not the source receipt.
+            receipt.commit_id.sequence += 1;
+            receipt.session_generation += 1;
         }
     }
 }
@@ -19390,7 +19493,7 @@ mod relocalization_terminal_query_tests {
 #[cfg(test)]
 mod assigned_checkpoint_assembly_tests {
 use super::*;
-fn frozen() -> MappingBackendCheckpoint {
+pub(super) fn frozen() -> MappingBackendCheckpoint {
     let id=MappingCommitIdentity {boot_nonce:vec![1;16],sequence:5};
     let occupancy=CanonicalOccupancyCommitReceipt { commit_id:Some(id.clone()),session_id:"source".into(),session_generation:2,
         occupancy_revision:7,source_timestamp_ns:100,backend_kind:"voxel".into(),backend_generation:3 };

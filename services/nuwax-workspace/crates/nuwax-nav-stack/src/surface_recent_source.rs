@@ -90,6 +90,10 @@ impl RecentSourceState {
 }
 
 #[cfg(test)]
+#[path = "recent_ingestion_diagnostics.rs"]
+mod ingestion_diagnostics;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use nuwax_codec::lcm::{lio,recent_cloud};

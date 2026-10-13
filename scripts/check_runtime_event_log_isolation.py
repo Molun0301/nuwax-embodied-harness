@@ -406,6 +406,7 @@ class EventLogIsolation(unittest.TestCase):
 
     def test_status_exposes_log_gap_to_runtime_reader(self):
         runtime = self.runtime(max_item_bytes=1)
+        runtime.mapping_service = SimpleNamespace(notification_status=lambda: {})
         runtime.event_bus.publish(self.event())
         status = runtime.get_live_map_stream_status()["event_log"]
         self.assertTrue(status["degraded"])

@@ -178,6 +178,15 @@ impl ForbiddenZoneCache {
     }
 
     fn load_inner(&mut self, path: &Path, map_name: &str) -> LoadedForbiddenZones {
+        self.load_inner_with_reader(path, map_name, |file, bytes| file.read_to_end(bytes))
+    }
+
+    fn load_inner_with_reader(
+        &mut self,
+        path: &Path,
+        map_name: &str,
+        read: impl FnOnce(&mut std::fs::File, &mut Vec<u8>) -> std::io::Result<usize>,
+    ) -> LoadedForbiddenZones {
         let map_name = map_name.trim();
         let mut file = match std::fs::File::open(path) {
             Ok(file) => file,
@@ -195,7 +204,7 @@ impl ForbiddenZoneCache {
             }
         }
         let mut bytes = Vec::new();
-        if let Err(error) = file.read_to_end(&mut bytes) {
+        if let Err(error) = read(&mut file, &mut bytes) {
             self.entry = None;
             return LoadedForbiddenZones::fail_closed(
                 format!("io-error:{map_name}:{error}"),
@@ -248,19 +257,22 @@ fn parse_for_map(bytes: &[u8], map_name: &str) -> LoadedForbiddenZones {
             "active map_name is empty",
         );
     }
-    let file_hash = crate::map_checksum::sha256_hex(bytes);
-    let document: ForbiddenZoneDocument = match serde_json::from_slice(&bytes) {
+    // A legacy/error identity belongs to this observation, not to its contents.
+    // Stable source snapshots retain it in ForbiddenZoneCache; cache misses must
+    // receive a fresh identity even when generation and byte length are unchanged.
+    let observation_id = || uuid::Uuid::new_v4().simple().to_string();
+    let document: ForbiddenZoneDocument = match serde_json::from_slice(bytes) {
         Ok(document) => document,
         Err(error) => {
             return LoadedForbiddenZones::fail_closed(
-                format!("invalid-json:{file_hash}"),
+                format!("invalid-json:{}", observation_id()),
                 format!("invalid forbidden-zone JSON: {error}"),
             );
         }
     };
     if document.schema_version != SUPPORTED_SCHEMA_VERSION {
         return LoadedForbiddenZones::fail_closed(
-            format!("unsupported-schema:{file_hash}"),
+            format!("unsupported-schema:{}", observation_id()),
             format!(
                 "unsupported forbidden-zone schema_version {}; expected {}",
                 document.schema_version, SUPPORTED_SCHEMA_VERSION
@@ -273,7 +285,7 @@ fn parse_for_map(bytes: &[u8], map_name: &str) -> LoadedForbiddenZones {
     let stored_map_name = zone_set.map_name.trim();
     if stored_map_name != map_name {
         return LoadedForbiddenZones::fail_closed(
-            format!("map-name-mismatch:{file_hash}:{map_name}"),
+            format!("map-name-mismatch:{}:{map_name}", observation_id()),
             format!(
                 "forbidden-zone key {map_name:?} contains map_name {:?}",
                 zone_set.map_name
@@ -282,16 +294,12 @@ fn parse_for_map(bytes: &[u8], map_name: &str) -> LoadedForbiddenZones {
     }
     if let Err(error) = validate_zone_set(zone_set) {
         return LoadedForbiddenZones::fail_closed(
-            format!("invalid-zone-set:{file_hash}:{map_name}"),
+            format!("invalid-zone-set:{}:{map_name}", observation_id()),
             error,
         );
     }
-    let entry_bytes = serde_json::to_vec(zone_set).unwrap_or_default();
     let signature = if zone_set.signature.trim().is_empty() {
-        format!(
-            "derived:{map_name}:{}",
-            crate::map_checksum::sha256_hex(&entry_bytes)
-        )
+        format!("observed:{map_name}:{}", observation_id())
     } else {
         zone_set.signature.trim().to_ascii_lowercase()
     };
@@ -887,6 +895,10 @@ pub(crate) mod copy_trial_reference;
 #[cfg(test)]
 #[path = "forbidden_zones_rectangle_scan_tests.rs"]
 pub(crate) mod rectangle_scan_tests;
+
+#[cfg(test)]
+#[path = "forbidden_zones_observation_tests.rs"]
+mod observation_tests;
 
 #[cfg(test)]
 mod tests {

@@ -5076,6 +5076,76 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_zone_observation_refresh_same_generation_is_stable_and_hash_free() {
+        struct NoHash(bool);
+        impl Drop for NoHash {
+            fn drop(&mut self) {
+                crate::map_checksum::FORBID_HASH.with(|flag| flag.set(self.0));
+            }
+        }
+        let _no_hash = NoHash(crate::map_checksum::FORBID_HASH.with(|flag| flag.replace(true)));
+        let zone_path = std::env::temp_dir().join(format!("nuwax-zone-refresh-observation-{}", uuid::Uuid::new_v4()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        let _cleanup = Cleanup(zone_path.clone());
+        let blank = br#"{"schema_version":1,"maps":{"test-map":{"map_name":"test-map","generation":7,"zones":[]}}}"#;
+        std::fs::write(&zone_path, blank).unwrap();
+        let mut adapter = active_adapter(sample_config());
+        adapter.forbidden_zones_path = Some(zone_path.clone());
+        let mut checkpoint = OccupancyGrid::with_frame(6, 6, 1.0, "map");
+        checkpoint.data.fill(0);
+        let (effective, _) = adapter.install_checkpoint(checkpoint, 10_000_000_000, 0).unwrap();
+        let state = Arc::new(RwLock::new(SharedState { map: effective, ..SharedState::default() }));
+        let (tx, mut rx) = broadcast::channel(16);
+        let initial = adapter.forbidden_zone_ack();
+        assert!(!adapter.refresh_forbidden_zones(&state, &tx).unwrap());
+        assert_eq!(adapter.current_revision(), initial.applied_revision);
+        assert!(rx.try_recv().is_err());
+
+        // Replacing identical unsigned bytes still denotes a new observed source.
+        let modified = std::fs::metadata(&zone_path).unwrap().modified().unwrap();
+        let replacement = zone_path.with_extension("next");
+        std::fs::write(&replacement, blank).unwrap();
+        std::fs::File::open(&replacement).unwrap().set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+        std::fs::rename(&replacement, &zone_path).unwrap();
+        let mut stale = adapter.begin_forbidden_zone_refresh().unwrap();
+        let stale_loaded = stale.load();
+        assert!(adapter.refresh_forbidden_zones(&state, &tx).unwrap());
+        let replaced = adapter.forbidden_zone_ack();
+        assert_eq!(replaced.generation, initial.generation);
+        assert_ne!(replaced.signature, initial.signature);
+        assert!(replaced.applied_revision > initial.applied_revision);
+        assert!(!adapter.finish_forbidden_zone_refresh(stale, stale_loaded, &state, &tx).unwrap());
+        assert_eq!(adapter.forbidden_zone_ack().signature, replaced.signature);
+        assert!(!adapter.refresh_forbidden_zones(&state, &tx).unwrap());
+
+        // A same-generation in-place edit must reach the canonical refresh fanout.
+        std::fs::write(&zone_path, br#"{"schema_version":1,"maps":{"test-map":{"map_name":"test-map","generation":7,"zones":[{"id":"circle","shape":"circle","mode":"inside","center":{"x":2.5,"y":2.5},"radius_m":0.3}]}}}"#).unwrap();
+        assert!(adapter.refresh_forbidden_zones(&state, &tx).unwrap());
+        let edited = adapter.forbidden_zone_ack();
+        assert_eq!(edited.generation, 7);
+        assert_ne!(edited.signature, replaced.signature);
+        assert!(state.try_read().unwrap().map.data.contains(&100));
+        assert!(!adapter.refresh_forbidden_zones(&state, &tx).unwrap());
+        assert_eq!(adapter.current_revision(), edited.applied_revision);
+
+        std::fs::write(&zone_path, b"{broken").unwrap();
+        assert!(adapter.refresh_forbidden_zones(&state, &tx).unwrap());
+        let invalid = adapter.forbidden_zone_ack();
+        assert!(state.try_read().unwrap().map.data.iter().all(|value| *value == 100));
+        assert!(!adapter.refresh_forbidden_zones(&state, &tx).unwrap());
+        assert_eq!(adapter.current_revision(), invalid.applied_revision);
+        std::fs::write(&zone_path, blank).unwrap();
+        assert!(adapter.refresh_forbidden_zones(&state, &tx).unwrap());
+        assert_eq!(adapter.forbidden_zone_ack().generation, 7);
+        assert!(state.try_read().unwrap().map.data.iter().all(|value| *value == 0));
+        assert!(!adapter.refresh_forbidden_zones(&state, &tx).unwrap());
+        assert_eq!(rx.len(), 4, "only changed observations publish revisions");
+    }
+
+    #[test]
     fn forbidden_zone_refresh_changes_effective_map_but_preserves_raw_checkpoint() {
         let zone_path = std::env::temp_dir().join(format!(
             "nuwax-forbidden-zone-adapter-{}-{}.json",

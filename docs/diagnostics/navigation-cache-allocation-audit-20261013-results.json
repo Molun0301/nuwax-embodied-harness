@@ -1,0 +1,611 @@
+{
+  "source_head": "efe424c78458beef248e3b247258dd10cc820544",
+  "scope": "Cloud synthetic fixtures; source audit, selected-command attribution and rejected test-only direct-domain microbenchmark. Production algorithms unchanged. Sustained-worker RSS cause remains unresolved.",
+  "raw_evidence_root": "/workspace/scratch/71cdb9d17732/neh-evidence/navigation-domain-allocation-20261013",
+  "runtime_profile": {
+    "test": "route_moving_worker_tests::selected_guard_contact_domain_profile_5cm_10cm",
+    "exit_code": 0,
+    "wall_seconds": 14.86,
+    "samples": 216,
+    "accepted": 216,
+    "source_resolution_cm": [
+      5,
+      10
+    ],
+    "planning_resolution_cm": 10,
+    "domain_m": [
+      6,
+      3
+    ],
+    "source_rate_hz": 5,
+    "producer_dropped_frames": {
+      "5cm": 0,
+      "10cm": 0
+    },
+    "cases": [
+      "steady_0.1_mps",
+      "steady_0.3_mps",
+      "ramp_0.05_to_0.1_mps"
+    ],
+    "samples_per_case_per_phase": 12,
+    "phases": {
+      "new_source": "Genuine newly acquired observation owner, same static geometry",
+      "warm_same_pose": "Identical exact pose and source following new_source",
+      "moved_xy_yaw": "Same source, plus 0.005 m X and 0.01 rad yaw"
+    },
+    "source_age_completion_max_ms": 4.021381,
+    "interval": "Complete selected-command guard and local cleanup; excludes map installation, odometry update, route/ranking, physical actuation and source assembly",
+    "timing": "Inclusive wall-time stages, not thread CPU; nested stages must not be added as independent costs",
+    "payload_metric": "Cumulative requested initial dense-table payload: 33 bytes per base slot plus 1 per actually allocated visited-table slot; excludes allocator metadata, queues, output and cache contents; not peak/live/retained memory or RSS",
+    "profile": {
+      "opt_level": "3",
+      "debuginfo": 0,
+      "debug_assertions": false,
+      "overflow_checks": false,
+      "test": true
+    },
+    "features": [
+      "body-query-profile",
+      "default"
+    ],
+    "binary_sha256": "07edfd8c26a5a8f32ab5ed667cffe7ce40f9dd07229ae9e8ea62a899f9c84420",
+    "summary": [
+      {
+        "source_cm": 5,
+        "phase": "new_source",
+        "samples": 36,
+        "accepted": 36,
+        "dense_calls": 372,
+        "dense_calls_distribution": {
+          "median": 11.0,
+          "p95": 14,
+          "max": 14
+        },
+        "guard_ms_distribution": {
+          "median": 0.6274314999999999,
+          "p95": 0.92762,
+          "max": 1.021381
+        },
+        "domain_ms_distribution": {
+          "median": 0.2051395,
+          "p95": 0.320595,
+          "max": 0.391279
+        },
+        "guard_total_ms": 23.127143,
+        "domain_percent_of_guard": 33.75109930353265,
+        "stage_total_ms": {
+          "contact_domain_collection": 7.805665,
+          "contact_point_sort": 0.123011,
+          "contact_plane_fit": 0.34654,
+          "dense_band_cache_read": 0.72248,
+          "dense_band_selection_seed": 3.948989,
+          "dense_connectivity_bfs": 1.982417,
+          "dense_ordered_emission": 0.828024
+        },
+        "table_payload_total_bytes": 2535652,
+        "source_age_completion_max_ms": 2.789536,
+        "plane_hits": 1020,
+        "plane_misses": 372,
+        "domain_unattributed_ms": 0.32375500000000024,
+        "domain_unattributed_per_guard_us": 8.99319444444445
+      },
+      {
+        "source_cm": 5,
+        "phase": "warm_same_pose",
+        "samples": 36,
+        "accepted": 36,
+        "dense_calls": 0,
+        "dense_calls_distribution": {
+          "median": 0.0,
+          "p95": 0,
+          "max": 0
+        },
+        "guard_ms_distribution": {
+          "median": 0.048353,
+          "p95": 0.077768,
+          "max": 0.341285
+        },
+        "domain_ms_distribution": {
+          "median": 0.0,
+          "p95": 0.0,
+          "max": 0.0
+        },
+        "guard_total_ms": 2.027969,
+        "domain_percent_of_guard": 0.0,
+        "stage_total_ms": {
+          "contact_domain_collection": 0.0,
+          "contact_point_sort": 0.0,
+          "contact_plane_fit": 0.0,
+          "dense_band_cache_read": 0.0,
+          "dense_band_selection_seed": 0.0,
+          "dense_connectivity_bfs": 0.0,
+          "dense_ordered_emission": 0.0
+        },
+        "table_payload_total_bytes": 0,
+        "source_age_completion_max_ms": 3.061362,
+        "plane_hits": 1392,
+        "plane_misses": 0,
+        "domain_unattributed_ms": 0.0,
+        "domain_unattributed_per_guard_us": 0.0
+      },
+      {
+        "source_cm": 5,
+        "phase": "moved_xy_yaw",
+        "samples": 36,
+        "accepted": 36,
+        "dense_calls": 348,
+        "dense_calls_distribution": {
+          "median": 9.0,
+          "p95": 15,
+          "max": 15
+        },
+        "guard_ms_distribution": {
+          "median": 0.37012849999999997,
+          "p95": 0.633987,
+          "max": 0.720197
+        },
+        "domain_ms_distribution": {
+          "median": 0.08513899999999999,
+          "p95": 0.216586,
+          "max": 0.23161
+        },
+        "guard_total_ms": 13.836312,
+        "domain_percent_of_guard": 26.68166199201059,
+        "stage_total_ms": {
+          "contact_domain_collection": 3.691758,
+          "contact_point_sort": 0.102428,
+          "contact_plane_fit": 0.353603,
+          "dense_band_cache_read": 0.771741,
+          "dense_band_selection_seed": 0.403404,
+          "dense_connectivity_bfs": 1.817856,
+          "dense_ordered_emission": 0.471035
+        },
+        "table_payload_total_bytes": 2404276,
+        "source_age_completion_max_ms": 3.66022,
+        "plane_hits": 1044,
+        "plane_misses": 348,
+        "domain_unattributed_ms": 0.22772199999999998,
+        "domain_unattributed_per_guard_us": 6.325611111111111
+      },
+      {
+        "source_cm": 10,
+        "phase": "new_source",
+        "samples": 36,
+        "accepted": 36,
+        "dense_calls": 372,
+        "dense_calls_distribution": {
+          "median": 11.0,
+          "p95": 14,
+          "max": 14
+        },
+        "guard_ms_distribution": {
+          "median": 0.480831,
+          "p95": 0.835797,
+          "max": 1.772886
+        },
+        "domain_ms_distribution": {
+          "median": 0.1100515,
+          "p95": 0.353179,
+          "max": 0.356129
+        },
+        "guard_total_ms": 18.655329,
+        "domain_percent_of_guard": 25.984001675875028,
+        "stage_total_ms": {
+          "contact_domain_collection": 4.847401,
+          "contact_point_sort": 0.091285,
+          "contact_plane_fit": 0.224138,
+          "dense_band_cache_read": 0.478153,
+          "dense_band_selection_seed": 2.361994,
+          "dense_connectivity_bfs": 1.306537,
+          "dense_ordered_emission": 0.314792
+        },
+        "table_payload_total_bytes": 1269560,
+        "source_age_completion_max_ms": 2.988602,
+        "plane_hits": 1020,
+        "plane_misses": 372,
+        "domain_unattributed_ms": 0.3859249999999994,
+        "domain_unattributed_per_guard_us": 10.720138888888872
+      },
+      {
+        "source_cm": 10,
+        "phase": "warm_same_pose",
+        "samples": 36,
+        "accepted": 36,
+        "dense_calls": 0,
+        "dense_calls_distribution": {
+          "median": 0.0,
+          "p95": 0,
+          "max": 0
+        },
+        "guard_ms_distribution": {
+          "median": 0.03626,
+          "p95": 0.110927,
+          "max": 0.474426
+        },
+        "domain_ms_distribution": {
+          "median": 0.0,
+          "p95": 0.0,
+          "max": 0.0
+        },
+        "guard_total_ms": 2.0743,
+        "domain_percent_of_guard": 0.0,
+        "stage_total_ms": {
+          "contact_domain_collection": 0.0,
+          "contact_point_sort": 0.0,
+          "contact_plane_fit": 0.0,
+          "dense_band_cache_read": 0.0,
+          "dense_band_selection_seed": 0.0,
+          "dense_connectivity_bfs": 0.0,
+          "dense_ordered_emission": 0.0
+        },
+        "table_payload_total_bytes": 0,
+        "source_age_completion_max_ms": 3.341815,
+        "plane_hits": 1392,
+        "plane_misses": 0,
+        "domain_unattributed_ms": 0.0,
+        "domain_unattributed_per_guard_us": 0.0
+      },
+      {
+        "source_cm": 10,
+        "phase": "moved_xy_yaw",
+        "samples": 36,
+        "accepted": 36,
+        "dense_calls": 348,
+        "dense_calls_distribution": {
+          "median": 9.0,
+          "p95": 15,
+          "max": 15
+        },
+        "guard_ms_distribution": {
+          "median": 0.3164075,
+          "p95": 0.666266,
+          "max": 0.792917
+        },
+        "domain_ms_distribution": {
+          "median": 0.0500505,
+          "p95": 0.188014,
+          "max": 0.233304
+        },
+        "guard_total_ms": 11.677457,
+        "domain_percent_of_guard": 19.766829370469956,
+        "stage_total_ms": {
+          "contact_domain_collection": 2.308263,
+          "contact_point_sort": 0.036793,
+          "contact_plane_fit": 0.143784,
+          "dense_band_cache_read": 0.396033,
+          "dense_band_selection_seed": 0.212713,
+          "dense_connectivity_bfs": 1.134367,
+          "dense_ordered_emission": 0.266589
+        },
+        "table_payload_total_bytes": 1183200,
+        "source_age_completion_max_ms": 4.021381,
+        "plane_hits": 1044,
+        "plane_misses": 348,
+        "domain_unattributed_ms": 0.2985610000000003,
+        "domain_unattributed_per_guard_us": 8.29336111111112
+      }
+    ]
+  },
+  "sparse_pending_bands_experiment": {
+    "decision": "Rejected; temporary candidate module and declaration removed; production function never switched",
+    "test": "surface::body::pending_bands_probe::compare_pending_bands_allocation",
+    "exit_code": 0,
+    "wall_seconds": 1.13,
+    "query_pairs": 41472,
+    "exact_output_bit_mismatches": 0,
+    "exact_fitted_plane_bit_mismatches": 0,
+    "cases": 18,
+    "rounds_per_case": 9,
+    "pairs_per_round": 256,
+    "cpu_affinity": [
+      2
+    ],
+    "timing": "Alternating baseline/candidate order per pair; direct domain kernel only, excluding owner construction, bit comparison, plane fitting and result retirement by caller; no body-query-profile feature",
+    "reason": "No stable common single-band gain; warmed dense multilayer median candidate/baseline ratios regress approximately 7.6-13.1%. Do not extrapolate exact deployment costs from this microbenchmark.",
+    "profile": {
+      "opt_level": "3",
+      "debuginfo": 0,
+      "debug_assertions": false,
+      "overflow_checks": false,
+      "test": true
+    },
+    "features": [
+      "default"
+    ],
+    "binary_sha256": "0c581e020307857b690676fbdcf872151bb57d134f49a7b42f50cb2f2a054635",
+    "summary": [
+      {
+        "source_cm": 5,
+        "scene": "single_band",
+        "mode": "new_owner",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 0.9884035418359215,
+        "min_ratio": 0.9530802197883598,
+        "max_ratio": 1.0341114071243704,
+        "baseline_per_call_median_us": 32.176109375,
+        "candidate_per_call_median_us": 31.83586328125
+      },
+      {
+        "source_cm": 5,
+        "scene": "single_band",
+        "mode": "warm_same",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 0.9969731067784245,
+        "min_ratio": 0.8041803741021771,
+        "max_ratio": 1.0467235397383392,
+        "baseline_per_call_median_us": 6.7796875,
+        "candidate_per_call_median_us": 6.58874609375
+      },
+      {
+        "source_cm": 5,
+        "scene": "single_band",
+        "mode": "warm_moved",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 1.0007125667115215,
+        "min_ratio": 0.9577028903799952,
+        "max_ratio": 1.1371923435169824,
+        "baseline_per_call_median_us": 6.94860546875,
+        "candidate_per_call_median_us": 7.0756484375
+      },
+      {
+        "source_cm": 5,
+        "scene": "empty_columns",
+        "mode": "new_owner",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 0.9904879905488155,
+        "min_ratio": 0.977277198034888,
+        "max_ratio": 1.0881790153635174,
+        "baseline_per_call_median_us": 27.12584765625,
+        "candidate_per_call_median_us": 27.4113515625
+      },
+      {
+        "source_cm": 5,
+        "scene": "empty_columns",
+        "mode": "warm_same",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 1.0294223458449425,
+        "min_ratio": 0.9181755705323884,
+        "max_ratio": 1.1092274063959486,
+        "baseline_per_call_median_us": 5.19599609375,
+        "candidate_per_call_median_us": 5.34913671875
+      },
+      {
+        "source_cm": 5,
+        "scene": "empty_columns",
+        "mode": "warm_moved",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 0.9876081087954547,
+        "min_ratio": 0.9167821118509251,
+        "max_ratio": 1.1936231426440882,
+        "baseline_per_call_median_us": 5.7444296875,
+        "candidate_per_call_median_us": 5.70513671875
+      },
+      {
+        "source_cm": 5,
+        "scene": "multi_band",
+        "mode": "new_owner",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 0.9757122924705379,
+        "min_ratio": 0.7586176737064748,
+        "max_ratio": 1.0579884804040878,
+        "baseline_per_call_median_us": 43.7730859375,
+        "candidate_per_call_median_us": 43.2381796875
+      },
+      {
+        "source_cm": 5,
+        "scene": "multi_band",
+        "mode": "warm_same",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 1.1162756360489103,
+        "min_ratio": 1.0526350404373133,
+        "max_ratio": 1.143175176331322,
+        "baseline_per_call_median_us": 7.5595703125,
+        "candidate_per_call_median_us": 8.185
+      },
+      {
+        "source_cm": 5,
+        "scene": "multi_band",
+        "mode": "warm_moved",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 1.0758924086741763,
+        "min_ratio": 1.0000782609722867,
+        "max_ratio": 1.3245675424814183,
+        "baseline_per_call_median_us": 7.9361875,
+        "candidate_per_call_median_us": 8.43383203125
+      },
+      {
+        "source_cm": 10,
+        "scene": "single_band",
+        "mode": "new_owner",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 0.9836601298470888,
+        "min_ratio": 0.9199171187840641,
+        "max_ratio": 1.093947687175573,
+        "baseline_per_call_median_us": 15.472859375,
+        "candidate_per_call_median_us": 15.23279296875
+      },
+      {
+        "source_cm": 10,
+        "scene": "single_band",
+        "mode": "warm_same",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 1.0498933429025683,
+        "min_ratio": 0.9829622646578844,
+        "max_ratio": 1.222894271149732,
+        "baseline_per_call_median_us": 3.2536796875,
+        "candidate_per_call_median_us": 3.54648046875
+      },
+      {
+        "source_cm": 10,
+        "scene": "single_band",
+        "mode": "warm_moved",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 1.033762466451377,
+        "min_ratio": 0.8613327439711265,
+        "max_ratio": 1.374356019273445,
+        "baseline_per_call_median_us": 3.421234375,
+        "candidate_per_call_median_us": 3.47865234375
+      },
+      {
+        "source_cm": 10,
+        "scene": "empty_columns",
+        "mode": "new_owner",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 0.9851848272470484,
+        "min_ratio": 0.9559844824685659,
+        "max_ratio": 1.021178750613979,
+        "baseline_per_call_median_us": 12.7702890625,
+        "candidate_per_call_median_us": 12.54990625
+      },
+      {
+        "source_cm": 10,
+        "scene": "empty_columns",
+        "mode": "warm_same",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 0.965413842678168,
+        "min_ratio": 0.8499886006161282,
+        "max_ratio": 1.089109647654128,
+        "baseline_per_call_median_us": 2.8544140625,
+        "candidate_per_call_median_us": 2.81736328125
+      },
+      {
+        "source_cm": 10,
+        "scene": "empty_columns",
+        "mode": "warm_moved",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 1.0695045530140779,
+        "min_ratio": 0.890357897395186,
+        "max_ratio": 1.1805878099849962,
+        "baseline_per_call_median_us": 2.80397265625,
+        "candidate_per_call_median_us": 2.96473046875
+      },
+      {
+        "source_cm": 10,
+        "scene": "multi_band",
+        "mode": "new_owner",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 0.9939100417749056,
+        "min_ratio": 0.8149538197946036,
+        "max_ratio": 1.3913008794543709,
+        "baseline_per_call_median_us": 20.56628515625,
+        "candidate_per_call_median_us": 20.5993828125
+      },
+      {
+        "source_cm": 10,
+        "scene": "multi_band",
+        "mode": "warm_same",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 1.1311173057770236,
+        "min_ratio": 1.0176351562199624,
+        "max_ratio": 1.2006040632482475,
+        "baseline_per_call_median_us": 3.782625,
+        "candidate_per_call_median_us": 4.27546875
+      },
+      {
+        "source_cm": 10,
+        "scene": "multi_band",
+        "mode": "warm_moved",
+        "rounds": 9,
+        "calls": 2304,
+        "median_ratio": 1.1308550209551471,
+        "min_ratio": 0.9934582156316313,
+        "max_ratio": 1.1993458248079412,
+        "baseline_per_call_median_us": 3.70330859375,
+        "candidate_per_call_median_us": 4.20044921875
+      }
+    ]
+  },
+  "fine_band_batch_bounds": [
+    {
+      "source_cm": 5,
+      "planning_size_f32": 0.10000000149011612,
+      "source_size_f32": 0.05000000074505806,
+      "coarse_x_range": [
+        0,
+        59
+      ],
+      "coarse_y_range": [
+        0,
+        29
+      ],
+      "max_enumerated_fine_columns_before_polygon_filter": 4,
+      "threshold_preinsert": 8192,
+      "max_after_extend_for_this_batch_bound": 8195,
+      "basis": "source-derived enumeration bound; no actual cache occupancy instrumented"
+    },
+    {
+      "source_cm": 10,
+      "planning_size_f32": 0.10000000149011612,
+      "source_size_f32": 0.10000000149011612,
+      "coarse_x_range": [
+        0,
+        59
+      ],
+      "coarse_y_range": [
+        0,
+        29
+      ],
+      "max_enumerated_fine_columns_before_polygon_filter": 1,
+      "threshold_preinsert": 8192,
+      "max_after_extend_for_this_batch_bound": 8192,
+      "basis": "source-derived enumeration bound; no actual cache occupancy instrumented"
+    }
+  ],
+  "historical_moving_profile": {
+    "source": "sustained-nav-20261013/existing-held-continuity.log",
+    "source_resolution_cm": 5,
+    "inner_steps": 886,
+    "steps_with_dense_calls": 840,
+    "dense_calls": 5043,
+    "contact_domain_total_ms": 104.054067,
+    "cumulative_dense_table_payload_bytes": 34397188,
+    "first_after_view_change": {
+      "steps": 222,
+      "dense_calls": 1326,
+      "contact_domain_total_ms": 43.785481
+    },
+    "scope": "Historical continuity-only run; not full-goal completion and not evidence of the RSS cause"
+  },
+  "rss_interpretation": "The separate five-minute arms retain roughly 2.0/2.4 MiB higher late-window RSS means with fluctuating samples. This audit neither proves a production leak nor explains that difference.",
+  "source_chronology": {
+    "assignment": "4d2726c",
+    "first_observed": "5df79d2",
+    "recorded_measurement_baseline": "efe424c78458beef248e3b247258dd10cc820544",
+    "relationship": "Measured baseline descends from assignment commit; intervening Geometry-server/documentation changes do not change navigation files"
+  },
+  "audit_deviation": {
+    "description": "Two manual binary SHA-256 provenance computations occurred despite the user instruction prohibiting manual hashes. These were audit commands, not production behavior. This investigation did not fully comply with that instruction.",
+    "events": [
+      {
+        "approximate_utc": "2026-10-13T21:18:00Z",
+        "input": "profile-test",
+        "preserved_record": "binary-sha256.txt"
+      },
+      {
+        "approximate_utc": "2026-10-13T21:21:00Z",
+        "input": "pending-test",
+        "preserved_record": "pending-sha256.txt"
+      }
+    ],
+    "records_preserved": true,
+    "recalculated": false,
+    "future_constraint": "No manual/content hash computations for files, binaries, provenance or benchmarks. Existing Git object IDs suffice for source identification."
+  }
+}

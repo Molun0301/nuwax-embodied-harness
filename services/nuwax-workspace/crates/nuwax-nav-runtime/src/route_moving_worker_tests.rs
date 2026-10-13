@@ -1289,3 +1289,50 @@ fn validate_motion_history(receipts:&[RawReceipt],segments:&[RawSegment],resolut
 
 #[path="route_sustained_worker_tests.rs"]
 mod sustained_worker;
+// Independent synthetic selected-command fixtures; no applied-motion claim.
+#[cfg(feature="body-query-profile")]
+#[test]
+#[ignore="serial source-owner and exact-pose allocation attribution"]
+fn selected_guard_contact_domain_profile_5cm_10cm() {
+    for resolution in [0.05_f32,0.1_f32] {
+        let (config,base,keys)=fixture(false,resolution,6.0);
+        let sensor=Sensor::new(base,keys);
+        let first=sensor.receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut previous=first.map;let mut previous_stamp=first.sample_ns;
+        let mut follower=SurfaceFollower::new(config).unwrap();
+        for (case,before,candidate) in [("steady_01",0.1,0.1),("steady_03",0.3,0.3),("ramp_005_01",0.05,0.1)] {
+            for sample in 0..12 {
+                let frame=sensor.receive.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(frame.sample_ns>previous_stamp);
+                assert!(nuwax_nav_pct::same_source_geometry(&previous,&frame.map));
+                assert!(!previous.same_body_query_view(&frame.map));
+                previous=frame.map.clone();previous_stamp=frame.sample_ns;
+                for (phase,dx,yaw) in [("new_source",0.0,0.0),("warm_same_pose",0.0,0.0),("moved_xy_yaw",0.005,0.01)] {
+                    if phase=="new_source" {follower.update_execution_map(ExecutionMap::Surface(frame.map.clone())).unwrap();}
+                    follower.update_odometry(pose(0.75+sample as f64*0.001+dx,1.5,yaw));
+                    follower.observe_applied_command(Twist2{linear:nuwax_nav_types_messages::Point2::new(before,0.0),angular_z:0.0});
+                    let entry=unix_ns();assert!(entry>=frame.sample_ns);
+                    body_query_profile::begin();
+                    let start=Instant::now();
+                    let accepted=follower.check_selected_candidate_for_test(Twist2{linear:nuwax_nav_types_messages::Point2::new(candidate,0.0),angular_z:0.0});
+                    let elapsed=start.elapsed();
+                    let record=body_query_profile::end();
+                    let end=unix_ns();
+                    eprintln!("DOMAIN_SAMPLE source_cm={} case={case} sample={sample} phase={phase} accepted={accepted} guard_ns={} source_entry_age_ns={} source_completion_age_ns={} dense_calls={} plane_hits={} plane_misses={} allocated_slots={} visited_slots={} table_payload_bytes={}",
+                        resolution*100.0,elapsed.as_nanos(),entry-frame.sample_ns,end-frame.sample_ns,
+                        record.counters[BodyCounter::DenseDomainCalls as usize],record.counters[BodyCounter::PlaneCacheHits as usize],
+                        record.counters[BodyCounter::PlaneCacheMisses as usize],record.counters[BodyCounter::DenseAllocatedSlots as usize],
+                        record.counters[BodyCounter::DenseVisitedTableSlots as usize],dense_initial_table_payload_bytes(&record));
+                    for stage in BodyStage::ALL {
+                        eprintln!("DOMAIN_STAGE source_cm={} case={case} sample={sample} phase={phase} stage={} calls={} ns={}",
+                            resolution*100.0,stage.label(),record.calls[stage as usize],record.wall_nanos[stage as usize]);
+                    }
+                    assert!(accepted,"no retry or zero substitution");
+                    assert!(end-frame.sample_ns<=1_000_000_000,"actual source health age exceeded");
+                }
+            }
+        }
+        eprintln!("DOMAIN_SOURCE source_cm={} dropped={}",resolution*100.0,sensor.dropped.load(Ordering::Relaxed));
+        drop(sensor);
+    }
+}

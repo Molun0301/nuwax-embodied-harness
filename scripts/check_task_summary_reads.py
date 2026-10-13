@@ -297,6 +297,81 @@ class TaskSummaryReads(unittest.TestCase):
         positive = GatewayRuntime._handle_get_active_tasks(self.runtime, {"history_limit": 2})
         self.assertEqual([status.task_id for status in positive["history_tasks"]], ids[-2:])
 
+    def test_active_scalar_queries_match_all_states_and_quarantine(self):
+        active_ids = []
+        for state in TaskState:
+            task_id = self.record(state, event=False)
+            self.manager._records[task_id].resource_quarantined = True
+            if state in (TaskState.ACCEPTED, TaskState.RUNNING):
+                active_ids.append(task_id)
+        expected = self.manager.list_active_tasks()
+        with patch.object(task_module, "deepcopy", side_effect=AssertionError("scalar query copied statuses")):
+            with patch.object(task_module, "_copy_task_value", side_effect=AssertionError("scalar query copied payload")):
+                self.assertEqual(self.manager.count_active_tasks(), len(expected))
+                self.assertTrue(self.manager.has_active_tasks())
+        self.assertEqual([status.task_id for status in self.manager.list_active_tasks()], active_ids)
+        self.assertEqual(len(self.manager.list_quarantined_tasks()), len(TaskState))
+        expected[0].message = "caller edit"
+        self.assertEqual(self.manager.get_task_status(active_ids[0]).message, "Synthetic status")
+
+    def test_active_scalar_queries_are_locked_and_boolean_short_circuits(self):
+        self.record(TaskState.RUNNING, event=False)
+        self.record(event=False)
+        manager = self.manager
+        class CountedRecords(dict):
+            visits = 0
+            def values(self):
+                for record in super().values():
+                    assert manager._lock._is_owned(), "scalar selection must hold the task lock"
+                    self.visits += 1
+                    yield record
+        records = CountedRecords(manager._records)
+        manager._records = records
+        self.assertTrue(manager.has_active_tasks())
+        self.assertEqual(records.visits, 1)
+        records.visits = 0
+        self.assertEqual(manager.count_active_tasks(), 1)
+        self.assertEqual(records.visits, 2)
+
+    def test_active_scalar_queries_follow_real_transitions_and_terminal_quarantine(self):
+        task_id = self.record(TaskState.ACCEPTED, event=False)
+        self.assertEqual(self.manager.count_active_tasks(), 1)
+        self.manager._set_running(task_id)
+        self.assertTrue(self.manager.has_active_tasks())
+        self.manager._set_terminal_state(task_id, TaskState.CANCELLED, "Synthetic cancellation",
+                                         release_resources=False)
+        self.manager._records[task_id].resource_quarantined = True
+        self.assertEqual(self.manager.count_active_tasks(), 0)
+        self.assertFalse(self.manager.has_active_tasks())
+        self.assertEqual([status.task_id for status in self.manager.list_quarantined_tasks()], [task_id])
+        self.assertEqual(self.manager.list_active_tasks(), ())
+        self.assertEqual(self.manager.capture_task_list(history_limit=0)["active_tasks"], [])
+
+    def test_active_scalar_queries_observe_locked_transition(self):
+        task_id = self.record(TaskState.ACCEPTED, event=False)
+        started, done = threading.Event(), threading.Event()
+        results, errors = [], []
+        def read():
+            started.set()
+            try:
+                results.append((self.manager.count_active_tasks(), self.manager.has_active_tasks()))
+            except BaseException as error:  # noqa: BLE001 - Forward test-thread failures.
+                errors.append(error)
+            finally:
+                done.set()
+        reader = threading.Thread(target=read, name="active-scalar-reader")
+        try:
+            with self.manager._lock:
+                reader.start()
+                self.assertTrue(started.wait(2))
+                self.assertFalse(done.wait(0.02))
+                self.manager._set_terminal_state(task_id, TaskState.SUCCEEDED, "Synthetic completion")
+        finally:
+            reader.join(2)
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [(0, False)])
+
     def test_active_filter_still_checks_current_records_under_lock(self):
         active = self.record(TaskState.RUNNING, event=False)
         self.record(event=False)

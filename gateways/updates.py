@@ -146,7 +146,7 @@ class UpdateService:
             return self.status()
 
     def require_idle(self):
-        if self.runtime.task_manager.list_active_tasks():
+        if self.runtime.task_manager.has_active_tasks():
             raise RuntimeError("有任务正在运行，请先完成或取消任务")
         health = self.runtime.get_health_summary()
         robot = health.get("latest_robot_snapshot")

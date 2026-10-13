@@ -148,7 +148,7 @@ class ServiceTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.robot = None
         self.runtime = SimpleNamespace(
-            task_manager=SimpleNamespace(list_active_tasks=list),
+            task_manager=SimpleNamespace(has_active_tasks=lambda: False),
             config=SimpleNamespace(robot=SimpleNamespace(active_robot="customrobot")),
             robot=SimpleNamespace(has_motion_actuator=lambda: None),
             get_health_summary=lambda: {"latest_robot_snapshot": self.robot},
@@ -197,7 +197,7 @@ class ServiceTests(unittest.TestCase):
         )
 
     def test_tasks_block_install(self):
-        self.runtime.task_manager.list_active_tasks = lambda: [{"task_id": "active"}]
+        self.runtime.task_manager.has_active_tasks = lambda: True
         with self.assertRaisesRegex(RuntimeError, "任务"):
             self.service.require_idle()
 

@@ -49,7 +49,7 @@ class Health(unittest.TestCase):
             _started=True,
             _serialize=lambda x: x,
             audio_service=AudioService(config=NS(), robot=robot),
-            task_manager=NS(list_active_tasks=list),
+            task_manager=NS(count_active_tasks=lambda: 0),
             event_bus=NS(latest_cursor=lambda: 0),
             stream_bus=NS(latest_cursor=lambda: 0, status=dict),
             artifact_store=NS(base_dir="test-owned"),

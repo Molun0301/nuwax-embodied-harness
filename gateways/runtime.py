@@ -4937,7 +4937,7 @@ class GatewayRuntime:
             "perception_runtime": self._health_perception_summary(perception_runtime),
             "active_map_workspace": self._health_workspace_summary(active_workspace),
             "audio_state": self.audio_service.get_cached_volume_state(),
-            "active_task_count": len(self.task_manager.list_active_tasks()),
+            "active_task_count": self.task_manager.count_active_tasks(),
             "latest_event_cursor": self.event_bus.latest_cursor(),
             "latest_stream_cursor": self.stream_bus.latest_cursor(),
             "artifact_dir": str(self.artifact_store.base_dir),
@@ -5438,7 +5438,7 @@ class GatewayRuntime:
             )
         )
 
-        active_task_count = len(self.task_manager.list_active_tasks())
+        active_task_count = self.task_manager.count_active_tasks()
         entries.append(
             self._make_service_health_entry(
                 service_id="task_manager",

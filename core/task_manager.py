@@ -963,6 +963,20 @@ class TaskManager:
         self._dispatch_task_event(event)
         return True
 
+    def count_active_tasks(self) -> int:
+        """读取活动任务数量，不复制公开状态快照。"""
+
+        with self._lock:
+            return sum(1 for record in self._records.values()
+                       if record.status.state not in _TERMINAL_STATES)
+
+    def has_active_tasks(self) -> bool:
+        """检查是否存在活动任务，找到首个后即停止。"""
+
+        with self._lock:
+            return any(record.status.state not in _TERMINAL_STATES
+                       for record in self._records.values())
+
     def list_active_tasks(self) -> Tuple[TaskStatus, ...]:
         """列出活动任务。"""
 

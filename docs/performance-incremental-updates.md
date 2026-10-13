@@ -359,3 +359,9 @@ tests::server_deadline_renewal_keeps_legal_slow_commands_alive
 ```
 
 这五项本轮没有重试，不能称 Runtime 无过滤全通过；49 ignored 未计入通过数。各次构建 JSON、二进制 provenance、完整命令、单场景日志及退出码均已保留。本轮未重跑 geometry 生产二进制、完整原生验收或整 workspace。以上也不替代长时 soak、实机传感器/执行器闭环、实机 CPU/内存、硬实时与控制延迟验收。
+
+### 五项 UDS 限制的独立环境核对（2026-10-13）
+
+在云端工作区自有临时目录执行最小 Python `AF_UNIX/SOCK_STREAM` 探针，默认执行与正常 `require_escalated` 审核执行均在创建 socket 本身时返回 **`PermissionError: [Errno 1] Operation not permitted`**，尚未进入 bind、listen 或 socket 路径访问。后者并非审核拒绝，而是获执行后的相同系统权限错误；正常提权执行方式没有解除限制。
+
+既有五项 Runtime 日志均在 `UnixListener::bind` 测试 fixture 初始化时失败（`lib.rs` 的 guard/priority guard/renew-slow-commands 入口），错误同为 `Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }`。独立 socket 原语也失败，说明这些已观察到的初始化失败具有环境限制证据；不能据此证明环境允许后五项一定通过。未再次运行这五项、未改变网络/安全设置或权限、未使用其他路线规避限制。五项仍保留为未通过的环境阻塞，等待真正支持 Unix socket 的授权执行环境按原二进制和断言复验。

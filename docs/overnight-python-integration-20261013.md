@@ -1,6 +1,10 @@
 # Overnight Python integration — 2026-10-13
 
-## Latest canonical-contract verification
+## Latest Python 3.8 StrEnum cross-stack verification
+
+Exact production commit `bb1a14ffb24a91aeda1811a2b7332544df757bee` (verified before and after execution): **652 passed, 0 failed, 1 deselected, 1 existing httpx warning in 52.07 seconds**, using Python 3.8.10. This reruns the canonical 609-test slice after the shared StrEnum fallback correction, plus 43 non-overlapping memory summary/ownership/service tests. No production or test-fixture changes were needed during this verification. This is a bounded offline suite pass, not full deployment or robot qualification. Earlier results remain below for traceability.
+
+## Earlier canonical-contract verification
 
 On baseline `c1d251f`, with the approved test-only canonical-contract alignments below and unchanged production code, the repeated combined suite plus `tests/test_dense_legacy_epoch.py` reports **609 passed, 0 failed, 1 deselected, 1 warning in 41.03 seconds**. This is a bounded offline suite pass, not full deployment or robot qualification. The earlier 593/5/1 result remains recorded below for traceability.
 
@@ -98,3 +102,27 @@ PYTHONPATH="$PWD/scripts:$PWD" OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python -
 Result: **63 passed in 1.90 seconds**. Then repeat the full command above, adding `tests/test_dense_legacy_epoch.py` before `-k 'not abrupt'`: **609 passed, 1 deselected, 1 warning in 41.03 seconds**. The count increase from 598 executed cases to 609 is nine legacy-epoch cases plus two newly split rejection tests; no earlier run counts are summed. All five initial failures are resolved by canonical test expectations, with no production edits. The abrupt-fork exclusion and all other scope limits remain.
 
 Workspace evidence: `canonical-focused.log` and `canonical-combined.log` in the same evidence directory. `git diff --check` passes for these changes.
+
+
+## Shared StrEnum compatibility cross-stack rerun
+
+The compatibility change on `bb1a14ffb24a91aeda1811a2b7332544df757bee` sets the Python <3.11 fallback's `__str__` to `str.__str__`. The checkout was clean before the run, and HEAD remained exactly this commit afterward. No test expectations were changed for this rerun.
+
+Reproduce with the complete combined command in this document, retaining `tests/test_dense_legacy_epoch.py` from the canonical rerun and adding these three targets before `-k 'not abrupt'`:
+
+```sh
+scripts/check_memory_summary_projection.py \
+scripts/check_memory_snapshot_payload_ownership.py \
+scripts/check_memory_service_regressions.py
+```
+
+The existing combined command already contains `scripts/check_memory_durable_integration.py`. The four-module memory group has 64 cases, of which its 21 durable-integration cases overlap the canonical selection. They are executed once: **609 + (64 - 21) = 652 passed**, with no double-counting. Existing hashing sentinels remain enabled; no source fingerprints or custom hash calculations were introduced.
+
+A separate rerun of the workspace `check_cross_boundary.py` probe also passed: a real task's idle/running/succeeded states agree across health, HTTP and capability views, and the updater refuses active work. This probe is not added to the pytest count. No new production regression was observed in the selected paths after the shared enum change.
+
+Evidence in `../neh-evidence/overnight-python-integration-20261013/`:
+
+- `bb1a14f-crossstack.log`: 652 passed, 1 deselected, 1 warning, 52.07 seconds
+- `bb1a14f-cross-boundary.log`: task lifecycle cross-boundary probe passed
+
+The one deselected abrupt-fork test, real UDS, hardware/models, live gateway and full deployment limits remain unchanged. The httpx raw-content deprecation warning is unchanged. Earlier static guardrail results were not rerun or relabeled as new results in this pass.

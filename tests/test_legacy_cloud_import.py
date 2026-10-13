@@ -267,7 +267,7 @@ class LegacyCloudImportTests(unittest.TestCase):
         no_fine = replace(stored, checkpoint=replace(stored.checkpoint, fine_archive=None))
         with self.assertRaises(ValueError):
             store.assign_legacy_cloud_checkpoint(no_fine, **kwargs)
-        for changed in (fine_archive(1), fine_archive(domain_update={'generation': 4})):
+        for changed in (fine_archive(domain_update={'generation': 4}),):
             with self.assertRaises(ValueError):
                 store.assign_legacy_cloud_checkpoint(
                     replace(stored, checkpoint=replace(stored.checkpoint, fine_archive=changed)), **kwargs)

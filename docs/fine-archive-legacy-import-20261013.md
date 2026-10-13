@@ -1,5 +1,12 @@
 # Assigned import of legacy-envelope fine archives — 2026-10-13
 
+## Stage boundary
+
+This document records the qualified AR2/AR3 stage. The subsequent capability-fenced
+AR1 extension and its separate evidence are in
+[AR1 paired implementation](ar1-assigned-import-proposal-20261013.md).
+Statements below about AR1 fallback and unchanged protocol describe this stage.
+
 ## Implemented scope
 
 Explicit saved-cloud activation can now import a schema-1 checkpoint containing

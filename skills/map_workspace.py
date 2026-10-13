@@ -301,11 +301,19 @@ class MapWorkspaceService:
             return None
         from skills.assigned_map_save import catalog_owner, reconcile_assigned_current
         captured = catalog_owner(self, asset)
+        runtime = getattr(self, "_geometry_runtime", None)
+        capture = getattr(runtime, "capture_assigned_fine_import_origin", None)
+        origin = capture() if callable(capture) else None
         loaded = self._asset_repository.import_legacy_cloud_bundle(map_name,
-            catalog_created_at=asset.created_at.isoformat(), map_directory_owner=captured[:2])
+            catalog_created_at=asset.created_at.isoformat(), map_directory_owner=captured[:2],
+            allow_ar1_source=origin is not None)
         if loaded is None:
             return None
-        reconcile_assigned_current(self, asset, loaded.bundle, captured=captured, confirm_durable=True)
+        fine = loaded.stored_checkpoint.checkpoint.fine_archive
+        adoption_guard = (runtime.assigned_fine_import_origin_guard(origin)
+            if fine is not None and fine[:8] == b"NUWAXAR1" else None)
+        reconcile_assigned_current(self, asset, loaded.bundle, captured=captured,
+            confirm_durable=True, adoption_guard=adoption_guard)
         return loaded
 
     @_serialized_map_activation_execution

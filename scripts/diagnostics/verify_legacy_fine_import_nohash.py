@@ -23,7 +23,9 @@ def main():
             guard.enter_context(patch.object(module, 'payload_digest',
                 side_effect=AssertionError('payload digest prohibited')))
         suite = unittest.defaultTestLoader.loadTestsFromNames([
-            'test_legacy_cloud_import', 'test_checkpoint_identity_v2', 'test_fine_archive_vector'])
+            'test_legacy_cloud_import', 'test_checkpoint_identity_v2', 'test_fine_archive_vector',
+            'test_assigned_ar1_import', 'test_assigned_activation_loader',
+            'test_planar_asset_catalog', 'test_planar_catalog_evidence', 'test_planar_workspace_load'])
         result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 

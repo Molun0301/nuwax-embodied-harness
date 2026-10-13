@@ -114,7 +114,8 @@ impl Store {
             }
             b"NUWAXAR1" | b"NUWAXAR2" | b"NUWAXAR3" => {
                 if matches!(&magic, b"NUWAXAR2" | b"NUWAXAR3") && r.identity_schema_version != 2 { return Err("AR2/AR3需要新制品身份".into()); }
-                if &magic == b"NUWAXAR1" && r.identity_schema_version == 2 { return Err("v2 fine member requires an AR2 or AR3 archive".into()); }
+                // Assigned outer ownership may retain AR1 source bytes. The
+                // real installation commit, not import, establishes its new baseline.
                 let mut fine = nuwax_map_chunks::ArchiveReader::open(file)?;
                 let (domain, revision, timestamp, keys) = match fine.root() {
                     nuwax_map_chunks::ArchivedRoot::Current(root) => (&root.domain, root.revision, root.source_timestamp_ns, root.blocks.iter().map(|b| b.key).collect::<Vec<_>>()),
@@ -330,14 +331,14 @@ mod assigned_identity_tests {
         let r=reference(bytes.len()as u64,CheckpointMemberRole::FineMap);let mut store=Store::default();request(&mut store,&r,1,0,&[]).unwrap();request(&mut store,&r,2,0,&bytes).unwrap();assert!(request(&mut store,&r,3,0,&[]).is_err());
     }
     #[test]
-    fn assigned_v2_store_rejects_ar1_wrapping_without_reinterpreting_legacy_aliases() {
+    fn assigned_v2_store_accepts_ar1_source_without_reinterpreting_legacy_aliases() {
         crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
         let root=nuwax_map_chunks::LegacyManifest{version:1,domain:nuwax_map_chunks::Domain{session:"source".into(),generation:2,frame_generation:4,producer_generation:6},revision:9,source_timestamp_ns:100,voxel_size_m:0.05,
             blocks:vec![nuwax_map_chunks::LegacyBlockRef{key:[0;3],sha256:nuwax_map_chunks::LegacyAlias([7;32]),geometry_sha256:nuwax_map_chunks::LegacyAlias([8;32]),points:1}]};
         let json=serde_json::to_vec(&root).unwrap();let block=nuwax_map_chunks::encode_block(&nuwax_map_chunks::Block::from([(0,nuwax_map_chunks::Evidence{observed_ns:100,hits:1})])).unwrap();
         let mut bytes=b"NUWAXAR1".to_vec();bytes.extend_from_slice(&(json.len()as u64).to_le_bytes());bytes.extend_from_slice(&[9;32]);bytes.extend_from_slice(&json);bytes.extend_from_slice(&1_u64.to_le_bytes());bytes.extend_from_slice(&(block.len()as u32).to_le_bytes());bytes.extend_from_slice(&block);
         assert!(matches!(nuwax_map_chunks::ArchiveReader::open(std::io::Cursor::new(&bytes)).unwrap().root(),nuwax_map_chunks::ArchivedRoot::Legacy(_)));
-        let r=reference(bytes.len()as u64,CheckpointMemberRole::FineMap);let mut store=Store::default();request(&mut store,&r,1,0,&[]).unwrap();request(&mut store,&r,2,0,&bytes).unwrap();assert!(request(&mut store,&r,3,0,&[]).unwrap_err().contains("requires an AR2"));
+        let r=reference(bytes.len()as u64,CheckpointMemberRole::FineMap);let mut store=Store::default();request(&mut store,&r,1,0,&[]).unwrap();request(&mut store,&r,2,0,&bytes).unwrap();assert!(request(&mut store,&r,3,0,&[]).unwrap().sealed);assert_eq!(request(&mut store,&r,4,0,&[]).unwrap().data,bytes);
     }
     #[test]
     fn assigned_v2_store_owned_insert_and_retirement() {

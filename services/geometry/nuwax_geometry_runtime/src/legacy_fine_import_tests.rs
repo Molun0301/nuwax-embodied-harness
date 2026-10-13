@@ -1,5 +1,5 @@
 //! Actual Python schema-1 import outputs, admitted through the existing v2 store.
-//! This synchronous slice intentionally does not claim activation/publication coverage.
+//! Includes AR1 cloud-writer installation and next commit; no end-to-end RPC activation claim.
 use super::*;
 
 struct NoHash {
@@ -27,8 +27,14 @@ struct Fixture {
     dense: Option<&'static [u8]>,
     backend: MappingBackendKind,
 }
-fn fixtures() -> [Fixture; 2] {
+fn fixtures() -> [Fixture; 3] {
     [
+        Fixture {
+            request: include_bytes!("../tests/fixtures/legacy_fine_import/ar1_voxel.request.pb"),
+            fine: include_bytes!("../tests/fixtures/legacy_fine_import/ar1_voxel.fine.archive"),
+            dense: None,
+            backend: MappingBackendKind::Voxel,
+        },
         Fixture {
             request: include_bytes!("../tests/fixtures/legacy_fine_import/ar2_voxel.request.pb"),
             fine: include_bytes!("../tests/fixtures/legacy_fine_import/ar2_voxel.fine.archive"),
@@ -117,6 +123,9 @@ fn python_legacy_fine_import_admits_exact_bytes_and_replays_after_release_withou
             &interner,
         )
         .unwrap();
+        if fixture.fine.starts_with(b"NUWAXAR1") {
+            install_ar1_and_commit(&admitted);
+        }
         let fine_owner = admitted.checkpoint().fine_map().unwrap();
         assert_eq!(fine_owner.reference(), &fine_reference);
         let mut retained = vec![0; fixture.fine.len()];
@@ -190,4 +199,142 @@ fn python_legacy_fine_import_rejects_wrong_source_and_truncated_archives_without
         .is_err());
         assert!(store.open(&truncated).is_err());
     }
+}
+
+// Follow the production preparation/install APIs with the actual admitted owner.
+// The occupancy input is synthetic; MappingCommitClock and cloud publication are real.
+fn install_ar1_and_commit(admitted: &ValidatedActivationRequestV2) {
+    use std::os::fd::AsRawFd;
+    let owner = admitted.checkpoint();
+    let fine = owner.fine_map().unwrap();
+    let file = std::fs::File::open(format!("/proc/self/fd/{}", fine.file().as_raw_fd())).unwrap();
+    let source = owner.occupancy_receipt();
+    let old_cloud = owner.cloud_receipt();
+    let prepared = crate::pointcloud::prepare_fine_cloud_archive(
+        file,
+        &source.session_id,
+        source.session_generation,
+        old_cloud.cloud_revision,
+        old_cloud.source_timestamp_ns,
+    )
+    .unwrap();
+    let mut writer = crate::pointcloud::CloudMapShmWriter::new_private_for_test().unwrap();
+    let member = fine.reference().member_identity.as_ref().unwrap();
+    writer
+        .bind_fine_map_owner(member.frame_generation, member.producer_generation)
+        .unwrap();
+    let mut clock = crate::mapping_commit::MappingCommitClock::new();
+    let mut occupancy = source.clone();
+    occupancy.commit_id = clock.reserve().unwrap();
+    occupancy.occupancy_revision += 1;
+    let cloud = owner.cloud();
+    let installed = writer
+        .install_checkpoint_with_fine(
+            &occupancy,
+            cloud.voxel_size(),
+            cloud.point_count(),
+            cloud.xyz_f32_le(),
+            Some(prepared),
+        )
+        .unwrap();
+    let baseline = writer.committed_fine_cloud().unwrap();
+    let root = baseline.manifest();
+    assert_eq!(installed.receipt.commit_id, occupancy.commit_id);
+    assert_eq!(
+        installed.receipt.cloud_revision,
+        old_cloud.cloud_revision + 1
+    );
+    assert_eq!(root.revision, installed.receipt.cloud_revision);
+    assert_eq!(root.geometry_revision, root.revision);
+    assert_eq!(root.domain.session, source.session_id);
+    assert_eq!(root.domain.generation, source.session_generation);
+    assert_eq!(root.domain.frame_generation, member.frame_generation);
+    assert_eq!(root.domain.producer_generation, member.producer_generation);
+    assert!(matches!(
+        root.blocks[0].object,
+        nuwax_map_chunks::ObjectIdentity::Legacy(_)
+    ));
+    let mut reader =
+        nuwax_map_chunks::RegionReader::new(baseline.repository.clone(), 4 * 1024 * 1024);
+    let old_evidence = reader.region(root, [0; 3], [1; 3], 10).unwrap();
+    assert_eq!(
+        (old_evidence[0].1.observed_ns, old_evidence[0].1.hits),
+        (11, 1)
+    );
+    assert!(writer.accumulate_mapping_scan(
+        source.session_generation,
+        &[nalgebra::Point3::new(0.0625, 0.0625, 0.0625)],
+        None,
+        12
+    ));
+    let mut next = occupancy.clone();
+    next.commit_id = clock.reserve().unwrap();
+    next.occupancy_revision += 1;
+    next.source_timestamp_ns = 12;
+    let published = writer.commit_accumulated_snapshot(&next).unwrap().unwrap();
+    let current = writer.committed_fine_cloud().unwrap();
+    assert_eq!(published.receipt.commit_id, next.commit_id);
+    assert_eq!(
+        published.receipt.cloud_revision,
+        installed.receipt.cloud_revision + 1
+    );
+    assert_eq!(
+        current.manifest().revision,
+        published.receipt.cloud_revision
+    );
+    assert_eq!(current.manifest().geometry_revision, root.geometry_revision);
+    assert_eq!(
+        current.manifest().blocks[0].block_revision,
+        published.receipt.cloud_revision
+    );
+    assert!(matches!(
+        current.manifest().blocks[0].object,
+        nuwax_map_chunks::ObjectIdentity::Assigned(_)
+    ));
+    assert!(writer.commit_accumulated_snapshot(&occupancy).is_err());
+    // Installation/publication must not mutate the retained imported source receipt.
+    assert_eq!(owner.cloud_receipt(), old_cloud);
+    assert_eq!(owner.cloud_receipt().cloud_revision, 7);
+}
+
+#[test]
+fn python_legacy_fine_import_ar1_rejects_conflicting_alias_bodies_without_hashes() {
+    let _no_hash = NoHash::enter();
+    let fixture = fixtures().into_iter().next().unwrap();
+    let request = proto::ActivateMapRequest::decode(fixture.request).unwrap();
+    let reader = nuwax_map_chunks::ArchiveReader::open(std::io::Cursor::new(fixture.fine)).unwrap();
+    let nuwax_map_chunks::ArchivedRoot::Legacy(legacy) = reader.root().clone() else {
+        panic!("AR1 fixture required");
+    };
+    let mut root = legacy.manifest;
+    let mut duplicate = root.blocks[0].clone();
+    duplicate.key = [1, 0, 0];
+    root.blocks.push(duplicate);
+    let json = serde_json::to_vec(&root).unwrap();
+    let mut bytes = b"NUWAXAR1".to_vec();
+    bytes.extend_from_slice(&(json.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&[b'X'; 32]);
+    bytes.extend_from_slice(&json);
+    bytes.extend_from_slice(&2_u64.to_le_bytes());
+    for observed_ns in [11, 10] {
+        let block = nuwax_map_chunks::encode_block(&nuwax_map_chunks::Block::from([(
+            0,
+            nuwax_map_chunks::Evidence {
+                observed_ns,
+                hits: 1,
+            },
+        )]))
+        .unwrap();
+        bytes.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&block);
+    }
+    let mut reference = request
+        .mapping_backend_checkpoint
+        .unwrap()
+        .fine_map_artifact
+        .unwrap();
+    reference.size = bytes.len() as u64;
+    let mut store = crate::planar_artifacts::Store::default();
+    assert!(upload(&mut store, &reference, &bytes).is_err());
+    assert!(store.open(&reference).is_err());
 }

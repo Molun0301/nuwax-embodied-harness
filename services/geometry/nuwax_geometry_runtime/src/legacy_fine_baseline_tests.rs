@@ -1,5 +1,5 @@
 //! Lower-level AR1 restore qualification, not assigned AR1 admission permission.
-//! The production v2 AR1 rejection gates intentionally remain in force.
+//! Assigned source admission is covered separately by legacy_fine_import_tests.
 use super::*;
 use std::io::{Seek, SeekFrom, Write};
 

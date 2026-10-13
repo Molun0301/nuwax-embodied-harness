@@ -270,7 +270,8 @@ class MapAssetBundleRepository:
                 continue
         return matches
 
-    def import_legacy_cloud_bundle(self, map_name, *, catalog_created_at, map_directory_owner):
+    def import_legacy_cloud_bundle(self, map_name, *, catalog_created_at, map_directory_owner,
+                                  allow_ar1_source=False):
         """Explicit activation import of eligible schema1 current; old files stay untouched.
 
         Caller holds the existing executor guard and commits catalog ownership.
@@ -316,8 +317,9 @@ class MapAssetBundleRepository:
                 if not isinstance(fine_source, dict) or not isinstance(fine_source.get("path"), str):
                     return None
                 fine_path = "mapping_backend/" + source["backend_kind"] + "/" + fine_source["path"]
-                if tree.require_file(fine_path, "legacy fine archive").slice(0, 8) not in (b"NUWAXAR2", b"NUWAXAR3"):
-                    return None  # AR1 still needs an explicit root-format migration.
+                formats = (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3") if allow_ar1_source else (b"NUWAXAR2", b"NUWAXAR3")
+                if tree.require_file(fine_path, "legacy fine archive").slice(0, 8) not in formats:
+                    return None  # AR1 needs the paired runtime capability before adoption.
             raw_catalog = _parse_json_object(_read_regular_file(self._map_dir(map_name) / "metadata.json",
                 "legacy catalog", maximum_bytes=_MAX_LEGACY_METADATA_JSON_BYTES), "legacy catalog")
             root_state = os.fstat(tree.root.descriptor)

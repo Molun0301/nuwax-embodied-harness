@@ -5714,6 +5714,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             uptime_ms: diag.uptime_ms,
             rss_kb: diag.rss_kb,
             lcm_backend: diag.lcm_backend,
+            supported_assigned_fine_archive_versions: vec![1, 2, 3],
         }))
     }
 

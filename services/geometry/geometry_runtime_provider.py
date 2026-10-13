@@ -4992,6 +4992,8 @@ class GeometryRuntimeProvider:
                     self._channel = staged_channel
                     self._stub = staged_stub
                     retired_attempt = self._invalidate_map_connection_locked()
+                    self._assigned_fine_archive_versions = frozenset(
+                        getattr(resp, "supported_assigned_fine_archive_versions", ()))
                 self._invalidate_map_delivery_tickets_locked()
             del retired_attempt
             self._wait_for_map_deliveries()
@@ -5453,6 +5455,7 @@ class GeometryRuntimeProvider:
         retired_attempt = getattr(self, "_assigned_activation_attempt", None)
         self._assigned_activation_attempt = None
         self._map_connection_epoch += 1
+        self._assigned_fine_archive_versions = frozenset()
         self._mapping_transition_epoch += 1
         self._mapping_transition_inflight = False
         self._mapping_identity = None
@@ -5652,8 +5655,12 @@ class GeometryRuntimeProvider:
                     generation=identity.occupancy_receipt["session_generation"], cloud_revision=identity.cloud_receipt["cloud_revision"],
                     source_timestamp_ns=identity.cloud_receipt["source_timestamp_ns"])
                 if identity.role == "fine_map":
-                    if payload[:8] not in (b"NUWAXAR2", b"NUWAXAR3"):
-                        raise ValueError("assigned fine artifact requires AR2 or AR3")
+                    if payload[:8] == b"NUWAXAR1":
+                        origin = self.capture_assigned_activation_origin()
+                        if _stub_override is not None and origin[0] is not _stub_override:
+                            raise RuntimeError("assigned fine download connection changed")
+                        if not self.supports_assigned_fine_archive_version(1, expected_origin=origin):
+                            raise RuntimeError("runtime does not support assigned AR1 source archives")
                     validate_fine_archive(payload, **keywords, frame_generation=identity.frame_generation,
                         producer_generation=identity.producer_generation)
                 elif identity.role == "dense_cloud":
@@ -5666,7 +5673,8 @@ class GeometryRuntimeProvider:
             if _release_on_completion:
                 self._graph_transfer(5, reference, **transfer_options)
 
-    def _upload_graph_artifact(self, checkpoint, *, payload=None, reference=None, transfer=None):
+    def _upload_graph_artifact(self, checkpoint, *, payload=None, reference=None, transfer=None,
+                               expected_origin=None):
         transfer = self._graph_transfer if transfer is None else transfer
         payload = checkpoint.payload if payload is None else payload
         if checkpoint.schema_version == 2:
@@ -5685,6 +5693,9 @@ class GeometryRuntimeProvider:
                     raise ValueError("planar upload requires its retained immutable payload owner")
             elif reference == checkpoint.fine_reference:
                 retained_payload = checkpoint.fine_archive
+                if retained_payload[:8] == b"NUWAXAR1":
+                    self.require_assigned_fine_archive_support(checkpoint,
+                        expected_origin=expected_origin or self.capture_assigned_activation_origin())
             elif reference == checkpoint.dense_reference:
                 retained_payload = checkpoint.dense_archive
             else:
@@ -5874,6 +5885,7 @@ class GeometryRuntimeProvider:
                 raise RuntimeError("assigned activation connection changed before dispatch")
             pending = self._assigned_activation_attempt
         stub = origin[0]
+        self.require_assigned_fine_archive_support(checkpoint, expected_origin=origin)
         transition = self._begin_mapping_transition()
         dispatched = False
         acknowledged = None
@@ -5953,7 +5965,8 @@ class GeometryRuntimeProvider:
                                        (checkpoint.dense_archive, checkpoint.dense_reference)):
                 if reference is not None:
                     attempted_artifacts.append(_artifact_reference_proto(reference))
-                    self._upload_graph_artifact(checkpoint, payload=archive, reference=reference, transfer=transfer)
+                    self._upload_graph_artifact(checkpoint, payload=archive, reference=reference, transfer=transfer,
+                        expected_origin=origin)
             require_origin()
             dispatched = True
             response = stub.ActivateMap(request, timeout=_heavy_deadline_sec())
@@ -7022,6 +7035,16 @@ class GeometryRuntimeProvider:
             if not self._connected or self._stub is None or self._stopping:
                 raise RuntimeError("assigned activation provider is disconnected")
             return self._stub, self._map_connection_epoch
+
+    def supports_assigned_fine_archive_version(self, version, *, expected_origin):
+        with self.assigned_activation_origin_guard(expected_origin):
+            return version in (2, 3) or (version == 1
+                and 1 in getattr(self, "_assigned_fine_archive_versions", ()))
+
+    def require_assigned_fine_archive_support(self, checkpoint, *, expected_origin):
+        if (checkpoint.fine_archive is not None and checkpoint.fine_archive[:8] == b"NUWAXAR1"
+                and not self.supports_assigned_fine_archive_version(1, expected_origin=expected_origin)):
+            raise RuntimeError("runtime does not support assigned AR1 source archives")
 
     def require_assigned_activation_origin(self, expected_origin) -> None:
         with self.assigned_activation_origin_guard(expected_origin):

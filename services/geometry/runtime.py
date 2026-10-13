@@ -5854,6 +5854,35 @@ class PlatformGeometryRuntime:
             raise RuntimeError("assigned activation runtime provider ownership changed")
         prepared._provider.require_assigned_activation_origin(prepared._provider_origin)
 
+    def capture_assigned_fine_import_origin(self):
+        """Use the existing connected provider's status capability, without RPC."""
+        with self._runtime_state_lock:
+            provider = getattr(self, "_remote_provider", None)
+            if provider is None or getattr(self, "_provider_attach_stopping", False):
+                return None
+            try:
+                origin = provider.capture_assigned_activation_origin()
+            except RuntimeError:
+                return None
+            if not provider.supports_assigned_fine_archive_version(1, expected_origin=origin):
+                return None
+            return provider, getattr(self, "_provider_attach_epoch", 0), origin
+
+    @contextmanager
+    def assigned_fine_import_origin_guard(self, captured):
+        """Fence the small catalog commit; never hold across archive I/O or callbacks."""
+        provider, attach_epoch, origin = captured
+        with self._runtime_state_lock:
+            if (getattr(self, "_remote_provider", None) is not provider
+                    or getattr(self, "_provider_attach_epoch", 0) != attach_epoch
+                    or getattr(self, "_provider_attach_stopping", False)):
+                raise RuntimeError("assigned fine import provider ownership changed")
+            if not provider.supports_assigned_fine_archive_version(1, expected_origin=origin):
+                raise RuntimeError("runtime does not support assigned AR1 source archives")
+            # Capability is immutable within this origin; reacquiring verifies its epoch.
+            with provider.assigned_activation_origin_guard(origin):
+                yield
+
     def prepare_assigned_map_activation(
         self, bundle: MapAssetBundle, *, bundle_root: Path,
     ) -> _PreparedAssignedMapActivation:
@@ -5900,6 +5929,8 @@ class PlatformGeometryRuntime:
                 or stored.checkpoint.checkpoint_id != checkpoint_metadata.get("checkpoint_id")
                 or stored.checkpoint.backend_kind != checkpoint_metadata["backend_kind"]):
             raise ValueError("assigned checkpoint differs from finalized bundle ownership")
+        if stored.checkpoint.fine_archive is not None and stored.checkpoint.fine_archive[:8] == b"NUWAXAR1":
+            provider.require_assigned_fine_archive_support(stored.checkpoint, expected_origin=origin)
         planar_default_seed = None
         if stored.checkpoint.backend_kind == "slam_toolbox":
             payload = stored.checkpoint.payload

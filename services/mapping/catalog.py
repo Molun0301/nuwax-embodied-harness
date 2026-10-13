@@ -109,7 +109,7 @@ def _fsync_directory(path: Path) -> None:
         os.close(directory_fd)
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _atomic_write_text(path: Path, text: str, *, adoption_guard=None) -> None:
     """原子且持久地替换文本文件。"""
 
     descriptor, temporary_name = tempfile.mkstemp(
@@ -123,7 +123,13 @@ def _atomic_write_text(path: Path, text: str) -> None:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
+        if adoption_guard is None:
+            os.replace(temporary_path, path)
+        else:
+            # Fence only the visible catalog replacement. File/directory fsync and
+            # extension callbacks must not hold runtime/provider ownership locks.
+            with adoption_guard:
+                os.replace(temporary_path, path)
         _fsync_directory(path.parent)
     finally:
         temporary_path.unlink(missing_ok=True)
@@ -242,7 +248,7 @@ class MapCatalogRepository:
             assets.append(self._load_map_asset(metadata_path))
         return assets
 
-    def save_map_asset(self, asset: MapAsset) -> MapAsset:
+    def save_map_asset(self, asset: MapAsset, *, adoption_guard=None) -> MapAsset:
         # 写入前先做 safe-segment 碰撞检查：如果目标目录已存在 metadata.json
         # 且其 map_name 与当前请求不同，说明两个不同 map_name 经 build_safe_dir_segment
         # 规整后落到同一目录（例如 "办公区/A" 与 "办公区_A"），拒绝静默覆盖。
@@ -264,6 +270,7 @@ class MapCatalogRepository:
         _atomic_write_text(
             self._metadata_path(asset.map_name),
             asset.model_dump_json(indent=2),
+            adoption_guard=adoption_guard,
         )
         return asset
 

@@ -90,6 +90,9 @@ message RuntimeStatus {
   uint64 uptime_ms = 3;
   uint32 rss_kb = 4;
   string lcm_backend = 5;
+  // Empty on older servers: assigned fine payloads remain AR2/AR3 only.
+  // AR1 support means unchanged legacy source bytes under assigned ownership.
+  repeated uint32 supported_assigned_fine_archive_versions = 6;
 }
 
 // === 定位 ===

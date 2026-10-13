@@ -41,7 +41,7 @@ def require_catalog_owner(owner, asset, captured):
 
 
 def reconcile_assigned_current(owner, asset, bundle, *, captured, reason=None, metadata=None,
-                               confirm_durable=False, expected_previous_identity=None):
+                               confirm_durable=False, expected_previous_identity=None, adoption_guard=None):
     """重启读取只采用已经持久的精确 current；不会重导出或重新分配 ID。"""
     if (bundle.identity_schema_version != 2 or bundle.asset_state != "finalized"
             or bundle.manifest_sha256 is not None):
@@ -71,7 +71,10 @@ def reconcile_assigned_current(owner, asset, bundle, *, captured, reason=None, m
                 and current.asset_identity == bundle.asset_identity
                 and current.frame_id == bundle.frame_id and current.finalized_at is not None):
             if confirm_durable:
-                owner._repository.save_map_asset(current)
+                if adoption_guard is None:
+                    owner._repository.save_map_asset(current)
+                else:
+                    owner._repository.save_map_asset(current, adoption_guard=adoption_guard)
             return current
         now = datetime.now(timezone.utc)
         is_active = owner._repository.get_active_map_name() == asset.map_name
@@ -88,7 +91,10 @@ def reconcile_assigned_current(owner, asset, bundle, *, captured, reason=None, m
                 **({"finalize_reason": str(reason or "").strip() or None} if reason is not None else {}),
                 **(owner._sanitize_map_metadata(metadata) or {})},
         })
-        owner._repository.save_map_asset(updated)
+        if adoption_guard is None:
+            owner._repository.save_map_asset(updated)
+        else:
+            owner._repository.save_map_asset(updated, adoption_guard=adoption_guard)
         published_owner = catalog_owner(owner, updated)
     # 持久化已完成。扩展 write/event 回调不可占用目录或运行态守卫。
     key = f"asset:{asset.map_name}"

@@ -23,7 +23,29 @@ def main():
     finally:
         case.doCleanups()
 
+    # AR1 uses the actual connect-time capability and workspace adoption boundary.
+    if not sys.argv[1:] or '1' in sys.argv[1:]:
+        from test_assigned_ar1_import import AssignedAr1ImportTests
+        case = AssignedAr1ImportTests()
+        case.setUp()
+        try:
+            case.source(dense=False)
+            client, _ = case.connect()
+            result = case.imported(client)
+            request = provider._assigned_activation_request_proto(result.stored_checkpoint,
+                asset_identity=result.bundle.asset_identity, session_id='mapload:fine', map_name='map',
+                activation_request_id='activate:fine', expected_runtime_generation=17)
+            for suffix, payload in {'request.pb': request.SerializeToString(),
+                    'fine.archive': bytes(result.stored_checkpoint.checkpoint.fine_archive)}.items():
+                target = destination / ('ar1_voxel.' + suffix)
+                target.write_bytes(payload)
+                print('%s: %d bytes' % (target.name, len(payload)))
+        finally:
+            case.doCleanups()
+
     for version, backend, dense in ((2, 'voxel', False), (3, 'raytracing', True)):
+        if sys.argv[1:] and str(version) not in sys.argv[1:]:
+            continue
         case = LegacyCloudImportTests()
         case.setUp()  # Hash sentinels precede every fixture and import operation.
         try:

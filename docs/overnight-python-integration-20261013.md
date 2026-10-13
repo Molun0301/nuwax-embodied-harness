@@ -126,3 +126,58 @@ Evidence in `../neh-evidence/overnight-python-integration-20261013/`:
 - `bb1a14f-cross-boundary.log`: task lifecycle cross-boundary probe passed
 
 The one deselected abrupt-fork test, real UDS, hardware/models, live gateway and full deployment limits remain unchanged. The httpx raw-content deprecation warning is unchanged. Earlier static guardrail results were not rerun or relabeled as new results in this pass.
+
+
+## Final occupancy, perception and memory integration pass
+
+After the canonical-occupancy NumPy scan, detector-owned immutable polygon/area reuse, depth-projection local support indices, and natural-identity privately decoded record copy changes were combined, the approved non-overlapping 30-module selection passed on **Python 3.8.10: 572 passed, 0 failed, 1 deselected in 42.26 seconds**, exit 0. No warning was emitted. HEAD was checked before and after and remained unchanged; exact source provenance is retained in the execution metadata. No production or test-fixture changes were made by this verification.
+
+This selection includes the new occupancy, projection and natural-identity regressions, the expanded detector contract tests, and adjacent retained activation/checkpoint, saved display, perception snapshot/dispatch, durable memory ownership/transaction/publication, and shared Python compatibility boundaries. It deliberately omits unrelated task-manager, audio-health, MCP, log-index and updater slices from the earlier 652-case run. Therefore **572 is a fresh scoped count, not an addition to or a regression in the earlier 652 count**; overlapping modules are invoked once. The earlier broader pass remains historical evidence, not a newly rerun result.
+
+### Exact command and selected modules
+
+Run from the repository root with the existing workspace Python 3.8 environment:
+
+```sh
+source ../neh-toolchain/env.sh
+PYTHONPATH="$PWD/scripts:$PWD/tests:$PWD" OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python -B -m pytest -q \
+  tests/test_checkpoint_occupancy_scan.py \
+  tests/test_checkpoint_finite_scan.py \
+  tests/test_activation_retained_read.py \
+  tests/test_assigned_activation_loader.py \
+  tests/test_runtime_assigned_activation_loader.py \
+  tests/test_assigned_workspace_activation.py \
+  tests/test_checkpoint_identity_v2.py \
+  tests/test_runtime_assigned_save_preparation.py \
+  tests/test_assigned_cloud_exchange.py \
+  tests/test_assigned_asset_storage.py \
+  tests/test_dense_archive_bounds.py \
+  tests/test_assigned_saved_cloud_sources.py \
+  tests/test_assigned_saved_display_gateway.py \
+  tests/unit/test_yolo_detection_contract.py \
+  tests/test_perception_geometry_support_indices.py \
+  tests/test_perception_snapshot_v18.py \
+  tests/test_observation_photo_v18.py \
+  scripts/check_perception_geometry_snapshot.py \
+  scripts/check_perception_scene_dispatch.py \
+  scripts/check_memory_natural_identity.py \
+  scripts/check_memory_storage_transactions.py \
+  scripts/check_memory_service_regressions.py \
+  scripts/check_memory_scene_graph_revisions.py \
+  scripts/check_memory_scene_identity_publication.py \
+  scripts/check_memory_scene_identity_service.py \
+  scripts/check_memory_durable_integration.py \
+  scripts/check_memory_snapshot_payload_ownership.py \
+  scripts/check_memory_summary_projection.py \
+  scripts/check_memory_limited_scene_listing.py \
+  scripts/check_python38_runtime_compatibility.py \
+  -k 'not abrupt'
+```
+
+All 30 target paths were checked for existence and uniqueness before execution. The existing `-k 'not abrupt'` excludes exactly `test_abrupt_exit_after_atomic_install_can_restart_and_retry` in `tests/test_checkpoint_identity_v2.py`; no additional skip or threshold change was introduced. Existing no-hashing sentinels continue to enforce the canonical contracts; legacy content-hash test suites and source-fingerprint/benchmark runners were not invoked.
+
+### Limits and preserved evidence
+
+The pass uses temporary synthetic fixtures with the real selected production modules. It does not invoke real UDS, devices, detector models, network services, paid services, native rebuilds, or a running end-to-end gateway. The source/ownership assertions are not relaxed or replaced by new mocks. Earlier failures and subsequent canonical-contract alignments remain recorded above; this clean selected pass does not retroactively reclassify those earlier runs.
+
+Execution evidence is retained at `../neh-evidence/python-final-2030/`: `targets.txt` (30 unique paths), `run.json` (full executable/arguments, actual Python version, before/after source provenance, exit code and process wall 42.70 seconds), and `combined.log` (complete pytest output). The 42.26-second figure is pytest's elapsed time; the outer process wall is a separate measurement. Frontend microbenchmark work was held during this correctness run, and the CPU lane was released afterward. No static guardrails or other earlier checks were relabeled as new results.

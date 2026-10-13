@@ -329,3 +329,33 @@ cargo test --release --offline -j2 -p nuwax-nav-mls-planner --lib
 最终 MLS release 全 lib：**315 passed / 0 failed / 15 ignored / 0 filtered**，执行 4.16 秒。新增回归覆盖范围双端包含、负坐标、全 i32 定义域面积不会溢出、三层列完整删除/重插与槽位复用、旧快照不变，以及远隔脏列延迟累积后的稀疏回退；完整前沿索引均与冷重建一致。既有边界/虚拟障碍失效、占据证据变化和可达性测试亦通过。ignored 诊断未运行，不计入通过。
 
 这是云端合成地图局部几何刷新测量，不含生产探索线程排队、导航可达搜索、传感器流水线或实机 CPU；未宣称完整平台性能验收。
+
+### 近期障碍高度行查询优化后的最终导航集成复验（2026-10-13）
+
+本轮验证已集成 current-view 保留、近期障碍高度行 query-local 优化及禁止区域身份修复的最终导航代码；在随后持续运行 soak fixture 加入前完成构建与执行。没有改动生产代码、资格 fixture 或阈值。
+
+- 普通非 `cfg(test)` 的 `nuwax-nav-stack` 二进制：`cargo check --locked --offline -j2 -p nuwax-nav-stack --bin nuwax-nav-stack --features simple-2d,replanning-astar` 通过，1 分 08 秒
+- Stack qualification release 增量构建通过，1 分 55 秒；由本次 Cargo JSON 提取实际 executable，核对 opt_level=3，使用原 thin LTO / codegen-units=1。复用既有 target，未 clean 或构建整 workspace
+- 普通 qualification：**15 passed / 0 failed / 8 ignored**
+- 显式源健康启动正负例 **1/1**；原 codec/geometry/body witness preflight **1/1**
+- 六项原完整 live 场景：**6 passed / 0 failed**，每项独立进程、串行执行，无其他 Cargo 或计时 workload 并发
+
+| 场景 | 局部规划 OFF | 局部规划 ON |
+| --- | ---: | ---: |
+| 已知落差支撑恢复并到达原目标 | 9.84 秒，通过 | 6.93 秒，通过 |
+| 持续 box 障碍 | 12.54 秒，通过 | 12.23 秒，通过 |
+| 持续 wall 障碍 | 7.38 秒，通过 | 8.22 秒，通过 |
+
+上述为测试框架场景耗时，不是优化前后配对性能结果。命令沿用前文同一 release 构建入口及六项 `--ignored --exact --nocapture --test-threads=1` 选择器。原 60 秒窗口、1 秒源 TTL、位置/朝向容差、五秒等待和连续碰撞/停车 oracle 均未改变；原失败历史继续保留。
+
+同一生产状态另重新构建并执行 Runtime 普通 release lib，**231 passed / 0 failed / 49 ignored / 5 filtered**，54.95 秒。仅显式排除以下五个此前因环境不能绑定 Unix socket 而失败的真实 UDS 项：
+
+```text
+tests::cancel_preempts_delayed_renew_over_real_uds_with_qualified_latency
+tests::cancel_preempts_delayed_submit_over_real_uds_with_qualified_latency
+tests::cancel_replays_identical_fence_after_first_response_timeout
+tests::real_uds_adapter_requires_correlated_applied_and_fence_proofs
+tests::server_deadline_renewal_keeps_legal_slow_commands_alive
+```
+
+这五项本轮没有重试，不能称 Runtime 无过滤全通过；49 ignored 未计入通过数。各次构建 JSON、二进制 provenance、完整命令、单场景日志及退出码均已保留。本轮未重跑 geometry 生产二进制、完整原生验收或整 workspace。以上也不替代长时 soak、实机传感器/执行器闭环、实机 CPU/内存、硬实时与控制延迟验收。

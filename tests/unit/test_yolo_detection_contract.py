@@ -364,3 +364,95 @@ def test_detector_close_retains_worker_owner_until_retry_completes():
     assert backend._inference_worker is owner
     assert backend.start_inference_worker_nonblocking() is False
     assert backend.close(timeout=1) is True
+
+
+@pytest.mark.parametrize("as_array", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_yolo_mask_geometry_keeps_winding_rounding_and_owned_points(as_array, reverse, monkeypatch):
+    backend = YoloWorldDetectorBackend(use_worker_process=False)
+    points = [[-3., -2.], [7., -2.], [7., 4.], [-3., 4.]]
+    if reverse:
+        points.reverse()
+    polygon = np.asarray(points) if as_array else points
+    result = _result(names=["chair"], boxes=[[1, 1, 10, 10]])
+    result.masks = SimpleNamespace(xy=[polygon])
+    area_calls = []
+    area = backend._polygon_signed_area
+
+    def counted_area(vertices):
+        area_calls.append(vertices)
+        return area(vertices)
+
+    monkeypatch.setattr(backend, "_polygon_signed_area", counted_area)
+    detection, = backend._normalize_yolo_result(result, _frame())
+    mask = detection.segmentation
+    assert len(area_calls) == 1
+    assert mask.polygon_px == tuple(tuple(point) for point in points)
+    assert mask.area_px == 60.
+    assert mask.area_ratio == .006
+    assert mask.centroid_uv == (2., 1.)
+    assert mask.bbox_xyxy == (-3., -2., 7., 4.)
+    polygon[0][0] = 99.
+    assert mask.polygon_px[0][0] != 99.
+    assert detection.attributes["mask_polygon_px"][0][0] != 99.
+    detection.attributes["mask_polygon_px"][0][1] = 123.
+    assert detection.attributes["segmentation_polygon_px"][0][1] != 123.
+    assert mask.polygon_px[0][1] != 123.
+
+
+def test_yolo_mask_extraction_preserves_filter_order_and_input_ownership():
+    backend = YoloWorldDetectorBackend(use_worker_process=False)
+    point = ["1.25", "-2.5", "ignored"]
+    payload = [None, "bad", [], [1], ["bad", 3], [float("nan"), 1],
+               [1, float("inf")], point, np.asarray([3., 4.]), (5, 6)]
+    extracted = backend._extract_mask_polygons(SimpleNamespace(xy=[payload]))
+    assert extracted == [[(1.25, -2.5), (3., 4.), (5., 6.)]]
+    assert all(isinstance(item, tuple) for item in extracted[0])
+    point[0] = 999
+    assert extracted[0][0] == (1.25, -2.5)
+    assert backend._extract_mask_polygons(SimpleNamespace(xy=np.asarray([[[1., 2.], [3., 4.]]]))) == [[(1., 2.), (3., 4.)]]
+
+
+@pytest.mark.parametrize("polygon,status", [
+    ([], "invalid_polygon"),
+    ([[1, 1], [2, 2]], "invalid_polygon"),
+    ([[1, 1], [2, 2], [3, 3]], "empty_polygon"),
+    ([[1, 1], [1, 1], [1, 1]], "empty_polygon"),
+])
+def test_yolo_mask_degenerate_status_is_unchanged(polygon, status):
+    result = _result(names=["chair"])
+    result.masks = SimpleNamespace(xy=[polygon])
+    detection, = YoloWorldDetectorBackend(use_worker_process=False)._normalize_yolo_result(result, _frame())
+    assert detection.segmentation is None
+    assert detection.attributes["segmentation_status"] == status
+    assert detection.attributes["segmentation_available"] is False
+
+
+def test_yolo_tiny_positive_mask_keeps_missing_centroid_and_rounded_zero_area():
+    result = _result(names=["chair"])
+    result.masks = SimpleNamespace(xy=[[[0., 0.], [.001, 0.], [0., .001]]])
+    detection, = YoloWorldDetectorBackend(use_worker_process=False)._normalize_yolo_result(result, _frame())
+    assert detection.segmentation.area_px == 0.
+    assert detection.segmentation.centroid_uv is None
+    assert detection.attributes["segmentation_status"] == "segmentation_preferred"
+    assert "mask_center_px" not in detection.attributes
+    assert "centroid_uv" not in detection.attributes
+
+
+def test_yolo_mask_float_conversion_failure_order_is_unchanged():
+    calls = []
+
+    class BadNumber:
+        def __init__(self, name, error):
+            self.name, self.error = name, error
+
+        def __float__(self):
+            calls.append(self.name)
+            raise self.error(self.name)
+
+    backend = YoloWorldDetectorBackend(use_worker_process=False)
+    payload = [[BadNumber("x", ValueError), BadNumber("skipped_y", OverflowError)],
+               [1, BadNumber("y", TypeError)], [BadNumber("fatal_x", OverflowError), 2]]
+    with pytest.raises(OverflowError, match="fatal_x"):
+        backend._extract_mask_polygons(SimpleNamespace(xy=[payload]))
+    assert calls == ["x", "y", "fatal_x"]

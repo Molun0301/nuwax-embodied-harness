@@ -635,7 +635,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
             detections.append(detection)
         return tuple(detections)
 
-    def _extract_mask_polygons(self, masks: Any) -> List[List[List[float]]]:
+    def _extract_mask_polygons(self, masks: Any) -> List[List[Tuple[float, float]]]:
         if masks is None:
             return []
         xy_payload = getattr(masks, "xy", None)
@@ -656,7 +656,8 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
                 try:
                     x, y = float(point[0]), float(point[1])
                     if math.isfinite(x) and math.isfinite(y):
-                        points.append([x, y])
+                        # Keep one owned immutable point representation through construction.
+                        points.append((x, y))
                 except (TypeError, ValueError):
                     continue
             polygons.append(points)
@@ -683,7 +684,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
 
     def _build_mask_segmentation(
         self,
-        polygon: List[List[float]],
+        polygon: List[Tuple[float, float]],
         score: float,
         image_frame: ImageFrame,
         *,
@@ -696,7 +697,8 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
                 "segmentation_status": "invalid_polygon",
                 "segmentation_priority": "bbox_only",
             }, None
-        area_px = abs(self._polygon_signed_area(polygon))
+        signed_area = self._polygon_signed_area(polygon)
+        area_px = abs(signed_area)
         if area_px <= 0.0:
             return {
                 "segmentation_available": False,
@@ -704,8 +706,8 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
                 "segmentation_priority": "bbox_only",
             }, None
         area_ratio = round(area_px / float(max(1, image_frame.width_px * image_frame.height_px)), 6)
-        centroid = self._polygon_centroid(polygon)
-        normalized_polygon = tuple((float(point[0]), float(point[1])) for point in polygon)
+        centroid = self._polygon_centroid(polygon, signed_area)
+        normalized_polygon = tuple(polygon)
         centroid_uv = None
         if centroid is not None:
             centroid_uv = (round(centroid[0], 3), round(centroid[1], 3))
@@ -758,15 +760,16 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
             attributes["centroid_uv"] = attributes["mask_center_px"]
         return attributes, segmentation
 
-    def _polygon_signed_area(self, polygon: List[List[float]]) -> float:
+    def _polygon_signed_area(self, polygon: List[Tuple[float, float]]) -> float:
         area = 0.0
         for index, point in enumerate(polygon):
             next_point = polygon[(index + 1) % len(polygon)]
             area += (point[0] * next_point[1]) - (next_point[0] * point[1])
         return area * 0.5
 
-    def _polygon_centroid(self, polygon: List[List[float]]) -> Optional[Tuple[float, float]]:
-        signed_area = self._polygon_signed_area(polygon)
+    def _polygon_centroid(
+        self, polygon: List[Tuple[float, float]], signed_area: float,
+    ) -> Optional[Tuple[float, float]]:
         if abs(signed_area) < 1e-6:
             return None
         cx = 0.0

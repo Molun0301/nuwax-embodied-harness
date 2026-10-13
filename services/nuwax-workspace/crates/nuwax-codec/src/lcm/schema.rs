@@ -1115,10 +1115,7 @@ pub fn decode_navigation_map_3d_body(encoded: &[u8]) -> CodecResult<NavigationMa
         else if root.is_empty() && included.is_empty() { None }
         else { return Err(CodecError::LcmDecode("空精细根不能携带隐藏数据".into())); };
     let cloud_body = cursor.read_exact(cursor.remaining())?;
-    let cloud = decode_point_cloud2(&with_fingerprint(
-        POINT_CLOUD2_FINGERPRINT,
-        cloud_body.to_vec(),
-    ))?;
+    let cloud = decode_point_cloud2_body(cloud_body)?;
     let message = NavigationMap3D {
         schema_version,
         producer_runtime_generation,
@@ -2088,14 +2085,23 @@ pub(super) fn encode_point_cloud2_body_into(message: &PointCloud2, out: &mut Vec
 
 /// Decode a top-level `sensor_msgs.PointCloud2` generated message.
 pub fn decode_point_cloud2(encoded: &[u8]) -> CodecResult<PointCloud2> {
+    let mut cursor = Cursor::new(encoded);
+    cursor.expect_fingerprint(POINT_CLOUD2_FINGERPRINT, "sensor_msgs.PointCloud2")?;
+    decode_point_cloud2_from(&mut cursor)
+}
+
+/// Decode the nested `_encode_one()` body without constructing a top-level packet.
+pub(super) fn decode_point_cloud2_body(body: &[u8]) -> CodecResult<PointCloud2> {
+    decode_point_cloud2_from(&mut Cursor::new(body))
+}
+
+fn decode_point_cloud2_from(cursor: &mut Cursor<'_>) -> CodecResult<PointCloud2> {
     const MIN_POINT_FIELD_BODY: usize = 14;
     const POINT_CLOUD_TAIL_WITHOUT_DATA: usize = 10;
 
-    let mut cursor = Cursor::new(encoded);
-    cursor.expect_fingerprint(POINT_CLOUD2_FINGERPRINT, "sensor_msgs.PointCloud2")?;
     let fields_length = cursor.read_nonnegative_len("fields_length")?;
     let data_length = cursor.read_nonnegative_len("data_length")?;
-    let header = decode_header(&mut cursor)?;
+    let header = decode_header(cursor)?;
     let height = cursor.read_i32()?;
     let width = cursor.read_i32()?;
     let required_tail = data_length
@@ -2779,6 +2785,24 @@ mod navigation_map_3d_tests {
             },
             ..NavigationMap3D::default()
         }
+    }
+
+    #[test]
+    #[ignore = "release codec allocation/copy timing diagnostic"]
+    fn navigation_nested_cloud_decode_cost() {
+        let mut message = live_map();
+        message.cloud.width = 100_000;
+        message.cloud.row_step = message.cloud.width * message.cloud.point_step;
+        message.cloud.data = vec![0; message.cloud.row_step as usize];
+        let wire = encode_navigation_map_3d(&message).unwrap();
+        assert_eq!(decode_navigation_map_3d(&wire).unwrap(), message);
+        let iterations = 2_000;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(decode_navigation_map_3d(std::hint::black_box(&wire)).unwrap());
+        }
+        eprintln!("navigation_nested_cloud iterations={iterations} data_bytes={} elapsed_ms={:.3}",
+            message.cloud.data.len(), start.elapsed().as_secs_f64() * 1000.0);
     }
 
     fn cleared_map() -> NavigationMap3D {
@@ -4290,6 +4314,40 @@ sys.stdout.buffer.write(message.encode())
         let encoded = encode_point_cloud2(&message).unwrap();
         assert_eq!(&encoded[..8], &POINT_CLOUD2_FINGERPRINT);
         assert_eq!(decode_point_cloud2(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn nested_point_cloud_matches_packet_parser_and_preserves_rejections() {
+        let mut message = PointCloud2 {
+            header: Header { frame_id: "map".into(), ..Header::default() },
+            height: 2, width: 2, point_step: 16, row_step: 40,
+            fields: vec![PointField { name: "x".into(), offset: 4, datatype: 8, count: 1 }],
+            data: (0_u8..80).collect(), is_bigendian: true, is_dense: false,
+        };
+        for _ in 0..2 {
+            let body = encode_point_cloud2_body(&message).unwrap();
+            let packet = encode_point_cloud2(&message).unwrap();
+            assert_eq!(decode_point_cloud2_body(&body).unwrap(), message);
+            assert_eq!(decode_point_cloud2(&packet).unwrap(), message);
+            for length in 0..body.len() {
+                assert!(decode_point_cloud2_body(&body[..length]).is_err());
+                assert!(decode_point_cloud2(&packet[..8 + length]).is_err());
+            }
+            let mut trailing = body.clone(); trailing.push(0);
+            assert!(decode_point_cloud2_body(&trailing).is_err());
+            for offset in [0, 4] {
+                for count in [-1_i32, i32::MAX] {
+                    let mut invalid = body.clone();
+                    invalid[offset..offset + 4].copy_from_slice(&count.to_be_bytes());
+                    assert!(decode_point_cloud2_body(&invalid).is_err());
+                    assert!(decode_point_cloud2(&with_fingerprint(POINT_CLOUD2_FINGERPRINT, invalid)).is_err());
+                }
+            }
+            let mut wrong_fingerprint = packet;
+            wrong_fingerprint[0] ^= 1;
+            assert!(decode_point_cloud2(&wrong_fingerprint).is_err());
+            message = PointCloud2::default();
+        }
     }
 
     #[test]

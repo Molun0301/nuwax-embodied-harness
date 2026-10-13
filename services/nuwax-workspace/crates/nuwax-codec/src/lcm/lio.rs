@@ -1,8 +1,8 @@
 //! Versioned LIO ingress envelopes generated from the repository LCM schemas.
 
 use super::schema::{
-    decode_odometry, decode_point_cloud2, encode_odometry_body, encode_point_cloud2_body_into, Odometry,
-    PointCloud2, ODOMETRY_FINGERPRINT, POINT_CLOUD2_FINGERPRINT,
+    decode_odometry, decode_point_cloud2_body, encode_odometry_body, encode_point_cloud2_body_into, Odometry,
+    PointCloud2, ODOMETRY_FINGERPRINT,
 };
 use crate::{CodecError, CodecResult};
 
@@ -259,7 +259,7 @@ pub fn decode_lio_cloud_envelope(encoded: &[u8]) -> CodecResult<LioCloudEnvelope
     let registration_state = cursor.read_i32()?;
     let source_point_count = cursor.read_i64()?;
     let emitted_point_count = cursor.read_i64()?;
-    let cloud = decode_nested_cloud(cursor.remaining_slice())?;
+    let cloud = decode_point_cloud2_body(cursor.remaining_slice())?;
     let message = LioCloudEnvelope {
         schema_version,
         backend,
@@ -752,13 +752,6 @@ fn decode_nested_odometry(body: &[u8]) -> CodecResult<Odometry> {
     decode_odometry(&encoded)
 }
 
-fn decode_nested_cloud(body: &[u8]) -> CodecResult<PointCloud2> {
-    let mut encoded = Vec::with_capacity(8 + body.len());
-    encoded.extend_from_slice(&POINT_CLOUD2_FINGERPRINT);
-    encoded.extend_from_slice(body);
-    decode_point_cloud2(&encoded)
-}
-
 fn encode_string(value: &str, out: &mut Vec<u8>) -> CodecResult<()> {
     let encoded_len = value
         .len()
@@ -1013,6 +1006,21 @@ mod tests {
                 "0000000100"
             ))
         );
+    }
+
+    #[test]
+    fn nested_cloud_rejects_truncation_trailing_and_wrong_outer_fingerprint() {
+        let message = cloud();
+        let wire = encode_lio_cloud_envelope(&message).unwrap();
+        for length in 0..wire.len() {
+            assert!(decode_lio_cloud_envelope(&wire[..length]).is_err());
+        }
+        let mut trailing = wire.clone();
+        trailing.push(0);
+        assert!(decode_lio_cloud_envelope(&trailing).is_err());
+        let mut wrong_fingerprint = wire;
+        wrong_fingerprint[0] ^= 1;
+        assert!(decode_lio_cloud_envelope(&wrong_fingerprint).is_err());
     }
 
     #[test]

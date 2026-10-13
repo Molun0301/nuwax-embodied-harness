@@ -315,6 +315,12 @@ mod tests {
         let value = live();
         let bytes = encode_body(&value).unwrap();
         assert_eq!(decode_body(&bytes).unwrap(), value);
+        for length in 0..bytes.len() {
+            assert!(decode_body(&bytes[..length]).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decode_body(&trailing).is_err());
         for indices in [vec![0, 0], vec![1, 0], vec![2], vec![u32::MAX]] {
             let mut invalid = value.clone();
             invalid.ground_point_indices = indices;
@@ -324,6 +330,28 @@ mod tests {
         invalid.cloud.as_mut().unwrap().registration_state = lio::LIO_REGISTRATION_RAW_SENSOR;
         assert!(encode_body(&invalid).is_err());
     }
+    #[test]
+    #[ignore = "release codec allocation/copy timing diagnostic"]
+    fn recent_nested_cloud_decode_cost() {
+        let mut value = live();
+        let cloud = value.cloud.as_mut().unwrap();
+        cloud.source_point_count = 100_000;
+        cloud.emitted_point_count = 100_000;
+        cloud.cloud.width = 100_000;
+        cloud.cloud.row_step = cloud.cloud.width * cloud.cloud.point_step;
+        cloud.cloud.data = vec![0; cloud.cloud.row_step as usize];
+        let data_bytes = cloud.cloud.data.len();
+        let wire = encode_body(&value).unwrap();
+        assert_eq!(decode_body(&wire).unwrap(), value);
+        let iterations = 2_000;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(decode_body(std::hint::black_box(&wire)).unwrap());
+        }
+        eprintln!("recent_nested_cloud iterations={iterations} data_bytes={data_bytes} elapsed_ms={:.3}",
+            start.elapsed().as_secs_f64() * 1000.0);
+    }
+
     #[test]
     fn generated_python_decodes_and_reencodes_the_exact_live_packet() {
         use std::io::Write;

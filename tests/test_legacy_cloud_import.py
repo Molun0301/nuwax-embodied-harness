@@ -37,6 +37,33 @@ def top_manifest(current):
     (current / 'manifest.json').write_text(json.dumps(dict(schema_version=1, map_name='map', bundle_path='bundle.json', files=files)))
 
 
+def fine_archive(version=2, *, root_update=None, domain_update=None):
+    """Literal historical/current archive structures; aliases are never computed."""
+    reference = dict(key=[0, 0, 0], points=1)
+    if version == 1:
+        reference.update(sha256=[20] * 32, geometry_sha256=[30] * 32)
+    else:
+        reference.update(object=dict(kind='assigned', value=[40] * 16),
+                         block_revision=7, geometry_revision=7)
+    root = dict(version=version, domain=dict(session='source', generation=3,
+        frame_generation=4, producer_generation=8), revision=7, source_timestamp_ns=11,
+        voxel_size_m=.125, blocks=[reference])
+    if version != 1:
+        root['geometry_revision'] = 7
+    root.update(root_update or {})
+    root['domain'].update(domain_update or {})
+    raw = json.dumps(root, separators=(',', ':')).encode()
+    tail = b''
+    if version == 3:
+        layer = dict(members=[0], normal=[0, 0, 1], plane_origin=[.0625, .0625, .08],
+            samples=[dict(point=[.04, .06, .08], source_sequence=5,
+                          source_timestamp_ns=11, point_index=0)])
+        tail = json.dumps([[0, layer]], separators=(',', ':')).encode()
+    block = (b'NUWAXBL2' if version == 3 else b'NUWAXBL1') + struct.pack('<IIHQH', 1, len(tail), 0, 11, 1) + tail
+    return (('NUWAXAR%d' % version).encode() + struct.pack('<Q', len(raw))
+            + (b'X' * 32 if version == 1 else b'') + raw + struct.pack('<QI', 1, len(block)) + block)
+
+
 def fixture(repository, catalog_owner, backend='voxel', dense=True):
     current = repository._map_dir('map') / 'current'; current.mkdir(parents=True)
     occupancy = dict(commit_id=dict(boot_nonce=b'N' * 16, sequence=5), session_id='source', session_generation=3,
@@ -112,6 +139,226 @@ class LegacyCloudImportTests(unittest.TestCase):
         owner=self.repository._map_dir('map').stat()
         return self.repository.import_legacy_cloud_bundle('map',catalog_created_at=self.asset.created_at.isoformat(),
             map_directory_owner=(owner.st_dev,owner.st_ino))
+
+    def add_fine_archive(self, payload):
+        source = self.bundle.geometry_asset.metadata['mapping_backend_checkpoint']
+        manifest = self.current / source['manifest_path']
+        document = json.loads(manifest.read_text())
+        relative = 'objects/sha256-' + '70' * 32 + '.bin'
+        (manifest.parent.parent / relative).write_bytes(payload)
+        document['fine_archive'] = dict(sha256='70' * 32, path=relative, size=len(payload))
+        manifest.write_bytes(store._encode_json(document))
+        top_manifest(self.current)
+
+    def test_fine_import_ar2_ar3_preserves_members_and_builds_normal_v2_request(self):
+        from services.geometry import geometry_runtime_provider as provider
+        for version, backend, dense in ((2, 'voxel', False), (3, 'raytracing', True)):
+            with self.subTest(version=version, backend=backend):
+                root = self.root / str(version)
+                self.repository = asset_store.MapAssetBundleRepository(str(root))
+                self.catalog = catalog.MapCatalogRepository(str(root))
+                self.prepare(backend, dense)
+                fine = fine_archive(version)
+                self.add_fine_archive(fine)
+                before = inventory(self.current)
+                result = self.import_current()
+                self.assertIsInstance(result, asset_store._AssignedActivationRead)
+                stored = result.stored_checkpoint
+                checkpoint = stored.checkpoint
+                self.assertEqual(bytes(checkpoint.fine_archive), fine)
+                reference = checkpoint.fine_reference
+                member = reference.member_identity
+                self.assertEqual(reference.identity_schema_version, 2)
+                self.assertEqual(reference.legacy_alias, b'')
+                self.assertEqual(reference.size, len(fine))
+                self.assertEqual(member.checkpoint_id, checkpoint.checkpoint_id)
+                self.assertEqual((member.role, member.frame_id, member.frame_generation,
+                                  member.producer_generation), ('fine_map', 'map', 4, 8))
+                self.assertEqual(member.occupancy_receipt, checkpoint.occupancy_receipt)
+                self.assertEqual(member.cloud_receipt, checkpoint.cloud_receipt)
+                self.assertEqual(member.cloud_receipt['cloud_revision'], 7)
+                if dense:
+                    self.assertNotEqual(reference.id, checkpoint.dense_reference.id)
+                    self.assertEqual(bytes(checkpoint.dense_archive), self.dense)
+                else:
+                    self.assertIsNone(checkpoint.dense_reference)
+                    self.assertIsNone(checkpoint.dense_archive)
+                request = provider._assigned_activation_request_proto(stored,
+                    asset_identity=result.bundle.asset_identity, session_id='mapload:fine', map_name='map',
+                    activation_request_id='activate:fine', expected_runtime_generation=17)
+                self.assertEqual(request.activation_contract_version, 2)
+                wire = request.mapping_backend_checkpoint.fine_map_artifact
+                self.assertEqual((wire.id, wire.size, wire.identity_schema_version),
+                                 (reference.id, len(fine), 2))
+                self.assertEqual((wire.member_identity.frame_generation,
+                                  wire.member_identity.producer_generation), (4, 8))
+                self.assertEqual(wire.sha256, b'')
+                self.assertEqual(request.asset_manifest_sha256, b'')
+                self.assertEqual(request.asset_bundle_sha256, b'')
+                self.assertEqual(inventory(self.current), before)
+                with patch.object(asset_store.uuid, 'uuid4', side_effect=AssertionError('retry allocation')):
+                    again = self.import_current()
+                self.assertEqual(again.bundle.asset_identity, result.bundle.asset_identity)
+                self.assertEqual(again.stored_checkpoint.checkpoint.fine_reference, reference)
+
+    def test_fine_import_catalog_failure_reuses_publication_before_assigned_dispatch(self):
+        self.prepare()
+        fine = fine_archive(3)
+        self.add_fine_archive(fine)
+        before = inventory(self.current)
+        owner = self.service()
+        with patch('skills.assigned_map_save.reconcile_assigned_current', side_effect=RuntimeError('catalog interrupted')):
+            with self.assertRaisesRegex(RuntimeError, 'catalog interrupted'):
+                owner._import_legacy_cloud_for_activation('map')
+        published = list(self.repository._map_dir('map').glob('assigned-id-*'))
+        self.assertEqual(len(published), 1)
+        def dispatch(service, bundle, **kwargs):
+            self.assertEqual(getattr(owner._map_activation_execution_state, 'depth', 0), 0)
+            result = kwargs['_activation_read']
+            self.assertEqual(result.root, published[0])
+            self.assertEqual(bytes(result.stored_checkpoint.checkpoint.fine_archive), fine)
+            self.assertEqual(self.catalog.get_map_asset('map').asset_identity, bundle.asset_identity)
+            return 'assigned fine dispatch'
+        with patch.object(asset_store.uuid, 'uuid4', side_effect=AssertionError('retry allocation')), \
+             patch('skills.assigned_map_activation.activate_assigned_workspace', side_effect=dispatch):
+            self.assertEqual(owner.activate_map(map_name='map'), 'assigned fine dispatch')
+        self.assertEqual(inventory(self.current), before)
+
+    def test_fine_import_ar1_preserves_existing_fallback_without_allocation(self):
+        self.prepare()
+        self.add_fine_archive(fine_archive(1))
+        before = inventory(self.current)
+        with patch.object(asset_store.uuid, 'uuid4', side_effect=AssertionError('legacy allocation')):
+            self.assertIsNone(self.import_current())
+        self.assertEqual(inventory(self.current), before)
+
+    def test_fine_import_rejects_malformed_and_mismatched_archives_before_allocation(self):
+        cases = [fine_archive()[:-1], fine_archive() + b'trailing',
+                 fine_archive(root_update={'revision': 8}),
+                 fine_archive(root_update={'source_timestamp_ns': 12}),
+                 fine_archive(domain_update={'session': 'another'}),
+                 fine_archive(domain_update={'generation': 4}),
+                 fine_archive(domain_update={'producer_generation': 0})]
+        self.prepare()
+        for payload in cases:
+            with self.subTest(payload_size=len(payload)):
+                self.add_fine_archive(payload)
+                before = inventory(self.current)
+                with patch.object(asset_store.uuid, 'uuid4', side_effect=AssertionError('invalid allocation')):
+                    with self.assertRaises((ValueError, store.MappingBackendCheckpointValidationError)):
+                        self.import_current()
+                self.assertEqual(inventory(self.current), before)
+                self.assertEqual(list(self.repository._map_dir('map').glob('assigned-id-*')), [])
+
+    def test_fine_import_converter_rejects_missing_extra_invalid_or_reused_ids(self):
+        from dataclasses import replace
+        self.prepare()
+        payload = fine_archive()
+        self.add_fine_archive(payload)
+        stored = store.MappingBackendCheckpointStore(self.current).load('voxel', schema_version=1)
+        kwargs = dict(canonical_occupancy_data=b'\xff\x64', canonical_cloud_xyz=self.xyz,
+                      checkpoint_id='a' * 32, fine_artifact_id='b' * 32, dense_artifact_id='c' * 32)
+        assigned, _, _ = store.assign_legacy_cloud_checkpoint(stored, **kwargs)
+        self.assertIs(assigned.fine_archive, stored.checkpoint.fine_archive)
+        for fine_id in (None, '', 'invalid', 'c' * 32):
+            with self.subTest(fine_id=fine_id):
+                with self.assertRaises(ValueError):
+                    store.assign_legacy_cloud_checkpoint(stored, **dict(kwargs, fine_artifact_id=fine_id))
+        no_fine = replace(stored, checkpoint=replace(stored.checkpoint, fine_archive=None))
+        with self.assertRaises(ValueError):
+            store.assign_legacy_cloud_checkpoint(no_fine, **kwargs)
+        for changed in (fine_archive(1), fine_archive(domain_update={'generation': 4})):
+            with self.assertRaises(ValueError):
+                store.assign_legacy_cloud_checkpoint(
+                    replace(stored, checkpoint=replace(stored.checkpoint, fine_archive=changed)), **kwargs)
+
+    def test_fine_import_duplicate_object_with_changed_body_is_rejected(self):
+        self.prepare()
+        payload = fine_archive()
+        length = struct.unpack('<Q', payload[8:16])[0]
+        root = json.loads(payload[16:16 + length])
+        root['blocks'].append(dict(root['blocks'][0], key=[1, 0, 0]))
+        raw = json.dumps(root, separators=(',', ':')).encode()
+        body = payload[16 + length + 8:]
+        changed = body[:-2] + struct.pack('<H', 2)
+        self.add_fine_archive(b'NUWAXAR2' + struct.pack('<Q', len(raw)) + raw
+                              + struct.pack('<Q', 2) + body + changed)
+        with patch.object(asset_store.uuid, 'uuid4', side_effect=AssertionError('invalid allocation')):
+            with self.assertRaisesRegex(ValueError, '实际字节不一致'):
+                self.import_current()
+
+    def test_fine_import_same_length_source_edit_is_a_distinct_owned_import(self):
+        self.prepare()
+        payload = fine_archive()
+        self.add_fine_archive(payload)
+        first = self.import_current()
+        changed = payload[:-2] + struct.pack('<H', 2)
+        self.add_fine_archive(changed)
+        second = self.import_current()
+        self.assertNotEqual(first.bundle.asset_identity, second.bundle.asset_identity)
+        left, right = first.stored_checkpoint.checkpoint, second.stored_checkpoint.checkpoint
+        self.assertNotEqual(left.checkpoint_id, right.checkpoint_id)
+        self.assertNotEqual(left.fine_reference.id, right.fine_reference.id)
+        self.assertEqual(bytes(left.fine_archive), payload)
+        self.assertEqual(bytes(right.fine_archive), changed)
+
+    def test_fine_root_helper_preserves_validator_results_and_error_order(self):
+        from services.geometry import fine_map_archive as parser
+        from fine_scalar_oracle import validate_fine_archive as original
+        from test_fine_archive_vector import Borrowed
+        def outcome(function, payload):
+            try:
+                return ('ok', function(payload))
+            except Exception as error:
+                return (type(error).__name__, str(error))
+        for version in (1, 2, 3):
+            payload = fine_archive(version)
+            length = struct.unpack('<Q', payload[8:16])[0]
+            start = 48 if version == 1 else 16
+            end = start + length
+            borrowed = Borrowed(payload)
+            magic, root, offset = parser.read_fine_archive_root(borrowed)
+            self.assertEqual((magic, root, offset),
+                             (payload[:8], original(payload) if version < 3 else json.loads(payload[start:end]), end))
+            self.assertTrue(all(part.stop <= end for part in borrowed.slices))
+            root_bytes = payload[start:end]
+            invalid_roots = [b'[]', b'null', b'{',
+                root_bytes.replace(b'"version":', b'"version":0,"version":', 1),
+                root_bytes.replace(b'0.125', b'NaN', 1),
+                root_bytes.replace(b'"producer_generation":8', b'"producer_generation":0', 1)]
+            cases = [payload, payload[:-1], payload + b'bad', payload[:15],
+                     payload[:8] + struct.pack('<Q', 32 * 1024 * 1024 + 1) + payload[16:]]
+            for raw in invalid_roots:
+                cases.append(payload[:8] + struct.pack('<Q', len(raw)) + payload[16:start]
+                             + raw + payload[end:])
+            for case in cases:
+                with self.subTest(version=version, size=len(case)):
+                    if version < 3:
+                        self.assertEqual(outcome(parser.validate_fine_archive, case), outcome(original, case))
+                    elif case == payload:
+                        self.assertEqual(parser.validate_fine_archive(case), root)
+                    else:
+                        with self.assertRaises(ValueError):
+                            parser.validate_fine_archive(case)
+        # Bounded JSON reading does not assert that the following blocks are valid.
+        damaged = fine_archive(3)[:-1]
+        self.assertEqual(parser.read_fine_archive_root(damaged)[1]['version'], 3)
+        with self.assertRaises(ValueError):
+            parser.validate_fine_archive(damaged)
+
+    def test_fine_root_refactor_keeps_ar3_layer_json_rejections(self):
+        from services.geometry import fine_map_archive as parser
+        payload = fine_archive(3)
+        _, _, offset = parser.read_fine_archive_root(payload)
+        block = payload[offset + 12:]
+        tail = block[28:]
+        for changed, message in (
+                (tail.replace(b'"members":', b'"members":[],"members":', 1), '精细地图根包含重复字段'),
+                (tail.replace(b'0.04', b'NaN', 1), '精细地图根包含非有限数')):
+            replacement = block[:12] + struct.pack('<I', len(changed)) + block[16:28] + changed
+            damaged = payload[:offset] + struct.pack('<QI', 1, len(replacement)) + replacement
+            with self.assertRaisesRegex(ValueError, message):
+                parser.validate_fine_archive(damaged)
 
     def _prepare_xyz_storage(self, point_count):
         self.prepare(dense=False)

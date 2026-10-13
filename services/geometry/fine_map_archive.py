@@ -27,9 +27,25 @@ def _validate_vector_block_evidence(block, points, source_time):
         raise ValueError("精细地图块观察证据错误")
 
 
-def validate_fine_archive(payload, *, session=None, generation=None, cloud_revision=None,
-                          source_timestamp_ns=None, frame_generation=None, producer_generation=None):
-    """读取 AR1/AR2/AR3 完整根并核对块结构和原提交；旧摘要字段仅保留为别名。"""
+def _unique_json_fields(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("精细地图根包含重复字段")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_json(_):
+    raise ValueError("精细地图根包含非有限数")
+
+
+def read_fine_archive_root(payload):
+    """Parse only bounded root JSON, returning magic, root and block offset.
+
+    This is not archive admission: root semantics, blocks and source bindings
+    still require validate_fine_archive before the payload can be accepted.
+    """
     if not isinstance(payload, (bytes, FrozenPayload)) or not 24 <= len(payload) <= MAX_FINE_ARCHIVE_BYTES:
         raise ValueError("精细地图资产类型或大小错误")
     magic = payload[:8]
@@ -44,18 +60,15 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
         raise ValueError("精细地图旧根别名为空")
     root_bytes = payload[root_offset:root_offset + root_length]
 
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("精细地图根包含重复字段")
-            result[key] = value
-        return result
+    root = json.loads(root_bytes, object_pairs_hook=_unique_json_fields, parse_constant=_reject_nonfinite_json)
+    return magic, root, root_offset + root_length
 
-    def nonfinite(_):
-        raise ValueError("精细地图根包含非有限数")
 
-    root = json.loads(root_bytes, object_pairs_hook=unique, parse_constant=nonfinite)
+def validate_fine_archive(payload, *, session=None, generation=None, cloud_revision=None,
+                          source_timestamp_ns=None, frame_generation=None, producer_generation=None):
+    """读取 AR1/AR2/AR3 完整根并核对块结构和原提交；旧摘要字段仅保留为别名。"""
+    magic, root, offset = read_fine_archive_root(payload)
+    legacy = magic == b"NUWAXAR1"
     root_fields = {"version", "domain", "revision", "source_timestamp_ns", "voxel_size_m", "blocks"}
     if not legacy:
         root_fields.add("geometry_revision")
@@ -102,7 +115,6 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
     blocks = root["blocks"]
     if not isinstance(blocks, list) or len(blocks) > 131072:
         raise ValueError("精细地图块目录超预算")
-    offset = root_offset + root_length
     if struct.unpack("<Q", payload[offset:offset + 8])[0] != len(blocks):
         raise ValueError("精细地图资产块数错误")
     offset += 8
@@ -165,7 +177,7 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
         else:
             _validate_vector_block_evidence(block, points, source_time)
         if layered:
-            layers = json.loads(block[records_end:], object_pairs_hook=unique, parse_constant=nonfinite)
+            layers = json.loads(block[records_end:], object_pairs_hook=_unique_json_fields, parse_constant=_reject_nonfinite_json)
             _validate_layer_structure(layers, integer)
     if offset != len(payload):
         raise ValueError("精细地图资产存在尾随数据")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from services.geometry.checkpoint_payload import FrozenPayload, payload_digest, payload_chunks, MAX_PLANAR_ARCHIVE_BYTES
 from services.geometry.planar_archive import read_planar_structure, assign_legacy_planar_archive, MAX_GRID
-from services.geometry.fine_map_archive import MAX_FINE_ARCHIVE_BYTES, validate_fine_archive
+from services.geometry.fine_map_archive import MAX_FINE_ARCHIVE_BYTES, read_fine_archive_root, validate_fine_archive
 from services.geometry.dense_cloud import MAX_DENSE_ARCHIVE_BYTES, validate_dense_archive, read_dense_metadata
 
 import fcntl
@@ -1804,16 +1804,18 @@ def _validate_canonical_members(checkpoint, occupancy, cloud):
 
 
 def assign_legacy_cloud_checkpoint(stored_checkpoint, *, canonical_occupancy_data,
-                                   canonical_cloud_xyz, checkpoint_id, dense_artifact_id=None):
+                                   canonical_cloud_xyz, checkpoint_id, fine_artifact_id=None,
+                                   dense_artifact_id=None):
     """Convert an actual legacy cloud owner; allocation/publication belong to importer."""
     if not isinstance(stored_checkpoint, StoredMappingBackendCheckpoint):
         raise TypeError("cloud import requires a stored checkpoint owner")
     previous = stored_checkpoint.checkpoint
     if (previous.schema_version != 1 or previous.backend_kind not in {"voxel", "raytracing"}
-            or previous.cloud_receipt is None or stored_checkpoint.cloud_asset is None
-            or previous.fine_archive is not None):
-        raise ValueError("cloud import requires original receipts and no fine archive")
+            or previous.cloud_receipt is None or stored_checkpoint.cloud_asset is None):
+        raise ValueError("cloud import requires original receipts")
     _validate_assigned_id(checkpoint_id, "checkpoint_id")
+    if (previous.fine_archive is None) != (fine_artifact_id is None):
+        raise ValueError("fine import bytes and owned artifact ID must both be present")
     if (previous.dense_archive is None) != (dense_artifact_id is None):
         raise ValueError("dense import bytes and owned artifact ID must both be present")
     occupancy = {key: value for key, value in stored_checkpoint.occupancy_asset.items()
@@ -1823,6 +1825,20 @@ def assign_legacy_cloud_checkpoint(stored_checkpoint, *, canonical_occupancy_dat
     def member(role, frame):
         return CheckpointMemberIdentity(checkpoint_id, role, previous.occupancy_receipt,
             previous.cloud_receipt, frame)
+    fine_reference = None
+    if previous.fine_archive is not None:
+        if previous.fine_archive[:8] not in (b"NUWAXAR2", b"NUWAXAR3"):
+            raise ValueError("assigned fine import requires AR2 or AR3")
+        # Only read the bounded root here; final bundle admission validates all
+        # blocks and binds these source generations to the original receipts.
+        _, root, _ = read_fine_archive_root(previous.fine_archive)
+        try:
+            fine_member = CheckpointMemberIdentity(checkpoint_id, "fine_map", previous.occupancy_receipt,
+                previous.cloud_receipt, cloud["frame_id"], root["domain"]["frame_generation"],
+                root["domain"]["producer_generation"])
+        except (KeyError, TypeError) as error:
+            raise ValueError("fine import root domain is incomplete") from error
+        fine_reference = CheckpointArtifactReference(fine_artifact_id, len(previous.fine_archive), 2, fine_member)
     dense_reference = None
     if previous.dense_archive is not None:
         _validate_assigned_id(dense_artifact_id, "dense artifact id")
@@ -1837,6 +1853,7 @@ def assign_legacy_cloud_checkpoint(stored_checkpoint, *, canonical_occupancy_dat
         backend_identity=member("backend_state", occupancy["frame_id"]),
         occupancy_identity=member("canonical_occupancy", occupancy["frame_id"]),
         cloud_identity=member("canonical_cloud", cloud["frame_id"]),
+        fine_archive=previous.fine_archive, fine_reference=fine_reference,
         dense_archive=previous.dense_archive, dense_reference=dense_reference)
     return MappingBackendCheckpointStore.validate_checkpoint_bundle(checkpoint,
         occupancy_asset=occupancy, cloud_asset=cloud)

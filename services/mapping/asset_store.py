@@ -309,9 +309,15 @@ class MapAssetBundleRepository:
             checkpoint_manifest = _parse_json_object(tree.require_file(source["manifest_path"], "checkpoint manifest")
                 .read(_MAX_CHECKPOINT_JSON_BYTES), "checkpoint manifest")
             receipts = checkpoint_manifest.get("canonical_receipts")
-            if (checkpoint_manifest.get("fine_archive") is not None or not isinstance(receipts, dict)
-                    or not receipts.get("occupancy") or not receipts.get("cloud")):
+            if (not isinstance(receipts, dict) or not receipts.get("occupancy") or not receipts.get("cloud")):
                 return None
+            fine_source = checkpoint_manifest.get("fine_archive")
+            if fine_source is not None:
+                if not isinstance(fine_source, dict) or not isinstance(fine_source.get("path"), str):
+                    return None
+                fine_path = "mapping_backend/" + source["backend_kind"] + "/" + fine_source["path"]
+                if tree.require_file(fine_path, "legacy fine archive").slice(0, 8) not in (b"NUWAXAR2", b"NUWAXAR3"):
+                    return None  # AR1 still needs an explicit root-format migration.
             raw_catalog = _parse_json_object(_read_regular_file(self._map_dir(map_name) / "metadata.json",
                 "legacy catalog", maximum_bytes=_MAX_LEGACY_METADATA_JSON_BYTES), "legacy catalog")
             root_state = os.fstat(tree.root.descriptor)
@@ -334,8 +340,6 @@ class MapAssetBundleRepository:
                 tree.verify_all()
                 return selected
             stored = MappingBackendCheckpointStore(current).load(source["backend_kind"], schema_version=1)
-            if stored.checkpoint.fine_archive is not None:
-                return None
             if (stored.manifest_path.relative_to(current).as_posix() != source["manifest_path"]
                     or stored.manifest_sha256 != source.get("manifest_sha256")
                     or stored.checkpoint.content_sha256.hex() != source.get("object_sha256")):
@@ -389,6 +393,7 @@ class MapAssetBundleRepository:
             checkpoint, occupancy, cloud = assign_legacy_cloud_checkpoint(stored,
                 canonical_occupancy_data=cells, canonical_cloud_xyz=xyz,
                 checkpoint_id=uuid.uuid4().hex,
+                fine_artifact_id=uuid.uuid4().hex if stored.checkpoint.fine_archive is not None else None,
                 dense_artifact_id=uuid.uuid4().hex if stored.checkpoint.dense_archive is not None else None)
             staging = self.create_staging_directory(map_name)
             try:

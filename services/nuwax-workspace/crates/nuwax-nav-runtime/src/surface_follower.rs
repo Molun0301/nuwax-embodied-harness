@@ -644,6 +644,9 @@ impl NavPlanner for SurfaceFollower {
     fn revalidate_selected_command(&mut self,command:Twist2)->Option<PlannerStep> {
         self.recheck_selected_body_command(command)
     }
+    fn revalidate_selected_command_at_current_state(&mut self,command:Twist2)->Option<PlannerStep> {
+        self.recheck_selected_body_command_at_current_state(command)
+    }
     fn take_command_dispatch_bound(&mut self)->Option<crate::CommandDispatchBound> {SurfaceFollower::take_command_dispatch_bound(self)}
     fn configure_boundary(&mut self,boundary:&[[f64;2]]) {
         self.last_command_dispatch_bound = None;

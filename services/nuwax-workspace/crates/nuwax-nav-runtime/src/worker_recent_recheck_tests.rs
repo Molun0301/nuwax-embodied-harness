@@ -25,6 +25,11 @@ impl NavPlanner for RecentRecheckProbe {
         let start=std::time::Instant::now();let result=self.inner.revalidate_selected_command(c);
         let mut counts=self.counts.lock().unwrap();counts.rechecks+=1;counts.recheck_us.push(start.elapsed().as_micros());result
     }
+    fn revalidate_selected_command_at_current_state(&mut self,c:Twist2)->Option<PlannerStep>{
+        let start=std::time::Instant::now();let result=self.inner.revalidate_selected_command_at_current_state(c);
+        let mut counts=self.counts.lock().unwrap();counts.rechecks+=1;counts.recheck_us.push(start.elapsed().as_micros());result
+    }
+    fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound>{self.inner.take_command_dispatch_bound()}
     fn stop(&mut self){self.inner.stop()}
 }
 fn recent_recheck_fixture()->(PlannerWorker,Arc<SurfaceSnapshot>,Arc<Mutex<RecentRecheckCounts>>,
@@ -130,7 +135,7 @@ fn latest_recent_recheck_preserves_original_expiration() {
 }
 
 #[test]
-fn latest_recent_pose_change_retires_inflight_and_published_selection() {
+fn latest_recent_pose_change_rechecks_current_state_without_reranking() {
     for published in [false,true] {
         let(mut worker,map,counts,computed,release)=recent_recheck_fixture();
         assert!(matches!(computed.recv_timeout(Duration::from_secs(2)).unwrap(),PlannerStep::Command(c) if c!=Twist2::ZERO));
@@ -143,10 +148,37 @@ fn latest_recent_pose_change_retires_inflight_and_published_selection() {
         assert_eq!(input.result_pose_version,input.pose_version);
         drop(input);
         let observed=counts.lock().unwrap();
-        assert_eq!(observed.rechecks,0,"a changed pose cannot replay the old selected trajectory");
-        assert_eq!(observed.full,2,"new pose requires a new selection, published={published}");
+        assert!(observed.rechecks>=1,"a changed pose requires a new full stopping check");
+        assert_eq!(observed.full,1,"current-state check must not rerank, published={published}");
         drop(observed);
         assert!(matches!(worker.step(0.3),PlannerStep::Command(c) if c!=Twist2::ZERO));
         worker.stop();
     }
+}
+
+#[test]
+fn latest_received_pose_recheck_keeps_twenty_hz_moving_progress() {
+    let(mut worker,_map,counts,computed,release)=recent_recheck_fixture();
+    computed.recv_timeout(Duration::from_secs(2)).unwrap();release.send(()).unwrap();wait_recent_rechecked(&worker);
+    let started=std::time::Instant::now();let mut next_pose=started;let mut next_control=started+Duration::from_millis(12);
+    let mut integrated=started;let mut x=0.5;let mut command=Twist2::ZERO;let mut nonzero=0;let mut controls=0;let mut poses=0;
+    while started.elapsed()<Duration::from_millis(1200) {
+        let now=std::time::Instant::now();x+=command.linear.x*now.duration_since(integrated).as_secs_f64();integrated=now;
+        if now>=next_pose {
+            let mut pose=route_pose(x,poses);let ns=crate::command_proof_trace::unix_ns();
+            pose.stamp=Timestamp::from_unix((ns/1_000_000_000)as i64,(ns%1_000_000_000)as u32);
+            worker.update_odometry(pose);poses+=1;next_pose+=Duration::from_millis(25);
+        }
+        if now>=next_control {
+            command=match worker.step(0.3) {PlannerStep::Command(c)=>c,_=>Twist2::ZERO};
+            worker.observe_applied_command(command);controls+=1;
+            if command!=Twist2::ZERO {nonzero+=1;}
+            next_control+=Duration::from_millis(50);
+        }
+        std::thread::sleep(Duration::from_micros(500));
+    }
+    let c=counts.lock().unwrap();
+    eprintln!("MOVING_CURRENT_RECHECK poses={poses} controls={controls} nonzero={nonzero} travelled={} full={} rechecks={} recheck_us={:?}",x-0.5,c.full,c.rechecks,c.recheck_us);
+    assert!(poses>=45 && controls>=23 && nonzero>=12 && x-0.5>0.05,"current-pose checks starved ordinary moving control");
+    assert!(c.rechecks>0);drop(c);worker.stop();
 }

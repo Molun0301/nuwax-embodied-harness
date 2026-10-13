@@ -977,8 +977,18 @@ impl SurfaceFollower {
     /// Reuse the selected command parameters, never the old collision answer.
     /// The original worker issue deadline remains owned by PlannerWorker.
     pub(super) fn recheck_selected_body_command(&mut self,command:Twist2)->Option<PlannerStep> {
-        let selected=self.selected_body_command.as_ref()?.clone();
+        self.recheck_selected_body_command_from(command,false)
+    }
+    pub(super) fn recheck_selected_body_command_at_current_state(&mut self,command:Twist2)->Option<PlannerStep> {
+        self.recheck_selected_body_command_from(command,true)
+    }
+    fn recheck_selected_body_command_from(&mut self,command:Twist2,current_state:bool)->Option<PlannerStep> {
+        let mut selected=self.selected_body_command.as_ref()?.clone();
         if selected.command!=command {return None;}
+        if current_state {
+            selected.pose=self.odometry.as_ref()?.clone();
+            selected.current=self.last_command;
+        }
         let saved_pose=self.odometry.replace(selected.pose.clone());
         let saved_map=self.map.clone();
         let saved_dirty=self.body_view_dirty;
@@ -986,22 +996,27 @@ impl SurfaceFollower {
         self.last_command=selected.current;
         self.body_view_dirty=true;
         self.refresh_current_body_view();
-        let checked=self.with_body_motion_checks(|clear,period,last_failure,_| {
+        let checked=self.with_body_motion_checks(|clear,period,last_failure,proof| {
             let valid=nuwax_nav_control::check_stopping_trajectory_with_period_check(
                 planar(&selected.pose),selected.current,selected.command,&selected.limits,
                 selected.dt,selected.sample_step,selected.radius,clear,period).is_some();
             #[cfg(test)] if valid {crate::command_proof_trace::record_selected(command);}
-            (valid,last_failure.take())
+            let bound=if valid {proof.bound().map_err(str::to_owned)}else{Ok(None)};
+            (valid,last_failure.take(),bound)
         });
         self.odometry=saved_pose;self.map=saved_map;self.body_view_dirty=saved_dirty;
         self.last_command=saved_command;
         match checked {
-            Ok((true,_))=>Some(PlannerStep::Command(command)),
+            Ok((true,_,Ok(bound)))=>{
+                self.selected_body_command=Some(selected);
+                self.last_command_dispatch_bound=bound;
+                Some(PlannerStep::Command(command))
+            },
             other=>{
                 self.selected_body_command=None;
                 self.last_command=selected.current;
                 self.begin_braking();
-                Some(PlannerStep::ReplanRequired(format!("最新近期障碍拒绝已选停车轨迹: {other:?}")))
+                Some(PlannerStep::ReplanRequired(format!("当前状态或最新近期障碍拒绝已选停车轨迹: {other:?}")))
             }
         }
     }

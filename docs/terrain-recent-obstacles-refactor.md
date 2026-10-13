@@ -54,10 +54,45 @@ CPython **3.8.10 实际运行**通过 21 项 archive、8 项 scalar/vector、43 
 | Rust assigned artifact | 8/8 | 包括 AR3 保留 identity 2；旧 envelope 拒绝 |
 | Python 3.8.10 | 72/72 | 真实 archive/store 回归，初始化隔离见上 |
 | Stack focused 集成 | selective refresh 27/27；recent consumer 1/1；surface chunks 8/8（2 ignored） | 含真实长门洞 1/1（317.68 秒）；不是 Stack 全组 |
-| Stack qualification feature | 最终 `--no-run` 编译成功（exit 0） | 首次编译暴露五处测试接口未迁移，修复后通过；完整 opt3 / 60 秒资格场景本轮未跑 |
+| Stack qualification feature | release opt3 编译成功；普通回归 15/15、几何预检 1/1、源健康启动正负例 1/1；最终六项 live 场景 6/6 | 先修正 fixture 的独立 recent 源接线，再修复首次交付旧位姿缺口；原 wall OFF 碰撞失败保留，详见下节 |
 | release A/B 性能 | 五对独立进程，10/10 断言通过 | A 按预期耗尽预算；B 返回有效路径，详见下节 |
 
 五项 UDS 过滤不能表述为忽略后“全通过”：独立重试仍在 bind 时出现 `PermissionDenied: Operation not permitted`。需要允许 Unix socket 的环境重跑。未执行全 workspace、实机传感器回放/运动闭环、实机 CPU/延迟长时采样及整 Web 服务启动验收。**不能据此宣称实机 98% CPU 问题已解决。**
+
+### 完整表面恢复资格：独立 live 源接线与保留失败（2026-10-13）
+
+使用原 workspace release 配置（opt3、thin LTO、codegen-units=1），只构建 `nuwax-nav-stack --lib --features mls,guard-runtime,surface-recovery-qualification` 的必要依赖图，复用现有 target；未 clean 或全 workspace 重建。每个场景独立进程、串行运行，保留原 60 秒窗口和全部 oracle。
+
+第一次六项都在初始运动前超时：调度器为 Idle、无路径、无运动指令，清理成功。原因是测试保留了一秒源健康要求，但 feeder 只发布静态 fine map 和 pose，未发布新增的 `RecentCloud3D`。生产调度器按要求把缺失的 live 源标为不可用，静态地图不能续期它。这六项原失败保留，不计作通过。
+
+修正仅在 qualification fixture：每次新合成扫描用当前采样 voxel 的中心返回同时发布独立 recent cloud；保留所有障碍点、采样顺序、真实采样时间、对应 pose 序号/时间和地图 authority。数据来自该次扫描，不读取 Writer 累积历史，也不把地图重放变成健康扫描。原一秒 TTL、碰撞与停车判据、目标容差不变。一个 1.25 秒的启动回归证实：只有地图/pose 时同一目标不准入；接入新 live 扫描后同一目标开始运动，取消有相关联的归零回执。
+
+仅修正 fixture、尚未修复首次交付缺口时，普通 qualification 回归 15 passed / 8 ignored；显式几何预检 1/1；六项原 live 场景结果：
+
+| 场景 | 结果 | 测试进程 wall |
+| --- | --- | --- |
+| 已知落差恢复，局部规划 OFF | passed；恢复原目标到达 | 6.71 s |
+| 已知落差恢复，局部规划 ON | passed；恢复原目标到达 | 7.14 s |
+| 持续 box 障碍，局部规划 OFF | passed；绕行原目标到达，连续 oracle 通过 | 11.60 s |
+| 持续 box 障碍，局部规划 ON | passed；绕行原目标到达，连续 oracle 通过 | 12.57 s |
+| 持续 wall 障碍，局部规划 OFF | **failed**；连续碰撞 oracle 检出实际轨迹穿入 | 8.95 s |
+| 持续 wall 障碍，局部规划 ON | passed；保持阻挡等待，连续 oracle 通过 | 10.34 s |
+
+wall OFF 已保持零速等待五秒，但此前实际 +0.05 m/s 指令从 x=1.8476569601 保持 49.590924 ms，归零时 x=1.8501365063。独立连续 oracle 在实际 segment 558 检出约 **0.136476 mm** 穿入（SAT gap=-0.000136476498 m）。原 epsilon=1e-8 未变，不能因穿入较小而忽略。源期限尚未过期；清理成功不能把轨迹失败算成通过。确切 guard 计算位姿与首次交付的时序还需定向诊断，不能据此宣布全部运动安全资格通过。
+
+后续两个确定性测试用真实 RouteFollower/机体守卫、仅屏障住发布时机，复现了首次交付缺口：从 x=.533 计算得到 +.1 m/s，已有速度在 80 ms 内移动到 x=.541；新位姿在发布前或发布后到达时，worker 仍交付旧候选，原 250 ms 窗口尚余约 167 ms，但在最新位姿执行同一完整停车扫掠会失败。两项原 desired-safety 断言均失败，日志保留。它证明真实旧位姿首次交付缺口，但不能伪称已捕获上述 wall 进程的确切内部 guard 计算位姿。
+
+生产修正只复核已选命令的一条完整停车轨迹：同一工作线程接纳最新已收位姿与实际 applied velocity，用原机体查询重新复核；不重新枚举候选。新位姿到达时主动唤醒这条复核，在交付处仍未跟上最新状态时等待；原选择开始时间与最早来源期限不续期。原 recent-only 复核与新 current-state 复核共享同一停车查询。时间戳单独变化不使同一几何姿态失效。两个旧 synthetic 单测原先明确允许旧位姿首次交付，已迁移为同姿态 provenance 保持和新姿态必须重算，同时保留一次消费、过期和终态断言。
+
+修正后首次交付两项缺口回归通过；latest-recent 五项通过，覆盖微抖、已选复核、障碍拒绝、当前位姿复核与原期限不续期。40 Hz 位姿 / 20 Hz 控制的 1.2 s 理想移动回归记录 48 个位姿、24 拍控制、24 次非零输出、0.544 m 行程；47 次单轨迹复核多数 0.2–0.9 ms、最大 2.687 ms，完整候选选择 25 次。这是该 fixture 的实际无饥饿证据，不是硬 20 Hz 长尾保证。
+
+最后一组独立进程完整 live 资格 **6 passed / 0 failed**：support OFF/ON 为 6.76 / 8.37 s，box OFF/ON 为 10.71 / 14.04 s，wall OFF/ON 为 7.41 / 7.74 s。原 60 秒窗口、1 秒源 TTL、.1 m 位置/.15 rad 朝向容差与连续 oracle 的 epsilon 均未改。wall OFF 此次通过原连续碰撞审计并保持障碍等待五秒；没有把旧失败改写成通过。
+
+最终 Runtime release 全 lib（同五项真实 UDS 过滤）为 **226 passed / 0 failed / 47 ignored / 5 filtered**；另显式运行首次交付两项与已消费指令 replay 两项，均通过。最终二进制上的 live 源启动正负例重跑通过（1.20 s）。这些 focused/ignored 结果另记，不与全 lib 计数重复相加。
+
+该复核以“最新已收到的位姿”为依据，不代表已证明传感器位姿延迟或真实执行器激活后的物理位置误差全部解决。
+
+这些是同一真实 liblcm memq context、生产 planner/worker/scheduler 与理想速度保持器的云端软件测试，不是物理制动、实机避障、实机 CPU、UDS 或硬实时证明。
 
 ## 性能诊断与保留失败
 
@@ -128,8 +163,8 @@ cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked -j2 -p n
 cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked -j2 -p nuwax-nav-stack --lib --features mls,guard-runtime recent_consumer -- --test-threads=1
 cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked -j2 -p nuwax-nav-stack --lib --features mls,guard-runtime surface_chunks::tests -- --test-threads=1 --skip complete_fine_manifest_resolves_a_real_door_across_storage_blocks
 cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked -j2 -p nuwax-nav-stack --lib --features mls,guard-runtime complete_fine_manifest_resolves_a_real_door_across_storage_blocks -- --test-threads=1
-# 仅编译，不执行完整 qualification
-cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked -j2 -p nuwax-nav-stack --lib --features mls,guard-runtime,surface-recovery-qualification --no-run
+# 完整 qualification 使用 release opt3；下面仅构建，执行必须另选 exact 场景
+cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked -j2 -p nuwax-nav-stack --lib --release --features mls,guard-runtime,surface-recovery-qualification --no-run
 cargo test --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml --locked -j2 --bin nuwax-geometry-runtime planar_artifacts::assigned_identity_tests -- --test-threads=1
 # 原预算失败复现，不应为获得通过而修改预算
 cargo test --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml --locked -j2 --bin nuwax-geometry-runtime pgo_map::tests::background_catchup_preserves_replay_cadence_maps_and_checkpoint -- --exact --test-threads=1

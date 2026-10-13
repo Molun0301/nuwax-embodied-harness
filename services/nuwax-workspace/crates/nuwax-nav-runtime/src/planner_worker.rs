@@ -127,10 +127,10 @@ impl PlannerWorker {
                         terrain_seq,
                         replay,
                         pose,
-                        pose_seq,
+                        mut pose_seq,
                         width,
                         applied,
-                        applied_seq,
+                        mut applied_seq,
                     ) = {
                         let mut input = lock.lock().unwrap();
                         while input.requested.is_none() && !input.lifecycle_stop && !input.lifecycle_update && !input.closed {
@@ -155,12 +155,15 @@ impl PlannerWorker {
                         let replay=input.result.as_ref().and_then(|(started,step)| {
                             let PlannerStep::Command(command)=step else {return None;};
                             (*command!=Twist2::ZERO && started.elapsed()<=DEFAULT_CONTROL_HORIZON
-                                && input.result_map_version!=input.map_version
+                                && (input.result_map_version!=input.map_version
+                                    || input.result_pose_version!=input.pose_version
+                                    || input.result_applied_version!=input.applied_version)
                                 && input.result_terrain_generation==input.terrain_generation
-                                && input.result_pose_version==input.pose_version
-                                && input.result_applied_version==input.applied_version
                                 && input.result_boundary_version==input.boundary_version)
-                                .then_some((*started,*command))
+                                .then_some((*started,*command,
+                                    input.result_pose_version!=input.pose_version
+                                        || input.result_applied_version!=input.applied_version,
+                                    input.result_dispatch_bound))
                         });
                         (
                             input.epoch,
@@ -182,7 +185,7 @@ impl PlannerWorker {
                             input.applied_version,
                         )
                     };
-                    let mut started = replay.map_or_else(std::time::Instant::now,|(started,_)|started);
+                    let mut started = replay.map_or_else(std::time::Instant::now,|(started,_,_,_)|started);
                     let mut rechecked=false;
                     #[cfg(test)] let compute_trace=width.map(|_| {
                         result_id=result_id.checked_add(1).expect("test worker result ID exhausted");
@@ -234,8 +237,10 @@ impl PlannerWorker {
                             path_version = path_seq;
                         }
                         planner.observe_applied_command(applied);
-                        if let Some((_,command))=replay {
-                            if let Some(result)=planner.revalidate_selected_command(command) {
+                        if let Some((_,command,current_state,_))=replay {
+                            let checked=if current_state {planner.revalidate_selected_command_at_current_state(command)}
+                                else {planner.revalidate_selected_command(command)};
+                            if let Some(result)=checked {
                                 rechecked=true;return Ok(result);
                             }
                             // Unsupported planners retain their ordinary full-compute semantics.
@@ -244,35 +249,50 @@ impl PlannerWorker {
                         Ok(width.map_or(PlannerStep::Pending(Vec::new()),|width|planner.step(width)))
                     })()
                     .unwrap_or_else(|error| PlannerStep::ReplanRequired(error.to_string()));
-                    // Sources can refresh while candidate ranking is running. Recheck only
-                    // that final command against the latest view, outside the input lock.
-                    // Any semantic/terrain gap or original deadline still retires it.
+                    // Keep the original source bound even when later rechecks use
+                    // fresher evidence. A selected trajectory never renews its lease.
+                    let candidate_bound=planner.take_command_dispatch_bound();
+                    let mut dispatch_bound=match (replay.and_then(|r|r.3),candidate_bound) {
+                        (Some(a),Some(b))=>Some(a.earliest(b)),(a,b)=>a.or(b),
+                    };
+                    // Catch up only this selected trajectory, not candidate ranking.
+                    // Input reception remains independent of this geometry work.
                     while matches!(computed,PlannerStep::Command(v) if v!=Twist2::ZERO)
                         && started.elapsed()<=DEFAULT_CONTROL_HORIZON {
                         let latest={
                             let mut input=lock.lock().unwrap();
-                            if input.epoch==version && input.applied_version==applied_seq
-                                && input.pose_version==pose_seq
-                                && input.boundary_version==boundary_seq && !input.closed
-                                && input.terrain_generation==terrain_seq && input.map_version!=map_seq {
+                            if input.epoch==version && input.boundary_version==boundary_seq && !input.closed
+                                && input.terrain_generation==terrain_seq
+                                && (input.map_version!=map_seq || input.pose_version!=pose_seq
+                                    || input.applied_version!=applied_seq) {
                                 input.map_pending=false;
-                                input.map.clone().map(|map|(input.map_version,map))
+                                Some((input.map_version,input.map.clone(),input.pose_version,input.pose.clone(),
+                                    input.applied_version,input.applied))
                             } else {None}
                         };
-                        let Some((sequence,map))=latest else {break;};
-                        if let Err(error)=planner.update_execution_map(map) {
-                            computed=PlannerStep::ReplanRequired(error.to_string());break;
+                        let Some((sequence,map,latest_pose_seq,pose,latest_applied_seq,applied))=latest else {break;};
+                        if sequence!=map_seq {
+                            if let Some(map)=map {if let Err(error)=planner.update_execution_map(map) {
+                                computed=PlannerStep::ReplanRequired(error.to_string());break;
+                            }}
+                            map_version=sequence;
                         }
-                        map_version=sequence;
+                        let current_state=latest_pose_seq!=pose_seq || latest_applied_seq!=applied_seq;
+                        if current_state {
+                            if let Some(pose)=pose {planner.update_odometry(pose);}
+                            planner.observe_applied_command(applied);
+                        }
                         let PlannerStep::Command(command)=computed else {unreachable!()};
-                        let Some(checked)=planner.revalidate_selected_command(command) else {break;};
-                        computed=checked;map_seq=sequence;rechecked=true;
+                        let checked=if current_state {planner.revalidate_selected_command_at_current_state(command)}
+                            else {planner.revalidate_selected_command(command)};
+                        let Some(checked)=checked else {break;};
+                        if let Some(bound)=planner.take_command_dispatch_bound() {
+                            dispatch_bound=Some(dispatch_bound.map_or(bound,|old|old.earliest(bound)));
+                        }
+                        computed=checked;map_seq=sequence;pose_seq=latest_pose_seq;applied_seq=latest_applied_seq;rechecked=true;
                     }
                     #[cfg(test)] let computed_proof=compute_trace.and_then(|trace|trace.finish(&computed));
-                    // Consume metadata with this exact completed computation, even
-                    // when the outcome cannot issue a nonzero command.
-                    let candidate_bound=planner.take_command_dispatch_bound();
-                    let mut dispatch_bound=if matches!(&computed,PlannerStep::Command(v) if *v!=Twist2::ZERO) {candidate_bound}else{None};
+                    if !matches!(&computed,PlannerStep::Command(v) if *v!=Twist2::ZERO) {dispatch_bound=None;}
                     if width.is_none() {continue;}
                     let mut wait_reason = if matches!(computed, PlannerStep::Pending(_))
                         || matches!(computed, PlannerStep::Command(command) if command == Twist2::ZERO) {
@@ -292,7 +312,8 @@ impl PlannerWorker {
                         && input.applied_version == applied_seq
                         && input.map_version == map_seq
                         && input.boundary_version == boundary_seq
-                        && (!rechecked || input.pose_version == pose_seq)
+                        && (!(rechecked || matches!(computed,PlannerStep::Command(v) if v!=Twist2::ZERO))
+                            || input.pose_version == pose_seq)
                         && (!matches!(computed, PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
                             || input.pose_version == pose_seq)
                         && !input.closed;
@@ -408,6 +429,13 @@ impl NavPlanner for PlannerWorker {
             !same_pose(previous, &pose))
         {
             input.pose_version += 1;
+            // Refresh an unissued selection ahead of the next control tick.
+            // This is one trajectory check; unchanged timestamp-only receipts
+            // neither invalidate nor re-enumerate the selected candidate.
+            if input.result.as_ref().is_some_and(|(_,step)|matches!(step,PlannerStep::Command(c) if *c!=Twist2::ZERO)) {
+                input.requested=input.control_width;
+                self.shared.1.notify_one();
+            }
         }
         input.pose = Some(pose);
     }
@@ -476,6 +504,10 @@ impl NavPlanner for PlannerWorker {
         let expired = input.result.as_ref().is_some_and(|(started, step)|
             matches!(step, PlannerStep::Command(_)) && started.elapsed() > DEFAULT_CONTROL_HORIZON);
         let dispatch_expired=input.result_dispatch_bound.is_some_and(CommandDispatchBound::expired_now);
+        let command_state_changed=input.result.as_ref().is_some_and(|(_,step)|
+            matches!(step,PlannerStep::Command(c) if *c!=Twist2::ZERO)
+                && (input.result_pose_version!=input.pose_version
+                    || input.result_applied_version!=input.applied_version));
         let arrival_changed = input.result.as_ref().is_some_and(|(_, step)|
             matches!(step, PlannerStep::Succeeded) && input.result_pose_version != input.pose_version
                 && !arrival_event_still_in_goal(&input));
@@ -488,7 +520,7 @@ impl NavPlanner for PlannerWorker {
         let source_changed = input.result.is_some()
             && (input.result_map_version != input.map_version
                 || input.result_boundary_version != input.boundary_version);
-        if input.result.is_none() || input.result.as_ref().is_some_and(|(_,s)|matches!(s,PlannerStep::Pending(_))) || expired || dispatch_expired || arrival_changed || terminal_changed || source_changed {
+        if input.result.is_none() || input.result.as_ref().is_some_and(|(_,s)|matches!(s,PlannerStep::Pending(_))) || expired || dispatch_expired || arrival_changed || terminal_changed || source_changed || command_state_changed {
             input.requested = Some(width);
             self.shared.1.notify_one();
         }
@@ -498,7 +530,7 @@ impl NavPlanner for PlannerWorker {
         let ready = input
             .result
             .as_ref()
-            .filter(|_| !source_changed && !terminal_changed && !dispatch_expired)
+            .filter(|_| !source_changed && !terminal_changed && !dispatch_expired && !command_state_changed)
             .filter(|(started, step)| {
                 // 时效窗约束速度许可；失败、重规划及到达只触发原调度器归零，
                 // 不能因计算慢而把这些结论吞成永远运行中的零速度。
@@ -528,6 +560,8 @@ impl NavPlanner for PlannerWorker {
             Some("位姿已更新，保持零速并重新核对到达状态".into())
         } else if terminal_changed {
             Some("位姿或执行回执已更新，保持零速并重新计算".into())
+        } else if command_state_changed {
+            Some("位姿或执行速度已更新，等待已选停车轨迹复核".into())
         } else if source_changed {
             Some("地图或边界已更新，保持零速并重新计算".into())
         } else if dispatch_expired {
@@ -538,8 +572,8 @@ impl NavPlanner for PlannerWorker {
             Some("局部轨迹正在计算，保持零速等待".into())
         };
         if matches!(&ready, Some(PlannerStep::Command(command)) if *command != Twist2::ZERO) {
-            // No consumer-side geometry or pose equality gate. A same-valued
-            // future command must come from another actual computation. Applied
+            // Consume only a selection rechecked for the latest received state.
+            // A same-valued future command needs a new selection. Applied
             // feedback (or a later step seeing no result) requests that compute;
             // selecting this candidate is not an actuator receipt.
             input.result = None;
@@ -598,6 +632,7 @@ impl Drop for PlannerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("worker_first_delivery_tests.rs");
     include!("worker_recent_recheck_tests.rs");
     use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
     use nuwax_nav_types_messages::{
@@ -686,6 +721,9 @@ mod tests {
         }
         fn observe_applied_command(&mut self, command: Twist2) {
             self.inner.observe_applied_command(command);
+        }
+        fn revalidate_selected_command_at_current_state(&mut self,c:Twist2)->Option<PlannerStep> {
+            self.inner.revalidate_selected_command_at_current_state(c)
         }
         fn execution_wait_reason(&self) -> Option<String> { self.inner.execution_wait_reason() }
         fn local_path_for_display(&self) -> Vec<[f64; 3]> { self.inner.local_path_for_display() }
@@ -1046,9 +1084,9 @@ mod tests {
         worker.update_odometry(original_pose.clone());
         assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
         started.recv_timeout(Duration::from_secs(1)).unwrap();
-        // A real first delivery still uses the original worker pose, even if
-        // newer odometry arrived while that exact computation was finishing.
-        worker.update_odometry(route_pose(0.500001,1));
+        // A timestamp-only receipt preserves geometric authority and the exact
+        // original computation provenance; moved-pose checks are separate.
+        worker.update_odometry(route_pose(0.5,1));
         finish.send((PlannerStep::Command(command),Some(101))).unwrap();
         wait_for_source_result(&worker);
         let published_id=worker.shared.0.lock().unwrap().result_proof.as_ref().unwrap().proof.input.result_id;
@@ -1409,7 +1447,7 @@ mod tests {
         }
     }
     #[test]
-    fn pose_only_motion_preserves_first_velocity_delivery_but_cannot_replay_it() {
+    fn pose_only_motion_requires_current_first_delivery_and_cannot_replay_it() {
         let (mut worker, started, finish) = terminal_worker();
         worker.update_odometry(route_pose(0.5, 0));
         worker.step(0.3);
@@ -1418,9 +1456,13 @@ mod tests {
         let command = PlannerStep::Command(Twist2 {
             linear: nuwax_nav_types_messages::Point2::new(0.1, 0.0), angular_z: 0.0,
         });
+        worker.step(0.3); // Unsupported selected recheck queues a new current-state computation.
+        finish.send(command.clone()).unwrap();
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(worker.shared.0.lock().unwrap().result.is_none(),"unrechecked old-pose command was published");
         finish.send(command.clone()).unwrap();
         wait_for_source_result(&worker);
-        assert_eq!(worker.step(0.3), command, "pose movement cannot retire a computed velocity candidate");
+        assert_eq!(worker.step(0.3), command, "current-pose first delivery remains available");
         worker.update_odometry(route_pose(0.500002, 2));
         assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()),
             "a consumed velocity cannot grant another hold from the newer pose");

@@ -328,6 +328,11 @@ impl NavPlanner for RouteFollower {
         if matches!(result,Some(PlannerStep::ReplanRequired(_))) {self.dirty=true;self.schedule(true);}
         result
     }
+    fn revalidate_selected_command_at_current_state(&mut self,command:Twist2)->Option<PlannerStep> {
+        let result=self.controller.revalidate_selected_command_at_current_state(command);
+        if matches!(result,Some(PlannerStep::ReplanRequired(_))) {self.dirty=true;self.schedule(true);}
+        result
+    }
     fn take_command_dispatch_bound(&mut self)->Option<crate::CommandDispatchBound> {self.controller.take_command_dispatch_bound()}
     fn configure_boundary(&mut self, boundary: &[[f64; 2]]) {
         self.preparation_fault=None;

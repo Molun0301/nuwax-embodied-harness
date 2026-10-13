@@ -848,6 +848,9 @@ pub trait NavPlanner: Send + 'static {
     /// Recheck only the previous selected full stopping trajectory after a soft
     /// surface-view refresh. None keeps the legacy full-computation behavior.
     fn revalidate_selected_command(&mut self,_command:Twist2)->Option<PlannerStep> {None}
+    /// Recheck the unissued selected command from latest odometry and actual
+    /// applied velocity, without selecting another candidate or renewing its lease.
+    fn revalidate_selected_command_at_current_state(&mut self,_command:Twist2)->Option<PlannerStep> {None}
     /// 传递既有导航会话标识用于计算线程日志，不参与运动准入。
     fn set_goal_log_context(&mut self, _goal_id: &str) {}
     /// 接续局部路线时保留已受理任务边界；无局部重规划的后端可沿原全局路径。

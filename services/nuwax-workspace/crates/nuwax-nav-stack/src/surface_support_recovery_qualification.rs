@@ -269,6 +269,11 @@ struct RecoveryHarness {
 }
 impl RecoveryHarness {
     async fn start(local_planning_enabled: bool) -> Self {
+        Self::start_with_recent(local_planning_enabled,
+            Arc::new(std::sync::atomic::AtomicBool::new(true))).await
+    }
+    async fn start_with_recent(local_planning_enabled: bool,
+        publish_recent: Arc<std::sync::atomic::AtomicBool>) -> Self {
         use crate::topics::{NavTopicConfig,TopicName};
         let config=calibrated_config(local_planning_enabled);
         let transport=LcmTransport::new_real("memq://").unwrap();
@@ -350,6 +355,7 @@ impl RecoveryHarness {
                     frame_id:"map".into()},pose:schema::Pose {position:body.0,orientation_xyzw:body.1}};
                 publish_body(&feed_transport,&feed_node.inputs[1],"geometry_msgs.PoseStamped",
                     schema::encode_pose_stamped_body(&pose).unwrap()).await.unwrap();
+                let pose_stamp=stamp;
                 if Instant::now()<next_sample {continue;}
                 let sample=Instant::now(); let stamp=current_unix_timestamp_ns().unwrap();
                 next_sample=sample+SAMPLE_PERIOD; // no catch-up/backdated sensor frames
@@ -382,6 +388,10 @@ impl RecoveryHarness {
                     probe_observed_ns:probe.map(|(_,evidence)|evidence.observed_ns)};
                 publish_body(&feed_transport,&feed_node.inputs[0],"nuwax_msgs.NavigationMap3D",
                     payload).await.unwrap();
+                if publish_recent.load(std::sync::atomic::Ordering::Relaxed) {
+                    publish_sampled_recent(&feed_transport,&map,sequence,stamp,pose_stamp,
+                        retained.iter().copied().map(|key|(key,true))).await;
+                }
                 // Only a successfully encoded and published source enters the ledger.
                 { let mut evidence=feed_evidence.lock().unwrap();
                     evidence.maps.insert(stamp,record); evidence.latest_map=Some(map); }
@@ -681,3 +691,85 @@ async fn original_goal_known_drop_recovers_and_arrives_local_planning_off() {qua
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 #[ignore="opt-in real-clock memq software qualification; full opt3, one recorded run"]
 async fn original_goal_known_drop_recovers_and_arrives_local_planning_on() {qualify(true).await;}
+
+// The synthetic sensor acquires one return at each sampled voxel center. Feed
+// those same current returns to the live channel, never the accumulated Writer
+// or a map replay. Static map publication alone cannot establish source health.
+pub(super) async fn publish_sampled_recent(
+    transport: &LcmTransport, map: &schema::NavigationMap3D, sequence: i32, stamp: i64, pose_stamp: i64,
+    returns: impl IntoIterator<Item=([i32;3],bool)>,
+) {
+    use nuwax_codec::lcm::{lio,recent_cloud};
+    let mut data=Vec::new(); let mut ground_point_indices=Vec::new(); let mut count=0;
+    for (index,(key,ground)) in returns.into_iter().enumerate() {
+        if ground {ground_point_indices.push(index as u32);}
+        for coordinate in key {data.extend_from_slice(&((coordinate as f32+0.5)*RESOLUTION).to_le_bytes());}
+        count+=1;
+    }
+    assert!(count>0,"a live scan must contain actual newly sampled returns");
+    let cloud=schema::PointCloud2 {
+        header:schema::Header {seq:sequence,stamp_sec:(stamp/1_000_000_000) as i32,
+            stamp_nsec:(stamp%1_000_000_000) as i32,frame_id:"map".into()},
+        height:1,width:count,fields:["x","y","z"].into_iter().enumerate().map(|(i,name)|schema::PointField {
+            name:name.into(),offset:(i*4) as i32,datatype:7,count:1,
+        }).collect(),is_bigendian:false,point_step:12,row_step:count*12,data,is_dense:true,
+    };
+    let packet=recent_cloud::RecentCloud3D {
+        producer_runtime_generation:map.producer_runtime_generation,
+        session_id:map.committed_map.session_id.clone(),
+        session_generation:map.committed_map.session_generation,
+        map_frame_generation:map.map_frame_generation,commit_boot_nonce:map.committed_map.commit_boot_nonce,
+        ground_point_indices,cloud:Some(lio::LioCloudEnvelope {
+            schema_version:1,backend:lio::LIO_BACKEND_DEVICE,runtime_generation:17,
+            source_sequence:i64::from(sequence),source_timestamp_ns:stamp,
+            correlated_odometry_source_sequence:i64::from(sequence),correlated_odometry_source_timestamp_ns:pose_stamp,
+            sensor_frame_id:"synthetic_sensor".into(),body_frame_id:"base_link".into(),
+            odom_frame_id:"odom".into(),map_frame_id:"map".into(),
+            registration_state:lio::LIO_REGISTRATION_REGISTERED_MAP,
+            source_point_count:i64::from(count),emitted_point_count:i64::from(count),cloud,
+        }),
+    };
+    publish_body(transport,recent_cloud::DEFAULT_TOPIC,recent_cloud::TYPE_NAME,
+        recent_cloud::encode_body(&packet).unwrap()).await.unwrap();
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+#[ignore="bounded real-owner startup regression; run in full opt3"]
+async fn live_source_is_required_before_goal_admission() {
+    let live=Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut harness=RecoveryHarness::start_with_recent(false,live.clone()).await;
+    let result=async {
+        tokio::time::timeout(Duration::from_secs(3),async {
+            loop {
+                let status=harness.scheduler.status();
+                if status.costmap_source_timestamp_ns>0 && status.pose_source_timestamp_ns>0
+                    && harness.evidence.lock().unwrap().maps.len()>=3 {break;}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.map_err(|_|"map/pose startup timeout")?;
+        assert!(!harness.scheduler.status().planner_inputs_fresh);
+        let map=harness.evidence.lock().unwrap().latest_map.clone().unwrap();
+        let goal=goal_for_with_options(&map,1,[3.5,1.5,0.5],nuwax_nav_types_messages::GoalOptions {
+            allow_reverse:false,position_tolerance_m:0.1,yaw_tolerance_rad:0.15 });
+        harness.goal=Some(goal.clone());
+        publish_body(&harness.transport,&harness.node.inputs[2],"nuwax_msgs.GoalEnvelope",
+            schema::encode_goal_envelope_body(&goal).unwrap()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let missing=harness.scheduler.status();
+        assert!(!missing.planner_inputs_fresh && missing.session_id.is_none());
+        assert_eq!(missing.applied_commands,0);
+        assert!(harness.evidence.lock().unwrap().paths.is_empty());
+        live.store(true,std::sync::atomic::Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(8),async {
+            loop {
+                if harness.plant.lock().unwrap().events.iter().any(is_nonzero_applied) {break;}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.map_err(|_|"live source failed to release buffered original goal")?;
+        assert_eq!(harness.scheduler.status().session_id.as_deref(),Some(goal.session_id.as_str()));
+        Ok::<(),&str>(())
+    }.await;
+    let cleanup=harness.shutdown().await;
+    harness.dump_evidence();
+    assert!(result.is_ok() && cleanup.is_ok(),"startup={result:?} cleanup={cleanup:?}");
+}

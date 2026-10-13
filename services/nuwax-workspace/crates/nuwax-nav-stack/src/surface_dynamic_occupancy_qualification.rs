@@ -1077,6 +1077,7 @@ impl OccupancyHarness {
                     frame_id:"map".into()},pose:schema::Pose {position:body.0,orientation_xyzw:body.1}};
                 publish_body(&feed_transport,&feed_node.inputs[1],"geometry_msgs.PoseStamped",
                     schema::encode_pose_stamped_body(&pose).unwrap()).await.unwrap();
+                let pose_stamp=stamp;
                 if Instant::now()<next_sample {continue;}
                 let (sample,stamp,control)={let guard=feed_sensor.lock().unwrap();
                     (Instant::now(),current_unix_timestamp_ns().unwrap(),guard.clone())};
@@ -1105,6 +1106,9 @@ impl OccupancyHarness {
                 }
                 publish_body(&feed_transport,&feed_node.inputs[0],"nuwax_msgs.NavigationMap3D",
                     payload).await.unwrap();
+                super::support_recovery_qualification::publish_sampled_recent(
+                    &feed_transport,&map,sequence,stamp,pose_stamp,
+                    retained.iter().copied().map(|key|(key,key[2]==1))).await;
                 // Only a successfully encoded and published source enters the ledger.
                 { let mut evidence=feed_evidence.lock().unwrap();
                     evidence.maps.insert(stamp,record); evidence.latest_map=Some(map); }

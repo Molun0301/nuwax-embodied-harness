@@ -150,3 +150,41 @@ cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked -j2 \
 ```
 
 本轮未重跑六项完整 live Stack 资格，也未运行整 workspace、实机传感器/执行器闭环或实机 CPU 采样；此前 wall OFF 的原碰撞失败及其修复验收记录继续保留在 `terrain-recent-obstacles-refactor.md`。
+
+## Map Writer 脏层字节账本增量维护（2026-10-13）
+
+基线 `bb863f7a86e79408ef3ab5490bea4db0de19c724` 的 `Writer::load_dirty` 每次首次加载一个脏块，都会调用 `dirty_layer_bytes()` 遍历所有已加载脏块及其层记录，再判断是否需要 pressure flush。即使各块没有层，遍历脏块的成本仍在；一次批次连续加载 N 个新块会反复扫描此前的块，形成二次累计工作。
+
+候选维护一个 `usize` 脏层字节总量：加载已有块时加该块层大小，成功替换层时减旧加新，删除占据成员时在原有 retain 遍历中扣除被删层；只有成功 flush/reset 才清零。失败 flush 的已冻结对象及其 dirty 账本都保留，非法或相同层替换不改账本。计费公式仍为每层 `128 + members.len()*2 + samples.len()*64`，不是实际堆容量或内存峰值；原来的除以 64、严格大于预算才 flush、点数计费、reader cache 和 pending bytes 均不变。未新增哈希身份、锁、整图验证或生产路径核对扫描。
+
+### release 对照
+
+先仅增加相同测试/诊断并保存生产基线 release 测试二进制，再实现计数器并保存候选。使用原 workspace release（opt3、thin LTO、codegen-units=1）、已有 target、`--locked --offline -j2`；未 clean 或整仓构建。五对新进程按 AB/BA 交替，计时无其他基准或 Cargo 并发。
+
+诊断使用 64 MiB Writer 预算，先建立 1,024 或 8,192 个脏块，分别每块零层或一层（一个真实成员和一个来源样本）。计时一次 `observe`，加入同样数量的新块，每块一个占据命中。初始构造、层填充、最终断言及销毁不在计时内。最终断言所有新旧块/点数及字节账本准确，且没有编码/flush；因此定时段无对象存储写入，刻意隔离脏块 bookkeeping，不能代表所有层密度或完整地图导入。
+
+| 初始块数 / 新块数 | 初始每块层数 | 基线中位数（范围），ms | 候选中位数（范围），ms |
+| --- | ---: | ---: | ---: |
+| 1,024 / 1,024 | 0 | 3.849（3.710–5.585） | 1.019（0.720–1.312） |
+| 1,024 / 1,024 | 1 | 7.447（6.178–10.902） | 0.791（0.723–1.007） |
+| 8,192 / 8,192 | 0 | 406.341（353.074–430.836） | 7.737（7.257–9.710） |
+| 8,192 / 8,192 | 1 | 1,618.839（1,499.774–1,693.492） | 7.781（6.894–8.246） |
+
+基线首次单次探索记录为 1,024 块零层 7.355 ms、有层 6.230 ms；8,192 块零层 409.999 ms、有层 1,548.336 ms。它不计入上述五对结果；不同进程有调度/缓存噪声，不能把单次极值作为实时承诺。
+
+复现入口：
+
+```sh
+cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked --offline -j2 \
+  --release -p nuwax-map-chunks --lib --no-run --message-format=json
+# 分别保存基线/候选 Cargo JSON 中 executable 的真实路径，然后五对 AB/BA：
+./map-binary writer::accounting_tests::dirty_layer_accounting_cost \
+  --ignored --exact --nocapture --test-threads=1
+./map-binary --test-threads=1
+```
+
+### 正确性和边界
+
+相同两项新增普通回归先在基线通过，最终候选 release 全 lib 为 **59 passed / 0 failed / 1 ignored / 0 filtered**（1.58 秒）；ignored 诊断另显式运行，不混入普通通过数。测试中的独立全扫描 oracle 覆盖加载、增大/缩小替换、非法/相同替换、同源时间无变化、删除最后层及最后占据、失败 flush 与原冻结 ID 重试保留、成功 flush 后重新加载、reset，以及预算恰好相等不 flush、再加入一个点后按原边界 flush。既有层 geometry/source、restore、frame rehome、归档和保留对象回归一并运行。
+
+这里确证的是脏块记账消除重复扫描。未测量 allocator、实际峰值/保留内存、完整地图流水线、实机 CPU 或 20 Hz 控制长尾，不扩展为这些指标的验收结论。

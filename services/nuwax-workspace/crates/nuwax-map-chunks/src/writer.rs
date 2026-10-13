@@ -1,6 +1,9 @@
 use super::*;
 
 struct Dirty { block: Block, layers: LayerObservations, changed: bool }
+fn layer_bytes(layer: &LayerObservation) -> usize {
+    128 + layer.members.len() * 2 + layer.samples.len() * 64
+}
 struct Pending { object: ObjectIdentity, bytes: Vec<u8>, installed: bool }
 /// Dirty payload is bounded; membership baselines retain references, never copied member lists.
 pub struct Writer {
@@ -10,7 +13,7 @@ pub struct Writer {
     published: Option<Arc<Manifest>>, legacy_baseline: Option<(Domain, u64)>, reader: RegionReader,
     id_source: Box<dyn FnMut() -> Result<ObjectId, String> + Send>,
     #[cfg(test)] pub(crate) encoded_blocks: usize,
-    voxel_size_m: f32, dirty_point_budget: usize, dirty_points: usize, max_observed_ns: u64,
+    voxel_size_m: f32, dirty_point_budget: usize, dirty_points: usize, dirty_layer_bytes: usize, max_observed_ns: u64,
 }
 impl Writer {
     pub fn new(repository: Repository, voxel_size_m: f32, cache_bytes: usize) -> Result<Self, String> {
@@ -23,7 +26,7 @@ impl Writer {
         }
         Ok(Self { reader: RegionReader::new(repository.clone(), cache_bytes / 2), repository,
             blocks: BTreeMap::new(), dirty: BTreeMap::new(), pending: BTreeMap::new(), touched: BTreeSet::new(), membership_touched: BTreeSet::new(),
-            layer_format: false, published: None, legacy_baseline: None, id_source: Box::new(id_source), #[cfg(test)] encoded_blocks: 0, voxel_size_m, dirty_point_budget: cache_bytes / 128, dirty_points: 0, max_observed_ns: 0 })
+            layer_format: false, published: None, legacy_baseline: None, id_source: Box::new(id_source), #[cfg(test)] encoded_blocks: 0, voxel_size_m, dirty_point_budget: cache_bytes / 128, dirty_points: 0, dirty_layer_bytes: 0, max_observed_ns: 0 })
     }
     pub fn repository(&self) -> &Repository { &self.repository }
     pub fn has_unpublished_changes(&self) -> bool {
@@ -90,19 +93,20 @@ impl Writer {
         match root { ArchivedRoot::Current(root) => self.restore(root), ArchivedRoot::Legacy(root) => self.restore_legacy(&root.manifest) }
     }
     fn reset_pending(&mut self) {
-        self.dirty.clear(); self.pending.clear(); self.touched.clear(); self.membership_touched.clear(); self.dirty_points = 0;
+        self.dirty.clear(); self.pending.clear(); self.touched.clear(); self.membership_touched.clear(); self.dirty_points = 0; self.dirty_layer_bytes = 0;
     }
     fn load_dirty(&mut self, key: Key) -> Result<&mut Dirty, String> {
         if !self.dirty.contains_key(&key) {
             if self.dirty_points + 32768 + self.dirty_layer_bytes() / 64 > self.dirty_point_budget { self.flush()?; }
             let block = match self.blocks.get(&key) { Some(reference) => (*self.reader.block(reference)?).clone(), None => Block::new() };
             let layers = match self.blocks.get(&key) { Some(reference) => (*self.reader.layers(reference)?).clone(), None => LayerObservations::new() };
+            self.dirty_layer_bytes += layers.values().map(layer_bytes).sum::<usize>();
             self.dirty_points += block.len(); self.dirty.insert(key, Dirty { block, layers, changed: false });
         }
         Ok(self.dirty.get_mut(&key).unwrap())
     }
     fn dirty_layer_bytes(&self) -> usize {
-        self.dirty.values().flat_map(|d| d.layers.values()).map(|l| 128 + l.members.len() * 2 + l.samples.len() * 64).sum()
+        self.dirty_layer_bytes
     }
     /// Read only one touched block; capture keeps no second whole-map statistics cache.
     pub fn layer_observations(&mut self, key: Key) -> Result<LayerObservations, String> {
@@ -115,7 +119,10 @@ impl Writer {
         let dirty = self.load_dirty(key)?;
         terrain_observations::validate_layers(&layers, &dirty.block)?;
         if dirty.layers == layers { return Ok(()); }
+        let before = dirty.layers.values().map(layer_bytes).sum::<usize>();
+        let after = layers.values().map(layer_bytes).sum::<usize>();
         dirty.layers = layers; dirty.changed = true;
+        self.dirty_layer_bytes = self.dirty_layer_bytes - before + after;
         self.layer_format = true;
         self.pending.remove(&key); self.touched.insert(key); self.membership_touched.insert(key);
         Ok(())
@@ -159,8 +166,13 @@ impl Writer {
             if !self.blocks.contains_key(&key) && !self.dirty.contains_key(&key) { continue; }
             let dirty = self.load_dirty(key)?; let before = dirty.block.len();
             for local in removed { dirty.block.remove(&local); }
-            dirty.layers.retain(|_, layer| layer.members.iter().all(|member| dirty.block.contains_key(member)));
-            let removed = before - dirty.block.len(); dirty.changed |= removed > 0; self.dirty_points -= removed;
+            let mut removed_layer_bytes = 0;
+            dirty.layers.retain(|_, layer| {
+                let retain = layer.members.iter().all(|member| dirty.block.contains_key(member));
+                if !retain { removed_layer_bytes += layer_bytes(layer); }
+                retain
+            });
+            let removed = before - dirty.block.len(); dirty.changed |= removed > 0; self.dirty_points -= removed; self.dirty_layer_bytes -= removed_layer_bytes;
             if removed > 0 { self.pending.remove(&key); self.touched.insert(key); self.membership_touched.insert(key); }
         }
         Ok(())
@@ -189,7 +201,7 @@ impl Writer {
                 block_revision: previous.map_or(0, |b| b.block_revision), geometry_revision: previous.map_or(0, |b| b.geometry_revision), points: dirty.block.len() as u32 };
             self.blocks.insert(*key, reference);
         }
-        self.dirty.clear(); self.pending.clear(); self.dirty_points = 0; Ok(())
+        self.dirty.clear(); self.pending.clear(); self.dirty_points = 0; self.dirty_layer_bytes = 0; Ok(())
     }
     pub fn snapshot(&mut self, domain: Domain, revision: u64, timestamp_ns: u64) -> Result<Arc<Manifest>, String> {
         Ok(self.seal(domain, revision, timestamp_ns)?.root)
@@ -269,3 +281,7 @@ impl Writer {
     #[cfg(test)]
     pub(crate) fn pending_ids(&self) -> Vec<ObjectIdentity> { self.pending.values().map(|p| p.object).collect() }
 }
+
+#[cfg(test)]
+#[path = "writer_accounting_tests.rs"]
+mod accounting_tests;

@@ -223,7 +223,7 @@ class MemoryRepository:
             return None
         return self._tag_loaded(self._load_record(SceneSpace, row), token)
 
-    def list_scene_spaces(
+    def _scene_space_select(
         self,
         *,
         scene_space_ids: Optional[Sequence[str]] = None,
@@ -231,8 +231,7 @@ class MemoryRepository:
         map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         review_statuses: Optional[Sequence[object]] = None,
-        limit: Optional[int] = None,
-    ) -> List[SceneSpace]:
+    ):
         where_clauses: List[str] = []
         params: List[object] = []
         if library_name is not None:
@@ -258,6 +257,22 @@ class MemoryRepository:
         if where_clauses:
             query = f"{query} WHERE {' AND '.join(where_clauses)}"
         query = f"{query} ORDER BY updated_at DESC, scene_space_id ASC"
+        return query, params
+
+    def list_scene_spaces(
+        self,
+        *,
+        scene_space_ids: Optional[Sequence[str]] = None,
+        library_name: Optional[str] = None,
+        map_name: Optional[str] = None,
+        localization_session_id: Optional[str] = None,
+        review_statuses: Optional[Sequence[object]] = None,
+        limit: Optional[int] = None,
+    ) -> List[SceneSpace]:
+        query, params = self._scene_space_select(
+            library_name=library_name, scene_space_ids=scene_space_ids, map_name=map_name,
+            localization_session_id=localization_session_id, review_statuses=review_statuses,
+        )
         if limit is not None and limit > 0:
             query = f"{query} LIMIT ?"
             params.append(int(limit))
@@ -279,6 +294,33 @@ class MemoryRepository:
             record_kinds = self._enum_values(payload_filter.record_kinds)
             if SCENE_SPACE_VECTOR_NAMESPACE not in record_kinds:
                 return []
+        if limit is not None and limit > 0:
+            query, params = self._scene_space_select(
+                library_name=library_name,
+                scene_space_ids=payload_filter.scene_space_ids,
+                map_name=payload_filter.map_name,
+                localization_session_id=payload_filter.localization_session_id,
+                review_statuses=payload_filter.review_statuses,
+            )
+            matched, matched_rows = [], []
+            result_limit = int(limit)
+            with self._read_snapshot() as transaction:
+                cursor = transaction.execute(query, tuple(params))
+                try:
+                    # SQL 只做可下推筛选；有界读取必须在剩余条件匹配后才停止。
+                    while len(matched) < result_limit:
+                        rows = cursor.fetchmany(min(250, result_limit - len(matched)))
+                        if not rows:
+                            break
+                        for row in rows:
+                            space = self._load_record(SceneSpace, row)
+                            if self._scene_space_matches_filter(space, payload_filter):
+                                matched.append(space)
+                                matched_rows.append(row)
+                finally:
+                    cursor.close()
+                tokens = self._capture_loaded_tokens(transaction, SceneSpace, matched_rows)
+            return [self._tag_loaded(space, token) for space, token in zip(matched, tokens)]
         spaces = self.list_scene_spaces(
             library_name=library_name,
             scene_space_ids=payload_filter.scene_space_ids,
@@ -287,8 +329,6 @@ class MemoryRepository:
             review_statuses=payload_filter.review_statuses,
         )
         matched = [space for space in spaces if self._scene_space_matches_filter(space, payload_filter)]
-        if limit is not None and limit > 0:
-            return matched[: int(limit)]
         return matched
 
     def load_vector_records(self, namespace: Optional[str] = None) -> Dict[str, VectorRecord]:

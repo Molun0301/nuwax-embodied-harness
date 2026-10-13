@@ -108,6 +108,72 @@ class NaturalIdentityChecks(unittest.TestCase):
         self.assertEqual(service._semantic_graph_relations_by_id[result.relation_id].confidence,.7)
         self.assertEqual(service._repository.load_semantic_graph_relations()[0].confidence,.7)
 
+    def test_natural_identity_nested_snapshot_ownership(self):
+        for kind in ('relation', 'summary'):
+            with self.subTest(kind=kind):
+                service = self.fixture()
+                suffix = 'semantic_graph_relation' if kind == 'relation' else 'semantic_summary_node'
+                column = 'relation_id' if kind == 'relation' else 'summary_id'
+                cache = (service._semantic_graph_relations_by_id if kind == 'relation'
+                         else service._semantic_summary_nodes_by_id)
+                method = getattr(service, '_upsert_' + suffix)
+                raw = getattr(service._repository, 'upsert_' + suffix)
+                load = getattr(service._repository, 'load_' + suffix + 's')
+                entry = (self.relation() if kind == 'relation' else self.summary()).model_copy(
+                    update={'metadata': {'memory_library_name': 'library',
+                                         'nested': {'values': [{'value': 'owned'}]}},
+                            'evidence_observation_event_ids': [IDS['oev']]}, deep=True)
+                raw(entry)  # Adopt a known legacy ID, so the full payload is comparable.
+                expected = entry.model_dump()
+                service._state_store.write = Mock()
+                with service._repository.storage.transaction():
+                    result = method(entry)
+                    result.metadata['nested']['values'][0]['value'] = 'returned mutation'
+                    result.evidence_observation_event_ids.clear()
+                    entry.metadata['nested']['values'][0]['value'] = 'input mutation'
+                    entry.evidence_observation_event_ids.clear()
+                    self.assertFalse(cache)
+                    service._state_store.write.assert_not_called()
+                previous = cache[getattr(result, column)]
+                self.assertEqual(previous.model_dump(), expected)
+                service._state_store.write.assert_called_once()
+                loaded = load()[0]
+                self.assertEqual(loaded.model_dump(), expected)
+                loaded.metadata['nested']['values'][0]['value'] = 'loaded mutation'
+                loaded.evidence_observation_event_ids.clear()
+                self.assertEqual(previous.model_dump(), expected)
+                second = method(type(entry).model_validate(expected))
+                second.metadata['nested']['values'].clear()
+                second.evidence_observation_event_ids.clear()
+                self.assertEqual(previous.model_dump(), expected)
+                current = cache[getattr(second, column)]
+                self.assertIsNot(current, previous)
+                self.assertIsNot(current.metadata['nested'], previous.metadata['nested'])
+                self.assertEqual(current.model_dump(), expected)
+                self.assertEqual(load()[0].model_dump(), expected)
+
+    def test_repository_natural_identity_owns_input_and_separate_results(self):
+        for kind in ('relation', 'summary'):
+            with self.subTest(kind=kind):
+                repo = MemoryRepository()
+                self.addCleanup(repo.close)
+                suffix = 'semantic_graph_relation' if kind == 'relation' else 'semantic_summary_node'
+                raw = getattr(repo, 'upsert_' + suffix)
+                load = getattr(repo, 'load_' + suffix + 's')
+                entry = (self.relation() if kind == 'relation' else self.summary()).model_copy(
+                    update={'metadata': {'nested': {'values': ['owned']}},
+                            'evidence_observation_event_ids': [IDS['oev']]}, deep=True)
+                raw(entry)
+                expected = entry.model_dump()
+                first = raw(entry, natural_identity='ownership-test')
+                second = raw(entry, natural_identity='ownership-test')
+                entry.metadata['nested']['values'].clear()
+                entry.evidence_observation_event_ids.clear()
+                first.metadata['nested']['values'].clear()
+                first.evidence_observation_event_ids.clear()
+                self.assertEqual(second.model_dump(), expected)
+                self.assertEqual(load()[0].model_dump(), expected)
+
     def test_failed_source_write_rolls_back_identity_and_cache(self):
         service = self.fixture(); service._state_store.write = Mock()
         with service._repository.storage.transaction() as tx:

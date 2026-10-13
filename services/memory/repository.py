@@ -873,7 +873,8 @@ class MemoryRepository:
                ON CONFLICT(library_incarnation,record_kind,natural_key) DO UPDATE SET record_id=excluded.record_id""",
             (identity_scope, kind, key, record_id),
         )
-        return entry.model_copy(update={column: record_id}, deep=True)
+        # Both callers pass a private JSON-decoded snapshot; only its ID changes.
+        return entry.model_copy(update={column: record_id})
 
     @staticmethod
     def _summary_identity_fields(entry):

@@ -20,6 +20,22 @@ def _font(size):
     return ImageFont.load_default(), False
 
 
+def _display_cells(occupancy, labels, size):
+    """Sample only presentation pixels, using Pillow's exact nearest-neighbor choices."""
+    height, width = occupancy.shape
+    if size[0] >= width and size[1] >= height:
+        return occupancy, labels
+    # Let Pillow choose indices: hand-written ratios can differ at rounding boundaries.
+    cols = np.asarray(Image.fromarray(np.arange(width, dtype=np.int32)[None, :]).resize(
+        (size[0], 1), Image.Resampling.NEAREST))[0]
+    rows = np.asarray(Image.fromarray(np.arange(height, dtype=np.int32)[:, None]).resize(
+        (1, size[1]), Image.Resampling.NEAREST))[:, 0]
+    # The renderer flips vertically after colorization; sample in that same orientation.
+    rows = height - 1 - rows[::-1]
+    selection = np.ix_(rows, cols)
+    return occupancy[selection], labels[selection]
+
+
 def render_scene_graph_image(index, snapshot, *, node_id=None, width=1280):
     if not isinstance(width, int) or isinstance(width, bool) or not 512 <= width <= 2048:
         raise GatewayError("图像宽度应为512至2048像素。", error_code="invalid_params", http_status=422)
@@ -47,6 +63,9 @@ def render_scene_graph_image(index, snapshot, *, node_id=None, width=1280):
     data = np.frombuffer(grid.data.raw, dtype=np.int8) if isinstance(grid.data, PackedOccupancyCells) else np.asarray(grid.data, dtype=np.int8)
     occupancy = data.reshape(grid.height, grid.width)[bottom:top, left:right]
     labels = geometry.labels[bottom:top, left:right]
+    scale = min((width - 48) / (right - left), (height - 144) / (top - bottom))
+    draw_width, draw_height = max(1, round((right - left) * scale)), max(1, round((top - bottom) * scale))
+    occupancy, labels = _display_cells(occupancy, labels, (draw_width, draw_height))
     palette = np.array([[236, 239, 242], [161, 211, 192], [169, 196, 224], [198, 180, 220],
                         [224, 206, 166], [187, 210, 171], [176, 184, 218]], dtype=np.uint8)
     raster = np.empty((*occupancy.shape, 3), dtype=np.uint8)
@@ -55,8 +74,6 @@ def render_scene_graph_image(index, snapshot, *, node_id=None, width=1280):
     raster[occupancy > 0] = [55, 62, 69]
     assigned = labels > 0
     raster[assigned] = palette[(labels[assigned] - 1) % 6 + 1]
-    scale = min((width - 48) / (right - left), (height - 144) / (top - bottom))
-    draw_width, draw_height = max(1, round((right - left) * scale)), max(1, round((top - bottom) * scale))
     x0, y0 = (width - draw_width) // 2, 68 + (height - 144 - draw_height) // 2
     canvas = Image.new("RGB", (width, height), "#ffffff")
     canvas.paste(Image.fromarray(raster[::-1]).resize((draw_width, draw_height), Image.Resampling.NEAREST), (x0, y0))

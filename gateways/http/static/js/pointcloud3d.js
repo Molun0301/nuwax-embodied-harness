@@ -1,6 +1,6 @@
 import * as THREE from './three.module.min.js';
 import { SemanticRegionLayer } from './semantic-regions3d.js?v=20261013-region-reuse';
-import { SceneGraphLayer } from './scene-graph3d.js?v=20260922-scene-graph';
+import { SceneGraphLayer } from './scene-graph3d.js?v=20261013-graph-camera';
 import { OrbitControls } from './OrbitControls.js';
 import { PointCloudProcessor } from './pointcloud-processing.js?v=20260918-dense-pointcloud';
 import { IncrementalPointCloudConnection, mappingEpochFromMap, pointCloudAssignedSourceEpoch } from './pointcloud-incremental.js?v=20261006-assigned-pages';

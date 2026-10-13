@@ -146,10 +146,14 @@ export class SceneGraphLayer {
   }
 
   updateForCamera(camera,container) {
-    if(!this.group.visible||!camera||!container?.clientHeight)return;
+    if(!this.group.visible||!camera)return;
+    const height=container?.clientHeight;
+    if(!height||!this.nodes.length)return;
+    // Camera FOV and viewport height are scalar invariants of this draw.
+    const halfFovTangent=Math.tan(THREE.MathUtils.degToRad(camera.fov)/2);
     for(const node of this.nodes){
       const distance=camera.position.distanceTo(node.marker.position);
-      const worldPerPixel=2*distance*Math.tan(THREE.MathUtils.degToRad(camera.fov)/2)/container.clientHeight;
+      const worldPerPixel=2*distance*halfFovTangent/height;
       const pixels=node.kind==='region'?4.5:2.8;
       node.marker.scale.setScalar(Math.max(.5,worldPerPixel*pixels/node.baseRadius)*(node.selected?1.5:1));
     }

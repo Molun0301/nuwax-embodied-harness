@@ -1,0 +1,26 @@
+{
+  "scope": "Actual Three/SceneGraph CPU operation counts; production scalar hoist versus legacy arithmetic; no browser layout, timing or FPS claim",
+  "exactScaleEquivalence": true,
+  "results": [
+    {
+      "nodes": 100,
+      "frames": 20,
+      "baselineHeightReads": 2020,
+      "optimizedHeightReads": 20,
+      "baselineTangentCalls": 2000,
+      "optimizedTangentCalls": 20,
+      "baselineFovReads": 2000,
+      "optimizedFovReads": 20
+    },
+    {
+      "nodes": 500,
+      "frames": 20,
+      "baselineHeightReads": 10020,
+      "optimizedHeightReads": 20,
+      "baselineTangentCalls": 10000,
+      "optimizedTangentCalls": 20,
+      "baselineFovReads": 10000,
+      "optimizedFovReads": 20
+    }
+  ]
+}

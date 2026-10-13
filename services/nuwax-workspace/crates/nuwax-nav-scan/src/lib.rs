@@ -730,7 +730,7 @@ mod tests {
     fn scene_with_slope(door: Option<i32>, slope: f64) -> SurfaceSnapshot {
         scene_with_extra_cells(door, slope, &[])
     }
-    fn scene_with_extra_cells(door: Option<i32>, slope: f64, extra: &[[i32; 3]]) -> SurfaceSnapshot {
+    pub(super) fn scene_with_extra_cells(door: Option<i32>, slope: f64, extra: &[[i32; 3]]) -> SurfaceSnapshot {
         let size = 0.01_f32;
         let max_step = if slope == 0.0 { 0.0 } else { 0.15 };
         let mut cells: Vec<[i32; 3]> = (-130..131)

@@ -65,6 +65,8 @@ thread_local! { static LAST_WORK: std::cell::Cell<(usize,usize,usize)> = const {
 #[cfg(test)]
 pub(super) fn last_work() -> (usize,usize,usize) { LAST_WORK.get() }
 #[cfg(test)]
+pub(super) fn reset_last_work() { LAST_WORK.set((0,0,0)); }
+#[cfg(test)]
 thread_local! { static INITIAL_ADMISSIONS: std::cell::RefCell<Vec<(f64,f64,BodyPose)>> = const { std::cell::RefCell::new(Vec::new()) }; }
 #[cfg(test)]
 pub(super) fn initial_admissions() -> Vec<(f64,f64,BodyPose)> {

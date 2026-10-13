@@ -76,4 +76,9 @@ Modified files are test-only instrumentation in `crates/nuwax-nav-scan/src/local
 
 Raw build metadata, binary path, 32-arm output, four diagnostic traces and summaries are retained under `/workspace/scratch/71cdb9d17732/priority-audit-20261013/`. Rust/Cargo 1.88 and the existing release/profile test build were used. No timing comparison is claimed: these serial cases share map caches, and trace runs add instrumentation.
 
-Default Scan regression: 51 passed, 0 failed, 4 ignored. Refreshed exported B: success, 186 poses, independently body-reswept, no local-search work emitted. These checks ran with diagnostic mode at its default baseline.
+Default-priority, **profile-enabled** Scan regression: 51 passed, 0 failed, 4 ignored. Refreshed exported B: success, 186 poses, independently body-reswept, no local-search work emitted. These checks ran with diagnostic mode at its default baseline.
+
+
+### Subsequent default-feature build correction
+
+The original 51-test qualification above used `--features profile`; it did not establish an ordinary default-feature test build. Phase-two validation exposed that the new priority diagnostic module used optional `serde_json` without a profile gate, causing default-feature test compilation to fail at `search_priority_diagnostic_tests.rs:73`. The module declaration is now gated by `feature="profile"`, matching the existing JSON-based diagnostic fixtures. No new dependency or production behavior was added. The first failure remains in `fallback-fixture-20261013/default-build-failure-before-profile-gate.log`. Actual default-feature retesting is documented in the [fine-departure regression qualification](recent-guide-fine-escape-regression-20261013.md).

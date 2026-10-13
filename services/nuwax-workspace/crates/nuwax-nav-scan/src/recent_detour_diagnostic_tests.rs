@@ -128,5 +128,10 @@ fn recent_wide_obstacle_exported_guide_ab() {
     }
 }
 
+#[cfg(feature="profile")]
 #[path="search_priority_diagnostic_tests.rs"]
 mod search_priority_diagnostic_tests;
+
+#[cfg(feature="profile")]
+#[path="recent_fine_escape_diagnostic_tests.rs"]
+mod recent_fine_escape_diagnostic_tests;

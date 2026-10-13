@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import platform
 import socket
 import subprocess
 import sys
@@ -73,7 +74,7 @@ SELECTION = {'tests/test_checkpoint_identity_v2.py': ('IdentityV2Tests.test_actu
                                           'AssignedAssetStorageTests.test_owned_snapshot_shares_immutable_cells_and_detaches_descriptors',
                                           'AssignedAssetStorageTests.test_equal_copy_updates_never_install_mutable_external_aliases',
                                           'AssignedAssetStorageTests.test_capture_and_validate_assigned_snapshot_without_fingerprint_hash',
-                                          'AssignedAssetStorageTests.test_assigned_previous_identity_and_legacy_writer_are_explicitly_gated',
+                                          'AssignedAssetStorageTests.test_assigned_previous_identity_requires_catalog_owner_and_legacy_writer_is_gated',
                                           'LegacyAssetStorageCompatibilityTests.test_literal_pred1_bundle_and_manifest_reopen_and_repeat_finalize',
                                           'LegacyAssetStorageCompatibilityTests.test_legacy_current_rejects_assigned_expectation_before_hashing')}
 SOURCES = ('services/geometry/runtime.py', 'services/mapping/asset_store.py',
@@ -110,6 +111,8 @@ def main():
     before = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in SOURCES}
     print('INTERPRETER', sys.executable, sys.version, flush=True)
     print('SOURCE_SHA256', before, flush=True)
+    # Python 3.8 uuid imports query uname; prime stdlib discovery before test guards.
+    platform.uname()
     with ExitStack() as guards:
         guards.enter_context(patch.object(socket, 'socket', NoSocket))
         guards.enter_context(patch.object(subprocess, 'Popen', side_effect=AssertionError('process forbidden')))

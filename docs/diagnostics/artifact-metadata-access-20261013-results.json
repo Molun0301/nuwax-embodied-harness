@@ -1,0 +1,168 @@
+{
+  "python": "3.8.10 (default, Oct 13 2026, 08:57:26) \n[GCC 14.2.0]",
+  "scope": "Unmodified production methods; synthetic temporary artifacts; warm OS page cache; shared host. Raw response construction excludes file transfer.",
+  "rows": [
+    {
+      "artifact_count": 100,
+      "payload_bytes_each": 7,
+      "paths": {
+        "metadata_only": {
+          "cold": {
+            "samples_ms": [
+              0.495749
+            ],
+            "median_ms": 0.495749
+          },
+          "warm": {
+            "samples_ms": [
+              0.143587,
+              0.109416,
+              0.101423,
+              0.314014,
+              0.128855,
+              0.103265,
+              0.097918
+            ],
+            "median_ms": 0.109416
+          },
+          "warm_scandir_calls": 2,
+          "warm_directory_entries_visited": 201,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": false
+        },
+        "raw_response_construction": {
+          "cold": {
+            "samples_ms": [
+              0.922533
+            ],
+            "median_ms": 0.922533
+          },
+          "warm": {
+            "samples_ms": [
+              0.102525,
+              0.087612,
+              0.081913,
+              0.165269,
+              0.127863,
+              0.102625,
+              0.078308
+            ],
+            "median_ms": 0.102525
+          },
+          "warm_scandir_calls": 0,
+          "warm_directory_entries_visited": 0,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": true
+        }
+      }
+    },
+    {
+      "artifact_count": 1000,
+      "payload_bytes_each": 7,
+      "paths": {
+        "metadata_only": {
+          "cold": {
+            "samples_ms": [
+              1.993179
+            ],
+            "median_ms": 1.993179
+          },
+          "warm": {
+            "samples_ms": [
+              1.216987,
+              0.845046,
+              0.720758,
+              1.154764,
+              0.701729,
+              0.697113,
+              0.694969
+            ],
+            "median_ms": 0.720758
+          },
+          "warm_scandir_calls": 2,
+          "warm_directory_entries_visited": 2001,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": false
+        },
+        "raw_response_construction": {
+          "cold": {
+            "samples_ms": [
+              1.790022
+            ],
+            "median_ms": 1.790022
+          },
+          "warm": {
+            "samples_ms": [
+              0.195205,
+              0.281245,
+              0.119591,
+              0.088204,
+              0.083456,
+              0.078789,
+              0.142746
+            ],
+            "median_ms": 0.119591
+          },
+          "warm_scandir_calls": 0,
+          "warm_directory_entries_visited": 0,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": true
+        }
+      }
+    },
+    {
+      "artifact_count": 10000,
+      "payload_bytes_each": 7,
+      "paths": {
+        "metadata_only": {
+          "cold": {
+            "samples_ms": [
+              14.673824
+            ],
+            "median_ms": 14.673824
+          },
+          "warm": {
+            "samples_ms": [
+              13.158646,
+              11.837582,
+              11.41274,
+              10.625211,
+              9.941479,
+              9.291287,
+              9.914017
+            ],
+            "median_ms": 10.625211
+          },
+          "warm_scandir_calls": 2,
+          "warm_directory_entries_visited": 20001,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": false
+        },
+        "raw_response_construction": {
+          "cold": {
+            "samples_ms": [
+              19.635774
+            ],
+            "median_ms": 19.635774
+          },
+          "warm": {
+            "samples_ms": [
+              0.109465,
+              0.122234,
+              0.091468,
+              0.083547,
+              0.080371,
+              0.091608,
+              0.080091
+            ],
+            "median_ms": 0.091468
+          },
+          "warm_scandir_calls": 0,
+          "warm_directory_entries_visited": 0,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": true
+        }
+      }
+    }
+  ]
+}

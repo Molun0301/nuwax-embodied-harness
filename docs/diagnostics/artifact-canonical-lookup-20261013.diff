@@ -1,0 +1,22 @@
+--- services/artifact_store.py
++++ services/artifact_store.py
+@@ -931,6 +931,19 @@
+             meta_path = cached.parent / f"{artifact_id}.meta.json"
+             if meta_path.is_file():
+                 return meta_path
++        # 保存布局可由既有 ID 契约定位；旧布局/移动后的侧车仍走原查找。
++        if ARTIFACT_ID_PATTERN.fullmatch(artifact_id):
++            try:
++                kind = ArtifactKind(artifact_id[4:].rsplit("_", 2)[0])
++            except ValueError:
++                pass
++            else:
++                meta_path = self._base_dir / kind.value / f"{artifact_id}.meta.json"
++                try:
++                    if meta_path.is_file():
++                        return meta_path
++                except OSError:
++                    pass
+         matches = list(self._base_dir.glob(f"**/{artifact_id}.meta.json"))
+         return matches[0] if matches else None
+ 

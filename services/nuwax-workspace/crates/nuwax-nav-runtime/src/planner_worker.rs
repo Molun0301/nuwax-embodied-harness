@@ -171,10 +171,13 @@ impl PlannerWorker {
                             input.goal_version,
                             input.path_version,
                             input.goal.clone(),
-                            input.boundary.clone(),
+                            if input.boundary_version != boundary_version || input.goal_version != goal_version {
+                                input.boundary.clone()
+                            } else { Vec::new() },
                             input.boundary_version,
                             input.path.clone(),
-                            input.map.clone(),
+                            // Planar maps own their cells; unchanged inputs need no deep copy.
+                            if input.map_version != map_version { input.map.clone() } else { None },
                             input.map_version,
                             input.terrain_generation,
                             replay,
@@ -266,7 +269,9 @@ impl PlannerWorker {
                                 && (input.map_version!=map_seq || input.pose_version!=pose_seq
                                     || input.applied_version!=applied_seq) {
                                 input.map_pending=false;
-                                Some((input.map_version,input.map.clone(),input.pose_version,input.pose.clone(),
+                                Some((input.map_version,
+                                    if input.map_version != map_seq { input.map.clone() } else { None },
+                                    input.pose_version,input.pose.clone(),
                                     input.applied_version,input.applied))
                             } else {None}
                         };
@@ -633,6 +638,7 @@ impl Drop for PlannerWorker {
 mod tests {
     use super::*;
     include!("worker_first_delivery_tests.rs");
+    mod snapshot_tests { use super::*; include!("worker_snapshot_tests.rs"); }
     include!("worker_recent_recheck_tests.rs");
     use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
     use nuwax_nav_types_messages::{

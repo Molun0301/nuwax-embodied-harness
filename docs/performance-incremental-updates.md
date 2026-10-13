@@ -94,3 +94,59 @@ cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked -j2 \
 基线与候选首次 full lib 均为 **108 passed / 1 failed / 3 ignored**。失败在既有 fresh-generated bindings 字节比对：仓库 `NavigationState.py` 末尾比 lcm-gen 1.5.2 输出少一个空行。首次未配置 native C include/lib 路径时另外两项编译失败，补齐 `CPATH` / `LIBRARY_PATH` 后通过；这些环境失败没有算作成功。仅恢复该 Python 文件末尾空行，不改 schema、字段或 Python 行为，后续复跑结果另记。
 
 恢复 exact-generated 末尾空行后，最终同一 release codec 二进制全 lib 为 **109 passed / 0 failed / 3 ignored / 0 filtered**（2.47 秒）。包含原失败的 fresh C/Python 互操作测试，未跳过任何普通测试。该正确性复跑经协调在另一 crate 编译阶段运行，不用于性能比较。生成文件的必要 EOF 空行会触发普通 `git diff --check` 的 `new blank line at EOF` 提示；移除它会再次破坏原有 exact-generated 比对，不能当作手写代码尾空白删除。
+
+## PlannerWorker 未变化输入不再重复复制（2026-10-13）
+
+`PlannerWorker` 的机体查询/局部控制计算已在独立 `nav-local-compute` 线程、输入交换锁外执行；Scan/PCT 请求另由 `PlanningOwner` 线程承担。本轮没有增加线程或锁，也没有把候选搜索放回控制接收路径。
+
+发现的确定性浪费在输入快照：每次控制请求及位姿/已执行速度追赶都会复制 `ExecutionMap`，随后仅在 map version 变化时才使用它。Surface 变体主要复制 Arc，但 Planar 的 `CostMap2D` 拥有完整 `Vec<u8>`，因此未变化的平面地图也在共享输入锁内被完整复制。边界向量同样在每次唤醒时复制，即使没有重新安装。
+
+候选只在对应 map version 变化时复制地图，在 boundary version 或 goal version 变化时复制边界；goal 重设后的边界重新安装仍保留。位姿、applied velocity、地图版本和无地图状态继续按原路径交付。不改首次交付当前状态复核、recent-only 复核、候选生成/排名、原选择起点、最早来源期限及非零命令一次性消费。最后一条已选轨迹的完整停车查询仍执行，不能把它当作可删除的重复候选搜索。
+
+### 平面快照合成测量
+
+新增 `worker_snapshot_tests.rs`：使用真实 worker 和极简合成 planner，安装一次 2,048×2,048 的平面地图（4 MiB cells），先预热一次，再串行请求/消费 256 个结果。每次进程断言地图只安装一次、总共 257 次合成选择；此 planner 不做机体几何，不能给真实运动授予许可。另有普通回归核对连续请求不重复安装地图、goal 重设恢复原边界、位姿及地图更新后安装新版本。
+
+先在仅加入同一测试的生产基线构建并保存二进制，再只应用上述输入复制调整构建候选；两次都包含本轮相同的 MLS/codec 依赖增量。使用原 workspace release 配置（opt3、thin LTO、codegen-units=1）、同一 target 和 `-j2`，没有 clean 或整仓重建。五对独立进程按 AB/BA 交替，计时无其他基准或 Cargo 并发，十次全部通过。
+
+| 口径 | 基线中位数（范围），ms | 候选中位数（范围），ms |
+| --- | ---: | ---: |
+| 256 次 worker 请求/消费 | 64.415（58.120–65.625） | 4.165（3.091–5.422） |
+| 整个测试进程 wall | 74.145（64.851–75.897） | 12.346（9.796–14.368） |
+
+按生产代码路径推导，该定时段基线额外复制 256 次×4 MiB＝1 GiB 未变化的 cells，候选为零次未变化地图复制；首次安装所需复制仍存在。这是代码路径计数，不是分配器或峰值内存测量。边界只有三个顶点，不是该探针的主要负载。
+
+测试线程等待结果时也记录获取同一输入锁的耗时。五个基线进程的各自最大采样值为 1.490–2.074 ms，候选为 0.000697–0.201 ms。采样次数由线程调度和进程进度决定，两组不同；这些值包括抢占/调度，既不是纯锁持有时间，也不能作为固定采样控制延迟分位数或硬实时上限。诊断日志保留原始样本数量和分位数，但不能用它们宣称生产 p95 改善。
+
+该结果只证实删除不变平面地图复制在这个刻意隔离复制成本的 workload 中有效，不代表完整平面导航，更不代表近期表面障碍路径、实机 CPU 或 20 Hz 长尾资格。显示路径复制、旧 Arc 最后拥有者的销毁等其他候选点没有本轮测量，因此未扩展改写。
+
+复现入口：
+
+```sh
+cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked -j2 \
+  --release -p nuwax-nav-runtime --lib --no-run --message-format=json
+# 分别保存基线/候选 Cargo JSON 中的真实测试二进制，再 AB/BA 交替：
+./runtime-binary planner_worker::tests::snapshot_tests::worker_unchanged_planar_snapshot_cost \
+  --ignored --exact --nocapture --test-threads=1
+./runtime-binary planner_worker::tests::snapshot_tests:: \
+  --nocapture --test-threads=1
+```
+
+### 保留当前状态安全回归
+
+最终 Runtime release lib 为 **227 passed / 0 failed / 48 ignored / 5 filtered**，52.50 秒。五个过滤项仍是此前环境不能 bind 的真实 UDS 测试；本轮未重试 UDS，也不能称完整 Runtime 全通过。比此前 226/47 新增一个普通输入安装回归和一个 ignored 性能探针；ignored 未混入通过数。
+
+同一最终二进制另显式运行首次交付旧位姿两项（2/2）、已消费命令 replay 两项（2/2），全部通过。latest-recent 五项重跑 5/5；40 Hz 位姿 / 20 Hz 控制理想移动回归重跑 1/1，记录 48 个位姿、24 拍控制、24 个非零结果、0.54365 m 行程，25 次完整选择、47 次单轨迹复核。复核耗时 219–1,009 µs 是本次 fixture 样本，不能承诺实机期限。原期限不续期、一次消费、最新 recent 阻挡和新位姿复核断言均保留；这两组普通回归已包含在上述 lib 通过数中，重跑结果不重复累加。
+
+```sh
+./runtime-binary first_command_pose_change_ --ignored --nocapture --test-threads=1
+./runtime-binary retained_command_replay_requires_current_full_braking_permission \
+  --ignored --nocapture --test-threads=1
+./runtime-binary retained_steady_command_replay_requires_current_full_braking_permission \
+  --ignored --nocapture --test-threads=1
+./runtime-binary latest_recent_ --nocapture --test-threads=1
+./runtime-binary latest_received_pose_recheck_keeps_twenty_hz_moving_progress \
+  --nocapture --test-threads=1
+```
+
+本轮未重跑六项完整 live Stack 资格，也未运行整 workspace、实机传感器/执行器闭环或实机 CPU 采样；此前 wall OFF 的原碰撞失败及其修复验收记录继续保留在 `terrain-recent-obstacles-refactor.md`。

@@ -164,22 +164,29 @@ impl SurfaceMapBuilder {
             {
                 return Err(SurfaceError::InvalidPointCloud);
             }
-            let mut zs = Vec::with_capacity(update.cells.len());
-            let mut changed = false;
-            for &(z, bounds) in &update.cells {
-                if zs.last().is_some_and(|old| *old >= z)
+            // Dirty source blocks also carry unchanged planning columns. Compare
+            // borrowed cells before copying any persistent-map pages or z vectors.
+            let old = columns.get(&key).map_or(&[][..], Vec::as_slice);
+            let mut changed = old.len() != update.cells.len();
+            let mut last_z = None;
+            for (index, &(z, bounds)) in update.cells.iter().enumerate() {
+                if last_z.is_some_and(|old| old >= z)
                     || !bounds.iter().all(|v| v.is_finite())
                     || bounds[0] >= bounds[1]
                     || z.abs_diff(0) > i32::MAX as u32 / 2
                 {
                     return Err(SurfaceError::InvalidPointCloud);
                 }
-                zs.push(z);
+                last_z = Some(z);
+                changed |= old.get(index) != Some(&z);
                 if self.config.voxel_size.to_bits() != source_voxel_size_m.to_bits() {
                     changed |= heights.get(&(key.0, key.1, z)) != Some(&bounds);
                 }
             }
-            changed |= columns.get(&key).map_or(!zs.is_empty(), |old| *old != zs);
+            if !changed {
+                continue;
+            }
+            let zs: Vec<_> = update.cells.iter().map(|&(z, _)| z).collect();
             count += zs.len();
             if let Some(old) = columns.remove(&key) {
                 count -= old.len();
@@ -195,9 +202,7 @@ impl SurfaceMapBuilder {
                     heights.insert((key.0, key.1, z), bounds);
                 }
             }
-            if changed {
-                changes.push(key);
-            }
+            changes.push(key);
         }
         if columns.is_empty() || count > MAX_SOURCE_POINTS {
             return Err(SurfaceError::InvalidPointCloud);
@@ -964,6 +969,70 @@ mod tests {
                     .snapshot
             ));
         }
+    }
+
+    #[test]
+    fn unchanged_dirty_columns_still_validate_and_mixed_changes_preserve_baseline() {
+        let data = points(&scene());
+        let source = SIZE * 0.5;
+        let columns = voxel_columns(&data, SIZE).unwrap();
+        let bounds = height_bounds(&data, SIZE, source);
+        let mut updates: Vec<_> = columns
+            .iter()
+            .map(|(&(x, y), zs)| SurfaceColumnUpdate {
+                column: [x, y],
+                cells: zs.iter().map(|&z| (z, bounds[&(x, y, z)])).collect(),
+            })
+            .collect();
+        let mut builder = SurfaceMapBuilder::new(config());
+        let first = builder.build(&data, source).unwrap().snapshot;
+        let reused = builder
+            .build_column_updates(&updates, source, false, data.len())
+            .unwrap();
+        assert_eq!(reused.stats.kind, SurfaceBuildKind::Reused);
+        assert!(Arc::ptr_eq(&first, &reused.snapshot));
+        let removed = updates[0].column;
+        updates[0].cells.clear();
+        // A later invalid unchanged-looking column must not commit an earlier deletion.
+        let duplicate = updates[1].clone();
+        updates.push(duplicate);
+        assert!(builder
+            .build_column_updates(&updates, source, false, data.len())
+            .is_err());
+        assert!(Arc::ptr_eq(
+            &first,
+            &builder
+                .build_column_updates(&[], source, false, 0)
+                .unwrap()
+                .snapshot
+        ));
+        updates.pop();
+        let actual = builder
+            .build_column_updates(&updates, source, false, data.len())
+            .unwrap();
+        assert_eq!(actual.changed_columns, vec![removed]);
+        let remaining: Vec<_> = data
+            .into_iter()
+            .filter(|&p| {
+                let (x, y, _) = voxelize(p, SIZE);
+                [x, y] != removed
+            })
+            .collect();
+        assert_equivalent(
+            &actual.snapshot,
+            &SurfaceSnapshot::from_points(&remaining, config(), source).unwrap(),
+        );
+        assert_eq!(first.data.occupied_columns.len(), columns.len());
+        // Validation still applies even when the source/planner precision ignores bounds.
+        let mut same_precision = SurfaceMapBuilder::new(config());
+        same_precision.build(&remaining, SIZE).unwrap();
+        let invalid = [SurfaceColumnUpdate {
+            column: updates[1].column,
+            cells: vec![(0, [f32::NAN, 1.0])],
+        }];
+        assert!(same_precision
+            .build_column_updates(&invalid, SIZE, false, 1)
+            .is_err());
     }
 
     #[test]

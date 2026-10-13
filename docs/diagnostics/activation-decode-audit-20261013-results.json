@@ -1,0 +1,693 @@
+{
+  "scope": "Synthetic assigned canonical cloud helper diagnostic; no production change. Process wall includes fixture, memory sampling, arbitrary scratch and seven timing repetitions. Exact allocation call counts unavailable.",
+  "binary": "/workspace/scratch/71cdb9d17732/neh-evidence/activation-decode-20261013/diagnostic-v1/runtime-test-binary",
+  "binary_size": 39798456,
+  "runs": [
+    {
+      "group": 0,
+      "points": 1000,
+      "arm": "baseline",
+      "log": "g0-n1000-baseline.log",
+      "exit_code": 0,
+      "process_wall_s": 0.01649319500211277,
+      "process_user_s": 0.005752999999999999,
+      "process_system_s": 0.005833,
+      "process_maxrss_kib": 22292,
+      "decoder_ms": [
+        0.034402,
+        0.033611,
+        0.033411,
+        0.033531,
+        0.033049,
+        0.03338,
+        0.119901
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=before_fixture rss_kib=Some(11508) hwm_kib=Some(11508) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=immutable_owner_writer rss_kib=Some(14096) hwm_kib=Some(14096) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=after_preflight rss_kib=Some(14192) hwm_kib=Some(14192) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(22388) hwm_kib=Some(22388) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 8392704, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=decode_result_live_with_scratch rss_kib=Some(22388) hwm_kib=Some(22388) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 150336, 120000, 8392704, 1]) set_capacity=Some(1792) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=results_and_scratch_dropped rss_kib=Some(14196) hwm_kib=Some(22292) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=all_fixture_owners_dropped rss_kib=Some(14512) hwm_kib=Some(22292) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111952, 158384, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=baseline points=1000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=3.993890"
+      ]
+    },
+    {
+      "group": 0,
+      "points": 1000,
+      "arm": "retained",
+      "log": "g0-n1000-retained.log",
+      "exit_code": 0,
+      "process_wall_s": 0.012024692998238606,
+      "process_user_s": 0.006552,
+      "process_system_s": 0.001811,
+      "process_maxrss_kib": 22472,
+      "decoder_ms": [
+        0.019249,
+        0.017336,
+        0.017246,
+        0.016926,
+        0.017086,
+        0.017927,
+        0.017377
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=before_fixture rss_kib=Some(11568) hwm_kib=Some(11568) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=immutable_owner_writer rss_kib=Some(14132) hwm_kib=Some(14132) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=after_preflight rss_kib=Some(14296) hwm_kib=Some(14296) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 150336, 120000, 0, 0]) set_capacity=Some(1792) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(22496) hwm_kib=Some(22496) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 150336, 120000, 8392704, 1]) set_capacity=Some(1792) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=decode_result_live_with_scratch rss_kib=Some(22496) hwm_kib=Some(22496) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 150336, 120000, 8392704, 1]) set_capacity=Some(1792) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=results_and_scratch_dropped rss_kib=Some(14300) hwm_kib=Some(22472) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=all_fixture_owners_dropped rss_kib=Some(14592) hwm_kib=Some(22472) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111952, 158384, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=retained points=1000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=3.968070"
+      ]
+    },
+    {
+      "group": 0,
+      "points": 100000,
+      "arm": "retained",
+      "log": "g0-n100000-retained.log",
+      "exit_code": 0,
+      "process_wall_s": 0.041063936998398276,
+      "process_user_s": 0.02906,
+      "process_system_s": 0.011169,
+      "process_maxrss_kib": 25184,
+      "decoder_ms": [
+        3.945878,
+        2.662069,
+        2.559143,
+        2.622199,
+        2.590481,
+        3.751374,
+        2.618783
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=before_fixture rss_kib=Some(11632) hwm_kib=Some(11632) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=immutable_owner_writer rss_kib=Some(15252) hwm_kib=Some(15252) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=after_preflight rss_kib=Some(16996) hwm_kib=Some(16996) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 2908160, 2]) set_capacity=Some(114688) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(25192) hwm_kib=Some(25192) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 11300864, 3]) set_capacity=Some(114688) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=decode_result_live_with_scratch rss_kib=Some(25192) hwm_kib=Some(25192) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 11300864, 3]) set_capacity=Some(114688) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=results_and_scratch_dropped rss_kib=Some(15328) hwm_kib=Some(25184) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=all_fixture_owners_dropped rss_kib=Some(16072) hwm_kib=Some(25184) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([1847296, 111952, 1735344, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=retained points=100000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=31.550561"
+      ]
+    },
+    {
+      "group": 0,
+      "points": 100000,
+      "arm": "baseline",
+      "log": "g0-n100000-baseline.log",
+      "exit_code": 0,
+      "process_wall_s": 0.061301704998186324,
+      "process_user_s": 0.046034,
+      "process_system_s": 0.012053,
+      "process_maxrss_kib": 25036,
+      "decoder_ms": [
+        5.869181,
+        5.333071,
+        5.956492,
+        5.71675,
+        5.37848,
+        5.461045,
+        5.498181
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=before_fixture rss_kib=Some(11444) hwm_kib=Some(11444) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=immutable_owner_writer rss_kib=Some(15192) hwm_kib=Some(15192) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=after_preflight rss_kib=Some(15260) hwm_kib=Some(16788) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(23456) hwm_kib=Some(23456) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 9592832, 2]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=decode_result_live_with_scratch rss_kib=Some(25120) hwm_kib=Some(25120) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([1847296, 1815632, 31664, 9592832, 2]) set_capacity=Some(114688) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=results_and_scratch_dropped rss_kib=Some(16924) hwm_kib=Some(25036) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([1847296, 111664, 1735632, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=all_fixture_owners_dropped rss_kib=Some(16068) hwm_kib=Some(25036) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([1847296, 111952, 1735344, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=baseline points=100000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=51.739890"
+      ]
+    },
+    {
+      "group": 0,
+      "points": 1000000,
+      "arm": "baseline",
+      "log": "g0-n1000000-baseline.log",
+      "exit_code": 0,
+      "process_wall_s": 1.1678942210019159,
+      "process_user_s": 1.145904,
+      "process_system_s": 0.019681999999999998,
+      "process_maxrss_kib": 60976,
+      "decoder_ms": [
+        121.8744,
+        138.202415,
+        136.59301,
+        138.794063,
+        144.321898,
+        137.300909,
+        134.078134
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=before_fixture rss_kib=Some(11552) hwm_kib=Some(11552) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=immutable_owner_writer rss_kib=Some(25836) hwm_kib=Some(25836) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=after_preflight rss_kib=Some(25912) hwm_kib=Some(52420) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(34104) hwm_kib=Some(52420) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([8531968, 8500288, 31680, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=decode_result_live_with_scratch rss_kib=Some(60728) hwm_kib=Some(60728) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([35794944, 35763296, 31648, 12001280, 1]) set_capacity=Some(1835008) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=results_and_scratch_dropped rss_kib=Some(60728) hwm_kib=Some(60728) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([35794944, 111664, 35683280, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=all_fixture_owners_dropped rss_kib=Some(49260) hwm_kib=Some(60976) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([35794944, 111952, 35682992, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=baseline points=1000000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=1156.840128"
+      ]
+    },
+    {
+      "group": 0,
+      "points": 1000000,
+      "arm": "retained",
+      "log": "g0-n1000000-retained.log",
+      "exit_code": 0,
+      "process_wall_s": 0.5969580480013974,
+      "process_user_s": 0.554719,
+      "process_system_s": 0.041108,
+      "process_maxrss_kib": 60600,
+      "decoder_ms": [
+        68.478369,
+        69.856366,
+        67.398669,
+        65.811023,
+        70.906775,
+        72.159957,
+        69.007408
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=before_fixture rss_kib=Some(11604) hwm_kib=Some(11604) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=immutable_owner_writer rss_kib=Some(25900) hwm_kib=Some(25900) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=after_preflight rss_kib=Some(52604) hwm_kib=Some(52604) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 39268352, 2]) set_capacity=Some(1835008) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(60800) hwm_kib=Some(60800) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 47661056, 3]) set_capacity=Some(1835008) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=decode_result_live_with_scratch rss_kib=Some(60800) hwm_kib=Some(60800) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 47661056, 3]) set_capacity=Some(1835008) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=results_and_scratch_dropped rss_kib=Some(25976) hwm_kib=Some(60600) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=all_fixture_owners_dropped rss_kib=Some(41160) hwm_kib=Some(60600) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([27406336, 111952, 27294384, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=retained points=1000000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=585.965288"
+      ]
+    },
+    {
+      "group": 1,
+      "points": 100000,
+      "arm": "retained",
+      "log": "g1-n100000-retained.log",
+      "exit_code": 0,
+      "process_wall_s": 0.03977523199864663,
+      "process_user_s": 0.027621999999999997,
+      "process_system_s": 0.00779,
+      "process_maxrss_kib": 25212,
+      "decoder_ms": [
+        3.44408,
+        2.683722,
+        2.831325,
+        2.728379,
+        2.597321,
+        2.564892,
+        2.732756
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=before_fixture rss_kib=Some(11532) hwm_kib=Some(11532) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=immutable_owner_writer rss_kib=Some(15216) hwm_kib=Some(15216) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=after_preflight rss_kib=Some(17024) hwm_kib=Some(17024) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 2908160, 2]) set_capacity=Some(114688) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(25220) hwm_kib=Some(25220) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 11300864, 3]) set_capacity=Some(114688) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=decode_result_live_with_scratch rss_kib=Some(25220) hwm_kib=Some(25220) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 11300864, 3]) set_capacity=Some(114688) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=results_and_scratch_dropped rss_kib=Some(15356) hwm_kib=Some(25212) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=all_fixture_owners_dropped rss_kib=Some(16192) hwm_kib=Some(25212) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([1847296, 111952, 1735344, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=retained points=100000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=29.507947"
+      ]
+    },
+    {
+      "group": 1,
+      "points": 100000,
+      "arm": "baseline",
+      "log": "g1-n100000-baseline.log",
+      "exit_code": 0,
+      "process_wall_s": 0.06922586799919372,
+      "process_user_s": 0.067463,
+      "process_system_s": 0.0,
+      "process_maxrss_kib": 25304,
+      "decoder_ms": [
+        5.703239,
+        5.780376,
+        5.866486,
+        5.399572,
+        5.713605,
+        5.731513,
+        5.670641
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=before_fixture rss_kib=Some(11508) hwm_kib=Some(11508) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=immutable_owner_writer rss_kib=Some(15256) hwm_kib=Some(15256) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=after_preflight rss_kib=Some(15396) hwm_kib=Some(17056) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(23592) hwm_kib=Some(23592) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 9592832, 2]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=decode_result_live_with_scratch rss_kib=Some(25256) hwm_kib=Some(25256) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([1847296, 1815632, 31664, 9592832, 2]) set_capacity=Some(114688) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=results_and_scratch_dropped rss_kib=Some(17060) hwm_kib=Some(25304) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([1847296, 111664, 1735632, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=all_fixture_owners_dropped rss_kib=Some(16204) hwm_kib=Some(25304) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([1847296, 111952, 1735344, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=baseline points=100000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=54.398884"
+      ]
+    },
+    {
+      "group": 1,
+      "points": 1000000,
+      "arm": "baseline",
+      "log": "g1-n1000000-baseline.log",
+      "exit_code": 0,
+      "process_wall_s": 1.2668772580000223,
+      "process_user_s": 1.236691,
+      "process_system_s": 0.026521,
+      "process_maxrss_kib": 60748,
+      "decoder_ms": [
+        161.621094,
+        148.109977,
+        141.494539,
+        147.752408,
+        142.638897,
+        135.635415,
+        150.508949
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=before_fixture rss_kib=Some(11324) hwm_kib=Some(11324) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=immutable_owner_writer rss_kib=Some(25556) hwm_kib=Some(25556) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=after_preflight rss_kib=Some(25696) hwm_kib=Some(52268) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(33888) hwm_kib=Some(52268) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([8531968, 8500288, 31680, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=decode_result_live_with_scratch rss_kib=Some(60512) hwm_kib=Some(60512) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([35794944, 35763296, 31648, 12001280, 1]) set_capacity=Some(1835008) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=results_and_scratch_dropped rss_kib=Some(60512) hwm_kib=Some(60512) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([35794944, 111664, 35683280, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=all_fixture_owners_dropped rss_kib=Some(49044) hwm_kib=Some(60748) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([35794944, 111952, 35682992, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=baseline points=1000000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=1253.751893"
+      ]
+    },
+    {
+      "group": 1,
+      "points": 1000000,
+      "arm": "retained",
+      "log": "g1-n1000000-retained.log",
+      "exit_code": 0,
+      "process_wall_s": 0.5879941879975377,
+      "process_user_s": 0.569323,
+      "process_system_s": 0.015776,
+      "process_maxrss_kib": 60344,
+      "decoder_ms": [
+        73.365557,
+        68.589418,
+        65.157576,
+        63.131668,
+        62.916954,
+        62.962506,
+        66.595312
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=before_fixture rss_kib=Some(11476) hwm_kib=Some(11476) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=immutable_owner_writer rss_kib=Some(25644) hwm_kib=Some(25644) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=after_preflight rss_kib=Some(52348) hwm_kib=Some(52348) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 39268352, 2]) set_capacity=Some(1835008) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(60544) hwm_kib=Some(60544) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 47661056, 3]) set_capacity=Some(1835008) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=decode_result_live_with_scratch rss_kib=Some(60544) hwm_kib=Some(60544) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 47661056, 3]) set_capacity=Some(1835008) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=results_and_scratch_dropped rss_kib=Some(25720) hwm_kib=Some(60344) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=all_fixture_owners_dropped rss_kib=Some(40940) hwm_kib=Some(60344) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([27406336, 111952, 27294384, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=retained points=1000000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=577.087271"
+      ]
+    },
+    {
+      "group": 1,
+      "points": 1000,
+      "arm": "retained",
+      "log": "g1-n1000-retained.log",
+      "exit_code": 0,
+      "process_wall_s": 0.012054323000484146,
+      "process_user_s": 0.011339,
+      "process_system_s": 0.0,
+      "process_maxrss_kib": 22224,
+      "decoder_ms": [
+        0.019449,
+        0.017606,
+        0.016965,
+        0.018347,
+        0.017166,
+        0.017466,
+        0.017095
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=before_fixture rss_kib=Some(11500) hwm_kib=Some(11500) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=immutable_owner_writer rss_kib=Some(14024) hwm_kib=Some(14024) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=after_preflight rss_kib=Some(14120) hwm_kib=Some(14120) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 150336, 120000, 0, 0]) set_capacity=Some(1792) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(22320) hwm_kib=Some(22320) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 150336, 120000, 8392704, 1]) set_capacity=Some(1792) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=decode_result_live_with_scratch rss_kib=Some(22320) hwm_kib=Some(22320) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 150336, 120000, 8392704, 1]) set_capacity=Some(1792) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=results_and_scratch_dropped rss_kib=Some(14124) hwm_kib=Some(22224) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=all_fixture_owners_dropped rss_kib=Some(14440) hwm_kib=Some(22224) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111952, 158384, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=retained points=1000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=3.207754"
+      ]
+    },
+    {
+      "group": 1,
+      "points": 1000,
+      "arm": "baseline",
+      "log": "g1-n1000-baseline.log",
+      "exit_code": 0,
+      "process_wall_s": 0.011220542997762095,
+      "process_user_s": 0.006862,
+      "process_system_s": 0.003431,
+      "process_maxrss_kib": 22264,
+      "decoder_ms": [
+        0.034943,
+        0.033911,
+        0.03357,
+        0.033691,
+        0.047692,
+        0.033942,
+        0.033681
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=before_fixture rss_kib=Some(11616) hwm_kib=Some(11616) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=immutable_owner_writer rss_kib=Some(14056) hwm_kib=Some(14056) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=after_preflight rss_kib=Some(14156) hwm_kib=Some(14156) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(22352) hwm_kib=Some(22352) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 8392704, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=decode_result_live_with_scratch rss_kib=Some(22352) hwm_kib=Some(22352) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 150336, 120000, 8392704, 1]) set_capacity=Some(1792) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=results_and_scratch_dropped rss_kib=Some(14160) hwm_kib=Some(22264) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=all_fixture_owners_dropped rss_kib=Some(14412) hwm_kib=Some(22264) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111952, 158384, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=baseline points=1000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=3.242717"
+      ]
+    },
+    {
+      "group": 2,
+      "points": 1000000,
+      "arm": "baseline",
+      "log": "g2-n1000000-baseline.log",
+      "exit_code": 0,
+      "process_wall_s": 1.2216882659995463,
+      "process_user_s": 1.1899440000000001,
+      "process_system_s": 0.027944,
+      "process_maxrss_kib": 61108,
+      "decoder_ms": [
+        141.969429,
+        134.348061,
+        140.271756,
+        139.017582,
+        146.337635,
+        147.724821,
+        155.687244
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=before_fixture rss_kib=Some(11528) hwm_kib=Some(11528) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=immutable_owner_writer rss_kib=Some(25776) hwm_kib=Some(25776) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=after_preflight rss_kib=Some(25916) hwm_kib=Some(52488) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(34108) hwm_kib=Some(52488) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([8531968, 8500288, 31680, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=decode_result_live_with_scratch rss_kib=Some(60732) hwm_kib=Some(60732) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([35794944, 35763296, 31648, 12001280, 1]) set_capacity=Some(1835008) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=results_and_scratch_dropped rss_kib=Some(60732) hwm_kib=Some(60732) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([35794944, 111664, 35683280, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000000 phase=all_fixture_owners_dropped rss_kib=Some(49328) hwm_kib=Some(61108) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([35794944, 111952, 35682992, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=baseline points=1000000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=1208.356234"
+      ]
+    },
+    {
+      "group": 2,
+      "points": 1000000,
+      "arm": "retained",
+      "log": "g2-n1000000-retained.log",
+      "exit_code": 0,
+      "process_wall_s": 0.696699735999573,
+      "process_user_s": 0.6621389999999999,
+      "process_system_s": 0.031529,
+      "process_maxrss_kib": 60576,
+      "decoder_ms": [
+        100.103216,
+        80.236158,
+        69.126907,
+        76.954535,
+        72.868446,
+        73.476704,
+        75.830747
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=before_fixture rss_kib=Some(11540) hwm_kib=Some(11540) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=immutable_owner_writer rss_kib=Some(25740) hwm_kib=Some(25740) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=after_preflight rss_kib=Some(52508) hwm_kib=Some(52508) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 39268352, 2]) set_capacity=Some(1835008) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(60704) hwm_kib=Some(60704) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 47661056, 3]) set_capacity=Some(1835008) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=decode_result_live_with_scratch rss_kib=Some(60704) hwm_kib=Some(60704) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 47661056, 3]) set_capacity=Some(1835008) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=results_and_scratch_dropped rss_kib=Some(25880) hwm_kib=Some(60576) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 12001280, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000000 phase=all_fixture_owners_dropped rss_kib=Some(41132) hwm_kib=Some(60576) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([27406336, 111952, 27294384, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=retained points=1000000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=683.995013"
+      ]
+    },
+    {
+      "group": 2,
+      "points": 1000,
+      "arm": "retained",
+      "log": "g2-n1000-retained.log",
+      "exit_code": 0,
+      "process_wall_s": 0.01237059500272153,
+      "process_user_s": 0.007264,
+      "process_system_s": 0.001916,
+      "process_maxrss_kib": 22164,
+      "decoder_ms": [
+        0.019189,
+        0.017176,
+        0.016816,
+        0.016855,
+        0.017176,
+        0.016484,
+        0.016886
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=before_fixture rss_kib=Some(11500) hwm_kib=Some(11500) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=immutable_owner_writer rss_kib=Some(13964) hwm_kib=Some(13964) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=after_preflight rss_kib=Some(14060) hwm_kib=Some(14060) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 150336, 120000, 0, 0]) set_capacity=Some(1792) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(22260) hwm_kib=Some(22260) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 150336, 120000, 8392704, 1]) set_capacity=Some(1792) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=decode_result_live_with_scratch rss_kib=Some(22260) hwm_kib=Some(22260) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 150336, 120000, 8392704, 1]) set_capacity=Some(1792) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=results_and_scratch_dropped rss_kib=Some(14064) hwm_kib=Some(22164) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=1000 phase=all_fixture_owners_dropped rss_kib=Some(14380) hwm_kib=Some(22164) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111952, 158384, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=retained points=1000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=3.155063"
+      ]
+    },
+    {
+      "group": 2,
+      "points": 1000,
+      "arm": "baseline",
+      "log": "g2-n1000-baseline.log",
+      "exit_code": 0,
+      "process_wall_s": 0.011365417998604244,
+      "process_user_s": 0.00601,
+      "process_system_s": 0.001478,
+      "process_maxrss_kib": 22156,
+      "decoder_ms": [
+        0.036245,
+        0.033651,
+        0.033621,
+        0.049455,
+        0.033661,
+        0.03372,
+        0.034072
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=before_fixture rss_kib=Some(11436) hwm_kib=Some(11436) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=immutable_owner_writer rss_kib=Some(14020) hwm_kib=Some(14020) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=after_preflight rss_kib=Some(14116) hwm_kib=Some(14116) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(22312) hwm_kib=Some(22312) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 8392704, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=decode_result_live_with_scratch rss_kib=Some(22312) hwm_kib=Some(22312) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 150336, 120000, 8392704, 1]) set_capacity=Some(1792) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=results_and_scratch_dropped rss_kib=Some(14120) hwm_kib=Some(22156) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 123680, 146656, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=1000 phase=all_fixture_owners_dropped rss_kib=Some(14436) hwm_kib=Some(22156) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111952, 158384, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=baseline points=1000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=3.743692"
+      ]
+    },
+    {
+      "group": 2,
+      "points": 100000,
+      "arm": "baseline",
+      "log": "g2-n100000-baseline.log",
+      "exit_code": 0,
+      "process_wall_s": 0.05760262900002999,
+      "process_user_s": 0.047524,
+      "process_system_s": 0.007763,
+      "process_maxrss_kib": 25420,
+      "decoder_ms": [
+        5.375685,
+        4.98752,
+        5.343306,
+        5.178928,
+        5.015352,
+        5.113229,
+        5.06723
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=before_fixture rss_kib=Some(11568) hwm_kib=Some(11568) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=immutable_owner_writer rss_kib=Some(15432) hwm_kib=Some(15432) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=after_preflight rss_kib=Some(15508) hwm_kib=Some(17172) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(23704) hwm_kib=Some(23704) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 9592832, 2]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=decode_result_live_with_scratch rss_kib=Some(25368) hwm_kib=Some(25368) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([1847296, 1815632, 31664, 9592832, 2]) set_capacity=Some(114688) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=results_and_scratch_dropped rss_kib=Some(17172) hwm_kib=Some(25420) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([1847296, 111664, 1735632, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=baseline points=100000 phase=all_fixture_owners_dropped rss_kib=Some(16252) hwm_kib=Some(25420) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([1847296, 111952, 1735344, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=baseline points=100000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=49.485856"
+      ]
+    },
+    {
+      "group": 2,
+      "points": 100000,
+      "arm": "retained",
+      "log": "g2-n100000-retained.log",
+      "exit_code": 0,
+      "process_wall_s": 0.03638381700147875,
+      "process_user_s": 0.027913999999999998,
+      "process_system_s": 0.008025,
+      "process_maxrss_kib": 24928,
+      "decoder_ms": [
+        3.167883,
+        2.644091,
+        2.618523,
+        2.861009,
+        2.671083,
+        2.761188,
+        2.606565
+      ],
+      "memory_lines": [
+        "test pointcloud::activation_decode_diagnostic_tests::assigned_activation_decode_pair_diagnostic ... ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=before_fixture rss_kib=Some(11512) hwm_kib=Some(11512) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 110384, 159952, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=immutable_owner_writer rss_kib=Some(15140) hwm_kib=Some(15140) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=after_preflight rss_kib=Some(16876) hwm_kib=Some(16876) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 2908160, 2]) set_capacity=Some(114688) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=arbitrary_8mib_intervening_scratch rss_kib=Some(25072) hwm_kib=Some(25072) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 11300864, 3]) set_capacity=Some(114688) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=decode_result_live_with_scratch rss_kib=Some(25072) hwm_kib=Some(25072) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 11300864, 3]) set_capacity=Some(114688) allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=results_and_scratch_dropped rss_kib=Some(15208) hwm_kib=Some(24928) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([270336, 111664, 158672, 1200128, 1]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true",
+        "ACTIVATION_DECODE_MEMORY arm=retained points=100000 phase=all_fixture_owners_dropped rss_kib=Some(16016) hwm_kib=Some(24928) allocator_arena_inuse_free_mmapbytes_mmapcount=Some([1847296, 111952, 1735344, 0, 0]) set_capacity=None allocator_not_exact_live_rust_bytes=true samples_not_atomic=true"
+      ],
+      "control_lines": [
+        "ACTIVATION_DECODE_CONTROL arm=retained points=100000 reduced_capacity_rejected=true no_fine_install_exercised=false no_production_install_changed=true test_wall_ms=28.275356"
+      ]
+    }
+  ],
+  "summary": {
+    "1000": {
+      "baseline": {
+        "process_decoder_medians_ms": [
+          0.033531,
+          0.033911,
+          0.03372
+        ],
+        "process_wall_ms": [
+          16.49319500211277,
+          11.220542997762095,
+          11.365417998604244
+        ],
+        "process_maxrss_kib": [
+          22292,
+          22264,
+          22156
+        ]
+      },
+      "retained": {
+        "process_decoder_medians_ms": [
+          0.017336,
+          0.017466,
+          0.016886
+        ],
+        "process_wall_ms": [
+          12.024692998238606,
+          12.054323000484146,
+          12.37059500272153
+        ],
+        "process_maxrss_kib": [
+          22472,
+          22224,
+          22164
+        ]
+      }
+    },
+    "100000": {
+      "baseline": {
+        "process_decoder_medians_ms": [
+          5.498181,
+          5.713605,
+          5.113229
+        ],
+        "process_wall_ms": [
+          61.301704998186324,
+          69.22586799919372,
+          57.60262900002999
+        ],
+        "process_maxrss_kib": [
+          25036,
+          25304,
+          25420
+        ]
+      },
+      "retained": {
+        "process_decoder_medians_ms": [
+          2.622199,
+          2.728379,
+          2.671083
+        ],
+        "process_wall_ms": [
+          41.063936998398276,
+          39.77523199864663,
+          36.38381700147875
+        ],
+        "process_maxrss_kib": [
+          25184,
+          25212,
+          24928
+        ]
+      }
+    },
+    "1000000": {
+      "baseline": {
+        "process_decoder_medians_ms": [
+          137.300909,
+          147.752408,
+          141.969429
+        ],
+        "process_wall_ms": [
+          1167.8942210019159,
+          1266.8772580000223,
+          1221.6882659995463
+        ],
+        "process_maxrss_kib": [
+          60976,
+          60748,
+          61108
+        ]
+      },
+      "retained": {
+        "process_decoder_medians_ms": [
+          69.007408,
+          65.157576,
+          75.830747
+        ],
+        "process_wall_ms": [
+          596.9580480013974,
+          587.9941879975377,
+          696.699735999573
+        ],
+        "process_maxrss_kib": [
+          60600,
+          60344,
+          60576
+        ]
+      }
+    }
+  }
+}

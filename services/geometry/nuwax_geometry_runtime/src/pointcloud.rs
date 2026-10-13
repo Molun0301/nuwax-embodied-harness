@@ -2547,3 +2547,7 @@ mod tests {
 #[cfg(test)]
 #[path = "legacy_fine_baseline_tests.rs"]
 mod legacy_fine_baseline_tests;
+
+#[cfg(test)]
+#[path = "activation_decode_diagnostic_tests.rs"]
+mod activation_decode_diagnostic_tests;

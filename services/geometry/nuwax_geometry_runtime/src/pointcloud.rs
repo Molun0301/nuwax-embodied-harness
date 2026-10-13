@@ -2543,3 +2543,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_fine_baseline_tests.rs"]
+mod legacy_fine_baseline_tests;

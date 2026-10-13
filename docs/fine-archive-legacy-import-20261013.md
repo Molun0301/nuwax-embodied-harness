@@ -86,9 +86,48 @@ shared bounded root parsing removed the extra conversion-time walk. The remainin
 four include existing read/admission/publication/reopen boundaries; this change
 makes no claim that those costs are eliminated. No latency benchmark was run.
 
-These are focused Python results. Native sealed-store/admission coverage is being
-prepared separately and is not counted as passed here. This is not end-to-end
-activation verification or complete removal of application hashing. Legacy
+These are focused Python results. This is not end-to-end activation verification
+or complete removal of application hashing. Legacy
 export, fallback activation, request/bundle/journal/policy hashes and other
 application paths remain outside this bounded change. LCM protocol fingerprints
 are unaffected.
+
+## Native qualification
+
+Final native verification completed on 2026-10-13 at 22:18 UTC: **3 tests passed,
+0 failed, 0 ignored; 1,332 filtered out**, with an 8m 47s incremental release
+build and process exit 0. No clean or release-profile change was used.
+
+Two synchronous `activation_request::legacy_fine_import_tests` tests consume
+actual protobuf requests and archive bytes emitted by the guarded Python
+on-disk importer. They exercise the real transfer Store's sealing and typed v2
+admission, exact pinned bytes, original member receipts/generations, read-only
+ownership, release followed by retained replay, changed-cloud conflict rejection,
+wrong producer generation and truncated archive rejection. They do not perform
+the full activation/publication transaction.
+
+One separate `pointcloud::legacy_fine_baseline_tests` test qualifies existing
+lower-level AR1 restore/install behavior with the real cloud writer and commit-ID
+allocator. It covers same/new domains, known/unknown point evidence, real next
+observation and membership commits, stale receipt/receiver rollback fences and
+retained source evidence. Occupancy input receipts are synthetic test inputs;
+this is not full mapping-adapter or assigned AR1 admission coverage. The current
+production AR1 rejection gates remain unchanged.
+
+Both native map/archive hash sentinels are enabled before fixture decoding or
+construction, restored with RAII, and never leave the synchronous test thread.
+Fixture generators and literal inputs are in
+`services/geometry/nuwax_geometry_runtime/tests/fixtures/legacy_fine_import/`.
+
+```sh
+source /workspace/scratch/71cdb9d17732/neh-toolchain/env.sh
+export CARGO_BUILD_JOBS=2 CMAKE_BUILD_PARALLEL_LEVEL=1
+cargo test --offline --release \
+  --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml \
+  --bin nuwax-geometry-runtime legacy_fine_ -- --test-threads=1
+```
+
+Evidence is retained at
+`/workspace/scratch/71cdb9d17732/neh-evidence/fine-import-native-release.log`
+and `fine-import-native-release.exit` (0). No content/provenance hash or legacy
+hashing fixture was computed for this qualification.

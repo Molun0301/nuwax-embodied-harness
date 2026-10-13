@@ -1490,3 +1490,7 @@ pub(crate) mod planar_test_support {
         assert!(!changed.validate(owner));
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_fine_import_tests.rs"]
+mod legacy_fine_import_tests;

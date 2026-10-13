@@ -225,3 +225,52 @@ for its baseline, so rerunning it after adoption does not accidentally use the
 optimized implementation as its own baseline. Already-indexed cases have no claimed speed benefit; legacy/moved paths
 still traverse as before with one optional canonical probe. Invalid duplicate
 selection behavior remains explicitly disclosed above.
+
+## Remaining payload lookup: rejected direct-path candidate
+
+2026-10-13 UTC. The remaining cold payload discovery was audited without a
+production change or another performance benchmark. The existing artifact ID
+identifies the canonical kind directory, but not the payload filename:
+`save_bytes` accepts arbitrary `extension` overrides, including a suffix without
+a dot. Persisted `ArtifactRef` contains kind, MIME type, URI and caller metadata,
+but no authoritative payload filename or extension. The URI addresses the
+artifact endpoint, not its filesystem path. Guessing from MIME type is only a
+hint and cannot recover custom suffixes.
+
+The actual raw HTTP path is `ArtifactFileResponse` → `acquire_artifacts` →
+payload-cache check / `_find_file_path` → `_read_entry`. Existing metadata
+identity and payload identity checks precede acquisition of the response hold;
+its final identity recheck remains under the mutation fence. Only afterward
+does response construction call `get_ref` and `get_file_path`. Thus the raw
+acquisition path does not already supply an authoritative filename that a
+direct lookup could reuse. A preceding client metadata request warms metadata
+parsing, but provides no additional filename field.
+
+More importantly, `_scan_entries` rejects repeated payload IDs within one
+directory and repeated sidecar IDs across directories, but accepts a canonical
+sidecar/payload pair plus a root-level same-ID orphan payload. In an owned
+fixture, cold recursive lookup selected the root orphan while inventory
+selected the canonical payload. A direct canonical probe would therefore
+select different bytes in a state accepted by the current scanner. This is
+distinct from the duplicate-sidecar inventory explicitly rejected in the
+earlier metadata optimization. Acceptance by the scanner does **not** establish
+a desired global unique-owner contract or endorse the ambiguous state.
+Changing which bytes are returned cannot be introduced as a performance-only
+change; the broader payload ambiguity policy needs separate treatment.
+
+[Tiny diagnostic](../scripts/diagnostics/artifact_payload_lookup_boundary.py)
+reproduces both the accepted orphan state and a production save with
+`extension="custom"`. It uses two owned temporary directories, ordinary literal
+payloads and the actual production store; it performs no hashing or timing.
+Run with Python 3.8.10:
+
+```sh
+python -B scripts/diagnostics/artifact_payload_lookup_boundary.py
+```
+
+Both fixture checks passed. No new cache, persisted path schema, scan,
+validation layer, ownership behavior, range handling or cancellation behavior
+was added. Existing payload-cache priority and legacy/moved lookup remain
+unchanged. The approximately 11 ms prior cold metadata-then-raw measurement
+alone does not establish sufficient workload frequency to justify a wider
+storage-contract change.

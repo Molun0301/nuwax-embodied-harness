@@ -1,12 +1,14 @@
 """Legacy saved-dense identity tests; checkpoint loading is an explicit fixture boundary."""
+import hashlib
 import json
+from contextlib import ExitStack
 import struct
 import sys
 import types
 import unittest
 from unittest.mock import Mock, patch
 
-from services.geometry import dense_cloud
+from services.geometry import checkpoint_payload, dense_cloud
 from services.geometry.assigned_saved_cloud import AssignedSavedCloudHandle
 
 
@@ -42,11 +44,15 @@ class LegacyDenseEpochTests(unittest.TestCase):
         module.MappingBackendCheckpointStore = self.store
         self.modules = patch.dict(sys.modules, {module.__name__: module})
         self.modules.start()
-        self.no_digest = patch.object(dense_cloud, "payload_digest", side_effect=AssertionError("business hash called"), create=True)
-        self.no_digest.start()
+        self.no_digest = ExitStack()
+        self.addCleanup(self.no_digest.close)
+        for name in hashlib.algorithms_guaranteed | {'new', 'file_digest'}:
+            if hasattr(hashlib, name):
+                self.no_digest.enter_context(patch.object(hashlib, name, side_effect=AssertionError("business hash called")))
+        self.no_digest.enter_context(patch.object(checkpoint_payload, "payload_digest", side_effect=AssertionError("business digest called")))
 
     def tearDown(self):
-        self.no_digest.stop()
+        self.no_digest.close()
         self.modules.stop()
         self.cache.close()
 

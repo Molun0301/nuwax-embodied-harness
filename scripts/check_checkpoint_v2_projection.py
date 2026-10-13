@@ -61,7 +61,7 @@ SELECTION = {'tests/test_checkpoint_identity_v2.py': ('IdentityV2Tests.test_actu
  'tests/test_assigned_asset_storage.py': ('AssignedAssetStorageTests.test_reopen_exact_identity_and_same_id_exact_request_is_idempotent',
                                           'AssignedAssetStorageTests.test_same_id_changed_body_or_inventory_is_rejected_without_overwrite',
                                           'AssignedAssetStorageTests.test_different_assigned_id_never_overwrites_current',
-                                          'AssignedAssetStorageTests.test_assigned_finalize_rejects_legacy_current_before_hash_or_body_read',
+                                          'AssignedAssetStorageTests.test_assigned_finalize_preserves_legacy_current_in_independent_namespace',
                                           'AssignedAssetStorageTests.test_concurrent_first_publishers_preserve_exact_one_owner',
                                           'AssignedAssetStorageTests.test_pre_and_post_rename_faults_restart_and_retry',
                                           'AssignedAssetStorageTests.test_postpublication_metadata_failure_is_recoverable_from_durable_owner',

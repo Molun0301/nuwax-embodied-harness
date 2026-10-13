@@ -165,14 +165,24 @@ class AssignedAssetStorageTests(unittest.TestCase):
         self.assertFalse(hasattr(raised.exception, 'existing_sha256'))
         self.assertEqual(self.repository.get_map_asset_bundle(MAP_NAME).asset_identity, ASSET_ID)
 
-    def test_assigned_finalize_rejects_legacy_current_before_hash_or_body_read(self):
+    def test_assigned_finalize_preserves_legacy_current_in_independent_namespace(self):
         current = self.repository.current_directory(MAP_NAME)
         write(current / 'manifest.json', LEGACY_MANIFEST)
-        with self.assertRaises(storage.AssignedMapAlreadyFinalizedError) as raised:
-            self.publish()
-        self.assertEqual(raised.exception.existing_identity_kind, 'legacy')
-        self.assertIsNone(raised.exception.existing_asset_identity)
-        self.assertFalse(hasattr(raised.exception, 'existing_sha256'))
+        inode = current.stat().st_ino
+        published = self.publish()
+        self.assertEqual(published.asset_identity, ASSET_ID)
+        self.assertEqual(published.asset_state, 'finalized')
+        self.assertTrue(self.repository.has_assigned_version(MAP_NAME, ASSET_ID))
+        assigned = current.parent / ('assigned-id-' + ASSET_ID.asset_id)
+        self.assertNotEqual(assigned, current)
+        self.assertTrue(assigned.is_dir())
+        restarted = MapAssetBundleRepository(str(self.root))
+        reopened = restarted.get_map_asset_bundle(MAP_NAME, expected_asset_identity=ASSET_ID)
+        self.assertEqual(reopened.asset_identity, ASSET_ID)
+        self.assertEqual(reopened.snapshot.occupancy_grid.data, [-1, 100])
+        # Publication alone does not grant a catalog switch or overwrite legacy ownership.
+        self.assertEqual(restarted.current_directory(MAP_NAME), current)
+        self.assertEqual(current.stat().st_ino, inode)
         self.assertEqual((current / 'manifest.json').read_bytes(), LEGACY_MANIFEST)
         self.assertEqual({path.name for path in current.iterdir()}, {'manifest.json'})
 

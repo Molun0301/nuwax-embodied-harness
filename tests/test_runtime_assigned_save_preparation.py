@@ -172,12 +172,19 @@ class RuntimeAssignedSavePreparationTests(unittest.TestCase):
         self.assertEqual(self.exports, [])
         self.assertEqual(list(self.root.iterdir()), [])
 
-    def test_v2_rejects_noncloud_backend_before_export(self):
-        for backend in ('slam_toolbox', 'unknown', None):
+    def test_v2_rejects_unknown_backend_before_export(self):
+        for backend in ('unknown', None):
             self.context['mapping_backend_kind'] = backend
-            with self.subTest(backend=backend), self.assertRaisesRegex(RuntimeError, 'cloud backend'):
+            with self.subTest(backend=backend), self.assertRaisesRegex(RuntimeError, 'active native backend'):
                 self.prepare()
         self.assertEqual(self.exports, [])
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_v2_rejects_supported_planar_context_with_cloud_export(self):
+        self.context['mapping_backend_kind'] = 'slam_toolbox'
+        with self.assertRaisesRegex(RuntimeError, 'backend changed during export'):
+            self.prepare()
+        self.assertEqual(self.exports, [{'checkpoint_schema_version': 2}])
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_v2_rejects_export_backend_and_session_drift(self):
@@ -203,13 +210,17 @@ class RuntimeAssignedSavePreparationTests(unittest.TestCase):
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_v2_rejects_missing_context_before_or_after_export(self):
-        for contexts in ((None,), (dict(self.context), None)):
+        for contexts, expected_error, export_count in (
+                ((None,), 'active native backend', 0),
+                ((dict(self.context), None), 'backend changed during export', 1)):
             with self.subTest(contexts=contexts):
+                self.exports.clear()
                 values = iter(contexts)
                 self.instance.get_mapping_session_context = lambda values=values: next(values)
-                with self.assertRaisesRegex(RuntimeError, 'cloud backend'):
+                with self.assertRaisesRegex(RuntimeError, expected_error):
                     self.prepare()
-        self.assertEqual(list(self.root.iterdir()), [])
+                self.assertEqual(len(self.exports), export_count)
+                self.assertEqual(list(self.root.iterdir()), [])
 
     def test_v2_rejects_runtime_and_provider_origin_drift_before_return(self):
         changes = (
@@ -336,15 +347,24 @@ class AssignedCheckpointExportOriginTests(unittest.TestCase):
                          [(5, response.fine_map_artifact.id)])
         self.assertIn(response.dense_cloud_artifact.id, stub.entries)
 
-    def test_export_rejects_planar_or_unknown_reply_before_download(self):
-        for backend in ('slam_toolbox', 'unknown'):
-            response = response_fixture()
-            response.backend_kind = backend
-            stub = TransferStub(response)
-            with self.subTest(backend=backend):
-                with self.assertRaisesRegex(ValueError, 'cloud backend'):
-                    provider_fixture(stub).export_mapping_backend_checkpoint(checkpoint_schema_version=2)
-                self.assertEqual(stub.requests, [])
+    def test_export_rejects_planar_reply_without_graph_member_before_download(self):
+        response = response_fixture()
+        response.backend_kind = 'slam_toolbox'
+        stub = TransferStub(response)
+        with self.assertRaisesRegex(ValueError, 'requires field graph_artifact'):
+            provider_fixture(stub).export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+        self.assertEqual(stub.requests, [])
+
+    def test_export_rejects_unknown_backend_before_envelope_or_download(self):
+        response = response_fixture()
+        response.backend_kind = 'unknown'
+        stub = TransferStub(response)
+        # Supported-backend admission precedes even the member-envelope parser.
+        with patch.object(provider_module, '_validate_checkpoint_identity_envelope',
+                          side_effect=AssertionError('unknown backend reached envelope')):
+            with self.assertRaisesRegex(ValueError, 'requires a paired backend'):
+                provider_fixture(stub).export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+        self.assertEqual(stub.requests, [])
 
 
 if __name__ == '__main__':

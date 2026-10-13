@@ -404,21 +404,33 @@ class AssignedSavedCloudTests(unittest.TestCase):
 
 
 class LegacySavedCloudTests(unittest.TestCase):
-    def test_legacy_dense_keeps_manifest_reload_and_digest_epoch(self):
+    def test_legacy_dense_reuses_retained_alias_and_installation_generation(self):
         payload = dense_bytes()
         source = {'bundle_root': Path('/unused/legacy'), 'backend_kind': 'voxel',
-                  'manifest_sha256': 'f' * 64, 'frame_id': 'map'}
+                  'manifest_sha256': 'f' * 64, 'frame_id': 'map', 'activation_generation': 7}
         stored = SimpleNamespace(manifest_sha256='f' * 64, checkpoint=SimpleNamespace(dense_archive=payload))
         cache = SavedDenseCloudCache()
-        with patch.object(MappingBackendCheckpointStore, 'load', return_value=stored) as load:
+        self.addCleanup(cache.close)
+        with ExitStack() as guards:
+            for name in hashlib.algorithms_guaranteed | {'new', 'file_digest'}:
+                if hasattr(hashlib, name):
+                    guards.enter_context(patch.object(hashlib, name, side_effect=AssertionError('hash called')))
+            guards.enter_context(patch.object(checkpoint_payload, 'payload_digest', side_effect=AssertionError('digest called')))
+            load = guards.enter_context(patch.object(MappingBackendCheckpointStore, 'load', return_value=stored))
             metadata, data = cache.read(source)
-            final, empty = cache.read(source, offset_points=2)
-        self.assertEqual(load.call_count, 1)
-        self.assertEqual(metadata['epoch'], 'saved:' + hashlib.sha256(payload).hexdigest())
-        self.assertNotIn('assigned_source', metadata)
-        self.assertEqual(data, struct.pack('<ffffff', 1, 2, 3, 4, 5, 6))
-        self.assertEqual((final['point_count'], empty), (0, b''))
-        cache.close()
+            final, empty = cache.read(source, expected_epoch=metadata['epoch'], offset_points=2)
+            self.assertEqual(load.call_count, 1)
+            self.assertEqual(metadata['epoch'], 'saved-legacy:voxel:' + 'f' * 64 + ':7')
+            self.assertNotIn('assigned_source', metadata)
+            self.assertEqual(data, struct.pack('<ffffff', 1, 2, 3, 4, 5, 6))
+            self.assertEqual((final['point_count'], empty), (0, b''))
+            reinstalled = dict(source, activation_generation=8)
+            with self.assertRaisesRegex(RuntimeError, 'DENSE_CLOUD_SOURCE_CHANGED'):
+                cache.read(reinstalled, expected_epoch=metadata['epoch'])
+            current, unchanged = cache.read(reinstalled)
+            self.assertEqual(load.call_count, 2)
+            self.assertEqual(current['epoch'], 'saved-legacy:voxel:' + 'f' * 64 + ':8')
+            self.assertEqual(unchanged, data)
 
     def test_legacy_switch_suppresses_equal_revision_and_advances_on_source_change(self):
         switch = PointCloudMapSourceSwitch(None, None)

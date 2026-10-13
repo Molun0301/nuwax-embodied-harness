@@ -34,6 +34,7 @@ At 200 retained terminal records and 50 active tasks, the count avoids approxima
 - `scripts/check_task_history_cleanup.py`: 20 passed
 - `scripts/check_audio_health_cache.py`: 11 passed
 - `scripts/check_self_update.py`: 55 passed
+- `scripts/check_artifact_runtime_integration.py`: 16/17 passed; unrelated pre-existing teardown fixture fails because its zero-argument `_close_mapping_recording` lambda receives the current timeout argument (line 253). The task-manager health double is updated; teardown fixture was unchanged in this stage. A later isolated test-only compatibility fix accepts the timeout and returns True; all 17 then pass
 - Existing health test doubles updated to implement the scalar TaskManager methods
 - `git diff --check`: passed
 

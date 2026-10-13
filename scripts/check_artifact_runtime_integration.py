@@ -248,7 +248,7 @@ class RuntimeChecks(unittest.TestCase):
         runtime.observation_service = SimpleNamespace(close=lambda **kw: order.append("observation") or True)
         runtime.perception_service = SimpleNamespace(close=lambda **kw: order.append("perception") or True)
         runtime.scene_mapping_service = SimpleNamespace(close=lambda: order.append("mapping"))
-        runtime._close_mapping_recording = lambda: None
+        runtime._close_mapping_recording = lambda _timeout: True
         runtime._close_runtime_event_bridge = lambda _timeout: order.append("event_bridge") or True
         self.assertTrue(runtime._close_dispatch_resources())
         self.assertEqual(order[:5], ["maintenance", "video", "observation", "perception", "mapping"])

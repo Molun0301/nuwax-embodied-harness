@@ -94,6 +94,33 @@ def test_mask_quality_converts_each_tensor_once():
     assert result[-1] == {"predicted_iou": .7, "segmentation_score": .9}
 
 
+def test_yolo_mask_normalization_owns_output_without_copying_new_detection(monkeypatch):
+    from contracts.perception import Detection2D
+
+    backend = YoloWorldDetectorBackend(use_worker_process=False)
+    polygon = np.asarray([[1., 2.], [10., 2.], [10., 20.], [1., 20.]])
+    result = _result(names={0: "Chair"}, boxes=[[1, 2, 10, 20]] * 2,
+                     scores=[.9, .8], classes=[0, 0])
+    result.masks = SimpleNamespace(xy=[polygon, polygon])
+    monkeypatch.setattr(Detection2D, "model_copy",
+                        lambda *args, **kwargs: pytest.fail("新检测应在构造时附带分割，不再复制多边形"))
+
+    first, second = backend._normalize_yolo_result(result, _frame())
+    assert first.label == "chair"
+    assert first.segmentation.polygon_px == ((1., 2.), (10., 2.), (10., 20.), (1., 20.))
+    assert first.segmentation.area_px == 162.
+    assert first.segmentation.quality.score == .9
+    assert first.attributes["mask_center_px"] is first.attributes["centroid_uv"]
+    first.attributes["mask_polygon_px"][0][0] = 99.
+    assert polygon[0, 0] == 1.
+    assert first.attributes["segmentation_polygon_px"][0][0] == 1.
+    assert first.segmentation.polygon_px[0][0] == 1.
+    assert second.attributes["mask_polygon_px"][0][0] == 1.
+    polygon[0, 0] = 50.
+    assert second.segmentation.polygon_px[0][0] == 1.
+    assert second.attributes["mask_polygon_px"][0][0] == 1.
+
+
 def test_compressed_image_shape_must_match_contract():
     image = np.zeros((4, 6, 3), dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", image)

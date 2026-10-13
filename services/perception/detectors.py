@@ -627,12 +627,11 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
                         "height_px": height,
                     },
                     "camera_id": image_frame.camera_id,
+                    "segmentation": segmentation,
                     "attributes": attributes,
                 },
                 image_frame,
             )
-            if segmentation is not None:
-                detection = detection.model_copy(update={"segmentation": segmentation}, deep=True)
             detections.append(detection)
         return tuple(detections)
 

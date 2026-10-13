@@ -232,3 +232,72 @@ done
 ```
 
 原始 production check 输出、此次 build JSON、binary provenance、精确选择器、每场景独立日志及进程退出码均已保留。本轮没有再次运行完整 Runtime lib；此前 **5 项真实 UDS 仍受环境限制**，不能据上述结果宣称 UDS 已通过。以上是云端合成闭环集成回归，不是实机传感器/执行器闭环、实机 CPU/峰值内存、硬实时或长时 20 Hz 延迟验收，也不是整 workspace 全测试。
+
+## 最新实际位姿复核保留已构造的当前视图（2026-10-13）
+
+`SurfaceFollower::recheck_selected_body_command_from` 对最新实际位姿执行完整停车轨迹复核时，会强制从当前 `source_map` 构造机体支撑视图。此前复核结束总会还原进入函数前的 map 和 dirty 状态；当新位姿已置 dirty 时，刚构造并实际查询过的视图随即丢弃，下一次普通视图刷新又构造同一实际站姿的视图。
+
+现在只有查询旧选择位姿的分支保存并还原临时视图；使用最新实际位姿的分支保留刚构造的视图。**每次复核仍强制刷新并执行原完整停车轨迹检查**，不跳过 geometry/recent 检查，不复用旧运动许可，不改变首次交付、原期限、一次消费、停止策略或字段合同。保留强制刷新也覆盖 signed-zero 位姿变化，不能因为普通数值相等就跳过。源、近期障碍、观察和位姿变化仍由原 setter 失效；新视图始终从环境源派生，不累计旧足迹清除。没有新增锁、缓存表、摘要或版本身份。
+
+### 实际 Runtime release 对照
+
+云执行环境被替换后，本轮重新恢复仓库、Rust 1.88.0、锁文件依赖和 native LCM 1.3.1；未假称先前丢失的 target 仍存在。只构建 Runtime lib 及其依赖，没有整 workspace 构建或 clean。先加入同一诊断、保存生产未改的基线二进制，再做上述窄改动，保存候选；使用原 release opt3 / thin LTO / codegen-units=1 和 `--locked --offline -j2`。候选另增加四项普通所有权/拒绝回归，诊断的场景、采样和调用口径未变。
+
+诊断 `current_pose_recheck_then_view_refresh_cost` 使用真实 `SurfaceFollower` 与完整停车检查，先通过真实选择得到非零命令，再在两个相距 1 mm 的实际位姿间交替复核。地图分别有 800 / 12,800 个地面列；每种尺寸都测完整观测地面，以及增加一个静态自体回波、需要派生支撑视图的场景。它不发布执行命令、不代表传感器回放，也没有把近期外部障碍当作可清除自体回波。
+
+每进程每场景 30 次，计时包括复核及随后单独调用的普通视图刷新；初始构图、选中命令、打印和最终断言在计时外。五对新进程按 AB/BA 交替，编译及其他性能探针暂停，10/10 进程成功。下表为五个进程各自中位数的中位数，单位 ms；“合计”直接对每次两段之和取中位数，不是两列中位数相加。
+
+| 地面列数 / 场景 | 复核：基线 → 候选 | 后续视图刷新：基线 → 候选 | 两段合计：基线 → 候选 |
+| --- | ---: | ---: | ---: |
+| 800 / 完整地面 | 0.011072 → 0.010981 | 0.000110 → 0.000020 | 0.011182 → 0.011006 |
+| 800 / 自体回波支撑派生 | 17.669178 → 17.583954 | 5.689258 → 0.000260 | 23.853009 → 17.584206 |
+| 12,800 / 完整地面 | 0.011207 → 0.011257 | 0.000110 → 0.000020 | 0.011332 → 0.011287 |
+| 12,800 / 自体回波支撑派生 | 25.019875 → 24.670152 | 8.251041 → 0.000240 | 33.309234 → 24.670447 |
+
+两个支撑派生场景的合计进程中位数范围分别为基线 22.824126–24.665455 / 候选 16.661772–18.046578 ms，以及基线 33.081164–33.790601 / 候选 22.471713–27.759561 ms。完整地面是负对照，本来就共享环境快照，绝对成本很低；不宣称普遍加速。复核本身仍包含约 5.8 / 8.1 ms 的强制视图重建，候选没有删除这道步骤。
+
+### 回归及限制
+
+新增四项普通回归全部通过，覆盖最新实际视图保留、旧选择位姿复核还原独立当前视图、旧足迹不累积、新近期障碍拒绝及选择清除、来源恢复必须重新准入、无地图不得恢复旧视图、signed-zero 仍强制刷新。既有源/观察变化、停止、失败、路径和边界测试包含在后续普通 lib 运行中。
+
+候选完整、不加过滤的 Runtime release lib 结果为 **231 passed / 5 failed / 49 ignored / 0 filtered**，51.50 秒。五个失败都是此前同类真实 UDS fixture 在 bind 时返回 `PermissionDenied: Operation not permitted`；本轮确实重试了它们，不能记作通过或宣称完整 lib 成功。其余普通测试通过，新增 ignored 诊断另行显式运行，未混入普通通过数。
+
+首次交付新位姿两项、已消费命令 replay 两项均显式通过。原 latest-recent 五项通过；40 Hz 位姿 / 20 Hz 控制移动回归记录 48 个位姿、24 拍控制、24 次非零结果、0.543624 m 行程、25 次完整选择和 47 次单轨迹复核，复核 215–970 µs。它们保留原断言与期限，重跑结果不重复累加到普通测试数。
+
+复现入口：
+
+```sh
+cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked --offline -j2 \
+  --release -p nuwax-nav-runtime --lib --no-run --message-format=json
+# 从本次 Cargo JSON 保存基线/候选真实 executable，各运行五对 AB/BA：
+./runtime-binary current_pose_recheck_then_view_refresh_cost --ignored --nocapture --test-threads=1
+./runtime-binary current_view_recheck_diagnostic --nocapture --test-threads=1
+./runtime-binary --test-threads=1
+./runtime-binary first_command_pose_change_ --ignored --nocapture --test-threads=1
+./runtime-binary retained_command_replay_requires_current_full_braking_permission --ignored --nocapture --test-threads=1
+./runtime-binary retained_steady_command_replay_requires_current_full_braking_permission --ignored --nocapture --test-threads=1
+./runtime-binary planner_worker::tests::latest_recent_ --nocapture --test-threads=1
+./runtime-binary latest_received_pose_recheck_keeps_twenty_hz_moving_progress --nocapture --test-threads=1
+```
+
+这里测量的是支撑派生场景中“复核 + 下一次视图刷新”的冗余成本，后半段没有包含下一拍完整候选选择，不能表述为整个控制循环加速比例。没有完成实机 CPU/峰值内存、硬实时或长时 20 Hz 资格，也没有在本节重跑六项完整 live Stack 资格；这些边界和 UDS 失败必须保留。
+
+另对候选执行非 `cfg(test)` 的 `cargo check --release --locked --offline -j2 -p nuwax-nav-runtime --lib`，通过，49.68 秒；这只是 Runtime 生产库编译检查，保留六条既有缺失文档 warning，不代替 Nav Stack 集成或上述失败的 UDS 验收。
+
+### 当前状态视图保留后的完整 Stack 资格复验（2026-10-13）
+
+本节是在上述 current-view 候选工作区执行的集成结果：基于已包含两项 Web/dense 优化的本地父版本，加上尚未提交的 `surface_body_control.rs` 视图保留改动及 `current_view_recheck_diagnostic.rs` 回归。测试时未加入后续 frontier/perception 优化。精确父版本与此次工作区差异另随原始构建证据保留，不能把本节结果转用于之后尚未验证的修改。
+
+恢复后的云端检查确认，本组 Stack feature 依赖图不包含 PCL、GTSAM 或 native PGO，因此无需为这些场景恢复其缓存。使用 Rust 1.88.0、锁文件、离线模式、原 workspace release opt3 / thin LTO / codegen-units=1，仅构建 `nuwax-nav-stack --lib --features mls,guard-runtime,surface-recovery-qualification` 的必要依赖，1 分 41 秒成功；未 clean、未整仓构建、未覆盖 profile。由本次 Cargo JSON 提取实际测试 executable 并核对 opt_level=3。
+
+编译完成后，普通 qualification **15 passed / 0 failed / 8 ignored**；显式源健康启动正负例 **1/1**，原 codec/geometry/body witness preflight **1/1**。六项原完整 live 场景在独立进程中串行执行，无其他 Cargo/计时 workload 并发，全部 **6 passed / 0 failed**：
+
+| 场景 | 局部规划 OFF | 局部规划 ON |
+| --- | ---: | ---: |
+| 已知落差支撑恢复并到达原目标 | 6.60 秒，通过 | 7.62 秒，通过 |
+| 持续 box 障碍 | 12.00 秒，通过 | 16.47 秒，通过 |
+| 持续 wall 障碍 | 7.64 秒，通过 | 7.60 秒，通过 |
+
+表中为测试框架记录的耗时；完整进程 wall 另有记录。每场使用原 `--ignored --exact --nocapture --test-threads=1` 选择器，沿用前文“四项增量优化后的集成复验”复现入口。原 60 秒窗口、1 秒源 TTL、位置/朝向容差、五秒等待及连续碰撞/停车 oracle 均未改动。普通回归的八个 ignored 不计入通过；此轮显式场景独立记录，不与 Runtime 单测重复累计。场景耗时不是优化前后配对性能结果。
+
+这补足前一节 current-view 候选尚未完成的六项 Stack 资格，不抹去历史 wall OFF 碰撞失败，也不解除 **5 项真实 UDS bind 环境失败**。本次未重新执行完整 Runtime lib、geometry 生产二进制或整 workspace；没有实机传感器/执行器闭环、实机 CPU/内存、硬实时或长时 20 Hz 验收。云端合成闭环通过仅覆盖上述精确候选与场景。

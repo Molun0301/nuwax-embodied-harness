@@ -990,8 +990,10 @@ impl SurfaceFollower {
             selected.current=self.last_command;
         }
         let saved_pose=self.odometry.replace(selected.pose.clone());
-        let saved_map=self.map.clone();
-        let saved_dirty=self.body_view_dirty;
+        // Only old-selection replay temporarily leaves the owner's actual pose.
+        // A current-state check's freshly derived view remains valid for the
+        // next step; source/pose setters still invalidate it normally.
+        let saved_view=(!current_state).then(||(self.map.clone(),self.body_view_dirty));
         let saved_command=self.last_command;
         self.last_command=selected.current;
         self.body_view_dirty=true;
@@ -1004,7 +1006,8 @@ impl SurfaceFollower {
             let bound=if valid {proof.bound().map_err(str::to_owned)}else{Ok(None)};
             (valid,last_failure.take(),bound)
         });
-        self.odometry=saved_pose;self.map=saved_map;self.body_view_dirty=saved_dirty;
+        self.odometry=saved_pose;
+        if let Some((map,dirty))=saved_view {self.map=map;self.body_view_dirty=dirty;}
         self.last_command=saved_command;
         match checked {
             Ok((true,_,Ok(bound)))=>{
@@ -2086,3 +2089,7 @@ mod query_reuse_tests {
 #[cfg(test)]
 #[path = "surface_body_control_doorway_tests.rs"]
 mod dense_doorway_checkpoint_diagnostic;
+
+#[cfg(test)]
+#[path = "current_view_recheck_diagnostic.rs"]
+mod current_view_recheck_diagnostic;

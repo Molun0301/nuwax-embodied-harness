@@ -157,8 +157,8 @@ def _require_assigned_target(saved, snapshot, target):
     receipt = target.activation_receipt
     if (receipt.asset_identity != saved.asset_identity or receipt.map_name != saved.request.map_name
             or receipt.to_dict()["request"]["checkpoint_id"] != saved.mapping_checkpoint_id
-            or snapshot.assigned_source_cloud_member is None
-            or receipt.to_dict()["target"]["source_cloud_member"] != _identity_document(snapshot.assigned_source_cloud_member)):
+            or snapshot.assigned_source_member is None
+            or receipt.to_dict()["target"]["source_cloud_member"] != _identity_document(snapshot.assigned_source_member)):
         raise ValueError("当前安装的资产或源检查点与探索记录不一致")
 
 

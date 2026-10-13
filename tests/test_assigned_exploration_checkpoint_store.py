@@ -160,8 +160,8 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
 
     def test_save_reopen_list_and_source_projection_preserve_opaque_progress(self):
         snapshot = self.store.validate_asset(self.record)
-        self.assertEqual(snapshot.assigned_source_cloud_member.checkpoint_id, CHECKPOINT_ID)
-        self.assertEqual(snapshot.assigned_source_cloud_member.frame_generation, 0)
+        self.assertEqual(snapshot.assigned_source_member.checkpoint_id, CHECKPOINT_ID)
+        self.assertEqual(snapshot.assigned_source_member.frame_generation, 0)
         self.assertEqual(json.loads(self.record.geometry_progress_json)["origin_frame_generation"], 17)
         self.store.save(self.record)
         path = self.store._path(self.record.checkpoint_id)
@@ -190,10 +190,10 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
     def test_missing_source_projection_and_wrong_member_role_fail_closed(self):
         from dataclasses import replace
         snapshot = self.store.validate_asset(self.record)
-        wrong = replace(snapshot.assigned_source_cloud_member, role="canonical_occupancy")
+        wrong = replace(snapshot.assigned_source_member, role="canonical_occupancy")
         for source in (None, wrong):
             with self.subTest(source=source), patch.object(self.store.assets,
-                    "get_validated_map_asset_bundle_snapshot", return_value=replace(snapshot, assigned_source_cloud_member=source)), \
+                    "get_validated_map_asset_bundle_snapshot", return_value=replace(snapshot, assigned_source_member=source)), \
                     self.assertRaises(ValueError):
                 self.store.validate_asset(self.record)
 

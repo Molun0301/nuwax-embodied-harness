@@ -148,7 +148,7 @@ class ExplorationCheckpointStore:
             raise ValueError("检查点地图资产与二维/三维链路不一致")
         if value.schema_version == 2:
             progress = json.loads(value.geometry_progress_json)
-            source = snapshot.assigned_source_cloud_member
+            source = snapshot.assigned_source_member
             if (snapshot.bundle.identity_schema_version != 2
                     or snapshot.bundle.asset_identity != value.asset_identity
                     or snapshot.bundle.map_name != progress["map_name"]

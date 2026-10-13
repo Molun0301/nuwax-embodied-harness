@@ -336,7 +336,7 @@ class AssignedCloudExchangeTests(unittest.TestCase):
         self.initial()
         snapshot = self.repository.get_validated_map_asset_bundle_snapshot(fixtures.MAP_NAME,
             expected_asset_identity=fixtures.ASSET_ID)
-        member = snapshot.assigned_source_cloud_member
+        member = snapshot.assigned_source_member
         self.assertEqual(member.checkpoint_id, fixtures.CHECKPOINT_ID)
         self.assertEqual(member.occupancy_receipt["session_id"], "source")
         self.assertEqual(member.frame_generation, 0)

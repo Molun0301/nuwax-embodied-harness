@@ -47,6 +47,105 @@ fn rss_status()->String {
         .filter(|s|s.starts_with("VmRSS:")||s.starts_with("VmHWM:")||s.starts_with("Threads:"))
         .collect::<Vec<_>>().join("; ")
 }
+
+// Opt-in stopped-boundary diagnostics only: no allocator replacement, production
+// cache clearing, extra hot-path counters, or changes to the motion oracles.
+// mallinfo2's in-use count includes allocator internals/tcache effects; it is NOT
+// an exact live Rust payload count. The sensor can allocate during A/B/C sampling.
+mod memory_diagnostic {
+    use super::*;
+
+    #[cfg(all(target_os="linux",target_env="gnu"))]
+    // This entire enclosing fixture is cfg(test). Only these optional GNU C ABI
+    // calls need unsafe; the crate's production deny(unsafe_code) is unchanged.
+    #[allow(unsafe_code)]
+    mod gnu {
+        use std::ffi::{c_char,c_int,c_void};
+        #[repr(C)]
+        struct Mallinfo2 {
+            arena:usize,ordblks:usize,smblks:usize,hblks:usize,hblkhd:usize,
+            usmblks:usize,fsmblks:usize,uordblks:usize,fordblks:usize,keepcost:usize,
+        }
+        // Resolve optionally: older GNU libc may not export mallinfo2. These are
+        // the system malloc.h signatures, with size_t represented by usize.
+        #[link(name="dl")]
+        unsafe extern "C" {fn dlsym(handle:*mut c_void,symbol:*const c_char)->*mut c_void;}
+        type Info=unsafe extern "C" fn()->Mallinfo2;
+        type Trim=unsafe extern "C" fn(usize)->c_int;
+        fn permitted()->bool {
+            std::env::var_os("LD_PRELOAD").is_none_or(|value|value.is_empty())
+        }
+        pub(super) fn info()->Option<[usize;6]> {
+            if !permitted(){return None;}
+            // RTLD_DEFAULT is null on GNU/Linux. No owned handle is created.
+            let symbol=unsafe {dlsym(std::ptr::null_mut(),c"mallinfo2".as_ptr())};
+            if symbol.is_null(){return None;}
+            let call:Info=unsafe {std::mem::transmute(symbol)};
+            let value=unsafe {call()};
+            Some([value.arena,value.uordblks,value.fordblks,value.hblkhd,value.hblks,value.keepcost])
+        }
+        pub(super) fn trim()->Option<i32> {
+            if !permitted(){return None;}
+            let symbol=unsafe {dlsym(std::ptr::null_mut(),c"malloc_trim".as_ptr())};
+            if symbol.is_null(){return None;}
+            let call:Trim=unsafe {std::mem::transmute(symbol)};
+            Some(unsafe {call(0)})
+        }
+    }
+
+    fn proc_value(text:&str,key:&str)->Option<u64> {
+        text.lines().find_map(|line|line.strip_prefix(key)
+            .and_then(|value|value.split_whitespace().next())
+            .and_then(|value|value.parse().ok()))
+    }
+    pub(super) fn checkpoint(enabled:bool,leg:usize,phase:&str,point:&str,sensor_live:bool) {
+        // Capture allocator statistics before allocating procfs read buffers.
+        #[cfg(all(target_os="linux",target_env="gnu"))]
+        let allocator=gnu::info();
+        #[cfg(not(all(target_os="linux",target_env="gnu")))]
+        let allocator:Option<[usize;6]>=None;
+        let status=std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let rollup=std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+        eprintln!("SUSTAINED_MEMORY enabled={enabled} leg={leg} phase={phase} point={point} sensor_live={sensor_live} rss_kib={:?} hwm_kib={:?} threads={:?} anonymous_kib={:?} private_dirty_kib={:?} allocator_arena_inuse_free_mmapbytes_mmapcount_releasable={allocator:?} allocator_units=bytes_except_mmapcount missing_metric=None inuse_is_not_exact_live_rust_bytes=true samples_not_atomic=true",
+            proc_value(&status,"VmRSS:"),proc_value(&status,"VmHWM:"),proc_value(&status,"Threads:"),
+            proc_value(&rollup,"Anonymous:"),proc_value(&rollup,"Private_Dirty:"));
+    }
+    fn vector<T>(enabled:bool,leg:usize,point:&str,name:&str,value:&Vec<T>) {
+        eprintln!("SUSTAINED_MEMORY_VECTOR enabled={enabled} leg={leg} point={point} name={name} len={} capacity={} element_bytes={} capacity_bytes={} nested_payload_excluded=true",
+            value.len(),value.capacity(),std::mem::size_of::<T>(),value.capacity()*std::mem::size_of::<T>());
+    }
+    pub(super) fn persistent(enabled:bool,leg:usize,point:&str,p:&Probe,checks:&Vec<f64>) {
+        vector(enabled,leg,point,"control_ms",&p.control_ms);
+        vector(enabled,leg,point,"map_update_ms",&p.map_update_ms);
+        vector(enabled,leg,point,"endpoints",&p.endpoints);
+        vector(enabled,leg,point,"control_samples",&p.control_samples);
+        vector(enabled,leg,point,"source_frames",&p.source_frames);
+        vector(enabled,leg,point,"source_installs",&p.source_installs);
+        vector(enabled,leg,point,"rechecks",checks);
+    }
+    pub(super) fn history<E>(enabled:bool,leg:usize,receipts:&Vec<RawReceipt>,segments:&Vec<RawSegment>,gaps:&Vec<f64>,events:&Vec<E>) {
+        vector(enabled,leg,"A_pre_oracle","receipts",receipts);
+        vector(enabled,leg,"A_pre_oracle","segments",segments);
+        vector(enabled,leg,"A_pre_oracle","gaps",gaps);
+        vector(enabled,leg,"A_pre_oracle","events",events);
+    }
+    pub(super) fn terminal_trim(enabled:bool) {
+        #[cfg(all(target_os="linux",target_env="gnu"))]
+        let result=gnu::trim();
+        #[cfg(not(all(target_os="linux",target_env="gnu")))]
+        let result:Option<i32>=None;
+        eprintln!("SUSTAINED_MEMORY_TRIM enabled={enabled} result={result:?} after_all_motion_and_owner_joins=true diagnostic_intervention_only=true missing_metric=None");
+    }
+    #[test]
+    fn proc_metrics_are_optional_and_exactly_named() {
+        let status="VmHWM:\t42 kB\nVmRSS:\t37 kB\nThreads:\t13\n";
+        assert_eq!(proc_value(status,"VmRSS:"),Some(37));
+        assert_eq!(proc_value(status,"Threads:"),Some(13));
+        assert_eq!(proc_value(status,"Rss:"),None);
+        assert_eq!(proc_value("VmRSS: unavailable","VmRSS:"),None);
+        assert_eq!(proc_value("","VmRSS:"),None);
+    }
+}
 #[derive(Default,Debug,PartialEq)]
 struct Lifecycle {epoch:u64,goal:u64,path:u64}
 impl Lifecycle {
@@ -85,6 +184,8 @@ fn stop_ack(worker:&mut planner_worker::PlannerWorker,stopped:&AtomicUsize) {
 }
 
 fn sustained(enabled:bool,short:bool) {
+    let memory=std::env::var_os("NEH_SUSTAINED_MEMORY_DIAGNOSTIC").is_some_and(|value|value=="1");
+    if memory {memory_diagnostic::checkpoint(enabled,0,"setup","before_fixture",false);}
     let (config,base,keys)=fixture(enabled,0.05,6.0);
     let sensor=Sensor::new(base.clone(),keys);
     let probe=Arc::new(Mutex::new(Probe{
@@ -217,9 +318,15 @@ fn sustained(enabled:bool,short:bool) {
         if phase==4 {assert!(replaced&&cancelled,"phase must execute both scheduled lifecycle changes");}
         assert!(!nonzero(command));stop_ack(&mut worker,&stopped);lifecycle.stop();
         let drain_start=Instant::now();
+        if memory {
+            memory_diagnostic::checkpoint(enabled,completed,PHASES[phase],"A_pre_oracle",true);
+            memory_diagnostic::history(enabled,completed,&receipts,&segments,&gaps,&events);
+            memory_diagnostic::persistent(enabled,completed,"A_pre_oracle",&probe.lock().unwrap(),&rechecks.lock().unwrap());
+        }
         for (ns,kind,index,sign) in &events {eprintln!("SUSTAINED_INPUT leg={completed} phase={} kind={kind} index={index} unix_ns={ns} perturbation_sign={sign}",PHASES[phase]);}
         report_sustained_mismatches(&receipts,completed,PHASES[phase]);
         validate_motion_history(&receipts,&segments,0.05);
+        if memory {memory_diagnostic::checkpoint(enabled,completed,PHASES[phase],"B_post_oracle_histories_live",true);}
         assert!(!receipts.is_empty()&&!segments.is_empty());
         assert!(gaps.iter().all(|ms|*ms<=75.0),"consumer gap exceeded unchanged 75ms allowance");
         let distance: f64=segments.iter().map(|s|(s.to.x-s.from.x).hypot(s.to.y-s.from.y)).sum();
@@ -235,7 +342,9 @@ fn sustained(enabled:bool,short:bool) {
         // Release snapshot owners and all diagnostic histories before sampling RSS.
         drop(receipts);drop(segments);drop(gaps);drop(events);
         p.control_ms.clear();p.map_update_ms.clear();p.endpoints.clear();p.control_samples.clear();p.source_frames.clear();p.source_installs.clear();checks.clear();
+        if memory {memory_diagnostic::persistent(enabled,completed,"C_post_clear",&p,&checks);}
         drop(checks);drop(p);
+        if memory {memory_diagnostic::checkpoint(enabled,completed,PHASES[phase],"C_post_drop_clear",true);}
         oracle_time+=drain_start.elapsed();phase_legs[phase]+=1;completed+=1;
         eprintln!("SUSTAINED_DRAIN enabled={enabled} completed_legs={completed} active_s={:.6} oracle_s={:.6} last_result_id={previous_id:?} retained_receipts=0 retained_edges=0 retained_endpoints=0 sensor_dropped={} {}",active_time.as_secs_f64(),oracle_time.as_secs_f64(),sensor.dropped.load(Ordering::Relaxed),rss_status());
         // The sensor remains alive while stopped. Reject stale queued acquisition
@@ -245,6 +354,20 @@ fn sustained(enabled:bool,short:bool) {
     if !enabled {assert_eq!(jobs.load(Ordering::Acquire),0);}
     if !short {assert!(phase_legs.iter().all(|count|*count>0));assert!(replacements>0&&cancellations>0);}
     eprintln!("SUSTAINED_DONE enabled={enabled} short={short} seed={SEED} active_s={:.6} oracle_s={:.6} wall_s={:.6} completed_legs={completed} phase_legs={phase_legs:?} phase_active_s={phase_seconds:?} receipts={total_receipts} edges={total_segments} travel_m={total_distance:.6} accepted_motion_s={total_motion_seconds:.6} held_continuity=separate_existing_7m_continuity_arm admitted={admitted} sensor_frames={frames} replacements={replacements} cancellations={cancellations} final_result_id={previous_id:?} rss_is_not_leak_proof=true",active_time.as_secs_f64(),oracle_time.as_secs_f64(),started.elapsed().as_secs_f64());
+    if memory {
+        // All acceptance checks precede this terminal teardown. No trim occurs
+        // during a leg, between goals, or while sensor/compute owners are alive.
+        drop(worker);
+        memory_diagnostic::checkpoint(enabled,completed,"terminal","worker_joined",true);
+        drop(sensor);
+        memory_diagnostic::checkpoint(enabled,completed,"terminal","sensor_joined_queue_dropped",false);
+        drop((map,boundary));
+        memory_diagnostic::checkpoint(enabled,completed,"terminal","map_dropped",false);
+        drop((probe,rechecks,jobs,held,held_phase,stopped));
+        memory_diagnostic::checkpoint(enabled,completed,"terminal","all_fixture_owners_dropped_pretrim",false);
+        memory_diagnostic::terminal_trim(enabled);
+        memory_diagnostic::checkpoint(enabled,completed,"terminal","all_fixture_owners_dropped_posttrim",false);
+    }
 }
 
 #[test] #[ignore="short persistent OFF five-phase smoke validates bounded oracle drains before endurance"]

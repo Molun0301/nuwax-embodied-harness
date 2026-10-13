@@ -18,6 +18,27 @@ pub(super) fn with_expansion_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T 
     f()
 }
 
+
+// Synthetic queue-order experiments only. Production builds and default tests do
+// not select these modes; costs, admission, actions and termination are unchanged.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(super) enum DiagnosticPriority {
+    #[default]
+    Baseline,
+    RelaxedGoal(f64),
+    OracleGuide(Vec<[f64; 3]>),
+}
+#[cfg(test)]
+thread_local! { static DIAGNOSTIC_PRIORITY: std::cell::RefCell<DiagnosticPriority> = const { std::cell::RefCell::new(DiagnosticPriority::Baseline) }; }
+#[cfg(test)]
+pub(super) fn with_diagnostic_priority<T>(mode: DiagnosticPriority, f: impl FnOnce() -> T) -> T {
+    struct Reset(DiagnosticPriority);
+    impl Drop for Reset { fn drop(&mut self) { DIAGNOSTIC_PRIORITY.with(|v| { v.replace(self.0.clone()); }); } }
+    let _reset = Reset(DIAGNOSTIC_PRIORITY.with(|v| v.replace(mode)));
+    f()
+}
+
 #[derive(Default, Debug)]
 struct SearchWork {
     expanded: usize,
@@ -419,7 +440,35 @@ pub fn plan(
     // with its outgoing direction before reaching the exact reference vertex.
     let guidance_distance=model.radius().max(tomogram.resolution);
     let turns = if follow_reference { reference_turns(reference)? } else { Vec::new() };
+    #[cfg(test)]
+    let diagnostic = DIAGNOSTIC_PRIORITY.with(|v| v.borrow().clone());
+    #[cfg(test)]
+    let oracle = if let DiagnosticPriority::OracleGuide(points) = &diagnostic {
+        Some((points, reference_turns(points)?, points.windows(2).map(|w| (w[1][0]-w[0][0]).hypot(w[1][1]-w[0][1])).sum::<f64>()))
+    } else { None };
     let heuristic = |p: BodyPose| {
+        #[cfg(test)]
+        {
+            if let DiagnosticPriority::RelaxedGoal(weight) = diagnostic {
+                // XY goal-ball relaxation: every accepted 3D goal also lies in
+                // this disk. projected_cost charges >= XY travel/v and >= yaw/omega
+                // per edge; their maximum (not sum) is a lower bound on that cost.
+                let (travel, turn) = if let Some((goal, tolerance)) = arrival {
+                    (((p.0[0]-goal[0]).hypot(p.0[1]-goal[1])-tolerance).max(0.0),
+                        final_yaw.map_or(0.0, |y| (angle(yaw(p.1)-y).abs()-0.1).max(0.0)))
+                } else {
+                    ((distance(p)-corridor).max(0.0),
+                        (angle(yaw(p.1)-tangent).abs()-std::f64::consts::FRAC_PI_2).max(0.0))
+                };
+                return weight * (travel/motion.max_forward_mps).max(turn/motion.max_angular_rps);
+            }
+            if let Some((points, oracle_turns, length)) = &oracle {
+                let (deviation, progress, _) = reference_progress([p.0[0],p.0[1],p.0[2]-support_offset],points);
+                let guide = reference_guide(points,progress+guidance_distance,*length);
+                let turn = heading_potential(p,target,tangent,corridor,arrival.is_some(),Some(guide),oracle_turns);
+                return 4.0*((length-progress).max(0.0)+deviation)/motion.max_forward_mps + 4.0*turn/motion.max_angular_rps;
+            }
+        }
         let (remaining_distance,progress)=remaining(p);
         let guide = follow_reference.then(|| reference_guide(reference,progress+guidance_distance,reference_length));
         let turn = heading_potential(p,target,tangent,corridor,arrival.is_some(),guide,&turns);
@@ -619,6 +668,8 @@ pub fn plan(
                 samples,
             });
             let heading_cost = final_yaw.map_or(0.0, |y| angle(y - yaw(next.1)).abs() / motion.max_angular_rps * 0.05);
+            #[cfg(test)]
+            let heading_cost = if matches!(diagnostic, DiagnosticPriority::RelaxedGoal(_)) { 0.0 } else { heading_cost };
             open.push(Entry(
                 next_cost + heuristic(next) + heading_cost,
                 next_id,

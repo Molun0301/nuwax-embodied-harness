@@ -43,4 +43,4 @@
 - `check_dense_pointcloud_polling.mjs`：9 项通过；`check_assigned_pointcloud_pairing.mjs`：22 项通过
 - 模块与脚本语法检查、差异空白检查通过
 
-本轮未执行浏览器/WebGL 像素比较，不声称新增 GPU 上传或实机验证；Python 文件未改动。
+本轮实际浏览器验证受环境限制：父任务使用已安装的 Chromium 154、全新的工作区用户配置和简单本地 HTML 进行无头启动，保留正常沙箱。浏览器在加载页面之前以退出码 134 终止，日志为 `process_singleton_posix.cc:297` 的 `socket()` 返回 `EPERM`。正常受审执行中的同类 AF_UNIX 操作也已确认被拒绝，因此未继续重试，也未关闭沙箱或修改安全设置。原始输出保存在工作区 `neh-evidence/cloud-browser-probe/stdout.log` 和 `stderr.log`。实际浏览器/WebGL 像素一致性仍未验证；不声称新增 GPU 上传或实机验证。Python 文件未改动。

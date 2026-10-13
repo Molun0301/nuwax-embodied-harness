@@ -127,3 +127,6 @@ fn recent_wide_obstacle_exported_guide_ab() {
             "failure":result.as_ref().err().map(|e|format!("{:?}",e.kind))}));
     }
 }
+
+#[path="search_priority_diagnostic_tests.rs"]
+mod search_priority_diagnostic_tests;

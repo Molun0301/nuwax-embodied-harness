@@ -1785,7 +1785,8 @@ def _validate_canonical_members(checkpoint, occupancy, cloud):
         if not isinstance(value, (bytes, FrozenPayload)) or len(value) != size or not 1 <= size <= maximum:
             raise MappingBackendCheckpointValidationError(f"exact canonical {name} bytes are required")
     for chunk in payload_chunks(checkpoint.canonical_occupancy_data):
-        if any(value > 100 and value != 255 for value in chunk):
+        values = np.frombuffer(chunk, dtype=np.uint8)
+        if ((values > 100) & (values != 255)).any():
             raise MappingBackendCheckpointValidationError("canonical occupancy values must be [-1, 100]")
     xyz = checkpoint.canonical_cloud_xyz
     for offset in range(0, len(xyz), 65536 * 12):

@@ -196,6 +196,7 @@ class SceneExecutorChecks(unittest.IsolatedAsyncioTestCase):
 class TerminalNameChecks(unittest.TestCase):
     def terminal(self, disposition):
         return SimpleNamespace(disposition=disposition, correction_revision=37,
+                               request=SimpleNamespace(body_key='assigned_cloud_v2'),
                                to_dict=lambda: {'assigned_cloud_v2': {'detail': 'offline detail'},
                                                 'preserved': 'unchanged'})
 

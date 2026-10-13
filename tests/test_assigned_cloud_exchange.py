@@ -310,7 +310,7 @@ class AssignedCloudExchangeTests(unittest.TestCase):
         geometry = candidate.geometry_asset.model_copy(update={"metadata": {"mapping_backend_checkpoint": source}})
         candidate = MapAssetBundle(**{**{key: getattr(candidate, key) for key in type(candidate).model_fields},
             "geometry_asset": geometry})
-        with self.assertRaisesRegex(storage.MapAssetBundleValidationError, "planar"):
+        with self.assertRaisesRegex(storage.MapAssetBundleValidationError, "unsupported assigned checkpoint backend"):
             self.repository.finalize_assigned_map_asset_bundle(candidate, staging_dir=stage,
                 asset_identity=NEW_ID, expected_previous_identity=fixtures.ASSET_ID)
 

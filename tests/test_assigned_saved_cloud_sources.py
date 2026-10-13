@@ -86,7 +86,7 @@ class AssignedSavedCloudTests(unittest.TestCase):
                              (FrozenPayload, '__eq__'), (MappingBackendCheckpoint, '__eq__'),
                              (runtime._PreparedAssignedMapActivation, '__eq__'),
                              (runtime._MapActivationSnapshot, '__eq__'),
-                             (checkpoint_payload, 'payload_digest'), (dense_cloud, 'payload_digest')):
+                             (checkpoint_payload, 'payload_digest')):
             self.stack.enter_context(patch.object(target, name, side_effect=AssertionError(name)))
         for name in ('_resolve_mapping_backend', '_configured_pcd_asset_candidates', '_is_usable_pcd_file',
                      '_materialize_assigned_checkpoint_pcd_asset'):

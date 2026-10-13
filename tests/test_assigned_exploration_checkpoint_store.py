@@ -1,6 +1,8 @@
 """探索检查点的双代身份、内部源凭据及锁外准入回归；不启动原生进程。"""
 import hashlib
 import json
+import os
+import shutil
 import tempfile
 import unittest
 from contextlib import ExitStack, contextmanager
@@ -8,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import test_assigned_asset_storage as asset_fixtures
 from test_assigned_asset_storage import ASSET_ID, CHECKPOINT_ID, MAP_NAME, bundle_fixture, stage_fixture
 
 from contracts.geometry import Pose
@@ -196,6 +199,144 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
                     "get_validated_map_asset_bundle_snapshot", return_value=replace(snapshot, assigned_source_member=source)), \
                     self.assertRaises(ValueError):
                 self.store.validate_asset(self.record)
+
+    def _write_list_record(self, value, order):
+        path = self.store._files.direct_path(value.checkpoint_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema_version": 2, "payload": value.model_dump_json()}))
+        os.utime(path, ns=(order, order))
+
+    def test_list_reuses_only_the_previous_snapshot_within_one_request(self):
+        for order in range(3):
+            self._write_list_record(record_fixture(checkpoint_id="list-%d" % order), order)
+        with patch.object(MapAssetBundle, "model_validate", wraps=MapAssetBundle.model_validate) as parse, \
+                patch.object(self.store, "_read", wraps=self.store._read) as read:
+            first = self.store.list()
+            self.assertEqual(parse.call_count, 1)
+            self.assertEqual(read.call_count, 3)
+            self.assertEqual(first, self.store.list())
+            self.assertEqual(parse.call_count, 2)
+            self.assertEqual(read.call_count, 6)
+        self.assertTrue(all(row["available"] for row in first))
+        self.assertEqual([row["checkpoint_id"] for row in first], ["list-2", "list-1", "list-0"])
+
+    def test_snapshot_reuse_keeps_expected_identity_and_generation_checks(self):
+        snapshot = self.store.validate_asset(self.record)
+        for expected in ({"expected_asset_identity": AssetIdentityV2(asset_id="e" * 32)},
+                         {"expected_manifest_sha256": "a" * 64},
+                         {"expected_asset_identity": ASSET_ID, "expected_manifest_sha256": "a" * 64}):
+            with self.subTest(expected=expected), self.assertRaises(asset_module.MapAssetBundleValidationError):
+                self.store.assets.get_validated_map_asset_bundle_snapshot(MAP_NAME, _previous=snapshot, **expected)
+
+    def test_list_rechecks_each_progress_source_against_reused_snapshot(self):
+        self._write_list_record(record_fixture(checkpoint_id="first"), 2)
+        variants = [record_fixture(checkpoint_id="second", localization_seed=None,
+            geometry_progress_json=progress_fixture(**change)) for change in (
+                {"origin_session_id": "other"}, {"origin_session_generation": 99},
+                {"map_frame_id": "other"})]
+        variants.append(record_fixture(checkpoint_id="second", mapping_checkpoint_id="f" * 32))
+        for value in variants:
+            self._write_list_record(value, 1)
+            with self.subTest(value=value), \
+                    patch.object(MapAssetBundle, "model_validate", wraps=MapAssetBundle.model_validate) as parse:
+                first, second = self.store.list()
+                self.assertTrue(first["available"])
+                self.assertFalse(second["available"])
+                self.assertIn("原始建图检查点、会话或坐标", second["unavailable_reason"])
+                self.assertEqual(parse.call_count, 1)
+
+    def test_list_rechecks_catalog_and_does_not_cache_unavailability(self):
+        for order in range(3):
+            self._write_list_record(record_fixture(checkpoint_id="list-%d" % order), order)
+        read = self.store._read
+        calls = []
+        def changing_read(path):
+            calls.append(path)
+            if len(calls) == 2:
+                self.store.maps.save_map_asset(self.asset.model_copy(update={"asset_identity": AssetIdentityV2(asset_id="e" * 32)}))
+            elif len(calls) == 3:
+                self.store.maps.save_map_asset(self.asset)
+            return read(path)
+        with patch.object(self.store, "_read", changing_read), \
+                patch.object(MapAssetBundle, "model_validate", wraps=MapAssetBundle.model_validate) as parse:
+            rows = self.store.list()
+            self.assertEqual([row["available"] for row in rows], [True, False, True])
+            self.assertEqual(parse.call_count, 2)
+
+    def test_list_reloads_replaced_directory_and_rejects_missing_body_or_exchange(self):
+        self._write_list_record(record_fixture(checkpoint_id="first"), 2)
+        self._write_list_record(record_fixture(checkpoint_id="second"), 1)
+        current = self.store.assets.current_directory(MAP_NAME)
+        body = current / "geometry/test/map.pgm"
+        original = body.read_bytes()
+        journal = current.parent / asset_module._PLANAR_EXCHANGE_JOURNAL
+        read = self.store._read
+        for change in ("replacement", "missing", "body", "exchange"):
+            calls = []
+            old = current.with_name("previous-directory")
+            def changing_read(path):
+                calls.append(path)
+                if len(calls) == 2:
+                    if change in ("replacement", "missing"):
+                        current.rename(old)
+                        if change == "replacement":
+                            shutil.copytree(old, current)
+                    elif change == "body":
+                        body.write_bytes(b"invalid replacement")
+                    else:
+                        journal.write_text("{}")
+                return read(path)
+            with self.subTest(change=change), patch.object(self.store, "_read", changing_read), \
+                    patch.object(MapAssetBundle, "model_validate", wraps=MapAssetBundle.model_validate) as parse:
+                first, second = self.store.list()
+                self.assertTrue(first["available"])
+                self.assertEqual(second["available"], change == "replacement")
+                if change == "replacement":
+                    self.assertEqual(parse.call_count, 2)
+            if change != "replacement":
+                with self.assertRaises(ValueError) as error:
+                    self.store.load("second")
+                self.assertEqual(second["unavailable_reason"], str(error.exception))
+            if old.exists():
+                if current.exists():
+                    shutil.rmtree(current)
+                old.rename(current)
+            body.write_bytes(original)
+            if journal.exists():
+                journal.unlink()
+
+    def test_list_rejects_replacement_during_metadata_currentness_check(self):
+        self._write_list_record(record_fixture(checkpoint_id="first"), 2)
+        self._write_list_record(record_fixture(checkpoint_id="second"), 1)
+        currentness = self.store.assets.map_asset_bundle_snapshot_is_current
+        observations = asset_module._assigned_observations
+        def changing_observations(tree):
+            (tree.path / "geometry/test/map.pgm").write_bytes(b"invalid replacement")
+            return observations(tree)
+        def current(*args):
+            with patch.object(asset_module, "_assigned_observations", changing_observations):
+                return currentness(*args)
+        with patch.object(self.store.assets, "map_asset_bundle_snapshot_is_current", current):
+            first, second = self.store.list()
+        self.assertTrue(first["available"])
+        self.assertFalse(second["available"])
+
+    def test_list_interleaved_maps_reload_without_cross_map_reuse(self):
+        with patch.object(asset_fixtures, "MAP_NAME", "other-map"):
+            bundle = bundle_fixture()
+            stage = stage_fixture(self.store.assets)
+        self.store.assets.finalize_assigned_map_asset_bundle(bundle, staging_dir=stage, asset_identity=ASSET_ID)
+        self.store.maps.save_map_asset(self.asset.model_copy(update={"map_name": "other-map"}))
+        self._write_list_record(record_fixture(checkpoint_id="first"), 3)
+        self._write_list_record(record_fixture(checkpoint_id="second",
+            request=self.record.request.model_copy(update={"map_name": "other-map"}),
+            geometry_progress_json=progress_fixture(map_name="other-map")), 2)
+        self._write_list_record(record_fixture(checkpoint_id="third"), 1)
+        with patch.object(MapAssetBundle, "model_validate", wraps=MapAssetBundle.model_validate) as parse:
+            rows = self.store.list()
+            self.assertEqual(parse.call_count, 3)
+        self.assertTrue(all(row["available"] for row in rows))
+        self.assertEqual([row["map_name"] for row in rows], [MAP_NAME, "other-map", MAP_NAME])
 
     def test_changed_asset_identity_never_reuses_exploration_alias(self):
         self.store.save(self.record)

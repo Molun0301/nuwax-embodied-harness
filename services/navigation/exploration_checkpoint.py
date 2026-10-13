@@ -130,12 +130,13 @@ class ExplorationCheckpointStore:
         elif asset.asset_manifest_sha256 != value.asset_manifest_sha256:
             raise ValueError("检查点绑定的完整地图已缺失或改变")
 
-    def validate_asset(self, value: ExplorationCheckpoint) -> ValidatedMapAssetBundleSnapshot:
+    def validate_asset(self, value: ExplorationCheckpoint, *,
+                       _previous: Optional[ValidatedMapAssetBundleSnapshot] = None) -> ValidatedMapAssetBundleSnapshot:
         self._validate_catalog_identity(value)
         try:
             if value.schema_version == 2:
                 snapshot = self.assets.get_validated_map_asset_bundle_snapshot(value.request.map_name,
-                    expected_asset_identity=value.asset_identity)
+                    expected_asset_identity=value.asset_identity, _previous=_previous)
             else:
                 snapshot = self.assets.get_validated_map_asset_bundle_snapshot(value.request.map_name,
                     expected_manifest_sha256=value.asset_manifest_sha256)
@@ -218,6 +219,7 @@ class ExplorationCheckpointStore:
     def list(self, limit: int = 50) -> list[dict]:
         self._files.refresh()
         records = []
+        previous_snapshot = None
         paths = heapq.nlargest(max(1, min(limit, 100)), self._files.iter_paths(), key=lambda path: (path.stat().st_mtime_ns, str(path)))
         for path in paths:
             value = self._read(path)
@@ -225,8 +227,9 @@ class ExplorationCheckpointStore:
                 raise ValueError("探索检查点文件名与身份不符")
             available, reason = True, None
             try:
-                self.validate_asset(value)
+                previous_snapshot = self.validate_asset(value, _previous=previous_snapshot)
             except ValueError as error:
+                previous_snapshot = None
                 available, reason = False, str(error)
             identity = ({"schema_version": 2, "asset_identity": value.asset_identity.model_dump(),
                          "mapping_checkpoint_id": value.mapping_checkpoint_id} if value.schema_version == 2

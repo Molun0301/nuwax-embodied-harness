@@ -510,6 +510,7 @@ class MapAssetBundleRepository:
         *,
         expected_manifest_sha256: Optional[str] = None,
         expected_asset_identity: Optional[AssetIdentityV2] = None,
+        _previous: Optional[ValidatedMapAssetBundleSnapshot] = None,
     ) -> Optional[ValidatedMapAssetBundleSnapshot]:
         """只读加载 modern current，并在同一稳定目录视图中返回地理参考原文。"""
 
@@ -518,6 +519,12 @@ class MapAssetBundleRepository:
             raise MapAssetBundleValidationError("mixed asset identity expectations are forbidden")
         if (self._map_dir(map_name) / _PLANAR_EXCHANGE_JOURNAL).exists():
             raise MapAssetBundleValidationError("二维资产交换尚未完成持久对账")
+        # 列表请求只保留上一份已验证快照；每次复用仍核对当前目录和成员。
+        if (_previous is not None and _previous.bundle.map_name == map_name
+                and _previous.bundle.asset_identity == expected_asset_identity
+                and _previous.bundle.manifest_sha256 == expected_manifest_sha256
+                and self.map_asset_bundle_snapshot_is_current(map_name, _previous)):
+            return _previous
         current_dir = self._current_dir(map_name, expected_asset_identity=expected_asset_identity)
         if not current_dir.exists() and not current_dir.is_symlink():
             return None

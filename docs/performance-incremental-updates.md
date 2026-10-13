@@ -188,3 +188,47 @@ cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked --offlin
 相同两项新增普通回归先在基线通过，最终候选 release 全 lib 为 **59 passed / 0 failed / 1 ignored / 0 filtered**（1.58 秒）；ignored 诊断另显式运行，不混入普通通过数。测试中的独立全扫描 oracle 覆盖加载、增大/缩小替换、非法/相同替换、同源时间无变化、删除最后层及最后占据、失败 flush 与原冻结 ID 重试保留、成功 flush 后重新加载、reset，以及预算恰好相等不 flush、再加入一个点后按原边界 flush。既有层 geometry/source、restore、frame rehome、归档和保留对象回归一并运行。
 
 这里确证的是脏块记账消除重复扫描。未测量 allocator、实际峰值/保留内存、完整地图流水线、实机 CPU 或 20 Hz 控制长尾，不扩展为这些指标的验收结论。
+
+## 四项增量优化后的集成复验（2026-10-13）
+
+在本篇四项优化全部合入后的同一代码状态，复用既有 target、Rust 1.88.0 和锁文件，执行最终普通生产二进制检查；未 clean、未构建整 workspace，也未修改任何生产配置或资格阈值：
+
+- `nuwax-nav-stack --bin nuwax-nav-stack --features simple-2d,replanning-astar`：`cargo check --locked --offline -j2` 通过，4.90 秒
+- 独立 geometry manifest 的 `--bin nuwax-geometry-runtime`：同样检查通过，24.59 秒
+- 两项都是非 `cfg(test)` 的生产编译检查，不是将测试二进制编译当作生产检查；既有 warning 保留，未发现新的编译错误
+
+随后对 `nuwax-nav-stack --lib --features mls,guard-runtime,surface-recovery-qualification` 进行 release 增量构建（2 分 58 秒），使用原 opt3、thin LTO、codegen-units=1，没有覆盖 profile。由此次 Cargo JSON 提取真实测试二进制，确认 test profile 的 opt_level 为 3；编译结束后，所有场景独立进程串行执行，无其他 Cargo/性能探针并发。
+
+普通 qualification 回归 **15 passed / 0 failed / 8 ignored**；显式 source-health 启动正负例 **1/1**（1.21 秒），原 codec/geometry/body witness preflight **1/1**（0.90 秒）。六项完整 live 场景全部显式 `--ignored --exact` 执行，结果 **6 passed / 0 failed**：
+
+| 场景 | 局部规划 OFF | 局部规划 ON |
+| --- | ---: | ---: |
+| 已知落差支撑恢复并到达原目标 | 7.60 秒，通过 | 10.13 秒，通过 |
+| 持续 box 障碍 | 12.85 秒，通过 | 16.91 秒，通过 |
+| 持续 wall 障碍 | 9.19 秒，通过 | 10.43 秒，通过 |
+
+表中时间为测试框架记录的场景耗时，不是算法耗时或优化前后配对基准。原 60 秒窗口、1 秒源 TTL、0.1 m 位置 / 0.15 rad 朝向容差、五秒障碍等待、连续碰撞/停车 oracle 及 epsilon 均未改变。此次复验补足前文 PlannerWorker 单项阶段尚未重跑六项资格的范围；没有将普通回归的八个 ignored 自动计入通过，也没有把先前 wall OFF 的碰撞失败改写成成功。
+
+复现使用上述生产检查命令对应的 manifest，并运行：
+
+```sh
+cargo +1.88.0 test --manifest-path services/nuwax-workspace/Cargo.toml \
+  --locked --offline -j2 -p nuwax-nav-stack --lib --release \
+  --features mls,guard-runtime,surface-recovery-qualification \
+  --no-run --message-format=json
+# 从本次 Cargo JSON 提取 opt_level=3 的 nuwax_nav_stack 测试 executable 后：
+./stack-binary qualification --nocapture --test-threads=1
+prefix=lcm_dataflow::surface_dataflow::tests
+./stack-binary "$prefix::support_recovery_qualification::live_source_is_required_before_goal_admission" --ignored --exact --nocapture --test-threads=1
+./stack-binary "$prefix::dynamic_occupancy_qualification::original_codec_geometry_and_body_witness_preflight" --ignored --exact --nocapture --test-threads=1
+for flag in off on; do
+  ./stack-binary "$prefix::support_recovery_qualification::original_goal_known_drop_recovers_and_arrives_local_planning_$flag" --ignored --exact --nocapture --test-threads=1 || exit "$?"
+done
+for scene in box wall; do
+  for flag in off on; do
+    ./stack-binary "$prefix::dynamic_occupancy_qualification::dynamic_${scene}_local_planning_$flag" --ignored --exact --nocapture --test-threads=1 || exit "$?"
+  done
+done
+```
+
+原始 production check 输出、此次 build JSON、binary provenance、精确选择器、每场景独立日志及进程退出码均已保留。本轮没有再次运行完整 Runtime lib；此前 **5 项真实 UDS 仍受环境限制**，不能据上述结果宣称 UDS 已通过。以上是云端合成闭环集成回归，不是实机传感器/执行器闭环、实机 CPU/峰值内存、硬实时或长时 20 Hz 延迟验收，也不是整 workspace 全测试。

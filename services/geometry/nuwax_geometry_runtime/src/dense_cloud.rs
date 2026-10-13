@@ -174,34 +174,47 @@ impl DenseCloud {
             .write_all_at(&keys, self.stored_count * 12)
             .map_err(|e| e.to_string())?;
         let pages = Arc::make_mut(&mut self.pages);
-        for (index, bytes) in bytes.chunks_exact(12).enumerate() {
+        // 每页只执行一次写时复制；旧快照仍持有追加前的可见性。
+        let mut index = 0;
+        while index < points.len() {
             let position = self.stored_count as usize + index;
             let page_index = position / PAGE_POINTS;
             if page_index == pages.len() {
                 pages.push(Arc::new(Page::default()));
             }
             let page = Arc::make_mut(&mut pages[page_index]);
-            let local = position % PAGE_POINTS;
-            page.visible[local / 64] |= 1 << (local % 64);
-            page.length = local + 1;
-            page.count += 1;
-            let point = decode_point(bytes);
-            for axis in 0..3 {
-                page.low[axis] = page.low[axis].min(point[axis]);
-                page.high[axis] = page.high[axis].max(point[axis]);
-            }
-            let source = points[index];
-            if let Some(blocks) = &mut self.block_pages {
-                if blocks.entry(index_block([source.x, source.y, source.z])).or_default().insert(page_index) {
-                    self.block_entries += 1;
+            let end = points.len().min(index + PAGE_POINTS - position % PAGE_POINTS);
+            for index in index..end {
+                let local = (self.stored_count as usize + index) % PAGE_POINTS;
+                let bytes = &bytes[index * 12..index * 12 + 12];
+                page.visible[local / 64] |= 1 << (local % 64);
+                page.length = local + 1;
+                page.count += 1;
+                let point = decode_point(bytes);
+                for axis in 0..3 {
+                    page.low[axis] = page.low[axis].min(point[axis]);
+                    page.high[axis] = page.high[axis].max(point[axis]);
                 }
-                // 达到预算后回退逐页检查，不丢点，也不无限扩大派生索引。
-                if self.block_entries > MAX_INDEX_ENTRIES { self.block_pages = None; }
+                let source = points[index];
+                if let Some(blocks) = &mut self.block_pages {
+                    if blocks.entry(index_block([source.x, source.y, source.z])).or_default().insert(page_index) {
+                        self.block_entries += 1;
+                    }
+                    // 达到预算后回退逐页检查，不丢点，也不无限扩大派生索引。
+                    if self.block_entries > MAX_INDEX_ENTRIES { self.block_pages = None; }
+                }
+                if let Some(live) = &mut self.live_keys {
+                    // 复用降精度前已验证并写入的键，不重复计算或从单精度坐标推导。
+                    let offset = index * 12;
+                    let key: [i32; 3] = std::array::from_fn(|axis| {
+                        let offset = offset + axis * 4;
+                        i32::from_le_bytes(keys[offset..offset + 4].try_into().unwrap())
+                    });
+                    live.insert((key[0], key[1], key[2]));
+                    if live.len() > MAX_INDEX_ENTRIES { self.live_keys = None; }
+                }
             }
-            if let Some(live) = &mut self.live_keys {
-                live.insert(crate::pointcloud::voxel_key([source.x, source.y, source.z], self.voxel_size).unwrap());
-                if live.len() > MAX_INDEX_ENTRIES { self.live_keys = None; }
-            }
+            index = end;
         }
         self.point_count += points.len() as u64;
         self.stored_count = count;
@@ -625,6 +638,127 @@ mod tests {
             source_timestamp_ns: revision * 100,
             point_count: 1,
         }
+    }
+
+    #[test]
+    #[ignore = "release-mode dense append timing; run alone with --nocapture"]
+    fn benchmark_dense_append_static_mix_and_retained_snapshots() {
+        for n in [1_000, 30_000, 100_000] {
+            let points = (0..n).map(|i| Point3::new(
+                (i % 317) as f64 * 0.051 + 0.025,
+                ((i / 317) % 317) as f64 * 0.051 + 0.025,
+                (i % 7) as f64 * 0.1 + 0.025,
+            )).collect::<Vec<_>>();
+            for dynamic_mix in [false, true] {
+                for live_index in [false, true] {
+                    for retained in [false, true] {
+                        let mut timings = Vec::new();
+                        for repetition in 0..17 {
+                            let mut cloud = DenseCloud::new().unwrap();
+                            if !live_index { cloud.live_keys = None; }
+                            let mut snapshots = Vec::new();
+                            if retained {
+                                for revision in 0..4 {
+                                    cloud.append(&points[..n.min(997)]).unwrap();
+                                    snapshots.push(cloud.snapshot(&receipt(revision), "追加基准").unwrap());
+                                }
+                            }
+                            let started = std::time::Instant::now();
+                            let static_points = points.iter().enumerate()
+                                .filter(|(i, _)| !dynamic_mix || i % 4 != 0)
+                                .map(|(_, point)| *point).collect::<Vec<_>>();
+                            cloud.append(std::hint::black_box(&static_points)).unwrap();
+                            let elapsed = started.elapsed().as_nanos();
+                            if repetition >= 2 { timings.push(elapsed); }
+                            std::hint::black_box((&cloud, &snapshots));
+                        }
+                        timings.sort_unstable();
+                        println!("dense_append n={n} dynamic_mix={dynamic_mix} live_index={live_index} retained={retained} median_ns={}", timings[timings.len() / 2]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn append_spans_partial_pages_preserving_keys_bounds_and_snapshots() {
+        for live_index in [false, true] {
+            let mut cloud = DenseCloud::new().unwrap();
+            if !live_index { cloud.live_keys = None; }
+            let boundary = f64::from(0.05_f32) * 40.0;
+            let points = (0..PAGE_POINTS * 2 + 17).map(|i| {
+                let x = if i % 2 == 0 { boundary - 1e-10 } else { boundary + 1e-10 };
+                Point3::new(x, if i % 3 == 0 { -0.025 } else { 0.025 }, (i % 11) as f64 * 0.05)
+            }).collect::<Vec<_>>();
+            let mut expected = Vec::new();
+            let mut frozen = Vec::new();
+            let mut start = 0;
+            for end in [1, PAGE_POINTS - 1, PAGE_POINTS, PAGE_POINTS + 1, points.len()] {
+                cloud.append(&points[start..end]).unwrap();
+                expected.extend(points[start..end].iter().flat_map(|p| [p.x, p.y, p.z].into_iter().flat_map(|v| (v as f32).to_le_bytes())));
+                let snapshot = cloud.snapshot(&receipt(end as u64), "分页追加").unwrap();
+                assert_eq!(snapshot.read(0, CHUNK_POINTS).unwrap(), expected);
+                for (old, old_bytes) in &frozen {
+                    let old: &DenseSnapshot = old;
+                    assert_eq!(old.read(0, CHUNK_POINTS).unwrap(), *old_bytes);
+                }
+                let (mut archive, _) = snapshot.archive("map").unwrap();
+                validate_archive(&mut archive).unwrap();
+                let restored = DenseCloud::from_archive(archive, &snapshot.metadata("map")).unwrap();
+                assert_eq!(restored.snapshot(&receipt(99), "恢复").unwrap().read(0, CHUNK_POINTS).unwrap(), expected);
+                frozen.push((snapshot, expected.clone()));
+                start = end;
+            }
+            let mut stored_keys = vec![0; points.len() * 12];
+            cloud.keys_file.read_exact_at(&mut stored_keys, 0).unwrap();
+            let expected_keys: Vec<_> = points.iter().flat_map(|p| {
+                let (x, y, z) = crate::pointcloud::voxel_key([p.x, p.y, p.z], 0.05).unwrap();
+                [x, y, z].into_iter().flat_map(i32::to_le_bytes)
+            }).collect();
+            assert_eq!(stored_keys, expected_keys);
+            let remove: Vec<_> = points.iter().step_by(2).map(|p|
+                crate::pointcloud::voxel_key([p.x, p.y, p.z], 0.05).unwrap()).collect();
+            assert_eq!(cloud.remove_voxels(&remove, 0.05).unwrap(), (points.len() + 1) / 2);
+            let survivors: Vec<_> = points.iter().skip(1).step_by(2).flat_map(|p|
+                [p.x, p.y, p.z].into_iter().flat_map(|v| (v as f32).to_le_bytes())).collect();
+            assert_eq!(cloud.snapshot(&receipt(100), "删除").unwrap().read(0, CHUNK_POINTS).unwrap(), survivors);
+            assert_eq!(frozen.last().unwrap().0.read(0, CHUNK_POINTS).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn append_failure_keeps_published_state_and_retry_overwrites_unpublished_tail() {
+        let mut cloud = DenseCloud::new().unwrap();
+        cloud.append(&[Point3::new(0.025, 0.025, 0.025)]).unwrap();
+        let before = cloud.snapshot(&receipt(1), "失败重试").unwrap();
+        let before_bytes = before.read(0, CHUNK_POINTS).unwrap();
+        let before_pages = Arc::clone(&cloud.pages);
+        let before_live = cloud.live_keys.clone();
+        let before_entries = cloud.block_entries;
+        let size = cloud.file.metadata().unwrap().len();
+        assert!(cloud.append(&[Point3::new(1.0, 2.0, 3.0), Point3::new(f64::NAN, 0.0, 0.0)]).is_err());
+        assert_eq!(cloud.file.metadata().unwrap().len(), size);
+        // 坐标文件写入成功而键文件失败，未发布的尾部不进入任何快照。
+        let writable_keys = std::mem::replace(&mut cloud.keys_file, File::open("/dev/null").unwrap());
+        assert!(cloud.append(&[Point3::new(9.0, 8.0, 7.0)]).is_err());
+        assert_eq!(cloud.file.metadata().unwrap().len(), size + 12);
+        assert_eq!(cloud.point_count, 1);
+        assert_eq!(cloud.stored_count, 1);
+        assert!(Arc::ptr_eq(&cloud.pages, &before_pages));
+        assert_eq!(cloud.live_keys, before_live);
+        assert_eq!(cloud.block_entries, before_entries);
+        assert_eq!(cloud.bounds_min, before.bounds_min);
+        assert_eq!(cloud.bounds_max, before.bounds_max);
+        assert_eq!(cloud.snapshot(&receipt(2), "失败重试").unwrap().read(0, CHUNK_POINTS).unwrap(), before_bytes);
+        cloud.keys_file = writable_keys;
+        let next = Point3::new(1.025, -2.025, 3.025);
+        cloud.append(&[next]).unwrap();
+        let expected: Vec<_> = before_bytes.iter().copied().chain([next.x, next.y, next.z].into_iter().flat_map(|v| (v as f32).to_le_bytes())).collect();
+        let after = cloud.snapshot(&receipt(3), "失败重试").unwrap();
+        assert_eq!(after.read(0, CHUNK_POINTS).unwrap(), expected);
+        assert_eq!(before.read(0, CHUNK_POINTS).unwrap(), before_bytes);
+        let (mut archive, _) = after.archive("map").unwrap();
+        validate_archive(&mut archive).unwrap();
     }
 
     #[test]

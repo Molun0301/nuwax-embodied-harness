@@ -3060,7 +3060,7 @@ class MemoryService(SceneMappingMemoryMixin):
         provenance_counts, vector_counts, collection_counts = {}, {}, {}
         point_count = 0
         for offset in range(0, len(visible), 128):
-            page, counts = self._durable_index.query_snapshot(visible[offset:offset + 128])
+            page, counts = self._durable_index.query_snapshot(visible[offset:offset + 128], include_readiness=False)
             for key, value in counts.items():
                 provenance_counts[key] = provenance_counts.get(key, 0) + value
             point_count += len(page)

@@ -54,3 +54,7 @@ Final checks on the profile-gated source passed:
 - Ordinary non-test `cargo check -p nuwax-nav-scan --lib --release`: passed; diagnostic overrides and work-reset hooks are excluded by `cfg(test)`
 
 The first default-feature build exposed an optional-`serde_json` reference in the phase-one diagnostic module. That failure was preserved, and the module received the same profile gate as existing JSON diagnostics before the actual default and final profile suites above. The phase-one report explicitly distinguishes its earlier profile-enabled qualification from this actual default-feature check. No dependency was added. Existing upstream MLS compiler warnings remain; no full-workspace build was run.
+
+## Subsequent actual-pipeline qualification
+
+The [actual-guide eligibility and non-arrival polyline reuse audit](scan-polyline-reuse-and-guide-eligibility-20261013.md) verifies all five former forced-static cases through production recent guidance: each succeeds without local search. It also qualifies a small exact non-arrival projection reuse, including a real-guide 68-pose/1-expansion window and the unchanged 119-pose/3-expansion arrival regression. No heuristic rewrite or large latency gain is claimed.

@@ -3,6 +3,8 @@
 mod cancellation;
 mod local_search;
 mod spline;
+#[cfg(test)]
+mod polyline_reuse_tests;
 #[cfg(feature="profile")]
 mod profile;
 pub use local_search::probe_motion;
@@ -587,17 +589,23 @@ fn plan_impl(
     }
     // 极窄空间可能需要显式转向；原折线也经过同一真实地形及机体检查。
     let sampled = spline::resample(reference, spacing)?;
-    if let Some(poses) = admit_candidate(project(
+    #[cfg(test)]
+    polyline_reuse_tests::record_projection();
+    let polyline_error = match project(
         map, start, &sampled, kinematics, false, final_yaw, interior, boundary, &blocked,
-    ))? {
-        #[cfg(feature="profile")]
-                        profile::success();
-                        return Ok(LocalTrajectory {
-            poses,
-            smoothed: false,
-            elapsed_ms: began.elapsed().as_secs_f64() * 1000.0,
-        });
-    }
+    ) {
+        Ok(poses) => {
+            #[cfg(feature="profile")]
+            profile::success();
+            return Ok(LocalTrajectory {
+                poses,
+                smoothed: false,
+                elapsed_ms: began.elapsed().as_secs_f64() * 1000.0,
+            });
+        }
+        Err(error) if matches!(error.kind, LocalPlanFailureKind::Cancelled) => return Err(error),
+        Err(error) => error,
+    };
     // 细门缝的中线可能落在全局粗格之间，直接使用近场真实占据给出的连续空隙。
     let mut attempted = 0;
     for pair in reference.windows(2) {
@@ -658,9 +666,23 @@ fn plan_impl(
             }
         }
     }
-    let poses = match project(
-        map, start, &sampled, kinematics, false, final_yaw, arrival, boundary, &blocked,
-    ) {
+    // Without an arrival ball, interior and arrival are both None: the exact
+    // original polyline already failed on this immutable request snapshot. Keep
+    // its full error, while still observing cancellation after passage attempts.
+    let reuse_polyline = arrival.is_none();
+    #[cfg(test)]
+    let reuse_polyline = reuse_polyline && !polyline_reuse_tests::replay_original();
+    let polyline = if reuse_polyline {
+        #[cfg(test)]
+        polyline_reuse_tests::before_reuse();
+        cancellation::checkpoint()?;
+        Err(polyline_error)
+    } else {
+        #[cfg(test)]
+        polyline_reuse_tests::record_projection();
+        project(map, start, &sampled, kinematics, false, final_yaw, arrival, boundary, &blocked)
+    };
+    let poses = match polyline {
         Ok(poses) => poses,
         Err(polyline) => {
             if matches!(polyline.kind, LocalPlanFailureKind::Cancelled) { return Err(polyline); }

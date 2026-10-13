@@ -70,3 +70,6 @@ impl Drop for Scope {
         });
     }
 }
+
+#[cfg(test)]
+pub(crate) fn calls() -> [u64; 3] { COUNTERS.with(|c| c.borrow().calls) }

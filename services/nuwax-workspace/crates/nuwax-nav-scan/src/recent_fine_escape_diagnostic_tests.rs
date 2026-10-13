@@ -3,6 +3,13 @@ use super::*;
 
 #[test]
 fn recent_guide_fine_escape_enters_search_and_succeeds() {
+    check_recent_guide_fine_escape(Some(0.015));
+}
+#[test]
+fn recent_guide_nonarrival_fine_escape_reuses_exact_polyline_failure() {
+    check_recent_guide_fine_escape(None);
+}
+fn check_recent_guide_fine_escape(tolerance: Option<f64>) {
     // Same two rear pins and forward wall as fine_escape_scene(false,[0,0],false,6).
     let mut extra=vec![];
     for z in 25..55 {
@@ -53,21 +60,47 @@ fn recent_guide_fine_escape_enters_search_and_succeeds() {
         &|a,b|overlay.accepts(a,b)).expect("real recent guide must exist").points;
     assert_ne!(reference,original,"recent guide must materially differ");
     eprintln!("FALLBACK_ELIGIBILITY reference={reference:?}");
-    local_search::reset_last_work();
-    let result=plan(&map,&tomo,start,&reference,&motion,&ScanConfig::default(),None,
-        Some((goal,0.015)),&[],true,false);
-    let work=local_search::last_work();
-    if let Ok(path)=&result {
-        for pair in path.poses.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
-        assert!(distance3(path.poses.last().unwrap().0,goal)<0.015);
+    let mut results=Vec::new();
+    let mut works=Vec::new();
+    let mut counts=Vec::new();
+    for replay in [true,false] {
+        let request_map=map.fork_for_planning();
+        local_search::reset_last_work();
+        let result=crate::polyline_reuse_tests::with_original(replay,||
+            plan(&request_map,&tomo,start,&reference,&motion,&ScanConfig::default(),None,
+                tolerance.map(|t|(goal,t)),&[],true,false));
+        let work=local_search::last_work();
+        let calls=crate::profile::calls();
+        assert_eq!(crate::polyline_reuse_tests::projections(),if replay || tolerance.is_some() {2}else{1});
+        if let Ok(path)=&result {
+            for pair in path.poses.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+            let end=*path.poses.last().unwrap();
+            if let Some(tolerance)=tolerance {
+                assert!(distance3(end.0,goal)<tolerance);
+            } else {
+                let a=reference[reference.len()-2];let b=*reference.last().unwrap();
+                let tangent=(b[1]-a[1]).atan2(b[0]-a[0]);
+                assert!((end.0[0]-b[0])*tangent.cos()+(end.0[1]-b[1])*tangent.sin()>=-1e-6,
+                    "non-arrival window must connect to its terminal cross-section");
+                assert!(angle(yaw(end.1)-tangent).cos()>0.0);
+            }
+        }
+        eprintln!("FALLBACK_ELIGIBILITY_RESULT {}",serde_json::json!({"arrival":tolerance.is_some(),
+            "replay_original":replay,"fallback_entered":work.1>0,"calls":calls,
+            "work":{"expanded":work.0,"nodes":work.1,"frontier_peak":work.2},
+            "success":result.is_ok(),"path_samples":result.as_ref().ok().map(|p|p.poses.len()),
+            "failure":result.as_ref().err().map(|e|format!("{:?}",e.kind)),
+            "detail":result.as_ref().err().map(|e|format!("{e:?}"))}));
+        assert!(work.1>0,"fixture is ineligible if exported Scan never enters fallback");
+        let path=result.as_ref().expect("current real-guide pipeline must retain witnessed fine escape");
+        assert!(path.poses.iter().any(|p|distance3(p.0,[0.021,0.0,0.4])<1e-9),
+            "search must retain the exact 1 cm departure before turning");
+        counts.push(calls);works.push(work);results.push(result);
     }
-    eprintln!("FALLBACK_ELIGIBILITY_RESULT {}",serde_json::json!({"fallback_entered":work.1>0,
-        "work":{"expanded":work.0,"nodes":work.1,"frontier_peak":work.2},
-        "success":result.is_ok(),"path_samples":result.as_ref().ok().map(|p|p.poses.len()),
-        "failure":result.as_ref().err().map(|e|format!("{:?}",e.kind)),
-        "detail":result.as_ref().err().map(|e|format!("{e:?}"))}));
-    assert!(work.1>0,"fixture is ineligible if exported Scan never enters fallback");
-    let path=result.expect("current real-guide pipeline must retain witnessed fine escape");
-    assert!(path.poses.iter().any(|p|distance3(p.0,[0.021,0.0,0.4])<1e-9),
-        "search must retain the exact 1 cm departure before turning");
+    crate::polyline_reuse_tests::assert_same_result(&results[0],&results[1]);
+    assert_eq!(works[0],works[1]);
+    if tolerance.is_none() {
+        assert!(counts[0].iter().zip(counts[1]).all(|(a,b)|*a>=b));
+        assert!(counts[0].iter().zip(counts[1]).any(|(a,b)|*a>b));
+    } else {assert_eq!(counts[0],counts[1]);}
 }

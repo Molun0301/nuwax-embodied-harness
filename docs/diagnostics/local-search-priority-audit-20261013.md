@@ -82,3 +82,7 @@ Default-priority, **profile-enabled** Scan regression: 51 passed, 0 failed, 4 ig
 ### Subsequent default-feature build correction
 
 The original 51-test qualification above used `--features profile`; it did not establish an ordinary default-feature test build. Phase-two validation exposed that the new priority diagnostic module used optional `serde_json` without a profile gate, causing default-feature test compilation to fail at `search_priority_diagnostic_tests.rs:73`. The module declaration is now gated by `feature="profile"`, matching the existing JSON-based diagnostic fixtures. No new dependency or production behavior was added. The first failure remains in `fallback-fixture-20261013/default-build-failure-before-profile-gate.log`. Actual default-feature retesting is documented in the [fine-departure regression qualification](recent-guide-fine-escape-regression-20261013.md).
+
+## Subsequent actual-pipeline qualification
+
+The [actual-guide eligibility and non-arrival polyline reuse audit](scan-polyline-reuse-and-guide-eligibility-20261013.md) verifies all five former forced-static cases through production recent guidance: each succeeds without local search. It also qualifies a small exact non-arrival projection reuse, including a real-guide 68-pose/1-expansion window and the unchanged 119-pose/3-expansion arrival regression. No heuristic rewrite or large latency gain is claimed.

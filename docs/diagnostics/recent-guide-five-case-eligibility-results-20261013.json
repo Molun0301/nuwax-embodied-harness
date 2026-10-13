@@ -1,0 +1,182 @@
+[
+  {
+    "case": "static_a",
+    "failure": null,
+    "fallback_entered": false,
+    "guide_changed": true,
+    "guide_success": true,
+    "path_samples": 186,
+    "reference": [
+      [
+        0.5,
+        1.0,
+        0.1
+      ],
+      [
+        0.5500000081956387,
+        1.3500000201165676,
+        0.10000000149011612
+      ],
+      [
+        2.2500000335276127,
+        1.3500000201165676,
+        0.10000000149011612
+      ],
+      [
+        3.0,
+        1.0,
+        0.10000000149011612
+      ]
+    ],
+    "success": true,
+    "work": {
+      "expanded": 0,
+      "frontier_peak": 0,
+      "nodes": 0
+    }
+  },
+  {
+    "case": "shift_upper",
+    "failure": null,
+    "fallback_entered": false,
+    "guide_changed": true,
+    "guide_success": true,
+    "path_samples": 183,
+    "reference": [
+      [
+        0.5,
+        1.0,
+        0.1
+      ],
+      [
+        0.5500000081956387,
+        0.7500000111758709,
+        0.10000000149011612
+      ],
+      [
+        2.550000037997961,
+        0.7500000111758709,
+        0.10000000149011612
+      ],
+      [
+        3.0,
+        1.0,
+        0.10000000149011612
+      ]
+    ],
+    "success": true,
+    "work": {
+      "expanded": 0,
+      "frontier_peak": 0,
+      "nodes": 0
+    }
+  },
+  {
+    "case": "shift_lower",
+    "failure": null,
+    "fallback_entered": false,
+    "guide_changed": true,
+    "guide_success": true,
+    "path_samples": 183,
+    "reference": [
+      [
+        0.5,
+        1.0,
+        0.1
+      ],
+      [
+        0.5500000081956387,
+        1.2500000186264515,
+        0.10000000149011612
+      ],
+      [
+        2.550000037997961,
+        1.2500000186264515,
+        0.10000000149011612
+      ],
+      [
+        3.0,
+        1.0,
+        0.10000000149011612
+      ]
+    ],
+    "success": true,
+    "work": {
+      "expanded": 0,
+      "frontier_peak": 0,
+      "nodes": 0
+    }
+  },
+  {
+    "case": "reversed",
+    "failure": null,
+    "fallback_entered": false,
+    "guide_changed": true,
+    "guide_success": true,
+    "path_samples": 190,
+    "reference": [
+      [
+        0.5,
+        1.0,
+        0.1
+      ],
+      [
+        0.5500000081956387,
+        1.3500000201165676,
+        0.10000000149011612
+      ],
+      [
+        2.2500000335276127,
+        1.3500000201165676,
+        0.10000000149011612
+      ],
+      [
+        3.0,
+        1.0,
+        0.10000000149011612
+      ]
+    ],
+    "success": true,
+    "work": {
+      "expanded": 0,
+      "frontier_peak": 0,
+      "nodes": 0
+    }
+  },
+  {
+    "case": "farther_wall",
+    "failure": null,
+    "fallback_entered": false,
+    "guide_changed": true,
+    "guide_success": true,
+    "path_samples": 160,
+    "reference": [
+      [
+        0.5,
+        1.0,
+        0.1
+      ],
+      [
+        0.850000012665987,
+        1.3500000201165676,
+        0.10000000149011612
+      ],
+      [
+        1.2500000186264515,
+        1.3500000201165676,
+        0.10000000149011612
+      ],
+      [
+        3.0,
+        1.0,
+        0.10000000149011612
+      ]
+    ],
+    "success": true,
+    "work": {
+      "expanded": 0,
+      "frontier_peak": 0,
+      "nodes": 0
+    }
+  }
+]

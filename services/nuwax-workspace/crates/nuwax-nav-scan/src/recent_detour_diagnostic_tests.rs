@@ -135,3 +135,7 @@ mod search_priority_diagnostic_tests;
 #[cfg(feature="profile")]
 #[path="recent_fine_escape_diagnostic_tests.rs"]
 mod recent_fine_escape_diagnostic_tests;
+
+#[cfg(feature="profile")]
+#[path="recent_pipeline_eligibility_tests.rs"]
+mod recent_pipeline_eligibility_tests;

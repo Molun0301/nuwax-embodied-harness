@@ -1743,8 +1743,10 @@ dependencies = [
  "imageproc",
  "nuwax-codec",
  "nuwax-explore-routing",
+ "nuwax-map-chunks",
  "nuwax-protocol",
  "nuwax-transport",
+ "nuwax-types",
  "rayon",
  "serde",
  "serde_json",
@@ -1788,6 +1790,7 @@ dependencies = [
  "ahash",
  "nuwax-nav-mls-planner",
  "nuwax-nav-types-messages",
+ "nuwax-types",
  "tracing",
 ]
 

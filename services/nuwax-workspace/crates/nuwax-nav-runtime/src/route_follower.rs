@@ -10,6 +10,7 @@ use nuwax_nav_types_messages::{
     GoalOptions, Path2D, Path3D, Point3, PoseStamped, Twist2,
 };
 use std::sync::Arc;
+use crate::surface_changes::{SurfaceGeometryChanges, SurfaceJobTicket, SurfaceMapUpdate};
 
 use crate::planning_owner::PlanningOwner;
 use crate::route_planning::{body, pose_bits, exact_points, PlanKernel, PlanRequest, PlanResult, ReferenceSource};
@@ -38,6 +39,8 @@ pub struct RouteFollower {
     owner: Option<PlanningOwner<PlanRequest,PlanResult>>,
     next_request: u64,
     submitted: Option<(u64,Point3,bool)>,
+    // Exactly the owner's active/completed and pending slots; no second queue.
+    source_tickets: [Option<(u64,SurfaceJobTicket)>;2],
     retry_after: Instant,
     preparation_fault: Option<String>,
     permanent_fault: Option<String>,
@@ -92,6 +95,7 @@ impl RouteFollower {
             owner,
             next_request: 0,
             submitted: None,
+            source_tickets: [None,None],
             retry_after: Instant::now(),
             preparation_fault: None,
             permanent_fault: None,
@@ -229,6 +233,7 @@ impl RouteFollower {
     fn cancel_planning(&mut self) {
         if let Some(owner)=&self.owner {owner.cancel();}
         self.submitted=None;
+        self.source_tickets=[None,None];
         self.qualified_failure=None;
         self.retry_after=Instant::now();
     }
@@ -248,8 +253,17 @@ impl RouteFollower {
         let request=PlanRequest{source:map.clone(),pose:pose.clone(),boundary:self.boundary.clone(),reference:Vec::new(),
             reference_source:Some(reference_source),final_yaw:None,arrival:None,end:0.0,progress:self.progress,
             generation:self.route_generation,straight:false,detour,scan:self.scan.clone()};
-        if self.owner.as_ref().unwrap().submit(id,request) {
+        if let Some(retired)=self.owner.as_ref().unwrap().submit_with_retired(id,request) {
             self.next_request=id;self.submitted=Some((id,pose.pose.position,detour));
+            for slot in &mut self.source_tickets {
+                if slot.as_ref().is_some_and(|(old,_)|Some(*old)==retired) {*slot=None;}
+            }
+            if map.body_envelope().is_some() {
+                let Some(slot)=self.source_tickets.iter_mut().find(|slot|slot.is_none()) else {
+                    self.cancel_planning();self.permanent_fault=Some("planning proof slots exhausted".into());return;
+                };
+                *slot=Some((id,SurfaceJobTicket::new(Some(Arc::clone(map)))));
+            }
             self.local_planning_calls+=1;
             self.retry_after=Instant::now()+Duration::from_millis(250);
         }
@@ -260,11 +274,17 @@ impl RouteFollower {
         let Some(completion)=owner.take() else {return;};
         if owner.faulted() {return;}
         if self.submitted.is_some_and(|(id,_,_)|id==completion.id) {self.submitted=None;}
+        let proof = self.source_tickets.iter_mut().find_map(|slot| {
+            if slot.as_ref().is_some_and(|(id,_)|*id==completion.id) {slot.take().map(|(_,proof)|proof)} else {None}
+        });
         let result=completion.value;
         let request=result.request;
         if completion.epoch!=owner.epoch() || request.generation!=self.route_generation || self.route.is_none()
             || !exact_points(&request.boundary,&self.boundary)
-            || self.map.as_ref().is_none_or(|map|!nuwax_nav_pct::same_source_geometry(map,&request.source)) {return;}
+            || self.map.as_ref().is_none_or(|map| match (&proof,&result.outcome) {
+                (Some(proof),Ok(candidate)) => !proof.permits_path(map,&candidate.path),
+                _ => !nuwax_nav_pct::same_source_geometry(map,&request.source),
+            }) {self.dirty=true;return;}
         match result.outcome {
             Ok(candidate)=> {
                 if request.end+1e-6<self.progress {self.dirty=true;return;}
@@ -303,6 +323,11 @@ impl RouteFollower {
 
 }
 impl NavPlanner for RouteFollower {
+    fn revalidate_selected_command(&mut self,command:Twist2)->Option<PlannerStep> {
+        let result=self.controller.revalidate_selected_command(command);
+        if matches!(result,Some(PlannerStep::ReplanRequired(_))) {self.dirty=true;self.schedule(true);}
+        result
+    }
     fn take_command_dispatch_bound(&mut self)->Option<crate::CommandDispatchBound> {self.controller.take_command_dispatch_bound()}
     fn configure_boundary(&mut self, boundary: &[[f64; 2]]) {
         self.preparation_fault=None;
@@ -378,14 +403,33 @@ impl NavPlanner for RouteFollower {
         self.controller.update_costmap(map);
     }
     fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
-        let ExecutionMap::Surface(surface) = map else {
-            return Err(error("三维路线执行缺少三维地图"));
+        let update = match map {
+            ExecutionMap::SurfaceUpdate(update) => update,
+            ExecutionMap::Surface(surface) => {
+                let same=self.map.as_ref().is_some_and(|old|nuwax_nav_pct::same_source_geometry(old,&surface));
+                SurfaceMapUpdate {snapshot:surface,change_basis:self.map.clone(),
+                    changes:Arc::new(if same {SurfaceGeometryChanges::Empty} else {SurfaceGeometryChanges::Unknown})}
+            }
+            ExecutionMap::Planar(_) => return Err(error("三维路线执行缺少三维地图")),
         };
+        let surface=update.snapshot;
         if self.map.as_ref().is_none_or(|old|!old.same_body_query_view(&surface)) {self.qualified_failure=None;}
-        if self.map.as_ref().is_some_and(|old|!nuwax_nav_pct::same_source_geometry(old,&surface)) {
-            self.cancel_planning();self.dirty=true;
+        for (_,ticket) in self.source_tickets.iter_mut().flatten() {
+            ticket.observe(&surface,update.change_basis.as_deref(),&update.changes);
         }
-        // New geometry cancels candidate work, but only the fresh guard revokes motion.
+        if let Some(old)=&self.map {
+            let mut change=SurfaceJobTicket::new(Some(Arc::clone(old)));
+            change.observe(&surface,update.change_basis.as_deref(),&update.changes);
+            // Unknown cannot be softened by a newer Empty batch or an equal revision.
+            // Include both the retained reference and the actual detour. Progress
+            // and current guarded admission remain intact even for related changes.
+            let affected=change.unknown || self.source_tickets.iter().flatten().any(|(_,ticket)|ticket.unknown)
+                || (!matches!(update.changes.as_ref(),SurfaceGeometryChanges::Empty)
+                    && (self.route.as_ref().is_some_and(|path|!change.permits_path(&surface,path))
+                        || self.local_path.as_ref().is_some_and(|path|!change.permits_path(&surface,path))));
+            if affected {self.cancel_planning();self.dirty=true;}
+        }
+        // Every publication reaches the current guard even when planning is unaffected.
         if self.local_path.is_none() {
             self.dirty = true;
         }
@@ -501,6 +545,7 @@ impl NavPlanner for RouteFollower {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("route_selective_refresh_tests.rs");
     use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
     use nuwax_nav_types_messages::{MotionKinematics, MotionModel, NavFrameId, Pose3, Quaternion, Timestamp};
     use crate::route_planning::Candidate;
@@ -1084,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn both_modes_reject_changed_support_and_expired_observations() {
+    fn both_modes_reject_changed_support_but_accept_old_ground() {
         for enabled in [true,false] {
             let mut follower = RouteFollower::new(comparison_config(Some(enabled))).unwrap();
             follower.update_execution_map(ExecutionMap::Surface(comparison_map(false,None))).unwrap();
@@ -1100,10 +1145,10 @@ mod tests {
             follower.update_execution_map(ExecutionMap::Surface(comparison_map(false,Some(now)))).unwrap();
             comparison_route(&mut follower,comparison_pose(0.5,0),comparison_pose(3.0,0));
             assert!(matches!(ready_step(&mut follower, 0.3),PlannerStep::Command(c) if c.linear.x > 0.0),"fresh evidence should move, mode={enabled}");
-            // A replacement source carries honestly older observations; no future timestamps or relaxed TTL.
+            // Old static ground remains support; live stream health is enforced by the scheduler.
             follower.update_execution_map(ExecutionMap::Surface(comparison_map(false,Some(now.saturating_sub(2_000_000_000))))).unwrap();
             follower.update_odometry(comparison_pose(0.5,1));
-            assert!(!matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x > 0.0),"expired evidence allowed motion, mode={enabled}");
+            assert!(matches!(ready_step(&mut follower,0.3),PlannerStep::Command(c) if c.linear.x > 0.0),"old ground must remain usable, mode={enabled}");
             if !enabled { assert_eq!(follower.local_planning_calls(),0); }
         }
     }

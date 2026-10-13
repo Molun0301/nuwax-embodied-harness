@@ -48,7 +48,7 @@ pub struct SurfaceFollowerConfig {
     pub motion_limits: Option<nuwax_nav_types_messages::MotionLimits>,
     /// 执行器声明的基本速度通道；完整制动标定缺失时仍使用原低速几何检查。
     pub basic_kinematics: Option<nuwax_nav_types_messages::MotionKinematics>,
-    /// 近场观察最长年龄。
+    /// 已配置的近期感知源年龄上界；不再授予或撤销逐地面格许可。
     pub max_observation_age_sec: Option<f64>,
     /// 已有速度、控制频率及位置/朝向容差。
     pub controller: LocalPlannerConfig,
@@ -144,6 +144,7 @@ pub struct SurfaceFollower {
     options: nuwax_nav_types_messages::GoalOptions,
     last_command: Twist2,
     last_command_dispatch_bound: Option<crate::CommandDispatchBound>,
+    selected_body_command: Option<body_control::SelectedBodyCommand>,
     braking_deadline: Option<std::time::Instant>,
     simulation_braking_deadline_ns: Option<i64>,
     control_target: Option<nuwax_nav_control::PlanarPose>,
@@ -175,6 +176,7 @@ impl SurfaceFollower {
             options:Default::default(),
             last_command:Twist2::ZERO,
             last_command_dispatch_bound:None,
+            selected_body_command:None,
             braking_deadline:None,
             simulation_braking_deadline_ns:None,
             control_target:None,
@@ -217,6 +219,13 @@ impl SurfaceFollower {
         map.body_envelope()?;
         let pose = self.odometry.as_ref()?;
         let q = pose.pose.orientation;
+        // A measured ground/pose contradiction cannot be repaired by replanning.
+        // Unknown ground is not a collision or a per-cell support permission.
+        let source=self.source_map.as_ref().unwrap_or(map);
+        if matches!(source.body_ground_relation(xyz(pose.pose.position), [q.x,q.y,q.z,q.w]),
+            Ok(nuwax_nav_mls_planner::surface::BodyGroundRelation::KnownIncompatible)) {
+            return Some(nuwax_nav_mls_planner::surface::SurfaceError::MissingSupport.to_string());
+        }
         let mut witness=None;
         map.validate_body_pose_with_witness(xyz(pose.pose.position), [q.x, q.y, q.z, q.w], &mut witness)
             .err().map(|error| match witness {
@@ -447,8 +456,9 @@ impl SurfaceFollower {
     }
 
     fn bounded_command_with_speed_limit(&mut self, twist: Twist2, speed_limit: Option<f64>) -> PlannerStep {
-        if self.config.max_observation_age_sec.is_some()
-            || self.config.motion_limits.is_some() && self.map.as_ref().is_some_and(|m|m.body_envelope().is_some()) {
+        // Calibrated body braking is selected by the physical model, never by
+        // an observation-age switch. Removing ground TTL cannot weaken this path.
+        if self.config.motion_limits.is_some() && self.map.as_ref().is_some_and(|m|m.body_envelope().is_some()) {
             return self.bounded_body_command(twist,speed_limit);
         }
         // 原控制器最小速度不能突破三维执行显式配置的低速上限。
@@ -631,6 +641,9 @@ impl SurfaceFollower {
 }
 
 impl NavPlanner for SurfaceFollower {
+    fn revalidate_selected_command(&mut self,command:Twist2)->Option<PlannerStep> {
+        self.recheck_selected_body_command(command)
+    }
     fn take_command_dispatch_bound(&mut self)->Option<crate::CommandDispatchBound> {SurfaceFollower::take_command_dispatch_bound(self)}
     fn configure_boundary(&mut self,boundary:&[[f64;2]]) {
         self.last_command_dispatch_bound = None;
@@ -690,7 +703,7 @@ impl NavPlanner for SurfaceFollower {
     fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
         self.last_command_dispatch_bound = None;
         match map {
-            ExecutionMap::Surface(map) => {
+            ExecutionMap::Surface(map) | ExecutionMap::SurfaceUpdate(crate::surface_changes::SurfaceMapUpdate {snapshot:map,..}) => {
                 if map.config().world_frame != "map" {
                     return Err(rejected("三维表面快照必须使用当前机体路径的map坐标系"));
                 }
@@ -1512,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn near_field_evidence_covers_the_emergency_braking_tail() {
+    fn old_ground_remains_usable_but_missing_support_brakes_the_complete_tail() {
         use nuwax_nav_mls_planner::{SurfaceBodyEnvelope, SurfaceObservation, SurfaceObservations};
         use nuwax_nav_types_messages::{MotionLimits, MotionModel};
         use std::collections::BTreeMap;
@@ -1523,7 +1536,8 @@ mod tests {
             max_cross_slope_deg: 10.0, support_uncertainty_m: 0.0,
         }).unwrap();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
-        for fresh in [true, false] {
+        for (fresh,missing_support,age) in [(true,false,Some(1.0)),(false,false,Some(1.0)),
+            (false,false,None),(false,true,Some(1.0)),(false,true,None)] {
             let mut blocks: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
             for (x,y,z) in base.cell_keys() {
                 let key = [x,y,z];
@@ -1532,9 +1546,12 @@ mod tests {
             }
             let mut observations = SurfaceObservations::new(base.source_voxel_size_m(), 32).unwrap();
             for (key, block) in blocks { observations.replace_block(key,block).unwrap(); }
-            let map = Arc::new(base.with_observations(Some(Arc::new(observations))));
+            let geometry=if missing_support {
+                test_snapshot(0.0,true).with_body_envelope(base.body_envelope().unwrap().clone()).unwrap()
+            } else {base.clone()};
+            let map = Arc::new(geometry.with_observations(Some(Arc::new(observations))));
             let mut config = SurfaceFollowerConfig::new(0.3);
-            config.max_observation_age_sec = Some(1.0);
+            config.max_observation_age_sec = age;
             config.motion_limits = Some(MotionLimits {
                 model: MotionModel::Differential, max_forward_mps: 0.5, max_reverse_mps: 0.3,
                 max_lateral_mps: 0.0, max_angular_rps: 0.7, linear_acceleration_mps2: 1.0,
@@ -1549,9 +1566,9 @@ mod tests {
             follower.last_command = speed;
             follower.control_target = Some(nuwax_nav_control::PlanarPose { x: 2.0, y: 0.55, yaw: 0.0 });
             let result = follower.bounded_command(speed);
-            if fresh { assert!(matches!(result, PlannerStep::Command(v) if v.linear.x > 0.0), "{result:?}"); }
+            if !missing_support { assert!(matches!(result, PlannerStep::Command(v) if v.linear.x > 0.0), "old ground={}: {result:?}",!fresh); }
             else {
-                // 初始机体及第一个50毫秒段仍在新鲜区域，停车尾段会越过1.2米。
+                // Missing support remains a geometric failure; the physical stop interval is retained.
                 assert!(matches!(result, PlannerStep::ReplanRequired(_)), "{result:?}");
                 assert_eq!(follower.last_command, Twist2::ZERO);
                 let deadline = follower.braking_deadline.expect("已运动后须保留制动上界");

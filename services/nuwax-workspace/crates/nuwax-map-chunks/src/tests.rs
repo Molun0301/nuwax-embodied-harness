@@ -145,7 +145,7 @@ fn block_summary_matches_frozen_record_corpus() {
 fn block_summary_matches_frozen_maximum_valid_block() {
     let records: Vec<_> = (0..32768_u16).map(|key| (key, u64::from(key) + 1, 1)).collect();
     let bytes = unchecked_block(&records);
-    assert_eq!(bytes.len(), MAX_BLOCK_BYTES);
+    assert_eq!(bytes.len(), MAX_LEGACY_BLOCK_BYTES);
     assert_block_oracle("maximum valid block", &bytes, None);
     assert_eq!(block_summary(&bytes), Ok((32768, 32768)));
 }

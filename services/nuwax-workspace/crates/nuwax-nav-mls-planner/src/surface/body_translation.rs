@@ -405,6 +405,40 @@ impl SurfaceSnapshot {
             sample((previous + interval[1]) * 0.5)?;
             sample(interval[1])
         };
+        // Recent returns have no terrain exemption. Enumerate the same exact
+        // translating/rotating prism contact events as persistent occupancy.
+        if let Some(recent)=&self.recent_obstacles {
+            let fine=recent.size;
+            for frame in &recent.frames {
+                let low=[(min[0]/fine).floor() as i32,(min[1]/fine).floor() as i32];
+                let high=[(max[0]/fine).floor() as i32,(max[1]/fine).floor() as i32];
+                for (&[x,y],zs) in frame.columns.range(low..=high) {
+                    if y<low[1] || y>high[1] {continue;}
+                    {
+                            for &z in zs {
+                                if let Some(points)=frame.surface_points.get(&[x,y,z]) {
+                                    for &point in points {
+                                        if let Some(interval)=prism.expanded_translated_interval(displacement,point,point,padding) {
+                                            if let Some(events)=&events {
+                                                for interval in events.contacts(model,point,point,interval,&changes) {record(interval)?;}
+                                            } else {record(interval)?;}
+                                        }
+                                    }
+                                    continue;
+                                }
+                                let low=[x,y,z].map(|v|f64::from(v)*fine);
+                                let high=[x,y,z].map(|v|f64::from(v+1)*fine);
+                                if high[2]<min[2] || low[2]>max[2] {continue;}
+                                if let Some(interval)=prism.expanded_translated_interval(displacement,low,high,padding) {
+                                    if let Some(events)=&events {
+                                        for interval in events.contacts(model,low,high,interval,&changes) {record(interval)?;}
+                                    } else {record(interval)?;}
+                                }
+                            }
+                    }
+                }
+            }
+        }
         let uncertainty = f64::from(self.source_voxel_size_m()) + model.support_uncertainty_m;
         let contact = model.max_step_up_m.max(model.max_step_down_m) + uncertainty;
         let allowance = ((model.z_bounds_m[0].max(-model.body_to_support_z_m) / r[2][2])
@@ -452,7 +486,7 @@ impl SurfaceSnapshot {
                                     let key = [ix,iy,iz];
                                     if observations.get(key).is_none() { continue; }
                                     found_fine = true;
-                                    if f64::from(iz+1)*fine <= cutoff || !observations.supports_obstacle(key)
+                                    if f64::from(iz+1)*fine <= cutoff || !observations.get(key).is_some()
                                         || self.current_body_support.as_ref().is_some_and(|c| c.cleared_voxels.contains(&key)) { continue; }
                                     let low=key.map(|v|f64::from(v)*fine);let high=key.map(|v|f64::from(v+1)*fine);
                                     if let Some(interval) = prism.expanded_translated_interval(displacement,low,high,padding) {

@@ -6,14 +6,7 @@ use nuwax_nav_mls_planner::{
 };
 use std::sync::Arc;
 
-/// Short-lived raw geometry scope, relative to one successful complete source.
-/// Arc ownership in SurfaceMapUpdate makes hub delivery constant-time.
-#[derive(Debug)]
-pub(crate) enum SurfaceGeometryChanges {
-    Empty,
-    Columns { fine_size: f32, fine: Vec<[i32; 2]>, planner_size: f32, coarse: Vec<[i32; 2]> },
-    Unknown,
-}
+pub(crate) use nuwax_nav_runtime::surface_changes::SurfaceGeometryChanges;
 
 pub(crate) struct SurfaceMapUpdate {
     pub snapshot: Arc<SurfaceSnapshot>,

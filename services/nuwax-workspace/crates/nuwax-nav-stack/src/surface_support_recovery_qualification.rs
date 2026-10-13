@@ -2,6 +2,9 @@
 // production owners and PlannerWorker. Only the motion boundary is synthetic.
 // The plant is an ideal velocity holder, not a physical braking/lease model.
 // Run each ignored case exactly once, individually, in the full opt3 profile.
+// This scenario lowers observed ground and restores it; it does not require
+// unknown terrain to be an obstacle. Feature compilation alone is not a pass
+// of either 60-second live qualification below.
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -160,7 +163,7 @@ impl NavMotionPort for RealTimeMotion {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stage { Full, Cut, Restored }
+enum Stage { Full, Lowered, Restored }
 #[derive(Clone, Debug)]
 struct SourceRecord {
     stage: Stage, sample: Instant, published: Instant, source: i64,
@@ -169,14 +172,19 @@ struct SourceRecord {
     probe_key: [i32;3], probe_hits: Option<u16>, probe_observed_ns: Option<u64>,
 }
 #[derive(Clone)]
-struct SensorControl { stage: Stage, cut: Option<([f64;2],f64)> }
+struct SensorControl { stage: Stage, lowered_region: Option<([f64;2],f64)> }
 impl SensorControl {
-    fn removed(&self, key: &[i32;3]) -> bool {
-        self.cut.is_some_and(|(center,radius)| {
+    fn in_lowered_region(&self, key: &[i32;3]) -> bool {
+        self.lowered_region.is_some_and(|(center,radius)| {
             let x=(key[0] as f64+0.5)*f64::from(RESOLUTION);
             let y=(key[1] as f64+0.5)*f64::from(RESOLUTION);
             (x-center[0]).abs() <= radius && (y-center[1]).abs() <= radius
         })
+    }
+    fn sample_keys(&self,ground:&[[i32;3]])->Vec<[i32;3]> {
+        ground.iter().map(|&key|if self.stage==Stage::Lowered && self.in_lowered_region(&key) {
+            [key[0],key[1],-8] // 45 cm below the original 5-cm voxel top.
+        } else {key}).collect()
     }
 }
 // The existing wire contract uses either inline coarse points or a fine root.
@@ -197,14 +205,18 @@ fn map_from_fine(root: &Manifest, repository: &Repository) -> schema::Navigation
 }
 
 #[test]
-fn fine_map_three_stage_codec_contract_roundtrips() {
+fn fine_map_known_drop_restore_codec_contract_roundtrips() {
+    use nuwax_nav_mls_planner::surface::BodyGroundRelation;
     let repository=Repository::temporary().unwrap();
     let mut writer=Writer::new(repository.clone(),RESOLUTION,4*1024*1024).unwrap();
+    let config=calibrated_config(false);
+    let mut cache=SurfaceGeometryCache::configured(&config);
     let cells:Vec<_>=(0..100).flat_map(|x|(0..60).map(move |y|[x,y,1])).collect();
-    for (index,stage) in [Stage::Full,Stage::Cut,Stage::Restored].into_iter().enumerate() {
-        let control=SensorControl {stage,cut:Some(([1.1,1.5],1.1))};
-        if stage==Stage::Cut {writer.remove(cells.iter().copied().filter(|key|control.removed(key))).unwrap();}
-        let retained:Vec<_>=cells.iter().copied().filter(|key|stage!=Stage::Cut || !control.removed(key)).collect();
+    for (index,stage) in [Stage::Full,Stage::Lowered,Stage::Restored].into_iter().enumerate() {
+        let control=SensorControl {stage,lowered_region:Some(([1.1,1.5],1.1))};
+        if stage==Stage::Lowered {writer.remove(cells.iter().copied().filter(|key|control.in_lowered_region(key))).unwrap();}
+        if stage==Stage::Restored {writer.remove(cells.iter().filter(|key|control.in_lowered_region(key)).map(|key|[key[0],key[1],-8])).unwrap();}
+        let retained=control.sample_keys(&cells);
         let stamp=current_unix_timestamp_ns().unwrap();
         writer.observe(retained.iter().copied(),stamp as u64).unwrap();
         let root=writer.snapshot(Domain {session:"memq-support-map".into(),generation:1,
@@ -222,9 +234,23 @@ fn fine_map_three_stage_codec_contract_roundtrips() {
         assert_eq!(decoded.source_timestamp_ns,stamp);
         assert_eq!(decoded.committed_map.source_timestamp_ns,stamp);
         assert_eq!(decoded.source_voxel_size,RESOLUTION);
+        let geometry=cache.build(&decoded).unwrap();
+        let pose=([1.1,1.5,0.5],[0.0,0.0,0.0,1.0]);
+        let expected=if stage==Stage::Lowered {BodyGroundRelation::KnownIncompatible}else{BodyGroundRelation::KnownCompatible};
+        assert_eq!(geometry.body_ground_relation(pose.0,pose.1),Ok(expected));
+        assert_eq!(geometry.validate_body_pose(pose.0,pose.1),Ok(()),
+            "已知下方落差与恢复均不凭空制造机体占据碰撞");
         eprintln!("CODEC_SMOKE stage={stage:?} revision={} source_ns={stamp} fine_cells={} bytes={} cleared={} coarse_width={} coarse_row_step={}",
             decoded.cloud_revision,retained.len(),encoded.len(),decoded.cleared,decoded.cloud.width,decoded.cloud.row_step);
     }
+    let control=SensorControl{stage:Stage::Lowered,lowered_region:Some(([1.1,1.5],1.1))};
+    let points:Vec<_>=cells.iter().filter(|key|!control.in_lowered_region(key)).map(|key|(
+        (key[0] as f32+0.5)*RESOLUTION,(key[1] as f32+0.5)*RESOLUTION,(key[2] as f32+0.5)*RESOLUTION)).collect();
+    let unknown=nuwax_nav_mls_planner::SurfaceSnapshot::from_points(&points,config.geometry,RESOLUTION).unwrap()
+        .with_body_envelope(config.body_envelope.unwrap()).unwrap();
+    let pose=([1.1,1.5,0.5],[0.0,0.0,0.0,1.0]);
+    assert_eq!(unknown.body_ground_relation(pose.0,pose.1),Ok(BodyGroundRelation::Unknown));
+    assert_eq!(unknown.validate_body_pose(pose.0,pose.1),Ok(()),"Unknown不是已知落差，也不是碰撞");
     // This checks legal messages only, not 200ms sensor maturity or navigation.
 }
 
@@ -261,7 +287,7 @@ impl RecoveryHarness {
         let executor_node=graph.find("surface_nav_scheduler").unwrap().clone();
         let mut paths=typed_stream(&transport,&node.outputs[0],"nuwax_msgs.PathEnvelope").await.unwrap();
         let mut states=typed_stream(&transport,&node.inputs[4],"nuwax_msgs.NavigationState").await.unwrap();
-        let hub=SurfaceMapHub::new(); let mut built=hub.events.subscribe();
+        let hub=SurfaceMapHub::new(Arc::from("base_link")); let mut built=hub.events.subscribe();
         let evidence=Arc::new(Mutex::new(Evidence { maps:BTreeMap::new(),built:BTreeMap::new(),
             latest_map:None,paths:Vec::new(),states:Vec::new() }));
         let path_evidence=evidence.clone(); let state_evidence=evidence.clone(); let map_evidence=evidence.clone();
@@ -294,7 +320,8 @@ impl RecoveryHarness {
         assert_eq!(scheduler_config.costmap_ttl,Duration::ZERO);
         let mut executor=boxed_owner("memq-recovery-real-executor",Box::new(move |shutdown,ready| {
             Box::pin(run_surface_scheduler_with_transport(executor_node,hub,executor_transport,
-                shutdown,ready,async move {
+                shutdown,ready,config.follower.body_to_support_z_m,
+                config.follower.max_observation_age_sec.map(Duration::from_secs_f64),async move {
                     let backend=nuwax_nav_runtime::qualification_surface_backend(config.follower)?;
                     let scheduler=nuwax_nav_runtime::NavScheduler::new(motion,backend,scheduler_config)?;
                     let pair=nuwax_nav_runtime::spawn_scheduler(scheduler);
@@ -304,7 +331,7 @@ impl RecoveryHarness {
         executor.start().unwrap();
         let scheduler=receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(handle_slot.set(scheduler.clone()).is_ok());
-        let sensor=Arc::new(Mutex::new(SensorControl {stage:Stage::Full,cut:None}));
+        let sensor=Arc::new(Mutex::new(SensorControl {stage:Stage::Full,lowered_region:None}));
         let feed_sensor=sensor.clone(); let feed_plant=plant.clone(); let feed_evidence=evidence.clone();
         let feed_transport=transport.clone(); let feed_node=node.clone();
         let feeder=tokio::spawn(async move {
@@ -327,22 +354,24 @@ impl RecoveryHarness {
                 let sample=Instant::now(); let stamp=current_unix_timestamp_ns().unwrap();
                 next_sample=sample+SAMPLE_PERIOD; // no catch-up/backdated sensor frames
                 let control=feed_sensor.lock().unwrap().clone();
-                if control.stage==Stage::Cut && previous_stage!=Stage::Cut {
-                    writer.remove(all.iter().copied().filter(|key|control.removed(key))).unwrap();
+                if control.stage==Stage::Lowered && previous_stage!=Stage::Lowered {
+                    writer.remove(all.iter().copied().filter(|key|control.in_lowered_region(key))).unwrap();
                 }
-                let retained:Vec<_>=all.iter().copied()
-                    .filter(|key|control.stage!=Stage::Cut || !control.removed(key)).collect();
+                if control.stage==Stage::Restored && previous_stage==Stage::Lowered {
+                    writer.remove(all.iter().filter(|key|control.in_lowered_region(key)).map(|key|[key[0],key[1],-8])).unwrap();
+                }
+                let retained=control.sample_keys(&all);
                 writer.observe(retained.iter().copied(),stamp as u64).unwrap(); revision+=1;
                 let root=writer.snapshot(Domain {session:"memq-support-map".into(),generation:1,
                     frame_generation:1,producer_generation:17},revision as u64,stamp as u64).unwrap();
                 let map=map_from_fine(&root,&repository);
                 let payload=schema::encode_navigation_map_3d_body(&map).unwrap();
-                let center=control.cut.map_or([1.0,1.5],|cut|cut.0);
+                let center=control.lowered_region.map_or([1.0,1.5],|lowered_region|lowered_region.0);
                 let probe_key=[(center[0]/f64::from(RESOLUTION)).floor() as i32,
-                    (center[1]/f64::from(RESOLUTION)).floor() as i32,1];
+                    (center[1]/f64::from(RESOLUTION)).floor() as i32,if control.stage==Stage::Lowered {-8}else{1}];
                 let probe=writer.region(probe_key,probe_key,1).unwrap().first().copied();
-                if control.stage==Stage::Cut {assert!(probe.is_none());}
-                if control.stage==Stage::Restored && previous_stage==Stage::Cut {
+                if control.stage==Stage::Lowered {assert!(probe.is_some(),"lowered ground must be actually observed, not missing");}
+                if control.stage==Stage::Restored && previous_stage==Stage::Lowered {
                     assert_eq!(probe.map(|(_,evidence)|evidence.hits),Some(1),
                         "restored deleted fine cell must begin with one real acquisition");
                 }
@@ -380,20 +409,17 @@ impl RecoveryHarness {
         let evidence=self.evidence.lock().unwrap();
         let Some(built)=evidence.built.get(&source) else {return false;};
         let Ok(map)=&built.snapshot else {return false;};
-        let Some(obs)=map.observations() else {return false;};
-        let key=[(body.0[0]/f64::from(RESOLUTION)).floor() as i32,
-            (body.0[1]/f64::from(RESOLUTION)).floor() as i32,1];
-        let Some(hit)=obs.get(key) else {return false;};
-        let now=current_unix_timestamp_ns().unwrap() as u64;
-        if hit.hits<2 || hit.observed_ns>now || now-hit.observed_ns>1_000_000_000 {return false;}
+        let Some(record)=evidence.maps.get(&source) else {return false;};
+        // This is acquisition health, not per-cell ground permission.
+        if record.sample.elapsed()>Duration::from_secs(1) {return false;}
         let mut ahead=body; ahead.0[0]+=0.05;
-        map.validate_body_pose(body.0,body.1).is_ok() && map.validate_observed_body_motion(
-            body,ahead,&BTreeSet::new(),now,1_000_000_000).is_ok()
+        map.validate_body_pose(body.0,body.1).is_ok() && map.validate_body_motion(body,ahead,&[]).is_ok()
     }
     fn current_body_supported(&self,event:&MotionEvent)->bool {
         let evidence=self.evidence.lock().unwrap();
         let Some(built)=evidence.built.get(&event.source) else {return false;};
         let Ok(map)=&built.snapshot else {return false;};
+        if map.body_ground_relation(event.body.0,event.body.1)!=Ok(nuwax_nav_mls_planner::surface::BodyGroundRelation::KnownCompatible) {return false;}
         // Match refresh_current_body_view: use its derived view when available,
         // otherwise retain the source snapshot. This is geometry, not proof replay.
         match map.with_current_body_support(event.body.0,event.body.1) {
@@ -405,9 +431,7 @@ impl RecoveryHarness {
         let evidence=self.evidence.lock().unwrap();
         let Some(built)=evidence.built.get(&event.source) else {return false;};
         let Ok(map)=&built.snapshot else {return false;};
-        map.validate_body_pose(event.body.0,event.body.1).is_err() &&
-            map.with_current_body_support(event.body.0,event.body.1)
-                .and_then(|view|view.validate_body_pose(event.body.0,event.body.1)).is_err()
+        map.body_ground_relation(event.body.0,event.body.1)==Ok(nuwax_nav_mls_planner::surface::BodyGroundRelation::KnownIncompatible)
     }
     fn validate_paths(&self,goal:&schema::GoalEnvelope)->Result<(),String> {
         let events=self.plant.lock().unwrap().events.clone();
@@ -472,28 +496,28 @@ impl RecoveryHarness {
             if moved && nonzero && !self.evidence.lock().unwrap().paths.is_empty() {break;}
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if self.scheduler.status().last_terminal.is_some() {return Err("goal terminated before cut".into());}
-        let (cut_body,cut_seq)={let mut plant=self.plant.lock().unwrap();
+        if self.scheduler.status().last_terminal.is_some() {return Err("goal terminated before lowering".into());}
+        let (lowered_body,lowered_seq)={let mut plant=self.plant.lock().unwrap();
             (plant.sample(),plant.events.len() as u64)};
-        if distance3(cut_body.0,goal.goal.pose.position)<=goal.options.position_tolerance_m {
-            return Err("cut was not before arrival".into());
+        if distance3(lowered_body.0,goal.goal.pose.position)<=goal.options.position_tolerance_m {
+            return Err("lowering was not before arrival".into());
         }
-        // Existing support view may fill a footprint from nearby terrain. Remove
-        // footprint + original 5-cell halo + 0.35m input-adoption drift margin.
+        // Lower the actually observed ground across the footprint + original
+        // 5-cell halo + 0.35m input-adoption drift margin; this is not a blind gap.
         let config=calibrated_config(self.local_planning_enabled);
         let halo=((config.follower.body_to_support_z_m+f64::from(RESOLUTION)) /
             f64::from(config.geometry.voxel_size)).ceil()*f64::from(config.geometry.voxel_size);
         let radius=config.body_envelope.as_ref().unwrap().radius()+halo+0.35;
-        {let mut sensor=self.sensor.lock().unwrap();sensor.stage=Stage::Cut;
-            sensor.cut=Some(([cut_body.0[0],cut_body.0[1]],radius));}
-        eprintln!("CUT at={:?} unix_ns={} cursor={cut_seq} body={cut_body:?} radius={radius}",
+        {let mut sensor=self.sensor.lock().unwrap();sensor.stage=Stage::Lowered;
+            sensor.lowered_region=Some(([lowered_body.0[0],lowered_body.0[1]],radius));}
+        eprintln!("LOWERED_GROUND at={:?} unix_ns={} cursor={lowered_seq} body={lowered_body:?} radius={radius}",
             Instant::now(),current_unix_timestamp_ns().unwrap());
         let stopped=loop {
-            self.check_live("post-cut support failure and fresh zero")?;
-            if self.scheduler.status().last_terminal.is_some() {return Err("unexpected terminal during cut".into());}
+            self.check_live("post-lowering support failure and fresh zero")?;
+            if self.scheduler.status().last_terminal.is_some() {return Err("unexpected terminal during known drop".into());}
             let events=self.plant.lock().unwrap().events.clone();
             let found=events.into_iter().find(|event| {
-                if event.seq<=cut_seq || !is_zero_event(event) || !self.source(event.source,Stage::Cut)
+                if event.seq<=lowered_seq || !is_zero_event(event) || !self.source(event.source,Stage::Lowered)
                     || event.session.as_deref()!=Some(goal.session_id.as_str()) || !self.unsupported(event) {return false;}
                 let evidence=self.evidence.lock().unwrap(); let row=&evidence.maps[&event.source];
                 event.at>=row.published && evidence.states.iter().any(|state|
@@ -505,11 +529,11 @@ impl RecoveryHarness {
         };
         let (zero_pose,hold_start)={let mut plant=self.plant.lock().unwrap();(plant.sample(),Instant::now())};
         while hold_start.elapsed()<SAMPLE_PERIOD*3 {
-            self.check_live("cut stationary hold")?;
+            self.check_live("known-drop stationary hold")?;
             let mut plant=self.plant.lock().unwrap(); let pose=plant.sample();
             if plant.applied!=Twist2::ZERO || distance3(pose.0,zero_pose.0)>1e-12 ||
                 plant.events.iter().any(|event|event.seq>stopped.seq && is_nonzero_applied(event)) {
-                return Err("post-cut plant moved or accepted another nonzero command".into());
+                return Err("post-lowering plant moved or accepted another nonzero command".into());
             }
             drop(plant);
             let status=self.scheduler.status();
@@ -519,11 +543,11 @@ impl RecoveryHarness {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let evidence=self.evidence.lock().unwrap();
-        let postcut_samples=evidence.maps.values().filter(|row|row.stage==Stage::Cut && row.published>=stopped.at).count();
-        if postcut_samples<2 {return Err("fewer than two actual post-cut samples during hold".into());}
+        let lowered_samples=evidence.maps.values().filter(|row|row.stage==Stage::Lowered && row.published>=stopped.at).count();
+        if lowered_samples<2 {return Err("fewer than two actual post-lowering samples during hold".into());}
         let publish_to_zero_ms=stopped.at.duration_since(evidence.maps[&stopped.source].published).as_secs_f64()*1000.0;
         drop(evidence);
-        eprintln!("STOP at={:?} unix_ns={} source={} publish_to_zero_ms={publish_to_zero_ms} zero_seq={} wait_reason={} hold_ms={} samples={postcut_samples}",
+        eprintln!("STOP at={:?} unix_ns={} source={} publish_to_zero_ms={publish_to_zero_ms} zero_seq={} wait_reason={} hold_ms={} samples={lowered_samples}",
             stopped.at,stopped.unix_ns,stopped.source,stopped.seq,SUPPORT_WAIT,hold_start.elapsed().as_millis());
         let restore_seq=self.plant.lock().unwrap().events.len() as u64;
         self.sensor.lock().unwrap().stage=Stage::Restored; // only map and ordinary measured pose continue
@@ -536,8 +560,8 @@ impl RecoveryHarness {
             if let Some(event)=found {break event;}
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        // Current-footprint evidence is exempt in the original selected-command
-        // proof. Do not impose the initial +50mm/empty-occupied maturity gate here.
+        // Restored measured height must be compatible and real geometry clear;
+        // neither a cell hit quorum nor a ground expiry lease grants recovery.
         if !self.current_body_supported(&resumed) {return Err("restored current body lacks original geometric support".into());}
         eprintln!("RESTORED_APPLIED at={:?} unix_ns={} applied_seq={} consumed_source={} original_goal={} revision={} deadline={:?} current_body_geometry=valid exact_selected_proof_cells=not_recorded",
             resumed.at,resumed.unix_ns,resumed.seq,resumed.source,goal.session_id,resumed.revision,resumed.deadline);
@@ -653,7 +677,7 @@ async fn qualify(enabled:bool) {
 }
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 #[ignore="opt-in real-clock memq software qualification; full opt3, one recorded run"]
-async fn original_goal_support_cut_recovers_and_arrives_local_planning_off() {qualify(false).await;}
+async fn original_goal_known_drop_recovers_and_arrives_local_planning_off() {qualify(false).await;}
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 #[ignore="opt-in real-clock memq software qualification; full opt3, one recorded run"]
-async fn original_goal_support_cut_recovers_and_arrives_local_planning_on() {qualify(true).await;}
+async fn original_goal_known_drop_recovers_and_arrives_local_planning_on() {qualify(true).await;}

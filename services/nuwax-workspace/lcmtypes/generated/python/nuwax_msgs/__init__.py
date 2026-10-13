@@ -26,3 +26,4 @@ from .PersonFollowTarget import PersonFollowTarget as PersonFollowTarget
 
 from .LioInputAck import LioInputAck
 from .LioInputFrame import LioInputFrame
+from .RecentCloud3D import RecentCloud3D as RecentCloud3D

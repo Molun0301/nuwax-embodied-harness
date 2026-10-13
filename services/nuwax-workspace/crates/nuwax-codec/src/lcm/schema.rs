@@ -2056,19 +2056,24 @@ pub fn encode_point_cloud2(message: &PointCloud2) -> CodecResult<Vec<u8>> {
 
 /// Encode only the generated `PointCloud2._encode_one()` body.
 pub fn encode_point_cloud2_body(message: &PointCloud2) -> CodecResult<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_point_cloud2_body_into(message, &mut out)?;
+    Ok(out)
+}
+
+pub(super) fn encode_point_cloud2_body_into(message: &PointCloud2, out: &mut Vec<u8>) -> CodecResult<()> {
     let fields_length = i32::try_from(message.fields.len())
         .map_err(|_| CodecError::LcmEncode("PointCloud2 fields_length exceeds int32".into()))?;
     let data_length = i32::try_from(message.data.len())
         .map_err(|_| CodecError::LcmEncode("PointCloud2 data_length exceeds int32".into()))?;
 
-    let mut out = Vec::new();
     out.extend_from_slice(&fields_length.to_be_bytes());
     out.extend_from_slice(&data_length.to_be_bytes());
-    encode_header(&message.header, &mut out)?;
+    encode_header(&message.header, out)?;
     out.extend_from_slice(&message.height.to_be_bytes());
     out.extend_from_slice(&message.width.to_be_bytes());
     for field in &message.fields {
-        encode_string(&field.name, &mut out)?;
+        encode_string(&field.name, out)?;
         out.extend_from_slice(&field.offset.to_be_bytes());
         out.push(field.datatype);
         out.extend_from_slice(&field.count.to_be_bytes());
@@ -2078,7 +2083,7 @@ pub fn encode_point_cloud2_body(message: &PointCloud2) -> CodecResult<Vec<u8>> {
     out.extend_from_slice(&message.row_step.to_be_bytes());
     out.extend_from_slice(&message.data);
     out.push(u8::from(message.is_dense));
-    Ok(out)
+    Ok(())
 }
 
 /// Decode a top-level `sensor_msgs.PointCloud2` generated message.

@@ -1013,7 +1013,7 @@ impl OccupancyHarness {
         let executor_node=graph.find("surface_nav_scheduler").unwrap().clone();
         let mut paths=typed_stream(&transport,&node.outputs[0],"nuwax_msgs.PathEnvelope").await.unwrap();
         let mut states=typed_stream(&transport,&node.inputs[4],"nuwax_msgs.NavigationState").await.unwrap();
-        let hub=SurfaceMapHub::new(); let mut built=hub.events.subscribe();
+        let hub=SurfaceMapHub::new(Arc::from("base_link")); let mut built=hub.events.subscribe();
         let evidence=Arc::new(Mutex::new(Evidence { maps:BTreeMap::new(),built:BTreeMap::new(),
             latest_map:None,paths:Vec::new(),states:Vec::new(),path_receipts:Vec::new(),consumed:Vec::new() }));
         let path_evidence=evidence.clone(); let state_evidence=evidence.clone(); let map_evidence=evidence.clone();
@@ -1047,7 +1047,8 @@ impl OccupancyHarness {
         assert_eq!(scheduler_config.costmap_ttl,Duration::ZERO);
         let mut executor=boxed_owner("memq-dynamic-occupancy-real-executor",Box::new(move |shutdown,ready| {
             Box::pin(run_surface_scheduler_with_transport(executor_node,hub,executor_transport,
-                shutdown,ready,async move {
+                shutdown,ready,config.follower.body_to_support_z_m,
+                config.follower.max_observation_age_sec.map(Duration::from_secs_f64),async move {
                     let backend=nuwax_nav_runtime::qualification_surface_backend(config.follower)?;
                     let scheduler=nuwax_nav_runtime::NavScheduler::new(motion,backend,scheduler_config)?;
                     let pair=nuwax_nav_runtime::spawn_scheduler(scheduler);
@@ -1132,15 +1133,11 @@ impl OccupancyHarness {
         let evidence=self.evidence.lock().unwrap();
         let Some(built)=evidence.built.get(&source) else {return false;};
         let Ok(map)=&built.snapshot else {return false;};
-        let Some(obs)=map.observations() else {return false;};
-        let key=[(body.0[0]/f64::from(RESOLUTION)).floor() as i32,
-            (body.0[1]/f64::from(RESOLUTION)).floor() as i32,1];
-        let Some(hit)=obs.get(key) else {return false;};
-        let now=current_unix_timestamp_ns().unwrap() as u64;
-        if hit.hits<2 || hit.observed_ns>now || now-hit.observed_ns>1_000_000_000 {return false;}
+        let Some(record)=evidence.maps.get(&source) else {return false;};
+        // Keep real sensor acquisition health separate from ground geometry.
+        if record.sample.elapsed()>Duration::from_secs(1) {return false;}
         let mut ahead=body; ahead.0[0]+=0.05;
-        map.validate_body_pose(body.0,body.1).is_ok() && map.validate_observed_body_motion(
-            body,ahead,&BTreeSet::new(),now,1_000_000_000).is_ok()
+        map.validate_body_pose(body.0,body.1).is_ok() && map.validate_body_motion(body,ahead,&[]).is_ok()
     }
     fn validate_paths(&self,goal:&schema::GoalEnvelope)->Result<(),String> {
         let events=self.plant.lock().unwrap().events.clone();

@@ -1,10 +1,10 @@
-//! Pure observation statistics math, not connected to runtime capture or BL1/AR2.
+//! Pure observation statistics math, reused by bounded capture-layer records.
 //!
 //! The caller supplies samples from one explicitly associated population.
 //! Occupancy fill and legacy voxel centres are not surface measurements.
 //! These types provide no classification, source tracking, scan admission,
 //! deduplication, storage budget, revision ownership or persistence. Those belong
-//! to the existing runtime owners when capture is connected.
+//! to the runtime capture owner and the versioned layer-record codec.
 
 const PAIRS: [(usize, usize); 6] = [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)];
 
@@ -74,7 +74,7 @@ impl CenteredMoments3 {
     }
 
     /// Rigid-frame transformation of the sufficient moments: R M2 R^T.
-    /// This is an unwired math interface, not a runtime correction path.
+    /// Reprojection of captured samples is owned by the runtime correction path.
     /// An exact observed AABB cannot be recovered after rotation from its old
     /// extrema alone, so this deliberately returns no transformed extent.
     pub fn rigid_transform(

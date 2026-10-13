@@ -5,7 +5,7 @@ use crate::native_lio_owner::BodyFromSensorTransform;
 use crate::{
     lcm_runtime::{
         handoff_lio_odometry, handoff_lio_odometry_with_correction,
-        handoff_registered_lio_cloud_fenced, handoff_registered_lio_cloud_replay_with_correction,
+        handoff_admitted_registered_cloud, handoff_registered_lio_cloud_replay_with_correction,
         handoff_registered_lio_cloud_with_correction, GeometryCanonicalCorrectionApplier,
         GeometryRuntimeHandle, PoseState,
     },
@@ -218,6 +218,7 @@ impl AcceptedRegisteredCloud {
     pub(crate) fn source_identity(&self) -> SourceIdentity { SourceIdentity::from_cloud(&self.envelope) }
     pub(crate) fn binding(&self) -> &RegistrationBinding { &self.binding }
     pub(crate) fn map_points(&self) -> &[Point3<f64>] { &self.map_points }
+    pub(crate) fn envelope(&self) -> &LioCloudEnvelope { &self.envelope }
     pub(crate) fn point_step(&self) -> u32 { self.envelope.cloud.point_step as u32 }
     pub(crate) fn adapter_timestamp_ns(&self) -> u64 { self.adapter_timestamp_ns as u64 }
     pub(crate) fn source_timestamp_ns(&self) -> u64 { self.envelope.source_timestamp_ns as u64 }
@@ -3322,20 +3323,7 @@ impl LioIngressSink for CommonLioIngress {
             }
             accepted
         };
-        let committed = handoff_registered_lio_cloud_fenced(
-            &runtime.handle,
-            &accepted.map_points,
-            XYZ_POINT_STEP as u32,
-            u64::try_from(accepted.adapter_timestamp_ns)
-                .map_err(|_| "adapter timestamp is negative".to_string())?,
-            u64::try_from(accepted.envelope.source_timestamp_ns)
-                .map_err(|_| "source timestamp is negative".to_string())?,
-            &accepted.envelope.map_frame_id,
-            accepted.binding().mapping_session_generation,
-            accepted.binding().map_frame_generation,
-            accepted.binding().sensor_origin_map,
-        )
-        .await?;
+        let committed = handoff_admitted_registered_cloud(&runtime.handle, &accepted).await?;
         if !committed {
             return Err("registered LIO cloud handoff committed no map revision".to_string());
         }

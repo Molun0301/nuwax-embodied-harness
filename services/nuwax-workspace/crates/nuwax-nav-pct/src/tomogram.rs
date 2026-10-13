@@ -3,6 +3,7 @@ use crate::cancellation::checkpoint;
 #[cfg(feature = "mls-adapter")]
 use nuwax_nav_mls_planner::SurfaceSnapshot;
 use std::collections::VecDeque;
+use nuwax_types::ground_layer::{GroundApproximation, GroundEvidence, GroundLayer};
 
 /// 一个压缩后的层析单元：同列重复切片只保留一组地面/顶面。
 #[derive(Clone, Debug)]
@@ -12,6 +13,8 @@ pub struct Cell {
     pub ground: f64,
     /// 实测地面带的范围，参考高程不冒充精确接触平面。
     pub ground_interval: [f64; 2],
+    /// Compatibility provenance, not a claim of measured point statistics.
+    pub ground_approximation: GroundApproximation,
     pub ceiling: f64,
     /// 已知障碍的层内距离，不把未采到地面的列直接当成墙。
     pub clearance: f64,
@@ -79,7 +82,7 @@ impl Tomogram {
         checkpoint()?;
         let (resolution, columns) = source.navigation_source_columns(window);
         checkpoint()?;
-        let result = Self::from_columns_with_evidence(
+        let result = Self::from_columns_with_layers(
             resolution,
             f64::from(source.source_voxel_size_m()),
             columns.take_while(|_| !crate::planning_cancelled()).map(|(column, mut bands)| {
@@ -94,6 +97,7 @@ impl Tomogram {
             f64::from(config.max_slope_deg),
             body.map_or(half_width, |body| body.radius()),
             source.ground_evidence()==nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume,
+            |column,bands|source.navigation_measured_ground_layers(column,resolution,bands),
         )?;
         checkpoint()?;
         Ok(result)
@@ -152,6 +156,24 @@ impl Tomogram {
         clearance_radius: f64,
         occupied_volume:bool,
     ) -> Result<Self, String> {
+        Self::from_columns_with_layers(resolution,source_quantum,columns,body_height,half_width,
+            step_up,step_down,max_slope_deg,clearance_radius,occupied_volume,|_,_|None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_columns_with_layers(
+        resolution: f64,
+        source_quantum: f64,
+        columns: impl IntoIterator<Item = ([i32; 2], Vec<[f64; 2]>)>,
+        body_height: f64,
+        half_width: f64,
+        step_up: f64,
+        step_down: f64,
+        max_slope_deg: f64,
+        clearance_radius: f64,
+        occupied_volume:bool,
+        measured_layers: impl Fn([i32;2], &[[f64;2]])->Option<Vec<(GroundLayer,f64)>>,
+    ) -> Result<Self, String> {
         checkpoint()?;
         if !resolution.is_finite()
             || resolution <= 0.0
@@ -200,17 +222,18 @@ impl Tomogram {
                     merged.push(band);
                 }
             }
-            for (i, band) in merged.iter().enumerate() {
+            let layers=measured_layers(column,&merged).unwrap_or_else(|| {
+                merged.iter().enumerate().map(|(i,band)| {
+                    let layer=GroundLayer::from_legacy_band(*band,source_quantum,
+                        if occupied_volume {GroundEvidence::OccupiedVolume}else{GroundEvidence::MeasuredSurface})
+                        .expect("validated height band");
+                    let ceiling=merged.get(i+1).map_or(f64::INFINITY,|next|next[0]);
+                    (layer,ceiling)
+                }).collect()
+            });
+            for (layer,ceiling) in layers {
                 checkpoint()?;
-                // 厚地面带是两种LIO都可能产生的测量厚度。只在地形能力范围内
-                // 使用带内代表高程，避免把每列最高回波都当成离散台阶；真实接触仍由近场判断。
-                let depth = band[1] - band[0];
-                let ground = if !occupied_volume && depth <= 2.0 * step_up.max(step_down) + source_quantum + 1e-6 {
-                    band[1] - (depth - source_quantum).max(0.0) * 0.5
-                } else {
-                    band[1]
-                };
-                let ceiling = merged.get(i + 1).map_or(f64::INFINITY, |next| next[0]);
+                let ground=layer.representative_z;
                 if ceiling - ground + 1e-6 < body_height {
                     continue;
                 }
@@ -219,7 +242,8 @@ impl Tomogram {
                     column,
                     layer: (ground / spacing).floor() as i32,
                     ground,
-                    ground_interval: *band,
+                    ground_interval: layer.occupied_interval,
+                    ground_approximation: layer.approximation,
                     ceiling,
                     clearance: f64::INFINITY,
                     support_clearance: f64::INFINITY,
@@ -689,3 +713,81 @@ mod masked_surface_tests;
 #[cfg(test)]
 #[path = "tomogram_connect_tests.rs"]
 mod connect_trial_tests;
+
+#[cfg(test)]
+mod shared_ground_tests {
+    use super::*;
+
+    #[test]
+    fn pct_uses_shared_layer_geometry_for_legacy_and_volume_columns() {
+        for occupied in [false,true] {
+            for step in [0.0,0.15,0.5] {
+                let evidence=if occupied {GroundEvidence::OccupiedVolume}else{GroundEvidence::MeasuredSurface};
+                let bands=vec![[-0.15,0.0],[0.85,1.0]];
+                let map=Tomogram::from_columns_with_evidence(0.05,0.05,
+                    [([0,0],bands.clone())],0.3,0.0,step,step,20.0,0.0,occupied).unwrap();
+                assert_eq!(map.cells.len(),2);
+                for (cell,band) in map.cells.iter().zip(bands) {
+                    let shared=GroundLayer::from_legacy_band(band,0.05,evidence).unwrap();
+                    assert_eq!(cell.ground,shared.representative_z);
+                    assert_eq!(cell.ground_interval,shared.occupied_interval);
+                    assert_eq!(cell.ground_approximation,shared.approximation);
+                }
+                assert_eq!(map.cells[0].ceiling,0.85);
+                assert!(map.cells[0].neighbors.is_empty());
+            }
+        }
+    }
+}
+
+#[cfg(all(test,feature="mls-adapter"))]
+mod measured_layer_adapter_tests {
+    use super::*;
+    use std::{collections::BTreeMap,sync::Arc};
+    use nuwax_nav_mls_planner::{mls_planner::Config,SurfaceObservation,SurfaceObservations};
+    use nuwax_nav_mls_planner::surface::SurfaceBodyEnvelope;
+    use nuwax_map_chunks::{block_key,local_key,LayerObservation,LayerSample,LayerObservations};
+
+    #[test]
+    fn pct_and_body_share_measured_plane_and_preserve_legacy_fallback() {
+        let fine=0.05_f32;let quantum=f64::from(fine);let plane=-0.025;
+        let points:Vec<_>=(-12..12).flat_map(|x|(-12..12).map(move|y|
+            ((x as f32+0.5)*fine,(y as f32+0.5)*fine,-0.025))).collect();
+        let cfg=Config {world_frame:"map".into(),voxel_size:0.1,robot_height:0.2,
+            surface_closing_radius:0.0,node_spacing_m:0.3,wall_clearance_m:0.0,wall_buffer_m:0.0,
+            wall_buffer_weight:0.0,max_slope_deg:20.0,step_threshold_m:0.1,
+            min_step_tread_depth_m:0.2,step_penalty_weight:1.0,goal_tolerance:0.1,viz_publish_hz:0.0};
+        let model=SurfaceBodyEnvelope{footprint_xy_m:vec![[-0.15,-0.1],[0.15,-0.1],[0.15,0.1],[-0.15,0.1]],
+            z_bounds_m:[-0.1,0.1],body_to_support_z_m:0.3,max_step_up_m:0.1,max_step_down_m:0.1,
+            max_cross_slope_deg:20.0,support_uncertainty_m:0.0};
+        let source=SurfaceSnapshot::from_points(&points,cfg,fine).unwrap().with_body_envelope(model).unwrap();
+        let mut occupancy=BTreeMap::<_,BTreeMap<_,_>>::new();
+        let mut layers=BTreeMap::<_,LayerObservations>::new();
+        for x in -12..12 {for y in -12..12 {
+            let key=[x,y,-1];let block=block_key(key);let local=local_key(key);
+            occupancy.entry(block).or_default().insert(key,SurfaceObservation{observed_ns:100,hits:1});
+            let point=[(f64::from(x)+0.5)*quantum,(f64::from(y)+0.5)*quantum,plane];
+            layers.entry(block).or_default().insert(local,LayerObservation{members:vec![local],
+                normal:[0.0,0.0,1.0],plane_origin:point,
+                samples:vec![LayerSample{point,source_sequence:1,source_timestamp_ns:100,point_index:u32::from(local)}]});
+        }}
+        let mut observations=SurfaceObservations::new(fine,32).unwrap();
+        for (key,values) in occupancy {observations.replace_block(key,values).unwrap();}
+        observations.mark_complete_geometry_source();
+        let legacy=source.with_observations(Some(Arc::new(observations.clone())));
+        let old=Tomogram::from_surface(&legacy).unwrap();
+        assert!(old.cells.iter().all(|c|c.ground_approximation==GroundApproximation::LegacyContactInterval));
+        for (key,records) in layers {observations.replace_ground_layers(key,Arc::new(records)).unwrap();}
+        observations.mark_complete_geometry_source();
+        let measured=source.with_observations(Some(Arc::new(observations)));
+        let pct=Tomogram::from_surface(&measured).unwrap();
+        assert!(pct.cells.iter().all(|c|c.ground==plane&&c.ground_approximation==GroundApproximation::ObservedLayer));
+        let body=measured.body_pose_on_surface([0.025,0.025],0.0,[0.025,0.025,0.0]).unwrap();
+        assert!((body.0[2]-0.3-plane).abs()<1e-9,"PCT and body must use the same source plane: {body:?}");
+        measured.validate_body_pose(body.0,body.1).unwrap();
+        let mut mask=vec![false;40*40];mask[20*40+20]=true;
+        let forbidden=measured.with_virtual_obstacles([-1.0,-1.0],0.05,40,40,&mask).unwrap();
+        let masked=Tomogram::from_surface(&forbidden).unwrap();
+        assert!(!masked.columns.contains_key(&[0,0]),"measured metadata cannot resurrect forbidden columns");
+    }
+}

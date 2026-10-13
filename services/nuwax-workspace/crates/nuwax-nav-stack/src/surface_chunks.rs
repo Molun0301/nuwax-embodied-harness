@@ -44,6 +44,9 @@ impl FineMapReader {
         for key in old.keys().filter(|key| !new.contains_key(*key)) {
             changed.extend(grid.replace_block_with_geometry_changes(*key, BTreeMap::new())
                 .map_err(|e| e.to_string())?);
+            // Removing the final occupied block also retires its measured layers.
+            changed.extend(grid.replace_ground_layers(*key, Arc::new(BTreeMap::new()))
+                .map_err(|e| e.to_string())?);
         }
         for reference in &root.blocks {
             if old.get(&reference.key).is_some_and(|old| old.block_revision == reference.block_revision) { continue; }
@@ -56,8 +59,13 @@ impl FineMapReader {
             }
             changed.extend(grid.replace_block_with_geometry_changes(reference.key, values)
                 .map_err(|e| e.to_string())?);
+            // BL2 layers use the same verified object and decode cache. BL1 returns
+            // an empty set, preserving honest geometric compatibility for old maps.
+            let layers = self.receiver.layers(reference)?;
+            changed.extend(grid.replace_ground_layers(reference.key, layers)
+                .map_err(|e| e.to_string())?);
         }
-        grid.set_source_timestamp_ns(root.source_timestamp_ns);
+
         // 同一提交根的全部块已经读取并验证，缺少占据块不等于缺少已提交的几何源。
         grid.mark_complete_geometry_source();
         changed.sort_unstable();
@@ -264,6 +272,7 @@ mod tests {
     use super::*;
     use nuwax_map_chunks::*;
     use std::collections::{BTreeMap, BTreeSet};
+    include!("surface_layer_transfer_tests.rs");
 
     // Fresh-root compatibility for existing doorway diagnostic recipes.
     #[allow(dead_code)]

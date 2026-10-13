@@ -15,6 +15,9 @@ struct Inputs {
     path: Option<Arc<Route>>,
     map: Option<ExecutionMap>,
     map_version: u64,
+    map_pending: bool,
+    terrain_generation: u64,
+    result_terrain_generation: u64,
     pose: Option<PoseStamped>,
     pose_version: u64,
     requested: Option<f64>,
@@ -34,6 +37,19 @@ struct Inputs {
     closed: bool,
     lifecycle_stop: bool,
     lifecycle_update: bool,
+}
+
+// A soft view update may request an actual final-trajectory recheck. This is
+// never permission to reuse the old collision result or cross an Unknown gap.
+fn recheckable_surface_update(previous:Option<&ExecutionMap>,next:&ExecutionMap)->bool {
+    let Some(previous)=previous else {return false;};
+    let previous=match previous {ExecutionMap::Surface(map)=>map,
+        ExecutionMap::SurfaceUpdate(update)=>&update.snapshot,_=>return false};
+    let ExecutionMap::SurfaceUpdate(update)=next else {return false;};
+    matches!(update.changes.as_ref(),surface_changes::SurfaceGeometryChanges::Empty)
+        && update.change_basis.as_ref().is_some_and(|basis|nuwax_nav_pct::same_source_geometry(previous,basis))
+        && nuwax_nav_pct::same_source_geometry(previous,&update.snapshot)
+        && surface_changes::same_query_semantics(previous,&update.snapshot)
 }
 
 // Only timestamps may advance without changing pose-derived authority. Preserve
@@ -107,7 +123,9 @@ impl PlannerWorker {
                         boundary_seq,
                         path,
                         map,
-                        map_seq,
+                        mut map_seq,
+                        terrain_seq,
+                        replay,
                         pose,
                         pose_seq,
                         width,
@@ -133,6 +151,17 @@ impl PlannerWorker {
                             continue;
                         }
                         input.lifecycle_update=false;
+                        input.map_pending=false;
+                        let replay=input.result.as_ref().and_then(|(started,step)| {
+                            let PlannerStep::Command(command)=step else {return None;};
+                            (*command!=Twist2::ZERO && started.elapsed()<=DEFAULT_CONTROL_HORIZON
+                                && input.result_map_version!=input.map_version
+                                && input.result_terrain_generation==input.terrain_generation
+                                && input.result_pose_version==input.pose_version
+                                && input.result_applied_version==input.applied_version
+                                && input.result_boundary_version==input.boundary_version)
+                                .then_some((*started,*command))
+                        });
                         (
                             input.epoch,
                             input.goal_id.clone(),
@@ -144,6 +173,8 @@ impl PlannerWorker {
                             input.path.clone(),
                             input.map.clone(),
                             input.map_version,
+                            input.terrain_generation,
+                            replay,
                             input.pose.clone(),
                             input.pose_version,
                             input.requested.take(),
@@ -151,7 +182,8 @@ impl PlannerWorker {
                             input.applied_version,
                         )
                     };
-                    let started = std::time::Instant::now();
+                    let mut started = replay.map_or_else(std::time::Instant::now,|(started,_)|started);
+                    let mut rechecked=false;
                     #[cfg(test)] let compute_trace=width.map(|_| {
                         result_id=result_id.checked_add(1).expect("test worker result ID exhausted");
                         crate::command_proof_trace::ComputeScope::begin(crate::command_proof_trace::ComputeInputTrace {
@@ -165,7 +197,7 @@ impl PlannerWorker {
                     });
                     let span=tracing::info_span!("navigation.local",goal_id=%goal_id);
                     let _entered=span.enter();
-                    let computed = (|| -> Result<PlannerStep, RuntimeError> {
+                    let mut computed = (|| -> Result<PlannerStep, RuntimeError> {
                         if goal_seq != goal_version {
                             planner.stop();
                             if let Some((goal, options)) = &goal {
@@ -202,9 +234,40 @@ impl PlannerWorker {
                             path_version = path_seq;
                         }
                         planner.observe_applied_command(applied);
+                        if let Some((_,command))=replay {
+                            if let Some(result)=planner.revalidate_selected_command(command) {
+                                rechecked=true;return Ok(result);
+                            }
+                            // Unsupported planners retain their ordinary full-compute semantics.
+                            started=std::time::Instant::now();
+                        }
                         Ok(width.map_or(PlannerStep::Pending(Vec::new()),|width|planner.step(width)))
                     })()
                     .unwrap_or_else(|error| PlannerStep::ReplanRequired(error.to_string()));
+                    // Sources can refresh while candidate ranking is running. Recheck only
+                    // that final command against the latest view, outside the input lock.
+                    // Any semantic/terrain gap or original deadline still retires it.
+                    while matches!(computed,PlannerStep::Command(v) if v!=Twist2::ZERO)
+                        && started.elapsed()<=DEFAULT_CONTROL_HORIZON {
+                        let latest={
+                            let mut input=lock.lock().unwrap();
+                            if input.epoch==version && input.applied_version==applied_seq
+                                && input.pose_version==pose_seq
+                                && input.boundary_version==boundary_seq && !input.closed
+                                && input.terrain_generation==terrain_seq && input.map_version!=map_seq {
+                                input.map_pending=false;
+                                input.map.clone().map(|map|(input.map_version,map))
+                            } else {None}
+                        };
+                        let Some((sequence,map))=latest else {break;};
+                        if let Err(error)=planner.update_execution_map(map) {
+                            computed=PlannerStep::ReplanRequired(error.to_string());break;
+                        }
+                        map_version=sequence;
+                        let PlannerStep::Command(command)=computed else {unreachable!()};
+                        let Some(checked)=planner.revalidate_selected_command(command) else {break;};
+                        computed=checked;map_seq=sequence;rechecked=true;
+                    }
                     #[cfg(test)] let computed_proof=compute_trace.and_then(|trace|trace.finish(&computed));
                     // Consume metadata with this exact completed computation, even
                     // when the outcome cannot issue a nonzero command.
@@ -229,6 +292,7 @@ impl PlannerWorker {
                         && input.applied_version == applied_seq
                         && input.map_version == map_seq
                         && input.boundary_version == boundary_seq
+                        && (!rechecked || input.pose_version == pose_seq)
                         && (!matches!(computed, PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
                             || input.pose_version == pose_seq)
                         && !input.closed;
@@ -245,6 +309,10 @@ impl PlannerWorker {
                         input.result_pose_version = pose_seq;
                         input.result_applied_version = applied_seq;
                         input.result_map_version = map_seq;
+                        input.result_terrain_generation=terrain_seq;
+                        if rechecked && input.pose_version==pose_seq {
+                            input.requested=None;input.lifecycle_update=false;
+                        }
                         input.result_boundary_version = boundary_seq;
                         input.result_wait_reason = wait_reason;
                         input.display_path = display_path;
@@ -349,7 +417,23 @@ impl NavPlanner for PlannerWorker {
     fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
         self.delivered_dispatch_bound=None;
         let mut input = self.shared.0.lock().unwrap();
+        if !recheckable_surface_update(input.map.as_ref(),&map) {
+            input.terrain_generation+=1;
+        }
+        let map = match (input.map_pending, input.map.as_ref(), map) {
+            (true, Some(ExecutionMap::SurfaceUpdate(previous)), ExecutionMap::SurfaceUpdate(next)) => {
+                let mut merged=previous.clone();merged.append(next);ExecutionMap::SurfaceUpdate(merged)
+            }
+            // A skipped legacy snapshot provides no complete delta across the gap.
+            (true, Some(ExecutionMap::Surface(_)), ExecutionMap::SurfaceUpdate(mut next)) => {
+                next.change_basis=None;
+                next.changes=Arc::new(surface_changes::SurfaceGeometryChanges::Unknown);
+                ExecutionMap::SurfaceUpdate(next)
+            }
+            (_, _, map) => map,
+        };
         input.map = Some(map);
+        input.map_pending = true;
         input.map_version += 1;
         input.display_path.clear();
         input.result_wait_reason = None;
@@ -514,11 +598,35 @@ impl Drop for PlannerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("worker_recent_recheck_tests.rs");
     use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
     use nuwax_nav_types_messages::{
         GoalOptions, MotionKinematics, MotionModel, NavFrameId, Path3D, Point3, Pose3,
         Quaternion, Timestamp,
     };
+
+    #[test]
+    fn selective_worker_coalesces_undelivered_related_and_far_columns() {
+        use crate::surface_changes::{SurfaceGeometryChanges,SurfaceMapUpdate};
+        let mut harness=RouteWorkerHarness::new(true);
+        let _=harness.worker.step(0.3);
+        let _=harness.next_computation(); // Owner is now held after a real guarded step.
+        let source=harness.clear.clone();
+        for columns in [vec![[10,10]],vec![[100,100]],vec![[110,100]]] {
+            harness.worker.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
+                snapshot:source.clone(),change_basis:Some(source.clone()),
+                changes:Arc::new(SurfaceGeometryChanges::Columns {fine_size:source.source_voxel_size_m(),
+                    fine:columns,planner_size:source.config().voxel_size,coarse:vec![]}),
+            })).unwrap();
+        }
+        let input=harness.worker.shared.0.lock().unwrap();
+        let Some(ExecutionMap::SurfaceUpdate(update))=&input.map else {panic!("missing delta publication");};
+        let SurfaceGeometryChanges::Columns {fine,..}=update.changes.as_ref() else {panic!("lost complete differences");};
+        assert_eq!(fine,&vec![[10,10],[100,100],[110,100]]);
+        assert!(input.map_pending);
+        drop(input);
+        harness.release.send(()).unwrap();
+    }
 
     struct RouteComputation {
         outcome: PlannerStep,
@@ -569,7 +677,7 @@ mod tests {
         fn update_costmap(&mut self, map: CostMap2D) { self.inner.update_costmap(map); }
         fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
             self.inner.update_execution_map(map.clone())?;
-            self.map = match map { ExecutionMap::Surface(map) => Some(map), _ => None };
+            self.map = match map { ExecutionMap::Surface(map) | ExecutionMap::SurfaceUpdate(surface_changes::SurfaceMapUpdate {snapshot:map,..}) => Some(map), _ => None };
             Ok(())
         }
         fn invalidate_execution_map(&mut self) {
@@ -1719,8 +1827,9 @@ mod tests {
             SurfaceObservation{observed_ns:if x>=7{sampled.saturating_sub(2_000_000_000)}else{sampled},hits:2});}
         let mut observations=SurfaceObservations::new(source.source_voxel_size_m(),32).unwrap();
         for (key,block) in blocks{observations.replace_block(key,block).unwrap();}
-        observations.set_source_timestamp_ns(sampled);observations.mark_complete_geometry_source();
-        let source=Arc::new(source.with_observations(Some(Arc::new(observations))));
+        observations.mark_complete_geometry_source();
+        let source=Arc::new(source.with_observations(Some(Arc::new(observations)))
+            .with_recent_obstacle_points(1,sampled,0,&[],[(0,[0.75,1.0,0.5])]).unwrap());
         let mut config=SurfaceFollowerConfig::new(0.4);config.local_planning_enabled=false;
         config.controller.control_frequency=20.0;config.controller.speed=0.5;
         config.motion_limits=Some(limits.clone());config.max_observation_age_sec=Some(1.0);
@@ -1730,9 +1839,9 @@ mod tests {
             inner:RouteFollower::new(config).unwrap(),computed,release:wait,map:None,boundary:Vec::new(),
             odometry:None,goal_updates:0,path_updates:0}).unwrap(),computed:receive,release,clear:source.clone()};
         let start=stamped(0.533);let goal=stamped(2.0);
-        let initial_occupied=source.body_observation_footprint(([0.533,1.0,0.5],[0.0,0.0,0.0,1.0])).unwrap();
-        eprintln!("REPLAY initial_occupied_max_x={:?} source_resolution={}",initial_occupied.iter().map(|p|p[0]).max(),source.source_voxel_size_m());
-        assert!(initial_occupied.iter().all(|p|p[0]<7),"stale strip must lie outside initial footprint exemption");
+        source.validate_body_pose([0.533,1.0,0.5],[0.0,0.0,0.0,1.0]).unwrap();
+        assert!(source.validate_body_pose([0.56,1.0,0.5],[0.0,0.0,0.0,1.0]).is_err(),
+            "real forward obstacle must separate initial clearance from unsafe continued travel");
         let previous=Twist2{linear:Point2::new(initial_speed,0.0),angular_z:0.0};
         harness.worker.update_execution_map(ExecutionMap::Surface(source.clone())).unwrap();
         harness.worker.configure_goal(&goal,GoalOptions::default()).unwrap();
@@ -1751,7 +1860,7 @@ mod tests {
         harness.worker.update_odometry(current.clone());harness.worker.observe_applied_command(first);
         let latest=harness.next_computation(); // hold the new guard outcome before publication
         let replay=harness.worker.step(0.3);
-        let receipt_ns=unix_ns();let remaining=first_deadline.saturating_duration_since(std::time::Instant::now());
+        let remaining=first_deadline.saturating_duration_since(std::time::Instant::now());
         eprintln!("REPLAY before={previous:?} initial={first:?} fresh_computed={:?} delivered={replay:?} x={} remaining_ms={}",latest.outcome,current.pose.position.x,remaining.as_secs_f64()*1000.0);
         assert!(remaining>Duration::from_millis(50),"fresh 50ms oracle must fit inside the selected original remaining lease");
         let command=match replay {
@@ -1766,12 +1875,11 @@ mod tests {
         let body=|p:PlanarPose|([p.x,p.y,0.5],[0.0,0.0,0.0,1.0]);
         let view=source.with_current_body_support(body(pose).0,body(pose).1).unwrap();
         assert!(view.same_body_query_view(&source),"flat source must need no different current-body permission");
-        let occupied=view.body_observation_footprint(body(pose)).unwrap();
         let failure=std::cell::RefCell::new(None);
-        let check=|a:PlanarPose,b:PlanarPose,elapsed:f64| {
+        let check=|a:PlanarPose,b:PlanarPose,_elapsed:f64| {
             let projected=view.body_pose_after_motion(body(a),[b.x,b.y],b.yaw).unwrap();
             assert!((projected.0[2]-0.5).abs()<1e-9,"oracle/source projection must agree");
-            match view.validate_observed_body_motion_in_boundary(body(a),projected,&occupied,receipt_ns+(elapsed*1e9)as u64,1_000_000_000,&[]) {
+            match view.validate_body_motion(body(a),projected,&[]) {
                 Ok(())=>true,Err(e)=>{if failure.borrow().is_none(){*failure.borrow_mut()=Some(e.to_string());}false}
             }
         };

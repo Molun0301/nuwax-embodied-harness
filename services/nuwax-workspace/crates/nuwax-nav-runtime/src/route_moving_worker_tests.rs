@@ -34,7 +34,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 const PERIOD: Duration = Duration::from_millis(50);
 const SENSOR_PERIOD: Duration = Duration::from_millis(200);
 const WIDTH: f64 = 0.3;
-const OBS_AGE: f64 = 1.0; // explicit synthetic terrain capability, never extended
+const OBS_AGE: f64 = 1.0; // explicit live sensor health age, not ground expiry
 const MAX_TICKS: usize = 1_200;
 // The compute owner can finish a little more work than consumer tick count.
 // Standard runs retain MAX_TICKS + 16 samples; existing 120s runs retain
@@ -145,7 +145,7 @@ impl Sensor {
                 for (key,block) in blocks {observations.replace_block(key,block).unwrap();}
                 let replace_ns=replacement.elapsed().as_nanos() as u64;
                 let snapshot=Instant::now();
-                observations.set_source_timestamp_ns(sample_ns);observations.mark_complete_geometry_source();
+                observations.mark_complete_geometry_source();
                 // Clone the previous persistent observation roots before replacing
                 // blocks: same occupied columns retain their actual identity.
                 let map=Arc::new(base.with_observations(Some(Arc::new(observations.clone()))));
@@ -259,7 +259,7 @@ impl NavPlanner for Measured {
         // caches. Its temporary upgrade is dropped before the inner update;
         // if the source is already gone, conservatively mark a new view.
         let (source,changed,sample_ns)=match &m {
-            ExecutionMap::Surface(next)=>{
+            ExecutionMap::Surface(next) | ExecutionMap::SurfaceUpdate(crate::surface_changes::SurfaceMapUpdate {snapshot:next,..})=>{
                 let changed=self.source.as_ref().and_then(Weak::upgrade)
                     .is_none_or(|old|!old.same_body_query_view(next));
                 // All fixture observations share the actual frame timestamp.
@@ -359,12 +359,15 @@ struct RawReceipt {tick:usize,map:Arc<SurfaceSnapshot>,boundary:Arc<Vec<[f64;2]>
     source_sample_ns:u64,source_sequence:u16,pose_stamp_ns:i64,worker_result_age_ms:f64,worker_remaining_ms:f64,
     receipt_pose:crate::command_proof_trace::PoseTrace,proof_context:Option<crate::command_proof_trace::DeliveredCommandContext>}
 struct RawSegment {map:Arc<SurfaceSnapshot>,boundary:Arc<Vec<[f64;2]>>,from:PlanarPose,to:PlanarPose,ns:u64,dt:f64}
-// Diagnostic replay only: the actual receipt oracle below remains unchanged.
+fn source_healthy_at(sample_ns:u64,checked_ns:u64)->bool {
+    sample_ns!=0 && checked_ns.checked_sub(sample_ns).is_some_and(|age|age<=(OBS_AGE*1e9)as u64)
+}
+// Acquisition health is checked at receipt, separately from every geometric
+// sample of the complete stopping trajectory. Ground has no expiry lease.
 fn receipt_oracle_at(r:&RawReceipt,resolution:f32,anchor_ns:u64)->bool {
-    let Ok(occupied)=r.map.body_observation_footprint(body(r.pose)) else{return false;};
-    let make_check=|| |a:PlanarPose,b:PlanarPose,elapsed:f64| {
-        r.map.validate_observed_body_motion_in_boundary(body(a),body(b),&occupied,
-            anchor_ns+(elapsed*1e9)as u64,(OBS_AGE*1e9)as u64,&r.boundary)
+    if !source_healthy_at(r.source_sample_ns,anchor_ns) {return false;}
+    let make_check=|| |a:PlanarPose,b:PlanarPose,_elapsed:f64| {
+        r.map.validate_body_motion(body(a),body(b),&r.boundary)
             .and_then(|_|r.map.body_query_with_current_support(body(a).0,body(a).1)
                 .and_then(|view|view.validate_body_motion(body(a),body(b),&r.boundary))).is_ok()
     };
@@ -765,7 +768,8 @@ fn run_with_source_layout(enabled:bool,resolution:f32,scenario:Scenario,factory:
         let receipt_at=Instant::now();
         // Local receipt admission uses the exact result's original bound. Keep
         // the later unchanged receipt oracle to expose any remaining time gap.
-        let dispatch_expired=dispatch_bound.is_some_and(CommandDispatchBound::expired_now);
+        let source_bound=CommandDispatchBound::from_source_timestamp(installed_sample_ns,Duration::from_secs_f64(OBS_AGE));
+        let dispatch_expired=dispatch_bound.is_some_and(CommandDispatchBound::expired_now)||source_bound.expired_now();
         if dispatch_expired {consumer_waits.dispatch_expired_at_receipt+=1;}
         // Original worker result expiry is captured under its selection lock.
         // Replaying the same candidate never renews its permission horizon.
@@ -784,8 +788,9 @@ fn run_with_source_layout(enabled:bool,resolution:f32,scenario:Scenario,factory:
                 worker.stop();Twist2::ZERO
             },_=>Twist2::ZERO,
         };
-        // First acquisition has one hit, never fabricate independent evidence.
-        if nonzero(command){assert!(sequence>=2);}
+        // One actual acquisition is sufficient geometry; live stream health
+        // must come from its real sample time, never a per-cell hit quorum.
+        if nonzero(command){assert!(sequence>=1);assert!(source_healthy_at(installed_sample_ns,unix_ns()));}
         if changed&&matches!(scenario,Scenario::ReplaceGoal|Scenario::ReplaceBoundary|Scenario::ReplaceGeometry|Scenario::Cancel){assert!(!nonzero(command),"stale command after {scenario:?}");}
         command_at=receipt_at;command_deadline=permitted_until;segment_ns=unix_ns();
         if nonzero(command){receipts.push(RawReceipt{tick,map:map.clone(),boundary:boundary.clone(),pose:planar(&current),before,command,ns:segment_ns,source_sample_ns:installed_sample_ns,source_sequence:sequence,pose_stamp_ns:current.stamp.nanos,
@@ -834,24 +839,21 @@ fn run_with_source_layout(enabled:bool,resolution:f32,scenario:Scenario,factory:
     drop(p);drop(sensor);
     report_proof_receipts(&receipts);
     // Run expensive independent oracles after wall-timed control. Retained immutable
-    // snapshots preserve hits, observation source stamp and actual receipt time.
+    // snapshots preserve geometry and the actual source/receipt timestamps.
     for (i,s) in segments.iter().enumerate(){
-        let occupied=s.map.body_observation_footprint(body(s.from)).unwrap();
         s.map.validate_body_motion(body(s.from),body(s.to),&s.boundary).unwrap_or_else(|e|panic!("segment {i} body: {e:?}"));
-        s.map.validate_observed_body_motion_in_boundary(body(s.from),body(s.to),&occupied,s.ns+(s.dt*1e9)as u64,(OBS_AGE*1e9)as u64,&s.boundary).unwrap_or_else(|e|panic!("segment {i} observation: {e:?}"));
     }
     for (i,r) in receipts.iter().enumerate(){
-        let occupied=r.map.body_observation_footprint(body(r.pose)).unwrap();
-        // Diagnostic-only additions: retain the exact prior flat-body oracle,
-        // receipt clock, initial footprint exemption and unchanged age limit.
-        // In particular a production-projected alternative cannot make it pass.
+        assert!(source_healthy_at(r.source_sample_ns,r.ns),"receipt {i} has stale or invalid sensor acquisition");
+        // Retain the independent flat-body and future-view geometric oracle.
+        // Production projection alternatives remain diagnostic only.
         let first_failure=std::cell::RefCell::new(None::<String>);
         let make_check=|kind:&'static str| {
-            let first_failure=&first_failure;let occupied=&occupied;
+            let first_failure=&first_failure;
             move |a:PlanarPose,b:PlanarPose,elapsed:f64| {
                 let checked_ns=r.ns+(elapsed*1e9)as u64;
-                let result=r.map.validate_observed_body_motion_in_boundary(body(a),body(b),occupied,checked_ns,(OBS_AGE*1e9)as u64,&r.boundary)
-                    .map_err(|e|format!("initial-footprint observed sweep: {e:?}"))
+                let result=r.map.validate_body_motion(body(a),body(b),&r.boundary)
+                    .map_err(|e|format!("source geometry sweep: {e:?}"))
                     .and_then(|_|r.map.body_query_with_current_support(body(a).0,body(a).1)
                         .and_then(|view|view.validate_body_motion(body(a),body(b),&r.boundary))
                         .map_err(|e|format!("future-footprint geometry sweep: {e:?}")));
@@ -873,7 +875,6 @@ fn run_with_source_layout(enabled:bool,resolution:f32,scenario:Scenario,factory:
         if choice.is_none() {
             let current_body_result=r.map.validate_body_pose(body(r.pose).0,body(r.pose).1);
             let current_view_same=r.map.with_current_body_support(body(r.pose).0,body(r.pose).1).map(|view|view.same_body_query_view(&r.map));
-            let footprint_evidence:Vec<_>=occupied.iter().take(4).map(|key|(*key,r.map.observations().and_then(|o|o.get(*key)))).collect();
             if let Some(context)=&r.proof_context {
                 let guard=&context.proof.guard;
                 let same_pose=guard.pose.bits==r.receipt_pose.bits && guard.pose.frame_id==r.receipt_pose.frame_id;
@@ -883,8 +884,8 @@ fn run_with_source_layout(enabled:bool,resolution:f32,scenario:Scenario,factory:
                     context.proof.input.result_id,guard.observation_max_age_ns,(OBS_AGE*1e9)as u64);
             }
 
-            eprintln!("BRAKING_ORACLE_FAILURE receipt={i} source_cm={} receipt_ns={} pose_stamp_ns={} source_sample_ns={} source_sequence={} source_age_at_receipt_ms={:.6} worker_result_age_ms={:.6} worker_remaining_ms={:.6} selected_proof_context={:?} receipt_pose_raw={:?} pose={:?} before={:?} command={:?} initial_footprint_cells={} footprint_evidence_first4={footprint_evidence:?} current_body={current_body_result:?} current_view_same={current_view_same:?} first_failure={:?}",
-                resolution*100.0,r.ns,r.pose_stamp_ns,r.source_sample_ns,r.source_sequence,r.ns.saturating_sub(r.source_sample_ns)as f64/1e6,r.worker_result_age_ms,r.worker_remaining_ms,r.proof_context,r.receipt_pose,r.pose,r.before,r.command,occupied.len(),first_failure.borrow());
+            eprintln!("BRAKING_ORACLE_FAILURE receipt={i} source_cm={} receipt_ns={} pose_stamp_ns={} source_sample_ns={} source_sequence={} source_age_at_receipt_ms={:.6} worker_result_age_ms={:.6} worker_remaining_ms={:.6} selected_proof_context={:?} receipt_pose_raw={:?} pose={:?} before={:?} command={:?} current_body={current_body_result:?} current_view_same={current_view_same:?} first_failure={:?}",
+                resolution*100.0,r.ns,r.pose_stamp_ns,r.source_sample_ns,r.source_sequence,r.ns.saturating_sub(r.source_sample_ns)as f64/1e6,r.worker_result_age_ms,r.worker_remaining_ms,r.proof_context,r.receipt_pose,r.pose,r.before,r.command,first_failure.borrow());
         }
         assert!(choice.is_some(),"receipt {i} independent full braking oracle rejected: {:?}",first_failure.into_inner());
     }
@@ -934,11 +935,18 @@ fn moving_5cm_source_positive_and_expired_negative_probe() {
     assert_eq!(second.sequence,2);
     let from=body(PlanarPose{x:0.75,y:1.5,yaw:0.0});
     let to=body(PlanarPose{x:0.95,y:1.5,yaw:0.0});
-    let occupied=second.map.body_observation_footprint(from).unwrap();
-    assert!(first.map.validate_observed_body_motion(from,to,&occupied,unix_ns(),(OBS_AGE*1e9)as u64).is_err(),"one sample must not invent two hits");
-    second.map.validate_observed_body_motion(from,to,&occupied,unix_ns(),(OBS_AGE*1e9)as u64).expect("fresh actual source evidence must permit independent segment");
+    first.map.validate_body_motion(from,to,&[]).expect("one real sample already supplies geometric ground");
+    second.map.validate_body_motion(from,to,&[]).expect("fresh source geometry must permit independent segment");
+    let bound=CommandDispatchBound::from_source_timestamp(second.sample_ns,Duration::from_secs_f64(OBS_AGE));
+    assert!(!bound.expired_now());
+    assert!(source_healthy_at(second.sample_ns,unix_ns()));
+    drop(sensor); // Stop the real producer; never rewrite its captured timestamp.
     std::thread::sleep(Duration::from_secs_f64(OBS_AGE+0.05));
-    assert!(second.map.validate_observed_body_motion(from,to,&occupied,unix_ns(),(OBS_AGE*1e9)as u64).is_err(),"genuinely aged captured source must reject; do not rewrite its timestamps");
+    assert!(bound.expired_now(),"stopped sensor source must lose execution health");
+    assert!(!source_healthy_at(second.sample_ns,unix_ns()));
+    second.map.validate_body_motion(from,to,&[]).expect("old ground geometry itself has no TTL");
+    let blocked=second.map.with_recent_obstacle_points(1,second.sample_ns,0,&[],[(0,[1.025,1.5,0.5])]).unwrap();
+    assert!(blocked.validate_body_motion(from,to,&[]).is_err(),"old ground cannot hide a real occupied obstacle");
 }
 
 
@@ -1215,6 +1223,7 @@ async fn dispatch_real_observed_backends_preserve_bound_to_scheduler() {
         let first=sensor.receive.recv_timeout(Duration::from_secs(2)).unwrap();
         let frame=sensor.receive.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(frame.sequence>=2 && frame.sample_ns>first.sample_ns);
+        let mut source_timestamp_ns=frame.sample_ns;
         let mut worker=match variant {
             0=>planner_worker::PlannerWorker::new(SurfaceFollower::new(config).unwrap()).unwrap(),
             1|2=>production_surface_backend(config).unwrap(),
@@ -1230,7 +1239,10 @@ async fn dispatch_real_observed_backends_preserve_bound_to_scheduler() {
         worker.observe_applied_command(Twist2{linear:nuwax_nav_types_messages::Point2::new(0.3,0.0),angular_z:0.0});
         let deadline=Instant::now()+Duration::from_secs(3);
         let step=loop {
-            if let Ok(frame)=sensor.receive.try_recv() {worker.update_execution_map(ExecutionMap::Surface(frame.map)).unwrap();}
+            if let Ok(frame)=sensor.receive.try_recv() {
+                source_timestamp_ns=frame.sample_ns;
+                worker.update_execution_map(ExecutionMap::Surface(frame.map)).unwrap();
+            }
             match worker.step(WIDTH) {
                 step@PlannerStep::Command(command) if command!=Twist2::ZERO=>break step,
                 PlannerStep::Pending(_)|PlannerStep::Command(_)=>{},
@@ -1239,7 +1251,8 @@ async fn dispatch_real_observed_backends_preserve_bound_to_scheduler() {
             assert!(Instant::now()<deadline,"real backend {variant} did not produce a finite observed command");
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        crate::tests::assert_real_bound_reaches_scheduler(worker,step).await;
+        crate::tests::assert_real_source_bound_reaches_scheduler(
+            worker,step,source_timestamp_ns,Duration::from_secs_f64(OBS_AGE)).await;
     }
 }
 

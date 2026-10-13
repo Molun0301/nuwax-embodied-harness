@@ -1,7 +1,7 @@
 //! Versioned LIO ingress envelopes generated from the repository LCM schemas.
 
 use super::schema::{
-    decode_odometry, decode_point_cloud2, encode_odometry_body, encode_point_cloud2_body, Odometry,
+    decode_odometry, decode_point_cloud2, encode_odometry_body, encode_point_cloud2_body_into, Odometry,
     PointCloud2, ODOMETRY_FINGERPRINT, POINT_CLOUD2_FINGERPRINT,
 };
 use crate::{CodecError, CodecResult};
@@ -208,8 +208,13 @@ pub fn decode_lio_odometry_envelope(encoded: &[u8]) -> CodecResult<LioOdometryEn
 
 /// Encode a complete generated `LioCloudEnvelope` message.
 pub fn encode_lio_cloud_envelope(message: &LioCloudEnvelope) -> CodecResult<Vec<u8>> {
-    validate_cloud(message).map_err(encode_error)?;
     let mut out = Vec::new();
+    encode_lio_cloud_envelope_into(message, &mut out)?;
+    Ok(out)
+}
+
+pub(super) fn encode_lio_cloud_envelope_into(message: &LioCloudEnvelope, out: &mut Vec<u8>) -> CodecResult<()> {
+    validate_cloud(message).map_err(encode_error)?;
     out.extend_from_slice(&LIO_CLOUD_ENVELOPE_FINGERPRINT_V1);
     encode_common_identity(
         message.schema_version,
@@ -217,7 +222,7 @@ pub fn encode_lio_cloud_envelope(message: &LioCloudEnvelope) -> CodecResult<Vec<
         message.runtime_generation,
         message.source_sequence,
         message.source_timestamp_ns,
-        &mut out,
+        out,
     );
     out.extend_from_slice(&message.correlated_odometry_source_sequence.to_be_bytes());
     out.extend_from_slice(
@@ -225,15 +230,15 @@ pub fn encode_lio_cloud_envelope(message: &LioCloudEnvelope) -> CodecResult<Vec<
             .correlated_odometry_source_timestamp_ns
             .to_be_bytes(),
     );
-    encode_string(&message.sensor_frame_id, &mut out)?;
-    encode_string(&message.body_frame_id, &mut out)?;
-    encode_string(&message.odom_frame_id, &mut out)?;
-    encode_string(&message.map_frame_id, &mut out)?;
+    encode_string(&message.sensor_frame_id, out)?;
+    encode_string(&message.body_frame_id, out)?;
+    encode_string(&message.odom_frame_id, out)?;
+    encode_string(&message.map_frame_id, out)?;
     out.extend_from_slice(&message.registration_state.to_be_bytes());
     out.extend_from_slice(&message.source_point_count.to_be_bytes());
     out.extend_from_slice(&message.emitted_point_count.to_be_bytes());
-    out.extend_from_slice(&encode_point_cloud2_body(&message.cloud)?);
-    Ok(out)
+    encode_point_cloud2_body_into(&message.cloud, out)?;
+    Ok(())
 }
 
 /// Decode and validate a complete generated `LioCloudEnvelope` message.
@@ -403,7 +408,7 @@ fn validate_odometry(message: &LioOdometryEnvelope) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_cloud(message: &LioCloudEnvelope) -> Result<(), String> {
+pub(super) fn validate_cloud(message: &LioCloudEnvelope) -> Result<(), String> {
     validate_common_identity(
         message.schema_version,
         message.backend,

@@ -66,7 +66,20 @@ impl Tomogram {
         penalties: &[crate::RoutePenalty],
     ) -> Result<Route, String> {
         checkpoint(cancelled)?;
-        let result = self.plan_bounded_impl(start, goal, tolerance, boundary, cancelled, radius, penalties);
+        let result = self.plan_bounded_impl(start, goal, tolerance, boundary, cancelled, radius, penalties, &|_, _| true);
+        checkpoint(cancelled)?;
+        result
+    }
+    /// Request-local guide restrictions without rebuilding or mutating the static tomogram.
+    /// The predicate must also accept shortcuts and actual start/end connectors.
+    /// This is reference geometry only; it does not grant executable body clearance.
+    pub fn plan_bounded_with_segment_filter(
+        &self, start: [f64; 3], goal: [f64; 3], tolerance: f64,
+        boundary: &[[f64; 2]], cancelled: Option<&AtomicBool>, radius: Option<f64>,
+        penalties: &[crate::RoutePenalty], accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
+    ) -> Result<Route, String> {
+        checkpoint(cancelled)?;
+        let result = self.plan_bounded_impl(start, goal, tolerance, boundary, cancelled, radius, penalties, accepts);
         checkpoint(cancelled)?;
         result
     }
@@ -88,6 +101,7 @@ impl Tomogram {
         cancelled: Option<&AtomicBool>,
         radius: Option<f64>,
         penalties: &[crate::RoutePenalty],
+        accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
     ) -> Result<Route, String> {
         let began = std::time::Instant::now();
         if !start.into_iter().chain(goal).all(f64::is_finite)
@@ -178,7 +192,8 @@ impl Tomogram {
                 break;
             }
             expanded += 1;
-            if let Some(&endpoint) = ends.get(&id) {
+            if let Some(&endpoint) = ends.get(&id).filter(|&&endpoint|
+                accepts(if id == from { start } else { self.position(id) }, endpoint)) {
                 // 终端代价偏好到达区域内部，避免每次都停在容差球的数值边缘。
                 let total = cost + 2.0 * distance(endpoint, goal);
                 if best.is_none_or(|(_, _, old)| total < old) {
@@ -191,6 +206,7 @@ impl Tomogram {
                 let b = self.position(next);
                 if !crate::segment_inside_boundary([a[0], a[1]], [b[0], b[1]], boundary)
                     || radius.is_some_and(|r| (b[0] - start[0]).hypot(b[1] - start[1]) > r)
+                    || !accepts(if id == from { start } else { a }, b)
                 {
                     continue;
                 }
@@ -248,7 +264,7 @@ impl Tomogram {
             elapsed_ms: 0.0,
             cells: self.cells.len(),
         };
-        let points = self.reduce(points, boundary, penalties, cancelled)?;
+        let points = self.reduce(points, boundary, penalties, cancelled, accepts)?;
         stats.elapsed_ms = began.elapsed().as_secs_f64() * 1000.0;
         Ok(Route { points, stats })
     }
@@ -260,8 +276,9 @@ impl Tomogram {
         boundary: &[[f64; 2]],
         penalties: &[crate::RoutePenalty],
         cancelled: Option<&AtomicBool>,
+        accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
     ) -> Option<f64> {
-        if !crate::segment_inside_boundary([a[0], a[1]], [b[0], b[1]], boundary)
+        if !accepts(a, b) || !crate::segment_inside_boundary([a[0], a[1]], [b[0], b[1]], boundary)
             || !self.segment_clear_cancelled(a, b, boundary, cancelled)
         {
             return None;
@@ -295,6 +312,7 @@ impl Tomogram {
         boundary: &[[f64; 2]],
         penalties: &[crate::RoutePenalty],
         cancelled: Option<&AtomicBool>,
+        accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
     ) -> Result<Vec<[f64; 3]>, String> {
         checkpoint(cancelled)?;
         if points.len() < 3 {
@@ -304,7 +322,7 @@ impl Tomogram {
         for pair in points.windows(2) {
             checkpoint(cancelled)?;
             let cost = self
-                .segment_cost(pair[0], pair[1], boundary, penalties, cancelled)
+                .segment_cost(pair[0], pair[1], boundary, penalties, cancelled, accepts)
                 .unwrap_or_else(|| distance(pair[0], pair[1]));
             prefix.push(prefix.last().unwrap() + cost);
         }
@@ -321,7 +339,7 @@ impl Tomogram {
             for next in (anchor + 2..=far).rev() {
                 checkpoint(cancelled)?;
                 if self
-                    .segment_cost(points[anchor], points[next], boundary, penalties, cancelled)
+                    .segment_cost(points[anchor], points[next], boundary, penalties, cancelled, accepts)
                     .is_some_and(|cost| cost <= (prefix[next] - prefix[anchor]) * 1.1 + 1e-6)
                 {
                     chosen = next;
@@ -352,6 +370,33 @@ mod tests {
         Tomogram::from_columns(0.1, columns, 0.5, 0.15, 0.2, 0.2, 20.0).unwrap()
     }
     #[test]
+    fn request_segment_filter_keeps_static_map_and_survives_reduction() {
+        let map = map(false);
+        let start = [0.05,0.05,0.0]; let goal = [2.05,0.05,0.0];
+        let before: Vec<_> = map.cells.iter().map(|cell|
+            (cell.column,cell.ground,cell.cost,cell.neighbors.clone())).collect();
+        let accepts = |a:[f64;3],b:[f64;3]| {
+            // A finite wall crossing x=.8, including endpoint contact.
+            if a[0].min(b[0])<=0.8 && a[0].max(b[0])>=0.8 {
+                let t = (0.8-a[0])/(b[0]-a[0]);
+                (a[1]+t*(b[1]-a[1])).abs()>0.35
+            } else { true }
+        };
+        let plain = map.plan(start,goal,0.01,&[],None).unwrap();
+        assert!(plain.points.windows(2).any(|p|!accepts(p[0],p[1])));
+        let route = map.plan_bounded_with_segment_filter(start,goal,0.01,&[],None,Some(3.),&[],&accepts).unwrap();
+        assert!(route.points.windows(2).all(|p|accepts(p[0],p[1])));
+        assert!(route.points.iter().any(|p|p[1].abs()>0.35));
+        assert!(map.plan_bounded_with_segment_filter(start,goal,0.01,&[],None,Some(3.),&[],
+            &|a,_|a!=start).is_err(),"actual start connector must obey the overlay");
+        assert!(map.plan_bounded_with_segment_filter(start,goal,0.0,&[],None,Some(3.),&[],
+            &|_,b|b!=goal).is_err(),"actual goal connector must obey the overlay");
+        let after: Vec<_> = map.cells.iter().map(|cell|
+            (cell.column,cell.ground,cell.cost,cell.neighbors.clone())).collect();
+        assert_eq!(before,after);
+        assert_eq!(plain.points,map.plan(start,goal,0.01,&[],None).unwrap().points);
+    }
+    #[test]
     fn epoch_cancellation_interrupts_search_and_reduction_without_changing_the_map() {
         let map = map(false);
         let before: Vec<_> = map.cells.iter().map(|cell|
@@ -363,7 +408,7 @@ mod tests {
         }
         let points: Vec<_> = (0..80).map(|x| [f64::from(x) * 0.1 + 0.05, 0.05, 0.0]).collect();
         let error = crate::cancellation::after_checkpoints(12, ||
-            map.reduce(points, &[], &[], None)).unwrap_err();
+            map.reduce(points, &[], &[], None, &|_, _| true)).unwrap_err();
         assert!(error.contains("取消"));
         let after: Vec<_> = map.cells.iter().map(|cell|
             (cell.column, cell.ground, cell.cost, cell.neighbors.clone())).collect();

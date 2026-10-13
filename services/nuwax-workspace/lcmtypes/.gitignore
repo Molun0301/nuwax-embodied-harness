@@ -68,3 +68,6 @@ generated/python/nuwax_msgs/*
 !generated/python/nuwax_msgs/PersonFollowCommand.py
 !generated/python/nuwax_msgs/PersonFollowTarget.py
 !generated/python/std_msgs/Bool.py
+
+# Independent live observation channel and its generated Python binding.
+!generated/python/nuwax_msgs/RecentCloud3D.py

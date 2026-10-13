@@ -48,6 +48,8 @@ use crate::CodecResult;
 pub mod canonical_measurement;
 /// Versioned LIO ingress envelope codecs.
 pub mod lio;
+/// Independent admitted 3D observation source and exact current ground indices.
+pub mod recent_cloud;
 /// Versioned native-PGO request, result, and owner-status codecs.
 pub mod native_pgo;
 /// Repository-native tracked-person input codec.

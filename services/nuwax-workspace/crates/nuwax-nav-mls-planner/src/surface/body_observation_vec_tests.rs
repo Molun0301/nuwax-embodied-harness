@@ -138,12 +138,15 @@ mod footprint_container_experiment {
         let map=scene(&[],true).with_observations(Some(observation_grid(|cells|{cells.remove(&[4,0,0]);})));
         let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
         let view=map.with_current_body_support(pose.0,pose.1).unwrap();
-        assert!(view.current_body_support.is_some());assert_private_parity(&view,pose);
+        assert!(view.current_body_support.is_none(),"缺测不是碰撞，不应为通过几何检查派生补地视图");
+        assert_private_parity(&view,pose);
+        assert_eq!(view.body_observation_footprint(pose),map.body_observation_footprint(pose));
+        assert!(view.data.physical_graph.surface_lookup.get(&(4,0)).is_none(),"缺测列不能被补成地面");
         assert!(view.observations.as_ref().unwrap().get([4,0,0]).is_none());
     }
 
     #[test]
-    fn vec_complete_geometry_failure_precedes_evidence_and_keeps_success_cache() {
+    fn vec_incomplete_footprint_keeps_success_cache_without_vetoing_geometry() {
         let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
         let map=scene(&[],false).with_observations(Some(observation_grid(|cells|{
             for value in cells.values_mut(){value.observed_ns=1;}
@@ -165,9 +168,9 @@ mod footprint_container_experiment {
         assert_eq!(measured_footprint_block_probe::<false>(&map,pose),Err(SurfaceError::MissingSupport));
         let none=BTreeSet::new();let mut checker=map.observed_body_motion_checker_with_expiry(&none,AGE,&[]);
         #[cfg(feature="body-query-profile")] query_profile::begin();
-        assert_eq!(checker(pose,pose,NOW),Err(SurfaceError::MissingSupport));
+        assert_eq!(checker(pose,pose,NOW),Ok(None),"足迹枚举缺列不等于实际占据碰撞");
         #[cfg(feature="body-query-profile")] {
-            let r=query_profile::end();assert_eq!(r.calls[QueryStage::ObservationFootprint as usize],1);
+            let r=query_profile::end();assert_eq!(r.calls[QueryStage::ObservationFootprint as usize],0);
             assert_eq!(r.calls[QueryStage::ObservationEvidence as usize],0);
         }
         // Failed geometry never replaces the last success, even for an ULP key.
@@ -177,23 +180,35 @@ mod footprint_container_experiment {
     }
 
     #[test]
-    fn vec_difference_keeps_full_xyz_first_error_and_expiry_edges() {
+    fn vec_legacy_age_and_hits_do_not_lease_geometry_or_hide_obstacles() {
         let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);let base=scene(&[],false);
         let good=base.with_observations(Some(observation_grid(|_|{})));
         let cells=measured_footprint_block_probe::<false>(&good,pose).unwrap();let first=*cells.first().unwrap();
         let wrong:BTreeSet<_>=cells.iter().map(|c|[c[0],c[1],c[2]+1]).collect();
         let mut checker=good.observed_body_motion_checker_with_expiry(&wrong,AGE,&[]);
-        assert_eq!(checker(pose,pose,11_000_000_000),Ok(Some(11_000_000_000)));
-        assert_eq!(checker(pose,pose,11_000_000_001),Err(SurfaceError::NearFieldObservation{cell:first,reason:"观察已过期",observed_ns:10_000_000_000,checked_ns:11_000_000_001}));
+        assert_eq!(checker(pose,pose,11_000_000_000),Ok(None));
+        assert_eq!(checker(pose,pose,11_000_000_001),Ok(None));
         let bad=base.with_observations(Some(observation_grid(|values|{let e=values.get_mut(&first).unwrap();e.hits=1;e.observed_ns=11_000_000_000;})));
         let mut checker=bad.observed_body_motion_checker_with_expiry(&wrong,AGE,&[]);
-        assert_eq!(checker(pose,pose,NOW),Err(SurfaceError::NearFieldObservation{cell:first,reason:"独立采样命中不足",observed_ns:11_000_000_000,checked_ns:NOW}));
+        assert_eq!(checker(pose,pose,NOW),Ok(None));
         let mut exempt=bad.observed_body_motion_checker_with_expiry(&cells,AGE,&[]);
         assert_eq!(exempt(pose,pose,12_000_000_000),Ok(None));
         for observed in [u64::MAX-100,u64::MAX-99] {
             let saturated=base.with_observations(Some(observation_grid(|values|{for e in values.values_mut(){e.observed_ns=observed;}})));
             let mut checker=saturated.observed_body_motion_checker_with_expiry(&wrong,100,&[]);
             assert_eq!(checker(pose,pose,u64::MAX),Ok(None));
+        }
+        // Keep the same old ground and low hit count, but add real occupied
+        // geometry. Neither the legacy exemption set nor time can hide it.
+        let blocked=scene(&[(0.05,0.05,0.4)],false).with_observations(Some(observation_grid(|values|{
+            for e in values.values_mut(){e.observed_ns=1;e.hits=0;}
+            values.insert([0,0,4],SurfaceObservation{observed_ns:1,hits:0});
+        })));
+        for occupied in [&wrong,&cells] {
+            let mut checker=blocked.observed_body_motion_checker_with_expiry(occupied,AGE,&[]);
+            for now in [NOW,11_000_000_001,u64::MAX] {
+                assert_eq!(checker(pose,pose,now),Err(SurfaceError::InsufficientClearance));
+            }
         }
     }
 

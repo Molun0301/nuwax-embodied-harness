@@ -4,6 +4,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 pub const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 const CURRENT_MAGIC: &[u8; 8] = b"NUWAXAR2";
+const LAYER_MAGIC: &[u8; 8] = b"NUWAXAR3";
 const LEGACY_MAGIC: &[u8; 8] = b"NUWAXAR1";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,7 +32,7 @@ impl ArchivedRoot {
     }
 }
 
-/// 只写 AR2；逐块流式输出，根已有拥有方身份，无根或归档摘要槽。
+/// 几何写 AR2，层统计写 AR3；逐块流式输出，根已有拥有方身份，无根或归档摘要槽。
 pub fn archive_file(root: &Manifest, repository: &Repository) -> Result<(File, u64), String> {
     let root_bytes = root.encode()?;
     let expected_size = 24 + root_bytes.len() as u64
@@ -39,19 +40,23 @@ pub fn archive_file(root: &Manifest, repository: &Repository) -> Result<(File, u
     if expected_size > MAX_ARCHIVE_BYTES { return Err("精细地图资产超出1吉比字节预算".into()); }
     let mut file = tempfile::tempfile().map_err(|e| e.to_string())?;
     let mut write = |bytes: &[u8]| file.write_all(bytes).map_err(|e| e.to_string());
-    write(CURRENT_MAGIC)?;
+    write(if root.version >= 3 { LAYER_MAGIC } else { CURRENT_MAGIC })?;
     write(&(root_bytes.len() as u64).to_le_bytes())?;
     write(&root_bytes)?;
     write(&(root.blocks.len() as u64).to_le_bytes())?;
+    let mut written_size = 24 + root_bytes.len() as u64;
     for reference in &root.blocks {
         let bytes = repository.read_object(reference.object, MAX_BLOCK_BYTES)?;
-        let block = decode_block(&bytes)?;
+        let (block, _layers) = decode_block_parts(&bytes)?;
+        admit_format(intrinsic_bytes(&bytes, &block), root)?;
         admit_intrinsic(intrinsic(&block), reference.points, root.source_timestamp_ns)?;
+        written_size += 4 + bytes.len() as u64;
+        if written_size > MAX_ARCHIVE_BYTES { return Err("精细地图资产超出1吉比字节预算".into()); }
         write(&(bytes.len() as u32).to_le_bytes())?;
         write(&bytes)?;
     }
     let size = file.stream_position().map_err(|e| e.to_string())?;
-    if size != expected_size { return Err("精细资产编码大小不符".into()); }
+    if size != written_size { return Err("精细资产编码大小不符".into()); }
     file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     Ok((file, size))
 }
@@ -72,7 +77,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         let mut header = [0; 16]; reader.read_exact(&mut header).map_err(|e| e.to_string())?;
         let legacy = match &header[..8] {
-            magic if magic == CURRENT_MAGIC => false,
+            magic if magic == CURRENT_MAGIC || magic == LAYER_MAGIC => false,
             magic if magic == LEGACY_MAGIC => true,
             _ => return Err("精细资产格式未知".into()),
         };
@@ -86,6 +91,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let mut bytes = vec![0; size as usize]; reader.read_exact(&mut bytes).map_err(|e| e.to_string())?;
         let root = if let Some(alias) = alias { ArchivedRoot::Legacy(LegacyRoot::decode(bytes, alias)?) }
             else { ArchivedRoot::Current(Manifest::decode(&bytes)?) };
+        let layered = &header[..8] == LAYER_MAGIC;
+        if matches!(&root, ArchivedRoot::Current(r) if (r.version >= 3) != layered) { return Err("archive/root version mismatch".into()); }
         let mut count = [0; 8]; reader.read_exact(&mut count).map_err(|e| e.to_string())?;
         let objects = root.objects();
         if u64::from_le_bytes(count) != objects.len() as u64 { return Err("精细资产块数与根不符".into()); }
@@ -94,7 +101,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         for (key, object, points) in objects {
             let mut size = [0; 4]; reader.read_exact(&mut size).map_err(|e| e.to_string())?;
             let size = u32::from_le_bytes(size) as usize;
-            if size != 16 + points as usize * 12 || size > MAX_BLOCK_BYTES { return Err("精细资产块长度不符".into()); }
+            if (!layered && size != 16 + points as usize * 12) || size < 16 + points as usize * 12 || size > MAX_BLOCK_BYTES { return Err("精细资产块长度不符".into()); }
             let offset = reader.stream_position().map_err(|e| e.to_string())?;
             if offset.checked_add(size as u64).is_none_or(|end| end > length) { return Err("精细资产块截断".into()); }
             first.entry(object).or_insert(key);
@@ -133,7 +140,12 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 if first_bytes != bytes { return Err("same archive object identity has conflicting bytes".into()); }
             }
         }
-        let block = decode_block(&bytes)?;
+        let (block, layers) = decode_block_parts(&bytes)?;
+        match &self.root {
+            ArchivedRoot::Current(root) => admit_format(intrinsic_bytes(&bytes, &block), root)?,
+            ArchivedRoot::Legacy(_) if !layers.is_empty() => return Err("legacy archive contains observed layer block".into()),
+            _ => {},
+        }
         admit_intrinsic(intrinsic(&block), item.points, self.root.source_timestamp_ns())?;
         self.checked.insert(key);
         Ok((bytes, block))

@@ -32,6 +32,8 @@ mod planner_worker;
 pub mod surface_follower;
 pub use nuwax_nav_mls_planner::SurfaceSnapshot;
 pub use surface_follower::{SurfaceFollower, SurfaceFollowerConfig};
+/// Shared ON/OFF source-change proofs.
+pub mod surface_changes;
 mod route_follower;
 mod planning_owner;
 mod route_planning;
@@ -72,13 +74,15 @@ pub enum ExecutionMap {
     Planar(CostMap2D),
     /// 由同一MLS拥有方生成的不可变表面快照。
     Surface(Arc<SurfaceSnapshot>),
+    /// Immutable surface plus complete differences from its explicit baseline.
+    SurfaceUpdate(surface_changes::SurfaceMapUpdate),
 }
 
 impl std::fmt::Debug for ExecutionMap {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Planar(map) => formatter.debug_tuple("Planar").field(map).finish(),
-            Self::Surface(_) => formatter.write_str("Surface(..)"),
+            Self::Surface(_) | Self::SurfaceUpdate(_) => formatter.write_str("Surface(..)"),
         }
     }
 }
@@ -841,6 +845,9 @@ pub trait NavPlanner: Send + 'static {
     /// Take observation timing metadata belonging only to the immediately returned command.
     /// None means that this result has no finite observation-time dependency.
     fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {None}
+    /// Recheck only the previous selected full stopping trajectory after a soft
+    /// surface-view refresh. None keeps the legacy full-computation behavior.
+    fn revalidate_selected_command(&mut self,_command:Twist2)->Option<PlannerStep> {None}
     /// 传递既有导航会话标识用于计算线程日志，不参与运动准入。
     fn set_goal_log_context(&mut self, _goal_id: &str) {}
     /// 接续局部路线时保留已受理任务边界；无局部重规划的后端可沿原全局路径。
@@ -886,7 +893,7 @@ pub trait NavPlanner: Send + 'static {
                 self.update_costmap(map);
                 Ok(())
             }
-            ExecutionMap::Surface(_) => Err(RuntimeError::InvalidInput {
+            ExecutionMap::Surface(_) | ExecutionMap::SurfaceUpdate(_) => Err(RuntimeError::InvalidInput {
                 field: "execution_map",
                 reason: "当前局部后端不支持三维表面地图".into(),
             }),
@@ -1046,6 +1053,8 @@ pub struct NavScheduler<M, P> {
     path_wait_started_at: Option<Instant>,
     pose_receipt: Option<PlannerInputReceipt>,
     pose_valid_until: Option<Instant>,
+    obstacle_source_available: bool,
+    obstacle_source_bound: Option<CommandDispatchBound>,
     costmap_receipt: Option<PlannerInputReceipt>,
     map_invalidated_at: Option<Instant>,
     operation_sequence: u64,
@@ -1085,6 +1094,8 @@ where
             path_wait_started_at: None,
             pose_receipt: None,
             pose_valid_until: None,
+            obstacle_source_available: true,
+            obstacle_source_bound: None,
             costmap_receipt: None,
             map_invalidated_at: None,
             operation_sequence: 0,
@@ -1271,6 +1282,14 @@ where
             InputKind::UpdateCostmap(observation, received_at) => {
                 self.observe_costmap(status_tx, observation, received_at)
             }
+            InputKind::UpdateObstacleSource(map, available, bound) => (|| {
+                if let Some(map)=map {self.planner.update_execution_map(map)?;}
+                self.obstacle_source_available=available;
+                self.obstacle_source_bound=bound;
+                self.refresh_input_status(Instant::now());
+                self.publish_status(status_tx);
+                Ok(())
+            })(),
             InputKind::PlanningDiagnostic(goal_id, key, message) => {
                 if self.status.phase == SchedulerPhase::AwaitingPath && self.session.as_ref().is_some_and(|session|
                     session.session_id == goal_id && session.execution_identity.goal_key() == key) {
@@ -1339,16 +1358,19 @@ where
                 "地图在来源失效前已经接收，不能迟到恢复旧地图".into(),
             ));
         }
-        validate_source_timestamp(
-            "costmap.source_timestamp_ns",
-            observation.source_timestamp_ns,
-            self.costmap_receipt,
-        )?;
+        // A verified surface mask/statistics update can keep the same source
+        // stamp. Deliver its geometry, but never renew the original receipt.
+        let unchanged_surface_source=matches!(&observation.costmap,ExecutionMap::SurfaceUpdate(_))
+            && self.costmap_receipt.is_some_and(|old|old.source_timestamp_ns==observation.source_timestamp_ns);
+        if !unchanged_surface_source {
+            validate_source_timestamp("costmap.source_timestamp_ns",observation.source_timestamp_ns,self.costmap_receipt)?;
+        }
         self.planner.update_execution_map(observation.costmap)?;
-        self.costmap_receipt = Some(PlannerInputReceipt {
-            source_timestamp_ns: observation.source_timestamp_ns,
-            received_at,
-        });
+        if !unchanged_surface_source {
+            self.costmap_receipt = Some(PlannerInputReceipt {
+                source_timestamp_ns: observation.source_timestamp_ns, received_at,
+            });
+        }
         self.refresh_input_status(Instant::now());
         if self.status.last_terminal.is_none() && self.session.is_none() {
             self.status.message = "fresh occupancy costmap consumed".into();
@@ -1370,6 +1392,8 @@ where
             .pose_receipt
             .is_some_and(|receipt| self.config.pose_ttl.is_zero() || now.duration_since(receipt.received_at) <= self.config.pose_ttl)
             && self.pose_valid_until.is_none_or(|deadline| now < deadline)
+            && self.obstacle_source_available
+            && self.obstacle_source_bound.is_none_or(|bound|!bound.expired_now())
             && self.costmap_receipt.is_some_and(|receipt| {
                 self.config.costmap_ttl.is_zero() || now.duration_since(receipt.received_at) <= self.config.costmap_ttl
             });
@@ -1377,6 +1401,10 @@ where
 
     fn stale_input_reason(&mut self, now: Instant) -> Option<String> {
         self.refresh_input_status(now);
+        if !self.obstacle_source_available {return Some("recent obstacle source revoked".into());}
+        if self.obstacle_source_bound.is_some_and(CommandDispatchBound::expired_now) {
+            return Some("recent obstacle source deadline elapsed".into());
+        }
         let pose_reason =
             stale_receipt_reason("pose", self.pose_receipt, now, self.config.pose_ttl).or_else(
                 || {
@@ -1702,6 +1730,11 @@ where
         &mut self, status_tx:&watch::Sender<SchedulerStatus>, twist:Twist2,
         mut bound:Option<CommandDispatchBound>,
     )->Result<bool,RuntimeError> {
+        if twist!=Twist2::ZERO {
+            if let Some(source)=self.obstacle_source_bound {
+                bound=Some(bound.map_or(source,|candidate|candidate.earliest(source)));
+            }
+        }
         if let Err(error)=validate_twist(twist) {return Err(self.fail_closed(status_tx,error).await);}
         if self.motion.renewal_due_at().is_some_and(|due|Instant::now()>=due) {
             if let Err(error)=self.renew().await {return Err(self.fail_closed(status_tx,error).await);}
@@ -1732,7 +1765,7 @@ where
             self.status.applied_commands=self.status.applied_commands.saturating_add(1);
             self.status.last_applied_twist=Some(applied_twist);
             self.planner.observe_applied_command(applied_twist);
-            self.status.message=if expired {"观察扫掠凭据在下发前已过期，零速已执行，等待重新计算".into()}else{"twist APPLIED".into()};
+            self.status.message=if expired {"执行来源凭据在下发前已过期，零速已执行，等待重新计算".into()}else{"twist APPLIED".into()};
             self.publish_status(status_tx);
             return Ok(!expired);
         }
@@ -2061,6 +2094,13 @@ impl NavSchedulerHandle {
             .await
     }
 
+    /// Refresh only current obstacle evidence and its admitted source deadline.
+    /// Persistent terrain receipts and planning geometry versions are unchanged.
+    pub async fn update_obstacle_source(&self,map:Option<ExecutionMap>,available:bool,
+        bound:Option<CommandDispatchBound>)->Result<(),RuntimeError> {
+        self.send_input(InputKind::UpdateObstacleSource(map,available,bound)).await
+    }
+
     /// 保留实际地图接收时刻，表面构建完成或队列等待不能延长输入有效期。
     pub async fn update_costmap_received(
         &self,
@@ -2240,6 +2280,7 @@ enum InputKind {
     SubmitPath(VersionedPath),
     UpdateOdometry(PoseStamped, Option<Instant>),
     UpdateCostmap(CostmapObservation, Instant),
+    UpdateObstacleSource(Option<ExecutionMap>,bool,Option<CommandDispatchBound>),
     PlanningDiagnostic(String, GoalKey, String),
 }
 
@@ -2496,6 +2537,7 @@ fn path_rejected(reason: impl Into<String>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
+    include!("recent_source_health_tests.rs");
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};

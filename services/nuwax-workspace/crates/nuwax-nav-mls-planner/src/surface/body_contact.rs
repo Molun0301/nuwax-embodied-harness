@@ -76,7 +76,7 @@ mod tests {
         SurfaceSnapshot::from_points(&points,config,0.05).unwrap().with_body_envelope(model).unwrap().with_observations(Some(Arc::new(observations)))
     }
     #[test]
-    fn observed_contact_plane_preserves_real_support_without_granting_floating_holes_or_layers() {
+    fn observed_contact_plane_does_not_turn_missing_support_into_collision() {
         let map=scene(0,true);let q=[0.0,0.0,0.0,1.0];let from=([-0.00001,0.025,0.51],q);let to=([0.00001,0.025,0.51],q);
         let reference=map.support_position_from_body(to.0,q,0.4).unwrap();
         assert!(map.locate_support(reference).is_err(),"中心粗列较低，不代表整个实际接触平面缺失");
@@ -86,11 +86,15 @@ mod tests {
         for(kind,height,label)in [(1,0.51,"平地悬空"),(2,0.51,"实际细列缺测"),(3,0.51,"实际断层"),(4,0.75,"跨层断开"),(5,0.75,"不同楼层"),(6,0.51,"超出原机体高度能力")] {
             let map=scene(kind,true);let p=[to.0[0],to.0[1],height];let reference=map.support_position_from_body(p,q,0.4).unwrap();
             assert!(!map.observed_contact_plane_covers_reference(p,q,reference),"{label}不能靠其它位置高度的min/max通过");
-            assert!(map.validate_body_pose(p,q).is_err(),"{label}最终机体许可也必须拒绝");
+            if kind<=3 {
+                assert_eq!(map.validate_body_pose(p,q),Ok(()),"{label}没有实际占据碰撞，接触证明失败不能否决纯几何查询");
+            } else {
+                assert_eq!(map.validate_body_pose(p,q),Err(SurfaceError::InsufficientClearance),"{label}仍有实际机体碰撞");
+            }
         }
         let partial=scene(0,false);
         assert!(!partial.observed_contact_plane_covers_reference(to.0,q,reference),"未声明完整来源不能补出连续接触证明");
-        assert!(partial.validate_body_pose(to.0,q).is_err());
+        assert_eq!(partial.validate_body_pose(to.0,q),Ok(()),"接触来源不完整本身不是占据障碍");
         let mut wrong=map.observations.as_ref().unwrap().as_ref().clone();wrong.size_m=0.1;
         assert!(!map.with_observations(Some(Arc::new(wrong))).observed_contact_plane_covers_reference(to.0,q,reference),"源精度不一致拒绝");
         let mut mask=vec![false;40*40];mask[20*40+20]=true;

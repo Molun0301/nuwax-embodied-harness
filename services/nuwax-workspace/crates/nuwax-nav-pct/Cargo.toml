@@ -13,7 +13,11 @@ default = ["mls-adapter"]
 mls-adapter = ["dep:nuwax-nav-mls-planner", "dep:nuwax-nav-types-messages", "dep:tracing"]
 
 [dependencies]
+nuwax-types = { path = "../nuwax-types" }
 nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages", optional = true }
 nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner", optional = true }
 ahash = "0.8"
 tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+nuwax-map-chunks = { path = "../nuwax-map-chunks" }

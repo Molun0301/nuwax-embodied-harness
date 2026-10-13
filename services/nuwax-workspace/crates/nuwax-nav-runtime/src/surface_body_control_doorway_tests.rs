@@ -663,7 +663,7 @@ use super::*;
             let max = [convert(block[0] * 32 + 31), convert(block[1] * 32 + 31)];
             for x in min[0]..=max[0] { for y in min[1]..=max[1] { dirty.insert([x, y]); } }
         }
-        observations.set_source_timestamp_ns(1);
+
         observations.mark_complete_geometry_source();
         let mut columns = BTreeMap::<[i32; 2], BTreeMap<i32, [f32; 2]>>::new();
         for key in &keys {
@@ -1248,21 +1248,26 @@ fn translation_advice_fresh_straight_fixture_emits_guarded_nonzero_command() {
 }
 
 #[test]
-fn translation_advice_rejects_expired_observation_only_in_stopping_tail() {
+fn translation_advice_old_ground_keeps_geometry_and_rejects_real_obstacle_in_stopping_tail() {
     use nuwax_nav_mls_planner::surface::SurfaceError;
-    let mut follower = tga_straight(tga_map(false, true), false);
+    let old_ground=tga_map(false,true);
+    let mut follower = tga_straight(old_ground.clone(), false);
     follower.observe_applied_command(tga_speed());
     tga_assert_initial_period_valid(&follower);
     let (safe, why) = tga_prove_command(&follower, tga_speed(), Twist2::ZERO);
-    assert!(!safe, "even immediate stopping must retain the old applied speed");
-    match why {
-        Some(SurfaceError::NearFieldObservation { cell, observed_ns, checked_ns, .. }) => {
-            assert!(cell[0] >= 12, "initial occupied cells must not be the failing evidence");
-            assert_eq!(observed_ns, 1);
-            assert!(checked_ns > observed_ns + 30_000_000_000);
-        }
-        other => panic!("expected typed expiry in future cells, got {other:?}"),
-    }
+    assert!(safe,"old ground remains valid geometry throughout stopping: {why:?}");
+    let result=follower.follow_body_step_policy::<true,true,true,true>(0.3);
+    assert!(matches!(result,PlannerStep::Command(command) if command.linear.x>0.0),"{result:?}");
+    // Keep the same old ground, add one real current obstacle beyond the first
+    // physical period, and require the complete stopping guard to reject it.
+    let blocked=Arc::new(old_ground.with_recent_obstacle_points(1,1,0,&[],[(0,[1.25,0.55,0.4])]).unwrap());
+    let mut follower=tga_straight(old_ground,false);
+    follower.update_execution_map(ExecutionMap::Surface(blocked)).unwrap();
+    follower.observe_applied_command(tga_speed());
+    tga_assert_initial_period_valid(&follower);
+    let (safe,why)=tga_prove_command(&follower,tga_speed(),Twist2::ZERO);
+    assert!(!safe,"even immediate stopping must retain the old applied speed");
+    assert!(matches!(why,Some(SurfaceError::InsufficientClearance)),"real occupied tail must collide: {why:?}");
     let result = follower.follow_body_step_policy::<true,true,true,true>(0.3);
     assert!(matches!(&result, PlannerStep::ReplanRequired(reason) if reason.contains("扫掠拒绝")),
         "the actual policy must reach and fail the final guard: {result:?}");
@@ -1559,7 +1564,7 @@ fn doorway_scene_transforms_preserve_identity_bits_and_source_key_bijections() {
             let max = [convert(block[0] * 32 + 31), convert(block[1] * 32 + 31)];
             for x in min[0]..=max[0] { for y in min[1]..=max[1] { dirty.insert([x, y]); } }
         }
-        observations.set_source_timestamp_ns(1);
+
         observations.mark_complete_geometry_source();
         let mut columns = BTreeMap::<[i32; 2], BTreeMap<i32, [f32; 2]>>::new();
         for key in &keys {
@@ -2349,7 +2354,7 @@ fn cpp_hard_pivot_map() -> Arc<SurfaceSnapshot> {
             for y in min[1]..=max[1] { dirty.insert([x,y]); }
         }
     }
-    observations.set_source_timestamp_ns(1);
+
     observations.mark_complete_geometry_source();
     let mut columns = BTreeMap::<[i32;2], BTreeMap<i32,[f32;2]>>::new();
     for key in &keys {
@@ -2506,10 +2511,12 @@ fn collinear_progress_retains_one_centimetre_needed_to_clear_a_real_pivot_obstac
 #[test]
 fn collinear_progress_retains_current_guard_after_consuming_a_reached_sample() {
     use crate::control_profile::{Counter,Stage};
-    for case in ["fresh", "expired_tail", "boundary_tail", "missing_tail"] {
+    for case in ["fresh", "expired_tail", "obstacle_tail", "boundary_tail", "missing_tail"] {
         let source=tga_map(false,case=="expired_tail");
         let poses=vec![tga_pose(1.0,0.55,0.0),tga_pose(1.01,0.55,0.0),tga_pose(2.0,0.55,0.0)];
         let mut follower=tga_follower(source,poses,false);
+        if case=="obstacle_tail" {follower.update_execution_map(ExecutionMap::Surface(Arc::new(
+            tga_map(false,true).with_recent_obstacle_points(1,1,0,&[],[(0,[1.25,0.55,0.4])]).unwrap()))).unwrap();}
         if case=="missing_tail" {follower.update_execution_map(ExecutionMap::Surface(tga_map(true,false))).unwrap();}
         if case=="boundary_tail" {follower.configure_boundary(&[[0.0,0.0],[1.14,0.0],[1.14,3.5],[0.0,3.5]]);}
         follower.update_odometry(tga_pose(1.0,0.57,0.0));
@@ -2521,7 +2528,7 @@ fn collinear_progress_retains_current_guard_after_consuming_a_reached_sample() {
         assert_eq!(record.calls[Stage::TranslationConnector as usize],0,"{case}: this must exercise the eligible bypass");
         assert_eq!(record.counters[Counter::ConnectionSubsteps as usize],0);
         assert!(record.calls[Stage::CandidateRankingSweeps as usize]>0,"{case}: the current guard must run");
-        if case=="fresh" {
+        if case=="fresh"||case=="expired_tail" {
             let PlannerStep::Command(command)=result else {panic!("{case}: {result:?}")};
             assert!(command.linear.x>0.0);
             let (safe,why)=tga_prove_command(&follower,tga_speed(),command);assert!(safe,"{why:?}");

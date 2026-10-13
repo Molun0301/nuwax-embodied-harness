@@ -11,27 +11,76 @@ pub struct SurfaceObservation {
     pub hits: u16,
 }
 
+/// A measured layer with exact source members and precomputed bounded statistics.
+/// All coordinates and normals are in the snapshot map frame.
+#[derive(Clone, Debug)]
+pub struct ObservedGroundLayer {
+    /// Stable only inside the immutable source: global anchor voxel.
+    pub anchor: [i32; 3],
+    /// Exact inlier occupied levels at the anchor's fine XY column.
+    pub members: Vec<i32>,
+    /// Observed bounded-return statistics, not a calibrated confidence estimate.
+    pub statistics: nuwax_map_chunks::surface_statistics::ObservationStatistics,
+    /// Unit upward map-frame normal.
+    pub normal: [f64; 3],
+    /// Producer-associated local plane origin, distinct from the raw sample mean.
+    pub plane_origin: [f64; 3],
+}
+impl ObservedGroundLayer {
+    /// Query the associated plane without rescanning or refitting its returns.
+    pub fn height_at(&self, xy: [f64; 2]) -> Option<f64> {
+        let mean=self.plane_origin;
+        let z=mean[2]-(self.normal[0]*(xy[0]-mean[0])+self.normal[1]*(xy[1]-mean[1]))/self.normal[2];
+        z.is_finite().then_some(z)
+    }
+    /// The same GroundLayer geometry used by global and body consumers.
+    pub fn ground_at(&self, xy:[f64;2], quantum:f64)->Option<GroundLayer> {
+        let first=*self.members.first()?;let last=*self.members.last()?;
+        let (minimum,maximum)=self.statistics.observed_extent();
+        Some(GroundLayer {
+            occupied_interval:[f64::from(first)*quantum,(f64::from(last)+1.0)*quantum],
+            contact_interval:[minimum[2],maximum[2]],
+            representative_z:self.height_at(xy)?,
+            evidence:GroundEvidence::MeasuredSurface,
+            approximation:GroundApproximation::ObservedLayer,
+        })
+    }
+    fn geometry_eq(&self,other:&Self)->bool {
+        self.anchor==other.anchor && self.members==other.members
+            && self.normal==other.normal && self.plane_origin==other.plane_origin
+    }
+}
+
 /// 按固定空间块共享的精细观察，业务来源身份由外层提交票据约束。
 #[derive(Clone, Debug)]
 pub struct SurfaceObservations {
     pub(super) size_m: f32,
+    #[cfg(test)]
     source_timestamp_ns: u64,
     complete_geometry_source: bool,
     block_edge: i32,
     blocks: im::HashMap<[i32; 3], Arc<AHashMap<[i32; 3], SurfaceObservation>>, ahash::RandomState>,
     // 按XY维护真实占据层号，局部地形查询不扫描整图或所有竖直块。
     columns: im::HashMap<[i32; 2], Arc<Vec<i32>>, ahash::RandomState>,
+    #[cfg(test)]
     obstacle_cache: Arc<std::sync::Mutex<AHashMap<[i32; 3], bool>>>,
+    observed_layers: im::HashMap<[i32;3],Arc<BTreeMap<u16,ObservedGroundLayer>>,ahash::RandomState>,
+    // Identity only changes when a measured plane/member geometry changes.
+    layer_geometry: Arc<()>,
 }
 impl SurfaceObservations {
     pub(super) fn fork_for_planning(&self) -> Self {
         Self {
             size_m: self.size_m,
+            #[cfg(test)]
             source_timestamp_ns: self.source_timestamp_ns,
             complete_geometry_source: self.complete_geometry_source,
             block_edge: self.block_edge,
             blocks: self.blocks.clone(),
             columns: self.columns.clone(),
+            observed_layers: self.observed_layers.clone(),
+            layer_geometry: self.layer_geometry.clone(),
+            #[cfg(test)]
             obstacle_cache: Default::default(),
         }
     }
@@ -43,11 +92,15 @@ impl SurfaceObservations {
         }
         Ok(Self {
             size_m,
+            #[cfg(test)]
             source_timestamp_ns: 0,
             complete_geometry_source: false,
             block_edge,
             blocks: Default::default(),
             columns: Default::default(),
+            observed_layers: Default::default(),
+            layer_geometry: Arc::new(()),
+            #[cfg(test)]
             obstacle_cache: Default::default(),
         })
     }
@@ -112,8 +165,84 @@ impl SurfaceObservations {
         } else {
             self.blocks.insert(block, Arc::new(values.into_iter().collect()));
         }
-        self.obstacle_cache = Default::default();
+        // Removing source members invalidates their layer immediately, even if
+        // this caller is a legacy block-only producer. Retained snapshots keep it.
+        if let Some(old)=self.observed_layers.get(&block).filter(|old|!same_membership
+            && old.values().any(|layer|layer.members.iter().any(|&z|
+                self.get([layer.anchor[0],layer.anchor[1],z]).is_none()))) {
+            let retained:BTreeMap<_,_>=old.iter().filter_map(|(&anchor,layer)| {
+                if layer.members.iter().all(|&z|self.get([layer.anchor[0],layer.anchor[1],z]).is_some()) {
+                    Some((anchor,layer.clone()))
+                } else {changed.push([layer.anchor[0],layer.anchor[1]]);None}
+            }).collect();
+            if retained.len()!=old.len() {
+                if retained.is_empty() {self.observed_layers.remove(&block);}
+                else {self.observed_layers.insert(block,Arc::new(retained));}
+                self.layer_geometry=Arc::new(());
+            }
+        }
+        changed.sort_unstable();changed.dedup();
+        #[cfg(test)] {self.obstacle_cache = Default::default();}
         Ok(changed)
+    }
+
+    /// Replace measured layer records after replacing the corresponding occupancy
+    /// block. Empty records explicitly restore legacy compatibility for that block.
+    /// Returns fine XY columns affected by plane/member changes, including deletion.
+    pub fn replace_ground_layers(&mut self,block:[i32;3],layers:Arc<nuwax_map_chunks::LayerObservations>)
+        ->Result<Vec<[i32;2]>,SurfaceError> {
+        let invalid=||SurfaceError::InvalidConfig("invalid measured ground layer block".into());
+        if !layers.is_empty() && (self.block_edge!=nuwax_map_chunks::BLOCK_SIDE
+            || layers.len()>nuwax_map_chunks::MAX_LAYERS_PER_BLOCK) {return Err(invalid());}
+        let mut converted=BTreeMap::new();let mut claimed=AHashSet::new();
+        for (&anchor,layer) in layers.iter() {
+            if layer.members.is_empty() || layer.members[0]!=anchor
+                || layer.members.len()>nuwax_map_chunks::MAX_LAYER_MEMBERS
+                || layer.samples.is_empty() || layer.samples.len()>nuwax_map_chunks::MAX_LAYER_SAMPLES
+                || layer.members.windows(2).any(|w|w[0]>=w[1]) {return Err(invalid());}
+            let key=nuwax_map_chunks::global_key(block,anchor).map_err(|_|invalid())?;
+            let mut members=Vec::with_capacity(layer.members.len());
+            for &local in &layer.members {
+                let member=nuwax_map_chunks::global_key(block,local).map_err(|_|invalid())?;
+                if member[..2]!=key[..2] || self.get(member).is_none() || !claimed.insert(local) {return Err(invalid());}
+                members.push(member[2]);
+            }
+            // Layer classification, identities and plane validity belong to the
+            // admitted source/codec. Here only cross-block membership is checked.
+            let statistics=layer.statistics().map_err(|_|invalid())?;
+            converted.insert(anchor,ObservedGroundLayer{anchor:key,members,statistics,normal:layer.normal,plane_origin:layer.plane_origin});
+        }
+        let old=self.observed_layers.get(&block);
+        let mut changed=AHashSet::new();
+        if let Some(old)=old {for (&anchor,layer) in old.iter() {
+            if converted.get(&anchor).is_none_or(|new|!layer.geometry_eq(new)) {
+                changed.insert([layer.anchor[0],layer.anchor[1]]);
+            }
+        }}
+        for (&anchor,layer) in &converted {
+            if old.and_then(|old|old.get(&anchor)).is_none_or(|old|!old.geometry_eq(layer)) {
+                changed.insert([layer.anchor[0],layer.anchor[1]]);
+            }
+        }
+        if converted.is_empty() {self.observed_layers.remove(&block);}
+        else {self.observed_layers.insert(block,Arc::new(converted));}
+        if !changed.is_empty() {self.layer_geometry=Arc::new(());self.complete_geometry_source=false;}
+        let mut changed:Vec<_>=changed.into_iter().collect();changed.sort_unstable();Ok(changed)
+    }
+
+    /// Measured layers at exactly one fine XY; uses the existing occupied-column
+    /// index and block-local anchors, never scans the whole map or refits samples.
+    pub fn ground_layers(&self,column:[i32;2])->impl Iterator<Item=&ObservedGroundLayer> {
+        self.columns.get(&column).filter(|_|!self.observed_layers.is_empty())
+            .into_iter().flat_map(|levels|levels.iter()).filter_map(move|&z| {
+            let key=[column[0],column[1],z];
+            self.observed_layers.get(&nuwax_map_chunks::block_key(key))?
+                .get(&nuwax_map_chunks::local_key(key))
+        })
+    }
+
+    pub(super) fn ground_member(&self,key:[i32;3])->bool {
+        self.ground_layers([key[0],key[1]]).any(|layer|layer.members.binary_search(&key[2]).is_ok())
     }
 
     /// 确认本索引覆盖同域、同精度、同次几何提交的全部已知占据。
@@ -132,6 +261,7 @@ impl SurfaceObservations {
         self.size_m.to_bits()==other.size_m.to_bits()
             && self.complete_geometry_source==other.complete_geometry_source
             && self.columns.ptr_eq(&other.columns)
+            && Arc::ptr_eq(&self.layer_geometry,&other.layer_geometry)
     }
     pub(super) fn navigation_columns(&self)->impl Iterator<Item=([i32;2],&[i32])> {
         self.columns.iter().map(|(&key,levels)|(key,levels.as_slice()))
@@ -156,15 +286,17 @@ impl SurfaceObservations {
     }
 
     /// 当前完整提交的源采样；零表示旧输入没有可用的帧身份。
+    #[cfg(test)]
     pub fn set_source_timestamp_ns(&mut self, timestamp_ns: u64) {
         if self.source_timestamp_ns != timestamp_ns {
-            self.obstacle_cache = Default::default();
+            #[cfg(test)] {self.obstacle_cache = Default::default();}
         }
         self.source_timestamp_ns = timestamp_ns;
     }
 
     /// 本帧障碍立即保留；历史碰撞须有重复命中或连片空间证据。
     /// 只影响导航派生判断，不删除原始地图或把未知证据当作自由。
+    #[cfg(test)]
     pub(super) fn supports_obstacle(&self, key: [i32; 3]) -> bool {
         if let Some(value) = self.obstacle_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied() {
             return value;
@@ -176,6 +308,7 @@ impl SurfaceObservations {
         supported
     }
 
+    #[cfg(test)]
     fn check_obstacle_support(&self, key: [i32; 3]) -> bool {
         let Some(value) = self.get(key) else { return false; };
         if self.source_timestamp_ns == 0 || value.observed_ns == 0 || value.hits == 0
@@ -198,12 +331,14 @@ impl SurfaceObservations {
 
 // One borrowed block per lookup scope. Exact evidence stays owned by this immutable
 // observation root; the entry cannot be reused with a different owner and stores no permission.
+#[cfg(test)]
 pub(super) struct ObservationBlockLookup<'a> {
     owner:&'a SurfaceObservations,
     last:Option<([i32;3],Option<&'a AHashMap<[i32;3],SurfaceObservation>>)>,
     #[cfg(any(test,feature="body-query-profile"))]
     roots:u64,
 }
+#[cfg(test)]
 impl<'a> ObservationBlockLookup<'a> {
     pub(super) fn new(owner:&'a SurfaceObservations)->Self{Self{owner,last:None,#[cfg(any(test,feature="body-query-profile"))] roots:0}}
     pub(super) fn get(&mut self,key:[i32;3])->Option<SurfaceObservation> {
@@ -217,7 +352,7 @@ impl<'a> ObservationBlockLookup<'a> {
 }
 
 
-#[cfg(feature="body-query-profile")]
+#[cfg(all(test,feature="body-query-profile"))]
 impl Drop for ObservationBlockLookup<'_> {
     fn drop(&mut self) {
         crate::body_query_profile::add(crate::body_query_profile::Counter::ObservationBlockRootResolutions,self.roots);
@@ -662,7 +797,7 @@ impl SurfaceSnapshot {
             return self.clone();
         }
         Self {
-            ground_evidence:self.ground_evidence,
+            ground_evidence:self.ground_evidence,recent_obstacles:self.recent_obstacles.clone(),
             data: Arc::clone(&self.data),
             observations,
             current_body_support: self.current_body_support.clone(),
@@ -701,5 +836,56 @@ mod snapshot_cache_tests {
         assert!(!Arc::ptr_eq(&observed.body_query_cache, &replacement.body_query_cache),
             "新提交即使数据相等也不能沿用旧观察的许可缓存");
         assert!(!Arc::ptr_eq(&observed.body_query_cache, &observed.with_observations(None).body_query_cache));
+    }
+}
+
+#[cfg(test)]
+mod measured_layer_tests {
+    use super::*;
+    use nuwax_map_chunks::{LayerObservation,LayerObservations,LayerSample};
+
+    fn record(plane:f64,sample:f64,time:u64)->Arc<LayerObservations> {
+        Arc::new(BTreeMap::from([(0,LayerObservation {members:vec![0],normal:[0.0,0.0,1.0],
+            plane_origin:[0.025,0.025,plane],samples:vec![LayerSample {
+                point:[0.025,0.025,sample],source_sequence:1,source_timestamp_ns:time,point_index:0,
+            }],})]))
+    }
+    fn source()->SurfaceObservations {
+        let mut source=SurfaceObservations::new(0.05,32).unwrap();
+        source.replace_block([0,0,0],BTreeMap::from([([0,0,0],SurfaceObservation{observed_ns:100,hits:1})])).unwrap();
+        source.mark_complete_geometry_source();source
+    }
+
+    #[test]
+    fn measured_layer_diffs_ignore_diagnostic_samples_but_preserve_plane_and_deletion() {
+        let mut source=source();
+        assert_eq!(source.replace_ground_layers([0,0,0],record(0.025,0.02,10)).unwrap(),vec![[0,0]]);
+        source.mark_complete_geometry_source();let first=source.clone();
+        assert_eq!(source.ground_layers([0,0]).next().unwrap().height_at([0.025,0.025]),Some(0.025));
+        assert!(source.replace_ground_layers([0,0,0],record(0.025,0.03,20)).unwrap().is_empty());
+        source.mark_complete_geometry_source();assert!(source.same_geometry(&first));
+        assert_ne!(source.ground_layers([0,0]).next().unwrap().statistics,
+            first.ground_layers([0,0]).next().unwrap().statistics,"updated bounded diagnostics are retained");
+        assert_eq!(source.replace_ground_layers([0,0,0],record(0.03,0.03,20)).unwrap(),vec![[0,0]]);
+        source.mark_complete_geometry_source();assert!(!source.same_geometry(&first));
+        let changed=source.replace_block_with_geometry_changes([0,0,0],BTreeMap::new()).unwrap();
+        assert_eq!(changed,vec![[0,0]]);assert_eq!(source.ground_layers([0,0]).count(),0);
+        assert_eq!(first.ground_layers([0,0]).count(),1,"old snapshot remains immutable");
+    }
+
+    #[test]
+    fn measured_layer_replacement_is_transactional_and_rejects_fabricated_members() {
+        let mut source=source();source.replace_ground_layers([0,0,0],record(0.025,0.02,10)).unwrap();
+        source.mark_complete_geometry_source();let old=source.clone();
+        for member in [1_u16,32_u16] {
+            let mut invalid=record(0.025,0.02,10).as_ref().clone();
+            let mut layer=invalid.remove(&0).unwrap();layer.members=vec![member];invalid.insert(member,layer);
+            assert!(source.replace_ground_layers([0,0,0],Arc::new(invalid)).is_err());
+            assert!(source.same_geometry(&old));
+            assert_eq!(source.ground_layers([0,0]).next().unwrap().height_at([0.025,0.025]),Some(0.025));
+        }
+        assert_eq!(source.replace_ground_layers([0,0,0],Arc::new(BTreeMap::new())).unwrap(),vec![[0,0]]);
+        assert_eq!(source.ground_layers([0,0]).count(),0);
+        assert!(source.get([0,0,0]).is_some(),"removing layer metadata does not clear occupancy");
     }
 }

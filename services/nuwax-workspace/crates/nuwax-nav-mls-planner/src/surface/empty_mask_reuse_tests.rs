@@ -31,6 +31,7 @@ fn cold_reference(input: &SurfaceSnapshot, mask: Arc<VirtualObstacleMask>) -> Su
     let regions = Arc::new(regions::RegionGraph::full(&graph, input.config().voxel_size));
     assert!(input.current_body_support.is_none(), "reference fixture must be a direct source");
     SurfaceSnapshot {
+        recent_obstacles:input.recent_obstacles.clone(),
         ground_evidence: input.ground_evidence,
         observations: input.observations.clone(), current_body_support: None,
         body_query_cache: Default::default(),

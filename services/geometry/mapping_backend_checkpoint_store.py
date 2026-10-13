@@ -1754,8 +1754,8 @@ def _validate_checkpoint_artifacts(checkpoint):
             cloud_revision=checkpoint.cloud_receipt["cloud_revision"],
             source_timestamp_ns=checkpoint.cloud_receipt["source_timestamp_ns"])
         if role == "fine_map":
-            if payload[:8] != b"NUWAXAR2":
-                raise MappingBackendCheckpointValidationError("assigned fine member requires AR2")
+            if payload[:8] not in (b"NUWAXAR2", b"NUWAXAR3"):
+                raise MappingBackendCheckpointValidationError("assigned fine member requires AR2 or AR3")
             validate_fine_archive(payload, **keywords,
                 frame_generation=reference.member_identity.frame_generation,
                 producer_generation=reference.member_identity.producer_generation)

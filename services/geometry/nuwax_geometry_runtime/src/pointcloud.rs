@@ -1057,6 +1057,18 @@ impl CloudMapShmWriter {
         self.fine_cloud.as_ref()?.latest_unclassified_scan().cloned()
     }
 
+    pub(crate) fn latest_ground_point_indices(&self, source: &crate::lio_ingress::AdmittedRegisteredScan) -> Option<Arc<[u32]>> {
+        self.fine_cloud.as_ref()?.latest_ground_indices(source)
+    }
+
+    /// The private PGO rebuild carries the original admitted scan plus its
+    /// corrected rigid pose. Reprojection replaces its geometry, not its identity.
+    pub(crate) fn capture_replayed_ground(&mut self, points: &[Point3<f64>],
+        source: &crate::lio_ingress::AdmittedRegisteredScan) -> Result<(), String> {
+        self.fine_cloud.as_mut().ok_or("replayed fine-map owner is unavailable")?
+            .capture_replayed_ground(points, source)
+    }
+
     pub(crate) fn committed_fine_cloud(&self) -> Option<Arc<nuwax_map_chunks::SealedMap>> {
         self.committed_fine_cloud.clone()
     }

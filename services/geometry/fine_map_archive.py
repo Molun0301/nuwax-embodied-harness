@@ -8,6 +8,7 @@ import numpy as np
 from services.geometry.checkpoint_payload import FrozenPayload
 
 MAX_FINE_ARCHIVE_BYTES = 1024 * 1024 * 1024
+_MAX_LAYER_BLOCK_BYTES = 4 * 1024 * 1024
 _FINE_RECORD_DTYPE = np.dtype([("local", "<u2"), ("stamp", "<u8"), ("hits", "<u2")])
 
 
@@ -28,11 +29,11 @@ def _validate_vector_block_evidence(block, points, source_time):
 
 def validate_fine_archive(payload, *, session=None, generation=None, cloud_revision=None,
                           source_timestamp_ns=None, frame_generation=None, producer_generation=None):
-    """读取 AR1/AR2 完整根并核对块结构和原提交；旧摘要字段仅保留为别名。"""
+    """读取 AR1/AR2/AR3 完整根并核对块结构和原提交；旧摘要字段仅保留为别名。"""
     if not isinstance(payload, (bytes, FrozenPayload)) or not 24 <= len(payload) <= MAX_FINE_ARCHIVE_BYTES:
         raise ValueError("精细地图资产类型或大小错误")
     magic = payload[:8]
-    if magic not in (b"NUWAXAR1", b"NUWAXAR2"):
+    if magic not in (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3"):
         raise ValueError("精细地图资产格式未知")
     legacy = magic == b"NUWAXAR1"
     root_offset = 48 if legacy else 16
@@ -74,7 +75,7 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
             raise ValueError("精细地图对象身份为空")
         return result
 
-    version = 1 if legacy else 2
+    version = int(chr(magic[-1]))
     integer(root["version"], version, version)
     revision = integer(root["revision"], 1, 2 ** 64 - 1)
     source_time = integer(root["source_timestamp_ns"], 1, 2 ** 64 - 1)
@@ -140,23 +141,68 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
             raise ValueError("精细地图块被截断")
         length = struct.unpack("<I", payload[offset:offset + 4])[0]
         offset += 4
-        if length != 16 + points * 12 or offset + length > len(payload):
+        records_end = 16 + points * 12
+        if (length < records_end or length > (_MAX_LAYER_BLOCK_BYTES if version == 3 else records_end)
+                or offset + length > len(payload)):
             raise ValueError("精细地图块长度错误")
         block = payload[offset:offset + length]
-        first_offset = object_offsets.setdefault(object_id, offset)
-        if first_offset != offset and payload[first_offset:first_offset + length] != block:
+        first_offset, first_length = object_offsets.setdefault(object_id, (offset, length))
+        if first_offset != offset and (first_length != length or payload[first_offset:first_offset + length] != block):
             raise ValueError("精细地图同一对象身份的实际字节不一致")
         offset += length
-        if block[:8] != b"NUWAXBL1" or struct.unpack("<I", block[8:12])[0] != points or block[12:16] != bytes(4):
+        layered = version == 3 and block[:8] == b"NUWAXBL2"
+        layer_length = struct.unpack("<I", block[12:16])[0]
+        if (block[:8] != b"NUWAXBL1" and not layered
+                or struct.unpack("<I", block[8:12])[0] != points
+                or length != records_end + layer_length or (not layered and layer_length != 0)):
             raise ValueError("精细地图块格式错误")
         if points < _FINE_VECTOR_MIN_POINTS:
             last = -1
-            for local, stamp, hits in struct.iter_unpack("<HQH", block[16:]):
+            for local, stamp, hits in struct.iter_unpack("<HQH", memoryview(block)[16:records_end]):
                 if not last < local < 32768 or stamp > source_time or (stamp == 0) != (hits == 0):
                     raise ValueError("精细地图块观察证据错误")
                 last = local
         else:
             _validate_vector_block_evidence(block, points, source_time)
+        if layered:
+            layers = json.loads(block[records_end:], object_pairs_hook=unique, parse_constant=nonfinite)
+            _validate_layer_structure(layers, integer)
     if offset != len(payload):
         raise ValueError("精细地图资产存在尾随数据")
     return root
+
+
+def _validate_layer_structure(layers, integer):
+    """Read the BL2 wire shape; geometry and sample association belong to Rust."""
+    def fail():
+        raise ValueError("精细地图层格式错误")
+
+    def vector(value):
+        if (not isinstance(value, list) or len(value) != 3
+                or any(type(v) not in (int, float) or not -1.7976931348623157e308 <= v <= 1.7976931348623157e308 for v in value)):
+            fail()
+
+    if not isinstance(layers, list) or not 1 <= len(layers) <= 256:
+        fail()
+    for entry in layers:
+        if not isinstance(entry, list) or len(entry) != 2:
+            fail()
+        anchor, layer = entry
+        integer(anchor, 0, 65535)
+        if not isinstance(layer, dict) or set(layer) != {"members", "plane_origin", "normal", "samples"}:
+            fail()
+        members, samples = layer["members"], layer["samples"]
+        if (not isinstance(members, list) or not 1 <= len(members) <= 32
+                or not isinstance(samples, list) or not 1 <= len(samples) <= 32):
+            fail()
+        for member in members:
+            integer(member, 0, 65535)
+        vector(layer["normal"])
+        vector(layer["plane_origin"])
+        for sample in samples:
+            if not isinstance(sample, dict) or set(sample) != {"point", "source_sequence", "source_timestamp_ns", "point_index"}:
+                fail()
+            vector(sample["point"])
+            integer(sample["source_sequence"], 0, 2 ** 64 - 1)
+            integer(sample["source_timestamp_ns"], 0, 2 ** 64 - 1)
+            integer(sample["point_index"], 0, 2 ** 32 - 1)

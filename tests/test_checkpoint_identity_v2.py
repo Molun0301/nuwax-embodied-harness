@@ -165,6 +165,33 @@ class IdentityV2Tests(unittest.TestCase):
         self.assertEqual(loaded.manifest_sha256, '')
         self.assertIsNone(loaded.legacy_alias)
 
+    def test_ar3_layers_export_store_restart_and_reupload_keep_v2_identity(self):
+        original = fine_bytes()
+        root_length = struct.unpack('<Q', original[8:16])[0]
+        root = json.loads(original[16:16 + root_length])
+        root['version'] = 3
+        raw = json.dumps(root, separators=(',', ':')).encode()
+        layer = dict(members=[0], normal=[0, 0, 1], plane_origin=[0.0625, 0.0625, 0.08],
+            samples=[dict(point=[0.04, 0.06, 0.08], source_sequence=5, source_timestamp_ns=11, point_index=0)])
+        tail = json.dumps([[0, layer]], separators=(',', ':')).encode()
+        block = b'NUWAXBL2' + struct.pack('<IIHQH', 1, len(tail), 0, 11, 1) + tail
+        payload = b'NUWAXAR3' + struct.pack('<Q', len(raw)) + raw + struct.pack('<QI', 1, len(block)) + block
+        self.response.fine_map_artifact.size = len(payload)
+        stub = TransferStub(self.response)
+        stub.entries[self.response.fine_map_artifact.id][1] = bytearray(payload)
+        client = runtime(stub)
+        bundle = client.export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+        self.assertEqual(bundle.checkpoint.fine_reference.identity_schema_version, 2)
+        self.assertEqual(bundle.checkpoint.fine_archive, payload)
+        bundle.publish_to(self.root)
+        reopened = provider.reopen_mapping_backend_checkpoint(self.root, 'voxel')
+        self.assertEqual(reopened.checkpoint.fine_archive, payload)
+        retained = reopened.checkpoint.fine_reference
+        uploaded = client._upload_graph_artifact(reopened.checkpoint,
+            payload=reopened.checkpoint.fine_archive, reference=retained)
+        self.assertEqual(uploaded, self.response.fine_map_artifact)
+        self.assertEqual(client._download_graph_artifact(uploaded, provider.MAX_FINE_ARCHIVE_BYTES), payload)
+
     def test_explicit_backend_and_occupancy_members_reject_skew_and_conflicts(self):
         for field, role in (("backend_identity", 1), ("occupancy_identity", 2)):
             response = copy.deepcopy(self.response)

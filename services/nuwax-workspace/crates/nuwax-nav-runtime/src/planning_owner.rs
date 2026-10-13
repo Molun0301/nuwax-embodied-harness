@@ -134,8 +134,13 @@ impl<T: Send + 'static, R: Send + 'static> PlanningOwner<T, R> {
         self.shared.fault.load(Ordering::Acquire) || !self.shared.alive.load(Ordering::Acquire)
     }
     pub fn submit(&self, id: u64, value: T) -> bool {
+        self.submit_with_retired(id,value).is_some()
+    }
+    /// Return the replaced pending ID so its source proof follows the same slot.
+    /// The active/completed slot is never retired by a newer pending submission.
+    pub fn submit_with_retired(&self, id:u64, value:T)->Option<Option<u64>> {
         if self.faulted() {
-            return false;
+            return None;
         }
         let old;
         {
@@ -144,7 +149,7 @@ impl<T: Send + 'static, R: Send + 'static> PlanningOwner<T, R> {
                 e.into_inner()
             });
             if slot.closed || self.shared.fault.load(Ordering::Acquire) {
-                return false;
+                return None;
             }
             old = slot.pending.replace(Request {
                 id,
@@ -152,9 +157,10 @@ impl<T: Send + 'static, R: Send + 'static> PlanningOwner<T, R> {
                 value,
             });
         }
+        let retired=old.as_ref().map(|request|request.id);
         drop(old);
         self.shared.wake.notify_one();
-        true
+        Some(retired)
     }
     pub fn take(&self) -> Option<Completion<R>> {
         let result = self

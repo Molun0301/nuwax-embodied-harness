@@ -1,6 +1,9 @@
 //! 三维导航生产拥有方：共享地图，交付PCT全局参考，并由Scan近场持续执行。
 
 use std::collections::VecDeque;
+#[path="surface_recent_source.rs"]
+mod recent_source;
+pub(super) use recent_source::RecentSourceState;
 
 use nuwax_nav_mls_planner::SurfaceSnapshot;
 use crate::surface_map::{SurfaceMapCache as SurfaceGeometryCache, SurfaceGeometryChanges};
@@ -144,14 +147,11 @@ async fn run_surface_scheduler(
     let transport = lcm_transport()?;
     let socket = std::env::var("NUWAX_MOTION_GUARD_SOCKET")
         .unwrap_or_else(|_| "/run/nuwax/motion-guard.sock".into());
-    let mut scheduler_config = nuwax_nav_runtime::SchedulerConfig {
+    let scheduler_config = nuwax_nav_runtime::SchedulerConfig {
         robot_width_m: config.robot_width_m,
         ..nuwax_nav_runtime::SchedulerConfig::default()
     };
-    if let Some(age)=config.follower.max_observation_age_sec {
-        scheduler_config.costmap_ttl=scheduler_config.costmap_ttl.min(Duration::from_secs_f64(age));
-    }
-    run_surface_scheduler_with_transport(node, hub, transport, shutdown, ready, config.follower.body_to_support_z_m, async move {
+    run_surface_scheduler_with_transport(node, hub, transport, shutdown, ready, config.follower.body_to_support_z_m, config.follower.max_observation_age_sec.map(Duration::from_secs_f64), async move {
         nuwax_nav_runtime::spawn_production_surface_scheduler(
             socket,
             scheduler_config,
@@ -170,6 +170,7 @@ async fn run_surface_scheduler_with_transport<F>(
     shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
     body_to_support_z_m: f64,
+    recent_source_max_age: Option<Duration>,
     create_scheduler: F,
 ) -> NavStackResult<()>
 where
@@ -184,6 +185,10 @@ where
         > + Send,
 {
     let source_max_age = configured_pose_source_max_age()?;
+    let recent = typed_stream(&transport, nuwax_codec::lcm::recent_cloud::DEFAULT_TOPIC,
+        nuwax_codec::lcm::recent_cloud::TYPE_NAME).await?;
+    let maps=Box::pin(futures::stream::select(hub.stream(),recent.map(|frame|
+        frame.map(GuardedMapFrame::RecentCloud))));
     let goals = typed_stream(&transport, &node.inputs[0], "nuwax_msgs.GoalEnvelope").await?;
     let poses = typed_stream(&transport, &node.inputs[1], "geometry_msgs.PoseStamped").await?;
     let paths = typed_stream(&transport, &node.inputs[2], "nuwax_msgs.PathEnvelope").await?;
@@ -212,13 +217,14 @@ where
         goals,
         poses,
         paths,
-        hub.stream(),
+        maps,
         cancels,
         status,
         Some(source_max_age),
         false,
         &hub.body_reference_frame_id,
         Some(body_to_support_z_m),
+        recent_source_max_age,
     );
     let loop_future=async {tokio::select! {
         result=execution_loop=>result,
@@ -667,7 +673,7 @@ fn off_source_geometry_changed(
 
 // One synchronous advisory after map delivery. Work is bounded before scanning
 // footprint vertices, path poses or columns; excess work conservatively refreshes.
-const MAX_REFERENCE_SCOPE_WORK: usize = 4096;
+use nuwax_nav_runtime::surface_changes::MAX_REFERENCE_SCOPE_WORK;
 fn reference_changes_affect_path(previous: &SurfaceSnapshot, current: &SurfaceSnapshot,
     basis: Option<&SurfaceSnapshot>, changes: &SurfaceGeometryChanges, path: &Path3D) -> bool {
     if basis.is_none_or(|basis| !nuwax_nav_pct::same_source_geometry(basis, previous)) { return true; }
@@ -688,61 +694,26 @@ struct SurfaceJobTicket {
     epoch: u64,
     goal_key: GoalKey,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
-    basis: Option<Arc<SurfaceSnapshot>>,
-    changes: Vec<Arc<SurfaceGeometryChanges>>,
-    columns: usize,
-    unknown: bool,
+    proof: nuwax_nav_runtime::surface_changes::SurfaceJobTicket,
+}
+impl std::ops::Deref for SurfaceJobTicket {
+    type Target = nuwax_nav_runtime::surface_changes::SurfaceJobTicket;
+    fn deref(&self) -> &Self::Target { &self.proof }
 }
 impl SurfaceJobTicket {
     fn new(epoch: u64, goal_key: GoalKey, cancelled: Arc<std::sync::atomic::AtomicBool>,
         source: &Arc<SurfaceSnapshot>, config: &SurfaceNavigationConfig) -> Self {
-        Self { epoch, goal_key, cancelled, basis: (!config.follower.local_planning_enabled
-                && source.body_envelope().is_some()).then(|| Arc::clone(source)),
-            changes: Vec::new(), columns: 0, unknown: false }
+        Self { epoch, goal_key, cancelled,
+            proof: nuwax_nav_runtime::surface_changes::SurfaceJobTicket::new(
+                (!config.follower.local_planning_enabled && source.body_envelope().is_some())
+                    .then(|| Arc::clone(source))) }
     }
-
     fn observe(&mut self, update: &PreparedSurfaceMap) {
-        if self.unknown { return; }
-        let Some(basis) = self.basis.as_ref() else { return; };
-        let Ok(current) = &update.snapshot else { self.unknown = true; return; };
-        if update.change_basis.as_ref().is_none_or(|previous|
-            !nuwax_nav_pct::same_source_geometry(basis, previous)) {
-            self.unknown = true; return;
-        }
-        match update.geometry_changes.as_ref() {
-            SurfaceGeometryChanges::Empty => {}
-            SurfaceGeometryChanges::Columns { fine, coarse, .. } => {
-                let count = fine.len().checked_add(coarse.len())
-                    .and_then(|count| self.columns.checked_add(count));
-                if count.is_none_or(|count| count > MAX_REFERENCE_SCOPE_WORK) {
-                    self.unknown = true; return;
-                }
-                self.columns = count.expect("bounded column count");
-                if !fine.is_empty() || !coarse.is_empty() {
-                    self.changes.push(Arc::clone(&update.geometry_changes));
-                }
-            }
-            SurfaceGeometryChanges::Unknown => { self.unknown = true; return; }
-        }
-        self.basis = Some(Arc::clone(current));
+        let Ok(current) = &update.snapshot else { self.proof.unknown = true; return; };
+        self.proof.observe(current, update.change_basis.as_deref(), &update.geometry_changes);
     }
-
     fn permits_changed_result(&self, latest: &SurfaceSnapshot, result: &NavStackResult<Path3D>) -> bool {
-        let Ok(path) = result else { return false; };
-        if self.unknown || self.basis.as_ref().is_none_or(|basis|
-            !nuwax_nav_pct::same_source_geometry(basis, latest)) { return false; }
-        let Some(model) = latest.body_envelope() else { return false; };
-        let work = model.footprint_xy_m.len().checked_add(path.poses.len())
-            .and_then(|work| work.checked_add(self.columns));
-        if work.is_none_or(|work| work > MAX_REFERENCE_SCOPE_WORK) { return false; }
-        let Some(corridor) = reference_scope::ReferenceCorridor::new(latest, path) else { return false; };
-        self.changes.iter().all(|changes| match changes.as_ref() {
-            SurfaceGeometryChanges::Columns { fine_size, fine, planner_size, coarse } =>
-                !corridor.intersects_columns(*fine_size, fine)
-                    && !corridor.intersects_columns(*planner_size, coarse),
-            SurfaceGeometryChanges::Empty => true,
-            SurfaceGeometryChanges::Unknown => false,
-        })
+        result.as_ref().is_ok_and(|path| self.proof.permits_path(latest, path))
     }
 }
 
@@ -2303,6 +2274,7 @@ mod tests {
                         shutdown,
                         ready,
                         configured.follower.body_to_support_z_m,
+                        configured.follower.max_observation_age_sec.map(Duration::from_secs_f64),
                         async move {
                             let local = nuwax_nav_runtime::RouteFollower::new(configured.follower)?;
                             let scheduler = nuwax_nav_runtime::NavScheduler::new(

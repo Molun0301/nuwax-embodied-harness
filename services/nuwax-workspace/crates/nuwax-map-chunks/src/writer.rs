@@ -1,11 +1,12 @@
 use super::*;
 
-struct Dirty { block: Block, changed: bool }
+struct Dirty { block: Block, layers: LayerObservations, changed: bool }
 struct Pending { object: ObjectIdentity, bytes: Vec<u8>, installed: bool }
 /// Dirty payload is bounded; membership baselines retain references, never copied member lists.
 pub struct Writer {
     repository: Repository, blocks: BTreeMap<Key, BlockRef>, dirty: BTreeMap<Key, Dirty>,
     pending: BTreeMap<Key, Pending>, touched: BTreeSet<Key>, membership_touched: BTreeSet<Key>,
+    layer_format: bool,
     published: Option<Arc<Manifest>>, legacy_baseline: Option<(Domain, u64)>, reader: RegionReader,
     id_source: Box<dyn FnMut() -> Result<ObjectId, String> + Send>,
     #[cfg(test)] pub(crate) encoded_blocks: usize,
@@ -22,7 +23,7 @@ impl Writer {
         }
         Ok(Self { reader: RegionReader::new(repository.clone(), cache_bytes / 2), repository,
             blocks: BTreeMap::new(), dirty: BTreeMap::new(), pending: BTreeMap::new(), touched: BTreeSet::new(), membership_touched: BTreeSet::new(),
-            published: None, legacy_baseline: None, id_source: Box::new(id_source), #[cfg(test)] encoded_blocks: 0, voxel_size_m, dirty_point_budget: cache_bytes / 128, dirty_points: 0, max_observed_ns: 0 })
+            layer_format: false, published: None, legacy_baseline: None, id_source: Box::new(id_source), #[cfg(test)] encoded_blocks: 0, voxel_size_m, dirty_point_budget: cache_bytes / 128, dirty_points: 0, max_observed_ns: 0 })
     }
     pub fn repository(&self) -> &Repository { &self.repository }
     pub fn has_unpublished_changes(&self) -> bool {
@@ -49,7 +50,7 @@ impl Writer {
         Ok(rehomed)
     }
     pub fn voxel_size_m(&self) -> f32 { self.voxel_size_m }
-    pub fn resident_bytes(&self) -> usize { self.dirty_points * 64 + self.reader.cached_bytes() + self.pending.values().map(|p| p.bytes.len()).sum::<usize>() }
+    pub fn resident_bytes(&self) -> usize { self.dirty_layer_bytes() + self.dirty_points * 64 + self.reader.cached_bytes() + self.pending.values().map(|p| p.bytes.len()).sum::<usize>() }
     pub fn block_count(&self) -> usize {
         self.blocks.len()
             + self.dirty.iter().filter(|(key, dirty)| !dirty.block.is_empty() && !self.blocks.contains_key(*key)).count()
@@ -60,8 +61,11 @@ impl Writer {
         if root.voxel_size_m != self.voxel_size_m { return Err("restored resolution differs from writer".into()); }
         let mut latest = 0;
         for reference in &root.blocks {
+            let layers = self.reader.layers(reference)?;
+            if !layers.is_empty() && root.version < 3 { return Err("observed layers require root version 3".into()); }
             let info = intrinsic(&*self.reader.block(reference)?); admit_intrinsic(info, reference.points, root.source_timestamp_ns)?; latest = latest.max(info.latest);
         }
+        self.layer_format = root.version >= 3;
         self.blocks = root.blocks.iter().map(|b| (b.key, b.clone())).collect();
         self.reset_pending(); self.max_observed_ns = latest;
         self.published = Some(Arc::new(root.clone())); self.legacy_baseline = None; Ok(())
@@ -71,9 +75,13 @@ impl Writer {
         if root.voxel_size_m != self.voxel_size_m { return Err("restored resolution differs from writer".into()); }
         let mut latest = 0;
         for reference in &root.blocks {
-            let info = intrinsic(&*self.reader.object(ObjectIdentity::Legacy(reference.sha256), reference.points)?);
+            let object = ObjectIdentity::Legacy(reference.sha256);
+            let view = BlockRef { key: reference.key, object, points: reference.points, block_revision: 0, geometry_revision: 0 };
+            if !self.reader.layers(&view)?.is_empty() { return Err("legacy root cannot contain observed layers".into()); }
+            let info = intrinsic(&*self.reader.object(object, reference.points)?);
             admit_intrinsic(info, reference.points, root.source_timestamp_ns)?; latest = latest.max(info.latest);
         }
+        self.layer_format = false;
         self.blocks = root.blocks.iter().map(|b| (b.key, BlockRef { key: b.key, object: ObjectIdentity::Legacy(b.sha256), block_revision: 0, geometry_revision: 0, points: b.points })).collect();
         self.reset_pending(); self.max_observed_ns = latest; self.published = None;
         self.legacy_baseline = Some((root.domain.clone(), root.revision)); Ok(())
@@ -86,11 +94,31 @@ impl Writer {
     }
     fn load_dirty(&mut self, key: Key) -> Result<&mut Dirty, String> {
         if !self.dirty.contains_key(&key) {
-            if self.dirty_points + 32768 > self.dirty_point_budget { self.flush()?; }
+            if self.dirty_points + 32768 + self.dirty_layer_bytes() / 64 > self.dirty_point_budget { self.flush()?; }
             let block = match self.blocks.get(&key) { Some(reference) => (*self.reader.block(reference)?).clone(), None => Block::new() };
-            self.dirty_points += block.len(); self.dirty.insert(key, Dirty { block, changed: false });
+            let layers = match self.blocks.get(&key) { Some(reference) => (*self.reader.layers(reference)?).clone(), None => LayerObservations::new() };
+            self.dirty_points += block.len(); self.dirty.insert(key, Dirty { block, layers, changed: false });
         }
         Ok(self.dirty.get_mut(&key).unwrap())
+    }
+    fn dirty_layer_bytes(&self) -> usize {
+        self.dirty.values().flat_map(|d| d.layers.values()).map(|l| 128 + l.members.len() * 2 + l.samples.len() * 64).sum()
+    }
+    /// Read only one touched block; capture keeps no second whole-map statistics cache.
+    pub fn layer_observations(&mut self, key: Key) -> Result<LayerObservations, String> {
+        if let Some(dirty) = self.dirty.get(&key) { return Ok(dirty.layers.clone()); }
+        match self.blocks.get(&key) { Some(reference) => Ok((*self.reader.layers(reference)?).clone()), None => Ok(LayerObservations::new()) }
+    }
+    /// Replace a touched block's associated layers after original point admission.
+    /// Occupancy must already contain the real member hits. On error no layers change.
+    pub fn replace_layer_observations(&mut self, key: Key, layers: LayerObservations) -> Result<(), String> {
+        let dirty = self.load_dirty(key)?;
+        terrain_observations::validate_layers(&layers, &dirty.block)?;
+        if dirty.layers == layers { return Ok(()); }
+        dirty.layers = layers; dirty.changed = true;
+        self.layer_format = true;
+        self.pending.remove(&key); self.touched.insert(key); self.membership_touched.insert(key);
+        Ok(())
     }
     pub fn observe(&mut self, keys: impl IntoIterator<Item = Key>, timestamp_ns: u64) -> Result<(), String> {
         if timestamp_ns == 0 { return Err("observation requires a source timestamp".into()); } self.update(keys, timestamp_ns)
@@ -131,6 +159,7 @@ impl Writer {
             if !self.blocks.contains_key(&key) && !self.dirty.contains_key(&key) { continue; }
             let dirty = self.load_dirty(key)?; let before = dirty.block.len();
             for local in removed { dirty.block.remove(&local); }
+            dirty.layers.retain(|_, layer| layer.members.iter().all(|member| dirty.block.contains_key(member)));
             let removed = before - dirty.block.len(); dirty.changed |= removed > 0; self.dirty_points -= removed;
             if removed > 0 { self.pending.remove(&key); self.touched.insert(key); self.membership_touched.insert(key); }
         }
@@ -141,7 +170,7 @@ impl Writer {
         for key in keys {
             if !self.pending.contains_key(&key) {
                 let object = ObjectIdentity::Assigned((self.id_source)()?); object.validate()?;
-                let bytes = encode_block(&self.dirty[&key].block)?;
+                let bytes = encode_layer_block(&self.dirty[&key].block, &self.dirty[&key].layers)?;
                 #[cfg(test)] { self.encoded_blocks += 1; }
                 self.pending.insert(key, Pending { object, bytes, installed: false });
             }
@@ -184,7 +213,7 @@ impl Writer {
                     (Some(a), Some(b)) if a.object == b.object => {},
                     (Some(a), Some(b)) => {
                         let a = self.reader.block(a)?; let b = self.reader.block(b)?;
-                        if a.keys().ne(b.keys()) { changed_members.insert(*key); }
+                        if a.keys().ne(b.keys()) || !layer_geometry_eq(&*self.reader.layers(previous.unwrap())?, &*self.reader.layers(&self.blocks[key])?) { changed_members.insert(*key); }
                     }
                     _ => { changed_members.insert(*key); }
                 }
@@ -205,7 +234,7 @@ impl Writer {
                 }
             }
         }
-        let root = Arc::new(Manifest { version: 2, domain, revision, geometry_revision, source_timestamp_ns: timestamp_ns,
+        let root = Arc::new(Manifest { version: if self.layer_format { 3 } else { 2 }, domain, revision, geometry_revision, source_timestamp_ns: timestamp_ns,
             voxel_size_m: self.voxel_size_m, blocks: blocks.values().cloned().collect() });
         root.validate()?;
         self.blocks = blocks; self.published = Some(root.clone()); self.legacy_baseline = None;

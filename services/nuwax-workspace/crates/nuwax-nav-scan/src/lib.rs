@@ -885,10 +885,11 @@ mod tests {
         for pair in path.windows(2) { map.validate_body_motion(pair[0],pair[1],&[]).unwrap(); }
     }
     fn branch_failure(branch: &str, x: f64) -> LocalPlanError {
-        use nuwax_nav_mls_planner::surface::{BodyFailureWitness,BodyRejection};
+        use nuwax_nav_mls_planner::surface::{BodyFailureWitness,BodyRejection,OccupancySource};
         LocalPlanError {body_witness:Some(BodyFailureWitness {
             pose:([x,0.0,0.4],[0.0,0.0,0.0,1.0]),
-            rejection:BodyRejection::CoreSupport {column:[x as i32,0]},
+            rejection:BodyRejection::Occupancy {cell:[x as i32,0,4],source:OccupancySource::CoarseFallback,
+                z_bounds:[0.4,0.5],ground_height:None},
         }), ..branch.into()}
     }
 
@@ -1499,3 +1500,6 @@ mod tests {
 #[cfg(all(test, feature="profile"))]
 #[path="current_on_diagnostic.rs"]
 mod current_on_diagnostic;
+
+#[cfg(test)]
+mod recent_detour_diagnostic_tests;

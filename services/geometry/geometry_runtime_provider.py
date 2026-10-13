@@ -5652,8 +5652,8 @@ class GeometryRuntimeProvider:
                     generation=identity.occupancy_receipt["session_generation"], cloud_revision=identity.cloud_receipt["cloud_revision"],
                     source_timestamp_ns=identity.cloud_receipt["source_timestamp_ns"])
                 if identity.role == "fine_map":
-                    if payload[:8] != b"NUWAXAR2":
-                        raise ValueError("assigned fine artifact requires AR2")
+                    if payload[:8] not in (b"NUWAXAR2", b"NUWAXAR3"):
+                        raise ValueError("assigned fine artifact requires AR2 or AR3")
                     validate_fine_archive(payload, **keywords, frame_generation=identity.frame_generation,
                         producer_generation=identity.producer_generation)
                 elif identity.role == "dense_cloud":

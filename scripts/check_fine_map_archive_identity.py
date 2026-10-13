@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reconstructed hash-fatal AR1/AR2 tests; old test logs do not apply."""
+"""Reconstructed hash-fatal AR1/AR2/AR3 tests; old test logs do not apply."""
 import copy
 import hashlib
 import json
@@ -43,7 +43,7 @@ def archive(root=None, *, blocks=None, raw=None, version=None, alias=ROOT_ALIAS,
     version = root['version'] if version is None else version
     raw = json.dumps(root, ensure_ascii=False, separators=(',', ':')).encode() if raw is None else raw
     blocks = [block()] if blocks is None else blocks
-    header = (b'NUWAXAR1' if version == 1 else b'NUWAXAR2') + struct.pack('<Q', len(raw))
+    header = ('NUWAXAR%d' % version).encode() + struct.pack('<Q', len(raw))
     return header + (alias if version == 1 else b'') + raw + struct.pack('<Q', len(blocks) if count is None else count) + b''.join(
         struct.pack('<I', len(value)) + value for value in blocks)
 
@@ -82,10 +82,64 @@ class FineArchiveChecks(unittest.TestCase):
         root['blocks'][0]['object'] = {'kind': 'legacy', 'value': BLOCK_ALIAS[:]}
         self.assertEqual(validate_fine_archive(archive(root)), root)
 
+    def test_ar3_layered_and_unchanged_blocks_without_hashing(self):
+        root, body, layer = self.layer_fixture()
+        for payload in (archive(root, blocks=[body]), FrozenPayload([archive(root, blocks=[body])])):
+            self.assertEqual(validate_fine_archive(payload), root)
+        self.assertEqual(validate_fine_archive(archive(manifest(3))), manifest(3))
+        for version in (1, 2):
+            self.reject(manifest(version), blocks=[body])
+        for changed in (body[:-1], body + b'x', body[:12] + struct.pack('<I', 0) + body[16:]):
+            self.reject(root, blocks=[changed])
+        for raw in (b'[]', b'null', b'{}', b'[[0,{}]]', b'NaN'):
+            self.reject(root, blocks=[self.layer_block(raw)])
+
+    @staticmethod
+    def layer_block(raw):
+        return b'NUWAXBL2' + struct.pack('<II', 2, len(raw)) + block(((0, 100, 1), (1024, 100, 1)))[16:] + raw
+
+    def layer_fixture(self):
+        root = manifest(3)
+        root['blocks'][0]['key'] = [0, 0, 0]
+        layer = dict(members=[0, 1024], normal=[0, 0, 1], plane_origin=[0.0625, 0.0625, 0.125],
+            samples=[dict(point=[0.0625, 0.0625, 0.12], source_sequence=1, source_timestamp_ns=100, point_index=0),
+                     dict(point=[0.0625, 0.0625, 0.13], source_sequence=1, source_timestamp_ns=100, point_index=1)])
+        return root, self.layer_block(json.dumps([[0, layer]]).encode()), layer
+
+    def test_ar3_layer_wire_shapes_and_budgets(self):
+        root, body, layer = self.layer_fixture()
+        for field, value in [('members', []), ('members', [65536]), ('members', [0] * 33),
+                             ('normal', [0, 0]), ('normal', [True, 0, 1]),
+                             ('plane_origin', 'invalid'), ('samples', []), ('samples', layer['samples'] * 17)]:
+            self.reject(root, blocks=[self.layer_block(json.dumps([[0, {**layer, field: value}]]).encode())])
+        for field, value in [('point', [float('inf'), 0, 0]), ('source_sequence', -1),
+                             ('source_timestamp_ns', U64_MAX + 1), ('point_index', -1)]:
+            changed = copy.deepcopy(layer)
+            changed['samples'][0][field] = value
+            self.reject(root, blocks=[self.layer_block(json.dumps([[0, changed]]).encode())])
+        self.reject(root, blocks=[self.layer_block(json.dumps([[0, layer]] * 257).encode())])
+
+    def test_ar3_vector_records_exclude_json_tail(self):
+        root, _, layer = self.layer_fixture()
+        layer['members'] = [0]
+        layer['samples'] = [layer['samples'][0]]
+        tail = json.dumps([[0, layer]]).encode()
+        root['blocks'][0]['points'] = 512
+        body = b'NUWAXBL2' + struct.pack('<II', 512, len(tail)) + block(tuple((i, 100, 1) for i in range(512)))[16:] + tail
+        self.assertEqual(validate_fine_archive(archive(root, blocks=[body])), root)
+
+    def test_ar3_reused_identity_rejects_different_tail_lengths(self):
+        root, body, layer = self.layer_fixture()
+        other = copy.deepcopy(root['blocks'][0])
+        other['key'] = [1, 0, 0]
+        root['blocks'].append(other)
+        longer = self.layer_block(json.dumps([[0, layer]], indent=2).encode())
+        self.reject(root, blocks=[body, longer])
+
     def test_all_source_dimensions_are_bound_for_both_versions(self):
         expected = dict(session='synthetic-地图', generation=5, frame_generation=0,
             producer_generation=8, cloud_revision=9007199254740993, source_timestamp_ns=U64_MAX)
-        for version in (1, 2):
+        for version in (1, 2, 3):
             payload = archive(manifest(version))
             self.assertEqual(validate_fine_archive(payload, **expected)['version'], version)
             for field, value in expected.items():
@@ -95,11 +149,11 @@ class FineArchiveChecks(unittest.TestCase):
                 validate_fine_archive(payload, frame_generation=False)
 
     def test_same_object_can_appear_at_multiple_spatial_keys(self):
-        for version in (1, 2):
+        for version in (1, 2, 3):
             root = manifest(version)
             repeated = copy.deepcopy(root['blocks'][0])
             repeated['key'] = [0, 0, 0]
-            if version == 2:
+            if version >= 2:
                 repeated['block_revision'] = 22
             root['blocks'].append(repeated)
             self.assertEqual(validate_fine_archive(archive(root, blocks=[block(), block()])), root)
@@ -107,7 +161,7 @@ class FineArchiveChecks(unittest.TestCase):
             self.reject(root, blocks=[block(), block(((0, 0, 0),))])
 
     def test_repeated_object_identity_rejects_changed_actual_bytes(self):
-        for version in (1, 2):
+        for version in (1, 2, 3):
             root = manifest(version)
             repeated = copy.deepcopy(root['blocks'][0])
             repeated['key'] = [0, 0, 0]
@@ -117,7 +171,7 @@ class FineArchiveChecks(unittest.TestCase):
                 self.reject(root, blocks=[block(), changed])
 
     def test_empty_maps_and_valid_coordinate_edges_are_accepted(self):
-        for version in (1, 2):
+        for version in (1, 2, 3):
             root = manifest(version)
             root['blocks'] = []
             self.assertEqual(validate_fine_archive(archive(root, blocks=[])), root)
@@ -130,7 +184,7 @@ class FineArchiveChecks(unittest.TestCase):
         for payload in (None, bytearray(archive()), b'', b'NUWAXAR2'+bytes(15), b'INVALID!'+archive()[8:], archive()[:-1], archive()+b'x'):
             with self.assertRaises(ValueError):
                 validate_fine_archive(payload)
-        for version in (1, 2):
+        for version in (1, 2, 3):
             payload = archive(manifest(version))
             for length in (0, 32*1024*1024+1, len(payload)):
                 with self.assertRaises(ValueError):
@@ -140,7 +194,7 @@ class FineArchiveChecks(unittest.TestCase):
         self.reject(manifest(1), alias=bytes(32))
 
     def test_bad_json_duplicate_fields_and_nonfinite_numbers(self):
-        for version in (1, 2):
+        for version in (1, 2, 3):
             for raw in (b'null', b'[]', b'{', b'\xff', b'{"version":1,"version":1}'):
                 self.reject(manifest(version), raw=raw)
             encoded = json.dumps(manifest(version)).encode()
@@ -149,8 +203,8 @@ class FineArchiveChecks(unittest.TestCase):
                 self.reject(manifest(version), raw=encoded.replace(b'"voxel_size_m": 0.125', f'"voxel_size_m": {value}'.encode()))
 
     def test_versions_root_fields_and_numeric_ranges_remain_strict(self):
-        for version in (1, 2):
-            for field, values in {'version': (0, 3, True, float(version), 3-version),
+        for version in (1, 2, 3):
+            for field, values in {'version': (0, 4, True, float(version), 4 if version == 3 else 3-version),
                 'revision': (0, -1, U64_MAX+1, True, 1.0), 'source_timestamp_ns': (0, -1, U64_MAX+1, False, 1.0),
                 'voxel_size_m': (0, -0.1, 1048577, True, '0.125', 10**400), 'blocks': ({}, None)}.items():
                 for value in values:
@@ -166,7 +220,7 @@ class FineArchiveChecks(unittest.TestCase):
                 self.reject(root, version=version)
 
     def test_domain_and_session_shapes_are_strict(self):
-        for version in (1, 2):
+        for version in (1, 2, 3):
             for field, values in {'session': ('', ' x', 'x ', 'x\n', 'x\x7f', 'x\x85', '地'*342, 1),
                 'generation': (0, -1, U64_MAX+1, True, 1.0), 'producer_generation': (0, -1, U64_MAX+1, True, 1.0),
                 'frame_generation': (-1, U64_MAX+1, False, 1.0)}.items():
@@ -180,7 +234,7 @@ class FineArchiveChecks(unittest.TestCase):
                 self.reject(root)
 
     def test_block_reference_fields_coordinates_counts_and_order_are_strict(self):
-        for version in (1, 2):
+        for version in (1, 2, 3):
             for key in ([0, 0], [0, 0, 0, 0], [True, 0, 0], [1.0, 0, 0], [-(2**26)-1, 0, 0], [2**26, 0, 0], '000'):
                 root = manifest(version)
                 root['blocks'][0]['key'] = key
@@ -228,7 +282,7 @@ class FineArchiveChecks(unittest.TestCase):
                 self.reject(root)
 
     def test_block_structure_and_observation_evidence(self):
-        for version in (1, 2):
+        for version in (1, 2, 3):
             for body in (b'WRONGMAG'+block()[8:], block()[:12]+struct.pack('<I', 1)+block()[16:], block()[:-1],
                          block(((0, 1, 0), (32767, U64_MAX, 1))), block(((0, 0, 1), (32767, U64_MAX, 1))),
                          block(((1, 0, 0), (0, 0, 0)))):

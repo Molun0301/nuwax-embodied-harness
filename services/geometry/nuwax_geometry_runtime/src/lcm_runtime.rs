@@ -11358,6 +11358,62 @@ async fn handoff_registered_lio_cloud_with_correction_for_test(
     handoff_registered_lio_cloud_with_correction(handle, &accepted, correction).await
 }
 
+/// Emit only live admitted source evidence, independent of map publication cadence.
+/// Caller holds the existing mapping lifecycle fence through domain check/publish.
+async fn publish_recent_cloud_while_lifecycle_fenced(
+    handle: &GeometryRuntimeHandle, accepted: &crate::lio_ingress::AcceptedRegisteredCloud,
+) -> Result<bool, String> {
+    use nuwax_codec::lcm::recent_cloud;
+    if handle.nav.configured_profile() != crate::nav_runtime::PROFILE_MLS3D { return Ok(false); }
+    let binding = accepted.binding();
+    let Some(mapping) = handle.mapping_adapter.as_ref() else { return Ok(false); };
+    let boot = {
+        let mapping = mapping.lock(); let snapshot = mapping.snapshot();
+        if !snapshot.active || snapshot.session_id != binding.mapping_session_id
+            || snapshot.session_generation != binding.mapping_session_generation
+            || mapping.global_frame_generation() != binding.map_frame_generation { return Ok(false); }
+        // Same canonical owner used by NavigationMap3D. The asynchronous
+        // occupancy fanout may not have installed its first authority yet.
+        mapping.mapping_commit_boot_nonce().to_be_bytes()
+    };
+    let generation = i64::try_from(binding.mapping_session_generation).map_err(|_| "recent source session overflow")?;
+    let scan = accepted.scan();
+    let ground = handle.cloud_map_writer.lock().as_ref()
+        .and_then(|writer| writer.latest_ground_point_indices(scan)).unwrap_or_else(|| Arc::from([]));
+    let payload = recent_cloud::encode_borrowed(
+        i64::try_from(handle.nav.producer_runtime_generation()).map_err(|_| "recent producer generation overflow")?,
+        &binding.mapping_session_id, generation,
+        i64::try_from(binding.map_frame_generation).map_err(|_| "recent frame generation overflow")?,
+        boot, Some(accepted.envelope()), &ground,
+    ).map_err(|error| error.to_string())?;
+    let topic = crate::channel_registry::channel_for(crate::channel_registry::ChannelKey::RecentCloud3D);
+    let message_type = LcmMessageType::new(recent_cloud::TYPE_NAME).map_err(|error|error.to_string())?;
+    let frame = crate::typed_codec::build_typed_frame(topic, message_type, payload, accepted.source_identity().source_sequence as u64);
+    match tokio::time::timeout(MAP_FANOUT_SINK_TIMEOUT, handle.transport.publish(frame)).await {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(error)) => Err(format!("recent cloud publish failed: {error}")),
+        Err(_) => Err("recent cloud publish timed out".into()),
+    }
+}
+
+/// Canonical public-device path retains the admitted source capability, just like
+/// native correction ingress. Compatibility-only arrays never gain this identity.
+pub(crate) async fn handoff_admitted_registered_cloud(handle: &GeometryRuntimeHandle,
+    accepted: &crate::lio_ingress::AcceptedRegisteredCloud) -> Result<bool, String> {
+    let binding=accepted.binding();
+    let commit=commit_registered_lio_cloud_inner(handle,accepted.map_points(),accepted.point_step(),
+        accepted.adapter_timestamp_ns(),accepted.source_timestamp_ns(),accepted.map_frame_id(),
+        canonical_mapping_source(accepted)?,Some((binding.mapping_session_generation,binding.map_frame_generation,binding.registration_correction_revision)),
+        None,None,binding.sensor_origin_map,Some(accepted.clone())).await?;
+    let observed=commit.outcome.occupancy_event.is_some() || !commit.outcome.accepted_map_points.is_empty();
+    publish_registered_lio_commit(handle,accepted.map_frame_id(),&commit).await?;
+    if observed {
+        let _lifecycle=handle.mapping_lifecycle_lock.lock().await;
+        publish_recent_cloud_while_lifecycle_fenced(handle,accepted).await?;
+    }
+    Ok(observed)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handoff_registered_lio_cloud_with_correction(
     handle: &GeometryRuntimeHandle,
@@ -11419,6 +11475,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
                 navigation_context.as_ref(),
             )
             .await?;
+            publish_recent_cloud_while_lifecycle_fenced(handle, accepted).await?;
             return Ok(true);
         }
     }
@@ -11446,6 +11503,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         handle.mapping_adapter.as_ref().ok_or("mapping adapter unavailable")?.lock()
             .record_pgo_scan(accepted)?;
     }
+    let accepted_cloud_for_recent = accepted;
     let occupancy_committed = commit.outcome.occupancy_event.is_some();
     if !occupancy_committed {
         let accepted = !commit.outcome.accepted_map_points.is_empty();
@@ -11458,6 +11516,12 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
                 map_frame,
                 "实时点云已接纳，等待下一次地图发布"
             );
+        }
+        if accepted {
+            let _lifecycle = handle.mapping_lifecycle_lock.lock().await;
+            if correction.relocalization_mode_snapshot() != initial_mode { return Ok(false); }
+            // No map commit is required to publish a genuinely new scan.
+            publish_recent_cloud_while_lifecycle_fenced(handle, accepted_cloud_for_recent).await?;
         }
         return Ok(accepted);
     }
@@ -11497,6 +11561,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         navigation_context.as_ref(),
     )
     .await?;
+    publish_recent_cloud_while_lifecycle_fenced(handle, accepted).await?;
     let event = commit
         .outcome
         .occupancy_event
@@ -18064,9 +18129,10 @@ mod mapping_feed_tests {
     }
 
     async fn exercise_registered_lio_correction_commit(register_cloud_session: bool, in_process: bool) {
-        let handle = if in_process {
-            let transport = LcmTransport::new(Arc::new(MappingFeedRecordingBackend::new(
-                LcmTopic::new("/unused/unit-unclassified-fine-scan").unwrap())));
+        let recent_backend = in_process.then(|| MappingFeedRecordingBackend::new(
+            LcmTopic::new("/unused/unit-unclassified-fine-scan").unwrap()));
+        let handle = if let Some(backend) = &recent_backend {
+            let transport = LcmTransport::new(Arc::new(backend.clone()));
             build_test_handle_parts(false, Some(crate::mapping_backend::MappingBackendSpec::Voxel), Some(transport))
                 .await.expect("in-process fine source handle")
         } else { build_handle_for_tests().await.expect("test Geometry handle") };
@@ -18358,6 +18424,16 @@ mod mapping_feed_tests {
             let source = handle.cloud_map_writer.lock().as_ref().unwrap().latest_unclassified_fine_scan().unwrap();
             assert_eq!(source, throttled_source, "pending scan reaches fine owner before a new publication");
             assert_eq!(source.body_points().len(), 3);
+            let frames = recent_backend.as_ref().unwrap().published.lock().unwrap();
+            let recent = frames.iter().filter(|frame| frame.topic.channel() == nuwax_codec::lcm::recent_cloud::DEFAULT_TOPIC)
+                .map(|frame| nuwax_codec::lcm::recent_cloud::decode_body(&frame.payload).unwrap()).collect::<Vec<_>>();
+            assert_eq!(recent.len(), 2, "new admitted scans publish independently; duplicate/stale sources do not");
+            let latest = recent.last().unwrap();
+            let cloud = latest.cloud.as_ref().unwrap();
+            assert_eq!(cloud.source_timestamp_ns, (source_timestamp_ns + 1) as i64);
+            assert_eq!(cloud.source_sequence, throttled_binding.cloud_source_sequence);
+            assert_eq!(latest.session_id, throttled_binding.mapping_session_id);
+            assert_eq!(latest.commit_boot_nonce, handle.committed_map_authority.lock().unwrap().as_ref().unwrap().commit_boot_nonce);
         }
         assert!(revision_rx.try_recv().is_err());
         assert_eq!(sink.staged.lock().await.len(), 1);

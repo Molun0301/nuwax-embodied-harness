@@ -5,6 +5,8 @@ use nalgebra::Point3;
 use nuwax_map_chunks::{Repository, SealedMap, Writer};
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
+#[path = "ground_observations.rs"]
+mod ground_observations;
 
 pub(super) struct FineCloud {
     writer: Writer,
@@ -16,6 +18,9 @@ pub(super) struct FineCloud {
     // One shared admitted payload, not another scan history or voxel classifier.
     // Original body coordinates and frozen binding preserve unresolved modes.
     latest_unclassified_scan: Option<crate::lio_ingress::AdmittedRegisteredScan>,
+    observation_watermark_ns: u64,
+    latest_ground_source: Option<crate::lio_ingress::WeakAdmittedRegisteredScan>,
+    latest_ground_indices: Arc<[u32]>,
 }
 impl FineCloud {
     pub(super) fn from_archive(file: std::fs::File) -> Result<(Self, nuwax_map_chunks::ArchivedRoot), String> {
@@ -24,11 +29,12 @@ impl FineCloud {
         let root = archive.import(cloud.writer.repository())?;
         cloud.writer.restore_archived(&root)?;
         cloud.baseline = Some(root.identity());
+        cloud.observation_watermark_ns = root.source_timestamp_ns();
         Ok((cloud, root))
     }
     pub(super) fn new(size: f32) -> Result<Self, String> {
         Ok(Self { writer: Writer::new(Repository::temporary()?, size, 32 * 1024 * 1024)?,
-            dynamic: DynamicCloudFilter::default(), failure: None, readers: FineCloudReaders::default(), commits: 0, baseline: None, latest_unclassified_scan: None })
+            dynamic: DynamicCloudFilter::default(), failure: None, readers: FineCloudReaders::default(), commits: 0, baseline: None, latest_unclassified_scan: None, observation_watermark_ns: 0, latest_ground_source: None, latest_ground_indices: Arc::from([]) })
     }
     pub(super) fn fresh() -> Result<Self, String> { Self::new(VOXEL_SIZE) }
     #[cfg(test)]
@@ -38,14 +44,33 @@ impl FineCloud {
     pub(super) fn is_dynamic(&self, point: &Point3<f64>) -> bool {
         self.dynamic.is_dynamic([point.x, point.y, point.z])
     }
-    pub(super) fn retire_unclassified_scan(&mut self) { self.latest_unclassified_scan = None; }
+    pub(super) fn retire_unclassified_scan(&mut self) { self.latest_unclassified_scan = None; self.latest_ground_source = None; self.latest_ground_indices = Arc::from([]); }
+    pub(super) fn latest_ground_indices(&self, source: &crate::lio_ingress::AdmittedRegisteredScan) -> Option<Arc<[u32]>> {
+        self.latest_ground_source.as_ref().filter(|old| old.matches(source)).map(|_| self.latest_ground_indices.clone())
+    }
     pub(super) fn latest_unclassified_scan(&self) -> Option<&crate::lio_ingress::AdmittedRegisteredScan> {
         self.latest_unclassified_scan.as_ref()
     }
     pub(super) fn accumulate(&mut self, points: &[Point3<f64>], origin: Option<[f64; 3]>, timestamp_ns: u64,
         source: Option<&crate::lio_ingress::AcceptedRegisteredCloud>) -> Result<(), String> {
         if let Some(error) = &self.failure { return Err(error.clone()); }
-        let result = self.accumulate_inner(points, origin, timestamp_ns);
+        let result = self.accumulate_inner(points, origin, timestamp_ns).and_then(|()| {
+            if timestamp_ns <= self.observation_watermark_ns { return Ok(()); }
+            let Some(source) = source else { return Ok(()); };
+            let identity = source.source_identity();
+            if identity.source_timestamp_ns <= 0 || identity.source_timestamp_ns as u64 != timestamp_ns || identity.source_sequence <= 0 { return Ok(()); }
+            // The admitted allocation is the only statistics source. Mapping's
+            // bounded suffix preserves its original emitted-point indices.
+            let Some(first) = source.map_points().len().checked_sub(points.len()) else { return Ok(()); };
+            let original_points = &source.map_points()[first..];
+            let dynamic = &self.dynamic;
+            let indices = ground_observations::capture(&mut self.writer, original_points, first, identity.source_sequence as u64, timestamp_ns,
+                |p| dynamic.is_dynamic([p.x, p.y, p.z]))?;
+            self.latest_ground_indices = indices.into();
+            self.latest_ground_source = Some(source.scan().downgrade());
+            self.observation_watermark_ns = timestamp_ns;
+            Ok(())
+        });
         // 存储故障后不能把部分更新公开成完整提交；由原拥有方的重建/新会话恢复。
         if let Err(error) = &result { self.failure = Some(error.clone()); }
         else {
@@ -54,6 +79,23 @@ impl FineCloud {
             self.latest_unclassified_scan = source.map(|accepted| accepted.scan().clone());
         }
         result
+    }
+    /// Rebuild one archived observation under a corrected pose. The original
+    /// sequence/index identifies the sample; a transformed float is not a new hit.
+    pub(super) fn capture_replayed_ground(&mut self, points: &[Point3<f64>],
+        source: &crate::lio_ingress::AdmittedRegisteredScan) -> Result<(), String> {
+        if let Some(error) = &self.failure { return Err(error.clone()); }
+        let identity = source.source_identity();
+        if identity.source_sequence <= 0 || identity.source_timestamp_ns <= 0
+            || points.len() != source.body_points().len() { return Err("invalid archived ground source".into()); }
+        let timestamp = identity.source_timestamp_ns as u64;
+        if timestamp <= self.observation_watermark_ns { return Ok(()); }
+        let dynamic = &self.dynamic;
+        let result = ground_observations::capture(&mut self.writer, points, 0, identity.source_sequence as u64, timestamp,
+            |p| dynamic.is_dynamic([p.x, p.y, p.z]));
+        if let Err(error) = &result { self.failure = Some(error.clone()); }
+        else { self.observation_watermark_ns = timestamp; }
+        result.map(|_| ())
     }
     fn accumulate_inner(&mut self, points: &[Point3<f64>], origin: Option<[f64; 3]>, timestamp_ns: u64) -> Result<(), String> {
         self.dynamic.clear_frame();
@@ -234,4 +276,45 @@ mod unclassified_scan_tests {
         fine.accumulate(&points, None, 0, None).unwrap();
         assert!(fine.latest_unclassified_scan().is_none(), "legacy/replay without source does not inherit the prior stage");
     }
+    #[test]
+    fn original_indices_are_counted_once_and_resampling_is_not_new_evidence() {
+        let points=(0..8).flat_map(|x|(0..8).map(move|y|Point3::new(0.008+x as f64*0.022,0.008+y as f64*0.022,0.01))).collect::<Vec<_>>();
+        let admitted=source(10,&points);let mut fine=FineCloud::fresh().unwrap();
+        fine.accumulate(&points,None,10,Some(&admitted)).unwrap();
+        let layers=fine.writer.layer_observations([0,0,0]).unwrap();assert!(!layers.is_empty());
+        fine.accumulate(&points,None,10,Some(&admitted)).unwrap();
+        assert_eq!(fine.writer.layer_observations([0,0,0]).unwrap(),layers);
+        let next=source(11,&points);let mut resampled=points.clone();resampled[0].x+=1e-9;
+        fine.accumulate(&resampled,None,11,Some(&next)).unwrap();
+        let layers=fine.writer.layer_observations([0,0,0]).unwrap();
+        for layer in layers.values() { for sample in &layer.samples {
+            let expected: [f64;3] = points[sample.point_index as usize].coords.into();
+            assert_eq!(sample.point, expected, "statistics use the admitted allocation, never supplied reconstructed floats");
+        }}
+        let domain=nuwax_map_chunks::Domain{session:"owner".into(),generation:3,frame_generation:4,producer_generation:5};
+        let sealed=fine.seal(domain,1,11).unwrap();let (file,_)=nuwax_map_chunks::archive_file(sealed.manifest(),&sealed.repository).unwrap();
+        let (mut restored,_)=FineCloud::from_archive(file).unwrap();
+        restored.accumulate(&points,None,10,Some(&admitted)).unwrap();
+        assert_eq!(restored.writer.layer_observations([0,0,0]).unwrap(),layers,"restored source watermark rejects old scan recounting");
+    }
+
+    #[test]
+    fn corrected_replay_preserves_admitted_sample_identity_without_recounting() {
+        let points=(0..8).flat_map(|x|(0..8).map(move|y|Point3::new(0.008+x as f64*0.022,0.008+y as f64*0.022,0.01))).collect::<Vec<_>>();
+        let admitted=source(10,&points);let scan=admitted.scan();
+        let transform=nalgebra::Isometry3::translation(0.2,0.0,0.1);
+        let corrected=scan.body_points().iter().map(|point|transform*point).collect::<Vec<_>>();
+        let mut fine=FineCloud::fresh().unwrap();
+        fine.accumulate(&corrected,None,10,None).unwrap();
+        fine.capture_replayed_ground(&corrected,scan).unwrap();
+        let layers=fine.writer.layer_observations([0,0,0]).unwrap();assert!(!layers.is_empty());
+        for layer in layers.values(){
+            assert!((layer.plane_origin[2]-0.11).abs()<1e-8);
+            for sample in &layer.samples{assert_eq!(sample.source_sequence,10);assert_eq!(sample.source_timestamp_ns,10);let expected: [f64;3]=corrected[sample.point_index as usize].coords.into();assert_eq!(sample.point,expected);}
+        }
+        fine.capture_replayed_ground(&corrected,scan).unwrap();
+        assert_eq!(fine.writer.layer_observations([0,0,0]).unwrap(),layers);
+        assert_eq!(fine.writer.layer_observations([0,0,0]).unwrap(),layers);
+    }
+
 }

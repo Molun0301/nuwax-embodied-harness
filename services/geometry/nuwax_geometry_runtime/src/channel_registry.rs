@@ -60,6 +60,7 @@ pub enum ChannelKey {
     CloudMap,
     Occupancy,
     PlanarNavigation,
+    RecentCloud3D,
     CmdVel,
     GoalPose,
     NavState,
@@ -68,7 +69,7 @@ pub enum ChannelKey {
 }
 
 impl ChannelKey {
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 13] = [
         Self::Odom,
         Self::Tf,
         Self::PointCloud,
@@ -76,6 +77,7 @@ impl ChannelKey {
         Self::CloudMap,
         Self::Occupancy,
         Self::PlanarNavigation,
+        Self::RecentCloud3D,
         Self::CmdVel,
         Self::GoalPose,
         Self::NavState,
@@ -92,6 +94,7 @@ impl ChannelKey {
             Self::CloudMap => "cloud_map",
             Self::Occupancy => "occupancy",
             Self::PlanarNavigation => "planar_navigation",
+            Self::RecentCloud3D => "recent_cloud_3d",
             Self::CmdVel => "cmd_vel",
             Self::GoalPose => "goal_pose",
             Self::NavState => "nav_state",
@@ -147,6 +150,12 @@ const CHANNEL_KEY_TABLE: &[(ChannelKey, &str, &str, &str, &str)] = &[
         "NUWAX_LCM_CHANNEL_PLANAR_NAVIGATION",
         nuwax_codec::lcm::planar_navigation::DEFAULT_TOPIC,
         nuwax_codec::lcm::planar_navigation::TYPE_NAME,
+    ),
+    (
+        ChannelKey::RecentCloud3D,
+        "", "",
+        nuwax_codec::lcm::recent_cloud::DEFAULT_TOPIC,
+        nuwax_codec::lcm::recent_cloud::TYPE_NAME,
     ),
     (
         ChannelKey::Occupancy,

@@ -1,4 +1,6 @@
 //! Planning-only state. This module has no controller or motion port.
+#[path="recent_guide_overlay.rs"]
+mod recent_guide_overlay;
 use crate::planning_owner::Cancellation;
 use crate::{SurfaceFollowerConfig, SurfaceSnapshot};
 use nuwax_nav_scan::{BodyPose, LocalPlanError, ScanConfig};
@@ -276,6 +278,38 @@ impl PlanKernel {
                 ) {
                     reference = route.points;
                 }
+                // Live obstacles constrain this request's guide only. Keep the
+                // static tomogram cache and final Scan body admission unchanged.
+                if let Some(model) = map.body_envelope() {
+                    let center = [r.pose.pose.position.x, r.pose.pose.position.y];
+                    let radius = r.scan.horizon_m + 1.5 + model.radius();
+                    let bounds = [center.map(|v|v-radius),center.map(|v|v+radius)];
+                    let hints = match map.recent_obstacle_hints(bounds,body(&r.pose)) {
+                        Ok(hints) => hints,
+                        Err(reason) => {
+                            tracing::debug!(target:"navigation.scan",%reason,
+                                "recent guide hints unavailable; retaining exact Scan fallback");
+                            Vec::new()
+                        }
+                    };
+                    let overlay = recent_guide_overlay::RecentGuideOverlay::new(hints,tomogram.resolution,model)
+                        .map_err(|e|vec![LocalPlanError::from(e)])?;
+                    if !overlay.is_empty() {
+                        match tomogram.plan_bounded_with_segment_filter(
+                            reference[0], *reference.last().unwrap(), tomogram.resolution,
+                            &r.boundary, None, Some(r.scan.horizon_m*1.5), &costs,
+                            &|a,b|overlay.accepts(a,b),
+                        ) {
+                            Ok(route) => reference = route.points,
+                            Err(reason) => {
+                                // A radius guide can reject a pose-feasible narrow
+                                // passage. Its failure never proves no executable path.
+                                tracing::debug!(target:"navigation.scan",%reason,
+                                    "recent guide unavailable; retaining exact Scan fallback");
+                            }
+                        }
+                    }
+                }
             }
             let start = body(&r.pose);
             let straight = r.straight && !*detour;
@@ -483,6 +517,53 @@ mod tests {
                 detour,
                 straight: request.straight && !detour,
             });
+        }
+    }
+    #[test]
+    fn recent_detour_overlay_reuses_static_tomogram_and_clears_without_rebuild() {
+        let (mut kernel,mut request,cancel)=fixture();
+        kernel.compute_inner(&request,&cancel).unwrap_or_else(|e|panic!("baseline: {e:?}"));
+        let cached=kernel.local_map.as_ref().unwrap().2.clone();
+        let original=request.source.clone();
+        request.source=Arc::new(original.with_recent_obstacle_points(1,1_000_000_000,0,&[],
+            (0..5).map(|i|(i,[0.73,0.8+f64::from(i)*0.1,0.5]))).unwrap());
+        request.detour=true;request.final_yaw=Some(0.0);
+        let detour=kernel.compute_inner(&request,&cancel).unwrap_or_else(|e|panic!("detour: {e:?}"));
+        assert!(Arc::ptr_eq(&cached,&kernel.local_map.as_ref().unwrap().2));
+        assert!(nuwax_nav_pct::same_source_geometry(&original,&request.source));
+        assert!(detour.path.poses.iter().any(|p|(p.pose.position.y-1.0).abs()>0.1));
+        for pair in detour.path.poses.windows(2) {
+            request.source.validate_body_motion(body(&pair[0]),body(&pair[1]),&[]).unwrap();
+        }
+        request.source=Arc::new(request.source.with_recent_obstacle_points(2,2_000_000_000,0,&[],std::iter::empty()).unwrap());
+        let clear=kernel.compute_inner(&request,&cancel).unwrap_or_else(|e|panic!("clear: {e:?}"));
+        assert!(Arc::ptr_eq(&cached,&kernel.local_map.as_ref().unwrap().2));
+        assert!(clear.path.poses.iter().all(|p|(p.pose.position.y-1.0).abs()<1e-6));
+    }
+    #[test]
+    fn recent_radius_guide_failure_preserves_pose_feasible_narrow_door() {
+        let (mut kernel,mut request,cancel)=fixture();
+        let mut model=request.source.body_envelope().unwrap().clone();
+        model.footprint_xy_m=vec![[-0.3,-0.1],[0.3,-0.1],[0.3,0.1],[-0.3,0.1]];
+        request.source=Arc::new(request.source.with_body_envelope(model).unwrap()
+            .with_recent_obstacle_points(1,1_000_000_000,0,&[],
+                [(0,[1.25,0.75,0.5]),(1,[1.25,1.25,0.5])]).unwrap());
+        request.boundary=Arc::new(vec![[0.0,0.82],[4.0,0.82],[4.0,1.18],[0.0,1.18]]);
+        request.detour=true;request.final_yaw=Some(0.0);
+        let map=&request.source;
+        let start=body(&request.pose);let end=([3.0,1.0,0.5],start.1);
+        map.validate_body_motion(start,end,&request.boundary).expect("real long body fits the narrow door");
+        let tomo=nuwax_nav_pct::Tomogram::local_from_surface(map,[0.5,1.0],6.5).unwrap();
+        let hints=map.recent_obstacle_hints([[-6.5,-6.5],[6.5,6.5]],start).unwrap();
+        let overlay=recent_guide_overlay::RecentGuideOverlay::new(hints,tomo.resolution,map.body_envelope().unwrap()).unwrap();
+        assert!(!overlay.is_empty());
+        assert!(tomo.plan_bounded_with_segment_filter(request.reference[0],*request.reference.last().unwrap(),
+            tomo.resolution,&request.boundary,None,Some(7.5),&[],&|a,b|overlay.accepts(a,b)).is_err(),
+            "radius-only guide must be demonstrably more conservative than this pose-feasible door");
+        let result=kernel.compute_inner(&request,&cancel).unwrap_or_else(|e|panic!("exact fallback: {e:?}"));
+        assert!(result.path.poses.iter().all(|p|(p.pose.position.y-1.0).abs()<1e-6));
+        for pair in result.path.poses.windows(2) {
+            request.source.validate_body_motion(body(&pair[0]),body(&pair[1]),&request.boundary).unwrap();
         }
     }
     #[test]

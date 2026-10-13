@@ -131,5 +131,5 @@ fn solid_volume_keeps_its_exposed_top_at_both_resolutions() {
             "同一真实高细列超过接触范围仍应拒绝");
         let mut slot=None;let rejected=[body[0],body[1],body[2]-0.004];
         assert!(map.validate_body_pose_with_witness(rejected,q,&mut slot).is_err());
-        assert!(matches!(slot.unwrap().rejection,BodyRejection::Ground{coarse_predicate:HeightPredicate::ContactBelowGround,..}));
+        assert!(matches!(slot.unwrap().rejection,BodyRejection::Occupancy{..}));
     }

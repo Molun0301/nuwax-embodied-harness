@@ -1327,6 +1327,7 @@ async fn run_guarded_nav_scheduler(
         planar_navigation_enabled(),
         &body_reference_frame_id,
         None,
+        None,
     );
     let task_future = async move {
         task.await
@@ -1381,6 +1382,8 @@ enum GuardedMapFrame {
     Planar(RawLcmFrame),
     #[cfg(feature = "mls")]
     Surface(surface_dataflow::PreparedSurfaceMap),
+    #[cfg(feature = "mls")]
+    RecentCloud(RawLcmFrame),
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -1573,6 +1576,7 @@ async fn run_guarded_nav_loop<M, T>(
     planar_mode: bool,
     body_reference_frame_id: &str,
     surface_support_z_m: Option<f64>,
+    recent_source_max_age: Option<Duration>,
 ) -> NavStackResult<()>
 where
     M: Stream<Item = TransportResult<T>> + Unpin + Send,
@@ -1589,6 +1593,12 @@ where
     let mut accepted_planner_generation: Option<(GoalKey, i64)> = None;
     let mut goal_buffer = PlannerGoalBuffer::default();
     let mut surface_authority: Option<GuardedMapAuthority> = None;
+    #[cfg(feature="mls")]
+    let mut recent_source=surface_dataflow::RecentSourceState::new(recent_source_max_age);
+    if recent_source_max_age.is_some() {
+        scheduler.update_obstacle_source(None,false,None).await
+            .map_err(|error|module_error("recent source initial health",error))?;
+    }
     let mut planar_admission=nuwax_codec::lcm::planar_navigation::Admission::default();
     let mut publications = GuardedStatusPublications::default();
     let mut diagnostics = InputDiagnosticLimiter::default();
@@ -1743,6 +1753,13 @@ where
                     .ok_or_else(|| NavStackError::Internal("guarded map stream closed".into()))?
                     .map_err(|error| module_error("guarded map input", error))?;
                 let (decoded, received_at) = match frame {
+                    #[cfg(feature="mls")]
+                    GuardedMapFrame::RecentCloud(frame) => {
+                        if let Err(reason)=recent_source.consume(&frame.payload,surface_authority.as_ref(),scheduler).await {
+                            diagnostics.reject("recent obstacle source",&reason);
+                        }
+                        continue;
+                    }
                     GuardedMapFrame::Planar(frame) => {
                         let mut source_received_at = None;
                         let body = if planar_mode {
@@ -1836,6 +1853,9 @@ where
                                 &snapshot,
                             );
                         }
+                        if changed_domain || update.snapshot.is_err() {
+                            recent_source.reset(scheduler).await.map_err(|error|module_error("recent source domain reset",error))?;
+                        }
                         surface_authority = Some(update.authority.clone());
                         let surface = match update.snapshot {
                             Ok(surface) => surface,
@@ -1844,11 +1864,14 @@ where
                                 continue;
                             }
                         };
+                        let surface=recent_source.attach_terrain(surface);
                         (
                             OwnerInput::Accepted(GuardedCostmapInput {
                                 map_frame: update.authority.committed_map.frame_id.clone(),
                                 observation: nuwax_nav_runtime::CostmapObservation {
-                                    costmap: nuwax_nav_runtime::ExecutionMap::Surface(surface),
+                                    costmap: nuwax_nav_runtime::ExecutionMap::SurfaceUpdate(nuwax_nav_runtime::surface_changes::SurfaceMapUpdate {
+                                        snapshot: surface, change_basis: update.change_basis, changes: update.geometry_changes,
+                                    }),
                                     source_timestamp_ns: update.source_timestamp_ns,
                                 },
                             }),
@@ -8649,6 +8672,7 @@ mod guarded_tests {
                     planar_mode,
                     body_reference,
                     support,
+                    None,
                 )
                 .await
             }));

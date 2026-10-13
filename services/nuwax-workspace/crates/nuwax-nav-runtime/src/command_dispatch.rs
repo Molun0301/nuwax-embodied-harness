@@ -30,6 +30,21 @@ pub struct CommandDispatchBound {
     monotonic_deadline:Option<Instant>,
 }
 impl CommandDispatchBound {
+    /// Preserve the admitted sensor's absolute time through asynchronous dispatch.
+    /// A stale or invalid source produces an already-expired bound, never freshness.
+    pub fn from_source_timestamp(source_timestamp_ns:u64,max_age:Duration)->Self {
+        let age=max_age.as_nanos().min(u128::from(u64::MAX)) as u64;
+        Self::from_anchor(ObservationClockAnchor::capture(),source_timestamp_ns.saturating_add(age))
+    }
+    pub(crate) fn earliest(self,other:Self)->Self {
+        Self {
+            anchor_unix_ns:self.anchor_unix_ns.max(other.anchor_unix_ns),
+            latest_issue_unix_ns:self.latest_issue_unix_ns.min(other.latest_issue_unix_ns),
+            monotonic_deadline:self.monotonic_deadline.zip(other.monotonic_deadline)
+                .map(|(a,b)|a.min(b)),
+        }
+    }
+
     pub(crate) fn from_anchor(anchor:ObservationClockAnchor,latest_issue_unix_ns:u64)->Self {
         let monotonic_deadline=(anchor.unix_ns != 0).then_some(latest_issue_unix_ns)
             .and_then(|latest|latest.checked_sub(anchor.unix_ns))
@@ -76,6 +91,17 @@ pub(crate) fn latest_start_for_query(latest_checked:Option<u64>,elapsed_ns:u64)-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_bound_combination_preserves_both_clock_qualifications() {
+        let start=Instant::now();
+        let first=CommandDispatchBound::from_anchor(ObservationClockAnchor{monotonic:start,unix_ns:100},200);
+        let second=CommandDispatchBound::from_anchor(ObservationClockAnchor{monotonic:start,unix_ns:150},300);
+        let combined=first.earliest(second);
+        assert!(!combined.expired_at(start,Some(175)));
+        assert!(combined.expired_at(start,Some(125)),"newer source clock anchor cannot be discarded");
+        assert!(combined.expired_at(start,Some(201)),"earlier absolute limit remains binding");
+        assert!(combined.expired_at(start+Duration::from_nanos(101),Some(175)));
+    }
     #[test]
     fn inclusive_deadline_and_both_clock_qualifications() {
         let start=Instant::now();let anchor=ObservationClockAnchor{monotonic:start,unix_ns:100};

@@ -92,7 +92,7 @@ fn evidence_only_new_arc_invalidates_warm_band_membership() {
     assert!(map.same_geometry(&changed));
     assert!(!Arc::ptr_eq(&map.body_query_cache,&changed.body_query_cache));
     assert!(changed.body_query_cache.lock().unwrap().fine_bands.is_empty());
-    assert!(changed.fine_contact_bands(0,0).is_empty());
+    assert_eq!(changed.fine_contact_bands(0,0)[0].run,[5,5],"persistent geometry is not erased by low hit count");
     assert_eq!(map.fine_contact_bands(0,0)[0].run,[5,5]);
     let restored=changed.with_observations(Some(strong));
     assert!(restored.body_query_cache.lock().unwrap().fine_bands.is_empty());
@@ -139,12 +139,12 @@ fn fine_contact_permission_is_recomputed_for_evidence_only_owner_replacement() {
     let base=scene(&[],false).with_observations(Some(strong.clone()));
     let q=[0.0,0.0,0.0,1.0];let r=rotation(q).unwrap();let body=[0.025,0.025,base.body_envelope().unwrap().body_to_support_z_m];
     let polygon=vec![[0.01,0.01],[0.04,0.01],[0.04,0.04],[0.01,0.04]];
-    for (map,expected) in [(base.clone(),true),(base.with_observations(Some(weak.clone())),false),(base.with_observations(None),false),(base.with_observations(Some(strong)),true)] {
+    for (map,expected) in [(base.clone(),true),(base.with_observations(Some(weak.clone())),true),(base.with_observations(None),false),(base.with_observations(Some(strong)),true)] {
         let prism=PrismQuery::new(map.body_envelope().unwrap(),r,body);
         let rows=map.fine_ground_columns(None,&PolygonQuery::new(&polygon),&prism,body,r[2],0,0);
         let permitted=rows.as_ref().is_some_and(|rows|rows.iter().any(|c|c.xy==[0,0]&&c.permits_contact(0)));
         assert_eq!(permitted,expected);
-        if permitted {let o=map.observations.as_ref().unwrap();assert!(o.get([0,0,0]).is_some()&&o.supports_obstacle([0,0,0]));}
+        if permitted {let o=map.observations.as_ref().unwrap();assert!(o.get([0,0,0]).is_some());}
     }
     assert!(weak.get([0,0,0]).is_some());assert!(!weak.supports_obstacle([0,0,0]));
 }

@@ -80,20 +80,22 @@ async fn dispatch_ambiguous_failure_keeps_fail_closed_fence() {
     assert!(scheduler.motion.inner.0.lock().unwrap().calls.iter().any(|call|call.starts_with("fence:")));
 }
 
-pub(super) async fn assert_real_bound_reaches_scheduler(
-    worker:planner_worker::PlannerWorker, step:PlannerStep,
+pub(super) async fn assert_real_source_bound_reaches_scheduler(
+    worker:planner_worker::PlannerWorker, step:PlannerStep, source_timestamp_ns:u64, max_age:Duration,
 ) {
     let template=dispatch_scheduler();
     let mut scheduler=NavScheduler::new(template.motion,worker,SchedulerConfig::default()).unwrap();
     scheduler.session=Some(session());scheduler.lease_active=true;
     scheduler.current_execution_identity=Some(Arc::new(execution_identity_for("goal-1",1)));
     let intent=scheduler.wrap_local_intent(step).unwrap();
-    let bound=intent.dispatch_bound.expect("real observed command lost its finite bound through a planner wrapper");
-    assert!(!bound.expired_now());
+    assert!(intent.dispatch_bound.is_none(), "static ground must not issue a per-cell execution lease");
+    let bound=CommandDispatchBound::from_source_timestamp(source_timestamp_ns,max_age);
+    assert!(!bound.expired_now(), "actual sensor source must still be healthy");
+    scheduler.obstacle_source_bound=Some(bound);
     let LocalExecutionPayload::Command(command)=intent.payload else {panic!("expected real command");};
     assert_ne!(command,Twist2::ZERO);
     let (status,_)=watch::channel(scheduler.status.clone());
-    assert!(scheduler.apply_controller_twist_with_bound(&status,command,Some(bound)).await.unwrap());
+    assert!(scheduler.apply_controller_twist_with_bound(&status,command,intent.dispatch_bound).await.unwrap());
     assert_eq!(scheduler.motion.bounded_attempts,1);
     assert_eq!(scheduler.motion.applied,vec![command]);
     scheduler.planner.stop();

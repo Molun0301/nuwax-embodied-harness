@@ -20,15 +20,16 @@ use crate::surfaces::ColumnIz;
 use crate::voxel::{surface_point_xyz, voxelize, VoxelKey};
 
 mod observations;
-pub use observations::{SurfaceObservation, SurfaceObservations};
+mod recent;
+pub use observations::{ObservedGroundLayer, SurfaceObservation, SurfaceObservations};
 mod body;
-pub use body::SurfaceBodyEnvelope;
+pub use body::{BodyGroundRelation, GroundQuery, GroundQueryState, SurfaceBodyEnvelope};
 mod passage;
 pub use passage::SurfaceBodyPassageCandidate;
 mod body_query;
 pub use body_query::SurfaceBodyQueryView;
 mod body_witness;
-pub use body_witness::{BodyFailureWitness, BodyRejection, CollisionCheck, FineGroundReject, HeightPredicate, OccupancySource, SupportRejection};
+pub use body_witness::{BodyFailureWitness, BodyRejection, CollisionCheck, OccupancySource};
 mod frontiers;
 pub use frontiers::SurfaceFrontierCacheStats;
 mod routing;
@@ -73,6 +74,7 @@ pub enum SurfaceError {
     MissingSupport,
     /// 新进入的精细位置缺少合格观察。
     #[error("近场支撑{cell:?}不可用：{reason}，采样={observed_ns}，检查={checked_ns}")]
+    #[cfg(test)]
     NearFieldObservation {
         /// 固定精度的实际三维格。
         cell: [i32; 3],
@@ -89,6 +91,9 @@ pub enum SurfaceError {
     /// 虚拟禁区或其足迹余量禁止使用该支撑点。
     #[error("support is blocked by the virtual navigation boundary")]
     VirtualObstacle,
+    /// No bounded same-layer estimate is available; this is not an obstacle claim.
+    #[error("ground geometry is unknown at the requested location")]
+    UnknownGround,
     /// 连接经过未知支撑、非法台阶、过陡坡道或受阻轮廓。
     #[error("surface segment is not traversable")]
     UntraversableSegment,
@@ -275,21 +280,15 @@ impl VirtualObstacleMask {
 #[path = "surface/virtual_mask_match_tests.rs"]
 mod virtual_mask_match_tests;
 
-/// 来源声明决定连续占据带是测量区间还是实体体积。
-#[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
-pub enum GroundEvidence {
-    /// 点云表面测量的连续厚带。
-    #[default]
-    MeasuredSurface,
-    /// 已知实体占据，接触面只能位于暴露带顶。
-    OccupiedVolume,
-}
+/// Shared layer interpretation used by PCT and body queries.
+pub use nuwax_types::ground_layer::{GroundApproximation, GroundEvidence, GroundLayer};
 
 /// 一次地图更新建立一次；克隆仅共享不可变表面和邻接图。
 #[derive(Clone)]
 pub struct SurfaceSnapshot {
     data: Arc<SurfaceData>,
     observations: Option<Arc<SurfaceObservations>>,
+    recent_obstacles: Option<Arc<recent::RecentObstacles>>,
     current_body_support: Option<Arc<body::CurrentBodySupport>>,
     /// 同一不可变快照与精确位姿的检查缓存；任何几何或观察替换均清空。
     body_query_cache: Arc<std::sync::Mutex<body::BodyQueryCache>>,
@@ -343,6 +342,7 @@ impl SurfaceSnapshot {
                 Arc::new(current.fork_for_planning())),
             body_query_cache: Default::default(),
             ground_evidence: self.ground_evidence,
+            recent_obstacles:self.recent_obstacles.clone(),
         }
     }
 
@@ -389,6 +389,46 @@ impl SurfaceSnapshot {
             window.is_none_or(|(center,radius)|((f64::from(column[0])+0.5)*size-center[0]).abs()<=radius
                 && ((f64::from(column[1])+0.5)*size-center[1]).abs()<=radius)
         })))
+    }
+
+    /// Source-owned measured layer interpretation for PCT. Unclassified legacy
+    /// bands remain compatibility candidates, and nonmember occupancy stays solid.
+    pub fn navigation_measured_ground_layers(&self,column:[i32;2],resolution:f64,bands:&[[f64;2]])
+        ->Option<Vec<(GroundLayer,f64)>> {
+        if self.ground_evidence!=GroundEvidence::MeasuredSurface {return None;}
+        // PCT clears forbidden columns before interpretation. Measured metadata
+        // must never resurrect a column removed by the virtual boundary.
+        if bands.is_empty() {return Some(Vec::new());}
+        let observations=self.observations.as_ref()?;
+        let quantum=f64::from(observations.size_m);
+        if !observations.is_complete_geometry_source()
+            || resolution.to_bits()!=quantum.to_bits() {return None;}
+        let observed:Vec<_>=observations.ground_layers(column).collect();
+        if observed.is_empty() {return None;}
+        let xy=column.map(|v|(f64::from(v)+0.5)*quantum);
+        let mut result=Vec::new();
+        for record in &observed {
+            let Some(layer)=record.ground_at(xy,quantum) else {continue;};
+            // Only exact associated members are excluded. A wall/box sharing the
+            // same contiguous raw band still supplies a ceiling above the plane.
+            let ceiling=observations.column_levels(column[0],column[1]).unwrap_or(&[]).iter()
+                .filter(|z|record.members.binary_search(z).is_err())
+                .map(|&z|f64::from(z)*quantum)
+                .filter(|&bottom|bottom+quantum>layer.representative_z+1e-9)
+                .min_by(f64::total_cmp).unwrap_or(f64::INFINITY);
+            result.push((layer,ceiling));
+        }
+        for (i,&band) in bands.iter().enumerate() {
+            let contains_measured=observed.iter().any(|record|record.members.iter().any(|&z|
+                (f64::from(z)+0.5)*quantum>=band[0] && (f64::from(z)+0.5)*quantum<=band[1]));
+            if !contains_measured {
+                if let Some(layer)=GroundLayer::from_legacy_band(band,quantum,self.ground_evidence) {
+                    result.push((layer,bands.get(i+1).map_or(f64::INFINITY,|next|next[0])));
+                }
+            }
+        }
+        result.sort_by(|a,b|a.0.representative_z.total_cmp(&b.0.representative_z));
+        Some(result)
     }
 
     /// 层析单元沿用当前图的虚拟障碍，不创建另一份禁区配置。
@@ -453,7 +493,7 @@ impl SurfaceSnapshot {
 
     fn with_virtual_mask(&self, mask: Arc<VirtualObstacleMask>) -> Result<Self, SurfaceError> {
         if let Some(current) = &self.current_body_support {
-            return current.source.with_observations(self.observations.clone())
+            return current.source.with_observations(self.observations.clone()).with_recent_obstacles_from(self)
                 .with_virtual_mask(mask)?.with_current_body_support(current.body, current.quaternion);
         }
         let physical = Arc::clone(&self.data.physical_graph);
@@ -489,6 +529,7 @@ impl SurfaceSnapshot {
         };
         let result=Self {
             ground_evidence:self.ground_evidence,
+            recent_obstacles:self.recent_obstacles.clone(),
             observations: self.observations.clone(),
             current_body_support: None,
             body_query_cache: Default::default(),

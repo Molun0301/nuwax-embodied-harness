@@ -1939,8 +1939,10 @@ dependencies = [
  "imageproc",
  "nuwax-codec",
  "nuwax-explore-routing",
+ "nuwax-map-chunks",
  "nuwax-protocol",
  "nuwax-transport",
+ "nuwax-types",
  "rayon",
  "serde",
  "serde_json",
@@ -2013,8 +2015,10 @@ name = "nuwax-nav-pct"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "nuwax-map-chunks",
  "nuwax-nav-mls-planner",
  "nuwax-nav-types-messages",
+ "nuwax-types",
  "tracing",
 ]
 

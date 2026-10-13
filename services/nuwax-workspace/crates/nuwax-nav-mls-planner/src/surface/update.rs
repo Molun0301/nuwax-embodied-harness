@@ -479,6 +479,7 @@ pub(super) fn from_columns(
     let occupied_voxels = columns.values().map(Vec::len).sum();
     Ok(SurfaceSnapshot {
         ground_evidence:GroundEvidence::MeasuredSurface,
+        recent_obstacles:None,
         observations: None,
         current_body_support: None,
         body_query_cache: Default::default(),
@@ -679,6 +680,7 @@ fn update_columns(
     };
     let snapshot = SurfaceSnapshot {
         ground_evidence:previous.ground_evidence,
+        recent_obstacles:previous.recent_obstacles.clone(),
         observations: None,
         current_body_support: None,
         body_query_cache: Default::default(),

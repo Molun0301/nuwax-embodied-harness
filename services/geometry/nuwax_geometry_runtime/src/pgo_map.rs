@@ -208,6 +208,8 @@ pub(crate) struct ReplayBuilder {
     background_parallel_available: bool,
     #[cfg(test)]
     force_parallel_lanes: bool,
+    #[cfg(test)]
+    skip_ground_capture_for_cost_comparison: bool,
     kernel_time: Duration,
     cloud_time: Duration,
 }
@@ -285,6 +287,8 @@ impl ReplayBuilder {
             background_parallel_available: false,
             #[cfg(test)]
             force_parallel_lanes: false,
+            #[cfg(test)]
+            skip_ground_capture_for_cost_comparison: false,
             kernel_time: Duration::ZERO,
             cloud_time: Duration::ZERO,
         })
@@ -395,6 +399,7 @@ impl ReplayBuilder {
                 sensor_origin_map: origin.coords.into(),
                 registered_points_map: points,
             });
+            let ground_source = ReplayedGroundSource { source: scan.source.clone() };
             let validation_started = Instant::now();
             mapping_backend::validate_backend_input(&self.kernel, &input)?;
             self.kernel_time += validation_started.elapsed();
@@ -406,7 +411,7 @@ impl ReplayBuilder {
                     && self.cloud_time.as_nanos() / self.processed as u128 >= 250_000);
             #[cfg(test)]
             let use_parallel = use_parallel || (self.background && self.force_parallel_lanes);
-            if !use_parallel || !self.append_parallel_stages(&input, cancelled)? {
+            if !use_parallel || !self.append_parallel_stages(&input, &ground_source, cancelled)? {
                 let phase = Instant::now();
                 append_kernel_stage(
                     &mut self.kernel,
@@ -417,7 +422,10 @@ impl ReplayBuilder {
                 self.kernel_time += phase.elapsed();
                 self.check(cancelled)?;
                 let phase = Instant::now();
-                append_cloud_stage(self.cloud.as_mut().expect("本地点云已保留"), &input)?;
+                let capture_source = Some(&ground_source);
+                #[cfg(test)]
+                let capture_source = capture_source.filter(|_| !self.skip_ground_capture_for_cost_comparison);
+                append_cloud_stage(self.cloud.as_mut().expect("本地点云已保留"), &input, capture_source)?;
                 self.cloud_time += phase.elapsed();
             }
             self.processed += 1;
@@ -430,6 +438,7 @@ impl ReplayBuilder {
     fn append_parallel_stages(
         &mut self,
         input: &Arc<MappingBackendInput>,
+        ground_source: &ReplayedGroundSource,
         cancelled: &impl Fn() -> bool,
     ) -> Result<bool, RebuildError> {
         if self.cloud_worker.is_none() {
@@ -443,7 +452,7 @@ impl ReplayBuilder {
                 }
             }
         }
-        self.cloud_worker.as_mut().unwrap().submit(input.clone())?;
+        self.cloud_worker.as_mut().unwrap().submit(input.clone(), Some(ground_source.clone()))?;
         let started = Instant::now();
         // 地图与点云各自推进，最多两路计算。
         let kernel_result = append_kernel_stage(
@@ -595,6 +604,11 @@ impl ReplayBuilder {
     }
 }
 
+#[derive(Clone)]
+struct ReplayedGroundSource {
+    source: AdmittedRegisteredScan,
+}
+
 struct CloudStageReply {
     source_timestamp_ns: u64,
     frame_sequence: u64,
@@ -604,7 +618,7 @@ struct CloudStageReply {
 
 /// 每次重建独立拥有；关闭回复端后再等待，避免未领取回执阻塞退出。
 struct CloudStageWorker {
-    input: Option<std::sync::mpsc::SyncSender<Arc<MappingBackendInput>>>,
+    input: Option<std::sync::mpsc::SyncSender<(Arc<MappingBackendInput>, Option<ReplayedGroundSource>)>>,
     replies: Option<std::sync::mpsc::Receiver<CloudStageReply>>,
     join: Option<std::thread::JoinHandle<Result<CloudMapShmWriter, RebuildError>>>,
 }
@@ -612,7 +626,7 @@ struct CloudStageWorker {
 impl CloudStageWorker {
     fn start(cloud: CloudMapShmWriter) -> Result<Self, CloudMapShmWriter> {
         let (initialize, initialized) = std::sync::mpsc::sync_channel::<CloudMapShmWriter>(1);
-        let (input, requests) = std::sync::mpsc::sync_channel::<Arc<MappingBackendInput>>(1);
+        let (input, requests) = std::sync::mpsc::sync_channel::<(Arc<MappingBackendInput>, Option<ReplayedGroundSource>)>(1);
         let (replies, receiver) = std::sync::mpsc::sync_channel(1);
         let join = std::thread::Builder::new()
             .name("pgo-cloud".into())
@@ -620,9 +634,9 @@ impl CloudStageWorker {
                 let mut cloud = initialized
                     .recv()
                     .map_err(|_| RebuildError::Invalid("PGO点云初始化通道关闭".into()))?;
-                while let Ok(input) = requests.recv() {
+                while let Ok((input, ground_source)) = requests.recv() {
                     let started = Instant::now();
-                    let result = append_cloud_stage(&mut cloud, &input);
+                    let result = append_cloud_stage(&mut cloud, &input, ground_source.as_ref());
                     let reply = CloudStageReply {
                         source_timestamp_ns: input.source_timestamp_ns,
                         frame_sequence: input.frame_sequence,
@@ -651,11 +665,11 @@ impl CloudStageWorker {
         })
     }
 
-    fn submit(&mut self, input: Arc<MappingBackendInput>) -> Result<(), RebuildError> {
+    fn submit(&mut self, input: Arc<MappingBackendInput>, ground_source: Option<ReplayedGroundSource>) -> Result<(), RebuildError> {
         self.input
             .as_ref()
             .ok_or("PGO点云工作已关闭")?
-            .send(input)
+            .send((input, ground_source))
             .map_err(|_| RebuildError::Invalid("PGO点云工作线程已退出".into()))
     }
 
@@ -714,7 +728,9 @@ fn append_kernel_stage(
 fn append_cloud_stage(
     cloud: &mut CloudMapShmWriter,
     input: &MappingBackendInput,
+    ground_source: Option<&ReplayedGroundSource>,
 ) -> Result<(), RebuildError> {
+    if ground_source.is_some_and(|s| s.source.source_timestamp_ns() != input.source_timestamp_ns) { return Err("PGO ground/source timestamp mismatch".into()); }
     if !cloud.accumulate_mapping_scan(
         1,
         &input.registered_points_map,
@@ -722,6 +738,9 @@ fn append_cloud_stage(
         input.source_timestamp_ns,
     ) {
         return Err("PGO重建点云无法接纳原始扫描".into());
+    }
+    if let Some(source) = ground_source {
+        cloud.capture_replayed_ground(&input.registered_points_map, &source.source)?;
     }
     Ok(())
 }
@@ -977,7 +996,7 @@ mod tests {
                     registered_frame_id: "map".into(),
                     sensor_origin_map: [0.0; 3],
                     registered_points_map: vec![Point3::new(sequence as f64, 0.0, 0.0)],
-                }))
+                }), None)
                 .unwrap();
         }
         // 回复端未领取也必须能关闭，不能在等待线程时被已满回复通道卡住。
@@ -1023,6 +1042,40 @@ mod tests {
             })
             .to_vec();
         (scans, trajectory)
+    }
+
+    #[test]
+    #[ignore = "same-fixture capture-only A/B diagnostic; original 10s budget, not a git baseline"]
+    fn pgo_capture_cost_same_fixture_ab() {
+        let (scans, mut trajectory) = scale_input(31);
+        let cutoff = 12;
+        trajectory[1].source_timestamp_ns = scans[cutoff].source_timestamp_ns as i64;
+        trajectory[1].translation_m = (scans[cutoff].odom_from_body.translation.vector
+            + nalgebra::Vector3::new(-0.04, 0.03, 0.0)).into();
+        trajectory.push(OptimizedKeyframe {
+            source_timestamp_ns: scans.last().unwrap().source_timestamp_ns as i64,
+            translation_m: (scans.last().unwrap().odom_from_body.translation.vector
+                + nalgebra::Vector3::new(-0.04, 0.03, 0.0)).into(),
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        });
+        let config = MappingBackendComputeConfig { resolution: 0.05, initial_safe_radius_meters: 0.0, window_capacity: 10_000 };
+        // Opposite orders reduce warm-cache/order bias. All runs use fresh private
+        // owners, the same input, profile and exact existing test budget.
+        for order in [[false, true], [true, false]] {
+            for spec in [MappingBackendSpec::Voxel, MappingBackendSpec::raytracing_defaults()] {
+                for skip in order {
+                    let mut builder = ReplayBuilder::new(&scans, trajectory.clone(),
+                        Isometry3::translation(0.73, -1.15, 0.04), spec, config, "map".into(),
+                        Duration::from_secs(10), &|| false).unwrap();
+                    builder.skip_ground_capture_for_cost_comparison = skip;
+                    let result = builder.append(&scans, &|| false).and_then(|()|builder.prepare(&|| false));
+                    eprintln!("CAPTURE_AB backend={spec:?} capture={} frames={} points_per_frame={} processed={} kernel_ms={} cloud_ms={} wall_ms={} result={:?}",
+                        !skip, scans.len(), scans[0].body_points.len(), builder.processed,
+                        builder.kernel_time.as_millis(), builder.cloud_time.as_millis(), builder.started.elapsed().as_millis(), result.as_ref().err());
+                    if let Some(cloud) = builder.cloud.as_mut() { cloud.cleanup_product_owned_file().unwrap(); }
+                }
+            }
+        }
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! 完整三维机体路径跟随与共享制动检查，仍由原调度器唯一写入运动守卫。
 use super::*;
 use nuwax_nav_control::{choose_tracking_control_with_period_check, PlanarPose, TrackingScore};
-use crate::command_dispatch::{latest_start_for_query, ObservationClockAnchor, ObservationProofAccumulator};
+use crate::command_dispatch::ObservationProofAccumulator;
+#[cfg(test)]
+use crate::command_dispatch::ObservationClockAnchor;
 type BodyPose = ([f64; 3], [f64; 4]);
 // Existing waypoint rotation completion tolerance, also reused as experimental
 // alignment guidance. It is not a body-clearance or motion-permission threshold.
@@ -247,6 +249,17 @@ pub(super) fn translation_connects(map:&SurfaceSnapshot,from:([f64;3],[f64;4]),n
         connection_endpoint(map,from,&aligned)
             .is_some_and(|arrival|connection_endpoint(map,arrival,next).is_some())
     }
+}
+
+#[derive(Clone)]
+pub(super) struct SelectedBodyCommand {
+    pose:PoseStamped,
+    current:Twist2,
+    command:Twist2,
+    limits:MotionLimits,
+    dt:f64,
+    sample_step:f64,
+    radius:f64,
 }
 
 impl SurfaceFollower {
@@ -836,16 +849,10 @@ impl SurfaceFollower {
         #[cfg(test)] let profile_setup=crate::control_profile::guard(crate::control_profile::Stage::GuardSetup);
         let map=self.map.as_ref().ok_or("缺少表面地图")?;
         let pose=self.odometry.as_ref().ok_or("缺少实际位姿")?;
-        let observation_check = if let Some(age) = self.config.max_observation_age_sec {
-            let Ok(occupied) = map.body_observation_footprint(body(pose)) else {
-                return Err("三维近场实际观察缺失".into());
-            };
-            let anchor = ObservationClockAnchor::capture();
-            Some((occupied, anchor, (age * 1e9) as u64))
-        } else { None };
-        #[cfg(test)] proof_scope.record_basis(pose,self.last_command,
-            observation_check.as_ref().map(|(_,anchor,age)|(anchor.unix_ns,*age)));
-        let proof=ObservationProofAccumulator::new(observation_check.as_ref().map(|(_,anchor,_)|*anchor));
+        // Persistent ground has no per-cell time lease. Source/pose health is
+        // checked by the scheduler using its own admitted live-input authority.
+        #[cfg(test)] proof_scope.record_basis(pose,self.last_command,None);
+        let proof=ObservationProofAccumulator::new(None);
         let last_failure = std::cell::RefCell::new(None);
         let source_map=self.source_map.as_ref().unwrap_or(map);
         let motion_queries = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -857,14 +864,10 @@ impl SurfaceFollower {
             let mut previous_xy=[pose.pose.position.x,pose.pose.position.y];
             let mut previous_yaw=pose.pose.orientation.yaw();
             let last_failure=&last_failure;
-            let observation_check=&observation_check;
             let proof=&proof;
-            // One last footprint-cell set per callback, bound to this immutable
-            // view and original exemption. This footprint context stores no
-            // time/evidence outcomes; each actual checker invocation uses the
-            // existing now+elapsed. Outer exact-time motion memoization is unchanged.
-            let mut observed_motion=observation_check.as_ref().map(|(occupied,anchor,age)|
-                (anchor.unix_ns,map.observed_body_motion_checker_with_expiry_and_witness(occupied,*age,boundary)));
+            // Same full-body prism/turning sweep; no occupied-footprint freshness
+            // exemption, hits threshold or earliest-ground-expiry dependency.
+            let mut geometry_motion=map.geometry_body_motion_checker_with_witness(boundary);
             // 两种回调的地形依据不同，不能共用运动许可；视图按精确站姿在本次选择内复用。
             let motion_queries=if rebase {&period_queries}else{&motion_queries};
             let future_views=&future_views;
@@ -876,10 +879,7 @@ impl SurfaceFollower {
                 }
                 let a = previous_body;
                 let preserve_height = (to.x-from.x).hypot(to.y-from.y)<1e-9;
-                let elapsed_ns=(elapsed * 1e9) as u64;
-                let observation_time = observation_check.as_ref()
-                    .map(|(_, anchor, _)| anchor.unix_ns.saturating_add(elapsed_ns));
-                let b=match memoized_body_motion_impl(motion_queries,proof,a,to,preserve_height,observation_time,|| -> Result<BodyMotionSuccess,BodyMotionFailure> {
+                let b=match memoized_body_motion_impl(motion_queries,proof,a,to,preserve_height,None,|| -> Result<BodyMotionSuccess,BodyMotionFailure> {
                     let mut witness=None;
                     let future=if rebase && a!=body(pose) {
                         let key=[a.0[0],a.0[1],a.0[2],a.1[0],a.1[1],a.1[2],a.1[3]].map(f64::to_bits);
@@ -911,21 +911,12 @@ impl SurfaceFollower {
                     };
                     if preserve_height {b.0[2]=a.0[2];}
                     // 未来足迹不能自行授予新区域许可，始终保留本拍初始视图的完整检查。
-                    let latest_start_ns=match observed_motion.as_mut() {
-                        Some((now, check)) => {
-                            #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::ObservedSweeps);
-                            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardObservedSweep);
-                            {let result=check(a,b,now.saturating_add(elapsed_ns),&mut witness);
-                            latest_start_for_query(motion_failure(result,witness)?,elapsed_ns)}
-                        },
-                        None => {
-                            #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
-                            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardGeometrySweep);
-                            let result=map.validate_body_motion_with_witness(a,b,boundary,&mut witness);
-                            motion_failure(result,witness)?;
-                            None
-                        },
-                    };
+                    {
+                        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
+                        #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardGeometrySweep);
+                        let result=geometry_motion(a,b,&mut witness);
+                        motion_failure(result,witness)?;
+                    }
                     if let Some(view)=future {
                         // 完全同源同足迹的视图可复用刚通过的同一扫掠；其它视图独立核验。
                         if !view.same_body_query_view(map) {
@@ -935,7 +926,7 @@ impl SurfaceFollower {
                             motion_failure(result,witness)?;
                         }
                     }
-                    Ok(BodyMotionSuccess {pose:b,latest_start_ns})
+                    Ok(BodyMotionSuccess {pose:b,latest_start_ns:None})
                 }) {
                     Ok(success)=>success.pose,
                     Err(error)=>{
@@ -956,7 +947,7 @@ impl SurfaceFollower {
             let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardCleanup);
             drop(period_check);drop(geometric_check);
             drop(future_views);drop(period_queries);drop(motion_queries);
-            drop(last_failure);drop(observation_check);
+            drop(last_failure);
         }
         Ok(result)
     }
@@ -983,7 +974,40 @@ impl SurfaceFollower {
         }).unwrap_or(false)
     }
 
+    /// Reuse the selected command parameters, never the old collision answer.
+    /// The original worker issue deadline remains owned by PlannerWorker.
+    pub(super) fn recheck_selected_body_command(&mut self,command:Twist2)->Option<PlannerStep> {
+        let selected=self.selected_body_command.as_ref()?.clone();
+        if selected.command!=command {return None;}
+        let saved_pose=self.odometry.replace(selected.pose.clone());
+        let saved_map=self.map.clone();
+        let saved_dirty=self.body_view_dirty;
+        let saved_command=self.last_command;
+        self.last_command=selected.current;
+        self.body_view_dirty=true;
+        self.refresh_current_body_view();
+        let checked=self.with_body_motion_checks(|clear,period,last_failure,_| {
+            let valid=nuwax_nav_control::check_stopping_trajectory_with_period_check(
+                planar(&selected.pose),selected.current,selected.command,&selected.limits,
+                selected.dt,selected.sample_step,selected.radius,clear,period).is_some();
+            #[cfg(test)] if valid {crate::command_proof_trace::record_selected(command);}
+            (valid,last_failure.take())
+        });
+        self.odometry=saved_pose;self.map=saved_map;self.body_view_dirty=saved_dirty;
+        self.last_command=saved_command;
+        match checked {
+            Ok((true,_))=>Some(PlannerStep::Command(command)),
+            other=>{
+                self.selected_body_command=None;
+                self.last_command=selected.current;
+                self.begin_braking();
+                Some(PlannerStep::ReplanRequired(format!("最新近期障碍拒绝已选停车轨迹: {other:?}")))
+            }
+        }
+    }
+
     pub(super) fn bounded_body_command(&mut self, preferred: Twist2, speed_limit:Option<f64>) -> PlannerStep {
+        self.selected_body_command=None;
         self.last_command_dispatch_bound = None;
         #[cfg(test)] crate::command_proof_trace::invalidate_selection();
         #[cfg(test)] let profile_setup=crate::control_profile::guard(crate::control_profile::Stage::GuardSetup);
@@ -1106,6 +1130,10 @@ impl SurfaceFollower {
         match result {
             Some(choice) if choice.command.linear.x.hypot(choice.command.linear.y) > 1e-9
                 || choice.command.angular_z.abs() > 1e-9 => {
+                self.selected_body_command=Some(SelectedBodyCommand {
+                    pose:pose.clone(),current,command:choice.command,limits,dt,
+                    sample_step:f64::from(map.source_voxel_size_m())*0.5,radius:model.radius(),
+                });
                 self.last_command = choice.command;
                 self.last_command_dispatch_bound = bound;
                 PlannerStep::Command(choice.command)
@@ -1704,7 +1732,7 @@ mod query_reuse_tests {
     }
 
     #[test]
-    fn observed_dependencies_are_restored_from_each_callback_memo() {
+    fn old_ground_callbacks_have_no_cell_expiry_lease() {
         let base=map(0.0);
         let observed_ns=crate::command_dispatch::unix_ns().unwrap();
         let mut blocks:BTreeMap<_,BTreeMap<_,_>>=BTreeMap::new();
@@ -1729,7 +1757,7 @@ mod query_reuse_tests {
         follower.with_body_motion_checks(|clear,period,_,proof| {
             assert!(clear(start,start,0.0));assert!(clear(start,target,0.2));
             let original=proof.bound().unwrap();
-            assert!(original.is_some(),"motion beyond the original footprint needs finite evidence");
+            assert_eq!(original,None,"static ground geometry has no per-cell time lease");
             proof.reset();
             assert!(period(start,start,0.0));assert!(period(start,target,0.2));
             assert_eq!(proof.bound().unwrap(),original);
@@ -1808,7 +1836,7 @@ mod query_reuse_tests {
     }
 
     #[test]
-    fn observed_selected_replay_excludes_rejected_prefix_and_keeps_current_stop_deadline() {
+    fn old_ground_selected_replay_keeps_complete_current_stop_geometry() {
         use crate::control_profile::Counter;
         let base=map(0.0);
         let size=f64::from(base.source_voxel_size_m());
@@ -1819,7 +1847,6 @@ mod query_reuse_tests {
         let start=PlanarPose{x:old_cell_edge-0.1775,y:1.05,yaw:0.0};
         let observed_ns=crate::command_dispatch::unix_ns().unwrap();
         let older_ns=observed_ns-200_000_000;
-        let max_age_ns=1_000_000_000;
         let mut blocks:BTreeMap<_,BTreeMap<_,_>>=BTreeMap::new();
         for (x,y,z) in base.cell_keys() {
             let key=[x,y,z];
@@ -1829,9 +1856,6 @@ mod query_reuse_tests {
         let mut observations=SurfaceObservations::new(base.source_voxel_size_m(),32).unwrap();
         for (key,block) in blocks {observations.replace_block(key,block).unwrap();}
         let source=Arc::new(base.with_observations(Some(Arc::new(observations))));
-        let initial_body=([start.x,start.y,0.4],[0.0,0.0,0.0,1.0]);
-        let occupied=source.body_observation_footprint(initial_body).unwrap();
-        assert!(!occupied.iter().any(|cell|cell[0]==12));
         let limits=MotionLimits {
             model:MotionModel::Differential,max_forward_mps:1.0,max_reverse_mps:0.0,
             max_lateral_mps:0.0,max_angular_rps:0.8,linear_acceleration_mps2:1.0,
@@ -1859,7 +1883,6 @@ mod query_reuse_tests {
         // The latter fails after successful tighter observation dependencies.
         let right=start.x+0.119375;
         follower.boundary=vec![[0.0,0.0],[right,0.0],[right,3.0],[0.0,3.0]];
-        let before=std::time::Instant::now();
         let (selected,replayed,rank_bound,selected_bound,trace,record)=
             follower.with_body_motion_checks(|clear,period,last_failure,proof| {
                 let trace=RefCell::new(Vec::new());
@@ -1884,7 +1907,7 @@ mod query_reuse_tests {
                 assert!(candidates.len()>=2,"the tighter proposal must actually reach the guard");
                 assert!(candidates[0].linear.x>0.399 && candidates[0].angular_z==0.0);
                 assert!(trace.borrow().iter().any(|(_,_,_,_,ok)|!*ok),"ranking must reject a real checked proposal");
-                let rank_bound=proof.bound().unwrap().unwrap();
+                let rank_bound=proof.bound().unwrap();
                 trace.borrow_mut().clear();
                 proof.reset();
                 crate::control_profile::begin();
@@ -1892,7 +1915,7 @@ mod query_reuse_tests {
                     start,current,selected.command,&limits,0.05,step,radius,
                     &mut geometric,&mut physical).unwrap();
                 let record=crate::control_profile::end();
-                let selected_bound=proof.bound().unwrap().unwrap();
+                let selected_bound=proof.bound().unwrap();
                 drop(physical);drop(geometric);
                 (selected,replayed,rank_bound,selected_bound,trace.into_inner(),record)
             }).unwrap();
@@ -1902,51 +1925,17 @@ mod query_reuse_tests {
                 start,current,selected.command,&limits,0.05,step,radius,
                 |a,b,t| {let ok=clear(a,b,t);trace.borrow_mut().push((0,a,b,t,ok));ok},
                 |a,b,t| {let ok=period(a,b,t);trace.borrow_mut().push((1,a,b,t,ok));ok}).unwrap();
-            (fresh,proof.bound().unwrap().unwrap(),trace.into_inner())
+            (fresh,proof.bound().unwrap(),trace.into_inner())
         }).unwrap();
         assert_eq!(trace,fresh_trace,"fresh original callbacks must check the same complete selected proof");
         assert_eq!(replayed.command,fresh.command);
         assert_eq!(replayed.stopped_pose,fresh.stopped_pose);
         assert_eq!(replayed.samples,fresh.samples);
-        // Independently identify which endpoints need evidence beyond the
-        // original footprint. The first geometric trajectory is current-stop;
-        // every later zero-time reset begins a selected-command tail.
-        let mut geometric_starts=0;
-        let mut current_stop_latest_elapsed=None;
-        let mut candidate_queries=0;
-        for &(basis,a,b,elapsed,ok) in &trace {
-            assert!(ok);
-            if basis==0 && elapsed==0.0 {geometric_starts+=1;}
-            let is_current_stop=basis==0 && geometric_starts==1;
-            for p in [a,b] {
-                let pose=([p.x,p.y,0.4],[0.0,0.0,(p.yaw*0.5).sin(),(p.yaw*0.5).cos()]);
-                let cells=source.body_observation_footprint(pose).unwrap();
-                let outside:Vec<_>=cells.difference(&occupied).copied().collect();
-                if is_current_stop {
-                    assert!(outside.iter().all(|cell|cell[0]==12));
-                    if !outside.is_empty() {
-                        current_stop_latest_elapsed=Some(current_stop_latest_elapsed
-                            .map_or((elapsed*1e9)as u64,|old:u64|old.max((elapsed*1e9)as u64)));
-                    }
-                } else {
-                    assert!(outside.is_empty(),"selected-command tails must not visit the older current-stop-only strip");
-                    candidate_queries+=1;
-                }
-            }
-        }
-        assert!(candidate_queries>0 && geometric_starts>=4);
-        let current_stop_latest_elapsed=current_stop_latest_elapsed.expect("real current-stop must need the old non-exempt cell");
-        let expected=older_ns+max_age_ns-current_stop_latest_elapsed;
-        eprintln!("OBSERVED_SELECTED_BOUND current_stop_elapsed_ns={current_stop_latest_elapsed} expected_latest_unix_ns={expected} ranking={rank_bound:?} selected={selected_bound:?} fresh={fresh_bound:?} replay_queries={:?}",record.counters);
-        // Different invocations capture different clock pairs. Their absolute
-        // Unix constraints must nevertheless agree to the nanosecond. The
-        // earlier monotonic sample isolates the inclusive Unix qualification.
-        for bound in [selected_bound,fresh_bound] {
-            assert!(!bound.expired_at(before,Some(expected)),"exact selected/current-stop deadline remains inclusive");
-            assert!(bound.expired_at(before,Some(expected+1)),"the next nanosecond must expire");
-        }
-        assert!(rank_bound.expired_at(before,Some(expected)),
-            "rejected proposal's tighter successful-prefix dependency must be absent after selection reset");
+        assert!(trace.iter().all(|entry|entry.4));
+        assert!(trace.iter().any(|entry|entry.0==1),"actual-period braking must be checked");
+        assert_eq!(rank_bound,None);
+        assert_eq!(selected_bound,None);
+        assert_eq!(fresh_bound,None,"old ground cannot create an execution time lease");
         assert!(record.counters[Counter::MotionMemoHits as usize]>0);
         for counter in [Counter::MotionMemoMisses,Counter::BodyProjectionCalls,Counter::GeometrySweeps,
             Counter::ObservedSweeps,Counter::FutureGeometrySweeps,Counter::FutureViewBuilds] {
@@ -1957,22 +1946,22 @@ mod query_reuse_tests {
     #[test]
     fn body_witness_current_pose_reaches_final_controller_failure() {
         use nuwax_nav_types_messages::{NavFrameId,Timestamp};
-        let source=Arc::new(map(0.0));
+        let source=Arc::new(map(0.0).with_recent_obstacle_points(1,1,0,&[],[(0,[1.05,1.05,0.4])]).unwrap());
         let pose=PoseStamped {frame_id:NavFrameId::Map,stamp:Timestamp::from_unix(1,0),
-            pose:Pose3{position:Point3::new(100.0,100.0,0.4),orientation:Quaternion::from_yaw(0.0)}};
+            pose:Pose3{position:Point3::new(1.05,1.05,0.4),orientation:Quaternion::from_yaw(0.0)}};
         let mut follower=SurfaceFollower::new(SurfaceFollowerConfig::new(0.3)).unwrap();
         follower.map=Some(source.clone());follower.source_map=Some(source.clone());
         follower.odometry=Some(pose.clone());follower.goal=Some(pose.clone());
         follower.path=Some(Path3D{poses:vec![pose.clone()]});
         // Fill the old API first: the final message must still recover evidence on a warm hit.
-        let old=source.validate_body_pose([100.0,100.0,0.4],[0.0,0.0,0.0,1.0]);
+        let old=source.validate_body_pose([1.05,1.05,0.4],[0.0,0.0,0.0,1.0]);
         assert!(old.is_err());
         let step=follower.follow_body_step_policy::<true,false,false,false>(0.2);
         let PlannerStep::ReplanRequired(message)=step else {panic!("expected current-body rejection: {step:?}")};
-        assert!(message.contains("CentreSupport"));assert_eq!(message.matches("拒绝样本").count(),1);
-        assert!(message.contains("100.0"));
+        assert!(message.contains("Occupancy"));assert_eq!(message.matches("拒绝样本").count(),1);
+        assert!(message.contains("1.05"));assert!(message.contains("Recent"));
         let current=follower.current_body_error().unwrap();
-        assert!(current.contains("CentreSupport"));assert_eq!(current.matches("拒绝样本").count(),1);
+        assert!(current.contains("Occupancy"));assert_eq!(current.matches("拒绝样本").count(),1);
         eprintln!("FINAL_CONTROLLER_FAILURE {message}\nFINAL_CURRENT_BODY_FAILURE {current}");
     }
 
@@ -1984,10 +1973,11 @@ mod query_reuse_tests {
             std::mem::size_of::<BodyMotionQuery>(),std::mem::size_of::<(BodyMotionQuery,BodyMotionResult)>(),
             std::mem::size_of::<(BodyMotionQuery,Result<BodyMotionSuccess,BodyMotionFailure>)>());
         let witness=BodyFailureWitness{pose:([0.05,0.05,0.4],[0.0,0.0,0.0,1.0]),
-            rejection:BodyRejection::CoreSupport{column:[1,0]}};
+            rejection:BodyRejection::Occupancy{cell:[1,0,4],source:nuwax_nav_mls_planner::surface::OccupancySource::Recent,
+                z_bounds:[0.4,0.5],ground_height:None}};
         let message=BodyMotionFailure::Body(witness).to_string();
-        assert!(message.contains("no observed support"));assert!(message.contains("拒绝样本"));
-        assert!(message.contains("NotChecked"));
+        assert!(message.contains("Occupancy"));assert!(message.contains("拒绝样本"));
+        assert!(message.contains("ConfirmedIntersection"));
     }
 
     #[test]
@@ -2046,7 +2036,7 @@ mod query_reuse_tests {
     }
 
     #[test]
-    fn exact_query_reuse_keeps_real_height_and_observation_expiry() {
+    fn exact_query_reuse_keeps_real_height_without_ground_expiry() {
         let base=map(0.0);
         let mut blocks:BTreeMap<_,BTreeMap<_,_>>=BTreeMap::new();
         for (x,y,z) in base.cell_keys() {
@@ -2059,12 +2049,11 @@ mod query_reuse_tests {
         let map=base.with_observations(Some(Arc::new(observations)));
         let from=([1.05,1.05,0.4],[0.0,0.0,0.0,1.0]);
         let target=PlanarPose{x:1.45,y:1.05,yaw:0.0};
-        let occupied=map.body_observation_footprint(from).unwrap();
         let cache=RefCell::new(HashMap::new());
         let proof=ObservationProofAccumulator::new(None);
         let query=|start:BodyPose,time| memoized_body_motion(&cache,&proof,start,target,false,Some(time),|| {
             let to=map.body_pose_after_motion(start,[target.x,target.y],target.yaw)?;
-            map.validate_observed_body_motion(start,to,&occupied,time,1_000_000_000)?;
+            map.validate_body_motion_with_witness(start,to,&[],&mut None)?;
             Ok(BodyMotionSuccess {pose:to,latest_start_ns:None})
         });
         let fresh=query(from,10_100_000_000).expect("真实新鲜地面应允许前进");
@@ -2074,7 +2063,7 @@ mod query_reuse_tests {
         assert_ne!(lower_result,fresh,"同平面起点的不同实际高度不得合并");
         let tilted=(from.0,[0.0,(0.01_f64/2.0).sin(),0.0,(0.01_f64/2.0).cos()]);
         assert_ne!(query(tilted,10_100_000_000).unwrap(),fresh,"实际倾斜不能由缓存清零");
-        assert!(query(from,12_000_000_000).is_err(),"同一扫掠的观察在停车末期过期，不能复用早期许可");
+        assert_eq!(query(from,12_000_000_000).unwrap(),fresh,"static ground remains geometric support at later times");
         assert_eq!(query(from,10_100_000_000).unwrap(),fresh,"过期拒绝也不能污染原时刻结果");
     }
 }

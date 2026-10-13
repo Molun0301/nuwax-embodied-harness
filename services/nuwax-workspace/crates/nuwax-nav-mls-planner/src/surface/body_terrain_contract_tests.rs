@@ -212,19 +212,41 @@ fn terrain_contract_real_uneven_ground_is_not_forced_to_a_horizontal_plane() {
 }
 
 #[test]
-fn terrain_contract_missing_strip_and_observed_pit_do_not_gain_a_footstep_capability() {
+fn terrain_contract_bounded_blind_gap_is_distinct_from_observed_pit_and_disconnected_strip() {
     for observed_pit in [false,true] {
         let mut keys=ground(Terrain::Gap);
         if observed_pit {keys.extend((-2..2).flat_map(|x|(-2..2).map(move|y|[x,y,-8])));}
         let map=build_map(&keys,true);
         let from=body(-0.525,0.025,0.4);map.validate_body_pose(from.0,from.1).unwrap();
-        assert!(advance(&map,from,0.525).is_err(),"没有离散接触执行契约时不能用躯干未碰撞证明跨空隙");
-        assert!(map.validate_body_pose([0.025,0.025,0.4],from.1).is_err());
+        let above_gap=body(0.025,0.025,0.4);
+        assert_eq!(map.validate_body_pose(above_gap.0,above_gap.1),Ok(()),
+            "缺地或下方深坑不是机体占据碰撞，纯姿态检查不承担落脚许可");
+        let projected=map.body_pose_after_motion(from,[above_gap.0[0],above_gap.0[1]],0.0);
         if observed_pit {
+            assert!(advance(&map,from,0.525).is_err(),"已观测深坑不能按同层无回波盲区补平");
+            assert!(projected.is_err(),"运动投影必须保留已知落差");
             assert!(map.with_current_body_support([0.025,0.025,0.4],from.1).is_err(),
                 "已观测下方落差不能借当前足迹合成支撑填平");
+        } else {
+            let estimated=map.query_ground([above_gap.0[0],above_gap.0[1]],0.0);
+            assert_eq!(estimated.state,GroundQueryState::Estimated,
+                "四周同层连通的20厘米无回波洞可作有界地形估计，不能冒充实测");
+            assert_eq!(estimated.height,Some(0.0));
+            assert!(!estimated.sources.is_empty());
+            assert_eq!(projected.unwrap(),above_gap);
+            assert_eq!(advance(&map,from,0.525).unwrap(),body(0.525,0.025,0.4));
         }
     }
+    let mut keys=ground(Terrain::Flat);
+    keys.retain(|key|!(-2..=1).contains(&key[0]));
+    let strip=build_map(&keys,true);
+    let from=body(-0.525,0.025,0.4);let above_strip=body(0.025,0.025,0.4);
+    assert_eq!(strip.validate_body_pose(above_strip.0,above_strip.1),Ok(()));
+    let unknown=strip.query_ground([above_strip.0[0],above_strip.0[1]],0.0);
+    assert_eq!(unknown.state,GroundQueryState::Unknown,"贯穿地图的缺测带隔开两侧地面，没有连通插值依据");
+    assert_eq!(unknown.height,None);assert_eq!(unknown.normal,None);
+    assert_eq!(strip.body_pose_after_motion(from,[above_strip.0[0],above_strip.0[1]],0.0),Err(SurfaceError::UnknownGround));
+    assert!(advance(&strip,from,0.525).is_err(),"纯几何无碰撞不能将不可估计断带补成floor");
 }
 
 #[test]
@@ -336,7 +358,8 @@ fn dense_rough_tread_proof_keeps_depth_step_and_complete_source_limits() {
     assert!(map.fine_observed_tread_support_samples(from,to).is_some());
     let deeper=build_map_config(&keys,true,0.1,0.25);
     assert!(deeper.fine_observed_tread_support_samples(from,to).is_none(),"20厘米实测踏面不满足25厘米明确要求");
-    assert!(deeper.validate_body_motion(from,to,&[]).is_err());
+    assert_eq!(deeper.validate_body_motion(from,to,&[]),Ok(()),
+        "静态踏深证明不足不等于实际扫掠碰撞；上面的细踏面负例仍保留25厘米要求");
     let mut model=map.body_envelope().unwrap().clone();model.max_step_up_m=0.025;
     let limited=map.with_body_envelope(model).unwrap();
     assert!(limited.fine_observed_tread_support_samples(from,to).is_none(),"5厘米上阶不满足2.5厘米能力");
@@ -364,7 +387,13 @@ fn dense_rough_continuation_uses_observed_width_across_grid_resolution_and_phase
         if width==4 {
             assert_eq!(result.unwrap().0[0],origin+0.4,"满足20厘米真实踏面时不依赖粗格对齐");
         } else {
-            assert_eq!(result,Err(SurfaceError::UntraversableSegment),"15厘米踏面不能膨胀成20厘米");
+            assert!(matches!(result,Err(SurfaceError::UntraversableSegment|SurfaceError::MissingSupport)),
+                "15厘米踏面不能膨胀成20厘米：{result:?}");
+            let edge=f64::from(width+phase)*f64::from(FINE);
+            let before=body(edge-0.5*f64::from(FINE),0.025,0.4);
+            let after=body(edge+0.5*f64::from(FINE),0.025,0.4+f64::from(FINE));
+            assert!(map.fine_observed_tread_support_samples(before,after).is_none(),
+                "显式细踏面证明仍须拒绝15厘米宽度，不能仅靠前进错误类作代理");
         }
     }}}
 }

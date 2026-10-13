@@ -18,6 +18,8 @@ name = "mls_planner_native"
 path = "src/bin/mls_planner_native.rs"
 
 [dependencies]
+nuwax-map-chunks = { path = "../nuwax-map-chunks" }
+nuwax-types = { path = "../nuwax-types" }
 nuwax-explore-routing = { path = "../nuwax-explore-routing" }
 # 注意:MLS core 不引入 nuwax-nav-types-messages / nuwax-nav-base 以保持独立编译
 # Foundation lane 正在修复类型收敛;本 crate 沿用原 dimos-mls-planner 的纯类型策略

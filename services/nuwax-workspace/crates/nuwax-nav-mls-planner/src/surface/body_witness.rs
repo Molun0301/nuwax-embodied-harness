@@ -3,64 +3,26 @@ use super::SurfaceError;
 
 /// Progress of the body's obstacle-exclusion pass, not a free-space certificate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CollisionCheck { NotChecked, Partial, ConfirmedIntersection }
+pub enum CollisionCheck { ConfirmedIntersection }
 /// The exact short-circuit height comparison which rejected the selected evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeightPredicate { ContactBelowGround, BodyPlaneBelowGround }
-/// Why a fine-column recheck did not establish compatibility.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum FineGroundReject {
-    NoFinerSource,
-    CurrentSupportColumn,
-    MissingBodyModel,
-    IncompleteColumn,
-    InvalidCurrentSupport,
-    IncompleteBlock { cell: [i32;3] },
-    NoSelectedHeight { column: [i32;2] },
-    NoIntersectingColumn,
-    Height {
-        cell: [i32;3],
-        /// Original enumeration bounds, not an inferred continuous support band.
-        scanned_z: [f64;2],
-        predicate: HeightPredicate,
-        /// Left and right operands of the actually executed comparison.
-        values: [f64;2],
-    },
-}
-/// The existing support condition which failed in a footprint column.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SupportRejection { MissingConnectedPatch, IncompleteObservation, OutsideCurrentFootprint }
+pub(super) enum HeightPredicate { ContactBelowGround, BodyPlaneBelowGround }
 /// Origin of an actual obstacle intersection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OccupancySource { CoarseFallback, Fine, FineFringe }
+pub enum OccupancySource { CoarseFallback, Fine, FineFringe, Recent }
 /// Pose-independent evidence. Missing values are deliberately not fabricated.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BodyRejection {
-    /// The existing centre support query failed; its inner branch is outside this witness scope.
-    CentreSupport,
-    CoreSupport { column:[i32;2] },
-    FootprintSupport { column:[i32;2], layer:Option<i32>, reason:SupportRejection, collision:CollisionCheck },
-    Ground {
-        coarse_cell:[i32;3], coarse_predicate:HeightPredicate, coarse_values:[f64;2],
-        fine:FineGroundReject, collision:CollisionCheck,
-    },
     Occupancy { cell:[i32;3], source:OccupancySource, z_bounds:[f64;2], ground_height:Option<f64> },
 }
 impl BodyRejection {
     /// Exact pre-existing error variant for legacy callers and oracles.
     pub fn error(self)->SurfaceError {
-        match self {
-            Self::CentreSupport|Self::CoreSupport{..}|Self::FootprintSupport{..}=>SurfaceError::MissingSupport,
-            Self::Ground{..}|Self::Occupancy{..}=>SurfaceError::InsufficientClearance,
-        }
+        SurfaceError::InsufficientClearance
     }
     /// Only an explicit Occupancy result proves an obstacle intersection.
     pub fn collision_check(self)->CollisionCheck {
-        match self {
-            Self::CentreSupport|Self::CoreSupport{..}=>CollisionCheck::NotChecked,
-            Self::FootprintSupport{collision,..}|Self::Ground{collision,..}=>collision,
-            Self::Occupancy{..}=>CollisionCheck::ConfirmedIntersection,
-        }
+        CollisionCheck::ConfirmedIntersection
     }
 }
 /// One rejected sample from one query; it never describes all candidate paths.

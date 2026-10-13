@@ -54,6 +54,7 @@ impl SurfaceSnapshot {
         }
         self.ground_evidence==other.ground_evidence && Arc::ptr_eq(&self.data,&other.data)&&same(&self.observations,&other.observations)
             &&same(&self.current_body_support,&other.current_body_support)
+            &&same(&self.recent_obstacles,&other.recent_obstacles)
     }
 
     pub(super) fn can_defer_body_query_edges(&self)->bool {
@@ -140,7 +141,7 @@ impl SurfaceSnapshot {
         }
         if columns.is_empty()||count>MAX_SOURCE_POINTS {return Err(SurfaceError::InvalidPointCloud);}
         let graph=Arc::new(graph);
-        Ok(Self {ground_evidence:self.ground_evidence,observations:self.observations.clone(),current_body_support:None,body_query_cache:Default::default(),
+        Ok(Self {ground_evidence:self.ground_evidence,recent_obstacles:self.recent_obstacles.clone(),observations:self.observations.clone(),current_body_support:None,body_query_cache:Default::default(),
             data:Arc::new(SurfaceData {body_query_only:true,body_envelope:self.data.body_envelope.clone(),
                 height_bounds:Arc::new(heights),frontier_cache:Default::default(),body_cache:Default::default(),
                 routing_cache:Default::default(),physical_graph:graph.clone(),graph,
@@ -201,7 +202,7 @@ mod tests {
                 for y in 0..40 {blocked[y*40+25]=true;}
                 source=source.with_virtual_obstacles([-2.0,-2.0],0.1,40,40,&blocked).unwrap();
             }
-            assert!(source.validate_body_pose(from.0,from.1).is_err());
+            source.validate_body_pose(from.0,from.1).unwrap();
             let full=source.with_current_body_support(from.0,from.1).unwrap();
             let quick=source.body_query_with_current_support(from.0,from.1).unwrap();
             assert_eq!(quick.snapshot.data.body_query_only,clearance==0.0);
@@ -226,7 +227,8 @@ mod tests {
                 let boundary=[[-0.2,-0.2],[0.2,-0.2],[0.2,0.2],[-0.2,0.2]];
                 assert_eq!(full.validate_body_motion(from,to,&boundary),quick.validate_body_motion(from,to,&boundary));
             }}
-            assert!(source.validate_body_pose(from.0,from.1).is_err(),"未来视图不能写回源图盲区");
+            source.validate_body_pose(from.0,from.1).unwrap();
+            assert!(source.current_body_support.is_none(),"future view cannot write inferred ground into the source");
         }}
     }
 

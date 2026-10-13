@@ -93,3 +93,14 @@ PYTHONPATH="$PWD" OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
 ```
 
 This command uses existing dependencies, starts only local multiprocessing workers and anonymous pipes, and writes the specified result JSON. Evidence paths are workspace-local and are not portable repository dependencies. A rerun elsewhere requires copying the diagnostic and using a compatible Python environment.
+
+## Follow-on provider polling and ownership audit
+
+On 2026-10-13 UTC, a separate **read-only caller audit** inspected the previously excluded provider getter. This adds no timing results to the IPC measurements above; no additional test or benchmark was run, and no production code changed. Source line references below describe the inspected checkout and may move in later revisions.
+
+- `drivers/go2/providers.py:219–226` deep-copies the frame returned by the data plane. Its only executable in-repository polling caller is `services/perception/service.py:1756–1763`, reached during full detection geometry augmentation when camera calibration and detections exist but the stream has no usable point cloud (`:1676–1692`). No dedicated polling timer or cadence for this getter was found; calls depend on full-perception requests and cache availability.
+- The ordinary gateway path subscribes to point-cloud callbacks (`gateways/runtime.py:2014–2016`) and publishes the existing payload reference (`:2654–2659`). Perception retains complete cached cloud/pose/frame-tree groups by reference before model and lock waits (`services/perception/service.py:1648–1665`). The high-frequency video loop calls the fast detection path (`services/perception/video_runtime.py:430–436`), which bypasses geometry augmentation.
+- The fallback consumer reads XYZ and converts it to float64 for projection (`services/perception/geometry.py:151–160`); it does not immediately repackage canonical metadata. Native LIO and recording consume subscriptions instead (`services/geometry/runtime_input_bridge.py:703–734, 1028–1060`), so removing this getter's copy would not accelerate those paths.
+- `PointCloudFrame` is a mutable contract (`contracts/pointcloud.py:36–59`), and the decoder deliberately retains writable primary/source XYZ arrays (`drivers/go2/data_plane.py:1707–1709`). Frozen canonical sensor models with immutable byte payloads do not make the surrounding metadata or ndarray buffers immutable. A shallow replacement for the public getter would therefore weaken its existing mutation isolation. The bridge also retains generation/readiness checks (`drivers/go2/data_plane.py:532–549`); any future borrowing path would need to preserve these and the cached-group timing semantics.
+
+**Decision:** retain the deep-copy getter. This trace establishes a conditional fallback, not a demonstrated high-frequency cost. It does not justify a new private borrowing API, changed public ownership semantics, or further performance measurement at this point.

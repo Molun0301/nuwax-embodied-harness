@@ -1,0 +1,446 @@
+{
+  "python": "3.8.10 (default, Oct 13 2026, 08:57:26) \n[GCC 14.2.0]",
+  "setup_seconds": 18.596452181998757,
+  "fixture": "AdmissionCertificateChecks.prepared(text, count=5000, varied=True), file-backed SQLite",
+  "timings": [
+    {
+      "label": "plain_before",
+      "wall_seconds": 1.1071703620000335,
+      "cpu_seconds": 1.1071174369999994
+    },
+    {
+      "label": "profile",
+      "wall_seconds": 1.5991227670019725,
+      "cpu_seconds": 1.5989930239999985
+    },
+    {
+      "label": "plain_after",
+      "wall_seconds": 1.1534097359981388,
+      "cpu_seconds": 1.1531513929999981
+    }
+  ],
+  "durable": [
+    {
+      "status": "completed_fresh",
+      "count": 5000
+    }
+  ],
+  "synchronous": 2,
+  "counts_before": {
+    "semantic_memories": 5000,
+    "memory_index_sources": 5000,
+    "memory_index_publications": 5000,
+    "memory_vector_points": 5000,
+    "memory_named_vectors": 5000,
+    "memory_vectorization_state": 5000
+  },
+  "counts_after": {
+    "semantic_memories": 5000,
+    "memory_index_sources": 5000,
+    "memory_index_publications": 5000,
+    "memory_vector_points": 5000,
+    "memory_named_vectors": 5000,
+    "memory_vectorization_state": 5000
+  },
+  "complete_outputs_equal": true,
+  "source_bytes_unchanged": true,
+  "candidate_count": 4944,
+  "returned_candidate_count": 5,
+  "profile": {
+    "total_seconds": 1.5604935930000003,
+    "total_calls": 1890526,
+    "selected": [
+      {
+        "file": "services/memory/service.py",
+        "line": 1956,
+        "name": "query_semantic_memory",
+        "primitive_calls": 1,
+        "total_calls": 1,
+        "self_seconds": 1.7496e-05,
+        "cumulative_seconds": 1.5990511500000002,
+        "callers": []
+      },
+      {
+        "file": "services/memory/service.py",
+        "line": 3856,
+        "name": "_query_records_impl",
+        "primitive_calls": 1,
+        "total_calls": 1,
+        "self_seconds": 0.070245289,
+        "cumulative_seconds": 1.5920645830000002,
+        "callers": [
+          {
+            "file": "services/memory/service.py",
+            "line": 3841,
+            "name": "_query_records",
+            "stats": [
+              1,
+              1,
+              0.070245289,
+              1.5920645830000002
+            ]
+          }
+        ]
+      },
+      {
+        "file": "services/memory/durable_index.py",
+        "line": 827,
+        "name": "query_snapshot",
+        "primitive_calls": 41,
+        "total_calls": 41,
+        "self_seconds": 0.123848172,
+        "cumulative_seconds": 1.061730171,
+        "callers": [
+          {
+            "file": "services/memory/service.py",
+            "line": 3856,
+            "name": "_query_records_impl",
+            "stats": [
+              41,
+              41,
+              0.123848172,
+              1.061730171
+            ]
+          }
+        ]
+      },
+      {
+        "file": "/workspace/scratch/71cdb9d17732/neh-toolchain/python38/lib/python3.8/json/__init__.py",
+        "line": 299,
+        "name": "loads",
+        "primitive_calls": 25050,
+        "total_calls": 25050,
+        "self_seconds": 0.019287391,
+        "cumulative_seconds": 0.42923451700000004,
+        "callers": [
+          {
+            "file": "services/memory/durable_index.py",
+            "line": 720,
+            "name": "_service_point",
+            "stats": [
+              5010,
+              5010,
+              0.0037248430000000003,
+              0.21878723500000002
+            ]
+          },
+          {
+            "file": "services/memory/durable_index.py",
+            "line": 827,
+            "name": "query_snapshot",
+            "stats": [
+              5010,
+              5010,
+              0.003720118,
+              0.106539438
+            ]
+          },
+          {
+            "file": "services/memory/durable_index.py",
+            "line": 1126,
+            "name": "_ack_conflicts",
+            "stats": [
+              10020,
+              10020,
+              0.008171241000000001,
+              0.058031633000000006
+            ]
+          },
+          {
+            "file": "services/memory/repository.py",
+            "line": 1234,
+            "name": "_load_record",
+            "stats": [
+              5010,
+              5010,
+              0.003671189,
+              0.045876211
+            ]
+          }
+        ]
+      },
+      {
+        "file": "services/memory/durable_index.py",
+        "line": 720,
+        "name": "_service_point",
+        "primitive_calls": 5010,
+        "total_calls": 5010,
+        "self_seconds": 0.122756005,
+        "cumulative_seconds": 0.36703786400000005,
+        "callers": [
+          {
+            "file": "services/memory/durable_index.py",
+            "line": 827,
+            "name": "query_snapshot",
+            "stats": [
+              5010,
+              5010,
+              0.122756005,
+              0.36703786400000005
+            ]
+          }
+        ]
+      },
+      {
+        "file": "services/memory/repository.py",
+        "line": 1234,
+        "name": "_load_record",
+        "primitive_calls": 5010,
+        "total_calls": 5010,
+        "self_seconds": 0.011363005,
+        "cumulative_seconds": 0.10889119800000001,
+        "callers": [
+          {
+            "file": "services/memory/durable_index.py",
+            "line": 827,
+            "name": "query_snapshot",
+            "stats": [
+              5010,
+              5010,
+              0.011363005,
+              0.10889119800000001
+            ]
+          }
+        ]
+      },
+      {
+        "file": "services/memory/durable_index.py",
+        "line": 1141,
+        "name": "_ack_matches",
+        "primitive_calls": 5010,
+        "total_calls": 5010,
+        "self_seconds": 0.008836745,
+        "cumulative_seconds": 0.10762439800000001,
+        "callers": [
+          {
+            "file": "services/memory/durable_index.py",
+            "line": 827,
+            "name": "query_snapshot",
+            "stats": [
+              5010,
+              5010,
+              0.008836745,
+              0.10762439800000001
+            ]
+          }
+        ]
+      },
+      {
+        "file": "services/memory/service.py",
+        "line": 6488,
+        "name": "_score_text_candidates",
+        "primitive_calls": 12113,
+        "total_calls": 12113,
+        "self_seconds": 0.020100244,
+        "cumulative_seconds": 0.103034573,
+        "callers": [
+          {
+            "file": "services/memory/service.py",
+            "line": 6395,
+            "name": "_score_semantic_entry",
+            "stats": [
+              10,
+              10,
+              6.2389e-05,
+              0.00053689
+            ]
+          },
+          {
+            "file": "services/memory/service.py",
+            "line": 3980,
+            "name": "<genexpr>",
+            "stats": [
+              12103,
+              12103,
+              0.020037855,
+              0.102497683
+            ]
+          }
+        ]
+      },
+      {
+        "file": "services/memory/service.py",
+        "line": 9010,
+        "name": "_normalize_text",
+        "primitive_calls": 22192,
+        "total_calls": 22192,
+        "self_seconds": 0.030727945000000003,
+        "cumulative_seconds": 0.09370072500000001,
+        "callers": [
+          {
+            "file": "services/memory/service.py",
+            "line": 6488,
+            "name": "_score_text_candidates",
+            "stats": [
+              12171,
+              12171,
+              0.017731098,
+              0.056979022000000004
+            ]
+          },
+          {
+            "file": "services/memory/service.py",
+            "line": 8985,
+            "name": "_normalize_tags",
+            "stats": [
+              10020,
+              10020,
+              0.012987703000000001,
+              0.036697196
+            ]
+          },
+          {
+            "file": "services/memory/service.py",
+            "line": 3856,
+            "name": "_query_records_impl",
+            "stats": [
+              1,
+              1,
+              9.144000000000001e-06,
+              2.4507e-05
+            ]
+          }
+        ]
+      },
+      {
+        "file": "services/memory/durable_index.py",
+        "line": 1126,
+        "name": "_ack_conflicts",
+        "primitive_calls": 5010,
+        "total_calls": 5010,
+        "self_seconds": 0.018877476,
+        "cumulative_seconds": 0.07909171100000001,
+        "callers": [
+          {
+            "file": "services/memory/durable_index.py",
+            "line": 1141,
+            "name": "_ack_matches",
+            "stats": [
+              5010,
+              5010,
+              0.018877476,
+              0.07909171100000001
+            ]
+          }
+        ]
+      },
+      {
+        "file": "services/memory/service.py",
+        "line": 6668,
+        "name": "_compute_recency_score",
+        "primitive_calls": 5010,
+        "total_calls": 5010,
+        "self_seconds": 0.009599471,
+        "cumulative_seconds": 0.077785581,
+        "callers": [
+          {
+            "file": "services/memory/service.py",
+            "line": 4115,
+            "name": "_score_candidate",
+            "stats": [
+              5010,
+              5010,
+              0.009599471,
+              0.077785581
+            ]
+          }
+        ]
+      },
+      {
+        "file": "services/memory/durable_index.py",
+        "line": 1115,
+        "name": "_publication_matches",
+        "primitive_calls": 10020,
+        "total_calls": 10020,
+        "self_seconds": 0.018621256000000003,
+        "cumulative_seconds": 0.038208804,
+        "callers": [
+          {
+            "file": "services/memory/durable_index.py",
+            "line": 827,
+            "name": "query_snapshot",
+            "stats": [
+              5010,
+              5010,
+              0.008360732000000001,
+              0.01883905
+            ]
+          },
+          {
+            "file": "services/memory/durable_index.py",
+            "line": 1141,
+            "name": "_ack_matches",
+            "stats": [
+              5010,
+              5010,
+              0.010260524,
+              0.019369754000000003
+            ]
+          }
+        ]
+      },
+      {
+        "file": "services/memory/service.py",
+        "line": 6680,
+        "name": "_point_matches_filter",
+        "primitive_calls": 5010,
+        "total_calls": 5010,
+        "self_seconds": 0.008248999,
+        "cumulative_seconds": 0.035131502,
+        "callers": [
+          {
+            "file": "services/memory/service.py",
+            "line": 3856,
+            "name": "_query_records_impl",
+            "stats": [
+              5010,
+              5010,
+              0.008248999,
+              0.035131502
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "raw_value_identity": {
+    "method": "Read-only sqlite URI, count(DISTINCT column), on preserved owned fixture; no new query, timing, hash, or mutation",
+    "values": {
+      "source_payload": {
+        "rows": 5000,
+        "literal_distinct_values": 5000,
+        "minimum_characters": 589,
+        "maximum_characters": 652,
+        "mean_characters": 626.712
+      },
+      "projection": {
+        "rows": 5000,
+        "literal_distinct_values": 5000,
+        "minimum_characters": 2319,
+        "maximum_characters": 2512,
+        "mean_characters": 2435.9134
+      },
+      "point_payload": {
+        "rows": 5000,
+        "literal_distinct_values": 5000,
+        "minimum_characters": 2122,
+        "maximum_characters": 2252,
+        "mean_characters": 2201.2014
+      },
+      "ack_input_versions": {
+        "rows": 5000,
+        "literal_distinct_values": 1,
+        "minimum_characters": 41,
+        "maximum_characters": 41,
+        "mean_characters": 41.0
+      },
+      "ack_binding": {
+        "rows": 5000,
+        "literal_distinct_values": 1,
+        "minimum_characters": 556,
+        "maximum_characters": 556,
+        "mean_characters": 556.0
+      }
+    }
+  }
+}

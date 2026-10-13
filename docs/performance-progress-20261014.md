@@ -1,6 +1,6 @@
 # NEH 云端夜间开发进度（持续更新）
 
-更新时间：2026-10-14 07:03 北京时间（2026-10-13 23:03 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
+更新时间：2026-10-14 07:37 北京时间（2026-10-13 23:37 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
 
 ## 当前结论与交付状态
 
@@ -9,10 +9,12 @@
 - 仓库：`Molun0301/nuwax-embodied-harness`
 - 工作分支：`fix/v3-legacy-cloud-seal-20261006`
 - 已确认的远端基线：`65d15c5262af71ee0ab532133bd0afdcb5e75911`；最近一次只读远端核对为2026-10-13 22:42 UTC，不能据此声称此后又核对过远端
-- 当前已提交本地代码状态：`a4333a302fe077d553c9fc535d07607992395424`，相对上述基线新增 **48 个本地提交**；本次报告更新、独立dispatch诊断文档和在建RSS诊断不包含在此计数中
-- 最新确认的同一 Library 检查点为 **v25，1,279,505 bytes**，覆盖截至 `0eed9d2` 的47个提交；第48个AR1提交已经本地提交，下一版检查点尚待完成。云环境重置后 CLI 登录缺失，Git 推送仍受阻；不能把本地提交或备份当作 GitHub 已更新
+- 当前已提交本地代码状态：`79bb33f97f16f8395436ca8ec3b53ca91bef6edc`，相对上述基线新增 **54 个本地提交**；本次报告与随后未提交文档不包含在此计数中
+- 最新确认的同一 Library 检查点为 **v28，2,778,711 bytes**，覆盖截至 `f952800` 的53个提交；后续本地提交与本文更新待下一检查点。23:22 UTC再次确认CLI认证仍缺失，Git推送受阻；不能把本地提交或备份当作GitHub已更新
 
 **最新导航结果：** 完整 `NavScheduler` 局部恢复修复已提交为 `0eed9d2`，固定持续障碍的原目标在 **13.32秒**完成，仅2次规划/2次准入，232条完整停车尾迹和715条实际运动边全部通过。早期60秒失败与两次短程停车尾迹失败仍保留；独立调查发现采样位姿到实际应用间的转动差异，当前只是合同诊断，没有生产修复或真实50 ms执行器hold证明。不能据此称现场机器人卡住或安全时序问题全部解决。
+
+**最新集成与归因：** Python3.8.10去重选集1160项通过；Runtime适用范围236项通过但仍排除5项真实UDS。新RSS诊断支持allocator/free-page retention是复现晚窗增长的主要原因，剩余约43/114 KiB未归因；没有修改生产allocator或宣称无泄漏。
 
 下面的“旧 → 新”均采用各专项报告的匹配基线，不意味着统一对比上述远端版本。局部连续优化的收益也不相加。
 
@@ -24,13 +26,15 @@
 - 前沿局部失效使用已有列索引枚举脏范围，稀疏大范围仍回退原槽位扫描。131,072 支撑单元夹具仅访问 361 列，局部几何刷新 **4700.015 → 1498.867 µs**；8,192 单元 **966.890 → 833.719 µs**。候选、收益、代价与冷重建比较一致；不含导航可达搜索和调度排队。[证据](performance-incremental-updates.md#前沿局部失效按既有列索引枚举2026-10-13)
 - 近期障碍碰撞查询只构造需要的高度行，并在一次完整位姿查询内复用相邻细列所属的同一粗列。10 cm 粗网格 / 5 cm 来源、8 帧清空场景 **294.08 → 159.64 µs**，门洞 **297.48 → 156.82 µs**；1 帧障碍拒绝 **17.18 → 9.46 µs**。基线为 `bb1a14f` 完整查询，9 对交替测量，暖来源缓存、刻意绕过位姿结果缓存。等分辨率、无 recent、coarse-only 负对照没有实质收益；没有分配器/RSS或整机 CPU 测量。[证据与完整结果](body-recent-query-reuse-20261013.md)
 
+- Scan非arrival路线窗口复用第一次完全相同的polyline投影拒绝结果（`8949d9d`），保留原passage尝试、取消检查、失败优先级和witness。真实recent-guide fine-escape非arrival夹具的 `[body-view/endpoint/sweep]` 调用 **124/124/67 → 122/122/67**，结果仍68 poses、1 expansion；boundary-drained **81/81/19 → 80/80/18**。arrival对照完全不变（仍119 poses、3 expansions）。这是少做少量查询，不是延迟或新路径能力提升。[证据](diagnostics/scan-polyline-reuse-and-guide-eligibility-20261013.md)
+
 ### 持续运行与搜索结论
 
 - 局部规划 OFF/ON 分别运行 **305.845 / 305.671 秒 live 控制时间**，完成 **49 / 47 个目标**。合计 **96 个目标、11,438 个非零回执、42,724 条实际理想 plant 运动边**均经原碰撞及停车尾迹 oracle 检查；实际接受非零命令的积分时间分别为 **291.985 / 279.719 秒**，不能把全部 live 时间称为持续非零运动
 - 真实 `RouteFollower`、`PlannerWorker` 和 5 Hz 合成来源跨目标保留，覆盖近期远端非地面点变化、测量抖动、目标/路径替换、取消重启。OFF/ON 最大复核 **20.682 / 33.732 ms**，最大消费者间隔 **53.454 / 58.266 ms**；后者沿用 ≤75 ms 的调度容许，不是严格 50 ms 实时保证
 - 这是理想命令积分 plant；不是物理机器人、完整 `NavScheduler`/memq 边界、执行器延迟或真实刹车验证。RSS 首尾有增长，不能宣称零泄漏；首次地面分类夹具与修正后的非地面障碍夹具分别保留。见[持续运行报告](navigation-sustained-worker-20261013.md)
 - 当前真实 recent-guide 的新机体敏感回归：7 个实际 recent hints 改变引导，必须先完成精确 **1 cm 直行**才能脱离初始约束；现有 fallback 已能在 **3 次展开、15 个节点、frontier peak 12** 内返回 **119 个全部复扫的位姿**。这是现有能力的正向回归，生产启发式、预算、原语和容差均未改变。[证据](diagnostics/recent-guide-fine-escape-regression-20261013.md)
-- 静态误导引导的五个独立可行夹具中，原排序、放松下界和四倍放松下界均耗尽 256 次展开；仅测试用 oracle 引导在 3–6 次展开成功。没有把 oracle 当作已实现算法，没有量化位姿或增大预算。现有 recent-guide 的另一开放绕障夹具本来就无需进入 local search。[负面结果](diagnostics/local-search-priority-audit-20261013.md)、[归因](diagnostics/local-search-frontier-audit-20261013.md)
+- 历史五个**强制static-guide**夹具中，原排序、放松下界及四倍下界均耗尽256次展开，只有测试oracle成功；这不代表实际运行链失败。新检查在相同地图/body/障碍/start/motion/arrival输入上调用生产 `RecentGuideOverlay → exported Scan`，**五项全部成功且均无需local search**，186/183/183/190/160个返回位姿独立复扫通过。没有oracle或启发式修改。只有hints不可用或overlay失败才可能回退static，而这五例并未触发该回退。[现行guide资格](diagnostics/scan-polyline-reuse-and-guide-eligibility-20261013.md)、[保留的历史ablation](diagnostics/local-search-priority-audit-20261013.md)
 
 ### 完整调度器恢复：已提交局部修复，另有独立时序边界
 
@@ -44,9 +48,26 @@
 - 650 ms held恢复期间，非零回执和旧路径Command结果均为0（含Command(ZERO)）；owner epoch6、route generation5保留，3次真实新source acquisition继续含同一障碍
 - 全程66次真实来源采集；**232条实际回执的完整停车尾迹、715条实际执行边**独立验证全部通过
 - 首轮普通范围234通过/1失败的cleared-obstacle夹具实际需要转弯，却固定不积分yaw；修正为按真实elapsed积分转动和回馈位姿，保留原正向速度断言、5秒deadline及owner/submission约束，并增加实际边/停车尾迹检查，**2.27秒通过**
-- 适用Runtime范围最终 **235 passed / 0 failed / 56 ignored / 5 UDS filtered，51.15秒**。full-goal运行于v1二进制，v2差别仅为上述夹具修正和显式ignored诊断；之后RSS诊断不在这轮覆盖内
+- 该恢复修复阶段的Runtime范围 **235 passed / 0 failed / 56 ignored / 5 UDS filtered，51.15秒**。full-goal运行于v1二进制，v2差别仅为上述夹具修正和显式ignored诊断；之后RSS诊断不在这轮覆盖内
 
 这是云端理想plant的模块集成资格，不是实机或一般时延保证。默认 `path_wait_timeout=0` 禁用等待超时，Pending不能被称为天然有界恢复。[完整失败、归因与修复时间线](diagnostics/navigation-replan-trigger-audit-20261013.md)、[结构化证据](diagnostics/navigation-replan-trigger-audit-20261013.json)
+
+### 完整调度器新增恢复稳健性
+
+生产恢复不变，两个新的cfg(test) moving arms覆盖原持续障碍目标之外的真实调度边界，包含已提交Scan复用：
+
+- 持有局部规划时真实新source清除障碍：原目标 **13.24秒完成**，2次提交/2次准入，230条回执完整停车尾迹和712条实际边全部通过；held期间无非零回执
+- 持有旧detour时按实际支持的“cancel→确认fence→启动新session”转向不同目标 `[3.0,2.3,0.5]`：从goal1起总计 **10.85秒完成goal2**，3次提交（含被取消请求）/2次准入，185条停车尾迹和571条实际边通过。所有后续非零回执核对goal2及更新epoch/goal/path version；没有发明运行中直接replace API
+
+两项共用原60秒总窗口、不为第二目标重置，650 ms真实held及5 Hz acquisition、40 Hz pose、原deadline/source bound和阈值均不变，安全审计在goal/timeout断言之前执行。既有persistent-obstacle arm未重复计数。最终普通Runtime **236 passed / 0 failed / 58 ignored / 5 UDS excluded，56.45秒**；两个moving arms为额外显式执行的ignored项，不混入普通计数。50 ms仍只是ideal-plant假设，未解决dispatch合同问题。[完整报告](diagnostics/navigation-recovery-robustness-20261013.md)
+
+### 持续worker RSS：有主因证据，非生产内存优化
+
+保留原五阶段motion/oracle标准的诊断重跑，OFF/ON各49目标，live **303.844/304.146秒**，accepted nonzero **291.892/291.747秒**，分别5839/5836回执、21860/21780边全部通过。这是另一次诊断，不替代或累加原96目标试验，也不通过完整NavScheduler。
+
+晚窗定义严格为第40–49次post-drain均值减第6–15次均值：RSS **+2742.0/+2666.8 KiB**，同期GNU allocator in-use+mmap仅 **+44,252.8/+117,067.2 bytes**，free arena **+3,198,550.4/+1,962,472.0 bytes**。所有持续诊断Vec容量在49次drain中固定、clear后len为0。fixture owners释放、worker/sensor join后，单次实验性 `malloc_trim(0)`使RSS **−24,776/−21,072 KiB**，allocator in-use不变。
+
+这直接支持**allocator/free-page retention是本次复现增长的主要原因**，不证明精确Rust活载荷、生产无泄漏或早期每字节同因；约43/114 KiB晚窗残差尚未定位。采样非原子且sensor并发，不能把所有阶段差额独占归于oracle。没有生产trim、allocator或缓存策略修改。首次unsafe lint失败保留，GNU FFI例外仅限测试诊断。[完整RSS报告](navigation-rss-ownership-20261013.md)
 
 ### 采样到实际应用的位姿漂移：仅诊断，未改生产
 
@@ -98,18 +119,24 @@
 - 更新状态/检查已在线程池，状态 GET 不查询远端；重叠 check 仍各自查询，故障重试及等待时分支变化也依赖重新读取。三项 fake-Git 并发探针各 **12 次 Git 调用 / 2 次 ls-remote**，这是调用证据，不是性能收益；未新增合并、锁或缓存。[审计](update-status-source-audit-20261013.md)
 - 语义索引已按受影响记录更新。StateStore 浅复制保护旧快照；0/100背景 key时占 helper耗时约 **1.3–2.8%**，1,000 key时约 **4.5–7.7%**，还是包含锁和 StateEntry 构造的上界。没有改变事务后回调、取消隔离或读者所有权。[审计](diagnostics/semantic-index-update-audit-20261013.md)
 
-- 导航cache/allocation调查（`6ed7e95`）没有发现所审路径无限跨目标保留，但entry上限不是byte预算，晚窗RSS增长仍未归因。216次非零guard均通过；稀疏pending-band测试候选虽有41,472次精确等价，多层暖场景仍退化约 **7.6–13.1%**，单层无稳定收益，候选已移除，保留诊断而未改生产算法。[证据](navigation-cache-allocation-audit-20261013.md)
+- 导航cache/allocation调查（`6ed7e95`）没有发现所审路径无限跨目标保留，但entry上限不是byte预算，该阶段未解释晚窗RSS，后续专门诊断已支持主要allocator retention归因但保留小残差。216次非零guard均通过；稀疏pending-band测试候选虽有41,472次精确等价，多层暖场景仍退化约 **7.6–13.1%**，单层无稳定收益，候选已移除，保留诊断而未改生产算法。[证据](navigation-cache-allocation-audit-20261013.md)
 - observation/robot-state/HTTP结果调查（`81a3712`）没有生产修改。16适配器合成ingest **298.94→220.93 µs** 的测试方案需扩大协议，绝对收益不足；JSON size-reuse收益混合且增加精确字节预算复杂性。保留独立结果树、redaction与原完整size enforcement。[证据](observation-state-serialization-audit-20261013.md)
 - stream/event调查（`bafa7b7`）没有生产修改。默认100pose、单客户端轨迹编码 **0.219 ms**，8客户端批次 **1.717 ms**；task progress单客户端public projection **0.357 ms**，含threadpool **0.653 ms**。这些不是实际网络或event-loop延迟；对象及嵌套pose可变，不支持泛化identity memoization，因此保留回放、缺口、回调顺序和脱敏。[证据](stream-delivery-audit-20261013.md)
+
+- artifact剩余raw payload直达方案未采用：ID只有kind、没有权威filename，生产允许任意extension（含无点后缀）。小夹具还证明inventory接受“canonical pair＋root同ID孤立payload”，冷递归会选root而直接canonical会改变返回字节。它不同于先前被inventory拒绝的重复sidecar，不能作为纯性能改动；两项tiny诊断通过，未做新计时或生产改动。[边界审计](performance-artifact-metadata-access.md#remaining-payload-lookup-rejected-direct-path-candidate)
+- provider pointcloud deep-copy只在full-perception有标定/检测但缓存无可用cloud时回退；video fast path、native LIO及recording走订阅。未找到固定高频polling，PointCloudFrame和ndarray仍可变，浅借用会削弱原隔离。保留getter，只有调用审计，没有额外timing或test结果。[后续传感器审计](performance-sensor-snapshot-audit.md#follow-on-provider-polling-and-ownership-audit)
+- 语义记忆完整查询的重复publication predicate审计：5k合法file-backed SQLite fixture，普通两次约 **1.107/1.153秒**；中间profile **1.599秒**，重复半段归因仅 **19.370 ms（约1.2%）**。三次完整输出一致、request-local状态清理、六表count及5000个completed_fresh保持；未实现candidate。重水合、source/provenance验证有各自权威边界，不能跨阶段复用模型/score冒充冗余。旧fuzzy-length候选继续撤回。这是负面归因，不是A/B收益，JSON累计调用时间互相包含不可相加。[新记忆审计](diagnostics/memory-query-owned-work-20261013.md)
 
 ## 七、验证状态与未完成边界
 
 以下按实际版本和范围分别报告，重叠测试数不相加，也不把历史通过等同最终 HEAD 全通过：
 
-- 最新 occupancy/perception/natural-identity 组合：Python **3.8.10，30个不重复目标模块，572 passed / 0 failed / 1 deselected，42.26秒**。此轮早于随后所有提交，不替代最终快照验证。更早 `bb1a14f` 的652通过为另一跨栈选择；不与572累计。[完整时间线](overnight-python-integration-20261013.md)
-- 最新已提交恢复修复的适用Runtime范围：**235 passed / 0 failed / 56 ignored / 5 UDS filtered，51.15秒**。较早持续worker fixture的233通过属于历史源状态，不另加到总数；五个真实UDS项仍明确排除，ignored不算通过
-- 最近碰撞优化 MLS 普通库：**320 passed / 0 failed / 16 ignored**。随后 Scan default-feature **50 passed / 1 ignored**，profile **52 passed / 4 ignored**；两者重叠且版本范围不同，不合并
-- 导航 Stack 普通资格 **15 passed / 8 ignored**，源健康正负例和 preflight 分别通过，六项原 live OFF/ON场景显式通过；场景耗时不是配对加速证据。此前失败与夹具修订历史保留
+- 最新Python **3.8.10，1160 passed / 0 failed / 0 skipped / 1 deselected，62.13秒**，既有httpx warning1条，exit0。57-target去重并集实际收集1161项；唯一排除的是会执行legacy digest的literal pred1 manifest fixture。以前排除的abrupt-exit测试本次已包含并通过，不再把它列为当前环境阻塞。执行HEAD为`3073f85`前后不变，之后native/文档提交未改该Python生产代码；便携runner只重做collection确认1160节点，不把它称作再次执行。[集成报告](diagnostics/python-guarded-integration-20261013.md)
+- 该Python执行在application/test imports前安装guard，**application hash attempts=0**；Starlette原FileResponse的mtime-size metadata ETag有**4次精确限定框架例外**，不读文件payload。不能称零框架hash，也不与早期572/652/177/143相加
+- 最新Runtime普通范围：**236 passed / 0 failed / 58 ignored / 5 UDS excluded，56.45秒**，以及另外显式执行的两个moving恢复arm。233/235通过属于之前源状态，不重复累计。[范围](diagnostics/navigation-recovery-robustness-20261013.md)
+- 历史近期碰撞优化MLS普通库 **320 passed / 16 ignored**；最终Scan default-feature **53 passed / 1 ignored**，profile **56 passed / 5 ignored**，non-test lib release check通过；两个Scan套件重叠不合并。五例current-guide和匹配复用diagnostic另外显式通过，不暗示其余ignored已运行
+- 新native集成基于冻结的`8949d9d`加scheduler test fixture；未在build时采样Git revision，23:34物化报告时的`79bb33f`不冒充build-time provenance。**两个非cfg(test) release cargo check通过**：Stack binary目标7.21秒、Geometry binary目标1分21秒；它们不是完整链接的部署binary或硬件SDK资格
+- 同轮Stack release测试构建1分34秒；普通资格 **15 passed / 0 failed / 8 ignored / 282 filtered**。源健康和codec/geometry/body preflight两个exact项、known-drop/box/wall各OFF/ON六个原live exact项逐进程显式运行，全部各1通过。原窗口/TTL/容差/oracle未改；场景耗时不是A/B加速。[最新native报告](diagnostics/final-native-integration-20261013.md)
 - Native 在 `9eb9617` 的扩展选择 **208 passed / 7 ignored**；此前不同范围147通过单独保留。后续 forbidden-zone21项、retained verifier2项分别验证，不构成最终原生全套通过。早期误执行五项实际 checksum 测试已在原生报告记录并排除扩展计数，未在限制传达后重复。[原生范围与例外](native-offline-regression-20261013.md)
 - 早期 checkpoint/dense 报告的旧 fixture 失败保留历史。后续按现有 canonical 合同修复预期并重跑609/652范围，并非修改生产接纳逻辑让旧测试通过；不可继续把这些旧失败描述为当前未解决缺陷
 
@@ -127,9 +154,9 @@
 
 ## 八、正在继续的工作（未计为成果）
 
-- RSS归因诊断仍在构建：已发现并处理测试专用GNU FFI触发的unsafe lint问题，例外仅限该测试诊断。**尚无运行样本**，没有RSS新结论，不能宣称泄漏已定位或allocator trim有效；生产策略未因此改变
-- Scan重复polyline重建的非arrival复用仅为计划，尚未应用、测量或资格验证，不列入本轮已实现优化
-- 继续至北京时间11:00；更新后的提交、最终回归、检查点和远端状态仍需核对
+- 已结束的RSS归因、Scan小幅复用与五例实际guide资格、Python与native聚焦集成已移入上述结果，不再列为待运行
+- 继续基于当前源码调查记忆JSON/模型边界和地图激活路径；只推进有调用与成本证据、保持权威校验/所有权的窄改动。已经否决的publication predicate、payload直达、provider借用方案不会当作已实现收益
+- 本轮继续至北京时间11:00（03:00 UTC）；后续结果、最终检查点、提交与远端状态仍待届时更新，当前不宣称全部完成
 
 ## 附：证据阅读顺序
 
@@ -144,3 +171,5 @@
 - 版本相关回归：[Python时间线](overnight-python-integration-20261013.md)、[原生离线范围](native-offline-regression-20261013.md)、[身份与剩余legacy路径](content-identity-hash-audit-20261013.md)
 
 - 新增证据：[artifact canonical配对JSON](diagnostics/artifact-canonical-lookup-20261013-results.json)、[实时点云回放JSON](diagnostics/incremental-pointcloud-replay-20261013-results.json)、[相机运算JSON](diagnostics/scene-graph-camera-invariants-20261013-results.json)、[cache负面结果](diagnostics/navigation-cache-allocation-audit-20261013-results.json)、[stream结果](diagnostics/stream-delivery-audit-20261013-results.json)
+
+- 最新验证与负面调查：[RSS逐drain结果](diagnostics/navigation-rss-ownership-20261013-results.json)、[Scan复用结果](diagnostics/scan-polyline-reuse-results-20261013.json)、[五例真实guide](diagnostics/recent-guide-five-case-eligibility-results-20261013.json)、[Python逐node与guard](diagnostics/python-guarded-integration-20261013-results.json)、[moving恢复](diagnostics/navigation-recovery-robustness-20261013.json)、[native精确选择及provenance](diagnostics/final-native-integration-20261013-results.json)、[记忆query归因](diagnostics/memory-query-owned-work-20261013-results.json)

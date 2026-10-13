@@ -617,7 +617,6 @@ fn surface_owner_observations(
     for (block, cells) in blocks {
         observations.replace_block(block, cells).unwrap();
     }
-    observations.set_source_timestamp_ns(message.source_timestamp_ns as u64);
     observations.mark_complete_geometry_source();
     Arc::new(observations)
 }

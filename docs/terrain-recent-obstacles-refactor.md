@@ -43,7 +43,7 @@ CPython **3.8.10 实际运行**通过 21 项 archive、8 项 scalar/vector、43 
 
 | 项目 | 已观察结果 | 范围/限制 |
 | --- | --- | --- |
-| 底层来源与协议 | map-chunks 57/57；codec 14/14；source 12/12 + live 发布 1/1 | 不包含仍失败的原 PGO 10 秒预算验收 |
+| 底层来源与协议 | map-chunks 57/57；codec 14/14；source 12/12 + live 发布 1/1 | 原 PGO 10 秒预算在 debug 仍失败；本节下方另列真实 release 对照 |
 | MLS 最终全 lib | 311 passed / 0 failed / 15 ignored | 最终共享地面实现 |
 | PCT 全 lib | 35 / 0 / 3 ignored | 最终接口另有 focused 1/1 |
 | Scan profile 全 lib | 50 / 0 / 2 ignored | 在删除死 witness、增加诊断测试前运行；生产搜索未改 |
@@ -61,7 +61,7 @@ CPython **3.8.10 实际运行**通过 21 项 archive、8 项 scalar/vector、43 
 
 ## 性能诊断与保留失败
 
-原 PGO Raytracing `background_catchup_preserves_replay_cadence_maps_and_checkpoint` 的 **10 秒预算仍失败**，没有调大预算掩盖失败。独占 debug 对照中关闭 layer capture 也失败：31 帧 × 2993 点的 workload 仅处理 14 帧便超时；capture 关/开分别约 10.201/10.307 秒。诊断测试自身通过只说明成功记录 A/B，不代表原 PGO 验收通过，也不足以断言全部开销来源。
+原 PGO Raytracing `background_catchup_preserves_replay_cadence_maps_and_checkpoint` 的 **debug 配置下 10 秒预算仍失败**，没有调大预算掩盖失败。后续真实 release 基线与候选都通过，不能把该 debug 失败直接表述为生产配置也超时。独占 debug 对照中关闭 layer capture 也失败：31 帧 × 2993 点的 workload 仅处理 14 帧便超时；capture 关/开分别约 10.201/10.307 秒。诊断测试自身通过只说明成功记录 A/B，不代表原 PGO 验收通过，也不足以断言全部开销来源。
 
 同组 Voxel capture 开为 8.94/8.46 秒，关为 7.65/7.67 秒。这是特定 fixture 的单次 debug 诊断样本，不能宣称普遍加速，也不能外推实机 CPU。release 局部导引 A/B 已完成五对新进程测量，按 AB / BA 交替顺序。两组使用同一 release/profile 二进制、同一合成固定起点场景；A 用静态 PCT 导引，B 从五个真实近期返回构建 request-local 导引。十次测试进程均 exit 0，其中 A 每次按预期返回 `BudgetExhausted`（256 展开、642 nodes），B 每次返回 186 poses，并通过真实机体逐段二次扫掠。
 
@@ -73,6 +73,27 @@ CPython **3.8.10 实际运行**通过 21 项 archive、8 项 scalar/vector、43 
 B 的 guide 中位数为 1.67 ms、Scan 为 5.00 ms。公共 Scan 沿导引直接成功，fallback 搜索调用与展开均为零；它与手工 witness 导引直接调用局部搜索得到“六次展开”的早期诊断不是同一测量路径。
 
 `total_ms` 排除 fixture / 静态图构建及输出后二次扫掠，进程 wall 包含这些工作。该 A/B 比较的是同版本算法导引选择，**不是旧 commit 对新 commit 的基准**；A 失败、B 成功的输出语义不同，不能表述成等效任务普遍加速。五对合成样本不能外推实机 CPU、运动闭环、长尾延迟或全平台性能。
+
+### PGO 法线重算热点与真实 release 对照（2026-10-13）
+
+后续诊断保留原失败日志、10 秒预算和完整占据图、点云、checkpoint 等价断言。31 帧 × 2993 点的**独立串行射线近似场景**中，debug 法线 refresh 占射线更新 13.962 / 15.297 秒（91.3%）；这不是完整 runtime，也不能用这组绝对时间代表 PGO 验收。
+
+唯一生产算法调整是复用 IRLS 最后一个已完成迭代的特征分解，避免对同一 covariance 再做一次分解。权重不足提前退出时保留上一次已完成结果；低点数、低支持率、planarity / linearity / scattering 阈值、特征值排序、射线节拍及地图提交均不变，没有新增生产验证、锁、哈希或 clone。独立原实现参考逐 bit 对比法线与 recency，覆盖低点数、零/线/并列/倾斜协方差、低支持率、权重下溢提前退出和 128 组确定性邻域。射线 crate debug 与同样 full-LTO release 的单元测试各 35 passed / 1 diagnostic ignored，包含上述逐 bit 等价测试。该 crate 原有 standalone lock 需要更新；本轮在临时源码副本中用 geometry lock 作为离线解析起点运行相同源码的测试，没有修改仓库 manifests / lockfiles。
+
+使用 geometry 自身 release 配置（opt-level=3、full LTO、codegen-units=1；没有覆盖 profile），先保存未改算法的基线二进制，再增量构建候选。首次该 profile 构建复用共享 target，但需要补齐 native PGO/GTSAM release 依赖；后续候选只重编射线库与 geometry 测试二进制，没有清理 target 或重建整个 workspace。原测试在**基线即已通过**，一次完整测试进程为 3.12 秒。
+
+五对 AB / BA 交替的新进程运行同一个原始 PGO 测试，十次全部通过原断言与预算。每次包含预期完整重放与分批追赶，两者合计 62 个 Raytracing 帧：
+
+| 口径 | 基线 A 中位数（范围），ms | 候选 B 中位数（范围），ms |
+| --- | --- | --- |
+| Raytracing update 阶段累计 | 649.278（635.140–736.060） | 602.719（582.319–678.097） |
+| 完整测试进程 wall | 3234.801（3185.699–3701.892） | 3167.534（3146.382–3647.818） |
+
+update 中位数降低 7.17%，进程 wall 中位数降低 2.08%，但范围有重叠。prepare / dynamic scene 两个控制阶段中位数为 30.243→30.308 / 227.749→230.063 ms。候选 release PGO 组为 9 passed / 5 ignored；surface-owner 组 5/5。capture 开/关诊断各次均完成 31 帧，候选 Raytracing 开为 935–952 ms、关为 908–917 ms。
+
+这只支持删除一次重复特征分解带来的局部收益，不证明普遍加速，也不证明实机 98% CPU、长尾延迟或运动闭环问题已经解决。候选 debug 原测试复跑仍在 Raytracing 处理第 16 帧时返回 `BudgetExceeded`（测试进程共 27.75 秒）；没有把失败记作通过。debug 的预算失败与 release 的通过必须分别保留。
+
+最终格式化后正常生产编译检查（非测试目标）已通过 nav-stack 的 `simple-2d,replanning-astar` 组合，以及 geometry `--bin nuwax-geometry-runtime`。首次 geometry release 测试编译另外暴露一处跨 crate 调用 test-only setter 的旧 fixture：只删除该无效调用，保留各点 observed_ns、完整源标记和所有断言；上述 surface-owner 5/5 覆盖此修复。
 
 ## 复现入口
 
@@ -112,6 +133,8 @@ cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked -j2 -p n
 cargo test --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml --locked -j2 --bin nuwax-geometry-runtime planar_artifacts::assigned_identity_tests -- --test-threads=1
 # 原预算失败复现，不应为获得通过而修改预算
 cargo test --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml --locked -j2 --bin nuwax-geometry-runtime pgo_map::tests::background_catchup_preserves_replay_cadence_maps_and_checkpoint -- --exact --test-threads=1
+# 真实生产优化配置下运行同一原测试；与上面的 debug 结果分开记录
+cargo test --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml --locked -j2 --release --bin nuwax-geometry-runtime pgo_map::tests::background_catchup_preserves_replay_cadence_maps_and_checkpoint -- --exact --test-threads=1
 cargo test --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml --locked -j2 --bin nuwax-geometry-runtime pgo_map::tests::pgo_capture_cost_same_fixture_ab -- --ignored --exact --nocapture --test-threads=1
 NEH_ON_DIAGNOSTIC=1 cargo test --manifest-path services/nuwax-workspace/Cargo.toml --locked -j2 -p nuwax-nav-scan --features profile --lib recent_wide_obstacle_fixed_start_reference_ab -- --ignored --nocapture --test-threads=1
 ```

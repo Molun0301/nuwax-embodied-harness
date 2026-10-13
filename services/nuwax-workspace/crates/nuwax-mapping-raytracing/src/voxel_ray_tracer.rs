@@ -603,8 +603,9 @@ fn validate_voxel_checkpoint_entry(
 }
 
 /// The surface normal of a covariance, or None unless it is clearly planar.
-fn fit_normal(cov: Matrix3<f32>) -> Option<Vector3<f32>> {
-    let eig = cov.symmetric_eigen();
+fn normal_from_eigensystem(
+    eig: nalgebra::linalg::SymmetricEigen<f32, nalgebra::Const<3>>,
+) -> Option<Vector3<f32>> {
     let mut idx = [0usize, 1, 2];
     idx.sort_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]));
     let e2 = eig.eigenvalues[idx[2]].max(0.0);
@@ -621,6 +622,11 @@ fn fit_normal(cov: Matrix3<f32>) -> Option<Vector3<f32>> {
         return None;
     }
     Some(eig.eigenvectors.column(idx[0]).into_owned())
+}
+
+#[cfg(test)]
+fn fit_normal(cov: Matrix3<f32>) -> Option<Vector3<f32>> {
+    normal_from_eigensystem(cov.symmetric_eigen())
 }
 
 /// Moments of one neighbor voxel: count, sum, sum of outer products, centroid.
@@ -676,7 +682,7 @@ fn pooled_normal_and_recency(
     let sigma = NORMAL_PLANE_SIGMA_FRAC * voxel_size;
     let two_sig2 = 2.0 * sigma * sigma;
     let mut weights = [1.0_f32; NEIGHBORHOOD_CAP];
-    let mut cov = Matrix3::zeros();
+    let mut last_eigensystem = None;
     for _ in 0..NORMAL_REWEIGHT_ITERS {
         let (mut wn, mut s, mut t) = (0.0_f32, Vector3::zeros(), Matrix3::zeros());
         for (nb, &w) in nbs.iter().zip(&weights) {
@@ -688,7 +694,7 @@ fn pooled_normal_and_recency(
             break;
         }
         let mean = s / wn;
-        cov = t / wn - mean * mean.transpose();
+        let cov = t / wn - mean * mean.transpose();
         let eig = cov.symmetric_eigen();
         let smallest = eig
             .eigenvalues
@@ -702,13 +708,16 @@ fn pooled_normal_and_recency(
             let dist = normal.dot(&(nb.centroid - mean)).abs();
             *w = (-(dist * dist) / two_sig2).exp();
         }
+        // The final covariance already has this eigensystem. Keep the last
+        // completed iteration if the next one exits on low weighted support.
+        last_eigensystem = Some(eig);
     }
     // Reject the plane if too many points had to be discarded to fit it.
     let kept: f32 = nbs.iter().zip(&weights).map(|(nb, &w)| w * nb.n).sum();
     if kept < NORMAL_MIN_SUPPORT * n_raw as f32 {
         return (None, recency);
     }
-    (fit_normal(cov), recency)
+    (last_eigensystem.and_then(normal_from_eigensystem), recency)
 }
 
 /// Refit the cached normal and neighborhood recency of every voxel whose
@@ -984,6 +993,10 @@ fn update_map_with_parallelism(
     cfg: &Config,
     parallel: bool,
 ) -> AHashSet<VoxelKey> {
+    #[cfg(test)]
+    let diagnostic = std::env::var_os("NEH_RAY_PHASE_DIAGNOSTIC").is_some();
+    #[cfg(test)]
+    let started = std::time::Instant::now();
     let inv = 1.0_f32 / cfg.voxel_size;
     let max_range_sq = if cfg.max_range > 0.0 {
         cfg.max_range * cfg.max_range
@@ -1041,6 +1054,10 @@ fn update_map_with_parallelism(
         points.iter().enumerate().fold(AHashSet::new(), trace)
     };
 
+    #[cfg(test)]
+    let trace_us = started.elapsed().as_micros();
+    #[cfg(test)]
+    let phase = std::time::Instant::now();
     for v in &hits {
         let c = map.voxels.entry(*v).or_insert_with(|| Voxel {
             health: cfg.min_health,
@@ -1065,7 +1082,15 @@ fn update_map_with_parallelism(
         }
     }
 
+    #[cfg(test)]
+    let mutate_us = phase.elapsed().as_micros();
+    #[cfg(test)]
+    let phase = std::time::Instant::now();
     refresh_voxels(map, &hits, &removed, cfg.voxel_size, parallel);
+    #[cfg(test)]
+    if diagnostic {
+        eprintln!("RAY_PHASE frame={frame} points={} voxels={} trace_us={trace_us} mutate_us={mutate_us} refresh_us={} total_us={}", points.len(), map.voxels.len(), phase.elapsed().as_micros(), started.elapsed().as_micros());
+    }
 
     hits
 }
@@ -1352,6 +1377,252 @@ mod tests {
             global_emit_every: 1,
             region_percentile: 95.0,
         }
+    }
+
+    #[test]
+    #[ignore = "PGO-sized serial ray phase diagnostic, not the full runtime acceptance"]
+    fn pgo_sized_serial_ray_phase_diagnostic() {
+        let mut config = basic_config();
+        config.voxel_size = 0.1;
+        config.max_range = 50.0;
+        config.shadow_depth = 0.2;
+        config.grace_depth = 0.2;
+        config.min_health = -2;
+        config.graze_cos = 0.7;
+        config.recency_window = 15;
+        let world: Vec<_> = (0..41)
+            .flat_map(|x| {
+                (0..41).map(move |y| (-4.0 + x as f64 * 0.2, -4.0 + y as f64 * 0.2, -1.0))
+            })
+            .chain((0..41).flat_map(|y| {
+                (0..16).map(move |z| (4.0, -4.0 + y as f64 * 0.2, -1.0 + z as f64 * 0.2))
+            }))
+            .chain((0..41).flat_map(|x| {
+                (0..16).map(move |z| (-4.0 + x as f64 * 0.2, 4.0, -1.0 + z as f64 * 0.2))
+            }))
+            .collect();
+        let mut map = VoxelMap::default();
+        let start = std::time::Instant::now();
+        for frame in 0..31 {
+            let correction = (frame as f64 / 12.0).min(1.0);
+            let dx = 0.73 - 0.04 * correction;
+            let dy = -1.15 + 0.03 * correction;
+            let points = world
+                .iter()
+                .map(|&(x, y, z)| ((x + dx) as f32, (y + dy) as f32, (z + 0.04) as f32))
+                .collect();
+            let origin = ((dx + frame as f64 / 150.0) as f32, dy as f32, 0.04);
+            PreparedRayUpdate::new(origin, points, config.clone())
+                .unwrap()
+                .apply_serial(&mut map);
+        }
+        eprintln!(
+            "RAY_PHASE_TOTAL frames={} voxels={} wall_us={}",
+            map.frame,
+            map.voxels.len(),
+            start.elapsed().as_micros()
+        );
+        assert_eq!(map.frame, 31);
+    }
+
+    #[test]
+    fn pooled_eigensystem_reuse_matches_original_fit_bits_and_rejection_paths() {
+        // Keep a copy of the original numerical path here, independent of the
+        // reused-eigensystem classifier. Compare signs and all f32 bits, not
+        // just direction or an approximate angular tolerance.
+        let compare = |name: &str, positions: &[[f32; 3]], expected_early: bool| {
+            let mut voxels = AHashMap::new();
+            for (i, &position) in positions.iter().enumerate() {
+                let key = (
+                    (i % 3) as i32 - 1,
+                    ((i / 3) % 3) as i32 - 1,
+                    (i / 9) as i32 - 1,
+                );
+                let offset = Vector3::new(key.0 as f32, key.1 as f32, key.2 as f32) * 0.1;
+                let mut voxel = Voxel::default();
+                voxel.observe(Vector3::from(position) - offset);
+                voxel.last_hit = 1 + i as u32;
+                voxels.insert(key, voxel);
+            }
+            let expected = pooled_normal_and_recency_reference(&voxels, (0, 0, 0), 0.1);
+            let actual = pooled_normal_and_recency(&voxels, (0, 0, 0), 0.1);
+            let bits = |normal: Option<Vector3<f32>>| {
+                normal.map(|n| [n.x.to_bits(), n.y.to_bits(), n.z.to_bits()])
+            };
+            assert_eq!(bits(actual.0), bits(expected.0), "{name}");
+            assert_eq!(actual.1, expected.1, "{name}: recency");
+            assert_eq!(expected.3, expected_early, "{name}: early-break coverage");
+            (expected.0, expected.2, expected.4)
+        };
+        let low = compare("low count", &[[0.0; 3], [0.1, 0.0, 0.0]], false);
+        assert_eq!(low.1, 0);
+        assert!(low.0.is_none());
+        let zero = compare("zero covariance", &[[0.0; 3]; 9], false);
+        assert_eq!(zero.1, 3);
+        let line: Vec<_> = (-4..=4).map(|i| [i as f32 * 0.025, 0.0, 0.0]).collect();
+        assert!(compare("collinear", &line, false).0.is_none());
+        let plane: Vec<_> = (-1..=1)
+            .flat_map(|x| (-1..=1).map(move |y| [x as f32 * 0.1, y as f32 * 0.1, 0.0]))
+            .collect();
+        assert!(compare("planar tied largest eigenvalues", &plane, false)
+            .0
+            .is_some());
+        let tilted: Vec<_> = plane
+            .iter()
+            .map(|p| [p[0], p[1], 0.2 * p[0] - 0.3 * p[1]])
+            .collect();
+        assert!(compare("tilted planar", &tilted, false).0.is_some());
+        let cube = |scale: f32| {
+            [-1.0_f32, 1.0]
+                .into_iter()
+                .flat_map(move |x| {
+                    [-1.0, 1.0].into_iter().flat_map(move |y| {
+                        [-1.0, 1.0]
+                            .into_iter()
+                            .map(move |z| [scale * x, scale * y, scale * z])
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(compare("nonplanar low support", &cube(0.1), false).2);
+        // Deliberately extreme center-relative moments exercise weight
+        // underflow and the existing early break without a new guard.
+        assert!(compare("zero weighted support break", &cube(1.0), true).2);
+        for seed in 0..128_u32 {
+            let mut state = seed + 1;
+            let positions: Vec<_> = (0..27)
+                .map(|i| {
+                    let mut next = || {
+                        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                        (state >> 8) as f32 / 16777216.0 - 0.5
+                    };
+                    [
+                        ((i % 3) as f32 - 1.0) * 0.1 + next() * 0.03,
+                        (((i / 3) % 3) as f32 - 1.0) * 0.1 + next() * 0.03,
+                        if seed % 2 == 0 {
+                            next() * 0.005
+                        } else {
+                            next() * 0.15
+                        },
+                    ]
+                })
+                .collect();
+            compare(
+                &format!("deterministic neighborhood {seed}"),
+                &positions,
+                false,
+            );
+        }
+    }
+
+    fn fit_normal_reference(cov: Matrix3<f32>) -> Option<Vector3<f32>> {
+        let eig = cov.symmetric_eigen();
+        let mut idx = [0usize, 1, 2];
+        idx.sort_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]));
+        let e2 = eig.eigenvalues[idx[2]].max(0.0);
+        if e2 < 1e-12 {
+            return None;
+        }
+        let l0 = eig.eigenvalues[idx[0]].max(0.0).sqrt();
+        let l1 = eig.eigenvalues[idx[1]].max(0.0).sqrt();
+        let l2 = e2.sqrt();
+        let linearity = (l2 - l1) / l2;
+        let planarity = (l1 - l0) / l2;
+        let scattering = l0 / l2;
+        if planarity < linearity || planarity < scattering {
+            return None;
+        }
+        Some(eig.eigenvectors.column(idx[0]).into_owned())
+    }
+
+    fn pooled_normal_and_recency_reference(
+        voxels: &AHashMap<VoxelKey, Voxel>,
+        key: VoxelKey,
+        voxel_size: f32,
+    ) -> (Option<Vector3<f32>>, u32, usize, bool, bool) {
+        let mut iterations = 0;
+        let mut broke_early = false;
+        let r = NORMAL_NEIGHBOR_RADIUS;
+        let mut nbs: ArrayVec<Neighbor, NEIGHBORHOOD_CAP> = ArrayVec::new();
+        let mut n_raw: u32 = 0;
+        let mut recency = 0;
+        for dx in -r..=r {
+            for dy in -r..=r {
+                for dz in -r..=r {
+                    let nk = (key.0 + dx, key.1 + dy, key.2 + dz);
+                    let Some(v) = voxels.get(&nk) else {
+                        continue;
+                    };
+                    recency = recency.max(v.last_hit);
+                    if v.num_pts == 0 {
+                        continue;
+                    }
+                    let ni = v.num_pts as f32;
+                    // Shift this voxel's center-relative moments to the target center.
+                    let d = Vector3::new(dx as f32, dy as f32, dz as f32) * voxel_size;
+                    let s = v.sum + d * ni;
+                    let t = v.m2
+                        + v.sum * d.transpose()
+                        + d * v.sum.transpose()
+                        + d * d.transpose() * ni;
+                    n_raw += v.num_pts;
+                    nbs.push(Neighbor {
+                        n: ni,
+                        s,
+                        t,
+                        centroid: s / ni,
+                    });
+                }
+            }
+        }
+        if n_raw < NORMAL_MIN_POINTS {
+            return (None, recency, iterations, broke_early, false);
+        }
+
+        let sigma = NORMAL_PLANE_SIGMA_FRAC * voxel_size;
+        let two_sig2 = 2.0 * sigma * sigma;
+        let mut weights = [1.0_f32; NEIGHBORHOOD_CAP];
+        let mut cov = Matrix3::zeros();
+        for _ in 0..NORMAL_REWEIGHT_ITERS {
+            let (mut wn, mut s, mut t) = (0.0_f32, Vector3::zeros(), Matrix3::zeros());
+            for (nb, &w) in nbs.iter().zip(&weights) {
+                wn += w * nb.n;
+                s += nb.s * w;
+                t += nb.t * w;
+            }
+            if wn < 1e-6 {
+                broke_early = true;
+                break;
+            }
+            iterations += 1;
+            let mean = s / wn;
+            cov = t / wn - mean * mean.transpose();
+            let eig = cov.symmetric_eigen();
+            let smallest = eig
+                .eigenvalues
+                .iter()
+                .enumerate()
+                .min_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap();
+            let normal = eig.eigenvectors.column(smallest).into_owned();
+            for (nb, w) in nbs.iter().zip(&mut weights) {
+                let dist = normal.dot(&(nb.centroid - mean)).abs();
+                *w = (-(dist * dist) / two_sig2).exp();
+            }
+        }
+        // Reject the plane if too many points had to be discarded to fit it.
+        let kept: f32 = nbs.iter().zip(&weights).map(|(nb, &w)| w * nb.n).sum();
+        if kept < NORMAL_MIN_SUPPORT * n_raw as f32 {
+            return (None, recency, iterations, broke_early, true);
+        }
+        (
+            fit_normal_reference(cov),
+            recency,
+            iterations,
+            broke_early,
+            false,
+        )
     }
 
     const CHECKPOINT_SCHEMA_OFFSET: usize = 8;

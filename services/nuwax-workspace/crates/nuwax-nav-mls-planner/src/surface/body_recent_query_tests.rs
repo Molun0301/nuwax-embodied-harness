@@ -324,7 +324,7 @@ fn recent_height_rows_keep_fine_xy_unknown_layers_and_exact_height_bits() {
     for (key,z) in [([0,0,0],0.025),([0,1,1],0.075)] {
         let local=local_key(key);let origin=[(f64::from(key[0])+0.5)*0.05,(f64::from(key[1])+0.5)*0.05,z];
         layers.insert(local,LayerObservation{members:vec![local],normal:[0.,0.,1.],plane_origin:origin,
-            samples:vec![LayerSample{point:origin,source_sequence:1,source_timestamp_ns:100,point_index:0}]});
+            samples:vec![LayerSample{source: Default::default(), point:origin,source_sequence:1,source_timestamp_ns:100,point_index:0}]});
     }
     observations.replace_ground_layers([0,0,0],Arc::new(layers)).unwrap();
     let base=recent_fixture(0.1,"no_recent",1).with_observations(Some(Arc::new(observations)));

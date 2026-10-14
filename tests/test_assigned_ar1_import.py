@@ -70,7 +70,8 @@ class AssignedAr1ImportTests(unittest.TestCase):
     def test_status_capability_uses_one_existing_connect_rpc_and_defaults_fail_closed(self):
         client = None
         for versions, absent, supports in (((), True, False), ((), False, False),
-                                          ((99,), False, False), ((1, 2, 3), False, True)):
+                                          ((99,), False, False), ((1, 2, 3), False, True),
+                                          ((1, 2, 3, 4), False, True)):
             with self.subTest(versions=versions, absent=absent):
                 client, stub = self.connect(versions, client=client, absent=absent)
                 origin = client.capture_assigned_activation_origin()
@@ -78,6 +79,8 @@ class AssignedAr1ImportTests(unittest.TestCase):
                     self.assertEqual(client.supports_assigned_fine_archive_version(1, expected_origin=origin), supports)
                     self.assertTrue(client.supports_assigned_fine_archive_version(2, expected_origin=origin))
                     self.assertTrue(client.supports_assigned_fine_archive_version(3, expected_origin=origin))
+                    self.assertEqual(client.supports_assigned_fine_archive_version(4, expected_origin=origin),
+                                     4 in versions and not absent)
                     self.assertFalse(client.supports_assigned_fine_archive_version(99, expected_origin=origin))
                 self.assertEqual(stub.GetStatus.call_count, 1)
         current = client.capture_assigned_activation_origin()

@@ -4,6 +4,7 @@ fn layers(samples: usize) -> LayerObservations {
     [(0, LayerObservation {
         members: vec![0], plane_origin: [0.0; 3], normal: [0.0, 0.0, 1.0],
         samples: (0..samples).map(|i| LayerSample {
+            source: Arc::new(LayerSource::Legacy),
             point: [0.0; 3], source_sequence: 1, source_timestamp_ns: 1, point_index: i as u32,
         }).collect(),
     })].into()
@@ -13,9 +14,9 @@ fn writer() -> Writer {
 }
 fn assert_accounting(w: &Writer) {
     let bytes: usize = w.dirty.values().flat_map(|d| d.layers.values())
-        .map(|l| 128 + l.members.len() * 2 + l.samples.len() * 64).sum();
+        .map(layer_bytes).sum();
     assert_eq!(w.dirty_layer_bytes(), bytes);
-    assert_eq!(w.resident_bytes(), bytes + w.dirty_points * 64 + w.reader.cached_bytes()
+    assert_eq!(w.resident_bytes(), w.source_watermark_bytes + bytes + w.dirty_points * 64 + w.reader.cached_bytes()
         + w.pending.values().map(|p| p.bytes.len()).sum::<usize>());
 }
 #[test]

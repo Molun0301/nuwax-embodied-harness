@@ -3,9 +3,10 @@
 use nalgebra::{Matrix3, Point3, Vector3};
 use nuwax_map_chunks::{
     block_key, local_key, Key, LayerObservation, LayerObservations, LayerSample, Writer,
-    MAX_LAYERS_PER_BLOCK, MAX_LAYER_SAMPLES,
+    LayerSource, MAX_LAYERS_PER_BLOCK, MAX_LAYER_SAMPLES,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 const PATCH_SIDE_VOXELS: i32 = 4;
 const MAX_PATCH_SAMPLES: usize = 192;
@@ -26,9 +27,10 @@ struct Return {
 pub(super) fn capture(
     writer: &mut Writer,
     points: &[Point3<f64>],
-    first_index: usize,
     sequence: u64,
     timestamp_ns: u64,
+    source: Arc<LayerSource>,
+    original_index: impl Fn(usize) -> Option<u32>,
     mut is_dynamic: impl FnMut(&Point3<f64>) -> bool,
 ) -> Result<Vec<u32>, String> {
     #[cfg(test)]
@@ -46,8 +48,7 @@ pub(super) fn capture(
         if is_dynamic(point) {
             continue;
         }
-        let index =
-            u32::try_from(first_index + index).map_err(|_| "admitted point index overflow")?;
+        let index = original_index(index).ok_or("admitted original point index missing")?;
         patches
             .entry([
                 key[0].div_euclid(PATCH_SIDE_VOXELS),
@@ -154,6 +155,7 @@ pub(super) fn capture(
                     .take(MAX_LAYER_SAMPLES)
                     .map(|p| LayerSample {
                         point: p.point,
+                        source: Arc::clone(&source),
                         point_index: p.index,
                         source_sequence: sequence,
                         source_timestamp_ns: timestamp_ns,
@@ -353,10 +355,12 @@ fn associate(layers: &mut LayerObservations, candidate: LayerObservation, thresh
             result.plane_origin = old.plane_origin;
             result.normal = old.normal;
         }
+        let current_source = Arc::clone(&result.samples[0].source);
         let mut samples = old.samples;
         for sample in result.samples {
             if !samples.iter().any(|old| {
-                old.source_sequence == sample.source_sequence
+                old.source == sample.source
+                    && old.source_sequence == sample.source_sequence
                     && old.source_timestamp_ns == sample.source_timestamp_ns
                     && old.point_index == sample.point_index
             }) {
@@ -366,10 +370,7 @@ fn associate(layers: &mut LayerObservations, candidate: LayerObservation, thresh
         // Retained inliers are rechecked against the newly fitted plane. Old ground
         // is not expired by a clock; only new geometric evidence changes this patch.
         samples.retain(|p| distance(p.point, center, result.normal).abs() <= threshold);
-        samples.sort_by_key(|s| (s.source_timestamp_ns, s.source_sequence, s.point_index));
-        if samples.len() > MAX_LAYER_SAMPLES {
-            samples.drain(..samples.len() - MAX_LAYER_SAMPLES);
-        }
+        retain_bounded_sources(&mut samples, &current_source);
         result.samples = samples;
         result.members.extend(old.members);
         result.members.sort_unstable();
@@ -381,6 +382,39 @@ fn associate(layers: &mut LayerObservations, candidate: LayerObservation, thresh
     {
         layers.insert(result.members[0], result);
     }
+}
+
+/// 各真实来源内部按采集顺序取新样本，再按来源轮流保留；不同设备时钟不可比大小。
+/// 输入最多是旧层与本帧各 32 个返回；只选原数组下标，不复制点或增加历史表。
+fn retain_bounded_sources(samples: &mut Vec<LayerSample>, current: &LayerSource) {
+    samples.sort_by(|a, b| (&a.source, a.source_timestamp_ns, a.source_sequence, a.point_index)
+        .cmp(&(&b.source, b.source_timestamp_ns, b.source_sequence, b.point_index)));
+    if samples.len() <= MAX_LAYER_SAMPLES { return; }
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < samples.len() {
+        let end = start + samples[start..].iter().take_while(|sample| sample.source == samples[start].source).count();
+        groups.push((start, end));
+        start = end;
+    }
+    // 来源数本身超过样本预算时，当前真实观测仍有一个位置；其余按稳定来源顺序选择。
+    if let Some(index) = groups.iter().position(|(start, _)| samples[*start].source.as_ref() == current) {
+        groups.rotate_left(index);
+    }
+    let mut selected = vec![false; samples.len()];
+    let mut count = 0;
+    while count < MAX_LAYER_SAMPLES {
+        for (start, end) in &mut groups {
+            if *end > *start {
+                *end -= 1;
+                selected[*end] = true;
+                count += 1;
+                if count == MAX_LAYER_SAMPLES { break; }
+            }
+        }
+    }
+    let mut index = 0;
+    samples.retain(|_| { let keep = selected[index]; index += 1; keep });
 }
 
 #[cfg(test)]
@@ -396,7 +430,7 @@ mod tests {
             .map(|p| super::super::voxel_key([p.x, p.y, p.z], 0.05).unwrap())
             .map(|k| [k.0, k.1, k.2]);
         writer.observe(keys, stamp).unwrap();
-        capture(writer, points, 0, stamp, stamp, |_| false).unwrap();
+        capture(writer, points, stamp, stamp, Arc::new(LayerSource::Legacy), |index| u32::try_from(index).ok(), |_| false).unwrap();
     }
     fn grid(z: impl Fn(f64, f64) -> f64) -> Vec<Point3<f64>> {
         (0..8)
@@ -563,7 +597,7 @@ mod tests {
         writer.snapshot(domain(), 1, 1).unwrap();
         writer.region([0, 0, 0], [0, 0, 0], 1).unwrap();
         let before = writer.resident_bytes();
-        assert!(capture(&mut writer, &[Point3::new(0.008, 0.008, 0.01)], 0, 2, 2, |_|false).unwrap().is_empty());
+        assert!(capture(&mut writer, &[Point3::new(0.008, 0.008, 0.01)], 2, 2, Arc::new(LayerSource::Legacy), |index| u32::try_from(index).ok(), |_|false).unwrap().is_empty());
         assert!(!writer.has_unpublished_changes());
         assert_eq!(writer.resident_bytes(), before, "no duplicate dirty occupancy for unchanged empty layers");
     }

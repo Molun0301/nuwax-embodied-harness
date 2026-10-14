@@ -5656,12 +5656,13 @@ class GeometryRuntimeProvider:
                     generation=identity.occupancy_receipt["session_generation"], cloud_revision=identity.cloud_receipt["cloud_revision"],
                     source_timestamp_ns=identity.cloud_receipt["source_timestamp_ns"])
                 if identity.role == "fine_map":
-                    if payload[:8] == b"NUWAXAR1":
+                    if payload[:8] in (b"NUWAXAR1", b"NUWAXAR4"):
+                        version = int(payload[7:8])
                         origin = self.capture_assigned_activation_origin()
                         if _stub_override is not None and origin[0] is not _stub_override:
                             raise RuntimeError("assigned fine download connection changed")
-                        if not self.supports_assigned_fine_archive_version(1, expected_origin=origin):
-                            raise RuntimeError("runtime does not support assigned AR1 source archives")
+                        if not self.supports_assigned_fine_archive_version(version, expected_origin=origin):
+                            raise RuntimeError("runtime does not support assigned AR%d source archives" % version)
                     validate_fine_archive(payload, **keywords, frame_generation=identity.frame_generation,
                         producer_generation=identity.producer_generation)
                 elif identity.role == "dense_cloud":
@@ -5694,7 +5695,7 @@ class GeometryRuntimeProvider:
                     raise ValueError("planar upload requires its retained immutable payload owner")
             elif reference == checkpoint.fine_reference:
                 retained_payload = checkpoint.fine_archive
-                if retained_payload[:8] == b"NUWAXAR1":
+                if retained_payload[:8] in (b"NUWAXAR1", b"NUWAXAR4"):
                     self.require_assigned_fine_archive_support(checkpoint,
                         expected_origin=expected_origin or self.capture_assigned_activation_origin())
             elif reference == checkpoint.dense_reference:
@@ -7039,13 +7040,14 @@ class GeometryRuntimeProvider:
 
     def supports_assigned_fine_archive_version(self, version, *, expected_origin):
         with self.assigned_activation_origin_guard(expected_origin):
-            return version in (2, 3) or (version == 1
-                and 1 in getattr(self, "_assigned_fine_archive_versions", ()))
+            return version in (2, 3) or (version in (1, 4)
+                and version in getattr(self, "_assigned_fine_archive_versions", ()))
 
     def require_assigned_fine_archive_support(self, checkpoint, *, expected_origin):
-        if (checkpoint.fine_archive is not None and checkpoint.fine_archive[:8] == b"NUWAXAR1"
-                and not self.supports_assigned_fine_archive_version(1, expected_origin=expected_origin)):
-            raise RuntimeError("runtime does not support assigned AR1 source archives")
+        if checkpoint.fine_archive is not None and checkpoint.fine_archive[:8] in (b"NUWAXAR1", b"NUWAXAR4"):
+            version = int(checkpoint.fine_archive[7:8])
+            if not self.supports_assigned_fine_archive_version(version, expected_origin=expected_origin):
+                raise RuntimeError("runtime does not support assigned AR%d source archives" % version)
 
     def require_assigned_activation_origin(self, expected_origin) -> None:
         with self.assigned_activation_origin_guard(expected_origin):

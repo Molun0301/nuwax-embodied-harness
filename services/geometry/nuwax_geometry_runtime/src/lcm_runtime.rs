@@ -8903,7 +8903,7 @@ async fn ingest_mapping_points_with_backend(
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
     task_control: Option<&GeometryRuntimeTaskControl>,
     sensor_origin_map: Option<[f64; 3]>,
-    accepted_cloud: Option<crate::lio_ingress::AcceptedRegisteredCloud>,
+    accepted_cloud: Option<crate::admitted_cloud::AcceptedMappingCloud>,
 ) -> Result<MappingIngestCommit, nuwax_mapping::SessionError> {
     let owned_mapping = mapping.clone();
     let owned_lifecycle_lock = lifecycle_lock.clone();
@@ -8986,7 +8986,7 @@ async fn ingest_mapping_points_with_backend_owned(
     expected_relocalization_epoch: Option<u64>,
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
     sensor_origin_map: Option<[f64; 3]>,
-    accepted_cloud: Option<crate::lio_ingress::AcceptedRegisteredCloud>,
+    accepted_cloud: Option<crate::admitted_cloud::AcceptedMappingCloud>,
 ) -> Result<MappingIngestCommit, nuwax_mapping::SessionError> {
     let prepared = {
         let _lifecycle_guard = lifecycle_lock.lock().await;
@@ -9408,7 +9408,7 @@ fn update_mapping_cloud_map_with_source(
     outcome: &MappingIngestOutcome,
     current_session: &crate::mapping_adapter::MappingSessionSnapshot,
     writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
-    source: Option<&crate::lio_ingress::AcceptedRegisteredCloud>,
+    source: Option<&crate::admitted_cloud::AcceptedMappingCloud>,
 ) -> Result<Option<CommittedMappingCloudMap>, String> {
     if !current_session.active || current_session.session_generation != outcome.session_generation {
         return Err("point-cloud candidate mapping session is inactive or stale".into());
@@ -11409,7 +11409,7 @@ pub(crate) async fn handoff_admitted_registered_cloud(handle: &GeometryRuntimeHa
     let commit=commit_registered_lio_cloud_inner(handle,accepted.map_points(),accepted.point_step(),
         receipt_ns,accepted.source_timestamp_ns(),accepted.map_frame_id(),
         canonical_mapping_source(accepted)?,Some((binding.mapping_session_generation,binding.map_frame_generation,binding.registration_correction_revision)),
-        None,None,binding.sensor_origin_map,Some(accepted.clone())).await?;
+        None,None,binding.sensor_origin_map,Some(accepted.clone().into())).await?;
     {
         let mut adapter=handle.mapping_adapter.as_ref().ok_or("建图拥有方缺失")?.lock();
         adapter.record_auxiliary_scans(auxiliary)?;
@@ -11512,7 +11512,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         Some(initial_mode.epoch),
         Some(correction.relocalization_mode_fence()),
         binding.sensor_origin_map,
-        Some(accepted.clone()),
+        Some(accepted.clone().into()),
     )
     .await?;
     {
@@ -11744,7 +11744,7 @@ pub(crate) async fn handoff_registered_lio_cloud_replay_with_correction(
         Some(initial_mode.epoch),
         Some(correction.relocalization_mode_fence()),
         binding.sensor_origin_map,
-        Some(accepted.clone()),
+        Some(accepted.clone().into()),
     )
     .await?;
     if !commit.outcome.accepted_map_points.is_empty() {
@@ -12195,7 +12195,7 @@ async fn commit_registered_lio_cloud_inner(
     expected_relocalization_epoch: Option<u64>,
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
     sensor_origin_map: Option<[f64; 3]>,
-    accepted_cloud: Option<crate::lio_ingress::AcceptedRegisteredCloud>,
+    accepted_cloud: Option<crate::admitted_cloud::AcceptedMappingCloud>,
 ) -> Result<MappingIngestCommit, String> {
     let mapping = handle
         .mapping_adapter
@@ -14567,7 +14567,7 @@ mod mapping_feed_tests {
                     base_anchor_map_from_odom: nalgebra::Isometry3::identity(), registration_map_from_odom: nalgebra::Isometry3::identity(),
                     registration_correction_revision: 0, sensor_origin_map: None, frame_capture_relocalization_epoch: Some(0),
                 });
-            assert!(writer.accumulate_mapping_scan_with_source(session.session_generation, &points, None, 100, Some(&source)));
+            assert!(writer.accumulate_mapping_scan_with_source(session.session_generation, &points, None, 100, Some(&source.clone().into())));
             assert!(writer.latest_unclassified_fine_scan().is_some());
             assert!(writer.committed_fine_cloud().is_none());
             let pending = if in_flight { Some(writer.prepare_scan_work().unwrap()) } else { None };
@@ -18406,7 +18406,7 @@ mod mapping_feed_tests {
                 session_generation: binding.mapping_session_generation, source_timestamp_ns: source_timestamp_ns + 10,
             };
             assert!(update_mapping_cloud_map_with_source(&empty_outcome, &mapping.lock().snapshot(),
-                &handle.cloud_map_writer, Some(&stale)).unwrap().is_none());
+                &handle.cloud_map_writer, Some(&stale.clone().into())).unwrap().is_none());
             assert!(!stale.body_points_captured_for_test(), "empty backend result is not a fine accumulation");
             for _ in 0..2 {
                 let _lifecycle = handle.mapping_lifecycle_lock.lock().await;

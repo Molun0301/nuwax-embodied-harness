@@ -5,6 +5,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 pub const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 const CURRENT_MAGIC: &[u8; 8] = b"NUWAXAR2";
 const LAYER_MAGIC: &[u8; 8] = b"NUWAXAR3";
+const SOURCE_MAGIC: &[u8; 8] = b"NUWAXAR4";
 const LEGACY_MAGIC: &[u8; 8] = b"NUWAXAR1";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,7 +33,7 @@ impl ArchivedRoot {
     }
 }
 
-/// 几何写 AR2，层统计写 AR3；逐块流式输出，根已有拥有方身份，无根或归档摘要槽。
+/// 来源统计写 AR4，兼容几何 AR2 与层统计 AR3；逐块流式输出，根已有拥有方身份，无根或归档摘要槽。
 pub fn archive_file(root: &Manifest, repository: &Repository) -> Result<(File, u64), String> {
     let root_bytes = root.encode()?;
     let expected_size = 24 + root_bytes.len() as u64
@@ -40,7 +41,7 @@ pub fn archive_file(root: &Manifest, repository: &Repository) -> Result<(File, u
     if expected_size > MAX_ARCHIVE_BYTES { return Err("精细地图资产超出1吉比字节预算".into()); }
     let mut file = tempfile::tempfile().map_err(|e| e.to_string())?;
     let mut write = |bytes: &[u8]| file.write_all(bytes).map_err(|e| e.to_string());
-    write(if root.version >= 3 { LAYER_MAGIC } else { CURRENT_MAGIC })?;
+    write(match root.version { 4 => SOURCE_MAGIC, 3 => LAYER_MAGIC, _ => CURRENT_MAGIC })?;
     write(&(root_bytes.len() as u64).to_le_bytes())?;
     write(&root_bytes)?;
     write(&(root.blocks.len() as u64).to_le_bytes())?;
@@ -77,7 +78,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         let mut header = [0; 16]; reader.read_exact(&mut header).map_err(|e| e.to_string())?;
         let legacy = match &header[..8] {
-            magic if magic == CURRENT_MAGIC || magic == LAYER_MAGIC => false,
+            magic if magic == CURRENT_MAGIC || magic == LAYER_MAGIC || magic == SOURCE_MAGIC => false,
             magic if magic == LEGACY_MAGIC => true,
             _ => return Err("精细资产格式未知".into()),
         };
@@ -91,8 +92,14 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let mut bytes = vec![0; size as usize]; reader.read_exact(&mut bytes).map_err(|e| e.to_string())?;
         let root = if let Some(alias) = alias { ArchivedRoot::Legacy(LegacyRoot::decode(bytes, alias)?) }
             else { ArchivedRoot::Current(Manifest::decode(&bytes)?) };
-        let layered = &header[..8] == LAYER_MAGIC;
-        if matches!(&root, ArchivedRoot::Current(r) if (r.version >= 3) != layered) { return Err("archive/root version mismatch".into()); }
+        let archive_version = match &header[..8] {
+            magic if magic == SOURCE_MAGIC => 4,
+            magic if magic == LAYER_MAGIC => 3,
+            magic if magic == CURRENT_MAGIC => 2,
+            _ => 1,
+        };
+        let layered = archive_version >= 3;
+        if matches!(&root, ArchivedRoot::Current(r) if r.version != archive_version) { return Err("archive/root version mismatch".into()); }
         let mut count = [0; 8]; reader.read_exact(&mut count).map_err(|e| e.to_string())?;
         let objects = root.objects();
         if u64::from_le_bytes(count) != objects.len() as u64 { return Err("精细资产块数与根不符".into()); }

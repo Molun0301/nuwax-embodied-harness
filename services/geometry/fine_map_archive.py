@@ -49,7 +49,7 @@ def read_fine_archive_root(payload):
     if not isinstance(payload, (bytes, FrozenPayload)) or not 24 <= len(payload) <= MAX_FINE_ARCHIVE_BYTES:
         raise ValueError("精细地图资产类型或大小错误")
     magic = payload[:8]
-    if magic not in (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3"):
+    if magic not in (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3", b"NUWAXAR4"):
         raise ValueError("精细地图资产格式未知")
     legacy = magic == b"NUWAXAR1"
     root_offset = 48 if legacy else 16
@@ -66,12 +66,15 @@ def read_fine_archive_root(payload):
 
 def validate_fine_archive(payload, *, session=None, generation=None, cloud_revision=None,
                           source_timestamp_ns=None, frame_generation=None, producer_generation=None):
-    """读取 AR1/AR2/AR3 完整根并核对块结构和原提交；旧摘要字段仅保留为别名。"""
+    """读取 AR1–AR4 完整根并核对块结构和原提交；旧摘要字段仅保留为别名。"""
     magic, root, offset = read_fine_archive_root(payload)
     legacy = magic == b"NUWAXAR1"
     root_fields = {"version", "domain", "revision", "source_timestamp_ns", "voxel_size_m", "blocks"}
     if not legacy:
         root_fields.add("geometry_revision")
+    version = int(chr(magic[-1]))
+    if version == 4 and isinstance(root, dict) and "source_watermarks" in root:
+        root_fields.add("source_watermarks")
     if not isinstance(root, dict) or set(root) != root_fields:
         raise ValueError("精细地图根字段错误")
 
@@ -88,8 +91,9 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
             raise ValueError("精细地图对象身份为空")
         return result
 
-    version = int(chr(magic[-1]))
     integer(root["version"], version, version)
+    if version == 4:
+        _validate_source_watermarks(root.get("source_watermarks", []), integer)
     revision = integer(root["revision"], 1, 2 ** 64 - 1)
     source_time = integer(root["source_timestamp_ns"], 1, 2 ** 64 - 1)
     if not legacy:
@@ -154,7 +158,7 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
         length = struct.unpack("<I", payload[offset:offset + 4])[0]
         offset += 4
         records_end = 16 + points * 12
-        if (length < records_end or length > (_MAX_LAYER_BLOCK_BYTES if version == 3 else records_end)
+        if (length < records_end or length > (_MAX_LAYER_BLOCK_BYTES if version >= 3 else records_end)
                 or offset + length > len(payload)):
             raise ValueError("精细地图块长度错误")
         block = payload[offset:offset + length]
@@ -162,7 +166,8 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
         if first_offset != offset and (first_length != length or payload[first_offset:first_offset + length] != block):
             raise ValueError("精细地图同一对象身份的实际字节不一致")
         offset += length
-        layered = version == 3 and block[:8] == b"NUWAXBL2"
+        sourced = version == 4 and block[:8] == b"NUWAXBL3"
+        layered = (version >= 3 and block[:8] == b"NUWAXBL2") or sourced
         layer_length = struct.unpack("<I", block[12:16])[0]
         if (block[:8] != b"NUWAXBL1" and not layered
                 or struct.unpack("<I", block[8:12])[0] != points
@@ -178,14 +183,49 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
             _validate_vector_block_evidence(block, points, source_time)
         if layered:
             layers = json.loads(block[records_end:], object_pairs_hook=_unique_json_fields, parse_constant=_reject_nonfinite_json)
-            _validate_layer_structure(layers, integer)
+            _validate_layer_structure(layers, integer, sourced=sourced)
     if offset != len(payload):
         raise ValueError("精细地图资产存在尾随数据")
     return root
 
 
-def _validate_layer_structure(layers, integer):
-    """Read the BL2 wire shape; geometry and sample association belong to Rust."""
+def _validate_observation_source(source, integer):
+    """Return a compact identity key; Legacy samples have no source group."""
+    if not isinstance(source, dict):
+        raise ValueError("精细地图观测来源格式错误")
+    kind = source.get("kind")
+    if kind == "lidar" and set(source) == {"kind", "backend", "runtime_generation", "sensor_frame_id"}:
+        backend = integer(source["backend"], 1, 3)
+        generation = integer(source["runtime_generation"], 1, 2 ** 63 - 1)
+        frame = source["sensor_frame_id"]
+        if isinstance(frame, str) and frame:
+            return kind, backend, generation, frame
+    elif kind == "auxiliary" and set(source) == {"kind", "sensor_id", "clock_id", "runtime_generation", "session_generation"}:
+        runtime = integer(source["runtime_generation"], 1, 2 ** 64 - 1)
+        session = integer(source["session_generation"], 1, 2 ** 64 - 1)
+        sensor, clock = source["sensor_id"], source["clock_id"]
+        if isinstance(sensor, str) and sensor.strip() and isinstance(clock, str) and clock.strip():
+            return kind, sensor, clock, runtime, session
+    raise ValueError("精细地图观测来源格式错误")
+
+
+def _validate_source_watermarks(watermarks, integer):
+    if not isinstance(watermarks, list):
+        raise ValueError("精细地图来源水位格式错误")
+    sources = set()
+    for watermark in watermarks:
+        if not isinstance(watermark, dict) or set(watermark) != {"source", "source_timestamp_ns", "source_sequence"}:
+            raise ValueError("精细地图来源水位格式错误")
+        source = _validate_observation_source(watermark["source"], integer)
+        if source in sources:
+            raise ValueError("精细地图来源水位重复")
+        sources.add(source)
+        integer(watermark["source_timestamp_ns"], 1, 2 ** 64 - 1)
+        integer(watermark["source_sequence"], 1 if source[0] == "lidar" else 0, 2 ** 64 - 1)
+
+
+def _validate_layer_structure(layers, integer, *, sourced=False):
+    """Read BL2/BL3 wire shapes; physical layer semantics belong to Rust."""
     def fail():
         raise ValueError("精细地图层格式错误")
 
@@ -201,7 +241,10 @@ def _validate_layer_structure(layers, integer):
             fail()
         anchor, layer = entry
         integer(anchor, 0, 65535)
-        if not isinstance(layer, dict) or set(layer) != {"members", "plane_origin", "normal", "samples"}:
+        fields = {"members", "plane_origin", "normal", "samples"}
+        if sourced and isinstance(layer, dict) and "sample_sources" in layer:
+            fields.add("sample_sources")
+        if not isinstance(layer, dict) or set(layer) != fields:
             fail()
         members, samples = layer["members"], layer["samples"]
         if (not isinstance(members, list) or not 1 <= len(members) <= 32
@@ -218,3 +261,26 @@ def _validate_layer_structure(layers, integer):
             integer(sample["source_sequence"], 0, 2 ** 64 - 1)
             integer(sample["source_timestamp_ns"], 0, 2 ** 64 - 1)
             integer(sample["point_index"], 0, 2 ** 32 - 1)
+        if sourced:
+            groups = layer.get("sample_sources", [])
+            if not isinstance(groups, list) or len(groups) > len(samples):
+                fail()
+            sources, positions = set(), set()
+            for group in groups:
+                if not isinstance(group, dict) or set(group) != {"source", "sample_positions"}:
+                    fail()
+                source = _validate_observation_source(group["source"], integer)
+                if source in sources:
+                    fail()
+                sources.add(source)
+                indexes = group["sample_positions"]
+                if not isinstance(indexes, list) or not 1 <= len(indexes) <= len(samples):
+                    fail()
+                for position in indexes:
+                    integer(position, 0, len(samples) - 1)
+                    if position in positions:
+                        fail()
+                    positions.add(position)
+                    sample = samples[position]
+                    integer(sample["source_timestamp_ns"], 1, 2 ** 64 - 1)
+                    integer(sample["source_sequence"], 1 if source[0] == "lidar" else 0, 2 ** 64 - 1)

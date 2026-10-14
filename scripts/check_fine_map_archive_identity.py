@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reconstructed hash-fatal AR1/AR2/AR3 tests; old test logs do not apply."""
+"""Hash-fatal AR1–AR4 structural and provenance compatibility tests."""
 import copy
 import hashlib
 import json
@@ -95,8 +95,8 @@ class FineArchiveChecks(unittest.TestCase):
             self.reject(root, blocks=[self.layer_block(raw)])
 
     @staticmethod
-    def layer_block(raw):
-        return b'NUWAXBL2' + struct.pack('<II', 2, len(raw)) + block(((0, 100, 1), (1024, 100, 1)))[16:] + raw
+    def layer_block(raw, version=2):
+        return ('NUWAXBL%d' % version).encode() + struct.pack('<II', 2, len(raw)) + block(((0, 100, 1), (1024, 100, 1)))[16:] + raw
 
     def layer_fixture(self):
         root = manifest(3)
@@ -136,10 +136,100 @@ class FineArchiveChecks(unittest.TestCase):
         longer = self.layer_block(json.dumps([[0, layer]], indent=2).encode())
         self.reject(root, blocks=[body, longer])
 
+    def provenance_fixture(self):
+        root, _, layer = self.layer_fixture()
+        root.update(version=4, source_timestamp_ns=100)
+        lidar = dict(kind='lidar', backend=1, runtime_generation=7, sensor_frame_id='lidar')
+        auxiliary = dict(kind='auxiliary', sensor_id='depth/front', clock_id='camera',
+                         runtime_generation=2, session_generation=3)
+        layer['samples'][1].update(source_sequence=0, source_timestamp_ns=90)
+        layer['sample_sources'] = [dict(source=lidar, sample_positions=[0]),
+                                   dict(source=auxiliary, sample_positions=[1])]
+        root['source_watermarks'] = [dict(source=lidar, source_timestamp_ns=100, source_sequence=1),
+                                     dict(source=auxiliary, source_timestamp_ns=900, source_sequence=0)]
+        return root, layer
+
+    def test_ar4_provenance_roundtrip_keeps_independent_clocks_and_sequences(self):
+        root, layer = self.provenance_fixture()
+        raw = archive(root, blocks=[self.layer_block(json.dumps([[0, layer]]).encode(), 3)])
+        for payload in (raw, FrozenPayload([raw])):
+            self.assertEqual(validate_fine_archive(payload), root)
+        # Source-local watermarks do not reinterpret the canonical root receipt time.
+        self.assertEqual(root['source_timestamp_ns'], 100)
+        self.assertEqual(layer['samples'][1]['source_timestamp_ns'], 90)
+        self.assertEqual(root['source_watermarks'][1]['source_timestamp_ns'], 900)
+        self.assertEqual(layer['samples'][1]['source_sequence'], 0)
+        layer['sample_sources'].reverse()
+        root['source_watermarks'].reverse()
+        self.assertEqual(validate_fine_archive(archive(root, blocks=[
+            self.layer_block(json.dumps([[0, layer]]).encode(), 3)])), root)
+
+    def test_ar4_legacy_blocks_and_missing_provenance_remain_legacy(self):
+        root, body, layer = self.layer_fixture()
+        root['version'] = 4
+        for value in (block(((0, 100, 1), (1024, 100, 1))), body,
+                      self.layer_block(json.dumps([[0, layer]]).encode(), 3)):
+            self.assertEqual(validate_fine_archive(archive(root, blocks=[value])), root)
+        root['source_watermarks'] = []
+        layer['sample_sources'] = []
+        self.assertEqual(validate_fine_archive(archive(root, blocks=[
+            self.layer_block(json.dumps([[0, layer]]).encode(), 3)])), root)
+        typed, layer = self.provenance_fixture()
+        layer['sample_sources'] = layer['sample_sources'][1:]
+        self.assertEqual(validate_fine_archive(archive(typed, blocks=[
+            self.layer_block(json.dumps([[0, layer]]).encode(), 3)])), typed)
+
+    def test_ar4_watermarks_require_typed_unique_sources_and_bounded_numbers(self):
+        root, layer = self.provenance_fixture()
+        body = self.layer_block(json.dumps([[0, layer]]).encode(), 3)
+        for marks in ({}, None, [None], [root['source_watermarks'][0]] * 2,
+                      [dict(root['source_watermarks'][0], extra=1)]):
+            self.reject(dict(root, source_watermarks=marks), blocks=[body])
+        for field, value in (('source_timestamp_ns', 0), ('source_timestamp_ns', U64_MAX + 1),
+                             ('source_sequence', 0), ('source_sequence', True)):
+            changed = copy.deepcopy(root)
+            changed['source_watermarks'][0][field] = value
+            self.reject(changed, blocks=[body])
+        for source in (dict(kind='legacy'), dict(kind='unknown'), {}, None,
+                       dict(kind='lidar', backend=4, runtime_generation=1, sensor_frame_id='lidar'),
+                       dict(kind='lidar', backend=1, runtime_generation=2 ** 63, sensor_frame_id='lidar'),
+                       dict(kind='lidar', backend=1, runtime_generation=1, sensor_frame_id=''),
+                       dict(kind='auxiliary', sensor_id=' ', clock_id='camera', runtime_generation=1, session_generation=1),
+                       dict(kind='auxiliary', sensor_id='front', clock_id=' ', runtime_generation=1, session_generation=1),
+                       dict(kind='auxiliary', sensor_id='front', clock_id='camera', runtime_generation=0, session_generation=1)):
+            changed = copy.deepcopy(root)
+            changed['source_watermarks'][0]['source'] = source
+            self.reject(changed, blocks=[body])
+
+    def test_bl3_source_groups_are_compact_disjoint_sample_positions(self):
+        root, layer = self.provenance_fixture()
+        first, second = layer['sample_sources']
+        for groups in ({}, [None], [first, first], [dict(first, sample_positions=[])],
+                       [dict(first, sample_positions=[0, 0])], [dict(first, sample_positions=[2])],
+                       [dict(first, sample_positions=[True])], [dict(first, sample_positions=[-1])],
+                       [first, dict(second, sample_positions=[0])], [dict(first, source={'kind': 'legacy'})],
+                       [dict(first, extra=1)]):
+            changed = dict(layer, sample_sources=groups)
+            self.reject(root, blocks=[self.layer_block(json.dumps([[0, changed]]).encode(), 3)])
+        for field, value in (('source_sequence', 0), ('source_timestamp_ns', 0)):
+            changed = copy.deepcopy(layer)
+            changed['samples'][0][field] = value
+            self.reject(root, blocks=[self.layer_block(json.dumps([[0, changed]]).encode(), 3)])
+
+    def test_new_provenance_requires_explicit_supported_archive_and_block_versions(self):
+        root, layer = self.provenance_fixture()
+        body = self.layer_block(json.dumps([[0, layer]]).encode(), 3)
+        for version in (1, 2, 3, 5):
+            self.reject(dict(root, version=version), blocks=[body])
+        self.reject(root, blocks=[self.layer_block(json.dumps([[0, layer]]).encode(), 2)])
+        self.reject(root, blocks=[body[:7] + b'4' + body[8:]])
+        for version in (1, 2, 3):
+            self.reject(manifest(version), blocks=[body])
+
     def test_all_source_dimensions_are_bound_for_both_versions(self):
         expected = dict(session='synthetic-地图', generation=5, frame_generation=0,
             producer_generation=8, cloud_revision=9007199254740993, source_timestamp_ns=U64_MAX)
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             payload = archive(manifest(version))
             self.assertEqual(validate_fine_archive(payload, **expected)['version'], version)
             for field, value in expected.items():
@@ -149,7 +239,7 @@ class FineArchiveChecks(unittest.TestCase):
                 validate_fine_archive(payload, frame_generation=False)
 
     def test_same_object_can_appear_at_multiple_spatial_keys(self):
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             root = manifest(version)
             repeated = copy.deepcopy(root['blocks'][0])
             repeated['key'] = [0, 0, 0]
@@ -161,7 +251,7 @@ class FineArchiveChecks(unittest.TestCase):
             self.reject(root, blocks=[block(), block(((0, 0, 0),))])
 
     def test_repeated_object_identity_rejects_changed_actual_bytes(self):
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             root = manifest(version)
             repeated = copy.deepcopy(root['blocks'][0])
             repeated['key'] = [0, 0, 0]
@@ -171,7 +261,7 @@ class FineArchiveChecks(unittest.TestCase):
                 self.reject(root, blocks=[block(), changed])
 
     def test_empty_maps_and_valid_coordinate_edges_are_accepted(self):
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             root = manifest(version)
             root['blocks'] = []
             self.assertEqual(validate_fine_archive(archive(root, blocks=[])), root)
@@ -184,7 +274,7 @@ class FineArchiveChecks(unittest.TestCase):
         for payload in (None, bytearray(archive()), b'', b'NUWAXAR2'+bytes(15), b'INVALID!'+archive()[8:], archive()[:-1], archive()+b'x'):
             with self.assertRaises(ValueError):
                 validate_fine_archive(payload)
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             payload = archive(manifest(version))
             for length in (0, 32*1024*1024+1, len(payload)):
                 with self.assertRaises(ValueError):
@@ -194,7 +284,7 @@ class FineArchiveChecks(unittest.TestCase):
         self.reject(manifest(1), alias=bytes(32))
 
     def test_bad_json_duplicate_fields_and_nonfinite_numbers(self):
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             for raw in (b'null', b'[]', b'{', b'\xff', b'{"version":1,"version":1}'):
                 self.reject(manifest(version), raw=raw)
             encoded = json.dumps(manifest(version)).encode()
@@ -203,8 +293,8 @@ class FineArchiveChecks(unittest.TestCase):
                 self.reject(manifest(version), raw=encoded.replace(b'"voxel_size_m": 0.125', f'"voxel_size_m": {value}'.encode()))
 
     def test_versions_root_fields_and_numeric_ranges_remain_strict(self):
-        for version in (1, 2, 3):
-            for field, values in {'version': (0, 4, True, float(version), 4 if version == 3 else 3-version),
+        for version in (1, 2, 3, 4):
+            for field, values in {'version': (0, 5, True, float(version), version % 4 + 1),
                 'revision': (0, -1, U64_MAX+1, True, 1.0), 'source_timestamp_ns': (0, -1, U64_MAX+1, False, 1.0),
                 'voxel_size_m': (0, -0.1, 1048577, True, '0.125', 10**400), 'blocks': ({}, None)}.items():
                 for value in values:
@@ -220,7 +310,7 @@ class FineArchiveChecks(unittest.TestCase):
                 self.reject(root, version=version)
 
     def test_domain_and_session_shapes_are_strict(self):
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             for field, values in {'session': ('', ' x', 'x ', 'x\n', 'x\x7f', 'x\x85', '地'*342, 1),
                 'generation': (0, -1, U64_MAX+1, True, 1.0), 'producer_generation': (0, -1, U64_MAX+1, True, 1.0),
                 'frame_generation': (-1, U64_MAX+1, False, 1.0)}.items():
@@ -234,7 +324,7 @@ class FineArchiveChecks(unittest.TestCase):
                 self.reject(root)
 
     def test_block_reference_fields_coordinates_counts_and_order_are_strict(self):
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             for key in ([0, 0], [0, 0, 0, 0], [True, 0, 0], [1.0, 0, 0], [-(2**26)-1, 0, 0], [2**26, 0, 0], '000'):
                 root = manifest(version)
                 root['blocks'][0]['key'] = key
@@ -282,7 +372,7 @@ class FineArchiveChecks(unittest.TestCase):
                 self.reject(root)
 
     def test_block_structure_and_observation_evidence(self):
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             for body in (b'WRONGMAG'+block()[8:], block()[:12]+struct.pack('<I', 1)+block()[16:], block()[:-1],
                          block(((0, 1, 0), (32767, U64_MAX, 1))), block(((0, 0, 1), (32767, U64_MAX, 1))),
                          block(((1, 0, 0), (0, 0, 0)))):

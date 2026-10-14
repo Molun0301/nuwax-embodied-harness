@@ -115,7 +115,7 @@ impl RobotSelfFilter {
         points.retain(|point| !self.contains_body(&(body_from_odom * point)));
     }
 
-    fn contains_body(&self, body: &Point3<f64>) -> bool {
+    pub(crate) fn contains_body(&self, body: &Point3<f64>) -> bool {
         // 非有限输入继续交给规范准入，不在过滤中静默吞掉。
         if body.coords.iter().any(|v| !v.is_finite()) { return false; }
         if (0..3).any(|axis| body[axis] < self.body_bounds.0[axis] || body[axis] > self.body_bounds.1[axis]) {

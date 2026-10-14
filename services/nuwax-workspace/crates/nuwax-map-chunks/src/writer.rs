@@ -1,15 +1,15 @@
 use super::*;
 
 struct Dirty { block: Block, layers: LayerObservations, changed: bool }
-fn layer_bytes(layer: &LayerObservation) -> usize {
-    128 + layer.members.len() * 2 + layer.samples.len() * 64
-}
+use terrain_observations::layer_bytes;
+fn watermark_bytes(source: &LayerSource) -> usize { source.resident_bytes() + 80 }
 struct Pending { object: ObjectIdentity, bytes: Vec<u8>, installed: bool }
 /// Dirty payload is bounded; membership baselines retain references, never copied member lists.
 pub struct Writer {
     repository: Repository, blocks: BTreeMap<Key, BlockRef>, dirty: BTreeMap<Key, Dirty>,
     pending: BTreeMap<Key, Pending>, touched: BTreeSet<Key>, membership_touched: BTreeSet<Key>,
-    layer_format: bool,
+    source_watermarks: BTreeMap<Arc<LayerSource>, (u64, u64)>,
+    source_watermark_bytes: usize, source_watermarks_changed: bool,
     published: Option<Arc<Manifest>>, legacy_baseline: Option<(Domain, u64)>, reader: RegionReader,
     id_source: Box<dyn FnMut() -> Result<ObjectId, String> + Send>,
     #[cfg(test)] pub(crate) encoded_blocks: usize,
@@ -26,11 +26,34 @@ impl Writer {
         }
         Ok(Self { reader: RegionReader::new(repository.clone(), cache_bytes / 2), repository,
             blocks: BTreeMap::new(), dirty: BTreeMap::new(), pending: BTreeMap::new(), touched: BTreeSet::new(), membership_touched: BTreeSet::new(),
-            layer_format: false, published: None, legacy_baseline: None, id_source: Box::new(id_source), #[cfg(test)] encoded_blocks: 0, voxel_size_m, dirty_point_budget: cache_bytes / 128, dirty_points: 0, dirty_layer_bytes: 0, max_observed_ns: 0 })
+            source_watermarks: BTreeMap::new(), source_watermark_bytes: 0, source_watermarks_changed: false, published: None, legacy_baseline: None, id_source: Box::new(id_source), #[cfg(test)] encoded_blocks: 0, voxel_size_m, dirty_point_budget: cache_bytes / 128, dirty_points: 0, dirty_layer_bytes: 0, max_observed_ns: 0 })
     }
     pub fn repository(&self) -> &Repository { &self.repository }
+    /// Last captured original (timestamp, sequence) in this exact namespace.
+    pub fn source_watermark(&self, source: &LayerSource) -> Option<(u64, u64)> {
+        self.source_watermarks.get(source).copied()
+    }
+    /// Advance only this source's lexicographic frame marker. Timestamp advance
+    /// permits an original lower sequence; different clocks are never compared.
+    pub fn record_source_watermark(&mut self, source: Arc<LayerSource>, timestamp: u64, sequence: u64) -> Result<(), String> {
+        SourceWatermark { source: source.clone(), source_timestamp_ns: timestamp, source_sequence: sequence }.validate()?;
+        let next = (timestamp, sequence);
+        if let Some(previous) = self.source_watermarks.get(source.as_ref()) {
+            if next < *previous { return Err("source watermark rolled back".into()); }
+            if next == *previous { return Ok(()); }
+        } else {
+            let bytes = watermark_bytes(&source);
+            if bytes > MAX_MANIFEST_BYTES.saturating_sub(self.source_watermark_bytes) {
+                return Err("source watermarks exceed resident budget".into());
+            }
+            self.source_watermark_bytes += bytes;
+        }
+        self.source_watermarks.insert(source, next);
+        self.source_watermarks_changed = true;
+        Ok(())
+    }
     pub fn has_unpublished_changes(&self) -> bool {
-        !self.touched.is_empty() || !self.membership_touched.is_empty() || !self.pending.is_empty()
+        self.source_watermarks_changed || !self.touched.is_empty() || !self.membership_touched.is_empty() || !self.pending.is_empty()
     }
     /// Move only the published baseline into the next frame. Dirty evidence,
     /// pressure-flushed references and partially installed frozen IDs stay pending.
@@ -53,7 +76,7 @@ impl Writer {
         Ok(rehomed)
     }
     pub fn voxel_size_m(&self) -> f32 { self.voxel_size_m }
-    pub fn resident_bytes(&self) -> usize { self.dirty_layer_bytes() + self.dirty_points * 64 + self.reader.cached_bytes() + self.pending.values().map(|p| p.bytes.len()).sum::<usize>() }
+    pub fn resident_bytes(&self) -> usize { self.source_watermark_bytes + self.dirty_layer_bytes() + self.dirty_points * 64 + self.reader.cached_bytes() + self.pending.values().map(|p| p.bytes.len()).sum::<usize>() }
     pub fn block_count(&self) -> usize {
         self.blocks.len()
             + self.dirty.iter().filter(|(key, dirty)| !dirty.block.is_empty() && !self.blocks.contains_key(*key)).count()
@@ -64,11 +87,15 @@ impl Writer {
         if root.voxel_size_m != self.voxel_size_m { return Err("restored resolution differs from writer".into()); }
         let mut latest = 0;
         for reference in &root.blocks {
-            let layers = self.reader.layers(reference)?;
-            if !layers.is_empty() && root.version < 3 { return Err("observed layers require root version 3".into()); }
-            let info = intrinsic(&*self.reader.block(reference)?); admit_intrinsic(info, reference.points, root.source_timestamp_ns)?; latest = latest.max(info.latest);
+            let (_, info, _) = self.reader.parts(reference.object, reference.points)?;
+            admit_format(info, root)?;
+            admit_intrinsic(info, reference.points, root.source_timestamp_ns)?; latest = latest.max(info.latest);
         }
-        self.layer_format = root.version >= 3;
+        let source_watermarks: BTreeMap<_, _> = root.source_watermarks.iter().map(|mark|
+            (mark.source.clone(), (mark.source_timestamp_ns, mark.source_sequence))).collect();
+        let source_watermark_bytes = source_watermarks.keys().map(|source| watermark_bytes(source)).sum::<usize>();
+        if source_watermark_bytes > MAX_MANIFEST_BYTES { return Err("source watermarks exceed resident budget".into()); }
+        self.source_watermarks = source_watermarks; self.source_watermark_bytes = source_watermark_bytes;
         self.blocks = root.blocks.iter().map(|b| (b.key, b.clone())).collect();
         self.reset_pending(); self.max_observed_ns = latest;
         self.published = Some(Arc::new(root.clone())); self.legacy_baseline = None; Ok(())
@@ -79,12 +106,11 @@ impl Writer {
         let mut latest = 0;
         for reference in &root.blocks {
             let object = ObjectIdentity::Legacy(reference.sha256);
-            let view = BlockRef { key: reference.key, object, points: reference.points, block_revision: 0, geometry_revision: 0 };
-            if !self.reader.layers(&view)?.is_empty() { return Err("legacy root cannot contain observed layers".into()); }
-            let info = intrinsic(&*self.reader.object(object, reference.points)?);
+            let (_, info, layers) = self.reader.parts(object, reference.points)?;
+            if !layers.is_empty() { return Err("legacy root cannot contain observed layers".into()); }
             admit_intrinsic(info, reference.points, root.source_timestamp_ns)?; latest = latest.max(info.latest);
         }
-        self.layer_format = false;
+        self.source_watermarks.clear(); self.source_watermark_bytes = 0;
         self.blocks = root.blocks.iter().map(|b| (b.key, BlockRef { key: b.key, object: ObjectIdentity::Legacy(b.sha256), block_revision: 0, geometry_revision: 0, points: b.points })).collect();
         self.reset_pending(); self.max_observed_ns = latest; self.published = None;
         self.legacy_baseline = Some((root.domain.clone(), root.revision)); Ok(())
@@ -93,13 +119,18 @@ impl Writer {
         match root { ArchivedRoot::Current(root) => self.restore(root), ArchivedRoot::Legacy(root) => self.restore_legacy(&root.manifest) }
     }
     fn reset_pending(&mut self) {
-        self.dirty.clear(); self.pending.clear(); self.touched.clear(); self.membership_touched.clear(); self.dirty_points = 0; self.dirty_layer_bytes = 0;
+        self.dirty.clear(); self.pending.clear(); self.touched.clear(); self.membership_touched.clear(); self.dirty_points = 0; self.dirty_layer_bytes = 0; self.source_watermarks_changed = false;
     }
     fn load_dirty(&mut self, key: Key) -> Result<&mut Dirty, String> {
         if !self.dirty.contains_key(&key) {
             if self.dirty_points + 32768 + self.dirty_layer_bytes() / 64 > self.dirty_point_budget { self.flush()?; }
-            let block = match self.blocks.get(&key) { Some(reference) => (*self.reader.block(reference)?).clone(), None => Block::new() };
-            let layers = match self.blocks.get(&key) { Some(reference) => (*self.reader.layers(reference)?).clone(), None => LayerObservations::new() };
+            let (block, layers) = match self.blocks.get(&key) {
+                Some(reference) => {
+                    let (block, _, layers) = self.reader.parts(reference.object, reference.points)?;
+                    ((*block).clone(), (*layers).clone())
+                },
+                None => (Block::new(), LayerObservations::new()),
+            };
             self.dirty_layer_bytes += layers.values().map(layer_bytes).sum::<usize>();
             self.dirty_points += block.len(); self.dirty.insert(key, Dirty { block, layers, changed: false });
         }
@@ -123,7 +154,6 @@ impl Writer {
         let after = layers.values().map(layer_bytes).sum::<usize>();
         dirty.layers = layers; dirty.changed = true;
         self.dirty_layer_bytes = self.dirty_layer_bytes - before + after;
-        self.layer_format = true;
         self.pending.remove(&key); self.touched.insert(key); self.membership_touched.insert(key);
         Ok(())
     }
@@ -246,11 +276,13 @@ impl Writer {
                 }
             }
         }
-        let root = Arc::new(Manifest { version: if self.layer_format { 3 } else { 2 }, domain, revision, geometry_revision, source_timestamp_ns: timestamp_ns,
-            voxel_size_m: self.voxel_size_m, blocks: blocks.values().cloned().collect() });
+        let root = Arc::new(Manifest { version: 4, domain, revision, geometry_revision, source_timestamp_ns: timestamp_ns,
+            voxel_size_m: self.voxel_size_m, blocks: blocks.values().cloned().collect(),
+            source_watermarks: self.source_watermarks.iter().map(|(source, &(source_timestamp_ns, source_sequence))|
+                SourceWatermark { source: source.clone(), source_timestamp_ns, source_sequence }).collect() });
         root.validate()?;
         self.blocks = blocks; self.published = Some(root.clone()); self.legacy_baseline = None;
-        self.touched.clear(); self.membership_touched.clear();
+        self.touched.clear(); self.membership_touched.clear(); self.source_watermarks_changed = false;
         Ok(SealedMap { root, repository: self.repository.clone() })
     }
     pub fn retained_objects(&self) -> BTreeSet<ObjectIdentity> {

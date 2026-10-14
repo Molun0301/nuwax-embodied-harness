@@ -62,16 +62,9 @@ pub(crate) struct ArchivedScan {
     source: ArchivedSource,
 }
 
-#[derive(Clone, PartialEq)]
-enum ArchivedSource {
-    Lidar(AdmittedRegisteredScan),
-    Auxiliary(crate::lcm_runtime::mapping_observation::RegisteredObservation),
-}
+use crate::admitted_cloud::AdmittedCloudSource as ArchivedSource;
 
 impl ArchivedSource {
-    fn lidar(&self) -> Option<&AdmittedRegisteredScan> {
-        match self { Self::Lidar(source) => Some(source), Self::Auxiliary(_) => None }
-    }
     fn key(&self) -> ArchiveSourceKey {
         match self {
             Self::Lidar(_) => ArchiveSourceKey::Lidar,
@@ -437,7 +430,7 @@ impl ReplayBuilder {
                 sensor_origin_map: origin.coords.into(),
                 registered_points_map: points,
             });
-            let ground_source = ReplayedGroundSource { source: scan.source.lidar().cloned() };
+            let ground_source = scan.source.clone();
             let validation_started = Instant::now();
             mapping_backend::validate_backend_input(&self.kernel, &input)?;
             self.kernel_time += validation_started.elapsed();
@@ -643,10 +636,7 @@ impl ReplayBuilder {
     }
 }
 
-#[derive(Clone)]
-struct ReplayedGroundSource {
-    source: Option<AdmittedRegisteredScan>,
-}
+type ReplayedGroundSource = ArchivedSource;
 
 struct CloudStageReply {
     source_timestamp_ns: u64,
@@ -769,7 +759,7 @@ fn append_cloud_stage(
     input: &MappingBackendInput,
     ground_source: Option<&ReplayedGroundSource>,
 ) -> Result<(), RebuildError> {
-    if ground_source.and_then(|s| s.source.as_ref()).is_some_and(|s| s.source_timestamp_ns() != input.source_timestamp_ns) { return Err("PGO ground/source timestamp mismatch".into()); }
+    if ground_source.is_some_and(|s| s.timestamp_ns() != input.source_timestamp_ns) { return Err("PGO ground/source timestamp mismatch".into()); }
     if !cloud.accumulate_mapping_scan(
         1,
         &input.registered_points_map,
@@ -778,7 +768,7 @@ fn append_cloud_stage(
     ) {
         return Err("PGO重建点云无法接纳原始扫描".into());
     }
-    if let Some(source) = ground_source.and_then(|s| s.source.as_ref()) {
+    if let Some(source) = ground_source {
         cloud.capture_replayed_ground(&input.registered_points_map, source)?;
     }
     Ok(())
@@ -1508,7 +1498,7 @@ mod tests {
         rebuild_scale(8, Duration::from_secs(30), || false).unwrap();
     }
     #[test]
-    fn auxiliary_same_time_keeps_lidar_owner_and_replays_without_lidar_ground_proof() {
+    fn auxiliary_same_time_keeps_lidar_owner_and_its_distinct_source() {
         let (original,trajectory)=scale_input(2);
         let mut history=ScanHistory::default();
         let lidar=original[0].source.lidar().unwrap();
@@ -1537,6 +1527,91 @@ mod tests {
         let conflicting=crate::lcm_runtime::mapping_observation::RegisteredObservation::for_test(
             scans[0].source_timestamp_ns,"depth-front",vec![Point3::new(9.,9.,9.)],Isometry3::identity(),[0.12,0.,0.3]);
         assert!(history.record_auxiliary(conflicting).unwrap_err().contains("来源冲突"));
+    }
+
+    #[test]
+    fn auxiliary_ground_replays_corrected_originals_in_serial_and_worker_lanes() {
+        use crate::lcm_runtime::mapping_observation::RegisteredObservation;
+        use nuwax_map_chunks::LayerSource;
+        let wall: Vec<_> = (0..8).flat_map(|y| (0..8).map(move |z|
+            Point3::new(0.28, 0.008 + y as f64 * 0.02, 0.21 + z as f64 * 0.02))).collect();
+        let floor: Vec<_> = (0..8).flat_map(|x| (0..8).map(move |y|
+            Point3::new(0.008 + x as f64 * 0.004, 0.008 + y as f64 * 0.004, 0.01))).collect();
+        let mut history = ScanHistory::default();
+        for (sequence, stamp) in [(1, 1_000_000_000), (2, 1_100_000_000)] {
+            let mut binding = test_binding();
+            binding.cloud_source_sequence = sequence;
+            history.record(&AdmittedRegisteredScan::from_map_points_for_test(stamp, binding, &wall), stamp + 1).unwrap();
+        }
+        for sensor in ["depth-front", "depth-left"] {
+            let mut points = floor.clone();
+            points.extend_from_slice(&wall);
+            let indices = (0..points.len()).map(|index| index as u32 * 2 + 3).collect();
+            let source = RegisteredObservation::for_test_source(1_100_000_000, 12,
+                LayerSource::Auxiliary { sensor_id: sensor.into(), clock_id: "clock".into(),
+                    runtime_generation: 7, session_generation: 1 }, points, indices, Isometry3::identity());
+            history.record_auxiliary(source.clone()).unwrap();
+            history.record_auxiliary(source).unwrap();
+        }
+        let scans = history.snapshot().unwrap();
+        assert_eq!(scans.len(), 4, "source replay is idempotent before geometry replay");
+        let trajectory = vec![
+            OptimizedKeyframe { source_timestamp_ns: 1_000_000_000,
+                translation_m: [0.; 3], rotation_xyzw: [0., 0., 0., 1.] },
+            OptimizedKeyframe { source_timestamp_ns: 1_100_000_000,
+                translation_m: [0.1, 0., 0.2], rotation_xyzw: [0., 0., 0., 1.] },
+        ];
+        let anchor = Isometry3::translation(0.2, 0., 0.1);
+        let expected_pose = anchor * Isometry3::translation(0.1, 0., 0.2);
+        let config = MappingBackendComputeConfig { resolution: 0.05, initial_safe_radius_meters: 0., window_capacity: 1000 };
+        let mut reference_layers = None;
+        for parallel in [false, true] {
+            let mut builder = ReplayBuilder::new(&scans, trajectory.clone(), anchor, MappingBackendSpec::Voxel,
+                config, "map".into(), Duration::from_secs(10), &|| false).unwrap();
+            if parallel {
+                builder = builder.into_background();
+                builder.force_parallel_lanes = true;
+            }
+            builder.append(&scans, &|| false).unwrap();
+            builder.recover_cloud_worker().unwrap();
+            let cloud = builder.cloud.as_mut().unwrap();
+            cloud.bind_fine_map_owner(1, 1).unwrap();
+            let receipt = crate::mapping_commit::OccupancyCommitReceipt {
+                commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 1, sequence: 1 },
+                session_id: "pgo-depth".into(), session_generation: 1, occupancy_revision: 1,
+                source_timestamp_ns: 1_100_000_000, backend_kind: mapping_backend::MappingBackendKind::Voxel,
+                backend_generation: 1,
+            };
+            cloud.commit_accumulated_snapshot(&receipt).unwrap().unwrap();
+            let root = cloud.committed_fine_cloud().unwrap();
+            let mut measured = BTreeMap::new();
+            for block in &root.manifest().blocks {
+                let bytes = root.repository.read_object(block.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
+                for (key, layer) in nuwax_map_chunks::decode_layer_observations(&bytes).unwrap() {
+                    measured.insert((block.key, key), layer);
+                }
+            }
+            assert!(!measured.is_empty());
+            let mut sensors = std::collections::BTreeSet::new();
+            for sample in measured.values().flat_map(|layer| &layer.samples) {
+                let LayerSource::Auxiliary { sensor_id, clock_id, runtime_generation, session_generation } = sample.source.as_ref()
+                    else { panic!("vertical LiDAR wall must not be ground"); };
+                sensors.insert(sensor_id.clone());
+                assert_eq!((clock_id.as_str(), *runtime_generation, *session_generation), ("clock", 7, 1));
+                assert_eq!((sample.source_sequence, sample.source_timestamp_ns), (12, 1_100_000_000));
+                let original = ((sample.point_index - 3) / 2) as usize;
+                assert!(original < floor.len(), "wall return was mislabeled ground");
+                assert_eq!(sample.point, <[f64; 3]>::from((expected_pose * floor[original]).coords));
+            }
+            assert_eq!(sensors.len(), 2, "same-time independent sensors both keep evidence");
+            if let Some(expected) = &reference_layers { assert_eq!(&measured, expected); }
+            else { reference_layers = Some(measured); }
+            let (file, _) = nuwax_map_chunks::archive_file(root.manifest(), &root.repository).unwrap();
+            let prepared = crate::pointcloud::prepare_fine_cloud_archive(file, "pgo-depth", 1,
+                root.manifest().revision, 1_100_000_000).unwrap();
+            assert_eq!(prepared.voxel_size(), root.manifest().voxel_size_m);
+            cloud.cleanup_product_owned_file().unwrap();
+        }
     }
 
 }

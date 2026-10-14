@@ -12,7 +12,7 @@ fn receive(receiver: &mut Receiver, root: &Manifest, source: &Repository) -> Res
 }
 fn body(local: u16, stamp: u64, hits: u16) -> Vec<u8> { encode_block(&BTreeMap::from([(local,Evidence {observed_ns:stamp,hits})])).unwrap() }
 fn archive_bytes(root: &Manifest, bodies: &[Vec<u8>]) -> Vec<u8> {
-    let json=root.encode().unwrap(); let mut out=b"NUWAXAR2".to_vec(); out.extend((json.len() as u64).to_le_bytes()); out.extend(json);
+    let json=root.encode().unwrap(); let mut out=match root.version { 4 => b"NUWAXAR4", 3 => b"NUWAXAR3", _ => b"NUWAXAR2" }.to_vec(); out.extend((json.len() as u64).to_le_bytes()); out.extend(json);
     out.extend((bodies.len() as u64).to_le_bytes()); for b in bodies {out.extend((b.len() as u32).to_le_bytes());out.extend(b);} out
 }
 fn legacy_bytes(stamp: u64, bodies: &[Vec<u8>], shared: bool) -> Vec<u8> {
@@ -313,7 +313,7 @@ fn receiver_default_budget_and_configured_working_set_remain_bounded() {
     let bytes = encode_block(&block).unwrap();
     let root = Manifest {
         version: 2, domain: domain(), revision: 1, geometry_revision: 1,
-        source_timestamp_ns: 1, voxel_size_m: 0.05,
+        source_timestamp_ns: 1, voxel_size_m: 0.05, source_watermarks: Vec::new(),
         blocks: (1..=3_u8).map(|id| BlockRef {
             key: [i32::from(id) - 1, 0, 0], object: ObjectId([id; 16]).into(),
             block_revision: 1, geometry_revision: 1, points: 32768,
@@ -409,8 +409,8 @@ fn receiver_rejects_future_evidence_domain_mismatch_and_extra_inclusions() {
     let mut t=transfer(&m,&src);t.included.insert(ObjectIdentity::Assigned(ObjectId([9;16])),body(0,1,1));assert!(recv.receive(&t,&domain(),|_,_|panic!()).is_err());
 }
 #[test]
-fn archive_ar2_stream_roundtrip_and_exact_reference_binding() {
-    let (r,_,m)=one();let (mut file,size)=archive_file(&m,&r).unwrap();let mut bytes=Vec::new();file.read_to_end(&mut bytes).unwrap();assert_eq!(bytes.len() as u64,size);assert_eq!(&bytes[..8],b"NUWAXAR2");
+fn archive_ar4_stream_roundtrip_and_exact_reference_binding() {
+    let (r,_,m)=one();let (mut file,size)=archive_file(&m,&r).unwrap();let mut bytes=Vec::new();file.read_to_end(&mut bytes).unwrap();assert_eq!(bytes.len() as u64,size);assert_eq!(&bytes[..8],b"NUWAXAR4");
     let mut reader=ArchiveReader::open(Cursor::new(bytes)).unwrap();assert_eq!(reader.root(),&ArchivedRoot::Current((*m).clone()));let mut bad=m.blocks[0].clone();bad.block_revision+=1;assert!(reader.block(&bad).is_err());
     let target=Repository::temporary().unwrap();reader.import(&target).unwrap();assert_eq!(target.read_object(m.blocks[0].object,MAX_BLOCK_BYTES).unwrap(),r.read_object(m.blocks[0].object,MAX_BLOCK_BYTES).unwrap());
 }

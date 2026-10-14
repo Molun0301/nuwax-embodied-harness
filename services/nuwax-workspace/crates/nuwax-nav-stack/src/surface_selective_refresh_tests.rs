@@ -186,6 +186,83 @@ async fn selective_refresh_original_unrelated_a_and_evidence_add_zero_planner_wo
 }
 
 #[tokio::test]
+async fn selective_refresh_source_watermarks_add_zero_geometry_or_planner_work() {
+    let normal = Arc::new(AtomicUsize::new(0));
+    let quick = Arc::new(AtomicUsize::new(0));
+    let mut harness = Harness::start_with_test_transport(counted(normal.clone(), false),
+        Duration::from_millis(25), configured(false, true), true,
+        Some(counted(quick.clone(), true))).await;
+    let source = Arc::new(nuwax_map_chunks::LayerSource::Auxiliary {
+        sensor_id: "depth-front".into(), clock_id: "camera-clock".into(),
+        runtime_generation: 7, session_generation: 1,
+    });
+    let marks = Arc::new(Mutex::new(vec![nuwax_map_chunks::SourceWatermark {
+        source: source.clone(), source_timestamp_ns: 90, source_sequence: 0,
+    }]));
+    let observed_marks = marks.clone();
+    let published: Arc<Mutex<Option<Arc<nuwax_map_chunks::Manifest>>>> = Arc::default();
+    let observed_root = published.clone();
+    let repository = nuwax_map_chunks::Repository::temporary().unwrap();
+    let mut writer = nuwax_map_chunks::Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
+    let mut initialized = false;
+    harness.feed.lock().unwrap().map_update = Some(Box::new(move |map| {
+        if !initialized {
+            writer.observe((0..80).flat_map(|x| (0..60).map(move |y| [x, y, 40])),
+                map.source_timestamp_ns as u64).unwrap();
+            initialized = true;
+        }
+        for mark in observed_marks.lock().unwrap().iter() {
+            writer.record_source_watermark(mark.source.clone(), mark.source_timestamp_ns,
+                mark.source_sequence).unwrap();
+        }
+        map.source_voxel_size = 0.05;
+        map.cloud.width = 0; map.cloud.row_step = 0; map.cloud.data.clear();
+        let root = writer.snapshot(schema::navigation_map_3d_domain(map), map.cloud_revision as u64,
+            map.source_timestamp_ns as u64).unwrap();
+        let included = root.blocks.iter().map(|block| (block.object,
+            repository.read_object(block.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap())).collect();
+        map.fine = Some(nuwax_map_chunks::Transfer { root: root.encode().unwrap(), included });
+        *observed_root.lock().unwrap() = Some(root);
+    }));
+    wait(|| latest(&harness).is_some_and(|map| map.observations().is_some())).await;
+    harness.wait_ready().await;
+    let (goal, initial) = active(&mut harness).await;
+    let first = latest(&harness).unwrap();
+    let first_root = published.lock().unwrap().as_ref().unwrap().clone();
+    let first_evidence = first.observations().unwrap().get([40, 30, 40]);
+    let before_commands = harness.scheduler.status().applied_commands;
+    {
+        let mut marks = marks.lock().unwrap();
+        marks[0].source_timestamp_ns = 900;
+        marks[0].source_sequence = 1;
+        marks.push(nuwax_map_chunks::SourceWatermark {
+            source: Arc::new(nuwax_map_chunks::LayerSource::Auxiliary {
+                sensor_id: "depth-front".into(), clock_id: "other-clock".into(),
+                runtime_generation: 7, session_generation: 1,
+            }), source_timestamp_ns: 2, source_sequence: 0,
+        });
+    }
+    evidence_updates(&harness, 3).await;
+    let refreshed = latest(&harness).unwrap();
+    let refreshed_root = published.lock().unwrap().as_ref().unwrap().clone();
+    assert_eq!(refreshed_root.source_watermarks.len(), 2);
+    assert!(refreshed_root.source_watermarks.iter().any(|mark| mark.source == source
+        && mark.source_timestamp_ns == 900 && mark.source_sequence == 1));
+    assert_ne!(first_root.source_watermarks, refreshed_root.source_watermarks);
+    assert_eq!(first_root.blocks, refreshed_root.blocks);
+    assert_eq!(first_root.geometry_revision, refreshed_root.geometry_revision);
+    assert_eq!(first_evidence, refreshed.observations().unwrap().get([40, 30, 40]));
+    assert!(nuwax_nav_pct::same_source_geometry(&first, &refreshed));
+    unchanged_path(&mut harness, initial.path_revision).await;
+    assert_eq!((normal.load(Ordering::SeqCst), quick.load(Ordering::SeqCst)), (1, 0));
+    assert_eq!(harness.hub.reference_checks.load(Ordering::SeqCst), 0);
+    assert!(harness.scheduler.status().applied_commands > before_commands);
+    harness.cancel(&goal).await;
+    harness.terminal(TerminalOutcome::Cancelled).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn selective_refresh_fences_both_old_completions_and_coalesces_held_burst() {
     let normal = Arc::new(AtomicUsize::new(0));
     let quick = Arc::new(AtomicUsize::new(0));
@@ -874,7 +951,7 @@ fn measured_flat_layer(cell: [i32; 3]) -> nuwax_map_chunks::LayerObservation {
     let point = cell.map(|v| (f64::from(v) + 0.5) * f64::from(0.05_f32));
     nuwax_map_chunks::LayerObservation {
         members: vec![nuwax_map_chunks::local_key(cell)], plane_origin: point,
-        normal: [0.0, 0.0, 1.0], samples: vec![nuwax_map_chunks::LayerSample {
+        normal: [0.0, 0.0, 1.0], samples: vec![nuwax_map_chunks::LayerSample {source: Default::default(),
             point, source_sequence: 1, source_timestamp_ns: 1, point_index: 0,
         }],
     }

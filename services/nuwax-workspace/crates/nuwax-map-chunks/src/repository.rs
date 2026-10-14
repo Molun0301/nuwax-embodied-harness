@@ -145,9 +145,7 @@ impl RegionReader {
         Self { repository, cache: BTreeMap::new(), budget_bytes, used_bytes: 0, clock: 0 }
     }
     pub fn layers(&mut self, reference: &BlockRef) -> Result<Arc<LayerObservations>, String> {
-        self.block(reference)?;
-        if let Some(entry) = self.cache.get(&reference.object) { return Ok(entry.4.clone()); }
-        Ok(Arc::new(decode_layer_observations(&self.repository.read_object(reference.object, MAX_BLOCK_BYTES)?)?))
+        self.parts(reference.object, reference.points).map(|(_, _, layers)| layers)
     }
     pub fn cached_bytes(&self) -> usize { self.used_bytes }
     #[cfg(test)]
@@ -160,22 +158,26 @@ impl RegionReader {
         self.object(reference.object, reference.points)
     }
     pub(crate) fn object(&mut self, object: ObjectIdentity, points: u32) -> Result<Arc<Block>, String> {
+        self.parts(object, points).map(|(block, _, _)| block)
+    }
+    /// One decode even when a large block cannot stay in the bounded cache.
+    pub(crate) fn parts(&mut self, object: ObjectIdentity, points: u32) -> Result<(Arc<Block>, Intrinsic, Arc<LayerObservations>), String> {
         self.clock = self.clock.wrapping_add(1);
-        if let Some((block, info, age, _, _)) = self.cache.get_mut(&object) {
+        if let Some((block, info, age, _, layers)) = self.cache.get_mut(&object) {
             if info.points != points { return Err("cached object point count conflicts with root".into()); }
-            *age = self.clock; return Ok(block.clone());
+            *age = self.clock; return Ok((block.clone(), *info, layers.clone()));
         }
         let bytes = self.repository.read_object(object, MAX_BLOCK_BYTES)?;
         let (block, layers) = decode_block_parts(&bytes)?;
         let block = Arc::new(block); let layers = Arc::new(layers);
         let info = intrinsic_bytes(&bytes, &block);
         if info.points != points { return Err("object point count conflicts with root".into()); }
-        self.cache_decoded(object, block.clone(), info, layers);
-        Ok(block)
+        self.cache_decoded(object, block.clone(), info, layers.clone());
+        Ok((block, info, layers))
     }
     pub(crate) fn cache_decoded(&mut self, object: ObjectIdentity, block: Arc<Block>, info: Intrinsic, layers: Arc<LayerObservations>) {
         if self.cache.contains_key(&object) { return; }
-        let bytes = block.len() * 64 + 128 + layers.values().map(|l| 128 + l.members.len() * 2 + l.samples.len() * 64).sum::<usize>();
+        let bytes = block.len() * 64 + 128 + layers.values().map(terrain_observations::layer_bytes).sum::<usize>();
         if bytes <= self.budget_bytes {
             while self.used_bytes + bytes > self.budget_bytes {
                 let Some(key) = self.cache.iter().min_by_key(|(_, (_, _, age, _, _))| *age).map(|(key, _)| *key) else { break; };

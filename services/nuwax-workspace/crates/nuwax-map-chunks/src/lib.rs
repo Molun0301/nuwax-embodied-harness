@@ -12,7 +12,7 @@ pub use writer::Writer;
 /// Observation moments reused by the capture owner and bounded layer records.
 pub mod surface_statistics;
 mod terrain_observations;
-pub use terrain_observations::{LayerObservation, LayerObservations, LayerSample, MAX_LAYER_SAMPLES, MAX_LAYERS_PER_BLOCK, MAX_LAYER_MEMBERS, layer_geometry_eq};
+pub use terrain_observations::{LayerObservation, LayerObservations, LayerSample, LayerSource, SourceWatermark, MAX_LAYER_SAMPLES, MAX_LAYERS_PER_BLOCK, MAX_LAYER_MEMBERS, layer_geometry_eq};
 mod archive;
 pub use archive::{archive_file, ArchiveReader, ArchivedRoot, LegacyRoot, MAX_ARCHIVE_BYTES};
 
@@ -76,15 +76,17 @@ pub fn block_summary(bytes: &[u8]) -> Result<(u32, u64), String> {
     Ok((points, latest))
 }
 
-/// BL2 uses the same occupancy records plus bounded physical-layer observations.
-/// Old BL1 bytes always decode with an empty layer map; no statistics are invented.
+/// BL2 retains Legacy-only observations; BL3 adds compact typed source groups.
+/// Occupancy and numeric sample records retain their original representation.
+/// Old BL1 bytes decode with an empty layer map; no statistics are invented.
 pub fn encode_layer_block(block: &Block, layers: &LayerObservations) -> Result<Vec<u8>, String> {
     if layers.is_empty() { return encode_block(block); }
     terrain_observations::validate_layers(layers, block)?;
     let json = serde_json::to_vec(&layers.iter().collect::<Vec<_>>()).map_err(|e| e.to_string())?;
     let mut bytes = encode_block(block)?;
     if bytes.len() + json.len() > MAX_BLOCK_BYTES { return Err("layer block exceeds byte budget".into()); }
-    bytes[..8].copy_from_slice(b"NUWAXBL2");
+    let typed = layers.values().any(|layer| layer.samples.iter().any(|sample| !sample.source.is_legacy()));
+    bytes[..8].copy_from_slice(if typed { b"NUWAXBL3" } else { b"NUWAXBL2" });
     bytes[12..16].copy_from_slice(&(json.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&json);
     Ok(bytes)
@@ -107,12 +109,15 @@ fn read_layers(bytes: &[u8], block: &Block) -> Result<LayerObservations, String>
         if previous.is_some_and(|old| old >= key) { return Err("unsorted or duplicate layer anchor".into()); }
         previous = Some(key); layers.insert(key, layer);
     }
-    if layers.is_empty() { return Err("BL2 requires observed layers".into()); }
+    if layers.is_empty() { return Err("layer block requires observed layers".into()); }
+    if bytes.starts_with(b"NUWAXBL2") && layers.values().any(|layer| layer.samples.iter().any(|sample| !sample.source.is_legacy())) {
+        return Err("typed layer sources require BL3".into());
+    }
     terrain_observations::validate_layers(&layers, block)?;
     Ok(layers)
 }
 fn visit_block(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Result<u32, String> {
-    if bytes.starts_with(b"NUWAXBL2") {
+    if bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3") {
         let (block, _) = decode_block_parts(bytes)?;
         for (&key, &evidence) in &block { visit(key, evidence); }
         Ok(block.len() as u32)
@@ -122,7 +127,7 @@ fn visit_block_records(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Re
     if bytes.len() < 16 || bytes.len() > MAX_BLOCK_BYTES { return Err("精细块格式或长度无效".into()); }
     let layer_bytes = match &bytes[..8] {
         b"NUWAXBL1" if bytes[12..16] == [0; 4] => 0,
-        b"NUWAXBL2" => u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
+        b"NUWAXBL2" | b"NUWAXBL3" => u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
         _ => return Err("精细块格式或长度无效".into()),
     };
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -188,6 +193,8 @@ pub struct BlockRef { pub key: Key, pub object: ObjectIdentity, pub block_revisi
 pub struct Manifest {
     pub version: u32, pub domain: Domain, pub revision: u64, pub geometry_revision: u64,
     pub source_timestamp_ns: u64, pub voxel_size_m: f32, pub blocks: Vec<BlockRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_watermarks: Vec<SourceWatermark>,
 }
 /// The v1 spelling is a wire format only. Both aliases are opaque.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,8 +226,16 @@ fn validate_members<'a>(members: impl Iterator<Item = (Key, ObjectIdentity, u32)
 impl Manifest {
     pub fn validate(&self) -> Result<(), String> {
         validate_header(&self.domain, self.revision, self.source_timestamp_ns, self.voxel_size_m, self.blocks.len())?;
-        if !matches!(self.version, 2 | 3) || self.geometry_revision == 0 || self.geometry_revision > self.revision { return Err("invalid current root revision".into()); }
+        if !matches!(self.version, 2 | 3 | 4) || self.geometry_revision == 0 || self.geometry_revision > self.revision { return Err("invalid current root revision".into()); }
         validate_members(self.blocks.iter().map(|b| (b.key, b.object, b.points)))?;
+        if self.version < 4 && !self.source_watermarks.is_empty() {
+            return Err("typed source watermarks require root version 4".into());
+        }
+        let mut sources = BTreeSet::new();
+        for watermark in &self.source_watermarks {
+            watermark.validate()?;
+            if !sources.insert(watermark.source.as_ref()) { return Err("duplicate source watermark".into()); }
+        }
         for b in &self.blocks {
             if b.geometry_revision == 0 || b.geometry_revision > b.block_revision || b.block_revision > self.revision || b.geometry_revision > self.geometry_revision {
                 return Err("invalid block revision ordering".into());
@@ -284,15 +299,17 @@ impl SealedMap {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transfer { pub root: Vec<u8>, pub included: BTreeMap<ObjectIdentity, Vec<u8>> }
 #[derive(Debug, Clone, Copy)]
-struct Intrinsic { points: u32, latest: u64, layered: bool }
+struct Intrinsic { points: u32, latest: u64, layered: bool, sourced: bool }
 fn intrinsic(block: &Block) -> Intrinsic {
-    Intrinsic { layered: false, points: block.len() as u32, latest: block.values().map(|e| e.observed_ns).max().unwrap_or(0) }
+    Intrinsic { layered: false, sourced: false, points: block.len() as u32, latest: block.values().map(|e| e.observed_ns).max().unwrap_or(0) }
 }
 fn intrinsic_bytes(bytes: &[u8], block: &Block) -> Intrinsic {
-    Intrinsic { layered: bytes.starts_with(b"NUWAXBL2"), ..intrinsic(block) }
+    Intrinsic { layered: bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3"),
+        sourced: bytes.starts_with(b"NUWAXBL3"), ..intrinsic(block) }
 }
 fn admit_format(info: Intrinsic, root: &Manifest) -> Result<(), String> {
-    if info.layered && root.version < 3 { Err("observed layer block requires root version 3".into()) } else { Ok(()) }
+    if info.sourced && root.version < 4 { Err("typed layer block requires root version 4".into()) }
+    else if info.layered && root.version < 3 { Err("observed layer block requires root version 3".into()) } else { Ok(()) }
 }
 fn admit_intrinsic(value: Intrinsic, points: u32, bound: u64) -> Result<(), String> {
     if value.points != points || value.latest > bound { Err("block count or evidence exceeds root".into()) } else { Ok(()) }
@@ -429,3 +446,6 @@ impl Receiver {
 mod tests;
 #[cfg(test)]
 mod terrain_observations_tests;
+
+#[cfg(test)]
+mod source_provenance_tests;

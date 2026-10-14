@@ -5714,7 +5714,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             uptime_ms: diag.uptime_ms,
             rss_kb: diag.rss_kb,
             lcm_backend: diag.lcm_backend,
-            supported_assigned_fine_archive_versions: vec![1, 2, 3],
+            supported_assigned_fine_archive_versions: vec![1, 2, 3, 4],
         }))
     }
 
@@ -6589,7 +6589,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                 // Assign once after the existing barrier froze receipts, payload and immutable byte owners.
                 let checkpoint_id = if envelope_version == 2 { uuid::Uuid::new_v4().simple().to_string() } else { String::new() };
                 if envelope_version == 1 && fine_snapshot.is_some() {
-                    return Err(Status::failed_precondition("staged AR2 fine export requires envelope v2; default finalized-map/activation remains v1 until paired consumers land"));
+                    return Err(Status::failed_precondition("AR4 fine export requires envelope v2; default finalized-map/activation remains v1 until paired consumers land"));
                 }
                 // 已拿到同一屏障内的不可变快照，归档不持生命周期锁。
                 drop(lifecycle_guard);
@@ -6602,7 +6602,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                         let (mut file, size) = dense.archive(&frame_id)?;
                         if envelope_version == 2 { store.lock().insert(file, size, member) }
                         else {
-                            // Explicit legacy DC1 compatibility only; never applied to AR2.
+                            // Explicit legacy DC1 compatibility only; never applied to assigned fine archives.
                             use std::io::{Seek, SeekFrom};
                             file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
                             let (_, sha) = crate::dense_cloud::hash_reader(&mut file)?;
@@ -12368,7 +12368,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             let cloud = checkpoint.canonical_cloud_checkpoint.as_ref().unwrap();
             assert_eq!(cloud.payload_schema_version, 2);
             assert!(cloud.xyz_sha256.is_empty());
-            let fine_reference = checkpoint.fine_map_artifact.as_ref().expect("native AR2 fine export");
+            let fine_reference = checkpoint.fine_map_artifact.as_ref().expect("native AR4 fine export");
             let dense_reference = checkpoint.dense_cloud_artifact.as_ref().expect("native dense export");
             let source_dense = source.handle.cloud_map_writer.lock().as_ref().unwrap()
                 .committed_dense_cloud().unwrap().unwrap();
@@ -12403,7 +12403,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             assert_eq!(destination.handle.state.read().await.pose.timestamp_ns, 91);
 
             transfer_assigned_checkpoint_member(
-                &source.service, &destination.service, fine_reference, b"NUWAXAR2",
+                &source.service, &destination.service, fine_reference, b"NUWAXAR4",
             ).await;
             transfer_assigned_checkpoint_member(
                 &source.service, &destination.service, dense_reference, b"NUWAXDC1",
@@ -15482,14 +15482,14 @@ async fn assigned_mapping_cloud_boundary_slice(
         assert_eq!(exported_cloud.source_revision, snapshot_before.revision);
         assert_eq!(exported_cloud.point_count, snapshot_before.point_count);
         assert_eq!(exported_cloud.voxel_size.to_bits(), snapshot_before.voxel_size.to_bits());
-        let fine_ref = checkpoint.fine_map_artifact.as_ref().expect("AR2 fine checkpoint member");
+        let fine_ref = checkpoint.fine_map_artifact.as_ref().expect("AR4 fine checkpoint member");
         assert_eq!(fine_ref.identity_schema_version, 2);
         assert!(fine_ref.sha256.is_empty());
         let member = fine_ref.member_identity.as_ref().unwrap();
         assert_eq!(member.frame_generation, frame_after);
         assert_eq!(member.producer_generation, handle.nav.producer_runtime_generation());
         let file = service.graph_artifacts.lock().open(fine_ref).expect("open exported fine member");
-        let mut archive = nuwax_map_chunks::ArchiveReader::open(file).expect("read AR2 fine member");
+        let mut archive = nuwax_map_chunks::ArchiveReader::open(file).expect("read AR4 fine member");
         assert_eq!(archive.root(), &nuwax_map_chunks::ArchivedRoot::Current(expected_root));
         for reference in &old_fine.manifest().blocks {
             assert!(matches!(reference.object, nuwax_map_chunks::ObjectIdentity::Assigned(_)));

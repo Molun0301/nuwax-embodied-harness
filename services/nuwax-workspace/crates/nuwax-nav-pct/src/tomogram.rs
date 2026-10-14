@@ -785,7 +785,7 @@ mod measured_layer_adapter_tests {
             let point=[(f64::from(x)+0.5)*quantum,(f64::from(y)+0.5)*quantum,plane];
             layers.entry(block).or_default().insert(local,LayerObservation{members:vec![local],
                 normal:[0.0,0.0,1.0],plane_origin:point,
-                samples:vec![LayerSample{point,source_sequence:1,source_timestamp_ns:100,point_index:u32::from(local)}]});
+                samples:vec![LayerSample{source: Default::default(), point,source_sequence:1,source_timestamp_ns:100,point_index:u32::from(local)}]});
         }}
         let mut observations=SurfaceObservations::new(fine,32).unwrap();
         for (key,values) in occupancy {observations.replace_block(key,values).unwrap();}

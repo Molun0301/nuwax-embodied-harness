@@ -2856,6 +2856,7 @@ mod navigation_map_3d_tests {
             hits: 2,
         })]);
         let root = Manifest {
+            source_watermarks: Vec::new(),
             version: 2,
             domain: navigation_map_3d_domain(&message),
             revision: message.cloud_revision as u64,
@@ -2907,6 +2908,7 @@ mod navigation_map_3d_tests {
             BlockRef { key, object, block_revision: 12, geometry_revision: 9, points: 1024 }
         }).collect();
         let root = Manifest {
+            source_watermarks: Vec::new(),
             version: 2, domain: navigation_map_3d_domain(&message),
             revision: message.cloud_revision as u64, geometry_revision: 9,
             source_timestamp_ns: message.source_timestamp_ns as u64,
@@ -3022,6 +3024,7 @@ mod navigation_map_3d_tests {
         message.cloud.row_step = 0;
         message.cloud.data.clear();
         let root = nuwax_map_chunks::Manifest {
+            source_watermarks: Vec::new(),
             version: 2, domain: navigation_map_3d_domain(&message),
             revision: message.cloud_revision as u64, geometry_revision: message.cloud_revision as u64,
             source_timestamp_ns: message.source_timestamp_ns as u64,

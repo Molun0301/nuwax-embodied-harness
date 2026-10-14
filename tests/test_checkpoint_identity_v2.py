@@ -166,20 +166,33 @@ class IdentityV2Tests(unittest.TestCase):
         self.assertIsNone(loaded.legacy_alias)
 
     def test_ar3_layers_export_store_restart_and_reupload_keep_v2_identity(self):
+        self._layer_archive_roundtrip(3)
+
+    def test_ar4_provenance_export_store_restart_and_reupload_keep_v2_identity(self):
+        self._layer_archive_roundtrip(4)
+
+    def _layer_archive_roundtrip(self, version):
         original = fine_bytes()
         root_length = struct.unpack('<Q', original[8:16])[0]
         root = json.loads(original[16:16 + root_length])
-        root['version'] = 3
-        raw = json.dumps(root, separators=(',', ':')).encode()
+        root['version'] = version
         layer = dict(members=[0], normal=[0, 0, 1], plane_origin=[0.0625, 0.0625, 0.08],
             samples=[dict(point=[0.04, 0.06, 0.08], source_sequence=5, source_timestamp_ns=11, point_index=0)])
+        if version == 4:
+            source = dict(kind='auxiliary', sensor_id='depth/front', clock_id='camera',
+                          runtime_generation=17, session_generation=3)
+            layer['samples'][0].update(source_sequence=0, source_timestamp_ns=9)
+            layer['sample_sources'] = [dict(source=source, sample_positions=[0])]
+            root['source_watermarks'] = [dict(source=source, source_timestamp_ns=900, source_sequence=0)]
+        raw = json.dumps(root, separators=(',', ':')).encode()
         tail = json.dumps([[0, layer]], separators=(',', ':')).encode()
-        block = b'NUWAXBL2' + struct.pack('<IIHQH', 1, len(tail), 0, 11, 1) + tail
-        payload = b'NUWAXAR3' + struct.pack('<Q', len(raw)) + raw + struct.pack('<QI', 1, len(block)) + block
+        block = (b'NUWAXBL3' if version == 4 else b'NUWAXBL2') + struct.pack('<IIHQH', 1, len(tail), 0, 11, 1) + tail
+        payload = ('NUWAXAR%d' % version).encode() + struct.pack('<Q', len(raw)) + raw + struct.pack('<QI', 1, len(block)) + block
         self.response.fine_map_artifact.size = len(payload)
         stub = TransferStub(self.response)
         stub.entries[self.response.fine_map_artifact.id][1] = bytearray(payload)
         client = runtime(stub)
+        client._assigned_fine_archive_versions = frozenset([4])
         bundle = client.export_mapping_backend_checkpoint(checkpoint_schema_version=2)
         self.assertEqual(bundle.checkpoint.fine_reference.identity_schema_version, 2)
         self.assertEqual(bundle.checkpoint.fine_archive, payload)
@@ -187,6 +200,14 @@ class IdentityV2Tests(unittest.TestCase):
         reopened = provider.reopen_mapping_backend_checkpoint(self.root, 'voxel')
         self.assertEqual(reopened.checkpoint.fine_archive, payload)
         retained = reopened.checkpoint.fine_reference
+        if version == 4:
+            client._assigned_fine_archive_versions = frozenset([1, 2, 3])
+            before = len(stub.requests)
+            with self.assertRaisesRegex(RuntimeError, 'does not support assigned AR4'):
+                client._upload_graph_artifact(reopened.checkpoint,
+                    payload=reopened.checkpoint.fine_archive, reference=retained)
+            self.assertEqual(len(stub.requests), before)
+            client._assigned_fine_archive_versions = frozenset([4])
         uploaded = client._upload_graph_artifact(reopened.checkpoint,
             payload=reopened.checkpoint.fine_archive, reference=retained)
         self.assertEqual(uploaded, self.response.fine_map_artifact)

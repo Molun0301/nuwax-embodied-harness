@@ -31,6 +31,8 @@ source 健康独立于静态地面：消费端检查 authority/domain、源序�
 
 ## 存储与 Python 兼容性
 
+以下记录 2026-10-13 的 BL2/AR3 阶段。2026-10-14 的来源保留升级统一新写 Manifest v4/AR4，并增加 BL3；配对部署、旧数据读取及回滚边界见 [地面观测来源归档升级](depth-ground-provenance-archive-20261014.md)。
+
 携带层观测的新增格式为 BL2、manifest v3、archive AR3（纯几何 archive 仍可为 AR2）；新读端保留 BL1、旧 manifest v2、AR1/AR2 读取。旧资料不会被捏造出真实点总体。AR3 的 assigned artifact identity schema 仍为 2；传输、保存、重开、重上传需保持既有身份绑定。**旧二进制不保证能读新格式**，回滚前应保留旧程序可读的地图备份；本次未访问、迁移或覆写用户地图。
 
 Python 读端只做 wire shape、有界数组、字段名、整数范围、有限数值及既有 archive/checkpoint 身份约束；物理层算法语义由 Rust owner 负责，Python 不重复拟合或质量判定。

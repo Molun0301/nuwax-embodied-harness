@@ -14,6 +14,7 @@ fn layer(z: f64, stamp: u64) -> LayerObservation {
         plane_origin: [0.0625, 0.0625, z],
         normal: [0.0, 0.0, 1.0],
         samples: vec![LayerSample {
+            source: Arc::new(LayerSource::Legacy),
             point: [0.04, 0.06, z],
             source_sequence: stamp,
             source_timestamp_ns: stamp,
@@ -54,7 +55,7 @@ fn layer_surface_change_and_metadata_change_have_separate_revisions() {
     let mut w = writer();
     update(&mut w, layer(0.08, 1));
     let first = w.snapshot(domain(), 1, 1).unwrap();
-    assert_eq!(first.version, 3);
+    assert_eq!(first.version, 4);
     let mut diagnostic = layer(0.08, 2);
     diagnostic.samples[0].point = [0.05, 0.06, 0.081];
     update(&mut w, diagnostic);
@@ -73,14 +74,14 @@ fn layer_surface_change_and_metadata_change_have_separate_revisions() {
     assert_eq!(fourth.geometry_revision, 4);
 }
 #[test]
-fn ar3_restore_preserves_bounded_returns_and_old_root_is_not_upgraded_to_statistics() {
+fn ar4_restore_preserves_bounded_returns_and_old_root_is_not_upgraded_to_statistics() {
     let mut w = writer();
     update(&mut w, layer(0.08, 1));
     let root = w.snapshot(domain(), 1, 1).unwrap();
     let (mut file, _) = archive_file(&root, w.repository()).unwrap();
     let mut magic = [0; 8];
     file.read_exact(&mut magic).unwrap();
-    assert_eq!(&magic, b"NUWAXAR3");
+    assert_eq!(&magic, b"NUWAXAR4");
     file.seek(SeekFrom::Start(0)).unwrap();
     let repository = Repository::temporary().unwrap();
     let mut archive = ArchiveReader::open(file).unwrap();

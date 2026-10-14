@@ -302,6 +302,7 @@ impl AdmittedRegisteredScan {
     }
     pub(crate) fn binding(&self) -> &RegistrationBinding { &self.0.binding }
     pub(crate) fn source_timestamp_ns(&self) -> u64 { self.0.source.source_timestamp_ns as u64 }
+    pub(crate) fn sensor_frame_id(&self) -> &str { &self.0.frames[0] }
     pub(crate) fn map_frame_id(&self) -> &str { &self.0.frames[3] }
     pub(crate) fn body_frame_id(&self) -> &str { &self.0.frames[1] }
     pub(crate) fn body_points(&self) -> &crate::correction_points::CorrectionPoints { &self.0.body_points }

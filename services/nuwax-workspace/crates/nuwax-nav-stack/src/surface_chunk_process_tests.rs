@@ -111,7 +111,7 @@ fn message(repository:&Repository,revision:u64,variant:u16)->schema::NavigationM
         references.push(BlockRef{key:[x,0,0],object,block_revision:revision,
             geometry_revision:1,points:block.len() as u32});
     }
-    let root=Manifest{version:2,domain,revision,geometry_revision:1,
+    let root=Manifest{source_watermarks:Vec::new(),version:2,domain,revision,geometry_revision:1,
         source_timestamp_ns:stamp,voxel_size_m:0.05,blocks:references}.encode().unwrap();
     std::fs::write(repository.path().join(format!("manifest-{revision}.json")), &root).unwrap();
     schema::NavigationMap3D {

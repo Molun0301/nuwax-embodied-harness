@@ -35,6 +35,7 @@ mod explore_mission;
 mod forbidden_zones;
 mod lcm_runtime;
 mod lio_ingress;
+mod admitted_cloud;
 mod self_cloud;
 mod lio_owner;
 mod native_lio_owner;

@@ -54,7 +54,7 @@ fn with_measured_floor(map:SurfaceSnapshot,plane_z:f64)->SurfaceSnapshot {
         let origin=[(f64::from(x)+0.5)*q,(f64::from(y)+0.5)*q,plane_z];
         blocks.entry(block_key(key)).or_default().insert(local,LayerObservation {
             members:vec![local],normal:[0.0,0.0,1.0],plane_origin:origin,
-            samples:(0..3).map(|i|LayerSample{point:origin,source_sequence:i+1,
+            samples:(0..3).map(|i|LayerSample{source: Default::default(), point:origin,source_sequence:i+1,
                 source_timestamp_ns:100+i,point_index:u32::from(local)}).collect(),
         });
     }}
@@ -108,7 +108,7 @@ fn unique_upper_observed_layer_is_not_contact_without_same_physical_ground_ancho
     let mut observed=map.observations.as_ref().unwrap().as_ref().clone();
     let key=local_key([0,0,9]);let origin=[0.025,0.025,0.475];
     let layer=LayerObservation{members:vec![key],normal:[0.,0.,1.],plane_origin:origin,
-        samples:vec![LayerSample{point:origin,source_sequence:1,source_timestamp_ns:1,point_index:0}]};
+        samples:vec![LayerSample{source: Default::default(), point:origin,source_sequence:1,source_timestamp_ns:1,point_index:0}]};
     observed.replace_ground_layers([0,0,0],Arc::new(std::collections::BTreeMap::from([(key,layer)]))).unwrap();
     observed.mark_complete_geometry_source();let map=map.with_observations(Some(Arc::new(observed)));
     let body=[0.025,0.025,0.4];let r=rotation([0.,0.,0.,1.]).unwrap();
@@ -146,7 +146,7 @@ fn measured_contact_members_do_not_require_a_connected_ground_anchor() {
     let local=local_key(floor);
     let layers=LayerObservations::from([(local,LayerObservation {
         members:vec![local],normal:[0.0,0.0,1.0],plane_origin:point,
-        samples:vec![LayerSample{point,source_sequence:1,source_timestamp_ns:100,point_index:0}],
+        samples:vec![LayerSample{source: Default::default(), point,source_sequence:1,source_timestamp_ns:100,point_index:0}],
     })]);
     observations.replace_ground_layers(block_key(floor),Arc::new(layers)).unwrap();
     observations.mark_complete_geometry_source();

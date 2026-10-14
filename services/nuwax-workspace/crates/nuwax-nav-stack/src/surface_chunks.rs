@@ -60,7 +60,7 @@ impl FineMapReader {
             }
             changed.extend(grid.replace_block_with_geometry_changes(reference.key, values)
                 .map_err(|e| e.to_string())?);
-            // BL2 layers use the same verified object and decode cache. BL1 returns
+            // BL2/BL3 layers use the same admitted object and decode cache. BL1 returns
             // an empty set, preserving honest geometric compatibility for old maps.
             let layers = self.receiver.layers(reference)?;
             changed.extend(grid.replace_ground_layers(reference.key, layers)

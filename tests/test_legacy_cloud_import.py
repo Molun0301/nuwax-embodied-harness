@@ -50,16 +50,24 @@ def fine_archive(version=2, *, root_update=None, domain_update=None):
         voxel_size_m=.125, blocks=[reference])
     if version != 1:
         root['geometry_revision'] = 7
+    auxiliary = dict(kind='auxiliary', sensor_id='depth/front', clock_id='camera',
+                     runtime_generation=17, session_generation=3)
+    if version == 4:
+        root['source_watermarks'] = [dict(source=auxiliary, source_timestamp_ns=900, source_sequence=0)]
     root.update(root_update or {})
     root['domain'].update(domain_update or {})
     raw = json.dumps(root, separators=(',', ':')).encode()
     tail = b''
-    if version == 3:
+    if version >= 3:
         layer = dict(members=[0], normal=[0, 0, 1], plane_origin=[.0625, .0625, .08],
             samples=[dict(point=[.04, .06, .08], source_sequence=5,
                           source_timestamp_ns=11, point_index=0)])
+        if version == 4:
+            layer['samples'][0].update(source_sequence=0, source_timestamp_ns=9)
+            layer['sample_sources'] = [dict(source=auxiliary, sample_positions=[0])]
         tail = json.dumps([[0, layer]], separators=(',', ':')).encode()
-    block = (b'NUWAXBL2' if version == 3 else b'NUWAXBL1') + struct.pack('<IIHQH', 1, len(tail), 0, 11, 1) + tail
+    magic = b'NUWAXBL3' if version == 4 else b'NUWAXBL2' if version == 3 else b'NUWAXBL1'
+    block = magic + struct.pack('<IIHQH', 1, len(tail), 0, 11, 1) + tail
     return (('NUWAXAR%d' % version).encode() + struct.pack('<Q', len(raw))
             + (b'X' * 32 if version == 1 else b'') + raw + struct.pack('<QI', 1, len(block)) + block)
 
@@ -150,9 +158,9 @@ class LegacyCloudImportTests(unittest.TestCase):
         manifest.write_bytes(store._encode_json(document))
         top_manifest(self.current)
 
-    def test_fine_import_ar2_ar3_preserves_members_and_builds_normal_v2_request(self):
+    def test_fine_import_ar2_ar3_ar4_preserves_members_and_builds_normal_v2_request(self):
         from services.geometry import geometry_runtime_provider as provider
-        for version, backend, dense in ((2, 'voxel', False), (3, 'raytracing', True)):
+        for version, backend, dense in ((2, 'voxel', False), (3, 'raytracing', True), (4, 'voxel', True)):
             with self.subTest(version=version, backend=backend):
                 root = self.root / str(version)
                 self.repository = asset_store.MapAssetBundleRepository(str(root))
@@ -311,7 +319,7 @@ class LegacyCloudImportTests(unittest.TestCase):
                 return ('ok', function(payload))
             except Exception as error:
                 return (type(error).__name__, str(error))
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             payload = fine_archive(version)
             length = struct.unpack('<Q', payload[8:16])[0]
             start = 48 if version == 1 else 16

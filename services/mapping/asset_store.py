@@ -317,7 +317,7 @@ class MapAssetBundleRepository:
                 if not isinstance(fine_source, dict) or not isinstance(fine_source.get("path"), str):
                     return None
                 fine_path = "mapping_backend/" + source["backend_kind"] + "/" + fine_source["path"]
-                formats = (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3") if allow_ar1_source else (b"NUWAXAR2", b"NUWAXAR3")
+                formats = (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3", b"NUWAXAR4") if allow_ar1_source else (b"NUWAXAR2", b"NUWAXAR3", b"NUWAXAR4")
                 if tree.require_file(fine_path, "legacy fine archive").slice(0, 8) not in formats:
                     return None  # AR1 needs the paired runtime capability before adoption.
             raw_catalog = _parse_json_object(_read_regular_file(self._map_dir(map_name) / "metadata.json",

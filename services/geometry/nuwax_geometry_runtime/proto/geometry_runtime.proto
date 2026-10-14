@@ -92,6 +92,7 @@ message RuntimeStatus {
   string lcm_backend = 5;
   // Empty on older servers: assigned fine payloads remain AR2/AR3 only.
   // AR1 support means unchanged legacy source bytes under assigned ownership.
+  // AR4 source provenance requires explicit advertisement; old readers reject it.
   repeated uint32 supported_assigned_fine_archive_versions = 6;
 }
 

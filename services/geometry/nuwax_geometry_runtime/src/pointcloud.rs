@@ -610,7 +610,7 @@ impl CloudMapShmWriter {
     pub(crate) fn accumulate_mapping_scan_with_source(
         &mut self, session_generation: u64, points: &[Point3<f64>],
         sensor_origin_map: Option<[f64; 3]>, source_timestamp_ns: u64,
-        source: Option<&crate::lio_ingress::AcceptedRegisteredCloud>,
+        source: Option<&crate::admitted_cloud::AcceptedMappingCloud>,
     ) -> bool {
         if points.is_empty()
             || points.len() > POINTCLOUD_MAX_FRAME_POINTS
@@ -1064,7 +1064,7 @@ impl CloudMapShmWriter {
     /// The private PGO rebuild carries the original admitted scan plus its
     /// corrected rigid pose. Reprojection replaces its geometry, not its identity.
     pub(crate) fn capture_replayed_ground(&mut self, points: &[Point3<f64>],
-        source: &crate::lio_ingress::AdmittedRegisteredScan) -> Result<(), String> {
+        source: &crate::admitted_cloud::AdmittedCloudSource) -> Result<(), String> {
         self.fine_cloud.as_mut().ok_or("replayed fine-map owner is unavailable")?
             .capture_replayed_ground(points, source)
     }

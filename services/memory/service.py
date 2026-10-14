@@ -23,6 +23,7 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 import numpy as np
 
 from contracts.base import utc_now
+from services.memory.object_extent import object_extent_payload
 from contracts.events import RuntimeEventCategory
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
@@ -1247,6 +1248,8 @@ class MemoryService(SceneMappingMemoryMixin):
             session_id=session_id,
             map_name=metadata.get("map_name") or (map_snapshot.map_name if map_snapshot is not None else scope["library_name"]),
             status=SimpleNamespace(value=metadata.get("session_status") or metadata.get("localization_session_status")),
+            asset_identity=SimpleNamespace(asset_id=metadata["asset_identity"].get("asset_id"))
+                if isinstance(metadata.get("asset_identity"), dict) else None,
         )
 
     def _record_library_name(self, record: object) -> str:
@@ -3218,8 +3221,11 @@ class MemoryService(SceneMappingMemoryMixin):
                 or str(active_session.map_name or "").strip() == resolved_map_name
             )
         )
+        asset_id = (getattr(getattr(active_session, "asset_identity", None), "asset_id", None)
+                    if session_matches_map else None)
         return {
             "map_name": resolved_map_name,
+            **({"map_asset_id": asset_id} if asset_id else {}),
             "map_source_name": getattr(map_snapshot, "source_name", None),
             "map_source_epoch": getattr(map_snapshot, "source_epoch", None),
             "map_update_sequence": (str(map_snapshot.update_sequence)
@@ -3470,6 +3476,7 @@ class MemoryService(SceneMappingMemoryMixin):
                     "label": inst.label,
                     "display_name": inst.display_name or inst.label,
                     "pose": {"x": pos.x, "y": pos.y, "z": pos.z} if valid_position else None,
+                    "object_extent": object_extent_payload(inst) if valid_position else None,
                     "frame_id": frame_id,
                     "confidence": inst.confidence if math.isfinite(inst.confidence) else None,
                     "instance_type": inst.instance_type,
@@ -7354,24 +7361,30 @@ class MemoryService(SceneMappingMemoryMixin):
             base_tokens = {point_id: (("raw", None) if getattr(prior, "_memory_source_deleted", False)
                                      else getattr(prior, TOKEN, ("raw", None)))
                            for point_id, prior in base_instances.items()} if persist else {}
+            platform_metadata = self._build_platform_semantic_metadata(
+                map_snapshot=map_snapshot, localization_snapshot=localization_snapshot,
+                map_name=resolved_map_name)
             # Association may encode an unseen label. It cannot hold the structural
             # lock while doing model work; source CAS fences the captured snapshots.
             with self._association_compute_lock:
                 updated_instances, outcomes = self._instance_association_service.associate(
                     projected, existing_instances=base_instances, map_name=resolved_map_name,
                     localization_session_id=resolved_session_id,
+                    map_asset_id=platform_metadata.get("map_asset_id"),
                     occupancy_grid=map_snapshot.occupancy_grid if map_snapshot is not None else None,
                     cost_map=map_snapshot.cost_map if map_snapshot is not None else None, now=resolved_now)
             linked_instance_ids: List[str] = []
+            published_instance_ids = set()
             for _projected_item, outcome in zip(projected, outcomes):
-                projection_metadata = dict(outcome.instance.metadata)
+                instance_id = outcome.instance.instance_id
+                if instance_id in published_instance_ids:
+                    linked_instance_ids.append(instance_id)
+                    continue
+                # 多个来源观察可关联同一 ID；提交该批最后的完整证据一次。
+                accepted_instance = updated_instances[instance_id]
+                projection_metadata = dict(accepted_instance.metadata)
                 # 关联可能保留历史可靠坐标，其质量证据必须与最终坐标保持一致。
                 # 当前帧退化信息由观察事件单独保存，不能覆盖实例已选中的投影证据。
-                platform_metadata = self._build_platform_semantic_metadata(
-                    map_snapshot=map_snapshot,
-                    localization_snapshot=localization_snapshot,
-                    map_name=outcome.instance.map_name,
-                )
                 projection_metadata.update(platform_metadata)
                 projection_metadata.update(
                     self._evaluate_navigation_metadata(
@@ -7385,7 +7398,7 @@ class MemoryService(SceneMappingMemoryMixin):
                         localization_session_id=str(platform_metadata.get("localization_session_id") or "").strip() or None,
                     )
                 )
-                instance = outcome.instance.model_copy(
+                instance = accepted_instance.model_copy(
                     update={
                         "metadata": self._attach_library_metadata(
                             {
@@ -7429,6 +7442,7 @@ class MemoryService(SceneMappingMemoryMixin):
                         object.__setattr__(instance, "_memory_live_only", True)
                         self._cache_artifact_record("instance", instance)
                         self._write_semantic_instance_state(instance)
+                published_instance_ids.add(instance.instance_id)
                 linked_instance_ids.append(instance.instance_id)
             matched_ids = {outcome.instance.instance_id for outcome in outcomes}
             for point_id, aged in updated_instances.items():

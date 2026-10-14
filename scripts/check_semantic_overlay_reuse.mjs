@@ -54,8 +54,8 @@ try {
   function setup() {
     viewer._scene = new THREE.Scene(); viewer._semanticGroup = new THREE.Group();
     viewer._scene.add(viewer._semanticGroup);
-    viewer._semanticMarkerGeometry = new THREE.BoxGeometry(.44, .28, .24);
-    viewer._semanticPreciseMaterial = new THREE.MeshBasicMaterial({ color: 0xf59e0b });
+    viewer._semanticMarkerGeometry = new THREE.BoxGeometry(1, 1, 1);
+    viewer._semanticPreciseMaterial = new THREE.MeshBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: .32, side: THREE.DoubleSide });
     viewer._semanticFallbackMaterial = new THREE.MeshBasicMaterial({ color: 0x94a3b8, transparent: true, opacity: .62, wireframe: true });
   }
   setup();
@@ -90,8 +90,17 @@ try {
     const expected = viewer._semanticRecords.flatMap(record => [record.marker, record.stem, record.label].filter(Boolean));
     assert.deepEqual(children, expected, 'flat marker/stem/label order');
   }
-  function update(data) { viewer.updateSemanticInstances(data); watch(); assertOrder(); }
-  const instance = (id, overrides = {}) => ({ instance_id: id, pose: { x: 1, y: 2, z: 1 }, display_name: `Item ${id}`, ...overrides });
+  function update(data) {
+    for (const item of data) if (item?.object_extent?.syntheticCentered) {
+      item.object_extent.center = { ...item.pose };
+      item.object_extent.top_z_m = item.pose.z + item.object_extent.size_m.z / 2;
+    }
+    viewer.updateSemanticInstances(data); watch(); assertOrder();
+    assert.ok(viewer._semanticRecords.every(record => record.stem === null), 'no invented z=0 floor stems');
+  }
+  const instance = (id, overrides = {}) => ({ instance_id: id, frame_id: 'map', pose: { x: 1, y: 2, z: 1 },
+    display_name: `Item ${id}`, object_extent: { syntheticCentered: true, frame_id: 'map',
+      size_m: { x: 1, y: 2, z: 3 }, orientation: { x: 0, y: 0, z: 0, w: 1 }, source: 'detection3d' }, ...overrides });
   let data = [instance('a'), instance('b'), instance('c')];
   update(data);
   const record = id => viewer._semanticRecords.find(r => r.id === id);
@@ -105,49 +114,41 @@ try {
     assert.equal(record(item.instance_id).marker.userData.semanticInstance, item);
     assert.equal(record(item.instance_id).label.userData.semanticInstance, item);
   }
-  // Mutable input records cannot hide a changed pose/name/identity.
-  const bResources = [record('b').stem.geometry, record('b').stem.material, record('b').label.material];
-  const a = record('a'), oldPositionVersion = a.stem.geometry.attributes.position.version;
-  a.stem.geometry.computeBoundingBox(); a.stem.geometry.computeBoundingSphere();
+  // Mutable inputs cannot hide pose, extent, orientation, label or identity changes.
+  const bResources = [record('b').marker.geometry, record('b').label.material];
+  const a = record('a');
   data[0].pose.x = 9; update(data);
   assert.equal(record('a'), a); assert.deepEqual(owned(), initial); assert.equal(canvases, canvasCount);
   assert.equal(a.marker.position.x, 9); assert.equal(a.label.position.x, 9);
-  assert.equal(a.stem.geometry.attributes.position.getX(0), 9);
-  assert.ok(a.stem.geometry.attributes.position.version > oldPositionVersion);
-  assert.equal(a.stem.geometry.boundingBox.min.x, 9); assert.equal(a.stem.geometry.boundingSphere.center.x, 9);
-  data[0].pose.z = 1.001; update(data); assert.equal(canvases, canvasCount, 'rounded-equivalent z reuses label');
+  data[0].pose.z = -1.001; update(data); assert.equal(canvases, canvasCount, 'position-only updates reuse label');
+  assert.equal(a.marker.position.z, -1.001); assert.equal(a.label.position.z, -1.001 + 1.5 + .24);
   const oldLabelMaterial = a.label.material, oldLabelTexture = oldLabelMaterial.map, stableSprite = a.label;
-  data[0].pose.z = 1.1; update(data);
-  assert.equal(a.label, stableSprite); assert.equal(canvases, canvasCount + 1);
+  data[0].object_extent.size_m.x = 2; update(data);
+  assert.equal(a.marker.scale.x, 2); assert.equal(a.label, stableSprite); assert.equal(canvases, canvasCount + 1);
   assert.equal(counts.get(oldLabelMaterial), 1); assert.equal(counts.get(oldLabelTexture), 1);
-  assert.equal(a.label.material.map.image.text, 'Item a · z 1.10m');
-  const stem = a.stem;
+  assert.equal(a.label.material.map.image.text, 'Item a · 检测尺寸 2.00×2.00×3.00m');
   data[0].display_name = '  Long name abcdefghijk '; update(data);
-  assert.equal(a.stem, stem); assert.equal(a.label, stableSprite);
-  assert.equal(a.label.material.map.image.text, 'Long name a… · z 1.10m');
+  assert.equal(a.label, stableSprite);
+  assert.equal(a.label.material.map.image.text, 'Long name a… · 检测尺寸 2.00×2.00×3.00m');
   const longLabel = a.label.material;
   data[0].display_name = 'Long name abcZZZZZZZZ'; update(data);
   assert.equal(a.label.material, longLabel, 'clipped-equivalent name does not redraw');
   data[0].is_fallback = true; update(data);
   assert.equal(a.marker.material, viewer._semanticFallbackMaterial);
-  assert.equal(a.stem.material.color.getHex(), 0x94a3b8); assert.equal(a.stem.material.opacity, .45);
   assert.equal(a.label.material.map.image.background, 'rgba(51,65,85,.86)');
   data[0].is_fallback = false; data[0].frame_id = 'odom'; update(data);
   assert.equal(a.marker.material, viewer._semanticFallbackMaterial);
+  assert.equal(a.label.material.map.image.text, 'Long name a… · 尺寸未知');
   data[0].frame_id = 'map'; update(data);
-  assert.equal(a.stem.material.color.getHex(), 0xf59e0b); assert.equal(a.stem.material.opacity, .72);
-  assert.deepEqual([record('b').stem.geometry, record('b').stem.material, record('b').label.material], bResources);
-  const removedStem = a.stem;
-  data[0].pose.z = .05; update(data); assert.equal(a.stem, null);
-  assert.equal(counts.get(removedStem.geometry), 1); assert.equal(counts.get(removedStem.material), 1);
-  data[0].pose.z = .051; update(data); assert.ok(a.stem); assertOrder();
+  assert.equal(a.marker.material, viewer._semanticPreciseMaterial);
+  assert.deepEqual([record('b').marker.geometry, record('b').label.material], bResources);
   // Reorder and insertion need wrapper tie repair, never owned-resource replacement.
   const beforeReorder = new Set(owned());
   data.reverse(); update(data); assert.deepEqual(new Set(owned()), beforeReorder);
   data.unshift(instance('new')); update(data);
   assert.equal(owned().filter(r => beforeReorder.has(r)).length, beforeReorder.size);
   const dropped = record('new'); data.shift(); update(data);
-  for (const resource of [dropped.stem.geometry, dropped.stem.material, dropped.label.material, dropped.label.material.map]) assert.equal(counts.get(resource), 1);
+  for (const resource of [dropped.label.material, dropped.label.material.map]) assert.equal(counts.get(resource), 1);
   // Metadata is never serialized, even when wrapper tie order needs repairing.
   data[0].opaque = { bigint: 1n }; data[0].opaque.self = data[0].opaque;
   data.reverse(); update(data);
@@ -155,7 +156,7 @@ try {
   const changedId = data[0], previousId = changedId.instance_id, oldRecord = record(previousId);
   changedId.instance_id = 'renamed-id'; update(data);
   assert.equal(record(previousId), undefined); assert.notEqual(record('renamed-id'), oldRecord);
-  assert.equal(counts.get(oldRecord.stem.geometry), 1);
+  assert.equal(counts.get(oldRecord.label.material), 1);
   // Duplicate, empty, and absent IDs preserve each occurrence and selection object.
   data = [instance(''), instance(''), instance('same'), instance('same'), instance(undefined), instance(undefined)];
   update(data); const duplicateResources = owned();
@@ -174,18 +175,46 @@ try {
   data[0].observation_only = false; update(data); assert.equal(viewer._semanticRecords.length, 5);
   // Same-length fast-path rejection after earlier selection references refreshed.
   data = [instance('early'), instance('late')]; update(data);
-  const earlyResources = [record('early').stem.geometry, record('early').label.material];
+  const earlyResources = [record('early').marker.geometry, record('early').label.material];
   data = data.map(item => ({ ...item, pose: { ...item.pose } }));
   data[1].display_name = 'Late rename'; update(data);
   assert.equal(record('early').marker.userData.semanticInstance, data[0]);
   assert.equal(record('late').label.userData.semanticInstance, data[1]);
-  assert.deepEqual([record('early').stem.geometry, record('early').label.material], earlyResources);
+  assert.deepEqual([record('early').marker.geometry, record('early').label.material], earlyResources);
   data[1].pose.x = null; update(data); assert.equal(record('late'), undefined);
   data[1].pose.x = 1; update(data); assert.ok(record('late'));
   let mutableName = 'Original name';
   data[1].display_name = { toString: () => mutableName }; update(data);
   mutableName = 'Changed name'; update(data);
-  assert.equal(record('late').label.material.map.image.text, 'Changed name · z 1.00m');
+  assert.equal(record('late').label.material.map.image.text, 'Changed name · 检测尺寸 1.00×2.00×3.00m');
+  const extent = data[1].object_extent;
+  extent.size_m = { x: 4, y: .5, z: 2 };
+  extent.orientation = { x: 0, y: 0, z: Math.SQRT1_2, w: Math.SQRT1_2 };
+  data[1].pose.z = -2; update(data);
+  const rotated = record('late').marker;
+  viewer._scene.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(rotated);
+  assert.ok(Math.abs(box.max.x - box.min.x - .5) < 1e-12);
+  assert.ok(Math.abs(box.max.y - box.min.y - 4) < 1e-12);
+  assert.equal(box.min.z, -3); assert.equal(box.max.z, -1);
+  assert.equal(record('late').label.position.z, -.76);
+  assert.equal(rotated.geometry, viewer._semanticMarkerGeometry, 'all sizes reuse one unit geometry');
+  const stableGeometry = rotated.geometry, stableMaterial = rotated.material;
+  const geometryUpdateCanvases = canvases, geometryUpdateLabel = record('late').label.material;
+  extent.size_m.x = 4.004; update(data);
+  assert.equal(record('late').marker.geometry, stableGeometry);
+  assert.equal(record('late').marker.material, stableMaterial);
+  assert.equal(record('late').label.material, geometryUpdateLabel);
+  assert.equal(canvases, geometryUpdateCanvases, 'sub-label-precision geometry updates allocate no canvas');
+  const fullBox = extent.size_m;
+  extent.source = 'observed_points'; extent.size_m = { x: 4, y: 0, z: 2 }; update(data);
+  assert.equal(record('late').marker.scale.y, 0, 'no invented surface thickness');
+  assert.match(record('late').label.material.map.image.text, /可见范围/);
+  data[1].object_extent = null; update(data);
+  assert.equal(record('late').marker.material, viewer._semanticFallbackMaterial);
+  assert.deepEqual(record('late').marker.scale.toArray(), [.16, .16, .16]);
+  assert.match(record('late').label.material.map.image.text, /尺寸未知/);
+  data[1].object_extent = extent; extent.source = 'detection3d'; extent.size_m = fullBox; update(data);
   const beforeVisibility = owned(), beforeVisibilityWrappers = viewer._semanticGroup.children.slice();
   viewer.setSemanticInstancesVisible(false); assert.equal(viewer._semanticGroup.visible, false);
   update(data.map(item => ({ ...item })));

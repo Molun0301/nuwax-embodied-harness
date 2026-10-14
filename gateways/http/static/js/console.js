@@ -2923,6 +2923,47 @@
         }
         return null;
       }
+      function semanticExtent(inst) {
+        const extent = inst.object_extent;
+        if (!extent || extent.frame_id !== inst.frame_id || extent.frame_id !== "map"
+          || !["detection3d", "observed_points"].includes(extent.source)) return null;
+        return ["x", "y", "z"].every(axis => typeof extent.size_m?.[axis] === "number"
+          && Number.isFinite(extent.size_m[axis]) && extent.size_m[axis] >= 0)
+          && Math.max(extent.size_m.x, extent.size_m.y, extent.size_m.z) > 0 ? extent : null;
+      }
+      function semanticExtentDescription(inst) {
+        const extent = semanticExtent(inst);
+        if (!extent) return "尺寸未知（仅位置标记）";
+        const size = ["x", "y", "z"].map(axis => extent.size_m[axis].toFixed(2)).join(" × ");
+        return `${size} 米 · ${extent.source === "observed_points" ? "可见支持点范围，遮挡部分未知" : "三维检测尺寸估计"}`;
+      }
+      function semanticFootprint(inst, anchor, scale) {
+        const extent = semanticExtent(inst);
+        const points = extent?.footprint_xy;
+        if (!Array.isArray(points) || points.length < 2 || points.length > 8
+          || !points.every(point => typeof point.x === "number" && Number.isFinite(point.x)
+            && typeof point.y === "number" && Number.isFinite(point.y))) return [];
+        return points.map(point => mapToCanvas(point, anchor, scale)).filter(Boolean);
+      }
+      function drawSemanticFootprints(ctx, instances, anchor, scale) {
+        // Physical footprints stay at map scale; clustering only combines labels.
+        for (const inst of instances) {
+          const points = semanticFootprint(inst, anchor, scale);
+          if (points.length < 2) continue;
+          const partial = inst.object_extent.source === "observed_points";
+          ctx.beginPath();
+          ctx.moveTo(points[0].x, points[0].y);
+          for (const point of points.slice(1)) ctx.lineTo(point.x, point.y);
+          if (points.length > 2) ctx.closePath();
+          ctx.fillStyle = "rgba(245,158,11,.18)";
+          ctx.strokeStyle = "#f59e0b";
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash(partial ? [5, 3] : []);
+          if (points.length > 2) ctx.fill();
+          ctx.stroke();
+        }
+        ctx.setLineDash([]);
+      }
       function drawSemanticInstances(ctx, anchor, scale) {
         if (!state.showSemanticInstances) return;
         const instances = semanticMapInstances();
@@ -2963,6 +3004,7 @@
         const hlKey = resolveHighlightCluster(clusters);
         ctx.save();
         ctx.setTransform(1, 0, 0, 1, 0, 0);
+        drawSemanticFootprints(ctx, instances, anchor, scale);
         for (const cl of clusters) {
           let drawX = cl.cx;
           let drawY = cl.cy;
@@ -3012,7 +3054,7 @@
           ctx.fillStyle = "rgba(51,65,85,0.9)";
           ctx.fill();
         } else {
-          ctx.fillStyle = highlighted ? "#fbbf24" : "#f59e0b";
+          ctx.fillStyle = highlighted ? "#fbbf24" : semanticExtent(inst) ? "#f59e0b" : "#cbd5e1";
           ctx.fill();
           ctx.strokeStyle = highlighted ? "#fff" : "#fef3c7";
           ctx.lineWidth = highlighted ? 2.5 : 1.5;
@@ -3152,7 +3194,17 @@
           }
         }
         ctx.restore();
-        return bestHit;
+        if (bestHit) return bestHit;
+        for (const inst of semanticMapInstances()) {
+          const points = semanticFootprint(inst, anchor, scale);
+          let inside = false;
+          for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+            const a = points[i], b = points[j];
+            if ((a.y > py) !== (b.y > py) && px < (b.x-a.x)*(py-a.y)/(b.y-a.y) + a.x) inside = !inside;
+          }
+          if (inside) return { type: "single", instance: inst };
+        }
+        return null;
       }
       function closeSemanticOverlay() {
         const el = document.getElementById("semanticOverlay");
@@ -3271,6 +3323,7 @@
           [semanticObservationOnly(inst) ? "观察位置" : "物体位置", pose ? `x ${pose.x.toFixed(2)} · y ${pose.y.toFixed(2)} · z ${pose.z.toFixed(2)} 米` : "未确定"],
           ["坐标系", inst.frame_id || "未记录"],
           ["位置依据", methodNames[inst.projection_method] || inst.projection_method || "未记录"],
+          ["物品尺寸", semanticExtentDescription(inst)],
           ["空间置信度", confidence],
           ["支持点数", Number.isFinite(inst.support_point_count) ? String(inst.support_point_count) : "未记录"],
           ["观察次数", Number.isFinite(inst.observation_count) ? String(inst.observation_count) : "未记录"],

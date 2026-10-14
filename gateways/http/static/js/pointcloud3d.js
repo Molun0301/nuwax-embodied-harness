@@ -675,8 +675,10 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._semanticGroup = new THREE.Group();
     this._semanticGroup.visible = this._semanticInstancesVisible;
     this._scene.add(this._semanticGroup);
-    this._semanticMarkerGeometry = new THREE.BoxGeometry(0.44, 0.28, 0.24);
-    this._semanticPreciseMaterial = new THREE.MeshBasicMaterial({ color: COLORS.semantic });
+    this._semanticMarkerGeometry = new THREE.BoxGeometry(1, 1, 1);
+    this._semanticPreciseMaterial = new THREE.MeshBasicMaterial({
+      color: COLORS.semantic, transparent: true, opacity: 0.32, side: THREE.DoubleSide,
+    });
     this._semanticFallbackMaterial = new THREE.MeshBasicMaterial({
       color: COLORS.semanticFallback,
       transparent: true,
@@ -1740,7 +1742,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
     const textWidth = Math.ceil(ctx.measureText(label).width);
     canvas.width = Math.max(180, Math.min(420, textWidth + 34));
     canvas.height = 54;
-    ctx.font = '600 24px system-ui, sans-serif';
+    const fontSize = Math.min(24, Math.floor(24 * (canvas.width - 34) / Math.max(1, textWidth)));
+    ctx.font = `600 ${fontSize}px system-ui, sans-serif`;
     ctx.fillStyle = fallback ? 'rgba(51,65,85,.86)' : 'rgba(120,53,15,.9)';
     this._drawRoundedRect(ctx, 1, 1, canvas.width - 2, canvas.height - 2, 12);
     ctx.fill();
@@ -1766,6 +1769,29 @@ class PointCloud3DViewer extends PointCloudProcessor {
     return sprite;
   }
 
+  _semanticExtent(instance) {
+    const extent = instance?.object_extent;
+    if (!extent || extent.frame_id !== instance.frame_id || extent.frame_id !== 'map'
+      || !['detection3d', 'observed_points'].includes(extent.source)) return null;
+    const finite = value => typeof value === 'number' && Number.isFinite(value);
+    if (!['x', 'y', 'z'].every(axis => finite(extent.center?.[axis])
+      && finite(extent.size_m?.[axis]) && extent.size_m[axis] >= 0)
+      || !['x', 'y', 'z', 'w'].every(axis => finite(extent.orientation?.[axis]))
+      || !finite(extent.top_z_m) || Math.max(extent.size_m.x, extent.size_m.y, extent.size_m.z) <= 0) return null;
+    const q = extent.orientation;
+    if (Math.abs(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w - 1) > 1e-5) return null;
+    return extent;
+  }
+
+  _semanticExtentMatches(record, extent) {
+    if (record.extentSource !== (extent?.source || '')) return false;
+    if (!extent) return true;
+    return record.extentTop === extent.top_z_m
+      && ['x', 'y', 'z'].every((axis, index) => record.extentCenter[index] === extent.center[axis]
+        && record.extentSize[index] === extent.size_m[axis])
+      && ['x', 'y', 'z', 'w'].every((axis, index) => record.extentOrientation[index] === extent.orientation[axis]);
+  }
+
   _rebuildSemanticInstances() {
     if (!this._semanticGroup) return;
     // New observation objects usually change only metadata. Compare the saved
@@ -1776,10 +1802,12 @@ class PointCloud3DViewer extends PointCloudProcessor {
         const record = this._semanticRecords[index];
         const instance = this._semanticInstances[index];
         const pose = instance?.pose;
+        const extent = this._semanticExtent(instance);
         if (!pose || record.id !== instance.instance_id
           || record.x !== pose.x || record.y !== pose.y || record.z !== pose.z
           || instance.observation_only || instance.projection_method === 'current_pose_fallback'
-          || record.fallback !== (Boolean(instance.is_fallback) || String(instance.frame_id || 'map') !== 'map')
+          || record.fallback !== (!extent || Boolean(instance.is_fallback) || String(instance.frame_id || 'map') !== 'map')
+          || !this._semanticExtentMatches(record, extent)
           || record.labelName !== this._semanticLabelName(instance)) {
           unchanged = false;
           break;
@@ -1803,9 +1831,11 @@ class PointCloud3DViewer extends PointCloudProcessor {
       if (!pose || ![pose.x, pose.y, pose.z].every(value => typeof value === 'number' && Number.isFinite(value))) continue;
       const { x, y, z } = pose;
       if (instance.observation_only || instance.projection_method === 'current_pose_fallback') continue;
-      const fallback = Boolean(instance.is_fallback) || String(instance.frame_id || 'map') !== 'map';
+      const extent = this._semanticExtent(instance);
+      const fallback = !extent || Boolean(instance.is_fallback) || String(instance.frame_id || 'map') !== 'map';
       const labelName = this._semanticLabelName(instance);
-      const labelText = `${labelName} · z ${z.toFixed(2)}m`;
+      const sizeText = extent ? `${extent.source === 'observed_points' ? '可见范围' : '检测尺寸'} ${['x', 'y', 'z'].map(axis => extent.size_m[axis].toFixed(2)).join('×')}m` : '尺寸未知';
+      const labelText = `${labelName} · ${sizeText}`;
       const bucket = available.get(instance.instance_id);
       let record = bucket?.records[bucket.used++];
       if (!record) {
@@ -1819,39 +1849,18 @@ class PointCloud3DViewer extends PointCloudProcessor {
       }
       const moved = record.x !== x || record.y !== y || record.z !== z;
       const restyled = record.fallback !== fallback;
-      if (moved) record.marker.position.set(x, y, z + 0.16);
+      const resized = !this._semanticExtentMatches(record, extent);
+      if (moved || resized) {
+        // The measured box is centered on its own bounds, not on the ground.
+        // z may be negative in map coordinates; never snap it to an invented floor.
+        record.marker.position.set(extent?.center.x ?? x, extent?.center.y ?? y, extent?.center.z ?? z);
+        record.marker.scale.set(extent?.size_m.x ?? 0.16, extent?.size_m.y ?? 0.16, extent?.size_m.z ?? 0.16);
+        const q = extent?.orientation;
+        record.marker.quaternion.set(q?.x ?? 0, q?.y ?? 0, q?.z ?? 0, q?.w ?? 1);
+      }
       if (restyled) record.marker.material = fallback ? this._semanticFallbackMaterial : this._semanticPreciseMaterial;
       record.marker.userData.semanticInstance = instance;
 
-      if (z > 0.05) {
-        if (!record.stem) {
-          record.stem = new THREE.Line(new THREE.BufferGeometry().setFromPoints([
-            new THREE.Vector3(x, y, 0.02), new THREE.Vector3(x, y, z),
-          ]), new THREE.LineBasicMaterial({
-            color: fallback ? COLORS.semanticFallback : COLORS.semantic,
-            transparent: true, opacity: fallback ? 0.45 : 0.72,
-          }));
-          this._semanticGroup.add(record.stem);
-        } else {
-          if (moved) {
-            const geometry = record.stem.geometry;
-            geometry.attributes.position.setXYZ(0, x, y, 0.02);
-            geometry.attributes.position.setXYZ(1, x, y, z);
-            geometry.attributes.position.needsUpdate = true;
-            geometry.computeBoundingSphere();
-            if (geometry.boundingBox) geometry.computeBoundingBox();
-          }
-          if (restyled) {
-            record.stem.material.color.set(fallback ? COLORS.semanticFallback : COLORS.semantic);
-            record.stem.material.opacity = fallback ? 0.45 : 0.72;
-          }
-        }
-      } else if (record.stem) {
-        record.stem.removeFromParent();
-        record.stem.geometry.dispose();
-        record.stem.material.dispose();
-        record.stem = null;
-      }
       if (record.labelText !== labelText || restyled || (moved && !record.label)) {
         const label = this._createSemanticLabelSprite(labelText, fallback);
         this._disposeSemanticLabel(record.label);
@@ -1867,12 +1876,18 @@ class PointCloud3DViewer extends PointCloudProcessor {
         changed = true;
       }
       if (record.label) {
-        record.label.position.set(x, y, z + 0.48);
+        record.label.position.set(extent?.center.x ?? x, extent?.center.y ?? y, (extent?.top_z_m ?? z) + 0.24);
         record.label.userData.semanticInstance = instance;
         record.label.userData.semanticSelectable = true;
       }
-      changed ||= moved || restyled || this._semanticRecords[next.length] !== record;
-      Object.assign(record, { x, y, z, fallback, labelName, labelText });
+      changed ||= moved || resized || restyled || this._semanticRecords[next.length] !== record;
+      Object.assign(record, { x, y, z, fallback, labelName, labelText, extentSource: extent?.source || '' });
+      if (extent) {
+        record.extentTop = extent.top_z_m;
+        record.extentCenter = ['x', 'y', 'z'].map(axis => extent.center[axis]);
+        record.extentSize = ['x', 'y', 'z'].map(axis => extent.size_m[axis]);
+        record.extentOrientation = ['x', 'y', 'z', 'w'].map(axis => extent.orientation[axis]);
+      }
       next.push(record);
     }
     for (const bucket of available.values()) {

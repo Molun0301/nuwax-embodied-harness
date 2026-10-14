@@ -6,7 +6,7 @@ from typing import Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 
-from contracts.frame_semantics import frame_ids_semantically_equal
+from contracts.frame_semantics import frame_ids_semantically_equal, infer_frame_role
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.runtime_views import LocalizationSnapshot, PerceptionContext
 from services.localization.frame_tree_ops import transform_points_to_frame, transform_pose_to_frame
@@ -169,21 +169,43 @@ class VisionToMapProjectionService:
         projected: List[ProjectedObservation] = []
         track_pose_by_id = self._build_track_pose_index(perception_context)
         for detection in perception_context.observation.detections_3d:
-            projected_pose = self._resolve_pose_to_map(
-                detection.pose,
-                current_pose=effective_pose,
-                map_frame=map_context.frame_id,
-                frame_tree=frame_tree,
-            )
+            if frame_ids_semantically_equal(detection.pose.frame_id, map_context.frame_id):
+                projected_pose = self._resolve_pose_to_map(
+                    detection.pose, current_pose=effective_pose, map_frame=map_context.frame_id, frame_tree=frame_tree,
+                )
+                extent_orientation = projected_pose.orientation
+            else:
+                transformed_pose = transform_pose_to_frame(
+                    frame_tree, detection.pose, target_frame_id=map_context.frame_id,
+                )
+                projected_pose = transformed_pose or self._relative_pose_to_map(
+                    detection.pose, current_pose=effective_pose, map_frame=map_context.frame_id,
+                )
+                extent_orientation = transformed_pose.orientation if transformed_pose is not None else None
+            if (extent_orientation is None and infer_frame_role(detection.pose.frame_id) == "base"
+                    and frame_ids_semantically_equal(effective_pose.frame_id, map_context.frame_id)):
+                # Existing relative-position fallback is valid for body-frame data.
+                # Compose the box's orientation too, without changing nav pose semantics.
+                a, b = effective_pose.orientation, detection.pose.orientation
+                extent_orientation = Quaternion(
+                    x=a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+                    y=a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+                    z=a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+                    w=a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z,
+                )
             if projected_pose is None:
                 continue
+            # Only explicit detector identity can bridge simultaneous 2D/3D
+            # observations. The context camera need not own a fused 3D detection.
+            camera_id = detection.attributes.get("camera_id")
+            track_id = detection.attributes.get("track_id")
             projected.append(
                 self._build_projected_observation(
                     label=detection.label,
                     score=detection.score,
                     pose=projected_pose,
-                    camera_id=None,
-                    track_id=None,
+                    camera_id=(camera_id.strip() or None) if isinstance(camera_id, str) else None,
+                    track_id=(track_id.strip() or None) if isinstance(track_id, str) else None,
                     instance_type=str(detection.attributes.get("instance_type") or "object"),
                     source_observation_id=perception_context.observation.observation_id,
                     source_artifact_ids=tuple(perception_context.observation.artifact_ids),
@@ -196,6 +218,15 @@ class VisionToMapProjectionService:
                         "size_x_m": detection.size_x_m,
                         "size_y_m": detection.size_y_m,
                         "size_z_m": detection.size_z_m,
+                        "extent_projection_status": "projected" if extent_orientation is not None else "frame_transform_unverified",
+                        "object_extent": {
+                            "frame_id": map_context.frame_id,
+                            "center_offset_m": {"x": 0.0, "y": 0.0, "z": 0.0},
+                            "size_m": {"x": detection.size_x_m, "y": detection.size_y_m, "z": detection.size_z_m},
+                            "orientation": extent_orientation.model_dump() if extent_orientation is not None else None,
+                            "source": "detection3d",
+                            "source_observation_id": perception_context.observation.observation_id,
+                        },
                     },
                 )
             )
@@ -555,7 +586,7 @@ class VisionToMapProjectionService:
     ) -> Tuple[Optional[Pose], Dict[str, object]]:
         map_points = self._extract_points(attributes, keys=self._MAP_POINT_KEYS, default_frame_id=map_frame)
         if map_points is not None:
-            return self._pose_from_resolved_points(
+            pose, evidence = self._pose_from_resolved_points(
                 map_points[0],
                 current_pose=current_pose,
                 map_frame=map_frame,
@@ -563,6 +594,13 @@ class VisionToMapProjectionService:
                 projection_confidence=0.97,
                 map_projection_coverage=1.0,
             )
+            try:
+                extent_frame_matches = frame_ids_semantically_equal(map_points[1], map_frame)
+            except ValueError:
+                extent_frame_matches = False
+            if not extent_frame_matches:
+                evidence["extent_projection_status"] = "frame_transform_unverified"
+            return pose, evidence
 
         camera_points = self._extract_points(
             attributes,
@@ -880,12 +918,15 @@ class VisionToMapProjectionService:
         )
         min_values = array.min(axis=0)
         max_values = array.max(axis=0)
+        # Mean support location remains the instance/navigation pose; box center
+        # is the midpoint of extrema and can differ with unevenly sampled surfaces.
+        box_center = (min_values + max_values) * 0.5
         bbox_3d_map = {
             "frame_id": map_frame,
             "center": {
-                "x": round(float(centroid[0]), 6),
-                "y": round(float(centroid[1]), 6),
-                "z": round(float(centroid[2]), 6),
+                "x": round(float(box_center[0]), 6),
+                "y": round(float(box_center[1]), 6),
+                "z": round(float(box_center[2]), 6),
             },
             "extent_m": {
                 "x": round(float(extent[0]), 6),
@@ -913,7 +954,7 @@ class VisionToMapProjectionService:
             },
             "map_projection_coverage": round(max(0.0, min(1.0, float(map_projection_coverage))), 6),
             "projection_degradation_reason": projection_degradation_reason,
-            "centroid_map": bbox_3d_map["center"],
+            "centroid_map": {axis: round(float(centroid[index]), 6) for index, axis in enumerate(("x", "y", "z"))},
             "bbox_3d_map": bbox_3d_map,
             "object_3d_bbox": bbox_3d_map,
             "centroid_map_x": round(float(centroid[0]), 6),

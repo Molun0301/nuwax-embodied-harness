@@ -133,6 +133,8 @@ def _original_semantic_instance_rows(self, instances, target_library, resolved_n
                 "label": inst.label,
                 "display_name": inst.display_name or inst.label,
                 "pose": {"x": pos.x, "y": pos.y, "z": pos.z} if valid_position else None,
+                # These historical lifecycle fixtures contain no metric dimensions.
+                "object_extent": None,
                 "frame_id": frame_id,
                 "confidence": inst.confidence if math.isfinite(inst.confidence) else None,
                 "instance_type": inst.instance_type,

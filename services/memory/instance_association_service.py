@@ -23,8 +23,13 @@ from contracts.spatial_memory import (
     SemanticInstance,
 )
 from services.memory.inspection_pose_planner import InspectionPosePlanner
+from services.memory.object_extent import merge_object_extent, resolve_object_extent
+from services.memory.spatial_candidate_index import SpatialCandidateIndex, overlaps
 from services.memory.vectorizer import TextEmbedder
 from services.memory.vision_to_map_projection_service import ProjectedObservation
+
+
+_UNRESOLVED_GEOMETRY = object()
 
 
 @dataclass(frozen=True)
@@ -39,16 +44,7 @@ class AssociationOutcome:
 class InstanceAssociationService:
     """按空间、属性、时间连续性合并语义实例。"""
 
-    _MERGE_DISTANCE_M = {
-        InstanceMovability.STATIC: 1.8,
-        InstanceMovability.MOVABLE: 0.9,
-        InstanceMovability.TRANSIENT: 1.2,
-    }
-    _MAX_TIME_GAP_SEC = {
-        InstanceMovability.STATIC: 7 * 24 * 3600.0,
-        InstanceMovability.MOVABLE: 12 * 3600.0,
-        InstanceMovability.TRANSIENT: 10 * 60.0,
-    }
+    _TRANSIENT_REIDENTIFICATION_SEC = 10 * 60.0
     _ATTRIBUTE_SIMILARITY_GATE = {
         InstanceMovability.STATIC: 0.18,
         InstanceMovability.MOVABLE: 0.22,
@@ -56,7 +52,6 @@ class InstanceAssociationService:
     }
     _SEGMENTATION_LOW_SIGNAL_THRESHOLD = 0.25
     _SEGMENTATION_REPROJECTION_ERROR_GATE = 2.0
-    _SEGMENTATION_CENTER_DISTANCE_PX_GATE = 80.0
     _UNCERTAIN_AFTER_SEC = {
         InstanceMovability.STATIC: 3 * 24 * 3600.0,
         InstanceMovability.MOVABLE: 2 * 3600.0,
@@ -102,7 +97,7 @@ class InstanceAssociationService:
         "coverage", "depth_coverage", "map_projection_coverage", "reprojection_error",
         "geometry_projection_method", "geometry_projection_status", "segmentation_projection_status",
         "support_points_2d", "support_points_3d", "support_points_map", "centroid_map",
-        "bbox_3d_map", "object_3d_bbox", "navigable", "non_navigable_reason",
+        "bbox_3d_map", "object_3d_bbox", "object_extent", "position_support_radius_m", "navigable", "non_navigable_reason",
         "has_structured_segmentation", "segmentation_score", "predicted_iou", "stability_score",
         "segmentation_quality_score", "segmentation_support_point_count", "segmentation_bbox_xyxy",
         "centroid_uv", "mask_center_px", "segmentation_area_ratio", "segmentation_occlusion_flags",
@@ -224,224 +219,296 @@ class InstanceAssociationService:
         existing_instances: Dict[str, SemanticInstance],
         map_name: Optional[str],
         localization_session_id: Optional[str] = None,
+        map_asset_id: Optional[str] = None,
         occupancy_grid=None,
         cost_map=None,
         now: Optional[datetime] = None,
     ) -> Tuple[Dict[str, SemanticInstance], Tuple[AssociationOutcome, ...]]:
         resolved_now = now or utc_now()
         instances = dict(existing_instances)
-        outcomes: List[AssociationOutcome] = []
-        matched_by_source: Dict[Tuple[str, Optional[str]], set[str]] = {}
-        # 同一次关联的地图域固定，只筛选一次；保留原字典顺序和未绑定地图的候选。
-        candidate_ids = [
-            instance_id for instance_id, candidate in instances.items()
-            if not (map_name and candidate.map_name and candidate.map_name != map_name)
-        ]
+        observations = tuple(projected_observations)
+        outcomes = [None] * len(observations)
+        groups = {}
+        for index, item in enumerate(observations):
+            groups.setdefault((item.source_observation_id, item.camera_id), []).append(index)
 
-        for item in projected_observations:
-            source_key = (item.source_observation_id, item.camera_id)
-            matched_ids = matched_by_source.setdefault(source_key, set())
-            best_instance = None
-            best_score = 0.0
-            for instance_id in candidate_ids:
-                candidate = instances[instance_id]
-                if candidate.lifecycle_state == InstanceLifecycleState.REMOVED:
-                    continue
-                if candidate.instance_id in matched_ids:
-                    continue
-                if map_name and candidate.map_name and candidate.map_name != map_name:
-                    continue
-                score = self._association_score(
-                    item, candidate, resolved_now, localization_session_id=localization_session_id
-                )
-                if score > best_score:
-                    best_score = score
-                    best_instance = candidate
+        def eligible(candidate):
+            if map_name and candidate.map_name and candidate.map_name != map_name:
+                return False
+            # saved asset ID 在重启/重定位后稳定；运行时 source_epoch 并非地图资产身份。
+            prior_asset = candidate.metadata.get("map_asset_id")
+            if map_asset_id and prior_asset and prior_asset != map_asset_id:
+                return False
+            return (candidate.lifecycle_state != InstanceLifecycleState.REMOVED
+                    or candidate.metadata.get("lifecycle_aged") is True)
 
-            if best_instance is not None and best_score >= 0.6:
-                merged = self._merge_instance(
-                    best_instance,
-                    item,
-                    map_name=map_name,
-                    localization_session_id=localization_session_id,
-                    occupancy_grid=occupancy_grid,
-                    cost_map=cost_map,
-                    now=resolved_now,
-                )
-                instances[merged.instance_id] = merged
-                matched_ids.add(merged.instance_id)
-                outcomes.append(AssociationOutcome(instance=merged, created=False, matched_score=best_score))
+        bounds_by_id = {}
+        track_ids = {}
+        geometry_cache = {}
+        def geometry(record):
+            key = id(record)
+            if key not in geometry_cache:
+                geometry_cache[key] = self._spatial_geometry(record)
+            return geometry_cache[key]
+        for instance_id, candidate in instances.items() if observations else ():
+            if not eligible(candidate):
                 continue
+            bounds = self._spatial_bounds(candidate)
+            if bounds is not None:
+                bounds_by_id[instance_id] = bounds
+            track = (candidate.metadata.get("last_camera_id"), candidate.metadata.get("last_track_id"))
+            if all(track):
+                track_ids.setdefault(track, set()).add(instance_id)
+        spatial_index = SpatialCandidateIndex(bounds_by_id.items())
+        changed_ids = set()
 
-            created = self._create_instance(
-                item,
-                map_name=map_name,
-                localization_session_id=localization_session_id,
-                occupancy_grid=occupancy_grid,
-                cost_map=cost_map,
-                now=resolved_now,
-            )
-            if created.instance_id not in instances:
-                candidate_ids.append(created.instance_id)
-            instances[created.instance_id] = created
-            matched_ids.add(created.instance_id)
-            outcomes.append(AssociationOutcome(instance=created, created=True, matched_score=1.0))
+        for indices in groups.values():
+            edges = []
+            representatives = []
+            duplicate_of = {}
+            by_track = {}
+            for index in indices:
+                item = observations[index]
+                duplicate = None
+                if item.camera_id and item.track_id:
+                    for prior_index in by_track.get(item.track_id, ()):
+                        prior = observations[prior_index]
+                        if (frame_ids_semantically_equal(item.pose.frame_id, prior.pose.frame_id)
+                                and self._label_similarity(item.label, prior.label) > 0.0
+                                and not self._conflicting_appearance(item, prior)
+                                and (self._is_fallback_observation(item) or self._is_fallback_observation(prior)
+                                     or self._geometry_fit(item, prior, left=geometry(item), right=geometry(prior)) is not None)):
+                            duplicate = prior_index
+                            break
+                if duplicate is None:
+                    representatives.append(index)
+                    if item.camera_id and item.track_id:
+                        by_track.setdefault(item.track_id, []).append(index)
+                else:
+                    # 明确同跟踪对象的 3D/2D 证据保留各自输出，只占一个实例名额。
+                    duplicate_of[index] = duplicate
+            for index in representatives:
+                item = observations[index]
+                bounds = self._spatial_bounds(item)
+                candidates = set(track_ids.get((item.camera_id, item.track_id), ()))
+                if bounds is not None:
+                    candidates.update(value for value in spatial_index.query(bounds) if value not in changed_ids)
+                    candidates.update(value for value in changed_ids
+                                      if value in bounds_by_id and overlaps(bounds, bounds_by_id[value]))
+                for instance_id in candidates:
+                    candidate = instances[instance_id]
+                    if not eligible(candidate):
+                        continue
+                    score = self._association_score(item, candidate, resolved_now,
+                        localization_session_id=localization_session_id,
+                        observation_geometry=geometry(item), candidate_geometry=geometry(candidate))
+                    if score >= 0.6:
+                        # 几何/跟踪证据优先；同分旧重复记录固定选择最早 ID，不改写历史。
+                        edges.append((-score, candidate.first_seen_ts, instance_id,
+                                      self._observation_order(item), index))
+            assignments = {}
+            reserved = set()
+            for negative_score, _seen, instance_id, _order, index in sorted(edges):
+                if index not in assignments and instance_id not in reserved:
+                    assignments[index] = (instance_id, -negative_score)
+                    reserved.add(instance_id)
+            # 同一相机同一观测内一对一；先决定归属，避免输入顺序抢走更吻合的物体。
+            for index in indices:
+                item = observations[index]
+                selected = assignments.get(index)
+                if index in duplicate_of:
+                    prior_outcome = outcomes[duplicate_of[index]]
+                    selected = (prior_outcome.instance.instance_id, prior_outcome.matched_score)
+                if selected is not None:
+                    current = instances[selected[0]]
+                    instance = self._merge_instance(current, item, map_name=map_name,
+                        localization_session_id=localization_session_id, occupancy_grid=occupancy_grid,
+                        cost_map=cost_map, now=resolved_now)
+                    old_track = (current.metadata.get("last_camera_id"), current.metadata.get("last_track_id"))
+                    track_ids.get(old_track, set()).discard(current.instance_id)
+                else:
+                    instance = self._create_instance(item, map_name=map_name,
+                        localization_session_id=localization_session_id, occupancy_grid=occupancy_grid,
+                        cost_map=cost_map, now=resolved_now)
+                if map_asset_id:
+                    instance.metadata["map_asset_id"] = map_asset_id
+                instances[instance.instance_id] = instance
+                changed_ids.add(instance.instance_id)
+                bounds = self._spatial_bounds(instance)
+                if bounds is not None:
+                    bounds_by_id[instance.instance_id] = bounds
+                else:
+                    bounds_by_id.pop(instance.instance_id, None)
+                track = (instance.metadata.get("last_camera_id"), instance.metadata.get("last_track_id"))
+                if all(track):
+                    track_ids.setdefault(track, set()).add(instance.instance_id)
+                outcomes[index] = AssociationOutcome(instance=instance, created=selected is None,
+                    matched_score=selected[1] if selected is not None else 1.0)
 
-        stale_updated: Dict[str, SemanticInstance] = {}
-        for instance_id, instance in instances.items():
-            stale_updated[instance_id] = self._mark_stale(instance, now=resolved_now)
-        return stale_updated, tuple(outcomes)
+        for key, value in instances.items():
+            if (value.lifecycle_state == InstanceLifecycleState.REMOVED
+                    and value.metadata.get("lifecycle_aged") is not True):
+                continue
+            aged = self._mark_stale(value, now=resolved_now)
+            if aged is not value and aged.lifecycle_state == InstanceLifecycleState.REMOVED:
+                aged.metadata["lifecycle_aged"] = True
+            instances[key] = aged
+        return instances, tuple(outcomes)
 
-    def _association_score(
-        self,
-        observation: ProjectedObservation,
-        candidate: SemanticInstance,
-        now: datetime,
-        *,
-        localization_session_id: Optional[str] = None,
-    ) -> float:
-        if not frame_ids_semantically_equal(observation.pose.frame_id, candidate.pose.frame_id):
-            return 0.0
-        distance_m = self._distance(observation.pose, candidate.pose)
-        if not math.isfinite(distance_m):
-            return 0.0
-        max_distance_m = self._MERGE_DISTANCE_M.get(candidate.movability, 1.0)
+    @staticmethod
+    def _observation_order(item):
+        return (float(item.pose.position.x), float(item.pose.position.y), float(item.pose.position.z),
+                item.label, item.track_id or "")
+
+    def _same_track(self, observation, candidate, now, localization_session_id):
         age_sec = max(0.0, (now - candidate.last_seen_ts).total_seconds())
-        max_time_gap_sec = self._MAX_TIME_GAP_SEC.get(candidate.movability, 3600.0)
-        if age_sec > max_time_gap_sec:
-            return 0.0
-        same_track = bool(
-            observation.track_id
-            and observation.track_id == str(candidate.metadata.get("last_track_id") or "")
-            and observation.camera_id
-            and observation.camera_id == candidate.metadata.get("last_camera_id")
-            and age_sec <= self._TRACK_CONTINUITY_SEC
-            and (not localization_session_id or localization_session_id == candidate.localization_session_id)
-        )
-        has_fallback_pose = self._is_fallback_observation(observation) or bool(
-            candidate.metadata.get("pending_localization")
-            or candidate.metadata.get("projection_method") == "current_pose_fallback"
-        )
-        # 无几何坐标只表达观察者位置，必须依靠短时、同相机跟踪连续性关联。
-        if has_fallback_pose and not same_track:
-            return 0.0
-        if distance_m > max_distance_m and not (same_track and has_fallback_pose):
-            return 0.0
-        label_score = self._label_similarity(observation.label, candidate.label)
-        if label_score == 0.0:
-            return 0.0
-        observation_segmentation = self._summarize_segmentation_metadata(observation.attributes)
-        candidate_segmentation = self._summarize_segmentation_metadata(candidate.metadata)
-        if not same_track and self._segmentation_blocks_merge(
-            observation.attributes,
-            candidate.metadata,
-            observation_segmentation=observation_segmentation,
-            candidate_segmentation=candidate_segmentation,
-        ):
-            return 0.0
-        distance_score = 1.0 if has_fallback_pose else 1.0 / (1.0 + distance_m)
-        attribute_score = self._attribute_similarity(observation, candidate)
-        temporal_score = max(0.1, 1.0 - (age_sec / max_time_gap_sec))
-        similarity_gate = self._ATTRIBUTE_SIMILARITY_GATE.get(candidate.movability, 0.0)
-        if attribute_score < similarity_gate:
-            return 0.0
-        base_score = (0.42 * label_score) + (0.26 * distance_score) + (0.17 * attribute_score) + (0.15 * temporal_score)
-        segmentation_score = self._segmentation_association_score(
-            observation.attributes,
-            candidate.metadata,
-            observation_segmentation=observation_segmentation,
-            candidate_segmentation=candidate_segmentation,
-        )
-        if segmentation_score is not None:
-            base_score = (0.82 * base_score) + (0.18 * segmentation_score)
-        track_bonus = 0.15 if same_track else 0.0
-        return min(1.0, base_score + track_bonus)
+        return bool(observation.track_id and observation.track_id == candidate.metadata.get("last_track_id")
+                    and observation.camera_id and observation.camera_id == candidate.metadata.get("last_camera_id")
+                    and age_sec <= self._TRACK_CONTINUITY_SEC
+                    and localization_session_id == candidate.localization_session_id)
 
-    def _segmentation_blocks_merge(
-        self,
-        observation_metadata: Dict[str, object],
-        candidate_metadata: Dict[str, object],
-        *,
-        observation_segmentation: Dict[str, object],
-        candidate_segmentation: Dict[str, object],
-    ) -> bool:
-        if not (
-            observation_segmentation["has_structured_segmentation"]
-            and candidate_segmentation["has_structured_segmentation"]
-        ):
-            return False
-        hard_risks = {
-            "segmentation_support_points_missing",
-            "segmentation_score_below_threshold",
-            "predicted_iou_below_threshold",
-            "coverage_below_threshold",
-            "depth_coverage_below_threshold",
-            "map_projection_coverage_below_threshold",
-            "reprojection_error_above_threshold",
-            "segmentation_occluded",
-            "segmentation_truncated",
-        }
-        observation_risks = set(observation_segmentation.get("segmentation_risk_factors") or ())
-        candidate_risks = set(candidate_segmentation.get("segmentation_risk_factors") or ())
-        if observation_risks & hard_risks or candidate_risks & hard_risks:
-            return True
-        left_center = self._segmentation_center_px(observation_metadata)
-        right_center = self._segmentation_center_px(candidate_metadata)
-        if left_center is not None and right_center is not None:
-            center_distance = ((left_center[0] - right_center[0]) ** 2 + (left_center[1] - right_center[1]) ** 2) ** 0.5
-            if center_distance > self._segmentation_center_gate_px(observation_metadata, candidate_metadata):
+    @staticmethod
+    def _spatial_geometry(record):
+        """可比地图坐标、轴向支持范围和尺度相关容差；容差不是测量协方差。
+
+        点云只描述可见表面，细长物体的深度抖动不能用最薄轴当作精确误差。
+        取最大已测跨度的 10% 作为支持范围容差，不使用类别固定米数。
+        没有尺寸时不伪造尺度，只允许精确位置或独立跟踪连续性。
+        """
+        pose = record.pose
+        metadata = record.attributes if isinstance(record, ProjectedObservation) else record.metadata
+        if (metadata.get("pending_localization") or metadata.get("observation_only")
+                or metadata.get("projection_method") in (None, "", "current_pose_fallback")):
+            return None
+        center = tuple(float(getattr(pose.position, axis)) for axis in "xyz")
+        if not all(math.isfinite(value) for value in center):
+            return None
+        extent = resolve_object_extent(record)
+        if extent is None:
+            # 可靠深度中心/三角化点没有实体尺寸时，仍可使用原投影的米制残差
+            # 或该深度处的观测视锥支持范围；这不是用于渲染的虚构物体尺寸。
+            radius = InstanceAssociationService._position_support_radius(record)
+            return center, (2.0*radius, 2.0*radius, 2.0*radius), 0.0
+        if not frame_ids_semantically_equal(extent["frame_id"], pose.frame_id):
+            return None
+        center = tuple(center[index] + extent["center_offset_m"][axis] for index, axis in enumerate("xyz"))
+        q = extent["orientation"]
+        x, y, z, w = (q[axis] for axis in "xyzw")
+        rotation = ((1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)),
+                    (2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)),
+                    (2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)))
+        sizes = tuple(extent["size_m"][axis] for axis in "xyz")
+        world_sizes = tuple(sum(abs(rotation[row][col])*sizes[col] for col in range(3)) for row in range(3))
+        return center, world_sizes, 0.1 * max(sizes)
+
+    @staticmethod
+    def _position_support_radius(record):
+        metadata = getattr(record, "metadata", None) or {}
+        attributes = record.attributes
+        stored = metadata.get("position_support_radius_m")
+        if isinstance(stored, (int, float)) and math.isfinite(stored) and stored >= 0.0:
+            return float(stored)
+        residual = attributes.get("triangulation_residual_m")
+        radius = float(residual) if isinstance(residual, (int, float)) and math.isfinite(residual) and residual >= 0.0 else 0.0
+        angle = attributes.get("ray_cone_half_angle_rad")
+        origin = attributes.get("ray_origin_map")
+        if (isinstance(angle, (int, float)) and math.isfinite(angle) and 0.0 < angle < math.pi/2
+                and isinstance(origin, (list, tuple)) and len(origin) >= 3
+                and all(isinstance(v, (int, float)) and math.isfinite(v) for v in origin[:3])):
+            depth = math.sqrt(sum((getattr(record.pose.position, axis) - origin[i])**2 for i, axis in enumerate("xyz")))
+            radius = max(radius, depth * math.tan(angle))
+        return radius
+
+    def _spatial_bounds(self, record):
+        # 新记录的规范尺寸直接给出保守外接球，不为全部历史对象复制/归一化
+        # 方向四元数或构造精确旋转盒。只有查询命中的少量候选解析精确几何。
+        metadata = record.attributes if isinstance(record, ProjectedObservation) else record.metadata
+        if (metadata.get("pending_localization") or metadata.get("observation_only")
+                or metadata.get("projection_method") in (None, "", "current_pose_fallback")):
+            return None
+        extent = metadata.get("object_extent")
+        pose = record.pose
+        if isinstance(extent, dict) and extent.get("frame_id") == pose.frame_id:
+            try:
+                size, offset, q = extent["size_m"], extent["center_offset_m"], extent["orientation"]
+                sx, sy, sz = size["x"], size["y"], size["z"]
+                ox, oy, oz = offset["x"], offset["y"], offset["z"]
+                qx, qy, qz, qw = q["x"], q["y"], q["z"], q["w"]
+                values = (sx,sy,sz,ox,oy,oz,qx,qy,qz,qw)
+                source = extent.get("source")
+                if (all(type(v) in (float,int) and math.isfinite(v) for v in values)
+                        and max(sx,sy,sz) > 0 and min(sx,sy,sz) >= 0
+                        and (source == "observed_points" or (source == "detection3d" and min(sx,sy,sz) > 0))
+                        and math.isfinite(qx*qx+qy*qy+qz*qz+qw*qw)
+                        and qx*qx+qy*qy+qz*qz+qw*qw >= 1e-24):
+                    center = (pose.position.x+ox, pose.position.y+oy, pose.position.z+oz)
+                    radius = 0.5*math.sqrt(sx*sx+sy*sy+sz*sz) + 0.1*max(sx,sy,sz)
+                    if all(math.isfinite(v) for v in center) and math.isfinite(radius):
+                        return (tuple(v-radius for v in center), tuple(v+radius for v in center))
+            except (KeyError,TypeError):
+                pass
+        # 无规范字段的历史记录只在此批按共享兼容规则解析，不改写原记录。
+        geometry = self._spatial_geometry(record)
+        if geometry is None:
+            return None
+        center, sizes, tolerance = geometry
+        return (tuple(center[i] - sizes[i]*0.5 - tolerance for i in range(3)),
+                tuple(center[i] + sizes[i]*0.5 + tolerance for i in range(3)))
+
+    def _geometry_fit(self, observation, candidate, *, left=_UNRESOLVED_GEOMETRY, right=_UNRESOLVED_GEOMETRY):
+        if left is _UNRESOLVED_GEOMETRY:
+            left = self._spatial_geometry(observation)
+        if right is _UNRESOLVED_GEOMETRY:
+            right = self._spatial_geometry(candidate)
+        if left is None or right is None:
+            return None
+        residuals = []
+        for axis in range(3):
+            delta = abs(left[0][axis] - right[0][axis])
+            gate = 0.5 * max(left[1][axis], right[1][axis]) + max(left[2], right[2])
+            if delta > gate and not math.isclose(delta, gate, rel_tol=1e-12, abs_tol=0.0):
+                return None
+            residuals.append(delta / gate if gate > 0.0 else 0.0)
+        return 1.0 - max(residuals)
+
+    @staticmethod
+    def _conflicting_appearance(observation, candidate):
+        for keys in (("color", "colour"), ("brand",), ("model",), ("text", "ocr_text")):
+            left = next((str(observation.attributes[key]).strip().lower() for key in keys
+                         if observation.attributes.get(key)), "")
+            right = next((str(candidate.attributes[key]).strip().lower() for key in keys
+                          if candidate.attributes.get(key)), "")
+            if left and right and left != right:
                 return True
         return False
 
-    def _segmentation_association_score(
-        self,
-        observation_metadata: Dict[str, object],
-        candidate_metadata: Dict[str, object],
-        *,
-        observation_segmentation: Dict[str, object],
-        candidate_segmentation: Dict[str, object],
-    ) -> Optional[float]:
-        if not (
-            observation_segmentation["has_structured_segmentation"]
-            or candidate_segmentation["has_structured_segmentation"]
-        ):
-            return None
-        quality_values = [
-            value
-            for value in (
-                observation_segmentation.get("segmentation_quality_score"),
-                candidate_segmentation.get("segmentation_quality_score"),
-                observation_segmentation.get("segmentation_score"),
-                candidate_segmentation.get("segmentation_score"),
-                observation_segmentation.get("depth_coverage"),
-                candidate_segmentation.get("depth_coverage"),
-                observation_segmentation.get("map_projection_coverage"),
-                candidate_segmentation.get("map_projection_coverage"),
-            )
-            if isinstance(value, (int, float))
-        ]
-        quality_score = sum(quality_values) / len(quality_values) if quality_values else 0.5
-        risk_count = len(observation_segmentation.get("segmentation_risk_factors") or ()) + len(
-            candidate_segmentation.get("segmentation_risk_factors") or ()
-        )
-        risk_score = max(0.0, 1.0 - (0.18 * risk_count))
-        geometry_score = 1.0
-        left_center = self._segmentation_center_px(observation_metadata)
-        right_center = self._segmentation_center_px(candidate_metadata)
-        if left_center is not None and right_center is not None:
-            center_distance = ((left_center[0] - right_center[0]) ** 2 + (left_center[1] - right_center[1]) ** 2) ** 0.5
-            geometry_score = min(geometry_score, 1.0 / (1.0 + (center_distance / 50.0)))
-        left_area = self._coerce_optional_float(
-            observation_metadata.get("segmentation_area_ratio"),
-            observation_metadata.get("area_ratio"),
-        )
-        right_area = self._coerce_optional_float(
-            candidate_metadata.get("segmentation_area_ratio"),
-            candidate_metadata.get("area_ratio"),
-        )
-        if left_area is not None and right_area is not None:
-            geometry_score = min(geometry_score, max(0.0, 1.0 - abs(left_area - right_area)))
-        return max(0.0, min(1.0, (0.45 * quality_score) + (0.35 * geometry_score) + (0.20 * risk_score)))
+    def _association_score(self, observation, candidate, now, *, localization_session_id=None,
+                           observation_geometry=_UNRESOLVED_GEOMETRY,
+                           candidate_geometry=_UNRESOLVED_GEOMETRY) -> float:
+        if not frame_ids_semantically_equal(observation.pose.frame_id, candidate.pose.frame_id):
+            return 0.0
+        if not math.isfinite(self._distance(observation.pose, candidate.pose)):
+            return 0.0
+        same_track = self._same_track(observation, candidate, now, localization_session_id)
+        geometry_fit = self._geometry_fit(observation, candidate,
+            left=observation_geometry, right=candidate_geometry)
+        if not same_track and geometry_fit is None:
+            return 0.0
+        age_sec = max(0.0, (now - candidate.last_seen_ts).total_seconds())
+        max_time_gap_sec = self._TRANSIENT_REIDENTIFICATION_SEC
+        if candidate.movability == InstanceMovability.TRANSIENT and age_sec > max_time_gap_sec:
+            return 0.0
+        label_score = self._label_similarity(observation.label, candidate.label)
+        if label_score == 0.0 or self._conflicting_appearance(observation, candidate):
+            return 0.0
+        attribute_score = self._attribute_similarity(observation, candidate)
+        if attribute_score < self._ATTRIBUTE_SIMILARITY_GATE[candidate.movability]:
+            return 0.0
+        # 像素中心/面积属于各自图像，换相机或视角后不可比较为物体身份。
+        # 空间证据负责身份；分割质量仍由导航/展示的质量策略单独处理。
+        spatial_score = geometry_fit if geometry_fit is not None else 0.0
+        return min(1.0, 0.42*label_score + 0.30*spatial_score + 0.18*attribute_score + 0.10
+                   + (0.15 if same_track else 0.0))
 
     def _summarize_segmentation_metadata(self, metadata: Dict[str, object]) -> Dict[str, object]:
         segmentation_score = self._coerce_optional_float(metadata.get("segmentation_score"))
@@ -563,41 +630,6 @@ class InstanceAssociationService:
             return False
         return False
 
-    def _segmentation_center_px(self, metadata: Dict[str, object]) -> Optional[Tuple[float, float]]:
-        for key in ("centroid_uv", "mask_center_px"):
-            value = metadata.get(key)
-            if isinstance(value, (list, tuple)) and len(value) >= 2:
-                try:
-                    return float(value[0]), float(value[1])
-                except (TypeError, ValueError):
-                    pass
-        bbox = metadata.get("segmentation_bbox_xyxy") or metadata.get("bbox_xyxy")
-        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-            try:
-                left, top, right, bottom = [float(item) for item in bbox[:4]]
-            except (TypeError, ValueError):
-                return None
-            return (left + right) / 2.0, (top + bottom) / 2.0
-        return None
-
-    def _segmentation_center_gate_px(
-        self,
-        observation_metadata: Dict[str, object],
-        candidate_metadata: Dict[str, object],
-    ) -> float:
-        sizes: List[float] = []
-        for metadata in (observation_metadata, candidate_metadata):
-            bbox = metadata.get("segmentation_bbox_xyxy") or metadata.get("bbox_xyxy")
-            if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-                try:
-                    left, top, right, bottom = [float(item) for item in bbox[:4]]
-                except (TypeError, ValueError):
-                    continue
-                sizes.extend([abs(right - left), abs(bottom - top)])
-        if not sizes:
-            return self._SEGMENTATION_CENTER_DISTANCE_PX_GATE
-        return max(self._SEGMENTATION_CENTER_DISTANCE_PX_GATE, 0.75 * max(sizes))
-
     def _merge_instance(
         self,
         current: SemanticInstance,
@@ -609,7 +641,12 @@ class InstanceAssociationService:
         cost_map,
         now: datetime,
     ) -> SemanticInstance:
-        updated_count = current.observation_count + 1
+        repeated = self._observation_already_seen(current, observation)
+        prior_sample = next((sample for sample in current.observation_window
+            if sample.metadata.get("source_observation_id") == observation.source_observation_id
+            and sample.metadata.get("camera_id", "") == (observation.camera_id or "")), None)
+        replaces_reliable = prior_sample is not None and self._sample_projection_reliable(prior_sample)
+        updated_count = current.observation_count + (0 if repeated else 1)
         reliable_pose_count = int(current.metadata.get("position_observation_count") or 0)
         if self._instance_pose_is_reliable(current) and reliable_pose_count <= 0:
             reliable_pose_count = current.observation_count
@@ -621,6 +658,12 @@ class InstanceAssociationService:
             blended_pose = current.pose if self._instance_pose_is_reliable(current) else observation.pose
         elif not self._instance_pose_is_reliable(current):
             blended_pose = observation.pose
+        elif replaces_reliable:
+            # 同一观察重放不重复加权；同帧精化只替换其原有贡献。
+            blended_pose = current.pose.model_copy(update={"position": current.pose.position.model_copy(update={
+                axis: getattr(current.pose.position, axis)
+                    + (getattr(observation.pose.position, axis) - getattr(prior_sample.pose.position, axis))
+                    / float(max(1, reliable_pose_count)) for axis in "xyz"})})
         else:
             blended_pose = self._blend_pose(
                 current.pose,
@@ -630,12 +673,6 @@ class InstanceAssociationService:
         visual_labels = self._merge_strings(current.visual_labels, observation.visual_labels)
         semantic_labels = self._merge_strings(current.semantic_labels, observation.semantic_labels)
         artifact_ids = self._merge_strings(current.artifact_ids, observation.source_artifact_ids)
-        inspection_poses = self._inspection_pose_planner.plan_for_target(
-            target_pose=blended_pose,
-            occupancy_grid=occupancy_grid,
-            cost_map=cost_map,
-            existing_poses=current.inspection_poses,
-        )
         supporting_event_ids = self._merge_strings(
             current.supporting_observation_event_ids,
             (),
@@ -646,6 +683,7 @@ class InstanceAssociationService:
             now=now,
             map_name=map_name or current.map_name,
             localization_session_id=localization_session_id or current.localization_session_id,
+            deduplicate_source=repeated,
         )
         deferred_cache = self._build_deferred_projection_cache(
             current.deferred_projection_cache,
@@ -658,13 +696,28 @@ class InstanceAssociationService:
             observation_window=observation_window,
             attributes=observation.attributes,
         )
+        if (dynamic_state == InstanceDynamicState.UNKNOWN
+                and current.dynamic_state == InstanceDynamicState.STATIC
+                and self._geometry_fit(observation, current) is not None):
+            # 旧持久记录可能没有短时窗口；一次重见不能抹掉既有静态证据。
+            dynamic_state = current.dynamic_state
+            dynamic_metadata.update(dynamic_state=dynamic_state.value,
+                dynamic_state_reason="retained_static_evidence", dynamic_short_term_obstacle_context=False,
+                long_term_static_target_eligible=True)
+        if (not self._is_fallback_observation(observation)
+                and dynamic_state in {InstanceDynamicState.DYNAMIC, InstanceDynamicState.QUASI_STATIC}):
+            # 已关联的移动物体不能继续拖着全生命周期平均位置。
+            blended_pose = observation.pose
+        inspection_poses = self._inspection_pose_planner.plan_for_target(
+            target_pose=blended_pose, occupancy_grid=occupancy_grid, cost_map=cost_map,
+            existing_poses=current.inspection_poses)
         metadata = self._build_instance_metadata(
             observation,
             movability=current.movability,
             current_metadata=current.metadata,
         )
         metadata["position_observation_count"] = (
-            reliable_pose_count + (0 if self._is_fallback_observation(observation) else 1)
+            reliable_pose_count + (0 if self._is_fallback_observation(observation) or replaces_reliable else 1)
         )
         if self._is_fallback_observation(observation) and self._instance_pose_is_reliable(current):
             # 坐标保留时同步保留其证据，最新观测退化另存 last_observation 字段。
@@ -676,6 +729,12 @@ class InstanceAssociationService:
                     metadata.pop(key, None)
             metadata["observation_only"] = False
             metadata.update(self._summarize_segmentation_metadata(metadata))
+        extent = merge_object_extent(current, observation, pose=blended_pose)
+        if extent is not None:
+            metadata["object_extent"] = extent
+        if not self._is_fallback_observation(observation):
+            metadata["position_support_radius_m"] = self._position_support_radius(observation)
+        metadata.pop("lifecycle_aged", None)
         metadata.update(dynamic_metadata)
         metadata = self._apply_dynamic_navigation_policy(metadata, dynamic_state)
         # 阶段0：待定位实例收到首个可信投影时，清除 pending_localization 标记并转回 ACTIVE。
@@ -695,7 +754,7 @@ class InstanceAssociationService:
             "semantic_region_id": observation.semantic_region_id or current.semantic_region_id,
             "confidence": max(float(current.confidence), float(observation.score)),
             "observation_count": updated_count,
-            "last_seen_ts": now,
+            "last_seen_ts": current.last_seen_ts if repeated else now,
             "artifact_ids": artifact_ids,
             "semantic_labels": semantic_labels,
             "visual_labels": visual_labels,
@@ -706,7 +765,7 @@ class InstanceAssociationService:
             "deferred_projection_cache": deferred_cache,
             "lifecycle_state": merged_lifecycle,
             "metadata": metadata,
-            "attributes": copy.deepcopy(current.attributes),
+            "attributes": {**current.attributes, **observation.attributes},
             "supporting_observation_event_ids": supporting_event_ids,
         }
         # 只复制本次生成的可变字段，避免每帧复制实例保留的完整射线历史。
@@ -746,6 +805,10 @@ class InstanceAssociationService:
             observation,
             movability=movability,
         )
+        extent = merge_object_extent(None, observation)
+        if extent is not None:
+            metadata["object_extent"] = extent
+        metadata["position_support_radius_m"] = self._position_support_radius(observation)
         metadata["position_observation_count"] = 0 if self._is_fallback_observation(observation) else 1
         metadata.update(dynamic_metadata)
         metadata = self._apply_dynamic_navigation_policy(metadata, dynamic_state)
@@ -942,8 +1005,8 @@ class InstanceAssociationService:
             non_navigable_reason = "current_pose_fallback_no_geometry"
         metadata = {
             **previous_metadata,
-            "last_track_id": observation.track_id or previous_metadata.get("last_track_id", ""),
-            "last_camera_id": observation.camera_id or previous_metadata.get("last_camera_id", ""),
+            "last_track_id": observation.track_id or "",
+            "last_camera_id": observation.camera_id or "",
             "last_source_observation_id": observation.source_observation_id,
             "last_observation_projection_method": str(observation.attributes.get("projection_method") or ""),
             "last_observation_projection_confidence": observation.attributes.get("projection_confidence"),
@@ -990,6 +1053,14 @@ class InstanceAssociationService:
         metadata.update(self._summarize_segmentation_metadata(metadata))
         return metadata
 
+    @staticmethod
+    def _observation_already_seen(current, observation):
+        return any(sample.metadata.get("source_observation_id") == observation.source_observation_id
+                   and sample.metadata.get("camera_id", "") == (observation.camera_id or "")
+                   for sample in current.observation_window) or (
+            current.metadata.get("last_source_observation_id") == observation.source_observation_id
+            and current.metadata.get("last_camera_id", "") == (observation.camera_id or ""))
+
     def _build_observation_window(
         self,
         current_window: Iterable[InstanceObservationWindowSample],
@@ -998,8 +1069,16 @@ class InstanceAssociationService:
         now: datetime,
         map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
+        deduplicate_source: bool = False,
     ) -> List[InstanceObservationWindowSample]:
         window = [item for item in current_window if isinstance(item, InstanceObservationWindowSample)]
+        for prior in window if deduplicate_source else ():
+            if (prior.metadata.get("source_observation_id") == observation.source_observation_id
+                    and prior.metadata.get("camera_id", "") == (observation.camera_id or "")):
+                now = prior.timestamp
+        window = [item for item in window if not (deduplicate_source and
+            item.metadata.get("source_observation_id") == observation.source_observation_id
+            and item.metadata.get("camera_id", "") == (observation.camera_id or ""))]
         projection_method = str(observation.attributes.get("projection_method") or "")
         window.append(
             InstanceObservationWindowSample(
@@ -1062,6 +1141,9 @@ class InstanceAssociationService:
         """
 
         cache = [item for item in current_cache if isinstance(item, DeferredProjectionInput)]
+        cache = [item for item in cache if not (
+            item.source_observation_id == observation.source_observation_id
+            and item.track_id == observation.track_id)]
         observer_pose = self._observer_pose_from_observation(observation)
         if observer_pose is None:
             return cache

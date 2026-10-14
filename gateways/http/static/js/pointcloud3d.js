@@ -1146,7 +1146,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
     const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geo.setAttribute('color', new THREE.Uint8BufferAttribute(
+    // 颜色缓冲由预处理结果一次性交给几何；私有调用方不再复用或修改。
+    geo.setAttribute('color', new THREE.BufferAttribute(
       colors || this._pointCloudColors(positions, measurement, floorContext),
       3,
       true,

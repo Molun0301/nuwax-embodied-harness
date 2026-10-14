@@ -3178,11 +3178,9 @@ class MapWorkspaceService:
                         _binding_result=binding_result,
                     )
                     latest_map_snapshot = binding_result[-1][1]
-        # —— speed-up-list-maps-summary ——
-        # 非活跃资产不调 get_summary()（其内部 list_memory_libraries 会逐行反序列化
-        # 8 张记忆表 payload，×8 资产 ≈8s 是 list_maps 实测 13s 的根因）。非活跃资产的
-        # 状态推断无需 memory_active 信息，置为 None 即可。活跃资产仍按原路径算一次完整 summary。
-        memory_summary = self._memory_service.get_summary() if is_active else None
+        # Asset status needs only the current library identity. Full summaries
+        # (including vector validation/repair) belong to workspace/summary reads.
+        active_library_name = self._memory_service.get_active_library_name() if is_active else None
         runtime_readiness = self._active_runtime_readiness() if is_active else {}
         live_map_loaded = bool(
             latest_map_snapshot is not None
@@ -3199,8 +3197,8 @@ class MapWorkspaceService:
         if recovering_target:
             localization_ready = False
         memory_active = (
-            memory_summary is not None
-            and memory_summary.metadata.get("active_library_name") == asset.bound_memory_library_name
+            is_active
+            and active_library_name == asset.bound_memory_library_name
         )
         updated_asset = asset.model_copy(
             update={

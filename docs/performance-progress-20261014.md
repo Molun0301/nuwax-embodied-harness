@@ -1,6 +1,6 @@
 # NEH 云端夜间开发进度（持续更新）
 
-更新时间：2026-10-14 09:23 北京时间（2026-10-14 01:23 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
+更新时间：2026-10-14 09:59 北京时间（2026-10-14 01:59 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
 
 ## 当前结论与交付状态
 
@@ -9,9 +9,9 @@
 - 仓库：`Molun0301/nuwax-embodied-harness`
 - 工作分支：`fix/v3-legacy-cloud-seal-20261006`
 - 已确认的远端基线：`65d15c5262af71ee0ab532133bd0afdcb5e75911`；最近一次只读核对为2026-10-14 01:17 UTC，远端仍停在该提交
-- 当前本地代码状态：`6eec75e`，相对远端基线新增 **69 个本地提交**；本次报告更新不包含在此计数中
-- 同一 Library 检查点 **v34，4,547,697 bytes** 已确认覆盖全部69个提交。高密度recent的完整纯文本原始日志也已单独保存到Library；不再是仅本地文件
-- 01:17 UTC仍未登录GitHub CLI；Git远端读取仍在认证步骤因禁止交互而无法读取Username。**没有推送**，也没有网络封锁证据；Library保存不代表GitHub分支已经更新
+- 当前本地代码状态：`315caa4de5064fc345a30a579735f5cf0f372999`，相对远端基线新增 **74 个本地提交**；本次报告更新不包含在此计数中
+- 同一 Library 检查点 **v35，4,959,910 bytes** 已确认覆盖全部74个提交；顺序应用及最终tree一致性已核对，本报告当前未提交更新在该快照之外。高密度recent的完整纯文本原始日志也已单独保存到Library；不再是仅本地文件
+- 01:17 UTC远端认证核对仍未登录；01:31 UTC默认GitHub CLI认证也确认缺失，Git远端读取仍在认证步骤因禁止交互而无法读取Username。目前已启动一次新的GitHub设备登录，**尚未确认认证成功，也没有推送**；没有网络封锁证据。Library保存不代表GitHub分支已经更新
 
 **最新导航结果：** 完整 `NavScheduler` 局部恢复修复已提交为 `0eed9d2`，固定持续障碍的原目标在 **13.32秒**完成，仅2次规划/2次准入，232条完整停车尾迹和715条实际运动边全部通过。早期60秒失败与两次短程停车尾迹失败仍保留；独立调查发现采样位姿到实际应用间的转动差异，当前只是合同诊断，没有生产修复或真实50 ms执行器hold证明。不能据此称现场机器人卡住或安全时序问题全部解决。
 
@@ -99,6 +99,17 @@
 
 后续只读核对还从保留的第二次失败记录算出：采样位姿到实际receipt仅 **1.132700 ms**，其中结果发布到取走 **0.405146 ms**，完整receipt停车尾迹仍失败。因此“完成就立即唤醒”单独不能保证receipt状态安全；它还会触及原20 Hz每步可达速度的语义。这里只分析原记录，没有新benchmark或生产改动，也未另做第二例几何重建。[新增时序核对](diagnostics/navigation-dispatch-drift-contract-20261013.md#2026-10-14-read-only-review-dispatch-ownership-and-latency)
 
+### 探索所有权负结果与旧测试合同修正
+
+移走本次决策私有的observation-cell sets，确实可少复制64个局部BTreeSet；但三对固定进程没有证明完整selection稳定提速，大夹具配对中位数反而退化约5–6%。因此**该性能candidate已撤回，生产仍保留原deep-copy路径**；只保留测试计数和诊断，不把复制字节减少当作实际加速。[负面审计](diagnostics/exploration-view-ownership-audit-20261014.md)
+
+调查中两边原suite均为56通过/3失败/1 ignored，失败后来确定是过时测试假设，另行只改fixture：
+
+- blind-start把缺失支撑误当成占据障碍。新断言同时要求raw pose collision-clear、raw support为MissingSupport、私有current-body view有支撑且没有伪造原观测，返回goal在原图上有支撑并全身clear
+- 两个长机体heading fixture把原 **324个frontier全部标为reached并排除**，所以NoFrontier是夹具结果。修正加入真实未分类recent occupied ring；原static frontier向量不变，独立side-pose先证明radial碰撞、tangential clear。两个sensor模式各80个visited、244个radial碰撞，返回goal全身clear且其radial pose必须精确报InsufficientClearance
+
+最终原workspace release范围 **59 passed / 0 failed / 2 ignored**；原324/324/324/324 diagnostic显式通过，旧失败日志保留。ignored不计入59通过，性能profile没有重跑。生产代码、碰撞/支撑责任、live-source健康和命令时复核均未改变。**这是测试合同修正，不是实机导航拒绝或机器人移动问题修复**。[准确资格](diagnostics/exploration-fixture-contract-20261014.md)
+
 ## 二、地图、接纳、保存与身份
 
 - 完整点云 XYZ 边界归约改为各坐标轴的步进视图，保留全部有限值、精确边界和身份检查。4M 点合成资产完整验证 **259.257 → 15.523 ms**，暖文件系统真实检查点加载 **298.398 → 39.697 ms**；不含 RPC、原生恢复、定位、冷盘或浏览器。[证据](performance-dense-admission.md)
@@ -164,6 +175,8 @@
 
 这些不同范围的结果不相加为一个系统测试总数。小型真实构建证明所列pin/重复/回滚行为，**没有完整SDK闭包、工具链/架构迁移、同时改Boost recipe、NEH整套安装回滚或部署耗时资格**。首次fake Boost fixture缺少FOUND标志的失败保留；修复夹具没有弱化产品检查。[source目录复用](diagnostics/slam2d-source-build-reuse-20261014.md)、[成对依赖绑定](diagnostics/slam2d-managed-binding-20261014.md)、[被否决的稳定prefix](diagnostics/slam2d-prefix-audit-20261014.md)
 
+真实已安装SDK包发现也完成两个额外configure/generate检查：直接使用未改的production native CMake文件，在新隔离目录中初次配置、再配置均成功。实际选择的TBB/Ceres及生成include/link路径均指向已有toolchain managed prefix。**没有构建native target、生成其object/library或安装**；这是实际包发现与CMake生成资格，不是SDK编译/链接/运行。该Debian Ceres选项与installer source recipe不同，既有CMP0167/METIS诊断保留，不混入13/64-stage计数。[真实包发现证据](diagnostics/slam2d-real-package-discovery-20261014-results.json)
+
 ## 四、感知与语义记忆
 
 - YOLO 输出归一化直接使用新建分割契约，去掉深复制：20 检测×128 点 **14.587 → 6.011 ms**；64×512 点 **281.206 → 153.505 ms**。后续在此基础上复用不可变坐标和有符号面积，三独立进程的 64×512 点为 **156.353/156.363/151.340 → 134.908/145.363/138.761 ms**。这是两个相继且不同基线的比较，收益不相加；不含模型推理或相机帧率。[证据](diagnostics/yolo-mask-normalization-copy.md)
@@ -187,7 +200,21 @@
 
 三独立Node进程、固定synthetic JPEG批次中，256 KiB×8帧的slice-copy字节 **9,443,360→7,608,352**，parser/append/selection中位数 **0.960510→0.758195 ms**；64 KiB×4帧 **0.076956→0.058889 ms**。少复制的量恰为 `(frames−1)×JPEG bytes`。单帧复制数量不变，微小时延方向混合，**不声称单帧加速**。
 
-最终实际生产源通过 **29项Node合同测试**，包含分片/metadata/error/tail等价、async前独立复制、取消和generation变化、真实render-admission函数的fake display/URL清理。初始26项不与最终29相加。计时不含fetch、Blob、真实解码、DOM/GPU、网络或消费者async调度；**仍无实际浏览器验证、FPS/机器人CPU或持续内存结论**。[完整报告](diagnostics/mjpeg-parser-owned-selection-20261014.md)
+第一阶段实际生产源通过 **29项Node合同测试**，包含分片/metadata/error/tail等价、async前独立复制、取消和generation变化、真实render-admission函数的fake display/URL清理。初始26项不与最终29相加。计时不含fetch、Blob、真实解码、DOM/GPU、网络或消费者async调度；**仍无实际浏览器验证、FPS/机器人CPU或持续内存结论**。[完整报告](diagnostics/mjpeg-parser-owned-selection-20261014.md)
+
+### MJPEG第二阶段：每批只分离一次后续缓冲
+
+在第一阶段已只复制selected frame的基础上，新的两行生产改动让完整frame后的remaining暂作同步subarray，解析完一批后才独立复制最终tail，再跨异步边界。selected frame的独立slice不变；no-complete、裁剪、size/error、取消与generation语义不变。临时变量仍可能维持原buffer可达，不宣称立即GC或RSS下降。
+
+第二阶段自己的基线是第一阶段版本，**不能与前一阶段收益相加**。256 KiB×8帧固定批次，slice-copy **7,608,352→262,146 bytes**，同步parser/append/两处copy中位数 **0.700559→0.058919 ms**。多帧固定cohort三个进程均改善；单帧256 KiB **0.023646→0.024097 ms**，4 KiB也有三进程小退化，原样保留，不说非退化。4 MiB incomplete tail仍有大复制，一进程退化，不宣称此类输入获益。
+
+最终 **48项Node合同通过**。历史第一阶段29项和当前源29项兼容检查亦通过，但与48项重叠，不累计；第一阶段计时未重跑。新验证覆盖input在render/next-read期间变更、分片续读、tail、overflow和generation；fetch/display仍mock。未验证真实浏览器、GPU解码、网络分布、FPS、端到端延迟或机器人CPU。[第二阶段报告](diagnostics/mjpeg-parser-owned-tail-20261014.md)
+
+### 实际浏览器资格的最新边界
+
+官方云浏览器的CDP连接可用。通过它对本次执行器自有HTTP标记服务 `127.0.0.1:18979` 做的一次访问返回 **`net::ERR_CONNECTION_REFUSED`**，没有加载NEH源码或MJPEG页面；标记服务随后已停止。因此实际浏览器MJPEG解码、DOM/GPU及生命周期仍未验证，已有Node合同结果不受影响。这只证明本次loopback访问失败，不代表所有云浏览器或网络不可用。
+
+此结果与早期在执行器启动原生Chromium154时的process-singleton socket **EPERM/exit134** 是两条独立路径，不应合并为“没有浏览器能力”。
 
 ## 六、没有贸然改动的路径
 
@@ -209,11 +236,16 @@
 
 - 重定位candidate-pair索引复用的小型离线夹具没有测出实质、可重复的完整计算收益；未修改生产索引或定位阈值/heading规则。后续同步准备基线与两行target交接优化已独立完成，未采纳该pair-index方案；不把小夹具外推为实机地图代表负载。[负面审计](diagnostics/relocalization-pair-reuse-audit-20261014.md)
 
+- MCP最终JSONResponse搬进已有projection worker的test-only方案已否决，没有生产改动。真实router/投影/字节预算＋同loop heartbeat与initialize请求显示大**合成容量**响应确会拖延loop，但小offload未实质改善：8 MiB fixture handler **408.391→420.091 ms**、每轮最大heartbeat gap的中位数 **319.133→325.256 ms**。2,340-byte小对照gap **1.490→1.509 ms**。没有把容量夹具当日常流量，GIL是可能机制而非每项延迟的唯一实证归因；不能说“放线程就不阻塞”或伪称整个系统已改善。九项原encoding合同各臂通过、计数/取消行为一致，18次执行不是18独立用例，也未新增广泛集成run。[审计](diagnostics/mcp-response-heartbeat-20261014.md)
+
 ## 七、验证状态与未完成边界
 
 以下按实际版本和范围分别报告，重叠测试数不相加，也不把历史通过等同最终 HEAD 全通过：
 
-- 最新target交接为19项精确功能通过、18个诊断进程/270样本及非cfg Geometry binary-target check；MJPEG为最终29项Node合同通过。两者是Rust/JS各自窄资格，不与既有Python1227或Runtime236混成“全HEAD通过”
+- 最新独立范围：探索test-only fixture修正后59通过/2 ignored；MJPEG第二阶段48项Node合同；真实SDK包初次及复用configure两次通过且未构建/安装native target。MCP worker方案与探索set-move均未采纳生产修改，不算新增优化收益
+
+
+- 最新target交接为19项精确功能通过、18个诊断进程/270样本及非cfg Geometry binary-target check；第一阶段MJPEG为29项Node合同通过，第二阶段48项另列。两者是Rust/JS各自窄资格，不与既有Python1227或Runtime236混成“全HEAD通过”
 
 
 - **最新recent-column冻结窗口**：MLS **322 passed / 0 failed / 17 ignored，20.22秒**；Stack ingestion contracts **3通过**、原qualification **15通过/8 ignored**、source-health/preflight两个exact通过、六项原live分别通过；Runtime **236通过 / 58 ignored / 5 UDS filtered，56.50秒**。新增focused MLS含在322中，不另加；各轮重复qualification不累计
@@ -237,7 +269,7 @@
 仍需明确保留：
 
 1. **真实 UDS 未通过**：五项曾在 Unix socket 初始化返回 EPERM。最小 AF_UNIX 探针在正常及获准执行中均失败；没有禁用安全设置或绕过限制，允许该原语的环境还需原断言复验
-2. **真实浏览器/WebGL 未验证**：Chromium154保留正常沙箱，在加载本地页面前因 process-singleton socket EPERM 退出134；Node/Three检查不能替代像素、GPU和浏览器生命周期验收
+2. **真实浏览器/WebGL 未验证**：官方云浏览器CDP可用，但一次访问执行器自有loopback标记服务返回ERR_CONNECTION_REFUSED，未加载任何NEH源码；服务已停止。早期原生Chromium的socket EPERM是独立失败。Node/Three结果有效，但不能替代真实MJPEG解码、像素、GPU或浏览器生命周期验收
 3. **实机未验证**：未运行真实传感器/执行器闭环、机器人CPU/RSS、真实网络/刹车或硬实时验收；没有将合成动力学、模型外归一化、暖缓存测量外推到硬件
 4. **legacy哈希与兼容仍在**：已去掉受审重复工作，并成对扩展受支持保存源的assigned迁移；其他仍承担接纳验证的legacy导出/激活接口没有整体移除。不得外推为全仓或所有外部客户端无哈希
 5. **局部修复通过不等于全部边界完成**：完整NavScheduler固定障碍恢复已通过并提交；原60秒失败、两次短程停车尾迹失败保留。独立dispatch漂移诊断未作生产修复，真实执行器50 ms hold/expiry未获证明。AR1成对扩展已资格验证，不等于完整激活RPC或实机部署
@@ -245,8 +277,8 @@
 
 ## 八、正在继续的工作（未计为成果）
 
-- 最新重定位准备基线、两行target交接、MJPEG选帧复制优化均已归入结果，分别保留其资格边界与负对照，不再称待研究或待提交
-- Library v34已覆盖69提交，完整dense日志也已单独保存；之后本报告及新增工作还需下一次检查点。GitHub CLI认证仍阻止推送
+- 两阶段MJPEG、探索fixture合同修正与真实SDK包发现已归入相应结果；MCP worker和探索set-move负面结论也已记录，不再列为待采纳优化
+- Library v35已覆盖74提交，完整dense日志也已单独保存；之后本报告及新增工作还需下一次检查点。新GitHub设备登录已启动但尚未确认成功，仍不能称已推送
 - 本轮云端工作继续至北京时间11:00（03:00 UTC）；继续核对后续源码变化、相关回归与交付状态，当前不宣称全部完成。实机、UDS、真实浏览器和dispatch时序边界仍如上保留
 
 ## 附：证据阅读顺序
@@ -274,3 +306,5 @@
 - 最新Python：[2026-10-14合并资格](diagnostics/python-guarded-integration-20261014.md)、[1227个唯一node结果与原始guard记录](diagnostics/python-guarded-integration-20261014-results.json)
 
 - 第67–69阶段：[真实重定位准备基线](diagnostics/relocalization-preparation-audit-20261014.md)、[基线45样本](diagnostics/relocalization-preparation-audit-20261014-results.json)、[MJPEG选帧29项及三进程配对](diagnostics/mjpeg-parser-owned-selection-20261014-results.json)、[target交接270样本与19项资格](diagnostics/relocalization-target-handoff-qualification-20261014-results.json)
+
+- 最新独立调查与第二阶段：[MCP loop与编码结果](diagnostics/mcp-response-heartbeat-20261014-results.json)、[探索set所有权负面结果](diagnostics/exploration-view-ownership-audit-20261014-results.json)、[探索fixture合同59项结果](diagnostics/exploration-fixture-contract-20261014-results.json)、[MJPEG第二阶段48项及配对](diagnostics/mjpeg-parser-owned-tail-20261014-results.json)

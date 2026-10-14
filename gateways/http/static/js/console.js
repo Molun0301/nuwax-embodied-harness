@@ -4308,7 +4308,7 @@
             }
             if (latestFrameBytes) {
               try {
-                await renderDecodedVideoFrame(latestFrameBytes, generation, latestFrameIdentity || {});
+                await renderDecodedVideoFrame(latestFrameBytes.slice(), generation, latestFrameIdentity || {});
               } catch (err) {
                 if (generation !== state.videoStreamGeneration || signal.aborted) return;
                 const message = err && err.message ? err.message : String(err || "未知错误");
@@ -4373,7 +4373,7 @@
             remaining: soi > 16384 ? buffer.slice(soi - 16384) : buffer,
           };
         }
-        const frame = buffer.slice(soi, eoi + 2);
+        const frame = buffer.subarray(soi, eoi + 2);
         const remaining = buffer.slice(eoi + 2);
         if (!frame.byteLength) return null;
         const cameraValue = header.match(/^X-Camera-Id:\s*([^\r\n]*)/mi)?.[1] || "";

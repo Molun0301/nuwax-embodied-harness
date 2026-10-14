@@ -75,6 +75,21 @@ fn main() {
     ] {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
+    // PCL模板实例化会直接引用OpenMP符号，最终Rust程序也必须显式链接。
+    for library in fs::read_to_string(build.join("gtsam-openmp-libraries.txt"))
+        .expect("CMake OpenMP库清单")
+        .lines()
+    {
+        let (name, location) = library.split_once('=').expect("OpenMP库记录格式");
+        println!(
+            "cargo:rustc-link-search=native={}",
+            Path::new(location)
+                .parent()
+                .expect("OpenMP库目录")
+                .display()
+        );
+        println!("cargo:rustc-link-lib=dylib={name}");
+    }
     let cpp = if env::var("TARGET").unwrap_or_default().contains("apple") {
         "c++"
     } else {

@@ -27,10 +27,17 @@ if(NOT GTSAM_FOUND)
 endif()
 # Ubuntu20/22的pkg-config名称带版本后缀，使用PCL官方CMake配置统一解析依赖。
 find_package(PCL 1.8 REQUIRED COMPONENTS common kdtree registration)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
 add_library(nuwax_gtsam STATIC solver.cpp registration.cpp)
 target_include_directories(nuwax_gtsam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PCL_INCLUDE_DIRS})
 target_compile_options(nuwax_gtsam PUBLIC ${PCL_DEFINITIONS})
 # GTSAM静态核心使用线程；由共享库声明，兼容pthread尚未并入libc的目标系统。
-target_link_libraries(nuwax_gtsam PUBLIC gtsam ${PCL_LIBRARIES} Threads::Threads)
+target_link_libraries(nuwax_gtsam PUBLIC gtsam ${PCL_LIBRARIES} Threads::Threads OpenMP::OpenMP_CXX)
 # Rust调用方读取CMake实际选定的库位置；C++调用方直接复用目标传递依赖。
 file(GENERATE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/gtsam-library.txt CONTENT "$<TARGET_FILE:gtsam>\n$<TARGET_FILE:metis-gtsam>\n$<TARGET_FILE:cephes-gtsam>\n")
+# 静态库不会携带动态依赖；把目标编译器选择的OpenMP运行库传给Rust最终链接。
+set(NUWAX_OPENMP_LIBRARIES "")
+foreach(NUWAX_OPENMP_NAME IN LISTS OpenMP_CXX_LIB_NAMES)
+  string(APPEND NUWAX_OPENMP_LIBRARIES "${NUWAX_OPENMP_NAME}=${OpenMP_${NUWAX_OPENMP_NAME}_LIBRARY}\n")
+endforeach()
+file(GENERATE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/gtsam-openmp-libraries.txt CONTENT "${NUWAX_OPENMP_LIBRARIES}")

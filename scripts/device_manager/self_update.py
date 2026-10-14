@@ -1,7 +1,6 @@
 """管理程序独立更新，复用引导器的封闭归档校验，不触碰业务拥有方。"""
 from __future__ import annotations
 
-import os
 import re
 import shutil
 import sys
@@ -10,7 +9,7 @@ from pathlib import Path
 
 from scripts.neh_bootstrap import MAX_MANAGER_BYTES, unpack_manager, switch_link, version_tuple
 
-from .common import ManagerError, atomic_json, digest_file, identifier, read_json
+from .common import ManagerError, digest_file, identifier, read_json
 from .releases import download, validate_url
 from .runtime import clean_environment, run_command
 

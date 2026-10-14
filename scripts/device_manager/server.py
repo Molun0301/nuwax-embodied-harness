@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import http.client
-import ipaddress
 import json
 import mimetypes
 import os
@@ -80,7 +79,6 @@ class ManagerServer(ThreadingHTTPServer):
             self.last_recovery = time.monotonic()
             self.recovery_thread = threading.Thread(target=self._recover_background, daemon=True)
             self.recovery_thread.start()
-        from .common import read_json
         from .runtime import clean_environment
         request_path = self.engine.home / "config/restart-manager.json"
         request = read_json(request_path, {})

@@ -49,8 +49,14 @@ def _download_entry(item: dict) -> None:
 
 
 def validate_install(install: dict, modules=()) -> dict:
-    if not isinstance(install, dict) or set(install) != {"python", "native", "models"} or any(not isinstance(install[key], list) for key in install):
+    if not isinstance(install, dict) or not {"python", "native", "models"}.issubset(install) or set(install) - {"python", "native", "models", "go2"} or any(not isinstance(install[key], list) for key in ("python", "native", "models")):
         raise ReleaseError("安装配方必须包含python/native/models三个列表")
+    if "go2" in install:
+        from scripts.go2_dependencies import validate_recipe
+        try:
+            validate_recipe(install["go2"])
+        except ValueError as exc:
+            raise ReleaseError(str(exc)) from exc
     names, filenames, targets = set(), set(), set()
     for item in install["python"]:
         _download_entry(item)
@@ -114,6 +120,14 @@ def validate_install(install: dict, modules=()) -> dict:
     if not required.issubset(setting_keys):
         raise ReleaseError("所选模块缺少模型下载配方：" + ",".join(sorted(required - setting_keys)))
     return install
+
+
+def dependency_bytes(install: dict) -> int:
+    total = sum(item["size"] for item in install["python"] + install["native"])
+    if "go2" in install:
+        from scripts.go2_dependencies import source_records
+        total += sum(item["size"] for item in source_records(install["go2"]))
+    return total
 
 
 def copy_asset(source: Path, destination: Path) -> None:

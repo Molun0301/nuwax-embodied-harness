@@ -1,189 +1,192 @@
-name: NEH产品版本包
+name: NEH正式构建与发布
 
 on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]*']
+    paths: ['.github/release.json']
   workflow_dispatch:
     inputs:
       version:
-        description: 明确版本号；所有目标一次发布，不可覆盖既有版本
-        required: true
+        description: 留空使用.github/release.json中的版本
         type: string
+        required: false
       targets:
-        description: 逗号分隔目标:预设；例ubuntu24-x86_64:core,ubuntu24-aarch64:map2d；详见pipeline presets
-        required: true
+        description: 留空使用完整配置；覆盖时为逗号分隔目标:预设
         type: string
-        default: ubuntu24-x86_64:core
+        required: false
       channel:
         description: 发布渠道
         type: choice
-        options: [preview, stable]
-        default: preview
+        options: [configured, stable, preview]
+        default: configured
       publish:
-        description: 全部声明目标成功后一次发布到GitHub Release（版本发布页）
+        description: 所有目标通过后正式公开完整版本
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: product-release-${{ inputs.version }}
+  group: neh-product-release
   cancel-in-progress: false
+
+env:
+  PYTHONPATH: ''
+  PYTHONHOME: ''
+  PYTHONNOUSERSITE: '1'
+  LD_LIBRARY_PATH: ''
+  PKG_CONFIG_PATH: ''
+  CMAKE_PREFIX_PATH: ''
+  PIP_CONFIG_FILE: /dev/null
+  PIP_INDEX_URL: https://pypi.org/simple
+  PIP_EXTRA_INDEX_URL: ''
+  GIT_OPTIONAL_LOCKS: '0'
+  NEH_RELEASE_STREAM_LOG: '1'
 
 jobs:
   select:
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+      already_published: ${{ steps.plan.outputs.already_published }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - id: plan
-        name: 校验受控目标与完整模块预设
+        name: 固定版本和全部发布目标
         env:
-          RELEASE_VERSION: ${{ inputs.version }}
-          RELEASE_TARGETS: ${{ inputs.targets }}
+          GH_TOKEN: ${{ github.token }}
+        run: /usr/bin/python3 -m scripts.product_release.ci select --output "$RUNNER_TEMP/neh-plan/request.json"
+      - name: 源码准入检查
+        if: steps.plan.outputs.already_published != 'true'
         run: |
-          python3 - <<'PY'
-          import json, os, pathlib
-          from scripts.product_release.builder import write_json
-          from scripts.product_release.pipeline import make_plan
-          plan = make_plan(os.environ['RELEASE_VERSION'], os.environ['RELEASE_TARGETS'])
-          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'neh-plan/release-plan.json'
-          write_json(path, plan)
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write('matrix=' + json.dumps(plan['matrix'], separators=(',', ':')) + '\n')
-          print(json.dumps(plan, ensure_ascii=False, indent=2))
-          PY
+          bash scripts/ci/no_ros2_residual.sh
+          bash scripts/check_layering.sh
+          /usr/bin/python3 scripts/ci/check_pep604.py scripts/product_release scripts/device_manager scripts/neh_bootstrap.py
       - uses: actions/upload-artifact@v4
         with:
-          name: neh-release-plan
-          path: ${{ runner.temp }}/neh-plan/release-plan.json
+          name: neh-release-request
+          path: ${{ runner.temp }}/neh-plan/request.json
           if-no-files-found: error
 
   build:
     needs: select
+    if: needs.select.outputs.already_published != 'true'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: neh-release-plan
+          name: neh-release-request
           path: ${{ runner.temp }}/neh-plan
-      - uses: actions/setup-python@v5
-        if: matrix.robot != 'go2' && !contains(matrix.target, '-prepared')
-        with:
-          python-version: ${{ matrix.platform.python }}
-      - name: 安装托管构建机系统依赖
-        if: matrix.robot != 'go2' && !contains(matrix.target, '-prepared')
-        env:
-          RELEASE_MODULES: ${{ toJSON(matrix.modules) }}
+      - name: 为原生构建释放托管执行器空间
         run: |
+          # 仅作用于本次临时执行器；这些预装工具不参与NEH构建。
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h "$RUNNER_TEMP"
+      - name: 安装目标系统构建依赖
+        if: matrix.container == ''
+        env:
+          NEH_BUILD_GROUP: ${{ matrix.id }}
+        run: |
+          /usr/bin/python3 -m scripts.product_release.ci packages --request "$RUNNER_TEMP/neh-plan/request.json" --group "$NEH_BUILD_GROUP" > "$RUNNER_TEMP/neh-packages.txt"
           sudo apt-get update
-          python3 - <<'PY'
-          import json, os, subprocess
-          from scripts.module_installer.catalog import module_system_packages
-          packages = list(module_system_packages(json.loads(os.environ['RELEASE_MODULES'])))
-          packages = ['libglib2.0-0t64' if item == 'libglib2.0-0' else item for item in packages]
+          /usr/bin/python3 - <<'PY'
+          import os, pathlib, subprocess
+          packages = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'neh-packages.txt').read_text().split()
           subprocess.run(['sudo', 'apt-get', 'install', '-y', '--no-install-recommends', *packages], check=True)
           PY
-      - name: 构建轻量业务包并固定在线安装配方
-        id: build
+          /usr/bin/python3 --version
+          /usr/bin/python3 -m pip --version
+          rustup toolchain install 1.88.0 --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ${{ runner.temp }}/neh-cache/${{ matrix.id }}
+          key: neh-${{ runner.os }}-${{ runner.arch }}-${{ matrix.id }}-${{ hashFiles('requirements/**/*.in', 'services/**/Cargo.lock', 'services/**/flake.lock', 'scripts/module_installer/builds.py') }}
+          restore-keys: |
+            neh-${{ runner.os }}-${{ runner.arch }}-${{ matrix.id }}-
+      - id: compile
+        name: 在真实目标用户态编译程序并生成轻量包
         env:
-          RELEASE_TARGET_ID: ${{ matrix.id }}
-          # 专用构建机按此根目录/目标/预设准备install.json、models.json、constraints.txt和可选assets。
-          # dependency-cache只用于发布端校验，依赖和模型永不装入业务包。
-          NEH_RELEASE_INPUT_ROOT: ${{ vars.NEH_RELEASE_INPUT_ROOT }}
+          NEH_BUILD_GROUP: ${{ matrix.id }}
+          NEH_BUILD_CONTAINER: ${{ matrix.container }}
         run: |
-          python3 - <<'PY'
-          import os, pathlib
-          from scripts.product_release.pipeline import build_target, load_plan
-          temporary = pathlib.Path(os.environ['RUNNER_TEMP'])
-          plan = load_plan(temporary / 'neh-plan/release-plan.json')
-          inputs = os.environ.get('NEH_RELEASE_INPUT_ROOT')
-          output = temporary / ('neh-build-' + os.environ['RELEASE_TARGET_ID'])
-          build_target(plan, os.environ['RELEASE_TARGET_ID'], pathlib.Path.cwd(), output, input_root=pathlib.Path(inputs) if inputs else None)
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as handle:
-              handle.write('files<<NEH_FILES\n' + '\n'.join(str(path) for path in sorted(output.iterdir()) if path.is_file()) + '\nNEH_FILES\n')
-          PY
+          if [[ -n "$NEH_BUILD_CONTAINER" ]]; then
+            /usr/bin/python3 -m scripts.product_release.ci container --request "$RUNNER_TEMP/neh-plan/request.json" --group "$NEH_BUILD_GROUP" --output "$RUNNER_TEMP/neh-build-$NEH_BUILD_GROUP" --cache "$RUNNER_TEMP/neh-cache/$NEH_BUILD_GROUP"
+          else
+            /usr/bin/python3 -m scripts.product_release.ci build --request "$RUNNER_TEMP/neh-plan/request.json" --group "$NEH_BUILD_GROUP" --output "$RUNNER_TEMP/neh-build-$NEH_BUILD_GROUP" --cache "$RUNNER_TEMP/neh-cache/$NEH_BUILD_GROUP"
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: neh-build-${{ matrix.id }}
           path: |
-            ${{ steps.build.outputs.files }}
-            ${{ runner.temp }}/neh-build-${{ matrix.id }}/*.build/build.log
-            ${{ runner.temp }}/neh-build-${{ matrix.id }}/*.build/result.json
+            ${{ steps.compile.outputs.files }}
+            ${{ runner.temp }}/neh-build-${{ matrix.id }}.work/build.log
+            ${{ runner.temp }}/neh-build-${{ matrix.id }}.work/result.json
+            ${{ runner.temp }}/neh-build-${{ matrix.id }}.work/smoke/离线验证结果.json
+            ${{ runner.temp }}/neh-build-${{ matrix.id }}.work/go2-cache/verification.json
           if-no-files-found: warn
 
   assemble:
-    # 任意矩阵目标失败、取消或未完成，整个聚合任务不会运行。
     needs: [select, build]
+    if: needs.select.outputs.already_published != 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
       - uses: actions/download-artifact@v4
         with:
-          name: neh-release-plan
+          name: neh-release-request
           path: ${{ runner.temp }}/neh-plan
       - uses: actions/download-artifact@v4
         with:
           pattern: neh-build-*
           path: ${{ runner.temp }}/neh-downloads
           merge-multiple: false
-      - name: 按计划核对全部目标并一次生成目录和管理包
+      - name: 核对全部目标、独立依赖并合并历史目录
         env:
-          RELEASE_CHANNEL: ${{ inputs.channel }}
-          RELEASE_REPOSITORY: ${{ github.repository }}
-        run: |
-          python3 - <<'PY'
-          import os, pathlib
-          from scripts.product_release.pipeline import assemble_release, load_plan
-          temporary = pathlib.Path(os.environ['RUNNER_TEMP'])
-          plan = load_plan(temporary / 'neh-plan/release-plan.json')
-          assemble_release(plan, temporary / 'neh-downloads', temporary / 'neh-release', pathlib.Path.cwd(), base_url='https://github.com/' + os.environ['RELEASE_REPOSITORY'] + '/releases/download/v' + plan['version'], channel=os.environ['RELEASE_CHANNEL'])
-          PY
+          GH_TOKEN: ${{ github.token }}
+        run: /usr/bin/python3 -m scripts.product_release.ci assemble --request "$RUNNER_TEMP/neh-plan/request.json" --downloads "$RUNNER_TEMP/neh-downloads" --output "$RUNNER_TEMP/neh-release"
       - uses: actions/upload-artifact@v4
         with:
-          name: neh-release-${{ inputs.version }}
+          name: neh-release-${{ needs.select.outputs.version }}
           path: ${{ runner.temp }}/neh-release/*
           if-no-files-found: error
 
   publish:
-    if: inputs.publish
-    needs: assemble
+    needs: [select, assemble]
+    if: needs.select.outputs.publish == 'true' && needs.select.outputs.already_published != 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: neh-release-${{ inputs.version }}
-          path: release
-      - name: 一次发布所有声明目标和引导资产
+          name: neh-release-request
+          path: ${{ runner.temp }}/neh-plan
+      - uses: actions/download-artifact@v4
+        with:
+          name: neh-release-${{ needs.select.outputs.version }}
+          path: ${{ runner.temp }}/neh-release
+      - name: 先完整上传并校验草稿，再公开正式版本
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_REPOSITORY: ${{ github.repository }}
-          RELEASE_VERSION: ${{ inputs.version }}
-          RELEASE_REVISION: ${{ github.sha }}
-          RELEASE_CHANNEL: ${{ inputs.channel }}
-        run: |
-          python3 - <<'PY'
-          import os, pathlib, subprocess
-          files = [str(path) for path in pathlib.Path('release').iterdir() if path.is_file()]
-          command = ['gh', 'release', 'create', 'v' + os.environ['RELEASE_VERSION'], '--repo', os.environ['RELEASE_REPOSITORY'], '--target', os.environ['RELEASE_REVISION'], '--title', 'NEH ' + os.environ['RELEASE_VERSION'], '--notes', '全部目标的NEH轻量业务包、端侧管理包与在线安装下载配方；模型和第三方依赖由安装任务按固定来源取得。完整矩阵见release-plan.json，目标目录见catalog.json。']
-          if os.environ['RELEASE_CHANNEL'] == 'preview':
-              command.append('--prerelease')
-          subprocess.run(command + files, check=True)
-          PY
+        run: /usr/bin/python3 -m scripts.product_release.ci publish --request "$RUNNER_TEMP/neh-plan/request.json" --directory "$RUNNER_TEMP/neh-release"

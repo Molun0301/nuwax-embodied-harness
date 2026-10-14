@@ -1,5 +1,11 @@
-# Go2 SDK 和 CycloneDDS 只能从 third_party/python-source-artifacts.json 指定的
-# 已校验本地 wheel 安装，禁止公共 PyPI 回退和目标机临时源码构建。
+# 产品安装从go2-online-sources.json固定的官方源安装SDK与CycloneDDS。
+# DDS原生库直接使用宇树提供的对应架构文件，Python适配首次安装后在设备缓存。
+# 下面固定官方Python源码安装所需工具与接口依赖，不替换JetPack推理组件。
+setuptools==75.3.2
+wheel==0.45.1
+rich-click==1.8.9
+auditwheel==6.0.0
+patchelf==0.17.2.2
 
 # Go2 相机源头持续推流；API 契约固定到 2.2.0。
 unitree-webrtc-connect==2.2.0

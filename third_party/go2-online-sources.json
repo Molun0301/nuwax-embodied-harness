@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "id": "unitree-sdk2-python",
+      "version": "1.0.1",
+      "commit": "814556d15970dd2ecf1c9984e845ca02ab07e206",
+      "filename": "unitree-sdk2-python-814556d15970.tar.gz",
+      "url": "https://codeload.github.com/unitreerobotics/unitree_sdk2_python/tar.gz/814556d15970dd2ecf1c9984e845ca02ab07e206",
+      "size": 279420,
+      "sha256": "5224e774cf7a2ff784b957685225300f9e9627eb0b4fe5a76b8146a4fcbf4743"
+    },
+    {
+      "id": "unitree-dds-native",
+      "version": "0.10.2",
+      "commit": "63096d0ac0c5d2dec9d6e0c22cd5233410ca2f36",
+      "filename": "unitree-sdk2-63096d0ac0c5.tar.gz",
+      "url": "https://codeload.github.com/unitreerobotics/unitree_sdk2/tar.gz/63096d0ac0c5d2dec9d6e0c22cd5233410ca2f36",
+      "size": 16976609,
+      "sha256": "19dc9ec903e8716233a2c4e00c37ff2547fd32bf6357ed3c55eb2f1194cdf96d"
+    },
+    {
+      "id": "cyclonedds-python",
+      "version": "0.10.2",
+      "filename": "cyclonedds-0.10.2.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/62/88/4b440f5916976234838989c3214222a5abc6fd48009a992c4dc22a86c04f/cyclonedds-0.10.2.tar.gz",
+      "size": 156849,
+      "sha256": "f834962eabbdcdf4e9cd75cf87222f3c5ef22d9cb9e7ed651d9a8710fe984a30"
+    }
+  ]
+}

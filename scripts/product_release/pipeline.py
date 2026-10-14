@@ -9,17 +9,15 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from scripts.module_installer.catalog import resolve_modules
-from .builder import build_manager, build_runtime, create_catalog, write_json
+from scripts.module_installer.catalog import MODULES, module_requirements, module_system_packages, resolve_modules
+from .builder import Runner, build_manager, build_modules, build_runtime, create_catalog, native_runner, prepare_wheels, snapshot, write_json
 from .validation import ReleaseError, digest, host_platform, read_json, verify_archive
-from .recipes import copy_asset, relative_assets
+from .recipes import canonical_name, copy_asset, python_recipe, relative_assets
 
 TARGETS = {
     "ubuntu24-x86_64": {"runner": "ubuntu-24.04", "architecture": "x86_64", "python": "3.12", "os_versions": ["24.04"], "robot": "customrobot"},
     "ubuntu24-aarch64": {"runner": "ubuntu-24.04-arm", "architecture": "aarch64", "python": "3.12", "os_versions": ["24.04"], "robot": "customrobot"},
-    "ubuntu24-x86_64-prepared": {"runner": ["self-hosted", "linux", "X64", "neh-linux-build"], "architecture": "x86_64", "python": "3.12", "os_versions": ["24.04"], "robot": "customrobot"},
-    "ubuntu24-aarch64-prepared": {"runner": ["self-hosted", "linux", "ARM64", "neh-linux-build"], "architecture": "aarch64", "python": "3.12", "os_versions": ["24.04"], "robot": "customrobot"},
-    "go2-jetson": {"runner": ["self-hosted", "linux", "ARM64", "neh-go2-build"], "architecture": "aarch64", "python": "3.8", "os_versions": ["20.04"], "robot": "go2"},
+    "go2-jetson": {"runner": "ubuntu-24.04-arm", "architecture": "aarch64", "python": "3.8", "os_versions": ["20.04"], "robot": "go2", "container": "go2-ubuntu20"},
 }
 PRESETS = {
     "core": ("core",),
@@ -40,6 +38,95 @@ PRESETS = {
     "full-fastlio2": ("fastlio2", "follow", "memory"),
     "full-pointlio": ("pointlio", "follow", "memory"),
 }
+
+
+def build_groups(entries: list) -> list:
+    """同一架构的轻量模块共用编译；最终模块选择仍分别执行互斥校验。"""
+    groups = []
+    for entry in entries:
+        isolated = bool(set(entry["modules"]) & {"perception", "memory"})
+        dependencies = module_requirements(entry["modules"], entry["robot"])
+        group = next((item for item in groups if not isolated and item["shared"] and item["target"] == entry["target"] and tuple(item["requirements"]) == dependencies), None)
+        if group is None:
+            group = {"id": entry["target"] + "--build-" + str(len(groups) + 1), "target": entry["target"], "runner": entry["runner"], "platform": entry["platform"], "robot": entry["robot"], "entries": [], "modules": [], "requirements": list(dependencies), "shared": not isolated, "container": entry.get("container", "")}
+            groups.append(group)
+        group["entries"].append(entry["id"])
+        selected = set(group["modules"]) | set(entry["modules"])
+        group["modules"] = [key for key in MODULES if key in selected]
+    return groups
+
+
+def group_system_packages(plan: dict, group_id: str) -> list:
+    group = next((item for item in plan["build_matrix"]["include"] if item["id"] == group_id), None)
+    if group is None:
+        raise ReleaseError("构建计划没有该组：" + group_id)
+    entries = [entry for entry in plan["matrix"]["include"] if entry["id"] in group["entries"]]
+    packages = {package for entry in entries for package in module_system_packages(entry["modules"], entry["robot"])}
+    packages.update({"python3-setuptools", "python3-wheel", "libclang-dev", "libboost-all-dev", "libeigen3-dev", "git", "curl", "binutils"})
+    return sorted("libglib2.0-0t64" if name == "libglib2.0-0" and group["platform"]["os_versions"] == ["24.04"] else name for name in packages)
+
+
+def build_group(plan: dict, group_id: str, root: Path, output: Path, *, jobs: int = 2, input_root: Optional[Path] = None, cache: Optional[Path] = None) -> list:
+    group = next((item for item in plan["build_matrix"]["include"] if item["id"] == group_id), None)
+    if group is None:
+        raise ReleaseError("构建计划没有该组：" + group_id)
+    actual = host_platform()
+    if any(actual.get(key) != value for key, value in group["platform"].items()):
+        raise ReleaseError("真实系统/架构/解释器与构建组不符")
+    entries = [entry for entry in plan["matrix"]["include"] if entry["id"] in group["entries"]]
+    if not group["shared"]:
+        return [build_target(plan, entry["id"], root, output / entry["id"], input_root=input_root) for entry in entries]
+    work = output.with_name(output.name + ".work")
+    if output.exists() or work.exists():
+        raise ReleaseError("构建组输出已存在，禁止覆盖")
+    work.mkdir(parents=True)
+    output.mkdir(parents=True)
+    run = Runner(work / "build.log")
+    frozen = work / "source"
+    snapshot(root, frozen, workspace=False)
+    dependency_stage = work / "dependencies"
+    dependency_stage.mkdir()
+    common_modules = resolve_modules(set(group["modules"]) - {"fastlio2", "pointlio", "slam2d"})
+    if any(module_requirements(entry["modules"], entry["robot"]) != module_requirements(common_modules, group["robot"]) for entry in entries):
+        raise ReleaseError("构建组的Python依赖并不相同，必须拆组")
+    records = prepare_wheels(frozen, dependency_stage, work, common_modules, group["robot"], run, None, None)
+    assets = work / "assets"
+    assets.mkdir()
+    registry = json.loads((frozen / "third_party/python-source-artifacts.json").read_text(encoding="utf-8"))
+    approved = {canonical_name(item["distribution"]): item for item in registry["artifacts"]}
+    python, origins = python_recipe(records, dependency_stage / "wheelhouse", assets, approved_sources=approved)
+    install = work / "install.json"
+    install_data = {"python": python, "native": [], "models": []}
+    if group["robot"] == "go2":
+        from scripts.go2_dependencies import load_recipe
+        install_data["go2"] = load_recipe(frozen)
+    write_json(install, install_data)
+    native = work / "native"
+    compiler_cache = cache or work / "cache"
+    compiler = native_runner(run, work / "verification/venv", jobs) if "geometry" in group["modules"] else run
+    # 双前端互斥是安装规则；构建组分别编译它们，随后按各自清单打包。
+    for frontend in ("pointlio", "fastlio2"):
+        if frontend in group["modules"]:
+            build_modules(frozen, native, compiler_cache, (frontend,), jobs, compiler)
+    rust_modules = set(group["modules"]) - {"pointlio", "fastlio2"}
+    build_modules(frozen, native, compiler_cache, rust_modules, jobs, compiler)
+    if "slam2d" in rust_modules and any("geometry" in entry["modules"] and "slam2d" not in entry["modules"] for entry in entries):
+        build_modules(frozen, native, compiler_cache, ("geometry",), jobs, compiler)
+    smoke = frozen / "scripts/diagnostics/offline_platform_smoke.py"
+    if smoke.is_file():
+        run([str(work / "verification/venv/bin/python"), str(smoke), "--output-dir", str(work / "smoke")], cwd=frozen)
+    result = []
+    for entry in entries:
+        destination = output / entry["id"]
+        destination.mkdir()
+        archive = destination / entry["filename"]
+        manifest = build_runtime(root, archive, version=plan["version"], modules=entry["modules"], robot=entry["robot"], payload=native, wheelhouse=assets, install_recipe=install)
+        write_json(archive.with_name(archive.name + ".dependency-origins.json"), {"version": plan["version"], "python": origins, "native": manifest["install"]["native"]})
+        receipt = {"schema_version": 1, "target_id": entry["id"], "version": manifest["version"], "revision": manifest["revision"], "filename": archive.name, "sha256": digest(archive), "size": archive.stat().st_size, "assets": relative_assets(manifest["install"])}
+        write_json(destination / "receipt.json", receipt)
+        result.append(receipt)
+    write_json(work / "result.json", {"status": "succeeded", "targets": [entry["target_id"] for entry in result]})
+    return result
 
 
 def make_plan(version: str, targets: str) -> dict:
@@ -66,9 +153,9 @@ def make_plan(version: str, targets: str) -> dict:
             "id": key, "target": target_name, "preset": preset, "runner": target["runner"],
             "robot": target["robot"], "modules": modules,
             "platform": {"system": "linux", "architecture": target["architecture"], "python": target["python"], "os_ids": ["ubuntu"], "os_versions": target["os_versions"]},
-            "filename": "neh-" + version + "-" + key + ".tar.gz",
+            "filename": "neh-" + version + "-" + key + ".tar.gz", "container": target.get("container", ""),
         })
-    return {"schema_version": 1, "product": "neh", "version": version, "requests": requests, "matrix": {"include": matrix}}
+    return {"schema_version": 1, "product": "neh", "version": version, "requests": requests, "matrix": {"include": matrix}, "build_matrix": {"include": build_groups(matrix)}}
 
 
 def load_plan(path: Path) -> dict:
@@ -97,8 +184,6 @@ def build_target(plan: dict, target_id: str, root: Path, output: Path, *, input_
         wheels = inputs / "assets"
     constraints = inputs / "constraints.txt" if inputs and (inputs / "constraints.txt").is_file() else None
     models = inputs / "models.json" if inputs and (inputs / "models.json").is_file() else None
-    if entry["robot"] == "go2" and wheels is None and recipe is None:
-        raise ReleaseError("Go2目标缺少已批准固定下载配方；请准备NEH_RELEASE_INPUT_ROOT/目标/预设/install.json")
     output.mkdir(parents=True, exist_ok=True)
     archive = output / entry["filename"]
     manifest = build_runtime(root, archive, version=plan["version"], modules=entry["modules"], robot=entry["robot"], wheelhouse=wheels, constraints=constraints, install_recipe=recipe, model_recipe=models)
@@ -143,7 +228,7 @@ def collect_artifacts(plan: dict, downloads: Path, *, revision: str) -> list:
     return collected
 
 
-def assemble_release(plan: dict, downloads: Path, output: Path, root: Path, *, base_url: str, channel: str) -> dict:
+def assemble_release(plan: dict, downloads: Path, output: Path, root: Path, *, base_url: str, channel: str, previous: Optional[Path] = None, notes: str = "") -> dict:
     revision = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     archives = collect_artifacts(plan, downloads, revision=revision)
     if output.exists():
@@ -168,7 +253,7 @@ def assemble_release(plan: dict, downloads: Path, output: Path, root: Path, *, b
         if source.is_symlink() or not source.is_file():
             raise ReleaseError("发布缺少引导入口：" + source_name)
         shutil.copyfile(source, output / target_name)
-    catalog = create_catalog(copied, output / "catalog.json", manager=manager, base_url=base_url, channel=channel)
+    catalog = create_catalog(copied, output / "catalog.json", manager=manager, base_url=base_url, channel=channel, previous=previous, notes=notes)
     write_json(output / "release-plan.json", plan)
     assets = list(output.iterdir())
     if len(assets) + 1 > 1000 or any(path.stat().st_size >= 2 * 1024 ** 3 for path in assets if path.is_file()):

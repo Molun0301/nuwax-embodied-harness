@@ -8,11 +8,17 @@ import shutil
 import urllib.parse
 from pathlib import Path, PurePosixPath
 
-from .common import ManagerError, atomic_json, digest_file, read_json
+from .common import ManagerError, atomic_json, digest_file
 from .releases import MAX_DOWNLOAD, download, validate_url
 
 MODEL_SETTINGS = {"NUWAX_PERCEPTION_YOLO_WORLD_MODEL", "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL",
                   "NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL", "NUWAX_MEMORY_EMBEDDING_MODEL"}
+
+
+def uses_default_model(value):
+    """与共同安装器保持一致：词法模式及旧占位符都不是用户模型路径。"""
+    value = str(value).strip().lower()
+    return value in {"", "lexical-only", "lexical_only", "disabled"} or value.startswith("hashing")
 
 
 def safe_relative(value, allow_dot=False):
@@ -63,7 +69,7 @@ def materialize_cached(source, destination, mode=0o600):
 
 def normalize_recipe(manifest, artifact_url):
     recipe = manifest.get("install")
-    if not isinstance(recipe, dict) or set(recipe) - {"python", "native", "models"}:
+    if not isinstance(recipe, dict) or set(recipe) - {"python", "native", "models", "go2"}:
         raise ManagerError("download_recipe_invalid", "业务包缺少受支持的在线安装配方。")
     recipe = json.loads(json.dumps(recipe))
     for key in ("python", "native", "models"):
@@ -118,6 +124,12 @@ def normalize_recipe(manifest, artifact_url):
     for record in recipe["python"] + recipe["native"] + [item for model in recipe["models"] for item in model["files"]]:
         record["url"] = urllib.parse.urljoin(artifact_url, record.get("url", ""))
         validate_download(record)
+    if "go2" in recipe:
+        from scripts.go2_dependencies import validate_recipe
+        try:
+            validate_recipe(recipe["go2"])
+        except ValueError as exc:
+            raise ManagerError("download_recipe_invalid", str(exc)) from exc
     return recipe
 
 
@@ -180,7 +192,11 @@ def validate_model_entry(key, path):
 def prepare_dependencies(engine, candidate, manifest, artifact, existing, job):
     recipe = normalize_recipe(manifest, artifact["url"])
     check_requirements((candidate / "requirements.txt").read_text(), recipe)
-    dependency_bytes = sum(item["size"] for item in recipe["python"] + recipe["native"])
+    go2_sources = []
+    if "go2" in recipe:
+        from scripts.go2_dependencies import source_records
+        go2_sources = source_records(recipe["go2"])
+    dependency_bytes = sum(item["size"] for item in recipe["python"] + recipe["native"] + go2_sources)
     model_bytes = sum(item["size"] for model in recipe["models"] for item in model["files"])
     if ("dependency_bytes" in artifact and artifact["dependency_bytes"] != dependency_bytes) or ("model_bytes" in artifact and artifact["model_bytes"] != model_bytes):
         raise ManagerError("recipe_size_mismatch", "下载配方总量与已确认的版本目录不一致。")
@@ -211,12 +227,14 @@ def prepare_dependencies(engine, candidate, manifest, artifact, existing, job):
         if target.exists():
             raise ManagerError("native_conflict", "第三方依赖与自有发布文件冲突。")
         materialize_cached(fetch(record, "运行库 " + record["name"]), target, 0o644)
+    for record in go2_sources:
+        fetch(record, "Go2官方依赖 " + record["id"] + " " + record["version"], record["filename"])
     overrides = {}
     for model in recipe["models"]:
         preserved = {}
         for key, entry in model["settings"].items():
             value = existing.get(key, "").strip()
-            if not value or value in ("hashing-v1", "disabled"):
+            if uses_default_model(value):
                 continue
             path = Path(value)
             if not path.is_absolute() and engine.current():
@@ -271,7 +289,7 @@ def prepare_dependencies(engine, candidate, manifest, artifact, existing, job):
                 raise ManagerError("model_entry_missing", "模型配方声明的入口文件不存在。")
             validate_model_entry(key, path)
             overrides[key] = str(path)
-    if "perception" in manifest["modules"] and not ("NUWAX_PERCEPTION_YOLO_WORLD_MODEL" in overrides):
+    if "perception" in manifest["modules"] and "NUWAX_PERCEPTION_YOLO_WORLD_MODEL" not in overrides:
         raise ManagerError("model_missing", "视觉模块缺少模型下载或明确自定义入口。")
     if "memory" in manifest["modules"] and not {"NUWAX_MEMORY_TEXT_EMBEDDING_MODEL", "NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL"}.issubset(overrides):
         raise ManagerError("model_missing", "记忆模块缺少文本或图像模型配方。")
@@ -279,12 +297,12 @@ def prepare_dependencies(engine, candidate, manifest, artifact, existing, job):
 
 
 def apply_model_overrides(existing, overrides):
-    """重新启用记忆模型时让原安装器恢复模型维度，不沿用停用时的哈希向量维度。"""
+    """重新启用记忆模型时让原安装器恢复模型维度，不沿用停用时的占位维度。"""
     existing = dict(existing)
     for kind in ("TEXT", "IMAGE"):
         key = "NUWAX_MEMORY_" + kind + "_EMBEDDING_MODEL"
         dimension = "NUWAX_MEMORY_" + kind + "_EMBEDDING_DIM"
-        if key in overrides and existing.get(key, "") in ("", "hashing-v1", "disabled"):
+        if key in overrides and uses_default_model(existing.get(key, "")):
             remembered = existing.get("_NUWAX_INSTALLER_SAVED_" + dimension, "")
             if remembered:
                 existing[dimension] = remembered

@@ -1,7 +1,6 @@
 """沿原网关拥有方管理进程；配置通过当前版本的共同实现读写。"""
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 import re
@@ -27,9 +26,7 @@ if request["operation"] == "runtime":
     result = {"ok": True}
 else:
     from core import config_io
-    if request["operation"] == "get":
-        result = config_io.build_schema()
-    elif request["operation"] in ("validate", "validate_existing", "normalize_profile"):
+    if request["operation"] in ("validate", "validate_existing", "normalize_profile"):
         from core.config_registry import get_field
         values = {}
         for key, value in request["values"].items():
@@ -57,7 +54,7 @@ else:
             values[key] = normalized
         result = values
     else:
-        result = asdict(config_io.save_values(request["values"], expected_revision=request.get("revision")))
+        raise ValueError("配置读写必须使用受管配置拥有方")
 print("NEH_RESULT=" + json.dumps(result, ensure_ascii=False))
 '''
 

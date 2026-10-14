@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path, PurePosixPath
 
-from .common import ManagerError, digest_file, identifier
+from .common import ManagerError, identifier
 
 MAX_DOWNLOAD = 32 * 1024 ** 3
 MAX_EXTRACTED = 40 * 1024 ** 3

@@ -19,7 +19,7 @@ from typing import Optional
 from scripts.module_installer.builds import build_modules
 from scripts.module_installer.catalog import module_imports, module_requirements, resolve_modules
 from .validation import ReleaseError, digest, elf_architecture, elf_interpreter, host_platform, safe_path, validate_platform, verify_archive
-from .recipes import canonical_name, copy_asset, python_recipe, relative_assets, validate_install
+from .recipes import canonical_name, copy_asset, dependency_bytes, python_recipe, relative_assets, validate_install
 
 _REQUIRED_SOURCE = (
     "scripts/start_gateway.sh", "scripts/module_installer/runtime.py", "scripts/module_installer/catalog.py",
@@ -51,9 +51,34 @@ class Runner:
         with self.path.open("a", encoding="utf-8") as log:
             log.write("\n运行：" + " ".join(str(arg) for arg in argv) + "\n")
             log.flush()
-            result = subprocess.run([str(arg) for arg in argv], cwd=cwd, env=environment, stdout=log, stderr=subprocess.STDOUT, check=False)
+            if os.environ.get("NEH_RELEASE_STREAM_LOG") == "1":
+                process = subprocess.Popen([str(arg) for arg in argv], cwd=cwd, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+                for line in process.stdout:
+                    log.write(line)
+                    print(line, end="", flush=True)
+                returncode = process.wait()
+            else:
+                result = subprocess.run([str(arg) for arg in argv], cwd=cwd, env=environment, stdout=log, stderr=subprocess.STDOUT, check=False)
+                returncode = result.returncode
+        if returncode:
+            raise ReleaseError("构建命令退出码%s，详细原因保留于%s" % (returncode, self.path))
+
+    def capture(self, argv, *, cwd=None, environment=None, timeout=1800, cancelled=None):
+        """适配共享安装器需要的stdout返回值，保留真实失败日志。"""
+        env = {**os.environ, **(environment or {})}
+        env.pop("PYTHONPATH", None)
+        env.pop("PYTHONHOME", None)
+        env["PYTHONNOUSERSITE"] = "1"
+        if cancelled:
+            cancelled()
+        result = subprocess.run([str(arg) for arg in argv], cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        with self.path.open("a", encoding="utf-8") as log:
+            log.write("\n共享安装步骤：" + " ".join(str(arg) for arg in argv) + "\n" + result.stdout)
+        if os.environ.get("NEH_RELEASE_STREAM_LOG") == "1":
+            print(result.stdout, end="", flush=True)
         if result.returncode:
-            raise ReleaseError("构建命令退出码%s，详细原因保留于%s" % (result.returncode, self.path))
+            raise ReleaseError("官方依赖安装失败，退出码%s；原因保留于%s" % (result.returncode, self.path))
+        return result.stdout
 
 
 def _git(root: Path, *args: str) -> bytes:
@@ -186,7 +211,10 @@ def wheel_records(directory: Path) -> list:
 
 
 def _vendor_gate(root: Path, modules: tuple, robot: str, wheelhouse: Optional[Path]) -> None:
-    needed = ({"unitree-sdk2py", "cyclonedds"} if robot == "go2" else set()) | ({"clip"} if "perception" in modules else set())
+    if robot == "go2":
+        from scripts.go2_dependencies import load_recipe
+        load_recipe(root)
+    needed = {"clip"} if "perception" in modules else set()
     if not needed:
         return
     data = json.loads((root / "third_party/python-source-artifacts.json").read_text(encoding="utf-8"))
@@ -209,6 +237,51 @@ def _vendor_gate(root: Path, modules: tuple, robot: str, wheelhouse: Optional[Pa
             raise ReleaseError("已提供%s轮子不符合批准的摘要" % name)
 
 
+def _verify_go2_dependencies(root: Path, prefix: Path, cache: Path, run: Runner) -> None:
+    """按设备相同路径验证官方下载安装，生成的本机适配缓存绝不发布。"""
+    import time
+    import urllib.request
+    from scripts.go2_dependencies import install, load_recipe
+    recipe = load_recipe(root)
+    def fetch(record):
+        destination = cache / "downloads" / record["sha256"] / record["filename"]
+        if destination.is_file() and destination.stat().st_size == record["size"] and digest(destination) == record["sha256"]:
+            return destination
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(destination.name + ".partial")
+        for attempt in range(3):
+            try:
+                count = 0
+                with urllib.request.urlopen(record["url"], timeout=60) as response, temporary.open("wb") as output:
+                    if not response.geturl().startswith("https://"):
+                        raise ReleaseError("官方依赖下载不能降级到HTTP")
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        count += len(chunk)
+                        if count > record["size"]:
+                            raise ReleaseError("官方依赖下载超过声明大小")
+                        output.write(chunk)
+                if count != record["size"] or digest(temporary) != record["sha256"]:
+                    raise ReleaseError("官方依赖下载摘要不符")
+                temporary.replace(destination)
+                return destination
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                if attempt == 2:
+                    raise
+                time.sleep(attempt + 1)
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    environment.pop("PYTHONHOME", None)
+    first = install(prefix, cache / "adaptations", recipe, fetch=fetch, run=run.capture, environment=environment, progress=lambda message: print(message, flush=True))
+    second = install(prefix, cache / "adaptations", recipe, fetch=fetch, run=run.capture, environment=environment, progress=lambda message: print(message, flush=True))
+    if not second["reused"]:
+        raise ReleaseError("Go2官方依赖的二次安装未复用已核验缓存")
+    write_json(cache / "verification.json", {"first": first, "second": second})
+
+
 def prepare_wheels(root: Path, stage: Path, work: Path, modules: tuple, robot: str, run: Runner, wheelhouse: Optional[Path], constraints: Optional[Path]) -> list:
     _vendor_gate(root, modules, robot, wheelhouse)
     destination = stage / "wheelhouse"
@@ -223,7 +296,7 @@ def prepare_wheels(root: Path, stage: Path, work: Path, modules: tuple, robot: s
         copy_tree(wheelhouse, destination)
     else:
         destination.mkdir()
-        command = [sys.executable, "-m", "pip", "wheel", "--disable-pip-version-check", "--wheel-dir", str(destination)]
+        command = [sys.executable, "-m", "pip", "wheel", "--disable-pip-version-check", "--wheel-dir", str(destination), "pip==25.0.1"]
         for recipe in module_requirements(modules, robot):
             command.extend(["-r", str(root / recipe)])
         if constraints:
@@ -232,10 +305,16 @@ def prepare_wheels(root: Path, stage: Path, work: Path, modules: tuple, robot: s
     records = wheel_records(destination)
     requirements = "".join("%s==%s\n" % (item["name"], item["version"]) for item in records)
     (stage / "requirements.txt").write_text(requirements, encoding="utf-8")
-    verify_env = work / "verify-venv"
+    verify_env = work / "verification/venv"
     run([sys.executable, "-m", "venv", str(verify_env)])
     python = str(verify_env / "bin/python")
+    # 先升级安装器再解析其余轮子，避免Python3.8默认pip拒绝PEP600平台标签。
+    installer = next((item for item in records if canonical_name(item["name"]) == "pip"), None)
+    if installer:
+        run([python, "-m", "pip", "install", "--disable-pip-version-check", "--no-index", "--no-deps", str(destination / installer["filename"])])
     run([python, "-m", "pip", "install", "--disable-pip-version-check", "--no-index", "--only-binary=:all:", "--find-links", str(destination), "-r", str(stage / "requirements.txt")])
+    if robot == "go2":
+        _verify_go2_dependencies(root, work / "verification", work / "go2-cache", run)
     run([python, "-m", "pip", "check"])
     recipes = [str(root / path) for path in module_requirements(modules, robot)]
     if constraints:
@@ -260,6 +339,21 @@ for filename in %r:
     run([python, "-c", check])
     run([python, "-c", "import importlib; [importlib.import_module(n) for n in " + repr(list(module_imports(modules, robot))) + "]"])
     return records
+
+
+def native_runner(run: Runner, venv: Path, jobs: int):
+    """原生协议生成器复用已核验的LCM轮子，避免系统包的旧版本改变线协议。"""
+    generator = venv / "bin/lcm-gen"
+    if not generator.is_file():
+        raise ReleaseError("已验证依赖中缺少lcm-gen，无法构建固定版本的原生协议")
+    version = subprocess.check_output([str(generator), "--version"], text=True).strip()
+    if version != "lcm-gen 1.5.2":
+        raise ReleaseError("发布构建需要lcm-gen 1.5.2，实际为：" + version)
+
+    def invoke(argv, *, cwd=None, env=None):
+        run(argv, cwd=cwd, env={**(env or {}), "LCM_GEN_EXECUTABLE": str(generator), "CMAKE_BUILD_PARALLEL_LEVEL": str(jobs)})
+
+    return invoke
 
 
 def native_closure(payload: Path, modules: tuple, architecture: str, run: Runner) -> list:
@@ -404,7 +498,14 @@ def _check_python_recipe(root: Path, modules: tuple, robot: str, install: dict, 
             raise ReleaseError("下载轮子的解释器/架构标签不兼容：" + item["filename"])
     if set(modules) & {"perception", "memory"} and not {"torch", "torchvision"}.issubset(available):
         raise ReleaseError("模型模块配方必须固定torch与torchvision精确版本")
-    required_vendor = ({"unitree-sdk2py", "cyclonedds"} if robot == "go2" else set()) | ({"clip"} if "perception" in modules else set())
+    if robot == "go2":
+        from scripts.go2_dependencies import load_recipe, validate_recipe
+        if install.get("go2") != load_recipe(root):
+            raise ReleaseError("Go2官方安装配方与本次源码注册表不一致")
+        validate_recipe(install["go2"])
+        if set(available) & {"unitree-sdk2py", "cyclonedds"}:
+            raise ReleaseError("Go2设备依赖应按官方来源安装，不能发布自建厂商轮子")
+    required_vendor = {"clip"} if "perception" in modules else set()
     if required_vendor:
         registry = json.loads((root / "third_party/python-source-artifacts.json").read_text(encoding="utf-8"))
         for name in required_vendor:
@@ -505,6 +606,9 @@ def build_runtime(root: Path, output: Path, *, version: str, modules, robot: str
             approved = {canonical_name(item["distribution"]): item for item in registry["artifacts"]}
             python, origins = python_recipe(records, dependency_stage / "wheelhouse", output.parent, local_assets=local_dependencies, approved_sources=approved)
             install = {"python": python, "native": [], "models": []}
+            if robot == "go2":
+                from scripts.go2_dependencies import load_recipe
+                install["go2"] = load_recipe(frozen)
         if model_recipe:
             install["models"] = json.loads(model_recipe.read_text(encoding="utf-8"))
         validate_install(install, selected)
@@ -512,7 +616,8 @@ def build_runtime(root: Path, output: Path, *, version: str, modules, robot: str
         (stage / "requirements.txt").write_text("".join("%s==%s\n" % (item["name"], item["version"]) for item in install["python"]), encoding="utf-8")
         build_prefix = payload.resolve() if payload else work / "native-build"
         if payload is None:
-            build_modules(frozen, build_prefix, work / "cache", selected, jobs, run)
+            compiler = native_runner(run, work / "verification/venv", jobs) if "geometry" in selected and not install_recipe else run
+            build_modules(frozen, build_prefix, work / "cache", selected, jobs, compiler)
         own = _own_payload(build_prefix, stage / "payload", selected, target["architecture"], output.parent, install["native"])
         validate_install(install, selected)
         # 显式配方的同级资产必须已提供并匹配；不会在发布中偷偷缺少文件。
@@ -529,13 +634,13 @@ def build_runtime(root: Path, output: Path, *, version: str, modules, robot: str
         if "pointlio" in selected:
             system_packages.append("libgoogle-glog-dev")
         if robot == "go2":
-            system_packages.append("python3-pyaudio")
+            system_packages += ["python3-pyaudio", "python3-dev", "build-essential"]
         manifest = pack(stage, output, {"schema_version": 2, "product": "neh", "version": version, **provenance, "platform": target, "robot": robot, "modules": list(selected), "data_schema": 1, "system_packages": system_packages, "install": install, "own_native": own})
         write_json(output.with_name(output.name + ".manifest.json"), manifest)
         write_json(output.with_name(output.name + ".dependency-origins.json"), {"version": version, "python": origins, "native": install["native"]})
-        write_json(work / "result.json", {"status": "succeeded", "output": str(output), "sha256": digest(output), "size": output.stat().st_size, "dependency_bytes": sum(item["size"] for item in install["python"] + install["native"]), "model_bytes": sum(item["size"] for model in install["models"] for item in model["files"])})
+        write_json(work / "result.json", {"status": "succeeded", "output": str(output), "sha256": digest(output), "size": output.stat().st_size, "dependency_bytes": dependency_bytes(install), "model_bytes": sum(item["size"] for model in install["models"] for item in model["files"])})
         shutil.rmtree(stage)
-        for name in ("verify-venv", "dependency-preparation"):
+        for name in ("verify-venv", "verification", "dependency-preparation"):
             if (work / name).exists():
                 shutil.rmtree(work / name)
         return manifest
@@ -563,10 +668,10 @@ def build_manager(root: Path, output: Path, *, version: str, workspace: bool = F
             for path in sorted(source.rglob("*")):
                 if path.is_file() and source_allowed(path.relative_to(root).as_posix()):
                     _copy_regular(path, stage / path.relative_to(root))
-        for relative in ("scripts/module_installer/__init__.py", "scripts/module_installer/catalog.py", "scripts/module_installer/hardware.py", "scripts/module_installer/runtime.py", "scripts/__init__.py", "core/config_values.py", "core/config_catalog.json", "core/config_descriptions.json", "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py", "scripts/systemd/check_lcm_multicast.sh"):
+        for relative in ("scripts/module_installer/__init__.py", "scripts/module_installer/catalog.py", "scripts/module_installer/hardware.py", "scripts/module_installer/runtime.py", "scripts/__init__.py", "core/config_values.py", "core/config_catalog.json", "core/config_descriptions.json", "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py", "scripts/go2_dependencies.py", "scripts/systemd/check_lcm_multicast.sh"):
             if (root / relative).is_file():
                 _copy_regular(root / relative, stage / relative)
-        for relative in ("scripts/device_manager/__main__.py", "scripts/device_manager/static/index.html", "scripts/module_installer/catalog.py", "core/config_values.py", "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py", "scripts/systemd/check_lcm_multicast.sh"):
+        for relative in ("scripts/device_manager/__main__.py", "scripts/device_manager/static/index.html", "scripts/module_installer/catalog.py", "core/config_values.py", "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py", "scripts/go2_dependencies.py", "scripts/systemd/check_lcm_multicast.sh"):
             if not (stage / relative).is_file():
                 raise ReleaseError("管理包缺少运行文件：" + relative)
         initializer = stage / "scripts/device_manager/__init__.py"
@@ -613,7 +718,7 @@ def create_catalog(archives: list, output: Path, *, base_url: str, channel: str 
         if release["revision"] != manifest["revision"]:
             raise ReleaseError("同一发布版本不能混用不同源码修订")
         install = manifest["install"]
-        artifact = {"kind": "runtime", "url": base_url.rstrip("/") + "/" + quote(archive.name), "sha256": digest(archive), "size": archive.stat().st_size, "platform": manifest["platform"], "robot": manifest["robot"], "modules": manifest["modules"], "dependency_bytes": sum(item["size"] for item in install["python"] + install["native"]), "model_bytes": sum(item["size"] for model in install["models"] for item in model["files"])}
+        artifact = {"kind": "runtime", "url": base_url.rstrip("/") + "/" + quote(archive.name), "sha256": digest(archive), "size": archive.stat().st_size, "platform": manifest["platform"], "robot": manifest["robot"], "modules": manifest["modules"], "dependency_bytes": dependency_bytes(install), "model_bytes": sum(item["size"] for model in install["models"] for item in model["files"])}
         if any(all(entry.get(key) == artifact[key] for key in ("platform", "robot", "modules")) for entry in release["artifacts"]):
             raise ReleaseError("该版本已有相同目标及模块集合，禁止覆盖")
         release["artifacts"].append(artifact)

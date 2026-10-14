@@ -197,6 +197,8 @@ def verify_archive(path: Path, *, manifest_name: str = "manifest.json", max_byte
                 if any(PurePosixPath(name).parts[0] not in ("source", "payload", "requirements.txt") for name in actual):
                     raise ReleaseError("业务归档包含契约之外的文件")
                 validate_install(manifest.get("install"), modules)
+                if (manifest["robot"] == "go2") != ("go2" in manifest["install"]):
+                    raise ReleaseError("Go2机器人身份与官方安装配方不一致")
                 for name in actual:
                     path_name = PurePosixPath(name)
                     if name.startswith("source/") and (path_name.name.lower().endswith((".whl", ".download", ".deb", ".rpm", ".pt", ".pth", ".onnx", ".safetensors", ".gguf", ".ckpt", ".h5", ".hdf5", ".engine", ".trt", ".bin", ".dll", ".dylib", ".a", ".o")) or re.search(r"\.so(?:\.\d+)*$", path_name.name.lower())):

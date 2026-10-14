@@ -190,7 +190,10 @@ def main(argv=None):
         elif command == "config":
             if args.file or args.set:
                 request = load_file(args.file) if args.file else {"values": dict(args.set or [])}
-                result = engine.save_config(request.get("values", request), request.get("revision", args.revision))
+                revision = request.get("revision", args.revision)
+                if revision is None:
+                    revision = engine.config().get("revision")
+                result = engine.save_config(request.get("values", request), revision)
             else:
                 result = engine.config()
         elif command == "wizard":

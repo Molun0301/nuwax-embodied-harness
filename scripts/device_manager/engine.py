@@ -11,7 +11,6 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import asdict
 from pathlib import Path
 
 from scripts.module_installer.catalog import MODULES, ModuleError, resolve_modules
@@ -19,6 +18,7 @@ from scripts.module_installer.hardware import detect_hardware, recommend_modules
 from scripts.module_installer.runtime import read_existing, read_settings, _VALUES
 
 from . import MANAGER_DEVELOPMENT, MANAGER_VERSION, PACKAGE_ROOT
+from .config_client import ConfigurationClient
 from .common import (ManagerError, compare_versions, atomic_json, atomic_write, digest_file, file_lock,
                      fsync_directory, identifier, process_alive, process_identity, read_json, timestamp)
 from .releases import download, github_catalog_url, load_catalog, platform_issues, unpack, validate_url
@@ -51,6 +51,7 @@ class Engine:
         except FileExistsError:
             pass
         self.instance_id = identity.read_text().strip()
+        self.configuration = ConfigurationClient(self.home, self.instance_id)
 
     def settings(self):
         settings = dict(feed_url="", channel="stable", auto_start=True, gateway_port=8766)
@@ -89,7 +90,6 @@ class Engine:
             atomic_json(self.home / "config/credentials.json", {"token": value.strip(), "origin": self.settings()["feed_url"]})
 
     def _source_options(self, catalog=None):
-        settings = self.settings()
         return {"allow_file": bool(catalog), "token": read_json(self.home / "config/credentials.json", {}).get("token", ""),
                 "token_origin": read_json(self.home / "config/credentials.json", {}).get("origin", "")}
 
@@ -227,10 +227,10 @@ class Engine:
         current = self.current()
         values = {"current": current.get("prefix"), "running": self.runtime.status()["running"], "settings": self.settings()}
         active = self.home / "data/settings/active.env"
-        if active.is_file():
-            values["config"] = digest_file(active)
-        import hashlib
-        return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+        if current and active.is_file():
+            values["config"] = self.configuration.request(Path(current["prefix"]), "revision")
+        # 绑定共同拥有方的当前快照令牌及明确状态，不散列整个配置文件。
+        return values
 
     def plan(self, request, *, local_catalog=None, local_request=False):
         self.recover_if_needed()
@@ -341,6 +341,8 @@ class Engine:
                 if hardware["hardware"]["free_disk_bytes"] < selected["size"] * 3 + 512 * 1024 ** 2:
                     blockers.append("可用磁盘空间不足以安全准备候选版本。")
             steps.extend([{"title": "下载并验证发布包"}, {"title": "按固定配方下载依赖与模型并准备运行环境"}, {"title": "保存配置并切换版本"}])
+            if robot == "go2":
+                warnings.append("Go2首次安装按官方流程编译Python接口适配并缓存；DDS原生库直接使用宇树官方预编译文件，后续安装复用已校验缓存。")
         elif action == "rollback":
             history = read_json(self.home / "config/history.json", {})
             previous = history.get("previous")
@@ -494,6 +496,7 @@ class Engine:
         atomic_json(self._job_path(job["id"]), job)
 
     def _switch(self, prefix):
+        self.configuration.close()
         link = self.home / "current"
         temporary = self.home / (".current-" + uuid.uuid4().hex)
         try:
@@ -701,14 +704,14 @@ class Engine:
         existing = self._existing(current)
         if plan.get("_migration"):
             existing = read_existing(Path(plan["_migration"]["source"]))
-        from .downloads import MODEL_SETTINGS, prepare_dependencies
+        from .downloads import MODEL_SETTINGS, prepare_dependencies, uses_default_model
         configuration = plan["_request"].get("configuration", {})
         if not isinstance(configuration, dict):
             raise ManagerError("invalid_config", "预配置必须是键值对象。")
         model_choices = dict(existing)
         for kind in ("TEXT", "IMAGE"):
             key = "NUWAX_MEMORY_" + kind + "_EMBEDDING_MODEL"
-            if model_choices.get(key, "") in ("", "hashing-v1", "disabled"):
+            if uses_default_model(model_choices.get(key, "")):
                 remembered = existing.get("_NUWAX_INSTALLER_SAVED_" + key, "")
                 if remembered:
                     model_choices[key] = remembered
@@ -738,8 +741,22 @@ class Engine:
         environment = clean_environment(candidate)
         run_command([python, "-m", "venv", str(candidate / "venv")], environment=environment, cancelled=lambda: self._cancelled(job_id))
         interpreter = str(candidate / "venv/bin/python")
+        # Ubuntu20自带pip不认识部分现代轮子标签，先安装配方已校验的通用pip轮子。
+        for record in manifest["install"]["python"]:
+            if record["name"] == "pip":
+                run_command([interpreter, "-m", "pip", "--isolated", "install", "--no-index", "--no-deps", str(wheelhouse / record["filename"])],
+                            environment=environment, timeout=600, cancelled=lambda: self._cancelled(job_id))
         run_command([interpreter, "-m", "pip", "--isolated", "install", "--no-index", "--only-binary=:all:", "--find-links", str(wheelhouse), "-r", str(candidate / "requirements.txt")],
                     environment=environment, timeout=1800, cancelled=lambda: self._cancelled(job_id))
+        if "go2" in manifest["install"]:
+            from scripts.go2_dependencies import install
+            from .downloads import cached_download
+            # 官方归档已计入下载量；共享安装器再次核验缓存，不重复累计下载统计。
+            install(candidate, self.home / "cache/go2", manifest["install"]["go2"],
+                    fetch=lambda record: cached_download(self, record, filename=record["filename"], progress=lambda *_: None,
+                                                         cancelled=lambda: self._cancelled(job_id))[0],
+                    run=run_command, environment=environment, cancelled=lambda: self._cancelled(job_id),
+                    progress=lambda message: self._progress(job, "go2_dependencies", 68, message))
         run_command([interpreter, "-m", "pip", "check"], environment=environment, cancelled=lambda: self._cancelled(job_id))
         self._progress(job, "runtime_files", 70, "核对原生产物并生成统一启动入口")
         if (source / "runtime_data").exists():
@@ -842,7 +859,7 @@ class Engine:
             try:
                 info = self._migration_info(str(path))
                 info["id"] = hashlib.sha256(info["source"].encode()).hexdigest()[:24]
-                sources.append(info)
+                sources.append({key: value for key, value in info.items() if not key.startswith("_")})
             except (ManagerError, OSError, ValueError):
                 continue
         return {"sources": sources, "message": "网页只迁入已识别的原安装；其它路径可在设备本地使用migrate明确指定。"}
@@ -871,17 +888,15 @@ class Engine:
             pid = int((source / "runtime_data/gateway/gateway.pid").read_text().strip())
         except (OSError, ValueError):
             pid = 0
-        import hashlib
-        config_digest = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
         legacy = read_json(source / "runtime_data/installation/current/manifest.json", {})
         return {"source": str(source), "launcher": str(launcher), "systemd": systemd,
-                "robot": values.get("NUWAX_ACTIVE_ROBOT", legacy.get("robot", "customrobot")), "modules": legacy.get("modules", []), "config_digest": config_digest,
+                "robot": values.get("NUWAX_ACTIVE_ROBOT", legacy.get("robot", "customrobot")), "modules": legacy.get("modules", []), "_configuration": values,
                 "running": bool(process_identity(pid)) or (systemd and "ActiveState=active" in (result.stdout if "result" in locals() else ""))}
 
     def _stop_migration(self, job):
         info = job["_plan"]["_migration"]
         fresh = self._migration_info(info["source"])
-        if any(fresh.get(key) != info.get(key) for key in ("running", "systemd", "launcher", "config_digest")):
+        if any(fresh.get(key) != info.get(key) for key in ("running", "systemd", "launcher", "_configuration")):
             raise ManagerError("plan_stale", "准备期间迁入源的拥有方或配置发生变化，请重新生成计划。", 409)
         self._journal(job, legacy_stopped=False, legacy_systemd=info["systemd"], legacy_running=info["running"], legacy_launcher=info["launcher"], legacy_source=info["source"])
         self._progress(job, "migration_stop", 68, "停止迁入源的原拥有方")
@@ -999,7 +1014,7 @@ class Engine:
         current = self.current()
         if not current:
             return {"available": False, "groups": [], "fields": [], "message": "安装完成后可在业务离线时编辑机器人配置；首次安装支持预配置文件。"}
-        schema = probe(Path(current["prefix"]), "get")
+        schema = self.configuration.request(Path(current["prefix"]), "get")
         fields, groups = [], []
         for section in schema["sections"]:
             groups.append({"key": section["section_id"], "title": section["section_title"]})
@@ -1011,6 +1026,8 @@ class Engine:
     def save_config(self, values, revision=None):
         if not isinstance(values, dict):
             raise ManagerError("invalid_config", "配置values必须是对象。")
+        if not isinstance(revision, str) or not revision:
+            raise ManagerError("config_revision_required", "保存配置需要编辑版本，请先读取当前配置。", 409)
         protected = {"NUWAX_GATEWAY_HOST": "127.0.0.1", "NUWAX_GATEWAY_PORT": str(self.runtime.port())}
         if any(key in values and str(values[key]) != expected for key, expected in protected.items()):
             raise ManagerError("managed_setting", "管理模式固定业务网关回环地址与受管端口。")
@@ -1019,7 +1036,7 @@ class Engine:
             current = self.current()
             if not current:
                 raise ManagerError("not_installed", "请先安装业务版本。", 409)
-            result = probe(Path(current["prefix"]), "save", values=values, revision=revision)
+            result = self.configuration.request(Path(current["prefix"]), "save", values=values, revision=revision)
             if result["rejected"]:
                 raise ManagerError("config_rejected", "部分配置没有通过原校验。", 400, result)
             return {"saved": [key for keys in result["written"].values() for key in keys], "restart_required": bool(result["written"]),

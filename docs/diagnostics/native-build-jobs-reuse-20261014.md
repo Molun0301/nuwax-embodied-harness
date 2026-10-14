@@ -69,10 +69,12 @@ python3 -B scripts/check_native_build_jobs_reuse.py \
   --evidence-dir /path/to/new-persistent-evidence-directory
 ```
 
-The portable script uses Python 3.8-compatible syntax; an AST parse at that
-language level is not an interpreter-execution compatibility claim. The recorded
-56-case run used the original task-local fixture. The portable entrypoint has
-not yet been rerun as part of these results.
+The original recorded 56-case run used the task-local fixture. The portable
+entrypoint was subsequently executed successfully with **Python 3.8.10** against
+the final managed-binding build scripts. Its expanded **64-case** run additionally
+checks entering/leaving the installer-owned dependency-prefix mode and no-op
+repeats; jobs-only reuse still passes. The extra cases do not replace the original
+56-case record. See the [coupled binding results](slam2d-managed-binding-20261014-results.json).
 
 ## Boundaries and rejected leads
 

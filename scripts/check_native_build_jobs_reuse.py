@@ -94,6 +94,8 @@ for name in SCRIPTS:
     assert call['prefix']==env['CMAKE_PREFIX_PATH'],row
     assert call['toolchain']==env['CMAKE_TOOLCHAIN_FILE'],row
     if call['phase']=='build': assert call['args'][-1]==env['CMAKE_BUILD_PARALLEL_LEVEL'],row
+    if name=='slam' and call['phase']=='configure':
+     assert '-DNUWAX_SLAM2D_DEPENDENCY_PREFIX='+env.get('NUWAX_SLAM2D_DEPENDENCY_PREFIX','') in call['args'],row
    if expected==2:
     assert calls[0]['phase']=='configure' and calls[1]['phase']=='build',row
     assert '-DCMAKE_TOOLCHAIN_FILE='+env['CMAKE_TOOLCHAIN_FILE'] in calls[0]['args'],row
@@ -118,4 +120,9 @@ for name in SCRIPTS:
   marker=root/'control/fail-build'; marker.write_text('fail\n')
   run('12-build-failure',2,False); marker.unlink()
   run('13-build-retry',2); run('14-final-repeat',0)
+  if name=='slam':
+   env['NUWAX_SLAM2D_DEPENDENCY_PREFIX']=str(root/'managed-generation')
+   run('15-managed-prefix',2); run('16-managed-repeat',0)
+   env.pop('NUWAX_SLAM2D_DEPENDENCY_PREFIX')
+   run('17-unmanaged-transition',2); run('18-unmanaged-repeat',0)
 print('PASS:',len(results),'Cargo invocations; fake CMake only; no SDK/object timing claims')

@@ -483,7 +483,10 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
             ]
             if features:
                 command.extend(("--features", ",".join(features)))
-            run(tuple(command), cwd=root, env=environment)
+            build_environment = environment
+            if binary_name == "nuwax-slam-2d-worker":
+                build_environment = {**environment, "NUWAX_SLAM2D_DEPENDENCY_PREFIX": str(prefix)}
+            run(tuple(command), cwd=root, env=build_environment)
             built = target / "release" / binary_name
             _executable(built)
             installed = prefix / "bin" / binary_name

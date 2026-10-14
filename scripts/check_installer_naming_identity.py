@@ -599,7 +599,8 @@ class CacheIdentityChecks(unittest.TestCase):
         self.assertEqual([command for command in self.commands if command[0] == "git"], git_before)
         for prefix in (first, second):
             for name in slam.SOURCES:
-                self.assertEqual((prefix / "lib" / ("fixture-" + name + ".so")).read_text(),
+                build_name = slots[slam.SOURCE_ROLES[name]]["path"]
+                self.assertEqual((prefix / "lib" / ("fixture-" + build_name + ".so")).read_text(),
                                  "fixture installed library")
             notices = prefix / "share/nuwax-slam2d"
             self.assertEqual((notices / "0-LICENSE").read_text(), slam.SOURCES["oneTBB"][1])
@@ -607,6 +608,108 @@ class CacheIdentityChecks(unittest.TestCase):
             self.assertEqual((notices / "2-LICENSE").read_text(), slam.SOURCES["ceres"][1])
             self.assertEqual(json.loads((notices / "来源.json").read_text())["sources"],
                              {name: list(source) for name, source in slam.SOURCES.items()})
+
+    def test_slam_build_directory_keeps_matching_legacy_and_outputs(self):
+        source = self.root / "admitted-source-a"
+        source.mkdir()
+        legacy = self.cache / "build/oneTBB"
+        legacy.mkdir(parents=True)
+        record = legacy / "CMakeCache.txt"
+        record.write_text("CMAKE_HOME_DIRECTORY:INTERNAL=" + str(source) + "\n")
+        artifact = legacy / "retained.o"
+        artifact.write_bytes(b"existing object")
+        before = (record.read_bytes(), artifact.read_bytes(), artifact.stat().st_mtime_ns)
+        self.assertEqual(slam._build_directory(self.cache, "oneTBB", source), legacy)
+        self.assertEqual((record.read_bytes(), artifact.read_bytes(), artifact.stat().st_mtime_ns), before)
+
+    def test_slam_build_directory_switches_source_and_reuses_legacy_on_rollback(self):
+        sources = [self.root / name for name in ("admitted-source-a", "admitted-source-b")]
+        for source in sources:
+            source.mkdir()
+        legacy = self.cache / "build/ceres"
+        legacy.mkdir(parents=True)
+        record = legacy / "CMakeCache.txt"
+        record.write_text("CMAKE_HOME_DIRECTORY:INTERNAL=" + str(sources[0]) + "\n")
+        before = record.read_bytes()
+        selected = self.cache / "build" / sources[1].name
+        self.assertEqual(slam._build_directory(self.cache, "ceres", sources[1]), selected)
+        self.assertFalse(selected.exists())
+        selected.mkdir()
+        artifact = selected / "retained.o"
+        artifact.write_bytes(b"source B object")
+        identity = artifact.stat().st_mtime_ns
+        self.assertEqual(slam._build_directory(self.cache, "ceres", sources[1]), selected)
+        self.assertEqual(slam._build_directory(self.cache, "ceres", sources[0]), legacy)
+        self.assertEqual(record.read_bytes(), before)
+        self.assertEqual((artifact.read_bytes(), artifact.stat().st_mtime_ns), (b"source B object", identity))
+
+    def test_slam_build_directory_missing_legacy_uses_assigned_source_name(self):
+        source = self.root / "admitted-source"
+        self.assertEqual(slam._build_directory(self.cache, "oneTBB", source),
+                         self.cache / "build" / source.name)
+        self.assertFalse(self.cache.exists())
+
+    def test_slam_build_directory_leaves_uninitialized_legacy_untouched(self):
+        source = self.root / "admitted-source"
+        legacy = self.cache / "build/oneTBB"
+        legacy.mkdir(parents=True)
+        artifact = legacy / "retained-partial"
+        artifact.write_text("partial evidence")
+        self.assertEqual(slam._build_directory(self.cache, "oneTBB", source),
+                         self.cache / "build" / source.name)
+        self.assertEqual(list(legacy.iterdir()), [artifact])
+        self.assertEqual(artifact.read_text(), "partial evidence")
+
+    def test_slam_build_directory_matches_resolved_source_with_equals_in_path(self):
+        source = self.root / "admitted=source"
+        source.mkdir()
+        alias = self.root / "source-alias"
+        alias.symlink_to(source, target_is_directory=True)
+        legacy = self.cache / "build/ceres"
+        legacy.mkdir(parents=True)
+        (legacy / "CMakeCache.txt").write_text("CMAKE_HOME_DIRECTORY:INTERNAL=" + str(alias) + "\n")
+        self.assertEqual(slam._build_directory(self.cache, "ceres", source), legacy)
+
+    def test_slam_managed_dependency_prefix_is_only_passed_to_worker_build(self):
+        source = self.root / "source"
+        for manifest, _package, _binary, _features in builds._RUST_BUILDS.values():
+            path = source / manifest
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.with_name("Cargo.lock").write_text("fixture lock")
+        for relative in ("services/nuwax-workspace/crates/nuwax-slam-toolbox-sys/native",
+                         "drivers/sensors/slamtec_native"):
+            (source / relative).mkdir(parents=True, exist_ok=True)
+        native = self.root / "native-core"
+        native.mkdir()
+        (native / "libnuwax_slam_toolbox.so.1").write_bytes(b"fixture core")
+        prefix = self.root / "generation"
+        cargo = self.root / "fixture-cargo"
+        environments = {}
+        ambient = os.environ.get("NUWAX_SLAM2D_DEPENDENCY_PREFIX")
+        def run(argv, **kwargs):
+            if argv[0] == "cmake":
+                self.assertNotIn("NUWAX_SLAM2D_DEPENDENCY_PREFIX", kwargs.get("env", {}))
+                return
+            self.assertEqual(argv[0], str(cargo))
+            target = Path(argv[argv.index("--target-dir") + 1])
+            binary = argv[argv.index("--bin") + 1]
+            (target / "release").mkdir(exist_ok=True)
+            (target / "release" / binary).write_bytes(b"\x7fELFfixture")
+            environments[binary] = dict(kwargs["env"])
+        with patch.object(builds.os, "geteuid", return_value=1000), patch.object(
+            builds, "_rust_toolchain", return_value=(cargo, {"FIXTURE_BASE_ENV": "retained"})
+        ), patch.object(builds, "_executable"), patch(
+            "scripts.prepare_slam2d_dependencies.build_dependencies", return_value=prefix
+        ) as dependencies, patch("scripts.package_slam2d.elf_info", return_value=("fixture", [], [native])):
+            builds.build_modules(source, prefix, self.cache,
+                                 ("slam2d", "geometry", "navigation", "follow"), 1, run)
+        dependencies.assert_called_once()
+        self.assertEqual(environments["nuwax-slam-2d-worker"]["NUWAX_SLAM2D_DEPENDENCY_PREFIX"], str(prefix))
+        for name, environment in environments.items():
+            self.assertEqual(environment["FIXTURE_BASE_ENV"], "retained")
+            if name != "nuwax-slam-2d-worker":
+                self.assertNotIn("NUWAX_SLAM2D_DEPENDENCY_PREFIX", environment)
+        self.assertEqual(os.environ.get("NUWAX_SLAM2D_DEPENDENCY_PREFIX"), ambient)
 
     def test_slam_dirty_source_fails_before_any_build_or_fetch(self):
         cache = self.build_slam_fixture(self.root / "generation-1")

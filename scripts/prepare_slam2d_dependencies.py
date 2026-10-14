@@ -64,6 +64,21 @@ def _boost(prefix, cache, compiler, jobs, run):
     return source_root
 
 
+def _build_directory(cache, name, source):
+    # CMake binds its cache to one source directory; retain matching legacy builds.
+    legacy = cache / "build" / name
+    try:
+        lines = (legacy / "CMakeCache.txt").read_text().splitlines()
+    except FileNotFoundError:
+        lines = ()
+    for line in lines:
+        if line.startswith("CMAKE_HOME_DIRECTORY:INTERNAL="):
+            if Path(line.split("=", 1)[1]).resolve() == source.resolve():
+                return legacy
+            break
+    return cache / "build" / source.name
+
+
 def build_dependencies(prefix, cache, *, jobs=2, toolchain=None, run=None):
     prefix, cache = Path(prefix).absolute(), Path(cache).absolute()
     if prefix.is_symlink() or cache.is_symlink():
@@ -79,7 +94,7 @@ def build_dependencies(prefix, cache, *, jobs=2, toolchain=None, run=None):
     for name, source in SOURCES.items():
         source_root = _checkout(cache, source, run, role=SOURCE_ROLES[name])
         source_roots.append(source_root)
-        build_root = cache / "build" / name
+        build_root = _build_directory(cache, name, source_root)
         options = ["-DTBB_TEST=OFF", "-DTBB_STRICT=OFF", "-DTBB_EXAMPLES=OFF"] if name == "oneTBB" else [
             "-DBUILD_TESTING=OFF", "-DBUILD_EXAMPLES=OFF", "-DBUILD_BENCHMARKS=OFF",
             "-DSUITESPARSE=OFF", "-DCXSPARSE=OFF", "-DEIGENSPARSE=ON", "-DUSE_CUDA=OFF"]

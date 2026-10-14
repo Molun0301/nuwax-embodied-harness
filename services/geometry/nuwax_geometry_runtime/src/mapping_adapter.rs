@@ -528,6 +528,8 @@ pub(crate) struct RegisteredMapCloud {
 pub(crate) enum MappingCloudSource {
     Legacy,
     SourceFencedCompatibility,
+    /// 已按采集姿态注册的辅助传感器，只参与地图，不构造LiDAR准入身份。
+    Auxiliary,
     Canonical(AdmittedFrameKey),
 }
 
@@ -1372,6 +1374,7 @@ pub struct MappingAdapter {
     last_built_received_at_ns: u64,
     lifecycle: MappingSessionSnapshot,
     next_session_generation: u64,
+    pub(crate) auxiliary_observations: crate::lcm_runtime::mapping_observation::Inbox,
 }
 
 /// 捕获既有会话和文件路径，读取时不持有生命周期或地图状态锁。
@@ -1566,6 +1569,7 @@ impl MappingAdapter {
             last_built_point_count: 0,
             last_built_received_at_ns: 0,
             lifecycle: MappingSessionSnapshot::idle(mapping_backend.kind()),
+            auxiliary_observations: Default::default(),
             next_session_generation: 0,
         }
     }
@@ -1888,6 +1892,7 @@ impl MappingAdapter {
         let retirement = self.detach_backend_worker()?;
         self.lifecycle.phase = MappingSessionPhase::Stopped;
         self.lifecycle.active = false;
+        self.auxiliary_observations = Default::default();
         self.in_flight_compute = None;
         self.checkpoint_export = None;
         self.backend_generation = next_backend_generation;
@@ -2231,7 +2236,7 @@ impl MappingAdapter {
                 points, odom_xy, point_step, received_at_ns, frame_id,
                 source_timestamp_ns, false, None,
             )?,
-            MappingCloudSource::SourceFencedCompatibility | MappingCloudSource::Canonical(_) => {
+            MappingCloudSource::SourceFencedCompatibility | MappingCloudSource::Auxiliary | MappingCloudSource::Canonical(_) => {
                 let key = match source {
                     MappingCloudSource::Canonical(key) => Some(key),
                     _ => None,
@@ -2530,6 +2535,17 @@ impl MappingAdapter {
         // Disabled or stale history must return before lazy body capture. This
         // preserves the original archive transform's adapter-guard ordering.
         self.pgo_history.as_mut().unwrap().record(accepted.scan(), accepted.adapter_timestamp_ns())
+    }
+
+    pub(crate) fn record_auxiliary_scans(&mut self,
+        scans: Vec<crate::lcm_runtime::mapping_observation::RegisteredObservation>,
+    ) -> Result<(), String> {
+        if self.pgo_history.is_none() { return Ok(()); }
+        for scan in scans {
+            if !scan.belongs_to(self) { return Err("PGO辅助观测来源已过期".into()); }
+            self.pgo_history.as_mut().unwrap().record_auxiliary(scan)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn pgo_static_point_indices(&self, source: &crate::lio_ingress::AdmittedRegisteredScan) -> Result<Option<Arc<[u32]>>, String> {

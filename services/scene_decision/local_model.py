@@ -22,7 +22,7 @@ class LocalModelInputError(ValueError):
 
 
 class OpenJevModel:
-    def __init__(self, *, model_path: str, processor_path: str, max_tokens: int = 4096) -> None:
+    def __init__(self, *, model_path: str, processor_path: str, max_tokens: int = 4096, load_in_4bit: bool = False) -> None:
         # 平台导入此模块不会触发GPU或远程代码加载。
         import torch
         from transformers import AutoImageProcessor, AutoModelForSequenceClassification, AutoTokenizer
@@ -36,10 +36,24 @@ class OpenJevModel:
         self._max_tokens = max_tokens
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=False)
         self.tokenizer.padding_side = "right"
+        loading = {}
+        if load_in_4bit:
+            from transformers import BitsAndBytesConfig
+            # 由官方加载器直接量化并放到GPU，避免先载入完整BF16权重。
+            loading = {"device_map": {"": 0}, "quantization_config": BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
+                # 三分类输出头保留原精度；该官方选项也用于4位替换。
+                llm_int8_skip_modules=["score"],
+            )}
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_path, local_files_only=True, trust_remote_code=False,
-            dtype=torch.bfloat16, attn_implementation="sdpa",
-        ).to("cuda").eval()
+            dtype=torch.bfloat16, attn_implementation="sdpa", **loading,
+        )
+        if not load_in_4bit:
+            self.model = self.model.to("cuda")
+        self.model.eval()
+        self._quantization = "nf4" if load_in_4bit else "none"
         self.model.config.get_text_config().pad_token_id = self.tokenizer.pad_token_id
         self.labels = [self.model.config.id2label[index] for index in range(3)]
         if self.labels != ["contradiction", "entailment", "neutral"]:
@@ -53,7 +67,7 @@ class OpenJevModel:
                         "peak_gpu_bytes": torch.cuda.max_memory_allocated(),
                         "device": torch.cuda.get_device_name(), "dtype": "bfloat16",
                         "model_revision": MODEL_REVISION, "processor_revision": PROCESSOR_REVISION,
-                        "max_tokens": max_tokens}
+                        "max_tokens": max_tokens, "quantization": self._quantization}
 
     def _image(self, data_url: str):
         from PIL import Image, UnidentifiedImageError
@@ -127,5 +141,6 @@ class OpenJevModel:
                       "processor_revision": PROCESSOR_REVISION, "view_count": len(views),
                       "aggregation": "arithmetic_mean_entailment_across_views",
                       "cross_category_normalized": False, "inference_duration_sec": round(time.monotonic() - started, 3),
-                      "peak_gpu_bytes": torch.cuda.max_memory_allocated(), "max_tokens": self._max_tokens},
+                      "peak_gpu_bytes": torch.cuda.max_memory_allocated(), "max_tokens": self._max_tokens,
+                      "quantization": self._quantization},
         )

@@ -266,6 +266,8 @@ class RuntimeInputBridge:
     _lio_publish_owner_active: bool = field(default=False, init=False)
     _lio_publish_owner_thread_id: Optional[int] = field(default=None, init=False)
     _lio_publisher_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
+    _mapping_pending: Optional[PointCloudFrame] = field(default=None, init=False, repr=False)
+    _mapping_publisher_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
     _native_lio_enabled: bool = field(default=False, init=False)
     _native_lio_backend: str = field(default=_DEVICE_LIO_BACKEND, init=False)
     _lio_in_flight_count: int = field(default=0, init=False)
@@ -383,11 +385,11 @@ class RuntimeInputBridge:
                     previous_generation = self._lio_generation
                 started = self._start_new_generation_locked()
                 rollback = None
-                if not started and self._native_lio_enabled and self._lio_generation != previous_generation:
+                if not started and self._lio_generation != previous_generation:
                     # 锁内撤销本次启动，锁外等待；发布线程也可能重入 stop 取得此锁。
                     self.stop(_wait_for_drain=False)
                     with self._lio_condition:
-                        rollback = (self._lio_generation, self._lio_publisher_thread)
+                        rollback = (self._lio_generation, self._lio_publisher_thread, self._mapping_publisher_thread)
             if rollback is not None:
                 self._wait_for_stop_drain(*rollback)
             return started
@@ -419,6 +421,7 @@ class RuntimeInputBridge:
         with self._lio_condition:
             previous_publisher = self._lio_publisher_thread
         self._join_native_lio_publisher(previous_publisher)
+        self._join_mapping_publisher(self._mapping_publisher_thread)
         with self._lock:
             if not self.ensure_runtime_connected(timeout_sec=0.0):
                 LOGGER.warning(
@@ -444,6 +447,16 @@ class RuntimeInputBridge:
             self._lio_queue_bytes = 0
             self._lio_measurement_assembler.reset()
 
+        self._mapping_pending = None
+        try:
+            self._mapping_publisher_thread = threading.Thread(
+                target=self._drain_mapping_frames, args=(lio_generation,),
+                name="nuwax-mapping-publisher-%d" % lio_generation, daemon=True)
+            self._mapping_publisher_thread.start()
+        except Exception as exc:
+            self._mapping_publisher_thread = None
+            self._record_error("辅助地图发布线程启动失败：%s" % exc)
+            return False
         if self._native_lio_enabled:
             try:
                 self._start_native_lio_publisher(lio_generation)
@@ -465,6 +478,8 @@ class RuntimeInputBridge:
             sensor_ok = self._subscribe_sensor_samples(lio_generation)
             localization_ok = False
             point_cloud_ok = sensor_ok
+            # 显示用规范激光视图不重复送LIO；仅额外订阅辅助地图帧。
+            self._subscribe_point_cloud(lio_generation, mapping_only=True)
         else:
             sensor_ok = False
             localization_ok = self._subscribe_localization(lio_generation)
@@ -551,6 +566,7 @@ class RuntimeInputBridge:
                         self._lio_generation
                     )
                     self._lio_publish_queue.clear()
+                    self._mapping_pending = None
                     self._lio_queue_bytes = 0
                     self._lio_condition.notify_all()
 
@@ -589,6 +605,7 @@ class RuntimeInputBridge:
             with self._lio_condition:
                 stopped_generation = self._lio_generation
                 stopped_publisher = self._lio_publisher_thread
+                stopped_mapping_publisher = self._mapping_publisher_thread
 
         with self._lio_condition:
             current_callback_count = (
@@ -608,13 +625,14 @@ class RuntimeInputBridge:
                 or self._lio_in_flight_count > 0
                 or self._callback_in_flight_count > 0
                 or self._lio_publisher_thread is not None
+                or self._mapping_publisher_thread is not None
             )
         if not _wait_for_drain or current_callback_count > 0 or current_owns_publish:
             return
         if should_drain:
-            self._wait_for_stop_drain(stopped_generation, stopped_publisher)
+            self._wait_for_stop_drain(stopped_generation, stopped_publisher, stopped_mapping_publisher)
 
-    def _wait_for_stop_drain(self, generation: int, publisher: Optional[threading.Thread]) -> None:
+    def _wait_for_stop_drain(self, generation: int, publisher: Optional[threading.Thread], mapping_publisher: Optional[threading.Thread] = None) -> None:
         """只等待本次停止的代际与句柄，不能误等并发重启后的空闲线程。"""
 
         with self._lio_condition:
@@ -627,6 +645,30 @@ class RuntimeInputBridge:
             if self._lio_generation == generation:
                 self._reset_lio_assembler_if_quiescent_locked()
         self._join_native_lio_publisher(publisher)
+        self._join_mapping_publisher(mapping_publisher)
+
+    def _drain_mapping_frames(self, generation: int) -> None:
+        """辅助帧只保留最新一张，慢RPC不占激光/惯性回调线程。"""
+        while True:
+            with self._lio_condition:
+                while self._lio_callback_is_current(generation) and self._mapping_pending is None:
+                    self._lio_condition.wait()
+                if not self._lio_callback_is_current(generation):
+                    return
+                frame, self._mapping_pending = self._mapping_pending, None
+            try:
+                self._on_point_cloud(frame, _lio_generation=generation, _mapping_publish=True)
+            except Exception as exc:
+                self._increment_counter("dropped_pointcloud_count")
+                self._record_error("辅助地图点云发布失败：%s" % exc)
+
+    def _join_mapping_publisher(self, worker: Optional[threading.Thread]) -> None:
+        if worker is None or worker is threading.current_thread():
+            return
+        worker.join()
+        with self._lio_condition:
+            if self._mapping_publisher_thread is worker:
+                self._mapping_publisher_thread = None
 
     def _start_native_lio_publisher(self, generation: int) -> None:
         """订阅前建立当前代际唯一发布拥有方，启动失败不留下活跃哨兵。"""
@@ -786,7 +828,7 @@ class RuntimeInputBridge:
             self._localization_subscription_id = int(subscription_id)
         return True
 
-    def _subscribe_point_cloud(self, lio_generation: int) -> bool:
+    def _subscribe_point_cloud(self, lio_generation: int, *, mapping_only: bool = False) -> bool:
         if self.point_cloud_provider is None:
             return False
         subscriber = getattr(self.point_cloud_provider, "subscribe_point_cloud", None)
@@ -794,6 +836,8 @@ class RuntimeInputBridge:
             return False
 
         def callback(point_cloud: PointCloudFrame) -> None:
+            if mapping_only and not getattr(point_cloud, "mapping_only", False):
+                return
             self._on_point_cloud(
                 point_cloud,
                 _lio_generation=lio_generation,
@@ -956,6 +1000,7 @@ class RuntimeInputBridge:
         *,
         _lio_generation: Optional[int] = None,
         _callback_admitted: bool = False,
+        _mapping_publish: bool = False,
     ) -> None:
         if not _callback_admitted:
             if not self._admit_bridge_callback(_lio_generation):
@@ -965,6 +1010,7 @@ class RuntimeInputBridge:
                     point_cloud,
                     _lio_generation=_lio_generation,
                     _callback_admitted=True,
+                    _mapping_publish=_mapping_publish,
                 )
             finally:
                 self._release_bridge_callback()
@@ -974,6 +1020,13 @@ class RuntimeInputBridge:
             self._record_error("point_cloud callback 收到 None")
             return
 
+        mapping_only = point_cloud.mapping_only
+        if mapping_only and not _mapping_publish:
+            with self._lio_condition:
+                if self._lio_callback_is_current(_lio_generation):
+                    self._mapping_pending = point_cloud
+                    self._lio_condition.notify_all()
+            return
         point_cloud_metadata = dict(getattr(point_cloud, "metadata", {}) or {})
         raw_frame_id = str(getattr(point_cloud, "frame_id", "") or "")
         frame_id = raw_frame_id.strip()
@@ -990,7 +1043,7 @@ class RuntimeInputBridge:
             "direct_pointcloud",
             "go2_direct_dds_pointcloud",
         }
-        native_lio_backend = self._native_lio_enabled
+        native_lio_backend = self._native_lio_enabled and not mapping_only
         if has_raw_sensor_payload or legacy_registered_metadata:
             source_frame = (
                 canonical_lidar.frame_id
@@ -1116,6 +1169,13 @@ class RuntimeInputBridge:
                 "is_dense": bool(getattr(payload, "is_dense", True)),
                 "imu_samples": imu_samples,
             }
+            if mapping_only:
+                origin = point_cloud.sensor_origin
+                metadata.update(mapping_only=True, sensor_origin_xyz=[origin.x, origin.y, origin.z],
+                    sensor_id=point_cloud_metadata.get("source_id", ""),
+                    source_sequence=point_cloud_metadata.get("source_sequence", 0),
+                    clock_id=point_cloud_metadata.get("clock_id", ""),
+                    calibration_ref=point_cloud_metadata.get("calibration_ref", ""))
             if not self._publisher_accepts_metadata(publisher):
                 raise TypeError(
                     "pointcloud publisher 必须接受 "

@@ -32,6 +32,14 @@ def same_scope(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
     ))
 
 
+def bound_to_semantic_reference(snapshot, binding: Dict[str, Any]) -> bool:
+    """按拥有方发布的资产代际/修订证明运行期地图归属，不按同名猜测。"""
+    asset_binding = snapshot.metadata.get("semantic_map_binding", {})
+    return (snapshot.map_name == binding["map_name"] and snapshot.frame_id == binding["frame_id"]
+            and binding_value(asset_binding) == binding_value(binding)
+            and asset_binding.get("schema_version") == binding["schema_version"])
+
+
 class SceneMappingMemoryMixin:
     """由MemoryService持有锁、仓储与索引，本类不创建第二份记忆状态。"""
 
@@ -39,18 +47,24 @@ class SceneMappingMemoryMixin:
         snapshot = getattr(self._mapping_service, "get_semantic_snapshot", self._mapping_service.get_latest_snapshot)()
         if snapshot is None or snapshot.occupancy_grid is None:
             raise GatewayError("当前没有可分割的规范占据地图。", error_code="scene_map_not_ready", http_status=409)
+        binding = snapshot_binding(snapshot)
         with self._instances_lock:
             library = self._require_memory_enabled(initialize_embedders=False)
             if library != snapshot.map_name:
                 raise GatewayError("当前地图与记忆库名称不一致。", error_code="scene_map_library_mismatch", http_status=409)
             capture = {
-                "snapshot": snapshot, "binding": snapshot_binding(snapshot), "library_name": library,
+                "snapshot": snapshot, "binding": binding, "library_name": library,
                 "generation": getattr(self, "_scene_scope_generation", 0),
             }
             if include_decision_inputs:
                 visible = None if self._durable_index.load_history else tuple(self._semantic_entries_by_id)
                 visible_spaces = None if self._durable_index.load_history else tuple(self._scene_spaces_by_id)
         if include_decision_inputs:
+            evidence_bindings = [binding]
+            live = self._mapping_service.get_latest_snapshot()
+            if live is not None and bound_to_semantic_reference(live, binding):
+                evidence_bindings.append(snapshot_binding(live))
+            capture["evidence_bindings"] = tuple(evidence_bindings)
             # Decode selected evidence outside the memory/SQL writer locks. The
             # captured memory-only generation also versions pre-index legacy rows.
             capture["spaces"], capture["entries"] = self._repository.capture_scene_decision_entries(

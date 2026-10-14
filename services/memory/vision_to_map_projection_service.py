@@ -127,6 +127,7 @@ class ProjectedObservation:
     visual_labels: Tuple[str, ...]
     attributes: Dict[str, object]
     pose_quality_level: str = "low"  # "high", "medium", "low", "fallback"
+    observer_body_pose: Optional[Pose] = None
 
 
 class VisionToMapProjectionService:
@@ -166,6 +167,13 @@ class VisionToMapProjectionService:
         if effective_pose is None:
             return ()
         frame_tree = localization_snapshot.frame_tree if localization_snapshot is not None else None
+        observer_body_pose = effective_pose
+        if not frame_ids_semantically_equal(effective_pose.frame_id, map_context.frame_id):
+            observer_body_pose = transform_pose_to_frame(
+                frame_tree, effective_pose, target_frame_id=map_context.frame_id)
+        if observer_body_pose is not None:
+            observer_body_pose = observer_body_pose.model_copy(update={
+                "frame_id": map_context.frame_id, "timestamp": effective_pose.timestamp})
         projected: List[ProjectedObservation] = []
         track_pose_by_id = self._build_track_pose_index(perception_context)
         for detection in perception_context.observation.detections_3d:
@@ -188,6 +196,7 @@ class VisionToMapProjectionService:
                     source_observation_id=perception_context.observation.observation_id,
                     source_artifact_ids=tuple(perception_context.observation.artifact_ids),
                     map_context=map_context,
+                    observer_body_pose=observer_body_pose,
                     attributes={
                         **dict(detection.attributes),
                         "projection_method": str(detection.attributes.get("projection_method") or "detection3d_pose"),
@@ -223,6 +232,7 @@ class VisionToMapProjectionService:
                     source_observation_id=perception_context.observation.observation_id,
                     source_artifact_ids=tuple(perception_context.observation.artifact_ids),
                     map_context=map_context,
+                    observer_body_pose=observer_body_pose,
                     attributes=projection_attributes,
                 )
             )
@@ -1082,9 +1092,12 @@ class VisionToMapProjectionService:
         source_artifact_ids: Tuple[str, ...],
         map_context: SemanticMapBuildResult,
         attributes: Dict[str, object],
+        observer_body_pose: Optional[Pose] = None,
     ) -> ProjectedObservation:
         semantic_region_id, topo_node_id, semantic_labels = self._resolve_semantic_anchor(pose, map_context=map_context)
         merged_attributes = dict(attributes)
+        if observer_body_pose is not None:
+            merged_attributes["observer_body_pose"] = observer_body_pose.model_dump(mode="json")
         merged_attributes.setdefault("semantic_region_id", semantic_region_id or "")
         merged_attributes.setdefault("topo_node_id", topo_node_id or "")
         merged_attributes.setdefault("semantic_labels", list(semantic_labels))
@@ -1107,6 +1120,7 @@ class VisionToMapProjectionService:
             visual_labels=(str(label).strip().lower(),),
             attributes=merged_attributes,
             pose_quality_level=pose_quality_level,
+            observer_body_pose=observer_body_pose,
         )
 
     def _resolve_semantic_anchor(

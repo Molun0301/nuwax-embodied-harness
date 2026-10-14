@@ -74,6 +74,8 @@ use crate::channel_registry::ChannelKey;
 #[cfg(test)]
 #[path = "vertical_v2_canary.rs"]
 mod vertical_v2_canary;
+#[path = "mapping_observation.rs"]
+pub(crate) mod mapping_observation;
 
 // ============================================================================
 // 状态定义
@@ -5553,8 +5555,8 @@ impl crate::explore_runtime::ExplorePoseProvider for SharedStatePoseProvider {
                 self.expected_map_frame, pose.frame_id, pose.timestamp_ns,
             ));
         }
-        let source_age_ns =
-            crate::explore_runtime::now_unix_nanos().saturating_sub(pose.timestamp_ns);
+        let source_age_ns = nuwax_nav_types_messages::source_time::age_ns_at(
+            pose.timestamp_ns, crate::explore_runtime::now_unix_nanos())?;
         if source_age_ns > self.max_receipt_age.as_nanos() as u64 {
             return Err(format!(
                 "map-frame pose source timestamp is stale (source_timestamp_ns={}, source_age_ms={})",
@@ -11401,10 +11403,18 @@ async fn publish_recent_cloud_while_lifecycle_fenced(
 pub(crate) async fn handoff_admitted_registered_cloud(handle: &GeometryRuntimeHandle,
     accepted: &crate::lio_ingress::AcceptedRegisteredCloud) -> Result<bool, String> {
     let binding=accepted.binding();
+    let auxiliary=mapping_observation::flush(handle,accepted.source_timestamp_ns(),
+        Some((binding.mapping_session_generation,binding.map_frame_generation,binding.registration_correction_revision)),None).await?;
+    let receipt_ns=if auxiliary.is_empty() { accepted.adapter_timestamp_ns() } else { crate::server::now_ns() };
     let commit=commit_registered_lio_cloud_inner(handle,accepted.map_points(),accepted.point_step(),
-        accepted.adapter_timestamp_ns(),accepted.source_timestamp_ns(),accepted.map_frame_id(),
+        receipt_ns,accepted.source_timestamp_ns(),accepted.map_frame_id(),
         canonical_mapping_source(accepted)?,Some((binding.mapping_session_generation,binding.map_frame_generation,binding.registration_correction_revision)),
         None,None,binding.sensor_origin_map,Some(accepted.clone())).await?;
+    {
+        let mut adapter=handle.mapping_adapter.as_ref().ok_or("建图拥有方缺失")?.lock();
+        adapter.record_auxiliary_scans(auxiliary)?;
+        if !commit.outcome.accepted_map_points.is_empty() { adapter.record_pgo_scan(accepted)?; }
+    }
     let observed=commit.outcome.occupancy_event.is_some() || !commit.outcome.accepted_map_points.is_empty();
     publish_registered_lio_commit(handle,accepted.map_frame_id(),&commit).await?;
     if observed {
@@ -11429,6 +11439,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
     let binding = accepted.binding();
     let navigation_context = handle.navigation_map_3d_publish_context();
     let initial_mode = correction.relocalization_mode_snapshot();
+    mapping_observation::observe_mode(handle,initial_mode.epoch);
     let Some(frame_capture_epoch) = binding.frame_capture_relocalization_epoch else {
         return Ok(false);
     };
@@ -11480,6 +11491,11 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         }
     }
 
+    let auxiliary=mapping_observation::flush(handle,source_timestamp_ns,
+        Some((binding.mapping_session_generation,binding.map_frame_generation,binding.registration_correction_revision)),
+        Some((initial_mode.epoch,correction.relocalization_mode_fence()))).await?;
+    // 只刷新实际提交接收时刻；采集戳和不可变LiDAR准入来源保持原值。
+    let adapter_timestamp_ns=if auxiliary.is_empty() { adapter_timestamp_ns } else { crate::server::now_ns() };
     let commit = commit_registered_lio_cloud_inner(
         handle,
         points,
@@ -11499,9 +11515,11 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         Some(accepted.clone()),
     )
     .await?;
-    if !commit.outcome.accepted_map_points.is_empty() {
-        handle.mapping_adapter.as_ref().ok_or("mapping adapter unavailable")?.lock()
-            .record_pgo_scan(accepted)?;
+    {
+        // 同刻辅助与LiDAR归档对PGO快照原子可见，避免时间水位追赶漏掉其中一帧。
+        let mut adapter=handle.mapping_adapter.as_ref().ok_or("mapping adapter unavailable")?.lock();
+        adapter.record_auxiliary_scans(auxiliary)?;
+        if !commit.outcome.accepted_map_points.is_empty() { adapter.record_pgo_scan(accepted)?; }
     }
     let accepted_cloud_for_recent = accepted;
     let occupancy_committed = commit.outcome.occupancy_event.is_some();
@@ -12118,6 +12136,8 @@ async fn handoff_registered_lio_cloud_inner(
     expected_generations: Option<(u64, u64, u64)>,
     sensor_origin_map: Option<[f64; 3]>,
 ) -> Result<bool, String> {
+    let auxiliary=mapping_observation::flush(handle,source_timestamp_ns,expected_generations,None).await?;
+    let adapter_timestamp_ns=if auxiliary.is_empty() { adapter_timestamp_ns } else { crate::server::now_ns() };
     let commit = commit_registered_lio_cloud_inner(
         handle,
         points,
@@ -12133,6 +12153,7 @@ async fn handoff_registered_lio_cloud_inner(
         None,
     )
     .await?;
+    handle.mapping_adapter.as_ref().ok_or("建图拥有方缺失")?.lock().record_auxiliary_scans(auxiliary)?;
     let occupancy_committed = commit.outcome.occupancy_event.is_some();
     let accepted = occupancy_committed || !commit.outcome.accepted_map_points.is_empty();
     publish_registered_lio_commit(handle, map_frame, &commit).await?;

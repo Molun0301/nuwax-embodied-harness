@@ -70,7 +70,7 @@ pub enum SurfaceError {
     #[error("invalid body/support pose or calibrated offset")]
     InvalidPose,
     /// 自身水平单元没有满足高度约束的真实支撑。
-    #[error("no observed support in the requested column")]
+    #[error("no observed support in the requested column（机器人足迹处缺少实测地面支撑，需补充观察）")]
     MissingSupport,
     /// 新进入的精细位置缺少合格观察。
     #[error("近场支撑{cell:?}不可用：{reason}，采样={observed_ns}，检查={checked_ns}")]

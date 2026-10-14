@@ -4162,7 +4162,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="relative_move",
                 display_name="相对移动",
-                description="按给定速度和时长执行短时底盘移动。",
+                description="按给定速度和时长执行短距离移动或原地转向，可用于调整观察方向；不代表已规划路径或确认导航到达。",
                 category=SkillCategory.MOTION,
                 capability_name="relative_move",
             ),
@@ -8035,7 +8035,7 @@ class GatewayRuntime:
                     remember_result=True,
                     frame_count=1,
                 )
-                search_state = self._build_target_search_state(
+                search_state = self._build_target_search_state_for_task(context, poll_interval_sec=poll_interval_sec,
                     query=query,
                     map_name=map_name,
                     camera_id=camera_id,
@@ -8171,7 +8171,7 @@ class GatewayRuntime:
                         )
                         last_search_refresh_at = now
 
-                    search_state = self._build_target_search_state(
+                    search_state = self._build_target_search_state_for_task(context, poll_interval_sec=poll_interval_sec,
                         query=query,
                         map_name=map_name,
                         camera_id=camera_id,
@@ -8273,7 +8273,7 @@ class GatewayRuntime:
                             remember_result=True,
                             frame_count=1,
                         )
-                        final_search_state = self._build_target_search_state(
+                        final_search_state = self._build_target_search_state_for_task(context, poll_interval_sec=poll_interval_sec,
                             query=query,
                             map_name=map_name,
                             camera_id=camera_id,
@@ -9606,6 +9606,43 @@ class GatewayRuntime:
             http_status=503,
             jsonrpc_code=-32010,
         )
+
+    def _build_target_search_state_for_task(self, task_context, *, poll_interval_sec, **arguments):
+        """同图增量重读沿任务期限等待；取消仍由外层原停车屏障处理。"""
+        from services.memory.scene_mapping_state import same_scope, snapshot_binding
+        expected = None
+
+        def require_same_source():
+            if expected is None:
+                return
+            snapshot = self.mapping_service.get_semantic_snapshot()
+            current = snapshot_binding(snapshot) if snapshot is not None else {}
+            if (not same_scope(current, expected)
+                    or current.get("schema_version") != expected.get("schema_version")):
+                raise GatewayError("目标查找等待期间地图来源已改变。", error_code="scene_map_changed", http_status=409)
+
+        while True:
+            task_context.ensure_active()
+            require_same_source()
+            try:
+                result = self._build_target_search_state(**arguments)
+                require_same_source()
+                return result
+            except GatewayError as exc:
+                if exc.error_code != "scene_map_updating":
+                    raise
+                binding = exc.details["map_binding"]
+                if expected is not None and not same_scope(binding, expected):
+                    raise GatewayError("目标查找等待期间地图来源已改变。", error_code="scene_map_changed", http_status=409) from exc
+                expected = binding
+                task_context.update(stage="target_search_wait_map", message=str(exc))
+                remaining = task_context.timeout_remaining_sec()
+                delay = min(0.2, max(0.05, poll_interval_sec))
+                if remaining is not None:
+                    if remaining <= 0:
+                        task_context.ensure_active()
+                    delay = min(delay, remaining)
+                time.sleep(delay)
 
     def _build_target_search_state(
         self,

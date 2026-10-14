@@ -1566,7 +1566,7 @@ fn take_activation_fault_after(
     false
 }
 
-fn now_ns() -> u64 {
+pub(crate) fn now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -8417,6 +8417,12 @@ impl GeometryRuntime for GeometryRuntimeService {
         if self.bridge.mapping_adapter.as_ref().is_some_and(|a|a.lock().planar.is_some()) {
             return Err(Status::failed_precondition("二维执行链不接纳三维点云"));
         }
+        if req.get_ref().mapping_only {
+            self.ensure_running_admission("PublishPointCloud").await?;
+            let _lifecycle = self.bridge.mapping_lifecycle_lock.lock().await;
+            return crate::lcm_runtime::mapping_observation::enqueue(&self.bridge, req.into_inner(), &self.base_frame_id)
+                .map(Response::new).map_err(Status::invalid_argument);
+        }
         let Some((topic, msg_type)) = self.point_cloud_binding.clone() else {
             return Ok(Response::new(PublishResult {
                 success: false,
@@ -8917,6 +8923,7 @@ mod pointcloud_request_tests {
             point_count: 2,
             is_dense: true,
             imu_samples: Vec::new(),
+            ..Default::default()
         }
     }
 

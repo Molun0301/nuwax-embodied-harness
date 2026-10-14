@@ -298,6 +298,23 @@ class ReceiptEvidenceChecks(unittest.TestCase):
             task_id = self.finish(fixed)
             self.assertEqual(self.manager.capture_task_receipt(task_id).snapshot()["result"].isoformat(), fixed.isoformat())
 
+    def test_restored_map_workspace_datetime_supports_task_receipt(self):
+        from contracts.map_workspace import MapAsset, MapWorkspace
+        from pydantic_core import TzInfo
+        # 地图持久化后再次激活，契约解析器会产生其自身的固定偏移时区。
+        original = MapWorkspace(active_map_name="住宅", map_asset=MapAsset(
+            map_name="住宅", display_name="住宅", bound_memory_library_name="住宅",
+            created_at=datetime(2026, 10, 14, 12, tzinfo=timezone(timedelta(hours=8))),
+            metadata={"观察": [1]}))
+        restored = MapWorkspace.model_validate_json(original.model_dump_json())
+        self.assertIs(type(restored.map_asset.created_at.tzinfo), TzInfo)
+        task_id = self.finish({"active_workspace": restored})
+        capture = self.manager.capture_task_receipt(task_id)
+        copied = capture.snapshot()["result"]["active_workspace"]
+        self.assertEqual(copied.model_dump(mode="json"), restored.model_dump(mode="json"))
+        copied.map_asset.metadata["观察"].append(2)
+        self.assertEqual(capture.snapshot()["result"]["active_workspace"].map_asset.metadata["观察"], [1])
+
     def test_tuple_list_cycle_does_not_share_original_metadata(self):
         child = []
         original = (child,)

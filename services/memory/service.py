@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from core.config_values import runtime_value
+from core.source_time import SourceTimeError, source_age_ns, acquired_unix_ns
 
 from collections import deque
 from contextlib import contextmanager
 import uuid
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 import logging
 import math
@@ -2812,7 +2813,11 @@ class MemoryService(SceneMappingMemoryMixin):
         snapshot = self._get_map_snapshot()
         if snapshot is None or pose is None or region.map_name != snapshot.map_name:
             return False
-        if not -1 <= (utc_now() - pose.timestamp).total_seconds() <= 2:
+        try:
+            age = source_age_ns(round(pose.timestamp.timestamp()*1e9)) / 1e9 if pose.timestamp.tzinfo is not None else None
+        except SourceTimeError:
+            return False
+        if age is None or not -1 <= age <= 2:
             return False
         binding = region.metadata.get("map_binding", {})
         if any(binding.get(key) != getattr(snapshot, key) for key in (
@@ -3118,15 +3123,11 @@ class MemoryService(SceneMappingMemoryMixin):
     ) -> NavigationSemanticContext:
         """返回当前命名地图绑定的语义导航上下文。"""
 
-        map_snapshot = self._get_map_snapshot()
+        map_snapshot, map_context = self._capture_current_semantic_map_context(map_name=map_name)
         active_session = self._localization_service.get_active_session()
         resolved_map_name = self._resolve_stable_map_name(
             map_name=map_name,
             map_snapshot=map_snapshot,
-        )
-        map_context = self._refresh_semantic_map_context(
-            map_snapshot,
-            map_name=resolved_map_name,
         )
         localization_session_id = None
         localization_ready = False
@@ -6456,8 +6457,21 @@ class MemoryService(SceneMappingMemoryMixin):
 
     def _build_scene_memory_metadata(self, perception_context) -> Dict[str, object]:
         scene_summary = perception_context.scene_summary
+        frame_timestamp = perception_context.metadata.get("frame_timestamp")
+        frame_acquired_timestamp = perception_context.metadata.get("frame_acquired_timestamp")
+        if frame_timestamp and not frame_acquired_timestamp:
+            timestamp = datetime.fromisoformat(str(frame_timestamp).replace("Z", "+00:00"))
+            if timestamp.tzinfo is not None:
+                source_ns = perception_context.metadata.get("source_timestamp_ns") or round(timestamp.timestamp()*1e9)
+                try:
+                    real_ns = acquired_unix_ns(source_ns)
+                except SourceTimeError as exc:
+                    raise GatewayError("图像真实采集时间不可用：" + str(exc),
+                        error_code="frame_source_time_unavailable", http_status=409) from exc
+                frame_acquired_timestamp = datetime.fromtimestamp(real_ns/1e9, timezone.utc).isoformat()
         return {
-            "frame_timestamp": perception_context.metadata.get("frame_timestamp"),
+            "frame_timestamp": frame_timestamp,
+            "frame_acquired_timestamp": frame_acquired_timestamp,
             "frame_timestamp_source": perception_context.metadata.get("frame_timestamp_source"),
             "visual_labels": self._collect_scene_visual_labels(scene_summary),
             "vision_tags": self._collect_scene_vision_tags(scene_summary),
@@ -6880,6 +6894,12 @@ class MemoryService(SceneMappingMemoryMixin):
         self, map_snapshot, *, map_name: Optional[str] = None, expected_generation=None,
     ) -> SemanticMapBuildResult:
         from services.memory.scene_identity import IdentityPlanChanged, IdentityScopeChanged
+        from services.memory.scene_mapping_state import bound_to_semantic_reference, snapshot_binding
+        reference_getter = getattr(self._mapping_service, "get_semantic_snapshot", None)
+        reference = reference_getter() if reference_getter is not None else None
+        if map_snapshot is not None and reference is not None and bound_to_semantic_reference(map_snapshot, snapshot_binding(reference)):
+            # 区域上下文消费封存资产；观察写入仍保留其原运行期快照和采集来源。
+            map_snapshot = reference
         caller_transaction = self._repository.storage.current_transaction
         scope = self._observation_write_scope()
         captured_generation = (scope.get("activation_generation") if scope and "activation_generation" in scope
@@ -8673,13 +8693,32 @@ class MemoryService(SceneMappingMemoryMixin):
         raise GatewayError("当前没有可用定位流帧。")
 
     def _get_map_snapshot(self):
+        return self._capture_current_semantic_map_context()[0]
+
+    def _capture_current_semantic_map_context(self, *, map_name=None):
+        """当前查询重取同来源增量快照；显式历史证据仍走原精确修订围栏。"""
+        from services.memory.scene_mapping_state import same_scope, snapshot_binding
         generation = self._durable_index.activation_generation
-        snapshot = getattr(self._mapping_service, "get_semantic_snapshot", self._mapping_service.get_latest_snapshot)()
-        if snapshot is not None:
-            self._refresh_semantic_map_context(snapshot, expected_generation=generation)
-            return snapshot
-        self._refresh_semantic_map_context(None, expected_generation=generation)
-        return None
+        getter = getattr(self._mapping_service, "get_semantic_snapshot", self._mapping_service.get_latest_snapshot)
+        snapshot = getter()
+        for attempt in range(3):
+            try:
+                context = self._refresh_semantic_map_context(snapshot, map_name=map_name, expected_generation=generation)
+                return snapshot, context
+            except GatewayError as exc:
+                if exc.error_code != "scene_map_changed":
+                    raise
+                latest = getter()
+                if (snapshot is None or latest is None
+                        or not same_scope(snapshot_binding(snapshot), snapshot_binding(latest))
+                        or snapshot.schema_version != latest.schema_version
+                        or latest.update_sequence < snapshot.update_sequence):
+                    raise
+                if attempt == 2:
+                    raise GatewayError("同一地图仍在增量更新，等待下一轮重读目标证据。",
+                        error_code="scene_map_updating", http_status=409,
+                        details={"retryable": True, "map_binding": snapshot_binding(latest)}) from exc
+                snapshot = latest
 
     def _load_primary_image_bytes(self, artifact_ids: List[str]) -> Optional[bytes]:
         if self._artifact_store is None:

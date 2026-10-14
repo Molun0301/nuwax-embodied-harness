@@ -59,12 +59,43 @@ pub(crate) struct ArchivedScan {
     pub odom_from_body: Isometry3<f64>,
     pub sensor_origin_body: Point3<f64>,
     pub body_points: crate::correction_points::CorrectionPoints,
-    source: AdmittedRegisteredScan,
+    source: ArchivedSource,
+}
+
+#[derive(Clone, PartialEq)]
+enum ArchivedSource {
+    Lidar(AdmittedRegisteredScan),
+    Auxiliary(crate::lcm_runtime::mapping_observation::RegisteredObservation),
+}
+
+impl ArchivedSource {
+    fn lidar(&self) -> Option<&AdmittedRegisteredScan> {
+        match self { Self::Lidar(source) => Some(source), Self::Auxiliary(_) => None }
+    }
+    fn key(&self) -> ArchiveSourceKey {
+        match self {
+            Self::Lidar(_) => ArchiveSourceKey::Lidar,
+            Self::Auxiliary(source) => { let (sensor, clock, sequence) = source.key();
+                ArchiveSourceKey::Auxiliary(sensor, clock, sequence) }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ArchiveSourceKey {
+    Lidar,
+    Auxiliary(String, String, u64),
+}
+
+type ArchiveKey = (u64, ArchiveSourceKey);
+
+impl ArchivedScan {
+    fn key(&self) -> ArchiveKey { (self.source_timestamp_ns, self.source.key()) }
 }
 
 #[derive(Default)]
 pub(crate) struct ScanHistory {
-    scans: BTreeMap<u64, ArchivedScan>,
+    scans: BTreeMap<ArchiveKey, ArchivedScan>,
     point_count: usize,
     incomplete: bool,
     dynamic_scene: crate::dynamic_scene::DynamicScene,
@@ -87,8 +118,8 @@ impl ScanHistory {
     ) -> Result<(), String> {
         let source_timestamp_ns = source.source_timestamp_ns();
         let binding = source.binding();
-        if let Some(existing) = self.scans.get(&source_timestamp_ns) {
-            return if existing.source == *source { Ok(()) }
+        if let Some(existing) = self.scans.get(&(source_timestamp_ns, ArchiveSourceKey::Lidar)) {
+            return if existing.source.lidar() == Some(source) { Ok(()) }
                 else { Err("PGO历史扫描来源冲突".into()) };
         }
         if let Some((stamp, count, latest, _)) = &self.latest_static_scan {
@@ -113,28 +144,37 @@ impl ScanHistory {
             (!self.dynamic_scene.is_dynamic([p.x, p.y, p.z])).then_some(index as u32)
         }).collect::<Vec<_>>();
         self.latest_static_scan = Some((source_timestamp_ns, body_points.len(), source.downgrade(), static_indices.into()));
+        self.archive(ArchivedScan {
+            source_timestamp_ns, received_at_ns, odom_from_body: binding.frozen_odom_from_body,
+            sensor_origin_body: sensor_origin.unwrap_or_else(Point3::origin),
+            body_points: body_points.clone(), source: ArchivedSource::Lidar(source.clone()),
+        })
+    }
+
+    pub(crate) fn record_auxiliary(&mut self,
+        source: crate::lcm_runtime::mapping_observation::RegisteredObservation,
+    ) -> Result<(), String> {
+        self.archive(ArchivedScan {
+            source_timestamp_ns: source.timestamp_ns(), received_at_ns: source.received_at_ns(),
+            odom_from_body: source.odom_from_body(), sensor_origin_body: source.origin_body(),
+            body_points: source.body_points().clone(), source: ArchivedSource::Auxiliary(source),
+        })
+    }
+
+    fn archive(&mut self, scan: ArchivedScan) -> Result<(), String> {
+        let key = scan.key();
+        if let Some(existing) = self.scans.get(&key) {
+            return if existing.source == scan.source { Ok(()) } else { Err("PGO归档来源冲突".into()) };
+        }
         if self.incomplete { return Ok(()); }
-        if self.point_count.saturating_add(body_points.len()) > MAX_ARCHIVED_POINTS {
+        if self.point_count.saturating_add(scan.body_points.len()) > MAX_ARCHIVED_POINTS {
             tracing::warn!(event = "pgo.history.exhausted", archived_points = self.point_count,
-                incoming_points = body_points.len(), "PGO归档容量耗尽，本会话停止完整历史校正，正常建图继续");
-            self.scans.clear();
-            self.point_count = 0;
-            self.incomplete = true;
+                incoming_points = scan.body_points.len(), "PGO归档容量耗尽，本会话停止完整历史校正，正常建图继续");
+            self.scans.clear(); self.point_count = 0; self.incomplete = true;
             return Ok(());
         }
-        let sensor_origin_body = sensor_origin.unwrap_or_else(Point3::origin);
-        self.point_count += body_points.len();
-        self.scans.insert(
-            source_timestamp_ns,
-            ArchivedScan {
-                source_timestamp_ns,
-                received_at_ns,
-                odom_from_body: binding.frozen_odom_from_body,
-                sensor_origin_body,
-                body_points: body_points.clone(),
-                source: source.clone(),
-            },
-        );
+        self.point_count += scan.body_points.len();
+        self.scans.insert(key, scan);
         Ok(())
     }
 
@@ -148,7 +188,7 @@ impl ScanHistory {
     }
 
     pub fn latest_timestamp_ns(&self) -> Option<u64> {
-        self.scans.last_key_value().map(|(stamp, _)| *stamp)
+        self.scans.last_key_value().map(|((stamp, _), _)| *stamp)
     }
 
     pub fn snapshot_after(&self, after: u64) -> Result<Vec<ArchivedScan>, RebuildError> {
@@ -158,7 +198,8 @@ impl ScanHistory {
         use std::ops::Bound::{Excluded, Unbounded};
         Ok(self
             .scans
-            .range((Excluded(after), Unbounded))
+            .range((Excluded((after, ArchiveSourceKey::Lidar)), Unbounded))
+            .filter(|((stamp, _), _)| *stamp > after)
             .map(|(_, scan)| scan.clone())
             .collect())
     }
@@ -201,6 +242,7 @@ pub(crate) struct ReplayBuilder {
     frame_id: String,
     config: MappingBackendComputeConfig,
     last_input: Option<Arc<MappingBackendInput>>,
+    last_archive_key: Option<ArchiveKey>,
     processed: usize,
     started: Instant,
     budget: Duration,
@@ -242,20 +284,18 @@ impl ReplayBuilder {
             .source_timestamp_ns;
         if !scans
             .windows(2)
-            .all(|pair| pair[0].source_timestamp_ns < pair[1].source_timestamp_ns)
+            .all(|pair| pair[0].key() < pair[1].key())
         {
-            return Err("PGO归档扫描必须按真实源时间严格递增".into());
+            return Err("PGO归档扫描必须按真实源时间和独立来源排序".into());
         }
         let mut keyframes = Vec::with_capacity(trajectory.len());
         for node in &trajectory {
             check_budget(started, budget, cancelled)?;
-            let frame = scans
-                .binary_search_by_key(&(node.source_timestamp_ns as u64), |s| {
-                    s.source_timestamp_ns
-                })
-                .ok()
-                .map(|index| &scans[index])
-                .ok_or("PGO轨迹引用了未保存的原始扫描")?;
+            let stamp = node.source_timestamp_ns as u64;
+            let start = scans.partition_point(|scan| scan.source_timestamp_ns < stamp);
+            let frame = scans[start..].iter().take_while(|scan| scan.source_timestamp_ns == stamp)
+                .find(|scan| scan.source.lidar().is_some())
+                .ok_or("PGO轨迹引用了未保存的原始LiDAR扫描")?;
             keyframes.push(CorrectionKeyframe {
                 timestamp: (node.source_timestamp_ns - first) as f64 / 1e9,
                 local_pose: frame.odom_from_body,
@@ -280,6 +320,7 @@ impl ReplayBuilder {
             frame_id,
             config,
             last_input: None,
+            last_archive_key: None,
             processed: 0,
             started,
             budget,
@@ -367,10 +408,7 @@ impl ReplayBuilder {
     ) -> Result<(), RebuildError> {
         for scan in scans {
             self.check(cancelled)?;
-            if self
-                .last_input
-                .as_ref()
-                .is_some_and(|input| scan.source_timestamp_ns <= input.source_timestamp_ns)
+            if self.last_archive_key.as_ref().is_some_and(|key| scan.key() <= *key)
             {
                 return Err("PGO追赶扫描与已处理前缀重叠或回退".into());
             }
@@ -399,7 +437,7 @@ impl ReplayBuilder {
                 sensor_origin_map: origin.coords.into(),
                 registered_points_map: points,
             });
-            let ground_source = ReplayedGroundSource { source: scan.source.clone() };
+            let ground_source = ReplayedGroundSource { source: scan.source.lidar().cloned() };
             let validation_started = Instant::now();
             mapping_backend::validate_backend_input(&self.kernel, &input)?;
             self.kernel_time += validation_started.elapsed();
@@ -430,6 +468,7 @@ impl ReplayBuilder {
             }
             self.processed += 1;
             self.last_input = Some(input);
+            self.last_archive_key = Some(scan.key());
         }
         self.check(cancelled)
     }
@@ -606,7 +645,7 @@ impl ReplayBuilder {
 
 #[derive(Clone)]
 struct ReplayedGroundSource {
-    source: AdmittedRegisteredScan,
+    source: Option<AdmittedRegisteredScan>,
 }
 
 struct CloudStageReply {
@@ -730,7 +769,7 @@ fn append_cloud_stage(
     input: &MappingBackendInput,
     ground_source: Option<&ReplayedGroundSource>,
 ) -> Result<(), RebuildError> {
-    if ground_source.is_some_and(|s| s.source.source_timestamp_ns() != input.source_timestamp_ns) { return Err("PGO ground/source timestamp mismatch".into()); }
+    if ground_source.and_then(|s| s.source.as_ref()).is_some_and(|s| s.source_timestamp_ns() != input.source_timestamp_ns) { return Err("PGO ground/source timestamp mismatch".into()); }
     if !cloud.accumulate_mapping_scan(
         1,
         &input.registered_points_map,
@@ -739,8 +778,8 @@ fn append_cloud_stage(
     ) {
         return Err("PGO重建点云无法接纳原始扫描".into());
     }
-    if let Some(source) = ground_source {
-        cloud.capture_replayed_ground(&input.registered_points_map, &source.source)?;
+    if let Some(source) = ground_source.and_then(|s| s.source.as_ref()) {
+        cloud.capture_replayed_ground(&input.registered_points_map, source)?;
     }
     Ok(())
 }
@@ -900,7 +939,7 @@ mod tests {
         history.record(&source, 11).unwrap();
         let replay = history.snapshot().unwrap();
         assert_eq!(replay[0].body_points.as_ptr(), allocation);
-        assert_eq!(replay[0].source.body_points().as_ptr(), allocation);
+        assert_eq!(replay[0].source.lidar().unwrap().body_points().as_ptr(), allocation);
         let correction_points = source.body_points().clone();
         assert_eq!(correction_points.as_ptr(), allocation);
         drop(source);
@@ -1030,7 +1069,7 @@ mod tests {
                     odom_from_body: pose,
                     sensor_origin_body: Point3::origin(),
                     body_points: source.body_points().clone(),
-                    source,
+                    source: ArchivedSource::Lidar(source),
                 }
             })
             .collect::<Vec<_>>();
@@ -1331,7 +1370,7 @@ mod tests {
             })
             .await
             .unwrap();
-            eprintln!("固定扰动 parallel={parallel} elapsed_ms={:.3} kernel_ms={kernel_ms:.3} cloud_ms={cloud_ms:.3} points={}",
+            eprintln!("固定扰动 parallel={parallel} elapsed_ms={:0.3} kernel_ms={kernel_ms:0.3} cloud_ms={cloud_ms:0.3} points={}",
                 started.elapsed().as_secs_f64()*1000.0, output.cloud.point_count);
             if let Some(reference) = &reference {
                 assert_eq!(output.persistent.grid.data, reference.persistent.grid.data);
@@ -1410,7 +1449,7 @@ mod tests {
         .await
         .unwrap();
         let materialize_ms = materialize_started.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("后台阶段 kernel_ms={kernel_ms:.3} cloud_ms={cloud_ms:.3} materialize_ms={materialize_ms:.3}");
+        eprintln!("后台阶段 kernel_ms={kernel_ms:0.3} cloud_ms={cloud_ms:0.3} materialize_ms={materialize_ms:0.3}");
         assert_eq!(
             output.source_timestamp_ns,
             scans.last().unwrap().source_timestamp_ns
@@ -1468,4 +1507,36 @@ mod tests {
         // 已取消的私有重建不污染下一次重建的内核或临时点云。
         rebuild_scale(8, Duration::from_secs(30), || false).unwrap();
     }
+    #[test]
+    fn auxiliary_same_time_keeps_lidar_owner_and_replays_without_lidar_ground_proof() {
+        let (original,trajectory)=scale_input(2);
+        let mut history=ScanHistory::default();
+        let lidar=original[0].source.lidar().unwrap();
+        history.record(lidar,original[0].received_at_ns).unwrap();
+        let indices=history.static_point_indices(lidar).unwrap();
+        let auxiliary=crate::lcm_runtime::mapping_observation::RegisteredObservation::for_test(
+            original[0].source_timestamp_ns,"depth-front",vec![Point3::new(0.7,0.3,-0.8)],
+            original[0].odom_from_body,[0.12,0.,0.3]);
+        history.record_auxiliary(auxiliary.clone()).unwrap();
+        history.record_auxiliary(auxiliary).unwrap();
+        assert_eq!(history.static_point_indices(lidar).unwrap(),indices);
+        assert_eq!(history.snapshot().unwrap().len(),2);
+        assert!(history.snapshot_after(original[0].source_timestamp_ns).unwrap().is_empty());
+        history.record(original[1].source.lidar().unwrap(),original[1].received_at_ns).unwrap();
+        let scans=history.snapshot().unwrap();
+        assert_eq!(scans.len(),3);
+        assert!(scans[0].source.lidar().is_some());
+        assert!(scans[1].source.lidar().is_none());
+        let config=MappingBackendComputeConfig {resolution:0.1,initial_safe_radius_meters:0.,window_capacity:10_000};
+        let mut builder=ReplayBuilder::new(&scans,trajectory,Isometry3::identity(),MappingBackendSpec::Voxel,
+            config,"map".into(),Duration::from_secs(10),&||false).unwrap();
+        builder.append(&scans,&||false).unwrap();
+        assert_eq!(builder.processed,3);
+        assert!(matches!(builder.append(&scans[2..],&||false),Err(RebuildError::Invalid(_))));
+        builder.cloud.as_mut().unwrap().cleanup_product_owned_file().unwrap();
+        let conflicting=crate::lcm_runtime::mapping_observation::RegisteredObservation::for_test(
+            scans[0].source_timestamp_ns,"depth-front",vec![Point3::new(9.,9.,9.)],Isometry3::identity(),[0.12,0.,0.3]);
+        assert!(history.record_auxiliary(conflicting).unwrap_err().contains("来源冲突"));
+    }
+
 }

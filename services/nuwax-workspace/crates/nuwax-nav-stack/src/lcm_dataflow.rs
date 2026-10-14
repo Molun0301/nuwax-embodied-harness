@@ -1094,14 +1094,11 @@ fn guarded_pose_source_deadline(
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "当前墙钟早于Unix纪元".to_string())?;
     let source = u64::try_from(source_timestamp_ns)
-        .ok()
-        .filter(|value| *value > 0)
-        .map(Duration::from_nanos)
+        .ok().filter(|value| *value > 0)
         .ok_or_else(|| "位姿源时间必须为正".to_string())?;
-    if source > unix_now + Duration::from_millis(50) {
-        return Err("位姿源时间超前当前墙钟超过50毫秒".into());
-    }
-    let age = unix_now.saturating_sub(source);
+    let age = Duration::from_nanos(nuwax_nav_types_messages::source_time::age_ns_at(
+        source, unix_now.as_nanos() as u64,
+    )?);
     let remaining = max_age
         .checked_sub(age)
         .filter(|value| !value.is_zero())

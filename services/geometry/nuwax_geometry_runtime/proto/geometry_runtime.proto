@@ -1067,6 +1067,13 @@ message PublishPointCloudRequest {
   uint32 point_count = 6;
   bool is_dense = 7;
   repeated LioImuSample imu_samples = 8;
+  // 辅助观测使用已估计位姿更新同一地图，不进入激光惯性前端。
+  bool mapping_only = 9;
+  repeated double sensor_origin_xyz = 10;
+  string sensor_id = 11;
+  uint64 source_sequence = 12;
+  string clock_id = 13;
+  string calibration_ref = 14;
 }
 message PublishResult { bool success = 1; string message = 2; }
 // 生产者报告已经破坏本代输入连续性；几何重启前禁止接纳更晚扫描。

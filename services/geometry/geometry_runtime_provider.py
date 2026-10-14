@@ -8,6 +8,7 @@ from __future__ import annotations
 from services.geometry.planar_archive import read_planar_structure
 from services.geometry.checkpoint_payload import FrozenPayload, payload_chunks, payload_digest, MAX_PLANAR_ARCHIVE_BYTES
 from core.config_values import runtime_value
+from core.source_time import acquired_unix_ns, acquired_times, SourceTimeError
 
 from contextlib import contextmanager
 from collections import deque
@@ -8813,6 +8814,18 @@ class GeometryRuntimeProvider:
             **typed_metadata,
         }
         metadata.setdefault("raw_status", raw_status)
+        if pose is not None:
+            source_ns = int(pose.timestamp.timestamp() * 1_000_000_000)
+            timing = {"source_timestamp_ns": source_ns}
+            try:
+                acquired_ns, acquired_mono_ns = acquired_times(source_ns)
+                age_ns = (time.monotonic_ns() - acquired_mono_ns if acquired_mono_ns is not None
+                          else time.time_ns() - acquired_ns)
+                timing.update(acquired_unix_ns=acquired_ns, age_ms=age_ns / 1_000_000,
+                              source_clock="simulation_logical" if acquired_mono_ns is not None else "unix")
+            except SourceTimeError as exc:
+                timing.update(acquired_unix_ns=None, age_ms=None, unavailable_reason=str(exc))
+            metadata["current_pose_timing"] = timing
         if include_readiness:
             try:
                 if deadline_monotonic is None:
@@ -10387,6 +10400,12 @@ class GeometryRuntimeProvider:
         point_count: int = 0,
         is_dense: bool = True,
         imu_samples: Optional[List[Any]] = None,
+        mapping_only: bool = False,
+        sensor_origin_xyz: Optional[List[float]] = None,
+        sensor_id: str = "",
+        source_sequence: int = 0,
+        clock_id: str = "",
+        calibration_ref: str = "",
     ) -> bool:
         """Publish normalized PointCloud2 data through the Rust gRPC facade.
 
@@ -10445,6 +10464,12 @@ class GeometryRuntimeProvider:
                 point_count=max(0, int(point_count)),
                 is_dense=bool(is_dense),
                 imu_samples=proto_imu_samples,
+                mapping_only=mapping_only,
+                sensor_origin_xyz=sensor_origin_xyz if sensor_origin_xyz is not None else [],
+                sensor_id=sensor_id,
+                source_sequence=source_sequence,
+                clock_id=clock_id,
+                calibration_ref=calibration_ref,
             )
             response = self._stub.PublishPointCloud(
                 request,
@@ -10589,6 +10614,10 @@ class GeometryRuntimeProvider:
                         try:
                             metadata = {"sequence": update.sequence,
                                         "source_timestamp_ns": int(update.pose.timestamp_ns)}
+                            try:
+                                metadata["source_acquired_unix_ns"] = acquired_unix_ns(metadata["source_timestamp_ns"])
+                            except SourceTimeError:
+                                metadata["source_acquired_unix_ns"] = None
                             with self._map_state_lock:
                                 receipt = self._planar_scan_receipts.get(metadata["source_timestamp_ns"])
                                 if receipt is not None and receipt[0] == self._mapping_identity:

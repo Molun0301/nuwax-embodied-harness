@@ -632,6 +632,7 @@ class InstanceAssociationService:
         artifact_ids = self._merge_strings(current.artifact_ids, observation.source_artifact_ids)
         inspection_poses = self._inspection_pose_planner.plan_for_target(
             target_pose=blended_pose,
+            observer_body_pose=observation.observer_body_pose,
             occupancy_grid=occupancy_grid,
             cost_map=cost_map,
             existing_poses=current.inspection_poses,
@@ -706,7 +707,9 @@ class InstanceAssociationService:
             "deferred_projection_cache": deferred_cache,
             "lifecycle_state": merged_lifecycle,
             "metadata": metadata,
-            "attributes": copy.deepcopy(current.attributes),
+            "attributes": {**copy.deepcopy(current.attributes), **({
+                "observer_body_pose": observation.observer_body_pose.model_dump(mode="json")
+            } if observation.observer_body_pose is not None else {})},
             "supporting_observation_event_ids": supporting_event_ids,
         }
         # 只复制本次生成的可变字段，避免每帧复制实例保留的完整射线历史。
@@ -728,6 +731,7 @@ class InstanceAssociationService:
         instance_id = build_instance_id(id_kind, timestamp=now)
         inspection_poses = self._inspection_pose_planner.plan_for_target(
             target_pose=observation.pose,
+            observer_body_pose=observation.observer_body_pose,
             occupancy_grid=occupancy_grid,
             cost_map=cost_map,
         )

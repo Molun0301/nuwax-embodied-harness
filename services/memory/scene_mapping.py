@@ -12,6 +12,7 @@ from contracts.base import utc_now
 from contracts.scene_decision import SceneDecisionRequest
 from contracts.spatial_memory import SceneCandidateLabel, SceneObservationSample, SceneSpaceReviewStatus
 from core.errors import GatewayError
+from core.source_time import SourceTimeError, source_age_ns
 from services.memory.room_segmentation import RoomSegmentationService, pose_in_scene_space
 from services.memory.scene_mapping_state import MANAGED_KEY, same_scope, snapshot_binding
 from services.memory.scene_graph import SceneGraphService
@@ -233,9 +234,11 @@ class SceneMappingService:
         for entry in capture["entries"]:
             if entry.map_name != space.map_name or entry.pose is None:
                 continue
-            if entry.metadata.get("map_source_epoch") != capture["binding"]["source_epoch"]:
-                continue
-            if entry.metadata.get("map_source_name") != capture["binding"]["source_name"]:
+            entry_binding = {"map_name": entry.map_name, "frame_id": entry.pose.frame_id,
+                             "source_epoch": entry.metadata.get("map_source_epoch"),
+                             "source_name": entry.metadata.get("map_source_name")}
+            if not any(same_scope(entry_binding, binding) for binding in
+                       capture.get("evidence_bindings", (capture["binding"],))):
                 continue
             if not pose_in_scene_space(entry.pose, space):
                 continue
@@ -246,8 +249,16 @@ class SceneMappingService:
                 timestamp = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
                 if timestamp.tzinfo is None:
                     continue
-                age = (now - timestamp).total_seconds()
-            except (TypeError, ValueError):
+                acquired = entry.metadata.get("frame_acquired_timestamp")
+                if acquired:
+                    acquired_time = datetime.fromisoformat(str(acquired).replace("Z", "+00:00"))
+                    if acquired_time.tzinfo is None:
+                        continue
+                    age = (now - acquired_time).total_seconds()
+                else:
+                    age = source_age_ns(round(timestamp.timestamp()*1e9),
+                        now_unix_ns=round(now.timestamp()*1e9)) / 1e9
+            except (TypeError, ValueError, SourceTimeError):
                 continue
             if age < -1 or age > self.config.max_evidence_age_sec:
                 continue
@@ -491,7 +502,11 @@ class SceneMappingService:
         pose = localization.current_pose if localization is not None else None
         if pose is None:
             raise GatewayError("当前没有定位位姿。", error_code="scene_pose_unavailable", http_status=409)
-        if pose.timestamp.tzinfo is None or not -1 <= (utc_now() - pose.timestamp).total_seconds() <= 2:
+        try:
+            age = source_age_ns(round(pose.timestamp.timestamp()*1e9)) / 1e9 if pose.timestamp.tzinfo is not None else None
+        except SourceTimeError as exc:
+            raise GatewayError(str(exc), error_code="scene_pose_stale", http_status=409) from exc
+        if age is None or not -1 <= age <= 2:
             raise GatewayError("当前位姿已过期，不能判断实时区域归属。", error_code="scene_pose_stale", http_status=409)
         active = self.memory._localization_service.get_active_session()
         if active is None or not active.pose_available:

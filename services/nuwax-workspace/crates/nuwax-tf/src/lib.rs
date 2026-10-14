@@ -182,6 +182,43 @@ impl TfTree {
         lookup_in(&g, child, Some((time_secs, tolerance_secs)))
     }
 
+    /// 使用采集时刻前后的位姿插值；不把最新位姿当成过去或未来的观测位姿。
+    ///
+    /// # Errors
+    /// 没有包围采集时刻的历史，或两帧父坐标不同，返回现有坐标查询错误。
+    pub fn lookup_interpolated_at(
+        &self,
+        child: &str,
+        time_secs: f64,
+    ) -> TfResult<TransformStamped> {
+        validate_time_query(time_secs, 0.0)?;
+        let histories = self.transforms.lock();
+        let history = histories.get(child).filter(|h| !h.is_empty())
+            .ok_or_else(|| TfError::FrameNotFound(child.into()))?;
+        let next = history.partition_point(|entry| timestamp_secs(entry) < time_secs);
+        if history.get(next).is_some_and(|entry| timestamp_secs(entry) == time_secs) {
+            return Ok(history[next].clone());
+        }
+        let (Some(previous), Some(after)) = (next.checked_sub(1), history.get(next)) else {
+            return lookup_in(&histories, child, Some((time_secs, 0.0)));
+        };
+        let before = &history[previous];
+        if before.parent != after.parent {
+            return Err(TfError::Disconnected { from: before.parent.clone(), to: after.parent.clone() });
+        }
+        let ratio = (time_secs - timestamp_secs(before))
+            / (timestamp_secs(after) - timestamp_secs(before));
+        let position = before.transform.translation.vector.lerp(&after.transform.translation.vector, ratio);
+        let rotation = before.transform.rotation.slerp(&after.transform.rotation, ratio);
+        let stamp_ns = (time_secs * 1e9).round() as i64;
+        Ok(TransformStamped {
+            parent: before.parent.clone(), child: child.into(),
+            stamp_secs: stamp_ns.div_euclid(1_000_000_000),
+            stamp_nanos: stamp_ns.rem_euclid(1_000_000_000) as u32,
+            transform: Isometry3::from_parts(Translation3::from(position), rotation),
+        })
+    }
+
     /// 返回某个 child frame 当前保留的历史帧数。
     #[must_use]
     pub fn history_len(&self, child: &str) -> usize {
@@ -579,4 +616,21 @@ mod tests {
         assert_relative_eq!(roundtrip.translation.vector.norm(), 0.0, epsilon = 1e-9);
         assert_relative_eq!(roundtrip.rotation.angle(), 0.0, epsilon = 1e-9);
     }
+    #[test]
+    fn interpolated_capture_pose_preserves_translation_and_rotation() {
+        let tree = TfTree::new();
+        let mut before = TransformStamped::identity("odom", "body");
+        before.stamp_secs = 10;
+        let mut after = before.clone();
+        after.stamp_secs = 12;
+        after.transform = Isometry3::from_parts(Translation3::new(2.0, 0.0, 0.0),
+            UnitQuaternion::from_euler_angles(0.0, 0.0, std::f64::consts::PI / 2.0));
+        tree.set(before); tree.set(after);
+        let actual = tree.lookup_interpolated_at("body", 11.0).unwrap();
+        assert_relative_eq!(actual.transform.translation.x, 1.0, epsilon=1e-12);
+        assert_relative_eq!(actual.transform.rotation.angle(), std::f64::consts::PI / 4.0, epsilon=1e-12);
+        assert!(tree.lookup_interpolated_at("body", 9.9).is_err());
+        assert!(tree.lookup_interpolated_at("body", 12.1).is_err());
+    }
+
 }

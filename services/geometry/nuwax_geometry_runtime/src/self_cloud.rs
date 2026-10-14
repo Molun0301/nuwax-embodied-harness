@@ -181,6 +181,12 @@ impl NativeSelfFilter {
             point_count: source.point_count,
             is_dense: source.is_dense,
             imu_samples: source.imu_samples.clone(),
+            mapping_only: source.mapping_only,
+            sensor_origin_xyz: source.sensor_origin_xyz.clone(),
+            sensor_id: source.sensor_id.clone(),
+            source_sequence: source.source_sequence,
+            clock_id: source.clock_id.clone(),
+            calibration_ref: source.calibration_ref.clone(),
         };
         for point in source.points.chunks_exact(step) {
             let xyz = [0, 4, 8].map(|offset| {

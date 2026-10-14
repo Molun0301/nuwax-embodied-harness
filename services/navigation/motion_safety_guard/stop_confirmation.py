@@ -9,6 +9,7 @@ from typing import Optional
 from contracts.motion_feedback import MotionExecutionFeedback
 from contracts.navigation_capabilities import MotionLimits, parse_navigation_capabilities
 from core.config_values import runtime_value
+from core.source_time import SourceTimeError, acquired_times, acquired_after
 from .go2_actuator import ActuatorError
 
 
@@ -30,12 +31,16 @@ class StopProgress:
     previous_source: int = 0
     count: int = 0
     samples: deque = field(default_factory=lambda: deque(maxlen=64))
-    last_error: str = "执行器在保证制动期限内未确认停稳。"
+    last_error: str = "执行器在停车确认期限内未确认停稳。"
 
 
 class StopConfirmation:
     def __init__(self, limits: Optional[MotionLimits], *, frame_id: str = "base_link",
-                 monotonic=time.monotonic, unix_ns=time.time_ns, sleep=time.sleep):
+                 monotonic=time.monotonic, unix_ns=time.time_ns, sleep=time.sleep,
+                 feedback_timeout_seconds: float = 1.0):
+        if not math.isfinite(feedback_timeout_seconds) or not 0 < feedback_timeout_seconds <= 30:
+            raise ValueError("真实反馈停车等待须大于0且不超过30秒")
+        self.feedback_timeout_seconds = feedback_timeout_seconds
         self.limits = limits
         self.locomotion = None
         self.frame_id = frame_id
@@ -50,7 +55,8 @@ class StopConfirmation:
     def from_environment(cls):
         capabilities = parse_navigation_capabilities(runtime_value("NUWAX_NAV_CAPABILITIES_JSON", ""))
         result = cls(capabilities.motion if capabilities else None,
-                     frame_id=runtime_value("NUWAX_BASE_FRAME", "").strip() or "base_link")
+                     frame_id=runtime_value("NUWAX_BASE_FRAME", "").strip() or "base_link",
+                     feedback_timeout_seconds=float(runtime_value("NUWAX_MOTION_STOP_FEEDBACK_TIMEOUT_SEC", 1.0)))
         terrain = capabilities.terrain if capabilities else None
         if terrain is not None and terrain.required_locomotion_mode is not None:
             from .mode_confirmation import LocomotionModeRequirement
@@ -59,7 +65,7 @@ class StopConfirmation:
 
     @property
     def maximum_wait_seconds(self) -> float:
-        return self.limits.maximum_stopping_time_sec() + 0.25 if self.limits else 1.0
+        return self.limits.maximum_stopping_time_sec() + 0.25 if self.limits else self.feedback_timeout_seconds
 
     def note_motion(self) -> None:
         self._motion_since_confirmation = True
@@ -84,15 +90,21 @@ class StopConfirmation:
         now = self._unix_ns()
         if feedback.frame_id != self.frame_id:
             raise ActuatorError("MOTION_FEEDBACK_INVALID", "执行器速度未使用受控机体坐标。")
-        if feedback.source_timestamp_ns > now + 50_000_000:
+        try:
+            acquired_unix, acquired_mono = acquired_times(feedback.source_timestamp_ns)
+        except SourceTimeError as exc:
+            raise ActuatorError("MOTION_FEEDBACK_STALE", str(exc)) from exc
+        if acquired_mono is None and acquired_unix > now + 50_000_000:
             raise ActuatorError("MOTION_FEEDBACK_STALE", "执行器反馈过期或位于未来。")
         if feedback.received_monotonic_ns is None:
-            stale = now - feedback.source_timestamp_ns > 250_000_000
+            stale = acquired_mono is None and now - acquired_unix > 250_000_000
         else:
-            # 接收新鲜度不依赖设备与主机的固定时钟差；设备原始时间仍由
-            # 停车窗口要求晚于停止请求，并严格递增，旧缓存不能补成新证明。
+            # 接收年龄与实际采集年龄分别核对；原样本时间继续用于递增证明。
             age = round(self._monotonic() * 1_000_000_000) - feedback.received_monotonic_ns
             stale = age < 0 or age > 250_000_000
+        if acquired_mono is not None:
+            acquisition_age = round(self._monotonic() * 1_000_000_000) - acquired_mono
+            stale = stale or acquisition_age < -50_000_000 or acquisition_age > 250_000_000
         if stale:
             raise ActuatorError("MOTION_FEEDBACK_STALE", "执行器反馈接收已过期。")
         return feedback
@@ -121,7 +133,8 @@ class StopConfirmation:
         try:
             value = self.feedback(actuator)
             assert value is not None
-            fresh = value.source_timestamp_ns >= progress.issued_ns and value.source_timestamp_ns > progress.previous_source
+            fresh = acquired_after(value.source_timestamp_ns, issued_unix_ns=progress.issued_ns,
+                issued_monotonic_ns=round(progress.started * 1_000_000_000)) and value.source_timestamp_ns > progress.previous_source
             if fresh:
                 progress.previous_source = value.source_timestamp_ns
                 # 对速度大小求短窗均值，抑制静止测量抖动；正反运动不会相互抵消。
@@ -144,10 +157,10 @@ class StopConfirmation:
                         return self._complete(StopEvidence(True, "measured_feedback", value.source_timestamp_ns))
                 else:
                     progress.first_settled, progress.count = None, 0
-        except ActuatorError as exc:
+        except (ActuatorError, SourceTimeError) as exc:
             progress.first_settled, progress.count = None, 0
             progress.samples.clear()
-            progress.last_error = exc.message
+            progress.last_error = str(exc) if isinstance(exc, SourceTimeError) else exc.message
         return None
 
     def remaining_seconds(self, progress: StopProgress) -> float:

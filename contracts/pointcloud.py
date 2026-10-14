@@ -43,6 +43,8 @@ class PointCloudFrame(TimestampedContract):
     )
 
     frame_id: str = Field(description="点云坐标系。")
+    mapping_only: bool = Field(default=False, description="仅更新地图，不作为定位主源。")
+    sensor_origin: Vector3 = Field(default_factory=Vector3, description="与点同坐标系的真实传感器光心。")
     point_count: int = Field(ge=0, description="点数量。")
     fields: List[PointField] = Field(default_factory=list, description="字段定义。")
     points: List[Vector3] = Field(default_factory=list, description="内联点集合。")

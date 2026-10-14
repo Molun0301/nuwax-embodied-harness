@@ -189,7 +189,8 @@ class CustomRobotProviderBundle:
         with self._lock:
             if not self._started:
                 return False
-            self._point_cloud = frame
+            if not frame.mapping_only:
+                self._point_cloud = frame
         self._notify("point_cloud", frame)
         return True
 

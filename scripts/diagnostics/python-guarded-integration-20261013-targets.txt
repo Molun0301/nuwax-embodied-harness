@@ -55,3 +55,5 @@ tests/test_assigned_ar1_import.py
 tests/test_planar_asset_catalog.py
 tests/test_planar_catalog_evidence.py
 tests/test_planar_workspace_load.py
+tests/test_map_status_scalar.py
+scripts/check_installer_naming_identity.py

@@ -1758,6 +1758,17 @@
     "Index capacity*element_size is known live Vec payload only, not RSS/allocator or total heap",
     "No production patch, no localization threshold/scoring/orientation/tie-break changes",
     "All output matrices, numerical bits and diagnostics compared exactly; one existing wrong-heading truth reproduced at128points; not an independent general localization correctness oracle",
-    "128/1024 source-point algorithm fixtures are below the normal50000-point actor accumulation gate; no large-map or actual actor workload benefit claim"
+    "128/1024-point sources are small synthetic algorithm fixtures, not representative full actor/robot workloads; active cutoff is lifecycle-guard-based, not a mandatory50000-point gate"
+  ],
+  "factual_corrections": [
+    {
+      "time_utc": "2026-10-14T00:42:00Z",
+      "original_error": "Reported a normal50000-point accumulation gate",
+      "verified_behavior": "The50000 constant is not used as a production count predicate. handle_frame cuts off on lifecycle guard; production active-mode LCM supplies that guard. Source policy minimum aggregate is0.",
+      "evidence": [
+        "correction_coordinator.rs:112,8994,3532",
+        "lcm_runtime.rs:11440-11455,11674-11689"
+      ]
+    }
   ]
 }

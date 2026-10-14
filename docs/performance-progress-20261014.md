@@ -1,6 +1,6 @@
 # NEH 云端夜间开发进度（持续更新）
 
-更新时间：2026-10-14 08:14 北京时间（2026-10-14 00:14 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
+更新时间：2026-10-14 08:44 北京时间（2026-10-14 00:44 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
 
 ## 当前结论与交付状态
 
@@ -8,13 +8,14 @@
 
 - 仓库：`Molun0301/nuwax-embodied-harness`
 - 工作分支：`fix/v3-legacy-cloud-seal-20261006`
-- 已确认的远端基线：`65d15c5262af71ee0ab532133bd0afdcb5e75911`；最近一次只读远端核对为2026-10-13 22:42 UTC，不能据此声称此后又核对过远端
-- 当前已提交本地代码状态：`e5854d7`，相对上述基线新增 **59 个本地提交**；本次报告阶段更新不包含在此计数中
-- 最新确认的同一 Library 检查点为 **v30，2,986,272 bytes**，覆盖截至 `29591a1` 的57个提交；随后jobs watcher及recent-column两个本地提交待下一检查点。最近一次CLI认证检查仍为2026-10-13 23:22 UTC缺失，Git推送受阻；远端最近核对仍为22:42 UTC，不能把本地提交或备份当作GitHub已更新
+- 已确认的远端基线：`65d15c5262af71ee0ab532133bd0afdcb5e75911`；最近一次只读核对为2026-10-14 00:17 UTC，远端仍停在该提交
+- 当前本地代码状态：`041b6f1`，相对远端基线新增 **65 个本地提交**；生产代码最新变更仍为`35ac900`；本次报告更新不包含在此计数中
+- 最新已确认的 Library 检查点为 **v32，3,324,225 bytes**，覆盖截至 `afcd7a6` 的61个提交；覆盖63提交（截至`2a12db8`）的本地检查点已核对为 **3,389,375 bytes**，但尚未上传Library；第64–65提交也尚无已上传检查点凭据。另有约15.458 MB原始日志只在本地，不能称已远端备份
+- 00:17 UTC检查仍缺CLI登录；00:19 UTC的Git远端读取已到达认证步骤，因禁止交互而无法读取Username。当前阻塞是认证，**没有证据称网络被封锁**；本地提交、测试和Library备份均不等于GitHub已更新
 
 **最新导航结果：** 完整 `NavScheduler` 局部恢复修复已提交为 `0eed9d2`，固定持续障碍的原目标在 **13.32秒**完成，仅2次规划/2次准入，232条完整停车尾迹和715条实际运动边全部通过。早期60秒失败与两次短程停车尾迹失败仍保留；独立调查发现采样位姿到实际应用间的转动差异，当前只是合同诊断，没有生产修复或真实50 ms执行器hold证明。不能据此称现场机器人卡住或安全时序问题全部解决。
 
-**最新集成与归因：** Python3.8.10去重选集1160项通过；Runtime适用范围236项通过但仍排除5项真实UDS。新RSS诊断支持allocator/free-page retention是复现晚窗增长的主要原因，剩余约43/114 KiB未归因；没有修改生产allocator或宣称无泄漏。
+**最新集成与归因：** Python3.8.10最新59目标去重选集 **1227项通过**，涵盖地图状态10项与完整installer57项；唯一排除仍为明确执行legacy内容哈希的pred1 fixture。它取代“待合并回归”状态，但仍是有界离线选择，不是全仓测试。Runtime适用范围236项通过但仍排除5项真实UDS。新RSS诊断支持allocator/free-page retention是复现晚窗增长的主要原因，剩余约43/114 KiB未归因；没有修改生产allocator或宣称无泄漏。
 
 下面的“旧 → 新”均采用各专项报告的匹配基线，不意味着统一对比上述远端版本。局部连续优化的收益也不相加。
 
@@ -40,6 +41,14 @@
 - 初始等价candidate记录的瞬时已知重叠payload **6,167,168 bytes**（flat keys＋group entries＋height Vecs），**不含**原points、retained frames、ground/obstacle sets、BTreeMap节点、sort内部和allocator开销；flat keys在bulk tree前drop，最终容量变小不意味着所有峰值变小
 
 测量含真实codec、状态/watermark更新，但使用无active goal的SurfaceFollower＋RecordingMotion，没有PlannerWorker、LCM/transport或真实plant。独立stage测量不能从full consume相减推算析构/分配成本。900次初始test-only等价比较与最终生产/original oracle资格分别保留；第一次copied oracle的Self返回类型编译失败只改测试类型，没有放宽生产语义。详细结果及冻结binary边界见[报告](diagnostics/recent-column-build-qualification-20261014.md)和[原始结构化结果](diagnostics/recent-column-build-qualification-20261014-results.json)。报告/JSON中的“root commit pending”是提交前记录；现已本地提交e5854d7，不代表远端发布。
+
+### 高密度近期点云：新增一次完整导航负载验证
+
+在原box障碍、局部规划ON的基础上新增独立测试，原六项live场景及通过标准保持不变。通过真实recent-cloud编码、同上下文liblcm memq、consumer、调度器ACK、PlannerWorker与controller，输入 **96,000个清空场景返回点 / 97,824个插入障碍后的返回点**。这些点落在原6,000个XY列中，不是100k独立列，也不是硬件采样保真声明。
+
+第一次也是唯一一次live运行通过：原封闭目标 **16.768秒到达**，位置误差0.07233 m、yaw误差0.10752 rad，随后匹配的zero fence通过。原连续SE(2) oracle检查 **1,162个轨迹区间/节点**全部通过，原命令期限审计通过，没有无期限非零命令。
+
+全程发布79帧；其中77帧位于首末实际非零命令之间的16.350秒窗口，该窗口可能包含停顿。实测source间隔200.013–225.661 ms、均值213.142 ms，**有效4.692 Hz，调度目标仍为5 Hz**。不能写成稳定精确5 Hz，也不能把publication数当作精确消费/ACK计数。没有基线配对、RSS或实机刹车结论；这只补足此前无active-goal ingestion测量与小点云live测试之间的负载覆盖。[完整证据](diagnostics/dense-recent-qualification-20261014.md)
 
 ### 持续运行与搜索结论
 
@@ -88,6 +97,8 @@
 
 现有输入只有采样位姿与最新twist，没有相关的完整应用转移历史；guard APPLIED时间未完整传入规划。dispatch admission bound也不等于真实actuator activation期限。生产Go2调用尚无已证明的每命令50 ms expiry，fixture的50 ms cap只约束理想plant；不能改写reaction-time含义或用常量twist外推掩盖空缺。本轮在这个合同边界结束诊断，**没有生产改动、新增安全框架或性能收益宣称**。[独立合同诊断](diagnostics/navigation-dispatch-drift-contract-20261013.md)
 
+后续只读核对还从保留的第二次失败记录算出：采样位姿到实际receipt仅 **1.132700 ms**，其中结果发布到取走 **0.405146 ms**，完整receipt停车尾迹仍失败。因此“完成就立即唤醒”单独不能保证receipt状态安全；它还会触及原20 Hz每步可达速度的语义。这里只分析原记录，没有新benchmark或生产改动，也未另做第二例几何重建。[新增时序核对](diagnostics/navigation-dispatch-drift-contract-20261013.md#2026-10-14-read-only-review-dispatch-ownership-and-latency)
+
 ## 二、地图、接纳、保存与身份
 
 - 完整点云 XYZ 边界归约改为各坐标轴的步进视图，保留全部有限值、精确边界和身份检查。4M 点合成资产完整验证 **259.257 → 15.523 ms**，暖文件系统真实检查点加载 **298.398 → 39.697 ms**；不含 RPC、原生恢复、定位、冷盘或浏览器。[证据](performance-dense-admission.md)
@@ -99,6 +110,14 @@
 - schema-1 外层检查点中的 **AR2/AR3 fine archive** 导入assigned路径（`96241b2`）：保留精确字节、原始occupancy/cloud receipts和frame/producer generations，为新不可变owner分配真实ID。该阶段Python有guard的**87项通过**；新导入5次有界root解析、4次全归档遍历，较初版少一次全遍历但未测延迟。22:18原生资格3项通过已提交为 `46db738`：2项实际Python AR2/3请求→transfer sealing/admission/replay，1项AR1现有底层install/next-commit/evidence/fences。该阶段报告的“AR1仍拒绝”是历史范围，已由下述成对扩展推进。[AR2/3阶段](fine-archive-legacy-import-20261013.md)
 - **AR1成对兼容扩展已提交 `a4333a3`**，涉及11个生产文件：新增RuntimeStatus field6支持版本声明；缺失/空/未知能力不授予AR1权限，旧服务器仍拒绝。现有GetStatus连接epoch内捕获能力，无新轮询；import/provider/store/Rust配对接受原AR1字节与原receipt，不伪装AR2、不制造revision。既有origin guard仅在catalog原 `os.replace` 线性化点覆盖rename，文件/目录fsync和回调均在runtime/provider锁外；rename前reconnect拒绝，rename后视为有效adoption，后续upload仍重查来源。AR2/3保持原save路径
 - AR1资格：**143项Python通过**（包括13项聚焦能力、reconnect/接纳race回归），**4项native通过**和**8项assigned-store通过**分别记录、不累计为全仓结果。实际Python on-disk importer生成请求/字节，经真实native seal、typed admission、cloud-writer install、下一次真实commit及retained replay；Python bridge/status/activation RPC仍为test double。no-hash sentinel在fixture前启用。早期缺最终rename fence的红测保留。此项是兼容与该支持迁移路径的应用哈希移除，**不是全RPC激活、所有legacy哈希移除或延迟提升**，也无部署AR1比例结论。[实现与准确资格](ar1-assigned-import-proposal-20261013.md)
+
+### schema-1地图状态只读取所需的库名（`afcd7a6`）
+
+活动旧版地图的状态同步原先构造完整记忆摘要，只取其中一个active-library name；现改用已有标量getter，仍在定位协调之后、runtime readiness之前读取。**schema-2仍走原assigned状态分支，没有这项提速**；非活动地图不读记忆。
+
+实际 `handle_list_maps` 会先列地图、再读活动workspace，因此完整摘要从 **3次降至1次**；响应确实需要的 `latest_memory_summary` 保留。1k记忆行、八个schema-1地图、真实file-backed SQLite与catalog的离线配对中，完整handler中位数 **412.007→141.150 ms**；单独list_maps为 **127.836→2.350 ms**，不能把后者当完整接口收益。没有网络、实机或所有地图通用加速声明。
+
+状态读取不再顺带执行摘要专属修复或遇到摘要专属错误，这是明确的范围变化，不声称副作用完全相同。直接summary/query及完整workspace继续保留验证、repair和错误；标量异常不吞掉，定位/readiness顺序不变。相关 **129项测试通过，零失败/跳过/排除，application hash attempts=0，framework ETag=0**；包括真实summary后续仍会修复的控制。早期1160项属于该改动前；后续最新1227项合并选择已覆盖这次地图状态改动。[报告](diagnostics/map-status-scalar-20261014.md)
 
 ## 三、任务、日志与兼容性
 
@@ -112,7 +131,24 @@
 
 `c5e2f43`仅移除slam-toolbox-sys与gtsam两个build.rs对 `CMAKE_BUILD_PARALLEL_LEVEL` 的rerun watcher；该变量只决定CMake `--parallel`，合法source/prefix/toolchain变化仍触发构建且使用当次jobs。实际Cargo/rustc1.88＋真实copied build scripts、fake CMake的**56次调用**均符合预期：jobs2→3时原版2次CMake、候选0次；源码、dependency prefix、toolchain变化仍各2次，configure/build故障及不改输入重试保留正确失败/恢复。注入故障的预期exit101不误报为Cargo全部exit0。
 
-这是避免重复build-script/CMake调度，不是实测SDK/native object编译或部署耗时收益；未链接SDK。generation-specific prefix仍是合法失效来源，**尚未采用稳定prefix生产修改**。便携脚本只验证语法/复现接口，不冒充另一次56-case执行。[证据](diagnostics/native-build-jobs-reuse-20261014.md)
+这是避免重复build-script/CMake调度，不是实测SDK/native object编译或部署耗时收益；未链接SDK。generation-specific prefix仍是合法失效来源，**尚未采用稳定prefix生产修改**。后续便携脚本已在Python3.8.10对最终managed-binding脚本执行64-case；这是扩展后的独立记录，不与最初56-case相加。[证据](diagnostics/native-build-jobs-reuse-20261014.md)
+
+### SDK源码构建缓存与受管理依赖绑定已成对提交（`35ac900`）
+
+修复的是两个相关问题：换源码pin后继续使用同一个CMake目录会报source-directory mismatch；即使新依赖B编译成功，consumer仍可能沿旧 `Ceres_DIR/TBB_DIR` 编译于A，造成同版本号下的ABI错配。小型真实CMake夹具重现了旧版A→B不重编译consumer、运行时undefined-symbol失败。
+
+新逻辑先读已有CMake cache的source绑定：兼容则保留原目录，不兼容才使用已接纳源码basename对应的构建目录。没有迁移、删除或重命名旧cache；换pin首次需正常编译，重复及回到旧pin可复用各自对象。安装prefix仍按generation隔离，**不是曾因旧时间戳漏重编译而否决的稳定安装prefix方案**。
+
+配套改动只给installer发起的slam2d-worker Cargo调用传入受管理generation prefix；CMake在此模式下从指定prefix选TBB/Ceres，缺包必须失败，离开模式显式清空。开发者非受管理模式的显式包目录仍保留；不修改父进程环境、不增加runtime设置、身份registry或内容哈希。
+
+资格按范围分开：
+
+- **10个source-cache阶段**：真实原编排器＋小型CMake/C++，换pin只重建必要对象，重复/返回A复用，configure/compile失败和重试保持，旧generation库仍可运行
+- **13个managed-binding阶段**：真实依赖发现片段，小型同版本不同ABI的A/B编译、链接、执行；B选对包，重复0/2对象重编译，缺包失败，retry、回滚A、切到开发者自定义目录、再切回B通过
+- **57项installer身份/环境隔离测试**：包括5项source选择及1项新环境合同，应用hash/network/真实外部进程guards仍启用
+- **64项真实Cargo＋fake CMake编排检查**：jobs-only不触发多余构建，source/prefix/toolchain/managed-mode变化正确失效；退出managed模式清空参数，失败/重试和no-op保持
+
+这些不同范围的结果不相加为一个系统测试总数。小型真实构建证明所列pin/重复/回滚行为，**没有完整SDK闭包、工具链/架构迁移、同时改Boost recipe、NEH整套安装回滚或部署耗时资格**。首次fake Boost fixture缺少FOUND标志的失败保留；修复夹具没有弱化产品检查。[source目录复用](diagnostics/slam2d-source-build-reuse-20261014.md)、[成对依赖绑定](diagnostics/slam2d-managed-binding-20261014.md)、[被否决的稳定prefix](diagnostics/slam2d-prefix-audit-20261014.md)
 
 ## 四、感知与语义记忆
 
@@ -149,6 +185,8 @@
 - assigned activation确有同一immutable canonical target在preflight与install各解码构造一次HashSet。1M点单decode诊断约65–76 ms、validate＋decode约137–148 ms，但**未采用保留set方案**：每个大请求多保留约26 MiB（实测27,267,072 mapped bytes），准备发生在transition锁前，缺少server-wide pending-task数量上限；50个set约1.27 GiB仅为并发风险示例，不是实际负载。18个进程是重复诊断、非18独立测试；它未实现完整activation、writer-lock时延或真实peak比较。没有移动准入次序、增加信号量/缓存或声称激活加速。[负面审计](diagnostics/activation-decode-audit-20261013.md)
 - recent ingestion初始基线的100k点XYZ materialization **0.820–0.846 ms**、finite scan **0.143–0.155 ms**，未支持扩大iterator/error-drain重构；两遍parser还会重复decode。保留原接口/错误/格式范围，三个ordinary contracts通过。之后较大的column构造热点才推进上述独立优化，不能把基线归因冒充同一A/B结果。[基线](diagnostics/recent-ingestion-baseline-20261013.md)
 
+- 重定位candidate-pair索引复用的小型离线夹具没有测出实质、可重复的完整计算收益；未修改生产索引或定位阈值/heading规则。同步准备阶段仍另行调查，不把这些小夹具外推为实机地图代表负载。[负面审计](diagnostics/relocalization-pair-reuse-audit-20261014.md)
+
 ## 七、验证状态与未完成边界
 
 以下按实际版本和范围分别报告，重叠测试数不相加，也不把历史通过等同最终 HEAD 全通过：
@@ -158,7 +196,8 @@
 - Stack/Runtime binary均冻结于`c5e2f43` watcher变更前；这一轮结果不是“由后来的e5854d7 HEAD全量构建”的声明。watcher两文件另经56-case测试，不改navigation算法。后续所有报告保持各自source window；没有全仓、实机或未过滤UDS通过声明
 
 
-- 最新Python **3.8.10，1160 passed / 0 failed / 0 skipped / 1 deselected，62.13秒**，既有httpx warning1条，exit0。57-target去重并集实际收集1161项；唯一排除的是会执行legacy digest的literal pred1 manifest fixture。以前排除的abrupt-exit测试本次已包含并通过，不再把它列为当前环境阻塞。执行HEAD为`3073f85`前后不变，之后native/文档提交未改该Python生产代码；便携runner只重做collection确认1160节点，不把它称作再次执行。[集成报告](diagnostics/python-guarded-integration-20261013.md)
+- schema-1地图状态改动前的Python集成 **3.8.10，1160 passed / 0 failed / 0 skipped / 1 deselected，62.13秒**，既有httpx warning1条，exit0。57-target去重并集实际收集1161项；唯一排除的是会执行legacy digest的literal pred1 manifest fixture。以前排除的abrupt-exit测试本次已包含并通过，不再把它列为当前环境阻塞。执行HEAD为`3073f85`前后不变，当时后续native/文档提交未改Python生产代码，但之后`afcd7a6`改变地图状态路径，该1160结果只作历史记录；本轮新1227结果见下项；便携runner只重做collection确认1160节点，不把它称作再次执行。[集成报告](diagnostics/python-guarded-integration-20261013.md)
+- 最新合并Python资格 **1227 passed / 0 failed / 1 exact pred1 deselected，65.42秒**，保留1条既有httpx warning。59个唯一目标包含原57目标、地图状态10项和完整installer身份套件57项；不是仅运行新增6项installer测试。application hash attempts **0**，精确框架mtime-size ETag例外 **4次**。执行前HEAD为`35ac900`、后为`041b6f1`，期间前进的是负面诊断/文档提交，生产代码未变；不把两个HEAD说成相同。129/1160/57与该选择重叠，不累计。本次只有一次实际集成执行，outer runner66.061秒，测试耗时不是性能对照；installer在此运行中仍使用fake外部工作，不重复tiny真实CMake资格。[新合并报告](diagnostics/python-guarded-integration-20261014.md)。高密度recent负载仍仅是一次candidate-only live资格，不称paired性能验证
 - 该Python执行在application/test imports前安装guard，**application hash attempts=0**；Starlette原FileResponse的mtime-size metadata ETag有**4次精确限定框架例外**，不读文件payload。不能称零框架hash，也不与早期572/652/177/143相加
 - 较早moving robustness阶段Runtime普通范围：**236 passed / 0 failed / 58 ignored / 5 UDS excluded，56.45秒**，以及另外显式执行的两个moving恢复arm。233/235通过属于之前源状态，不重复累计。[范围](diagnostics/navigation-recovery-robustness-20261013.md)
 - 历史近期碰撞优化MLS普通库 **320 passed / 16 ignored**；最终Scan default-feature **53 passed / 1 ignored**，profile **56 passed / 5 ignored**，non-test lib release check通过；两个Scan套件重叠不合并。五例current-guide和匹配复用diagnostic另外显式通过，不暗示其余ignored已运行
@@ -181,9 +220,10 @@
 
 ## 八、正在继续的工作（未计为成果）
 
-- 已结束的RSS归因、Scan复用、Python/native聚焦集成、activation decode负面审计和recent列构造资格均已归入结果，不再列为待运行
-- 继续source-prefix增量构建的tiny fixture调查；稳定路径若触及复制/patch/generated header时间戳，可能错误重编译或漏失效，必须实证。**尚无stable-prefix生产变更或已实现编译耗时收益**，jobs-only watcher的已验证范围保持独立
-- 本轮云端工作继续至北京时间11:00（03:00 UTC）；后续结果、最终检查点、提交与远端状态仍待届时更新，当前不宣称全部完成
+- SDK源码目录复用与受管理依赖绑定已成对接受并提交35ac900，移入已完成的局部成果；完整SDK/部署资格仍未声称
+- 最新1227项合并Python资格已通过并纳入结果；重定位同步准备路径仍在调查，未形成新的生产索引优化
+- 63提交本地检查点尚未上传，第64–65提交也待新检查点；Library仍只确认v32的61提交
+- 本轮云端工作继续至北京时间11:00（03:00 UTC）；后续结果、最终备份和远端状态届时再更新，当前不宣称全部完成
 
 ## 附：证据阅读顺序
 
@@ -202,3 +242,9 @@
 - 最新验证与负面调查：[RSS逐drain结果](diagnostics/navigation-rss-ownership-20261013-results.json)、[Scan复用结果](diagnostics/scan-polyline-reuse-results-20261013.json)、[五例真实guide](diagnostics/recent-guide-five-case-eligibility-results-20261013.json)、[Python逐node与guard](diagnostics/python-guarded-integration-20261013-results.json)、[moving恢复](diagnostics/navigation-recovery-robustness-20261013.json)、[native精确选择及provenance](diagnostics/final-native-integration-20261013-results.json)、[记忆query归因](diagnostics/memory-query-owned-work-20261013-results.json)
 
 - 最新阶段：[activation decode机会与保留风险](diagnostics/activation-decode-audit-20261013.md)、[recent ingestion原始基线](diagnostics/recent-ingestion-baseline-20261013.md)、[列构造资格及12-cohort样本](diagnostics/recent-column-build-qualification-20261014-results.json)、[jobs-only构建56-case](diagnostics/native-build-jobs-reuse-20261014-results.json)
+
+- 后续阶段：[地图状态完整handler配对结果](diagnostics/map-status-scalar-20261014-results.json)、[129项相关回归](diagnostics/map-status-scalar-20261014-regression.json)、[高密度recent完整负载结果](diagnostics/dense-recent-qualification-20261014-results.json)
+
+- 第64阶段：[source-cache真实编排结果](diagnostics/slam2d-source-build-reuse-20261014-results.json)、[managed-binding与64-case结果](diagnostics/slam2d-managed-binding-20261014-results.json)
+
+- 最新Python：[2026-10-14合并资格](diagnostics/python-guarded-integration-20261014.md)、[1227个唯一node结果与原始guard记录](diagnostics/python-guarded-integration-20261014-results.json)
